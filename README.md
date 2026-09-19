@@ -2,6 +2,13 @@
 
 A minimal Rust crate bootstrap for the `skys3` repository.
 
+## Design
+
+See the [SkyS3 architecture proposal](docs/design.md) for replicated append-log
+ingestion, automatic background erasure coding, S3/OIDC/STS compatibility,
+external S3 caching, and pre-completion multi-region replication.
+This is a design for review, not implemented functionality.
+
 ## Development
 
 ```bash
