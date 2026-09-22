@@ -39,7 +39,7 @@ The previous proposal (#2) designed SkyS3 as an authoritative object store with 
 ### 1.1 Decisions
 
 1. **No consensus on the request path.** Each key belongs to a shard. Each shard has one primary and a small set of backups (three replicas by default). A write succeeds only after **every current member** has made it durable. If any member fails to acknowledge in time, the request fails. This is the SeaweedFS volume model[^seaweed-repl] applied to both payload and metadata.
-2. **Membership changes automatically through compare-and-swap registers in the remote S3.** Every shard's configuration is one small object in a control bucket. Changes to it use S3 conditional writes (`If-Match` / `If-None-Match`)[^s3-cond]. Epochs fence stale primaries. Primary leases are granted by the backups, so the data path never waits on the control store. This is the PacificA / Vertical Paxos family of designs[^pacifica][^vpaxos], with S3 conditional writes as the configuration master.
+2. **Membership changes automatically through compare-and-swap registers in the remote S3.** Every shard's configuration is one small object in a control bucket. Changes to it use S3 conditional writes (`If-Match` / `If-None-Match`)[^s3-cond]. Epochs fence stale primaries. Primary leases are granted by the backups, and every node keeps a durable local copy of the control state it uses, so the data path never waits on the control store. This is the PacificA / Vertical Paxos family of designs[^pacifica][^vpaxos], with S3 conditional writes as the configuration master.
 3. **Three copies while dirty, one disposable copy after flush.** Unflushed data is replicated to every shard member. Once the remote target confirms it, SkyS3 keeps at most one local copy as evictable cache. Erasure coding, EC cleaning, and cross-node garbage collection are not needed.
 4. **Ordered, coalescing, conditional flush.** Each shard flushes its keys in commit order, uploads only the latest version of a key, and uses conditional requests so that out-of-band writes to the remote are detected instead of silently overwritten.
 5. **Streaming flush for large objects.** Multipart parts, and large single PUTs, are streamed to the remote while the client is still uploading. The remote object becomes visible only when the local upload has committed.
@@ -112,7 +112,7 @@ All roles run from a single binary. Every node runs the gateway and the storage 
 - **Gateway.** Terminates S3 and STS HTTP, authenticates requests, routes each key to its shard primary using a cached shard map, and streams request bodies.
 - **Shard replica.** Holds one shard's log records, index, and cached payload. The primary orders writes, replicates them, serves strong reads, and runs the shard's flusher.
 - **Coordinator.** Handles placement, replacement, rebalancing, and node bookkeeping. It holds a lease in the control store. It is never on the request path, and it can never break safety, because every change it makes is a CAS.
-- **Control store.** A prefix in an S3 bucket holding the cluster, bucket, shard, and identity configuration as CAS registers. It can live in the same account as a data target or a different one, but it must not be a SkyS3 bucket.
+- **Control store.** A prefix in an S3 bucket holding the cluster, bucket, shard, and identity configuration as CAS registers. No client request touches it, and every node keeps a durable local copy of the parts it uses (section 6.2). It should use the endpoint nearest the cluster, which need not be a data target's endpoint, and it must not be a SkyS3 bucket.
 
 ## 4. Data model
 
@@ -186,7 +186,7 @@ Large bodies are streamed as 1 MiB extent records, which are replicated the same
 
 If any member has not acknowledged within `replica_ack_timeout`, the request fails with `503 SlowDown`. That is what "require all acks" means here.
 
-A failed response means **not acknowledged**, not **not applied**. S3 has the same semantics for a 5xx or a timeout. The record may already be on some members. It will later either commit, when a reconfiguration removes the unresponsive member (section 6.3), or be discarded, when a new primary does not have it (section 6.5). Two rules keep this safe:
+A failed response means **not acknowledged**, not **not applied**. S3 has the same semantics for a 5xx or a timeout. The record may already be on some members. It will later either commit, when a reconfiguration removes the unresponsive member (section 6.4), or be discarded, when a new primary does not have it (section 6.6). Two rules keep this safe:
 
 - **No reordering.** The log is strictly sequential per shard. A later committed write always supersedes an earlier failed one, so a failed PUT can never resurface over a later PUT or DELETE of the same key.
 - **No holes.** A member cannot accept `seq + 1` without `seq`. While a member is unresponsive, the shard cannot commit anything until that member catches up or is removed.
@@ -204,7 +204,7 @@ Setting `replica_ack_timeout` above the time a reconfiguration takes lets reques
 
 Group commit batches fsyncs across all shards that share a disk, so the per-object sync count falls further under concurrency. Section 15.3 defines how these counts are measured.
 
-The cost of this model is tail latency. Every PUT waits for the slowest of the member fsyncs, and one sick member stalls its shards until it is removed. Section 6.3 bounds that stall to roughly `member_suspect_after` plus one CAS round trip.
+The cost of this model is tail latency. Every PUT waits for the slowest of the member fsyncs, and one sick member stalls its shards until it is removed. Section 6.4 bounds that stall to roughly `member_suspect_after` plus one CAS round trip.
 
 ### 5.4 Leases and strong reads
 
@@ -236,8 +236,6 @@ Each write includes a unique `proposal_id` in the body. If a response is lost an
 
 At startup, each node probes the control store. It races two conditional writes on a scratch key and requires exactly one to succeed, and it checks read-after-write consistency. A store that fails the probe is refused.
 
-Traffic to the control store is small. The coordinator renews its lease every few seconds, and shard registers change only when membership changes. Nodes cache every register they use and refresh one when an epoch mismatch shows it is stale.
-
 An example shard register:
 
 ```json
@@ -254,7 +252,50 @@ An example shard register:
 }
 ```
 
-### 6.2 Configuration rules
+#### Traffic and latency
+
+**No client request reads or writes the control store.** Routing, leases, commits, and reads all stay inside the cluster. The control store sees background traffic, plus bursts when membership changes:
+
+| Activity | Control-store requests | Effect of a 100 ms round trip |
+|---|---|---|
+| Any client request | 0 | None |
+| Primary leases | 0 (granted by backups, section 5.4) | None |
+| Coordinator lease renewal | 1 conditional PUT every `coordinator_lease / 3` | None while renewal fits well inside the lease |
+| Configuration propagation (section 6.2) | 1 conditional GET per node every `config_poll_interval`, usually `304 Not Modified` | None |
+| Member removal or primary takeover | 1 CAS per affected shard | Adds about 1–2 round trips to a failover dominated by `member_suspect_after` or `primary_grace` |
+| Member replacement | 2 CAS per shard (add learner, promote) | None on writes; promotion does not pause commits (section 6.7) |
+| Node restart with an intact local copy | 0 for shards whose membership did not change | None |
+| Node restart without a local copy | 1 GET per register it needs, issued in parallel | Proportional to register count ÷ parallelism |
+
+Losing a node generates a burst of CAS requests: one per shard the node belonged to, for example about 240 in a 20-node cluster with 1,600 shards. Issued in parallel, the burst adds well under a second. It stays far below S3 per-prefix request limits.
+
+**Placement.** The control store does not have to use the data targets' endpoint or region. Put it in the region or endpoint nearest the cluster, even when the data targets are far away. Its latency only affects failover time, and its availability only affects membership changes.
+
+### 6.2 Local copies of control state
+
+The control store holds **only cluster control state**. Object metadata lives in each shard's index on every shard replica (section 8.1). The remote targets hold the objects and their S3 metadata.
+
+Every node also keeps a durable local copy of the control state it uses:
+
+| State | Local copy | Kept current by |
+|---|---|---|
+| Configuration of each shard the node belongs to | A `CONFIG` record in that shard's log (section 9.1) | The replica appends it, and group commit makes it durable, before the replica acts on the new epoch |
+| Shard map used by the gateway for routing | Node-local index, with each shard's epoch | Redirect hints from shard replicas, and coordinator pushes |
+| Bucket bindings, identity and trust configuration, node registry | Node-local index, tagged with a configuration generation | Coordinator pushes, plus polling of `cluster.json` |
+
+**Propagation.** Every control-store change the coordinator makes also increments the generation number in `cluster.json`, and the coordinator pushes the change to every node. As a backstop, each node polls `cluster.json` every `config_poll_interval` with `If-None-Match: <etag>`, and refetches changed objects only when the generation moves.
+
+**Stale routing.** A shard replica that is not the current primary rejects a forwarded request with its current configuration (epoch, primary, members). The gateway updates its shard map from that hint and retries, without touching the control store. It reads the shard register directly only if no member of the configuration it knows answers.
+
+**The control store is the authority; local copies are caches.** Membership changes are CAS operations against the control store's current version, so there is exactly one place where competing changes are ordered. A stale local copy cannot cause an incorrect commit, because every data-path message carries an epoch and members reject old ones (rule R2 in section 6.3). The worst a stale copy costs is a redirect.
+
+What the local copies make possible:
+
+- **Restart while the control store is unreachable.** On restart, a replica loads each shard's latest `CONFIG` record and resumes. A shard whose membership did not change while the node was down resumes serving without contacting the control store. A shard whose membership did change is fenced by epochs, because the other members reject the stale configuration, until the node can read the current register.
+- **STS during a control-store outage.** STS keeps validating tokens with the cached trust configuration and roles. A revocation made in the control store during the outage cannot reach the node, so new session issuance fails closed once the cached identity configuration is older than `identity_max_staleness`. Sessions already issued stay valid until they expire.
+- **Rebuilding a lost control store.** If the control bucket is lost, a replacement can be rebuilt from the newest `CONFIG` record of every shard plus the cached bucket and identity configuration. Rebuilding is a deliberate operator action (section 6.9). Doing it automatically could let two clusters claim the same prefix.
+
+### 6.3 Configuration rules
 
 A new configuration always has epoch `e+1` and is written with CAS over configuration `e`. Four kinds of change exist:
 
@@ -263,15 +304,15 @@ A new configuration always has epoch `e+1` and is written with CAS over configur
 | Remove a member | Current primary, or the coordinator | Member unresponsive for `member_suspect_after`, or the coordinator's placement decision |
 | Take over as primary | A member of `e`, for itself only | `primary_grace` has passed without beacons, or the current primary asked it to take over |
 | Add a learner | Coordinator | Placement rules allow the node |
-| Promote a learner to member | Current primary | Learner is durable up to the frozen commit watermark (section 6.6) |
+| Promote a learner to member | Current primary | The primary already requires the learner's acknowledgements, and the learner is durable up to the commit watermark (section 6.7) |
 
-Three rules carry the safety argument (section 6.7):
+Three rules carry the safety argument (section 6.8):
 
 - **R1.** A configuration with a new primary can be written only by that new primary. It must have been a member (not a learner) of `e`, and it must stop acknowledging epoch-`e` appends before it proposes.
 - **R2.** Every member rejects appends stamped with an epoch older than the newest one it has seen.
 - **R3.** A learner becomes a member only after it holds every committed record.
 
-### 6.3 Member failure
+### 6.4 Member failure
 
 ```mermaid
 sequenceDiagram
@@ -291,6 +332,7 @@ sequenceDiagram
     Note over P,B1: Writes commit again with two members
     K->>CS: CAS epoch 43 to 44 adding learner N
     P->>P: Stream snapshot and log to N
+    Note over P: N caught up, so commits also wait for N
     P->>CS: CAS epoch 44 to 45 promoting N
 ```
 
@@ -300,7 +342,7 @@ If removing a member would leave fewer than `min_write_replicas` members, the re
 
 The default `min_write_replicas = 2` with `target_replicas = 3` means a shard keeps accepting writes after losing one node, with two copies of new data, and returns to three copies without anyone intervening.
 
-### 6.4 Primary failure
+### 6.5 Primary failure
 
 ```mermaid
 sequenceDiagram
@@ -327,7 +369,7 @@ If only one member survives, it can still take over. Every committed record is o
 
 A deposed primary finds out on its next CAS attempt or on its next rejected append, and then stops serving.
 
-### 6.5 Reconciling logs after a primary change
+### 6.6 Reconciling logs after a primary change
 
 The new primary's log is authoritative for the new epoch:
 
@@ -337,7 +379,7 @@ The new primary's log is authoritative for the new epoch:
 
 The uncommitted tail is **rolled forward**. Clients that received a 503 for those writes may find them applied. Section 5.2 allows exactly that.
 
-### 6.6 Placement, replacement, and node lifecycle
+### 6.7 Placement, replacement, and node lifecycle
 
 The coordinator holds `coordinator.lease`. It renews every `coordinator_lease / 3` with `If-Match`. A candidate takes over only after it has observed the same lease ETag for longer than `coordinator_lease × (1+ρ)`, measured on its own monotonic clock. No clock comparison between nodes is needed.
 
@@ -346,26 +388,28 @@ Every change the coordinator makes is a CAS, so two nodes that briefly both beli
 The coordinator:
 
 - Tracks node health from heartbeats it receives directly. This is advisory only. Shard failover never depends on it.
-- **Replaces** lost members. It adds a learner on an eligible node that respects failure-domain separation and capacity. The primary streams a snapshot of the shard index plus dirty payload, then the live log. Clean payload is not copied, because the new member can fetch it from the remote if needed. To promote, the primary freezes its commit watermark, waits for the learner to reach it, CASes the promotion, and resumes. The pause is short.
+- **Replaces** lost members. It adds a learner on an eligible node that respects failure-domain separation and capacity. The primary streams a snapshot of the shard index plus dirty payload, then the live log. Clean payload is not copied, because the new member can fetch it from the remote if needed.
+- **Promotes** caught-up learners **without pausing commits**. Once a learner is close to the log head, the primary adds it to the set of acknowledgements every new commit waits for. When the learner is durable up to the commit watermark, it holds every committed record, and the primary CASes the promotion. Commits keep flowing during the CAS and only wait for the learner's LAN acknowledgement. The control-store round trip is never on the write path. Requiring an extra acknowledgement never weakens the commit rule. If the CAS fails, the primary re-reads the register and either retries or stops waiting for the learner.
 - **Rebalances** shards and primaries across nodes, including newly joined ones, with add-learner, promote, remove steps. Primaries are moved by asking the target member to propose itself (rule R1).
 - **Re-admits** returning nodes. A node that was removed from a shard rejoins only as a learner. Its old records for that shard may seed catch-up after their `(epoch, seq)` prefix is verified, and are otherwise discarded.
 - **Forgets** nodes that stay unreachable for `node_forget_after`, after re-homing their shards.
 
 Joining a new node is a provisioning action: the node starts with valid credentials and registers itself. Every membership decision after that is automatic.
 
-### 6.7 Safety argument (sketch)
+### 6.8 Safety argument (sketch)
 
 - **Committed records survive.** A committed record is durable on every member of its epoch (commit rule). R3 extends this to every later member, and R1 guarantees any new primary was a member. Committed data is lost only if every member of a shard loses its disk before the next flush.
 - **One writer per epoch.** Committing in epoch `e` needs every member of `e`. When a member takes over, it first stops acknowledging `e` (R1). The CAS on the register serializes competing proposals, and R2 fences stragglers. A deposed primary therefore cannot commit anything after the takeover begins. A member removal leaves the primary unchanged and only shrinks the set whose acknowledgements are required.
 - **Linearizable reads.** A primary serves reads only while every member's lease is valid (section 5.4). A new primary serves reads only after the old primary's leases must have expired, under the drift bound.
-- **Stale coordinators and stale caches are harmless.** Every register update is a CAS, and every data-path message carries an epoch.
+- **Promotion keeps R3.** A learner is promoted only while every commit already waits for it and it has everything up to the commit watermark. Nothing commits in between without it.
+- **Stale coordinators and stale local copies are harmless.** Every register update is a CAS, and every data-path message carries an epoch (section 6.2).
 
 This protocol is PacificA's[^pacifica] with an S3 register as the configuration manager. Vertical Paxos[^vpaxos] gives the general correctness argument for this design family. The state machine will be model-checked before implementation (section 15.1).
 
-### 6.8 What still needs a human
+### 6.9 What still needs a human
 
 - **Provisioning hardware.** Adding and physically retiring machines. Membership changes that follow are automatic.
-- **Loss of the control store.** Bucket deleted, credentials revoked, or a provider that stops honoring conditional writes. The data path keeps running, but no membership change can happen until it is restored.
+- **Loss of the control store.** Bucket deleted, credentials revoked, or a provider that stops honoring conditional writes. The data path keeps running from local copies (section 6.2), but no membership change can happen until the store is restored, or an operator rebuilds it from the nodes' local copies.
 - **Flush conflicts under the `hold` policy** (section 7.2).
 - **Every member of a shard lost before flushing.** SkyS3 reports exactly which dirty keys were lost. It cannot recover them.
 
@@ -377,7 +421,7 @@ Each shard primary runs a flusher over committed records in `seq` order:
 
 - **Per-key order is preserved.** Each key has at most one flush in flight. If a newer version commits while an older one is being flushed, the newer version is flushed next, conditioned on the ETag the older flush produced.
 - **Intermediate versions are coalesced.** Only the latest committed state of a key is flushed. If that state is a tombstone, the flusher issues `DeleteObject`.
-- **Keys flush concurrently** (`flush_concurrency_per_shard`). Remote observers may see writes to different keys in a different order than they were committed. SkyS3 does not provide a cross-key snapshot at the remote.
+- **Keys flush concurrently**, with adaptive concurrency per shard between `flush_min_concurrency_per_shard` and `flush_max_concurrency_per_shard` (section 7.7). Remote observers may see writes to different keys in a different order than they were committed. SkyS3 does not provide a cross-key snapshot at the remote.
 - When the remote accepts, the primary appends a `FLUSHED(key, seq, remote_etag, remote_version_id)` record. The record is piggybacked on the next group commit and never triggers an fsync of its own. If it is lost in a crash, the key is flushed again. The retry is idempotent (section 7.2).
 
 ### 7.2 Conditional flush and ownership conflicts
@@ -435,13 +479,28 @@ sequenceDiagram
 
 ### 7.5 Write-through buckets
 
-A bucket may set `ack_policy = "write_through"`. A PUT then succeeds only after the local commit **and** the remote flush. Every acknowledged write is already at the remote, so losing the local cluster loses no acknowledged data (zero RPO), at the cost of remote latency on every write. Reads still benefit from the cache.
+A bucket may set `ack_policy = "write_through"`. A PUT then succeeds only after the local commit **and** the remote flush. Every acknowledged write is already at the remote, so losing the local cluster loses no acknowledged data (zero RPO). The cost is at least one remote round trip on every write, plus transfer time. Streaming flush (section 7.3) hides the transfer time for large objects, but not the final round trip. Reads still benefit from the cache.
 
 ### 7.6 Backpressure and loss exposure
 
 - A dirty-data budget applies per bucket and per cluster (`max_dirty_bytes`). New writes get `503 SlowDown` when it is exhausted, including during a remote outage.
 - Loss exposure (RPO) with `ack_policy = "local"` is the dirty set of any shard whose members are all lost together. The metrics `dirty_bytes`, `oldest_dirty_age`, and `flush_lag_seconds` measure it.
 - Flush bandwidth must exceed the ingest rate over time, or the dirty set grows until admission control stops writes. Remote request-rate limits (for example per-prefix limits) are handled with adaptive concurrency and retry with backoff.
+
+### 7.7 High-latency remote targets
+
+Remote targets may sit behind a slow link, for example a 100 ms round trip. That latency never reaches local writes with `ack_policy = "local"`, but it bounds flush throughput and shows up wherever a request has to wait for the remote:
+
+| Path | Effect of round trip `RTT` | Mitigation |
+|---|---|---|
+| Local writes, `ack_policy = "local"` | None | |
+| Small-object flush throughput | About `concurrency ÷ RTT` requests per second per shard | Adaptive concurrency sized from the bandwidth-delay product |
+| Large-object flush | Transfer overlaps the client upload | Streaming flush (section 7.3) |
+| Write-through PUT | At least one `RTT` per write | Use only on buckets that need zero RPO |
+| Cache miss | At least one `RTT` before the first byte | Cache sizing, fill coalescing |
+| Namespace import | 1,000 keys per `RTT` per listing stream | Parallel import by key range (section 8.1) |
+
+Flush concurrency adapts per target. It grows additively while throughput rises and latency stays near the target's base round trip, and it shrinks multiplicatively on `503 SlowDown` or rising latency. The ceiling, `flush_max_concurrency_per_shard`, together with `flush_max_inflight_bytes_per_target`, keeps enough requests in flight to fill the link: roughly `bandwidth × RTT ÷ average object size`. For example, 8 shards at 64 requests each keep 512 small-object PUTs in flight. At a 100 ms round trip that is about 5,000 PUTs per second per bucket, before the target's own rate limits apply.
 
 ## 8. Reads, namespace, and cache management
 
@@ -450,6 +509,8 @@ A bucket may set `ack_policy = "write_through"`. A PUT then succeeds only after 
 Every shard's index holds an entry for every key in its slice of the bucket, including keys whose payload has been evicted. This makes HEAD, LIST, conditional checks, and 404 responses local and strongly consistent.
 
 Attaching a bucket runs a resumable **import**. The remote prefix is listed and a stub is committed for each object: key, size, ETag, last-modified, and storage class. User metadata and content type are loaded lazily on the first HEAD or GET. The import rate is limited.
+
+One listing stream imports at most 1,000 keys per round trip, which is about 10,000 keys per second at 100 ms. A 100-million-object bucket would take roughly three hours that way. So the import splits the key space and lists ranges in parallel (`import_parallel_streams`). It first discovers split points with delimiter listings, or by sampling keys, then lists each range with `StartAfter` up to the next split point. Each range checkpoints its last imported key, so a restart resumes where it stopped.
 
 Until the import finishes, a local miss falls through to a remote HEAD, and LIST merges the remote listing with local entries. Afterwards, a local miss is a 404.
 
@@ -465,7 +526,7 @@ An optional periodic **reconciliation scan** re-lists the remote and reports dif
 
 ### 8.3 Clean copies and eviction
 
-When a key becomes clean, the member that holds the payload (the primary, by default) keeps it as cache. Other members mark their copies dead. Eviction is local LRU per node, bounded by `cache_max_bytes`, and needs no coordination.
+When a key becomes clean, the member that holds the payload (the primary, by default) keeps it as cache. Other members mark their copies dead. Eviction is local LRU per node, bounded by `cache_max_bytes_per_node`, and needs no coordination.
 
 Dirty payload is never evicted. The capacity model per node is: dirty replicas + clean cache + learner catch-up reserve + filesystem overhead. Cache is reclaimed first.
 
@@ -492,6 +553,8 @@ Each disk has append-only segment files shared by every shard replica on that di
 
 Record header: magic, format version, record kind, shard id, epoch, seq, key hash, header and payload lengths, and CRC32C. Record kinds are `PUT`, `DELETE`, `EXTENT`, `MPU_CREATE`, `MPU_PART`, `MPU_COMPLETE`, `MPU_ABORT`, `FLUSHED`, `TAGS`, `TRUNCATE`, and `CONFIG`.
 
+A `CONFIG` record holds a full shard configuration: epoch, primary, members, learners, and replica targets. A replica appends one, and group commit makes it durable, whenever it adopts a new epoch, before it acknowledges or serves anything in that epoch. Checkpoints keep each shard's latest `CONFIG` record reachable, so it survives log reclamation. It is the replica's local copy of its membership (section 6.2).
+
 Parsing checks lengths before allocating, uses checked arithmetic, and rejects unknown versions. On recovery, a torn tail is cut back to the last record whose CRC verifies.
 
 ### 9.2 Index and checkpoints
@@ -500,7 +563,8 @@ A per-node `redb` database[^redb] holds:
 
 - each shard's namespace index, keyed by `(shard, key)`, with state, ETags, checksums, metadata, and payload location,
 - the node-local location map, from extent to `(segment, offset, length)`,
-- each shard's applied `(epoch, seq)`.
+- each shard's applied `(epoch, seq)`,
+- the node's local copy of control state: the gateway shard map, bucket bindings, identity configuration, and node registry, each tagged with its configuration generation (section 6.2).
 
 Index updates are committed **without fsync** (`Durability::None`). A durable checkpoint runs every `index_checkpoint_interval`. After a crash, redb reverts to the last durable checkpoint, and records after the checkpointed `seq` are replayed from the log. The log is the source of truth, and only log appends are fsynced on the write path. Log segments are released only once they are behind the durable checkpoint.
 
@@ -531,7 +595,7 @@ S3 parsing and serialization use `s3s`[^s3s]. SkyS3 implements authentication, a
 
 CopyObject within the cluster copies the bytes into the destination shard. If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth.
 
-**Workload identity.** STS implements `AssumeRoleWithWebIdentity`[^sts-wif]. It validates the JWT signature against allowlisted issuers (discovery and JWKS fetched with bounded size and rate), and checks `iss`, `aud`, `sub`, `exp`, `nbf`, and `azp` where required, using an algorithm allowlist. It then issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`. Trust policies and roles live in the control store. Session records live in an internal, local-only system bucket that is replicated like any shard and never flushed. Session tokens are stored hashed. Secrets needed for SigV4 are held in memory with `secrecy`/`zeroize`.
+**Workload identity.** STS implements `AssumeRoleWithWebIdentity`[^sts-wif]. It validates the JWT signature against allowlisted issuers (discovery and JWKS fetched with bounded size and rate), and checks `iss`, `aud`, `sub`, `exp`, `nbf`, and `azp` where required, using an algorithm allowlist. It then issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`. Trust policies and roles live in the control store. Each node validates against its local copy, and stops issuing new sessions once that copy is older than `identity_max_staleness` (section 6.2). Session records live in an internal, local-only system bucket that is replicated like any shard and never flushed. Session tokens are stored hashed. Secrets needed for SigV4 are held in memory with `secrecy`/`zeroize`.
 
 Clients point both `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL_STS` at SkyS3. The SDK matrix (section 15.2) verifies that each SDK's web-identity provider honors them.
 
@@ -552,10 +616,11 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 | Backup slow or dead | In-flight writes on its shards fail with 503. The primary removes it after `member_suspect_after` and writes resume with 2 members. The coordinator adds a replacement. |
 | Primary dead | Its shards are unavailable for about `primary_grace` plus one CAS plus reconciliation (under 10 s by default). A backup takes over and rolls the tail forward. |
 | Two of three members dead | The survivor becomes primary with the full committed history. The shard is read-only until a learner catches up. |
-| Whole cluster loses power | Nodes replay logs from their checkpoints, read cached or remote configuration, and resume. Epoch checks prevent stale primaries. |
+| Whole cluster loses power | Nodes replay logs from their checkpoints and resume from each shard's latest `CONFIG` record, even if the control store is unreachable. Shards whose membership changed while a node was down are fenced by epochs until that node reads the current register. |
 | Every member of a shard permanently lost | Dirty data of that shard is lost. SkyS3 reports the exact keys. Clean data is refilled from the remote. |
 | Remote target unreachable | Writes continue up to the dirty budget. Reads of cached data continue. Reads of evicted data fail. |
-| Control store unreachable | Data path continues. Shards that need a membership change stay unavailable for writes (and reads after lease expiry) until it returns. |
+| Control store unreachable | Data path continues from local copies. Shards that need a membership change stay unavailable for writes (and reads after lease expiry) until it returns. STS stops issuing new sessions after `identity_max_staleness`. |
+| High-latency link to the control store | Client requests are unaffected. Failover and member removal take 1–2 extra round trips per CAS. |
 | Coordinator dies | Another node takes the lease. Only placement work is delayed. |
 | Primary partitioned from its backups | The primary loses its leases and stops serving. A backup takes over by CAS. |
 | Out-of-band write at the remote | Detected at flush (conflict policy) or at fill (clean entry adopts the remote version). |
@@ -576,6 +641,7 @@ endpoint = "https://s3.us-east-1.amazonaws.com"
 bucket = "example-skys3-control"
 prefix = "skys3-prod-a/"
 coordinator_lease_seconds = 10
+config_poll_interval_seconds = 30
 
 [replication]
 target_replicas = 3
@@ -604,7 +670,9 @@ reserve_fraction = 0.10
 
 [flush]
 ack_policy = "local"
-flush_concurrency_per_shard = 16
+flush_min_concurrency_per_shard = 4
+flush_max_concurrency_per_shard = 64
+flush_max_inflight_bytes_per_target = 1073741824
 streaming_flush_min_bytes = 67108864
 flush_part_bytes = 67108864
 flush_conflict_policy = "hold"
@@ -614,12 +682,14 @@ max_dirty_bytes = 2199023255552
 [buckets.defaults]
 shards_per_bucket = 8
 mode = "write_back"
+import_parallel_streams = 32
 
 [identity]
 anonymous_access = false
 sts_web_identity = true
 session_default_seconds = 3600
 session_maximum_seconds = 3600
+identity_max_staleness_hours = 24
 ```
 
 ## 14. Rust dependencies
@@ -644,6 +714,7 @@ session_maximum_seconds = 3600
 
 - Specify the shard protocol (commit rule, R1 to R3, leases, reconciliation) and model-check it, in TLA+ or with a Rust model checker. Check durability of committed records, a single committing primary per epoch, and read linearizability under the drift bound.
 - Run the real replication and flush code under deterministic simulation. The simulated disk distinguishes written from fsynced data. The simulated S3 store supports conditional writes, delay, 5xx errors, and lost responses. Inject crashes, partitions, message loss, reordering, and clock drift. Record seeds so failures replay.
+- Include control-store faults: long outages, 100 ms and higher round trips, lost CAS responses, and whole-cluster restarts while the control store is unreachable. Nodes must resume from their `CONFIG` records, and stale configurations must stay fenced.
 - Check histories for linearizability per key at the primary. Check that every acknowledged write is either flushed, or present on a surviving member, or reported lost.
 
 ### 15.2 Compatibility
@@ -657,8 +728,8 @@ session_maximum_seconds = 3600
 Measure on fixed hardware and against remote targets with shaped links:
 
 - PUT p50/p99 for 1 KiB to 1 GiB objects, including fsyncs per acknowledged PUT, records per group commit, and serial durable rounds. Section 5.3's table is the claim to verify.
-- Failover time distribution for primary and backup failures, and the write-unavailability window per shard.
-- Flush lag, dirty backlog, and sustained flush throughput. Streaming-flush overlap: the fraction of bytes already at the remote when the client completes.
+- Failover time distribution for primary and backup failures, and the write-unavailability window per shard, with the control store at 1 ms and at 100 ms round trips. Confirm that learner promotion adds no write stall.
+- Flush lag, dirty backlog, and sustained flush throughput at target round trips from 1 ms to 150 ms. Confirm that adaptive concurrency reaches the bandwidth-delay product. Measure import rate with parallel key ranges. Streaming-flush overlap: the fraction of bytes already at the remote when the client completes.
 - Cache hit rate, fill latency, and compaction write amplification.
 
 ## 16. Delivery plan
