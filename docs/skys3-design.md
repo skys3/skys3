@@ -554,7 +554,7 @@ SkyS3 assumes it **exclusively owns** the remote prefix. Every flush is conditio
 
 | Write | The identity names | Carried into |
 |---|---|---|
-| PUT, DELETE, or copy flushed after it commits | The committing `PUT`, `DELETE`, or copy record | Nothing else |
+| PUT, DELETE, or copy flushed after it commits | The committing `PUT` or `DELETE` record. A copy commits as a `PUT` that records its source (section 10.1). | Nothing else |
 | Multipart upload | The `MPU_CREATE` record that opened it | The `MPU_COMPLETE` record |
 | Large single PUT streamed during upload (section 7.3 or 7.8) | An `UPLOAD_BEGIN` record committed when streaming starts | The final `PUT` record |
 
@@ -649,7 +649,7 @@ A write-back target or a backup target can itself be a SkyS3 cluster, for exampl
 - **Batched small objects**, instead of one request and one round trip each.
 - **No head-of-line blocking** between objects that share a connection.
 
-With a loss-driven controller, throughput is expected to **match** the REST path, not beat it, because both are bounded per connection and both use enough connections to fill the link (`peer_connections_per_node` is sized and adapted like REST flush concurrency). Throughput **above** REST on lossy links needs a loss-tolerant controller, and that is gated on measurement.
+With a loss-driven controller, throughput is expected to **match** the REST path, not beat it, because both are bounded per connection and both use enough connections to fill the link. The peer connection budget has the same scope and ceiling as REST flush concurrency: `peer_connections_per_shard` mirrors `flush_max_concurrency_per_shard`, so a node that is primary for many shards of a bucket gets as many peer connections as it would REST connections. Throughput **above** REST on lossy links needs a loss-tolerant controller, and that is gated on measurement.
 
 Quinn[^quinn] provides:
 
@@ -701,7 +701,7 @@ sequenceDiagram
 - **Preconditions on every operation.** The destination evaluates the precondition in its own shard log, so PUTs, multipart completions, copies, and deletes are all conditional, without any provider gaps. A `COMMIT` is keyed by write identity, so a replay after a lost `APPLIED` returns the stored result.
 - **Small objects in batches.** Objects of up to one frame skip staging. Many of them travel in one `BATCH`, and the destination commits them in one group commit. That keeps destination-side durable operations per small object close to the source's (section 5.3).
 - **Flow control.** Stream and connection windows are sized from the bandwidth-delay product and capped by `peer_max_inflight_bytes`. The destination limits staged bytes per source (`peer_staging_quota_bytes`) and discards uncommitted staging after `peer_staging_ttl_seconds`.
-- **Topology.** Each source node keeps up to `peer_connections_per_node` QUIC connections to destination gateways, adapting the count the way REST flush concurrency adapts (section 7.7), and spreads streams across them. It opens one stream per object or batch. Destination gateways relay to their shard primaries over the LAN.
+- **Topology.** Each shard primary's flusher may use up to `peer_connections_per_shard` QUIC connections to destination gateways, adapting the count the way REST flush concurrency adapts (section 7.7). A node pools the connections of all the shards it hosts per destination and spreads streams across them. It opens one stream per object or batch. Destination gateways relay to their shard primaries over the LAN.
 - **Receiving buckets.** A bucket that receives native replication names its source cluster (`peer_source`). By default it is read-only to the destination's own clients, so each key has a single writer.
 - **Acknowledgement policies.** `write_through` buckets and `backup_ack = "write_through"` wait for `APPLIED`. The default policies acknowledge after the local commit, as before.
 
@@ -884,6 +884,8 @@ Each disk has append-only segment files shared by every shard replica on that di
 
 Record header: magic, format version, record kind, shard id, epoch, seq, key hash, header and payload lengths, and CRC32C. Record kinds are `PUT`, `DELETE`, `EXTENT`, `MPU_CREATE`, `MPU_PART`, `MPU_COMPLETE`, `MPU_ABORT`, `UPLOAD_BEGIN`, `FLUSHED`, `PART_FLUSHED`, `TAGS`, `IMPORT`, `ADOPT`, `EC_PUBLISH`, `EC_RELOCATE`, `EC_RELEASE`, `TRUNCATE`, and `CONFIG`.
 
+A copy has no record kind of its own. It commits as a `PUT` that records its source: bucket, key, version identity, and the source's `remote_etag`. The flusher uses that source reference to choose a remote `CopyObject` with `x-amz-copy-source-if-match` (section 11).
+
 A `CONFIG` record holds a full shard configuration: epoch, primary, members, learners, and replica targets. A replica appends one, and group commit makes it durable, whenever it adopts a new epoch, before it acknowledges or serves anything in that epoch. Checkpoints keep each shard's latest `CONFIG` record reachable, so it survives log reclamation. It is the replica's local copy of its membership (section 6.2).
 
 Parsing checks lengths before allocating, uses checked arithmetic, and rejects unknown versions. On recovery, a torn tail is cut back to the last record whose CRC verifies.
@@ -926,7 +928,7 @@ A member acknowledges a record only after `fdatasync` covers it. New segment fil
 
 S3 parsing and serialization use `s3s`[^s3s]. SkyS3 implements authentication, authorization, and resource limits itself.
 
-CopyObject within the cluster copies the bytes into the destination shard. If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth. The remote copy must carry the copy's own write identity. With the default `COPY` metadata directive, it would keep the source's identity, and the 412 recovery rule (section 7.2) would report a successful flush as a conflict. So the flush sends `x-amz-metadata-directive: REPLACE` with the full metadata and the copy's write identity, `x-amz-tagging-directive: REPLACE` with the tags, `x-amz-copy-source-if-match: <source remote_etag>` so the source has not changed, and the destination precondition. A target that does not support all of these gets a regular upload instead.
+CopyObject within the cluster copies the bytes into the destination shard and commits a `PUT` that records its source (section 10.1). If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth. The remote copy must carry the copy's own write identity. With the default `COPY` metadata directive, it would keep the source's identity, and the 412 recovery rule (section 7.2) would report a successful flush as a conflict. So the flush sends `x-amz-metadata-directive: REPLACE` with the full metadata and the copy's write identity, `x-amz-tagging-directive: REPLACE` with the tags, `x-amz-copy-source-if-match: <source remote_etag>` so the source has not changed, and the destination precondition. A target that does not support all of these gets a regular upload instead.
 
 **Workload identity.** STS implements `AssumeRoleWithWebIdentity`[^sts-wif]. It validates the JWT signature against allowlisted issuers (discovery and JWKS fetched with bounded size and rate), and checks `iss`, `aud`, `sub`, `exp`, `nbf`, and `azp` where required, using an algorithm allowlist. It then issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`. Trust policies and roles live in the control store. Each node validates against its local copy, and stops issuing new sessions once that copy is older than `identity_max_staleness` (section 6.2). Session records live in an internal, local-only system bucket that is replicated like any shard and never flushed. Session tokens are stored hashed. Secrets needed for SigV4 are held in memory with `secrecy`/`zeroize`.
 
@@ -1054,7 +1056,7 @@ quic_listen = "0.0.0.0:7443"
 congestion_control = "cubic"  # "cubic", "new_reno", or "bbr" (experimental in Quinn)
 peer_frame_bytes = 262144
 peer_connect_timeout_ms = 3000
-peer_connections_per_node = 64     # upper bound; adapts like REST flush concurrency
+peer_connections_per_shard = 64    # upper bound; mirrors flush_max_concurrency_per_shard
 peer_max_inflight_bytes = 268435456
 peer_staging_quota_bytes = 1099511627776
 peer_staging_ttl_seconds = 86400
