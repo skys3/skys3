@@ -9,7 +9,9 @@ for the proposed architecture: shard replication where every replica
 acknowledges, automatic membership through a pluggable compare-and-swap control
 store (S3, R2, or etcd), write-back buckets flushed to remote S3 targets, and
 local buckets with per-object erasure coding. This is a design for review, not
-implemented functionality.
+implemented functionality. The
+[task and PR plan](https://github.com/skys3/skys3/blob/main/docs/skys3-tasks-plan.md)
+breaks its delivery into milestones and pull requests.
 
 ## Development
 
