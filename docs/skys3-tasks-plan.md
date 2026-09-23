@@ -26,7 +26,7 @@
 ## 1. How to read this plan
 
 - The plan follows the design's milestones M1 to M7 and adds **M0** for the foundations every later PR relies on. Section 2 lists every place where this plan moves or adds scope relative to §17.
-- Each task is one pull request with an ID such as `M1-09`. PR titles start with the ID (`[M1-09] Object PUT, GET, HEAD, and DELETE`), and branch names include it. A PR that grows past about 1,500 lines of non-test code is split, with suffixed IDs (`M1-09a`, `M1-09b`).
+- Each task is one pull request with an ID such as `M1-09`. PR titles start with the ID (`[M1-09] Object PUT, GET, HEAD, and DELETE`), and branch names include it. A PR that grows past about 1,500 lines of non-test code is split. A split planned up front gives every part a letter (`M1-07a`, `M1-07b`). A part split off later takes the next letter, and the original ID keeps the rest (`M1-16`, `M1-16b`).
 - Each entry gives the design sections it implements, the PRs it depends on, a size, its scope, and **Done when**: the tests or checks the PR adds and passes. A PR is done when those checks pass in CI, not when its code exists.
 - Sizes are rough. **S** is under 500 lines of non-test code, **M** is 500 to 1,500, and **L** is a candidate for splitting.
 - Each ID should become a GitHub issue, so the plan can be tracked without editing this document.
@@ -35,7 +35,7 @@
 
 - CI is green: formatting, clippy with `-D warnings`, tests, and the jobs added by M0 (section 5).
 - Every crate keeps `#![forbid(unsafe_code)]`.
-- Configuration keys use the names in §14, are validated at load time, and are added to the configuration reference (M0-03).
+- Configuration keys use the names in §14, are validated at load time, and are added to the configuration reference (M0-03). A key that §14 does not name, such as a certificate path or a rate limit, is added to §14 in the same PR.
 - Metrics use the names the design gives (`dirty_bytes`, `oldest_dirty_age`, `flush_lag_seconds`, `under_replicated_bytes`, `oldest_under_replicated_age`) and are added to the metrics reference (M0-06).
 - A parser of untrusted input (log records, SigV4 and aws-chunked framing, XML, tokens, continuation tokens, peer frames) ships with a proptest and a `cargo-fuzz` target in the same PR.
 - Code on the replication, flush, encoding, or peer paths runs under the simulation harness (M0-04, M2-03), and the PR adds its failure cases as seeded scenarios.
@@ -49,7 +49,7 @@
 |---|---|
 | New **M0 Foundations**: workspace, core types, configuration, disk and clock abstractions, simulated S3 store | §16.1 runs the real replication and flush code under deterministic simulation. Those abstractions must exist before the first storage PR. |
 | Local, non-streaming multipart moves from M4 to M1 | M1's exit criterion is the SDK matrix (§16.2), which exercises multipart, and SDK transfer managers switch to multipart for large files by default. M4 keeps streaming flush, takeover of in-flight uploads, and UploadPartCopy. |
-| Write identity for PUT, DELETE, and copy moves from M4 to M1 | M1's flusher must be correct, and its 412 recovery rule (§7.2) depends on the write identity. M4 adds the `MPU_CREATE` and `UPLOAD_BEGIN` cases for streamed uploads. |
+| Write identity for PUT, DELETE, copy, and multipart uploads moves from M4 to M1 | M1's flusher must be correct, and its 412 recovery rule (§7.2) depends on the write identity. Multipart uploads use the `MPU_CREATE` identity from the start, so objects flushed in M1 keep a valid identity after M4. M4 adds only the `UPLOAD_BEGIN` case for streamed single PUTs. |
 | The `hold` conflict policy is in M1. `overwrite` and `discard_local` stay in M4. | Conditional flush detects conflicts from the first flusher PR. `hold` is the default and needs no extra machinery. |
 | The `ControlStore` trait, the register layout, and in-memory and file backends are in M1 | A single node already needs bucket bindings and identity configuration. M2 adds the S3 and etcd backends and the conformance suite. |
 | The protocol model (M2-01) starts during M1 and gates the replication PRs | §6.8: the state machine is model-checked before implementation. |
@@ -61,10 +61,10 @@
 | Milestone | PRs | Can start after | Exit criterion |
 |---|---:|---|---|
 | M0 Foundations | 6 | Now | CI, simulation, and configuration baselines in place |
-| M1 Single node | 26 | M0 | SDK matrix passes; crash tests lose no acknowledged write; flush and fill are correct against AWS S3 and one other provider |
+| M1 Single node | 28 | M0 | SDK matrix passes; crash tests lose no acknowledged write; flush and fill are correct against AWS S3 and one other provider |
 | M2 Replicated shards | 20 | M2-01, M2-02, M2-04, and M2-05 during M1; the replication path after M1-13 | Model check and simulation pass; kill and partition tests lose no acknowledged write |
 | M3 Coordinator | 8 | M2-04 and M2-05; replacement also needs M2-15 | Node loss and addition heal with no operator action |
-| M4 Large objects | 13 | M1-16; M4-04 also needs M2-12 | No partial remote objects under fault injection; ETags match |
+| M4 Large objects | 13 | M1-16; M4-02 also needs M1-16b, and M4-04 needs M2-12 | No partial remote objects under fault injection; ETags match |
 | M5 Local erasure coding | 12 | M5-01 and M5-02 early; the encoder after M3-03; coded reads after M2-18 | All loss combinations up to `m` fragments pass; node loss heals with no operator action |
 | M6 Native peer transport | 9 | M6-01 and M6-02 early; staging after M2-07; the source side after M4-03 and M4-09 | The §17 M6 criteria, measured on shaped lossy links |
 | M7 Hardening | 9 | Continuous; closes after M5 and M6 | Published compatibility matrix; §16.3 targets met or the design revised |
@@ -88,7 +88,7 @@ flowchart LR
     M6 --> M7
 ```
 
-**Critical path.** Counted in PRs, the longest chain runs through the storage engine and the first object operations (M1-01 to M1-04, M1-09, M1-13), then replication (M2-03, M2-07, M2-10 to M2-12, M2-14, M2-15), then replacement, rebalancing, and heal tests (M3-05, M3-06, M3-08). The large-object and peer chain (M1-12, M1-16, M4-01 to M4-03, M4-09, M6-06 to M6-09) is nearly as long, so it should run beside M2 rather than after M3. The protocol model (M2-01) must merge before M2-07, so it starts during M1.
+**Critical path.** Counted in PRs, the longest chain runs through the storage engine and the first object operations (M1-01 to M1-04, M1-09, M1-13), then replication (M2-03, M2-07, M2-10 to M2-12, M2-14, M2-15), then replacement, rebalancing, and heal tests (M3-05, M3-06, M3-08). The large-object and peer chain (M1-12, M1-16b, M4-02, M4-03, M4-09, M6-06 to M6-09) is nearly as long, so it should run beside M2 rather than after M3. The protocol model (M2-01) must merge before M2-07, so it starts during M1.
 
 ## 4. Repository layout
 
@@ -154,7 +154,7 @@ Workspace, core types, configuration, and the abstractions that let every later 
 
 - `ClusterId`, `BucketId`, `ShardId`, `NodeId`, `Epoch`, `Seq`, ordered `(epoch, seq)` pairs, and `ProposalId`.
 - Shard assignment `hash(bucket_id, key) mod shards`. Choose the hash and freeze it with golden vectors, because it can never change for an existing bucket.
-- `WriteIdentity` (`<cluster>/<bucket>/<shard>/<epoch>.<seq>`, at most 96 bytes) and the version identity (`seq` and ETag).
+- `WriteIdentity` (`<cluster>/<bucket>/<shard>/<epoch>.<seq>`, at most 96 bytes) and the version identity (`seq` and ETag). With 20-digit epoch and seq values, a 3-digit shard, and 4 separators, the fixed parts take up to 47 bytes, which leaves 49 for the cluster and bucket IDs together. Their lengths are bounded accordingly (section 14).
 - `ShardConfig` and the other register documents, with serde round trips against the §6.1 JSON example.
 - **Done when:** golden vectors cover hashing and write identities; proptests cover round trips.
 
@@ -163,7 +163,7 @@ Workspace, core types, configuration, and the abstractions that let every later 
 **Design:** §14 · **After:** M0-02 · **Size:** M
 
 - A TOML schema and defaults for every section of §14.
-- Validation at load time, including: `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin`; in wait-through mode, `replica_ack_timeout` above `member_suspect_after` plus a CAS allowance (§5.2); `min_write_replicas ≤ replicas`; `clean_copies ≤ replicas`; `shards_per_bucket ≤ 256`; `lease_renew_interval < primary_lease`; `read_registration_renew_interval < read_registration_ttl`.
+- Validation at load time, including: `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin`; in wait-through mode, `replica_ack_timeout` above `member_suspect_after` plus a CAS allowance (§5.2); `min_write_replicas ≤ replicas`; `clean_copies ≤ replicas`; `shards_per_bucket ≤ 256`; cluster and bucket ID lengths that keep the write identity within 96 bytes (M0-02); `lease_renew_interval < primary_lease`; `read_registration_renew_interval < read_registration_ttl`.
 - A configuration reference under `docs/` that later PRs extend.
 - **Done when:** the §14 example loads unchanged, and each validation rule has a test with a config that breaks it.
 
@@ -191,7 +191,7 @@ Workspace, core types, configuration, and the abstractions that let every later 
 
 **Design:** §6.4, §7.6 · **After:** M0-01 · **Size:** S
 
-- `tracing` setup, a metrics exporter, and an admin HTTP listener with metrics and health endpoints.
+- `tracing` setup, a metrics exporter, and an admin HTTP listener with metrics and health endpoints. This PR decides how callers of the admin listener are authenticated (section 14).
 - Metric naming conventions and a metrics reference under `docs/`.
 - **Done when:** a test scrapes a registered metric from the listener.
 
@@ -202,8 +202,8 @@ Workspace, core types, configuration, and the abstractions that let every later 
 Four tracks can run in parallel after M0:
 
 - **Storage engine:** M1-01 to M1-04, then M1-13 and M1-14. M1-22 follows once the write-back track reaches M1-21.
-- **S3 API:** M1-05 to M1-12. M1-05 to M1-08 need nothing from the engine, and M1-06 to M1-08 run against an in-memory shard stub until M1-04 lands.
-- **Write-back:** M1-15 needs only M0-05, then M1-16 to M1-21.
+- **S3 API:** M1-05 to M1-12. M1-05 to M1-08 need nothing from the engine, and M1-06 to M1-08 run against an in-memory shard stub until M1-04 lands. M1-07a (signing) does not wait for the authorization decisions in M1-07b.
+- **Write-back:** M1-15 needs only M0-05. M1-16 to M1-21 follow once M1-09 lands, and M1-16b waits for M1-12.
 - **Identity:** M1-23, then M1-24.
 
 #### M1-01 Log record format
@@ -240,7 +240,7 @@ Four tracks can run in parallel after M0:
 
 - Per-shard sequencing and a deterministic `apply(record)`, which every member runs from M2 on. It covers the object states of §4.2, tombstones, `IMPORT` (applied only if the key has no entry at all), `ADOPT` (applied only if the entry is still clean at the named `seq`), and `FLUSHED` (moves an entry to clean only if its `seq` is still current).
 - With `replicas = 1`, a record commits once it is durable locally.
-- **Done when:** a proptest shows that replaying any record sequence from any checkpoint yields the same index, and every transition in §4.2 is covered, including the rejection of invalid ones.
+- **Done when:** a proptest shows that replaying any record sequence from any checkpoint yields the same index, and every §4.2 transition driven by `PUT`, `DELETE`, `FLUSHED`, `ADOPT`, and `IMPORT` is covered, including the rejection of invalid ones. M1-16, M1-20, M1-21, and M4-06 cover the other transitions.
 
 #### M1-05 Control store interface and local backends
 
@@ -263,26 +263,32 @@ Four tracks can run in parallel after M0:
 - Decide detach semantics for a bucket that still has dirty data (section 14).
 - **Done when:** each rejected feature has a test; bucket operations pass against the shard stub.
 
-#### M1-07 SigV4 authentication and authorization
+#### M1-07a SigV4 signing and aws-chunked bodies
 
-**Design:** §11, §12 · **After:** M1-06 · **Size:** L
+**Design:** §11, §12 · **After:** M1-06 · **Size:** M
 
 - SigV4 header authentication and presigned URLs, keeping the canonical request bytes intact; session tokens; `aws-chunked` bodies with signed chunks and trailers.
+- **Done when:** published SigV4 test vectors pass; fuzz targets cover the canonicalizer and the chunk parser; presigned URL expiry and clock-skew cases are tested.
+
+#### M1-07b Authorization and static credentials
+
+**Design:** §11, §12 · **After:** M1-07a · **Size:** M
+
 - Static credentials for bootstrap and service accounts, held with `secrecy` and `zeroize`. `anonymous_access = false` is enforced.
 - Authorization that evaluates role and session policies. The policy subset is decided here (section 14). Until M1-24 lands, static credentials map to policies.
-- **Done when:** published SigV4 test vectors pass; fuzz targets cover the canonicalizer and the chunk parser; presigned URL expiry and clock-skew cases are tested.
+- **Done when:** requests outside a credential's policy are denied for every S3 operation the gateway supports, and anonymous requests are rejected.
 
 #### M1-08 Checksums and ETags
 
-**Design:** §7.4, §11 · **After:** M1-06 · **Size:** S
+**Design:** §7.4, §11 · **After:** M1-07a · **Size:** S
 
 - Streaming validation of CRC32, CRC32C, CRC64NVME, SHA1, SHA256, and Content-MD5 at the protocol boundary, on the blocking pool. MD5 ETags and multipart ETags.
-- Checksums are stored with the entry and returned as S3 does.
+- Checksums are stored with the entry and returned as S3 does. Trailing checksums arrive through the M1-07a chunk decoder.
 - **Done when:** known-answer tests pass for each algorithm, and mismatches return the S3 error codes.
 
 #### M1-09 Object PUT, GET, HEAD, and DELETE
 
-**Design:** §5.1, §7.2, §9.2, §11 · **After:** M1-04, M1-07, M1-08 · **Size:** L
+**Design:** §5.1, §7.2, §9.2, §11 · **After:** M1-04, M1-08 · **Size:** L
 
 - Bodies up to `inline_max_bytes` go inline. Larger bodies are streamed as 1 MiB `EXTENT` records while they arrive, and the final `PUT` references them.
 - GET, HEAD, range reads, and conditional requests (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) evaluated against the index, including conditional PUTs.
@@ -310,11 +316,12 @@ Four tracks can run in parallel after M0:
 
 - CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts, and ListMultipartUploads, as `MPU_CREATE`, `MPU_PART`, `MPU_COMPLETE`, and `MPU_ABORT` records.
 - Part boundaries are kept, so a flush can reproduce the multipart ETag (§7.4).
-- **Done when:** multipart ETags match AWS S3 for the same parts, and aborted uploads release their extents.
+- `MPU_COMPLETE` stores the write identity of the `MPU_CREATE` record that opened the upload (§7.2), so the flush in M1-16b and the streaming flush in M4-02 use the same identity.
+- **Done when:** multipart ETags match AWS S3 for the same parts, the completed object carries its `MPU_CREATE` identity, and aborted uploads release their extents.
 
 #### M1-13 Node binary and startup recovery
 
-**Design:** §3, §10.2 · **After:** M1-05, M1-09 · **Size:** M
+**Design:** §3, §10.2 · **After:** M1-05, M1-07b, M1-09 · **Size:** M
 
 - The `skys3` binary: load and validate configuration, discover disks, recover each disk's log from its checkpoint, start the gateway and the shards, and shut down gracefully.
 - Node-local copies of bucket bindings and identity configuration, kept in the index and loaded at startup (§6.2).
@@ -323,7 +330,7 @@ Four tracks can run in parallel after M0:
 
 #### M1-14 Crash-consistency suite
 
-**Design:** §16.1, §17 · **After:** M1-13 · **Size:** M
+**Design:** §16.1, §17 · **After:** M1-12, M1-13 · **Size:** M
 
 - Simulated crashes at every sync boundary under a concurrent PUT, DELETE, and multipart workload, plus `kill -9` loops against the real binary on a real filesystem.
 - A history recorder and checker: every acknowledged write survives recovery unless a later acknowledged write superseded it, and no unacknowledged write resurfaces over a later acknowledged one (§5.2).
@@ -340,16 +347,23 @@ Four tracks can run in parallel after M0:
 
 #### M1-16 Flusher
 
-**Design:** §7.1, §7.2, §7.4 · **After:** M1-09, M1-12, M1-15 · **Size:** L
+**Design:** §7.1, §7.2, §7.4 · **After:** M1-09, M1-15 · **Size:** L
 
 - A per-shard flusher over committed records in `seq` order: at most one flush in flight per key, only the latest committed state of a key flushed, tombstones flushed as `DeleteObject`, and a fixed concurrency per shard (adaptive in M4-10).
 - Conditional requests per the §7.2 table, including a HEAD first for keys whose remote state is unknown.
 - A write identity on every flushed object. On 412, HEAD the object: a matching identity means the flush already succeeded; for a delete, a missing object means the delete already happened; anything else is a conflict held under `hold`.
 - `FLUSHED(key, seq, remote_etag, remote_version_id)` rides the next group commit and never triggers an fsync of its own.
-- Completed multipart uploads flush after commit as remote multipart uploads with the client's part boundaries. Streaming comes in M4-02.
+- How a tag-only change (`TAGS`) flushes is decided here (section 14). Multipart uploads flush in M1-16b.
 - Retry with backoff on 5xx and `503 SlowDown`.
 - Metrics `dirty_bytes`, `oldest_dirty_age`, `flush_lag_seconds`, and conflict counts. The admin API lists conflicts.
-- **Done when:** simulation with lost responses, 5xx errors, and out-of-band remote writes shows that every acknowledged write reaches the remote in its latest state, that lost responses are recognized by write identity, and that out-of-band writes become conflicts instead of being overwritten on protected operations.
+- **Done when:** simulation with lost responses, 5xx errors, and out-of-band remote writes shows that every acknowledged write reaches the remote in its latest state, that lost responses are recognized by write identity, and that out-of-band writes become conflicts instead of being overwritten on protected operations. Tests cover the §4.2 transitions Dirty → Flushing, Flushing → Dirty on retryable errors, and Flushing → Conflict.
+
+#### M1-16b Multipart flush after commit
+
+**Design:** §7.2, §7.4 · **After:** M1-12, M1-16 · **Size:** S
+
+- A completed multipart upload flushes after the local commit as a remote multipart upload with the client's part boundaries. The remote `CreateMultipartUpload` carries the `MPU_CREATE` write identity, and the remote Complete carries the §7.2 precondition where the target supports it. A failed remote upload is aborted. Streaming comes in M4-02.
+- **Done when:** the remote multipart ETag equals the local one, and the 412 recovery recognizes an earlier successful flush by its `MPU_CREATE` identity.
 
 #### M1-17 Dirty budget and admission control
 
@@ -382,7 +396,7 @@ Four tracks can run in parallel after M0:
 
 - Evicted payload is filled from the remote with `If-Match: <remote_etag>`, plus `versionId` when the remote is versioned. Concurrent fills of the same range are coalesced, ranges are served while the fill streams, and the filled payload becomes clean cache.
 - If the fill precondition fails, commit `ADOPT` and retry. The `ADOPT` is dropped if a local write made the entry dirty in between. Conflicts are counted either way.
-- **Done when:** simulation with out-of-band remote changes shows reads switching to the remote's version after the `ADOPT`, and never adopting over a dirty local write.
+- **Done when:** simulation with out-of-band remote changes shows reads switching to the remote's version after the `ADOPT`, and never adopting over a dirty local write. Tests cover the §4.2 transition Evicted → Clean.
 
 #### M1-21 Clean cache and eviction
 
@@ -390,7 +404,7 @@ Four tracks can run in parallel after M0:
 
 - Clean payload is kept on up to `clean_copies` members (one, on a single node). Per-node LRU eviction is bounded by `cache_max_bytes_per_node`. Eviction leaves a stub with the §4.2 metadata. Dirty payload is never evicted.
 - Capacity accounting follows the §9.3 model, with `reserve_fraction`.
-- **Done when:** a workload larger than the cache keeps every dirty byte, evicts only clean payload, and refills evicted keys.
+- **Done when:** a workload larger than the cache keeps every dirty byte, evicts only clean payload, and refills evicted keys. Tests cover the §4.2 transition Clean → Evicted, which is node-local and not applied from the log.
 
 #### M1-22 Segment compaction
 
@@ -408,7 +422,7 @@ Four tracks can run in parallel after M0:
 
 #### M1-24 STS and session credentials
 
-**Design:** §6.2, §11 · **After:** M1-05, M1-07, M1-23 · **Size:** L
+**Design:** §6.2, §11 · **After:** M1-05, M1-07b, M1-23 · **Size:** L
 
 - `AssumeRoleWithWebIdentity` on the STS endpoint, with roles and trust policies read from the node's local copy of `identity/`. It issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`, bounded by `session_default_seconds` and `session_maximum_seconds`.
 - Session records live in an internal, local-only system bucket that is never flushed. Session tokens are stored hashed, and secrets are held in memory with `secrecy` and `zeroize`.
@@ -417,7 +431,7 @@ Four tracks can run in parallel after M0:
 
 #### M1-25 SDK matrix
 
-**Design:** §16.2 · **After:** M1-12, M1-13, M1-24 · **Size:** M
+**Design:** §16.2 · **After:** M1-10, M1-11, M1-12, M1-13, M1-24 · **Size:** M
 
 - Containerized clients for Python, Go v2, JavaScript v3, Java v2, Rust, and the AWS CLI, with `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL_STS` pointed at SkyS3.
 - Default checksums, aws-chunked uploads, multipart, presigned URLs, and web-identity credential refresh under load.
@@ -426,7 +440,7 @@ Four tracks can run in parallel after M0:
 
 #### M1-26 Remote provider validation
 
-**Design:** §16.2, §17 · **After:** M1-18, M1-21 · **Size:** M
+**Design:** §16.2, §17 · **After:** M1-16b, M1-18, M1-21 · **Size:** M
 
 - Flush, import, and fill against AWS S3 and one other provider. R2 is the suggested second provider, because it lacks preconditions on `CompleteMultipartUpload` and `DeleteObject` and so exercises the unprotected path (§7.2).
 - Covers the capability probe, conflict detection, and fill preconditions.
@@ -632,7 +646,7 @@ Shard placement in M2 is static: a bootstrap command or the test harness writes 
 
 #### M3-04 Automatic bucket and shard creation
 
-**Design:** §4.1, §6.1 · **After:** M3-03 · **Size:** S
+**Design:** §4.1, §6.1 · **After:** M2-07, M2-08, M2-09, M3-03 · **Size:** S
 
 - CreateBucket writes the bucket register and `shards_per_bucket` shard registers with placed members. DeleteBucket detaches. This replaces M2's static placement.
 - **Done when:** buckets created through the S3 API on a multi-node cluster serve reads and writes.
@@ -673,18 +687,18 @@ Shard placement in M2 is static: a bootstrap command or the test harness writes 
 
 Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failover scenarios of M4-13, need M2-12.
 
-#### M4-01 Write identity for streamed uploads
+#### M4-01 Write identity for streamed single PUTs
 
 **Design:** §7.2, §10.1 · **After:** M1-16 · **Size:** S
 
-- An `UPLOAD_BEGIN` record committed when a large single PUT starts streaming, and the identity of the `MPU_CREATE` record for multipart uploads. The final `PUT` or `MPU_COMPLETE` stores the identity it inherits. A streamed PUT that fails never publishes its identity.
+- An `UPLOAD_BEGIN` record committed when a large single PUT starts streaming. The final `PUT` stores the identity it inherits. A streamed PUT that fails never publishes its identity. Multipart uploads already use their `MPU_CREATE` identity from M1-12.
 - **Done when:** the remote create, a replayed completion, and the 412 HEAD check all compare the same identity in tests.
 
 #### M4-02 Streaming multipart flush
 
-**Design:** §7.3 · **After:** M1-12, M4-01 · **Size:** L
+**Design:** §7.3 · **After:** M1-16b, M4-01 · **Size:** L
 
-- Remote `CreateMultipartUpload` with the write identity when the local upload is created. Each part is streamed from the incoming body and from the local extents, falling back to local extents when the remote is slow. A part that fails local validation is never listed in the remote Complete, and a client re-upload replaces it at the remote too.
+- Remote `CreateMultipartUpload` with the `MPU_CREATE` write identity when the local upload is created. Each part is streamed from the incoming body and from the local extents, falling back to local extents when the remote is slow. A part that fails local validation is never listed in the remote Complete, and a client re-upload replaces it at the remote too.
 - `PART_FLUSHED` records ride group commits. Remote upload IDs are kept in the shard log. The remote Complete, with `If-Match` or `If-None-Match`, is sent only after the local commit. `AbortMultipartUpload` runs on local aborts and for orphaned remote uploads.
 - A streaming-overlap metric: the fraction of bytes at the remote when the client completes (§16.3).
 - **Done when:** the remote multipart ETag equals the local one, and no remote object appears before the local commit under fault injection.
@@ -715,7 +729,7 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 **Design:** §7.2 · **After:** M1-16 · **Size:** M
 
 - The `overwrite` policy, and `discard_local` as a per-bucket opt-in, because it drops acknowledged writes. Admin API calls to list held conflicts and to resolve one, which returns the key to dirty under a chosen policy.
-- **Done when:** each policy is tested against out-of-band writes on protected and unprotected operations.
+- **Done when:** each policy is tested against out-of-band writes on protected and unprotected operations, including the §4.2 transition Conflict → Dirty.
 
 #### M4-07 Remote server-side copy
 
@@ -782,11 +796,11 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 #### M5-02 Fragment segments and fragment store
 
-**Design:** §8.4, §10.1, §10.3 · **After:** M1-02, M2-02 · **Size:** M
+**Design:** §8.4, §10.1 · **After:** M1-02, M2-02 · **Size:** M
 
-- The fragment segment class. A fragment header holds the bucket, key, version identity, stripe number, and object metadata. A node-local fragment map. Calls to write and fsync a fragment (returning a fragment ID) and to read a range of one with its checksum.
-- Compaction of fragment segments copies live fragments and updates only the node-local map.
-- **Done when:** crashes during fragment writes and compaction lose no acknowledged fragment.
+- The fragment segment class, a node-local fragment map, and calls to write and fsync a fragment (returning a fragment ID) and to read a range of one with its checksum.
+- A fragment header that is enough on its own to rebuild the stripe's `EC_PUBLISH` metadata: the bucket, key, version identity, and object metadata that §8.4 lists, plus the stripe number, the fragment's index within the stripe, the geometry (`k` and `m`), the codec ID, the stripe's data length, and the encoding ID (M5-04). §8.4 is updated to match (section 14).
+- **Done when:** crashes during fragment writes lose no acknowledged fragment, and a stripe's layout and codec can be rebuilt from its fragment headers alone.
 
 #### M5-03 Geometry and fragment placement
 
@@ -801,6 +815,7 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 - An object qualifies once it is at least `ec_min_object_bytes`, has been committed for `ec_after_seconds`, and the cluster has enough eligible nodes for a satisfiable policy. Otherwise encoding pauses.
 - Encoding runs stripe by stripe, up to `ec_stripe_data_bytes` of data per stripe. `EC_PUBLISH` commits on every member after every fragment is durable, and members then drop their replicas. An `EC_PUBLISH` for a superseded version is dropped when applied.
+- Each encoding attempt has an ID, carried in its fragment headers, that the primary tracks while the attempt is in progress.
 - A per-shard index from node to fragments.
 - **Done when:** crashes at each encoding step never leave the object without a complete representation.
 
@@ -809,7 +824,8 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 **Design:** §8.4 · **After:** M5-04 · **Size:** S
 
 - After `fragment_orphan_after_seconds`, a fragment node reclaims fragments once the shard primary confirms that no `EC_PUBLISH` references them.
-- **Done when:** fragments left by crashed or superseded encodings are reclaimed, and published fragments never are.
+- The confirmation is fenced against publication. The primary confirms an orphan only for an encoding ID that is not in progress, and marks that encoding abandoned in the same step. It never commits an `EC_PUBLISH` for an abandoned encoding. A new primary answers orphan queries only after reconciliation (§6.6) has committed any rolled-forward `EC_PUBLISH`. After that, every unpublished encoding it did not start counts as abandoned. §8.4 is updated to match (section 14).
+- **Done when:** fragments left by crashed or superseded encodings are reclaimed, published fragments never are, and simulation shows no reclaimed fragment in a published stripe when reclamation races publication or an encoding outlasts `fragment_orphan_after_seconds`.
 
 #### M5-06 Coded reads
 
@@ -820,10 +836,11 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 #### M5-07 Fragment release and reclamation
 
-**Design:** §8.7 · **After:** M1-22, M5-06 · **Size:** M
+**Design:** §8.7, §10.3 · **After:** M1-22, M5-06 · **Size:** M
 
 - `EC_RELEASE` after an overwrite or delete. Fragments are kept for `fragment_release_delay_seconds` and while read registrations reference them, then reclaimed by fragment-segment compaction.
-- **Done when:** reads that hold an old plan finish or fail cleanly, and released space is reclaimed.
+- Compaction of fragment segments copies live fragments and updates only the node-local fragment map.
+- **Done when:** reads that hold an old plan finish or fail cleanly, released space is reclaimed, and crashes during fragment compaction lose no live fragment.
 
 #### M5-08 Repair
 
@@ -851,7 +868,7 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 **Design:** §6.9, §8.4, §8.9, §16.1 · **After:** M4-11, M5-04 · **Size:** M
 
 - An operator-run recovery that re-indexes coded objects from their fragment headers, and a restore drill that combines the latest snapshot with fragment headers.
-- **Done when:** the drill's lost-key report matches the known ground truth.
+- **Done when:** the drill restores coded objects written after the latest snapshot from their fragment headers alone, and its lost-key report matches the known ground truth.
 
 #### M5-12 Erasure-coding simulation suite
 
@@ -916,6 +933,7 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 **Design:** §7.8 · **After:** M6-06 · **Size:** M
 
 - `target_transport` is `auto`, `native`, or `s3`. With `auto`, the flusher fetches a signed peer descriptor from the target's S3 endpoint, uses QUIC if the handshake succeeds within `peer_connect_timeout`, and otherwise falls back to S3 REST and probes again later. The target status reports the transport in use.
+- The destination side serves the descriptor from its S3 endpoint, signed with the cluster's peer identity, and the source verifies it against the peer trust bundle. Where it is served and how it is signed are decided here (section 14).
 - **Done when:** with UDP blocked, flushing continues over S3 REST, and it returns to QUIC once UDP is allowed again.
 
 #### M6-08 Peer protocol simulation
@@ -1010,12 +1028,18 @@ The design leaves these points open. Each named PR decides the point and records
 | Gap | Decided in |
 |---|---|
 | The shard hash function, frozen with golden vectors | M0-02 |
+| Length limits on cluster and bucket IDs, so the write identity stays within its 96-byte reservation (§7.2) | M0-02, validated in M0-03 |
+| Authentication of callers of the admin HTTP listener. §12 covers admin messages between nodes, not the admin API. | M0-06 |
 | DeleteBucket (detach) of a `write_back` bucket that still has dirty entries: refuse until drained, or drain and then detach | M1-06 |
-| The authorization model: the policy language subset for roles and session policies, and static credentials for bootstrap and service accounts | M1-07, M1-24 |
+| The authorization model: the policy language subset for roles and session policies, and static credentials for bootstrap and service accounts | M1-07b, M1-24 |
 | Where the continuation-token HMAC key lives and how it rotates | M1-11 |
 | The admin API surface (bucket status, conflicts, health), which the design refers to without specifying | M1-13, extended by M1-16, M3-03, and M4-06 |
+| How a tag-only change flushes. §7.2 has no row for `TAGS`, and remote `PutObjectTagging` takes no preconditions: re-PUT the object conditionally, or call `PutObjectTagging` and accept an unprotected write. | M1-16 |
 | How per-bucket and per-cluster `max_dirty_bytes` apply when a bucket's shard primaries are on different nodes | M1-17, revisited in M3-02 |
 | How lazily loaded user metadata and content type are recorded, since §10.1 lists no record kind for it | M1-18 |
+| The fragment header fields needed to re-index coded objects: §8.4 omits the fragment index, geometry, codec ID, and stripe length | M5-02 |
+| Fencing orphan-fragment reclamation against encodings still in progress, which §8.4 does not specify | M5-04, M5-05 |
+| The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07 |
 | Upgrade rules for on-disk and wire format versions | M7-09, with version fields present from M1-01 |
 
 ## 15. Open questions from design section 19
