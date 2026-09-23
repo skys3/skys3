@@ -276,7 +276,7 @@ Four tracks can run in parallel after M0:
 
 - Static credentials for bootstrap and service accounts, held with `secrecy` and `zeroize`. `anonymous_access = false` is enforced.
 - Authorization that evaluates role and session policies. The policy subset is decided here (section 14). Until M1-24 lands, static credentials map to policies.
-- **Done when:** requests outside a credential's policy are denied for every S3 operation the gateway supports, and anonymous requests are rejected.
+- **Done when:** requests outside a credential's policy are denied for every S3 operation the gateway supports, and anonymous requests are rejected. Each later gateway PR extends this test to the operations it adds.
 
 #### M1-08 Checksums and ETags
 
@@ -799,7 +799,7 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 **Design:** §8.4, §10.1 · **After:** M1-02, M2-02 · **Size:** M
 
 - The fragment segment class, a node-local fragment map, and calls to write and fsync a fragment (returning a fragment ID) and to read a range of one with its checksum.
-- A fragment header that is enough on its own to rebuild the stripe's `EC_PUBLISH` metadata: the bucket, key, version identity, and object metadata that §8.4 lists, plus the stripe number, the fragment's index within the stripe, the geometry (`k` and `m`), the codec ID, the stripe's data length, and the encoding ID (M5-04). §8.4 is updated to match (section 14).
+- A fragment header that is enough on its own to rebuild the stripe's `EC_PUBLISH` metadata: the bucket, key, version identity, and object metadata that §8.4 lists, plus the stripe number, the fragment's index within the stripe, the geometry (`k` and `m`), the codec ID, the stripe's data length, and the ID of the attempt that wrote it (M5-04). §8.4 is updated to match (section 14).
 - **Done when:** crashes during fragment writes lose no acknowledged fragment, and a stripe's layout and codec can be rebuilt from its fragment headers alone.
 
 #### M5-03 Geometry and fragment placement
@@ -815,7 +815,7 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 - An object qualifies once it is at least `ec_min_object_bytes`, has been committed for `ec_after_seconds`, and the cluster has enough eligible nodes for a satisfiable policy. Otherwise encoding pauses.
 - Encoding runs stripe by stripe, up to `ec_stripe_data_bytes` of data per stripe. `EC_PUBLISH` commits on every member after every fragment is durable, and members then drop their replicas. An `EC_PUBLISH` for a superseded version is dropped when applied.
-- Each encoding attempt has an ID, carried in its fragment headers, that the primary tracks while the attempt is in progress.
+- Every attempt that writes fragments (encoding here, repair in M5-08, moves in M5-09) has an ID carried in its fragment headers. The primary tracks the attempt as in progress until its publishing record (`EC_PUBLISH` or `EC_RELOCATE`) commits, or until the primary abandons the attempt before appending that record. An appended publishing record cannot be retracted, so the attempt stays in progress until that record commits.
 - A per-shard index from node to fragments.
 - **Done when:** crashes at each encoding step never leave the object without a complete representation.
 
@@ -823,9 +823,9 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 **Design:** §8.4 · **After:** M5-04 · **Size:** S
 
-- After `fragment_orphan_after_seconds`, a fragment node reclaims fragments once the shard primary confirms that no `EC_PUBLISH` references them.
-- The confirmation is fenced against publication. The primary confirms an orphan only for an encoding ID that is not in progress, and marks that encoding abandoned in the same step. It never commits an `EC_PUBLISH` for an abandoned encoding. A new primary answers orphan queries only after reconciliation (§6.6) has committed any rolled-forward `EC_PUBLISH`. After that, every unpublished encoding it did not start counts as abandoned. §8.4 is updated to match (section 14).
-- **Done when:** fragments left by crashed or superseded encodings are reclaimed, published fragments never are, and simulation shows no reclaimed fragment in a published stripe when reclamation races publication or an encoding outlasts `fragment_orphan_after_seconds`.
+- After `fragment_orphan_after_seconds`, a fragment node reclaims fragments once the shard primary confirms that no committed stripe layout (`EC_PUBLISH` or `EC_RELOCATE`) references them.
+- The confirmation is fenced against publication. The primary confirms an orphan only for an attempt that is not in progress, and marks that attempt abandoned in the same step. It never appends a publishing record for an abandoned attempt. A new primary answers orphan queries only after reconciliation (§6.6) has committed any rolled-forward publishing record. After that, every unpublished attempt it did not start counts as abandoned. §8.4 is updated to match (section 14).
+- **Done when:** fragments left by crashed or superseded attempts are reclaimed, referenced fragments never are, and simulation shows no reclaimed fragment in a committed stripe layout when reclamation races publication or an encoding outlasts `fragment_orphan_after_seconds`. M5-08 and M5-09 add the same scenarios for repair and moves.
 
 #### M5-06 Coded reads
 
@@ -844,17 +844,17 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 #### M5-08 Repair
 
-**Design:** §8.6 · **After:** M3-02, M5-04 · **Size:** M
+**Design:** §8.6 · **After:** M3-02, M5-05 · **Size:** M
 
-- When a node is lost, each shard primary finds its stripes with a fragment there, reads `k` surviving fragments, rebuilds the missing fragment on another eligible node, and commits `EC_RELOCATE`. Stripes missing two fragments go first. Bandwidth is capped by `repair_bytes_per_second_per_node`.
-- **Done when:** node loss is repaired with no operator action, and repair time is reported (§16.3).
+- When a node is lost, each shard primary finds its stripes with a fragment there, reads `k` surviving fragments, rebuilds the missing fragment on another eligible node, and commits `EC_RELOCATE`. Each repair is a fragment-writing attempt, fenced as in M5-05. Stripes missing two fragments go first. Bandwidth is capped by `repair_bytes_per_second_per_node`.
+- **Done when:** node loss is repaired with no operator action, repair time is reported (§16.3), and a repair that outlasts `fragment_orphan_after_seconds` loses none of its fragments to orphan reclamation.
 
 #### M5-09 Fragment rebalancing
 
 **Design:** §8.3 · **After:** M3-06, M5-08 · **Size:** S
 
-- Moves fragments with the same publish-before-retire steps as encoding.
-- **Done when:** rebalancing under concurrent reads and node loss never leaves a stripe below its geometry.
+- Moves fragments with the same publish-before-retire steps as encoding. Each move is a fragment-writing attempt, fenced as in M5-05.
+- **Done when:** rebalancing under concurrent reads and node loss never leaves a stripe below its geometry, and a move that outlasts `fragment_orphan_after_seconds` loses none of its fragments to orphan reclamation.
 
 #### M5-10 Lifecycle expiration and multipart cleanup
 
@@ -1038,7 +1038,7 @@ The design leaves these points open. Each named PR decides the point and records
 | How per-bucket and per-cluster `max_dirty_bytes` apply when a bucket's shard primaries are on different nodes | M1-17, revisited in M3-02 |
 | How lazily loaded user metadata and content type are recorded, since §10.1 lists no record kind for it | M1-18 |
 | The fragment header fields needed to re-index coded objects: §8.4 omits the fragment index, geometry, codec ID, and stripe length | M5-02 |
-| Fencing orphan-fragment reclamation against encodings still in progress, which §8.4 does not specify | M5-04, M5-05 |
+| Fencing orphan-fragment reclamation against fragment-writing attempts still in progress (encoding, repair, and moves), which §8.4 does not specify | M5-04, M5-05, M5-08, M5-09 |
 | The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07 |
 | Upgrade rules for on-disk and wire format versions | M7-09, with version fields present from M1-01 |
 
