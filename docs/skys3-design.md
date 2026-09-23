@@ -43,11 +43,11 @@ The previous proposal (#2) designed SkyS3 as an authoritative object store with 
 
 ### 1.1 Decisions
 
-1. **No consensus on the request path.** Each key belongs to a shard. Each shard has one primary and a small set of backups (three replicas by default). A write succeeds only after **every current member** has made it durable. If any member fails to acknowledge in time, the request fails. This is the SeaweedFS volume model[^seaweed-repl] applied to both payload and metadata.
+1. **No consensus on the request path.** Each key belongs to a shard. Each shard has one primary and a small set of backups (three replicas by default). A write succeeds only after **every current member** has made it durable. A member that stops acknowledging is removed automatically. By default, requests wait through the removal; a fail-fast mode returns 503 instead (section 5.2). This is the SeaweedFS volume model[^seaweed-repl] applied to both payload and metadata.
 2. **Membership changes automatically through a pluggable control store.** Every shard's configuration is one small compare-and-swap register. The first backends are S3 conditional writes (`If-Match` / `If-None-Match`)[^s3-cond], on AWS S3, Cloudflare R2[^r2-api], or any provider that passes a startup probe, and etcd[^etcd-api] for sites that prefer an on-site store. Epochs fence stale primaries. Primary leases are granted by the backups, and every node keeps a durable local copy of the control state it uses, so the data path never waits on the control store. This is the PacificA / Vertical Paxos family of designs[^pacifica][^vpaxos], with the control store as the configuration master.
 3. **Replicate first, then move data to its durable home.** New writes are replicated to every shard member (3 by default). A write-back bucket then flushes to its remote target and keeps `clean_copies` local copies as evictable cache. A local bucket erasure-codes each large object in the background and keeps small objects replicated. Each object is encoded on its own, so deletes free space without a cross-node cleaner.
 4. **Ordered, coalescing, conditional flush.** Each shard flushes its keys in commit order, uploads only the latest version of a key, and uses conditional requests so that out-of-band writes to the remote are detected instead of silently overwritten.
-5. **Streaming flush for large objects.** Multipart parts, and large single PUTs, are streamed to the remote while the client is still uploading. The remote object becomes visible only when the local upload has committed.
+5. **Streaming flush for large objects.** Multipart parts, and large single PUTs, are streamed to the remote while the client is still uploading. The remote object becomes visible only when the local upload has committed. When the remote is another SkyS3 cluster, flush uses a native protocol over QUIC with byte-range resume, built for long, lossy links (section 7.8).
 6. **One durable round per small PUT.** Payload and metadata travel in a single replicated log record. A small PUT costs 3 group-committed fsyncs in one round, with no consensus round.
 7. **Reads scale out.** The shard primary resolves which version is current. The bytes can come from any replica, fragment, or node-local hot cache holding that exact version.
 
@@ -60,7 +60,7 @@ The previous proposal (#2) designed SkyS3 as an authoritative object store with 
 | Membership changes | Raft reconfiguration | CAS registers in a pluggable control store (S3, R2, etcd) plus a lease-elected coordinator, fully automatic |
 | Local redundancy | 3 replicas, then deferred EC | Write-back: replicas while dirty, then `clean_copies` evictable copies. Local: replicas, then per-object EC for large objects |
 | Erasure coding and cleaning | Packed segments with cross-node EC-to-EC cleaning | Per-object EC in local buckets; node-local compaction only |
-| Cross-region durability | Native streaming replication over QUIC | Streaming flush to a remote or backup target, which may be another SkyS3 cluster |
+| Cross-region durability | Native streaming replication over QUIC | Streaming flush to a remote or backup target. Between SkyS3 clusters, a native QUIC protocol with byte-range resume; S3 REST otherwise |
 | Small PUT before acknowledgement | 3 serial durable rounds, about 13 sync participants | 1 round, 3 participants |
 
 ### 1.3 Coverage of the previous proposal
@@ -71,10 +71,10 @@ With local buckets, this design covers the previous proposal's single-region fea
 |---|---|---|
 | 3-replica ingest, then deferred EC | 3-replica ingest, then per-object EC for objects of at least `ec_min_object_bytes` (section 8) | Small objects stay replicated. Packing them into shared EC segments is deferred (section 19). |
 | Strongly consistent regional metadata | Per-shard, all-member commit with leases (sections 5 and 6) | None |
-| Survives two node failures | Any two of a shard's three replicas, or two of a stripe's fragments | A single surviving replica is read-only until replacements catch up |
+| Survives two node failures | Any two of a shard's three replicas, or two of a stripe's fragments | The budget counts failures before repair completes. After a member loss, the shard's data has two copies until backfill restores the third, so the exposure is the repair time (section 6.4). A single surviving replica is read-only until replacements catch up. |
 | Fully on-site operation | The data path is fully on-site. Membership changes need the control store. | Sites without S3 access use etcd, or the future embedded-Raft backend (section 6.1) |
 | S3 API, STS / workload identity, read-through origins | Same (sections 9 and 11) | Local versioning is deferred (section 19) |
-| Native pre-completion multi-region replication | A backup target that is another SkyS3 cluster, with streaming flush (section 8.9) | A failed transfer resumes per multipart part, not per byte range |
+| Native pre-completion multi-region replication | A backup or write-back target that is another SkyS3 cluster, over the native QUIC transport (sections 7.8 and 8.9) | None between SkyS3 clusters. Other S3 providers resume per multipart part. |
 
 ## 2. Goals, non-goals, and assumptions
 
@@ -91,6 +91,7 @@ With local buckets, this design covers the previous proposal's single-region fea
 | AWS SDK compatibility including OIDC/STS workload identity | Standard S3 wire protocol plus `AssumeRoleWithWebIdentity` |
 | Client-side encryption (E2EE) | Ciphertext is stored and flushed byte for byte; no SSE or KMS |
 | Upload overlaps transfer to the remote | Streaming flush of multipart parts and large PUTs |
+| Fast replication over long, lossy links | Native QUIC transport between SkyS3 clusters (section 7.8) |
 
 ### 2.2 Non-goals for the first release
 
@@ -120,6 +121,7 @@ flowchart TB
     P --> B2["Backup 2"]
     P --> F["Flusher"]
     F --> Remote["Remote or backup S3 target"]
+    F -. "QUIC" .-> Peer["Peer SkyS3 cluster"]
     P --> Fill["Read-through fill"]
     Fill --> Remote
     P --> Enc["Encoder"]
@@ -156,7 +158,7 @@ Attaching a `write_back` bucket imports the remote namespace (section 9.1). Dele
 Replication is configured per bucket, because every shard belongs to exactly one bucket:
 
 - `replicas`: the number of shard members, and so of copies of every write until it reaches its durable home (default 3).
-- `min_write_replicas`: the fewest members a shard may have and still accept writes (default 2).
+- `min_write_replicas`: the fewest copies every new write must reach, counting members and learners already acknowledging (default 2, section 6.4).
 - `clean_copies`: for `write_back` buckets, how many members keep a flushed object as cache, from 0 to `replicas` (default 1). More copies spread read load (section 9.2).
 
 Each bucket has a fixed number of shards chosen at creation (`shards_per_bucket`, default 8, maximum 256). A key is assigned by `hash(bucket_id, key) mod shards`. Hash sharding avoids split and merge machinery. The cost is that LIST merges results from every shard of the bucket (section 9.4). Changing a bucket's shard count later is deferred.
@@ -225,14 +227,19 @@ Large bodies are streamed as 1 MiB extent records, which are replicated the same
 
 ### 5.2 Failed writes
 
-If any member has not acknowledged within `replica_ack_timeout`, the request fails with `503 SlowDown`. That is what "require all acks" means here.
+If any member has not acknowledged within `replica_ack_timeout`, the request fails with `503 SlowDown`. Every write needs every current member's acknowledgement. The timeout only decides how long a request waits for the membership to change.
 
 A failed response means **not acknowledged**, not **not applied**. S3 has the same semantics for a 5xx or a timeout. The record may already be on some members. It will later either commit, when a reconfiguration removes the unresponsive member (section 6.4), or be discarded, when a new primary does not have it (section 6.6). Two rules keep this safe:
 
 - **No reordering.** The log is strictly sequential per shard. A later committed write always supersedes an earlier failed one, so a failed PUT can never resurface over a later PUT or DELETE of the same key.
 - **No holes.** A member cannot accept `seq + 1` without `seq`. While a member is unresponsive, the shard cannot commit anything until that member catches up or is removed.
 
-Setting `replica_ack_timeout` above the time a reconfiguration takes lets requests wait through a member removal instead of failing. The default fails fast, as requested.
+`replica_ack_timeout` decides what clients see while a member is failing:
+
+- **Wait through removal (default, 5 s).** The timeout is longer than `member_suspect_after` plus one control-store round trip. Requests in flight wait while the primary removes the member, then commit with the remaining members. Clients see added latency, not errors.
+- **Fail fast (opt-in, for example 2 s).** Requests fail with 503 as soon as a member is late. AWS SDK default retry policies (three attempts, backoff starting near 100 ms) usually give up inside the removal window. One sick disk then becomes client-visible errors on every shard that includes it: about `replicas × shards ÷ nodes` shards, or 240 in the section 6.1 example.
+
+If the member cannot be removed, because the control store is unreachable, requests fail after the timeout in both modes. Section 16.3 measures the p99 cost of each.
 
 ### 5.3 Durable I/O per small PUT
 
@@ -243,7 +250,7 @@ Setting `replica_ack_timeout` above the time a reconfiguration takes lets reques
 | Consensus or control-store calls on the path | 2 Raft commits | 0 |
 | Background I/O per object | EC conversion writes about 1.5x the payload, plus cleaning | Write-back: one remote PUT. Local, large objects: one encoding pass writing `(k+m)/k` × the payload. Either way, a marker record carried in a later group commit |
 
-Group commit batches fsyncs across all shards that share a disk, so the per-object sync count falls further under concurrency. Section 16.3 defines how these counts are measured.
+Group commit batches fsyncs across all shards that share a disk, so the per-object sync count falls further under concurrency. Section 16.3 defines how these counts are measured. These counts assume a full replica set. After a member loss, writes commit with one fewer copy until a replacement starts acknowledging, and existing data has one fewer copy until backfill finishes (section 6.4).
 
 The cost of this model is tail latency. Every PUT waits for the slowest of the member fsyncs, and one sick member stalls its shards until it is removed. Section 6.4 bounds that stall to roughly `member_suspect_after` plus one CAS round trip.
 
@@ -304,7 +311,7 @@ Every backend uses the same register layout:
   identity/                     OIDC providers, roles, trust and session policies
 ```
 
-**S3 backends.** Registers are objects in a control bucket. They are updated with `PutObject` and `If-Match: <etag>`, or created with `If-None-Match: *`. A precondition failure (412) means someone else won. A `409 ConditionalRequestConflict` means a concurrent conditional write was in progress, and the caller retries after re-reading[^s3-cond]. At startup, each node probes an S3 control store: it races two conditional writes on a scratch key, requires exactly one to succeed, and checks read-after-write consistency. A store that fails the probe is refused.
+**S3 backends.** Registers are objects in a control bucket. They are updated with `PutObject` and `If-Match: <etag>`, or created with `If-None-Match: *`. A precondition failure (412) means someone else won. A `409 ConditionalRequestConflict` means a concurrent conditional write was in progress, and the caller retries after re-reading[^s3-cond]. At startup, each node probes an S3 control store. It runs 100 rounds across several scratch keys, racing conditional writers on different nodes, and requires exactly one winner in every round. After each round, the losers read the register and must see the winner's value, because the lost-response rule below depends on read-after-write. A store that fails any round is refused. The conformance suite (section 16.1) runs the same probe against every backend, not only at startup.
 
 **Lost responses.** Each write includes a unique `proposal_id` in the value. If a response is lost and the retry fails its precondition, the proposer re-reads the register. If the register contains its own `proposal_id`, the write succeeded. This applies to every backend.
 
@@ -341,7 +348,13 @@ An example shard register:
 
 Losing a node generates a burst of CAS requests: one per shard the node belonged to, for example about 240 in a 20-node cluster with 1,600 shards. Issued in parallel, the burst adds well under a second. It stays far below S3 per-prefix request limits.
 
-**Placement.** The control store does not have to use the data targets' endpoint or region. Put it in the region or endpoint nearest the cluster, even when the data targets are far away. Its latency only affects failover time, and its availability only affects membership changes. An R2 control store can serve a cluster whose buckets are all `local`, with no remote data at all.
+**Placement.** The control store must not share a failure domain with any data target. Otherwise one regional outage removes flushing and membership changes together, and during it a single node failure takes that node's shards offline: about `replicas × shards ÷ nodes` shards. For production:
+
+- **etcd running on-site is the recommended default.** It is independent of every remote target by construction.
+- **An S3 or R2 control store** is supported when it is in a different provider or region from every data target. For example, R2 can serve a cluster whose targets are in AWS, or whose buckets are all `local`.
+- **The configuration validator refuses** a control store that it can tell shares a provider region with a data target, unless `allow_correlated_control_store = true`.
+
+Within those rules, prefer the store nearest the cluster. Its latency only affects failover time.
 
 ### 6.2 Local copies of control state
 
@@ -396,7 +409,7 @@ sequenceDiagram
     P->>B1: Append seq 100
     P->>B2: Append seq 100
     B1-->>P: Durable 100
-    Note over P,B2: No ack within replica_ack_timeout, requests fail with 503
+    Note over P,B2: No ack yet, requests wait (default) or fail with 503 (fail-fast)
     Note over P,B2: No ack within member_suspect_after
     P->>CS: CAS shard epoch 42 to 43 without B2
     CS-->>P: OK
@@ -410,9 +423,15 @@ sequenceDiagram
 
 Records that were pending when the member failed commit under the new epoch, because every remaining member has them.
 
-If removing a member would leave fewer than `min_write_replicas` members, the removal still happens, so the shard stays readable. The shard rejects writes until a learner is promoted.
+If removing a member would leave fewer than `min_write_replicas` acknowledging copies, the removal still happens, so the shard stays readable. The shard rejects writes until a learner brings the acknowledgement set back to `min_write_replicas`.
 
-The default `min_write_replicas = 2` with `replicas = 3` means a shard keeps accepting writes after losing one node, with two copies of new data, and returns to three copies without anyone intervening.
+**Durability window after a member loss.** The two-failure budget counts failures before repair completes. After a shard loses one member, **every** record it holds, old or new, has two copies. A second failure leaves one copy, and a third loses data. That is the usual replication contract, and the exposure is the time until the third copy is back. With the defaults (`replicas = 3`, `min_write_replicas = 2`), the shard keeps accepting writes during that time, and new writes are exactly as exposed as old ones. Three measures keep the window short and visible:
+
+- **Live stream first.** A new learner joins the acknowledgement set as soon as it can store new records, before it has backfilled any history. New writes have three copies again within seconds of the learner being added.
+- **Under-replicated data first.** Backfill copies dirty and unencoded objects first, since they have no other home, and then the rest. Its duration is the exposure window for existing data. Promotion (rule R3) waits until backfill is complete.
+- **Exposure metrics.** `under_replicated_bytes` and `oldest_under_replicated_age` report data with fewer than `replicas` copies.
+
+A bucket can set `min_write_replicas = 3` for a stricter acknowledgement: every acknowledged write had three copies when it was acknowledged. That does not shorten the window for data already stored. Its cost is that, after any member loss, writes to the affected shards stall until a learner joins the acknowledgement set. That needs a spare eligible node, so in a 3-node cluster writes stall until the lost node returns.
 
 ### 6.5 Primary failure
 
@@ -461,11 +480,18 @@ Every change the coordinator makes is a CAS, so two nodes that briefly both beli
 The coordinator:
 
 - Tracks node health from heartbeats it receives directly. This is advisory only. Shard failover never depends on it.
-- **Replaces** lost members. It adds a learner on an eligible node that respects failure-domain separation and capacity. The primary streams a snapshot of the shard index plus dirty payload, then the live log. Clean payload of write-back buckets is not copied, because the new member can fetch it from the remote if needed. Replicated objects of local buckets are copied. Coded objects are not, because their fragments live outside the shard (section 8.6).
-- **Promotes** caught-up learners **without pausing commits**. Once a learner is close to the log head, the primary adds it to the set of acknowledgements every new commit waits for. When the learner is durable up to the commit watermark, it holds every committed record, and the primary CASes the promotion. Commits keep flowing during the CAS and only wait for the learner's LAN acknowledgement. The control-store round trip is never on the write path. Requiring an extra acknowledgement never weakens the commit rule. If the CAS fails, the primary re-reads the register and either retries or stops waiting for the learner.
+- **Replaces** lost members. It adds a learner on an eligible node that respects failure-domain separation and capacity. The learner receives the live log at once and backfills a snapshot of the shard index and the payload it needs in parallel, under-replicated data first (section 6.4). Clean payload of write-back buckets is not copied, because the new member can fetch it from the remote if needed. Replicated objects of local buckets are copied. Coded objects are not, because their fragments live outside the shard (section 8.6).
+- **Promotes** caught-up learners **without pausing commits**. The primary adds a learner to the set of acknowledgements every new commit waits for as soon as it accepts the live log. When backfill is complete and the learner is durable up to the commit watermark, it holds every committed record, and the primary CASes the promotion. Commits keep flowing during the CAS and only wait for the learner's LAN acknowledgement. The control-store round trip is never on the write path. Requiring an extra acknowledgement never weakens the commit rule. If the CAS fails, the primary re-reads the register and either retries or stops waiting for the learner.
 - **Rebalances** shards and primaries across nodes, including newly joined ones, with add-learner, promote, remove steps. Primaries are moved by planned handoff: the current primary steps down and the target member proposes itself (section 5.4 and rule R1).
 - **Re-admits** returning nodes. A node that was removed from a shard rejoins only as a learner. Its old records for that shard may seed catch-up after their `(epoch, seq)` prefix is verified, and are otherwise discarded.
 - **Forgets** nodes that stay unreachable for `node_forget_after`, after re-homing their shards.
+
+**Failure domains.** Nodes carry `zone` and `rack` labels, and `failure_domain` selects the level placement must respect: `node` (the default), `rack`, or `zone`. The coordinator enforces two rules at that level:
+
+- at most one member of a shard per domain,
+- at most `m` fragments of a stripe per domain, and never more than one per node, so losing a whole domain loses no more than a stripe can rebuild.
+
+A bucket whose policy the cluster cannot satisfy is rejected at creation. If the cluster later stops satisfying it, for example after losing a rack, the coordinator never co-locates to make up the difference. Shards run with fewer members, encoding pauses so objects stay replicated, and cluster health reports the unsatisfied policy until capacity returns.
 
 Joining a new node is a provisioning action: the node starts with valid credentials and registers itself. Every membership decision after that is automatic.
 
@@ -485,7 +511,7 @@ This protocol is PacificA's[^pacifica] with a control-store register as the conf
 - **Loss of the control store.** Bucket deleted, credentials revoked, or a provider that stops honoring conditional writes. The data path keeps running from local copies (section 6.2), but no membership change can happen until the store is restored, or an operator rebuilds it from the nodes' local copies.
 - **Flush conflicts under the `hold` policy** (section 7.2).
 - **Loss of a majority of voters** in an etcd or embedded-Raft control store.
-- **Every member of a shard lost.** Data that had not reached its durable home is lost, and SkyS3 reports exactly which keys. For a local bucket, the shard's index is lost too. Coded objects can be re-indexed from their fragment headers (section 8.4) by an operator-run recovery.
+- **Every member of a shard lost.** Data that had not reached its durable home is lost. The shard's index is lost too, so the cluster alone cannot list every lost key. SkyS3 reports what it can from the latest index snapshot (section 8.9): the keys whose data existed only on the lost members, and the time window after the snapshot in which other keys may also have been lost. For `local` buckets, coded objects are re-indexed from their fragment headers (section 8.4) by an operator-run recovery.
 
 ### 6.10 Control-store outages and the choice of referee
 
@@ -500,7 +526,7 @@ Local copies cannot remove that dependency, because the problem is agreement, no
 
 They are incompatible. Under property 1, A and C may agree to drop B. Under property 2, B may at the same time get the control store to accept B alone. The two decisions have no participant in common, so nothing prevents both, and the shard would have two primaries.
 
-This design chooses property 2: the control store is the only referee. The exposure is a node failure during a control-store outage, which is roughly the store's unavailability per node failure. Sites that cannot accept that use a control store that runs on-site: etcd now, or embedded Raft later.
+This design chooses property 2: the control store is the only referee. The exposure is a node failure during a control-store outage, which is roughly the store's unavailability per node failure. Sites that cannot accept that use a control store that runs on-site: etcd now, or embedded Raft later. Section 6.1 keeps the control store out of every data target's failure domain, so one regional outage cannot take out both.
 
 ## 7. Write-back flush
 
@@ -522,6 +548,7 @@ SkyS3 assumes it **exclusively owns** the remote prefix. Every flush is conditio
 | Key absent at the remote (imported namespace or earlier delete) | `PutObject` with `If-None-Match: *` |
 | Key present with a known `remote_etag` | `PutObject`, `CompleteMultipartUpload`, or `DeleteObject` with `If-Match: <remote_etag>` |
 | Remote state unknown, because the key was written locally before the import reached it (section 9.1) | `HeadObject` first, then one of the rows above |
+| Copy of a clean source in the same target | `CopyObject` with `REPLACE` metadata and tagging directives, the copy's own write identity, `x-amz-copy-source-if-match`, and the destination precondition from the rows above (section 11) |
 
 **Write identity.** Every object SkyS3 writes to a remote carries a write identity in its user metadata: `x-amz-meta-skys3-wid: <cluster>/<bucket>/<shard>/<epoch>.<seq>`. It names exactly one committed local write. SkyS3 strips it from responses to its own clients, and reserves its size (at most 96 bytes) out of the 2 KiB user-metadata limit it enforces. Other readers of the remote bucket can see it.
 
@@ -562,6 +589,7 @@ sequenceDiagram
 - The remote object appears only after the local commit and the remote `CompleteMultipartUpload`. No partial object is ever visible there.
 - The remote `CreateMultipartUpload` carries the write identity, so the completed object has it.
 - Remote multipart upload IDs are stored in the shard log. If the local upload is aborted, or a remote upload is orphaned, the flusher calls `AbortMultipartUpload`. The remote bucket should also have an abort-incomplete-uploads lifecycle rule as a backstop.
+- Each remote part's ETag is recorded in a `PART_FLUSHED(upload, part, remote_etag)` record, piggybacked like `FLUSHED`. A new primary that takes over an upload reconciles with a remote `ListParts` before completing. It re-uploads every part that is missing at the remote, or whose ETag differs from the local part's MD5, which is the expected remote ETag because part boundaries match (section 7.4). A part whose acknowledgement was lost in a crash is therefore either found or sent again.
 - A large single PUT is streamed as a remote multipart upload with `flush_part_bytes` parts. Its `remote_etag` then differs from the MD5 `local_etag` that clients see (section 7.4).
 
 ### 7.4 ETag and checksum fidelity
@@ -592,8 +620,75 @@ Remote targets may sit behind a slow link, for example a 100 ms round trip. That
 | Write-through PUT | At least one `RTT` per write | Use only on buckets that need zero RPO |
 | Cache miss | At least one `RTT` before the first byte | Cache sizing, fill coalescing |
 | Namespace import | 1,000 keys per `RTT` per listing stream | Parallel import by key range (section 9.1) |
+| Long, lossy link to a SkyS3 peer | Loss-driven TCP throughput and head-of-line blocking | Native QUIC transport (section 7.8) |
 
 Flush concurrency adapts per target. It grows additively while throughput rises and latency stays near the target's base round trip, and it shrinks multiplicatively on `503 SlowDown` or rising latency. The ceiling, `flush_max_concurrency_per_shard`, together with `flush_max_inflight_bytes_per_target`, keeps enough requests in flight to fill the link: roughly `bandwidth × RTT ÷ average object size`. For example, 8 shards at 64 requests each keep 512 small-object PUTs in flight. At a 100 ms round trip that is about 5,000 PUTs per second per bucket, before the target's own rate limits apply.
+
+### 7.8 Native transport between SkyS3 clusters
+
+A write-back target or a backup target can itself be a SkyS3 cluster, for example one on another continent. Between two SkyS3 clusters, the flusher uses a native peer protocol over QUIC[^rfc9000] instead of S3 REST. S3 REST remains the fallback, and the only transport to other providers.
+
+**Why S3 REST falls short on long, lossy links.** Cross-continent paths often combine 150–300 ms round trips with random packet loss.
+
+- *Loss-driven congestion control.* Classic TCP congestion control treats every lost packet as congestion. Per connection, throughput is bounded by about `1.22 × MSS ÷ (RTT × √p)`[^mathis]. At a 200 ms round trip and 1% loss, that is roughly 0.7 Mbit/s. Cubic does better, but it is still driven by loss.
+- *Head-of-line blocking.* One lost packet stalls everything behind it on a TCP connection, including every HTTP/2 stream multiplexed on it. Filling the link then takes hundreds of connections, each with its own slow start.
+- *Coarse recovery and per-request cost.* A failed transfer resumes per multipart part, which is at least 5 MiB and usually `flush_part_bytes`. Every small object is its own request and round trip, and preconditions depend on what the provider supports (section 7.2).
+
+**What QUIC changes.** Quinn[^quinn] provides:
+
+- many independent streams per connection, so a lost packet delays only the stream it belonged to,
+- pluggable congestion control per connection: Cubic (the default), NewReno, and BBR. BBR[^bbr] paces sending from measured bandwidth and round trip instead of backing off on every loss, which suits random-loss paths. Quinn marks its BBR implementation experimental, so peer links use Cubic until BBR, or a controller SkyS3 implements through Quinn's pluggable interface, passes the lossy-link tests in section 16.3,
+- one handshake per peer connection, and connection migration across address changes,
+- 0-RTT, which SkyS3 disables for peer traffic, because a replayed mutation must never be accepted.
+
+**Protocol.** The peer protocol restores the previous proposal's streaming replication, mapped onto the flush semantics of this design:
+
+| Message | Meaning |
+|---|---|
+| `HELLO` | Cluster identities, protocol versions, and capabilities |
+| `BEGIN` | Open private staging at the destination for one write identity: bucket, key, source epoch, and `seq` |
+| `DATA` | A frame of ciphertext at an offset, with its checksum (`peer_frame_bytes`) |
+| `DURABLE` | These ranges are durable on every member of the destination shard |
+| `RESUME` | After a reconnect, the destination returns its durable ranges, and the source resends only what is missing |
+| `COMMIT` | Metadata, final checksums, the write identity, and the precondition: the destination's expected current write identity, or absent |
+| `APPLIED` | The destination's result: committed, precondition failed (with the current write identity), or error |
+| `BATCH` | Many small objects with inline payload and their `COMMIT`s, applied in one group commit |
+| `ABORT` | Discard the staging for a write identity |
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Source primary
+    participant G as Destination gateway
+    participant D as Destination shard primary
+    C->>S: PUT or UploadPart, body arriving
+    S->>G: BEGIN on a QUIC stream
+    G->>D: Route by key
+    loop While the body arrives
+        S->>G: DATA frame at offset
+        G->>D: Stage as a private extent on all members
+        D-->>S: DURABLE ranges, cumulative
+    end
+    C->>S: Last byte, or CompleteMultipartUpload
+    S->>S: Commit locally on all members
+    S-->>C: 200 OK
+    S->>G: COMMIT with write identity and precondition
+    G->>D: Check ranges, checksums, and precondition
+    D->>D: Commit a PUT that references the staged extents
+    D-->>S: APPLIED
+    S->>S: Append FLUSHED
+```
+
+- **Pre-completion streaming with byte-range resume.** Each frame is sent as soon as its extent is durable at the source, while the client is still uploading. The destination stages frames as private extent records, replicated on its own shard members, and acknowledges durable ranges cumulatively, never with a round trip per frame. After a disconnect, `RESUME` restarts from the last durable byte, not from the start of a part.
+- **Whole-object visibility.** Staged data is invisible at the destination. `COMMIT` is sent only after the source's local commit. The destination publishes the object in one record that references the staged extents, without copying them.
+- **Preconditions on every operation.** The destination evaluates the precondition in its own shard log, so PUTs, multipart completions, copies, and deletes are all conditional, without any provider gaps. A `COMMIT` is keyed by write identity, so a replay after a lost `APPLIED` returns the stored result.
+- **Small objects in batches.** Objects of up to one frame skip staging. Many of them travel in one `BATCH`, and the destination commits them in one group commit. That keeps destination-side durable operations per small object close to the source's (section 5.3).
+- **Flow control.** Stream and connection windows are sized from the bandwidth-delay product and capped by `peer_max_inflight_bytes`. The destination limits staged bytes per source (`peer_staging_quota_bytes`) and discards uncommitted staging after `peer_staging_ttl_seconds`.
+- **Topology.** Each source node keeps a few QUIC connections to destination gateways and opens one stream per object or batch. Destination gateways relay to their shard primaries over the LAN.
+- **Receiving buckets.** A bucket that receives native replication names its source cluster (`peer_source`). By default it is read-only to the destination's own clients, so each key has a single writer.
+- **Acknowledgement policies.** `write_through` buckets and `backup_ack = "write_through"` wait for `APPLIED`. The default policies acknowledge after the local commit, as before.
+
+**Discovery and fallback.** A target's `target_transport` is `auto` (the default), `native`, or `s3`. With `auto`, the flusher asks the target's S3 endpoint for a signed SkyS3 peer descriptor: cluster identity, QUIC addresses, and protocol versions. It uses QUIC if the handshake succeeds within `peer_connect_timeout`. Otherwise it falls back to S3 REST and probes again periodically, so a network that blocks UDP degrades to REST instead of failing. Peer connections use mutual TLS with the peer cluster's identity from a configured trust bundle (section 12).
 
 ## 8. Local buckets and erasure coding
 
@@ -634,7 +729,7 @@ Count eligible **nodes**, not disks, and put at most one fragment of a stripe on
 
 Two parity fragments survive any two node losses, the same failure budget as three replicas. A stripe with a spare node outside it can be repaired onto a new failure domain right away. A 5-node cluster has no spare, so repair waits for a replacement node.
 
-Fragments may land on any eligible node, not only the shard's members. Placement follows failure domains and free space. Each stripe records its geometry, codec ID, and fragment locations, and these are never recomputed from the current cluster size. Growing the cluster changes only new stripes. Rebalancing moves fragments with the same publish-before-retire steps as encoding.
+Fragments may land on any eligible node, not only the shard's members. Placement follows failure domains (section 6.7) and free space. Each stripe records its geometry, codec ID, and fragment locations, and these are never recomputed from the current cluster size. Growing the cluster changes only new stripes. Rebalancing moves fragments with the same publish-before-retire steps as encoding.
 
 ### 8.4 Encoding: publish before retire
 
@@ -671,7 +766,12 @@ Repair is automatic and follows the same publish-before-retire rule as encoding.
 
 ### 8.7 Overwrites, deletes, and space reclamation
 
-An overwrite or delete commits like any other write. The superseded version's fragments are then released with an `EC_RELEASE` record. Fragment nodes keep released fragments for `fragment_release_delay_seconds`, so reads already holding the old read plan can finish, and then mark them dead.
+An overwrite or delete commits like any other write. The superseded version's fragments are then released with an `EC_RELEASE` record. Reads that already hold the old read plan are protected by registration. Before fetching, a gateway registers the plan's version with each holder it reads from, and renews the registration while it streams. A holder keeps released data while any registration references it, for fragments and replicated payload alike. Two timers bound this:
+
+- `fragment_release_delay_seconds` (default 60) covers the gap between the primary issuing a plan and the gateway registering it.
+- `read_registration_ttl_seconds` (default 30) expires the registrations of a gateway that vanished without releasing them.
+
+If a registration lapses anyway, for example because a gateway is partitioned from a holder for longer than the TTL, the GET fails mid-stream. The client sees a failed response and retries. No data is lost.
 
 Dead fragments are reclaimed by node-local compaction of fragment segments (section 10.3). Fragment locations inside a node never appear in shard metadata, so no stripe is ever re-encoded and there is no cross-node cleaner. That is the difference from the previous proposal's packed segments, where deleting one object meant rewriting a shared stripe across nodes.
 
@@ -695,7 +795,9 @@ Encoding runs off the request path, in large sequential writes. The small-PUT co
 
 A `local` bucket may name a `backup_target`. The flusher (section 7) then also uploads every committed change to it, with the same ordering, conditional writes, write identity, and streaming multipart flush, but nothing is evicted locally. `backup_ack` is `local` (the default, asynchronous) or `write_through`, where a write succeeds only after the backup has it.
 
-The backup target can be any S3-compatible store, including another SkyS3 cluster's S3 endpoint. That gives cross-region replication without a separate protocol. Large uploads stream to the other cluster while the client is still uploading, and objects appear there only after the local commit. Compared with the previous proposal's native replication, one difference remains: a failed transfer resumes from the last completed multipart part, not from an arbitrary byte offset.
+The backup target can be any S3-compatible store, including another SkyS3 cluster. Between SkyS3 clusters, the native QUIC transport (section 7.8) streams uploads while the client is still uploading, resumes from the last durable byte after a disconnect, and publishes objects at the destination only after the local commit. That restores the previous proposal's native cross-region replication.
+
+**Protecting local data and metadata.** A `local` bucket whose data matters should have a `backup_target`. Without one, losing every member of a shard loses its replicated small objects for good. Every bucket also writes periodic per-shard index snapshots (`index_snapshot_interval_seconds`) to a `snapshot_target`: by default the backup target, otherwise a bucket outside the data namespace. A snapshot gives re-indexing a starting point, and lets SkyS3 report lost keys as section 6.9 describes. Restore drills are part of the acceptance tests (section 16.1).
 
 ## 9. Reads, namespace, and cache management
 
@@ -724,7 +826,7 @@ An optional periodic **reconciliation scan** re-lists the remote and reports dif
 2. For a GET, the primary returns a **read plan**: the object's version identity (`seq` and ETag), its size, and the holders of its bytes. Holders are members with a local copy, fragment nodes for coded objects, or the remote for evicted write-back objects. Holder lists are hints: a holder that no longer has the version says so, and the gateway tries the next.
 3. The gateway fetches the bytes directly from the best holder. It prefers its own node-local hot cache, then the least-loaded member with a copy, then fragments, then the remote. Any holder of that exact version is correct, because a version never changes. The primary only sends metadata, so it does not become a bandwidth bottleneck.
 4. A fill from the remote uses `If-Match: <remote_etag>`, plus `versionId` when the remote is versioned. Concurrent fills of the same range are coalesced. Ranges are served while the fill streams, and the filled payload becomes clean cache on up to `clean_copies` members.
-5. If the fill precondition fails, the remote was changed out of band. For a clean entry, SkyS3 adopts the remote object's current metadata and retries. The remote is the system of record for clean data. The conflict is also counted.
+5. If the fill precondition fails, the remote was changed out of band. The remote is the system of record for clean data, so the primary commits an `ADOPT(key, remote_etag, remote_version_id, metadata)` record through the shard log, and the gateway retries. `ADOPT` applies only if the entry is still clean at the `seq` the read plan named. If a local write committed in between, the entry is dirty, the `ADOPT` is dropped, and the flusher's conflict policy owns the key (section 7.2). The conflict is counted either way.
 
 **Hot cache.** Every node can keep recently read objects in a node-local cache (`hot_cache_bytes_per_node`), keyed by bucket, key, and version identity. It is only used for the version named in the primary's read plan, so it never serves a stale version. It spreads reads of hot objects across every gateway without adding copies inside the shard.
 
@@ -756,7 +858,7 @@ Each disk has append-only segment files shared by every shard replica on that di
 - **bulk** segments for 1 MiB extent records of large objects,
 - **fragment** segments for erasure-coded fragments, which any shard's encoder may place on the node.
 
-Record header: magic, format version, record kind, shard id, epoch, seq, key hash, header and payload lengths, and CRC32C. Record kinds are `PUT`, `DELETE`, `EXTENT`, `MPU_CREATE`, `MPU_PART`, `MPU_COMPLETE`, `MPU_ABORT`, `FLUSHED`, `TAGS`, `IMPORT`, `EC_PUBLISH`, `EC_RELOCATE`, `EC_RELEASE`, `TRUNCATE`, and `CONFIG`.
+Record header: magic, format version, record kind, shard id, epoch, seq, key hash, header and payload lengths, and CRC32C. Record kinds are `PUT`, `DELETE`, `EXTENT`, `MPU_CREATE`, `MPU_PART`, `MPU_COMPLETE`, `MPU_ABORT`, `FLUSHED`, `PART_FLUSHED`, `TAGS`, `IMPORT`, `ADOPT`, `EC_PUBLISH`, `EC_RELOCATE`, `EC_RELEASE`, `TRUNCATE`, and `CONFIG`.
 
 A `CONFIG` record holds a full shard configuration: epoch, primary, members, learners, and replica targets. A replica appends one, and group commit makes it durable, whenever it adopts a new epoch, before it acknowledges or serves anything in that epoch. Checkpoints keep each shard's latest `CONFIG` record reachable, so it survives log reclamation. It is the replica's local copy of its membership (section 6.2).
 
@@ -800,7 +902,7 @@ A member acknowledges a record only after `fdatasync` covers it. New segment fil
 
 S3 parsing and serialization use `s3s`[^s3s]. SkyS3 implements authentication, authorization, and resource limits itself.
 
-CopyObject within the cluster copies the bytes into the destination shard. If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth.
+CopyObject within the cluster copies the bytes into the destination shard. If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth. The remote copy must carry the copy's own write identity. With the default `COPY` metadata directive, it would keep the source's identity, and the 412 recovery rule (section 7.2) would report a successful flush as a conflict. So the flush sends `x-amz-metadata-directive: REPLACE` with the full metadata and the copy's write identity, `x-amz-tagging-directive: REPLACE` with the tags, `x-amz-copy-source-if-match: <source remote_etag>` so the source has not changed, and the destination precondition. A target that does not support all of these gets a regular upload instead.
 
 **Workload identity.** STS implements `AssumeRoleWithWebIdentity`[^sts-wif]. It validates the JWT signature against allowlisted issuers (discovery and JWKS fetched with bounded size and rate), and checks `iss`, `aud`, `sub`, `exp`, `nbf`, and `azp` where required, using an algorithm allowlist. It then issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`. Trust policies and roles live in the control store. Each node validates against its local copy, and stops issuing new sessions once that copy is older than `identity_max_staleness` (section 6.2). Session records live in an internal, local-only system bucket that is replicated like any shard and never flushed. Session tokens are stored hashed. Secrets needed for SigV4 are held in memory with `secrecy`/`zeroize`.
 
@@ -814,20 +916,23 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 - Internal traffic uses mutual TLS with node identities issued by the operator's PKI. Replication, lease, and admin messages are authenticated per node and per role.
 - The control store is a trust anchor. Whoever can write it can reassign shards. It gets a dedicated bucket or prefix, least-privilege credentials, and remote-side versioning for audit.
 - E2EE ciphertext never leaves its original form. The service never needs decryption keys. Keys, sizes, and access patterns remain visible to SkyS3 and to the remote.
+- Peer clusters authenticate each other with mutual TLS against a configured trust bundle, and each peer is authorized for specific bucket pairs. QUIC 0-RTT is disabled, so a replayed peer message can never apply a mutation.
 - Nodes are assumed non-malicious. No Byzantine tolerance is claimed.
 
 ## 13. Failure matrix
 
 | Failure | Outcome |
 |---|---|
-| Backup slow or dead | In-flight writes on its shards fail with 503. The primary removes it after `member_suspect_after` and writes resume with 2 members. The coordinator adds a replacement. |
+| Backup slow or dead | In-flight writes on its shards wait through the removal (default) or fail with 503 (fail-fast, section 5.2). The primary removes it after `member_suspect_after`. The shard's data has two copies until a replacement joins the acknowledgement set (new writes) and finishes backfill (existing data) (section 6.4). |
 | Primary dead | Its shards are unavailable for about `primary_grace` plus one CAS plus reconciliation (under 10 s by default). A backup takes over and rolls the tail forward. |
 | Two of three members dead | The survivor becomes primary with the full committed history. The shard is read-only until a learner catches up. |
 | Whole cluster loses power | Nodes replay logs from their checkpoints and resume from each shard's latest `CONFIG` record, even if the control store is unreachable. Shards whose membership changed while a node was down are fenced by epochs until that node reads the current register. |
-| Every member of a shard permanently lost | Data that had not reached its durable home is lost, and SkyS3 reports the exact keys. Clean data is refilled from the remote. Coded objects survive in their fragments and can be re-indexed by an operator-run recovery. |
+| Every member of a shard permanently lost | Data that had not reached its durable home is lost. SkyS3 reports the lost keys it can identify from the latest index snapshot, and the window after it (section 6.9). Clean data is refilled from the remote. Coded objects survive in their fragments and can be re-indexed by an operator-run recovery. |
 | Node holding EC fragments lost | Coded objects stay readable; degraded reads decode from any `k` fragments. Shard primaries rebuild the lost fragments on other nodes (section 8.6). |
 | Node fails while the control store is unreachable | Shards that include the node stop taking writes, and stop serving reads when their leases lapse, until the control store returns (section 6.10). |
 | Remote target unreachable | Writes continue up to the dirty budget. Reads of cached data continue. Reads of evicted data fail. |
+| Link to a peer SkyS3 cluster drops or flaps | Transfers resume from the last durable range (`RESUME`). Objects stay dirty at the source until `APPLIED` arrives. |
+| UDP blocked between peer clusters | `target_transport = "auto"` falls back to S3 REST, and the target's status reports it. |
 | Control store unreachable | Data path continues from local copies. Shards that need a membership change stay unavailable for writes (and reads after lease expiry) until it returns. STS stops issuing new sessions after `identity_max_staleness`. |
 | High-latency link to the control store | Client requests are unaffected. Failover and member removal take 1–2 extra round trips per CAS. |
 | Coordinator dies | Another node takes the lease. Only placement work is delayed. |
@@ -843,18 +948,19 @@ This schema is proposed, not implemented. The values are starting points to be t
 ```toml
 [cluster]
 cluster_id = "skys3-prod-a"
-failure_domain = "node"
+failure_domain = "node"       # "node", "rack", or "zone"; nodes carry rack and zone labels
 
 [control_store]
-backend = "s3"                # "s3" (AWS S3, R2, other probed stores) or "etcd"
-endpoint = "https://s3.us-east-1.amazonaws.com"
-bucket = "example-skys3-control"
+backend = "etcd"              # "etcd" (production default) or "s3" (AWS S3, R2, other probed stores)
+etcd_endpoints = ["https://etcd-1.example.internal:2379", "https://etcd-2.example.internal:2379", "https://etcd-3.example.internal:2379"]
 prefix = "skys3-prod-a/"
+# For backend = "s3": endpoint and bucket, in a different failure domain from every target
+allow_correlated_control_store = false
 coordinator_lease_seconds = 10
 config_poll_interval_seconds = 30
 
 [replication]
-replica_ack_timeout_ms = 2000
+replica_ack_timeout_ms = 5000        # wait-through default; 2000 for fail-fast
 member_suspect_after_ms = 3000
 lease_renew_interval_ms = 1000
 primary_lease_ms = 4000
@@ -870,6 +976,7 @@ group_commit_max_delay_us = 500
 group_commit_max_bytes = 4194304
 index_checkpoint_interval_seconds = 10
 compaction_live_threshold = 0.5
+read_registration_ttl_seconds = 30
 
 [cache]
 hot_cache_bytes_per_node = 68719476736
@@ -890,7 +997,7 @@ max_dirty_bytes = 2199023255552
 parity_fragments = 2
 max_data_fragments = 8
 min_eligible_nodes = 5
-fragment_release_delay_seconds = 300
+fragment_release_delay_seconds = 60
 fragment_orphan_after_seconds = 3600
 repair_bytes_per_second_per_node = 104857600
 
@@ -905,6 +1012,17 @@ ec_min_object_bytes = 4194304
 ec_stripe_data_bytes = 67108864
 ec_after_seconds = 600
 backup_ack = "local"
+index_snapshot_interval_seconds = 3600
+target_transport = "auto"     # "auto", "native" (QUIC to a SkyS3 peer), or "s3"
+
+[peering]
+quic_listen = "0.0.0.0:7443"
+congestion_control = "cubic"  # "cubic", "new_reno", or "bbr" (experimental in Quinn)
+peer_frame_bytes = 262144
+peer_connect_timeout_ms = 3000
+peer_max_inflight_bytes = 268435456
+peer_staging_quota_bytes = 1099511627776
+peer_staging_ttl_seconds = 86400
 
 [identity]
 anonymous_access = false
@@ -921,10 +1039,11 @@ identity_max_staleness_hours = 24
 | S3 HTTP | `s3s`, `hyper`, `http`, `bytes` | Wire adaptation only. Auth and limits are implemented in SkyS3.[^s3s] |
 | Async runtime | `tokio` | Dedicated blocking pools for disk and hashing |
 | Index | `redb` | Non-durable commits plus periodic durable checkpoints (section 10.2)[^redb] |
+| Peer transport between clusters | `quinn` with `rustls` | QUIC streams, pluggable congestion control (section 7.8)[^quinn] |
 | Remote targets and S3 control store | `aws-sdk-s3`, `aws-config` | Conditional writes, multipart, credential providers[^aws-sdk-rust] |
 | etcd control store | `etcd-client` | Transactions and watches |
 | Erasure coding | `reed-solomon-simd` behind a versioned `EcCodec` trait | The codec ID is stored with every stripe[^rs-simd] |
-| Internal transport | TCP with `rustls`/`tokio-rustls`, `prost` headers, raw payload frames | Simple on a LAN. QUIC is unnecessary without native WAN replication. |
+| Intra-cluster transport | TCP with `rustls`/`tokio-rustls`, `prost` headers, raw payload frames | Simple on a LAN. Traffic between clusters uses QUIC. |
 | Identity | `openidconnect`, `jsonwebtoken` or equivalent, `secrecy`, `zeroize` | Workload-token profile with explicit `azp` handling |
 | Integrity | `crc32c`, `md-5`, `sha1`, `sha2`, a CRC64NVME implementation | Checksums are validated at the protocol boundary |
 | Config and observability | `serde`, `toml`, `serde_json`, `tracing`, a metrics exporter | |
@@ -939,9 +1058,11 @@ identity_max_staleness_hours = 24
 - Specify the shard protocol (commit rule, R1 to R3, leases, reconciliation) and model-check it, in TLA+ or with a Rust model checker. Check durability of committed records, a single committing primary per epoch, and read linearizability under the drift bound.
 - Run the real replication and flush code under deterministic simulation. The simulated disk distinguishes written from fsynced data. The simulated S3 store supports conditional writes, delay, 5xx errors, and lost responses. Inject crashes, partitions, message loss, reordering, and clock drift. Record seeds so failures replay.
 - Include planned handoffs racing gateway reads that use stale shard maps, and imports racing client PUTs and DELETEs of the same keys.
-- Run one conformance suite against every control-store backend: linearizable `put_if`, lost responses, 409 retries, and watch or poll delivery.
+- Run one conformance suite against every control-store backend: the startup probe repeated at scale, linearizable `put_if`, lost responses, 409 retries, and watch or poll delivery.
 - For erasure coding: every loss combination up to `m` fragments, crashes at each encoding and repair step, repair racing overwrites and deletes, and golden codec vectors kept across upgrades.
+- Include the peer protocol: lost `DURABLE` and `APPLIED` messages, reconnects mid-transfer, duplicate `COMMIT`s, and staging expiry.
 - Include control-store faults: long outages, 100 ms and higher round trips, lost CAS responses, and whole-cluster restarts while the control store is unreachable. Nodes must resume from their `CONFIG` records, and stale configurations must stay fenced.
+- Restore drills: rebuild a shard's index from its latest snapshot plus fragment headers, and compare the lost-key report with the known ground truth.
 - Check histories for linearizability per key at the primary. Check that every acknowledged write is either flushed, or present on a surviving member, or reported lost.
 
 ### 16.2 Compatibility
@@ -957,6 +1078,8 @@ Measure on fixed hardware and against remote targets with shaped links:
 - PUT p50/p99 for 1 KiB to 1 GiB objects, including fsyncs per acknowledged PUT, records per group commit, and serial durable rounds. Section 5.3's table is the claim to verify.
 - Failover time distribution for primary and backup failures, and the write-unavailability window per shard, with the control store at 1 ms and at 100 ms round trips. Confirm that learner promotion adds no write stall.
 - Flush lag, dirty backlog, and sustained flush throughput at target round trips from 1 ms to 150 ms. Confirm that adaptive concurrency reaches the bandwidth-delay product. Measure import rate with parallel key ranges. Streaming-flush overlap: the fraction of bytes already at the remote when the client completes.
+- Peer transport: flush throughput and lag between two clusters over shaped links (150–300 ms round trips, 0–2% random loss), for QUIC with each congestion controller and for S3 REST. Also resume after link flaps, and fallback when UDP is blocked.
+- Durability window: time from a member loss until new writes, and then all existing data, have `replicas` copies again, and p99 write latency in wait-through and fail-fast modes.
 - Cache hit rate, fill latency, and compaction write amplification.
 - Read scaling: GET throughput for one hot object as `clean_copies` and the number of gateways grow.
 - Local buckets: stored bytes per logical byte at the measured object-size distribution, encoding backlog, and repair time after a node loss.
@@ -970,7 +1093,8 @@ Measure on fixed hardware and against remote targets with shaped links:
 | M3 Coordinator | Placement, replacement, rebalancing, node lifecycle | Node loss and addition heal with no operator action |
 | M4 Large objects | Multipart, streaming flush, write identity, conflict policies, write-through buckets, backup targets | No partial remote objects under fault injection; ETags match |
 | M5 Local erasure coding | Per-object encoding, placement, degraded reads, repair, fragment compaction, lifecycle expiration | All loss combinations up to `m` fragments pass; node loss heals with no operator action |
-| M6 Hardening | Conformance matrix, fuzzing, metrics, runbooks, performance | Published compatibility matrix; section 16.3 targets met or the design revised |
+| M6 Native peer transport | QUIC peer protocol, staging, byte-range resume, batching, discovery and S3 REST fallback, peer mTLS | Over shaped lossy links, throughput beats S3 REST; flaps resume without resending durable ranges |
+| M7 Hardening | Conformance matrix, fuzzing, metrics, runbooks, performance | Published compatibility matrix; section 16.3 targets met or the design revised |
 
 ## 18. Alternatives considered
 
@@ -983,11 +1107,13 @@ Measure on fixed hardware and against remote targets with shaped links:
 | Chain replication[^chain] | Same fault tolerance as all-member commit and lower primary bandwidth, but latency grows with chain length. Small-write latency is the priority. |
 | Hedged writes (send to r+1, wait for r) | Better p99, but it is a quorum system and needs quorum-style reconciliation. Worth revisiting if measured p99 demands it. |
 | Packed-segment EC (#2) | Better space for small objects, but deleting one object means re-encoding a shared stripe across nodes. Per-object EC of large objects needs only node-local compaction. Revisit if small objects hold a large share of bytes. |
+| S3 REST as the only transport between SkyS3 clusters | One protocol, but loss-driven TCP throughput, head-of-line blocking, per-part resume, and provider-dependent preconditions on long, lossy links. Kept as the fallback. |
+| gRPC or HTTP/2 over TCP for peer traffic | Better tooling, but the same TCP loss and head-of-line behaviour |
 | SeaweedFS with Cloud Drive and `filer.remote.sync`[^seaweed-cloud] | Existing, proven write-back to cloud storage and the strongest reuse option. Not Rust. Its metadata consistency depends on the chosen filer store, and ordered conditional flush and streaming multipart flush would need assessment. |
 
 ## 19. Open questions and risks
 
-1. **Control-store backend per deployment.** Failover needs the control store (section 6.10). S3 or R2 suits clusters with reliable internet access. Isolated sites need etcd, or the future embedded-Raft backend.
+1. **Control-store backend (decided).** etcd on-site is the production default. S3 or R2 is allowed only in a different failure domain from every data target (section 6.1). Open: whether sites that cannot run etcd need the embedded-Raft backend in an early release.
 2. **Provider support.** Which remote targets must be supported, and which operations honor preconditions on each? An S3 control store needs linearizable conditional `PutObject`. Data targets need preconditions only for conflict detection.
 3. **Dirty budget and RPO.** What dirty-data volume and flush lag are acceptable, and which buckets need `write_through`?
 4. **Tail latency.** All-member commit makes p99 depend on the slowest fsync. Measure before considering hedging.
@@ -995,13 +1121,14 @@ Measure on fixed hardware and against remote targets with shaped links:
 6. **Metadata size.** The namespace mirror stores an entry per remote object on every member. Very large imported buckets need capacity planning, or a later lazy-namespace mode.
 7. **Versioning.** Do applications need local S3 versioning APIs? Local buckets are the strongest case. Write-back buckets would also have to flush every version in order, with coalescing disabled.
 8. **Small objects in local buckets.** What share of bytes sits in objects smaller than `ec_min_object_bytes`? If it is large, packing small objects into shared EC segments may be worth its cleaner.
-9. **EC thresholds.** `ec_min_object_bytes`, `ec_stripe_data_bytes`, and `ec_after_seconds` need measurement against real object sizes and overwrite rates.
+9. **Peer congestion control.** Quinn marks its BBR implementation experimental. Validate it against measured cross-continent loss, or implement a controller through Quinn's pluggable interface, before making BBR the peer default. Also confirm that UDP is allowed between sites.
+10. **EC thresholds.** `ec_min_object_bytes`, `ec_stripe_data_bytes`, and `ec_after_seconds` need measurement against real object sizes and overwrite rates.
 
 ## References
 
 [^seaweed-repl]: SeaweedFS, *Replication*. "All the writes are strongly consistent and all N replica should be successful. If one of the replica fails to write, the whole write request will fail." [Source](https://github.com/seaweedfs/seaweedfs/wiki/Replication)
 
-[^s3-cond]: AWS, *Conditional requests* in the Amazon S3 User Guide. `PutObject` and `CompleteMultipartUpload` accept `If-Match` and `If-None-Match`, and `DeleteObject` accepts `If-Match`. A failed precondition returns 412, and a conflicting concurrent operation returns `409 ConditionalRequestConflict`. These details were checked against the API model in `aws-sdk-s3` 1.149.0. [Source](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html)
+[^s3-cond]: AWS, *Conditional requests* in the Amazon S3 User Guide. `PutObject`, `CopyObject`, and `CompleteMultipartUpload` accept `If-Match` and `If-None-Match`, and `DeleteObject` accepts `If-Match`. A failed precondition returns 412, and a conflicting concurrent operation returns `409 ConditionalRequestConflict`. These details were checked against the API model in `aws-sdk-s3` 1.149.0. [Source](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-requests.html)
 
 [^pacifica]: Wei Lin, Mao Yang, Lintao Zhang, Lidong Zhou, *PacificA: Replication in Log-Based Distributed Storage Systems*, Microsoft Research, 2008. [Source](https://www.microsoft.com/en-us/research/publication/pacifica-replication-in-log-based-distributed-storage-systems/)
 
@@ -1016,6 +1143,14 @@ Measure on fixed hardware and against remote targets with shaped links:
 [^etcd-api]: etcd, *API guarantees and transactions*: a transaction compares key revisions and applies atomically. [Source](https://etcd.io/docs/v3.5/learning/api/)
 
 [^rs-simd]: Anders Trier, *reed-solomon-simd*. [Source](https://github.com/AndersTrier/reed-solomon-simd)
+
+[^quinn]: Quinn, a Rust QUIC implementation. Version 0.11 provides Cubic (the default), NewReno, and BBR congestion controllers, and marks BBR experimental. Checked in the `quinn-proto` 0.11.18 source. [Source](https://github.com/quinn-rs/quinn)
+
+[^rfc9000]: IETF, *RFC 9000: QUIC, a UDP-based multiplexed and secure transport*, 2021. [Source](https://www.rfc-editor.org/rfc/rfc9000)
+
+[^mathis]: Matthew Mathis, Jeffrey Semke, Jamshid Mahdavi, Teunis Ott, *The macroscopic behavior of the TCP congestion avoidance algorithm*, ACM SIGCOMM Computer Communication Review, 1997. [Source](https://dl.acm.org/doi/10.1145/263932.264023)
+
+[^bbr]: Neal Cardwell et al., *BBR congestion control*, IETF Internet-Draft. [Source](https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control)
 
 [^redb]: redb, README and design notes. [Source](https://github.com/cberner/redb)
 
