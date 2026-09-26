@@ -52,6 +52,8 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-24.04
+    outputs:
+      report: ${{ steps.report.outputs.complete }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -87,6 +89,18 @@ jobs:
           path: target/coverage/
           if-no-files-found: error
 
+      # Tells publish-badges whether there are figures to publish: a
+      # coverage report from a run whose tests all passed. That holds when
+      # only the threshold was missed, but not when the tests failed.
+      - name: Check for a complete coverage report
+        id: report
+        if: always()
+        run: |
+          if [ -s target/coverage/coverage.json ] &&
+            ! grep -q '^test result: FAILED' target/coverage/coverage.log; then
+            echo complete=true >> "$GITHUB_OUTPUT"
+          fi
+
   # Publishes the coverage and test-count badges for the pushed branch to
   # the `badges` branch (path `<branch>/`) as SVG files; the README embeds
   # `main/` through github.com, so the badges also render in a private
@@ -94,10 +108,15 @@ jobs:
   # this step, which runs no project code, holds a write-capable token.
   # Runs on pushes to main and on manual dispatch (any branch, so the
   # mechanism can be exercised before merge). scripts/ci/publish-badges.sh
-  # skips figures for a commit that is no longer its branch's tip.
+  # skips figures for a commit that is no longer its branch's tip. Also
+  # runs when the coverage job failed only on its threshold, so the badge
+  # shows the below-threshold figure instead of the last passing one.
   publish-badges:
     name: Publish badges
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: >-
+      !cancelled() && needs.coverage.outputs.report == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs: coverage
     runs-on: ubuntu-24.04
     permissions:
