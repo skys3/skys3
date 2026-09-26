@@ -6,6 +6,6 @@ description = "Rust bootstrap for the skys3 repository."
 readme = "README.md"
 license-file = "LICENSE"
 repository = "https://github.com/skys3/skys3"
-rust-version = "1.85"
+rust-version = "1.98.1"
 
 [dependencies]

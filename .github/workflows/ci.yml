@@ -1,15 +1,25 @@
 name: CI
 
 on:
-  pull_request:
   push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    name: Format, lint, test, docs
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -26,4 +36,110 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-targets
+        run: cargo test --all-targets --all-features
+
+      - name: Run doctests
+        run: cargo test --doc --all-features
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Line coverage gate. The threshold lives in the `coverage` alias in
+  # .cargo/config.toml. Reports are uploaded even when the gate fails. The
+  # job has read-only access; badge publication is a separate job.
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add --toolchain stable llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Check coverage threshold
+        run: |
+          set -o pipefail
+          mkdir -p target/coverage
+          cargo coverage --json --summary-only --output-path target/coverage/coverage.json 2>&1 \
+            | tee target/coverage/coverage.log
+
+      - name: Coverage summary
+        if: always()
+        run: cargo llvm-cov report --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: target/coverage/
+          if-no-files-found: error
+
+  # Publishes the coverage and test-count badges for the pushed branch to
+  # the `badges` branch (path `<branch>/`) as SVG files; the README embeds
+  # `main/` through github.com, so the badges also render in a private
+  # repository and need no external service. A separate job so that only
+  # this step, which runs no project code, holds a write-capable token.
+  # Runs on pushes to main and on manual dispatch (any branch, so the
+  # mechanism can be exercised before merge). scripts/ci/publish-badges.sh
+  # skips figures for a commit that is no longer its branch's tip.
+  publish-badges:
+    name: Publish badges
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: badges-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: target/coverage
+
+      - name: Publish
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: sh scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" target/coverage/coverage.json target/coverage/coverage.log
+
+      # Fetches the README as GitHub renders it and checks that it embeds
+      # the tests and coverage badges once each and that GitHub serves the
+      # files just published as SVG images.
+      - name: Verify the README badges render
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/ci/verify-badges-render.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the `rust-version` toolchain from Cargo.toml
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+
+      - name: Check
+        run: cargo check --all-targets --all-features
