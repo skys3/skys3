@@ -105,6 +105,22 @@ of this file. A task with nothing unexpected keeps "None."
   treated every Markdown file as documentation, so a pull request that
   changed only the design's §14 example would skip the test that loads it.
   The design doc and the configuration reference now count as code.
+- **URL authorities reuse the node-address rules.** Review found that any
+  non-empty authority was accepted (`https://:9000`, `https://host:bad`, an
+  unclosed `[fd00::1`) and that IP literals were compared as text, so
+  `[fd00::1]` and `[fd00:0:0:0:0:0:0:1]` escaped the correlated-store
+  check. `skys3-types` exposes no parser for a host with an optional port,
+  so the authority is parsed as a `NodeAddress`, with the scheme's default
+  port appended when none is written. `NodeAddress` rejects uppercase DNS
+  names, but host names are case-insensitive and operators paste them from
+  provider consoles, so the authority is lowercased first and endpoints are
+  stored in canonical form. Failure scopes compare parsed addresses, with
+  IPv4-mapped IPv6 folded to IPv4.
+- **Early returns hid violations.** An invalid `cluster_id` without an
+  explicit `prefix` ended control-store validation early, and one invalid
+  bucket table skipped the correlated-store check. Resolvers now check
+  every key and return placeholders for values that failed, which are
+  never used because a violation was reported.
 - **No fuzz target.** The configuration file comes from the operator, not
   from untrusted clients, so the plan's parser rule does not apply; its
   parsing is `toml`'s.

@@ -664,3 +664,110 @@ fn peer_source_must_be_another_cluster() {
         &["buckets.alpha.peer_source"],
     );
 }
+
+// Rules keep running after an early failure.
+
+#[test]
+fn an_invalid_cluster_id_does_not_hide_other_violations() {
+    let violations = violations_of(
+        r#"
+        [cluster]
+        cluster_id = "Not_A_Valid_Cluster"
+        [control_store]
+        backend = "s3"
+        endpoint = "https://[fd00::1]:9000"
+        bucket = "ctl"
+        coordinator_lease_seconds = 0
+        config_poll_interval_seconds = 0
+        [replication]
+        lease_renew_interval_ms = 4000
+        [buckets.archive]
+        mode = "local"
+        backup_target = "http://[fd00:0:0:0:0:0:0:1]/backup"
+        [buckets.broken]
+        clean_copies = 9
+        "#,
+    );
+    let keys: Vec<_> = violations
+        .as_slice()
+        .iter()
+        .map(|v| v.key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "cluster.cluster_id",
+            "control_store.coordinator_lease_seconds",
+            "control_store.config_poll_interval_seconds",
+            "replication.lease_renew_interval_ms",
+            "replication.member_suspect_after_ms",
+            "buckets.broken.clean_copies",
+            "control_store.endpoint",
+        ]
+    );
+}
+
+// Endpoint and target authorities.
+
+#[test]
+fn endpoint_authorities_are_validated() {
+    for (endpoints, reason) in [
+        (r#"["https://:2379"]"#, "invalid host"),
+        (r#"["https://etcd-1:bad"]"#, "invalid port"),
+        (r#"["https://[fd00::1:2379"]"#, "invalid host"),
+        (r#"["https://etcd-1:70000"]"#, "invalid port"),
+    ] {
+        let violations = violations_of(&control_store(&format!("etcd_endpoints = {endpoints}")));
+        assert_eq!(violations.len(), 1, "{violations}");
+        let violation = &violations.as_slice()[0];
+        assert_eq!(violation.key, "control_store.etcd_endpoints");
+        assert!(violation.message.contains(reason), "{violation}");
+    }
+    assert_violations(
+        "[buckets.archive]\nmode = \"local\"\nbackup_target = \"https://peer:bad/archive\"",
+        &["buckets.archive.backup_target"],
+    );
+}
+
+#[test]
+fn endpoint_hosts_are_normalized() {
+    let config = load(
+        "[buckets.archive]\nmode = \"local\"\n\
+         backup_target = \"https://Peer.Example:8443/archive\"\n\
+         snapshot_target = \"http://[FD00:0::1]/snaps/\"",
+    )
+    .unwrap();
+    let archive = config.buckets().get(&BucketName::new("archive").unwrap());
+    let endpoint =
+        |target: &Option<skys3_types::RemoteTarget>| target.as_ref().unwrap().endpoint.clone();
+    assert_eq!(
+        endpoint(&archive.backup_target),
+        "https://peer.example:8443"
+    );
+    assert_eq!(endpoint(&archive.snapshot_target), "http://[fd00::1]");
+}
+
+#[test]
+fn correlated_ip_endpoints_are_compared_as_addresses() {
+    let with = |control: &str, backup: &str| {
+        control_store(&format!(
+            "backend = \"s3\"\nendpoint = \"{control}\"\nbucket = \"ctl\"\n\
+             [buckets.archive]\nmode = \"local\"\nbackup_target = \"{backup}/archive\""
+        ))
+    };
+    for (control, backup) in [
+        ("http://[fd00::1]:9000", "http://[fd00:0:0:0:0:0:0:1]:9001"),
+        ("http://10.0.0.5:9000", "http://[::ffff:10.0.0.5]"),
+        ("https://minio.example", "https://MINIO.example:9443"),
+    ] {
+        let violations = violations_of(&with(control, backup));
+        assert_eq!(
+            violations.as_slice()[0].key,
+            "control_store.endpoint",
+            "{violations}"
+        );
+    }
+    with("http://[fd00::1]", "http://[fd00::2]")
+        .parse::<Config>()
+        .unwrap();
+}

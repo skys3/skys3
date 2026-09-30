@@ -358,7 +358,7 @@ Losing a node generates a burst of CAS requests: one per shard the node belonged
 
 - **etcd running on-site is the recommended default.** It is independent of every remote target by construction.
 - **An S3 or R2 control store** is supported when it is in a different provider or region from every data target. For example, R2 can serve a cluster whose targets are in AWS, or whose buckets are all `local`.
-- **The configuration validator refuses** a control store that it can tell shares a provider region with a data target, unless `allow_correlated_control_store = true`. It can tell when both endpoints have the same host, or are AWS S3 endpoints in the same region. Configuration loading checks backup targets; attaching a bucket checks its target.
+- **The configuration validator refuses** a control store that it can tell shares a provider region with a data target, unless `allow_correlated_control_store = true`. It can tell when both endpoints have the same host name or IP address, or are AWS S3 endpoints in the same region. Configuration loading checks backup targets; attaching a bucket checks its target.
 
 Within those rules, prefer the store nearest the cluster. Its latency only affects failover time.
 

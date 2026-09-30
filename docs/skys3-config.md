@@ -33,7 +33,7 @@ Only `[cluster]` and its `cluster_id` are required. Every other key has a defaul
 
 - Durations are integers whose key names the unit: `_us`, `_ms`, `_seconds`, or `_hours`. Durations must be at least 1 unless a row says otherwise.
 - Sizes are integers in bytes.
-- An *endpoint URL* is `https://host[:port]` or `http://host[:port]`, without a path, query, or credentials. A *target URL* is path-style: `https://host[:port]/bucket`, or `https://host[:port]/bucket/prefix` to confine SkyS3 to a key prefix. Credentials never appear in the file; SkyS3 takes them from `aws-config` providers (design §11).
+- An *endpoint URL* is `https://host[:port]` or `http://host[:port]`, without a path, query, or user information (`user:password@`). The host is a DNS name, an IPv4 address, or an IPv6 address in brackets, and the port a decimal number from 1 to 65535 without leading zeros, the rules of node addresses (`NodeAddress` in `skys3-types`). Host names are case-insensitive: they are lowercased, and IPv6 addresses are rewritten in RFC 5952 form, so `https://S3.Example` loads as `https://s3.example`. A *target URL* is path-style: `https://host[:port]/bucket`, or `https://host[:port]/bucket/prefix` to confine SkyS3 to a key prefix. Credentials never appear in the file; SkyS3 takes them from `aws-config` providers (design §11).
 - Enumerations are lowercase strings, such as `"write_back"`.
 - *Positive* means at least 1.
 
@@ -59,7 +59,7 @@ Where the cluster's registers live (§6.1).
 | `coordinator_lease_seconds` | integer | `10` | Positive. The holder renews every third of it (§6.7). |
 | `config_poll_interval_seconds` | integer | `30` | Positive. How often a node polls `cluster.json` as a backstop to pushes (§6.2). |
 
-**Independence from data targets.** With `backend = "s3"`, loading refuses a control-store `endpoint` in the same failure scope as a bucket's `backup_target`, unless `allow_correlated_control_store = true` (§6.1). Two endpoints share a scope when they have the same host, or are AWS S3 endpoints in the same region. Write-back targets are bound when a bucket is attached, and the attach path applies the same check.
+**Independence from data targets.** With `backend = "s3"`, loading refuses a control-store `endpoint` in the same failure scope as a bucket's `backup_target`, unless `allow_correlated_control_store = true` (§6.1). Two endpoints share a scope when they have the same host name or IP address, whatever their ports, or are AWS S3 endpoints in the same region. IP addresses are compared as addresses: every spelling of an IPv6 address, and an IPv4 address and its IPv4-mapped IPv6 form, are the same. Write-back targets are bound when a bucket is attached, and the attach path applies the same check.
 
 ## `[replication]`
 

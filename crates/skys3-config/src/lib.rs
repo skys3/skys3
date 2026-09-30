@@ -45,6 +45,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use serde::Deserialize;
+use skys3_types::BucketName;
 
 /// Adds accessors that return integer duration fields as [`Duration`]s.
 macro_rules! durations {
@@ -182,19 +183,21 @@ impl Config {
         raw.cache.check(&mut checker);
         raw.flush.check(&mut checker);
         raw.ec.check(&mut checker);
-        let buckets = buckets::resolve(&raw.buckets, &raw.flush, cluster_id, &mut checker);
+        let (bucket_defaults, named_buckets) =
+            buckets::resolve(&raw.buckets, &raw.flush, cluster_id, &mut checker);
         raw.peering.check(&mut checker);
         raw.identity.check(&mut checker);
         raw.admin.check(&mut checker);
-        if let (Some(control_store), Some(buckets)) = (&control_store, &buckets) {
-            check_control_store_independence(control_store, buckets, &mut checker);
-        }
+        check_control_store_independence(&control_store, &named_buckets, &mut checker);
         checker.finish()?;
 
         // Each resolver returns `None` only after reporting a violation.
-        let (Some(cluster), Some(control_store), Some(buckets)) = (cluster, control_store, buckets)
-        else {
+        let (Some(cluster), Some(defaults)) = (cluster, bucket_defaults) else {
             unreachable!("a section failed to resolve without reporting a violation");
+        };
+        let buckets = BucketsConfig {
+            defaults,
+            named: named_buckets,
         };
         Ok(Self {
             cluster,
@@ -300,7 +303,7 @@ impl FromStr for Config {
 /// attach path applies the same check to them.
 fn check_control_store_independence(
     control_store: &ControlStoreConfig,
-    buckets: &BucketsConfig,
+    buckets: &BTreeMap<BucketName, BucketSettings>,
     checker: &mut Checker,
 ) {
     let ControlStoreBackend::S3 { endpoint, .. } = &control_store.backend else {
@@ -309,12 +312,15 @@ fn check_control_store_independence(
     if control_store.allow_correlated_control_store {
         return;
     }
-    let scope = target::failure_scope(endpoint);
-    for (name, settings) in &buckets.named {
+    // An invalid endpoint is already reported and has no scope.
+    let Some(scope) = target::failure_scope(endpoint) else {
+        return;
+    };
+    for (name, settings) in buckets {
         let Some(backup) = &settings.backup_target else {
             continue;
         };
-        if target::failure_scope(&backup.endpoint) == scope {
+        if target::failure_scope(&backup.endpoint).as_ref() == Some(&scope) {
             checker.report(
                 "control_store.endpoint",
                 format!(

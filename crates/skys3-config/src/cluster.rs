@@ -141,15 +141,17 @@ impl Default for RawControlStore {
 }
 
 impl RawControlStore {
-    /// Checks the section and resolves it. `cluster_id` is `None` when the
-    /// cluster ID is itself invalid. Returns `None` only after reporting a
-    /// violation.
+    /// Checks every key of the section and resolves it. `cluster_id` is
+    /// `None` when the cluster ID is itself invalid. A value that breaks a
+    /// rule, or the default prefix without a cluster ID, is left empty; the
+    /// violation is reported, so the result is never used as a [`Config`].
+    ///
+    /// [`Config`]: crate::Config
     pub(crate) fn resolve(
         &self,
         cluster_id: Option<&ClusterId>,
         checker: &mut Checker,
-    ) -> Option<ControlStoreConfig> {
-        let before = checker.count();
+    ) -> ControlStoreConfig {
         let backend = match self.backend {
             BackendKind::Etcd => self.etcd_backend(checker),
             BackendKind::S3 => self.s3_backend(checker),
@@ -168,7 +170,7 @@ impl RawControlStore {
                 });
                 prefix.clone()
             }
-            None => format!("{}/", cluster_id?),
+            None => cluster_id.map(|id| format!("{id}/")).unwrap_or_default(),
         };
         checker.nonzero(
             "control_store.coordinator_lease_seconds",
@@ -178,13 +180,13 @@ impl RawControlStore {
             "control_store.config_poll_interval_seconds",
             self.config_poll_interval_seconds,
         );
-        (checker.count() == before).then_some(ControlStoreConfig {
+        ControlStoreConfig {
             backend,
             prefix,
             allow_correlated_control_store: self.allow_correlated_control_store,
             coordinator_lease_seconds: self.coordinator_lease_seconds,
             config_poll_interval_seconds: self.config_poll_interval_seconds,
-        })
+        }
     }
 
     fn etcd_backend(&self, checker: &mut Checker) -> ControlStoreBackend {

@@ -200,16 +200,18 @@ impl Defaults {
     }
 }
 
-/// Checks and resolves `[buckets]`. `cluster_id` is `None` when the
-/// cluster ID is itself invalid. Returns `None` only after reporting a
-/// violation.
+/// Checks every `[buckets]` table and resolves them. `cluster_id` is
+/// `None` when the cluster ID is itself invalid.
+///
+/// Returns the defaults, `None` only after reporting a violation, and every
+/// named bucket whose table resolved; a table that breaks a rule is reported
+/// and left out.
 pub(crate) fn resolve(
     tables: &BTreeMap<String, BucketTable>,
     flush: &FlushConfig,
     cluster_id: Option<&ClusterId>,
     checker: &mut Checker,
-) -> Option<BucketsConfig> {
-    let before = checker.count();
+) -> (Option<BucketSettings>, BTreeMap<BucketName, BucketSettings>) {
     let empty = BucketTable::default();
     let defaults_table = tables.get(DEFAULTS).unwrap_or(&empty);
     let prefix = key_path("buckets", DEFAULTS);
@@ -261,8 +263,7 @@ pub(crate) fn resolve(
         }
     }
 
-    let defaults = defaults?;
-    (checker.count() == before).then_some(BucketsConfig { defaults, named })
+    (defaults, named)
 }
 
 /// Checks one table's resolved values and builds its settings. `named` is
