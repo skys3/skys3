@@ -127,7 +127,54 @@ of this file. A task with nothing unexpected keeps "None."
 
 ### M0-04 Disk and clock abstractions
 
-None.
+- **`syn` 2 and 3 in one tree.** `tokio-macros` 2.7.2 moved to `syn` 3, while
+  `tracing-attributes` (through `turmoil`'s `tracing`) and `zerocopy-derive`
+  (through `rand`) still use `syn` 2, which `multiple-versions = "deny"`
+  rejects. `turmoil` enables Tokio's `macros` feature, so it cannot be turned
+  off. Pinning `tokio-macros` 2.7.1 (the last release on `syn` 2) worked for
+  this branch alone, but a trial merge with M0-02 and M0-06 showed it does
+  not hold: `serde`, `thiserror`, and `prometheus-client`'s derive are on
+  `syn` 3 too. `deny.toml` therefore skips `syn@2` with the reason, both
+  versions being build-time only, and the lock takes `tokio-macros` 2.7.2.
+  The skip goes once `tracing-attributes` and `zerocopy-derive` move to
+  `syn` 3.
+- **`rand` 0.9, not 0.10.** `turmoil` 0.7.2 depends on `rand` 0.9, so the
+  workspace uses 0.9 as well to avoid a second copy of `rand` and
+  `getrandom`. For the same reason `tempfile` is used without its default
+  `getrandom` feature, which would pull in `getrandom` 0.4.
+- **`turmoil`'s own file system is not used.** `turmoil` 0.7 has an
+  `unstable-fs` feature: a `std::fs` shim with crash semantics. It is
+  unstable, simulates at the `std::fs` level rather than behind a trait that
+  also has a real implementation on a blocking pool, and its worker-thread
+  context draws from `ThreadRng`, which a seed cannot replay. `SimDisk` in
+  `skys3-io` implements the `Disk` trait instead.
+- **Simulated time is per host.** `turmoil` runs each host on its own paused
+  Tokio runtime, so `tokio::time::Instant` is that host's simulated time.
+  `MonotonicClock` builds on it and adds drift and an origin, which means a
+  node must create its clock inside its host software (`NodeClock::start`),
+  not in the test driver.
+- **One open file per segment on the real disk.** A first version kept each
+  handle's length separately, so a second `open` of a file did not see
+  appends made through the first. `RealDisk` now keeps a registry of open
+  files by name and returns the same open file to every `open`.
+- **Races in the open-file registry.** Review found that the registry's
+  first version raced: between `remove`'s unlink and its registry update, a
+  concurrent `create` of the same name could register the new file, whose
+  entry `remove` then deleted, so a later `open` made a second open file with
+  its own length and appends could overlap. A stress test reproduced it
+  reliably. `create`, `open`, and `remove` now hold one async lock per disk
+  across the system call and the registry update. `open` always opens the
+  file system's file and shares a registered file only if its device and
+  inode match, so a stale entry is never reused for a replaced file.
+  Entries are weak, so closing the last handle closes the file. `SimDisk`
+  already had these semantics: its operations run under one lock without
+  awaiting.
+- **Finding the replay command.** Cargo sets `CARGO_PKG_NAME` for test
+  processes, the test binary is named `<target>-<hash>`, and the test harness
+  names each test's thread after the test, including with
+  `--test-threads=1`. The runner builds
+  `SKYS3_SIM_SEED=<seed> cargo test -p <package> --test <target> -- <test> --exact`
+  from these, and a test checks the exact output.
 
 ### M0-05 Simulated S3 store
 

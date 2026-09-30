@@ -42,7 +42,14 @@ ignore = true
 multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
-skip = []
+skip = [
+    # The ecosystem is moving proc macros from syn 2 to syn 3. turmoil's
+    # tracing (#[instrument], tracing-attributes) and rand's zerocopy-derive
+    # are still on syn 2, while serde, thiserror, tokio-macros and
+    # prometheus-client's derive are on syn 3. Both are build-time only.
+    # Remove once tracing-attributes and zerocopy-derive move to syn 3.
+    { crate = "syn@2", reason = "proc-macro dependencies are split between syn 2 and syn 3; build-time only" },
+]
 
 [sources]
 unknown-registry = "deny"
