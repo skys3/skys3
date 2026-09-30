@@ -23,8 +23,8 @@ branch=${2:?branch}
 html=$(curl -sS -f -H "Authorization: Bearer ${GH_TOKEN:?}" \
     -H "Accept: application/vnd.github.html+json" \
     "https://api.github.com/repos/$repo/readme?ref=$branch")
-urls=$(printf '%s' "$html" | grep -o '<img[^>]*src="[^"]*"' | sed -E 's/.*src="([^"]*)".*/\1/' \
-    | grep -E 'coverage\.svg|tests\.svg' || true)
+urls=$(printf '%s' "$html" | grep -o '<img[^>]*>' | grep -E 'coverage\.svg|tests\.svg' \
+    | sed -E 's/^<img[^>]*[[:space:]]src="([^"]*)".*/\1/' || true)
 if [ -z "$urls" ]; then
     echo "verify-badges-render: no badge <img> in the rendered README:" >&2
     printf '%s\n' "$html" | grep -o '<img[^>]*>' >&2 || true
