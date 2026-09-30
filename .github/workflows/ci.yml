@@ -248,6 +248,21 @@ jobs:
       - name: Check
         run: cargo check --all-targets --all-features
 
+  # License allowlist, RustSec advisories, duplicate-version bans, and
+  # allowed sources, as configured in deny.toml.
+  deny:
+    name: cargo-deny
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check licenses, advisories, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
   # The one check to require in branch protection. A job skipped for a
   # docs-only change satisfies a required check, except a matrix job: it
   # reports under its unexpanded name, so a required `Format, lint, test,
@@ -256,7 +271,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv]
+    needs: [changes, rust, docs, coverage, msrv, deny]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results

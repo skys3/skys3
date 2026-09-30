@@ -24,19 +24,24 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 cargo coverage
+cargo deny check
 ```
 
 `cargo coverage` is an alias (in `.cargo/config.toml`) for `cargo llvm-cov`
 that fails if line coverage is below 85%. Change `--fail-under-lines` there to
 move the threshold. It needs `cargo install cargo-llvm-cov` and
-`rustup component add llvm-tools-preview`.
+`rustup component add llvm-tools-preview`. `cargo deny check` (from
+`cargo install cargo-deny`) checks dependency licenses, RustSec advisories,
+and duplicate versions against `deny.toml`.
+
+The code is a Cargo workspace: each crate lives under `crates/`.
 
 ## CI
 
 GitHub Actions runs the same formatting, lint, test, doc, and coverage checks
 on pushes to `main` and on pull requests, plus a `cargo check` on the minimum
-supported Rust version declared in `Cargo.toml`. Dependabot keeps actions and
-crates up to date.
+supported Rust version declared in `Cargo.toml` and a `cargo deny` check.
+Dependabot keeps actions and crates up to date.
 
 The tests and coverage badges above are generated on every push to `main`
 and stored as SVG files on the `badges` branch
