@@ -614,6 +614,7 @@ A bucket may set `ack_policy = "write_through"`. A PUT then succeeds only after 
 
 - A dirty-data budget applies per bucket and per cluster (`max_dirty_bytes`). New writes get `503 SlowDown` when it is exhausted, including during a remote outage.
 - Loss exposure (RPO) with `ack_policy = "local"` is the dirty set of any shard whose members are all lost together. The metrics `dirty_bytes`, `oldest_dirty_age`, and `flush_lag_seconds` measure it.
+- Metric names in this document omit the `skys3_` prefix and sometimes the unit. The [metrics reference](skys3-metrics.md) gives the exported names, such as `skys3_oldest_dirty_age_seconds`, and the naming conventions.
 - Flush bandwidth must exceed the ingest rate over time, or the dirty set grows until admission control stops writes. Remote request-rate limits (for example per-prefix limits) are handled with adaptive concurrency and retry with backoff.
 
 ### 7.7 High-latency remote targets
@@ -940,6 +941,7 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 
 - Clients, headers, XML, chunk framing, and keys are untrusted. XML depth, header sizes, part counts, and ranges are bounded. Canonical request bytes are kept intact for SigV4.
 - Internal traffic uses mutual TLS with node identities issued by the operator's PKI. Replication, lease, and admin messages are authenticated per node and per role.
+- The admin HTTP listener (metrics, health, and the admin API) binds to loopback by default (`[admin] listen = "127.0.0.1:7490"`). On a non-loopback address, callers present a bearer token read from `[admin] token_file` (`Authorization: Bearer`); configuration validation rejects a non-loopback `listen` without one. A configured token also applies on loopback. `/healthz` and `/readyz` never require it, so load balancers and orchestrators can probe them; they disclose only which components are not ready. The token is at least 32 bytes and compared in constant time. A bearer token rather than client certificates, because scrapers and operator tools send one from a file with no PKI enrollment, and node certificates identify nodes, not people. Until the listener serves TLS, the token crosses the network in cleartext, so a non-loopback listener belongs on a management network or behind a TLS-terminating proxy. TLS for the admin listener (`tls_cert_file`, `tls_key_file`), and client certificates as an alternative to the token, are added with the node PKI (plan M2-02).
 - The control store is a trust anchor. Whoever can write it can reassign shards. It gets a dedicated bucket or prefix, least-privilege credentials, and remote-side versioning for audit.
 - E2EE ciphertext never leaves its original form. The service never needs decryption keys. Keys, sizes, and access patterns remain visible to SkyS3 and to the remote.
 - Peer clusters authenticate each other with mutual TLS against a configured trust bundle, and each peer is authorized for specific bucket pairs. QUIC 0-RTT is disabled, so a replayed peer message can never apply a mutation.
@@ -1067,6 +1069,14 @@ sts_web_identity = true
 session_default_seconds = 3600
 session_maximum_seconds = 3600
 identity_max_staleness_hours = 24
+
+[admin]                       # metrics, health checks, admin API (section 12)
+listen = "127.0.0.1:7490"     # a non-loopback address requires token_file
+token_file = "/etc/skys3/admin.token"   # optional on loopback; at least 32 bytes
+
+[logging]
+filter = "info"               # tracing EnvFilter directives, e.g. "info,skys3_flush=debug"
+format = "text"               # "text" or "json"
 ```
 
 ## 15. Rust dependencies
@@ -1083,7 +1093,7 @@ identity_max_staleness_hours = 24
 | Intra-cluster transport | TCP with `rustls`/`tokio-rustls`, `prost` headers, raw payload frames | Simple on a LAN. Traffic between clusters uses QUIC. |
 | Identity | `openidconnect`, `jsonwebtoken` or equivalent, `secrecy`, `zeroize` | Workload-token profile with explicit `azp` handling |
 | Integrity | `crc32c`, `md-5`, `sha1`, `sha2`, a CRC64NVME implementation | Checksums are validated at the protocol boundary |
-| Config and observability | `serde`, `toml`, `serde_json`, `tracing`, a metrics exporter | |
+| Config and observability | `serde`, `toml`, `serde_json`, `tracing`, `tracing-subscriber`, `prometheus-client` | Per-node metrics registry, not a process-global one, so simulated nodes in one process keep separate metrics. The admin listener runs on `hyper`. |
 | Testing | `turmoil`, `proptest`, `cargo-fuzz` | Deterministic simulation of network, disk, and clocks[^turmoil] |
 
 `Cargo.lock` pins exact versions once license and advisory checks pass.

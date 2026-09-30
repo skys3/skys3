@@ -48,4 +48,32 @@ None.
 
 ### M0-06 Observability scaffolding
 
-None.
+- **No crate for observability in the layout.** Plan section 4 had no home
+  for `tracing` setup, metrics, and the admin listener, and none of the
+  planned crates fits: the binary crate would make every library depend on
+  it to register metrics. A small `skys3-obs` crate is added to the layout.
+- **`syn` 2 and `syn` 3 in one build.** `tokio-macros` and
+  `prometheus-client`'s derive macro have moved to `syn` 3, while
+  `tracing-attributes` (the `#[instrument]` macro, on by default in
+  `tracing`) is still on `syn` 2, which `multiple-versions = "deny"`
+  rejects. The workspace pins `tracing` with `default-features = false,
+  features = ["std"]`, so `#[instrument]` is unavailable. A later PR that
+  wants it, or that pulls in another `syn` 2 user, adds a `skip` entry for
+  `syn` to `deny.toml`.
+- **A per-node registry instead of the `metrics` facade.** The `metrics`
+  crate records into one process-global recorder, which would merge the
+  metrics of the several nodes the simulation harness runs in one process.
+  `prometheus-client` registries are plain values, so each node owns one.
+  Its text output is OpenMetrics rather than the classic Prometheus format;
+  Prometheus scrapes both.
+- **Admin authentication without TLS.** The admin listener authenticates
+  with a bearer token on non-loopback addresses (design section 12), but
+  it serves plain HTTP until `rustls` arrives with the intra-cluster
+  transport (M2-02), which should add admin TLS and client certificates.
+- **Configuration keys for M0-03.** The listener takes plain structs
+  (`AdminConfig`, `LogConfig`) until the configuration crate exists. The
+  keys are in the design's section 14 example: `[admin] listen`,
+  `[admin] token_file`, `[logging] filter`, and `[logging] format`.
+  `AdminConfig::validate` holds the non-loopback-needs-a-token rule for
+  configuration validation to call, and `AdminToken::from_file` loads the
+  token file.
