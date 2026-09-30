@@ -74,7 +74,56 @@ of this file. A task with nothing unexpected keeps "None."
 
 ### M0-03 Configuration
 
-None.
+- **The §14 example contradicted a rule.** Its `[buckets.archive-from-us]`
+  table named its own cluster, `skys3-prod-a`, as `peer_source`: it showed
+  the peer cluster's side in this cluster's file. A bucket cannot receive
+  native replication from its own cluster, so loading rejects that. The
+  example now shows `[buckets.archive-from-eu]` receiving from
+  `skys3-prod-eu`, the cluster `archive` backs up to.
+- **Keys the design names but §14 did not.** Wait-through versus fail-fast
+  (§5.2) had no key, so the rule "in wait-through mode" could not be
+  applied; §14 now has `replica_ack_timeout_mode`. The S3 control store's
+  "endpoint and bucket" became the keys `endpoint` and `bucket`. §7.5 lets a
+  bucket set `ack_policy` and §7.2 requires `discard_local` to be chosen per
+  bucket, but §14 had both only in `[flush]`: they are now per-bucket
+  overrides, and `discard_local` is refused in `[flush]`.
+- **Unspecified constants.** §5.4's lease `margin` and §5.2's "one
+  control-store round trip" had no values. They are fixed at 500 ms and 1 s
+  (`ReplicationConfig::LEASE_MARGIN`, `CAS_ALLOWANCE`) and recorded in the
+  design; the defaults satisfy both with room to spare.
+- **All violations at once versus typed fields.** Serde stops at the first
+  error, so fields whose checks are listed rules (`cluster_id`,
+  `shards_per_bucket`, bucket names, target URLs, `peer_source`) are parsed
+  as plain strings and numbers and converted during validation, which
+  collects every violation. Type errors and unknown keys still stop parsing,
+  with the key and line.
+- **Inherited bucket settings.** A bad value in `[buckets.defaults]` would
+  otherwise be reported again for every named bucket. A table is reported
+  only for keys it sets, so each mistake appears once, at the table that
+  made it.
+- **Docs-only CI would skip the §14 test.** `scripts/ci/docs-only.sh`
+  treated every Markdown file as documentation, so a pull request that
+  changed only the design's §14 example would skip the test that loads it.
+  The design doc and the configuration reference now count as code.
+- **URL authorities reuse the node-address rules.** Review found that any
+  non-empty authority was accepted (`https://:9000`, `https://host:bad`, an
+  unclosed `[fd00::1`) and that IP literals were compared as text, so
+  `[fd00::1]` and `[fd00:0:0:0:0:0:0:1]` escaped the correlated-store
+  check. `skys3-types` exposes no parser for a host with an optional port,
+  so the authority is parsed as a `NodeAddress`, with the scheme's default
+  port appended when none is written. `NodeAddress` rejects uppercase DNS
+  names, but host names are case-insensitive and operators paste them from
+  provider consoles, so the authority is lowercased first and endpoints are
+  stored in canonical form. Failure scopes compare parsed addresses, with
+  IPv4-mapped IPv6 folded to IPv4.
+- **Early returns hid violations.** An invalid `cluster_id` without an
+  explicit `prefix` ended control-store validation early, and one invalid
+  bucket table skipped the correlated-store check. Resolvers now check
+  every key and return placeholders for values that failed, which are
+  never used because a violation was reported.
+- **No fuzz target.** The configuration file comes from the operator, not
+  from untrusted clients, so the plan's parser rule does not apply; its
+  parsing is `toml`'s.
 
 ### M0-04 Disk and clock abstractions
 

@@ -240,8 +240,8 @@ A failed response means **not acknowledged**, not **not applied**. S3 has the sa
 
 `replica_ack_timeout` decides what clients see while a member is failing:
 
-- **Wait through removal (default, 5 s).** The timeout is longer than `member_suspect_after` plus one control-store round trip. Requests in flight wait while the primary removes the member, then commit with the remaining members. Clients see added latency, not errors.
-- **Fail fast (opt-in, for example 2 s).** Requests fail with 503 as soon as a member is late. AWS SDK default retry policies (three attempts, backoff starting near 100 ms) usually give up inside the removal window. One sick disk then becomes client-visible errors on every shard that includes it: about `replicas × shards ÷ nodes` shards, or 240 in the section 6.1 example.
+- **Wait through removal (default, 5 s).** The timeout is longer than `member_suspect_after` plus one control-store round trip. Configuration loading enforces this with a fixed allowance of 1 s for the removal CAS: `replica_ack_timeout > member_suspect_after + 1 s`. Requests in flight wait while the primary removes the member, then commit with the remaining members. Clients see added latency, not errors.
+- **Fail fast (opt-in with `replica_ack_timeout_mode = "fail_fast"`, for example 2 s).** Requests fail with 503 as soon as a member is late. AWS SDK default retry policies (three attempts, backoff starting near 100 ms) usually give up inside the removal window. One sick disk then becomes client-visible errors on every shard that includes it: about `replicas × shards ÷ nodes` shards, or 240 in the section 6.1 example.
 
 If the member cannot be removed, because the control store is unreachable, requests fail after the timeout in both modes. Section 16.3 measures the p99 cost of each.
 
@@ -263,7 +263,7 @@ The cost of this model is tail latency. Every PUT waits for the slowest of the m
 The primary serves strongly consistent reads (GET, HEAD, LIST, and conditional checks) only while it holds a **lease from every member**. Leases are carried on heartbeats and appends every `lease_renew_interval`.
 
 - A member that acknowledges a beacon sent at primary-local time `t` grants a lease valid until `t + primary_lease`, measured on the primary's clock.
-- A member does not propose a new primary until `primary_grace` has passed on its own clock since the last beacon it acknowledged. `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin` (defaults: 4 s lease, 6 s grace).
+- A member does not propose a new primary until `primary_grace` has passed on its own clock since the last beacon it acknowledged. `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin` (defaults: 4 s lease, 6 s grace). The margin is 500 ms. It covers the time between the primary's lease check and the index read it admits, and timer granularity. Configuration loading enforces the inequality, and also `lease_renew_interval < primary_lease`.
 - **A new primary acknowledges nothing, neither reads nor writes, until the old primary can no longer serve reads.** There are two ways to establish that:
   - *Takeover after silence.* The candidate proposes only after `primary_grace` has passed since it last granted the old primary a lease. By then that lease has expired under the drift bound. The old primary needs a lease from every member, so it has already stopped serving. The new primary can serve as soon as reconciliation (section 6.6) finishes.
   - *Planned handoff.* The old primary first stops serving reads and writes, stops renewing its leases, and sends the candidate a step-down message with its last `seq`. Only then does the candidate propose. If the step-down message does not arrive, the candidate falls back to waiting out `primary_grace`.
@@ -358,7 +358,7 @@ Losing a node generates a burst of CAS requests: one per shard the node belonged
 
 - **etcd running on-site is the recommended default.** It is independent of every remote target by construction.
 - **An S3 or R2 control store** is supported when it is in a different provider or region from every data target. For example, R2 can serve a cluster whose targets are in AWS, or whose buckets are all `local`.
-- **The configuration validator refuses** a control store that it can tell shares a provider region with a data target, unless `allow_correlated_control_store = true`.
+- **The configuration validator refuses** a control store that it can tell shares a provider region with a data target, unless `allow_correlated_control_store = true`. It can tell when both endpoints have the same host name or IP address, or are AWS S3 endpoints in the same region. Configuration loading checks backup targets; attaching a bucket checks its target.
 
 Within those rules, prefer the store nearest the cluster. Its latency only affects failover time.
 
@@ -977,7 +977,7 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 
 ## 14. Illustrative configuration
 
-This schema is proposed, not implemented. The values are starting points to be tuned by measurement.
+The [configuration reference](skys3-config.md) lists every key with its type, default, and the rules checked at load time. The values are starting points to be tuned by measurement. Unknown keys are rejected. `[buckets.defaults]` applies to every bucket, and a `[buckets.<name>]` table overrides it for the bucket with that S3 name.
 
 ```toml
 [cluster]
@@ -989,12 +989,15 @@ backend = "etcd"              # "etcd" (production default) or "s3" (AWS S3, R2,
 etcd_endpoints = ["https://etcd-1.example.internal:2379", "https://etcd-2.example.internal:2379", "https://etcd-3.example.internal:2379"]
 prefix = "skys3-prod-a/"
 # For backend = "s3": endpoint and bucket, in a different failure domain from every target
+# endpoint = "https://s3.eu-central-1.amazonaws.com"
+# bucket = "example-skys3-control"
 allow_correlated_control_store = false
 coordinator_lease_seconds = 10
 config_poll_interval_seconds = 30
 
 [replication]
 replica_ack_timeout_ms = 5000        # wait-through default; 2000 for fail-fast
+replica_ack_timeout_mode = "wait_through"   # or "fail_fast"
 member_suspect_after_ms = 3000
 lease_renew_interval_ms = 1000
 primary_lease_ms = 4000
@@ -1019,13 +1022,13 @@ cache_max_bytes_per_node = 1099511627776
 reserve_fraction = 0.10
 
 [flush]
-ack_policy = "local"
+ack_policy = "local"          # "local" or "write_through"; a [buckets.<name>] table may override
 flush_min_concurrency_per_shard = 4
 flush_max_concurrency_per_shard = 64
 flush_max_inflight_bytes_per_target = 1073741824
 streaming_flush_min_bytes = 67108864
 flush_part_bytes = 67108864
-flush_conflict_policy = "hold"
+flush_conflict_policy = "hold" # or "overwrite"; "discard_local" only in a [buckets.<name>] table
 max_dirty_bytes = 2199023255552
 
 [ec]
@@ -1055,9 +1058,9 @@ mode = "local"
 backup_target = "https://s3.skys3-prod-eu.example.internal/archive"
 snapshot_target = "https://s3.us-west-2.amazonaws.com/example-skys3-snapshots/archive/"
 
-[buckets.archive-from-us]     # on the peer cluster: receives native replication
+[buckets.archive-from-eu]     # receives native replication from the peer cluster
 mode = "local"
-peer_source = "skys3-prod-a"
+peer_source = "skys3-prod-eu"
 
 [peering]
 quic_listen = "0.0.0.0:7443"
