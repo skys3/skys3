@@ -44,10 +44,13 @@ None.
   `tracing-attributes` (through `turmoil`'s `tracing`) and `zerocopy-derive`
   (through `rand`) still use `syn` 2, which `multiple-versions = "deny"`
   rejects. `turmoil` enables Tokio's `macros` feature, so it cannot be turned
-  off. `Cargo.lock` pins `tokio-macros` 2.7.1, the last release on `syn` 2
-  (Tokio 1.53 accepts `~2.7.0`). Dependabot will propose 2.7.2 and
-  `cargo deny` will fail that PR; take it once the `syn` 2 users move, or add
-  a `skip` then.
+  off. Pinning `tokio-macros` 2.7.1 (the last release on `syn` 2) worked for
+  this branch alone, but a trial merge with M0-02 and M0-06 showed it does
+  not hold: `serde`, `thiserror`, and `prometheus-client`'s derive are on
+  `syn` 3 too. `deny.toml` therefore skips `syn@2` with the reason, both
+  versions being build-time only, and the lock takes `tokio-macros` 2.7.2.
+  The skip goes once `tracing-attributes` and `zerocopy-derive` move to
+  `syn` 3.
 - **`rand` 0.9, not 0.10.** `turmoil` 0.7.2 depends on `rand` 0.9, so the
   workspace uses 0.9 as well to avoid a second copy of `rand` and
   `getrandom`. For the same reason `tempfile` is used without its default
