@@ -163,6 +163,10 @@ Replication is configured per bucket, because every shard belongs to exactly one
 
 Each bucket has a fixed number of shards chosen at creation (`shards_per_bucket`, default 8, maximum 256). A key is assigned by `hash(bucket_id, key) mod shards`. Hash sharding avoids split and merge machinery. The cost is that LIST merges results from every shard of the bucket (section 9.4). Changing a bucket's shard count later is deferred.
 
+**Bucket IDs.** A bucket's ID is not its S3 name. It is assigned when the bucket is created and never reused in the cluster, even after the bucket is deleted. A bucket recreated with the same name and remote therefore hashes keys differently and writes identities that no object flushed by its predecessor carries, so the 412 recovery rule (section 7.2) cannot mistake an old remote object for a new write. Bucket IDs are at most 25 bytes (section 7.2).
+
+**The shard hash.** A key's shard can never change for an existing bucket, so the hash is fixed and frozen with golden vectors. Version 1 hashes the bytes `"skys3-shard-v1" 0x00 bucket_id 0x00 key` with SHA-256 (FIPS 180-4), using the key's bytes exactly as stored. The first 8 bytes of the digest, read as a big-endian integer, are the key hash, and the shard is the key hash mod `shards_per_bucket`. A bucket ID never contains a zero byte, so the encoding is unambiguous, and the modulo bias is below 2⁻⁵⁶. SHA-256 is chosen because its specification is a standard that every language and `sha256sum` implement, so any tool can reproduce shard assignment. It is already a dependency for checksums (section 15), and its cost, about a microsecond or less for a typical key, is small next to a request. Rust's `DefaultHasher` makes no stability guarantee, and fast non-cryptographic hashes such as xxHash would add a dependency and a less universal specification for no measurable gain.
+
 Each shard has a **configuration**: an epoch, a primary, members, learners, and `min_write_replicas`. Members acknowledge every write. Learners receive the log while catching up and do not acknowledge.
 
 ### 4.2 Object states
@@ -236,8 +240,8 @@ A failed response means **not acknowledged**, not **not applied**. S3 has the sa
 
 `replica_ack_timeout` decides what clients see while a member is failing:
 
-- **Wait through removal (default, 5 s).** The timeout is longer than `member_suspect_after` plus one control-store round trip. Requests in flight wait while the primary removes the member, then commit with the remaining members. Clients see added latency, not errors.
-- **Fail fast (opt-in, for example 2 s).** Requests fail with 503 as soon as a member is late. AWS SDK default retry policies (three attempts, backoff starting near 100 ms) usually give up inside the removal window. One sick disk then becomes client-visible errors on every shard that includes it: about `replicas × shards ÷ nodes` shards, or 240 in the section 6.1 example.
+- **Wait through removal (default, 5 s).** The timeout is longer than `member_suspect_after` plus one control-store round trip. Configuration loading enforces this with a fixed allowance of 1 s for the removal CAS: `replica_ack_timeout > member_suspect_after + 1 s`. Requests in flight wait while the primary removes the member, then commit with the remaining members. Clients see added latency, not errors.
+- **Fail fast (opt-in with `replica_ack_timeout_mode = "fail_fast"`, for example 2 s).** Requests fail with 503 as soon as a member is late. AWS SDK default retry policies (three attempts, backoff starting near 100 ms) usually give up inside the removal window. One sick disk then becomes client-visible errors on every shard that includes it: about `replicas × shards ÷ nodes` shards, or 240 in the section 6.1 example.
 
 If the member cannot be removed, because the control store is unreachable, requests fail after the timeout in both modes. Section 16.3 measures the p99 cost of each.
 
@@ -259,7 +263,7 @@ The cost of this model is tail latency. Every PUT waits for the slowest of the m
 The primary serves strongly consistent reads (GET, HEAD, LIST, and conditional checks) only while it holds a **lease from every member**. Leases are carried on heartbeats and appends every `lease_renew_interval`.
 
 - A member that acknowledges a beacon sent at primary-local time `t` grants a lease valid until `t + primary_lease`, measured on the primary's clock.
-- A member does not propose a new primary until `primary_grace` has passed on its own clock since the last beacon it acknowledged. `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin` (defaults: 4 s lease, 6 s grace).
+- A member does not propose a new primary until `primary_grace` has passed on its own clock since the last beacon it acknowledged. `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin` (defaults: 4 s lease, 6 s grace). The margin is 500 ms. It covers the time between the primary's lease check and the index read it admits, and timer granularity. Configuration loading enforces the inequality, and also `lease_renew_interval < primary_lease`.
 - **A new primary acknowledges nothing, neither reads nor writes, until the old primary can no longer serve reads.** There are two ways to establish that:
   - *Takeover after silence.* The candidate proposes only after `primary_grace` has passed since it last granted the old primary a lease. By then that lease has expired under the drift bound. The old primary needs a lease from every member, so it has already stopped serving. The new primary can serve as soon as reconciliation (section 6.6) finishes.
   - *Planned handoff.* The old primary first stops serving reads and writes, stops renewing its leases, and sends the candidate a step-down message with its last `seq`. Only then does the candidate propose. If the step-down message does not arrive, the candidate falls back to waiting out `primary_grace`.
@@ -331,6 +335,8 @@ An example shard register:
 }
 ```
 
+Register values are JSON objects. Readers reject unknown fields and invalid values, and the format version in `cluster.json` covers every register, so a new field comes with a new format version.
+
 #### Traffic and latency
 
 **No client request reads or writes the control store.** Routing, leases, commits, and reads all stay inside the cluster. The control store sees background traffic, plus bursts when membership changes:
@@ -352,7 +358,7 @@ Losing a node generates a burst of CAS requests: one per shard the node belonged
 
 - **etcd running on-site is the recommended default.** It is independent of every remote target by construction.
 - **An S3 or R2 control store** is supported when it is in a different provider or region from every data target. For example, R2 can serve a cluster whose targets are in AWS, or whose buckets are all `local`.
-- **The configuration validator refuses** a control store that it can tell shares a provider region with a data target, unless `allow_correlated_control_store = true`.
+- **The configuration validator refuses** a control store that it can tell shares a provider region with a data target, unless `allow_correlated_control_store = true`. It can tell when both endpoints have the same host name or IP address, or are AWS S3 endpoints in the same region. Configuration loading checks backup targets; attaching a bucket checks its target.
 
 Within those rules, prefer the store nearest the cluster. Its latency only affects failover time.
 
@@ -473,7 +479,7 @@ The uncommitted tail is **rolled forward**. Clients that received a 503 for thos
 
 ### 6.7 Placement, replacement, and node lifecycle
 
-The coordinator holds `coordinator.lease`. It renews every `coordinator_lease / 3` with `If-Match`. A candidate takes over only after it has observed the same lease ETag for longer than `coordinator_lease × (1+ρ)`, measured on its own monotonic clock. No clock comparison between nodes is needed.
+The coordinator holds `coordinator.lease`. It renews every `coordinator_lease / 3` with `If-Match`. A candidate takes over only after it has observed the same lease ETag for longer than `coordinator_lease × (1+ρ)`, measured on its own monotonic clock. No clock comparison between nodes is needed. Every renewal writes a fresh `proposal_id` (section 6.1), so the ETag changes even though the holder does not.
 
 Every change the coordinator makes is a CAS, so two nodes that briefly both believe they are coordinator can only compete. They cannot corrupt state.
 
@@ -558,7 +564,9 @@ SkyS3 assumes it **exclusively owns** the remote prefix. Every flush is conditio
 | Multipart upload | The `MPU_CREATE` record that opened it | The `MPU_COMPLETE` record |
 | Large single PUT streamed during upload (section 7.3 or 7.8) | An `UPLOAD_BEGIN` record committed when streaming starts | The final `PUT` record |
 
-The final record stores the identity it inherits, so the remote `CreateMultipartUpload`, a native `BEGIN`, a `COMMIT` replay, and the 412 HEAD check all compare the same value. A new primary that takes over a multipart upload reads it from the log. A streamed single PUT that fails never commits its final record, so its identity is never published. SkyS3 strips it from responses to its own clients, and reserves its size (at most 96 bytes) out of the 2 KiB user-metadata limit it enforces. Other readers of the remote bucket can see it.
+The final record stores the identity it inherits, so the remote `CreateMultipartUpload`, a native `BEGIN`, a `COMMIT` replay, and the 412 HEAD check all compare the same value. A new primary that takes over a multipart upload reads it from the log. A streamed single PUT that fails never commits its final record, so its identity is never published. SkyS3 strips it from responses to its own clients. S3 counts both metadata keys and values against the 2 KiB user-metadata limit, so SkyS3 reserves 105 bytes out of the limit it enforces: the key `skys3-wid` and a value of at most 96 bytes. Other readers of the remote bucket can see it.
+
+**Identity limits.** The fixed parts of a write identity take at most 47 bytes: a shard number of at most 3 digits, epoch and seq of at most 20 digits each, and 4 separators. Cluster IDs are limited to 24 bytes and bucket IDs to 25, so every identity fits in 96 bytes. Cluster, bucket, and node IDs (node IDs up to 63 bytes) use lowercase ASCII letters, digits, and `-`, and start and end with a letter or digit, the lowercase form of a DNS label. They are safe in register paths, header values, and file names on case-insensitive file systems, and never contain the separators `/` and `.`. Numbers are written in canonical decimal, without sign or leading zeros, so each identity has exactly one text form and the 412 check compares bytes.
 
 On 412, the flusher HEADs the remote object. If the object carries the write identity being flushed, an earlier attempt succeeded and only its response was lost, so the flush is recorded as done. A matching checksum and size are not enough: another writer could upload identical bytes with different metadata or tags. For a delete, a 412 followed by a HEAD that finds no object means the delete already happened. Anything else puts the key in **conflict**, and `flush_conflict_policy` decides what happens:
 
@@ -969,7 +977,7 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 
 ## 14. Illustrative configuration
 
-This schema is proposed, not implemented. The values are starting points to be tuned by measurement.
+The [configuration reference](skys3-config.md) lists every key with its type, default, and the rules checked at load time. The values are starting points to be tuned by measurement. Unknown keys are rejected. `[buckets.defaults]` applies to every bucket, and a `[buckets.<name>]` table overrides it for the bucket with that S3 name.
 
 ```toml
 [cluster]
@@ -981,12 +989,15 @@ backend = "etcd"              # "etcd" (production default) or "s3" (AWS S3, R2,
 etcd_endpoints = ["https://etcd-1.example.internal:2379", "https://etcd-2.example.internal:2379", "https://etcd-3.example.internal:2379"]
 prefix = "skys3-prod-a/"
 # For backend = "s3": endpoint and bucket, in a different failure domain from every target
+# endpoint = "https://s3.eu-central-1.amazonaws.com"
+# bucket = "example-skys3-control"
 allow_correlated_control_store = false
 coordinator_lease_seconds = 10
 config_poll_interval_seconds = 30
 
 [replication]
 replica_ack_timeout_ms = 5000        # wait-through default; 2000 for fail-fast
+replica_ack_timeout_mode = "wait_through"   # or "fail_fast"
 member_suspect_after_ms = 3000
 lease_renew_interval_ms = 1000
 primary_lease_ms = 4000
@@ -1011,13 +1022,13 @@ cache_max_bytes_per_node = 1099511627776
 reserve_fraction = 0.10
 
 [flush]
-ack_policy = "local"
+ack_policy = "local"          # "local" or "write_through"; a [buckets.<name>] table may override
 flush_min_concurrency_per_shard = 4
 flush_max_concurrency_per_shard = 64
 flush_max_inflight_bytes_per_target = 1073741824
 streaming_flush_min_bytes = 67108864
 flush_part_bytes = 67108864
-flush_conflict_policy = "hold"
+flush_conflict_policy = "hold" # or "overwrite"; "discard_local" only in a [buckets.<name>] table
 max_dirty_bytes = 2199023255552
 
 [ec]
@@ -1047,9 +1058,9 @@ mode = "local"
 backup_target = "https://s3.skys3-prod-eu.example.internal/archive"
 snapshot_target = "https://s3.us-west-2.amazonaws.com/example-skys3-snapshots/archive/"
 
-[buckets.archive-from-us]     # on the peer cluster: receives native replication
+[buckets.archive-from-eu]     # receives native replication from the peer cluster
 mode = "local"
-peer_source = "skys3-prod-a"
+peer_source = "skys3-prod-eu"
 
 [peering]
 quic_listen = "0.0.0.0:7443"
