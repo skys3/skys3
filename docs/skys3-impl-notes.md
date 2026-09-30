@@ -32,7 +32,39 @@ of this file. A task with nothing unexpected keeps "None."
 
 ### M0-02 Core types
 
-None.
+- **Bucket IDs cannot be S3 bucket names.** The plan has M0-03 validate
+  "cluster and bucket ID lengths" in the configuration, which reads as if the
+  bucket ID were the configured bucket name. S3 names run to 63 bytes, and
+  the write identity leaves 49 bytes for the cluster and bucket IDs
+  together. The bucket ID is therefore a separate ID, assigned at creation
+  and never reused (design §4.1), at most 25 bytes; cluster IDs are at most
+  24 (§7.2). Never reusing it also closes a hole: a bucket deleted and
+  recreated over the same remote, with shard epochs starting again, could
+  otherwise produce a write identity that an old remote object already
+  carries, and the 412 check would take that object for its own write.
+  M0-03 validates `cluster_id` with `ClusterId::new`; bucket IDs are
+  validated where they are assigned and when registers are read.
+- **The 96-byte reservation leaves out the metadata key.** S3 counts both
+  keys and values against the 2 KiB user-metadata limit, so the identity
+  needs 105 bytes: `skys3-wid` plus a 96-byte value. The design (§7.2) now
+  says so, and `WriteIdentity::METADATA_RESERVED_BYTES` holds the figure.
+  The plan's user-metadata item in M1 still says 96; it should use the
+  constant.
+- **Coordinator lease renewals must change the ETag.** A candidate takes
+  over after seeing the same lease ETag for long enough (§6.7). S3 ETags are
+  content hashes, so a renewal that rewrote identical bytes would look like
+  no renewal. The fresh `proposal_id` in every write changes the bytes;
+  §6.7 now states it.
+- **Members may outnumber `replicas`.** A rebalance promotes the new member
+  before removing the old one (§6.7), so `ShardConfig` validation does not
+  bound the member count by `replicas`.
+- **No fuzz target for write-identity parsing.** The plan asks for a
+  `cargo-fuzz` target with every parser of untrusted input, but fuzzing
+  infrastructure arrives with M1-01. The 412 check compares the remote value
+  with the canonical text (`WriteIdentity::matches`) and never parses it,
+  so no parser sits on an untrusted path yet. `FromStr` is covered by
+  proptests for totality and canonical round trips; a caller that starts
+  parsing remote values should add a fuzz target.
 
 ### M0-03 Configuration
 
