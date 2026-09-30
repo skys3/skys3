@@ -16,8 +16,10 @@
 # push attempt, the script checks that BRANCH on the remote still points
 # at SHA, and exits 0 without publishing ("superseded") when it does not,
 # so a slower run for an older commit can never overwrite the badges of
-# a newer one. A branch that no longer exists on the remote counts as
-# superseded too.
+# a newer one. A branch that has moved past SHA only by documentation
+# changes (scripts/ci/docs-only.sh) still counts as at SHA: CI skips the
+# coverage job for those, so these are the newest figures it will get. A
+# branch that no longer exists on the remote counts as superseded.
 #
 # Every publication is generated on top of the current tip of the badges
 # branch and pushed with a plain fast-forward. If the push is rejected
@@ -40,13 +42,21 @@ attempts=${BADGES_ATTEMPTS:-5}
 here=$(cd "$(dirname "$0")" && pwd)
 
 # Exits 0 (nothing to do) unless the source branch on the remote still
-# points at the commit these figures were measured at.
+# points at the commit these figures were measured at, or has moved past
+# it only by documentation changes.
 source_is_current() {
     current=$(git ls-remote "$remote" "refs/heads/$branch" | awk 'NR == 1 { print $1 }')
-    if [ "$current" != "$source_sha" ]; then
-        echo "publish-badges: $branch advanced from $source_sha to ${current:-nothing (branch gone)}; superseded, not publishing"
-        exit 0
+    if [ "$current" = "$source_sha" ]; then
+        return 0
     fi
+    if [ -n "$current" ] &&
+        git -c maintenance.auto=false -c gc.auto=0 fetch -q --depth=1 --no-write-fetch-head "$remote" "$current" 2>/dev/null &&
+        sh "$here/docs-only.sh" "$source_sha" "$current" >/dev/null; then
+        echo "publish-badges: $branch advanced from $source_sha to $current by documentation changes only; publishing"
+        return 0
+    fi
+    echo "publish-badges: $branch advanced from $source_sha to ${current:-nothing (branch gone)}; superseded, not publishing"
+    exit 0
 }
 source_is_current
 

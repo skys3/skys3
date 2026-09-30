@@ -17,9 +17,53 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust:
-    name: Format, lint, test, docs
+  # Decides whether this change needs the build and test jobs. When every
+  # changed file is documentation (scripts/ci/docs-only.sh), they are
+  # skipped and the `docs` job runs instead. Manual dispatches, and pushes
+  # whose previous tip cannot be fetched, run everything.
+  changes:
+    name: Classify changes
     runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A pull request is checked out as its merge commit, whose first
+          # parent is the tip of the base branch.
+          fetch-depth: 2
+
+      - name: Classify
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=
+          case "$EVENT" in
+            pull_request) base=HEAD^1 ;;
+            push) if git fetch -q --depth=1 origin "$BEFORE"; then base=$BEFORE; fi ;;
+          esac
+          if [ -n "$base" ] && sh scripts/ci/docs-only.sh "$base" HEAD; then
+            echo "Only documentation changed; skipping the build and test jobs."
+            echo code=false >> "$GITHUB_OUTPUT"
+          else
+            echo code=true >> "$GITHUB_OUTPUT"
+          fi
+
+  rust:
+    name: Format, lint, test, docs (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
@@ -46,11 +90,48 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  # Runs instead of the build and test jobs when only documentation
+  # changed. The README is the crate's rustdoc (src/lib.rs includes it),
+  # so its doctests and links are still checked, and on main so are its
+  # badges.
+  docs:
+    name: Doctests and docs
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run doctests
+        run: cargo test --doc --all-features
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # A docs-only push to main publishes no badges but may have changed
+      # the README that embeds them, so check that it still renders the
+      # badges already published for main.
+      - name: Verify the README badges render
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/ci/verify-badges-render.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+
   # Line coverage gate. The threshold lives in the `coverage` alias in
   # .cargo/config.toml. Reports are uploaded even when the gate fails. The
-  # job has read-only access; badge publication is a separate job.
+  # job has read-only access; badge publication is a separate job. Runs on
+  # x86_64 only, so the coverage badge has one figure.
   coverage:
     name: Coverage
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     outputs:
       report: ${{ steps.report.outputs.complete }}
@@ -110,7 +191,9 @@ jobs:
   # mechanism can be exercised before merge). scripts/ci/publish-badges.sh
   # skips figures for a commit that is no longer its branch's tip. Also
   # runs when the coverage job failed only on its threshold, so the badge
-  # shows the below-threshold figure instead of the last passing one.
+  # shows the below-threshold figure instead of the last passing one. A
+  # docs-only change skips coverage and publishes nothing; the script
+  # keeps publishing for a commit that only such changes followed.
   publish-badges:
     name: Publish badges
     if: >-
@@ -150,6 +233,8 @@ jobs:
 
   msrv:
     name: Minimum supported Rust version
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -162,3 +247,26 @@ jobs:
 
       - name: Check
         run: cargo check --all-targets --all-features
+
+  # The one check to require in branch protection. A job skipped for a
+  # docs-only change satisfies a required check, except a matrix job: it
+  # reports under its unexpanded name, so a required `Format, lint, test,
+  # docs (x86_64)` would never arrive. This job passes when every job it
+  # needs passed or was skipped.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [changes, rust, docs, coverage, msrv]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
