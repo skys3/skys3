@@ -163,6 +163,10 @@ Replication is configured per bucket, because every shard belongs to exactly one
 
 Each bucket has a fixed number of shards chosen at creation (`shards_per_bucket`, default 8, maximum 256). A key is assigned by `hash(bucket_id, key) mod shards`. Hash sharding avoids split and merge machinery. The cost is that LIST merges results from every shard of the bucket (section 9.4). Changing a bucket's shard count later is deferred.
 
+**Bucket IDs.** A bucket's ID is not its S3 name. It is assigned when the bucket is created and never reused in the cluster, even after the bucket is deleted. A bucket recreated with the same name and remote therefore hashes keys differently and writes identities that no object flushed by its predecessor carries, so the 412 recovery rule (section 7.2) cannot mistake an old remote object for a new write. Bucket IDs are at most 25 bytes (section 7.2).
+
+**The shard hash.** A key's shard can never change for an existing bucket, so the hash is fixed and frozen with golden vectors. Version 1 hashes the bytes `"skys3-shard-v1" 0x00 bucket_id 0x00 key` with SHA-256 (FIPS 180-4), using the key's bytes exactly as stored. The first 8 bytes of the digest, read as a big-endian integer, are the key hash, and the shard is the key hash mod `shards_per_bucket`. A bucket ID never contains a zero byte, so the encoding is unambiguous, and the modulo bias is below 2⁻⁵⁶. SHA-256 is chosen because its specification is a standard that every language and `sha256sum` implement, so any tool can reproduce shard assignment. It is already a dependency for checksums (section 15), and its cost, about a microsecond or less for a typical key, is small next to a request. Rust's `DefaultHasher` makes no stability guarantee, and fast non-cryptographic hashes such as xxHash would add a dependency and a less universal specification for no measurable gain.
+
 Each shard has a **configuration**: an epoch, a primary, members, learners, and `min_write_replicas`. Members acknowledge every write. Learners receive the log while catching up and do not acknowledge.
 
 ### 4.2 Object states
@@ -331,6 +335,8 @@ An example shard register:
 }
 ```
 
+Register values are JSON objects. Readers reject unknown fields and invalid values, and the format version in `cluster.json` covers every register, so a new field comes with a new format version.
+
 #### Traffic and latency
 
 **No client request reads or writes the control store.** Routing, leases, commits, and reads all stay inside the cluster. The control store sees background traffic, plus bursts when membership changes:
@@ -473,7 +479,7 @@ The uncommitted tail is **rolled forward**. Clients that received a 503 for thos
 
 ### 6.7 Placement, replacement, and node lifecycle
 
-The coordinator holds `coordinator.lease`. It renews every `coordinator_lease / 3` with `If-Match`. A candidate takes over only after it has observed the same lease ETag for longer than `coordinator_lease × (1+ρ)`, measured on its own monotonic clock. No clock comparison between nodes is needed.
+The coordinator holds `coordinator.lease`. It renews every `coordinator_lease / 3` with `If-Match`. A candidate takes over only after it has observed the same lease ETag for longer than `coordinator_lease × (1+ρ)`, measured on its own monotonic clock. No clock comparison between nodes is needed. Every renewal writes a fresh `proposal_id` (section 6.1), so the ETag changes even though the holder does not.
 
 Every change the coordinator makes is a CAS, so two nodes that briefly both believe they are coordinator can only compete. They cannot corrupt state.
 
@@ -558,7 +564,9 @@ SkyS3 assumes it **exclusively owns** the remote prefix. Every flush is conditio
 | Multipart upload | The `MPU_CREATE` record that opened it | The `MPU_COMPLETE` record |
 | Large single PUT streamed during upload (section 7.3 or 7.8) | An `UPLOAD_BEGIN` record committed when streaming starts | The final `PUT` record |
 
-The final record stores the identity it inherits, so the remote `CreateMultipartUpload`, a native `BEGIN`, a `COMMIT` replay, and the 412 HEAD check all compare the same value. A new primary that takes over a multipart upload reads it from the log. A streamed single PUT that fails never commits its final record, so its identity is never published. SkyS3 strips it from responses to its own clients, and reserves its size (at most 96 bytes) out of the 2 KiB user-metadata limit it enforces. Other readers of the remote bucket can see it.
+The final record stores the identity it inherits, so the remote `CreateMultipartUpload`, a native `BEGIN`, a `COMMIT` replay, and the 412 HEAD check all compare the same value. A new primary that takes over a multipart upload reads it from the log. A streamed single PUT that fails never commits its final record, so its identity is never published. SkyS3 strips it from responses to its own clients. S3 counts both metadata keys and values against the 2 KiB user-metadata limit, so SkyS3 reserves 105 bytes out of the limit it enforces: the key `skys3-wid` and a value of at most 96 bytes. Other readers of the remote bucket can see it.
+
+**Identity limits.** The fixed parts of a write identity take at most 47 bytes: a shard number of at most 3 digits, epoch and seq of at most 20 digits each, and 4 separators. Cluster IDs are limited to 24 bytes and bucket IDs to 25, so every identity fits in 96 bytes. Cluster, bucket, and node IDs (node IDs up to 63 bytes) use lowercase ASCII letters, digits, and `-`, and start and end with a letter or digit, the lowercase form of a DNS label. They are safe in register paths, header values, and file names on case-insensitive file systems, and never contain the separators `/` and `.`. Numbers are written in canonical decimal, without sign or leading zeros, so each identity has exactly one text form and the 412 check compares bytes.
 
 On 412, the flusher HEADs the remote object. If the object carries the write identity being flushed, an earlier attempt succeeded and only its response was lost, so the flush is recorded as done. A matching checksum and size are not enough: another writer could upload identical bytes with different metadata or tags. For a delete, a 412 followed by a HEAD that finds no object means the delete already happened. Anything else puts the key in **conflict**, and `flush_conflict_policy` decides what happens:
 

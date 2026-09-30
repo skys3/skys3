@@ -163,7 +163,7 @@ Workspace, core types, configuration, and the abstractions that let every later 
 **Design:** §14 · **After:** M0-02 · **Size:** M
 
 - A TOML schema and defaults for every section of §14.
-- Validation at load time, including: `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin`; in wait-through mode, `replica_ack_timeout` above `member_suspect_after` plus a CAS allowance (§5.2); `min_write_replicas ≤ replicas`; `clean_copies ≤ replicas`; `shards_per_bucket ≤ 256`; cluster and bucket ID lengths that keep the write identity within 96 bytes (M0-02); `lease_renew_interval < primary_lease`; `read_registration_renew_interval < read_registration_ttl`.
+- Validation at load time, including: `primary_grace ≥ primary_lease × (1+ρ)/(1−ρ) + margin`; in wait-through mode, `replica_ack_timeout` above `member_suspect_after` plus a CAS allowance (§5.2); `min_write_replicas ≤ replicas`; `clean_copies ≤ replicas`; `shards_per_bucket ≤ 256`; the cluster ID's length and characters, which with the bucket ID limit keep the write identity within 96 bytes (M0-02; bucket IDs are generated at bucket creation, not configured); `lease_renew_interval < primary_lease`; `read_registration_renew_interval < read_registration_ttl`.
 - A configuration reference under `docs/` that later PRs extend.
 - **Done when:** the §14 example loads unchanged, and each validation rule has a test with a config that breaks it.
 
@@ -292,7 +292,7 @@ Four tracks can run in parallel after M0:
 
 - Bodies up to `inline_max_bytes` go inline. Larger bodies are streamed as 1 MiB `EXTENT` records while they arrive, and the final `PUT` references them.
 - GET, HEAD, range reads, and conditional requests (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`) evaluated against the index, including conditional PUTs.
-- User metadata is limited to 2 KiB minus the 96 bytes reserved for the write identity. `x-amz-meta-skys3-wid` is stripped from responses (§7.2).
+- User metadata is limited to 2 KiB minus the 105 bytes reserved for the write identity (`WriteIdentity::METADATA_RESERVED_BYTES`: the `skys3-wid` key and a value of at most 96 bytes). `x-amz-meta-skys3-wid` is stripped from responses (§7.2).
 - **Done when:** request-level tests cover each conditional header and range form, and a PUT is acknowledged only after its record is durable.
 
 #### M1-10 DeleteObjects, tagging, and CopyObject
@@ -1028,7 +1028,7 @@ The design leaves these points open. Each named PR decides the point and records
 | Gap | Decided in |
 |---|---|
 | The shard hash function, frozen with golden vectors | M0-02 |
-| Length limits on cluster and bucket IDs, so the write identity stays within its 96-byte reservation (§7.2) | M0-02, validated in M0-03 |
+| Length limits on cluster and bucket IDs, so the write identity stays within 96 bytes (§7.2) | M0-02; M0-03 validates the configured cluster ID |
 | Authentication of callers of the admin HTTP listener. §12 covers admin messages between nodes, not the admin API. | M0-06 |
 | DeleteBucket (detach) of a `write_back` bucket that still has dirty entries: refuse until drained, or drain and then detach | M1-06 |
 | The authorization model: the policy language subset for roles and session policies, and static credentials for bootstrap and service accounts | M1-07b, M1-24 |
