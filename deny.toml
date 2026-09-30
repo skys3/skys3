@@ -1,0 +1,49 @@
+# cargo-deny configuration: license allowlist, RustSec advisories, and
+# duplicate-version bans. CI runs `cargo deny check` on every change that
+# is not docs-only. See docs/skys3-tasks-plan.md, M0-01.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every RustSec advisory fails the check, including unmaintained and
+# unsound crates. An exception goes in `ignore` with the advisory ID and a
+# reason.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses only. Add a license here only after checking that it
+# is compatible with FSL-1.1-ALv2 distribution of the SkyS3 binary.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# The allowlist is policy, not an inventory of the current tree.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# The workspace crates are unpublished and licensed by LICENSE (FSL-1.1-ALv2).
+ignore = true
+
+[bans]
+# Two versions of one crate in the build fail the check. A duplicate that
+# cannot be avoided yet goes in `skip` with the reason and the crates that
+# pull in each version.
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

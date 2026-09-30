@@ -1,11 +1,16 @@
-[package]
-name = "skys3"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Rust bootstrap for the skys3 repository."
-readme = "README.md"
+rust-version = "1.98.1"
 license-file = "LICENSE"
 repository = "https://github.com/skys3/skys3"
-rust-version = "1.98.1"
+publish = false
 
-[dependencies]
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]

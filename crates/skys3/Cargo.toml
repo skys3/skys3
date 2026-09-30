@@ -1,0 +1,15 @@
+[package]
+name = "skys3"
+description = "SkyS3 node: configuration, wiring, startup recovery, and admin commands."
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
