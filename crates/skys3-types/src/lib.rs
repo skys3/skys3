@@ -7,7 +7,8 @@
 //!   [`BucketName`], [`ProposalId`]): validated strings whose length limits
 //!   and character sets are part of the design (§7.2). Constructors,
 //!   [`FromStr`](std::str::FromStr), and deserialization all validate, so a
-//!   value of one of these types is always valid.
+//!   value of one of these types is always valid. [`NodeAddress`] validates
+//!   the `host:port` a node is reached at the same way.
 //! - **Log positions** ([`Epoch`], [`Seq`], [`EpochSeq`], [`Generation`]):
 //!   shard configuration epochs, per-shard sequence numbers, and the
 //!   `(epoch, seq)` pairs that order a shard's log.
@@ -34,12 +35,14 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod address;
 mod id;
 mod identity;
 mod position;
 mod register;
 pub mod shard;
 
+pub use address::{AddressError, DnsName, Host, NodeAddress};
 pub use id::{BucketId, BucketName, ClusterId, IdError, Label, NodeId, ProposalId};
 pub use identity::{ETag, ETagError, ParseWriteIdentityError, VersionIdentity, WriteIdentity};
 pub use position::{Epoch, EpochSeq, Generation, ParseNumberError, Seq};

@@ -2,11 +2,14 @@
 
 use proptest::collection::vec;
 use proptest::prelude::*;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU16;
+
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, BucketName, ClusterDocument, ClusterId, CoordinatorLease,
-    DiskInfo, ETag, Epoch, EpochSeq, Generation, KeyHash, Label, NodeId, NodeRegistration,
-    ProposalId, RegisterDocument, RemoteTarget, Seq, ShardConfig, ShardCount, ShardId,
-    VersionIdentity, WriteIdentity,
+    DiskInfo, DnsName, ETag, Epoch, EpochSeq, Generation, Host, KeyHash, Label, NodeAddress,
+    NodeId, NodeRegistration, ProposalId, RegisterDocument, RemoteTarget, Seq, ShardConfig,
+    ShardCount, ShardId, VersionIdentity, WriteIdentity,
 };
 
 /// A lowercase DNS-label identifier of 1 to `max` bytes.
@@ -134,11 +137,32 @@ fn bucket_document() -> impl Strategy<Value = BucketDocument> {
         )
 }
 
+/// A DNS name of 1 to 4 labels whose last label has a letter.
+fn dns_name() -> impl Strategy<Value = DnsName> {
+    (vec(label(63), 0..4), "[a-z]([a-z0-9-]{0,61}[a-z0-9])?").prop_filter_map(
+        "at most 253 bytes",
+        |(mut labels, last)| {
+            labels.push(last);
+            DnsName::new(labels.join(".")).ok()
+        },
+    )
+}
+
+fn node_address() -> impl Strategy<Value = NodeAddress> {
+    let host = prop_oneof![
+        dns_name().prop_map(Host::Dns),
+        any::<u32>().prop_map(|ip| Host::Ipv4(Ipv4Addr::from(ip))),
+        any::<u128>().prop_map(|ip| Host::Ipv6(Ipv6Addr::from(ip))),
+    ];
+    (host, 1..=u16::MAX)
+        .prop_map(|(host, port)| NodeAddress::new(host, NonZeroU16::new(port).unwrap()))
+}
+
 fn node_registration() -> impl Strategy<Value = NodeRegistration> {
     let label = || label(Label::MAX_LEN).prop_map(|s| Label::new(s).unwrap());
     (
         node_id(),
-        "[!-~]{1,255}",
+        node_address(),
         proptest::option::of(label()),
         proptest::option::of(label()),
         proptest::collection::btree_map(label(), any::<u64>(), 0..8),
@@ -168,6 +192,30 @@ fn round_trip<T: RegisterDocument + PartialEq + std::fmt::Debug>(document: &T) {
 }
 
 proptest! {
+    #[test]
+    fn node_addresses_round_trip(address in node_address()) {
+        let text = address.to_string();
+        prop_assert!(text.len() <= NodeAddress::MAX_LEN);
+        prop_assert_eq!(text.parse::<NodeAddress>().unwrap(), address.clone());
+        let json = serde_json::to_string(&address).unwrap();
+        prop_assert_eq!(serde_json::from_str::<NodeAddress>(&json).unwrap(), address);
+    }
+
+    #[test]
+    fn node_address_parse_is_total_and_canonical(
+        s in "[a-z0-9.:\\[\\]-]{0,40}|\\PC{0,60}",
+    ) {
+        // Whatever parses prints in canonical form, which re-parses equal and
+        // is the input itself unless an IPv6 literal was normalized.
+        if let Ok(address) = s.parse::<NodeAddress>() {
+            let canonical = address.to_string();
+            prop_assert_eq!(canonical.parse::<NodeAddress>().unwrap(), address.clone());
+            if !matches!(address.host(), Host::Ipv6(_)) {
+                prop_assert_eq!(canonical, s);
+            }
+        }
+    }
+
     #[test]
     fn ids_round_trip_through_text_and_json(cluster in cluster_id(), node in node_id()) {
         prop_assert_eq!(cluster.to_string().parse::<ClusterId>().unwrap(), cluster.clone());
