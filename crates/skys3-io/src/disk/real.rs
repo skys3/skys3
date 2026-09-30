@@ -4,12 +4,13 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::{Bytes, BytesMut};
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::{Disk, SegmentFile, check_name, read_past_end, truncate_extends};
 use crate::pool::BlockingPool;
@@ -19,13 +20,19 @@ use crate::pool::BlockingPool;
 /// Every operation runs on the disk's [`BlockingPool`], never on the calling
 /// task's thread. Give each physical disk its own pool.
 ///
-/// Opening a file that is already open returns a handle to the same open
-/// file, so every handle sees the length the others appended to.
+/// Every open of a file returns a handle to the same open file, so all
+/// handles see the length the others appended to and their appends never
+/// overlap. Creates, opens, and removes are serialized per disk, so none of
+/// them can run between another's system call and its update of the
+/// open-file registry.
 #[derive(Clone, Debug)]
 pub struct RealDisk {
     dir: Arc<Path>,
     pool: BlockingPool,
-    open_files: Arc<Mutex<HashMap<String, Weak<FileInner>>>>,
+    /// The open file behind each name. Entries are weak, so a file whose
+    /// last handle is dropped is closed. The lock is held across each
+    /// namespace operation's system call.
+    open_files: Arc<AsyncMutex<HashMap<String, Weak<FileInner>>>>,
 }
 
 impl RealDisk {
@@ -69,32 +76,38 @@ impl RealDisk {
         Ok(self.dir.join(name))
     }
 
-    /// Opens `name` on the pool, or with `create`, creates it, and registers
-    /// the open file so later opens share it.
+    /// Opens `name`, or with `create`, creates it, and returns a handle to
+    /// the registered open file for it.
     async fn open_file(&self, name: &str, create: bool) -> io::Result<RealFile> {
         let path = self.file_path(name)?;
-        if !create && let Some(inner) = self.open_files().get(name).and_then(Weak::upgrade) {
-            return Ok(self.handle(inner));
-        }
-        let (file, len) = self
+        let mut open_files = self.open_files.lock().await;
+        // Always ask the file system, and share a registered file only if it
+        // is the same file, so a stale entry is never reused for another
+        // file of the same name.
+        let (file, identity, len) = self
             .pool
-            .run(move || -> io::Result<(File, u64)> {
+            .run(move || -> io::Result<(File, FileIdentity, u64)> {
                 let file = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create_new(create)
                     .open(path)?;
-                let len = file.metadata()?.len();
-                Ok((file, len))
+                let metadata = file.metadata()?;
+                let identity = FileIdentity {
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                };
+                Ok((file, identity, metadata.len()))
             })
             .await??;
-        let mut open_files = self.open_files();
-        // Another task may have opened the file meanwhile: share it.
-        if !create && let Some(inner) = open_files.get(name).and_then(Weak::upgrade) {
+        let registered = open_files.get(name).and_then(Weak::upgrade);
+        if let Some(inner) = registered.filter(|inner| inner.identity == identity) {
+            // Already open: share it, and close the new descriptor.
             return Ok(self.handle(inner));
         }
         let inner = Arc::new(FileInner {
             file,
+            identity,
             write_lock: Mutex::new(()),
             len: AtomicU64::new(len),
         });
@@ -108,12 +121,6 @@ impl RealDisk {
             inner,
             pool: self.pool.clone(),
         }
-    }
-
-    fn open_files(&self) -> MutexGuard<'_, HashMap<String, Weak<FileInner>>> {
-        self.open_files
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -130,9 +137,10 @@ impl Disk for RealDisk {
 
     async fn remove(&self, name: &str) -> io::Result<()> {
         let path = self.file_path(name)?;
+        let mut open_files = self.open_files.lock().await;
         self.pool.run(move || fs::remove_file(path)).await??;
         // Open handles keep the unlinked file; a new file may take the name.
-        self.open_files().remove(name);
+        open_files.remove(name);
         Ok(())
     }
 
@@ -172,9 +180,17 @@ pub struct RealFile {
     pool: BlockingPool,
 }
 
+/// Identifies a file independently of its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
 #[derive(Debug)]
 struct FileInner {
     file: File,
+    identity: FileIdentity,
     /// Serializes appends and truncations. Locked only on pool threads.
     write_lock: Mutex<()>,
     /// The file's length, published after each append or truncation.

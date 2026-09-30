@@ -96,6 +96,15 @@ async fn removed_file_stays_readable_through_open_handles<D: Disk>(disk: D) {
     // The name is free again.
     let new = disk.create("seg").await.unwrap();
     assert!(new.is_empty());
+    // Opening the name finds the new file, shared with its creator, while
+    // the old handle keeps the removed one.
+    new.append(Bytes::from_static(b"fresh")).await.unwrap();
+    let opened = disk.open("seg").await.unwrap();
+    assert_eq!(opened.len(), 5);
+    assert_eq!(opened.append(Bytes::from_static(b"!")).await.unwrap(), 5);
+    assert_eq!(new.len(), 6);
+    assert_eq!(&file.read_at(0, 7).await.unwrap()[..], b"payload");
+    assert_eq!(file.len(), 7);
 }
 
 async fn truncate_cuts_the_tail<D: Disk>(disk: D) {
@@ -191,6 +200,72 @@ async fn real_disk_rejects_a_path_that_is_a_file() {
     let path = dir.path().join("not-a-dir");
     std::fs::write(&path, b"").unwrap();
     assert!(RealDisk::open(path, test_pool()).await.is_err());
+}
+
+/// Races `remove` against `create` and `open` of the same name. Every handle
+/// to the file that holds the name afterwards must share one length, or two
+/// writers would append at the same offset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_disk_namespace_races_keep_one_open_file_per_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = BlockingPool::new("race", NonZeroUsize::new(4).unwrap()).unwrap();
+    let disk = RealDisk::open(dir.path(), pool).await.unwrap();
+    for _ in 0..500 {
+        let old = disk.create("seg").await.unwrap();
+        let remove = tokio::spawn({
+            let disk = disk.clone();
+            async move { disk.remove("seg").await }
+        });
+        let create = tokio::spawn({
+            let disk = disk.clone();
+            async move { disk.create("seg").await }
+        });
+        let open = tokio::spawn({
+            let disk = disk.clone();
+            async move { disk.open("seg").await }
+        });
+        remove.await.unwrap().unwrap();
+        let created = create.await.unwrap();
+        let opened = open.await.unwrap();
+        drop(old);
+
+        match created {
+            Ok(created) => {
+                created.append(Bytes::from_static(b"x")).await.unwrap();
+                let reopened = disk.open("seg").await.unwrap();
+                assert_eq!(reopened.len(), created.len());
+                assert_eq!(reopened.append(Bytes::from_static(b"y")).await.unwrap(), 1);
+                assert_eq!(created.len(), 2);
+                if let Ok(opened) = opened {
+                    // Opened either the removed file or the new one.
+                    assert!(opened.len() == 0 || opened.len() == 2, "{}", opened.len());
+                }
+                disk.remove("seg").await.unwrap();
+            }
+            Err(error) => {
+                // The create ran before the remove.
+                assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+                assert!(disk.open("seg").await.is_err());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_disk_does_not_reuse_an_open_file_for_a_replaced_name() {
+    let (disk, _dir) = real_disk().await;
+    let old = disk.create("seg").await.unwrap();
+    old.append(Bytes::from_static(b"old")).await.unwrap();
+    // Another process replaces the file behind the disk's back.
+    std::fs::remove_file(disk.path().join("seg")).unwrap();
+    std::fs::write(disk.path().join("seg"), b"replaced").unwrap();
+
+    let opened = disk.open("seg").await.unwrap();
+    assert_eq!(&opened.read_at(0, 8).await.unwrap()[..], b"replaced");
+    assert_eq!(old.len(), 3);
+    // Later opens share the file now registered for the name.
+    assert_eq!(opened.append(Bytes::from_static(b"!")).await.unwrap(), 8);
+    assert_eq!(disk.open("seg").await.unwrap().len(), 9);
 }
 
 #[tokio::test]
