@@ -93,14 +93,13 @@ None.
   `cargo +nightly fuzz run obs_bearer -- -max_total_time=30` ran about 9
   million inputs without a failure. No CI job runs it yet; M1-01 wires the
   fuzz smoke runs in (plan section 5).
-- **`forbid(unsafe_code)` does work in a fuzz target.** The shared
-  `fuzz/Cargo.toml` header says the fuzz crate cannot forbid unsafe code
+- **`forbid(unsafe_code)` does work in a fuzz target.** The fuzz crate
+  was first set up on the assumption that it could not forbid unsafe code,
   because `fuzz_target!` expands to a `#[no_mangle]` export. With
-  `libfuzzer-sys` 0.4.13, the lint does not report code expanded from an
-  external macro, so `obs_bearer.rs` builds with `#![forbid(unsafe_code)]`,
-  and a deliberate `unsafe {}` in it is still rejected. The header is kept
-  word for word so the two branches merge cleanly; it should be corrected
-  once both have merged.
+  `libfuzzer-sys` 0.4.13 the lint does not report code expanded from an
+  external macro, so every target builds with `#![forbid(unsafe_code)]`,
+  and a deliberate `unsafe {}` in one is still rejected. The
+  `fuzz/Cargo.toml` header says so.
 - **The fuzz crate is outside `cargo deny`.** `cargo deny check` runs on the
   main workspace, and the fuzz crate has its own workspace and lock file
   (`fuzz/Cargo.lock`, committed). Its dependencies never reach the shipped

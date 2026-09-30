@@ -2,8 +2,9 @@
 # Run with `cargo +nightly fuzz run <target>` from the repository root.
 #
 # This crate is outside the main workspace: it needs a nightly toolchain and
-# libFuzzer. It cannot use `#![forbid(unsafe_code)]`, because `fuzz_target!`
-# expands to a `#[no_mangle]` export, which the `unsafe_code` lint flags.
+# libFuzzer. Every target still has `#![forbid(unsafe_code)]`: the
+# `#[no_mangle]` export that `fuzz_target!` generates comes from an external
+# macro, which the `unsafe_code` lint does not report.
 
 [package]
 name = "skys3-fuzz"
