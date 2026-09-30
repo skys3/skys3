@@ -32,7 +32,45 @@ of this file. A task with nothing unexpected keeps "None."
 
 ### M0-02 Core types
 
-None.
+- **Bucket IDs cannot be S3 bucket names.** The plan has M0-03 validate
+  "cluster and bucket ID lengths" in the configuration, which reads as if the
+  bucket ID were the configured bucket name. S3 names run to 63 bytes, and
+  the write identity leaves 49 bytes for the cluster and bucket IDs
+  together. The bucket ID is therefore a separate ID, assigned at creation
+  and never reused (design §4.1), at most 25 bytes; cluster IDs are at most
+  24 (§7.2). Never reusing it also closes a hole: a bucket deleted and
+  recreated over the same remote, with shard epochs starting again, could
+  otherwise produce a write identity that an old remote object already
+  carries, and the 412 check would take that object for its own write.
+  M0-03 validates `cluster_id` with `ClusterId::new`; bucket IDs are
+  validated where they are assigned and when registers are read. The plan's
+  M0-03 entry and section 14 row now say so.
+- **The 96-byte reservation leaves out the metadata key.** S3 counts both
+  keys and values against the 2 KiB user-metadata limit, so the identity
+  needs 105 bytes: `skys3-wid` plus a 96-byte value. The design (§7.2) now
+  says so, and `WriteIdentity::METADATA_RESERVED_BYTES` holds the figure.
+  The plan's M1 user-metadata item said 96; it now names the constant.
+- **Coordinator lease renewals must change the ETag.** A candidate takes
+  over after seeing the same lease ETag for long enough (§6.7). S3 ETags are
+  content hashes, so a renewal that rewrote identical bytes would look like
+  no renewal. The fresh `proposal_id` in every write changes the bytes;
+  §6.7 now states it.
+- **Members may outnumber `replicas`.** A rebalance promotes the new member
+  before removing the old one (§6.7), so `ShardConfig` validation does not
+  bound the member count by `replicas`.
+- **Fuzz targets before the fuzz CI job.** Rule 1.1 wants a `cargo-fuzz`
+  target with every parser of untrusted input; write identities read back
+  from remote metadata and quoted ETags from remote responses qualify. The
+  targets `types_write_identity` and `types_etag` live in `fuzz/`, a crate
+  with its own empty `[workspace]` table, so the stable workspace never
+  builds it and needs no `exclude`. The targets keep
+  `#![forbid(unsafe_code)]`: the `#[no_mangle]` export that `fuzz_target!`
+  generates comes from an external macro, which the lint does not report
+  (found in M0-06; the first version of this crate wrongly said otherwise).
+  Both targets build with
+  `cargo +nightly fuzz build` and ran 30 s each without findings; CI runs
+  them once M1-01 adds the fuzz smoke job. The 412 check itself still
+  compares bytes (`WriteIdentity::matches`) rather than parsing.
 
 ### M0-03 Configuration
 

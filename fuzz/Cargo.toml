@@ -1,0 +1,43 @@
+# cargo-fuzz targets for SkyS3's parsers of untrusted input (plan rule 1.1).
+# Run with `cargo +nightly fuzz run <target>` from the repository root.
+#
+# This crate is outside the main workspace: it needs a nightly toolchain and
+# libFuzzer. Every target still has `#![forbid(unsafe_code)]`: the
+# `#[no_mangle]` export that `fuzz_target!` generates comes from an external
+# macro, which the `unsafe_code` lint does not report.
+
+[package]
+name = "skys3-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+skys3-types = { path = "../crates/skys3-types" }
+
+[[bin]]
+name = "types_write_identity"
+path = "fuzz_targets/types_write_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "types_etag"
+path = "fuzz_targets/types_etag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "types_node_address"
+path = "fuzz_targets/types_node_address.rs"
+test = false
+doc = false
+bench = false
