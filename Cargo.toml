@@ -27,4 +27,5 @@ skys3-types = { path = "crates/skys3-types" }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", default-features = false }
+toml = { version = "1.1.6", default-features = false, features = ["parse", "serde", "std"] }
 turmoil = "0.7.2"
