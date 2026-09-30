@@ -263,6 +263,28 @@ jobs:
         with:
           command: check
 
+  # Deterministic simulation scenarios over a fixed seed set, larger than
+  # the few seeds the `rust` job's tests run. Scenario tests live in each
+  # crate's `simulation` test target (crates/skys3-sim/src/lib.rs). A failure
+  # prints the seed and the command that replays it.
+  simulation:
+    name: Simulation with a fixed seed set
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run simulation scenarios
+        run: cargo test --workspace --all-features --test simulation
+        env:
+          SKYS3_SIM_SEEDS: 256
+
   # The one check to require in branch protection. A job skipped for a
   # docs-only change satisfies a required check, except a matrix job: it
   # reports under its unexpanded name, so a required `Format, lint, test,
@@ -271,7 +293,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny]
+    needs: [changes, rust, docs, coverage, msrv, deny, simulation]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results

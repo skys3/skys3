@@ -20,10 +20,32 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 skys3-obs = { path = "../crates/skys3-obs" }
+skys3-types = { path = "../crates/skys3-types" }
 
 [[bin]]
 name = "obs_bearer"
 path = "fuzz_targets/obs_bearer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "types_etag"
+path = "fuzz_targets/types_etag.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "types_node_address"
+path = "fuzz_targets/types_node_address.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "types_write_identity"
+path = "fuzz_targets/types_write_identity.rs"
 test = false
 doc = false
 bench = false
