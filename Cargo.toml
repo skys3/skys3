@@ -14,3 +14,9 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+bytes = "1.12.1"
+rand = "0.9.5"
+skys3-io = { path = "crates/skys3-io" }
+tempfile = { version = "3.27.0", default-features = false }
+tokio = "1.53.1"
+turmoil = "0.7.2"
