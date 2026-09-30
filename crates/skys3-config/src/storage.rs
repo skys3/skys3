@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use skys3_log::record::{MAX_PAYLOAD_LEN, MIN_EXTENT_LEN};
 
 use crate::error::Checker;
 
@@ -71,8 +72,32 @@ crate::durations! {
 
 impl StorageConfig {
     pub(crate) fn check(&self, checker: &mut Checker) {
+        // Both sizes become log record payloads, which the record format
+        // bounds; the smallest extent keeps a 5 GiB object within the
+        // extents one PUT record can reference (§10.1).
+        let max_payload = u64::from(MAX_PAYLOAD_LEN);
+        checker.require(
+            self.inline_max_bytes <= max_payload,
+            "storage.inline_max_bytes",
+            || {
+                format!(
+                    "is {}; it must be at most {max_payload}, the largest log record payload",
+                    self.inline_max_bytes
+                )
+            },
+        );
+        let min_extent = u64::from(MIN_EXTENT_LEN);
+        checker.require(
+            (min_extent..=max_payload).contains(&self.extent_bytes),
+            "storage.extent_bytes",
+            || {
+                format!(
+                    "is {}; it must be from {min_extent} to {max_payload}",
+                    self.extent_bytes
+                )
+            },
+        );
         for (key, value) in [
-            ("storage.extent_bytes", self.extent_bytes),
             ("storage.segment_bytes", self.segment_bytes),
             (
                 "storage.group_commit_max_bytes",
