@@ -63,9 +63,11 @@ of this file. A task with nothing unexpected keeps "None."
   from remote metadata and quoted ETags from remote responses qualify. The
   targets `types_write_identity` and `types_etag` live in `fuzz/`, a crate
   with its own empty `[workspace]` table, so the stable workspace never
-  builds it and needs no `exclude`. The fuzz crate cannot
-  `forbid(unsafe_code)`: `fuzz_target!` expands to a `#[no_mangle]` export,
-  which the `unsafe_code` lint flags. Both targets build with
+  builds it and needs no `exclude`. The targets keep
+  `#![forbid(unsafe_code)]`: the `#[no_mangle]` export that `fuzz_target!`
+  generates comes from an external macro, which the lint does not report
+  (found in M0-06; the first version of this crate wrongly said otherwise).
+  Both targets build with
   `cargo +nightly fuzz build` and ran 30 s each without findings; CI runs
   them once M1-01 adds the fuzz smoke job. The 412 check itself still
   compares bytes (`WriteIdentity::matches`) rather than parsing.

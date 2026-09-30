@@ -1,8 +1,7 @@
 //! Fuzzes `ETag` parsing, which reads entity tags from remote responses.
-//!
-//! No `#![forbid(unsafe_code)]`: `fuzz_target!` expands to a `#[no_mangle]`
-//! export, which the `unsafe_code` lint flags.
+
 #![no_main]
+#![forbid(unsafe_code)]
 
 use libfuzzer_sys::fuzz_target;
 use skys3_types::ETag;
