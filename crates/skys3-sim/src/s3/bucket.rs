@@ -55,14 +55,6 @@ struct Upload {
     parts: BTreeMap<u32, Part>,
 }
 
-/// Where a listing continues: after `key`, and past every key under it if
-/// it was a common prefix.
-#[derive(Clone, Debug)]
-struct ListMarker {
-    after: String,
-    skip_under: bool,
-}
-
 /// The objects and uploads of one simulated bucket.
 #[derive(Debug)]
 pub(super) struct Bucket {
@@ -71,9 +63,9 @@ pub(super) struct Bucket {
     /// has exactly one, an object; deleting it removes the key.
     keys: BTreeMap<String, Vec<Version>>,
     uploads: BTreeMap<UploadId, Upload>,
-    /// Continuation tokens issued, so that tokens stay opaque and nothing
-    /// parses them.
-    list_tokens: HashMap<String, ListMarker>,
+    /// Continuation tokens issued, and the last entry of the page each one
+    /// continues, so that tokens stay opaque and nothing parses them.
+    list_tokens: HashMap<String, String>,
     /// Numbers version IDs, upload IDs, and continuation tokens.
     next_id: u64,
 }
@@ -304,85 +296,81 @@ impl Bucket {
         })
     }
 
+    /// Lists one page. Keys roll up into common prefixes, and S3 returns an
+    /// entry, key or common prefix, only if it sorts after the position the
+    /// page starts from: `start_after`, or the last entry of the previous
+    /// page. So a common prefix at or before `start_after` is left out even
+    /// if keys under it come after, and a common prefix is never returned on
+    /// two pages.
+    ///
+    /// `max_keys == 0` returns an empty page that is not truncated, as S3
+    /// does. It tells the caller nothing about the keys, so callers never
+    /// send it.
     pub(super) fn list_objects_v2(
         &mut self,
         request: &ListObjectsV2,
     ) -> S3Result<ListObjectsV2Output> {
-        let marker = match &request.continuation_token {
+        let position = match &request.continuation_token {
             Some(token) => Some(self.list_tokens.get(token).cloned().ok_or_else(|| {
                 S3Error::new(
                     S3ErrorKind::InvalidArgument,
                     "the continuation token is not valid",
                 )
             })?),
-            None => request.start_after.clone().map(|after| ListMarker {
-                after,
-                skip_under: false,
-            }),
+            None => request.start_after.clone(),
         };
         let prefix = request.prefix.as_str();
         let delimiter = request.delimiter.as_deref().filter(|d| !d.is_empty());
         let max_keys = request.max_keys.min(MAX_LIST_KEYS) as usize;
+        let mut output = ListObjectsV2Output::default();
+        if max_keys == 0 {
+            return Ok(output);
+        }
 
-        let start = match &marker {
-            Some(marker) if marker.after.as_str() >= prefix => {
-                Bound::Excluded(marker.after.clone())
-            }
+        let start = match &position {
+            Some(after) if after.as_str() >= prefix => Bound::Excluded(after.clone()),
             _ => Bound::Included(prefix.to_owned()),
         };
-        let mut output = ListObjectsV2Output::default();
+        // The last entry returned, or the start position: every entry
+        // returned sorts after it.
+        let mut floor = position;
         let mut emitted = 0;
-        let mut last: Option<ListMarker> = None;
         for (key, versions) in self.keys.range::<String, _>((start, Bound::Unbounded)) {
             if !key.starts_with(prefix) {
                 break;
             }
-            let skipped = [marker.as_ref(), last.as_ref()]
-                .into_iter()
-                .flatten()
-                .any(|m| m.skip_under && key.starts_with(&m.after));
             let Some(object) = versions.last().and_then(|v| v.object.as_ref()) else {
                 continue;
             };
-            if skipped {
-                continue;
-            }
             let common_prefix = delimiter.and_then(|delimiter| {
                 let rest = &key[prefix.len()..];
                 rest.find(delimiter)
                     .map(|at| &key[..prefix.len() + at + delimiter.len()])
             });
+            let entry = common_prefix.unwrap_or(key);
+            if floor.as_deref().is_some_and(|floor| entry <= floor) {
+                continue;
+            }
             if emitted == max_keys {
-                output.is_truncated = max_keys > 0;
+                output.is_truncated = true;
                 break;
             }
             emitted += 1;
-            last = Some(match common_prefix {
-                Some(common_prefix) => {
-                    output.common_prefixes.push(common_prefix.to_owned());
-                    ListMarker {
-                        after: common_prefix.to_owned(),
-                        skip_under: true,
-                    }
-                }
-                None => {
-                    output.objects.push(ListedObject {
-                        key: key.clone(),
-                        etag: object.etag.clone(),
-                        size: object.body.len() as u64,
-                    });
-                    ListMarker {
-                        after: key.clone(),
-                        skip_under: false,
-                    }
-                }
-            });
+            match common_prefix {
+                Some(common_prefix) => output.common_prefixes.push(common_prefix.to_owned()),
+                None => output.objects.push(ListedObject {
+                    key: key.clone(),
+                    etag: object.etag.clone(),
+                    size: object.body.len() as u64,
+                }),
+            }
+            floor = Some(entry.to_owned());
         }
         if output.is_truncated
-            && let Some(last) = last
+            && let Some(floor) = floor
         {
             let token = self.next_id("t");
-            self.list_tokens.insert(token.clone(), last);
+            self.list_tokens.insert(token.clone(), floor);
             output.next_continuation_token = Some(token);
         }
         Ok(output)
@@ -558,9 +546,15 @@ impl Bucket {
         Ok(())
     }
 
+    /// Lists one page of an upload's parts. As with
+    /// [`Bucket::list_objects_v2`], `max_parts == 0` returns an empty page
+    /// that is not truncated, so a truncated page always has a marker.
     pub(super) fn list_parts(&mut self, request: &ListParts) -> S3Result<ListPartsOutput> {
         let upload = self.upload_mut(&request.key, &request.upload_id)?;
         let max_parts = request.max_parts.min(MAX_LIST_PARTS) as usize;
+        if max_parts == 0 {
+            return Ok(ListPartsOutput::default());
+        }
         let after = request.part_number_marker.unwrap_or(0);
         let mut remaining = upload
             .parts
@@ -573,9 +567,7 @@ impl Bucket {
         let parts: Vec<_> = remaining.by_ref().take(max_parts).collect();
         let is_truncated = remaining.next().is_some();
         Ok(ListPartsOutput {
-            next_part_number_marker: is_truncated
-                .then(|| parts.last().map(|p| p.part_number))
-                .flatten(),
+            next_part_number_marker: parts.last().filter(|_| is_truncated).map(|p| p.part_number),
             is_truncated,
             parts,
         })

@@ -311,12 +311,16 @@ pub struct ListObjectsV2 {
     /// prefixes.
     pub delimiter: Option<String>,
     /// The most keys and common prefixes to return, at most
-    /// [`MAX_LIST_KEYS`] (larger values are treated as that).
+    /// [`MAX_LIST_KEYS`] (larger values are treated as that). Zero returns
+    /// an empty page that is not truncated, which says nothing about the
+    /// keys, so callers never send it.
     pub max_keys: u32,
     /// Continues a listing from the previous page's
     /// [`ListObjectsV2Output::next_continuation_token`].
     pub continuation_token: Option<String>,
-    /// Starts after this key. Ignored with a continuation token.
+    /// Lists only entries, keys and common prefixes alike, that sort after
+    /// this string. A common prefix at or before it is left out even if
+    /// keys under it sort after it. Ignored with a continuation token.
     pub start_after: Option<String>,
 }
 
@@ -520,7 +524,8 @@ pub struct ListParts {
     /// Lists parts after this part number.
     pub part_number_marker: Option<u32>,
     /// The most parts to return, at most [`MAX_LIST_PARTS`] (larger values
-    /// are treated as that).
+    /// are treated as that). Zero returns an empty page that is not
+    /// truncated, like `ListObjectsV2`'s `max_keys`.
     pub max_parts: u32,
 }
 

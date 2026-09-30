@@ -410,6 +410,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "md-5",
+ "proptest",
  "rand",
  "skys3-io",
  "skys3-remote",

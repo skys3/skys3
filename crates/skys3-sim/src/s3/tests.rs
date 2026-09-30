@@ -1317,6 +1317,49 @@ async fn listing_limits() {
 }
 
 #[tokio::test]
+async fn start_after_inside_a_common_prefix_leaves_the_prefix_out() {
+    let store = store();
+    populate(&store, &["a", "b/1", "b/3", "c"]).await;
+    let request = ListObjectsV2::new("")
+        .with_delimiter("/")
+        .with_start_after("b/2");
+    let output = store.list_objects_v2(request.clone()).await.unwrap();
+    // "b/" sorts before "b/2", so S3 leaves it out although "b/3" follows.
+    let keys: Vec<_> = output.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["c"]);
+    assert!(output.common_prefixes.is_empty());
+    // A start before the prefix keeps it.
+    let output = store
+        .list_objects_v2(request.with_start_after("b"))
+        .await
+        .unwrap();
+    assert_eq!(output.common_prefixes, ["b/"]);
+}
+
+#[tokio::test]
+async fn a_common_prefix_is_never_returned_on_two_pages() {
+    let store = store();
+    populate(&store, &["a/1", "a/2", "b/1", "b/2", "c"]).await;
+    let request = ListObjectsV2::new("").with_delimiter("/");
+    let (keys, prefixes, pages) = list_all(&store, request, 1).await;
+    assert_eq!(keys, ["c"]);
+    assert_eq!(prefixes, ["a/", "b/"]);
+    assert_eq!(pages, 3);
+}
+
+#[tokio::test]
+async fn list_parts_with_no_room_is_an_empty_final_page() {
+    let store = store();
+    let (upload_id, _) = upload(&store, "k", &["a", "b"]).await;
+    let request = ListParts {
+        max_parts: 0,
+        ..ListParts::new("k", upload_id)
+    };
+    let output = store.list_parts(request).await.unwrap();
+    assert_eq!(output, ListPartsOutput::default());
+}
+
+#[tokio::test]
 async fn listing_caps_pages_at_1000_keys() {
     let store = store();
     for i in 0..1001 {

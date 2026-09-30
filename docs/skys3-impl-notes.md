@@ -164,6 +164,18 @@ None.
 - **Nothing to fuzz.** Ranges are the typed `ByteRange`, and continuation
   tokens are keys into a table of issued tokens, so the simulator parses no
   strings. `ByteRange::resolve` has a proptest against a byte-by-byte model.
+- **Listing edge cases the first version got wrong.** Review found two:
+  a `ListParts` page with `max_parts = 0` was marked truncated without a
+  marker, so a paginator looped forever, and a common prefix at or before
+  `StartAfter` was returned when keys under it sorted after it (keys `b/1`,
+  `b/3`, `StartAfter = b/2` returned `b/`, which S3 leaves out). Listing now
+  compares each entry, key or common prefix, with the page's start position
+  and the last entry returned, and a limit of zero returns an empty page
+  that is not truncated for both operations, as S3 does for `max-keys=0`.
+  Property tests page through both listings with page sizes from 0 up and
+  compare them with a reference model. The first property test did not
+  find the `StartAfter` bug in 256 cases: positions inside a common prefix
+  were too rare, so the generator now biases toward them.
 - **Simulation tests moved into a directory.** `tests/simulation.rs` became
   `tests/simulation/{main,disk,s3}.rs`, keeping the target name, so CI's
   `--test simulation` and the replay commands are unchanged.
