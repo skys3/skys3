@@ -117,7 +117,44 @@ None.
 
 ### M0-05 Simulated S3 store
 
-None.
+- **The object-store trait needed a home before its client.** The flusher
+  (M1-16), the remote client (M1-15), and the S3 control store (M2-04) must
+  share one trait that the simulator implements without either depending on
+  the other. `skys3-remote` is created now holding only the `ObjectStore`
+  trait and its request, response, metadata, and error types (plan section
+  4 updated); M1-15 adds the AWS SDK client and the probe to it. Its tests
+  that use `SimS3` must be integration tests: `skys3-sim` depends on
+  `skys3-remote`, so a unit test would see two copies of the trait.
+- **`If-Match` on a missing key is 404, not 412.** AWS answers a
+  conditional write whose `If-Match` finds no current object with `404
+  NoSuchKey`, which the §7.2 recovery rule did not cover, and a retried
+  `CompleteMultipartUpload` whose first attempt landed gets `404
+  NoSuchUpload`. Design §7.2 now treats both like a 412. The AWS
+  documentation was not reachable from the build environment, and older
+  pages for conditional deletes described `204` for a missing key, so M1-26
+  should confirm the behavior against AWS for each operation.
+- **409 has no precise AWS definition.** AWS documents
+  `ConditionalRequestConflict` only as a race with a concurrent write. The
+  simulator makes a conditional write fail with it when another write to
+  the key is applied during its request delay, so conflicts appear only with
+  delays (random ones, or a scripted `Fault::Delay` in unit tests). Design
+  §7.2 now says how the flusher handles it.
+- **Lost `CreateMultipartUpload` responses orphan uploads.** The simulation
+  scenario found that such an upload's ID never reaches the flusher, so the
+  abort path of §7.3 cannot find it. Design §7.3 now names the lifecycle
+  rule as its only backstop; a `ListMultipartUploads` scan would need a new
+  trait method, left to M1-16b or M4-02.
+- **Ignored versus rejected preconditions.** Providers without support may
+  apply the write unconditionally or answer `501 NotImplemented`. The
+  simulator models both per operation (`ConditionalSupport`), so the
+  capability probe (M1-15) can be tested against each; design §7.2 records
+  that both count as unsupported.
+- **Nothing to fuzz.** Ranges are the typed `ByteRange`, and continuation
+  tokens are keys into a table of issued tokens, so the simulator parses no
+  strings. `ByteRange::resolve` has a proptest against a byte-by-byte model.
+- **Simulation tests moved into a directory.** `tests/simulation.rs` became
+  `tests/simulation/{main,disk,s3}.rs`, keeping the target name, so CI's
+  `--test simulation` and the replay commands are unchanged.
 
 ### M0-06 Observability scaffolding
 

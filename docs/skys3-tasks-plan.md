@@ -107,7 +107,7 @@ crates/
   skys3-control/        ControlStore trait, backends, startup probe (§6.1, §6.2)
   skys3-coord/          coordinator and placement (§6.7)
   skys3-net/            intra-cluster transport: mutual TLS over TCP, prost headers
-  skys3-remote/         remote target client and capability probe
+  skys3-remote/         ObjectStore trait for S3 stores (M0-05), remote target client, capability probe
   skys3-flush/          flusher, import, fill, snapshots (§7, §8.9, §9.1)
   skys3-ec/             EcCodec, fragment store, encoder, repair (§8)
   skys3-gateway/        S3 on s3s, SigV4, routing, listing merge (§9, §11)

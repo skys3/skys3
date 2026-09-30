@@ -1,6 +1,6 @@
 [package]
 name = "skys3-sim"
-description = "SkyS3 deterministic simulation: the seeded runner, and later the simulated S3 store and cluster harness."
+description = "SkyS3 deterministic simulation: the seeded runner and the simulated S3 store, and later the cluster harness."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,10 +12,14 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytes.workspace = true
+md-5.workspace = true
 rand.workspace = true
 skys3-io.workspace = true
+skys3-remote.workspace = true
+skys3-types.workspace = true
+tokio = { workspace = true, features = ["time"] }
 turmoil.workspace = true
 
 [dev-dependencies]
-bytes.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
