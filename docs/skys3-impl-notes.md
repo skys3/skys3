@@ -43,13 +43,13 @@ of this file. A task with nothing unexpected keeps "None."
   otherwise produce a write identity that an old remote object already
   carries, and the 412 check would take that object for its own write.
   M0-03 validates `cluster_id` with `ClusterId::new`; bucket IDs are
-  validated where they are assigned and when registers are read.
+  validated where they are assigned and when registers are read. The plan's
+  M0-03 entry and section 14 row now say so.
 - **The 96-byte reservation leaves out the metadata key.** S3 counts both
   keys and values against the 2 KiB user-metadata limit, so the identity
   needs 105 bytes: `skys3-wid` plus a 96-byte value. The design (§7.2) now
   says so, and `WriteIdentity::METADATA_RESERVED_BYTES` holds the figure.
-  The plan's user-metadata item in M1 still says 96; it should use the
-  constant.
+  The plan's M1 user-metadata item said 96; it now names the constant.
 - **Coordinator lease renewals must change the ETag.** A candidate takes
   over after seeing the same lease ETag for long enough (§6.7). S3 ETags are
   content hashes, so a renewal that rewrote identical bytes would look like
@@ -58,13 +58,19 @@ of this file. A task with nothing unexpected keeps "None."
 - **Members may outnumber `replicas`.** A rebalance promotes the new member
   before removing the old one (§6.7), so `ShardConfig` validation does not
   bound the member count by `replicas`.
-- **No fuzz target for write-identity parsing.** The plan asks for a
-  `cargo-fuzz` target with every parser of untrusted input, but fuzzing
-  infrastructure arrives with M1-01. The 412 check compares the remote value
-  with the canonical text (`WriteIdentity::matches`) and never parses it,
-  so no parser sits on an untrusted path yet. `FromStr` is covered by
-  proptests for totality and canonical round trips; a caller that starts
-  parsing remote values should add a fuzz target.
+- **Fuzz targets before the fuzz CI job.** Rule 1.1 wants a `cargo-fuzz`
+  target with every parser of untrusted input; write identities read back
+  from remote metadata and quoted ETags from remote responses qualify. The
+  targets `types_write_identity` and `types_etag` live in `fuzz/`, a crate
+  with its own empty `[workspace]` table, so the stable workspace never
+  builds it and needs no `exclude`. The targets keep
+  `#![forbid(unsafe_code)]`: the `#[no_mangle]` export that `fuzz_target!`
+  generates comes from an external macro, which the lint does not report
+  (found in M0-06; the first version of this crate wrongly said otherwise).
+  Both targets build with
+  `cargo +nightly fuzz build` and ran 30 s each without findings; CI runs
+  them once M1-01 adds the fuzz smoke job. The 412 check itself still
+  compares bytes (`WriteIdentity::matches`) rather than parsing.
 
 ### M0-03 Configuration
 
