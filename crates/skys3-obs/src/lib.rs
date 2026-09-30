@@ -34,6 +34,8 @@
 //! ```
 
 pub mod admin;
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod health;
 pub mod logging;
 pub mod metrics;

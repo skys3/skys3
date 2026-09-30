@@ -47,6 +47,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::health::Health;
 use crate::metrics::{MetricsRegistry, OPENMETRICS_CONTENT_TYPE};
@@ -327,7 +328,7 @@ impl AdminState {
         method: &Method,
         headers: &HeaderMap,
     ) -> Response<Full<Bytes>> {
-        if endpoint.requires_auth() && !self.authorized(headers) {
+        if endpoint.requires_auth() && !authorized(self.token.as_ref(), headers) {
             let mut response = text(StatusCode::UNAUTHORIZED, "unauthorized\n");
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
@@ -353,18 +354,6 @@ impl AdminState {
         handler(self)
     }
 
-    /// Whether the request carries the configured bearer token. Every
-    /// request is authorized when no token is set.
-    fn authorized(&self, headers: &HeaderMap) -> bool {
-        let Some(token) = &self.token else {
-            return true;
-        };
-        headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| bearer_credentials(value.as_bytes()))
-            .is_some_and(|candidate| token.matches(candidate))
-    }
-
     fn readiness(&self) -> Response<Full<Bytes>> {
         let not_ready = self.health.not_ready();
         if not_ready.is_empty() {
@@ -386,14 +375,30 @@ impl AdminState {
     }
 }
 
-/// Returns the credentials of an `Authorization: Bearer` header value. The
-/// scheme name is case-insensitive (RFC 9110, section 11.1).
-fn bearer_credentials(value: &[u8]) -> Option<&[u8]> {
+/// Whether `headers` carry `token` as bearer credentials. Every request is
+/// authorized when no token is set.
+pub(crate) fn authorized(token: Option<&AdminToken>, headers: &HeaderMap) -> bool {
+    let Some(token) = token else {
+        return true;
+    };
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| bearer_credentials(value.as_bytes()))
+        .is_some_and(|candidate| token.matches(candidate))
+}
+
+/// Returns the credentials of an `Authorization: Bearer` header value, with
+/// surrounding ASCII whitespace removed, or `None` if the value uses
+/// another scheme or carries no credentials. The scheme name is
+/// case-insensitive and one space separates it from the credentials
+/// (RFC 9110, section 11.4).
+pub(crate) fn bearer_credentials(value: &[u8]) -> Option<&[u8]> {
     const SCHEME: &[u8] = b"bearer ";
-    if value.len() < SCHEME.len() || !value[..SCHEME.len()].eq_ignore_ascii_case(SCHEME) {
+    let (scheme, credentials) = value.split_at_checked(SCHEME.len())?;
+    if !scheme.eq_ignore_ascii_case(SCHEME) {
         return None;
     }
-    Some(value[SCHEME.len()..].trim_ascii())
+    Some(credentials.trim_ascii()).filter(|credentials| !credentials.is_empty())
 }
 
 fn text(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
@@ -417,6 +422,7 @@ fn with_content_type(
 pub struct AdminListener {
     listener: TcpListener,
     state: Arc<AdminState>,
+    drain_timeout: Duration,
 }
 
 impl AdminListener {
@@ -456,6 +462,7 @@ impl AdminListener {
                 health,
                 requests,
             }),
+            drain_timeout: SHUTDOWN_DRAIN_TIMEOUT,
         })
     }
 
@@ -470,14 +477,21 @@ impl AdminListener {
     }
 
     /// Serves connections until `shutdown` completes, then stops accepting
-    /// and gives in-flight requests a short time to finish.
+    /// and gives in-flight requests the drain deadline (5 seconds) to
+    /// finish. Connections still open at the deadline are dropped, so when
+    /// `serve` returns no connection of this listener remains.
     ///
     /// A failed `accept` is logged and retried after a pause, so running
     /// out of file descriptors does not stop the listener for good.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) {
-        let Self { listener, state } = self;
+        let Self {
+            listener,
+            state,
+            drain_timeout,
+        } = self;
         let graceful = GracefulShutdown::new();
         let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let mut connections = JoinSet::new();
         let mut builder = http1::Builder::new();
         builder
             .timer(TokioTimer::new())
@@ -485,6 +499,10 @@ impl AdminListener {
         tokio::pin!(shutdown);
 
         loop {
+            // Reap finished connections. At most one more connection is
+            // accepted per pass, so the set stays within MAX_CONNECTIONS
+            // plus one entry.
+            while connections.try_join_next().is_some() {}
             let slot = tokio::select! {
                 () = &mut shutdown => break,
                 slot = Arc::clone(&slots).acquire_owned() => {
@@ -509,21 +527,28 @@ impl AdminListener {
             });
             let connection =
                 graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
-            tokio::spawn(async move {
+            connections.spawn(async move {
+                // The slot is released when the task ends or is aborted.
+                let _slot = slot;
                 if let Err(err) = connection.await {
                     tracing::debug!(%peer, error = %err, "admin connection ended with an error");
                 }
-                drop(slot);
             });
         }
 
         drop(listener);
         tokio::select! {
             () = graceful.shutdown() => {}
-            () = tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT) => {
-                tracing::warn!("admin listener shut down with requests still in flight");
+            () = tokio::time::sleep(drain_timeout) => {
+                tracing::warn!(
+                    connections = connections.len(),
+                    "admin listener dropped connections still open at the drain deadline"
+                );
             }
         }
+        // Abort what the deadline cut off, and wait until every task,
+        // with its socket, slot, and share of the state, is gone.
+        connections.shutdown().await;
     }
 }
 
@@ -686,6 +711,9 @@ mod tests {
         assert_eq!(bearer_credentials(b"BEARER abc"), Some(&b"abc"[..]));
         assert_eq!(bearer_credentials(b"Basic abc"), None);
         assert_eq!(bearer_credentials(b"Bearer"), None);
+        assert_eq!(bearer_credentials(b"Bearer "), None);
+        assert_eq!(bearer_credentials(b"Bearer \t "), None);
+        assert_eq!(bearer_credentials(b"Bearer\tabc"), None);
     }
 
     #[test]
@@ -802,6 +830,63 @@ mod tests {
         }
     }
 
+    /// A client that stops mid-request must not keep its connection, and
+    /// with it the listener's state and a connection slot, alive after
+    /// `serve` returns.
+    #[tokio::test]
+    async fn stuck_connection_is_dropped_after_the_drain_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = AdminConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            token: None,
+        };
+        let mut listener = AdminListener::bind(config, MetricsRegistry::new(), Health::new())
+            .await
+            .unwrap();
+        listener.drain_timeout = Duration::from_millis(200);
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::clone(&listener.state);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(listener.serve(async {
+            let _ = stopped.await;
+        }));
+
+        // Headers without their final blank line: the request never ends.
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: skys3\r\n")
+            .await
+            .unwrap();
+        // Wait until the server has accepted the connection: the listener,
+        // the connection's service, and this test then hold the state.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&state) < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the server accepts the connection");
+        // Let hyper read the partial head, so the connection is mid-request.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), serving)
+            .await
+            .expect("serve returns after the drain deadline")
+            .unwrap();
+        assert_eq!(
+            Arc::strong_count(&state),
+            1,
+            "the connection task was dropped"
+        );
+        let mut buf = [0; 64];
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf))
+            .await
+            .expect("the server closed the connection");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    }
+
     #[test]
     fn bind_error_messages() {
         let err = AdminError::Bind {
@@ -813,5 +898,70 @@ mod tests {
                 .starts_with("cannot bind the admin listener to 127.0.0.1:7490")
         );
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Header whitespace: space and horizontal tab.
+        fn whitespace() -> impl Strategy<Value = String> {
+            proptest::string::string_regex("[ \t]{0,4}").unwrap()
+        }
+
+        /// "Bearer" in an arbitrary mix of upper and lower case.
+        fn scheme() -> impl Strategy<Value = String> {
+            proptest::collection::vec(any::<bool>(), 6).prop_map(|upper| {
+                "bearer"
+                    .chars()
+                    .zip(upper)
+                    .map(|(c, up)| if up { c.to_ascii_uppercase() } else { c })
+                    .collect()
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn parsing_arbitrary_bytes_keeps_its_invariants(value in any::<Vec<u8>>()) {
+                if let Some(credentials) = bearer_credentials(&value) {
+                    prop_assert!(value[..7].eq_ignore_ascii_case(b"bearer "));
+                    prop_assert!(!credentials.is_empty());
+                    prop_assert_eq!(credentials, credentials.trim_ascii());
+                    // The credentials are a slice of the value, after the scheme.
+                    let offset = credentials.as_ptr() as usize - value.as_ptr() as usize;
+                    prop_assert!(offset >= 7 && offset + credentials.len() <= value.len());
+                }
+            }
+
+            #[test]
+            fn well_formed_values_round_trip(
+                scheme in scheme(),
+                leading in whitespace(),
+                token in "[!-~]{1,128}",
+                trailing in whitespace(),
+            ) {
+                let value = format!("{scheme} {leading}{token}{trailing}");
+                prop_assert_eq!(bearer_credentials(value.as_bytes()), Some(token.as_bytes()));
+            }
+
+            #[test]
+            fn only_the_exact_token_is_authorized(
+                scheme in scheme(),
+                candidate in "[!-~]{0,40}",
+            ) {
+                let token = AdminToken::new(TOKEN).unwrap();
+                let mut headers = HeaderMap::new();
+                let value = format!("{scheme} {candidate}");
+                headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&value).unwrap());
+                prop_assert_eq!(authorized(Some(&token), &headers), candidate == TOKEN);
+                headers.insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_str(&format!("{scheme} {TOKEN}")).unwrap(),
+                );
+                prop_assert!(authorized(Some(&token), &headers));
+                prop_assert!(authorized(None, &HeaderMap::new()));
+            }
+        }
     }
 }

@@ -77,3 +77,32 @@ None.
   `AdminConfig::validate` holds the non-loopback-needs-a-token rule for
   configuration validation to call, and `AdminToken::from_file` loads the
   token file.
+- **Detached connection tasks outlived shutdown.** The first version
+  spawned each admin connection with `tokio::spawn` and kept no handle, so
+  a client stalled mid-request kept its socket, connection slot, and the
+  listener's state alive after `serve` returned at the drain deadline.
+  Connections now live in a `JoinSet`, which is reaped as the listener
+  accepts and aborted and awaited at the deadline. A test holds a
+  connection open with half-sent headers and checks it is gone when
+  `serve` returns.
+- **The bearer-token parser needed a fuzz target.** Plan rule 1.1 covers
+  tokens, so the `Authorization: Bearer` parser has proptests and the
+  `obs_bearer` cargo-fuzz target in `fuzz/`, the crate layout shared with
+  M0-02. The parser is private, so the target reaches it through
+  `skys3_obs::fuzzing`, a `#[doc(hidden)]` module that is not a stable API.
+  `cargo +nightly fuzz run obs_bearer -- -max_total_time=30` ran about 9
+  million inputs without a failure. No CI job runs it yet; M1-01 wires the
+  fuzz smoke runs in (plan section 5).
+- **`forbid(unsafe_code)` does work in a fuzz target.** The shared
+  `fuzz/Cargo.toml` header says the fuzz crate cannot forbid unsafe code
+  because `fuzz_target!` expands to a `#[no_mangle]` export. With
+  `libfuzzer-sys` 0.4.13, the lint does not report code expanded from an
+  external macro, so `obs_bearer.rs` builds with `#![forbid(unsafe_code)]`,
+  and a deliberate `unsafe {}` in it is still rejected. The header is kept
+  word for word so the two branches merge cleanly; it should be corrected
+  once both have merged.
+- **The fuzz crate is outside `cargo deny`.** `cargo deny check` runs on the
+  main workspace, and the fuzz crate has its own workspace and lock file
+  (`fuzz/Cargo.lock`, committed). Its dependencies never reach the shipped
+  binary. `libfuzzer-sys` bundles libFuzzer under the NCSA license, which is
+  not on the allowlist.

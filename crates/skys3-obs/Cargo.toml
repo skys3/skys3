@@ -23,4 +23,5 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "fmt", "json", "std", "tracing-log"] }
 
 [dev-dependencies]
+proptest.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
