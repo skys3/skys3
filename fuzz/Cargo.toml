@@ -34,3 +34,10 @@ path = "fuzz_targets/types_etag.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "types_node_address"
+path = "fuzz_targets/types_node_address.rs"
+test = false
+doc = false
+bench = false

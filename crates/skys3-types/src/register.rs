@@ -29,8 +29,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BucketId, BucketName, ClusterId, Epoch, Generation, Label, NodeId, ProposalId, ShardCount,
-    ShardId,
+    BucketId, BucketName, ClusterId, Epoch, Generation, Label, NodeAddress, NodeId, ProposalId,
+    ShardCount, ShardId,
 };
 
 /// A control-store register document.
@@ -148,9 +148,6 @@ pub enum InvalidRegister {
     /// A remote target field is empty or malformed.
     #[error("target {0} is empty or contains whitespace or control characters")]
     InvalidTarget(&'static str),
-    /// A node address is empty, too long, or malformed.
-    #[error("node address {0:?} must be 1 to 255 bytes of visible ASCII")]
-    InvalidAddress(String),
     /// A disk ID is listed twice in a node registration.
     #[error("disk {0} is listed twice")]
     DuplicateDisk(Label),
@@ -315,7 +312,7 @@ pub struct NodeRegistration {
     /// The node's ID.
     pub node_id: NodeId,
     /// The `host:port` other nodes reach it at.
-    pub address: String,
+    pub address: NodeAddress,
     /// The node's zone label, if it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<Label>,
@@ -328,11 +325,6 @@ pub struct NodeRegistration {
     pub proposal_id: ProposalId,
 }
 
-impl NodeRegistration {
-    /// The longest address accepted, in bytes.
-    pub const MAX_ADDRESS_LEN: usize = 255;
-}
-
 impl RegisterDocument for NodeRegistration {
     const KIND: &'static str = "node registration";
 
@@ -341,12 +333,6 @@ impl RegisterDocument for NodeRegistration {
     }
 
     fn validate(&self) -> Result<(), InvalidRegister> {
-        let address_ok = !self.address.is_empty()
-            && self.address.len() <= Self::MAX_ADDRESS_LEN
-            && self.address.bytes().all(|b| b.is_ascii_graphic());
-        if !address_ok {
-            return Err(InvalidRegister::InvalidAddress(self.address.clone()));
-        }
         let mut seen = BTreeSet::new();
         for disk in &self.disks {
             if !seen.insert(&disk.disk_id) {

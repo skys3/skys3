@@ -261,17 +261,26 @@ fn node_registration_round_trips() {
 
 #[test]
 fn node_registration_checks_address_and_disks() {
-    let registration = NodeRegistration::from_json(NODE_EXAMPLE.as_bytes()).unwrap();
     for address in [
-        String::new(),
-        "a b:1".to_owned(),
-        "é:1".to_owned(),
-        "a".repeat(256),
+        "",
+        "not-an-address",
+        "a b:1",
+        "é:1",
+        "10.0.3.17:0",
+        "::1:7400",
     ] {
-        let mut bad = registration.clone();
-        bad.address.clone_from(&address);
-        assert_eq!(invalid(&bad), InvalidRegister::InvalidAddress(address));
+        let json = NODE_EXAMPLE.replace("10.0.3.17:7400", address);
+        let err = NodeRegistration::from_json(json.as_bytes()).unwrap_err();
+        assert!(
+            matches!(err, RegisterError::Json { .. }),
+            "{address:?}: {err}"
+        );
+        assert!(err.to_string().contains("node address"), "{err}");
     }
+    let json = NODE_EXAMPLE.replace("10.0.3.17:7400", "[fd00::17]:7400");
+    let registration = NodeRegistration::from_json(json.as_bytes()).unwrap();
+    assert_eq!(registration.address.to_string(), "[fd00::17]:7400");
+
     let mut bad = registration;
     bad.disks.push(DiskInfo {
         disk_id: "nvme0".parse().unwrap(),
