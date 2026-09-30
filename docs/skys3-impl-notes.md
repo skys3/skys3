@@ -108,6 +108,18 @@ None.
   handle's length separately, so a second `open` of a file did not see
   appends made through the first. `RealDisk` now keeps a registry of open
   files by name and returns the same open file to every `open`.
+- **Races in the open-file registry.** Review found that the registry's
+  first version raced: between `remove`'s unlink and its registry update, a
+  concurrent `create` of the same name could register the new file, whose
+  entry `remove` then deleted, so a later `open` made a second open file with
+  its own length and appends could overlap. A stress test reproduced it
+  reliably. `create`, `open`, and `remove` now hold one async lock per disk
+  across the system call and the registry update. `open` always opens the
+  file system's file and shares a registered file only if its device and
+  inode match, so a stale entry is never reused for a replaced file.
+  Entries are weak, so closing the last handle closes the file. `SimDisk`
+  already had these semantics: its operations run under one lock without
+  awaiting.
 - **Finding the replay command.** Cargo sets `CARGO_PKG_NAME` for test
   processes, the test binary is named `<target>-<hash>`, and the test harness
   names each test's thread after the test, including with
