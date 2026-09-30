@@ -1,0 +1,27 @@
+[package]
+name = "skys3-obs"
+description = "SkyS3 observability: tracing setup, the metrics registry, and the admin HTTP listener."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["http1", "server", "server-graceful", "tokio"] }
+prometheus-client.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["ansi", "env-filter", "fmt", "json", "std", "tracing-log"] }
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["io-util"] }

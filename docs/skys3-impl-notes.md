@@ -231,4 +231,60 @@ of this file. A task with nothing unexpected keeps "None."
 
 ### M0-06 Observability scaffolding
 
-None.
+- **No crate for observability in the layout.** Plan section 4 had no home
+  for `tracing` setup, metrics, and the admin listener, and none of the
+  planned crates fits: the binary crate would make every library depend on
+  it to register metrics. A small `skys3-obs` crate is added to the layout.
+- **`syn` 2 and `syn` 3 in one build.** `tokio-macros` and
+  `prometheus-client`'s derive macro have moved to `syn` 3, while
+  `tracing-attributes` (the `#[instrument]` macro, on by default in
+  `tracing`) is still on `syn` 2, which `multiple-versions = "deny"`
+  rejects. The workspace pins `tracing` with `default-features = false,
+  features = ["std"]`, so `#[instrument]` is unavailable. A later PR that
+  wants it, or that pulls in another `syn` 2 user, adds a `skip` entry for
+  `syn` to `deny.toml`.
+- **A per-node registry instead of the `metrics` facade.** The `metrics`
+  crate records into one process-global recorder, which would merge the
+  metrics of the several nodes the simulation harness runs in one process.
+  `prometheus-client` registries are plain values, so each node owns one.
+  Its text output is OpenMetrics rather than the classic Prometheus format;
+  Prometheus scrapes both.
+- **Admin authentication without TLS.** The admin listener authenticates
+  with a bearer token on non-loopback addresses (design section 12), but
+  it serves plain HTTP until `rustls` arrives with the intra-cluster
+  transport (M2-02), which should add admin TLS and client certificates.
+- **Configuration keys for M0-03.** The listener takes plain structs
+  (`AdminConfig`, `LogConfig`) until the configuration crate exists. The
+  keys are in the design's section 14 example: `[admin] listen`,
+  `[admin] token_file`, `[logging] filter`, and `[logging] format`.
+  `AdminConfig::validate` holds the non-loopback-needs-a-token rule for
+  configuration validation to call, and `AdminToken::from_file` loads the
+  token file.
+- **Detached connection tasks outlived shutdown.** The first version
+  spawned each admin connection with `tokio::spawn` and kept no handle, so
+  a client stalled mid-request kept its socket, connection slot, and the
+  listener's state alive after `serve` returned at the drain deadline.
+  Connections now live in a `JoinSet`, which is reaped as the listener
+  accepts and aborted and awaited at the deadline. A test holds a
+  connection open with half-sent headers and checks it is gone when
+  `serve` returns.
+- **The bearer-token parser needed a fuzz target.** Plan rule 1.1 covers
+  tokens, so the `Authorization: Bearer` parser has proptests and the
+  `obs_bearer` cargo-fuzz target in `fuzz/`, the crate layout shared with
+  M0-02. The parser is private, so the target reaches it through
+  `skys3_obs::fuzzing`, a `#[doc(hidden)]` module that is not a stable API.
+  `cargo +nightly fuzz run obs_bearer -- -max_total_time=30` ran about 9
+  million inputs without a failure. No CI job runs it yet; M1-01 wires the
+  fuzz smoke runs in (plan section 5).
+- **`forbid(unsafe_code)` does work in a fuzz target.** The fuzz crate
+  was first set up on the assumption that it could not forbid unsafe code,
+  because `fuzz_target!` expands to a `#[no_mangle]` export. With
+  `libfuzzer-sys` 0.4.13 the lint does not report code expanded from an
+  external macro, so every target builds with `#![forbid(unsafe_code)]`,
+  and a deliberate `unsafe {}` in one is still rejected. The
+  `fuzz/Cargo.toml` header says so.
+- **The fuzz crate is outside `cargo deny`.** `cargo deny check` runs on the
+  main workspace, and the fuzz crate has its own workspace and lock file
+  (`fuzz/Cargo.lock`, committed). Its dependencies never reach the shipped
+  binary. `libfuzzer-sys` bundles libFuzzer under the NCSA license, which is
+  not on the allowlist.
