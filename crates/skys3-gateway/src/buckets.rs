@@ -31,7 +31,7 @@
 //! deletion, and answers `204` (design §4.1).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::rngs::SmallRng;
@@ -47,6 +47,7 @@ use skys3_io::BlockingPool;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
 use crate::authz::Permissions;
+use crate::fill::Fills;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
@@ -89,6 +90,9 @@ pub struct GatewayConfig {
     /// hashed on the request's task, which only tests should do; the node
     /// sets one.
     pub hashing_pool: Option<BlockingPool>,
+    /// Read-through fill of evicted versions of `write_back` buckets
+    /// (§9.2). Without it, a GET of one answers `503`; the node sets it.
+    pub fills: Option<Arc<dyn Fills>>,
     /// The keys that sign and verify ListObjectsV2 continuation tokens
     /// (§9.4). [`GatewayConfig::new`] generates a key, so tokens are valid
     /// on this gateway until it restarts.
@@ -111,6 +115,7 @@ impl GatewayConfig {
             inline_max_bytes: config.storage().inline_max_bytes,
             extent_bytes: config.storage().extent_bytes,
             hashing_pool: None,
+            fills: None,
             list_token_keys: ListTokenKeys::generate(),
         }
     }

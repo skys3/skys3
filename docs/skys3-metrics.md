@@ -14,6 +14,7 @@ exports yet is listed as planned, with the PR that owns it.
   - [3.1 Process, node, and admin listener](#31-process-node-and-admin-listener)
   - [3.2 Flush and loss exposure](#32-flush-and-loss-exposure)
   - [3.3 Replication](#33-replication)
+  - [3.4 Read-through fill](#34-read-through-fill)
 
 ## 1. Scraping
 
@@ -95,8 +96,7 @@ under `ack_policy = "local"`.
 
 The `bucket` label is the bucket's name. A node exports the gauges for every
 `write_back` bucket it knows, counting the shards open on it, and the counters
-once the bucket's target passed its capability probe. A bucket's gauges
-disappear when it is deleted.
+once it follows the bucket. A bucket's gauges disappear when it is deleted.
 
 ### 3.3 Replication
 
@@ -106,3 +106,15 @@ Design section 6.4. These report data with fewer than `replicas` copies.
 |---|---|---|---|---|
 | `skys3_under_replicated_bytes` | gauge | decided in M2-11 | planned (M2-11) | Bytes held by fewer than `replicas` copies (`under_replicated_bytes`). |
 | `skys3_oldest_under_replicated_age_seconds` | gauge | decided in M2-11 | planned (M2-11) | Age of the oldest under-replicated data (`oldest_under_replicated_age`). |
+
+### 3.4 Read-through fill
+
+Design section 9.2. A fill reads an evicted version from a `write_back`
+bucket's remote target into the clean cache.
+
+| Name | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `skys3_fills_total` | counter | `bucket` | exported (M1-20) | Evicted versions filled from the remote target and made clean cache. A fill whose version a write replaced meanwhile serves its reads but is not counted. |
+| `skys3_fill_conflicts_total` | counter | `bucket` | exported (M1-20) | Fills that found the remote changed out of band: their precondition failed, or the object or version was gone. Counted whether the remote's version was adopted, a local write came first and the `ADOPT` was dropped, or the remote object was deleted and nothing could be adopted. |
+
+The `bucket` label is the bucket's name, as for the flush metrics.

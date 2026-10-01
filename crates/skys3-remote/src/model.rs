@@ -638,6 +638,9 @@ pub struct ObjectInfo {
     pub metadata: UserMetadata,
     /// Content type.
     pub content_type: Option<String>,
+    /// `Last-Modified`, in milliseconds since the Unix epoch, if the store
+    /// returned it.
+    pub last_modified_ms: Option<u64>,
 }
 
 /// The result of a write that creates an object: `PutObject`, `CopyObject`,

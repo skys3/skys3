@@ -74,6 +74,13 @@ fn version(value: Option<&str>) -> Option<VersionId> {
     value.map(|id| VersionId(id.to_owned()))
 }
 
+/// `Last-Modified` in milliseconds since the Unix epoch, if it is after it.
+fn last_modified(value: Option<&DateTime>) -> Option<u64> {
+    value
+        .and_then(|time| time.to_millis().ok())
+        .and_then(|ms| u64::try_from(ms).ok())
+}
+
 fn size(operation: &str, value: Option<i64>) -> S3Result<u64> {
     let value = value.ok_or_else(|| malformed(operation, "no size"))?;
     u64::try_from(value).map_err(|_| malformed(operation, format!("negative size {value}")))
@@ -192,6 +199,7 @@ impl ObjectStore for AwsS3 {
             version_id: version(output.version_id()),
             metadata: user_metadata(output.metadata()),
             content_type: output.content_type().map(str::to_owned),
+            last_modified_ms: last_modified(output.last_modified()),
         };
         let body = output.body.collect().await.map_err(|error| {
             S3Error::new(
@@ -228,6 +236,7 @@ impl ObjectStore for AwsS3 {
             version_id: version(output.version_id()),
             metadata: user_metadata(output.metadata()),
             content_type: output.content_type().map(str::to_owned),
+            last_modified_ms: last_modified(output.last_modified()),
         })
     }
 

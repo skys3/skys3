@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Write-back flush: sending each `write_back` bucket's committed writes to
-//! its remote target (§7.1, §7.2, §7.4).
+//! its remote target (§7.1, §7.2, §7.4), and reading evicted versions back
+//! from it (§9.2).
 //!
 //! Section numbers (§) refer to the [SkyS3 design](https://github.com/skys3/skys3/blob/main/docs/skys3-design.md).
 //!
@@ -30,10 +31,16 @@
 //! - [`Target`]: what the flushers of one target share: the store, the
 //!   probe's findings, the in-flight byte budget, the settings
 //!   ([`FlushSettings`]), and the remote uploads left to abort.
+//! - [`Filler`]: read-through fill (§9.2). It reads an evicted version from
+//!   the target with `If-Match` and `versionId`, commits it as extents that
+//!   become clean cache, serves ranges while it streams, coalesces
+//!   concurrent reads of one version, and commits `ADOPT` when the remote
+//!   changed out of band.
 //! - [`FlushService`]: every flusher of a node, following its buckets and
-//!   open shards, with each target's capability probe.
+//!   open shards, with each target's capability probe, and each bucket's
+//!   [`Filler`].
 //! - [`FlushMetrics`]: `dirty_bytes`, `oldest_dirty_age`,
-//!   `flush_lag_seconds`, and conflict counts, by bucket.
+//!   `flush_lag_seconds`, conflict counts, and fill counts, by bucket.
 //!
 //! Streaming multipart flush (M4-02) opens the remote upload while the
 //! client uploads; adaptive concurrency (M4-10) replaces the fixed
@@ -49,6 +56,7 @@
 //! ```
 
 mod attempt;
+mod fill;
 mod metrics;
 mod multipart;
 mod service;
@@ -56,6 +64,7 @@ mod shard;
 mod target;
 
 pub use attempt::Conflict;
+pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
 pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};

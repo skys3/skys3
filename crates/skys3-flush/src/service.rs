@@ -14,6 +14,7 @@ use skys3_shard::{Shard, ShardSet};
 use skys3_types::{BucketDocument, BucketId, BucketMode, ClusterId, RemoteTarget, ShardId};
 use tokio::task::JoinHandle;
 
+use crate::fill::Filler;
 use crate::metrics::{FlushMetrics, Gauges};
 use crate::shard::{ShardFlusher, ShardStatus};
 use crate::target::{FlushSettings, Target};
@@ -76,7 +77,8 @@ impl BucketStatus {
 /// probes which preconditions the target honors (§7.2), retrying until the
 /// probe succeeds, and then runs a [`ShardFlusher`] for each of the
 /// bucket's shards open on the node. Flushers of buckets and shards that
-/// are gone are stopped.
+/// are gone are stopped. Each bucket's [`Filler`] reads evicted versions
+/// from the same target (§9.2); it needs no probe.
 ///
 /// Only the `hold` conflict policy exists so far (§7.2); `overwrite` and
 /// `discard_local` arrive with plan M4.
@@ -109,6 +111,7 @@ struct BucketFlusher<S> {
     probe_task: JoinHandle<()>,
     target: Option<Arc<Target<S>>>,
     shards: BTreeMap<ShardId, ShardFlusher>,
+    filler: Filler<S>,
 }
 
 impl<S> Drop for BucketFlusher<S> {
@@ -187,6 +190,13 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         let prefix = target.prefix.clone().unwrap_or_default();
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
         let writes = Arc::new(Mutex::default());
+        let filler = Filler::new(
+            Arc::clone(&store),
+            prefix.clone(),
+            self.settings.clone(),
+            self.metrics.counters(bucket.name.as_str()),
+            Arc::clone(&self.wall),
+        );
         let probe_task = tokio::spawn(run_probe(
             Arc::clone(&store),
             ConditionalProbe::with_fresh_nonce(&prefix),
@@ -203,6 +213,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             probe_task,
             target: None,
             shards: BTreeMap::new(),
+            filler,
         }
     }
 
@@ -258,6 +269,15 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .as_ref()
                 .map_or(0, |target| target.orphaned_uploads() as u64),
         })
+    }
+
+    /// The read-through fills of `bucket`'s target, if the bucket is a
+    /// `write_back` bucket this node follows.
+    #[must_use]
+    pub fn filler(&self, bucket: &BucketId) -> Option<Filler<S>> {
+        self.lock()
+            .get(bucket)
+            .map(|flusher| flusher.filler.clone())
     }
 
     /// Sets the flush gauges of every bucket flushed here.

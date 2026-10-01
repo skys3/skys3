@@ -14,8 +14,8 @@ use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    CredentialError, Gateway, GatewayConfig, GatewayListener, IdSource, LocalShards, ShardRef,
-    Shards, SigV4Authenticator, StaticCredentials, StsService,
+    CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig, GatewayListener, IdSource,
+    LocalShards, ShardRef, Shards, SigV4Authenticator, StaticCredentials, StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
@@ -67,6 +67,47 @@ type NodeAuth = SigV4Authenticator<NodeCredentials<Sessions>>;
 type NodeGateway = Gateway<NodeAuth>;
 /// The flushers of `write_back` buckets.
 pub(crate) type NodeFlush = FlushService<AwsS3, RealDisk>;
+
+/// Read-through fill on this node (§9.2): the gateway's [`Fills`] over
+/// each `write_back` bucket's [`skys3_flush::Filler`], into the bucket's
+/// local shards.
+#[derive(Debug)]
+struct NodeFills {
+    shards: NodeShards,
+    flush: Arc<NodeFlush>,
+}
+
+impl Fills for NodeFills {
+    fn read(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: skys3_types::EpochSeq,
+        range: std::ops::Range<u64>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>> {
+        let (shard, key) = (shard.clone(), key.to_owned());
+        Box::pin(async move {
+            let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
+            let local = self
+                .shards
+                .set()
+                .get(&(&shard).into())
+                .await
+                .ok_or_else(|| unavailable("the shard is not open on this node"))?;
+            let filler = self
+                .flush
+                .filler(&shard.bucket)
+                .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
+            filler
+                .read(&local, &key, version, range)
+                .await
+                .map_err(|error| match error {
+                    skys3_flush::FillError::Changed => FillError::Changed,
+                    other => FillError::Unavailable(other.to_string()),
+                })
+        })
+    }
+}
 
 /// Why a node could not start.
 #[derive(Debug, thiserror::Error)]
@@ -811,9 +852,32 @@ impl Node {
         );
         let auth = SigV4Authenticator::new(lookup, Arc::clone(&wall))
             .with_hashing_pool(pools.hashing.clone());
+        let flush = {
+            let region = config.flush().target_region.clone();
+            let credentials = default_credentials(&region).await;
+            let connect = move |target: &skys3_types::RemoteTarget| {
+                AwsS3::builder(target, region.clone(), credentials.clone())
+                    .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
+                    .build()
+            };
+            let settings = FlushSettings {
+                extent_bytes: config.storage().extent_bytes,
+                ..FlushSettings::from_config(config.flush())
+            };
+            Arc::new(FlushService::new(
+                cluster.clone(),
+                settings,
+                Box::new(connect),
+                FlushMetrics::register(&metrics.registry),
+            ))
+        };
         let mut gateway_config = GatewayConfig::new(&config);
         gateway_config.retry = retry;
         gateway_config.hashing_pool = Some(pools.hashing.clone());
+        gateway_config.fills = Some(Arc::new(NodeFills {
+            shards: storage.shards.clone(),
+            flush: Arc::clone(&flush),
+        }));
         let ids = IdSource::from_os_rng();
         let mut gateway = Gateway::new(
             gateway_config,
@@ -826,21 +890,6 @@ impl Node {
         if let Some(sts) = &sts {
             gateway = gateway.with_sts(Arc::clone(sts) as Arc<dyn StsService>);
         }
-        let flush = {
-            let region = config.flush().target_region.clone();
-            let credentials = default_credentials(&region).await;
-            let connect = move |target: &skys3_types::RemoteTarget| {
-                AwsS3::builder(target, region.clone(), credentials.clone())
-                    .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
-                    .build()
-            };
-            Arc::new(FlushService::new(
-                cluster.clone(),
-                FlushSettings::from_config(config.flush()),
-                Box::new(connect),
-                FlushMetrics::register(&metrics.registry),
-            ))
-        };
         let shared = Arc::new(Shared {
             config,
             retry,

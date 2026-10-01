@@ -19,6 +19,9 @@
 //!   is deleted (§4.1).
 //! - [`ShardSet`]: the shards open on a node, as the gateway opens, seals,
 //!   and drops them.
+//! - [`cache`]: the node-local transitions between clean and evicted, which
+//!   no record makes: a read-through fill ([`Shard::fill`]) and eviction
+//!   ([`Shard::evict`]).
 //!
 //! Replication (M2) runs the same state machine on every member; only the
 //! commit rule changes.
@@ -47,6 +50,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod cache;
 mod error;
 mod machine;
 mod multipart;
@@ -54,6 +58,7 @@ mod pipeline;
 mod set;
 mod shard;
 
+pub use cache::CacheRefusal;
 pub use error::ShardError;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
 pub use set::ShardSet;

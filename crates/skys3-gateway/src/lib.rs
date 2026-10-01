@@ -25,7 +25,9 @@
 //!   ([`Precondition`]) checked when the shard sequences the write. A body
 //!   up to `inline_max_bytes` is stored inline in its `PUT` record, a
 //!   larger one as `EXTENT` records while it arrives, and a PUT is answered
-//!   only once its record is durable and applied. User metadata is limited
+//!   only once its record is durable and applied. A GET of an evicted
+//!   version of a `write_back` bucket reads it through a read-through fill
+//!   from the bucket's remote target ([`Fills`]). User metadata is limited
 //!   to [`MAX_USER_METADATA_BYTES`]. DeleteObjects deletes up to
 //!   [`MAX_DELETE_KEYS`] keys, each authorized on its own. CopyObject copies
 //!   the source's bytes into the destination's shard and commits a `PUT`
@@ -114,6 +116,7 @@ pub mod checksum;
 mod conditions;
 mod credentials;
 mod features;
+mod fill;
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub mod fuzzing;
@@ -132,6 +135,7 @@ pub use authz::{Permissions, Principal};
 pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER};
 pub use conditions::{ConditionFailed, Precondition};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
+pub use fill::{FillBody, FillError, Fills};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
 pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};

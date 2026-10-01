@@ -148,6 +148,7 @@ async fn put_get_and_head_round_trip() {
         version_id: None,
         metadata,
         content_type: Some("text/plain".into()),
+        last_modified_ms: None,
     };
     assert_eq!(got.info, expected);
     assert_eq!(

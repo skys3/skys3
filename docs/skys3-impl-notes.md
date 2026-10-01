@@ -1639,6 +1639,82 @@ of this file. A task with nothing unexpected keeps "None."
   its flush is retried with the provider's error. The provider tests of
   M1-26 should cover it.
 
+### M1-20 Read-through fill and ADOPT
+
+- **Nothing evicted payload yet.** Imported and adopted stubs are evicted,
+  but no clean entry could become one, and the design left open how the
+  move between clean and evicted is recorded. Both directions are now
+  node-local and made by no record (design §4.2): `Shard::fill` and
+  `Shard::evict`, through a new `Index::update_local` that commits like an
+  apply without moving the applied position. Each names the version it was
+  decided for and is refused once the entry holds another, so a write that
+  committed in between wins. `Shard::evict` is the transition only; the LRU
+  policy and its budget are M1-21's. It refuses multipart objects: an
+  evicted stub has no place for part boundaries, which `partNumber` reads
+  and a later `TAGS` flush need, so M1-21 has to add one before it evicts
+  them.
+- **Where filled bytes go.** The design says only that they become clean
+  cache. A fill commits them as `EXTENT` records of the shard, like a
+  PUT's body, so the location map, compaction, and the gateway's extent
+  streaming all apply unchanged. The cost is that fill extents take shard
+  positions and are refused while the shard is sealed (a read then answers
+  `503` until the DeleteBucket ends), and in M2 they would be replicated to
+  every member; the replication PRs should give fills a node-local path or
+  have members drop them at once, as §9.3 already has them drop clean
+  copies beyond `clean_copies`.
+- **The store reads whole bodies, and returned no `Last-Modified`.**
+  `ObjectStore::get_object` returns one `Bytes`, so a fill reads ranges of
+  at most 8 MiB (`FILL_CHUNK_BYTES`), each with the same `If-Match` and
+  `versionId`, which also bounds its memory; the fills of a target hold at
+  most `flush_max_inflight_bytes_per_target` at once, a budget beside the
+  flushers' own. Ranges are
+  served as soon as the extents covering them are applied, so a read far
+  into a large object waits for the fill to reach it. `ObjectInfo` gained
+  `last_modified_ms` for the `ADOPT` record; the AWS client fills it, and
+  `SimS3`, which keeps no times, leaves it out, so the primary's clock
+  stands in.
+- **`versionId` pins the version.** The plan's "Done when" reads as if a
+  fill always notices an out-of-band write, but with `versionId` a GET of
+  the named version succeeds after one. A versioned remote therefore keeps
+  serving the version SkyS3 knows, which matches its metadata, and adopts
+  only once that version is gone (`NoSuchVersion`, for example after a
+  lifecycle rule expired it). Design §9.2 says so; the simulation expires
+  versions on versioned seeds to reach the `ADOPT`.
+- **An out-of-band delete cannot be adopted.** `ADOPT` always makes an
+  evicted stub, and no record removes a clean entry. When the HEAD after a
+  failed fill finds no object, the conflict is counted, the read answers
+  `503`, and the stub stays until a write replaces it (design §9.2).
+  Adopting the delete as a tombstone would need a new record or a `DELETE`
+  that SkyS3 itself would then flush; neither seemed right for M1.
+- **How the gateway reaches the fill.** The gateway does not depend on
+  `skys3-flush` or `skys3-remote`, so it defines a `Fills` trait (a boxed
+  future and an `mpsc` body of `io::Result<Bytes>`), set in
+  `GatewayConfig::fills`. The node implements it over each bucket's
+  `Filler`, which `FlushService` keeps beside the bucket's flushers and
+  creates before the probe finishes (reads need none), so the flush
+  service is now built before the gateway. A GET resolves the key again
+  after `FillError::Changed`, at most three times. Because the filler's
+  counters are taken when the node starts following a bucket, the flush
+  counters' series now appear then too, not after the probe; the metrics
+  reference says so. `FlushSettings` gained `extent_bytes`, which the node
+  sets from `[storage]`.
+- **The simulation needed a deliberate race.** Random interleavings almost
+  never commit a local write while a fill that will adopt is at the
+  remote, so a mutation that applies `ADOPT` over a dirty entry passed 300
+  seeds. The scenario now also stages that race (out-of-band write, a
+  delayed fill, a local PUT while its GET is in flight) and requires the
+  key to end at the local write. With it, that mutation fails at seed 0;
+  a fill without its `If-Match` and `versionId`, and a fill that caches
+  over a changed entry, fail at seed 7. 300 seeds take about 30 seconds.
+- **Left open.** A copy whose source is evicted still answers `503`
+  (§7.2's remote `CopyObject` row would avoid reading the bytes at all). A
+  `TAGS` change of an evicted stub still cannot flush, since the flusher
+  needs the bytes: reading them from the remote under `If-Match` would
+  need its own conflict handling in the flusher. The node's `Fills` is
+  wired in the binary but, like the flusher, not exercised end to end: no
+  S3 server in the tests honors preconditions, so the `Filler` runs against
+  `SimS3`, and M1-26 runs it against real providers.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named

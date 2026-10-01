@@ -323,6 +323,7 @@ impl Bucket {
             version_id,
             metadata: object.metadata.clone(),
             content_type: object.content_type.clone(),
+            last_modified_ms: None,
         }
     }
 
