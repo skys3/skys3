@@ -117,7 +117,12 @@ impl Applier for TestApplier {
 
 /// The disk label the tests use.
 pub fn disk_label() -> Label {
-    Label::new("disk-0").unwrap()
+    disk_label_of(0)
+}
+
+/// The label of the node's disk number `n`.
+pub fn disk_label_of(n: usize) -> Label {
+    Label::new(format!("disk-{n}")).unwrap()
 }
 
 /// Shard `n` of one of two buckets.
@@ -172,12 +177,21 @@ pub async fn open_log(mount: SimMount) -> SegmentLog<SimMount> {
 
 /// Opens the index and the log on `mount`, as a node does after a restart.
 pub async fn open_node(mount: &SimMount, pool: &BlockingPool) -> Checkpointer<SimMount> {
-    let log = open_log(mount.clone()).await;
-    let index = Arc::new(Index::open_sim(mount, "index.redb", &index_config()).unwrap());
-    Checkpointer::new(index, BTreeMap::from([(disk_label(), log)]), pool.clone())
+    open_node_on(std::slice::from_ref(mount), pool).await
 }
 
-/// Returns the log of `node`'s only disk.
+/// Opens a node with a log on each of `mounts`, labelled `disk-0` on, and
+/// the index on the first.
+pub async fn open_node_on(mounts: &[SimMount], pool: &BlockingPool) -> Checkpointer<SimMount> {
+    let mut logs = BTreeMap::new();
+    for (n, mount) in mounts.iter().enumerate() {
+        logs.insert(disk_label_of(n), open_log(mount.clone()).await);
+    }
+    let index = Arc::new(Index::open_sim(&mounts[0], "index.redb", &index_config()).unwrap());
+    Checkpointer::new(index, logs, pool.clone())
+}
+
+/// Returns the log of `node`'s first disk.
 pub fn log_of<D: Disk>(node: &Checkpointer<D>) -> &SegmentLog<D> {
     node.logs().get(&disk_label()).unwrap()
 }
@@ -236,16 +250,20 @@ impl Workload {
         apply(node, &records);
     }
 
-    /// Appends one operation's records to `node`'s log, and returns them
-    /// with their locations once the log has acknowledged them.
+    /// Appends one operation's records to the logs of `node`, each to a
+    /// disk picked at random, and returns them with their locations once
+    /// the logs have acknowledged them. A node with several disks thus has
+    /// shards whose records interleave across disks.
     pub async fn append(
         &mut self,
         node: &Checkpointer<SimMount>,
     ) -> Vec<(LogRecord, RecordLocation)> {
         let n = self.rng.random_range(0..self.shards);
+        let logs: Vec<_> = node.logs().values().collect();
         let mut appended = Vec::new();
         for record in self.records(node, n) {
-            let location = log_of(node).append(&record).await.unwrap();
+            let log = logs[self.rng.random_range(0..logs.len())];
+            let location = log.append(&record).await.unwrap();
             appended.push((record, location));
         }
         appended

@@ -1,7 +1,8 @@
 //! Simulation scenarios for the index, run by CI's simulation job with a
 //! larger seed set.
 //!
-//! Each seed runs a workload over several restarts of one node. Between
+//! Each seed runs a workload over several restarts of one node with one or
+//! two disks, whose shards' records interleave across the disks. Between
 //! restarts the node appends and applies records, takes checkpoints, and
 //! changes its control-state copy, and then loses power (the simulated disk
 //! keeps only synced bytes, plus torn writes) or has its process killed
@@ -20,10 +21,11 @@ use std::sync::Arc;
 
 use rand::Rng;
 use skys3_index::{Checkpoint, Checkpointer, IndexDump};
-use skys3_io::{SimDiskFaults, SimMount};
+use skys3_io::{SimDisk, SimDiskFaults, SimMount};
 use skys3_log::SegmentId;
 use skys3_sim::{Runner, SimContext};
-use support::{TestApplier, Workload, apply, disk_label, log_of, open_node, pool, runtime};
+use skys3_types::Label;
+use support::{TestApplier, Workload, apply, open_node_on, pool, runtime};
 
 /// Torn writes on half of the crashes, for segments and for the index file.
 const TORN: SimDiskFaults = SimDiskFaults {
@@ -35,7 +37,12 @@ const TORN: SimDiskFaults = SimDiskFaults {
 /// Checks that every record in each released segment is behind
 /// `checkpoint`.
 async fn check_released(node: &Checkpointer<SimMount>, checkpoint: &Checkpoint) {
-    let log = log_of(node);
+    for log in node.logs().values() {
+        check_released_in(log, checkpoint).await;
+    }
+}
+
+async fn check_released_in(log: &skys3_log::SegmentLog<SimMount>, checkpoint: &Checkpoint) {
     for segment in log.released() {
         let mut scanner = log.scan(segment).unwrap();
         while let Some(record) = scanner.next().await.unwrap() {
@@ -55,18 +62,25 @@ async fn check_released(node: &Checkpointer<SimMount>, checkpoint: &Checkpoint) 
 async fn checkpoint(
     node: &Checkpointer<SimMount>,
     durable: &mut IndexDump,
-    released: &mut Vec<SegmentId>,
+    released: &mut Vec<(Label, SegmentId)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let checkpoint = node.checkpoint().await?;
     check_released(node, &checkpoint).await;
     *durable = node.index().read()?.dump()?;
-    *released = log_of(node).released().into_iter().collect();
+    *released = node
+        .logs()
+        .iter()
+        .flat_map(|(disk, log)| log.released().into_iter().map(|s| (disk.clone(), s)))
+        .collect();
     Ok(())
 }
 
 /// Runs one seed, and returns the index as the last restart left it.
 fn scenario(context: &mut SimContext) -> Result<IndexDump, Box<dyn std::error::Error>> {
-    let disk = context.disk_with_faults(TORN);
+    let disk_count = context.rng().random_range(1..=2);
+    let disks: Vec<SimDisk> = (0..disk_count)
+        .map(|_| context.disk_with_faults(TORN))
+        .collect();
     let mut workload = Workload::new(context.fork_seed(), 3);
     let restarts = context.rng().random_range(2..=4);
     let pool = pool();
@@ -74,10 +88,10 @@ fn scenario(context: &mut SimContext) -> Result<IndexDump, Box<dyn std::error::E
         // The index at its last durable commit, and just before the crash.
         let mut durable = IndexDump::default();
         let mut before_crash = IndexDump::default();
-        let mut released: Vec<SegmentId> = Vec::new();
+        let mut released: Vec<(Label, SegmentId)> = Vec::new();
         for _ in 0..restarts {
-            let mount = disk.mount();
-            let node = open_node(&mount, &pool).await;
+            let mounts: Vec<SimMount> = disks.iter().map(SimDisk::mount).collect();
+            let node = open_node_on(&mounts, &pool).await;
             let index = Arc::clone(node.index());
             assert_eq!(
                 index.read()?.dump()?,
@@ -93,8 +107,8 @@ fn scenario(context: &mut SimContext) -> Result<IndexDump, Box<dyn std::error::E
             );
             for segment in &released {
                 assert!(
-                    !report.scanned.contains_key(&(disk_label(), *segment)),
-                    "replay read released segment {segment}"
+                    !report.scanned.contains_key(segment),
+                    "replay read released segment {segment:?}"
                 );
             }
 
@@ -124,7 +138,9 @@ fn scenario(context: &mut SimContext) -> Result<IndexDump, Box<dyn std::error::E
             if workload.rng().random_bool(0.7) {
                 // Power loss: the handles fail from here on, so dropping the
                 // index cannot make anything durable.
-                disk.crash();
+                for disk in &disks {
+                    disk.crash();
+                }
                 drop(node);
                 drop(index);
             } else {
