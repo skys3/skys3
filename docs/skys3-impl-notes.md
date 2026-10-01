@@ -3201,3 +3201,13 @@ of this file. A task with nothing unexpected keeps "None."
   about 1,300 lines of non-test code, not counting comments. Most of it
   is the `prost` wire structs and the checked conversions to typed
   messages.
+- **Batch items could share a write identity (review).** `BATCH`
+  validation refused two items of the same key, but not two items of
+  different keys with the same write identity. Each item's `APPLIED`
+  names it only by its identity, and a destination treats a known
+  identity as a `COMMIT` replay. The second item could therefore get the
+  first one's stored result and never be applied. Validation now
+  refuses repeated identities too, on encode and decode. The proptest
+  batch generator gives each item a distinct identity. A proptest that
+  copies one item's identity onto another, and a rules test, both fail
+  without the check.
