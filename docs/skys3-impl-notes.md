@@ -454,3 +454,7 @@ of this file. A task with nothing unexpected keeps "None."
   `aws-lc-sys` with the sanitizer flags, which took about 3.5 minutes.
   `sts_jwt` ran about 4.3 million inputs in 30 s and `sts_jwks` about 1.9
   million, with no failures.
+- **`base64` 0.22 would duplicate the AWS SDK's 0.23.** `hyper-util`'s
+  client features, which the AWS SDK's HTTP client enables (M1-15), pull in
+  `base64` 0.23. Stacking M1-15 on this PR failed the duplicate-version ban,
+  so the workspace uses `base64` 0.23; its API is unchanged for our use.
