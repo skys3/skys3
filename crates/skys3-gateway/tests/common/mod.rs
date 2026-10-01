@@ -87,7 +87,7 @@ pub async fn setup_with(config: GatewayConfig) -> Setup {
     )
     .await
     .unwrap();
-    let shards = MemoryShards::new();
+    let shards = MemoryShards::new().await;
     let gateway = Gateway::new(
         config,
         store.clone(),
@@ -119,7 +119,7 @@ pub async fn gateway_with<A: Authenticator>(config: GatewayConfig, auth: A) -> G
     Gateway::new(
         config,
         memory,
-        MemoryShards::new(),
+        MemoryShards::new().await,
         IdSource::seeded(7),
         auth,
     )

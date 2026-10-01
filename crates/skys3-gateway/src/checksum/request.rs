@@ -267,12 +267,22 @@ impl ChecksumValidator {
         trailers: Option<Trailers>,
         pool: &BlockingPool,
     ) -> Result<Self, IntegrityError> {
+        Self::on(expected, trailers, Some(pool.clone()))
+    }
+
+    /// [`ChecksumValidator::new`], hashing on `pool`, or on the caller's
+    /// task without one.
+    pub(crate) fn on(
+        expected: ExpectedChecksums,
+        trailers: Option<Trailers>,
+        pool: Option<BlockingPool>,
+    ) -> Result<Self, IntegrityError> {
         if matches!(expected.checksum, Some(ExpectedChecksum::Trailer(_))) && trailers.is_none() {
             return Err(IntegrityError::NoTrailers);
         }
         let algorithms = [ChecksumAlgorithm::Md5, expected.stored_algorithm()];
         Ok(Self {
-            hasher: PooledHasher::new(algorithms, Some(pool.clone())),
+            hasher: PooledHasher::new(algorithms, pool),
             expected,
             trailers,
             length: 0,

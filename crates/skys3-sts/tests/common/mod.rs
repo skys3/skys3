@@ -24,8 +24,9 @@ use skys3_io::{ManualWallClock, WallClock};
 use skys3_sts::identity::{provider_key, role_key};
 use skys3_sts::testkit::{TestKey, jwks};
 use skys3_sts::{
-    Algorithm, IdentityCopy, MemoryFetcher, MemorySessionStore, NodeCredentials, OidcProvider,
-    OidcValidator, ProviderDocument, StsEndpoint, StsSettings, ValidatorSettings,
+    Algorithm, DocumentFetcher, FetchError, IdentityCopy, MemoryFetcher, MemorySessionStore,
+    NodeCredentials, OidcProvider, OidcValidator, ProviderDocument, StsEndpoint, StsSettings,
+    ValidatorSettings,
 };
 use skys3_types::policy::PolicyDocument;
 use skys3_types::{RegisterDocument, RoleDocument};
@@ -38,7 +39,23 @@ pub const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/deployer";
 
 pub type Store = FaultyStore<MemoryControlStore>;
 pub type Lookup = NodeCredentials<MemorySessionStore>;
-pub type Sts = StsEndpoint<MemoryFetcher, MemorySessionStore>;
+pub type Sts = StsEndpoint<GatedFetcher, MemorySessionStore>;
+
+/// The issuer's documents, served from memory through a gate that a test
+/// can close to hold fetches open, as a slow issuer would.
+pub struct GatedFetcher {
+    documents: MemoryFetcher,
+    gate: Arc<tokio::sync::RwLock<()>>,
+    waiting: Arc<tokio::sync::Notify>,
+}
+
+impl DocumentFetcher for GatedFetcher {
+    async fn fetch(&self, url: &str, max_bytes: usize) -> Result<Bytes, FetchError> {
+        self.waiting.notify_one();
+        let _open = self.gate.read().await;
+        self.documents.fetch(url, max_bytes).await
+    }
+}
 
 /// The `[identity]` settings and buckets every node in these tests uses.
 const CONFIG: &str = r#"
@@ -92,6 +109,8 @@ pub struct Node {
     pub sessions: MemorySessionStore,
     pub clock: ManualWallClock,
     pub key: TestKey,
+    pub gate: Arc<tokio::sync::RwLock<()>>,
+    pub fetching: Arc<tokio::sync::Notify>,
     pub retry: RetryPolicy,
     ids: std::sync::Mutex<ProposalIds>,
 }
@@ -129,6 +148,12 @@ impl Node {
             json!({"issuer": ISSUER, "jwks_uri": JWKS}).to_string(),
         );
         fetcher.insert(JWKS, jwks(&[&key]));
+        let (gate, fetching) = (Arc::default(), Arc::default());
+        let fetcher = GatedFetcher {
+            documents: fetcher,
+            gate: Arc::clone(&gate),
+            waiting: Arc::clone(&fetching),
+        };
         let validator =
             OidcValidator::new(fetcher, Arc::clone(&wall), ValidatorSettings::default());
         let identity = Arc::new(IdentityCopy::new(
@@ -153,7 +178,7 @@ impl Node {
         let gateway = Gateway::new(
             gateway_config,
             store.clone(),
-            MemoryShards::new(),
+            MemoryShards::new().await,
             IdSource::seeded(3),
             SigV4Authenticator::new(lookup, wall),
         )
@@ -168,6 +193,8 @@ impl Node {
             sessions,
             clock,
             key,
+            gate,
+            fetching,
             retry,
             ids: std::sync::Mutex::new(ids),
         };

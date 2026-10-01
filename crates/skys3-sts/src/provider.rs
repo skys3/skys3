@@ -11,6 +11,7 @@ use skys3_types::{InvalidRegister, ProposalId, RegisterDocument};
 use thiserror::Error;
 
 use crate::jwt::Algorithm;
+use crate::validator::VerifiedToken;
 
 /// The path OIDC Discovery appends to an issuer.
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
@@ -73,6 +74,21 @@ impl OidcProvider {
             authorized_parties: Vec::new(),
             algorithms: default_algorithms(),
         }
+    }
+
+    /// Whether this provider, as it is now, accepts a token another version
+    /// of it validated: the same issuer, an accepted audience and
+    /// algorithm, and an accepted authorized party if it lists any. Claims,
+    /// lifetimes, and signatures do not depend on the provider record.
+    pub fn accepts(&self, token: &VerifiedToken) -> bool {
+        self.issuer == token.issuer
+            && self.audiences.contains(&token.audience)
+            && self.algorithms.contains(&token.algorithm)
+            && (self.authorized_parties.is_empty()
+                || token
+                    .authorized_party
+                    .as_ref()
+                    .is_some_and(|azp| self.authorized_parties.contains(azp)))
     }
 
     /// Returns the OIDC Discovery URL (OpenID Connect Discovery 1.0 §4).
@@ -248,6 +264,36 @@ mod tests {
             error.to_string(),
             "issuer \"https://idp.example\" must accept at least one algorithm"
         );
+    }
+
+    #[test]
+    fn accepts_tokens_it_would_validate() {
+        let token = VerifiedToken {
+            issuer: "https://i".into(),
+            subject: "s".into(),
+            audience: "a".into(),
+            authorized_party: Some("p".into()),
+            expires_at: std::time::Duration::ZERO,
+            algorithm: Algorithm::Rs256,
+            claims: serde_json::Map::new(),
+        };
+        let provider = OidcProvider::new("https://i", ["a"]);
+        assert!(provider.accepts(&token));
+        assert!(!OidcProvider::new("https://j", ["a"]).accepts(&token));
+        assert!(!OidcProvider::new("https://i", ["b"]).accepts(&token));
+        let mut es256 = provider.clone();
+        es256.algorithms = vec![Algorithm::Es256];
+        assert!(!es256.accepts(&token));
+        let mut parties = provider.clone();
+        parties.authorized_parties = vec!["p".into()];
+        assert!(parties.accepts(&token));
+        parties.authorized_parties = vec!["q".into()];
+        assert!(!parties.accepts(&token));
+        let without_azp = VerifiedToken {
+            authorized_party: None,
+            ..token
+        };
+        assert!(!parties.accepts(&without_azp));
     }
 
     #[test]

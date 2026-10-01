@@ -3,7 +3,7 @@
 //! `s3s` parses each request into its operation's input and serializes the
 //! output or error; [`Api`] implements the operations. Operations it does
 //! not implement answer `501 NotImplemented`, the default of `s3s`'s
-//! [`S3`] trait. The operations that exist only for features SkyS3 rejects
+//! [`S3`] trait. Object operations are in `crate::objects`. The operations that exist only for features SkyS3 rejects
 //! (`crate::features`) answer here, after checking that the bucket exists,
 //! as S3 does.
 
@@ -13,17 +13,19 @@ use std::time::{Duration, UNIX_EPOCH};
 use http::HeaderMap;
 use s3s::dto::{
     Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
-    GetBucketEncryptionInput, GetBucketEncryptionOutput, GetBucketLocationInput,
-    GetBucketLocationOutput, GetBucketOwnershipControlsInput, GetBucketOwnershipControlsOutput,
-    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectLegalHoldInput,
-    GetObjectLegalHoldOutput, GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput,
+    DeleteObjectInput, DeleteObjectOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
+    GetBucketLocationInput, GetBucketLocationOutput, GetBucketOwnershipControlsInput,
+    GetBucketOwnershipControlsOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
+    GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput,
+    GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectOutput,
     GetObjectRetentionInput, GetObjectRetentionOutput, HeadBucketInput, HeadBucketOutput,
-    ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
-    ObjectOwnership, OwnershipControls, OwnershipControlsRule, PutBucketAclInput,
-    PutBucketAclOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
-    PutBucketOwnershipControlsInput, PutBucketOwnershipControlsOutput, PutBucketVersioningInput,
-    PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput, PutObjectLegalHoldInput,
-    PutObjectLegalHoldOutput, PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput,
+    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
+    ListObjectVersionsInput, ListObjectVersionsOutput, ObjectOwnership, OwnershipControls,
+    OwnershipControlsRule, PutBucketAclInput, PutBucketAclOutput, PutBucketEncryptionInput,
+    PutBucketEncryptionOutput, PutBucketOwnershipControlsInput, PutBucketOwnershipControlsOutput,
+    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
+    PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
+    PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput, PutObjectOutput,
     PutObjectRetentionInput, PutObjectRetentionOutput, Timestamp,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
@@ -35,6 +37,7 @@ use crate::features::{
     BUCKET_OWNER_ENFORCED, acls_not_supported, missing_object_lock, object_lock_not_implemented,
     ownership_not_implemented, sse_not_implemented, versioning_not_implemented,
 };
+use crate::objects::Objects;
 use crate::shard::Shards;
 
 /// The most buckets one ListBuckets page returns (the S3 limit).
@@ -43,11 +46,12 @@ const MAX_BUCKETS_PER_PAGE: usize = 10_000;
 /// The S3 operations, over the bucket records and the shards.
 pub(crate) struct Api<C, H> {
     buckets: Arc<Buckets<C, H>>,
+    objects: Objects<H>,
 }
 
 impl<C, H> Api<C, H> {
-    pub(crate) fn new(buckets: Arc<Buckets<C, H>>) -> Self {
-        Self { buckets }
+    pub(crate) fn new(buckets: Arc<Buckets<C, H>>, objects: Objects<H>) -> Self {
+        Self { buckets, objects }
     }
 }
 
@@ -160,6 +164,38 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         // SkyS3 has no regions: every bucket answers as one in us-east-1.
         self.bucket(&req.input.bucket)?;
         ok(GetBucketLocationOutput::default())
+    }
+
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.put(&bucket, req).await?)
+    }
+
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.get(&bucket, req).await?)
+    }
+
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.head(&bucket, req).await?)
+    }
+
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.delete(&bucket, req).await?)
     }
 
     async fn get_bucket_versioning(

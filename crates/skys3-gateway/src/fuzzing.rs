@@ -4,12 +4,13 @@
 //! [`Harness`] drives arbitrary bytes, as a whole request or as the XML
 //! body of a bucket or object operation, through the full request
 //! pipeline: limits, rejected features, XML bounds, `s3s` parsing, and the
-//! operations, over a fresh in-memory control store and shard stub.
+//! operations, over a fresh in-memory control store and fresh shards on a
+//! simulated disk.
 //! [`Harness::sigv4`] drives requests through SigV4 canonicalization and
 //! verification, and [`aws_chunked`] drives bodies through the chunk
 //! decoder. [`checksums`] reads checksum headers and values.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -65,10 +66,17 @@ const METHODS: [Method; 6] = [
     Method::OPTIONS,
 ];
 
+/// How many inputs share one simulated disk. Each input gets shards of
+/// its own, removed afterwards, so inputs do not see each other's objects;
+/// a new disk now and then bounds the memory the log takes.
+const INPUTS_PER_DISK: u64 = 256;
+
 /// Runs fuzz inputs through fresh gateways.
 #[derive(Debug)]
 pub struct Harness {
     runtime: tokio::runtime::Runtime,
+    /// The disk recent inputs used, and how many inputs ran.
+    shards: Mutex<(Option<MemoryShards>, u64)>,
 }
 
 impl Default for Harness {
@@ -90,7 +98,28 @@ impl Harness {
                 .enable_time()
                 .build()
                 .expect("a current-thread runtime builds"),
+            shards: Mutex::default(),
         }
+    }
+
+    /// Shards for the next input, and the input's number.
+    async fn shards(&self) -> (MemoryShards, u64) {
+        let (reused, input) = {
+            let mut state = self.shards.lock().unwrap_or_else(PoisonError::into_inner);
+            state.1 += 1;
+            let fresh = state.1.is_multiple_of(INPUTS_PER_DISK);
+            (state.0.clone().filter(|_| !fresh), state.1)
+        };
+        let shards = match reused {
+            Some(shards) => shards,
+            None => {
+                let shards = MemoryShards::new().await;
+                let mut state = self.shards.lock().unwrap_or_else(PoisonError::into_inner);
+                state.0 = Some(shards.clone());
+                shards
+            }
+        };
+        (shards, input)
     }
 
     /// Answers the request `data` encodes, and returns the response's
@@ -110,7 +139,8 @@ impl Harness {
     pub fn request(&self, data: &[u8]) -> Option<(u16, usize)> {
         let request = decode(data)?;
         self.runtime.block_on(async {
-            let gateway = gateway().await;
+            let (shards, input) = self.shards().await;
+            let gateway = gateway(shards.clone(), input).await;
             let response = gateway.handle(request).await;
             let status = response.status().as_u16();
             let mut body = response.into_body();
@@ -118,6 +148,13 @@ impl Harness {
                 .store_all_limited(MAX_RESPONSE_BYTES)
                 .await
                 .expect("responses are small and complete");
+            drop(gateway);
+            let set = shards.local().set();
+            for shard in set.shards().await {
+                set.remove(&shard)
+                    .await
+                    .expect("a simulated shard is removed");
+            }
             Some((status, bytes.len()))
         })
     }
@@ -414,9 +451,10 @@ fn decode_body(
     Ok((out, trailers))
 }
 
-/// A gateway with bucket [`BUCKET`] over fresh in-memory state.
-async fn gateway() -> Gateway<TrustAll> {
-    let config: Config = "[cluster]\ncluster_id = \"fuzz\"\n[control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]"
+/// A gateway with bucket [`BUCKET`] over a fresh control store and
+/// `shards`, whose bucket IDs come from `seed`.
+async fn gateway(shards: MemoryShards, seed: u64) -> Gateway<TrustAll> {
+    let config: Config = "[cluster]\ncluster_id = \"fuzz\"\n[control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n[buckets.defaults]\nshards_per_bucket = 1"
         .parse()
         .expect("the configuration is valid");
     let config = GatewayConfig::new(&config);
@@ -430,15 +468,9 @@ async fn gateway() -> Gateway<TrustAll> {
     )
     .await
     .expect("the memory store bootstraps");
-    let gateway = Gateway::new(
-        config,
-        store,
-        MemoryShards::new(),
-        IdSource::seeded(0),
-        TrustAll,
-    )
-    .await
-    .expect("the gateway loads");
+    let gateway = Gateway::new(config, store, shards, IdSource::seeded(seed), TrustAll)
+        .await
+        .expect("the gateway loads");
     let create = Request::put(format!("/{BUCKET}"))
         .header(MODE_HEADER, "local")
         .body(Body::empty())

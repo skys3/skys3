@@ -30,7 +30,7 @@ async fn a_local_bucket_is_created_listed_and_located() {
         setup.generation().await > before,
         "the creation was not announced"
     );
-    assert_eq!(setup.shards.open_shards(&bucket.bucket_id).len(), 8);
+    assert_eq!(setup.shards.open_shards(&bucket.bucket_id).await.len(), 8);
 
     setup
         .call(Method::HEAD, "/photos", &[], "")
@@ -141,7 +141,7 @@ async fn modes_and_targets_come_from_headers_or_configuration() {
         .assert(400, Some("InvalidArgument"));
     assert!(setup.register("other").await.is_none());
     // Refused creations opened no shards.
-    assert_eq!(setup.shards.len(), 8);
+    assert_eq!(setup.shards.len().await, 8);
 }
 
 #[tokio::test]
@@ -180,7 +180,7 @@ async fn deleting_an_empty_bucket_detaches_it() {
         .await
         .assert(204, None);
     assert!(setup.register("photos").await.is_none());
-    assert!(setup.shards.open_shards(&bucket.bucket_id).is_empty());
+    assert!(setup.shards.open_shards(&bucket.bucket_id).await.is_empty());
     assert!(
         setup.generation().await > before,
         "the deletion was not announced"
@@ -204,16 +204,18 @@ async fn a_local_bucket_with_objects_is_not_deleted() {
     let shard = setup
         .shards
         .put(&bucket, "cat.jpg", EntryState::Clean)
+        .await
         .unwrap();
     assert_eq!(shard, ShardRef::for_key(&bucket, "cat.jpg"));
     let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
     answer.assert(409, Some("BucketNotEmpty"));
     assert!(setup.register("photos").await.is_some());
     // The seals were lifted: writes go on.
-    assert_eq!(setup.shards.is_sealed(&shard), Some(false));
+    assert_eq!(setup.shards.is_sealed(&shard).await, Some(false));
     setup
         .shards
         .put(&bucket, "dog.jpg", EntryState::Dirty)
+        .await
         .unwrap();
 }
 
@@ -221,18 +223,27 @@ async fn a_local_bucket_with_objects_is_not_deleted() {
 async fn a_write_back_bucket_detaches_once_flushed() {
     let setup = setup("").await;
     let bucket = setup.create_write_back("remote").await;
-    setup.shards.put(&bucket, "a", EntryState::Dirty).unwrap();
+    setup
+        .shards
+        .put(&bucket, "a", EntryState::Dirty)
+        .await
+        .unwrap();
     setup
         .shards
         .put(&bucket, "b", EntryState::Tombstone)
+        .await
         .unwrap();
-    setup.shards.put(&bucket, "c", EntryState::Clean).unwrap();
+    setup
+        .shards
+        .put(&bucket, "c", EntryState::Clean)
+        .await
+        .unwrap();
     let answer = setup.call(Method::DELETE, "/remote", &[], "").await;
     answer.assert(409, Some("BucketNotEmpty"));
     assert!(answer.body.contains("2 changes"), "{answer:?}");
 
     // Clean entries live at the target, which detaching leaves alone.
-    setup.shards.flush(&bucket.bucket_id);
+    setup.shards.flush(&bucket.bucket_id).await;
     setup
         .call(Method::DELETE, "/remote", &[], "")
         .await
@@ -251,7 +262,7 @@ async fn writes_are_refused_while_a_detach_decides() {
         Fault::before(move || {
             let (shards, bucket) = (shards.clone(), sealed_bucket.clone());
             async move {
-                let refused = shards.put(&bucket, "late", EntryState::Dirty);
+                let refused = shards.put(&bucket, "late", EntryState::Dirty).await;
                 assert!(matches!(refused, Err(ShardError::Sealed(_))), "{refused:?}");
             }
         }),
@@ -314,14 +325,14 @@ async fn a_deletion_whose_answers_were_lost_is_finished_on_retry() {
     assert!(setup.register("photos").await.is_none());
     assert_eq!(setup.generation().await, before);
     let shard = ShardRef::for_key(&bucket, "k");
-    assert_eq!(setup.shards.is_sealed(&shard), Some(true));
+    assert_eq!(setup.shards.is_sealed(&shard).await, Some(true));
 
     // The retry finds the register gone, and finishes the detach.
     setup
         .call(Method::DELETE, "/photos", &[], "")
         .await
         .assert(204, None);
-    assert!(setup.shards.open_shards(&bucket.bucket_id).is_empty());
+    assert!(setup.shards.open_shards(&bucket.bucket_id).await.is_empty());
     assert!(
         setup.generation().await > before,
         "the deletion was never announced"
@@ -360,8 +371,8 @@ async fn a_lost_deletion_superseded_by_a_new_bucket_is_finished() {
         .call(Method::DELETE, "/photos", &[], "")
         .await
         .assert(204, None);
-    assert!(setup.shards.open_shards(&old.bucket_id).is_empty());
-    assert!(setup.shards.open_shards(&new.bucket_id).is_empty());
+    assert!(setup.shards.open_shards(&old.bucket_id).await.is_empty());
+    assert!(setup.shards.open_shards(&new.bucket_id).await.is_empty());
 }
 
 #[tokio::test]
@@ -378,7 +389,7 @@ async fn seals_of_a_lost_deletion_are_lifted_once_it_cannot_apply() {
     ]);
     let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
     answer.assert(503, Some("ServiceUnavailable"));
-    assert_eq!(setup.shards.is_sealed(&shard), Some(true));
+    assert_eq!(setup.shards.is_sealed(&shard).await, Some(true));
 
     // A retry that applies nothing keeps the earlier seal: the earlier
     // delete may still land.
@@ -390,7 +401,7 @@ async fn seals_of_a_lost_deletion_are_lifted_once_it_cannot_apply() {
     ]);
     let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
     answer.assert(503, Some("ServiceUnavailable"));
-    assert_eq!(setup.shards.is_sealed(&shard), Some(true));
+    assert_eq!(setup.shards.is_sealed(&shard).await, Some(true));
 
     // Once the register moves on, no earlier delete can apply.
     let key = TypedKey::bucket(&bucket.name);
@@ -410,8 +421,12 @@ async fn seals_of_a_lost_deletion_are_lifted_once_it_cannot_apply() {
     ]);
     let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
     answer.assert(503, Some("ServiceUnavailable"));
-    assert_eq!(setup.shards.is_sealed(&shard), Some(false));
-    setup.shards.put(&bucket, "k", EntryState::Dirty).unwrap();
+    assert_eq!(setup.shards.is_sealed(&shard).await, Some(false));
+    setup
+        .shards
+        .put(&bucket, "k", EntryState::Dirty)
+        .await
+        .unwrap();
     let refused = setup.call(Method::DELETE, "/photos", &[], "").await;
     refused.assert(409, Some("BucketNotEmpty"));
 }
@@ -426,7 +441,7 @@ async fn a_lost_delete_answer_still_detaches() {
         .await
         .assert(204, None);
     assert!(setup.register("photos").await.is_none());
-    assert!(setup.shards.open_shards(&bucket.bucket_id).is_empty());
+    assert!(setup.shards.open_shards(&bucket.bucket_id).await.is_empty());
 }
 
 #[tokio::test]
@@ -454,7 +469,7 @@ async fn a_bucket_changed_during_a_detach_is_kept() {
     answer.assert(409, Some("OperationAborted"));
     assert!(setup.register("photos").await.is_some());
     let shard = ShardRef::for_key(&bucket, "k");
-    assert_eq!(setup.shards.is_sealed(&shard), Some(false));
+    assert_eq!(setup.shards.is_sealed(&shard).await, Some(false));
 }
 
 #[tokio::test]
@@ -501,8 +516,8 @@ async fn a_lost_creation_race_removes_its_shards() {
     assert_eq!(bucket.bucket_id.as_str(), "b-theirs");
     // Only the first bucket's shards remain, and the gateway learned the
     // winner.
-    assert_eq!(setup.shards.len(), 8);
-    assert_eq!(setup.shards.open_shards(&winner.bucket_id).len(), 8);
+    assert_eq!(setup.shards.len().await, 8);
+    assert_eq!(setup.shards.open_shards(&winner.bucket_id).await.len(), 8);
     setup
         .call(Method::HEAD, "/photos", &[], "")
         .await
@@ -526,7 +541,7 @@ async fn control_store_outages_are_service_unavailable() {
     let answer = setup.create("maybe", "local", None).await;
     answer.assert(503, Some("ServiceUnavailable"));
     let landed = setup.register("maybe").await.unwrap();
-    assert_eq!(setup.shards.open_shards(&landed.bucket_id).len(), 8);
+    assert_eq!(setup.shards.open_shards(&landed.bucket_id).await.len(), 8);
     setup.gateway.reload_buckets().await.unwrap();
     setup
         .call(Method::HEAD, "/maybe", &[], "")
@@ -544,7 +559,10 @@ async fn control_store_outages_are_service_unavailable() {
     let answer = setup.call(Method::DELETE, "/kept", &[], "").await;
     answer.assert(503, Some("ServiceUnavailable"));
     assert_eq!(
-        setup.shards.is_sealed(&ShardRef::for_key(&bucket, "k")),
+        setup
+            .shards
+            .is_sealed(&ShardRef::for_key(&bucket, "k"))
+            .await,
         Some(false)
     );
 
@@ -558,7 +576,10 @@ async fn control_store_outages_are_service_unavailable() {
     let answer = setup.call(Method::DELETE, "/kept", &[], "").await;
     answer.assert(503, Some("ServiceUnavailable"));
     assert_eq!(
-        setup.shards.is_sealed(&ShardRef::for_key(&bucket, "k")),
+        setup
+            .shards
+            .is_sealed(&ShardRef::for_key(&bucket, "k"))
+            .await,
         Some(true)
     );
     // A retry resolves it.
@@ -586,7 +607,10 @@ async fn shard_outages_are_service_unavailable() {
     answer.assert(503, Some("ServiceUnavailable"));
     setup.shards.set_unavailable(false);
     assert_eq!(
-        setup.shards.is_sealed(&ShardRef::for_key(&bucket, "k")),
+        setup
+            .shards
+            .is_sealed(&ShardRef::for_key(&bucket, "k"))
+            .await,
         Some(false)
     );
     // A missing shard fails the delete and lifts the seals already taken.
@@ -597,7 +621,8 @@ async fn shard_outages_are_service_unavailable() {
     assert_eq!(
         setup
             .shards
-            .is_sealed(&ShardRef::all(&bucket).next().unwrap()),
+            .is_sealed(&ShardRef::all(&bucket).next().unwrap())
+            .await,
         Some(false)
     );
 }

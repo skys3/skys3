@@ -942,6 +942,81 @@ of this file. A task with nothing unexpected keeps "None."
   format 1 byte, ran 30 s each without failures, as did
   `gateway_checksums` again.
 
+### M1-09 Object PUT, GET, HEAD, and DELETE
+
+- **Conditional writes needed a protocol in the shard.** A precondition
+  read from the index misses writes that are sequenced but not applied,
+  and the index read is blocking I/O, which cannot run under the
+  sequencer's lock. `Shard::commit_if` keeps, per key, the position of the
+  latest record sequenced for it while it is unapplied, waits for such a
+  record before reading, registers the read, and sequences the write only
+  if no record of the key was sequenced since the read began. Records
+  stay listed while an earlier read is in progress. The first version
+  ended the read before checking for such a record, which let the list
+  forget a write the read had missed; a multi-threaded race of
+  `If-None-Match: *` creations found two winners on its first run. Design
+  §5.1 records the rule. Disabling the wait for unapplied writes fails
+  three of the new shard tests.
+- **The shard stub became real shards.** The gateway's `Shards` trait
+  gained `entry`, `payload`, `append_extent`, and `write` (with a
+  `Precondition`), and `LocalShards` serves it from `ShardSet`, mapping a
+  `BucketDocument` to a single-member `ShardConfig` in epoch 1 (the node
+  ID is the caller's; M1-13 supplies it). Rather than reimplement objects
+  in memory, `stub::MemoryShards` is now `LocalShards` over a `SimDisk`,
+  with the old helpers (`put` in a state, `flush`, `is_sealed`,
+  `set_unavailable`) built from real records, so they became `async`. The
+  bucket tests now run against the real state machine, and
+  `MemoryShards::open` replays a crashed disk, which the durability test
+  uses. The gateway's own `ShardRef` stays a separate type from the log's
+  (it carries the routing helpers), with a `From` conversion.
+- **Durability is shown by crashing the simulated disk.** Acknowledged
+  objects, inline and in extents, survive `SimDisk::crash` and a replay;
+  a PUT whose sync fails answers `503`, as does every later one on the
+  out-of-service disk.
+- **s3s answers some things differently from S3.** It refuses a `Range`
+  header it cannot parse as one range with `400`, where S3 serves the
+  whole object; the pipeline drops such a header before `s3s` sees it
+  (design §11), so no Range parser and no fuzz target were added. Its
+  HeadObject is always `200`, so the pipeline turns a ranged HEAD's answer
+  into `206`. It has no `InvalidPartNumber` code; the gateway builds one
+  with status `416`.
+- **Local tombstones.** M1-04 left tombstones of `local` buckets forever.
+  A DELETE in a local bucket is followed by a `FLUSHED` of its tombstone
+  (no remote ETag), which removes it unless a later write came first. It
+  is not awaited; a crash can leave the tombstone, which hides nothing
+  (design §4.2).
+- **The write identity is refused on input.** The design only said it is
+  stripped from responses. Accepting `x-amz-meta-skys3-wid` from a client
+  would let it forge an identity the 412 recovery rule trusts, so a PUT
+  carrying it gets `400 InvalidArgument` (design §7.2). User metadata is
+  counted as S3 does, names without the `x-amz-meta-` prefix plus values.
+- **Hashing without a pool.** `ChecksumValidator::new` requires a pool;
+  `GatewayConfig` gained an optional `hashing_pool` (and
+  `inline_max_bytes`, `extent_bytes` from `[storage]`). Without one, the
+  gateway hashes on the request's task, which only tests do; the node
+  (M1-13) must set it.
+- **A conditional PUT is checked twice.** Once before its body is read,
+  so a write bound to fail does not upload, say, 5 GiB of extents first,
+  and again when the shard sequences it, which is the check that counts.
+- **Fuzzing got slower.** `gateway_request` now reaches PutObject,
+  GetObject, and DeleteObject over real shards. A fresh simulated disk,
+  index, and pool per input cost about 1.5 ms natively, six times the
+  rest of the pipeline, so the harness shares a disk among 256 inputs,
+  gives each input fresh shards (a new bucket ID), and removes them
+  afterwards. A 60-second run executed about 13,700 inputs (about 230 per
+  second under the sanitizers) with no failure.
+- **Left open.** Tags on upload (`x-amz-tagging`) answer `501` until
+  M1-10. An entry without local bytes (an imported or evicted stub)
+  answers GET with `503` until read-through fill (M1-20). The extents of
+  a failed upload stay in bulk segments until compaction (M1-22) reclaims
+  unreferenced ones. `x-amz-storage-class` is accepted and ignored.
+- **Response header overrides.** `s3s` applies GetObject's `response-*`
+  query parameters to the response itself, but parses HeadObject's and
+  never applies them, and neither refuses them on anonymous requests. The
+  gateway applies them to both outputs and refuses them, and values that
+  are not header values, with `400 InvalidRequest` before reading the
+  object.
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
@@ -1126,6 +1201,18 @@ of this file. A task with nothing unexpected keeps "None."
   signs with the node's manual clock as the SDK's time source, so advancing
   the clock past expiry makes the SDK's identity cache refresh the session
   through the chain.
+- **Review: the identity copy was read before a wait.** The endpoint took
+  its snapshot before validating the token, which can wait seconds for an
+  issuer's discovery document and keys. A sync during the wait that removed
+  the provider or the role, or narrowed the trust policy, did not stop the
+  session, and the copy could pass `identity_max_staleness` unnoticed. The
+  endpoint now checks freshness before validation (so a stale node fetches
+  nothing) and reads the copy again after it, deciding the provider
+  (`OidcProvider::accepts`), the role, and the trust policy on that. A test
+  holds the key fetch open with a gated fetcher and changes the
+  configuration meanwhile. The session record is stored after these checks,
+  so a sync between the checks and the insert can still race; that window
+  holds no await on a remote service.
 - **Test support moved behind a feature.** The token-minting `testkit`
   was `cfg(test)`; it is now behind `skys3-sts`'s `test-util` feature so
   the integration tests can mint tokens.
