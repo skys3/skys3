@@ -68,8 +68,9 @@ pub enum Effect {
     Cleaned,
     /// A `FLUSHED` of the current version, a tombstone, removed the entry.
     Removed,
-    /// A `FLUSHED` of an older version recorded what the remote now holds,
-    /// leaving the newer version dirty.
+    /// A `FLUSHED` of an older version, or an `IMPORT` of a key written
+    /// before the import reached it, recorded what the remote holds,
+    /// leaving the entry dirty.
     RemoteRecorded,
     /// An `IMPORT` created a stub.
     Imported,
@@ -101,8 +102,9 @@ pub enum Rejection {
     /// The key's entry is a tombstone.
     #[error("the key is deleted")]
     Deleted,
-    /// An `IMPORT` found an entry: a local change, a tombstone, or an
-    /// earlier import.
+    /// An `IMPORT` found an entry other than a local change whose remote
+    /// state is unknown: an earlier import, or an entry whose remote ETag
+    /// is known.
     #[error("the key already has an entry")]
     HasEntry,
     /// An `ADOPT` found the entry no longer clean: a local write committed
@@ -417,14 +419,27 @@ fn flush(
 
 /// `IMPORT`: a stub for a remote object, only if the key has no entry at
 /// all (§9.1). Its user metadata and content type are loaded later.
+///
+/// A key written locally before the import reached it has an entry whose
+/// remote state is unknown: dirty, with no remote ETag. The `IMPORT` then
+/// records what the remote held instead, as its remote ETag, so the
+/// flush replaces that object with `If-Match` (§7.2) rather than finding
+/// it foreign. Every other entry rejects it.
 fn import_stub(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
     position: EpochSeq,
     import: &Import,
 ) -> Result<Rule, IndexError> {
-    if index.entry(shard, &import.key)?.is_some() {
-        return Ok(Err(Rejection::HasEntry));
+    if let Some(mut entry) = index.entry(shard, &import.key)? {
+        let unknown = matches!(entry.state, EntryState::Dirty | EntryState::Conflict)
+            && entry.remote_etag.is_none();
+        if !unknown {
+            return Ok(Err(Rejection::HasEntry));
+        }
+        entry.remote_etag = Some(import.etag.clone());
+        index.put_entry(shard, &import.key, &entry)?;
+        return Ok(Ok(Effect::RemoteRecorded));
     }
     let entry = Entry {
         version: position,

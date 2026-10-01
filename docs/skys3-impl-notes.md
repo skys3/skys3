@@ -1772,6 +1772,73 @@ of this file. A task with nothing unexpected keeps "None."
   warnings` failed on the budget's `fetch_update`. The fix was
   `try_update`, which MSRV 1.98.1 already has.
 
+### M1-18 Namespace import
+
+- **Writes made before the import reached their key ended in conflict.**
+  M1-16's flusher HEADed a write of unknown remote state only while the
+  import had not passed its key, deciding at flush time. A PUT committed
+  before the import reached the key but flushed after the import passed it
+  had no `remote_etag`, so it went out with `If-None-Match: *`, found the
+  object the remote already held, and was held in conflict forever. The
+  design had `IMPORT` dropped for every existing entry, so nothing ever
+  told the entry what the remote held. An `IMPORT` now records the listed
+  ETag on a dirty entry that has no `remote_etag` (design §4.2), and the
+  flusher asks whether the import passed a key before it reads the entry.
+  The new simulation scenario fails on its first seed with either change
+  undone.
+- **The import checkpoint lives in the index, not the log.** Plan M2-17
+  says a new primary resumes import checkpoints "from the log", but §10.1
+  has no record kind for them, and adding one changes the log format. A
+  restarted import turned out to be safe from any position: every
+  `IMPORT` is conditional, and the remote no longer holds what a flushed
+  delete removed. So M1 keeps one checkpoint per bucket in a new `imports`
+  table, synced after each page (index format 3), and M2-17 decides
+  whether it moves into the log.
+- **Lazily loaded metadata needed a marker, not a record kind.** An
+  `ADOPT` naming the stub's `seq` already has the right semantics (dropped
+  if a local write came first, adopts an out-of-band change). What it
+  lacked was a way to tell a loaded entry from an unloaded one without a
+  new entry field: every local write stores a checksum (the gateway
+  computes CRC64NVME since M1-08), so "no checksums and no
+  `Content-Type`" marks an unloaded stub, provided every `ADOPT` stores a
+  `Content-Type`. The lazy load stores S3's default where the remote has
+  none; M1-20's HEAD-based `ADOPT` must do the same once both are in the
+  stack, or such objects reload on every read.
+- **Tombstones waited up to 30 s after the import passed them.** The
+  flusher retried a tombstone waiting for the import after the maximum
+  backoff. It now backs off from the minimum, doubling, like any retry.
+- **A retried capability probe misjudged the target.** The flush service
+  built its probe, and so its scratch-key nonce, once and reused it for
+  every retry. A run that failed under faults could leave its scratch
+  keys behind, and the next run's `If-None-Match: *` that must hold then
+  got `412`, so `PutObject` and `CompleteMultipartUpload` were reported
+  unprotected and every flush went out unconditionally. The import
+  scenario, whose remote is faulty from the start, found it on seed 0.
+  Each run now takes a fresh nonce, and the scenario checks that the probe
+  found every precondition honored.
+- **The rate limit let single pages through at once.** Review found
+  that the import waited only after a truncated page, so the first page
+  committed at once and the last never waited: an import of one page
+  ignored `import_max_keys_per_second`, and a rate of 1 still committed
+  1,000 keys in a burst. A token bucket that starts empty and holds one
+  second's keys now admits every page before it commits, and a page asks
+  for at most a second's keys, so no stretch of `t` seconds commits more
+  than `rate * (t + 1)` keys, even after slow requests.
+- **A listing lost a common prefix the import was inside.** Review found
+  that the remote side of a delimited listing sent the import's position
+  as `StartAfter`, and S3 (and `SimS3`, since M0-05) leaves out a common
+  prefix at or before it: with the import past `a/x`, a remote-only `a/y`
+  did not list as `a/` unless a live local entry produced it. The merge
+  now adds that prefix to the remote's items and checks it like any
+  remote-only prefix. The gateway's test remote had modeled the opposite
+  S3 behavior, which hid the bug; it now matches `SimS3`.
+- **Index bytes per imported entry: 157** (§19 item 6). Measured by
+  `index_bytes_per_imported_entry` in `skys3-flush`: 20,000 stubs with
+  40-byte keys and a storage class, applied to a fresh index and made
+  durable, grow the redb file by 157 bytes each, about 16 GB per member
+  for 100 million objects. The log's `IMPORT` records come on top until
+  their segments are released.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named
