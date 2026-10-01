@@ -134,6 +134,7 @@ bench/                  performance suite (§16.3)
 | etcd integration | M2-05 | Every push and PR |
 | SDK matrix | M1-25 | PRs that touch the gateway or identity, and nightly |
 | Remote providers (AWS S3 and a second provider) | M1-26 | Nightly, with credentials held as CI secrets |
+| Control-store conformance against AWS S3 and R2 | M2-06 | Nightly, when their credentials are set as CI secrets |
 | Kill and partition tests | M2-20 | Nightly |
 | Shaped-link and performance suites | M6-09, M7-06 | On fixed hardware, before each release |
 

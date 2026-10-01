@@ -2151,3 +2151,59 @@ of this file. A task with nothing unexpected keeps "None."
   that wires it adds the TLS keys (CA, client certificate and key) to
   `[control_store]` and §14. etcd's user-and-password tokens are not
   supported; client certificates are.
+
+### M2-06 Control-store conformance suite
+
+- **Most of the suite already existed.** M1-05 started
+  `skys3_control::conformance` and M2-04 and M2-05 ran it against their
+  backends, each on one shared handle and with backend-specific extras
+  (more racing writers, the probe over separate etcd connections). This
+  PR makes it the harness the plan asks for: `Backend::connect` gives
+  each racing writer, probing node, and change stream its own handle (a
+  new etcd connection, a new S3 client), `Scale` sets writers,
+  operations, and probe runs, and `run_at` runs every check with a fresh
+  store and names each check as it starts. The extras folded into it:
+  the etcd conformance and probe tests in `tests/etcd.rs`, two probe
+  tests in `tests/probe.rs` (the AWS-like profile and faults per writer),
+  and the extra racing calls in `tests/conformance.rs`.
+- **A linearizability check without a search.** The cluster harness's
+  checker (M2-03) searches over plain registers. Control-store values
+  are unique and every successful `put_if` names the version it
+  replaced, so the successful writes form one chain, which is the only
+  order a linearization can give them; each read, write, and failed
+  precondition then has a position (a lower bound for a failure), and
+  real time must not contradict the positions. The check is a sweep over
+  logical call and return ticks. An unanswered write counts once a read
+  returns its value. Unit tests feed it forked, stale, and out-of-order
+  histories, and `tests/conformance.rs` shows the suite failing on
+  simulated stores that ignore preconditions, read stale, or list stale.
+- **Change streams had to be `'static`.** Watchers run as tasks, but
+  `ControlStore::Changes` had no `'static` bound, so a generic check
+  could not move a stream into one. Every backend's stream already owns
+  what it reads; the trait now says so.
+- **The file store refuses a second node.** The watcher check first
+  wrote one `nodes/` register per writer, which the file backend rejects
+  by design (`SecondNode`); it writes `buckets/` registers instead.
+- **No provider credentials here.** The nightly job could not be run.
+  Its plumbing was checked end to end instead against SkyS3's own
+  gateway, a local node with a file control store serving the control
+  bucket over HTTP through the AWS SDK client (MinIO's download is
+  blocked by the egress proxy): the whole suite passed at the default
+  scale in 27 seconds and the cleanup left the bucket empty. The first
+  nightly runs must confirm two open questions: whether R2 honors
+  `If-Match` on `DeleteObject` (if not, the R2 job fails, which means R2
+  is refused as a control store, design §6.1), and whether AWS answers
+  `If-Match` on a missing key with `404` or `204` (M2-04's note;
+  `conditional_deletes` expects a failed precondition).
+- **Gating on secrets.** GitHub Actions cannot test secrets in a job's
+  `if:`, so the nightly job maps each provider's `CONTROL_STORE_<P>_*`
+  secrets into the environment and its first step skips the rest, with a
+  notice, when any required one is empty. The test itself also skips
+  when `SKYS3_CONTROL_S3_ENDPOINT` or `SKYS3_CONTROL_S3_BUCKET` is unset,
+  like the etcd tests. The run is a task of its own so that the cleanup
+  runs even when a check panics.
+- **Run times.** At `Scale::LARGE` the suite takes about 29 seconds
+  against a local etcd 3.6.10 (the CI job runs it after the M2-05
+  tests), and a few seconds on the simulated stores with the paused
+  clock. The file store and the fake etcd run on real time at
+  `Scale::SMALL`.
