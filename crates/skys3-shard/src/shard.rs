@@ -280,7 +280,6 @@ impl<D: Disk> Shard<D> {
     /// its log ([`Shard::align`]).
     ///
     /// # Errors
-
     ///
     /// As [`Shard::open`], and [`ShardError::Configuration`] if `node` is
     /// not a member of `config` or `config` has learners (plan M2-14).
