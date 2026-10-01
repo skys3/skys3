@@ -479,7 +479,7 @@ async fn next<C: ChangeStream>(changes: &mut C) -> Change {
 
 /// Change streams report announced writes as the [`ChangeStream`]
 /// contract says: a snapshot first, then coalesced differences, and never
-/// `cluster.json` or `coordinator.lease`.
+/// `cluster.json`, `coordinator.lease`, or keys outside the layout.
 pub async fn changes_follow_the_generation<S: ControlStore>(store: &S) {
     let cluster = ClusterId::new("conformance").expect("valid");
     let mut ids = ProposalIds::seeded(4);
@@ -509,6 +509,7 @@ pub async fn changes_follow_the_generation<S: ControlStore>(store: &S) {
     };
     let node = put("nodes/node-1.json").await;
     put("coordinator.lease").await;
+    put("probe/0").await;
     put("buckets/b.json").await;
     let bucket = put("buckets/b.json").await;
     let generation = bump_generation(store, &cluster, &mut ProposalIds::seeded(5), &policy)
