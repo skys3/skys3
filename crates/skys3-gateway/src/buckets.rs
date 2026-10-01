@@ -46,6 +46,7 @@ use skys3_control::{
 use skys3_io::BlockingPool;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
+use crate::admission::{Admission, AdmitAll};
 use crate::authz::Permissions;
 use crate::fill::Fills;
 use crate::limits::RequestLimits;
@@ -97,6 +98,10 @@ pub struct GatewayConfig {
     /// (§9.4). [`GatewayConfig::new`] generates a key, so tokens are valid
     /// on this gateway until it restarts.
     pub list_token_keys: ListTokenKeys,
+    /// Admission control: whether a write that adds data may proceed
+    /// (§7.6, §13). [`GatewayConfig::new`] admits everything; the node
+    /// checks the dirty-data budgets and free disk space.
+    pub admission: Arc<dyn Admission>,
 }
 
 impl GatewayConfig {
@@ -117,6 +122,7 @@ impl GatewayConfig {
             hashing_pool: None,
             fills: None,
             list_token_keys: ListTokenKeys::generate(),
+            admission: Arc::new(AdmitAll),
         }
     }
 }

@@ -41,11 +41,14 @@
 //!   [`Filler`].
 //! - [`FlushMetrics`]: `dirty_bytes`, `oldest_dirty_age`,
 //!   `flush_lag_seconds`, conflict counts, and fill counts, by bucket.
+//! - [`DirtyBudget`] (§7.6): the flushers' dirty bytes counted against each
+//!   bucket's and the cluster's `max_dirty_bytes`, which admission control
+//!   checks before a write. Each node enforces a share of each budget in
+//!   proportion to the shards whose primary it is ([`share`]).
 //!
 //! Streaming multipart flush (M4-02) opens the remote upload while the
-//! client uploads; adaptive concurrency (M4-10) replaces the fixed
-//! [`FlushSettings::concurrency`]; and the dirty budget (M1-17) reads the
-//! flushers' [`ShardStatus`].
+//! client uploads, and adaptive concurrency (M4-10) replaces the fixed
+//! [`FlushSettings::concurrency`].
 //!
 //! ```
 //! use skys3_flush::FlushSettings;
@@ -56,6 +59,7 @@
 //! ```
 
 mod attempt;
+mod budget;
 mod fill;
 mod metrics;
 mod multipart;
@@ -64,6 +68,7 @@ mod shard;
 mod target;
 
 pub use attempt::Conflict;
+pub use budget::{DirtyBudget, Exhausted, Usage, share};
 pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
 pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};

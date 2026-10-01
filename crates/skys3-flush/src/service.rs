@@ -12,11 +12,13 @@ use skys3_remote::ObjectStore;
 use skys3_remote::probe::{ConditionalOperation, ConditionalProbe, ConditionalWrites};
 use skys3_shard::{Shard, ShardSet};
 use skys3_types::{BucketDocument, BucketId, BucketMode, ClusterId, RemoteTarget, ShardId};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::budget::DirtyBudget;
 use crate::fill::Filler;
-use crate::metrics::{FlushMetrics, Gauges};
-use crate::shard::{ShardFlusher, ShardStatus};
+use crate::metrics::{Counters, FlushMetrics, Gauges};
+use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{FlushSettings, Target};
 
 /// Builds the store of a bucket's remote target.
@@ -51,6 +53,9 @@ pub struct BucketStatus {
     /// Remote multipart uploads that flushes left open and that wait to be
     /// aborted ([`Target::orphaned_uploads`]).
     pub orphaned_uploads: u64,
+    /// This node's share of the bucket's dirty-data budget
+    /// ([`DirtyBudget`]).
+    pub dirty_budget: u64,
 }
 
 impl BucketStatus {
@@ -66,6 +71,7 @@ impl BucketStatus {
             flush_lag: age(statuses.clone().filter_map(|s| s.oldest_pending).min()),
             conflicted_keys: statuses.map(|s| s.conflicts.len() as u64).sum(),
             orphaned_uploads: self.orphaned_uploads,
+            dirty_budget: self.dirty_budget,
         }
     }
 }
@@ -75,10 +81,13 @@ impl BucketStatus {
 /// [`FlushService::reconcile`] makes them follow the node's buckets and
 /// open shards: for each `write_back` bucket it connects to the target,
 /// probes which preconditions the target honors (§7.2), retrying until the
-/// probe succeeds, and then runs a [`ShardFlusher`] for each of the
-/// bucket's shards open on the node. Flushers of buckets and shards that
-/// are gone are stopped. Each bucket's [`Filler`] reads evicted versions
-/// from the same target (§9.2); it needs no probe.
+/// probe succeeds, and runs a [`ShardFlusher`] for each of the bucket's
+/// shards open on the node. A flusher tracks its shard's dirty keys at
+/// once, so their bytes count against the [`DirtyBudget`] even while the
+/// target is unreachable, and starts flushing when the probe is done.
+/// Flushers of buckets and shards that are gone are stopped. Each bucket's
+/// [`Filler`] reads evicted versions from the same target (§9.2); it needs
+/// no probe.
 ///
 /// Only the `hold` conflict policy exists so far (§7.2); `overwrite` and
 /// `discard_local` arrive with plan M4.
@@ -88,6 +97,7 @@ pub struct FlushService<S, D> {
     connect: Connect<S>,
     wall: Arc<dyn WallClock>,
     metrics: FlushMetrics,
+    budget: Arc<DirtyBudget>,
     buckets: Mutex<BTreeMap<BucketId, BucketFlusher<S>>>,
     _disk: std::marker::PhantomData<fn() -> D>,
 }
@@ -104,12 +114,10 @@ impl<S, D> fmt::Debug for FlushService<S, D> {
 /// The flushers of one bucket.
 struct BucketFlusher<S> {
     name: String,
-    prefix: String,
-    store: Arc<S>,
     probe: Arc<Mutex<ProbeStatus>>,
-    writes: Arc<Mutex<Option<ConditionalWrites>>>,
     probe_task: JoinHandle<()>,
-    target: Option<Arc<Target<S>>>,
+    /// The target, once the probe is done.
+    target: Ready<S>,
     shards: BTreeMap<ShardId, ShardFlusher>,
     filler: Filler<S>,
 }
@@ -135,6 +143,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             connect,
             wall: Arc::new(SystemWallClock),
             metrics,
+            budget: Arc::new(DirtyBudget::unlimited()),
             buckets: Mutex::default(),
             _disk: std::marker::PhantomData,
         }
@@ -145,6 +154,19 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     pub fn with_wall_clock(mut self, wall: Arc<dyn WallClock>) -> Self {
         self.wall = wall;
         self
+    }
+
+    /// Counts the flushers' dirty bytes against `budget`.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Arc<DirtyBudget>) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// The budget the flushers' dirty bytes count against.
+    #[must_use]
+    pub fn budget(&self) -> &Arc<DirtyBudget> {
+        &self.budget
     }
 
     /// Starts and stops flushers so that every `write_back` bucket in
@@ -166,6 +188,11 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             }
             open.push((bucket, target, shards));
         }
+        self.budget.plan(
+            open.iter().map(|(bucket, _, shards)| {
+                (*bucket, u32::try_from(shards.len()).unwrap_or(u32::MAX))
+            }),
+        );
         let mut flushers = self.lock();
         let wanted: BTreeSet<&BucketId> =
             open.iter().map(|(bucket, ..)| &bucket.bucket_id).collect();
@@ -180,74 +207,56 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let flusher = flushers
                 .entry(bucket.bucket_id.clone())
                 .or_insert_with(|| self.start(bucket, target));
-            self.follow(flusher, shards);
+            self.follow(&bucket.bucket_id, flusher, shards);
         }
     }
 
-    /// Starts a bucket's flushers with its target's probe.
+    /// Starts a bucket's flushers with its target's probe, which makes the
+    /// target ready once it succeeds.
     fn start(&self, bucket: &BucketDocument, target: &RemoteTarget) -> BucketFlusher<S> {
-        let store = Arc::new((self.connect)(target));
-        let prefix = target.prefix.clone().unwrap_or_default();
+        let name = bucket.name.as_str().to_owned();
+        let parts = TargetParts {
+            store: Arc::new((self.connect)(target)),
+            prefix: target.prefix.clone().unwrap_or_default(),
+            cluster: self.cluster.clone(),
+            settings: self.settings.clone(),
+            wall: Arc::clone(&self.wall),
+            counters: self.metrics.counters(&name),
+        };
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
-        let writes = Arc::new(Mutex::default());
         let filler = Filler::new(
-            Arc::clone(&store),
-            prefix.clone(),
-            self.settings.clone(),
-            self.metrics.counters(bucket.name.as_str()),
-            Arc::clone(&self.wall),
+            Arc::clone(&parts.store),
+            parts.prefix.clone(),
+            parts.settings.clone(),
+            parts.counters.clone(),
+            Arc::clone(&parts.wall),
         );
-        let probe_task = tokio::spawn(run_probe(
-            Arc::clone(&store),
-            ConditionalProbe::with_fresh_nonce(&prefix),
-            Arc::clone(&probe),
-            Arc::clone(&writes),
-            self.settings.clone(),
-        ));
+        let (ready, target) = watch::channel(None);
+        let probe_task = tokio::spawn(run_probe(parts, Arc::clone(&probe), ready));
         BucketFlusher {
-            name: bucket.name.as_str().to_owned(),
-            prefix,
-            store,
+            name,
             probe,
-            writes,
             probe_task,
-            target: None,
+            target,
             shards: BTreeMap::new(),
             filler,
         }
     }
 
-    /// Runs a flusher for each of `shards` once the probe is done, and
-    /// stops the bucket's other flushers.
-    fn follow(&self, flusher: &mut BucketFlusher<S>, shards: Vec<Shard<D>>) {
-        if flusher.target.is_none() {
-            let Some(writes) = *lock(&flusher.writes) else {
-                return;
-            };
-            let target = Target::new(
-                Arc::clone(&flusher.store),
-                flusher.prefix.clone(),
-                writes,
-                self.cluster.clone(),
-                self.settings.clone(),
-            )
-            .with_wall_clock(Arc::clone(&self.wall))
-            .with_counters(self.metrics.counters(&flusher.name));
-            flusher.target = Some(Arc::new(target));
-        }
-        let Some(target) = &flusher.target else {
-            return;
-        };
+    /// Runs a flusher for each of `shards`, and stops the bucket's other
+    /// flushers.
+    fn follow(&self, bucket: &BucketId, flusher: &mut BucketFlusher<S>, shards: Vec<Shard<D>>) {
         let open: BTreeSet<ShardId> = shards.iter().map(|shard| shard.shard().shard).collect();
         flusher
             .shards
             .retain(|id, shard| open.contains(id) && !shard.is_stopped());
         for shard in shards {
             let id = shard.shard().shard;
-            flusher
-                .shards
-                .entry(id)
-                .or_insert_with(|| ShardFlusher::spawn(shard, Arc::clone(target)));
+            flusher.shards.entry(id).or_insert_with(|| {
+                let charge = self.budget.charge(bucket);
+                let (ready, wall) = (flusher.target.clone(), Arc::clone(&self.wall));
+                ShardFlusher::start(shard, ready, wall, Some(charge))
+            });
         }
     }
 
@@ -266,8 +275,13 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .collect(),
             orphaned_uploads: flusher
                 .target
+                .borrow()
                 .as_ref()
                 .map_or(0, |target| target.orphaned_uploads() as u64),
+            dirty_budget: self
+                .budget
+                .usage(bucket)
+                .map_or(u64::MAX, |usage| usage.share),
         })
     }
 
@@ -312,17 +326,35 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Probes `store` until a run succeeds, backing off between runs.
-async fn run_probe<S: ObjectStore>(
+/// What a bucket's [`Target`] is built from once its probe is done.
+struct TargetParts<S> {
     store: Arc<S>,
-    probe: ConditionalProbe,
-    status: Arc<Mutex<ProbeStatus>>,
-    writes: Arc<Mutex<Option<ConditionalWrites>>>,
+    prefix: String,
+    cluster: ClusterId,
     settings: FlushSettings,
+    wall: Arc<dyn WallClock>,
+    counters: Counters,
+}
+
+impl<S> TargetParts<S> {
+    fn build(self, writes: ConditionalWrites) -> Target<S> {
+        Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
+            .with_wall_clock(self.wall)
+            .with_counters(self.counters)
+    }
+}
+
+/// Probes the target until a run succeeds, backing off between runs, and
+/// then makes the target ready.
+async fn run_probe<S: ObjectStore>(
+    parts: TargetParts<S>,
+    status: Arc<Mutex<ProbeStatus>>,
+    ready: watch::Sender<Option<Arc<Target<S>>>>,
 ) {
+    let probe = ConditionalProbe::with_fresh_nonce(&parts.prefix);
     let mut failures = 0;
     loop {
-        match probe.run(&*store).await {
+        match probe.run(&*parts.store).await {
             Ok(found) => {
                 let unprotected = found.unprotected();
                 if !unprotected.is_empty() {
@@ -332,8 +364,8 @@ async fn run_probe<S: ObjectStore>(
                         these operations are sent unconditionally (§7.2)"
                     );
                 }
-                *lock(&writes) = Some(found);
                 *lock(&status) = ProbeStatus::Done { unprotected };
+                ready.send_replace(Some(Arc::new(parts.build(found))));
                 return;
             }
             Err(error) => {
@@ -342,7 +374,7 @@ async fn run_probe<S: ObjectStore>(
                 *lock(&status) = ProbeStatus::Running {
                     error: Some(error.to_string()),
                 };
-                tokio::time::sleep(settings.backoff(failures)).await;
+                tokio::time::sleep(parts.settings.backoff(failures)).await;
             }
         }
     }

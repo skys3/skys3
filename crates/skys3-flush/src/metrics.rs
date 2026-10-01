@@ -42,12 +42,15 @@ pub struct Gauges {
     pub conflicted_keys: u64,
     /// Remote multipart uploads flushes left open that wait to be aborted.
     pub orphaned_uploads: u64,
+    /// This node's share of the bucket's dirty-data budget, in bytes.
+    pub dirty_budget: u64,
 }
 
 /// The flush metrics of a node.
 #[derive(Debug, Clone, Default)]
 pub struct FlushMetrics {
     dirty_bytes: Family<Labels, Gauge>,
+    dirty_budget: Family<Labels, Gauge>,
     oldest_dirty_age: Family<Labels, Gauge<f64, AtomicU64>>,
     flush_lag: Family<Labels, Gauge<f64, AtomicU64>>,
     conflicted_keys: Family<Labels, Gauge>,
@@ -70,6 +73,13 @@ impl FlushMetrics {
              included.",
             Unit::Bytes,
             metrics.dirty_bytes.clone(),
+        );
+        registry.register_with_unit(
+            "dirty_budget",
+            "This node's share of the bucket's dirty-data budget (max_dirty_bytes): new writes \
+             get 503 SlowDown while dirty bytes are at or above it.",
+            Unit::Bytes,
+            metrics.dirty_budget.clone(),
         );
         registry.register_with_unit(
             "oldest_dirty_age",
@@ -144,6 +154,9 @@ impl FlushMetrics {
         self.dirty_bytes
             .get_or_create(&labels)
             .set(saturate(gauges.dirty_bytes));
+        self.dirty_budget
+            .get_or_create(&labels)
+            .set(saturate(gauges.dirty_budget));
         self.oldest_dirty_age
             .get_or_create(&labels)
             .set(gauges.oldest_dirty_age);
@@ -160,6 +173,7 @@ impl FlushMetrics {
     pub fn remove(&self, bucket: &str) {
         let labels = labels(bucket);
         self.dirty_bytes.remove(&labels);
+        self.dirty_budget.remove(&labels);
         self.oldest_dirty_age.remove(&labels);
         self.flush_lag.remove(&labels);
         self.conflicted_keys.remove(&labels);

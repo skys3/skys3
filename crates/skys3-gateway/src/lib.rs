@@ -39,6 +39,11 @@
 //!   upload's ID ([`upload_id`]) is the position of its `MPU_CREATE`, the
 //!   write identity of the object it completes, which keeps its parts'
 //!   boundaries for GetObject's `partNumber` and the multipart ETag.
+//! - [`Admission`] control (§7.6, §13): before a write that adds data,
+//!   the gateway asks whether it may proceed, and answers `503 SlowDown`
+//!   with the [`Refusal`] if not, such as when the bucket's dirty-data
+//!   budget is used up or the shard's disk is low on space. Deletes are
+//!   always admitted.
 //! - Listings: ListObjectsV2 and ListObjects (V1), with prefixes,
 //!   delimiters, `start-after` and markers, and `encoding-type=url`. Each
 //!   shard returns a sorted page from its index, the gateway merges them,
@@ -109,6 +114,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod admission;
 mod api;
 pub mod authz;
 mod buckets;
@@ -131,6 +137,7 @@ pub mod sigv4;
 #[cfg(any(test, feature = "test-util"))]
 pub mod stub;
 
+pub use admission::{Admission, AdmitAll, Refusal};
 pub use authz::{Permissions, Principal};
 pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER};
 pub use conditions::{ConditionFailed, Precondition};

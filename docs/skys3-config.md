@@ -130,6 +130,7 @@ The node storage engine (§10) and read registrations (§8.7).
 | `compaction_live_threshold` | float | `0.5` | Greater than 0 and less than 1. Segments with a lower live ratio are reclaimed (§10.3). |
 | `read_registration_ttl_seconds` | integer | `30` | Positive. |
 | `read_registration_renew_interval_seconds` | integer | `10` | Positive, and less than `read_registration_ttl_seconds`. |
+| `disk_min_free_bytes` | integer | `1073741824` (1 GiB) | May be 0, which turns the check off. Admission control (§13): while a log disk has less free space than this, writes that add data to the shards on it get `503 SlowDown`, and while the data directory's file system has less, every such write does. Deletes are still admitted. The margin keeps the disk from filling, since the first write error takes a disk out of service (§10.4). |
 
 ## `[cache]`
 
@@ -152,7 +153,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | `streaming_flush_min_bytes` | integer | `67108864` (64 MiB) | Positive. |
 | `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. |
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
-| `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6). |
+| `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
 | `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain. |
 
 ## `[ec]`
@@ -186,6 +187,7 @@ Erasure coding of `local` buckets (§8).
 | `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). |
 | `index_snapshot_interval_seconds` | integer | `3600` | Positive (§8.9). |
 | `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. |
+| `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets have dirty data. |
 
 Keys allowed only in a `[buckets.<name>]` table:
 

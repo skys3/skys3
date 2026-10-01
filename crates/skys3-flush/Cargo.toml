@@ -28,7 +28,11 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+http.workspace = true
 md-5.workspace = true
 rand.workspace = true
+s3s.workspace = true
+skys3-control.workspace = true
+skys3-gateway = { workspace = true, features = ["test-util"] }
 skys3-sim.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
