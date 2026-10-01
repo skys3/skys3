@@ -296,6 +296,7 @@ pub fn reseal(record: &mut [u8]) {
 /// The fields of a hand-built fixed header.
 #[derive(Clone)]
 pub struct Frame {
+    pub version: u16,
     pub kind: u16,
     pub bucket: &'static str,
     pub shard: u8,
@@ -308,6 +309,7 @@ impl Frame {
     /// A frame of `kind` in shard 3 of bucket `b1`, at position 5.9.
     pub fn new(kind: u16) -> Self {
         Self {
+            version: skys3_log::record::FORMAT_VERSION,
             kind,
             bucket: "b1",
             shard: 3,
@@ -329,7 +331,7 @@ impl Frame {
         let mut out = Vec::new();
         out.extend_from_slice(b"SKYL");
         out.extend_from_slice(&[0; 4]);
-        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.kind.to_le_bytes());
         out.extend_from_slice(&u32::try_from(80 + body.len()).unwrap().to_le_bytes());
         out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());

@@ -867,8 +867,18 @@ of this file. A task with nothing unexpected keeps "None."
   `ChecksumAlgorithm` moved to `skys3_types::checksum` (`skys3-log`
   re-exports it), and the map's value is now a `Checksum`: the digest and,
   for a composite checksum, the part count. Log records and index values
-  encode a `u16` part count after each digest, zero for `FULL_OBJECT`; the
-  format versions stay at 1 because no release has written either.
+  encode a `u16` part count after each digest, zero for `FULL_OBJECT`.
+  The first version of this PR kept the formats at 1, reasoning that no
+  release had written either; review pointed out that §10.1 requires a new
+  version for any body change, and that the stack's PRs may land one by
+  one, so version 1 data can exist. The log format is now version 2 and
+  the index value format 2. Both readers still decode version 1, whose
+  checksums have no part count and are `FULL_OBJECT`: the version reaches
+  the body decoder in the log's `Reader` and the index's, a few lines
+  each, and it keeps the rule meaningful. Versions 0 and 3 and up are
+  rejected. A version 1 record re-encodes as version 2, so the fuzz
+  targets compare bytes only for the current version and otherwise check
+  that the re-encoding decodes to the same value.
   `ChecksumAlgorithm` is no longer `#[non_exhaustive]`: every algorithm
   needs a hasher, so a new one must break every `match`.
 - **The S3 error documentation was unreachable.** The sandbox's proxy
@@ -912,8 +922,10 @@ of this file. A task with nothing unexpected keeps "None."
   PUT and GET (M1-09) and multipart uploads (M1-12) call them.
 - **Fuzzing.** `gateway_checksums` reads checksum headers and stored
   checksum values; it ran about 500,000 inputs in 30 s with no failures.
-  `log_record` and `index_codec`, whose checksum encodings changed, ran
-  20 s each without failures.
+  After the version bump, `log_record` (about 5.2 million inputs) and
+  `index_codec` (about 500,000), which now also try every value behind a
+  format 1 byte, ran 30 s each without failures, as did
+  `gateway_checksums` again.
 
 ### M1-15 Remote target client and capability probe
 

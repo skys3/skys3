@@ -2,7 +2,11 @@
 //!
 //! redb stores raw bytes; this module defines what they mean. Every value
 //! starts with a format byte ([`VALUE_FORMAT`]) so a later build can change
-//! a layout without guessing. Integers in values are little-endian. Keys
+//! a layout without guessing. This build writes format 2 and reads formats
+//! 1 and 2 ([`MIN_VALUE_FORMAT`]); any other format byte is rejected. Format
+//! 2 adds a `u16` part count after each checksum digest of an [`Entry`],
+//! zero for a `FULL_OBJECT` checksum; a format 1 checksum has none and is
+//! `FULL_OBJECT`. Every other value is the same in both. Integers in values are little-endian. Keys
 //! use big-endian integers so that redb's byte order sorts them
 //! numerically:
 //!
@@ -23,7 +27,8 @@
 //! byte, and a map has a count followed by its entries in strictly
 //! increasing key order. Decoders check every length against its bound and
 //! against the remaining bytes before allocating, and reject trailing
-//! bytes, so every value has exactly one encoding.
+//! bytes, so every value of the current format has exactly one encoding. A
+//! value of an older format re-encodes in the current one.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,8 +45,15 @@ use skys3_types::{
 
 use crate::entry::{ControlEntry, Entry, EntryState, ObjectVersion, Payload};
 
-/// The format byte every value starts with.
-pub const VALUE_FORMAT: u8 = 1;
+/// The format byte every value this build writes starts with, and the
+/// newest format it reads.
+pub const VALUE_FORMAT: u8 = 2;
+
+/// The oldest value format this build reads.
+pub const MIN_VALUE_FORMAT: u8 = 1;
+
+/// The first value format with a part count after each checksum digest.
+const PART_COUNTS_SINCE: u8 = 2;
 
 /// The longest control-state value kept locally, in bytes.
 pub const MAX_CONTROL_VALUE_LEN: usize = 1 << 20;
@@ -160,15 +172,20 @@ impl Writer {
     }
 }
 
-/// Reads primitive values, checking every length before using it.
-struct Reader<'a>(&'a [u8]);
+/// Reads primitive values, checking every length before using it. The
+/// second field is the format of the value being read; keys have none and
+/// read as the current format.
+struct Reader<'a>(&'a [u8], u8);
 
 impl<'a> Reader<'a> {
     /// Starts reading a value, checking its format byte.
     fn value(bytes: &'a [u8], field: &'static str) -> Result<Self> {
-        let mut reader = Self(bytes);
+        let mut reader = Self(bytes, VALUE_FORMAT);
         match reader.u8(field)? {
-            VALUE_FORMAT => Ok(reader),
+            format @ MIN_VALUE_FORMAT..=VALUE_FORMAT => {
+                reader.1 = format;
+                Ok(reader)
+            }
             format => Err(CodecError::new(
                 field,
                 format_args!("unsupported value format {format}"),
@@ -328,7 +345,7 @@ pub fn shard_key(shard: &ShardRef) -> Vec<u8> {
 ///
 /// Returns a [`CodecError`] if `bytes` is not exactly one shard.
 pub fn decode_shard_key(bytes: &[u8]) -> Result<ShardRef> {
-    let mut r = Reader(bytes);
+    let mut r = Reader(bytes, VALUE_FORMAT);
     let shard = r.shard("shard")?;
     r.finish("shard")?;
     Ok(shard)
@@ -349,7 +366,7 @@ pub fn entry_key(shard: &ShardRef, key: &str) -> Vec<u8> {
 /// Returns a [`CodecError`] if the shard is malformed or the object key is
 /// empty, too long, or not UTF-8.
 pub fn decode_entry_key(bytes: &[u8]) -> Result<(ShardRef, String)> {
-    let mut r = Reader(bytes);
+    let mut r = Reader(bytes, VALUE_FORMAT);
     let shard = r.shard("entry key")?;
     let key = Reader::check("entry key", r.0.len(), MAX_KEY_LEN)?;
     if key == 0 {
@@ -373,7 +390,7 @@ pub fn location_key(shard: &ShardRef, position: EpochSeq) -> Vec<u8> {
 ///
 /// Returns a [`CodecError`] if `bytes` is not a shard and a position.
 pub fn decode_location_key(bytes: &[u8]) -> Result<(ShardRef, EpochSeq)> {
-    let mut r = Reader(bytes);
+    let mut r = Reader(bytes, VALUE_FORMAT);
     let shard = r.shard("location key")?;
     let epoch = u64::from_be_bytes(r.array("location key")?);
     let seq = u64::from_be_bytes(r.array("location key")?);
@@ -406,7 +423,7 @@ pub fn coverage_prefix(disk: &Label) -> Vec<u8> {
 ///
 /// Returns a [`CodecError`] if `bytes` is not a label and a segment id.
 pub fn decode_coverage_key(bytes: &[u8]) -> Result<(Label, SegmentId)> {
-    let mut r = Reader(bytes);
+    let mut r = Reader(bytes, VALUE_FORMAT);
     let len = r.len8("coverage key", Label::MAX_LEN)?;
     let label = Reader::text("coverage key", r.take("coverage key", len)?)?;
     let label = Label::new(label).map_err(|e| CodecError::new("coverage key", e))?;
@@ -798,10 +815,11 @@ fn write_checksums(w: &mut Writer, checksums: &Checksums) -> Result<()> {
 }
 
 /// Reads checksums: a count, then for each its algorithm's code, the
-/// digest, and the part count of a composite checksum (zero for
-/// `FULL_OBJECT`).
+/// digest, and, from format 2, the part count of a composite checksum
+/// (zero for `FULL_OBJECT`).
 fn read_checksums(r: &mut Reader<'_>) -> Result<Checksums> {
     let field = "object.checksums";
+    let part_counts = r.1 >= PART_COUNTS_SINCE;
     let count = r.len8(field, ChecksumAlgorithm::ALL.len())?;
     let mut checksums = Checksums::new();
     for _ in 0..count {
@@ -809,7 +827,8 @@ fn read_checksums(r: &mut Reader<'_>) -> Result<Checksums> {
         let algorithm = ChecksumAlgorithm::from_code(code)
             .ok_or_else(|| CodecError::new(field, format_args!("invalid algorithm {code}")))?;
         let digest = r.take(field, algorithm.digest_len())?;
-        let checksum = match r.u16(field)? {
+        let parts = if part_counts { r.u16(field)? } else { 0 };
+        let checksum = match parts {
             0 => Checksum::full_object(algorithm, digest),
             parts => Checksum::composite(algorithm, digest, parts.into()),
         }

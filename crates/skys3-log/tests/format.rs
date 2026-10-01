@@ -12,7 +12,7 @@ use bytes::Bytes;
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, DecodeError, Delete, EncodeError, ErrorClass, Extent, ExtentRef,
     FORMAT_VERSION, FieldError, LogRecord, MAGIC, MAX_HEADER_LEN, MAX_PAYLOAD_LEN, MAX_TAGS,
-    Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef,
+    MIN_FORMAT_VERSION, Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -102,6 +102,98 @@ fn crc32c_is_the_castagnoli_crc() {
     assert_eq!(crc32c::crc32c(b"123456789"), 0xe306_9283);
 }
 
+/// A `DELETE` record in format version 1, before checksums had part counts.
+const DELETE_V1: &str = concat!(
+    "534b594c",                                                         // magic "SKYL"
+    "df5f015d",         // CRC32C, checked with an independent bitwise implementation
+    "0100",             // format version 1
+    "0200",             // kind DELETE
+    "60000000",         // header_len 96
+    "00000000",         // payload_len 0
+    "07",               // shard 7
+    "06",               // bucket ID length
+    "0000",             // reserved
+    "2a00000000000000", // epoch 42
+    "e903000000000000", // seq 1001
+    "5730ceb8173a7db0", // key hash 0xb07d3a17b8ce3057
+    "622d376633610000000000000000000000000000000000000000000000000000", // "b-7f3a"
+    "0e00",             // key length 14
+    "70686f746f732f6361742e6a7067", // "photos/cat.jpg"
+);
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn version_1_records_still_decode() {
+    let delete = LogRecord {
+        shard: ShardRef::new(BucketId::new("b-7f3a").unwrap(), ShardId::new(7)),
+        position: position(42, 1001),
+        body: RecordBody::Delete(Delete {
+            key: "photos/cat.jpg".into(),
+        }),
+    };
+    let v1 = unhex(DELETE_V1);
+    assert_eq!(LogRecord::decode(&v1).unwrap(), (delete, v1.len()));
+    assert_eq!(RecordHeader::decode(&v1).unwrap().version, 1);
+
+    // A version 1 `PUT` with checksums: a digest each, no part counts.
+    let crc32 = [1, 2, 3, 4];
+    let md5 = [9; 16];
+    let body = |part_counts: bool| {
+        let mut checksums = Body::default().u8(2).u8(1).raw(&crc32);
+        if part_counts {
+            checksums = checksums.u16(0);
+        }
+        checksums = checksums.u8(6).raw(&md5);
+        if part_counts {
+            checksums = checksums.u16(0);
+        }
+        Body::default()
+            .str16("k")
+            .u64(2)
+            .u64(1_700_000_000_000)
+            .str16("d41d8cd98f00b204e9800998ecf8427e")
+            .u8(0) // no inherited identity
+            .u16(0) // no metadata
+            .u8(0) // no tags
+            .raw(&checksums.0)
+            .u8(0) // no copy source
+            .u8(0) // inline data
+    };
+    let v1 = Frame {
+        version: 1,
+        ..Frame::new(PUT).keyed("k")
+    }
+    .build(&body(false).0, b"hi");
+    let (decoded, _) = LogRecord::decode(&v1).unwrap();
+    let mut put = inline_put("k", b"hi");
+    put.checksums = BTreeMap::from([
+        (
+            ChecksumAlgorithm::Crc32,
+            Checksum::full_object(ChecksumAlgorithm::Crc32, &crc32).unwrap(),
+        ),
+        (
+            ChecksumAlgorithm::Md5,
+            Checksum::full_object(ChecksumAlgorithm::Md5, &md5).unwrap(),
+        ),
+    ]);
+    assert_eq!(decoded, record(RecordBody::Put(put)));
+    // It re-encodes in the current version, with part counts.
+    let v2 = Frame::new(PUT).keyed("k").build(&body(true).0, b"hi");
+    assert_eq!(decoded.to_bytes().unwrap(), v2);
+    assert_eq!(LogRecord::decode(&v2).unwrap().0, decoded);
+    // Version 2 bytes read as version 1 leave the part counts unread.
+    let mut misread = v2.clone();
+    misread[8] = 1;
+    reseal(&mut misread);
+    assert!(LogRecord::decode(&misread).is_err());
+}
+
 #[test]
 fn delete_record_golden_bytes() {
     let record = LogRecord {
@@ -116,8 +208,8 @@ fn delete_record_golden_bytes() {
         hex(&bytes),
         concat!(
             "534b594c",                                                         // magic "SKYL"
-            "df5f015d", // CRC32C, checked with an independent bitwise implementation
-            "0100",     // format version 1
+            "2a0d3f54", // CRC32C, checked with an independent bitwise implementation
+            "0200",     // format version 2
             "0200",     // kind DELETE
             "60000000", // header_len 96
             "00000000", // payload_len 0
@@ -155,7 +247,8 @@ fn encoder_follows_the_documented_layout() {
     assert_eq!(record(RecordBody::Truncate).to_bytes().unwrap(), expected);
     assert_eq!(expected.len(), RecordHeader::LEN);
     assert_eq!(&expected[..4], &MAGIC);
-    assert_eq!(FORMAT_VERSION, 1);
+    assert_eq!(FORMAT_VERSION, 2);
+    assert_eq!(MIN_FORMAT_VERSION, 1);
 }
 
 #[test]
@@ -244,9 +337,11 @@ fn framing_is_checked_before_the_rest() {
         }
     );
 
-    let mut bytes = good.clone();
-    bytes[8] = 2;
-    assert_eq!(decode_err(&bytes), DecodeError::UnsupportedVersion(2));
+    for version in [0, 3, u16::MAX] {
+        let mut bytes = good.clone();
+        bytes[8..10].copy_from_slice(&version.to_le_bytes());
+        assert_eq!(decode_err(&bytes), DecodeError::UnsupportedVersion(version));
+    }
 
     for (at, value, field, min, max) in [
         (12, 79, "header_len", 80, MAX_HEADER_LEN),
@@ -901,9 +996,9 @@ fn errors_are_classified_and_described() {
             "CRC32C mismatch: the record stores 0x00000001, its bytes give 0x00000002",
         ),
         (
-            DecodeError::UnsupportedVersion(2),
+            DecodeError::UnsupportedVersion(3),
             ErrorClass::Unsupported,
-            "log format version 2 is not supported; this build reads version 1",
+            "log format version 3 is not supported; this build reads versions 1 to 2",
         ),
         (
             DecodeError::UnknownKind(99),

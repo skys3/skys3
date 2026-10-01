@@ -1,4 +1,4 @@
-//! The log record format, version 1 (§10.1).
+//! The log record format, version 2 (§10.1).
 //!
 //! A record is a fixed header, a kind-specific header, and a payload:
 //!
@@ -40,7 +40,11 @@
 //! **Versions.** The format version covers the fixed header and every
 //! defined body. Any change to either takes a new version, and a reader
 //! rejects every version it does not know
-//! ([`DecodeError::UnsupportedVersion`]) instead of guessing. Defining the
+//! ([`DecodeError::UnsupportedVersion`]) instead of guessing. This build
+//! writes version 2 ([`FORMAT_VERSION`]) and reads versions 1 and 2
+//! ([`MIN_FORMAT_VERSION`]). Version 2 adds a `u16` part count after each
+//! checksum digest of `PUT` and `ADOPT`, zero for a `FULL_OBJECT`
+//! checksum; a version 1 checksum has none and is `FULL_OBJECT`. Defining the
 //! body of a reserved kind does not change the version: a reader that
 //! predates it rejects the kind as [`DecodeError::UnsupportedKind`]. The
 //! rules for upgrading a node across versions are decided in M7-09.
@@ -69,6 +73,8 @@
 //!   present,
 //! - a map as a count followed by its entries in strictly increasing key
 //!   order, so every map has exactly one encoding,
+//! - checksums as a map from the algorithm's code (`u8`) to its digest,
+//!   followed by the `u16` part count of a `COMPOSITE` checksum, or zero,
 //! - a `PUT`'s data as a tag byte: 0 for inline data, which is the payload;
 //!   or 1 for extents, followed by a `u32` count and, per extent, its
 //!   position and a `u32` length.
@@ -83,7 +89,8 @@
 //! that remain before anything is allocated, and arithmetic on decoded
 //! values is checked. A defined kind must use exactly its header's bytes
 //! and have a payload only if the kind has one. The encoding is canonical:
-//! a buffer that decodes re-encodes to the same bytes.
+//! a buffer of the current version that decodes re-encodes to the same
+//! bytes. A record of an older version re-encodes in the current one.
 
 mod body;
 mod error;
@@ -107,8 +114,11 @@ use wire::Writer;
 /// The bytes every record starts with.
 pub const MAGIC: [u8; 4] = *b"SKYL";
 
-/// The format version this build reads and writes.
-pub const FORMAT_VERSION: u16 = 1;
+/// The format version this build writes, and the newest it reads.
+pub const FORMAT_VERSION: u16 = 2;
+
+/// The oldest format version this build reads.
+pub const MIN_FORMAT_VERSION: u16 = 1;
 
 /// The largest `header_len`: the fixed header plus the kind-specific header.
 /// A `PUT` that references [`MAX_EXTENTS`] extents fits with room to spare.
@@ -242,6 +252,7 @@ impl LogRecord {
         let header_len = header.header_len as usize;
         let body = RecordBody::decode(
             header.kind,
+            header.version,
             &buf[RecordHeader::LEN..header_len],
             &buf[header_len..record_len],
             &header.shard,

@@ -304,12 +304,13 @@ impl RecordBody {
     /// kind-specific header and its payload.
     pub(crate) fn decode(
         kind: RecordKind,
+        version: u16,
         header: &[u8],
         payload: &[u8],
         shard: &ShardRef,
         position: EpochSeq,
     ) -> Result<Self, FieldError> {
-        let mut r = Reader::new(header);
+        let mut r = Reader::new(header, version);
         let body = match kind {
             RecordKind::Put => Self::Put(Put::decode(&mut r, payload, position)?),
             RecordKind::Delete => Self::Delete(Delete {
@@ -867,7 +868,11 @@ fn write_checksums(
     Ok(())
 }
 
+/// The first format version with a part count after each checksum digest.
+const PART_COUNTS_SINCE: u16 = 2;
+
 fn read_checksums(r: &mut Reader<'_>, field: &'static str) -> Result<Checksums, FieldError> {
+    let part_counts = r.version() >= PART_COUNTS_SINCE;
     let count = r.len8(field, 0, ChecksumAlgorithm::ALL.len())?;
     let mut checksums = Checksums::new();
     for _ in 0..count {
@@ -875,7 +880,8 @@ fn read_checksums(r: &mut Reader<'_>, field: &'static str) -> Result<Checksums, 
         let algorithm = ChecksumAlgorithm::from_code(code)
             .ok_or(FieldError::new(field, Problem::InvalidTag(code)))?;
         let digest = r.take(field, algorithm.digest_len())?;
-        let checksum = match r.u16(field)? {
+        let parts = if part_counts { r.u16(field)? } else { 0 };
+        let checksum = match parts {
             0 => Checksum::full_object(algorithm, digest),
             parts => Checksum::composite(algorithm, digest, parts.into()),
         }
