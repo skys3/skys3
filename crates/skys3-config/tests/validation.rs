@@ -452,6 +452,103 @@ fn identity_rules() {
     );
 }
 
+const READ_ONLY: &str =
+    r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:Get*","Resource":"*"}}"#;
+
+#[test]
+fn anonymous_access_needs_a_policy() {
+    assert!(load("").unwrap().identity().anonymous_policy.is_none());
+    assert_violations(
+        "[identity]\nanonymous_access = true",
+        &["identity.anonymous_policy"],
+    );
+    assert_violations(
+        &format!("[identity]\nanonymous_policy = '{READ_ONLY}'"),
+        &["identity.anonymous_policy"],
+    );
+    let config = load(&format!(
+        "[identity]\nanonymous_access = true\nanonymous_policy = '{READ_ONLY}'"
+    ))
+    .unwrap();
+    assert_eq!(
+        config.identity().anonymous_policy,
+        Some(READ_ONLY.parse().unwrap())
+    );
+    let error = parse_error(&format!(
+        "{BASE}\n[identity]\nanonymous_access = true\nanonymous_policy = '{{\"Version\":\"2012-10-17\"}}'"
+    ));
+    assert!(error.contains("Statement is required"), "{error}");
+}
+
+fn static_credential(name: &str, key_id: &str, file: &str) -> String {
+    format!(
+        "[identity.static_credentials.{name}]\naccess_key_id = \"{key_id}\"\n\
+         secret_access_key_file = \"{file}\"\npolicy = '{READ_ONLY}'\n"
+    )
+}
+
+#[test]
+fn static_credentials_are_checked() {
+    let both = format!(
+        "{}{}",
+        static_credential(
+            "bootstrap",
+            "AKIABOOTSTRAP0001",
+            "/etc/skys3/bootstrap.secret"
+        ),
+        static_credential(
+            "backup-svc",
+            "AKIABACKUPSERVICE",
+            "/etc/skys3/backup.secret"
+        ),
+    );
+    let config = load(&both).unwrap();
+    let credentials = &config.identity().static_credentials;
+    assert_eq!(credentials.len(), 2);
+    assert_eq!(credentials["bootstrap"].access_key_id, "AKIABOOTSTRAP0001");
+    assert_eq!(
+        credentials["backup-svc"].secret_access_key_file,
+        std::path::Path::new("/etc/skys3/backup.secret")
+    );
+
+    assert_violations(
+        &static_credential("\"bad/name\"", "AKIABOOTSTRAP0001", "/s"),
+        &["identity.static_credentials.\"bad/name\""],
+    );
+    assert_violations(
+        &static_credential(&"n".repeat(65), "AKIABOOTSTRAP0001", "/s"),
+        &[&format!("identity.static_credentials.{}", "n".repeat(65))],
+    );
+    for key_id in ["AKIASHORT", "AKIA-BOOTSTRAP-0001", &"A".repeat(129)] {
+        assert_violations(
+            &static_credential("a", key_id, "/s"),
+            &["identity.static_credentials.a.access_key_id"],
+        );
+    }
+    assert_violations(
+        &static_credential("a", "AKIABOOTSTRAP0001", ""),
+        &["identity.static_credentials.a.secret_access_key_file"],
+    );
+    assert_violations(
+        &format!(
+            "{}{}",
+            static_credential("a", "AKIABOOTSTRAP0001", "/a"),
+            static_credential("b", "AKIABOOTSTRAP0001", "/b"),
+        ),
+        &["identity.static_credentials.b.access_key_id"],
+    );
+    let error = parse_error(&format!(
+        "{BASE}\n[identity.static_credentials.a]\naccess_key_id = \"AKIABOOTSTRAP0001\"\n\
+         secret_access_key_file = \"/s\"\npolicy = '{{\"Version\":\"2012-10-17\",\"Statement\":{{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\",\"Condition\":{{}}}}}}'"
+    ));
+    assert!(error.contains("Condition is not supported"), "{error}");
+    let error = parse_error(&format!(
+        "{BASE}\n[identity.static_credentials.a]\naccess_key_id = \"AKIABOOTSTRAP0001\"\n\
+         secret_access_key = \"inline\"\nsecret_access_key_file = \"/s\"\npolicy = '{READ_ONLY}'"
+    ));
+    assert!(error.contains("unknown field"), "{error}");
+}
+
 #[test]
 fn admin_listener_off_loopback_needs_a_token() {
     assert_violations("[admin]\nlisten = \"0.0.0.0:7490\"", &["admin.token_file"]);

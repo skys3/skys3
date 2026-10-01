@@ -98,6 +98,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "types_policy"
+path = "fuzz_targets/types_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "types_write_identity"
 path = "fuzz_targets/types_write_identity.rs"
 test = false

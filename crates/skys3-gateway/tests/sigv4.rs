@@ -43,10 +43,10 @@ fn assert_code(result: Result<Request<Body>, S3Error>, code: S3ErrorCode) {
     }
 }
 
-fn principal(request: &Request<Body>) -> &Authenticated<String> {
+fn principal(request: &Request<Body>) -> &Authenticated {
     request
         .extensions()
-        .get::<Authenticated<String>>()
+        .get::<Authenticated>()
         .expect("the request is authenticated")
 }
 
@@ -87,7 +87,7 @@ async fn the_documented_get_object_request_is_accepted() {
     let (auth, _) = authenticator(DOC_TIME);
     let accepted = auth.authenticate(doc_get_object()).await.unwrap();
     let caller = principal(&accepted);
-    assert_eq!(caller.principal, DOC_KEY);
+    assert_eq!(caller.principal.name(), DOC_KEY);
     assert_eq!(caller.access_key_id, DOC_KEY);
     assert_eq!(caller.method, AuthMethod::Header);
     assert!(!accepted.headers().contains_key("authorization"));
@@ -390,7 +390,7 @@ async fn sdk_signed_requests_are_accepted() {
             .authenticate(signed)
             .await
             .unwrap_or_else(|e| panic!("{method} {uri}: {e:?}"));
-        assert_eq!(principal(&accepted).principal, KEY);
+        assert_eq!(principal(&accepted).principal.name(), KEY);
         assert_eq!(read(accepted).await.unwrap(), body);
     }
 }
@@ -582,7 +582,7 @@ async fn unsigned_requests_pass_unauthenticated() {
     let (auth, _) = authenticator(NOW);
     let anonymous = request(Method::GET, "/b/k", &[], Bytes::new());
     let passed = auth.authenticate(anonymous).await.unwrap();
-    assert!(passed.extensions().get::<Authenticated<String>>().is_none());
+    assert!(passed.extensions().get::<Authenticated>().is_none());
     // An unsigned aws-chunked body still decodes.
     let body = Bytes::from_static(b"3\r\nabc\r\n0\r\nx-amz-checksum-crc32:NSRBwg==\r\n\r\n");
     let chunked = request(

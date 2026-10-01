@@ -1031,6 +1031,13 @@ CopyObject within the cluster copies the bytes into the destination shard and co
 - **Keys.** Discovery is fetched from `<issuer>/.well-known/openid-configuration`, and its `issuer` must equal the provider's. Discovery documents and key sets are at most 64 KiB, key sets at most 100 keys, and fetches use HTTPS (plain HTTP only in tests, never through configuration) with a 10 s timeout and no redirects. Server certificates are checked against the system roots; the fetcher also accepts extra roots, for an issuer with a private CA. Keys are cached for an hour and discovery for a day. A token with an unknown `kid` triggers a refresh, since the issuer may have rotated its keys. At most one refresh is attempted per issuer every 30 s, so tokens with made-up key IDs cannot make SkyS3 flood an issuer. If a refresh fails, cached keys stay in use until they are a day old. These limits are constants, not configuration keys.
 - **Implementation.** Tokens and key sets are parsed by SkyS3 (`skys3-sts`), and signatures are verified with `aws-lc-rs`, the provider rustls already uses. `openidconnect` is built for relying parties that run login flows, not for validating bearer tokens on a server. `jsonwebtoken` selects its crypto backend through a process-wide provider chosen by Cargo features, which panics when feature unification enables both backends. The parsing a validator needs is small enough to own and fuzz.
 
+**Authorization.** Every request is authorized against IAM-style policies before its operation runs; anonymous requests and requests no policy allows answer `403 AccessDenied`.
+
+- **Principals.** A signed request comes from the principal of its credential. A static credential, for bootstrap and service accounts, is a `[identity.static_credentials.<name>]` table: an access key ID, a file holding the secret access key, read at startup and held in memory with `secrecy`/`zeroize`, and a policy. A session (plan M1-24) is evaluated against its role's policies and, if it has one, its session policy. An unsigned request is refused right after authentication, before rejected-feature checks or reading its body, unless `anonymous_access = true`; then `anonymous_policy` authorizes it.
+- **Policy language.** The subset is: `Version` `2012-10-17` (required), an optional `Id`, and `Statement`, one statement or a non-empty array. A statement has `Effect` (`Allow` or `Deny`), exactly one of `Action` and `NotAction`, exactly one of `Resource` and `NotResource`, and an optional `Sid`; each is a string or a non-empty array of strings. An action is `*` or `service:name`, where the name may contain `*` and `?`, matched without case. A resource is `*` or `arn:aws:s3:::` followed by a bucket and optionally `/` and a key, where `*` (which also matches `/`) and `?` may appear, matched with case. `Principal`, `NotPrincipal`, `Condition`, policy variables (`${...}`), other ARNs, and unknown or duplicate keys are refused, so no accepted policy changes meaning when a later version supports more: ignoring a `Condition` would widen an `Allow`. A document is at most 10,240 bytes and a pattern at most 1,280, which bounds matching cost. Trust policies (plan M1-24) extend the subset with `Principal` and conditions on token claims.
+- **Evaluation.** An explicit `Deny` in any applicable policy wins. Otherwise the request is allowed if an identity policy allows it and, for a session with a session policy, that policy allows it too, so a session policy only narrows. Otherwise it is denied.
+- **Actions and resources.** Once `s3s` has routed a request, its operation names the IAM actions it needs, all of which must be allowed: the action AWS documents for it (HeadBucket needs `s3:ListBucket`, GetObjectAttributes `s3:GetObject` and `s3:GetObjectAttributes`, multipart and copy operations `s3:PutObject`). The resource is `arn:aws:s3:::<bucket>` or `arn:aws:s3:::<bucket>/<key>` from the path, and `arn:aws:s3:::*` for ListBuckets. An operation without an action is denied to everyone. Operations whose permissions depend on their input check them when they are implemented: CopyObject and UploadPartCopy also need `s3:GetObject` on the source, and DeleteObjects needs `s3:DeleteObject` on each key. Because the operation is known only after routing, headers that ask for a rejected feature are refused before authorization; they reveal nothing about buckets or objects.
+
 Clients point both `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL_STS` at SkyS3. The SDK matrix (section 16.2) verifies that each SDK's web-identity provider honors them.
 
 SkyS3's own credentials for remote targets and the control store come from `aws-config` providers, including web identity when SkyS3 runs as a workload. The control-store credential is scoped to the control prefix.
@@ -1167,11 +1174,17 @@ peer_staging_ttl_seconds = 86400
 
 [identity]
 anonymous_access = false
+# anonymous_policy = '{"Version": "2012-10-17", "Statement": ...}'   # required when anonymous_access = true
 sts_web_identity = true
 session_default_seconds = 3600
 session_maximum_seconds = 3600
 identity_max_staleness_hours = 24
 oidc_clock_skew_seconds = 60
+
+[identity.static_credentials.bootstrap]   # a static access key (section 11)
+access_key_id = "AKIASKYS3BOOTSTRAP"
+secret_access_key_file = "/etc/skys3/bootstrap.secret"
+policy = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}}'
 
 [admin]                       # metrics, health checks, admin API (section 12)
 listen = "127.0.0.1:7490"     # a non-loopback address requires token_file

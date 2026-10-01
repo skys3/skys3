@@ -1,5 +1,6 @@
-//! The request pipeline: limits, authentication, rejected features, body
-//! bounds, then `s3s` routing to the S3 operations.
+//! The request pipeline: limits, authentication, the anonymous-access
+//! gate, rejected features, body bounds, then `s3s` routing, authorization,
+//! and the S3 operations.
 
 use std::fmt;
 use std::future::Future;
@@ -12,11 +13,12 @@ use s3s::{Body, BodySizeLimitExceeded, S3Error, s3_error};
 use skys3_control::{ControlError, ControlStore};
 
 use crate::api::Api;
+use crate::authz::{self, Access, NoSignatures, Permissions};
 use crate::buckets::{Buckets, GatewayConfig, IdSource};
 use crate::features;
 use crate::limits::{BodyKind, RequestLimits};
 use crate::shard::Shards;
-use crate::sigv4::BodyError;
+use crate::sigv4::{Authenticated, BodyError};
 
 /// Authenticates requests before they are routed.
 ///
@@ -39,15 +41,27 @@ pub trait Authenticator: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Request<Body>, S3Error>> + Send;
 }
 
-/// An [`Authenticator`] that lets every request through unauthenticated,
-/// for tests.
+/// An [`Authenticator`] for tests that trusts every request: it takes each
+/// one as signed by [`TrustAll::PRINCIPAL`], whom every policy check
+/// allows.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Unauthenticated;
+pub struct TrustAll;
 
 #[cfg(any(test, feature = "test-util"))]
-impl Authenticator for Unauthenticated {
-    async fn authenticate(&self, request: Request<Body>) -> Result<Request<Body>, S3Error> {
+impl TrustAll {
+    /// The name of the principal every request comes from.
+    pub const PRINCIPAL: &str = "trusted";
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Authenticator for TrustAll {
+    async fn authenticate(&self, mut request: Request<Body>) -> Result<Request<Body>, S3Error> {
+        request.extensions_mut().insert(Authenticated {
+            principal: crate::Principal::new(Self::PRINCIPAL, Permissions::allow_all()),
+            access_key_id: String::new(),
+            method: crate::sigv4::AuthMethod::Header,
+        });
         Ok(request)
     }
 }
@@ -69,9 +83,12 @@ impl<C: ControlStore, H: Shards> Catalog for Buckets<C, H> {
 ///
 /// 1. The head is checked against the [`RequestLimits`].
 /// 2. The [`Authenticator`] authenticates it.
-/// 3. Requests for features SkyS3 rejects are answered (design §11).
-/// 4. An XML body is read, within its size limit, and checked for depth.
-/// 5. `s3s` parses the request and calls the S3 operation.
+/// 3. An unsigned request is refused unless anonymous access is on.
+/// 4. Requests for features SkyS3 rejects are answered (design §11).
+/// 5. An XML body is read, within its size limit, and checked for depth.
+/// 6. `s3s` routes the request to its operation, which the caller's
+///    permissions must allow ([`crate::authz`]), parses it, and calls the
+///    operation.
 ///
 /// Clones share the gateway.
 pub struct Gateway<A> {
@@ -82,6 +99,7 @@ struct Inner<A> {
     s3: S3Service,
     limits: RequestLimits,
     auth: A,
+    anonymous: Option<Permissions>,
     catalog: Arc<dyn Catalog>,
 }
 
@@ -116,14 +134,18 @@ impl<A: Authenticator> Gateway<A> {
         auth: A,
     ) -> Result<Self, ControlError> {
         let limits = config.limits;
+        let anonymous = config.anonymous.clone();
         let buckets = Arc::new(Buckets::load(store, shards, config, ids).await?);
         let mut builder = S3ServiceBuilder::new(Api::new(Arc::clone(&buckets)));
         builder.set_config(limits.s3s_config());
+        builder.set_auth(NoSignatures);
+        builder.set_access(Access::new(anonymous.clone()));
         Ok(Self {
             inner: Arc::new(Inner {
                 s3: builder.build(),
                 limits,
                 auth,
+                anonymous,
                 catalog: buckets,
             }),
         })
@@ -162,6 +184,9 @@ impl<A: Authenticator> Gateway<A> {
             .authenticate(Request::from_parts(parts, body))
             .await?;
         let (parts, mut body) = request.into_parts();
+        if inner.anonymous.is_none() && parts.extensions.get::<Authenticated>().is_none() {
+            return Err(authz::access_denied());
+        }
         features::reject_unsupported(&parts, &shape)?;
         if shape.body == BodyKind::Xml {
             let max = inner.limits.max_xml_body_bytes;

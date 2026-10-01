@@ -29,6 +29,7 @@ hyper-util = { workspace = true, features = ["http1", "server", "server-graceful
 quick-xml.workspace = true
 rand.workspace = true
 s3s.workspace = true
+secrecy.workspace = true
 serde_urlencoded.workspace = true
 skys3-config.workspace = true
 skys3-control.workspace = true
@@ -37,6 +38,7 @@ skys3-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 aws-credential-types.workspace = true
@@ -48,4 +50,5 @@ proptest.workspace = true
 serde_json.workspace = true
 # Enables `test-util` for this crate's own tests.
 skys3-gateway = { path = ".", features = ["test-util"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "test-util", "time"] }
