@@ -1201,6 +1201,18 @@ of this file. A task with nothing unexpected keeps "None."
   signs with the node's manual clock as the SDK's time source, so advancing
   the clock past expiry makes the SDK's identity cache refresh the session
   through the chain.
+- **Review: the identity copy was read before a wait.** The endpoint took
+  its snapshot before validating the token, which can wait seconds for an
+  issuer's discovery document and keys. A sync during the wait that removed
+  the provider or the role, or narrowed the trust policy, did not stop the
+  session, and the copy could pass `identity_max_staleness` unnoticed. The
+  endpoint now checks freshness before validation (so a stale node fetches
+  nothing) and reads the copy again after it, deciding the provider
+  (`OidcProvider::accepts`), the role, and the trust policy on that. A test
+  holds the key fetch open with a gated fetcher and changes the
+  configuration meanwhile. The session record is stored after these checks,
+  so a sync between the checks and the insert can still race; that window
+  holds no await on a remote service.
 - **Test support moved behind a feature.** The token-minting `testkit`
   was `cfg(test)`; it is now behind `skys3-sts`'s `test-util` feature so
   the integration tests can mint tokens.
