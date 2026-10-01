@@ -13,6 +13,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType,
 };
+use skys3_control::faults::{Fault, FaultyStore};
 use skys3_control::{
     Expected, MemoryControlStore, ProposalOutcome, RetryPolicy, TypedKey, propose_document,
 };
@@ -39,7 +40,9 @@ use crate::stub::{EntryState, MemoryShards};
 /// Every wait in these tests.
 const WAIT: Duration = Duration::from_secs(30);
 
-type Routed = RoutedShards<LocalShards<SimMount>, SimMount, TokioNetwork, MemoryControlStore>;
+type Store = FaultyStore<MemoryControlStore>;
+
+type Routed = RoutedShards<LocalShards<SimMount>, SimMount, TokioNetwork, Store>;
 
 struct Pki {
     cluster: ClusterId,
@@ -138,12 +141,15 @@ fn config(shard: u8, epoch: u64, members: &[u8]) -> ShardConfig {
 struct Cluster {
     nodes: Vec<(MemoryShards, Routed)>,
     served: Arc<Mutex<Vec<Served>>>,
+    store: Store,
+    pki: Pki,
+    peers: BTreeMap<NodeId, NodeAddress>,
 }
 
 impl Cluster {
     async fn start(timing: RoutingConfig) -> Self {
         let pki = Pki::new();
-        let store = MemoryControlStore::new();
+        let store = FaultyStore::new(MemoryControlStore::new());
         let current = config(0, 2, &[1]);
         let key = TypedKey::shard(&bucket_id(), ShardId::new(0));
         let retry = RetryPolicy::default();
@@ -214,7 +220,13 @@ impl Cluster {
             tokio::spawn(serve_peers(listener, replication, routed.server().clone()));
             nodes.push((shards, routed));
         }
-        Self { nodes, served }
+        Self {
+            nodes,
+            served,
+            store,
+            pki,
+            peers,
+        }
     }
 
     fn gateway(&self, n: usize) -> &Routed {
@@ -468,6 +480,72 @@ async fn register_reads_are_spaced_out() {
     let error = timed(gateway.entry(&shard(0), "k")).await.unwrap_err();
     assert!(error.to_string().contains("node-4"), "{error}");
     assert_eq!(gateway.stats().register_reads, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_that_wait_for_a_register_read_share_its_result() {
+    let timing = RoutingConfig {
+        register_interval: Duration::from_millis(200),
+        ..timing()
+    };
+    let cluster = Cluster::start(timing).await;
+    let gateway = cluster.gateway(2);
+    // The map names node 4, which has no address, in a newer epoch than
+    // the register's: every request reads the register, which names
+    // nothing newer.
+    gateway.map().learn(config(0, 3, &[4])).await;
+    let shard = shard(0);
+    let entries = || async {
+        let entry = || gateway.entry(&shard, "k");
+        let (a, b, c, d) = tokio::join!(entry(), entry(), entry(), entry());
+        [a, b, c, d]
+    };
+
+    // A read that outlasts the interval: the requests that waited for it
+    // take its result instead of reading again, one after another.
+    let slow = Fault::before(|| tokio::time::sleep(Duration::from_millis(600)));
+    cluster.store.script([slow]);
+    for result in timed(entries()).await {
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("node-4"), "{error}");
+    }
+    assert_eq!(gateway.stats().register_reads, 1);
+
+    // Once the interval has passed, a read that fails gives its error to
+    // the requests that waited for it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cluster.store.script([Fault::Fail]);
+    for result in timed(entries()).await {
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("could not be read"), "{error}");
+    }
+    assert_eq!(gateway.stats().register_reads, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_served_request_is_observed_even_if_its_answer_is_lost() {
+    let cluster = Cluster::start(timing()).await;
+    let transport = cluster.pki.transport(&node(5));
+    let mut connection = timed(transport.connect(&node(1), &cluster.peers[&node(1)]))
+        .await
+        .unwrap();
+    let request = Request::Entry { key: "k".into() };
+    let frame = wire::request_frame(&shard(0), Epoch::new(2), &request).unwrap();
+    timed(connection.send(&frame)).await.unwrap();
+    // The gateway goes away before the answer arrives.
+    drop(connection);
+    timed(async {
+        while cluster.served().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let served = Served {
+        shard: shard(0),
+        node: node(1),
+        epoch: Epoch::new(2),
+    };
+    assert_eq!(cluster.served(), [served]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

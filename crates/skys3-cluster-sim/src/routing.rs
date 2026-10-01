@@ -38,9 +38,12 @@ pub type RoutingShards =
 /// epoch `e − 1` with the next member as its primary, so that a gateway
 /// asks a member before the primary for every shard.
 ///
-/// An audit records every request a replica served, and
+/// An audit records every request a replica served, as the replica
+/// serves it, so a request whose answer is lost is recorded too, and
 /// [`RoutedServices::check_served`] finds any that the shard's primary in
-/// the current configuration did not serve.
+/// the current configuration did not serve. The current configuration is
+/// the register's: a primary that removed a member (plan M2-11) serves in
+/// a later epoch than the placement's.
 #[derive(Clone)]
 pub struct RoutedServices {
     replicated: ReplicatedServices,
@@ -117,9 +120,11 @@ impl RoutedServices {
         &self.replicated
     }
 
-    /// Checks that every request a gateway accepted was served by the
+    /// Checks that every request a replica served was served by the
     /// primary of its shard's current configuration, in that
-    /// configuration's epoch.
+    /// configuration's epoch or, while a removal's compare-and-swap has
+    /// landed unseen, an earlier one since the placement's (removals keep
+    /// the primary), whether or not its answer arrived.
     ///
     /// # Errors
     ///
@@ -202,10 +207,10 @@ impl NodeServices for RoutedServices {
             map.learn(config).await;
         }
         let replication = local.replication.clone();
-        let (audit, placement, node) = (
+        let (audit, placement, registers) = (
             Arc::clone(&self.audit),
             Arc::clone(&env.placement),
-            env.node.clone(),
+            local.clone(),
         );
         let shards = RoutedShards::new(
             env.node,
@@ -220,12 +225,18 @@ impl NodeServices for RoutedServices {
         .with_observer(move |served| {
             let mut audit = audit.lock().unwrap_or_else(PoisonError::into_inner);
             audit.served += 1;
-            let current = &placement[&served.shard];
-            if served.node != current.primary || served.epoch != current.epoch {
+            let placed = &placement[&served.shard];
+            let current = registers
+                .current(&served.shard)
+                .unwrap_or_else(|| placed.clone());
+            if served.node != current.primary
+                || served.epoch > current.epoch
+                || served.epoch < placed.epoch
+            {
                 audit.wrong.push(format!(
-                    "{node}'s gateway was served on shard {} by {} in epoch {}, but its primary \
-                     is {} in epoch {}",
-                    served.shard, served.node, served.epoch, current.primary, current.epoch
+                    "{} served a request on shard {} in epoch {}, but its primary is {} in \
+                     epoch {}",
+                    served.node, served.shard, served.epoch, current.primary, current.epoch
                 ));
             }
         });

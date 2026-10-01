@@ -2,14 +2,14 @@
 //! intra-cluster connections.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use skys3_io::Disk;
 use skys3_net::{Frame, Listener, MessageKind, Network, Receiver, Sender};
 use skys3_shard::ShardSet;
 use skys3_shard::replication::Replication;
-use skys3_types::Epoch;
+use skys3_types::{Epoch, NodeId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{Reply, Request, Response, wire};
@@ -23,6 +23,20 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// ([`RoutingConfig::idle_timeout`](super::RoutingConfig::idle_timeout)),
 /// so a request rarely meets a connection the server just dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A request a node's replica served, as an observer of its
+/// [`ForwardServer`] sees it (see [`ForwardServer::observe`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Served {
+    /// The shard.
+    pub shard: ShardRef,
+    /// The node whose replica served it.
+    pub node: NodeId,
+    /// The epoch of the configuration the replica served it in.
+    pub epoch: Epoch,
+}
+
+type Observer = Arc<dyn Fn(&Served) + Send + Sync>;
 
 /// Serves forwarded requests on a node's shard replicas.
 ///
@@ -39,8 +53,10 @@ pub struct ForwardServer<S, D: Disk> {
 }
 
 struct Inner<S, D: Disk> {
+    node: NodeId,
     set: ShardSet<D>,
     shards: S,
+    observer: OnceLock<Observer>,
 }
 
 impl<S, D: Disk> Clone for ForwardServer<S, D> {
@@ -54,18 +70,35 @@ impl<S, D: Disk> Clone for ForwardServer<S, D> {
 impl<S: fmt::Debug, D: Disk> fmt::Debug for ForwardServer<S, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ForwardServer")
+            .field("node", &self.inner.node)
             .field("shards", &self.inner.shards)
             .finish_non_exhaustive()
     }
 }
 
 impl<S: Shards, D: Disk> ForwardServer<S, D> {
-    /// Serves requests on the replicas in `set` through `shards`, which
-    /// calls them.
+    /// Serves requests on the replicas in `set` of node `node` through
+    /// `shards`, which calls them.
     #[must_use]
-    pub fn new(set: ShardSet<D>, shards: S) -> Self {
+    pub fn new(node: NodeId, set: ShardSet<D>, shards: S) -> Self {
         Self {
-            inner: Arc::new(Inner { set, shards }),
+            inner: Arc::new(Inner {
+                node,
+                set,
+                shards,
+                observer: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Reports every request a replica of this node serves to `observer`,
+    /// for metrics and audits, whichever gateway sent it. The report comes
+    /// as the replica answers, before the answer is sent, so a request is
+    /// observed even if its answer is then lost. A server has at most one
+    /// observer: the first one set stays.
+    pub fn observe(&self, observer: impl Fn(&Served) + Send + Sync + 'static) {
+        if self.inner.observer.set(Arc::new(observer)).is_err() {
+            tracing::warn!("a forward server already has an observer");
         }
     }
 
@@ -80,11 +113,20 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
             return Reply::Behind(config.epoch);
         }
         match self.execute(shard, request).await {
-            Ok(response) => Reply::Served {
-                response,
-                epoch: config.epoch,
-                hint: (config.epoch > epoch).then_some(config),
-            },
+            Ok(response) => {
+                if let Some(observer) = self.inner.observer.get() {
+                    observer(&Served {
+                        shard: shard.clone(),
+                        node: self.inner.node.clone(),
+                        epoch: config.epoch,
+                    });
+                }
+                Reply::Served {
+                    response,
+                    epoch: config.epoch,
+                    hint: (config.epoch > epoch).then_some(config),
+                }
+            }
             Err(ShardError::NotPrimary { .. }) => Reply::Redirect(replica.config()),
             Err(error) => Reply::Refused(error),
         }

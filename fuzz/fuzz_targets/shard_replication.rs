@@ -43,6 +43,7 @@ fn check(frame: &Frame) {
                 let again = Sync {
                     config: config.to_json().expect("a valid register encodes"),
                     primary_last: sync.primary_last,
+                    sequencing: sync.sequencing,
                 };
                 assert_eq!(again.configuration(), Ok(config));
             }

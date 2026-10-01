@@ -2337,6 +2337,7 @@ dependencies = [
  "skys3",
  "skys3-config",
  "skys3-control",
+ "skys3-coord",
  "skys3-flush",
  "skys3-gateway",
  "skys3-index",
@@ -2391,6 +2392,24 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "turmoil",
+]
+
+[[package]]
+name = "skys3-coord"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "prost",
+ "rcgen",
+ "skys3-config",
+ "skys3-control",
+ "skys3-io",
+ "skys3-net",
+ "skys3-types",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2577,14 +2596,17 @@ name = "skys3-shard"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "prometheus-client",
  "proptest",
  "prost",
  "rand",
  "rcgen",
+ "skys3-control",
  "skys3-index",
  "skys3-io",
  "skys3-log",
  "skys3-net",
+ "skys3-obs",
  "skys3-sim",
  "skys3-types",
  "thiserror",

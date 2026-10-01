@@ -17,7 +17,7 @@ use skys3_shard::ShardSet;
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeAddress, NodeId, ShardConfig};
 use tokio::time::Instant;
 
-use super::{ForwardServer, Reply, Request, Response, ShardMap, wire};
+use super::{ForwardServer, Reply, Request, Response, Served, ShardMap, wire};
 use crate::conditions::{ConditionFailed, Precondition};
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
 
@@ -41,9 +41,11 @@ pub struct RoutingConfig {
     pub idle_timeout: Duration,
     /// How many idle connections to each node are kept.
     pub idle_per_node: usize,
-    /// How often, at most, the gateway reads one shard's register when no
-    /// member it knows answers, so that a shard whose members are all down
-    /// does not turn every request into a control-store read (§6.1).
+    /// How long after a read of one shard's register finishes the gateway
+    /// waits before it reads it again, when no member it knows answers;
+    /// requests in between take that read's result. A shard whose members
+    /// are all down then does not turn every request into a control-store
+    /// read (§6.2).
     pub register_interval: Duration,
 }
 
@@ -59,18 +61,6 @@ impl Default for RoutingConfig {
     }
 }
 
-/// A request a replica served, as [`RoutedShards::with_observer`] reports
-/// it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Served {
-    /// The shard.
-    pub shard: ShardRef,
-    /// The node whose replica served it.
-    pub node: NodeId,
-    /// The epoch of the configuration the replica served it in.
-    pub epoch: Epoch,
-}
-
 /// Counts of how [`RoutedShards`] routed its calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoutingStats {
@@ -81,8 +71,6 @@ pub struct RoutingStats {
     /// Reads of a shard's register.
     pub register_reads: u64,
 }
-
-type Observer = Arc<dyn Fn(&Served) + Send + Sync>;
 
 /// The idle connections to each node, with when each became idle.
 type Idle<S> = BTreeMap<NodeId, Vec<(Instant, Connection<S>)>>;
@@ -99,7 +87,6 @@ pub struct RoutedShards<L, D: Disk, N: Network, C> {
     inner: Arc<Inner<L, D, N, C>>,
     config: RoutingConfig,
     retry: RetryPolicy,
-    observer: Option<Observer>,
 }
 
 struct Inner<L, D: Disk, N: Network, C> {
@@ -111,8 +98,9 @@ struct Inner<L, D: Disk, N: Network, C> {
     peers: BTreeMap<NodeId, NodeAddress>,
     store: C,
     idle: Mutex<Idle<N::Stream>>,
-    /// When each shard's register was last read.
-    register_reads: tokio::sync::Mutex<BTreeMap<ShardRef, Instant>>,
+    /// The last read of each shard's register: when it finished, and the
+    /// error it ended with, if any.
+    register_reads: tokio::sync::Mutex<BTreeMap<ShardRef, (Instant, Option<ShardError>)>>,
     next_request: AtomicU64,
     forwarded: AtomicU64,
     redirects: AtomicU64,
@@ -125,7 +113,6 @@ impl<L, D: Disk, N: Network, C> Clone for RoutedShards<L, D, N, C> {
             inner: Arc::clone(&self.inner),
             config: self.config,
             retry: self.retry,
-            observer: self.observer.clone(),
         }
     }
 }
@@ -183,7 +170,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                server: ForwardServer::new(set, local.clone()),
+                server: ForwardServer::new(node.clone(), set, local.clone()),
                 node,
                 local,
                 map,
@@ -199,7 +186,6 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
             }),
             config: RoutingConfig::default(),
             retry: RetryPolicy::default(),
-            observer: None,
         }
     }
 
@@ -211,11 +197,12 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
         self
     }
 
-    /// Reports every request a replica served to `observer`, for metrics
-    /// and audits.
+    /// Reports every request this node's replicas serve to `observer`,
+    /// for metrics and audits, whichever gateway sent it (see
+    /// [`ForwardServer::observe`]).
     #[must_use]
-    pub fn with_observer(mut self, observer: impl Fn(&Served) + Send + Sync + 'static) -> Self {
-        self.observer = Some(Arc::new(observer));
+    pub fn with_observer(self, observer: impl Fn(&Served) + Send + Sync + 'static) -> Self {
+        self.inner.server.observe(observer);
         self
     }
 
@@ -298,20 +285,9 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 }
             };
             match reply {
-                Reply::Served {
-                    response,
-                    epoch,
-                    hint,
-                } => {
+                Reply::Served { response, hint, .. } => {
                     if let Some(hint) = hint {
                         self.inner.map.learn(hint).await;
-                    }
-                    if let Some(observer) = &self.observer {
-                        observer(&Served {
-                            shard: shard.clone(),
-                            node: node.clone(),
-                            epoch,
-                        });
                     }
                     return Round::Done(Ok(response));
                 }
@@ -439,9 +415,10 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     /// Reads `shard`'s register, and returns whether the map now holds a
     /// newer configuration than `asked`, the one whose members did not
     /// answer. Reads of one node wait for each other, and a shard's
-    /// register is read at most once per
-    /// [`RoutingConfig::register_interval`]: concurrent requests to a
-    /// shard whose members are all down share one read.
+    /// register is read again only
+    /// [`RoutingConfig::register_interval`] after its last read finished:
+    /// concurrent requests to a shard whose members are all down share
+    /// one read, and its result, however long it takes.
     async fn read_register(
         &self,
         shard: &ShardRef,
@@ -451,26 +428,28 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
         if self.newer(shard, asked).is_some() {
             return Ok(true);
         }
-        if reads
-            .get(shard)
-            .is_some_and(|at| at.elapsed() < self.config.register_interval)
+        if let Some((at, error)) = reads.get(shard)
+            && at.elapsed() < self.config.register_interval
         {
-            return Ok(false);
+            return error.clone().map_or(Ok(false), Err);
         }
-        reads.insert(shard.clone(), Instant::now());
         self.inner.reads.fetch_add(1, Ordering::Relaxed);
         let key = TypedKey::shard(&shard.bucket, shard.shard);
-        match read_with_retries(&self.inner.store, &key, &self.retry).await {
+        let read = match read_with_retries(&self.inner.store, &key, &self.retry).await {
             Ok(Some(register)) => {
                 self.inner.map.learn(register.value).await;
-                Ok(self.newer(shard, asked).is_some())
+                Ok(())
             }
             Ok(None) => Err(ShardError::NotFound(shard.clone())),
             Err(error) => Err(ShardError::Unavailable {
                 shard: shard.clone(),
                 reason: format!("its register could not be read: {error}"),
             }),
-        }
+        };
+        // The interval starts when the read finishes, so requests that
+        // waited for it take its result rather than read again.
+        reads.insert(shard.clone(), (Instant::now(), read.clone().err()));
+        read.map(|()| self.newer(shard, asked).is_some())
     }
 }
 

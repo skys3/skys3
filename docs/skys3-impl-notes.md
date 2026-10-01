@@ -2589,7 +2589,11 @@ of this file. A task with nothing unexpected keeps "None."
   rate-limited per shard, so every request that arrived while another was
   reading a shard's register failed. Reads of one node now wait for each
   other and look at the map again before reading, so concurrent requests
-  share one read.
+  share one read. A review then found that the interval was timed from
+  the start of a read: a read slower than the interval, or one that
+  failed, left every waiting request to read again in turn. The interval
+  now runs from when a read finishes, and the requests within it take
+  its result, its error included.
 - **No new index format for the shard map.** The map is a new `shard_map`
   table, keyed like `shards`, holding each configuration's register JSON.
   It is a cache that is safe when stale, so it takes no index format of
@@ -2631,9 +2635,12 @@ of this file. A task with nothing unexpected keeps "None."
   primary (a redirect corrects it), a third in epoch 2 with only a node
   that does not exist (no member answers, so the gateway reads the
   register), and a third unknown. Clients send every request to a random
-  node. An observer on every gateway records which node served each
-  request in which epoch, and an invariant fails the run if any was not
-  the current primary in the current epoch. A seeded bug, members that
+  node. An observer on every node's forward server records which replica
+  served each request in which epoch, as it serves it, and an invariant
+  fails the run if any was not the current primary in the current epoch.
+  The observer first sat in the gateway, after the answer arrived, and so
+  missed a request served by the wrong replica whose answer was lost; a
+  review caught it. A seeded bug, members that
   answer reads from their own index, trips it; that scenario starts every
   map with a member as each shard's primary, since with the mixed maps a
   write's redirect could correct a map before any read reached the
@@ -2644,11 +2651,16 @@ of this file. A task with nothing unexpected keeps "None."
   object replaced between the entry and the payload answers a retryable
   `503`. Forwarding both calls widens that window, so the fault-free
   scenario allows a few failed reads; it still allows no failed write.
-- **A replication scenario fails on one seed in 4,096, before this
-  task.** `replicated_writes_under_crashes_and_message_loss` with
-  `SKYS3_SIM_SEED=86` finds a history no order explains on
-  `bucket-1/key-1`. It fails the same way on the M2-07 head, so it is not
-  routing; it is left to the replication tasks.
+- **A replication seed failed before this task, and passes after the
+  merge with M2-10, for no identified reason.**
+  `replicated_writes_under_crashes_and_message_loss` with
+  `SKYS3_SIM_SEED=86` found a history no order explains on
+  `bucket-1/key-1`, on the M2-07 head (a4e1066) as well, so not through
+  routing. It passes once M2-07's review fixes, M2-09, M1-18 and M2-10
+  are merged in. It is not M2-10's relaxed rule for failed writes: the
+  seed passes with a4e1066's checker too. The merged changes also change
+  what the replicas do, and so the run that seed draws; the case the
+  seed found may still exist, unexplained, under another seed.
 - **Left for later.**
   - **Binary wiring.** Not done: the routing code alone is about 2,000
     lines of non-test library code, over the plan's 1,500, before any
@@ -2786,3 +2798,179 @@ of this file. A task with nothing unexpected keeps "None."
   writes on its shards each wait the full timeout and their records pile
   up in the primary's memory and log until the member returns; fail-fast
   bounds that to the records sequenced before the first timeout.
+
+### M2-11 Member removal
+
+- **A replica cannot switch epochs at its own last `seq`.** M2-07 appended
+  a `CONFIG` record at `(epoch, last seq)` of whichever replica adopted a
+  configuration. A member behind its primary (say at seq 95 while the
+  primary's `CONFIG` record follows seq 100) would then hold `(e+1, 95)`
+  and next be sent `(e, 96)`: positions running backwards. Every replica
+  now switches at the `seq` of the primary's `CONFIG` record. A `Sync`
+  carries the epoch the primary sequences in, besides its configuration;
+  a member that learned a newer configuration keeps sequencing in its old
+  epoch, takes that epoch's tail, and appends its own `CONFIG` record just
+  before the first record of the new epoch, or once it holds the
+  primary's last record if all of those are older. This is the deliberate
+  relaxation of "one epoch per record" M2-07 left for this task. A
+  primary appends its `CONFIG` record only once every member of the new
+  configuration has reported its log in this life, so no member holds an
+  older-epoch record the primary lacks; until then the record waits, and
+  the link of the last member to report appends it
+  (`Shard::align`). Design §5.1 records the rules.
+- **Restarting into a newer epoch had the same problem.** `Shard::open`
+  appended the `CONFIG` record at once whenever the configuration was
+  newer than the log. A replicated replica now opens in its log's epoch
+  and aligns as above (`Shard::sequencing`). The node keeps no copy of
+  the configuration of its log's epoch until M2-16, so a primary opened
+  this way commits that epoch's tail under the newer configuration's
+  rule: safe, since the register already holds it and a removal only
+  shrinks the members.
+- **When the commit rule changes.** The primary could drop the member as
+  soon as its compare-and-swap landed, or once its `CONFIG` record is
+  durable. It waits for the record (`Leader::adopt`, called by the
+  pipeline when the record is durable), as §5.1 asks of every replica
+  before it acts in a new epoch; it costs one group commit on the
+  primary's own disk. The watchdog adopts without waiting for the record
+  to *commit* (`Shard::begin_reconfigure`): a second late member would
+  hold that up, and the watchdog would never get to remove it too.
+- **A removal needs no durable proposal (decided, design §6.3).** §6.3
+  makes every proposer record its proposal and act as if it succeeded.
+  For a removal, acting as if it failed is the safe side: the primary
+  keeps needing the member's acknowledgements and lease until it knows,
+  and finds a lost answer in the register later, which it adopts if it
+  keeps the primary and only removes members. A register naming another
+  primary, or gone, stops the primary (`Shard::depose`); M2-12 refines
+  what a deposed primary does.
+- **"Unresponsive" was not defined (decided, design §6.4).** A member
+  responds while its acknowledgements advance, or, once it holds what the
+  primary had sequenced a moment earlier, while it answers anything. A
+  member whose disk is stuck still answers beacons, so "heard from
+  recently" was not enough. A member that never reports its log after the
+  primary starts is suspected too, so a primary that restarts while a
+  member is dead does not wait for it forever.
+- **Pending writes and `min_write_replicas` (decided, design §6.4).** The
+  design rejects new writes once fewer copies remain, but said nothing of
+  the writes in flight that then commit with too few copies. They are
+  applied, and their writers get `ShardError::UnderReplicated` (`503`):
+  not acknowledged, as §5.2 allows. `FLUSHED`, `IMPORT`, and `ADOPT` are
+  not client writes and go on, as under a seal.
+- **The simulation assumed static placements in three places.** The
+  every-member durability check read the members of each shard from the
+  placement, the commit audit took them from it at acknowledgement time,
+  and restarted nodes reopened every shard in epoch 1, which a replica
+  past epoch 1 refuses. The harness now reads the registers straight from
+  the control bucket, without requests or faults, as a stand-in for the
+  shard map (M2-08) and the local copies (M2-16): nodes open a shard in
+  its register's configuration (a removed member does not reopen it), the
+  audit checks each acknowledgement against the register's members at
+  that moment (so a primary dropping a member before its compare-and-swap
+  landed is still caught), and the final check reads every member of the
+  final configurations. The every-member check also split survivors by
+  member index, which left shards with fewer members with no copy at all;
+  their last member now stands in. The removal's compare-and-swap goes
+  through each node's faulty control store, with lost answers and `409`s.
+- **Measured.** Ten seeds of node 3 cut off from both other nodes
+  for 8 s, with the defaults (3 s suspicion, 5 s wait-through timeout) and
+  the control store losing, conflicting, or refusing 2 % of requests each:
+  no write failed or went unanswered, and the slowest acknowledged write
+  took 3.02 to 3.10 s, `member_suspect_after` plus the watchdog's check
+  interval (100 ms), the compare-and-swap, and the `CONFIG` record's group
+  commit. In fail-fast mode (2 s), every write that failed after taking a
+  position, 2 to 6 per seed, later committed under the new epoch. The
+  loopback test in `skys3-shard` sees the same with 300 ms.
+- **The protocol model needed no change.** `RemoveMember` and the
+  same-primary branch of `Adopt` in `spec/ShardProtocol.tla` already keep
+  acknowledgements across the change and let a removed member grant
+  leases only in its own epoch. The implementation refines them: between
+  the compare-and-swap and the durable `CONFIG` record it needs the old,
+  larger set of acknowledgements and leases, which only removes behaviors.
+- **Metrics.** `under_replicated_bytes` and `oldest_under_replicated_age`
+  have no labels: a node counts the shards it leads, so the sum over nodes
+  counts each shard once (`Replication::exposure`,
+  `ReplicationMetrics`). The bytes are an index scan per under-replicated
+  shard and report; the age restarts with the node, since the register
+  keeps no removal time. `docs/skys3-metrics.md` lists them as defined,
+  not exported: the binary does not run replication yet.
+- **With routing (M2-08).** `ShardError::UnderReplicated` reaches the
+  gateway as `NotAcknowledged` without a position, so clients get
+  `503 SlowDown` as §6.4 asks, and it crosses the forward wire as outcome
+  7. A removal shows in the shard maps without further changes: the
+  primary serves in epoch e+1 once it adopted it, so a gateway asking in
+  epoch e learns it from the reply's hint, and the members that remain
+  redirect with e+1 once they follow. The removed member stays a member
+  of epoch e: it serves no routed request and redirects with epoch e,
+  which a gateway that knows e+1 ignores. A primary deposed by its
+  register refuses with `503` instead of redirecting; M2-12 decides what
+  it answers. The routing scenarios now check served requests against the
+  register, since a removal moves the epoch past the placement's.
+- **Left for later.** Wiring (`member_suspect_after_ms` maps onto
+  `ReplicationConfig::member_suspect_after`, and `with_removal` takes the
+  node's control store) comes with replication in the binary. A removal
+  does not bump the generation in `cluster.json`; nodes learn of it from
+  sessions, and the removed member keeps its replica open in the old
+  epoch until it restarts or rejoins as a learner (M2-15, M2-16).
+  `skys3-shard` now depends on `skys3-control`, `skys3-obs`, and
+  `prometheus-client`.
+
+## M3 Coordinator
+
+### M3-01 Coordinator lease and change propagation
+
+- **The takeover wait alone does not keep tenures apart.** §6.7 gave only
+  the candidate's rule, `coordinator_lease × (1+ρ)` after it first sees a
+  lease version. A holder that acts for a whole `coordinator_lease` after
+  each renewal can outlast that wait when its clock runs slow by `ρ` and
+  the candidate's fast by `ρ`: by about `2ρ` of the lease. The holder now
+  acts only for `coordinator_lease × (1−ρ)` after sending its renewal,
+  counted from the first attempt of a write retried after a lost answer,
+  and the candidate counts from when its read returned, which is after
+  the write. Recorded in §6.7. Safety never rested on it (every change is
+  a compare-and-swap), but it makes "two coordinators at once" a fault
+  beyond `ρ` rather than routine, and the simulation checks it: no two
+  tenures overlap in simulated time, and a seeded bug, one node with a
+  quarter-length lease, is caught.
+- **A lease write whose answer was lost spans calls.** `propose` applies
+  the lost-response rule within one call; a renewal or takeover that ran
+  out of attempts and is sent again in a later round would see its own
+  landed write as a lost race. The elector keeps the pending lease write
+  and resends the same value under the same precondition, and adopts it
+  when a later read finds its `proposal_id`, with the tenure counted from
+  the first attempt (so an old adoption is renewed before the node acts).
+- **A holder whose tenure lapsed keeps renewing its own version.**
+  Stepping down to a candidate would make it wait out its own lease
+  (`coordinator_lease × (1+ρ)`) after a store outage longer than the
+  tenure. It keeps the version it holds and renews by `If-Match`: if
+  nobody took over, the renewal lands and it acts again at once; if
+  someone did, the renewal is rejected and it follows the new holder.
+- **Pushes have a port of their own in the simulation.** Replication's
+  listener owns the transport port and serves only replication links, and
+  the node binary does not wire the transport yet. The harness serves
+  pushes (`ControlChanged`, acknowledged by `AdminReply`) on port 7401;
+  serving both on one port needs a dispatch by message class when the
+  transport is wired into the binary.
+- **Pushes do not wake the node's sync yet.** `ControlHints::newer_than`
+  is the hook beside the change stream in the node's sync loop, which
+  M2-16 rewrites; the simulation records and checks delivery instead. A
+  push is a hint, so a forged one from an admin certificate costs a read.
+- **The push audit had to learn when nodes run.** Injected control-store
+  faults stop a node during startup now and then, and the supervisor
+  restarts it 500 ms later; invariants only run once clients start, and
+  the harness restarts every node at the end. The check covers
+  announcements from when the clients start until the final restart,
+  skipping those within the bound before a node went down or a second
+  after it came back, and announcements from different coordinators can
+  arrive out of order, so a newer pushed generation counts.
+- **The placement stand-in.** Placement proper is M3-02 to M3-06, so the
+  simulated coordinator moves shard registers of a bucket no gateway
+  serves through their epochs, as membership changes will. The
+  `Placement` trait is the extension point; `NoPlacement` changes
+  nothing. The `ControlStore` trait is unchanged.
+- **Numbers.** Over 32 seeds with a 1.2 s lease and `ρ` = 1%: placement
+  paused at most 1.32 s when the coordinator lost the control store,
+  against a bound of the takeover wait plus two read intervals and three
+  placement intervals (2.31 s), and no client request failed; a node
+  acting without the lease beside the holder made 8,712 changes with
+  the holder, 325 of which lost a race and none of which wrote an epoch
+  twice; the quarter-length-lease bug was caught in 20 of 32 seeds (in
+  the rest the hasty node held the lease from the start).
