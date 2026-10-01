@@ -64,7 +64,7 @@ impl Account {
             // accounting slip from refusing every later write.
             let _ = self
                 .dirty
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |dirty| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |dirty| {
                     Some(dirty.saturating_sub(less))
                 });
         }
