@@ -20,6 +20,7 @@ test-util = ["skys3-control/test-util"]
 [dependencies]
 async-trait.workspace = true
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+base64.workspace = true
 bytes.workspace = true
 crc-fast.workspace = true
 http.workspace = true
@@ -35,7 +36,10 @@ secrecy.workspace = true
 serde_urlencoded.workspace = true
 skys3-config.workspace = true
 skys3-control.workspace = true
+skys3-index.workspace = true
 skys3-io.workspace = true
+skys3-log.workspace = true
+skys3-shard.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }

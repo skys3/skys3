@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! The SkyS3 S3 gateway: the S3 API over HTTP, request limits, key-to-shard
-//! routing, and bucket operations (design §3, §4.1, §11, §12).
+//! routing, and bucket and object operations (design §3, §4.1, §5.1, §9.2,
+//! §11, §12).
 //!
 //! Section numbers (§) refer to the [SkyS3 design](https://github.com/skys3/skys3/blob/main/docs/skys3-design.md).
 //!
@@ -18,9 +19,23 @@
 //!   detaches; HeadBucket; ListBuckets; and GetBucketLocation. Bucket
 //!   registers live in the control store, and the gateway answers reads
 //!   from its local copy.
+//! - Object operations: PutObject, GetObject (with a byte range),
+//!   HeadObject, and DeleteObject, with conditional requests evaluated
+//!   against the key's entry in its shard's index, and conditional PUTs
+//!   ([`Precondition`]) checked when the shard sequences the write. A body
+//!   up to `inline_max_bytes` is stored inline in its `PUT` record, a
+//!   larger one as `EXTENT` records while it arrives, and a PUT is answered
+//!   only once its record is durable and applied. User metadata is limited
+//!   to [`MAX_USER_METADATA_BYTES`].
+//! - Listings: ListObjectsV2 and ListObjects (V1), with prefixes,
+//!   delimiters, `start-after` and markers, and `encoding-type=url`. Each
+//!   shard returns a sorted page from its index, the gateway merges them,
+//!   and a V2 page ends with a continuation token authenticated with the
+//!   gateway's [`ListTokenKeys`].
 //! - [`Shards`] and [`ShardRef`]: the shard interface the gateway calls,
 //!   and routing of each key to its shard with the frozen hash. On a single
-//!   node every shard is local.
+//!   node every shard is local: [`LocalShards`] serves the interface from
+//!   the node's `skys3_shard::ShardSet`.
 //!
 //! - [`sigv4`]: SigV4 authentication with the `Authorization` header or a
 //!   presigned URL, session tokens, and `aws-chunked` bodies with signed
@@ -37,13 +52,13 @@
 //! - [`checksum`]: checksum validation of request bodies, on a blocking
 //!   pool, for CRC32, CRC32C, CRC64NVME, SHA1, SHA256, and `Content-MD5`
 //!   (trailing checksums included), MD5 ETags, and multipart ETags and
-//!   checksums. Object operations (plan M1-09) use it.
+//!   checksums. PutObject uses it.
 //!
 //! The gateway serves path-style requests. The node binary does not serve
 //! it yet (plan M1-13).
 //!
-//! With the `test-util` feature, `stub` provides an in-memory [`Shards`]
-//! implementation, `TrustAll` an authenticator that takes every request
+//! With the `test-util` feature, `stub` provides [`LocalShards`] on a
+//! simulated disk, `TrustAll` an authenticator that takes every request
 //! as signed by a principal allowed everything, and
 //! `sigv4::MemoryCredentials` a fixed set of keys.
 //!
@@ -64,13 +79,19 @@
 //! let store = MemoryControlStore::new();
 //! bootstrap(&store, &config.cluster_id, ProposalIds::seeded(1).next_id(), &RetryPolicy::default())
 //!     .await?;
-//! let gateway =
-//!     Gateway::new(config, store, MemoryShards::new(), IdSource::seeded(1), TrustAll)
-//!         .await?;
+//! let shards = MemoryShards::new().await;
+//! let gateway = Gateway::new(config, store, shards, IdSource::seeded(1), TrustAll).await?;
 //! let request = http::Request::put("/photos")
 //!     .header(skys3_gateway::MODE_HEADER, "local")
 //!     .body(s3s::Body::empty())?;
 //! assert_eq!(gateway.handle(request).await.status(), 200);
+//!
+//! let put = http::Request::put("/photos/cat.txt").body(s3s::Body::from("meow".to_owned()))?;
+//! let response = gateway.handle(put).await;
+//! assert_eq!(response.status(), 200);
+//! assert_eq!(response.headers()["etag"], "\"4a4be40c96ac6314e91d93f38043a634\"");
+//! let get = http::Request::get("/photos/cat.txt").body(s3s::Body::empty())?;
+//! assert_eq!(gateway.handle(get).await.headers()["content-length"], "4");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! # })?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -80,6 +101,7 @@ mod api;
 pub mod authz;
 mod buckets;
 pub mod checksum;
+mod conditions;
 mod credentials;
 mod features;
 #[cfg(feature = "test-util")]
@@ -87,6 +109,9 @@ mod features;
 pub mod fuzzing;
 mod limits;
 mod listener;
+mod listing;
+mod local;
+mod objects;
 mod service;
 mod shard;
 pub mod sigv4;
@@ -95,9 +120,13 @@ pub mod stub;
 
 pub use authz::{Permissions, Principal};
 pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER};
+pub use conditions::{ConditionFailed, Precondition};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
+pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};
+pub use local::LocalShards;
+pub use objects::{MAX_OBJECT_BYTES, MAX_USER_METADATA_BYTES};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};

@@ -60,7 +60,9 @@ Where the cluster's registers live (§6.1).
 | `coordinator_lease_seconds` | integer | `10` | Positive. The holder renews every third of it (§6.7). |
 | `config_poll_interval_seconds` | integer | `30` | Positive. How often a node polls `cluster.json` as a backstop to pushes (§6.2). |
 
-**Independence from data targets.** With `backend = "s3"`, loading refuses a control-store `endpoint` in the same failure scope as a bucket's `backup_target`, unless `allow_correlated_control_store = true` (§6.1). Two endpoints share a scope when they have the same host name or IP address, whatever their ports, or are AWS S3 endpoints in the same region. IP addresses are compared as addresses: every spelling of an IPv6 address, and an IPv4 address and its IPv4-mapped IPv6 form, are the same. Write-back targets are bound when a bucket is attached, and the attach path applies the same check.
+**Independence from data targets.** With `backend = "s3"`, loading refuses a control-store `endpoint` in the same failure scope as a bucket's `backup_target` or `snapshot_target`, unless `allow_correlated_control_store = true` (§6.1). Two endpoints share a scope when they have the same host name or IP address, whatever their ports, or are AWS S3 endpoints in the same region. IP addresses are compared as addresses: every spelling of an IPv6 address, and an IPv4 address and its IPv4-mapped IPv6 form, are the same. Even with `allow_correlated_control_store = true`, a target in the control bucket whose prefix overlaps the control `prefix` (one starts with the other; no prefix covers the whole bucket) is refused, so that no target's credential reaches the registers. Write-back targets are bound when a bucket is attached, and the attach path applies the same checks.
+
+**Credential scope.** The S3 control store addresses only keys under `prefix`. Its credential is the operator's to scope: `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on `arn:aws:s3:::<bucket>/<prefix>*`, and `s3:ListBucket` on the bucket with an `s3:prefix` condition starting with `prefix`, and nothing else (§6.1).
 
 ## `[transport]`
 
