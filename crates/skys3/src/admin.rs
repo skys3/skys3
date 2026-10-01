@@ -26,7 +26,8 @@
 //!   remote object's ETag and write identity;
 //! - `awaiting_multipart`: the keys whose latest version is a multipart
 //!   object, which waits for multipart flush (plan M1-16b);
-//! - `errors`: the latest flush error of each shard that has one.
+//! - `errors`: the latest flush error of each shard that has one, until
+//!   a later attempt gets its key past it.
 //!
 //! Placement (M3-03) adds shard members, and M4-06 its own fields.
 
