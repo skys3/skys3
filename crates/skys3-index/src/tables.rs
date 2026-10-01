@@ -4,6 +4,7 @@
 //! encoding.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
 use skys3_log::RecordLocation;
@@ -13,6 +14,7 @@ use skys3_types::{EpochSeq, Generation};
 use crate::codec;
 use crate::entry::{ControlEntry, Entry, Part, Upload};
 use crate::error::IndexError;
+use crate::listing::{self, ListPage, ListQuery};
 
 type Bytes = &'static [u8];
 
@@ -38,6 +40,9 @@ pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta")
 pub(crate) const FORMAT_VERSION_KEY: &str = "format_version";
 /// The key of the control generation in [`META`].
 const CONTROL_GENERATION_KEY: &str = "control_generation";
+/// The key in [`META`] of when the sync that produced the control copy
+/// started, in milliseconds since the Unix epoch.
+const CONTROL_SYNCED_AT_KEY: &str = "control_synced_at_ms";
 
 fn entry<T: ReadableTable<Bytes, Bytes>>(
     table: &T,
@@ -144,7 +149,7 @@ where
 /// Returns the smallest key greater than every key that starts with
 /// `prefix`. A shard key ends with its shard number and starts with a
 /// bucket ID length below 255, so it never consists of `0xff` bytes alone.
-fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+pub(crate) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
         if last < u8::MAX {
@@ -488,6 +493,29 @@ impl<'txn> ControlWriter<'txn> {
         Ok(self.control.remove(key)?.is_some())
     }
 
+    /// Removes the copy of every register, before a sync stores a complete
+    /// new copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn clear(&mut self) -> Result<(), IndexError> {
+        self.control.retain(|_, _| false)?;
+        Ok(())
+    }
+
+    /// Records when the sync that produced the copy started, as time since
+    /// the Unix epoch, so a restarted node knows the copy's age (§6.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn set_synced_at(&mut self, since_epoch: Duration) -> Result<(), IndexError> {
+        let millis = u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX);
+        self.meta.insert(CONTROL_SYNCED_AT_KEY, millis)?;
+        Ok(())
+    }
+
     /// Records that the local copy is complete up to `generation`.
     ///
     /// # Errors
@@ -690,6 +718,17 @@ impl IndexReader {
         Ok(page)
     }
 
+    /// Returns one page of `shard`'s listing (§9.4): its live objects and
+    /// common prefixes in order, as [`ListQuery`] describes, skipping
+    /// delete tombstones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, IndexError> {
+        listing::list(&self.namespace, shard, query)
+    }
+
     /// Returns the location of the record at `position` in `shard`.
     ///
     /// # Errors
@@ -748,12 +787,12 @@ impl IndexReader {
             .map(|value| Generation::new(value.value())))
     }
 
-    /// Returns everything the index holds except its bookkeeping.
+    /// Returns the copy of every register, by register key.
     ///
     /// # Errors
     ///
     /// Returns an [`IndexError`] if reading or decoding fails.
-    pub fn dump(&self) -> Result<IndexDump, IndexError> {
+    pub fn control_entries(&self) -> Result<BTreeMap<String, ControlEntry>, IndexError> {
         let mut control = BTreeMap::new();
         for row in self.control.iter()? {
             let (key, value) = row?;
@@ -761,6 +800,29 @@ impl IndexReader {
                 codec::decode_control(value.value()).map_err(IndexError::codec("control"))?;
             control.insert(key.value().to_owned(), entry);
         }
+        Ok(control)
+    }
+
+    /// Returns when the sync that produced the control copy started, as
+    /// time since the Unix epoch, or `None` if it was never recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading fails.
+    pub fn control_synced_at(&self) -> Result<Option<Duration>, IndexError> {
+        Ok(self
+            .meta
+            .get(CONTROL_SYNCED_AT_KEY)?
+            .map(|value| Duration::from_millis(value.value())))
+    }
+
+    /// Returns everything the index holds except its bookkeeping.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn dump(&self) -> Result<IndexDump, IndexError> {
+        let control = self.control_entries()?;
         Ok(IndexDump {
             entries: read_all(
                 &self.namespace,

@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{
-    Checkpointer, Entry, EntryState as IndexState, Index, IndexConfig, Part, Upload,
+    Checkpointer, Entry, EntryState as IndexState, Index, IndexConfig, ListPage, ListQuery, Part,
+    Upload,
 };
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Delete, Extent, ExtentRef, Flushed, Put, PutData};
@@ -296,6 +297,11 @@ impl Shards for MemoryShards {
     ) -> Result<Vec<(u16, Part)>, ShardError> {
         self.check(shard)?;
         self.local.parts(shard, upload, after, limit).await
+    }
+
+    async fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, ShardError> {
+        self.check(shard)?;
+        self.local.list(shard, query).await
     }
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {

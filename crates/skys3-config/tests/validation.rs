@@ -562,6 +562,31 @@ fn admin_listener_off_loopback_needs_a_token() {
     );
 }
 
+#[test]
+fn transport_certificate_files_are_set_together() {
+    let config = load("").unwrap();
+    assert_eq!(config.transport().listen.to_string(), "0.0.0.0:7400");
+    assert_eq!(config.transport().tls_files(), None);
+
+    let all = "tls_cert_file = \"/etc/skys3/node.crt\"\n\
+               tls_key_file = \"/etc/skys3/node.key\"\n\
+               tls_ca_file = \"/etc/skys3/ca.crt\"";
+    let config = load(&format!("[transport]\nlisten = \"10.0.0.5:7400\"\n{all}")).unwrap();
+    let files = config.transport().tls_files().unwrap();
+    assert_eq!(files.cert, std::path::Path::new("/etc/skys3/node.crt"));
+    assert_eq!(files.key, std::path::Path::new("/etc/skys3/node.key"));
+    assert_eq!(files.ca, std::path::Path::new("/etc/skys3/ca.crt"));
+
+    assert_violations(
+        "[transport]\ntls_cert_file = \"/etc/skys3/node.crt\"",
+        &["transport.tls_key_file", "transport.tls_ca_file"],
+    );
+    assert_violations(
+        &format!("[transport]\n{}", all.replace("/etc/skys3/node.key", "")),
+        &["transport.tls_key_file"],
+    );
+}
+
 // [control_store]
 
 fn control_store(body: &str) -> String {
@@ -624,8 +649,94 @@ fn s3_backend_rules() {
 }
 
 #[test]
+fn file_backend_rules() {
+    let config: Config = control_store("backend = \"file\"").parse().unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::File {
+            directory: "/var/lib/skys3/control".into(),
+        }
+    );
+    let config: Config = format!(
+        "{}\n[node]\ndata_dir = \"/data\"",
+        control_store("backend = \"file\"")
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::File {
+            directory: "/data/control".into(),
+        },
+        "the default follows data_dir"
+    );
+    let config: Config = control_store("backend = \"file\"\ndirectory = \"/ctl\"")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::File {
+            directory: "/ctl".into(),
+        }
+    );
+    assert_control_store_violations(
+        "backend = \"file\"\ndirectory = \"\"\netcd_endpoints = [\"http://e\"]\nbucket = \"b\"",
+        &[
+            "control_store.etcd_endpoints",
+            "control_store.bucket",
+            "control_store.directory",
+        ],
+    );
+    assert_control_store_violations(
+        "etcd_endpoints = [\"http://e\"]\ndirectory = \"/ctl\"",
+        &["control_store.directory"],
+    );
+}
+
+// [node] and [gateway]
+
+#[test]
+fn node_rules() {
+    let config = load("[node]\nnode_id = \"node-2\"\ndisks = [\"/a\", \"/b\"]").unwrap();
+    assert_eq!(config.node().node_id.as_ref().unwrap().as_str(), "node-2");
+    assert_eq!(config.node().disks.len(), 2);
+    assert_violations(
+        "[node]\nnode_id = \"Node_2\"\ndata_dir = \"\"\ndisks = [\"/a\", \"\", \"/a\"]",
+        &["node.node_id", "node.data_dir", "node.disks", "node.disks"],
+    );
+    assert_violations("[node]\ndisks = []", &["node.disks"]);
+    let many: Vec<_> = (0..65).map(|i| format!("\"/d{i}\"")).collect();
+    assert_violations(
+        &format!("[node]\ndisks = [{}]", many.join(", ")),
+        &["node.disks"],
+    );
+}
+
+#[test]
+fn gateway_rules() {
+    let config = load("[gateway]\nlisten = \"0.0.0.0:443\"").unwrap();
+    assert_eq!(config.gateway().listen.port(), 443);
+    assert_violations(
+        "[gateway]\ntls_key_file = \"/k\"",
+        &["gateway.tls_cert_file"],
+    );
+    assert_violations(
+        "[gateway]\ntls_cert_file = \"\"\ntls_key_file = \"/k\"",
+        &["gateway.tls_cert_file"],
+    );
+}
+
+#[test]
 fn prefix_rules() {
-    for prefix in ["", "/", "no-slash", "/abs/", "has space/"] {
+    let too_long = format!("{}/", "p".repeat(512));
+    for prefix in [
+        "",
+        "/",
+        "no-slash",
+        "/abs/",
+        "has space/",
+        too_long.as_str(),
+    ] {
         assert_control_store_violations(
             &format!("etcd_endpoints = [\"http://e\"]\nprefix = \"{prefix}\""),
             &["control_store.prefix"],
@@ -862,6 +973,61 @@ fn endpoint_hosts_are_normalized() {
 }
 
 #[test]
+fn an_s3_control_store_must_not_share_a_snapshot_targets_scope() {
+    let with = |snapshot: &str| {
+        control_store(&format!(
+            "backend = \"s3\"\nendpoint = \"https://r2.example\"\nbucket = \"ctl\"\n\
+             [buckets.archive]\nmode = \"local\"\n\
+             backup_target = \"https://s3.us-west-2.amazonaws.com/backup\"\n\
+             snapshot_target = \"{snapshot}\""
+        ))
+    };
+    let violations = violations_of(&with("https://R2.example/snaps"));
+    let [violation] = violations.as_slice() else {
+        panic!("{violations}");
+    };
+    assert_eq!(violation.key, "control_store.endpoint");
+    assert!(
+        violation
+            .message
+            .contains("snapshot target of bucket archive"),
+        "{violation:?}"
+    );
+    with("https://s3.us-east-2.amazonaws.com/snaps")
+        .parse::<Config>()
+        .unwrap();
+}
+
+#[test]
+fn a_target_must_not_overlap_the_control_prefix_even_when_correlation_is_allowed() {
+    let with = |backup: &str| {
+        control_store(&format!(
+            "backend = \"s3\"\nendpoint = \"https://minio.example\"\nbucket = \"shared\"\n\
+             prefix = \"control/\"\nallow_correlated_control_store = true\n\
+             [buckets.archive]\nmode = \"local\"\nbackup_target = \"{backup}\""
+        ))
+    };
+    for backup in [
+        "https://minio.example/shared",
+        "https://minio.example/shared/control/",
+        "https://minio.example/shared/control/archive/",
+        "https://minio.example/shared/con",
+    ] {
+        let violations = violations_of(&with(backup));
+        assert!(
+            violations.as_slice()[0].message.contains("overlap"),
+            "{backup}: {violations}"
+        );
+    }
+    for backup in [
+        "https://minio.example/shared/data/",
+        "https://minio.example/other/control/",
+    ] {
+        with(backup).parse::<Config>().unwrap();
+    }
+}
+
+#[test]
 fn correlated_ip_endpoints_are_compared_as_addresses() {
     let with = |control: &str, backup: &str| {
         control_store(&format!(
@@ -909,4 +1075,9 @@ fn attached_targets_must_not_share_the_control_stores_scope() {
     s3(false).check_target_independence(&elsewhere).unwrap();
     let etcd = config("etcd_endpoints = [\"https://s3.us-west-2.amazonaws.com\"]");
     etcd.check_target_independence(&target).unwrap();
+    // The control bucket itself, under the control prefix, is never a
+    // target.
+    let control = skys3_config::parse_target("https://s3.us-west-2.amazonaws.com/ctl").unwrap();
+    let error = s3(true).check_target_independence(&control).unwrap_err();
+    assert!(error.contains("overlap"), "{error}");
 }

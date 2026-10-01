@@ -236,7 +236,23 @@ impl<F: DocumentFetcher, S: SessionStore> StsEndpoint<F, S> {
         store: &C,
         retry: &RetryPolicy,
     ) -> Result<(), ControlError> {
-        let snapshot = self.identity.sync(store, retry).await?;
+        self.sync_identity_as_of(store, retry, self.clock.now())
+            .await
+    }
+
+    /// As [`StsEndpoint::sync_identity`], with the copy's age running from
+    /// `started` ([`IdentityCopy::sync_as_of`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`StsEndpoint::sync_identity`].
+    pub async fn sync_identity_as_of<C: ControlStore>(
+        &self,
+        store: &C,
+        retry: &RetryPolicy,
+        started: Duration,
+    ) -> Result<(), ControlError> {
+        let snapshot = self.identity.sync_as_of(store, retry, started).await?;
         // The copy holds valid providers, one per issuer, so this cannot
         // fail; if it did, the old allowlist would stay.
         if let Err(error) = self

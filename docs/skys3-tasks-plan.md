@@ -1038,6 +1038,7 @@ The design leaves these points open. Each named PR decides the point and records
 | How a tag-only change flushes. §7.2 has no row for `TAGS`, and remote `PutObjectTagging` takes no preconditions: re-PUT the object conditionally, or call `PutObjectTagging` and accept an unprotected write. | M1-16 |
 | How per-bucket and per-cluster `max_dirty_bytes` apply when a bucket's shard primaries are on different nodes | M1-17, revisited in M3-02 |
 | How lazily loaded user metadata and content type are recorded, since §10.1 lists no record kind for it | M1-18 |
+| TLS for the admin HTTP listener, and `admin` certificates of the node PKI as an alternative to its bearer token (§12). M2-02 defines the PKI and the `admin` role. | M3-02 |
 | The fragment header fields needed to re-index coded objects: §8.4 omits the fragment index, geometry, codec ID, and stripe length | M5-02 |
 | Fencing orphan-fragment reclamation against fragment-writing attempts still in progress (encoding, repair, and moves), which §8.4 does not specify | M5-04, M5-05, M5-08, M5-09 |
 | The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07 |

@@ -70,10 +70,12 @@ mod ec;
 mod error;
 mod flush;
 mod identity;
+mod node;
 mod peering;
 mod replication;
 mod storage;
 mod target;
+mod transport;
 
 pub use admin::{AdminConfig, LogFormat, LoggingConfig};
 pub use buckets::{BucketSettings, BucketsConfig, TargetTransport};
@@ -82,14 +84,17 @@ pub use ec::EcConfig;
 pub use error::{ConfigError, Violation, Violations};
 pub use flush::{AckPolicy, ConflictPolicy, FlushConfig};
 pub use identity::{IdentityConfig, StaticCredentialConfig};
+pub use node::{GatewayListenConfig, NodeConfig};
 pub use peering::{CongestionControl, PeeringConfig};
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};
 pub use target::parse_target;
+pub use transport::{TlsFiles, TransportConfig};
 
 use buckets::BucketTable;
 use cluster::{RawCluster, RawControlStore};
 use error::Checker;
+use node::RawNode;
 
 /// A duration of `hours` hours, saturating.
 pub(crate) const fn hours(hours: u64) -> Duration {
@@ -104,7 +109,10 @@ pub(crate) const fn hours(hours: u64) -> Duration {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     cluster: ClusterConfig,
+    node: NodeConfig,
+    gateway: GatewayListenConfig,
     control_store: ControlStoreConfig,
+    transport: TransportConfig,
     replication: ReplicationConfig,
     storage: StorageConfig,
     cache: CacheConfig,
@@ -123,7 +131,13 @@ pub struct Config {
 struct RawConfig {
     cluster: RawCluster,
     #[serde(default)]
+    node: RawNode,
+    #[serde(default)]
+    gateway: GatewayListenConfig,
+    #[serde(default)]
     control_store: RawControlStore,
+    #[serde(default)]
+    transport: TransportConfig,
     #[serde(default)]
     replication: ReplicationConfig,
     #[serde(default)]
@@ -178,7 +192,12 @@ impl Config {
         let mut checker = Checker::default();
         let cluster = raw.cluster.resolve(&mut checker);
         let cluster_id = cluster.as_ref().map(|cluster| &cluster.cluster_id);
-        let control_store = raw.control_store.resolve(cluster_id, &mut checker);
+        let node = raw.node.resolve(&mut checker);
+        raw.gateway.check(&mut checker);
+        let control_store = raw
+            .control_store
+            .resolve(cluster_id, &node.data_dir, &mut checker);
+        raw.transport.check(&mut checker);
         raw.replication.check(&mut checker);
         raw.storage.check(&mut checker);
         raw.cache.check(&mut checker);
@@ -202,7 +221,10 @@ impl Config {
         };
         Ok(Self {
             cluster,
+            node,
+            gateway: raw.gateway,
             control_store,
+            transport: raw.transport,
             replication: raw.replication,
             storage: raw.storage,
             cache: raw.cache,
@@ -222,10 +244,28 @@ impl Config {
         &self.cluster
     }
 
+    /// `[node]`.
+    #[must_use]
+    pub fn node(&self) -> &NodeConfig {
+        &self.node
+    }
+
+    /// `[gateway]`.
+    #[must_use]
+    pub fn gateway(&self) -> &GatewayListenConfig {
+        &self.gateway
+    }
+
     /// `[control_store]`.
     #[must_use]
     pub fn control_store(&self) -> &ControlStoreConfig {
         &self.control_store
+    }
+
+    /// `[transport]`.
+    #[must_use]
+    pub fn transport(&self) -> &TransportConfig {
+        &self.transport
     }
 
     /// `[replication]`.
@@ -297,8 +337,9 @@ impl FromStr for Config {
     }
 }
 
-/// Refuses an S3 control store in the failure scope of a configured backup
-/// target, unless `allow_correlated_control_store` is set (§6.1).
+/// Refuses an S3 control store that a bucket's backup or snapshot target
+/// shares a failure scope or keys with (§6.1), as
+/// [`ControlStoreConfig::check_target_independence`] defines.
 ///
 /// Write-back targets are bound when a bucket is attached, not here; the
 /// attach path applies the same check to them.
@@ -307,29 +348,26 @@ fn check_control_store_independence(
     buckets: &BTreeMap<BucketName, BucketSettings>,
     checker: &mut Checker,
 ) {
-    let ControlStoreBackend::S3 { endpoint, .. } = &control_store.backend else {
-        return;
-    };
-    if control_store.allow_correlated_control_store {
-        return;
-    }
-    // An invalid endpoint is already reported and has no scope.
-    let Some(scope) = target::failure_scope(endpoint) else {
-        return;
-    };
     for (name, settings) in buckets {
-        let Some(backup) = &settings.backup_target else {
-            continue;
-        };
-        if target::failure_scope(&backup.endpoint).as_ref() == Some(&scope) {
-            checker.report(
-                "control_store.endpoint",
-                format!(
-                    "shares its failure scope ({scope}) with the backup target of bucket \
-                     {name}; one outage would stop both flushing and membership changes \
-                     (§6.1). Move the control store, or set allow_correlated_control_store = true"
-                ),
-            );
+        // A snapshot target defaults to the backup target: check it once.
+        let snapshot = settings
+            .snapshot_target
+            .as_ref()
+            .filter(|target| settings.backup_target.as_ref() != Some(*target));
+        let targets = [
+            ("backup", settings.backup_target.as_ref()),
+            ("snapshot", snapshot),
+        ];
+        for (role, target) in targets {
+            let Some(target) = target else {
+                continue;
+            };
+            if let Err(reason) = control_store.check_target_independence(target) {
+                checker.report(
+                    "control_store.endpoint",
+                    format!("conflicts with the {role} target of bucket {name}: {reason}"),
+                );
+            }
         }
     }
 }

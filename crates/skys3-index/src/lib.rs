@@ -13,6 +13,8 @@
 //!   its segment, offset, and length; each shard's applied position; and
 //!   the node's copy of control-state registers, tagged with their
 //!   configuration generation (§6.2). [`codec`] specifies every encoding.
+//! - **Listing** ([`IndexReader::list`]): one shard's page of a
+//!   listing, with prefix and delimiter handling (§9.4).
 //! - **Applying** ([`Index::apply`], [`Applier`]): records are applied
 //!   with non-durable commits. The state machine that decides what a
 //!   record does to an entry plugs in as an [`Applier`] (M1-04).
@@ -47,6 +49,7 @@ pub mod codec;
 mod entry;
 mod error;
 mod index;
+mod listing;
 mod tables;
 
 pub use checkpointer::{Checkpointer, ReplayReport};
@@ -57,4 +60,5 @@ pub use error::IndexError;
 pub use index::{
     Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
 };
+pub use listing::{ListItem, ListPage, ListQuery};
 pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter};

@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use skys3_index::{Entry, Part, Upload};
+use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
@@ -180,6 +180,14 @@ impl<D: Disk> Shards for LocalShards<D> {
         let local = self.find(shard).await?;
         local
             .parts(upload, after, limit)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
+    async fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, ShardError> {
+        let local = self.find(shard).await?;
+        local
+            .list(query.clone())
             .await
             .map_err(|error| convert(shard, error))
     }

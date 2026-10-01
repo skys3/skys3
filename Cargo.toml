@@ -37,11 +37,14 @@ hyper-util = { version = "0.1.21", default-features = false }
 md-5 = { version = "0.11.0", default-features = false }
 prometheus-client = "0.25.1"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
 quick-xml = { version = "0.42.0", default-features = false }
 rand = "0.9.5"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
 rustls = { version = "0.23.45", default-features = false }
 rustls-native-certs = "0.8.4"
+rustls-webpki = { version = "0.103.15", default-features = false, features = ["std"] }
 s3s = { version = "0.17.0", default-features = false }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -54,9 +57,12 @@ skys3-gateway = { path = "crates/skys3-gateway" }
 skys3-index = { path = "crates/skys3-index" }
 skys3-io = { path = "crates/skys3-io" }
 skys3-log = { path = "crates/skys3-log" }
+skys3-net = { path = "crates/skys3-net" }
+skys3-obs = { path = "crates/skys3-obs" }
 skys3-remote = { path = "crates/skys3-remote" }
 skys3-shard = { path = "crates/skys3-shard" }
 skys3-sim = { path = "crates/skys3-sim" }
+skys3-sts = { path = "crates/skys3-sts" }
 skys3-types = { path = "crates/skys3-types" }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = "2.0.21"

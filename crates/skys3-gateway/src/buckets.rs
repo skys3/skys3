@@ -48,6 +48,7 @@ use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, P
 
 use crate::authz::Permissions;
 use crate::limits::RequestLimits;
+use crate::listing::ListTokenKeys;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
 /// The CreateBucket header that sets the bucket's mode: `write_back`,
@@ -88,11 +89,16 @@ pub struct GatewayConfig {
     /// hashed on the request's task, which only tests should do; the node
     /// sets one.
     pub hashing_pool: Option<BlockingPool>,
+    /// The keys that sign and verify ListObjectsV2 continuation tokens
+    /// (§9.4). [`GatewayConfig::new`] generates a key, so tokens are valid
+    /// on this gateway until it restarts.
+    pub list_token_keys: ListTokenKeys,
 }
 
 impl GatewayConfig {
     /// The gateway settings of a node configuration, with the default
-    /// limits and retries, and no hashing pool.
+    /// limits and retries, no hashing pool, and a fresh continuation-token
+    /// key.
     #[must_use]
     pub fn new(config: &Config) -> Self {
         Self {
@@ -105,6 +111,7 @@ impl GatewayConfig {
             inline_max_bytes: config.storage().inline_max_bytes,
             extent_bytes: config.storage().extent_bytes,
             hashing_pool: None,
+            list_token_keys: ListTokenKeys::generate(),
         }
     }
 }

@@ -1,5 +1,6 @@
 //! `[cluster]` and `[control_store]` (§6.1, §6.2, §6.7).
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -63,6 +64,7 @@ pub(crate) enum BackendKind {
     #[default]
     Etcd,
     S3,
+    File,
 }
 
 /// The control-store backend and where it is.
@@ -79,6 +81,13 @@ pub enum ControlStoreBackend {
         endpoint: String,
         /// `bucket`: the control bucket.
         bucket: String,
+    },
+    /// A directory on this node, for a single-node cluster. It refuses to
+    /// serve a second node.
+    File {
+        /// `directory`: where the registers are kept. Defaults to
+        /// `<data_dir>/control`.
+        directory: PathBuf,
     },
 }
 
@@ -101,32 +110,59 @@ pub struct ControlStoreConfig {
 }
 
 impl ControlStoreConfig {
-    /// Checks that a data target does not share the control store's
-    /// failure scope (§6.1), as attaching a bucket requires: the target's
-    /// endpoint must not have the host name or IP address of an S3 control
-    /// store's endpoint, nor be an AWS S3 endpoint in the same region,
-    /// unless `allow_correlated_control_store` is set. An etcd control
-    /// store is never correlated with a target.
+    /// The longest `prefix`, in bytes: S3's 1,024-byte limit on object
+    /// keys, less the longest register key (512 bytes), so that every
+    /// register fits under the prefix (§6.1). `skys3-control` checks that
+    /// its S3 backend uses the same bound.
+    pub const MAX_PREFIX_LEN: usize = 512;
+
+    /// Checks a data target against an S3 control store (§6.1), as
+    /// configuration loading does for backup and snapshot targets and
+    /// attaching a bucket does for its target.
+    ///
+    /// - The target must not hold keys under the control prefix, nor the
+    ///   control prefix keys of the target: in one bucket, one prefix must
+    ///   not start with the other. Otherwise a credential for the target
+    ///   would also reach the registers. This holds even with
+    ///   `allow_correlated_control_store`.
+    /// - The target must not share the control store's failure scope: the
+    ///   host name or IP address of its endpoint, or the region of an AWS
+    ///   S3 endpoint, unless `allow_correlated_control_store` is set.
+    ///
+    /// An etcd control store passes every target.
     ///
     /// # Errors
     ///
-    /// A message naming the shared scope.
+    /// A message naming the shared bucket or scope.
     pub fn check_target_independence(&self, target: &RemoteTarget) -> Result<(), String> {
-        let ControlStoreBackend::S3 { endpoint, .. } = &self.backend else {
+        let ControlStoreBackend::S3 { endpoint, bucket } = &self.backend else {
             return Ok(());
         };
+        let Some(scope) = target::failure_scope(endpoint) else {
+            return Ok(());
+        };
+        if target::failure_scope(&target.endpoint).as_ref() != Some(&scope) {
+            return Ok(());
+        }
+        let target_prefix = target.prefix.as_deref().unwrap_or_default();
+        if target.bucket == *bucket
+            && (self.prefix.starts_with(target_prefix) || target_prefix.starts_with(&self.prefix))
+        {
+            return Err(format!(
+                "the target's keys overlap the control store's, {bucket}/{}; a credential for \
+                 the target would reach the registers (§6.1). Give the control store a prefix \
+                 of its own",
+                self.prefix
+            ));
+        }
         if self.allow_correlated_control_store {
             return Ok(());
         }
-        match target::failure_scope(endpoint) {
-            Some(scope) if target::failure_scope(&target.endpoint).as_ref() == Some(&scope) => {
-                Err(format!(
-                    "the target shares its failure scope ({scope}) with the control store; \
-                     one outage would stop both flushing and membership changes (§6.1)"
-                ))
-            }
-            _ => Ok(()),
-        }
+        Err(format!(
+            "the target shares its failure scope ({scope}) with the control store; one outage \
+             would stop both flushing and membership changes (§6.1). Move the control store, \
+             or set allow_correlated_control_store = true"
+        ))
     }
 }
 
@@ -149,6 +185,7 @@ pub(crate) struct RawControlStore {
     etcd_endpoints: Option<Vec<String>>,
     endpoint: Option<String>,
     bucket: Option<String>,
+    directory: Option<PathBuf>,
     prefix: Option<String>,
     allow_correlated_control_store: bool,
     coordinator_lease_seconds: u64,
@@ -162,6 +199,7 @@ impl Default for RawControlStore {
             etcd_endpoints: None,
             endpoint: None,
             bucket: None,
+            directory: None,
             prefix: None,
             allow_correlated_control_store: false,
             coordinator_lease_seconds: 10,
@@ -180,22 +218,32 @@ impl RawControlStore {
     pub(crate) fn resolve(
         &self,
         cluster_id: Option<&ClusterId>,
+        data_dir: &Path,
         checker: &mut Checker,
     ) -> ControlStoreConfig {
+        if self.backend != BackendKind::File && self.directory.is_some() {
+            checker.report(
+                "control_store.directory",
+                "applies only to backend = \"file\"",
+            );
+        }
         let backend = match self.backend {
             BackendKind::Etcd => self.etcd_backend(checker),
             BackendKind::S3 => self.s3_backend(checker),
+            BackendKind::File => self.file_backend(data_dir, checker),
         };
         let prefix = match &self.prefix {
             Some(prefix) => {
                 let valid = prefix.len() > 1
+                    && prefix.len() <= ControlStoreConfig::MAX_PREFIX_LEN
                     && prefix.ends_with('/')
                     && !prefix.starts_with('/')
                     && prefix.bytes().all(|b| b.is_ascii_graphic());
                 checker.require(valid, "control_store.prefix", || {
                     format!(
-                        "{prefix:?} must be visible ASCII that ends with '/' and does not start \
-                         with it"
+                        "{prefix:?} must be at most {} bytes of visible ASCII that ends with '/' \
+                         and does not start with it",
+                        ControlStoreConfig::MAX_PREFIX_LEN
                     )
                 });
                 prefix.clone()
@@ -220,14 +268,7 @@ impl RawControlStore {
     }
 
     fn etcd_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
-        for (key, value) in [("endpoint", &self.endpoint), ("bucket", &self.bucket)] {
-            if value.is_some() {
-                checker.report(
-                    format!("control_store.{key}"),
-                    "applies only to backend = \"s3\"",
-                );
-            }
-        }
+        self.refuse_other_keys(&["etcd_endpoints"], "etcd", checker);
         let urls = self.etcd_endpoints.as_deref().unwrap_or_default();
         checker.require(!urls.is_empty(), "control_store.etcd_endpoints", || {
             "backend = \"etcd\" needs at least one endpoint".to_owned()
@@ -242,13 +283,38 @@ impl RawControlStore {
         ControlStoreBackend::Etcd { endpoints }
     }
 
-    fn s3_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
-        if self.etcd_endpoints.is_some() {
-            checker.report(
-                "control_store.etcd_endpoints",
-                "applies only to backend = \"etcd\"",
-            );
+    /// Reports `etcd_endpoints`, `endpoint`, and `bucket` unless `allowed`
+    /// names them.
+    fn refuse_other_keys(&self, allowed: &[&str], backend: &str, checker: &mut Checker) {
+        let keys = [
+            ("etcd_endpoints", self.etcd_endpoints.is_some()),
+            ("endpoint", self.endpoint.is_some()),
+            ("bucket", self.bucket.is_some()),
+        ];
+        for (key, set) in keys {
+            if set && !allowed.contains(&key) {
+                checker.report(
+                    format!("control_store.{key}"),
+                    format!("does not apply to backend = \"{backend}\""),
+                );
+            }
         }
+    }
+
+    fn file_backend(&self, data_dir: &Path, checker: &mut Checker) -> ControlStoreBackend {
+        self.refuse_other_keys(&[], "file", checker);
+        let directory = match &self.directory {
+            Some(directory) => {
+                crate::node::nonempty_path(checker, "control_store.directory", directory);
+                directory.clone()
+            }
+            None => data_dir.join("control"),
+        };
+        ControlStoreBackend::File { directory }
+    }
+
+    fn s3_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
+        self.refuse_other_keys(&["endpoint", "bucket"], "s3", checker);
         let endpoint = match self.endpoint.as_deref().map(target::parse_endpoint) {
             Some(Ok(endpoint)) => endpoint,
             Some(Err(error)) => {

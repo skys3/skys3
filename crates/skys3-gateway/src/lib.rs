@@ -33,6 +33,11 @@
 //!   upload's ID ([`upload_id`]) is the position of its `MPU_CREATE`, the
 //!   write identity of the object it completes, which keeps its parts'
 //!   boundaries for GetObject's `partNumber` and the multipart ETag.
+//! - Listings: ListObjectsV2 and ListObjects (V1), with prefixes,
+//!   delimiters, `start-after` and markers, and `encoding-type=url`. Each
+//!   shard returns a sorted page from its index, the gateway merges them,
+//!   and a V2 page ends with a continuation token authenticated with the
+//!   gateway's [`ListTokenKeys`].
 //! - [`Shards`] and [`ShardRef`]: the shard interface the gateway calls,
 //!   and routing of each key to its shard with the frozen hash. On a single
 //!   node every shard is local: [`LocalShards`] serves the interface from
@@ -55,8 +60,8 @@
 //!   (trailing checksums included), MD5 ETags, and multipart ETags and
 //!   checksums. PutObject and the multipart operations use it.
 //!
-//! The gateway serves path-style requests. The node binary does not serve
-//! it yet (plan M1-13).
+//! The gateway serves path-style requests, over HTTP or, with
+//! [`GatewayListener::with_tls`], HTTPS. The `skys3` node binary serves it.
 //!
 //! With the `test-util` feature, `stub` provides [`LocalShards`] on a
 //! simulated disk, `TrustAll` an authenticator that takes every request
@@ -110,6 +115,7 @@ mod features;
 pub mod fuzzing;
 mod limits;
 mod listener;
+mod listing;
 mod local;
 mod objects;
 mod service;
@@ -124,6 +130,7 @@ pub use conditions::{ConditionFailed, Precondition};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
+pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};
 pub use local::LocalShards;
 pub use objects::{
     MAX_MULTIPART_OBJECT_BYTES, MAX_OBJECT_BYTES, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
