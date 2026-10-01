@@ -5,35 +5,61 @@
 #![forbid(unsafe_code)]
 
 use libfuzzer_sys::fuzz_target;
-use skys3_index::codec::{self, VALUE_FORMAT};
+use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 
 fuzz_target!(|data: &[u8]| {
     check(data);
-    // Most random bytes fail at the format byte; also try them behind a
-    // valid one, to reach the field decoders.
-    let mut value = Vec::with_capacity(data.len() + 1);
-    value.push(VALUE_FORMAT);
-    value.extend_from_slice(data);
-    check(&value);
+    // Most random bytes fail at the format byte; also try them behind each
+    // format this build reads, to reach the field decoders.
+    for format in MIN_VALUE_FORMAT..=VALUE_FORMAT {
+        let mut value = Vec::with_capacity(data.len() + 1);
+        value.push(format);
+        value.extend_from_slice(data);
+        check(&value);
+    }
 });
 
+/// Asserts that `decoded`, read from `data`, re-encodes to exactly `data`
+/// if `data` is in the current value format, and otherwise to a value that
+/// decodes to the same thing.
+fn same<T: PartialEq + std::fmt::Debug>(
+    data: &[u8],
+    encoded: &[u8],
+    decoded: &T,
+    decode: impl Fn(&[u8]) -> Option<T>,
+) {
+    if data.first() == Some(&VALUE_FORMAT) {
+        assert_eq!(encoded, data);
+    } else {
+        assert_eq!(encoded.first(), Some(&VALUE_FORMAT));
+        assert_eq!(decode(encoded).as_ref(), Some(decoded));
+    }
+}
+
 /// Decoding must never panic, and whatever decodes re-encodes to exactly
-/// the bytes it was read from: every key and value has one encoding.
+/// the bytes it was read from: every key, and every value of the current
+/// format, has one encoding. A value of an older format re-encodes in the
+/// current one.
 fn check(data: &[u8]) {
     if let Ok(entry) = codec::decode_entry(data) {
-        assert_eq!(codec::encode_entry(&entry).expect("a decoded entry encodes"), data);
+        let encoded = codec::encode_entry(&entry).expect("a decoded entry encodes");
+        same(data, &encoded, &entry, |b| codec::decode_entry(b).ok());
     }
     if let Ok(summary) = codec::decode_summary(data) {
-        assert_eq!(codec::encode_summary(&summary).expect("a decoded summary encodes"), data);
+        let encoded = codec::encode_summary(&summary).expect("a decoded summary encodes");
+        same(data, &encoded, &summary, |b| codec::decode_summary(b).ok());
     }
     if let Ok(control) = codec::decode_control(data) {
-        assert_eq!(codec::encode_control(&control).expect("a decoded copy encodes"), data);
+        let encoded = codec::encode_control(&control).expect("a decoded copy encodes");
+        same(data, &encoded, &control, |b| codec::decode_control(b).ok());
     }
     if let Ok(location) = codec::decode_location(data) {
-        assert_eq!(codec::encode_location(&location), data);
+        let encoded = codec::encode_location(&location);
+        same(data, &encoded, &location, |b| codec::decode_location(b).ok());
     }
     if let Ok(applied) = codec::decode_applied(data) {
-        assert_eq!(codec::encode_applied(applied), data);
+        let encoded = codec::encode_applied(applied);
+        same(data, &encoded, &applied, |b| codec::decode_applied(b).ok());
     }
     if let Ok((shard, key)) = codec::decode_entry_key(data) {
         assert_eq!(codec::entry_key(&shard, &key), data);

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use proptest::collection::{btree_map, vec};
 use proptest::option;
 use proptest::prelude::*;
-use skys3_index::codec::{self, VALUE_FORMAT};
+use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 use skys3_index::{ControlEntry, Entry, EntryState, ObjectVersion, Payload};
 use skys3_log::record::{Checksum, ChecksumAlgorithm, Checksums, CopySource, ExtentRef, ShardRef};
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
@@ -256,12 +256,95 @@ fn with(bytes: &[u8], at: usize, value: u8) -> Vec<u8> {
     bytes
 }
 
+/// An entry value in format 1, before checksums had part counts.
+const ENTRY_V1: &str = concat!(
+    "01",                                 // format 1
+    "0100000000000000",                   // version: epoch 1
+    "0200000000000000",                   // seq 2
+    "01",                                 // state DIRTY
+    "00",                                 // no remote ETag
+    "00",                                 // no remote version ID
+    "01",                                 // an object
+    "0300000000000000",                   // size 3
+    "0400000000000000",                   // last modified 4
+    "0300313233",                         // local ETag "123"
+    "00",                                 // no write identity
+    "0000",                               // no metadata
+    "00",                                 // no tags
+    "02",                                 // two checksums
+    "0101020304",                         // CRC32 01020304, no part count
+    "06000102030405060708090a0b0c0d0e0f", // MD5 00..0f
+    "00",                                 // no storage class
+    "00",                                 // no copy source
+    "00",                                 // no payload
+);
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn format_1_entries_still_decode() {
+    let v1 = unhex(ENTRY_V1);
+    let entry = codec::decode_entry(&v1).unwrap();
+    let md5: Vec<u8> = (0..16).collect();
+    let expected = Entry {
+        version: EpochSeq::new(Epoch::new(1), Seq::new(2)),
+        state: EntryState::Dirty,
+        object: Some(ObjectVersion {
+            size: 3,
+            last_modified_ms: 4,
+            local_etag: ETag::new("123").unwrap(),
+            write_identity: None,
+            metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksums: BTreeMap::from([
+                (
+                    ChecksumAlgorithm::Crc32,
+                    Checksum::full_object(ChecksumAlgorithm::Crc32, &[1, 2, 3, 4]).unwrap(),
+                ),
+                (
+                    ChecksumAlgorithm::Md5,
+                    Checksum::full_object(ChecksumAlgorithm::Md5, &md5).unwrap(),
+                ),
+            ]),
+            storage_class: None,
+            copy_source: None,
+            payload: Payload::None,
+        }),
+        remote_etag: None,
+        remote_version_id: None,
+    };
+    assert_eq!(entry, expected);
+    // It re-encodes in format 2: a part count, zero, after each digest.
+    let v2 = codec::encode_entry(&entry).unwrap();
+    let mut expected_v2 = ENTRY_V1.replacen("01", "02", 1);
+    expected_v2 = expected_v2.replace("0101020304", "01010203040000");
+    expected_v2 = expected_v2.replace("0c0d0e0f", "0c0d0e0f0000");
+    assert_eq!(v2, unhex(&expected_v2));
+    assert_eq!(codec::decode_entry(&v2).unwrap(), entry);
+    // Format 2 bytes read as format 1 leave the part counts unread.
+    assert!(codec::decode_entry(&with(&v2, 0, 1)).is_err());
+    // Other values read the same in both formats.
+    let applied = codec::encode_applied(EpochSeq::new(Epoch::new(3), Seq::new(4)));
+    assert_eq!(applied[0], VALUE_FORMAT);
+    assert_eq!(
+        codec::decode_applied(&with(&applied, 0, MIN_VALUE_FORMAT)).unwrap(),
+        EpochSeq::new(Epoch::new(3), Seq::new(4))
+    );
+}
+
 #[test]
 fn rejects_broken_entries() {
     let bytes = codec::encode_entry(&sample_entry()).unwrap();
     let decode = |bytes: &[u8]| codec::decode_entry(bytes).unwrap_err().field();
     assert_eq!(decode(&[]), "entry");
-    assert_eq!(decode(&with(&bytes, 0, 2)), "entry");
+    for format in [0, 3, u8::MAX] {
+        assert_eq!(decode(&with(&bytes, 0, format)), "entry", "format {format}");
+    }
     // The state code follows the format byte and the version.
     assert_eq!(decode(&with(&bytes, 17, 0)), "entry.state");
     assert_eq!(decode(&with(&bytes, 18, 2)), "entry.remote_etag");
