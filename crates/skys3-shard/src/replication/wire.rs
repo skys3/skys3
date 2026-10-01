@@ -7,9 +7,10 @@
 //!
 //! ```text
 //! primary                                  member
-//!   Sync(config, primary's last seq, sequencing epoch) ->
+//!   Sync(config, primary's last seq, sequencing epoch, lineage) ->
 //!                                          <- SyncAck(last, record)*   records past the primary's last seq
-//!                                          <- SyncAck(last, done)
+//!                                          <- SyncAck(last, done)      after truncating, if it had to
+//!                                          <- SyncAck(refused)         a member that cannot reconcile
 //!   Append(epoch, commit, lazy, lease) + record ->
 //!   Beacon(epoch, commit, lease)          ->
 //!                                          <- AppendAck(durable, lease) as durability grows, and per beacon
@@ -22,14 +23,20 @@
 //! `primary_lease`, on the primary's clock.
 //!
 //! A `Sync` may carry a newer configuration than the member's, after a
-//! member removal (§6.4). Its `sequencing` epoch tells the member whether
-//! the primary has appended that configuration's `CONFIG` record, and so
-//! where the member appends its own (§5.1).
+//! member removal (§6.4) or a takeover (§6.5). Its `sequencing` epoch tells
+//! the member whether the primary has appended that configuration's
+//! `CONFIG` record, and so where the member appends its own (§5.1). Its
+//! lineage, the epochs of the primary's records, tells the member which of
+//! its own records the primary holds too (§6.6): the member sends back
+//! those past the primary's log that the primary sequenced itself, and
+//! truncates any other it holds past the prefix they share.
 
 use bytes::Bytes;
 use prost::Message;
 use skys3_net::{Frame, Header, MessageKind};
-use skys3_types::{RegisterDocument, ShardConfig};
+use skys3_types::{Epoch, RegisterDocument, Seq, ShardConfig};
+
+use crate::lineage::{self, Lineage};
 
 /// Primary to member: open a session for one shard.
 #[derive(Clone, PartialEq, Message)]
@@ -46,6 +53,24 @@ pub struct Sync {
     /// once it has appended its `CONFIG` record, an earlier one before.
     #[prost(uint64, tag = "3")]
     pub sequencing: u64,
+    /// The `seq` after which the primary's lineage is known.
+    #[prost(uint64, tag = "4")]
+    pub known_after: u64,
+    /// The primary's lineage: the epochs of its log's records (§6.6).
+    #[prost(message, repeated, tag = "5")]
+    pub lineage: Vec<Run>,
+}
+
+/// One run of a [`Lineage`]: the log holds records of `epoch` up to
+/// `last`.
+#[derive(Clone, Copy, PartialEq, Eq, Message)]
+pub struct Run {
+    /// The epoch.
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    /// The last `seq` of the run.
+    #[prost(uint64, tag = "2")]
+    pub last: u64,
 }
 
 impl Sync {
@@ -56,6 +81,38 @@ impl Sync {
     /// Why the configuration is not a valid shard register.
     pub fn configuration(&self) -> Result<ShardConfig, String> {
         ShardConfig::from_json(&self.config).map_err(|error| error.to_string())
+    }
+
+    /// The primary's lineage, checked.
+    ///
+    /// # Errors
+    ///
+    /// Why it is not a lineage ([`Lineage::from_parts`]).
+    pub fn lineage(&self) -> Result<Lineage, String> {
+        let runs = self
+            .lineage
+            .iter()
+            .map(|run| lineage::Run {
+                epoch: Epoch::new(run.epoch),
+                last: Seq::new(run.last),
+            })
+            .collect();
+        Lineage::from_parts(Seq::new(self.known_after), runs)
+    }
+
+    /// Sets the primary's lineage.
+    #[must_use]
+    pub fn with_lineage(mut self, lineage: &Lineage) -> Self {
+        self.known_after = lineage.known_after().get();
+        self.lineage = lineage
+            .runs()
+            .iter()
+            .map(|run| Run {
+                epoch: run.epoch.get(),
+                last: run.last.get(),
+            })
+            .collect();
+        self
     }
 }
 
@@ -151,6 +208,8 @@ pub fn body<M: Message + Default>(frame: &Frame, kind: MessageKind) -> Result<M,
 mod tests {
     use proptest::prelude::*;
 
+    use skys3_types::EpochSeq;
+
     use super::*;
 
     proptest! {
@@ -187,9 +246,16 @@ mod tests {
             config: b"{}".to_vec(),
             primary_last: 7,
             sequencing: 2,
+            ..Sync::default()
         };
 
         assert!(sync.configuration().is_err());
+        // No lineage: refused.
+        assert!(sync.lineage().is_err());
+        let mut lineage = Lineage::new(EpochSeq::new(Epoch::new(1), Seq::new(3)));
+        lineage.push(EpochSeq::new(Epoch::new(2), Seq::new(7)));
+        let sync = sync.with_lineage(&lineage);
+        assert_eq!(sync.lineage(), Ok(lineage));
         let sent = frame(MessageKind::Sync, &sync, Bytes::new());
         assert_eq!(body::<Sync>(&sent, MessageKind::Sync), Ok(sync));
         let error = body::<SyncAck>(&sent, MessageKind::SyncAck).unwrap_err();

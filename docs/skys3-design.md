@@ -473,7 +473,7 @@ Three rules carry the safety argument (section 6.8):
 - **R2.** Every member rejects appends stamped with an epoch older than the newest one it has seen.
 - **R3.** A learner becomes a member only after it holds every committed record.
 
-**Proposals are durable.** A node records each configuration it proposes, with its `proposal_id`, before it issues the CAS, and until it learns the outcome, across restarts too, it acts as if the CAS succeeded. A candidate keeps acknowledging nothing in epoch `e` and granting no leases (R1); a promoting primary keeps waiting for the learner (section 6.7). The lost-response rule (section 6.1) needs the `proposal_id` kept anyway. A candidate that forgot its proposal on restart could grant the old primary a lease and then find itself primary, and serve while that lease still holds. A primary's removal of a member is the exception: until it learns the outcome it keeps needing the member's acknowledgements and lease, which is safe whichever way the CAS went, since requiring more never weakens the commit rule or the leases. It records nothing, and after a restart it finds the outcome in the register: a newer configuration that keeps it as primary and adds no member is adopted.
+**Proposals are durable.** A node records each configuration it proposes, with its `proposal_id`, before it issues the CAS, and until it learns the outcome, across restarts too, it acts as if the CAS succeeded. A candidate keeps acknowledging nothing in epoch `e` and granting no leases (R1); a promoting primary keeps waiting for the learner (section 6.7). The lost-response rule (section 6.1) needs the `proposal_id` kept anyway. A candidate that forgot its proposal on restart could grant the old primary a lease and then find itself primary, and serve while that lease still holds. A primary's removal of a member is the exception: until it learns the outcome it keeps needing the member's acknowledgements and lease, which is safe whichever way the CAS went, since requiring more never weakens the commit rule or the leases. It records nothing, and after a restart it finds the outcome in the register: a newer configuration that keeps it as primary and adds no member is adopted. A takeover candidate records nothing either, as long as a restarted node opens each replica only in the configuration the register holds, which tells it the outcome before it grants anything. A node that opened from its local copy while the register is unreachable (section 6.2) would need the proposal in its log first.
 
 ### 6.4 Member failure
 
@@ -536,11 +536,15 @@ sequenceDiagram
     Note over B,C: B commits the tail, then serves reads and writes
 ```
 
-If several backups propose at once, CAS picks exactly one winner. The losers read the new register and follow it. Candidates may add a small random delay that shrinks as their durable `seq` grows, so the member with the longest log usually wins. That preference is not needed for safety.
+The candidate proposes epoch `e+1` with itself as primary, the other members of `e`, and no learners. The old primary is left out, and rejoins only as a learner (section 6.7).
+
+If several backups propose at once, CAS picks exactly one winner. The losers read the new register and follow it: they adopt its configuration, so they refuse the old primary's appends (R2), and propose again over it if the winner stays silent for `primary_grace` too. Candidates wait a delay of up to `takeover_delay` (400 ms by default) that shrinks as their durable `seq` grows past what they have applied, plus a jitter drawn from the node, the shard, and the epoch, so the member with the longest log usually wins. That preference is not needed for safety. With the defaults a takeover lands about 6.5 s after the primary's last grant: the grace, the delay, the CAS, and reconciliation (section 13).
+
+`member_suspect_after` (3 s) is shorter than `primary_grace` (6 s), so a primary cut off from its members but not from the control store removes them before they could take over (section 6.4). Members take over from a primary that crashed, or that lost the control store too.
 
 If only one member survives, it can still take over. Every committed record is on every member, so a single survivor holds the full committed history. That is the main durability advantage of all-member commit over majority quorums. The shard stays readable, and becomes writable again once enough learners have caught up.
 
-A deposed primary finds out on its next CAS attempt or on its next rejected append, and then stops serving.
+A deposed primary finds out on its next CAS attempt or on its next rejected append, and then stops serving. A member's refusal names its newer epoch, and the primary then reads the register. Once it knows the new configuration, it answers requests routed to it with a redirect to the new primary, as a member does (section 5.1), rather than `503`. Without the register it answers `503`.
 
 Planned handoffs, used for rebalancing, follow the step-down path in section 5.4, so they do not wait for `primary_grace`.
 
@@ -551,6 +555,13 @@ The new primary's log is authoritative for the new epoch:
 1. It collects each member's last `(epoch, seq)`.
 2. Each member truncates the records past the longest prefix of its log that matches the new primary's, comparing records by `(epoch, seq)`. A record keeps the epoch of the primary that created it when a later primary rolls it forward, and one primary per epoch assigns each `seq` once, so the pair identifies the record. Comparing `seq` alone is not enough: a member can hold, at a `seq` the new primary also holds, a different record from another epoch, for example a node re-admitted with its old log (section 6.7). The truncated records were never committed, because committing requires the new primary's acknowledgement. The shared per-disk log is not physically truncated. A `TRUNCATE(shard, epoch, seq)` record invalidates them (section 10.1).
 3. The new primary re-replicates its log past each member's matching prefix, which includes its own uncommitted tail, commits it, and then accepts new writes.
+
+How a member finds the matching prefix and truncates:
+
+- **Lineages.** The new primary's session carries its lineage: for each epoch of its log since the point it last opened at, the last `seq` it holds in that epoch. One primary per epoch assigns each `seq` once, so two logs hold the same records up to the largest `min(last)` over the epochs they share. A member compares its own lineage with that.
+- **The `TRUNCATE` epoch.** A member invalidates its records past the match with `TRUNCATE(shard, epoch, seq)` where `epoch` is the primary's at the next `seq`, or the new configuration's if the primary's log ends there. A `TRUNCATE` at `(E, s)` invalidates every record at `(e', s')` with `s' > s` and `e' < E`: the records it truncates are all older than `E`, and the ones the primary sends next are not. Replay and reads of the log skip what it invalidates, so the records keep their positions in the shared log.
+- **Applied records stay.** A member applies only committed records, which the new primary holds, so nothing it truncates is applied. A member that cannot meet that (after a restart replayed records past the commit watermark, for example), or the epoch rule, or shares no epoch to compare by, is diverged: it refuses the session, the new primary removes it after `member_suspect_after`, and it rejoins as a learner.
+- **Rolling forward.** A member that holds the primary's whole log and records past it in no older epoch holds records the primary sequenced and lost in a crash, and sends them back (section 5.1). Members accept records of the epochs between their own and the new configuration's as the primary sends its tail.
 
 The uncommitted tail is **rolled forward**. Clients that received a 503 for those writes may find them applied. Section 5.2 allows exactly that.
 

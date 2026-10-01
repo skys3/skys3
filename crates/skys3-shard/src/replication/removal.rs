@@ -15,6 +15,7 @@ use skys3_control::{
     propose_document, read_with_retries,
 };
 use skys3_io::Disk;
+use skys3_log::ShardRef;
 use skys3_types::{NodeId, ProposalId, Seq, ShardConfig};
 use tokio::time::Instant;
 
@@ -36,8 +37,9 @@ pub enum Replaced {
     Holds(Option<ShardConfig>),
 }
 
-/// The shard registers of the control store, as a primary changes its
-/// shard's configuration through them (§6.1, §6.3).
+/// The shard registers of the control store, as replicas change their
+/// shard's configuration through them: a primary removing members, and a
+/// member taking over (§6.1, §6.3).
 pub trait ShardRegisters: Send + Sync + 'static {
     /// Replaces `current` with `next` in the shard's register, if the
     /// register still holds `current`, with the lost-response rule of
@@ -47,6 +49,13 @@ pub trait ShardRegisters: Send + Sync + 'static {
         current: &'a ShardConfig,
         next: &'a ShardConfig,
     ) -> BoxFuture<'a, Result<Replaced, ControlError>>;
+
+    /// The configuration the register of `shard` holds, or `None` if it
+    /// holds none.
+    fn read<'a>(
+        &'a self,
+        shard: &'a ShardRef,
+    ) -> BoxFuture<'a, Result<Option<ShardConfig>, ControlError>>;
 }
 
 /// [`ShardRegisters`] in any [`ControlStore`], under the register layout
@@ -100,6 +109,17 @@ impl<S: ControlStore> ShardRegisters for ControlRegisters<S> {
     ) -> BoxFuture<'a, Result<Replaced, ControlError>> {
         Box::pin(self.replace_now(current, next))
     }
+
+    fn read<'a>(
+        &'a self,
+        shard: &'a ShardRef,
+    ) -> BoxFuture<'a, Result<Option<ShardConfig>, ControlError>> {
+        Box::pin(async move {
+            let key = TypedKey::shard(&shard.bucket, shard.shard);
+            let held = read_with_retries(&self.store, &key, &self.policy).await?;
+            Ok(held.map(|held| held.value))
+        })
+    }
 }
 
 /// What a node's primaries remove members through: the shard registers,
@@ -116,7 +136,7 @@ impl fmt::Debug for Removal {
 }
 
 impl Removal {
-    fn next_id(&self) -> ProposalId {
+    pub(super) fn next_id(&self) -> ProposalId {
         self.ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -148,7 +168,8 @@ struct Seen {
 ///
 /// A failed attempt is tried again on a later check. A register that names
 /// another primary, or no longer exists, deposes this one: it stops
-/// (§6.5).
+/// (§6.5). So does a member's refusal of an append for a newer epoch, once
+/// the register confirms it: the watchdog reads the register then.
 pub(super) struct Watchdog<D: Disk> {
     pub shard: Shard<D>,
     pub leader: Arc<Leader>,
@@ -173,8 +194,18 @@ impl<D: Disk> Watchdog<D> {
         let interval = self.interval();
         let mut seen: BTreeMap<NodeId, Seen> = BTreeMap::new();
         let mut sequenced = self.shard.last_sequenced();
+        let mut rejections = self.leader.rejections();
         while !self.shard.is_stopped() {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                biased;
+                changed = rejections.changed() => {
+                    if changed.is_ok() {
+                        self.check_register().await;
+                    }
+                    continue;
+                }
+                () = tokio::time::sleep(interval) => {}
+            }
             let now = Instant::now();
             let mut suspects = Vec::new();
             for member in self.leader.members() {
@@ -228,21 +259,44 @@ impl<D: Disk> Watchdog<D> {
         tracing::info!(%shard, ?suspects, %epoch, "removing unresponsive members");
         match self.removal.registers.replace(&current, &next).await {
             Ok(Replaced::Accepted) => self.adopt(&next),
-            // The coordinator removed members, or an earlier proposal of
-            // this primary landed unseen.
-            Ok(Replaced::Holds(Some(held))) if self.can_adopt(&current, &held) => {
-                self.adopt(&held);
-            }
-            Ok(Replaced::Holds(held)) if held.as_ref().is_none_or(|h| h.epoch > current.epoch) => {
-                tracing::warn!(%shard, ?held, "the shard's register names another configuration");
-                self.shard
-                    .depose("the shard's register names a configuration this primary cannot adopt");
-            }
-            Ok(Replaced::Holds(held)) => {
-                tracing::warn!(%shard, ?held, "the shard's register is behind this primary");
-            }
+            Ok(Replaced::Holds(held)) => self.follow(&current, held.as_ref()),
             Err(error) => {
                 tracing::warn!(%shard, %error, "removing members failed; trying again");
+            }
+        }
+    }
+
+    /// Reads the shard's register after a member refused an append for a
+    /// newer epoch, and follows what it holds (§6.5). A failed read is
+    /// tried again on the next refusal.
+    async fn check_register(&self) {
+        let shard = self.shard.shard();
+        match self.removal.registers.read(shard).await {
+            Ok(held) => self.follow(&self.shard.config(), held.as_ref()),
+            Err(error) => {
+                tracing::warn!(%shard, %error, "reading the shard's register failed");
+            }
+        }
+    }
+
+    /// Acts on `held`, what the shard's register holds while this primary
+    /// is in `current`: adopts a removal of members (the coordinator's, or
+    /// an earlier proposal of this primary that landed unseen), and stops
+    /// as deposed if the register names another primary or is gone. It
+    /// then redirects to the register's configuration.
+    fn follow(&self, current: &ShardConfig, held: Option<&ShardConfig>) {
+        let shard = self.shard.shard();
+        match held {
+            Some(held) if self.can_adopt(current, held) => self.adopt(held),
+            Some(held) if held.epoch <= current.epoch => {
+                tracing::warn!(%shard, ?held, "the shard's register is behind this primary");
+            }
+            held => {
+                tracing::warn!(%shard, ?held, "the shard's register names another configuration");
+                self.shard.depose(
+                    "the shard's register names a configuration this primary cannot adopt",
+                    held,
+                );
             }
         }
     }

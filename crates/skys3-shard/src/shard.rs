@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use bytes::Bytes;
 use skys3_index::{Entry, EntryState, Index, IndexError, ListPage, ListQuery, Part, Upload};
 use skys3_io::{BlockingPool, Disk};
+use skys3_log::record::truncated_by;
 use skys3_log::record::{Extent, ExtentRef, MpuPart, Put, PutData};
 use skys3_log::{LogRecord, RecordBody, RecordKind, SegmentClass, SegmentLog, ShardRef};
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq, ShardConfig};
@@ -19,6 +20,7 @@ use tokio::task::JoinSet;
 use crate::ack::{AckMode, AckTimeout};
 use crate::error::ShardError;
 use crate::leader::Leader;
+use crate::lineage::{Lineage, Reconcile};
 use crate::machine::{Effect, Outcome, Recorder, StateMachine};
 use crate::pipeline::{Durable, Pipeline, Ready};
 
@@ -110,6 +112,9 @@ pub(crate) enum Message {
     Barrier(BarrierReply),
     /// Every record up to this `seq` is committed.
     Commit(Seq),
+    /// Drop the records after this `seq` unapplied: a member truncated
+    /// them (§6.6).
+    Truncate(Seq),
     /// Stop the shard, fail every record and barrier still queued, then
     /// reply.
     Abandon(BarrierReply),
@@ -146,6 +151,11 @@ pub(crate) struct Sequencer {
     adopt_after: Option<Seq>,
     /// Why the shard stopped, once it has.
     stopped: Option<String>,
+    /// Whether the replica stopped as a primary that learned another one
+    /// took over (§6.5): it then redirects to the configuration it learned.
+    deposed: bool,
+    /// The epochs of the records the replica's log holds (§6.6).
+    lineage: Lineage,
     /// The position of the latest record sequenced for each key, other than
     /// an `EXTENT`, while it is not applied, and while a conditional read
     /// that began at or before it is in progress (see
@@ -174,8 +184,8 @@ struct Inner<D: Disk> {
     /// The last `seq` of the longest run of the shard's records that is
     /// durable here.
     durable: watch::Receiver<Seq>,
-    /// The primary's replication state.
-    leader: Option<Arc<Leader>>,
+    /// The primary's replication state, once the replica is a primary.
+    leader: Arc<OnceLock<Arc<Leader>>>,
 }
 
 /// One shard replica on this node: the shard's only member, its primary,
@@ -355,6 +365,8 @@ impl<D: Disk> Shard<D> {
             node: node.cloned(),
             adopt_after: None,
             stopped: None,
+            deposed: false,
+            lineage: Lineage::new(last),
             writes: BTreeMap::new(),
             readers: BTreeMap::new(),
             subscriber: None,
@@ -363,15 +375,16 @@ impl<D: Disk> Shard<D> {
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
         let (durable_tx, durable) = watch::channel(last.seq);
-        let leader = (role == Role::Primary).then(|| {
-            Arc::new(Leader::new(
+        let leader = Arc::new(OnceLock::new());
+        if role == Role::Primary {
+            let _ = leader.set(Arc::new(Leader::new(
                 shard.clone(),
                 config,
                 Arc::clone(&sequencer),
                 sender.clone(),
                 durable.clone(),
-            ))
-        });
+            )));
+        }
         let mut pipeline = Pipeline::default();
         if role != Role::Alone {
             pipeline.require_commit(last.seq);
@@ -383,7 +396,7 @@ impl<D: Disk> Shard<D> {
             sequencer: Arc::clone(&sequencer),
             pipeline,
             durable: durable_tx,
-            leader: leader.clone(),
+            leader: Arc::clone(&leader),
             stopped: None,
         };
         tokio::spawn(task.run(receiver));
@@ -391,7 +404,7 @@ impl<D: Disk> Shard<D> {
         let task = Appender {
             log: log.clone(),
             pipeline: sender.clone(),
-            leader: leader.clone(),
+            leader: Arc::clone(&leader),
             ordered: role != Role::Alone,
             in_flight: JoinSet::new(),
             class: SegmentClass::Hot,
@@ -467,7 +480,14 @@ impl<D: Disk> Shard<D> {
     /// A primary's replication state, which its replication links drive.
     #[must_use]
     pub fn leader(&self) -> Option<&Arc<Leader>> {
-        self.inner.leader.as_ref()
+        self.inner.leader.get()
+    }
+
+    /// The epochs of the records the replica's log holds, as far as this
+    /// life knows them (§6.6).
+    #[must_use]
+    pub fn lineage(&self) -> Lineage {
+        self.sequencer().lineage.clone()
     }
 
     /// Bounds how long the requests of a replicated shard wait for its
@@ -654,7 +674,7 @@ impl<D: Disk> Shard<D> {
         let key = entry_key(&body)
             .filter(|_| !matches!(body, RecordBody::Flushed(_)))
             .map(str::to_owned);
-        let receiver = self.sequence(position, body, None, lazy)?;
+        let receiver = self.sequence(sequencer, position, body, None, lazy)?;
         sequencer.next = EpochSeq::new(position.epoch, next);
         if let Some(key) = key {
             sequencer.writes.insert(key, position);
@@ -682,7 +702,9 @@ impl<D: Disk> Shard<D> {
     /// its `CONFIG` record just before the first record of the new epoch,
     /// or once it reaches its primary's `CONFIG` record (see
     /// [`Shard::follow`]), so that it switches epochs at the same `seq` as
-    /// its primary (§5.1).
+    /// its primary (§5.1). A primary that took over may also send records
+    /// of epochs between the two, which it rolls forward from earlier
+    /// primaries (§6.6): the replica sequences in each as it comes.
     ///
     /// # Errors
     ///
@@ -749,9 +771,11 @@ impl<D: Disk> Shard<D> {
         // The record's own epoch, not only the message's: a record of
         // another epoch would move the sequencer away from the
         // configuration. Only the tail of the epoch a replica still
-        // sequences in can arrive in a session of a newer one (§5.1).
+        // sequences in, and of later epochs before its configuration's,
+        // can arrive in a session of a newer one (§5.1, §6.6).
         let sequencing = sequencer.next.epoch;
-        if position.epoch != sequencing {
+        let later = position.epoch > sequencing && position.epoch < ours && position.seq == next;
+        if position.epoch != sequencing && !later {
             return Err(ShardError::invalid(
                 shard,
                 format!("the record at {position} is not of the replica's epoch {sequencing}"),
@@ -771,8 +795,8 @@ impl<D: Disk> Shard<D> {
             .checked_next()
             .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
         let body = record.body;
-        drop(self.sequence(position, body, Some(encoded), lazy)?);
-        sequencer.next = EpochSeq::new(sequencing, after);
+        drop(self.sequence(&mut sequencer, position, body, Some(encoded), lazy)?);
+        sequencer.next = EpochSeq::new(position.epoch, after);
         self.adopt_if_due(&mut sequencer)?;
         Ok(true)
     }
@@ -823,7 +847,7 @@ impl<D: Disk> Shard<D> {
     fn adopt_locked(&self, sequencer: &mut Sequencer) -> Result<WriteReceiver, ShardError> {
         let config = sequencer.config.clone();
         let position = EpochSeq::new(config.epoch, sequencer.last_sequenced().seq);
-        let reply = self.sequence(position, RecordBody::Config(config), None, false)?;
+        let reply = self.sequence(sequencer, position, RecordBody::Config(config), None, false)?;
         sequencer.next = EpochSeq::new(position.epoch, sequencer.next.seq);
         sequencer.adopt_after = None;
         Ok(reply)
@@ -887,6 +911,141 @@ impl<D: Disk> Shard<D> {
         let _ = self.inner.pipeline.send(Message::Commit(seq));
     }
 
+    /// What this member does with its log when the primary of a
+    /// configuration in `epoch`, whose log has the lineage `primary`,
+    /// opens a session: see [`Lineage::reconcile`] (§6.6). Call it once
+    /// the records queued so far are durable ([`Shard::settle`]).
+    #[must_use]
+    pub fn reconcile(&self, primary: &Lineage, epoch: Epoch) -> Reconcile {
+        let sequencer = self.sequencer();
+        sequencer
+            .lineage
+            .reconcile(primary, epoch, sequencer.applied.seq)
+    }
+
+    /// Invalidates this member's records after `after`, which its new
+    /// primary does not hold, with a `TRUNCATE` record at
+    /// `(epoch, after)`, and returns once that record is durable (§6.6).
+    /// The member then takes the primary's records from `after + 1` on.
+    ///
+    /// The truncated records were never committed, since committing them
+    /// needed the new primary's acknowledgement. They are dropped from the
+    /// pipeline unapplied, replay and [`Shard::read_tail`] skip them
+    /// ([`truncated_by`]), and the commit watermark of the earlier primary
+    /// stops counting past `after`. `epoch` must be newer than every record
+    /// truncated and no newer than any taken next, as [`Shard::reconcile`]
+    /// chooses it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Configuration`] on a replica that is not a member, or
+    /// if a record past `after` is applied already;
+    /// [`ShardError::Unavailable`] if the shard stopped.
+    pub async fn truncate(&self, after: Seq, epoch: Epoch) -> Result<(), ShardError> {
+        let shard = self.shard();
+        self.settle().await;
+        {
+            let mut sequencer = self.sequencer();
+            sequencer.check_running(shard)?;
+            if sequencer.role != Role::Member {
+                return Err(ShardError::configuration(shard, "only a member truncates"));
+            }
+            if after < sequencer.applied.seq {
+                return Err(ShardError::configuration(
+                    shard,
+                    format!("records up to seq {} are applied", sequencer.applied.seq),
+                ));
+            }
+            if after >= sequencer.last_sequenced().seq {
+                return Ok(());
+            }
+            let record = LogRecord {
+                shard: shard.clone(),
+                position: EpochSeq::new(epoch, after),
+                body: RecordBody::Truncate,
+            };
+            // The pipeline drops the records before any later one reaches
+            // it. The TRUNCATE takes no place in it and is never applied:
+            // its position is past records it leaves valid.
+            let stopped = || self.unavailable("the shard's pipeline stopped");
+            self.inner
+                .pipeline
+                .send(Message::Truncate(after))
+                .map_err(|_| stopped())?;
+            let job = Job::Append {
+                record: Box::new(record),
+                encoded: None,
+                lazy: false,
+            };
+            self.inner.appender.send(job).map_err(|_| stopped())?;
+            sequencer.lineage.truncate(after);
+            let epoch = sequencer.lineage.last().epoch;
+            let next = after.checked_next().unwrap_or(Seq::MAX);
+            sequencer.next = EpochSeq::new(epoch, next);
+            sequencer.adopt_after = None;
+            sequencer.writes.retain(|_, position| position.seq <= after);
+        }
+        self.settle().await;
+        self.sequencer().check_running(shard)
+    }
+
+    /// Makes this member the primary of `config`, which it proposed over
+    /// its current configuration `over` and the shard's register accepted
+    /// (§6.5). It appends `config`'s `CONFIG` record after every record it
+    /// holds, and returns once that record is durable; it serves once its
+    /// links have reconciled every member with its log and all of it is
+    /// committed (§6.6). Its records past the commit watermark it knew stay
+    /// in the pipeline and commit under `config`.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Configuration`] if the replica is not a member in
+    /// `over`, or `config` does not name this node as its primary in a
+    /// newer epoch; [`ShardError::Unavailable`] if the shard stopped.
+    pub(crate) async fn take_over(
+        &self,
+        over: &ShardConfig,
+        config: &ShardConfig,
+    ) -> Result<(), ShardError> {
+        let shard = self.shard();
+        self.settle().await;
+        {
+            let mut sequencer = self.sequencer();
+            sequencer.check_running(shard)?;
+            let ours = sequencer.node.as_ref() == Some(&config.primary);
+            if sequencer.role != Role::Member
+                || sequencer.config != *over
+                || !ours
+                || config.epoch <= over.epoch
+            {
+                return Err(ShardError::configuration(
+                    shard,
+                    "the replica is not the member that proposed the configuration",
+                ));
+            }
+            let leader = Leader::new(
+                shard.clone(),
+                config,
+                Arc::clone(&self.inner.sequencer),
+                self.inner.pipeline.clone(),
+                self.inner.durable.clone(),
+            );
+            if self.inner.leader.set(Arc::new(leader)).is_err() {
+                return Err(ShardError::configuration(shard, "the replica led before"));
+            }
+            sequencer.role = Role::Primary;
+            sequencer.config = config.clone();
+            sequencer.serving = false;
+            sequencer.adopt_after = None;
+            // Appends of the earlier primary's sessions are refused.
+            sequencer.session += 1;
+            drop(self.adopt_locked(&mut sequencer)?);
+        }
+        // Members reconcile against a log that holds the CONFIG record.
+        self.settle().await;
+        self.sequencer().check_running(shard)
+    }
+
     /// The records of the shard after `after`, up to `through`, as this
     /// replica's log holds them, encoded, in `seq` order: what a primary
     /// sends a member that is behind, or a member sends a primary that
@@ -907,21 +1066,31 @@ impl<D: Disk> Shard<D> {
         let shard = self.shard();
         let log = &self.inner.log;
         let failed = |error: &dyn fmt::Display| ShardError::unavailable(shard, error);
-        let mut found = BTreeMap::new();
+        let (mut candidates, mut truncates) = (Vec::new(), Vec::new());
         for segment in log.segments() {
             let mut scanner = log.scan(segment.id).map_err(|e| failed(&e))?;
             while let Some(record) = scanner.next().await.map_err(|e| failed(&e))? {
                 let header = &record.header;
                 let seq = header.position.seq;
-                if header.shard == *shard
-                    && seq > after
-                    && seq <= through
-                    && !matches!(header.kind, RecordKind::Config | RecordKind::Truncate)
-                {
-                    found.insert(seq, (header.position, record.bytes));
+                if header.shard != *shard {
+                    continue;
+                }
+                match header.kind {
+                    RecordKind::Truncate => truncates.push(header.position),
+                    RecordKind::Config => {}
+                    _ if seq > after && seq <= through => {
+                        candidates.push((header.position, record.bytes));
+                    }
+                    _ => {}
                 }
             }
         }
+        // Records a reconciliation truncated are not the shard's (§6.6).
+        let found: BTreeMap<_, _> = candidates
+            .into_iter()
+            .filter(|(position, _)| !truncates.iter().any(|t| truncated_by(*t, *position)))
+            .map(|(position, bytes)| (position.seq, (position, bytes)))
+            .collect();
         let expected = through.get().saturating_sub(after.get());
         if found.len() as u64 != expected {
             return Err(failed(&format!(
@@ -1200,9 +1369,10 @@ impl<D: Disk> Shard<D> {
     /// configuration the shard is in already changes nothing, even on a
     /// stopped shard.
     ///
-    /// On a replicated shard the configuration keeps its primary and adds
-    /// no member: it removes members (§6.4). The epoch must switch at the
-    /// same `seq` on every replica (§5.1), so:
+    /// On a replicated shard the configuration adds no member: it removes
+    /// members (§6.4), or names one of them as the new primary after a
+    /// takeover (§6.5), which a member follows. The epoch must switch at
+    /// the same `seq` on every replica (§5.1), so:
     ///
     /// - **A primary** appends the record once every member of `config`
     ///   has reported its log in this life, at once if they have, and
@@ -1220,8 +1390,9 @@ impl<D: Disk> Shard<D> {
     /// [`ShardError::Configuration`] if `config` is of another shard, is
     /// older than the shard's configuration, differs from it in the same
     /// epoch, cannot open (see [`Shard::open`]), or makes a change a
-    /// replicated shard does not support: a new primary (plan M2-12), a new
-    /// member or a learner (M2-14), or this replica's removal;
+    /// replicated shard does not support: a new primary on the primary or
+    /// on the member it names, a new member or a learner (M2-14), or this
+    /// replica's removal;
     /// [`ShardError::Unavailable`] if the shard stopped, and otherwise as
     /// [`Shard::commit`].
     pub async fn reconfigure(&self, config: &ShardConfig) -> Result<(), ShardError> {
@@ -1291,20 +1462,37 @@ impl<D: Disk> Shard<D> {
     }
 
     /// Stops a primary that learned it no longer leads the shard: its
-    /// register holds a configuration it cannot adopt (§6.5). Its writers
-    /// still waiting are not acknowledged.
-    pub(crate) fn depose(&self, reason: &str) {
+    /// register holds a configuration it cannot adopt, `register` if the
+    /// register holds one, or a member refused its appends for a newer
+    /// epoch (§6.5). Its writers still waiting are not acknowledged. It
+    /// serves nothing from then on: with the register's configuration it
+    /// answers requests with that configuration as a redirect hint
+    /// ([`ShardError::NotPrimary`]), and without it as unavailable.
+    pub(crate) fn depose(&self, reason: &str, register: Option<&ShardConfig>) {
         let mut sequencer = self.sequencer();
         sequencer.stopped.get_or_insert_with(|| reason.to_owned());
         sequencer.subscriber = None;
+        sequencer.deposed = true;
+        if let Some(config) = register.filter(|config| config.epoch > sequencer.config.epoch) {
+            sequencer.config = config.clone();
+        }
+    }
+
+    /// Whether the replica was a primary that another one replaced
+    /// (§6.5).
+    #[must_use]
+    pub fn is_deposed(&self) -> bool {
+        self.sequencer().deposed
     }
 
     /// Gives `body` the position `position` and queues its append, as
     /// `encoded` if it arrived encoded; the caller holds the sequencer's
     /// lock, so records reach the pipeline and the appender in position
-    /// order, and advances `next` on success.
+    /// order, and advances `next` on success. The lineage records the
+    /// position.
     fn sequence(
         &self,
+        sequencer: &mut Sequencer,
         position: EpochSeq,
         body: RecordBody,
         encoded: Option<Bytes>,
@@ -1332,6 +1520,7 @@ impl<D: Disk> Shard<D> {
             lazy,
         };
         self.inner.appender.send(job).map_err(|_| stopped())?;
+        sequencer.lineage.push(position);
         Ok(receiver)
     }
 
@@ -1534,7 +1723,7 @@ impl<D: Disk> Shard<D> {
     /// [`ShardError::NotPrimary`] on a member.
     pub fn check_readable(&self) -> Result<(), ShardError> {
         self.sequencer().check_serving(self.shard())?;
-        match &self.inner.leader {
+        match self.leader() {
             Some(leader) if !leader.holds_leases() => {
                 Err(self.unavailable("the primary does not hold a lease from every member"))
             }
@@ -1588,8 +1777,16 @@ impl Sequencer {
         }
     }
 
-    /// Checks that the replica takes client writes.
+    /// Checks that the replica takes client writes. A deposed primary that
+    /// knows its successor's configuration redirects to it.
     fn check_serving(&self, shard: &ShardRef) -> Result<(), ShardError> {
+        if self.deposed && self.node.as_ref() != Some(&self.config.primary) {
+            return Err(ShardError::NotPrimary {
+                shard: shard.clone(),
+                primary: self.config.primary.clone(),
+                epoch: self.config.epoch,
+            });
+        }
         self.check_running(shard)?;
         self.check_role(shard)
     }
@@ -1615,12 +1812,17 @@ impl Sequencer {
     }
 
     /// Checks that a replicated shard supports changing to `config`, a
-    /// newer configuration: the same primary, no new member nor learner,
-    /// and this replica still a member (§6.4).
+    /// newer configuration: no new member nor learner, and this replica
+    /// still a member (§6.4). A new primary is one of the members, and only
+    /// a member that does not propose it follows it (§6.5): a primary
+    /// learns of its successor by being deposed, and a candidate takes over
+    /// itself ([`Shard::take_over`]).
     fn check_change(&self, shard: &ShardRef, config: &ShardConfig) -> Result<(), ShardError> {
         let refuse = |reason: &str| Err(ShardError::configuration(shard, reason));
-        if config.primary != self.config.primary {
-            return refuse("a new primary takes over by reconciling (plan M2-12)");
+        if config.primary != self.config.primary
+            && (self.role != Role::Member || self.node.as_ref() == Some(&config.primary))
+        {
+            return refuse("a new primary takes over by proposing itself");
         }
         if !config.learners.is_empty() {
             return refuse("learners are not supported yet");
@@ -1834,7 +2036,7 @@ struct PipelineTask {
     /// Where the durable run of records is published.
     durable: watch::Sender<Seq>,
     /// A primary's replication state, told of every change.
-    leader: Option<Arc<Leader>>,
+    leader: Arc<OnceLock<Arc<Leader>>>,
     /// Why the shard stopped, once a record failed or applying did.
     stopped: Option<ShardError>,
 }
@@ -1852,7 +2054,7 @@ impl PipelineTask {
             while let Some(ready) = self.pipeline.next() {
                 self.release(ready).await;
             }
-            if let Some(leader) = &self.leader {
+            if let Some(leader) = self.leader.get() {
                 leader.progress();
             }
         }
@@ -1865,7 +2067,7 @@ impl PipelineTask {
                 // A primary's CONFIG record of a configuration without some
                 // members is durable: the commit rule and the leases stop
                 // needing them (§6.4).
-                if let (Some(leader), Ok(durable)) = (&self.leader, &result)
+                if let (Some(leader), Ok(durable)) = (self.leader.get(), &result)
                     && let RecordBody::Config(config) = &durable.0.body
                 {
                     leader.adopt(config);
@@ -1874,6 +2076,14 @@ impl PipelineTask {
             }
             Message::Barrier(reply) => self.pipeline.barrier(reply),
             Message::Commit(seq) => self.pipeline.commit_through(seq),
+            Message::Truncate(after) => {
+                self.pipeline.truncate(after);
+                self.durable.send_if_modified(|durable| {
+                    let truncated = *durable > after;
+                    *durable = (*durable).min(after);
+                    truncated
+                });
+            }
             Message::Abandon(reply) => {
                 let error = self.stop("the shard was closed".to_owned());
                 let (writes, barriers) = self.pipeline.abandon();
@@ -2018,7 +2228,7 @@ impl PipelineTask {
 struct Appender<D: Disk> {
     log: SegmentLog<D>,
     pipeline: mpsc::UnboundedSender<Message>,
-    leader: Option<Arc<Leader>>,
+    leader: Arc<OnceLock<Arc<Leader>>>,
     /// Whether records of different classes are queued in order.
     ordered: bool,
     /// The appends queued and not yet acknowledged.
@@ -2059,7 +2269,7 @@ impl<D: Disk> Appender<D> {
             Err(error) => return self.resolved(position, Err(error.to_string())),
         };
         // Members append their CONFIG records for themselves.
-        if let Some(leader) = &self.leader
+        if let Some(leader) = self.leader.get()
             && !matches!(record.body, RecordBody::Config(_))
         {
             leader.push(position, encoded.clone(), lazy);

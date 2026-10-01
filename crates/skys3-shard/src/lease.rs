@@ -26,11 +26,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use skys3_io::{Clock, MonoTime};
-use skys3_types::NodeId;
+use skys3_types::{Epoch, NodeId};
 use tokio::sync::watch;
 
 /// The leases a primary holds from its members, timed on its own clock.
@@ -95,14 +95,24 @@ impl Leases {
 /// A member's grace for one shard: when it last granted the primary a
 /// lease, on its own clock (§5.4).
 ///
-/// A member proposes no new primary until [`Grace::has_passed`] (plan
-/// M2-12). The grace counts from the grace's creation as if a lease had
-/// been granted then, because a node that restarts does not know when it
-/// last granted one.
+/// A member proposes no new primary until [`Grace::has_passed`]. The grace
+/// counts from the grace's creation as if a lease had been granted then,
+/// because a node that restarts does not know when it last granted one.
+///
+/// A candidate stops granting, and acknowledging, before it proposes
+/// itself (rule R1, §6.3): [`Grace::stop_if_passed`] decides that under the
+/// same lock as every grant, so no grant slips in between. The grace then
+/// holds the epoch the candidate proposes over, so that a session of that
+/// epoch, or an older one, cannot resume it ([`Grace::resume_for`]) while
+/// the proposal may still land, and a candidate that was resumed proposes
+/// nothing more ([`Grace::propose_over`]).
 pub struct Grace {
     clock: Arc<dyn Clock>,
     grace: Duration,
     granted: watch::Sender<MonoTime>,
+    /// The epoch the member proposes over, once it stopped granting to
+    /// propose itself.
+    stopped: Mutex<Option<Epoch>>,
 }
 
 impl fmt::Debug for Grace {
@@ -123,18 +133,95 @@ impl Grace {
             clock,
             grace: primary_grace,
             granted: watch::Sender::new(now),
+            stopped: Mutex::new(None),
         }
     }
 
     /// Records a lease granted now: call it after the stamp it echoes
-    /// arrived, and before the acknowledgement that grants it leaves.
-    pub fn grant(&self) {
+    /// arrived, and send the acknowledgement that grants it only if this
+    /// returns `true`. A member that stopped granting grants nothing.
+    pub fn grant(&self) -> bool {
+        let stopped = self.lock();
+        if stopped.is_some() {
+            return false;
+        }
+        self.record_grant();
+        true
+    }
+
+    fn record_grant(&self) {
         let now = self.clock.now();
         self.granted.send_if_modified(|last| {
             let later = now > *last;
             *last = (*last).max(now);
             later
         });
+    }
+
+    /// Stops granting leases, and acknowledging appends, if the grace has
+    /// passed: the member may then propose itself as primary over its
+    /// configuration in `epoch` (R1). Returns whether it is stopped.
+    pub fn stop_if_passed(&self, epoch: Epoch) -> bool {
+        let mut stopped = self.lock();
+        if stopped.is_none() && self.has_passed() {
+            *stopped = Some(epoch);
+        }
+        stopped.is_some()
+    }
+
+    /// Whether the member stopped granting to propose itself.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    /// Records that a stopped member proposes over its configuration in
+    /// `epoch` now. Returns `false` if it was resumed in the meantime: it
+    /// may have granted since, so it must not propose.
+    pub fn propose_over(&self, epoch: Epoch) -> bool {
+        match self.lock().as_mut() {
+            Some(over) => {
+                *over = (*over).max(epoch);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Grants again for a session of a configuration in `epoch`, which a
+    /// stopped member follows only if it is newer than the one it proposes
+    /// over: the register has then moved past that, so the proposal cannot
+    /// land. Returns whether the member grants.
+    pub fn resume_for(&self, epoch: Epoch) -> bool {
+        let mut stopped = self.lock();
+        if stopped.is_some_and(|over| epoch <= over) {
+            return false;
+        }
+        if stopped.take().is_some() {
+            self.record_grant();
+        }
+        true
+    }
+
+    /// Grants again after a proposal lost: the member follows the
+    /// configuration that won, and counts this as a grant, so that it
+    /// gives the new primary a whole grace to reach it before it proposes
+    /// again.
+    pub fn resume(&self) {
+        if self.lock().take().is_some() {
+            self.record_grant();
+        }
+    }
+
+    /// Waits until the grace has passed.
+    pub async fn passed(&self) {
+        while !self.has_passed() {
+            self.clock.sleep_until(self.passes_at()).await;
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Epoch>> {
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// When the member last granted a lease, or the grace started.
@@ -233,16 +320,49 @@ mod tests {
         tokio::time::advance(ms(500)).await;
         assert_eq!(grace.since_granted(), ms(500));
         assert!(!grace.has_passed());
-        grace.grant();
+        assert!(grace.grant());
         assert!(granted.has_changed().unwrap());
         assert_eq!(*granted.borrow_and_update(), MonoTime::ZERO + ms(500));
         // A second grant at the same reading changes nothing.
-        grace.grant();
+        assert!(grace.grant());
         assert!(!granted.has_changed().unwrap());
+        // Too early to stop granting.
+        assert!(!grace.stop_if_passed(Epoch::new(3)));
         tokio::time::advance(ms(599)).await;
         assert!(!grace.has_passed());
-        tokio::time::advance(ms(1)).await;
+        let started = tokio::time::Instant::now();
+        grace.passed().await;
+        assert_eq!(started.elapsed(), ms(1));
         assert!(grace.has_passed());
         assert!(format!("{grace:?}").contains("last_granted"));
+
+        // A candidate stops granting (R1) until it resumes, which counts as
+        // a grant.
+        let epoch = Epoch::new;
+        assert!(grace.stop_if_passed(epoch(3)));
+        assert!(grace.is_stopped());
+        assert!(!grace.grant());
+        assert!(!granted.has_changed().unwrap());
+        // It proposes over epoch 4 next: sessions up to that epoch do not
+        // resume it, a newer one does.
+        assert!(grace.propose_over(epoch(4)));
+        assert!(!grace.resume_for(epoch(4)));
+        assert!(grace.is_stopped());
+        assert!(grace.resume_for(epoch(5)));
+        assert!(!grace.is_stopped());
+        assert!(granted.has_changed().unwrap());
+        assert!(!grace.has_passed());
+        // Resumed, it proposes nothing more until its grace passes again.
+        assert!(!grace.propose_over(epoch(5)));
+        assert!(!grace.stop_if_passed(epoch(5)));
+        assert!(grace.resume_for(epoch(1)));
+        tokio::time::advance(ms(600)).await;
+        assert!(grace.stop_if_passed(epoch(5)));
+        grace.resume();
+        assert!(!grace.is_stopped());
+        // Resuming a grace that is not stopped changes nothing.
+        granted.borrow_and_update();
+        grace.resume();
+        assert!(!granted.has_changed().unwrap());
     }
 }

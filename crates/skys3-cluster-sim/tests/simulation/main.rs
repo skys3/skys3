@@ -21,6 +21,9 @@
 //!   both modes, without the control store, and across a restart.
 //! - [`routing`]: gateways on every node with stale shard maps, routing
 //!   each request to its primary under crashes and partitions.
+//! - [`takeover`]: members taking over from a primary that crashed, with
+//!   competing candidates, partitions, crashes during reconciliation, and
+//!   a single survivor.
 
 mod acks;
 mod coordinator;
@@ -30,6 +33,7 @@ mod leases;
 mod removal;
 mod replication;
 mod routing;
+mod takeover;
 mod workload;
 
 /// What one seed of a cluster scenario costs, in seeds of a typical

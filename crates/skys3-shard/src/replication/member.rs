@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
 use super::{Inner, LinkError, ReplicationConfig, recv};
 use crate::lease::Grace;
-use crate::set::ShardSet;
+use crate::lineage::Reconcile;
 use crate::shard::{Role, Shard};
 
 /// Serves one link from a primary, whose first frame is `frame`: a session
@@ -30,22 +30,34 @@ where
 {
     let config = inner.config;
     let request: Sync = wire::body(&frame, MessageKind::Sync).map_err(LinkError::Protocol)?;
-    let (shard, epoch) = match accept(&request, receiver.peer(), &inner.set).await {
+    let (shard, epoch) = match accept(&request, receiver.peer(), inner).await {
         Ok(accepted) => accepted,
-        Err((epoch, refused)) => {
-            let answer = SyncAck {
-                epoch: epoch.get(),
-                refused: refused.clone(),
-                ..SyncAck::default()
-            };
-            sender
-                .send(&wire::frame(MessageKind::SyncAck, &answer, Bytes::new()))
-                .await?;
-            return Err(LinkError::Protocol(refused));
-        }
+        Err((epoch, refused)) => return refuse(&mut sender, epoch, refused).await,
     };
     let session = shard.begin_session();
     shard.settle().await;
+    let primary_last = Seq::new(request.primary_last);
+    // Reconciliation (§6.6): keep the prefix shared with the primary's
+    // log, send back what the primary sequenced and lost, and truncate the
+    // rest.
+    let reconcile = match request.lineage() {
+        Ok(lineage) => shard.reconcile(&lineage, epoch),
+        Err(error) => Reconcile::Diverged(format!("the primary's lineage is invalid: {error}")),
+    };
+    let rolled = match reconcile {
+        Reconcile::Keep => false,
+        Reconcile::RollForward => true,
+        Reconcile::Truncate { after, epoch: at } => {
+            tracing::info!(shard = %shard.shard(), %after, epoch = %at, "truncating to reconcile");
+            shard.truncate(after, at).await?;
+            false
+        }
+        Reconcile::Diverged(why) => {
+            tracing::warn!(shard = %shard.shard(), %why, "cannot reconcile with the primary");
+            let refused = format!("the member's log diverged: {why}");
+            return refuse(&mut sender, epoch, refused).await;
+        }
+    };
     let last = *shard.durable().borrow();
     let answer = |done| SyncAck {
         last: last.get(),
@@ -53,8 +65,7 @@ where
         epoch: epoch.get(),
         refused: String::new(),
     };
-    let primary_last = Seq::new(request.primary_last);
-    if last > primary_last {
+    if rolled && last > primary_last {
         for (_, record) in shard.read_tail(primary_last, last).await? {
             let frame = wire::frame(MessageKind::SyncAck, &answer(false), record);
             sender.send(&frame).await?;
@@ -104,20 +115,40 @@ where
     })
 }
 
+/// Answers a `Sync` with a refusal: the member's epoch, and why.
+async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
+    sender: &mut Sender<S>,
+    epoch: Epoch,
+    refused: String,
+) -> Result<(), LinkError> {
+    let answer = SyncAck {
+        epoch: epoch.get(),
+        refused: refused.clone(),
+        ..SyncAck::default()
+    };
+    sender
+        .send(&wire::frame(MessageKind::SyncAck, &answer, Bytes::new()))
+        .await?;
+    Err(LinkError::Protocol(refused))
+}
+
 /// Finds the shard a `Sync` names, which must be open on this node as a
 /// member, and checks that the peer is its primary in its epoch. A newer
-/// configuration that keeps the primary and this member is adopted
-/// ([`Shard::reconfigure`]): its primary removed other members (§6.4). A
-/// refusal carries the member's epoch, if it knows the shard, and why.
-async fn accept<D: Disk>(
+/// configuration that keeps this member is adopted
+/// ([`Shard::reconfigure`]): its primary removed other members (§6.4), or
+/// took over (§6.5). A member that proposed itself as primary follows only
+/// a newer configuration than the one it proposed over, which tells it
+/// that its proposal lost (R1, §6.3). A refusal carries the member's
+/// epoch, if it knows the shard, and why.
+async fn accept<N: Network, D: Disk>(
     request: &Sync,
     peer: &PeerIdentity,
-    set: &ShardSet<D>,
+    inner: &Inner<N, D>,
 ) -> Result<(Shard<D>, Epoch), (Epoch, String)> {
     let refuse = |epoch, reason: &str| Err((epoch, reason.to_owned()));
     let theirs = request.configuration().map_err(|e| (Epoch::ZERO, e))?;
     let shard = ShardRef::new(theirs.bucket_id.clone(), theirs.shard);
-    let Some(replica) = set.get(&shard).await else {
+    let Some(replica) = inner.set.get(&shard).await else {
         return refuse(Epoch::ZERO, "the shard is not open on this node");
     };
     let ours = replica.config();
@@ -138,6 +169,9 @@ async fn accept<D: Disk>(
             ours.epoch,
             "the primary's configuration differs from the member's",
         );
+    }
+    if !inner.grace_of(&shard).resume_for(theirs.epoch) {
+        return refuse(ours.epoch, "this member proposed itself as primary");
     }
     if let Err(error) = replica.reconfigure(&theirs).await {
         return refuse(ours.epoch, &error.to_string());
@@ -236,7 +270,9 @@ impl<D: Disk> Follower<'_, D> {
     /// Acknowledges the run of records held durably as it grows, and
     /// answers every beacon. Each acknowledgement echoes the latest lease
     /// stamp, which grants the primary a lease, so it restarts the grace
-    /// before it leaves (§5.4).
+    /// before it leaves (§5.4). A member that stops granting to propose
+    /// itself as primary stops acknowledging too, and ends the session
+    /// (R1, §6.3).
     async fn acknowledge<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         sender: &mut Sender<S>,
@@ -253,8 +289,15 @@ impl<D: Disk> Follower<'_, D> {
                 () = self.beacons.notified() => {}
             }
             let lease = *self.stamp.lock().unwrap_or_else(PoisonError::into_inner);
-            if lease.is_some() {
-                self.grace.grant();
+            let granted = if lease.is_some() {
+                self.grace.grant()
+            } else {
+                !self.grace.is_stopped()
+            };
+            if !granted {
+                return Err(
+                    LinkError::Protocol("the member proposed itself as primary".into()).into(),
+                );
             }
             let ack = AppendAck {
                 durable: durable.borrow_and_update().get(),

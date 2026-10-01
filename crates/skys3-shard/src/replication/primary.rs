@@ -25,6 +25,9 @@ pub(super) struct Link<N: Network, D: Disk> {
     pub address: NodeAddress,
     pub transport: Transport<N>,
     pub config: ReplicationConfig,
+    /// Whether a watchdog checks the shard's register when a member
+    /// refuses an append for a newer epoch.
+    pub watched: bool,
 }
 
 /// What a session told the member: the primary's configuration, and the
@@ -90,13 +93,16 @@ impl<N: Network, D: Disk> Link<N, D> {
     ) -> Result<(Session, Seq), LinkError> {
         let session = self.session();
         let config = &session.config;
+        let lineage = self.shard.lineage();
         let request = Sync {
             config: config
                 .to_json()
                 .map_err(|error| LinkError::Protocol(error.to_string()))?,
-            primary_last: self.shard.last_sequenced().get(),
+            primary_last: lineage.last().seq.get(),
             sequencing: session.sequencing.get(),
-        };
+            ..Sync::default()
+        }
+        .with_lineage(&lineage);
         sender
             .send(&wire::frame(MessageKind::Sync, &request, Bytes::new()))
             .await?;
@@ -105,6 +111,7 @@ impl<N: Network, D: Disk> Link<N, D> {
             let answer: SyncAck =
                 wire::body(&frame, MessageKind::SyncAck).map_err(LinkError::Protocol)?;
             if !answer.refused.is_empty() {
+                self.newer_epoch(Epoch::new(answer.epoch));
                 return Err(LinkError::Protocol(format!(
                     "the member refused the session in its epoch {}: {}",
                     answer.epoch, answer.refused
@@ -196,6 +203,22 @@ impl<N: Network, D: Disk> Link<N, D> {
         }
     }
 
+    /// Acts on a member that refused a session or an append in its
+    /// `epoch`: if that is newer than the primary's, this primary may be
+    /// deposed (§6.5). Its watchdog checks the register; without one,
+    /// nothing but a takeover moves the epoch past it, so it stops.
+    fn newer_epoch(&self, epoch: Epoch) {
+        if epoch <= self.shard.config().epoch {
+            return;
+        }
+        if self.watched {
+            self.leader.rejected(epoch);
+        } else {
+            self.shard
+                .depose("a member refused the primary for a newer epoch", None);
+        }
+    }
+
     /// The lease stamp for a frame sent now.
     fn stamp(&self) -> Option<u64> {
         self.leader.lease_stamp().map(MonoTime::as_nanos)
@@ -212,8 +235,7 @@ impl<N: Network, D: Disk> Link<N, D> {
             let ack: AppendAck =
                 wire::body(&frame, MessageKind::AppendAck).map_err(LinkError::Protocol)?;
             if ack.rejected != 0 {
-                // The member knows a newer epoch: this primary may be
-                // deposed (plan M2-12 acts on it).
+                self.newer_epoch(Epoch::new(ack.rejected));
                 return Err(LinkError::Protocol(format!(
                     "the member refused an append: it is in epoch {}",
                     ack.rejected

@@ -605,6 +605,61 @@ fn replay_orders_a_shards_records_across_disks() {
     });
 }
 
+/// A member reconciled with a new primary (§6.6): it truncated two
+/// records of epoch 2 past seq 1, then took the primary's records from
+/// seq 2 on, of epoch 3 and later. Replay applies the valid ones in
+/// position order, and neither the truncated records nor the `TRUNCATE`,
+/// whose position is past records it keeps valid.
+#[test]
+fn replay_skips_what_a_truncate_invalidates() {
+    runtime().block_on(async {
+        let disk = SimDisk::new(8);
+        let pool = pool();
+        let node = open_node(&disk.mount(), &pool).await;
+        let at = |epoch: u64, seq: u64| EpochSeq::new(Epoch::new(epoch), Seq::new(seq));
+        let record = |position: EpochSeq, body: RecordBody| LogRecord {
+            shard: shard(0),
+            position,
+            body,
+        };
+        let delete =
+            |position, key: &str| record(position, RecordBody::Delete(Delete { key: key.into() }));
+        let log = log_of(&node);
+        for written in [
+            delete(at(1, 1), "kept"),
+            delete(at(2, 2), "truncated-2"),
+            delete(at(2, 3), "truncated-3"),
+            record(at(3, 1), RecordBody::Truncate),
+            delete(at(3, 2), "taken-2"),
+            delete(at(4, 3), "taken-3"),
+            // Another shard's records are not its business.
+            LogRecord {
+                shard: shard(1),
+                ..delete(at(2, 2), "other")
+            },
+        ] {
+            log.append(&written).await.unwrap();
+        }
+        disk.crash();
+        drop(node);
+
+        let node = open_node(&disk.mount(), &pool).await;
+        let report = node.replay(Arc::new(TestApplier)).await.unwrap();
+        // Three records of shard 0, the TRUNCATE, and the other shard's.
+        assert_eq!(report.applied, 5);
+        let reader = node.index().read().unwrap();
+        let keys: Vec<String> = reader
+            .entries(&shard(0), None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["kept", "taken-2", "taken-3"]);
+        assert_eq!(reader.applied(&shard(0)).unwrap(), Some(at(4, 3)));
+        assert!(reader.entry(&shard(1), "other").unwrap().is_some());
+    });
+}
+
 /// redb's magic number, which a complete database file begins with.
 const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
 

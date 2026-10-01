@@ -55,6 +55,7 @@ mod ack;
 mod error;
 mod leader;
 mod lease;
+pub mod lineage;
 mod machine;
 mod multipart;
 mod pipeline;

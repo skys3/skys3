@@ -177,6 +177,18 @@ impl<W, B> Pipeline<W, B> {
         (writes, barriers)
     }
 
+    /// Drops the records after `after`, which a member truncated to
+    /// reconcile with a new primary (§6.6), without releasing or answering
+    /// them, and lowers the commit limit to `after`: a watermark of the
+    /// earlier primary says nothing of the records that take their place.
+    pub(crate) fn truncate(&mut self, after: Seq) {
+        self.slots.retain(|slot| match slot {
+            Slot::Write { position, .. } => position.seq <= after,
+            Slot::Barrier(_) => true,
+        });
+        self.limit = self.limit.map(|limit| limit.min(after));
+    }
+
     fn committed(&self, position: EpochSeq) -> bool {
         self.limit.is_none_or(|limit| position.seq <= limit)
     }
@@ -228,6 +240,27 @@ mod tests {
             Some(Ready::Apply(batch)) => batch.into_iter().map(|(_, reply)| reply).collect(),
             other => panic!("expected records to apply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_truncated_tail_is_dropped_and_waits_for_a_new_watermark() {
+        let mut pipeline = Pipeline::<u64, &str>::default();
+        pipeline.require_commit(Seq::new(3));
+        for seq in 1..=3 {
+            pipeline.sequenced(at(seq), seq);
+            pipeline.resolved(at(seq), durable(seq));
+        }
+        pipeline.barrier("after");
+        pipeline.truncate(Seq::new(1));
+        assert_eq!(applied(pipeline.next()), [1]);
+        assert!(matches!(pipeline.next(), Some(Ready::Barrier("after"))));
+        // A record taken in place of a truncated one waits for a watermark
+        // that covers it.
+        pipeline.sequenced(at(2), 20);
+        pipeline.resolved(at(2), durable(2));
+        assert!(pipeline.next().is_none());
+        pipeline.commit_through(Seq::new(2));
+        assert_eq!(applied(pipeline.next()), [20]);
     }
 
     #[test]
