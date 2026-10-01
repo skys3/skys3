@@ -1760,6 +1760,17 @@ of this file. A task with nothing unexpected keeps "None."
 - **Only `write_back` buckets have dirty bytes in M1.** A `local` bucket's
   writes are never flushed yet, so the budget does not limit them; they
   will count once flushing to a backup target (plan M5) exists.
+- **Zero shares refused every write.** Review found that a `write_back`
+  bucket with no open shard on the node got an account with a share of 0,
+  and `dirty >= share` then refused all its writes, although nothing was
+  dirty. Such a bucket now gets no account (its shards still count in the
+  cluster's share), and a share that rounds down to 0 for a node that
+  holds a shard is raised to one byte, so a write is admitted while
+  nothing is dirty.
+- **Rust 1.99 deprecated `fetch_update`.** It became stable on 2026-10-01
+  while this PR was in review. CI tracks stable, so clippy with `-D
+  warnings` failed on the budget's `fetch_update`. The fix was
+  `try_update`, which MSRV 1.98.1 already has.
 
 ### M1-23 OIDC token validation
 
