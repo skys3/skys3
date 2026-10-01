@@ -19,9 +19,9 @@ use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::{Clock, MonoTime, MonotonicClock, SimMount};
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_log::{LogStats, RecordBody, SegmentLog};
-use skys3_net::TurmoilNetwork;
+use skys3_net::{Listener, TurmoilNetwork};
 use skys3_shard::replication::{ControlRegisters, Replication, ReplicationConfig};
-use skys3_shard::{Grace, Shard};
+use skys3_shard::{Grace, Role, Shard};
 use skys3_sim::SimS3;
 use skys3_types::{BucketDocument, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
 
@@ -59,6 +59,8 @@ pub struct ReplicatedServices {
     alone: bool,
     /// A seeded bug: writes that were not acknowledged are sent again.
     resubmit: bool,
+    /// A seeded bug: members answer reads from their own index.
+    members_read: bool,
     audit: Arc<Mutex<Audit>>,
 }
 
@@ -153,9 +155,18 @@ impl ReplicatedServices {
     pub fn new(config: ReplicationConfig) -> Self {
         Self {
             config,
-            alone: false,
-            resubmit: false,
-            audit: Arc::default(),
+            ..Self::default()
+        }
+    }
+
+    /// Services with a seeded bug for the routing audit to catch: a member
+    /// answers the entry of a key from its own index instead of refusing,
+    /// so a gateway with a stale map is served by a non-primary.
+    #[must_use]
+    pub fn members_serving_reads() -> Self {
+        Self {
+            members_read: true,
+            ..Self::default()
         }
     }
 
@@ -364,6 +375,20 @@ impl NodeServices for ReplicatedServices {
     }
 
     async fn start(&self, env: NodeEnv) -> Result<ReplicatedShards, BoxError> {
+        let (shards, listener) = self.start_replicas(&env).await?;
+        let serving = shards.replication.clone();
+        tokio::spawn(async move { serving.serve(listener).await });
+        Ok(shards)
+    }
+}
+
+impl ReplicatedServices {
+    /// The replicated shards of one life of a node, and its bound
+    /// transport listener, which the caller serves.
+    pub(crate) async fn start_replicas(
+        &self,
+        env: &NodeEnv,
+    ) -> Result<(ReplicatedShards, Listener<TurmoilNetwork>), BoxError> {
         let set = env.shards.set().clone();
         self.audit()
             .logs
@@ -385,20 +410,20 @@ impl NodeServices for ReplicatedServices {
             .transport
             .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
             .await?;
-        let serving = replication.clone();
-        tokio::spawn(async move { serving.serve(listener).await });
-        Ok(ReplicatedShards {
-            local: env.shards,
+        let shards = ReplicatedShards {
+            local: env.shards.clone(),
             replication,
             registers: store.map(|store| store.inner().clone()),
-            placement: env.placement,
-            node: env.node,
-            clock: env.clock,
+            placement: Arc::clone(&env.placement),
+            node: env.node.clone(),
+            clock: Arc::clone(&env.clock),
             alone: self.alone,
             resubmit: self.resubmit,
+            members_read: self.members_read,
             audit: Arc::clone(&self.audit),
             followed: Arc::default(),
-        })
+        };
+        Ok((shards, listener))
     }
 }
 
@@ -408,7 +433,7 @@ impl NodeServices for ReplicatedServices {
 #[derive(Clone)]
 pub struct ReplicatedShards {
     local: LocalShards<SimMount>,
-    replication: Replication<TurmoilNetwork, SimMount>,
+    pub(crate) replication: Replication<TurmoilNetwork, SimMount>,
     /// The control store without the node's faults, for reading registers.
     registers: Option<S3ControlStore<SimS3>>,
     /// The placement the harness wrote, epoch 1 of every shard.
@@ -418,6 +443,7 @@ pub struct ReplicatedShards {
     clock: Arc<MonotonicClock>,
     alone: bool,
     resubmit: bool,
+    members_read: bool,
     audit: Arc<Mutex<Audit>>,
     /// The shards whose grace this life follows.
     followed: Arc<Mutex<BTreeSet<ShardRef>>>,
@@ -434,7 +460,7 @@ impl fmt::Debug for ReplicatedShards {
 impl ReplicatedShards {
     /// The shard's configuration now: its register's, or the placement's
     /// if the register cannot be read.
-    fn current(&self, shard: &ShardRef) -> Option<ShardConfig> {
+    pub(crate) fn current(&self, shard: &ShardRef) -> Option<ShardConfig> {
         self.registers
             .as_ref()
             .and_then(|store| register(store, shard))
@@ -569,6 +595,21 @@ impl Shards for ReplicatedShards {
     }
 
     async fn entry(&self, shard: &ShardRef, key: &str) -> Result<Option<Entry>, ShardError> {
+        if self.members_read
+            && let Some(replica) = self.local.set().get(&shard.into()).await
+            && replica.role() == Role::Member
+        {
+            // The seeded bug: read the member's index, which may lag its
+            // primary's.
+            let read = replica
+                .index()
+                .read()
+                .and_then(|r| r.entry(&shard.into(), key));
+            return read.map_err(|error| ShardError::Unavailable {
+                shard: shard.clone(),
+                reason: error.to_string(),
+            });
+        }
         let entry = self.local.entry(shard, key).await;
         self.audit_read(shard, &entry).await;
         entry

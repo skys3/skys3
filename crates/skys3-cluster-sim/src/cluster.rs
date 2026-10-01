@@ -54,6 +54,9 @@ pub struct ClusterConfig {
     /// [`ReplicatedServices`](crate::ReplicatedServices) keep one on every
     /// member.
     pub replicas: usize,
+    /// The epoch of every shard's configuration in the static placement.
+    /// Above 1, gateways can be given maps of older epochs.
+    pub placement_epoch: u64,
     /// Whether every member of a shard, not only one, must hold each
     /// acknowledged write after recovery, as the all-member commit rule
     /// promises (§5.1).
@@ -84,6 +87,7 @@ impl Default for ClusterConfig {
             write_back_buckets: 0,
             shards_per_bucket: 4,
             replicas: 1,
+            placement_epoch: 1,
             every_member_durable: false,
             drift: Drift::from_ppm(1_000).expect("the drift is valid"),
             node_drifts: Vec::new(),
@@ -660,7 +664,11 @@ impl<S: NodeServices> World<S> {
                 placement: Arc::clone(&placement),
                 remote: remote.clone(),
             }),
-            routes: Routes { buckets, placement },
+            routes: Routes {
+                buckets,
+                placement,
+                nodes: node_ids,
+            },
             base_control: control.faults(),
             control,
             registers: store,
@@ -820,7 +828,7 @@ fn registers(
             let shard_config = ShardConfig {
                 bucket_id: bucket.bucket_id.clone(),
                 shard: shard.shard,
-                epoch: Epoch::new(1),
+                epoch: Epoch::new(config.placement_epoch),
                 primary: members[0].clone(),
                 members,
                 learners: Vec::new(),

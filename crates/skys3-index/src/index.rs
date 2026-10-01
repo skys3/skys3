@@ -8,14 +8,14 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, StorageBackend};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableHandle};
 use skys3_config::StorageConfig;
 use skys3_io::{Disk, SimBlockFile, SimMount};
 use skys3_log::record::ShardRef;
 use skys3_log::{
     LogRecord, RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentLog, SegmentSummary,
 };
-use skys3_types::{BucketId, EpochSeq, Label};
+use skys3_types::{BucketId, EpochSeq, Label, ShardConfig};
 
 use crate::codec;
 use crate::entry::ImportCheckpoint;
@@ -219,6 +219,12 @@ impl Index {
         let mut txn = db.begin_write()?;
         let mut coverage = Coverage::new();
         let created = {
+            // An index of this format may predate the shard map, which
+            // needs no new format (see `tables::SHARD_MAP`).
+            let had_map = txn
+                .list_tables()?
+                .any(|table| table.name() == tables::SHARD_MAP.name());
+            txn.open_table(tables::SHARD_MAP)?;
             let mut meta = txn.open_table(META)?;
             for table in [
                 tables::NAMESPACE,
@@ -254,7 +260,7 @@ impl Index {
                     codec::decode_summary(value.value()).map_err(IndexError::codec("coverage"))?;
                 coverage.entry(disk).or_default().insert(segment, summary);
             }
-            format != Some(FORMAT_VERSION)
+            format != Some(FORMAT_VERSION) || !had_map
         };
         if created {
             txn.set_durability(Durability::Immediate)?;
@@ -407,6 +413,41 @@ impl Index {
                 }
             }
         }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Keeps `config` as the gateway's configuration of its shard, in one
+    /// durable commit (§6.2). The shard map is not in the log, so replay
+    /// cannot restore it, but it is a cache: a stale or lost configuration
+    /// costs a redirect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the configuration does not encode or
+    /// redb fails; nothing changes then.
+    pub fn store_route(&self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("shard_map"))?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::SHARD_MAP)?
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes the gateway's configuration of `shard`, in one durable
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn forget_route(&self, shard: &ShardRef) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::SHARD_MAP)?
+            .remove(codec::shard_key(shard).as_slice())?;
         txn.commit()?;
         Ok(())
     }

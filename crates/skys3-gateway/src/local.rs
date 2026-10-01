@@ -82,6 +82,17 @@ impl<D: Disk> LocalShards<D> {
             .await
             .ok_or_else(|| ShardError::NotFound(shard.clone()))
     }
+
+    /// The replica of `shard`, if it serves client requests: a member
+    /// refuses with [`ShardError::NotPrimary`] (§5.1). Reads and writes
+    /// check this in the replica; payloads and seals check it here.
+    async fn serving(&self, shard: &ShardRef) -> Result<Shard<D>, ShardError> {
+        let local = self.find(shard).await?;
+        local
+            .check_readable()
+            .map_err(|error| convert(shard, error))?;
+        Ok(local)
+    }
 }
 
 /// The gateway's view of a shard error.
@@ -92,6 +103,11 @@ fn convert(shard: &ShardRef, error: skys3_shard::ShardError) -> ShardError {
         skys3_shard::ShardError::InvalidRecord { reason, .. } => ShardError::Invalid {
             shard: shard.clone(),
             reason,
+        },
+        skys3_shard::ShardError::NotPrimary { primary, epoch, .. } => ShardError::NotPrimary {
+            shard: shard.clone(),
+            primary,
+            epoch,
         },
         skys3_shard::ShardError::NotAcknowledged {
             position, reason, ..
@@ -118,8 +134,9 @@ impl<D: Disk> Shards for LocalShards<D> {
 
     async fn seal(&self, shard: &ShardRef) -> Result<ShardSummary, ShardError> {
         let summary = self
-            .set
-            .seal(&shard.into())
+            .serving(shard)
+            .await?
+            .seal()
             .await
             .map_err(|error| convert(shard, error))?;
         Ok(ShardSummary {
@@ -129,10 +146,8 @@ impl<D: Disk> Shards for LocalShards<D> {
     }
 
     async fn unseal(&self, shard: &ShardRef) -> Result<(), ShardError> {
-        self.set
-            .unseal(&shard.into())
-            .await
-            .map_err(|error| convert(shard, error))
+        self.serving(shard).await?.unseal();
+        Ok(())
     }
 
     async fn remove(&self, shard: &ShardRef) -> Result<(), ShardError> {
@@ -202,7 +217,7 @@ impl<D: Disk> Shards for LocalShards<D> {
     }
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
-        let local = self.find(shard).await?;
+        let local = self.serving(shard).await?;
         local
             .payload(position)
             .await
