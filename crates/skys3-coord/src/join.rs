@@ -5,17 +5,18 @@
 //! credentials name it, and its configuration gives its address, labels,
 //! and disks. The first start creates the register with `If-None-Match: *`.
 //! A restart rewrites it with `If-Match` only if something changed, so a
-//! node that restarts as it was costs one read. Every write is announced by
-//! a generation increment through the coordinator's change path
-//! ([`apply`]), so other nodes and the coordinator find the registration
-//! when they next list `nodes/`.
+//! node that restarts as it was costs one read; it also clears a
+//! coordinator's `departing` mark. Every write goes through the
+//! coordinator's change path ([`apply`]) and is announced by a generation
+//! increment once it is known to have landed, so other nodes find the
+//! registration when they next list `nodes/`.
 
 use skys3_control::{ControlError, ControlStore, ProposalIds, RetryPolicy, TypedKey, Version};
 use skys3_types::{
     ClusterId, DiskInfo, Generation, Label, NodeAddress, NodeId, NodeRegistration, ProposalId,
 };
 
-use crate::change::{ChangeError, ChangeSet, apply};
+use crate::change::{ChangeError, ChangeSet, Pending, apply, settle};
 
 /// How many times [`register`] re-reads a register another writer changed
 /// under it before it gives up.
@@ -48,11 +49,13 @@ impl NodeProfile {
             zone: self.zone.clone(),
             rack: self.rack.clone(),
             disks: self.disks.clone(),
+            departing: false,
             proposal_id: proposal,
         }
     }
 
-    /// Whether `registration` already says everything this profile does.
+    /// Whether `registration` already says everything this profile does,
+    /// and carries no `departing` mark.
     #[must_use]
     pub fn describes(&self, registration: &NodeRegistration) -> bool {
         registration.node_id == self.node
@@ -60,6 +63,7 @@ impl NodeProfile {
             && registration.zone == self.zone
             && registration.rack == self.rack
             && registration.disks == self.disks
+            && !registration.departing
     }
 }
 
@@ -104,6 +108,18 @@ pub enum RegistrationError {
     /// process running with the same node ID.
     #[error("the registration of {0} kept changing under this node")]
     Contended(NodeId),
+    /// A registration write got no answer that settles it, or landed
+    /// while its generation increment failed, and settling it failed too.
+    /// The caller [`settle`]s `pending` before it registers again, so a
+    /// write that lands is announced, and only once it has landed.
+    #[error("a registration write is unsettled: {source}")]
+    Unsettled {
+        /// What is still to be settled and announced.
+        pending: Box<Pending>,
+        /// Why settling it failed.
+        #[source]
+        source: ControlError,
+    },
 }
 
 /// Registers the node `profile` describes in `nodes/<node-id>.json`:
@@ -113,12 +129,14 @@ pub enum RegistrationError {
 ///
 /// A write that loses its compare-and-swap, to a coordinator forgetting
 /// the node or to anything else, is planned again from a fresh read. One
-/// whose answer was lost is resolved by the lost-response rule, and one
-/// that may have landed is announced all the same ([`apply`]).
+/// whose answer was lost is resolved by the lost-response rule; one that
+/// may still land is settled ([`settle`]) and announced only if it took
+/// effect.
 ///
 /// # Errors
 ///
-/// [`RegistrationError`]. The caller tries again later.
+/// [`RegistrationError`]. The caller tries again later, settling first
+/// what [`RegistrationError::Unsettled`] hands it.
 pub async fn register<S: ControlStore>(
     store: &S,
     cluster: &ClusterId,
@@ -147,16 +165,40 @@ pub async fn register<S: ControlStore>(
                 Registration::Created,
             ),
         };
-        let applied = apply(store, cluster, &change, proposals, policy).await?;
-        if let Some((_, Some(version))) = applied.written.into_iter().next() {
+        let (written, generation) = match apply(store, cluster, &change, proposals, policy).await {
+            Ok(applied) => (applied.written.into_iter().next(), applied.generation),
+            Err(failed) => {
+                let Some(pending) = failed.applied.pending else {
+                    return Err(failed.source.into());
+                };
+                match settle(store, cluster, &pending, proposals, policy).await {
+                    Ok(settled) => (
+                        failed
+                            .applied
+                            .written
+                            .into_iter()
+                            .next()
+                            .or(settled.written),
+                        settled.generation,
+                    ),
+                    Err(source) => {
+                        return Err(RegistrationError::Unsettled {
+                            pending: Box::new(pending),
+                            source,
+                        });
+                    }
+                }
+            }
+        };
+        if let Some((_, Some(version))) = written {
             tracing::info!(node = %profile.node, ?registration, "registered the node");
             return Ok(Registered {
                 registration,
                 version,
-                generation: applied.generation,
+                generation,
             });
         }
-        tracing::debug!(node = %profile.node, "the registration changed under this node; reading it again");
+        tracing::debug!(node = %profile.node, "the registration did not take effect; reading it again");
     }
     Err(RegistrationError::Contended(profile.node.clone()))
 }
@@ -336,6 +378,67 @@ mod tests {
             matches!(&error, RegistrationError::Contended(id) if *id == node.node),
             "{error}"
         );
+    }
+
+    /// The read passes; the create lands with its answer lost, and the
+    /// store then stops answering for the rest of the attempts.
+    fn unanswered_create() -> Vec<Fault> {
+        let mut faults = vec![Fault::Pass, Fault::LoseResponse];
+        faults.extend(std::iter::repeat_n(Fault::Unavailable, 3));
+        faults
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_write_is_settled_before_it_is_announced() {
+        let store = FaultyStore::new(store().await);
+        let before = generation(store.inner()).await;
+        store.script(unanswered_create());
+        let registered = register(
+            &store,
+            &cluster(),
+            &profile(7),
+            &mut ProposalIds::seeded(7),
+            &retry(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(registered.registration, Registration::Created);
+        let generation = registered.generation.unwrap();
+        assert!(generation > before);
+        assert_eq!(generation, self::generation(store.inner()).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_cannot_be_settled_is_handed_back() {
+        let store = FaultyStore::new(store().await);
+        let before = generation(store.inner()).await;
+        let mut faults = unanswered_create();
+        // Settling it gets no answer either.
+        faults.extend(std::iter::repeat_n(Fault::Unavailable, 4));
+        store.script(faults);
+        let mut ids = ProposalIds::seeded(8);
+        let error = register(&store, &cluster(), &profile(8), &mut ids, &retry())
+            .await
+            .unwrap_err();
+        let RegistrationError::Unsettled { pending, .. } = error else {
+            panic!("{error}");
+        };
+        assert!(error_text(&pending).contains("node-8"));
+        // Not announced yet; settling later announces the landed write.
+        assert_eq!(generation(store.inner()).await, before);
+        let settled = settle(&store, &cluster(), &pending, &mut ids, &retry())
+            .await
+            .unwrap();
+        assert!(settled.written.is_some());
+        assert!(settled.generation.unwrap() > before);
+        let again = register(&store, &cluster(), &profile(8), &mut ids, &retry())
+            .await
+            .unwrap();
+        assert_eq!(again.registration, Registration::Unchanged);
+    }
+
+    fn error_text(pending: &Pending) -> String {
+        format!("{:?}", pending.unsettled())
     }
 
     #[tokio::test(start_paused = true)]

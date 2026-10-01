@@ -901,7 +901,9 @@ impl Placement for EpochPlacement {
                 register,
                 epoch,
             }),
-            _ => audit.rejected += 1,
+            _ if applied.rejected.is_some() => audit.rejected += 1,
+            // Failed without an answer that settles it: not a race.
+            _ => {}
         }
     }
 }
