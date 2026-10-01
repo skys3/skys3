@@ -29,6 +29,7 @@ hyper-util = { workspace = true, features = ["http1", "server", "server-graceful
 quick-xml.workspace = true
 rand.workspace = true
 s3s.workspace = true
+serde_urlencoded.workspace = true
 skys3-config.workspace = true
 skys3-control.workspace = true
 skys3-io.workspace = true

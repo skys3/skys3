@@ -551,6 +551,22 @@ of this file. A task with nothing unexpected keeps "None."
   executed about 250,000 inputs without a failure. The target asserts that
   no input gets a `500` and that responses stay under 64 KiB; memory is
   bounded with libFuzzer's `-rss_limit_mb`.
+- **The checks must decode what s3s decodes (review).** The first version
+  read raw query pairs and split the raw path, while `s3s` decodes the
+  path before splitting off the bucket and decodes query names and
+  values. `?part%4Eumber=10001` skipped the part-number check, `?a%63l`
+  made an ACL body look like object data and skipped the XML checks, and
+  `/b%2Fk` looked like a bucket request. `s3s`'s query parser
+  (`OrderedQs`) is public only under `cfg(fuzzing)`, so the gateway parses
+  queries with `serde_urlencoded` directly, as `s3s` does, and decodes the
+  path the same way before splitting it.
+- **Lost answers also lose the announcement (review).** A create or delete
+  that landed with every answer lost returned `503` before incrementing
+  the generation, and the retry, finding the work done, did not increment
+  it either, so other gateways never learned of the change; a lost delete
+  also left its sealed shards behind. Retries now announce what they find
+  done, and a gateway remembers its deletions of unknown outcome (at most
+  256) so a retry can finish them; design §4.1 and §6.1 record the rule.
 
 ### M1-07a SigV4 signing and aws-chunked bodies
 
@@ -568,6 +584,18 @@ of this file. A task with nothing unexpected keeps "None."
   The AWS Common Runtime suite agrees on every S3-relevant vector, except
   that its `post-sts-header-after` presigned form adds the session token
   after signing, which S3 does not do, so that form is skipped.
+- **Parameter names are decoded as `s3s` decodes them.** M1-06's review
+  fixes made the limit checks decode the query with `serde_urlencoded`, as
+  `s3s` does. The authenticator first matched raw names, so
+  `X-Amz-%53ignature` would have escaped presigned detection and
+  stripping while `s3s` still saw a signature (and answered `501`). Every
+  decision on a query parameter's name (presigned or SigV2, which values
+  are the signing parameters, which pairs to strip, which pair the
+  canonical query leaves out) now uses the pair decoded the same way;
+  values decode as in a form, so a raw `+` in a token is a space. The
+  canonical request still uses the pairs as received. Headers need no
+  such care: their names are not escaped, and every query parameter is
+  in the canonical query, so all of them are signed.
 - **The published examples could not be fetched.** The sandbox's proxy
   refuses `docs.aws.amazon.com`. The S3 documentation's signatures (GET
   and PUT Object, lifecycle, listing, the presigned URL, and both chunked

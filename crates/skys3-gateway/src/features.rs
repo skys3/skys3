@@ -21,7 +21,7 @@ use http::HeaderMap;
 use http::request::Parts;
 use s3s::{S3Error, s3_error};
 
-use crate::limits::{RequestShape, query_pairs};
+use crate::limits::RequestShape;
 
 /// The canned ACLs that grant nothing beyond the bucket owner's full
 /// control, which a bucket-owner-enforced bucket accepts.
@@ -110,8 +110,10 @@ pub(crate) fn reject_unsupported(parts: &Parts, shape: &RequestShape) -> Result<
     }) {
         return Err(ownership_not_implemented());
     }
-    let query = parts.uri.query().unwrap_or("");
-    if query_pairs(query).any(|(name, value)| name == "versionId" && value != "null") {
+    if shape
+        .query()
+        .any(|(name, value)| name == "versionId" && value != "null")
+    {
         return Err(s3_error!(InvalidArgument, "Invalid version id specified"));
     }
     Ok(())

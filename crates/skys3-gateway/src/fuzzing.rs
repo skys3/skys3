@@ -188,17 +188,17 @@ impl Harness {
 
         let mut signed = decode(data)?;
         sign(&mut signed);
-        let must_pass =
-            !crate::limits::query_pairs(signed.uri().query().unwrap_or("")).any(|(name, _)| {
-                matches!(
-                    name,
-                    "X-Amz-Algorithm"
-                        | "X-Amz-Credential"
-                        | "X-Amz-Signature"
-                        | "AWSAccessKeyId"
-                        | "Signature"
-                )
-            });
+        let query = signed.uri().query().unwrap_or("");
+        let must_pass = !crate::sigv4::params::query_params(query).any(|(_, name, _)| {
+            matches!(
+                name.as_str(),
+                "X-Amz-Algorithm"
+                    | "X-Amz-Credential"
+                    | "X-Amz-Signature"
+                    | "AWSAccessKeyId"
+                    | "Signature"
+            )
+        });
         let resigned = self.runtime.block_on(auth.authenticate(signed));
         if must_pass && let Err(error) = &resigned {
             panic!("a request the harness signed was refused: {error:?}");

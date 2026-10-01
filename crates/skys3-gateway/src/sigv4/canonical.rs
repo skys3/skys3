@@ -116,8 +116,8 @@ pub(crate) fn canonical_query(query: &str, presigned: bool, out: &mut Vec<u8>) {
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = query
         .split('&')
         .filter(|pair| !pair.is_empty())
+        .filter(|pair| !(presigned && super::params::decode_pair(pair).0 == "X-Amz-Signature"))
         .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-        .filter(|(name, _)| !(presigned && *name == "X-Amz-Signature"))
         .map(|(name, value)| {
             let mut canonical_name = Vec::with_capacity(name.len());
             push_canonical(name.as_bytes(), false, &mut canonical_name);
@@ -396,6 +396,11 @@ mod tests {
             "k=a%2Bb&k2=a%2Bb&k3=a%2Fb"
         );
         assert_eq!(query("a=1&X-Amz-Signature=s", true), "a=1");
+        assert_eq!(query("a=1&X-Amz-%53ignature=s", true), "a=1");
+        assert_eq!(
+            query("a=1&x-amz-signature=s", true),
+            "a=1&x-amz-signature=s"
+        );
         assert_eq!(
             query("a=1&X-Amz-Signature=s", false),
             "X-Amz-Signature=s&a=1"

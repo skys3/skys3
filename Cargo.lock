@@ -2158,6 +2158,7 @@ dependencies = [
  "rand",
  "s3s",
  "serde_json",
+ "serde_urlencoded",
  "skys3-config",
  "skys3-control",
  "skys3-gateway",

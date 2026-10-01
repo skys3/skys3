@@ -201,6 +201,56 @@ fn a_full_group_commits_without_waiting() {
     });
 }
 
+/// The delay bounds how long a group waits, not which queued records it
+/// takes: records that queued behind a slow sync all join the next group
+/// at once, even those that arrived after its first record's deadline.
+#[test]
+fn records_queued_behind_a_slow_sync_join_the_next_group_without_waiting() {
+    run(async {
+        let disk = SimDisk::new(21);
+        let plan = Audit {
+            sync_delay: Duration::from_millis(5),
+            ..Audit::default()
+        };
+        let config = LogConfig {
+            group_commit_max_delay: Duration::from_millis(1),
+            ..small_config()
+        };
+        let (log, _) = open(AuditedMount::new(&disk, plan), config).await.unwrap();
+        let start = Instant::now();
+        let append_at = |at_ms: u64, seq: u64| {
+            let log = log.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(at_ms)).await;
+                let location = log.append(&delete(0, seq)).await.unwrap();
+                (location, start.elapsed())
+            })
+        };
+        // A's group closes at 1 ms, and its syncs take until 6 ms. B and C
+        // queue meanwhile; C arrives after B's deadline of 3 ms. D arrives
+        // to an idle log.
+        let tasks = [
+            append_at(0, 1),
+            append_at(2, 2),
+            append_at(4, 3),
+            append_at(20, 4),
+        ];
+        let mut acks = Vec::new();
+        for task in tasks {
+            acks.push(task.await.unwrap());
+        }
+        let ms = Duration::from_millis;
+        let times: Vec<_> = acks.iter().map(|(_, at)| *at).collect();
+        assert_eq!(times, [ms(6), ms(11), ms(11), ms(26)]);
+        let [_, (b, _), (c, _), _] = acks[..] else {
+            unreachable!()
+        };
+        assert_eq!(c.segment, b.segment);
+        assert_eq!(c.offset, b.end());
+        assert_eq!(log.stats().group_commits, 3);
+    });
+}
+
 #[test]
 fn segments_roll_over_between_group_commits() {
     run(async {

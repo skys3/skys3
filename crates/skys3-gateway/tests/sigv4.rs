@@ -182,6 +182,44 @@ fn doc_presigned() -> Request<Body> {
 }
 
 #[tokio::test]
+async fn escaped_presigned_parameter_names_are_found_and_stripped() {
+    let (auth, _) = authenticator(DOC_TIME);
+    let get = |uri: &str| {
+        request(
+            Method::GET,
+            uri,
+            &[("host", "examplebucket.s3.amazonaws.com")],
+            Bytes::new(),
+        )
+    };
+    // The signature parameter, escaped, is still the signature: it is left
+    // out of the canonical request and stripped before s3s sees it.
+    let escaped = DOC_PRESIGNED.replace("X-Amz-Signature=", "X-Amz-%53ignature=");
+    let accepted = auth.authenticate(get(&escaped)).await.unwrap();
+    assert_eq!(principal(&accepted).method, AuthMethod::Presigned);
+    assert_eq!(accepted.uri(), "/test.txt");
+    // An escaped session token is the session token: it reaches the
+    // credential lookup, which refuses it for this key.
+    let token = format!("{DOC_PRESIGNED}&X-Amz-%53ecurity-Token=t");
+    assert_code(
+        auth.authenticate(get(&token)).await,
+        S3ErrorCode::InvalidToken,
+    );
+    // An escaped signature alone still makes the request presigned.
+    assert_code(
+        auth.authenticate(get("/test.txt?X%2DAmz%2DSignature=x"))
+            .await,
+        S3ErrorCode::AuthorizationQueryParametersError,
+    );
+    // And an escaped SigV2 parameter is still refused.
+    assert_code(
+        auth.authenticate(get("/test.txt?%53ignature=x&AWSAccessKeyId=y"))
+            .await,
+        S3ErrorCode::InvalidRequest,
+    );
+}
+
+#[tokio::test]
 async fn the_documented_presigned_url_lives_for_its_lifetime() {
     let (auth, clock) = authenticator(DOC_TIME);
     let accepted = auth.authenticate(doc_presigned()).await.unwrap();

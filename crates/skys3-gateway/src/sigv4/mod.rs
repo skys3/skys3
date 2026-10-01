@@ -56,7 +56,7 @@ pub use params::AuthMethod;
 use self::body::Payload;
 use self::canonical::Head;
 use self::chunked::ChunkSigner;
-use self::params::{PRESIGNED_PARAMS, Signed};
+use self::params::{PRESIGNED_PARAMS, Signed, decode_pair};
 use crate::service::Authenticator;
 
 /// How far a header-signed request's time may be from the node's clock
@@ -335,8 +335,7 @@ fn strip_signature(parts: &mut Parts, method: AuthMethod) -> Result<(), S3Error>
     let kept: Vec<&str> = query
         .split('&')
         .filter(|pair| {
-            let (name, _) = pair.split_once('=').unwrap_or((pair, ""));
-            !pair.is_empty() && !PRESIGNED_PARAMS.contains(&name)
+            !pair.is_empty() && !PRESIGNED_PARAMS.contains(&decode_pair(pair).0.as_str())
         })
         .collect();
     let mut target = parts.uri.path().to_owned();
@@ -452,5 +451,10 @@ mod tests {
             "http://h/b/k?x-id=GetObject&flag"
         );
         assert_eq!(strip("/b/k?X-Amz-Signature=s"), "/b/k");
+        // Escaped names are stripped too, so s3s never sees a signature.
+        assert_eq!(
+            strip("/b/k?X-Amz-%53ignature=s&X%2DAmz%2DSecurity%2DToken=t&keep=%53"),
+            "/b/k?keep=%53"
+        );
     }
 }

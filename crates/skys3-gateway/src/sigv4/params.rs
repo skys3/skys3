@@ -8,8 +8,6 @@ use http::HeaderMap;
 use http::request::Parts;
 use s3s::{S3Error, S3ErrorCode, s3_error};
 
-use crate::limits::query_pairs;
-
 /// The only signing algorithm SkyS3 accepts.
 pub(crate) const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 
@@ -33,6 +31,29 @@ pub(crate) const PRESIGNED_PARAMS: [&str; 7] = [
     "X-Amz-Signature",
     "X-Amz-Security-Token",
 ];
+
+/// Decodes one `name=value` pair of a query string as `s3s` decodes it
+/// (`application/x-www-form-urlencoded`: `%XX` escapes and `+` for a
+/// space, invalid UTF-8 replaced). A pair without `=` has an empty value.
+///
+/// Every decision made on a parameter's name (whether a request is
+/// presigned, which pairs carry its signature) uses the decoded name, so an
+/// escaped name such as `X-Amz-%53ignature` is seen as `s3s` would see it.
+/// The canonical request uses the pairs as received.
+pub(crate) fn decode_pair(raw: &str) -> (String, String) {
+    serde_urlencoded::from_str::<Vec<(String, String)>>(raw)
+        .ok()
+        .and_then(|pairs| pairs.into_iter().next())
+        .unwrap_or_default()
+}
+
+/// The pairs of a query string, as received and decoded.
+pub(crate) fn query_params(query: &str) -> impl Iterator<Item = (&str, String, String)> {
+    query.split('&').filter(|raw| !raw.is_empty()).map(|raw| {
+        let (name, value) = decode_pair(raw);
+        (raw, name, value)
+    })
+}
 
 /// Where a request carries its signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,14 +130,14 @@ pub(crate) fn unsupported() -> S3Error {
 /// `AuthorizationQueryParametersError` for malformed parameters.
 pub(crate) fn parse(parts: &Parts, service: &str) -> Result<Option<Signed>, S3Error> {
     let query = parts.uri.query().unwrap_or("");
-    let presigned = query_pairs(query).any(|(name, _)| {
+    let presigned = query_params(query).any(|(_, name, _)| {
         matches!(
-            name,
+            name.as_str(),
             "X-Amz-Algorithm" | "X-Amz-Credential" | "X-Amz-Signature"
         )
     });
-    let v2_query =
-        query_pairs(query).any(|(name, _)| matches!(name, "AWSAccessKeyId" | "Signature"));
+    let v2_query = query_params(query)
+        .any(|(_, name, _)| matches!(name.as_str(), "AWSAccessKeyId" | "Signature"));
     let mut authorization = parts.headers.get_all(http::header::AUTHORIZATION).iter();
     let header = authorization.next();
     if header.is_some() && authorization.next().is_some() {
@@ -220,13 +241,11 @@ fn parse_header(value: &[u8], headers: &HeaderMap, service: &str) -> Result<Sign
 fn parse_query(query: &str, service: &str) -> Result<Signed, S3Error> {
     let method = AuthMethod::Presigned;
     let mut values: [Option<String>; PRESIGNED_PARAMS.len()] = Default::default();
-    for (name, value) in query_pairs(query) {
+    for (_, name, value) in query_params(query) {
         let Some(index) = PRESIGNED_PARAMS.iter().position(|param| *param == name) else {
             continue;
         };
-        let decoded = percent_decode(value)
-            .ok_or_else(|| method.malformed(format!("The {name} query parameter is not valid.")))?;
-        if values[index].replace(decoded).is_some() {
+        if values[index].replace(value).is_some() {
             return Err(method.malformed(format!(
                 "The {name} query parameter appears more than once."
             )));
@@ -413,25 +432,6 @@ fn lower_hex_value(digit: u8) -> Option<u8> {
     }
 }
 
-/// Decodes `%XX` escapes. A `+` stays a `+`.
-fn percent_decode(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = bytes.get(i + 1..i + 3)?;
-            let value = u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-            out.push(value);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
 /// Parses a SigV4 timestamp, `YYYYMMDDTHHMMSSZ` in UTC, into the time
 /// since the Unix epoch. Years before 1970 are refused.
 pub(crate) fn parse_timestamp(text: &str) -> Option<Duration> {
@@ -611,6 +611,14 @@ mod tests {
         assert_eq!(code(parse(&both, "s3")), S3ErrorCode::InvalidArgument);
         let v2 = parts("/b/k?AWSAccessKeyId=AKID&Signature=x&Expires=1", &[]);
         assert_eq!(code(parse(&v2, "s3")), S3ErrorCode::InvalidRequest);
+        // Names are read as s3s decodes them.
+        let v2 = parts("/b/k?%53ignature=x", &[]);
+        assert_eq!(code(parse(&v2, "s3")), S3ErrorCode::InvalidRequest);
+        let both = parts(
+            "/b/k?X-Amz-%53ignature=x",
+            &[("authorization", AUTH), ("x-amz-date", "20130524T000000Z")],
+        );
+        assert_eq!(code(parse(&both, "s3")), S3ErrorCode::InvalidArgument);
     }
 
     const PRESIGNED: &str = "/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256\
@@ -625,9 +633,29 @@ mod tests {
         assert_eq!(signed.access_key_id, "AKIAIOSFODNN7EXAMPLE");
         assert_eq!(signed.expires, Some(Duration::from_secs(86_400)));
         assert_eq!(signed.session_token, None);
+        // Values decode as in a form: `+` is a space.
         let token = format!("{PRESIGNED}&X-Amz-Security-Token=a%2Bb%2F%3D+c");
         let signed = parse(&parts(&token, &[]), "s3").unwrap().unwrap();
-        assert_eq!(signed.session_token.as_deref(), Some("a+b/=+c"));
+        assert_eq!(signed.session_token.as_deref(), Some("a+b/= c"));
+        // Escaped names are the same parameters, as s3s decodes them.
+        let escaped = PRESIGNED
+            .replace("X-Amz-Algorithm", "X-Amz-%41lgorithm")
+            .replace("X-Amz-Signature", "X%2DAmz%2DSignature");
+        let signed = parse(&parts(&escaped, &[]), "s3").unwrap().unwrap();
+        assert_eq!(signed.method, AuthMethod::Presigned);
+        let token = format!("{PRESIGNED}&X-Amz-%53ecurity-Token=t");
+        let signed = parse(&parts(&token, &[]), "s3").unwrap().unwrap();
+        assert_eq!(signed.session_token.as_deref(), Some("t"));
+        let twice = format!("{PRESIGNED}&X-Amz-%53ignature=x");
+        assert_eq!(
+            code(parse(&parts(&twice, &[]), "s3")),
+            S3ErrorCode::AuthorizationQueryParametersError
+        );
+        let only_escaped = "/k?X-Amz-%53ignature=x";
+        assert_eq!(
+            code(parse(&parts(only_escaped, &[]), "s3")),
+            S3ErrorCode::AuthorizationQueryParametersError
+        );
     }
 
     #[test]
