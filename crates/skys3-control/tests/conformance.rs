@@ -31,12 +31,15 @@ use skys3_control::{
     ChangeFeed, ChangeStream, ControlError, ControlStore, DeleteOutcome, EtcdControlStore,
     EtcdStoreConfig, Expected, FileControlStore, FileStoreConfig, KeyPrefix, MemoryControlStore,
     ProposalIds, PutOutcome, RegisterKey, RetryPolicy, S3ControlStore, S3StoreConfig, Version,
-    Versioned, bootstrap, bump_generation,
+    Versioned, bootstrap, bump_generation, propose_delete,
 };
 use skys3_io::BlockingPool;
+use skys3_remote::ObjectStore;
 use skys3_remote::aws::{AwsS3, SharedCredentialsProvider, default_credentials};
 use skys3_sim::SimS3;
-use skys3_sim::s3::{ConditionalSupport, Conditionals, SimS3Config, SimS3Faults};
+use skys3_sim::s3::{
+    ConditionalSupport, Conditionals, Fault as SimFault, Operation, SimS3Config, SimS3Faults,
+};
 use skys3_types::{Generation, RemoteTarget};
 use tempfile::TempDir;
 
@@ -407,27 +410,96 @@ impl Provider {
             .build();
         S3ControlStore::new(objects, config).unwrap()
     }
+}
 
-    /// Deletes every register under the stores in `stores`, and says how
-    /// many it could not.
-    async fn clean_up(stores: &Mutex<Vec<S3ControlStore<AwsS3>>>) {
-        let stores = stores.lock().unwrap().clone();
-        let mut left = 0;
-        for store in &stores {
-            let Ok(registers) = store.list(&KeyPrefix::root()).await else {
-                eprintln!("could not list {} to clean it up", store.config().prefix);
-                continue;
-            };
-            for (key, version) in registers {
-                if store.delete_if(&key, &version).await.is_err() {
-                    left += 1;
-                }
-            }
-        }
-        if left > 0 {
-            eprintln!("{left} registers were left behind");
+/// How many times [`clean_up`] lists a prefix, deleting what it finds,
+/// before it gives up on it.
+const CLEANUP_PASSES: u32 = 5;
+
+/// Deletes every register under each store's prefix. Listings and deletes
+/// are retried with backoff, since the stores do not retry, and each
+/// prefix is listed again until it is empty.
+///
+/// # Errors
+///
+/// The prefixes still not empty after [`CLEANUP_PASSES`], and why.
+async fn clean_up<O: ObjectStore>(stores: &[S3ControlStore<O>]) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for store in stores {
+        if let Err(error) = empty(store).await {
+            failures.push(format!("{}: {error}", store.config().prefix));
         }
     }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the cleanup left registers behind under {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Empties one store, or says why it could not.
+async fn empty<O: ObjectStore>(store: &S3ControlStore<O>) -> Result<(), String> {
+    let policy = RetryPolicy::default();
+    let mut last = String::new();
+    for pass in 0..CLEANUP_PASSES {
+        if pass > 0 {
+            tokio::time::sleep(Duration::from_millis(200) * 2_u32.pow(pass - 1)).await;
+        }
+        let registers = match store.list(&KeyPrefix::root()).await {
+            Ok(registers) => registers,
+            Err(error) if error.is_retryable() => {
+                last = format!("listing failed: {error}");
+                continue;
+            }
+            Err(error) => return Err(format!("listing failed: {error}")),
+        };
+        if registers.is_empty() {
+            return Ok(());
+        }
+        last = format!("{} registers were still listed", registers.len());
+        for (key, version) in &registers {
+            if let Err(error) = propose_delete(store, key, version, &policy).await {
+                last = format!("deleting {key} failed: {error}");
+            }
+        }
+    }
+    Err(last)
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_cleanup_retries_and_reports_what_it_left() {
+    let mut backend = SimulatedS3::new(SimS3Config::default());
+    let store = backend.store().await;
+    let create = async |name: &str| {
+        let key = RegisterKey::new(format!("buckets/{name}.json")).unwrap();
+        let value = Bytes::from(format!(r#"{{"proposal_id":"{name}"}}"#));
+        let written = store.put_if(&key, Expected::Absent, value).await.unwrap();
+        assert!(matches!(written, PutOutcome::Written(_)));
+    };
+    for name in ["a", "b", "c"] {
+        create(name).await;
+    }
+    for fault in [
+        SimFault::InternalError,
+        SimFault::SlowDown,
+        SimFault::LostRequest,
+    ] {
+        store.objects().inject(Operation::ListObjectsV2, fault);
+    }
+    store
+        .objects()
+        .inject(Operation::DeleteObject, SimFault::LostResponse);
+    clean_up(std::slice::from_ref(&store)).await.unwrap();
+    assert!(store.objects().keys().is_empty());
+
+    // A store that stops answering is reported, not passed over.
+    create("left").await;
+    store.objects().set_faults(SimS3Faults::OUTAGE);
+    let error = clean_up(&[store]).await.unwrap_err();
+    assert!(error.contains("skys3-prod-a/: listing failed"), "{error}");
 }
 
 impl Backend for Provider {
@@ -465,8 +537,18 @@ async fn an_s3_provider_conforms() {
         conformance::run_at(&mut provider, Scale::DEFAULT).await;
     }));
     let result = run.await;
-    Provider::clean_up(&stores).await;
-    if let Err(error) = result {
-        std::panic::resume_unwind(error.into_panic());
+    let stores = stores.lock().unwrap().clone();
+    let cleanup = clean_up(&stores).await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => {}
+        (Ok(()), Err(error)) => panic!("{error}"),
+        // The run's own failure comes first; the cleanup's is reported
+        // beside it.
+        (Err(failure), cleanup) => {
+            if let Err(error) = cleanup {
+                eprintln!("{error}");
+            }
+            std::panic::resume_unwind(failure.into_panic());
+        }
     }
 }
