@@ -31,7 +31,8 @@
 //!   partitions, held links (delay and reordering), random message loss,
 //!   failed syncs, control-store outages, control-store round trips of
 //!   100 ms and more, and lost control-store answers, plus a new clock
-//!   drift for every life of a node. Separately,
+//!   drift for every life of a node, or a fixed one, even beyond `ρ`
+//!   ([`ClusterConfig::node_drifts`]). Separately,
 //!   [`Cluster::power_loss_at_sync`] cuts a node's power at one numbered
 //!   sync of its disks, so a scenario can visit every sync boundary of a
 //!   seed, one per run.
@@ -88,7 +89,7 @@ mod workload;
 pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View};
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
-pub use replication::{IoCounts, ReplicatedServices, ReplicatedShards};
+pub use replication::{IoCounts, LeaseCounts, ReplicatedServices, ReplicatedShards};
 pub use s3::S3_PORT;
 pub use workload::Workload;
 

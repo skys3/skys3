@@ -67,7 +67,8 @@ pub enum Role {
     /// durable here.
     Alone,
     /// The primary of a configuration with other members: a record commits
-    /// once every member has it durably.
+    /// once every member has it durably, and reads are served only while
+    /// every member grants a lease (§5.4).
     Primary,
     /// A member that stores and acknowledges what its primary sends, and
     /// applies it once the primary's commit watermark covers it. It serves
@@ -573,8 +574,8 @@ impl<D: Disk> Shard<D> {
     /// R2 refuses older ones; a newer one needs the configuration first),
     /// or the session is not the current one; [`ShardError::InvalidRecord`]
     /// if the record is of another shard, is a `CONFIG` or `TRUNCATE`, which
-    /// a replica appends for itself, cannot be appended, or does not follow
-    /// the last record held; [`ShardError::Unavailable`] if the shard
+    /// a replica appends for itself, is of another epoch than the shard's,
+    /// cannot be appended, or does not follow the last record held; [`ShardError::Unavailable`] if the shard
     /// stopped.
     pub fn receive(
         &self,
@@ -613,6 +614,16 @@ impl<D: Disk> Shard<D> {
             ));
         }
         let position = record.position;
+        // The record's own epoch, not only the message's: a record of
+        // another epoch would move the sequencer away from the
+        // configuration. Configurations are static, so every record a
+        // replica takes is of its epoch (§5.1).
+        if position.epoch != ours {
+            return Err(ShardError::invalid(
+                shard,
+                format!("the record at {position} is not of the replica's epoch {ours}"),
+            ));
+        }
         let next = sequencer.next.seq;
         match position.seq.cmp(&next) {
             Ordering::Less => return Ok(false),
@@ -1186,15 +1197,24 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
-    /// Checks that the replica serves reads: it is not a member, and not a
-    /// primary still reconciling its members.
+    /// Checks that the replica serves reads: it has not stopped, since its
+    /// index may then miss records it acknowledged, it is not a member, nor
+    /// a primary still reconciling its members, and as a primary it holds a
+    /// valid lease from every member (§5.4).
     ///
     /// # Errors
     ///
-    /// [`ShardError::NotPrimary`] on a member, and
-    /// [`ShardError::Unavailable`] on a primary that does not serve yet.
+    /// [`ShardError::Unavailable`] if the shard stopped, or is a primary
+    /// that does not serve yet or holds no lease from some member, and
+    /// [`ShardError::NotPrimary`] on a member.
     pub fn check_readable(&self) -> Result<(), ShardError> {
-        self.sequencer().check_role(self.shard())
+        self.sequencer().check_serving(self.shard())?;
+        match &self.inner.leader {
+            Some(leader) if !leader.holds_leases() => {
+                Err(self.unavailable("the primary does not hold a lease from every member"))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn sequencer(&self) -> MutexGuard<'_, Sequencer> {

@@ -2500,3 +2500,48 @@ of this file. A task with nothing unexpected keeps "None."
     it doc comments, plus about 350 in the simulation harness: over the
     plan's 1,500. Splitting would have left the data path without its
     checks, so it stays one task.
+
+### M2-09 Leases and strong reads
+
+- **No takeover yet, so no read can really be stale.** Placements are
+  static until M2-12, so the old primary is always the only one and the
+  history checker cannot see a stale read. The simulation checks the
+  property a takeover relies on instead: the lease audit of
+  `ReplicatedServices` flags every read a primary serves once some
+  member's `primary_grace` has passed, since that member could then have
+  proposed itself and acknowledged writes the read misses. Within `ρ` no
+  read is flagged, also with node 1 as slow and node 2 as fast as `ρ`
+  allows; with node 1 40% slow and node 2 40% fast, reads during a
+  partition between them are (about 1.33 s of lease against 1 s of grace),
+  while the commit audit, linearizability, and the every-member
+  durability check still pass. M2-12 can turn the drift-beyond-`ρ`
+  scenario into an actual stale read in the history.
+- **Clock readings cannot cross hosts, not even in the checker.** Each
+  `turmoil` host runs its own paused Tokio runtime, whose `Instant`s have
+  their own base, and outside any host `tokio::time::Instant::now` falls
+  back to real time, so the driver cannot read a node's `MonotonicClock`.
+  The audit converts each member's grace deadline to simulated time inside
+  the member's host, as it changes (`Grace::subscribe`), and checks reads
+  in the primary's host with `turmoil::sim_elapsed`. For the same reason,
+  `ReplicatedServices::ready` asks only that every member granted each
+  primary a lease, not that it is still valid.
+- **Stalled writes hid the anomaly.** A partition stalls the writes of
+  every shard it cuts a member from (there is no `replica_ack_timeout`
+  before M2-10), and with the default 2 s client timeout every client was
+  soon waiting on one, so no read landed in the 330 ms window. The lease
+  scenarios give clients a 300 ms timeout.
+- **Fixed drifts.** The harness drew every life's drift within the bound,
+  so a scenario could not put two chosen clocks beyond `ρ`.
+  `ClusterConfig::node_drifts` fixes the drift of the first nodes; the
+  drift is still drawn, so fixing it changes no other draw of a seed.
+- **Stamps rather than beacon numbers.** The primary stamps each append
+  and beacon with its clock reading, and members echo the latest one, so
+  the primary keeps no table of beacons in flight. A member grants a lease
+  with every acknowledgement after its first stamp, also when it repeats
+  an old stamp; that only restarts its grace later. Design §5.4 records
+  the details, and that unconditional writes need no lease.
+- **Left for later.** R1 needs a member to stop granting leases before it
+  proposes (M2-12): `Grace` has no such switch yet, and the member's link
+  echoes stamps as long as it follows the primary. The lease timings sit
+  in `ReplicationConfig` with the design's defaults; the configuration
+  keys exist (M0-03) but are wired in only with replication itself.
