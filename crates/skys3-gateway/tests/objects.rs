@@ -9,17 +9,18 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use common::signing::request as with_body;
-use common::{Answer, Setup, config, setup_with};
+use common::signing::{NOW, request as with_body};
+use common::{Answer, Setup, config, gateway_with, setup_with};
 use http::{Method, Request};
 use s3s::Body;
 use s3s::dto::{Timestamp, TimestampFormat};
 use skys3_gateway::stub::MemoryShards;
 use skys3_gateway::{
     Gateway, GatewayConfig, IdSource, MAX_USER_METADATA_BYTES, Precondition, ShardRef, Shards,
-    TrustAll,
+    SigV4Authenticator, StaticCredentials, TrustAll,
 };
 use skys3_index::Payload;
+use skys3_io::ManualWallClock;
 use skys3_log::RecordBody;
 use skys3_log::record::{Import, Put, PutData};
 use skys3_types::{BucketDocument, ETag};
@@ -731,6 +732,139 @@ async fn stubs_without_local_bytes_are_not_served_yet() {
     assert_eq!(head.header("etag"), Some("\"abc\""));
     let got = setup.get("imported", &[]).await;
     got.assert(503, Some("ServiceUnavailable"));
+}
+
+#[tokio::test]
+async fn the_stored_storage_class_is_returned_unless_standard() {
+    let (setup, bucket) = local(config("")).await;
+    for (key, class) in [
+        ("glacier", Some("GLACIER")),
+        ("standard", Some("STANDARD")),
+        ("none", None),
+    ] {
+        let import = RecordBody::Import(Import {
+            key: key.into(),
+            size: 3,
+            last_modified_ms: 1_600_000_000_000,
+            etag: ETag::new("abc").unwrap(),
+            storage_class: class.map(str::to_owned),
+        });
+        let shard = ShardRef::for_key(&bucket, key);
+        setup
+            .shards
+            .write(&shard, import, Precondition::None)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let head = setup.head("glacier", &[]).await;
+    head.assert(200, None);
+    assert_eq!(head.header("x-amz-storage-class"), Some("GLACIER"));
+    for key in ["standard", "none"] {
+        let head = setup.head(key, &[]).await;
+        head.assert(200, None);
+        assert!(head.header("x-amz-storage-class").is_none(), "{head:?}");
+    }
+    // An object written through the gateway is STANDARD.
+    setup
+        .put("cat", &[], Bytes::from_static(b"meow"))
+        .await
+        .assert(200, None);
+    let got = setup.get("cat", &[]).await;
+    got.assert(200, None);
+    assert!(got.header("x-amz-storage-class").is_none(), "{got:?}");
+}
+
+#[tokio::test]
+async fn response_header_overrides_replace_the_stored_headers() {
+    let (setup, _) = local(config("")).await;
+    setup
+        .put(
+            "cat.txt",
+            &[
+                ("content-type", "text/plain"),
+                ("cache-control", "max-age=60"),
+            ],
+            Bytes::from_static(b"meow"),
+        )
+        .await
+        .assert(200, None);
+    let query = "response-content-type=image%2Fpng&response-content-language=fr\
+                 &response-expires=Thu%2C%2001%20Dec%202033%2016%3A00%3A00%20GMT\
+                 &response-cache-control=no-store\
+                 &response-content-disposition=attachment%3B%20filename%3D%22c.txt%22\
+                 &response-content-encoding=gzip";
+    let uri = format!("/photos/cat.txt?{query}");
+    let expected = [
+        ("content-type", "image/png"),
+        ("content-language", "fr"),
+        ("expires", "Thu, 01 Dec 2033 16:00:00 GMT"),
+        ("cache-control", "no-store"),
+        ("content-disposition", "attachment; filename=\"c.txt\""),
+        ("content-encoding", "gzip"),
+    ];
+    for method in [Method::GET, Method::HEAD] {
+        let answer = setup.call(method.clone(), &uri, &[], "").await;
+        answer.assert(200, None);
+        for (name, value) in expected {
+            assert_eq!(
+                answer.header(name),
+                Some(value),
+                "{method} {name}: {answer:?}"
+            );
+        }
+        assert_eq!(answer.header("content-length"), Some("4"));
+    }
+    // One override leaves the other stored headers as they are.
+    let uri = "/photos/cat.txt?response-content-type=text%2Fhtml";
+    for method in [Method::GET, Method::HEAD] {
+        let answer = setup.call(method.clone(), uri, &[], "").await;
+        answer.assert(200, None);
+        assert_eq!(answer.header("content-type"), Some("text/html"), "{method}");
+        assert_eq!(
+            answer.header("cache-control"),
+            Some("max-age=60"),
+            "{method}"
+        );
+    }
+    // A value that is not a valid header value is refused.
+    let uri = "/photos/cat.txt?response-cache-control=a%0Ab";
+    for method in [Method::GET, Method::HEAD] {
+        let answer = setup.call(method.clone(), uri, &[], "").await;
+        assert_eq!(answer.status, 400, "{method}: {answer:?}");
+    }
+    // Overrides do not turn a missing object into anything else.
+    let uri = "/photos/missing?response-content-type=text%2Fhtml";
+    let answer = setup.call(Method::GET, uri, &[], "").await;
+    answer.assert(404, Some("NoSuchKey"));
+}
+
+#[tokio::test]
+async fn anonymous_requests_cannot_override_response_headers() {
+    let allow_all = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}}"#;
+    let config = config(&format!(
+        "[buckets.defaults]\nmode = \"local\"\n[identity]\nanonymous_access = true\nanonymous_policy = '{allow_all}'\n"
+    ));
+    let clock = Arc::new(ManualWallClock::new(Duration::from_secs(NOW)));
+    let auth = SigV4Authenticator::new(StaticCredentials::new(), clock);
+    let gateway = gateway_with(config, auth).await;
+    let send = async |method, uri: &str, body: &'static [u8]| {
+        let request = with_body(method, uri, &[], Bytes::from_static(body));
+        common::answer(gateway.handle(request).await).await
+    };
+    send(Method::PUT, "/photos", b"").await.assert(200, None);
+    send(Method::PUT, "/photos/cat.txt", b"meow")
+        .await
+        .assert(200, None);
+    let got = send(Method::GET, "/photos/cat.txt", b"").await;
+    got.assert(200, None);
+    assert_eq!(got.body, "meow");
+    let uri = "/photos/cat.txt?response-content-type=text%2Fhtml";
+    send(Method::GET, uri, b"")
+        .await
+        .assert(400, Some("InvalidRequest"));
+    let head = send(Method::HEAD, uri, b"").await;
+    assert_eq!(head.status, 400, "{head:?}");
 }
 
 #[tokio::test]

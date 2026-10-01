@@ -1010,6 +1010,12 @@ of this file. A task with nothing unexpected keeps "None."
   answers GET with `503` until read-through fill (M1-20). The extents of
   a failed upload stay in bulk segments until compaction (M1-22) reclaims
   unreferenced ones. `x-amz-storage-class` is accepted and ignored.
+- **Response header overrides.** `s3s` applies GetObject's `response-*`
+  query parameters to the response itself, but parses HeadObject's and
+  never applies them, and neither refuses them on anonymous requests. The
+  gateway applies them to both outputs and refuses them, and values that
+  are not header values, with `400 InvalidRequest` before reading the
+  object.
 
 ### M1-15 Remote target client and capability probe
 
