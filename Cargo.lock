@@ -639,6 +639,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "skys3-control"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "skys3-control",
+ "skys3-io",
+ "skys3-sim",
+ "skys3-types",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "turmoil",
+]
+
+[[package]]
 name = "skys3-io"
 version = "0.1.0"
 dependencies = [
