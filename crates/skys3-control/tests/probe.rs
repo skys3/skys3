@@ -13,7 +13,7 @@ use skys3_control::{
     S3StoreConfig, Version, Versioned,
 };
 use skys3_sim::SimS3;
-use skys3_sim::s3::{ConditionalSupport, Conditionals, SimS3Config, SimS3Faults};
+use skys3_sim::s3::{ConditionalSupport, Conditionals, Fault, Operation, SimS3Config, SimS3Faults};
 use skys3_types::Generation;
 
 const WRITERS: usize = 3;
@@ -225,6 +225,61 @@ async fn stale_reads_are_refused() {
     // The cleanup reads through the stale reads.
     store.objects().set_faults(SimS3Faults::NONE);
     assert!(store.objects().keys().is_empty());
+}
+
+/// A store whose reads are consistent but whose listings lag is refused:
+/// change streams would miss what a generation announces.
+#[tokio::test(start_paused = true)]
+async fn stale_listings_are_refused() {
+    let faults = SimS3Faults {
+        stale_list_probability: 0.3,
+        ..SimS3Faults::NONE
+    };
+    let store = s3(SimS3Config::default(), faults);
+    let error = ControlProbe::new(13)
+        .run(&writers(&store))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.failure, ProbeFailure::StaleListing { .. }),
+        "{error}"
+    );
+    assert!(error.refuses_store());
+    assert!(error.leftovers.is_empty());
+    assert!(store.objects().keys().is_empty());
+}
+
+/// Each kind of lagging listing fails the probe: a created register that is
+/// missing, an overwritten one at its old version, and a deleted one still
+/// listed.
+#[tokio::test(start_paused = true)]
+async fn every_kind_of_stale_listing_is_caught() {
+    // (rounds, the listing that is stale, what it shows)
+    let cases = [
+        (1, 0, "showed no probe/"),
+        (2, 1, "at version"),
+        (1, 1, "which is deleted or was never written"),
+    ];
+    for (rounds, stale, shows) in cases {
+        let store = with(Conditionals::AWS_S3);
+        for _ in 0..stale {
+            // A zero delay uses up a scripted slot and changes nothing.
+            store
+                .objects()
+                .inject(Operation::ListObjectsV2, Fault::Delay(Duration::ZERO));
+        }
+        store
+            .objects()
+            .inject(Operation::ListObjectsV2, Fault::StaleRead);
+        let probe = ControlProbe::new(14).with_rounds(rounds, 1);
+        let error = probe.run(&writers(&store)).await.unwrap_err();
+        assert!(
+            matches!(error.failure, ProbeFailure::StaleListing { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains(shows), "{error}");
+        assert!(store.objects().keys().is_empty());
+    }
 }
 
 #[tokio::test(start_paused = true)]
