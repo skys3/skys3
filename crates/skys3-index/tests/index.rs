@@ -16,7 +16,8 @@ use skys3_log::record::{Delete, RecordBody};
 use skys3_log::{LogRecord, RecordLocation, SegmentId};
 use skys3_types::{Epoch, EpochSeq, Generation, Seq};
 use support::{
-    TestApplier, Workload, apply, disk_label, index_config, log_of, open_node, pool, runtime, shard,
+    TestApplier, Workload, apply, disk_label, disk_label_of, index_config, log_of, open_node,
+    open_node_on, pool, runtime, shard,
 };
 
 fn position(seq: u64) -> EpochSeq {
@@ -383,5 +384,45 @@ fn replay_refuses_a_damaged_record() {
             IndexError::Damaged { location: at, .. } => assert_eq!(at, location),
             error => panic!("{error}"),
         }
+    });
+}
+
+#[test]
+fn replay_orders_a_shards_records_across_disks() {
+    runtime().block_on(async {
+        let disks = [SimDisk::new(6), SimDisk::new(7)];
+        let pool = pool();
+        let mounts = disks.each_ref().map(SimDisk::mount);
+        let node = open_node_on(&mounts, &pool).await;
+        // Shard 0's first record is on the second disk by label, and its
+        // second on the first, which replay reads first.
+        let (first, _) = delete(0, 1, "first");
+        let (second, _) = delete(0, 2, "second");
+        let logs = node.logs();
+        let at_1 = logs[&disk_label_of(1)].append(&first).await.unwrap();
+        let at_0 = logs[&disk_label_of(0)].append(&second).await.unwrap();
+        apply(&node, &[(first, at_1), (second, at_0)]);
+        let before = node.index().read().unwrap().dump().unwrap();
+        for disk in &disks {
+            disk.crash();
+        }
+        drop(node);
+
+        let mounts = disks.each_ref().map(SimDisk::mount);
+        let node = open_node_on(&mounts, &pool).await;
+        assert!(
+            node.index()
+                .read()
+                .unwrap()
+                .dump()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let report = node.replay(Arc::new(TestApplier)).await.unwrap();
+        assert_eq!(report.applied, 2);
+        let after = node.index().read().unwrap().dump().unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.entries.len(), 2);
     });
 }
