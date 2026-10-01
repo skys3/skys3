@@ -285,6 +285,7 @@ fn strip_trusted_extensions(extensions: &mut http::Extensions) {
     extensions.remove::<Authenticated>();
     extensions.remove::<Trailers>();
     extensions.remove::<authz::KeyDecisions>();
+    extensions.remove::<authz::CopiedTags>();
 }
 
 /// Checks an XML body against the `Content-MD5` or `x-amz-checksum-*` value

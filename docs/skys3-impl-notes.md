@@ -1066,6 +1066,30 @@ of this file. A task with nothing unexpected keeps "None."
   compare. With `x-amz-checksum-algorithm`, the copy stores that
   algorithm's checksum, reused from the source only when it is a
   full-object one. Design §11 records it.
+- **Writes could store and copy tags without the tagging actions.**
+  Review found that PutObject and CreateMultipartUpload with
+  `x-amz-tagging`, and CopyObject, needed only `s3:PutObject`, so a caller
+  denied `s3:PutObjectTagging` could still set tags, and one denied
+  `s3:GetObjectTagging` could copy a source's tags. As in S3, a write that
+  gives tags now also needs `s3:PutObjectTagging`, checked in the
+  operation's access hook, and a copy of a tagged source with the `COPY`
+  tagging directive also needs `s3:GetObjectTagging` on the source and
+  `s3:PutObjectTagging` on the copy. Whether the source has tags is known
+  only once the operation reads it, so the hook leaves its decision in a
+  `CopiedTags` extension, stripped from incoming requests like
+  `KeyDecisions`; the copy fails closed without it. An empty
+  `x-amz-tagging` still needs the action, and copies of untagged sources
+  need neither. The S3 documentation was unreachable from the sandbox; the
+  rule follows the AWS guidance that copying tagged objects needs both
+  tagging actions, and the SDK matrix (M1-25) should confirm it. The
+  authorization table gained rows for tagged writes and copies, and a test
+  checks that callers denied the tagging actions still write untagged
+  objects.
+- **A self-copy that only set a storage class or website redirect was
+  accepted and lost.** S3 counts either as a change, but SkyS3 stores
+  neither (PutObject accepts and ignores them, M1-09), so such a copy
+  answered success and changed nothing. It is now refused like any copy
+  onto itself that does not replace the metadata.
 - **Imported and adopted objects can carry a write identity.** Their
   metadata comes from the remote, so a `COPY` directive would have copied
   `x-amz-meta-skys3-wid` into the copy, naming another write. Copies drop
