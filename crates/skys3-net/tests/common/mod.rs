@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +14,9 @@ use rcgen::{
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use skys3_net::{CertificateDer, Credentials, PrivateKeyDer};
-use skys3_types::ClusterId;
+use skys3_net::{CertificateDer, Credentials, Network, PrivateKeyDer};
+use skys3_types::{ClusterId, NodeAddress};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 /// The longest a test waits on the network before it fails.
 pub const WAIT: Duration = Duration::from_secs(30);
@@ -34,6 +36,54 @@ pub trait Bounded: Future + Sized {
 }
 
 impl<F: Future> Bounded for F {}
+
+/// The socket buffer size [`SmallBuffers`] asks for. Linux doubles it,
+/// and a loopback connection then holds a few hundred KiB in flight.
+pub const SMALL_BUFFER: u32 = 16 * 1024;
+
+/// The operating system's TCP with small send and receive buffers, so a
+/// test hangs wherever a frame larger than the buffers is written while
+/// nobody reads it, whatever the host's buffer settings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SmallBuffers;
+
+impl SmallBuffers {
+    fn socket(addr: &SocketAddr) -> std::io::Result<TcpSocket> {
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.set_send_buffer_size(SMALL_BUFFER)?;
+        socket.set_recv_buffer_size(SMALL_BUFFER)?;
+        Ok(socket)
+    }
+}
+
+impl Network for SmallBuffers {
+    type Stream = TcpStream;
+    type Listener = TcpListener;
+
+    async fn bind(&self, addr: SocketAddr) -> std::io::Result<TcpListener> {
+        // Accepted sockets inherit the listener's buffer sizes.
+        let socket = Self::socket(&addr)?;
+        socket.bind(addr)?;
+        socket.listen(64)
+    }
+
+    async fn accept(listener: &TcpListener) -> std::io::Result<(TcpStream, SocketAddr)> {
+        listener.accept().await
+    }
+
+    fn local_addr(listener: &TcpListener) -> std::io::Result<SocketAddr> {
+        listener.local_addr()
+    }
+
+    async fn connect(&self, addr: &NodeAddress) -> std::io::Result<TcpStream> {
+        let addr: SocketAddr = addr.to_string().parse().map_err(std::io::Error::other)?;
+        Self::socket(&addr)?.connect(addr).await
+    }
+}
 
 /// The cluster every test uses unless it tests another.
 pub const CLUSTER: &str = "test-cluster";

@@ -7,12 +7,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::{Bounded, CLUSTER, Leaf, TestCa, Validity, cluster, pem, raw_client, raw_server};
+use common::{
+    Bounded, CLUSTER, Leaf, SmallBuffers, TestCa, Validity, cluster, pem, raw_client, raw_server,
+};
 use rustls::pki_types::ServerName;
 use rustls::{AlertDescription, CertificateError};
 use skys3_net::{
     ALPN_PROTOCOL, Connection, Credentials, Frame, FrameError, Header, IdentityError, MessageKind,
-    PeerIdentity, PkiError, Role, TokioNetwork, Transport, TransportError, read_frame, write_frame,
+    Network, PeerIdentity, PkiError, Role, TokioNetwork, Transport, TransportError, read_frame,
+    write_frame,
 };
 use skys3_types::{ClusterId, NodeAddress, NodeId};
 use tokio::net::{TcpListener, TcpStream};
@@ -36,7 +39,11 @@ struct Server {
 }
 
 async fn serve(credentials: &Credentials) -> Server {
-    let transport = Transport::new(TokioNetwork, credentials);
+    serve_on(TokioNetwork, credentials).await
+}
+
+async fn serve_on<N: Network<Stream = TcpStream>>(network: N, credentials: &Credentials) -> Server {
+    let transport = Transport::new(network, credentials);
     let listener = transport
         .bind("127.0.0.1:0".parse().unwrap())
         .bounded()
@@ -105,9 +112,9 @@ async fn nodes_exchange_frames_with_raw_payloads() {
     let ca = TestCa::new("ca");
     let server_creds = ca.credentials(&Leaf::node("n1"));
     let client_creds = ca.credentials(&Leaf::node("n2"));
-    let mut server = serve(&server_creds).bounded().await;
+    let mut server = serve_on(SmallBuffers, &server_creds).bounded().await;
 
-    let client = Transport::new(TokioNetwork, &client_creds);
+    let client = Transport::new(SmallBuffers, &client_creds);
     assert_eq!(client.identity(), &PeerIdentity::Node(node_id("n2")));
     let mut outbound = client
         .connect(&node_id("n1"), &address(server.addr))
@@ -125,8 +132,9 @@ async fn nodes_exchange_frames_with_raw_payloads() {
             .with_body(&b"epoch 3 seq 9"[..]),
         payload.clone(),
     );
-    // A frame larger than the socket buffers is sent and received at the
-    // same time: sent alone, it would wait for a reader forever.
+    // The frame is far larger than the socket buffers, so it is sent and
+    // received at the same time: sent alone, it would wait for a reader
+    // forever.
     let (sent, received) = async { tokio::join!(outbound.send(&append), inbound.recv()) }
         .bounded()
         .await;
@@ -165,6 +173,65 @@ async fn nodes_exchange_frames_with_raw_payloads() {
         matches!(error, TransportError::Frame(FrameError::Truncated)),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn both_peers_can_send_large_frames_at_once() {
+    // Each side sends frames much larger than the socket buffers before it
+    // reads anything. With each connection split, every receiver runs on
+    // its own task, so neither writer waits on a reader that cannot run.
+    let ca = TestCa::new("ca");
+    let mut server = serve_on(SmallBuffers, &ca.credentials(&Leaf::node("n1")))
+        .bounded()
+        .await;
+    let client = Transport::new(SmallBuffers, &ca.credentials(&Leaf::node("n2")));
+    let outbound = client
+        .connect(&node_id("n1"), &address(server.addr))
+        .bounded()
+        .await
+        .unwrap();
+    let inbound = server.next().bounded().await.unwrap();
+
+    let frames = |kind, fill: u8| -> Vec<Frame> {
+        (1..=4)
+            .map(|id| {
+                Frame::new(
+                    Header::new(kind).with_request_id(id),
+                    vec![fill; (1 + id as usize) << 20],
+                )
+            })
+            .collect()
+    };
+    let exchange = |connection: Conn, send: Vec<Frame>| {
+        let (mut receiver, mut sender) = connection.into_split();
+        let expected = send.len();
+        let receiving = tokio::spawn(async move {
+            let mut received = Vec::new();
+            while received.len() < expected {
+                received.push(receiver.recv().await.unwrap().unwrap());
+            }
+            received
+        });
+        let sending = tokio::spawn(async move {
+            for frame in &send {
+                sender.send(frame).await.unwrap();
+            }
+            send
+        });
+        async move { (sending.await.unwrap(), receiving.await.unwrap()) }
+    };
+    let from_client = frames(MessageKind::Append, 1);
+    let from_server = frames(MessageKind::Backfill, 2);
+    let ((client_sent, client_received), (server_sent, server_received)) = async {
+        tokio::join!(
+            exchange(outbound, from_client),
+            exchange(inbound, from_server)
+        )
+    }
+    .bounded()
+    .await;
+    assert_eq!(client_received, server_sent);
+    assert_eq!(server_received, client_sent);
 }
 
 #[tokio::test]
