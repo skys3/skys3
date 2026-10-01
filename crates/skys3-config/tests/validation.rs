@@ -360,9 +360,22 @@ fn storage_rules() {
         &["storage.segment_bytes"],
     );
     assert_violations(
-        "[storage]\ninline_max_bytes = 536870912",
+        "[storage]\nsegment_bytes = 16777216\ninline_max_bytes = 16777216",
         &["storage.segment_bytes"],
     );
+    // Record payloads are bounded by the log format.
+    assert_violations(
+        "[storage]\ninline_max_bytes = 16777217",
+        &["storage.inline_max_bytes"],
+    );
+    for extent_bytes in ["65535", "16777217"] {
+        assert_violations(
+            &format!("[storage]\nextent_bytes = {extent_bytes}"),
+            &["storage.extent_bytes"],
+        );
+    }
+    let config = load("[storage]\nextent_bytes = 65536\ninline_max_bytes = 16777216").unwrap();
+    assert_eq!(config.storage().extent_bytes, 65536);
     for threshold in ["0.0", "1.0"] {
         assert_violations(
             &format!("[storage]\ncompaction_live_threshold = {threshold}"),

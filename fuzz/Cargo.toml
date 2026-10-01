@@ -18,10 +18,19 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+crc32c = "0.6"
 libfuzzer-sys = "0.4"
+skys3-log = { path = "../crates/skys3-log" }
 skys3-obs = { path = "../crates/skys3-obs" }
 skys3-sts = { path = "../crates/skys3-sts" }
 skys3-types = { path = "../crates/skys3-types" }
+
+[[bin]]
+name = "log_record"
+path = "fuzz_targets/log_record.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "obs_bearer"
