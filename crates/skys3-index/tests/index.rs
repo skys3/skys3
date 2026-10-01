@@ -9,12 +9,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_config::StorageConfig;
 use skys3_index::{
-    Applier, ControlEntry, Entry, EntryState, Index, IndexConfig, IndexError, IndexWriter, LogState,
+    Applier, ControlEntry, Entry, EntryState, Index, IndexConfig, IndexError, IndexWriter,
+    LogState, codec,
 };
 use skys3_io::{SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_log::record::{Delete, RecordBody};
 use skys3_log::{LogRecord, RecordLocation, SegmentId};
-use skys3_types::{Epoch, EpochSeq, Generation, Seq};
+use skys3_types::{
+    Epoch, EpochSeq, Generation, NodeId, ProposalId, RegisterDocument, Seq, ShardConfig, ShardId,
+};
 use support::{
     TestApplier, Workload, apply, disk_label, disk_label_of, index_config, log_of, open_node,
     open_node_on, pool, runtime, shard,
@@ -305,6 +308,75 @@ fn control_state_is_durable_at_once() {
         read.control_synced_at().unwrap(),
         Some(std::time::Duration::from_millis(1_234_567))
     );
+}
+
+fn route(shard_no: u8, epoch: u64) -> ShardConfig {
+    let node: NodeId = "node-1".parse().unwrap();
+    ShardConfig {
+        bucket_id: shard(shard_no).bucket,
+        shard: ShardId::new(shard_no),
+        epoch: Epoch::new(epoch),
+        primary: node.clone(),
+        members: vec![node],
+        learners: Vec::new(),
+        min_write_replicas: 1,
+        replicas: 1,
+        proposal_id: ProposalId::new("p").unwrap(),
+    }
+}
+
+#[test]
+fn the_shard_map_is_durable_at_once() {
+    let disk = SimDisk::new(1);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    index.store_route(&route(0, 1)).unwrap();
+    index.store_route(&route(0, 2)).unwrap();
+    index.store_route(&route(1, 1)).unwrap();
+    index.forget_route(&shard(1)).unwrap();
+    index.forget_route(&shard(2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let map = index.read().unwrap().shard_map().unwrap();
+    assert_eq!(map, BTreeMap::from([(shard(0), route(0, 2))]));
+
+    let encoded = codec::encode_route(&route(3, 9)).unwrap();
+    assert_eq!(codec::decode_route(&encoded).unwrap(), route(3, 9));
+    let mut damaged = encoded;
+    damaged.pop();
+    assert!(codec::decode_route(&damaged).is_err());
+    let mut wrong = codec::encode_route(&route(3, 9)).unwrap();
+    let json_start = wrong.len() - route(3, 9).to_json().unwrap().len();
+    wrong[json_start] = b'[';
+    let error = codec::decode_route(&wrong).unwrap_err();
+    assert_eq!(error.field(), "shard_map.config");
+}
+
+#[test]
+fn an_index_from_before_the_shard_map_gains_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.redb");
+    {
+        // An index of the current format, written before the shard map.
+        let index = Index::open(&path, &IndexConfig::default()).unwrap();
+        index.apply(&TestApplier, &[delete(0, 1, "a")]).unwrap();
+        index.checkpoint(&BTreeMap::new()).unwrap();
+        drop(index);
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        let map: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("shard_map");
+        assert!(txn.delete_table(map).unwrap());
+        txn.commit().unwrap();
+    }
+    let index = Index::open(&path, &IndexConfig::default()).unwrap();
+    assert!(index.read().unwrap().shard_map().unwrap().is_empty());
+    assert_eq!(
+        index.read().unwrap().entry(&shard(0), "a").unwrap(),
+        Some(tombstone(1))
+    );
+    index.store_route(&route(0, 1)).unwrap();
+    assert_eq!(index.read().unwrap().shard_map().unwrap().len(), 1);
 }
 
 #[test]

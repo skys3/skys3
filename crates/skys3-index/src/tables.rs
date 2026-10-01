@@ -9,7 +9,7 @@ use std::time::Duration;
 use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
 use skys3_log::RecordLocation;
 use skys3_log::record::ShardRef;
-use skys3_types::{EpochSeq, Generation};
+use skys3_types::{EpochSeq, Generation, ShardConfig};
 
 use crate::codec;
 use crate::entry::{ControlEntry, Entry, Part, Upload};
@@ -33,6 +33,11 @@ pub(crate) const PARTS: TableDefinition<Bytes, Bytes> = TableDefinition::new("pa
 pub(crate) const COVERAGE: TableDefinition<Bytes, Bytes> = TableDefinition::new("coverage");
 /// The node's local copy of control state, keyed by register key.
 pub(crate) const CONTROL: TableDefinition<&str, Bytes> = TableDefinition::new("control");
+/// The gateway's shard map (§6.2): the newest configuration the node knows
+/// of each shard, keyed by shard. It is a cache that is safe when stale,
+/// so a build that does not know the table loses nothing by ignoring it,
+/// and the table needs no new format version.
+pub(crate) const SHARD_MAP: TableDefinition<Bytes, Bytes> = TableDefinition::new("shard_map");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -567,6 +572,7 @@ pub struct IndexReader {
     uploads: ReadOnlyTable<Bytes, Bytes>,
     parts: ReadOnlyTable<Bytes, Bytes>,
     control: ReadOnlyTable<&'static str, Bytes>,
+    shard_map: ReadOnlyTable<Bytes, Bytes>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
 
@@ -579,8 +585,24 @@ impl IndexReader {
             uploads: txn.open_table(UPLOADS)?,
             parts: txn.open_table(PARTS)?,
             control: txn.open_table(CONTROL)?,
+            shard_map: txn.open_table(SHARD_MAP)?,
             meta: txn.open_table(META)?,
         })
+    }
+
+    /// Returns the gateway's shard map: the configuration kept for each
+    /// shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn shard_map(&self) -> Result<BTreeMap<ShardRef, ShardConfig>, IndexError> {
+        read_all(
+            &self.shard_map,
+            "shard_map",
+            codec::decode_shard_key,
+            codec::decode_route,
+        )
     }
 
     /// Returns the open upload of `key` in `shard` opened at `upload`.

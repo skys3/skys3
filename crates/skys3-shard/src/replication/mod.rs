@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use skys3_io::Disk;
-use skys3_net::{Frame, Listener, Network, Receiver, Transport, TransportError};
+use skys3_net::{Frame, Listener, Network, Receiver, Sender, Transport, TransportError};
 use skys3_types::{NodeAddress, NodeId, ShardConfig};
 
 use crate::error::ShardError;
@@ -169,7 +169,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
                     continue;
                 }
             };
-            let (set, config) = (self.inner.set.clone(), self.inner.config);
+            let replication = self.clone();
             tokio::spawn(async move {
                 let connection = match incoming.handshake().await {
                     Ok(connection) => connection,
@@ -178,10 +178,27 @@ impl<N: Network, D: Disk> Replication<N, D> {
                         return;
                     }
                 };
-                if let Err(error) = member::serve(connection, &set, config).await {
-                    tracing::debug!(%error, "a replication link to a primary ended");
+                let (mut receiver, sender) = connection.into_split();
+                let timeout = replication.inner.config.link_timeout;
+                match recv(&mut receiver, timeout).await {
+                    Ok(first) => replication.follow((receiver, sender), first).await,
+                    Err(error) => tracing::debug!(%error, "a replication link sent nothing"),
                 }
             });
+        }
+    }
+
+    /// Serves a link from a primary, whose first frame `first` arrived on
+    /// `link`, as a member, until the link fails or a later session
+    /// replaces it. A node whose transport also carries other messages
+    /// accepts connections itself and hands replication links here.
+    pub async fn follow<S>(&self, link: (Receiver<S>, Sender<S>), first: Frame)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let inner = &self.inner;
+        if let Err(error) = member::serve(link, first, &inner.set, inner.config).await {
+            tracing::debug!(%error, "a replication link to a primary ended");
         }
     }
 }

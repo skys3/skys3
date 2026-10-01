@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use skys3_io::Disk;
 use skys3_log::{LogRecord, ShardRef};
-use skys3_net::{Connection, MessageKind, PeerIdentity, Receiver, Sender};
+use skys3_net::{Frame, MessageKind, PeerIdentity, Receiver, Sender};
 use skys3_types::{Epoch, Seq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
@@ -13,10 +13,11 @@ use super::{LinkError, ReplicationConfig, recv};
 use crate::set::ShardSet;
 use crate::shard::{Role, Shard};
 
-/// Serves one link from a primary: a session for one shard, until the link
-/// fails or a later session replaces it.
+/// Serves one link from a primary, whose first frame is `frame`: a session
+/// for one shard, until the link fails or a later session replaces it.
 pub(super) async fn serve<S, D>(
-    connection: Connection<S>,
+    (mut receiver, mut sender): (Receiver<S>, Sender<S>),
+    frame: Frame,
     set: &ShardSet<D>,
     config: ReplicationConfig,
 ) -> Result<(), LinkError>
@@ -24,8 +25,6 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     D: Disk,
 {
-    let (mut receiver, mut sender) = connection.into_split();
-    let frame = recv(&mut receiver, config.link_timeout).await?;
     let request: Sync = wire::body(&frame, MessageKind::Sync).map_err(LinkError::Protocol)?;
     let (shard, epoch) = match accept(&request, receiver.peer(), set).await {
         Ok(accepted) => accepted,

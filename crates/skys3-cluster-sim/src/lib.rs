@@ -26,7 +26,8 @@
 //!   extents, conditional `PUT`s, one-part multipart uploads, `GET`, `HEAD`,
 //!   and `DELETE`, each sent to the primary of its key's shard under the
 //!   static placement the harness writes to the control store (`shards/`
-//!   registers).
+//!   registers), or to any node, whose gateway routes it
+//!   ([`Workload::any_gateway`]).
 //! - **Faults.** A [`FaultPlan`]: crashes with or without power loss,
 //!   partitions, held links (delay and reordering), random message loss,
 //!   failed syncs, control-store outages, control-store round trips of
@@ -56,7 +57,8 @@
 //! Protocols plug in as [`NodeServices`]: started in each life of each
 //! node with its recovered storage, clock, transport, and the placement,
 //! they return the shards the gateway calls. [`ReplicatedServices`] is
-//! replication (plan M2-07), and later protocols extend it. Their failure
+//! replication (plan M2-07), [`RoutedServices`] adds gateways that route
+//! by their shard maps (plan M2-08), and later protocols extend them. Their failure
 //! cases become seeded scenarios: a
 //! [`FaultPlan`] built by hand or drawn from a [`FaultProfile`], and
 //! invariants over the state the services expose. Scenario tests live in
@@ -82,6 +84,7 @@ mod faults;
 mod node;
 mod pki;
 mod replication;
+mod routing;
 mod s3;
 mod workload;
 
@@ -89,6 +92,7 @@ pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View};
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{IoCounts, ReplicatedServices, ReplicatedShards};
+pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
 pub use workload::Workload;
 

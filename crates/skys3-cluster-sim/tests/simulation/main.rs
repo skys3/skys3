@@ -10,10 +10,13 @@
 //!   catching seeded bugs, invariants, and node services.
 //! - [`replication`]: shards with three members, under crashes, power
 //!   loss, partitions, and message loss.
+//! - [`routing`]: gateways on every node with stale shard maps, routing
+//!   each request to its primary under crashes and partitions.
 
 mod crash;
 mod harness;
 mod replication;
+mod routing;
 mod workload;
 
 /// What one seed of a cluster scenario costs, in seeds of a typical

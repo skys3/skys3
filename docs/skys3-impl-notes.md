@@ -2449,3 +2449,105 @@ of this file. A task with nothing unexpected keeps "None."
     it doc comments, plus about 350 in the simulation harness: over the
     plan's 1,500. Splitting would have left the data path without its
     checks, so it stays one task.
+
+### M2-08 Shard map and routing
+
+- **A forwarded record cannot travel at position `(0, 0)`.** A write's
+  record crosses the wire in the log record format, but the encoder
+  refuses a `PUT` or an `MPU_PART` that names an extent or an upload at or
+  after its own position. Records travel at the last position,
+  `(2⁶⁴−1, 2⁶⁴−1)`, and the replica sequences them as usual. The fault
+  scenarios first passed with every such write failing, since a forwarded
+  write that fails is recorded as unknown; the fault-free scenario, which
+  asserts no unknown outcome, caught it.
+- **Members served payloads and seals.** `Shard::payload` and `Shard::seal`
+  never checked the replica's role; only reads and writes did, through
+  `check_readable`. `LocalShards` now checks it for both, and maps the
+  replica's `NotPrimary` to a new gateway `ShardError::NotPrimary`, which
+  the forward server turns into a redirect hint. The replica's own check
+  stays the only authority on who serves, so the server does not repeat
+  it.
+- **A forwarded write can outlive its gateway.** The harness ends an
+  unanswered operation when the node it was sent to crashes, which is
+  sound only if that node applies it. A gateway can forward a write and
+  crash, or give up on it with `503`, while the primary still commits it.
+  `Workload::any_gateway` records operations without a server and writes
+  answered with a server error as unknown; the scenarios that send to the
+  primary are unchanged.
+- **Concurrent register reads failed requests.** Register reads were first
+  rate-limited per shard, so every request that arrived while another was
+  reading a shard's register failed. Reads of one node now wait for each
+  other and look at the map again before reading, so concurrent requests
+  share one read.
+- **No new index format for the shard map.** The map is a new `shard_map`
+  table, keyed like `shards`, holding each configuration's register JSON.
+  It is a cache that is safe when stale, so the index format stays 2: an
+  older build ignores the table, and opening an index that lacks it adds
+  it. It is kept apart from the control-state copy, which each sync
+  replaces whole.
+- **A pooled connection the peer dropped fails one write.** The gateway
+  keeps idle connections per node (at most 8, for at most 60 s; the server
+  drops a connection idle for 5 min). After a node restarts, the first
+  write on each connection to it fails with `503`, because the gateway
+  cannot tell whether the request arrived; a read moves to the next
+  member. Probing a connection before reuse would cost a round trip on
+  every request.
+- **Primary-only flushing.** `FlushService::reconcile` starts flushers
+  only on shards this node is the primary of, which M2-07 left open: a
+  member refuses the `FLUSHED` records its primary does not send. The
+  routing scenarios include a replicated `write_back` bucket.
+- **Lazy `FLUSHED` records outlast short forwarding timeouts.** A write
+  to a `write_back` shard can wait behind a lazy `FLUSHED` record on its
+  primary for up to `LAZY_MAX_DELAY` (1 s), which M2-07 named as a risk. A
+  routing scenario with a 1 s forwarding timeout failed writes that way;
+  the scenarios now give forwarded requests 4 s, and the default is 30 s.
+- **Seals across nodes.** The design left them to this task. The gateway
+  forwards seal and unseal to the primary, which holds a seal until it is
+  lifted or it restarts. Lifting the seals of a crashed gateway, and seals
+  across a primary change, go to M3-04, the first task that deletes
+  buckets on several nodes; §4.1 says so.
+- **How the simulation checks it.** `RoutedServices` puts a routing
+  gateway on every node and starts each map stale, with the placement in
+  epoch 3: a third of the shards known in epoch 2 with a member as
+  primary (a redirect corrects it), a third in epoch 2 with only a node
+  that does not exist (no member answers, so the gateway reads the
+  register), and a third unknown. Clients send every request to a random
+  node. An observer on every gateway records which node served each
+  request in which epoch, and an invariant fails the run if any was not
+  the current primary in the current epoch. A seeded bug, members that
+  answer reads from their own index, trips it; that scenario starts every
+  map with a member as each shard's primary, since with the mixed maps a
+  write's redirect could correct a map before any read reached the
+  member, and one seed in 4,096 missed the bug. Scenarios cover no
+  faults, random crashes, partitions, and message loss, and every node
+  restarting in turn; each passed 4,096 seeds (`SKYS3_SIM_SEEDS=4096`).
+- **A `GET` can fail when it races an overwrite.** A read that finds its
+  object replaced between the entry and the payload answers a retryable
+  `503`. Forwarding both calls widens that window, so the fault-free
+  scenario allows a few failed reads; it still allows no failed write.
+- **A replication scenario fails on one seed in 4,096, before this
+  task.** `replicated_writes_under_crashes_and_message_loss` with
+  `SKYS3_SIM_SEED=86` finds a history no order explains on
+  `bucket-1/key-1`. It fails the same way on the M2-07 head, so it is not
+  routing; it is left to the replication tasks.
+- **Left for later.**
+  - **Binary wiring.** Not done: the routing code alone is about 2,000
+    lines of non-test library code, over the plan's 1,500, before any
+    wiring. Running replicated shards in the binary also needs: a shared
+    control store (the binary refuses anything but the file store, which
+    a second node cannot open), peers' transport addresses (node
+    registration is M3-02, so a static list in the configuration until
+    then), shard registers for a static placement (no bootstrap command
+    writes them yet; M3-04 makes CreateBucket write them), loading the
+    `[transport]` credentials, opening replicas from the registers, the
+    `serve_peers` listener, and configuration keys for the replication
+    timing (`ReplicationConfig`) and `RoutingConfig`. A follow-up task
+    (M2-08b) should take these; until then the binary serves every shard
+    alone, as before.
+  - **Multiplexing.** One request per connection at a time, with a small
+    pool per node. Request IDs are on the wire, so a connection can carry
+    several requests later.
+  - **Coordinator pushes** of configurations (§6.2) come with M3-01.
+  - **Size.** About 2,000 lines of non-test library code, most of it
+    the forwarding messages and their checks, plus about 350 in the
+    simulation harness.
