@@ -1132,6 +1132,76 @@ of this file. A task with nothing unexpected keeps "None."
   `base64` 0.23. Stacking M1-15 on this PR failed the duplicate-version ban,
   so the workspace uses `base64` 0.23; its API is unchanged for our use.
 
+### M1-24 STS and session credentials
+
+- **Session records sit behind a trait, in memory.** Object operations
+  (M1-09) were being built in parallel, and writing sessions straight into
+  a `ShardSet` would have meant reading inline payloads back out of the log,
+  which no API offers yet. `SessionStore` has `insert`, `get`, and
+  `remove_expired`, `MemorySessionStore` implements it, and `Session`
+  serializes as JSON for the system bucket that will back the trait. Until
+  then sessions do not survive a restart. Nothing serves the gateway yet
+  (M1-13), so nothing is lost in practice; whoever wires the node must back
+  the trait with the system bucket and call `remove_expired` periodically.
+- **The secret cannot be derived from the token.** Deriving the secret
+  from the session token would have kept no secret at rest, but every
+  request carries the token, and a presigned URL puts it in the URL: anyone
+  who saw one could sign anything for the session. The record instead holds
+  the token's SHA-256 and the secret sealed with
+  `HMAC-SHA256(token, "skys3 session secret")`, so a copy of the store
+  cannot sign either. Expiry is checked only after the token opens the
+  secret, so a caller without the token learns nothing about the session.
+- **The identity copy is in memory.** Design §6.2 keeps local copies in the
+  node index, and M2-16 owns persisting and propagating them. `IdentityCopy`
+  is filled by `StsEndpoint::sync_identity`, which lists and reads
+  `identity/` and then replaces the validator's allowlist. Its age runs from
+  the start of the last complete sync. A register that does not parse is
+  left out rather than failing the sync: failing would keep the register's
+  old value, perhaps a looser trust policy, in force until the copy went
+  stale. Two providers naming one issuer are both left out.
+- **The provider record had no `proposal_id`.** M1-23's `OidcProvider`
+  rejects unknown fields, so it could not be a register as it was.
+  `ProviderDocument` repeats its fields plus `proposal_id`; flattening was
+  not an option, since serde cannot combine `flatten` with
+  `deny_unknown_fields`. `InvalidRegister::Document` carries the errors of
+  documents defined outside `skys3-types`.
+- **Policies are strings in registers.** `Policy` deserializes but has no
+  serialized form, and a register must round-trip. `PolicyDocument<P>`
+  keeps a policy with its JSON text and serializes as that string, as the
+  configuration and IAM's API do. Role registers and session records use
+  it, for identity, trust, and session policies alike.
+- **Trust policies are a separate language.** Extending `Policy` with
+  `Principal` and `Condition` would have let both appear in identity
+  policies. `policy::trust::TrustPolicy` shares the parser's pieces and its
+  limits: the base PR changed mid-task to count text instead of bytes and to
+  bound arrays (`MAX_ARRAY_LEN`), and trust policies follow it, with
+  condition objects bounded and duplicate keys refused by a small
+  `UniqueMap`, since serde's maps keep the last duplicate silently. Only
+  `StringEquals` and `StringLike` on `aud`, `sub`, and `azp` are accepted; a
+  condition key must name an issuer that is a principal of its statement, so
+  a typo is refused instead of making the condition never hold.
+- **STS shares the S3 listener.** The AWS SDKs send STS query requests as
+  `POST /`, which is not an S3 operation, so the gateway routes that shape to
+  an `StsService` before authentication. No new listener or configuration
+  key was needed, and `sts_web_identity` decides whether the node attaches
+  one. `PolicyArns`, `ProviderId`, unknown, and repeated parameters are
+  refused, because ignoring a narrowing parameter widens the session.
+- **The SDK's provider cannot be pointed at an endpoint directly.**
+  `ProviderConfig::with_env` is crate-private in `aws-config`, so a test
+  could not hand the web-identity provider `AWS_ENDPOINT_URL_STS`. The test
+  uses `aws_config::defaults(..).env(..)` instead, behind `aws-config`'s
+  `test-util` feature (a dev-dependency only). That exercises the default
+  credential chain configured purely by environment, as a workload is. It
+  signs with the node's manual clock as the SDK's time source, so advancing
+  the clock past expiry makes the SDK's identity cache refresh the session
+  through the chain.
+- **Test support moved behind a feature.** The token-minting `testkit`
+  was `cfg(test)`; it is now behind `skys3-sts`'s `test-util` feature so
+  the integration tests can mint tokens.
+- **Per-role session limits were left out.** AWS roles carry a
+  `MaxSessionDuration`; here `DurationSeconds` is bounded by
+  `session_maximum_seconds` only, which keeps the role register small.
+
 ## M2 Replicated shards
 
 ### M2-01 Protocol model

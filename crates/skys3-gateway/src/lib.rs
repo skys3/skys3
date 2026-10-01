@@ -12,7 +12,8 @@
 //!   ACLs other than bucket-owner-enforced), and bounds on XML bodies,
 //!   before `s3s` routes it, [`authz`] authorizes it, and `s3s` parses it
 //!   and calls the S3 operation.
-//!   [`GatewayListener`] serves it over HTTP/1.1.
+//!   [`GatewayListener`] serves it over HTTP/1.1. A `POST` to `/` goes to
+//!   the gateway's [`StsService`], if it has one, instead.
 //! - Bucket operations: CreateBucket with a mode and, for `write_back`, a
 //!   target ([`MODE_HEADER`], [`TARGET_HEADER`]); DeleteBucket, which
 //!   detaches; HeadBucket; ListBuckets; and GetBucketLocation. Bucket
@@ -121,7 +122,7 @@ pub use local::LocalShards;
 pub use objects::{MAX_OBJECT_BYTES, MAX_USER_METADATA_BYTES};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
-pub use service::{Authenticator, Gateway};
+pub use service::{Authenticator, Gateway, StsService};
 pub use shard::{ShardError, ShardRef, ShardSummary, Shards};
 pub use sigv4::{
     Authenticated, BodyError, CredentialLookup, LookupError, SecretAccessKey, SigV4Authenticator,

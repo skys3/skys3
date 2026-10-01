@@ -1,4 +1,6 @@
-//! Test keys and token minting.
+//! Test keys and token minting, for tests of token validation and STS.
+//!
+//! This module is hidden from the documentation and is not a stable API.
 
 use std::sync::{Arc, OnceLock};
 
@@ -15,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::jwt::Algorithm;
 
-pub(crate) fn b64(bytes: impl AsRef<[u8]>) -> String {
+pub fn b64(bytes: impl AsRef<[u8]>) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -37,19 +39,19 @@ enum Signer {
 
 /// A signing key with its public JWK.
 #[derive(Clone)]
-pub(crate) struct TestKey {
+pub struct TestKey {
     signer: Signer,
     kid: Option<String>,
 }
 
 impl TestKey {
     /// The first shared RSA key.
-    pub(crate) fn rsa(kid: &str) -> Self {
+    pub fn rsa(kid: &str) -> Self {
         Self::rsa_n(0, kid)
     }
 
     /// The second shared RSA key, a different key pair from [`TestKey::rsa`].
-    pub(crate) fn other_rsa(kid: &str) -> Self {
+    pub fn other_rsa(kid: &str) -> Self {
         Self::rsa_n(1, kid)
     }
 
@@ -60,7 +62,7 @@ impl TestKey {
         }
     }
 
-    pub(crate) fn ec(alg: Algorithm, kid: &str) -> Self {
+    pub fn ec(alg: Algorithm, kid: &str) -> Self {
         let curve = match alg {
             Algorithm::Es256 => &ECDSA_P256_SHA256_FIXED_SIGNING,
             Algorithm::Es384 => &ECDSA_P384_SHA384_FIXED_SIGNING,
@@ -72,7 +74,7 @@ impl TestKey {
         }
     }
 
-    pub(crate) fn ed25519(kid: &str) -> Self {
+    pub fn ed25519(kid: &str) -> Self {
         TestKey {
             signer: Signer::Ed(Arc::new(Ed25519KeyPair::generate().unwrap())),
             kid: Some(kid.to_owned()),
@@ -80,7 +82,7 @@ impl TestKey {
     }
 
     /// Returns a key for `alg`: the shared RSA key for RSA algorithms.
-    pub(crate) fn for_algorithm(alg: Algorithm, kid: &str) -> Self {
+    pub fn for_algorithm(alg: Algorithm, kid: &str) -> Self {
         match alg {
             Algorithm::Es256 | Algorithm::Es384 => Self::ec(alg, kid),
             Algorithm::EdDsa => Self::ed25519(kid),
@@ -89,13 +91,13 @@ impl TestKey {
     }
 
     /// Returns the same key without a key ID, in its JWK and its tokens.
-    pub(crate) fn without_kid(mut self) -> Self {
+    pub fn without_kid(mut self) -> Self {
         self.kid = None;
         self
     }
 
     /// The public JWK, without `alg`.
-    pub(crate) fn jwk(&self) -> Value {
+    pub fn jwk(&self) -> Value {
         let mut jwk = match &self.signer {
             Signer::Rsa(pair) => {
                 let (n, e) = rsa_components(pair.public_key().as_ref());
@@ -123,7 +125,7 @@ impl TestKey {
     }
 
     /// Mints a token signed with `alg`, with this key's `kid`.
-    pub(crate) fn sign(&self, alg: Algorithm, claims: &Value) -> String {
+    pub fn sign(&self, alg: Algorithm, claims: &Value) -> String {
         let mut header = json!({"alg": alg.name(), "typ": "JWT"});
         if let Some(kid) = &self.kid {
             header["kid"] = json!(kid);
@@ -132,7 +134,7 @@ impl TestKey {
     }
 
     /// Mints a token with an arbitrary header, signed as `alg`.
-    pub(crate) fn sign_raw(&self, alg: Algorithm, header: &Value, claims: &Value) -> String {
+    pub fn sign_raw(&self, alg: Algorithm, header: &Value, claims: &Value) -> String {
         let input = format!("{}.{}", b64(header.to_string()), b64(claims.to_string()));
         format!("{input}.{}", b64(self.signature(alg, input.as_bytes())))
     }
@@ -165,7 +167,7 @@ impl TestKey {
 
     /// Mints an `HS256` token whose HMAC key is this key's public JWK
     /// modulus or point: the classic algorithm-confusion forgery.
-    pub(crate) fn hs256_confusion(&self, claims: &Value) -> String {
+    pub fn hs256_confusion(&self, claims: &Value) -> String {
         let secret = self.jwk().to_string();
         let mut header = json!({"alg": "HS256", "typ": "JWT"});
         if let Some(kid) = &self.kid {
@@ -179,7 +181,7 @@ impl TestKey {
 }
 
 /// A JWKS document holding `keys`.
-pub(crate) fn jwks(keys: &[&TestKey]) -> String {
+pub fn jwks(keys: &[&TestKey]) -> String {
     json!({"keys": keys.iter().map(|key| key.jwk()).collect::<Vec<_>>()}).to_string()
 }
 

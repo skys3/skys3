@@ -1715,12 +1715,19 @@ dependencies = [
  "hyper-util",
  "rustls",
  "rustls-native-certs",
+ "s3s",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "skys3-config",
+ "skys3-control",
+ "skys3-gateway",
  "skys3-io",
+ "skys3-types",
  "thiserror",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

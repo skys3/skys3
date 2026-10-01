@@ -21,7 +21,9 @@ aws-lc-rs = { version = "1.18.1", default-features = false }
 aws-runtime = "1.10.0"
 aws-sdk-s3 = { version = "1.151.0", default-features = false, features = ["rt-tokio"] }
 aws-sigv4 = { version = "1.6.0", default-features = false, features = ["http1", "sign-http"] }
+aws-smithy-async = "1.3.0"
 aws-smithy-http-client = { version = "1.5.0", default-features = false, features = ["rustls-aws-lc"] }
+aws-types = "1.6.0"
 base64 = "0.23.1"
 bytes = "1.12.1"
 crc-fast = { version = "1.10.0", default-features = false }
@@ -48,6 +50,7 @@ serde_urlencoded = "0.7.1"
 sha2 = { version = "0.11.0", default-features = false }
 skys3-config = { path = "crates/skys3-config" }
 skys3-control = { path = "crates/skys3-control" }
+skys3-gateway = { path = "crates/skys3-gateway" }
 skys3-index = { path = "crates/skys3-index" }
 skys3-io = { path = "crates/skys3-io" }
 skys3-log = { path = "crates/skys3-log" }
