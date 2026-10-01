@@ -11,7 +11,7 @@ use skys3_index::Index;
 use skys3_io::{BlockingPool, SimDisk, SimMount};
 use skys3_log::{LogRecord, RecordBody, SegmentLog};
 use skys3_shard::{Pending, Role, Shard, ShardError};
-use skys3_types::{Epoch, NodeId, Seq, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, NodeId, Seq, ShardConfig};
 use support::{at, config, delete, index_config, open_log, pool, put, record, runtime, shard};
 
 fn node(n: u8) -> NodeId {
@@ -139,6 +139,15 @@ fn roles_follow_the_configuration() {
         let alone = replica.open(&config(&shard(1), 1), &node(1)).await.unwrap();
         assert_eq!(alone.role(), Role::Alone);
         assert!(alone.is_serving());
+        assert_eq!(alone.entry("k").await, Ok(None));
+        // A stopped replica serves no reads: its index may be stale.
+        alone.close().await.unwrap();
+        let stopped = alone.entry("k").await;
+        assert!(
+            matches!(stopped, Err(ShardError::Unavailable { .. })),
+            "{stopped:?}"
+        );
+        assert!(alone.check_readable().is_err());
     });
 }
 
@@ -179,6 +188,21 @@ fn a_member_takes_its_primarys_records_in_order() {
             false,
         );
         assert!(configuration_error(older).contains("epoch 0"));
+        // A record of another epoch, wrapped in an append of the member's.
+        for wrapped in [Epoch::ZERO, Epoch::new(2)] {
+            let record = LogRecord {
+                position: EpochSeq::new(wrapped, Seq::new(2)),
+                ..second.clone()
+            };
+            let bytes = record.to_bytes().unwrap();
+            let taken = member.receive(Some(session), epoch, record, bytes, false);
+            assert!(
+                matches!(&taken, Err(ShardError::InvalidRecord { reason, .. })
+                    if reason.contains("not of the replica's epoch")),
+                "{taken:?}"
+            );
+        }
+        assert_eq!(member.last_sequenced(), Seq::new(1));
         let config_record = record(at(1), RecordBody::Config(replicated()));
         let config_bytes = config_record.to_bytes().unwrap();
         let own = member.receive(Some(session), epoch, config_record, config_bytes, false);
