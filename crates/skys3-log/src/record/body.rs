@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use skys3_types::RegisterDocument;
+use skys3_types::checksum::{Checksum, ChecksumAlgorithm, Checksums};
 use skys3_types::{
     BucketId, ETag, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, VersionIdentity,
 };
@@ -55,72 +56,6 @@ pub type Metadata = BTreeMap<String, String>;
 
 /// An object's tags, keyed by tag key: at most [`MAX_TAGS`] of them.
 pub type TagSet = BTreeMap<String, String>;
-
-/// An object's client checksums (§7.4), stored so a flush forwards them and
-/// the remote verifies the same bytes. At most one per algorithm.
-pub type Checksums = BTreeMap<ChecksumAlgorithm, Vec<u8>>;
-
-/// A checksum algorithm S3 clients can supply (`x-amz-checksum-*`, and
-/// `Content-MD5`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
-pub enum ChecksumAlgorithm {
-    /// CRC-32 (`x-amz-checksum-crc32`).
-    Crc32,
-    /// CRC-32C (`x-amz-checksum-crc32c`).
-    Crc32c,
-    /// CRC-64/NVME (`x-amz-checksum-crc64nvme`).
-    Crc64Nvme,
-    /// SHA-1 (`x-amz-checksum-sha1`).
-    Sha1,
-    /// SHA-256 (`x-amz-checksum-sha256`).
-    Sha256,
-    /// MD5 (`Content-MD5`).
-    Md5,
-}
-
-impl ChecksumAlgorithm {
-    /// Every algorithm, in code order.
-    pub const ALL: [Self; 6] = [
-        Self::Crc32,
-        Self::Crc32c,
-        Self::Crc64Nvme,
-        Self::Sha1,
-        Self::Sha256,
-        Self::Md5,
-    ];
-
-    /// The algorithm's code in a record.
-    #[must_use]
-    pub const fn code(self) -> u8 {
-        match self {
-            Self::Crc32 => 1,
-            Self::Crc32c => 2,
-            Self::Crc64Nvme => 3,
-            Self::Sha1 => 4,
-            Self::Sha256 => 5,
-            Self::Md5 => 6,
-        }
-    }
-
-    /// The algorithm with `code`, if any.
-    #[must_use]
-    pub fn from_code(code: u8) -> Option<Self> {
-        Self::ALL.into_iter().find(|a| a.code() == code)
-    }
-
-    /// The length of a digest, in bytes.
-    #[must_use]
-    pub const fn digest_len(self) -> usize {
-        match self {
-            Self::Crc32 | Self::Crc32c => 4,
-            Self::Crc64Nvme => 8,
-            Self::Sha1 => 20,
-            Self::Sha256 => 32,
-            Self::Md5 => 16,
-        }
-    }
-}
 
 /// A committed object write (§5.1). A copy commits as a `PUT` that records
 /// its source (§10.1, §11).
@@ -923,10 +858,11 @@ fn write_checksums(
     checksums: &Checksums,
 ) -> Result<(), FieldError> {
     w.len8(field, checksums.len(), 0, ChecksumAlgorithm::ALL.len())?;
-    for (&algorithm, digest) in checksums {
-        check_digest(field, algorithm, digest.len())?;
+    for (&algorithm, checksum) in checksums {
+        checksum.check(algorithm).map_err(|e| invalid(field, e))?;
         w.u8(algorithm.code());
-        w.raw(digest);
+        w.raw(checksum.digest());
+        w.u16(checksum.parts().unwrap_or(0));
     }
     Ok(())
 }
@@ -938,28 +874,15 @@ fn read_checksums(r: &mut Reader<'_>, field: &'static str) -> Result<Checksums, 
         let code = r.u8(field)?;
         let algorithm = ChecksumAlgorithm::from_code(code)
             .ok_or(FieldError::new(field, Problem::InvalidTag(code)))?;
-        let digest = r.take(field, algorithm.digest_len())?.to_vec();
-        insert_sorted(field, &mut checksums, algorithm, digest)?;
+        let digest = r.take(field, algorithm.digest_len())?;
+        let checksum = match r.u16(field)? {
+            0 => Checksum::full_object(algorithm, digest),
+            parts => Checksum::composite(algorithm, digest, parts.into()),
+        }
+        .map_err(|e| invalid(field, e))?;
+        insert_sorted(field, &mut checksums, algorithm, checksum)?;
     }
     Ok(checksums)
-}
-
-fn check_digest(
-    field: &'static str,
-    algorithm: ChecksumAlgorithm,
-    len: usize,
-) -> Result<(), FieldError> {
-    if len == algorithm.digest_len() {
-        Ok(())
-    } else {
-        Err(invalid(
-            field,
-            format_args!(
-                "a {algorithm:?} digest is {} bytes, not {len}",
-                algorithm.digest_len()
-            ),
-        ))
-    }
 }
 
 /// Inserts a decoded map entry, requiring keys in strictly increasing order

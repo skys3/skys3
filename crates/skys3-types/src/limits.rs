@@ -9,6 +9,10 @@
 /// The largest single PUT S3 accepts, in bytes (5 GiB).
 pub const MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
+/// The most parts a multipart upload can have (the S3 limit), and so the
+/// largest part count of a multipart ETag or composite checksum.
+pub const MAX_PARTS: u32 = 10_000;
+
 /// The largest log record payload, in bytes (16 MiB): one inline body or one
 /// extent. `inline_max_bytes` and `extent_bytes` are at most this.
 pub const MAX_RECORD_PAYLOAD_LEN: u32 = 16 * 1024 * 1024;

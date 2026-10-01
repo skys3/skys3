@@ -1,6 +1,6 @@
 [package]
 name = "skys3-gateway"
-description = "SkyS3 S3 gateway: the S3 API on s3s and hyper, request limits, key-to-shard routing, and bucket operations."
+description = "SkyS3 S3 gateway: the S3 API on s3s and hyper, request limits, SigV4, checksums and ETags, key-to-shard routing, and bucket operations."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,11 +21,13 @@ test-util = ["skys3-control/test-util"]
 async-trait.workspace = true
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
 bytes.workspace = true
+crc-fast.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["http1", "server", "server-graceful", "tokio"] }
+md-5.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 s3s.workspace = true

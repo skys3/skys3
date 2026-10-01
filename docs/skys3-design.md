@@ -637,6 +637,21 @@ sequenceDiagram
 - A multipart upload is flushed with the client's exact part boundaries, so the remote multipart ETag equals the local one.
 - Client checksums (`x-amz-checksum-*`, `Content-MD5`) are stored and forwarded on flush, so the remote verifies the same bytes end to end. Ciphertext is never transformed.
 
+**Validation.** The gateway hashes a request body while it streams, on a hashing pool rather than the reactor, and checks every value the request supplies once the body ends: `Content-MD5`, and at most one `x-amz-checksum-*` value (CRC32, CRC32C, CRC64NVME, SHA1, or SHA256), in a header or in an `aws-chunked` trailer that `x-amz-trailer` declares. Nothing commits before the checks pass. A body uploaded without an `x-amz-checksum-*` value gets a computed CRC64NVME checksum, as S3 adds one. Failures get S3's answers:
+
+| Case | Answer |
+|---|---|
+| `Content-MD5` is not the base64 of 16 bytes | `400 InvalidDigest` |
+| `Content-MD5` or an `x-amz-checksum-*` value does not match the body, or the value is not base64 | `400 BadDigest` |
+| An `x-amz-checksum-*` value is base64 of the wrong length | `400 InvalidRequest` |
+| `x-amz-sdk-checksum-algorithm` names another algorithm than the value | `400 BadDigest` |
+| `x-amz-sdk-checksum-algorithm` without a value, more than one value, or an unknown algorithm | `400 InvalidRequest` |
+| An algorithm S3 defines that SkyS3 does not support (SHA512, `x-amz-checksum-md5`, XXHASH) | `501 NotImplemented` |
+
+SkyS3 never answers `XAmzContentChecksumMismatch`, which some S3-compatible stores use: the S3 API reference and the `s3-tests` suite expect `BadDigest`.
+
+**Stored form.** An entry and its `PUT`, `ADOPT`, and multipart records keep at most one checksum per algorithm: the digest, and for a `COMPOSITE` multipart checksum the part count, which S3 prints as `<base64>-<parts>`. Any other checksum is `FULL_OBJECT`. A composite checksum is the digest of the parts' digests in part order; CRC32, CRC32C, SHA1, and SHA256 have one. A multipart `FULL_OBJECT` checksum is a CRC combined from the parts' CRCs and lengths; CRC32, CRC32C, and CRC64NVME have one. A multipart ETag is the MD5 of the parts' MD5 digests in part order, then `-` and the part count.
+
 ### 7.5 Write-through buckets
 
 A bucket may set `ack_policy = "write_through"`. A PUT then succeeds only after the local commit **and** the remote flush. Every acknowledged write is already at the remote, so losing the local cluster loses no acknowledged data (zero RPO). The cost is at least one remote round trip on every write, plus transfer time. Streaming flush (section 7.3) hides the transfer time for large objects, but not the final round trip. Reads still benefit from the cache.
@@ -1195,7 +1210,7 @@ format = "text"               # "text" or "json"
 | Erasure coding | `reed-solomon-simd` behind a versioned `EcCodec` trait | The codec ID is stored with every stripe[^rs-simd] |
 | Intra-cluster transport | TCP with `rustls`/`tokio-rustls`, `prost` headers, raw payload frames | Simple on a LAN. Traffic between clusters uses QUIC. |
 | Identity | `aws-lc-rs` for signatures and SigV4 HMACs, `hyper-rustls` for discovery and key sets, `secrecy`, `zeroize` | Workload-token profile with explicit `azp` handling. SkyS3 parses tokens and key sets itself (section 11). |
-| Integrity | `crc32c`, `md-5`, `sha1`, `sha2`, a CRC64NVME implementation | Checksums are validated at the protocol boundary |
+| Integrity | `aws-lc-rs` (SHA-1, SHA-256), `md-5` (MD5, which `aws-lc-rs` lacks), `crc-fast` (CRC32, CRC32C, CRC64NVME, and combining CRCs of parts), `crc32c` (log records) | Checksums are validated at the protocol boundary (section 7.4). `crc-fast`, `md-5`, `sha1`, and `sha2` already come with `s3s` and the AWS SDK. |
 | Config and observability | `serde`, `toml`, `serde_json`, `tracing`, `tracing-subscriber`, `prometheus-client` | Per-node metrics registry, not a process-global one, so simulated nodes in one process keep separate metrics. The admin listener runs on `hyper`. |
 | Testing | `turmoil`, `proptest`, `cargo-fuzz` | Deterministic simulation of network, disk, and clocks[^turmoil] |
 

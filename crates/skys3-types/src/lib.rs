@@ -19,6 +19,9 @@
 //! - **Identities** ([`WriteIdentity`], [`VersionIdentity`], [`ETag`]): the
 //!   identity every flushed object carries (§7.2) and the identity of a
 //!   committed version (§9.2).
+//! - **Checksums** ([`checksum`]): the checksum algorithms S3 clients
+//!   use, `FULL_OBJECT` and `COMPOSITE` checksum types, and the stored form
+//!   of an object's checksums (§7.4).
 //! - **Limits** ([`limits`]): size limits that the log record format and
 //!   configuration loading both enforce.
 //! - **Register documents** ([`ShardConfig`], [`BucketDocument`],
@@ -38,6 +41,7 @@
 //! ```
 
 mod address;
+pub mod checksum;
 mod id;
 mod identity;
 pub mod limits;

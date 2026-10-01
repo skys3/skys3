@@ -94,13 +94,13 @@ use bytes::Bytes;
 use skys3_types::{EpochSeq, KeyHash, limits};
 
 pub use body::{
-    Adopt, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed, Import,
-    MAX_EXTENTS, MAX_KEY_LEN, MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
-    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet,
-    Tags,
+    Adopt, CopySource, Delete, Extent, ExtentRef, Flushed, Import, MAX_EXTENTS, MAX_KEY_LEN,
+    MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS,
+    MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet, Tags,
 };
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
+pub use skys3_types::checksum::{Checksum, ChecksumAlgorithm, ChecksumType, Checksums};
 
 use wire::Writer;
 

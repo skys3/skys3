@@ -7,7 +7,7 @@ use proptest::option;
 use proptest::prelude::*;
 use skys3_index::codec::{self, VALUE_FORMAT};
 use skys3_index::{ControlEntry, Entry, EntryState, ObjectVersion, Payload};
-use skys3_log::record::{ChecksumAlgorithm, CopySource, ExtentRef, ShardRef};
+use skys3_log::record::{Checksum, ChecksumAlgorithm, Checksums, CopySource, ExtentRef, ShardRef};
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, Generation, Label, Seq, ShardId, VersionIdentity,
@@ -33,10 +33,19 @@ fn text(max: usize) -> impl Strategy<Value = String> {
     proptest::string::string_regex(&format!(".{{0,{max}}}")).unwrap()
 }
 
-fn checksums() -> impl Strategy<Value = BTreeMap<ChecksumAlgorithm, Vec<u8>>> {
+fn checksums() -> impl Strategy<Value = Checksums> {
     proptest::sample::subsequence(ChecksumAlgorithm::ALL.to_vec(), 0..=6).prop_flat_map(|algs| {
         algs.into_iter()
-            .map(|a| vec(any::<u8>(), a.digest_len()).prop_map(move |d| (a, d)))
+            .map(|a| {
+                (vec(any::<u8>(), a.digest_len()), 0..=10_000_u32).prop_map(move |(d, parts)| {
+                    let checksum = if parts == 0 || !a.supports_composite() {
+                        Checksum::full_object(a, &d)
+                    } else {
+                        Checksum::composite(a, &d, parts)
+                    };
+                    (a, checksum.unwrap())
+                })
+            })
             .collect::<Vec<_>>()
             .prop_map(|pairs| pairs.into_iter().collect())
     })
@@ -224,7 +233,10 @@ fn sample_entry() -> Entry {
             write_identity: None,
             metadata: BTreeMap::from([("a".into(), "1".into()), ("b".into(), "2".into())]),
             tags: BTreeMap::new(),
-            checksums: BTreeMap::from([(ChecksumAlgorithm::Crc32, vec![1, 2, 3, 4])]),
+            checksums: BTreeMap::from([(
+                ChecksumAlgorithm::Crc32,
+                Checksum::composite(ChecksumAlgorithm::Crc32, &[1, 2, 3, 4], 2).unwrap(),
+            )]),
             storage_class: None,
             copy_source: None,
             payload: Payload::Extents(vec![ExtentRef {
@@ -264,15 +276,26 @@ fn rejects_broken_entries() {
     // An invalid payload tag: the byte before the extent count.
     assert_eq!(decode(&with(&bytes, bytes.len() - 25, 9)), "object.payload");
     // A checksum algorithm that does not exist: find the CRC32 code.
-    let crc = bytes.windows(5).position(|w| w == [1, 1, 2, 3, 4]).unwrap();
+    let crc = bytes
+        .windows(7)
+        .position(|w| w == [1, 1, 2, 3, 4, 2, 0])
+        .unwrap();
     assert_eq!(decode(&with(&bytes, crc, 99)), "object.checksums");
+    // A composite checksum of more than 10,000 parts (0x2711 = 10,001).
+    let mut part_count = bytes.clone();
+    part_count[crc + 5] = 0x11;
+    part_count[crc + 6] = 0x27;
+    assert_eq!(decode(&part_count), "object.checksums");
 }
 
 #[test]
 fn rejects_values_it_cannot_encode() {
     let mut entry = sample_entry();
     let object = entry.object.as_mut().unwrap();
-    object.checksums.insert(ChecksumAlgorithm::Sha1, vec![0; 3]);
+    object.checksums.insert(
+        ChecksumAlgorithm::Sha1,
+        Checksum::full_object(ChecksumAlgorithm::Crc32, &[0; 4]).unwrap(),
+    );
     assert_eq!(
         codec::encode_entry(&entry).unwrap_err().field(),
         "object.checksums"

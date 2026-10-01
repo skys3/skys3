@@ -703,6 +703,72 @@ of this file. A task with nothing unexpected keeps "None."
   signs and verifies many small chunks under the sanitizers) and
   `gateway_sigv4_canonical` about 440,000, with no failures.
 
+### M1-08 Checksums and ETags
+
+- **`aws-lc-rs` has no MD5.** Its `digest` module offers SHA-1
+  (`SHA1_FOR_LEGACY_USE_ONLY`) and SHA-256, which the gateway uses, but no
+  MD5, legacy or not. MD5 comes from `md-5` 0.11, already a workspace
+  dependency (M0-05) and in the tree through `s3s`. The CRCs come from
+  `crc-fast`, which `s3s` and the AWS SDK's checksums already pull in, and
+  which also combines the CRCs of consecutive ranges, as `FULL_OBJECT`
+  multipart checksums need. It is declared with `default-features = false`;
+  `s3s` turns on its `std` feature anyway, so the lock file gains no crate.
+  `crc32c` stays for log records. Design §15 lists the choices.
+- **The stored checksums could not hold a multipart checksum.** M1-01's
+  `Checksums` mapped each algorithm to a digest, with no checksum type, so a
+  `COMPOSITE` checksum (`<base64>-<parts>`) from an `ADOPT` of a remote
+  multipart object, or from a completed upload, had no representation.
+  `ChecksumAlgorithm` moved to `skys3_types::checksum` (`skys3-log`
+  re-exports it), and the map's value is now a `Checksum`: the digest and,
+  for a composite checksum, the part count. Log records and index values
+  encode a `u16` part count after each digest, zero for `FULL_OBJECT`; the
+  format versions stay at 1 because no release has written either.
+  `ChecksumAlgorithm` is no longer `#[non_exhaustive]`: every algorithm
+  needs a hasher, so a new one must break every `match`.
+- **The S3 error documentation was unreachable.** The sandbox's proxy
+  refuses `docs.aws.amazon.com`, so the error mapping comes from the S3 API
+  reference text in the `aws-sdk-s3` crate (`BadDigest` when
+  `x-amz-sdk-checksum-algorithm` names another algorithm), from the Ceph
+  `s3-tests` suite (`InvalidDigest` and `BadDigest` for `Content-MD5`, and
+  `BadDigest` for the checksum value `bad`), and from S3's message for a
+  value of the wrong length (`InvalidRequest`, "Value for
+  x-amz-checksum-crc32 header is invalid."). Telling a value that is not
+  base64 (`BadDigest`) from base64 of the wrong length (`InvalidRequest`)
+  reconciles the last two; the SDK matrix (M1-25) and the provider runs
+  (M1-26) should confirm it against S3. `XAmzContentChecksumMismatch`,
+  which the task suggested, is a code MinIO uses and none of these S3
+  sources has; SkyS3 never sends it.
+- **Known answers from `s3-tests`.** Besides the CRC catalogue's check
+  values and the FIPS 180 and RFC 1321 examples, the tests use the suite's
+  three 5 MiB parts: each part's checksum in all five algorithms, the
+  composite SHA1 and SHA256 checksums, the combined CRC32, CRC32C, and
+  CRC64NVME checksums, and the multipart ETag. All matched on the first run.
+- **S3 adds a CRC64NVME checksum.** Since late 2024 S3 stores a CRC64NVME
+  checksum with every object uploaded without one, and returns it with
+  `x-amz-checksum-mode: ENABLED`; the validator does the same, at the cost
+  of one CRC pass beside the MD5. Whether a flush forwards that checksum is
+  the flusher's decision (M1-16), since some providers reject flexible
+  checksums (M1-15).
+- **Hashing on the pool is batched.** A pool job per body frame would cost
+  a thread handoff every few KiB. `PooledHasher` hands the pool 256 KiB at
+  a time, keeps one batch in flight while the caller reads on, and waits
+  only when a second batch is full, so at most two batches are held. The
+  `x-amz-content-sha256` hash moved onto it too, through
+  `SigV4Authenticator::with_hashing_pool`; without a pool (tests, fuzzing)
+  it hashes inline. The SHA-256 of each signed `aws-chunked` chunk still
+  runs in the decoder, on the reactor: the decoder checks a chunk's
+  signature before it yields the chunk's last byte, so moving that hash
+  needs an asynchronous decoder. The SDKs' default upload form,
+  `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, has no chunk signatures.
+- **No object operation uses it yet.** `ChecksumValidator` takes the
+  decoded body chunk by chunk and returns the MD5 ETag and the checksums
+  to store, and `MultipartEtag` and `MultipartChecksum` fold part digests;
+  PUT and GET (M1-09) and multipart uploads (M1-12) call them.
+- **Fuzzing.** `gateway_checksums` reads checksum headers and stored
+  checksum values; it ran about 500,000 inputs in 30 s with no failures.
+  `log_record` and `index_codec`, whose checksum encodings changed, ran
+  20 s each without failures.
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s

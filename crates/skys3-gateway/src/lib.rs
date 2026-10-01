@@ -26,6 +26,11 @@
 //!   [`CredentialLookup`] and records the caller in an [`Authenticated`]
 //!   request extension.
 //!
+//! - [`checksum`]: checksum validation of request bodies, on a blocking
+//!   pool, for CRC32, CRC32C, CRC64NVME, SHA1, SHA256, and `Content-MD5`
+//!   (trailing checksums included), MD5 ETags, and multipart ETags and
+//!   checksums. Object operations (plan M1-09) use it.
+//!
 //! The gateway serves path-style requests. Authorization arrives with plan
 //! M1-07b; until then nothing outside tests constructs a gateway, and the
 //! node binary does not serve one.
@@ -65,6 +70,7 @@
 
 mod api;
 mod buckets;
+pub mod checksum;
 mod features;
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
