@@ -89,6 +89,35 @@ fn prefixes_must_end_with_a_slash_and_leave_room_for_keys() {
     }
 }
 
+/// Configuration validation and the backend agree on the longest prefix,
+/// so a configuration that loads never fails at startup.
+#[test]
+fn configuration_and_backend_bound_the_prefix_alike() {
+    assert_eq!(
+        S3ControlStore::<SimS3>::MAX_PREFIX_LEN,
+        skys3_config::ControlStoreConfig::MAX_PREFIX_LEN
+    );
+    let load = |prefix: &str| {
+        format!(
+            "[cluster]\ncluster_id = \"c\"\n[control_store]\nbackend = \"s3\"\n\
+             endpoint = \"https://r2.example\"\nbucket = \"ctl\"\nprefix = \"{prefix}\""
+        )
+        .parse::<skys3_config::Config>()
+    };
+    let longest = format!(
+        "{}/",
+        "p".repeat(S3ControlStore::<SimS3>::MAX_PREFIX_LEN - 1)
+    );
+    let loaded = load(&longest).unwrap();
+    let config = S3StoreConfig {
+        prefix: loaded.control_store().prefix.clone(),
+        ..config()
+    };
+    let objects = SimS3::new(0, SimS3Config::default());
+    assert!(S3ControlStore::new(objects, config).is_ok());
+    assert!(load(&format!("p{longest}")).is_err());
+}
+
 #[tokio::test]
 async fn registers_are_json_objects_under_the_prefix() {
     let store = store();
@@ -447,6 +476,37 @@ async fn change_streams_poll_cluster_json_with_if_none_match() {
     assert_eq!(deleted.unwrap(), DeleteOutcome::Deleted);
     let error = changes.next().await.unwrap_err();
     assert!(matches!(error, ControlError::NotBootstrapped), "{error}");
+}
+
+/// Why the probe checks listings: a change stream lists the registers once
+/// per generation it observes, so a listing that lags the writes it
+/// announces loses them until the next increment.
+#[tokio::test(start_paused = true)]
+async fn a_lagging_listing_would_hide_announced_writes() {
+    let store = store();
+    let cluster = "skys3-prod-a".parse().unwrap();
+    let policy = RetryPolicy::default();
+    let mut ids = ProposalIds::seeded(5);
+    bootstrap(&store, &cluster, ids.next_id(), &policy)
+        .await
+        .unwrap();
+    let mut changes = store.changes(Generation::ZERO).await.unwrap();
+    assert!(changes.next().await.unwrap().snapshot);
+    let version = create(&store, "buckets/b.json").await;
+    bump_generation(&store, &cluster, &mut ids, &policy)
+        .await
+        .unwrap();
+    store
+        .objects()
+        .inject(Operation::ListObjectsV2, Fault::StaleRead);
+    let missed = changes.next().await.unwrap();
+    assert!(missed.registers.is_empty(), "{missed:?}");
+    // It appears only once another increment makes the stream list again.
+    bump_generation(&store, &cluster, &mut ids, &policy)
+        .await
+        .unwrap();
+    let late = changes.next().await.unwrap();
+    assert_eq!(late.registers, [(key("buckets/b.json"), Some(version))]);
 }
 
 async fn create_on<O: ObjectStore>(store: &S3ControlStore<O>, k: &str) -> Version {

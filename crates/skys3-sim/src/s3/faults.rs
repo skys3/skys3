@@ -58,9 +58,11 @@ pub enum Fault {
     Conflict,
     /// A `GetObject` or `HeadObject` of a key's current object answers with
     /// what the key held before its latest write, or `404 NoSuchKey` if it
-    /// held nothing, as an eventually consistent store may. Reads of a
-    /// specific version, reads of a key never written, and other operations
-    /// are unaffected.
+    /// held nothing, as an eventually consistent store may. A
+    /// `ListObjectsV2` lists every key as it was before its latest write:
+    /// a new key is missing, a deleted one is still listed, and an
+    /// overwritten one has its old ETag. Reads of a specific version, keys
+    /// never written, and other operations are unaffected.
     StaleRead,
 }
 
@@ -70,8 +72,9 @@ pub enum Fault {
 /// which must sum to at most 1, and independently two delays within
 /// `min_delay..=max_delay`: one before the store applies the request and
 /// one before the caller gets the response. A read is also stale with
-/// `stale_read_probability`, independently of the rest. The default injects
-/// nothing and never sleeps.
+/// `stale_read_probability`, and a listing with `stale_list_probability`,
+/// independently of the rest. The default injects nothing and never
+/// sleeps.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SimS3Faults {
     /// The shortest delay of each leg of a request.
@@ -86,9 +89,13 @@ pub struct SimS3Faults {
     pub lost_request_probability: f64,
     /// The probability of [`Fault::LostResponse`].
     pub lost_response_probability: f64,
-    /// The probability that a read is [`Fault::StaleRead`], drawn apart
-    /// from the error faults: a store without read-after-write consistency.
+    /// The probability that a `GetObject` or `HeadObject` is
+    /// [`Fault::StaleRead`], drawn apart from the error faults: a store
+    /// without read-after-write consistency.
     pub stale_read_probability: f64,
+    /// The probability that a `ListObjectsV2` is [`Fault::StaleRead`]: a
+    /// store whose listings lag its writes.
+    pub stale_list_probability: f64,
 }
 
 impl SimS3Faults {
@@ -101,6 +108,7 @@ impl SimS3Faults {
         lost_request_probability: 0.0,
         lost_response_probability: 0.0,
         stale_read_probability: 0.0,
+        stale_list_probability: 0.0,
     };
 
     /// A store that is down: every request fails with `500 InternalError`.
@@ -125,7 +133,8 @@ impl SimS3Faults {
         assert!(
             probabilities.iter().all(|p| (0.0..=1.0).contains(p))
                 && probabilities.iter().sum::<f64>() <= 1.0 + f64::EPSILON
-                && (0.0..=1.0).contains(&self.stale_read_probability),
+                && (0.0..=1.0).contains(&self.stale_read_probability)
+                && (0.0..=1.0).contains(&self.stale_list_probability),
             "fault probabilities must be within 0..=1 and sum to at most 1: {self:?}"
         );
         assert!(
@@ -208,8 +217,13 @@ impl Injector {
         plan.fault = random;
         // Drawn only when enabled, so profiles without stale reads keep the
         // generator's sequence, and the seeds recorded for them, unchanged.
-        if faults.stale_read_probability > 0.0 {
-            plan.stale = self.rng.random_bool(faults.stale_read_probability);
+        let stale = match operation {
+            Operation::GetObject | Operation::HeadObject => faults.stale_read_probability,
+            Operation::ListObjectsV2 => faults.stale_list_probability,
+            _ => 0.0,
+        };
+        if stale > 0.0 {
+            plan.stale = self.rng.random_bool(stale);
         }
 
         if let Some(index) = self.scripted.iter().position(|&(op, _)| op == operation) {
@@ -261,6 +275,7 @@ mod tests {
             lost_request_probability: 0.3,
             lost_response_probability: 0.4,
             stale_read_probability: 0.0,
+            stale_list_probability: 0.0,
         });
         let mut counts = [0_u32; 4];
         for _ in 0..10_000 {
@@ -316,6 +331,20 @@ mod tests {
         assert!(plans.iter().all(|p| p.fault == Some(Fault::LostResponse)));
         let stale = plans.iter().filter(|p| p.stale).count();
         assert!(stale.abs_diff(500) < 100, "{stale}");
+
+        // Listings and other operations draw from their own probability.
+        let mut lists = injector(SimS3Faults {
+            stale_read_probability: 1.0,
+            ..SimS3Faults::NONE
+        });
+        assert!(!lists.plan(Operation::ListObjectsV2).stale);
+        assert!(!lists.plan(Operation::PutObject).stale);
+        let mut lists = injector(SimS3Faults {
+            stale_list_probability: 1.0,
+            ..SimS3Faults::NONE
+        });
+        assert!(lists.plan(Operation::ListObjectsV2).stale);
+        assert!(!lists.plan(Operation::HeadObject).stale);
 
         let mut scripted = injector(SimS3Faults::NONE);
         scripted.script(Operation::GetObject, Fault::StaleRead);

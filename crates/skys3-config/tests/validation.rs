@@ -650,7 +650,15 @@ fn s3_backend_rules() {
 
 #[test]
 fn prefix_rules() {
-    for prefix in ["", "/", "no-slash", "/abs/", "has space/"] {
+    let too_long = format!("{}/", "p".repeat(512));
+    for prefix in [
+        "",
+        "/",
+        "no-slash",
+        "/abs/",
+        "has space/",
+        too_long.as_str(),
+    ] {
         assert_control_store_violations(
             &format!("etcd_endpoints = [\"http://e\"]\nprefix = \"{prefix}\""),
             &["control_store.prefix"],

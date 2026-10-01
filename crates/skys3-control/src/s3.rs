@@ -110,6 +110,11 @@ enum Polled {
 }
 
 impl<O: ObjectStore> S3ControlStore<O> {
+    /// The longest prefix, in bytes: S3's object-key limit less the
+    /// longest register key, so that every register fits. Configuration
+    /// validation applies the same bound to `[control_store] prefix`.
+    pub const MAX_PREFIX_LEN: usize = skys3_remote::MAX_KEY_LEN - RegisterKey::MAX_LEN;
+
     /// A store whose registers are the objects of `objects` under
     /// `config.prefix`.
     ///
@@ -122,7 +127,7 @@ impl<O: ObjectStore> S3ControlStore<O> {
         let prefix = &config.prefix;
         let reason = if !prefix.is_empty() && !prefix.ends_with('/') {
             Some("an S3 control-store prefix must be empty or end with '/'")
-        } else if prefix.len() + RegisterKey::MAX_LEN > skys3_remote::MAX_KEY_LEN {
+        } else if prefix.len() > Self::MAX_PREFIX_LEN {
             Some("an S3 control-store prefix is at most 512 bytes")
         } else {
             None
