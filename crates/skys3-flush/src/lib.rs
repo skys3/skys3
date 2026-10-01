@@ -18,19 +18,25 @@
 //!   succeeded, an earlier write of the shard is superseded, and anything
 //!   else is a conflict, held under the `hold` policy. Operations the
 //!   capability probe found unprotected are sent unconditionally.
+//! - **Multipart objects** (§7.4) are sent as a remote multipart upload
+//!   with the client's part boundaries, so the remote ETag is the local
+//!   one. The remote `CreateMultipartUpload` carries the write identity of
+//!   the upload's `MPU_CREATE`, and the `CompleteMultipartUpload` carries
+//!   the precondition. An upload that does not complete is aborted, and
+//!   one whose abort fails is kept by the [`Target`] to abort later.
 //! - **Tags** (`TAGS`) need no request of their own: a version made by
-//!   `TAGS` is flushed like any other, a conditional `PutObject` of the
-//!   bytes with the new tags and the `TAGS` record's write identity.
+//!   `TAGS` is flushed like any other, the bytes uploaded again with the
+//!   new tags and the `TAGS` record's write identity.
 //! - [`Target`]: what the flushers of one target share: the store, the
-//!   probe's findings, the in-flight byte budget, and the settings
-//!   ([`FlushSettings`]).
+//!   probe's findings, the in-flight byte budget, the settings
+//!   ([`FlushSettings`]), and the remote uploads left to abort.
 //! - [`FlushService`]: every flusher of a node, following its buckets and
 //!   open shards, with each target's capability probe.
 //! - [`FlushMetrics`]: `dirty_bytes`, `oldest_dirty_age`,
 //!   `flush_lag_seconds`, and conflict counts, by bucket.
 //!
-//! Multipart uploads are flushed by plan M1-16b, which adds a request kind
-//! to the attempt; adaptive concurrency (M4-10) replaces the fixed
+//! Streaming multipart flush (M4-02) opens the remote upload while the
+//! client uploads; adaptive concurrency (M4-10) replaces the fixed
 //! [`FlushSettings::concurrency`]; and the dirty budget (M1-17) reads the
 //! flushers' [`ShardStatus`].
 //!
@@ -44,6 +50,7 @@
 
 mod attempt;
 mod metrics;
+mod multipart;
 mod service;
 mod shard;
 mod target;

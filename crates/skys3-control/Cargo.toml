@@ -1,6 +1,6 @@
 [package]
 name = "skys3-control"
-description = "SkyS3 control store: the ControlStore interface, the register layout, the lost-response rule, cluster bootstrap, change feeds, the startup probe, and the in-memory, file, and S3 backends."
+description = "SkyS3 control store: the ControlStore interface, the register layout, the lost-response rule, cluster bootstrap, change feeds, the startup probe, and the in-memory, file, S3, and etcd backends."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,7 +18,13 @@ test-util = []
 
 [dependencies]
 bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+hyper = { workspace = true, features = ["client", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+prost.workspace = true
 rand.workspace = true
+rustls = { workspace = true, features = ["aws_lc_rs", "std"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -26,13 +32,18 @@ skys3-io.workspace = true
 skys3-remote.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs"] }
 
 [dev-dependencies]
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http2", "server"] }
+proptest.workspace = true
+rcgen.workspace = true
 # Enables `test-util` for this crate's own tests.
 skys3-control = { path = ".", features = ["test-util"] }
 skys3-config.workspace = true
 skys3-sim.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "test-util", "time"] }
 turmoil.workspace = true

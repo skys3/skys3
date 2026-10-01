@@ -98,6 +98,32 @@ async fn puts_keep_tags_and_check_content_md5() {
 }
 
 #[tokio::test]
+async fn multipart_uploads_keep_tags_and_check_content_md5() {
+    let store = store();
+    let tags = std::collections::BTreeMap::from([("team".to_owned(), "a".to_owned())]);
+    let create = CreateMultipartUpload::new("m").with_tags(tags.clone());
+    let upload_id = store.create_multipart_upload(create).await.unwrap();
+    let wrong = UploadPart::new("m", upload_id.clone(), 1, "other")
+        .with_content_md5("XUFAKrxLKna5cZ2REBfFkg==");
+    let error = store.upload_part(wrong).await.unwrap_err();
+    assert_eq!((error.status(), error.code()), (Some(400), "BadDigest"));
+    let part = UploadPart::new("m", upload_id.clone(), 1, "hello")
+        .with_content_md5("XUFAKrxLKna5cZ2REBfFkg==");
+    let etag = store.upload_part(part).await.unwrap();
+    let request = CompleteMultipartUpload {
+        key: "m".into(),
+        upload_id,
+        parts: vec![CompletedPart {
+            part_number: 1,
+            etag,
+        }],
+        precondition: WritePrecondition::None,
+    };
+    store.complete_multipart_upload(request).await.unwrap();
+    assert_eq!(store.tags("m"), Some(tags));
+}
+
+#[tokio::test]
 async fn put_get_and_head_round_trip() {
     let store = store();
     let mut metadata = UserMetadata::new();
@@ -386,6 +412,7 @@ async fn upload(
                 upload_id: upload_id.clone(),
                 part_number,
                 body: Bytes::from_static(body.as_bytes()),
+                content_md5: None,
             })
             .await
             .unwrap();
@@ -762,6 +789,34 @@ async fn lost_responses_hide_applied_writes() {
     assert_eq!(store.stats().lost_responses, 16);
 }
 
+#[tokio::test(start_paused = true)]
+async fn successes_whose_answer_never_arrives_are_counted() {
+    let store = store();
+    let create = || store.create_multipart_upload(CreateMultipartUpload::new("m"));
+    create().await.unwrap();
+    // A failure is not counted, even if its answer is lost.
+    store.inject(Operation::CreateMultipartUpload, Fault::InternalError);
+    create().await.unwrap_err();
+    store.inject(Operation::CreateMultipartUpload, Fault::LostResponse);
+    create().await.unwrap_err();
+    assert_eq!(store.unanswered(Operation::CreateMultipartUpload), 1);
+    // Nor is a caller that gives up before the store applies the request;
+    // one that gives up while the answer is on its way is.
+    store.set_faults(SimS3Faults {
+        min_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        ..SimS3Faults::NONE
+    });
+    for (patience, uploads) in [(5, 2), (15, 3)] {
+        let wait = Duration::from_millis(patience);
+        tokio::time::timeout(wait, create()).await.unwrap_err();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(store.uploads().len(), uploads);
+    }
+    assert_eq!(store.unanswered(Operation::CreateMultipartUpload), 2);
+    assert_eq!(store.unanswered(Operation::PutObject), 0);
+}
+
 #[tokio::test]
 async fn a_lost_conditional_create_is_recognized_by_its_write_identity() {
     // The §7.2 recovery rule: the retry fails its precondition, and a HEAD
@@ -981,6 +1036,7 @@ async fn random_faults_hit_every_operation() {
         upload_id: upload_id.clone(),
         part_number: 1,
         body: Bytes::new(),
+        content_md5: None,
     };
     assert_eq!(kind(store.upload_part(part).await), internal);
     let request = complete("m", &upload_id, Vec::new(), WritePrecondition::None);
@@ -1061,6 +1117,7 @@ async fn multipart_uploads_have_s3_etags() {
                 upload_id: upload_id.clone(),
                 part_number,
                 body: Bytes::from(body),
+                content_md5: None,
             })
             .await
             .unwrap();
@@ -1095,6 +1152,7 @@ async fn completing_uses_only_the_named_parts_and_the_latest_upload_of_each() {
             upload_id: upload_id.clone(),
             part_number: 1,
             body: Bytes::from("AAAA"),
+            content_md5: None,
         })
         .await
         .unwrap();
@@ -1151,6 +1209,7 @@ async fn uploads_are_found_by_id_and_key() {
         upload_id: upload_id.clone(),
         part_number,
         body: Bytes::from("x"),
+        content_md5: None,
     };
     assert_eq!(
         kind(store.upload_part(part("other", 1)).await),

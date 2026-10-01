@@ -1066,6 +1066,30 @@ of this file. A task with nothing unexpected keeps "None."
   compare. With `x-amz-checksum-algorithm`, the copy stores that
   algorithm's checksum, reused from the source only when it is a
   full-object one. Design §11 records it.
+- **Writes could store and copy tags without the tagging actions.**
+  Review found that PutObject and CreateMultipartUpload with
+  `x-amz-tagging`, and CopyObject, needed only `s3:PutObject`, so a caller
+  denied `s3:PutObjectTagging` could still set tags, and one denied
+  `s3:GetObjectTagging` could copy a source's tags. As in S3, a write that
+  gives tags now also needs `s3:PutObjectTagging`, checked in the
+  operation's access hook, and a copy of a tagged source with the `COPY`
+  tagging directive also needs `s3:GetObjectTagging` on the source and
+  `s3:PutObjectTagging` on the copy. Whether the source has tags is known
+  only once the operation reads it, so the hook leaves its decision in a
+  `CopiedTags` extension, stripped from incoming requests like
+  `KeyDecisions`; the copy fails closed without it. An empty
+  `x-amz-tagging` still needs the action, and copies of untagged sources
+  need neither. The S3 documentation was unreachable from the sandbox; the
+  rule follows the AWS guidance that copying tagged objects needs both
+  tagging actions, and the SDK matrix (M1-25) should confirm it. The
+  authorization table gained rows for tagged writes and copies, and a test
+  checks that callers denied the tagging actions still write untagged
+  objects.
+- **A self-copy that only set a storage class or website redirect was
+  accepted and lost.** S3 counts either as a change, but SkyS3 stores
+  neither (PutObject accepts and ignores them, M1-09), so such a copy
+  answered success and changed nothing. It is now refused like any copy
+  onto itself that does not replace the metadata.
 - **Imported and adopted objects can carry a write identity.** Their
   metadata comes from the remote, so a `COPY` directive would have copied
   `x-amz-meta-skys3-wid` into the copy, naming another write. Copies drop
@@ -1422,6 +1446,11 @@ of this file. A task with nothing unexpected keeps "None."
   with a random `SKYS3_KILL_SEED`. 25 rounds in a debug build took 31 s,
   with about 3,700 operations of which 32 writes were cut off by a kill.
   The process helpers of `binary.rs` moved to `tests/support/process.rs`.
+- **Multipart objects are flushed now.** Rebased onto M1-16b, the
+  harness's flusher sends completed multipart uploads to the remote store
+  instead of parking them, so the `write_back` checks also cover them: the
+  remote ETag of a flushed upload is its multipart ETag, which is the value
+  the history records. The harness needed no change for it.
 - **Left open.** The kill loop has only a `local` bucket: no S3 server in
   the tests keeps `x-amz-meta-skys3-wid` and honors preconditions (M1-16's
   note), so the binary's flush path stays covered by the simulation only.
@@ -1590,6 +1619,26 @@ of this file. A task with nothing unexpected keeps "None."
   and not superseding the shard's own earlier writes. No fuzz target was
   added: the flusher parses nothing new (write identities go through the
   existing `WriteIdentity` parser).
+- **Subscribing cannot miss a write being applied (PR review).** The
+  apply pipeline used to take the shard's subscriber before applying a
+  batch. A flusher that subscribed and scanned while the batch was applied
+  then found the write neither in the index nor in its stream, and never
+  flushed it. The pipeline now takes the subscriber after the index holds
+  the batch, under the same lock that advances the applied position.
+  - A subscriber that was there by then hears of the write.
+  - A later subscriber's scan finds the write in the index.
+  - A write may reach a subscriber both ways; the flusher ignores a
+    version it already tracks.
+  - The test `a_subscription_during_an_apply_hears_of_it` holds the
+    index's write lock so that an apply stays in flight, then subscribes
+    and scans. It fails without the fix.
+- **Errors clear once their key gets past them (PR review).** The status
+  kept the latest flush error forever, even after its key had flushed.
+  The flusher now keeps each key's latest error. It drops that error when
+  a later attempt flushes or settles the key, or finds it in conflict or
+  awaiting multipart flush, and when the key is no longer tracked.
+  `last_error` is the newest error still held, so one key's recovery does
+  not hide another key that is still failing.
 - **Multipart objects wait for M1-16b.** The flusher's branch merges M1-12.
   A completed multipart object (`Payload::Parts`) cannot be flushed as one
   `PutObject`: that would give it an MD5 ETag rather than the multipart
@@ -1619,6 +1668,66 @@ of this file. A task with nothing unexpected keeps "None."
   M4-03. Concurrency is fixed at `flush_min_concurrency_per_shard` until
   M4-10. A conflict is not persisted, so after a restart it is
   re-detected rather than remembered.
+
+### M1-16b Multipart flush after commit
+
+- **The remote upload ID stays in memory.** Design §7.3 keeps remote
+  upload IDs in the shard log, but that is for streaming (M4-02), where an
+  upload outlives the request that opened it. A flush after commit opens,
+  fills, and completes its upload within one attempt, so it logs nothing.
+  A Complete whose answer is lost is resolved by aborting the upload:
+  `404 NoSuchUpload` means it is gone, and a HEAD that finds the version's
+  `MPU_CREATE` identity means the flush is done, without a retry that
+  would upload every part again. When the abort fails too, the next
+  attempt completes a new upload conditioned on the old ETag, gets `412`,
+  and the HEAD finds the identity (§7.2); a test scripts both paths.
+- **Abandoned remote uploads cannot be found by identity.** The plan
+  suggested listing them. `ObjectStore` has no `ListMultipartUploads`, and
+  S3's answer to it carries the key, upload ID, and initiation time but no
+  user metadata, so it could not tell SkyS3's uploads from another
+  writer's. The target instead keeps the uploads it knows are open: an
+  abort that failed, and, through a drop guard, the upload of an attempt
+  that was cancelled because its flusher stopped. The next multipart
+  flush to the target aborts up to 16 of them first. What is lost with the
+  node's memory, or was never known (a lost `CreateMultipartUpload`
+  answer), is left to the abort-incomplete-uploads lifecycle rule of
+  §7.3, as the design already says; M4-02's logged upload IDs cover the
+  streaming case. M5-10 is cleanup for local buckets and does not apply.
+- **The awaiting-multipart status was repurposed.** With multipart
+  objects flushed, nothing waits. `Phase::AwaitsMultipart` and the
+  admin field `awaiting_multipart` are gone. The admin field was added in
+  M1-16 and never released, so removing it does not break the rule that
+  admin fields are only added (§12). The gauge became
+  `skys3_flush_orphaned_uploads`, the uploads the target holds to abort,
+  and the admin flush status shows the same count as `orphaned_uploads`.
+- **The remote model was missing fields.** `CreateMultipartUpload` had no
+  standard headers or tags, and `UploadPart` no `Content-MD5`, so a
+  multipart flush could not carry what a `PutObject` carries. Both gained
+  them, in the AWS client and in `SimS3`, which also dropped the tags of
+  a completed upload. Each part is sent with the `Content-MD5` its local
+  part ETag already is. A `TAGS` change of a multipart object uploads its
+  parts again as a multipart upload with the `TAGS` identity, so its ETag
+  stays; §7.2's table says so.
+- **The simulation rarely reached the 412 recovery.** The abort resolves
+  most lost Complete answers at once, so treating a found
+  `MPU_CREATE` identity as a conflict failed only at seed 295. The
+  scenario now loses the answer to a third of its multipart completions,
+  half of them with a failed abort as well, and that mutation fails at
+  seed 9. To check aborts exactly, `SimS3::unanswered(operation)` counts
+  successful requests whose answer never reached the caller (lost, or
+  abandoned by a caller that stopped waiting); at the end, the open
+  remote uploads must be exactly the unanswered `CreateMultipartUpload`
+  requests. Not aborting after a failed part, and not handing a cancelled
+  attempt's upload to the target, each fail at seed 0. 300 seeds take
+  about 50 seconds.
+- **Left open.** Parts are uploaded one at a time from the local log,
+  each within the in-flight budget; concurrent parts and resuming a
+  partly uploaded object belong to the streaming PRs (M4-02, M4-03). Some
+  S3-compatible providers constrain parts beyond S3's 5 MiB minimum (R2
+  documents that every part but the last must have the same size); a
+  client upload that breaks such a rule cannot be reproduced there, and
+  its flush is retried with the provider's error. The provider tests of
+  M1-26 should cover it.
 
 ### M1-23 OIDC token validation
 
@@ -1908,6 +2017,19 @@ of this file. A task with nothing unexpected keeps "None."
   that; the driver kills or crashes the disks before it crashes the host.
   A node with a failed sync is always restarted with a power loss, as
   M1-02 requires.
+- **Heals must end their own fault.** Review found that the driver's
+  heals were not scoped: the fallback power-loss restart of a failed sync
+  (the fence) also hit the process that replaced the failed one after a
+  crash or a supervisor restart, overlapping control-store windows that
+  ended out of start order removed the oldest one's effect instead of
+  their own, and the end of any message-loss window stopped all loss. The
+  driver now counts each node's processes and a fence applies only to
+  the process whose sync failed (moving to the next one if the node was
+  down when the sync failed), and each loss or control-store window has
+  an identity and ends on its own; what is in force is recomputed from
+  the windows still open. Overlapping loss windows give the highest rate,
+  as overlapping lost-response windows give the highest probability.
+  `Report::fences` counts the fences a run forced.
 - **A transient control-store error fails a node's start.**
   `Buckets::reload`, which `Gateway::new` calls, lists `buckets/` without
   retries, so one lost answer stops a starting node. The node binary has
@@ -2042,3 +2164,80 @@ of this file. A task with nothing unexpected keeps "None."
   applies `ControlStoreConfig::MAX_PREFIX_LEN`, and a test in
   `skys3-control` checks that it equals the backend's bound, derived from
   `skys3-remote`, which `skys3-config` does not depend on.
+
+### M2-05 etcd control-store backend
+
+- **No `etcd-client`.** The plan's client crate, `etcd-client` 0.20 (tonic
+  0.14, prost 0.14), compiles etcd's `.proto` files in its build script
+  with `tonic-prost-build`, so every machine and CI job that builds the
+  workspace would need `protoc`. It also adds about 25 crates (tonic's
+  `axum` router, `prost-build`, `petgraph`, `pulldown-cmark`), and
+  `cargo deny` fails on three new duplicates: `base64` 0.22 beside the
+  workspace's 0.23, and `hashbrown` 0.15 and `foldhash` 0.1. The backend
+  instead carries its own client for the three calls it uses
+  (`KV.Range`, `KV.Txn`, `Watch.Watch`): hand-written `prost` messages, a
+  field-for-field subset of etcd 3.6's `rpc.proto` and `kv.proto`, over
+  `hyper`'s HTTP/2 client, with `rustls` and `aws-lc-rs` for `https://`
+  endpoints. No new crate entered the tree. Tests decode responses
+  captured from etcd 3.6.10 with `etcdctl -w protobuf`, so a wrong field
+  number fails a test. Design §6.1 and §15 record the choice.
+- **gRPC framing is untrusted input.** The 5-byte message prefix is
+  checked against a 4 MiB limit before anything is buffered for the
+  message, and a compressed message (never asked for) is refused. A
+  proptest splits framed streams at random points, and the fuzz target
+  `control_etcd_frame` feeds the decoder, the Protobuf responses, and the
+  status trailers.
+- **Which etcd errors may hide a write.** etcd answers "request timed
+  out", "leader changed", and "no leader" with `UNAVAILABLE`, but a
+  proposal that timed out can still commit, so a write answered with
+  `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `CANCELLED`, `ABORTED`, `INTERNAL`,
+  or `UNKNOWN`, or not answered, is `Indeterminate` and goes to the
+  lost-response rule; for reads these are `Unavailable`.
+  `RESOURCE_EXHAUSTED` ("too many requests", the space quota) applied
+  nothing. A failed comparison is not a gRPC error (`succeeded = false`),
+  so `FAILED_PRECONDITION`, like `PERMISSION_DENIED` and
+  `UNAUTHENTICATED`, is `Rejected`. Only a request that never left (no
+  connection to any endpoint) is `Unavailable` for a write. A call without
+  an answer drops the connection and moves to the next endpoint, and so
+  does a transient status (review): a member cut off from its quorum
+  still answers over TCP, with `UNAVAILABLE`, so moving only on missing
+  answers kept every retry, and the lost-response re-read, on that
+  member. HTTP/2
+  pings every 10 seconds while a call is open (etcd refuses pings more
+  often than every 5) detect a dead watch connection; idle connections
+  are not pinged, since etcd counts pings without streams against the
+  client.
+- **The watch only wakes the shared feed.** `changes()` opens a watch on
+  `cluster.json`, returns once etcd confirms it, and hands the shared
+  `ChangeFeed` a wake-up channel, so the delivery rules stay the ones
+  every backend shares. Watches start at the current revision, so none
+  is compacted at creation. When etcd ends, cancels, or compacts a
+  watch, or the connection breaks, the task opens it again after a second
+  and wakes the feed once; the feed reads the generation, which covers
+  writes made while no watch was open. The task ends when the feed is
+  dropped. Tests against an in-process fake etcd check each case with
+  the feed already waiting, which only the watch can wake.
+- **Listings are paged at one revision.** A listing reads 1,000 keys a
+  page, every page after the first at the first one's revision, and
+  starts over (three times at most) if that revision is compacted away
+  between pages.
+- **Tests with and without etcd.** `tests/etcd.rs` runs the conformance
+  suite, the startup probe with writers on separate connections, a
+  listing of 2,005 registers, endpoint failover, and watch delivery
+  against the etcd in `SKYS3_ETCD_ENDPOINTS`, and returns at once, saying
+  so, when it is unset. The new `etcd` CI job runs it against the pinned
+  `gcr.io/etcd-development/etcd:v3.6.10` service container; the image has
+  no shell, so the job polls `/health` in a bounded loop instead of a
+  container health check. Error paths, TLS, and watch restarts run in
+  every job against `etcd::fake`, an in-process stand-in on `hyper`'s
+  HTTP/2 server, which also passes the conformance suite. Locally, all of
+  it passed against an etcd 3.6.10 binary.
+- **Not wired into the node.** M1-13 left the binary refusing etcd until
+  this backend landed. It keeps refusing it: until replication (M2-07,
+  M2-08) each M1 node serves every shard alone, and the file backend's
+  owner record is what stops a second node from loading the same catalog
+  over its own empty shards. A shared etcd store has no such guard, so
+  two nodes would serve one bucket apart. The refusal now says so. The PR
+  that wires it adds the TLS keys (CA, client certificate and key) to
+  `[control_store]` and §14. etcd's user-and-password tokens are not
+  supported; client certificates are.

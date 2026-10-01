@@ -2366,7 +2366,16 @@ name = "skys3-control"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "proptest",
+ "prost",
  "rand",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2379,6 +2388,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "turmoil",
 ]
 

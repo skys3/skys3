@@ -144,6 +144,9 @@ pub struct Report {
     /// Keys of `write_back` buckets that the remote store holds an object
     /// for at the end.
     pub flushed: usize,
+    /// Power-loss restarts the driver forced on nodes whose sync failed
+    /// and that had not been restarted otherwise.
+    pub fences: usize,
 }
 
 impl Report {
@@ -232,20 +235,101 @@ const FINAL_READ_ATTEMPTS: usize = 120;
 enum Heal {
     Repair(Endpoint, Endpoint),
     Release(Endpoint, Endpoint),
-    StopLoss,
-    EndOutage,
-    EndLatency,
-    EndLostResponses,
-    /// Not a heal: the power-loss restart a failed sync needs.
-    Fence(usize),
+    /// The end of a window of [`InForce`].
+    End(Window),
+    /// Not a heal: the power-loss restart a failed sync needs, for the
+    /// node's process `life` (see `Driver::life`).
+    Fence {
+        node: usize,
+        life: u64,
+    },
 }
 
-/// The control store's faults in force.
+/// A window of a fault whose effect overlaps others of its kind, which
+/// [`InForce`] combines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Window {
+    Loss(u64),
+    Outage(u64),
+    Latency(u64),
+    LostResponses(u64),
+}
+
+/// The faults in force whose windows may overlap: message loss and the
+/// control store's. Each window ends on its own; what is in force is
+/// recomputed from the windows still open.
 #[derive(Debug, Default)]
-struct ControlFaults {
-    outages: usize,
-    latencies: Vec<Duration>,
-    lost: Vec<f64>,
+struct InForce {
+    next: u64,
+    loss: Vec<(u64, f64)>,
+    outages: Vec<u64>,
+    latencies: Vec<(u64, Duration)>,
+    lost: Vec<(u64, f64)>,
+}
+
+impl InForce {
+    /// Opens the window `fault` starts, if it has one.
+    fn open(&mut self, fault: &Fault) -> Option<Window> {
+        let id = self.next;
+        let window = match *fault {
+            Fault::MessageLoss { rate, .. } => {
+                self.loss.push((id, rate));
+                Window::Loss(id)
+            }
+            Fault::ControlOutage { .. } => {
+                self.outages.push(id);
+                Window::Outage(id)
+            }
+            Fault::ControlLatency { min, .. } => {
+                self.latencies.push((id, min));
+                Window::Latency(id)
+            }
+            Fault::LostCasResponses { probability, .. } => {
+                self.lost.push((id, probability));
+                Window::LostResponses(id)
+            }
+            _ => return None,
+        };
+        self.next += 1;
+        Some(window)
+    }
+
+    /// Closes `window`, and leaves every other open.
+    fn close(&mut self, window: Window) {
+        match window {
+            Window::Loss(id) => self.loss.retain(|(open, _)| *open != id),
+            Window::Outage(id) => self.outages.retain(|open| *open != id),
+            Window::Latency(id) => self.latencies.retain(|(open, _)| *open != id),
+            Window::LostResponses(id) => self.lost.retain(|(open, _)| *open != id),
+        }
+    }
+
+    /// The message loss rate in force: the highest of the open windows'.
+    fn loss_rate(&self) -> f64 {
+        self.loss.iter().map(|(_, rate)| *rate).fold(0.0, f64::max)
+    }
+
+    /// The control store's fault rates in force over `base`.
+    fn control_rates(&self, base: FaultRates) -> FaultRates {
+        let mut rates = base;
+        if !self.outages.is_empty() {
+            rates.unavailable = 1.0;
+        }
+        if let Some(lost) = self.lost.iter().map(|(_, p)| *p).reduce(f64::max) {
+            rates.lose_response = lost;
+        }
+        rates
+    }
+
+    /// The control bucket's faults in force over `base`.
+    fn control_faults(&self, base: &SimS3Faults) -> SimS3Faults {
+        let mut faults = base.clone();
+        if let Some(min) = self.latencies.iter().map(|(_, min)| *min).max() {
+            faults.min_delay = min;
+            faults.max_delay = min * 4;
+        }
+        faults
+    }
 }
 
 impl<S: NodeServices> Cluster<S> {
@@ -330,8 +414,10 @@ impl<S: NodeServices> Cluster<S> {
             heals: Vec::new(),
             down: vec![None; world.slots.len()],
             fenced: vec![false; world.slots.len()],
-            control: ControlFaults::default(),
+            life: vec![0; world.slots.len()],
+            in_force: InForce::default(),
             faults: 0,
+            fences: 0,
         };
         // The clients start once every node serves, and the faults with
         // them.
@@ -391,6 +477,7 @@ impl<S: NodeServices> Cluster<S> {
                 .values()
                 .filter(|survivor| matches!(survivor.flushed, Some(Some(_))))
                 .count(),
+            fences: driver.fences,
         })
     }
 
@@ -758,8 +845,12 @@ struct Driver<'a, S> {
     down: Vec<Option<Duration>>,
     /// Nodes with a failed sync, whose next restart must be a power loss.
     fenced: Vec<bool>,
-    control: ControlFaults,
+    /// Which process of each node runs, or runs next if the node is down:
+    /// bumped each time a process ends, by a crash or by itself.
+    life: Vec<u64>,
+    in_force: InForce,
     faults: usize,
+    fences: usize,
 }
 
 impl<S: NodeServices> Driver<'_, S> {
@@ -820,6 +911,7 @@ impl<S: NodeServices> Driver<'_, S> {
                     self.history.crashed(host);
                     self.world.slots[index].stop_disks(true);
                     self.fenced[index] = false;
+                    self.life[index] += 1;
                     self.down[index] = Some(now + SUPERVISOR_DELAY);
                 }
                 None => {}
@@ -843,12 +935,18 @@ impl<S: NodeServices> Driver<'_, S> {
         slot.stop_disks(power_loss);
         sim.crash(slot.host.as_str());
         self.history.crashed(&slot.host);
+        self.life[node] += 1;
         self.down[node] = Some(now + downtime);
     }
 
     fn start(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, fault: Fault) {
         self.faults += 1;
         let until = now + fault.duration().unwrap_or_default();
+        if let Some(window) = self.in_force.open(&fault) {
+            self.heals.push((until, Heal::End(window)));
+            self.apply_in_force(sim);
+            return;
+        }
         match fault {
             Fault::Crash {
                 node,
@@ -863,31 +961,18 @@ impl<S: NodeServices> Driver<'_, S> {
                 sim.hold(self.host(a).as_str(), self.host(b).as_str());
                 self.heals.push((until, Heal::Release(a, b)));
             }
-            Fault::MessageLoss { rate, .. } => {
-                sim.set_fail_rate(rate);
-                self.heals.push((until, Heal::StopLoss));
-            }
             Fault::FailSync { node, disk } => {
                 let disks = &self.world.slots[node].disks;
                 disks[disk % disks.len()].1.fail_next_syncs(1);
                 self.fenced[node] = true;
-                self.heals.push((now + FENCE_DELAY, Heal::Fence(node)));
+                let life = self.life[node];
+                self.heals
+                    .push((now + FENCE_DELAY, Heal::Fence { node, life }));
             }
-            Fault::ControlOutage { .. } => {
-                self.control.outages += 1;
-                self.heals.push((until, Heal::EndOutage));
-                self.apply_control();
-            }
-            Fault::ControlLatency { min, .. } => {
-                self.control.latencies.push(min);
-                self.heals.push((until, Heal::EndLatency));
-                self.apply_control();
-            }
-            Fault::LostCasResponses { probability, .. } => {
-                self.control.lost.push(probability);
-                self.heals.push((until, Heal::EndLostResponses));
-                self.apply_control();
-            }
+            Fault::MessageLoss { .. }
+            | Fault::ControlOutage { .. }
+            | Fault::ControlLatency { .. }
+            | Fault::LostCasResponses { .. } => unreachable!("a window opened"),
         }
     }
 
@@ -895,56 +980,173 @@ impl<S: NodeServices> Driver<'_, S> {
         match heal {
             Heal::Repair(a, b) => sim.repair(self.host(a).as_str(), self.host(b).as_str()),
             Heal::Release(a, b) => sim.release(self.host(a).as_str(), self.host(b).as_str()),
-            Heal::StopLoss => sim.set_fail_rate(0.0),
-            Heal::EndOutage => {
-                self.control.outages -= 1;
-                self.apply_control();
+            Heal::End(window) => {
+                self.in_force.close(window);
+                self.apply_in_force(sim);
             }
-            Heal::EndLatency => {
-                self.control.latencies.remove(0);
-                self.apply_control();
+            // The process whose sync failed has already ended, and its
+            // end was a power loss.
+            Heal::Fence { node, life } if life != self.life[node] => {}
+            // The sync failed while the node was down: the process that
+            // starts next inherits the failure, and the fence.
+            Heal::Fence { node, life } if self.down[node].is_some() => {
+                let at = if heal_all {
+                    now
+                } else {
+                    self.down[node].unwrap_or(now) + FENCE_DELAY
+                };
+                self.heals.push((at, Heal::Fence { node, life }));
             }
-            Heal::EndLostResponses => {
-                self.control.lost.remove(0);
-                self.apply_control();
-            }
-            Heal::Fence(node) if !heal_all => {
-                let downtime = Duration::from_millis(200);
+            Heal::Fence { node, .. } => {
+                // At the end of the run, the node restarts at once.
+                let downtime = if heal_all {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(200)
+                };
+                self.fences += 1;
                 self.crash(sim, now, node, true, downtime);
-            }
-            Heal::Fence(node) => {
-                // The run is ending: restart the node at once.
-                self.crash(sim, now, node, true, Duration::ZERO);
             }
         }
     }
 
-    /// Sets every node's control-store faults, and the control bucket's,
-    /// from the faults in force.
-    fn apply_control(&self) {
+    /// Sets the message loss rate, every node's control-store faults, and
+    /// the control bucket's, from the faults in force.
+    fn apply_in_force(&self, sim: &mut turmoil::Sim<'_>) {
         let world = self.world;
-        let mut rates = world.rates;
-        if self.control.outages > 0 {
-            rates.unavailable = 1.0;
-        }
-        if let Some(lost) = self.control.lost.iter().copied().reduce(f64::max) {
-            rates.lose_response = lost;
-        }
+        sim.set_fail_rate(self.in_force.loss_rate());
+        let rates = self.in_force.control_rates(world.rates);
         for slot in &world.slots {
             slot.control.set_rates(rates);
         }
-        let mut faults = world.base_control.clone();
-        if let Some(min) = self.control.latencies.iter().copied().max() {
-            faults.min_delay = min;
-            faults.max_delay = min * 4;
-        }
-        world.control.set_faults(faults);
+        world
+            .control
+            .set_faults(self.in_force.control_faults(&world.base_control));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opens the window of each fault of `plan`, in start order.
+    fn open_all(in_force: &mut InForce, plan: &FaultPlan) -> Vec<Window> {
+        plan.faults()
+            .iter()
+            .map(|scheduled| in_force.open(&scheduled.fault).unwrap())
+            .collect()
+    }
+
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn overlapping_message_loss_windows_end_on_their_own() {
+        let duration = Duration::from_secs(1);
+        let plan = FaultPlan::none()
+            .with(
+                ms(0),
+                Fault::MessageLoss {
+                    rate: 0.2,
+                    duration,
+                },
+            )
+            .with(
+                ms(100),
+                Fault::MessageLoss {
+                    rate: 0.5,
+                    duration,
+                },
+            );
+        let mut in_force = InForce::default();
+        let windows = open_all(&mut in_force, &plan);
+        assert_eq!(in_force.loss_rate(), 0.5);
+        // Either window ending leaves the other's loss in force.
+        in_force.close(windows[1]);
+        assert_eq!(in_force.loss_rate(), 0.2);
+        in_force.close(windows[0]);
+        assert_eq!(in_force.loss_rate(), 0.0);
+
+        let mut in_force = InForce::default();
+        let windows = open_all(&mut in_force, &plan);
+        in_force.close(windows[0]);
+        assert_eq!(in_force.loss_rate(), 0.5);
+        in_force.close(windows[1]);
+        assert_eq!(in_force.loss_rate(), 0.0);
+    }
+
+    #[test]
+    fn control_windows_that_end_out_of_start_order_remove_their_own_effect() {
+        let (long, short) = (Duration::from_secs(4), Duration::from_secs(1));
+        // Each later window ends first.
+        let plan = FaultPlan::none()
+            .with(
+                ms(0),
+                Fault::ControlLatency {
+                    min: ms(100),
+                    duration: long,
+                },
+            )
+            .with(
+                ms(10),
+                Fault::LostCasResponses {
+                    probability: 0.1,
+                    duration: long,
+                },
+            )
+            .with(ms(20), Fault::ControlOutage { duration: long })
+            .with(
+                ms(30),
+                Fault::ControlLatency {
+                    min: ms(300),
+                    duration: short,
+                },
+            )
+            .with(
+                ms(40),
+                Fault::LostCasResponses {
+                    probability: 0.6,
+                    duration: short,
+                },
+            )
+            .with(ms(50), Fault::ControlOutage { duration: short });
+        let base_rates = FaultRates::default();
+        let base_faults = SimS3Faults::default();
+        let mut in_force = InForce::default();
+        let windows = open_all(&mut in_force, &plan);
+        assert_eq!(in_force.control_faults(&base_faults).min_delay, ms(300));
+        assert_eq!(in_force.control_rates(base_rates).lose_response, 0.6);
+        assert_eq!(in_force.control_rates(base_rates).unavailable, 1.0);
+
+        // The short windows end: the long ones' effects stay.
+        for window in &windows[3..] {
+            in_force.close(*window);
+        }
+        let faults = in_force.control_faults(&base_faults);
+        assert_eq!((faults.min_delay, faults.max_delay), (ms(100), ms(400)));
+        assert_eq!(in_force.control_rates(base_rates).lose_response, 0.1);
+        assert_eq!(in_force.control_rates(base_rates).unavailable, 1.0);
+
+        // Then the long ones: back to the base.
+        for window in &windows[..3] {
+            in_force.close(*window);
+        }
+        assert_eq!(in_force.control_faults(&base_faults), base_faults);
+        assert_eq!(in_force.control_rates(base_rates), base_rates);
+    }
+
+    #[test]
+    fn only_overlapping_kinds_open_windows() {
+        let mut in_force = InForce::default();
+        let crash = Fault::Crash {
+            node: 0,
+            power_loss: false,
+            downtime: ms(1),
+        };
+        assert_eq!(in_force.open(&crash), None);
+        assert_eq!(in_force.open(&Fault::FailSync { node: 0, disk: 0 }), None);
+    }
 
     #[test]
     fn placement_spreads_primaries() {

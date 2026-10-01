@@ -2125,7 +2125,13 @@ name = "skys3-control"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "prost",
  "rand",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2134,6 +2140,7 @@ dependencies = [
  "skys3-types",
  "thiserror",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -2143,6 +2150,7 @@ dependencies = [
  "crc32c",
  "libfuzzer-sys",
  "serde_json",
+ "skys3-control",
  "skys3-gateway",
  "skys3-index",
  "skys3-log",

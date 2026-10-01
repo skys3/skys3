@@ -7,7 +7,8 @@
 //! and requests outside the caller's policy are denied, and that a policy
 //! granting exactly those actions on exactly those resources is enough.
 //! DeleteObjects is authorized key by key: a caller outside its policy gets
-//! `200` with an `AccessDenied` entry for the key.
+//! `200` with an `AccessDenied` entry for the key. Writes that give or copy
+//! tags have rows of their own, since they also need the tagging actions.
 //!
 //! A pull request that adds an S3 operation adds its row here.
 
@@ -21,7 +22,9 @@ use common::{Answer, answer, config, gateway_with};
 use http::{Method, Request};
 use s3s::Body;
 use serde_json::json;
-use skys3_gateway::authz::{is_per_key, s3_actions, source_actions};
+use skys3_gateway::authz::{
+    TAG_READ_ACTIONS, TAG_WRITE_ACTIONS, is_per_key, s3_actions, source_actions,
+};
 use skys3_gateway::sigv4::AuthMethod;
 use skys3_gateway::{
     Authenticated, Gateway, GatewayConfig, MODE_HEADER, Permissions, Principal, SecretAccessKey,
@@ -44,6 +47,14 @@ struct Case {
     resource: &'static str,
     /// For a copy, the actions it needs on its source, and the source.
     source: Option<(&'static [&'static str], &'static str)>,
+    /// The actions it also needs on `resource` for the tags it gives or
+    /// copies.
+    tag_actions: &'static [&'static str],
+    /// For a copy, the actions it also needs on its source to copy its tags.
+    source_tag_actions: &'static [&'static str],
+    /// Objects that exist before the request, with the headers of their
+    /// PutObject.
+    existing: &'static [(&'static str, &'static [(&'static str, &'static str)])],
     /// The answer to a caller allowed exactly `actions` on `resource`.
     allowed: (u16, Option<&'static str>),
 }
@@ -52,8 +63,34 @@ impl Case {
     /// Every resource the case names, with the actions it needs there.
     fn grants(&self) -> Vec<(&'static [&'static str], &'static str)> {
         let mut grants = vec![(self.actions, self.resource)];
-        grants.extend(self.source);
+        if !self.tag_actions.is_empty() {
+            grants.push((self.tag_actions, self.resource));
+        }
+        if let Some((actions, source)) = self.source {
+            grants.push((actions, source));
+            if !self.source_tag_actions.is_empty() {
+                grants.push((self.source_tag_actions, source));
+            }
+        }
         grants
+    }
+
+    /// The action `DENIED` is denied on `resource`: the last it needs there.
+    fn denied(&self) -> &'static str {
+        let actions = [self.actions, self.tag_actions].concat();
+        actions.last().copied().unwrap()
+    }
+
+    /// The action `DENIED_SOURCE` is denied, and where: the last a copy
+    /// needs on its source, or else [`Case::denied`].
+    fn denied_source(&self) -> (&'static str, &'static str) {
+        match self.source {
+            Some((actions, source)) => {
+                let actions = [actions, self.source_tag_actions].concat();
+                (actions.last().copied().unwrap(), source)
+            }
+            None => (self.denied(), self.resource),
+        }
     }
 
     /// Every action the case needs.
@@ -102,6 +139,9 @@ const CASES: &[Case] = &[
         actions: &["s3:CreateBucket"],
         resource: "arn:aws:s3:::new-bucket",
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -113,6 +153,9 @@ const CASES: &[Case] = &[
         actions: &["s3:DeleteBucket"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (204, None),
     },
     Case {
@@ -124,6 +167,9 @@ const CASES: &[Case] = &[
         actions: &["s3:ListBucket"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -135,6 +181,9 @@ const CASES: &[Case] = &[
         actions: &["s3:ListAllMyBuckets"],
         resource: "arn:aws:s3:::*",
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -146,6 +195,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetBucketLocation"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -157,6 +209,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetBucketVersioning"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -168,6 +223,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutBucketVersioning"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (501, Some("NotImplemented")),
     },
     Case {
@@ -179,6 +237,9 @@ const CASES: &[Case] = &[
         actions: &["s3:ListBucketVersions"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (501, Some("NotImplemented")),
     },
     Case {
@@ -190,6 +251,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutEncryptionConfiguration"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (501, Some("NotImplemented")),
     },
     Case {
@@ -201,6 +265,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetEncryptionConfiguration"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (400, Some("ServerSideEncryptionConfigurationNotFoundError")),
     },
     Case {
@@ -212,6 +279,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutBucketObjectLockConfiguration"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (501, Some("NotImplemented")),
     },
     Case {
@@ -223,6 +293,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetBucketObjectLockConfiguration"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("ObjectLockConfigurationNotFoundError")),
     },
     Case {
@@ -234,6 +307,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObjectRetention"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (400, Some("InvalidRequest")),
     },
     Case {
@@ -245,6 +321,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetObjectRetention"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (400, Some("InvalidRequest")),
     },
     Case {
@@ -256,6 +335,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObjectLegalHold"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (400, Some("InvalidRequest")),
     },
     Case {
@@ -267,6 +349,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetObjectLegalHold"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (400, Some("InvalidRequest")),
     },
     Case {
@@ -278,6 +363,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutBucketAcl"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -289,6 +377,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObjectAcl"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (501, Some("NotImplemented")),
     },
     Case {
@@ -300,6 +391,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutBucketOwnershipControls"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -311,6 +405,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetBucketOwnershipControls"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -322,6 +419,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -333,6 +433,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchKey")),
     },
     Case {
@@ -344,6 +447,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchKey")),
     },
     Case {
@@ -355,6 +461,9 @@ const CASES: &[Case] = &[
         actions: &["s3:DeleteObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (204, None),
     },
     Case {
@@ -366,6 +475,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -377,6 +489,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchUpload")),
     },
     Case {
@@ -388,6 +503,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchUpload")),
     },
     Case {
@@ -399,6 +517,9 @@ const CASES: &[Case] = &[
         actions: &["s3:AbortMultipartUpload"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchUpload")),
     },
     Case {
@@ -410,6 +531,9 @@ const CASES: &[Case] = &[
         actions: &["s3:ListMultipartUploadParts"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchUpload")),
     },
     Case {
@@ -421,6 +545,9 @@ const CASES: &[Case] = &[
         actions: &["s3:ListBucketMultipartUploads"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -432,6 +559,9 @@ const CASES: &[Case] = &[
         actions: &["s3:ListBucket"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -443,6 +573,9 @@ const CASES: &[Case] = &[
         actions: &["s3:ListBucket"],
         resource: BUCKET,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -454,6 +587,9 @@ const CASES: &[Case] = &[
         actions: &["s3:DeleteObject"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (200, None),
     },
     Case {
@@ -465,7 +601,71 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObject"],
         resource: OBJECT,
         source: Some((&["s3:GetObject"], SOURCE)),
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchKey")),
+    },
+    // Tags given or copied with a write need the tagging actions too.
+    Case {
+        operation: "PutObject",
+        method: Method::PUT,
+        uri: "/bucket/k",
+        headers: &[("x-amz-tagging", "a=b")],
+        body: b"data",
+        actions: &["s3:PutObject"],
+        resource: OBJECT,
+        source: None,
+        tag_actions: &["s3:PutObjectTagging"],
+        source_tag_actions: &[],
+        existing: &[],
+        allowed: (200, None),
+    },
+    Case {
+        operation: "CreateMultipartUpload",
+        method: Method::POST,
+        uri: "/bucket/k?uploads",
+        headers: &[("x-amz-tagging", "a=b")],
+        body: b"",
+        actions: &["s3:PutObject"],
+        resource: OBJECT,
+        source: None,
+        tag_actions: &["s3:PutObjectTagging"],
+        source_tag_actions: &[],
+        existing: &[],
+        allowed: (200, None),
+    },
+    Case {
+        operation: "CopyObject",
+        method: Method::PUT,
+        uri: "/bucket/k",
+        headers: &[
+            ("x-amz-copy-source", "bucket/source"),
+            ("x-amz-tagging-directive", "REPLACE"),
+            ("x-amz-tagging", "a=b"),
+        ],
+        body: b"",
+        actions: &["s3:PutObject"],
+        resource: OBJECT,
+        source: Some((&["s3:GetObject"], SOURCE)),
+        tag_actions: &["s3:PutObjectTagging"],
+        source_tag_actions: &[],
+        existing: &[("/bucket/source", &[("x-amz-tagging", "c=d")])],
+        allowed: (200, None),
+    },
+    Case {
+        operation: "CopyObject",
+        method: Method::PUT,
+        uri: "/bucket/k",
+        headers: &[("x-amz-copy-source", "bucket/source")],
+        body: b"",
+        actions: &["s3:PutObject"],
+        resource: OBJECT,
+        source: Some((&["s3:GetObject"], SOURCE)),
+        tag_actions: &["s3:PutObjectTagging"],
+        source_tag_actions: &["s3:GetObjectTagging"],
+        existing: &[("/bucket/source", &[("x-amz-tagging", "c=d")])],
+        allowed: (200, None),
     },
     Case {
         operation: "GetObjectTagging",
@@ -476,6 +676,9 @@ const CASES: &[Case] = &[
         actions: &["s3:GetObjectTagging"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchKey")),
     },
     Case {
@@ -487,6 +690,9 @@ const CASES: &[Case] = &[
         actions: &["s3:PutObjectTagging"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchKey")),
     },
     Case {
@@ -498,6 +704,9 @@ const CASES: &[Case] = &[
         actions: &["s3:DeleteObjectTagging"],
         resource: OBJECT,
         source: None,
+        tag_actions: &[],
+        source_tag_actions: &[],
+        existing: &[],
         allowed: (404, Some("NoSuchKey")),
     },
 ];
@@ -524,8 +733,9 @@ fn policy(statements: &[serde_json::Value]) -> Permissions {
 /// - `OTHER_RESOURCES` may perform the case's actions on every other
 ///   resource;
 /// - `DENIED` may do anything, except that one statement denies the case's
-///   last action on its resource;
-/// - `DENIED_SOURCE`, for a copy, may do anything except read its source.
+///   last action on its resource ([`Case::denied`]);
+/// - `DENIED_SOURCE`, for a copy, may do anything except the last action
+///   it needs on its source ([`Case::denied_source`]).
 fn credentials(case: &Case) -> StaticCredentials {
     let key = |credentials: StaticCredentials, id: &str, permissions| {
         credentials.with_key(
@@ -566,16 +776,16 @@ fn credentials(case: &Case) -> StaticCredentials {
         DENIED,
         policy(&[
             json!({"Effect": "Allow", "Action": "s3:*", "Resource": "*"}),
-            json!({"Effect": "Deny", "Action": case.actions.last(), "Resource": case.resource}),
+            json!({"Effect": "Deny", "Action": case.denied(), "Resource": case.resource}),
         ]),
     );
-    let (source_actions, source) = case.source.unwrap_or((case.actions, case.resource));
+    let (source_action, source) = case.denied_source();
     key(
         credentials,
         DENIED_SOURCE,
         policy(&[
             json!({"Effect": "Allow", "Action": "s3:*", "Resource": "*"}),
-            json!({"Effect": "Deny", "Action": source_actions, "Resource": source}),
+            json!({"Effect": "Deny", "Action": source_action, "Resource": source}),
         ]),
     )
 }
@@ -627,6 +837,11 @@ async fn requests_outside_the_policy_are_denied_for_every_operation() {
             case.source.map(|(actions, _)| actions),
             "{name} needs the source actions the table gives"
         );
+        assert!(
+            [&[][..], TAG_WRITE_ACTIONS].contains(&case.tag_actions)
+                && [&[][..], TAG_READ_ACTIONS].contains(&case.source_tag_actions),
+            "{name} needs the tagging actions the table gives"
+        );
         let gateway = gateway(config(""), credentials(case)).await;
         let send = async |request| answer(gateway.handle(request).await).await;
         let create = sdk_signed(
@@ -641,6 +856,15 @@ async fn requests_outside_the_policy_are_denied_for_every_operation() {
             },
         );
         send(create).await.assert(200, None);
+        for (uri, headers) in case.existing {
+            let signing = Signing {
+                key: ADMIN,
+                secret: SECRET,
+                ..Signing::default()
+            };
+            let put = sdk_signed(Method::PUT, uri, headers, b"data", signing);
+            send(put).await.assert(200, None);
+        }
 
         // The status and error code; an answer to HEAD has no body, so no
         // code.
@@ -762,6 +986,187 @@ async fn deletes_are_authorized_key_by_key() {
     send(Method::HEAD, "/bucket/other", &[], b"", ADMIN)
         .await
         .assert(200, None);
+}
+
+/// The tagging actions are needed only by writes that give or copy tags: a
+/// caller denied them writes and copies untagged objects as before.
+#[tokio::test]
+async fn tagging_actions_are_needed_only_for_tags() {
+    const NO_PUT_TAGS: &str = "AKIANOPUTTAGS";
+    const NO_GET_TAGS: &str = "AKIANOGETTAGS";
+    let all_but = |action: &str| {
+        policy(&[
+            json!({"Effect": "Allow", "Action": "s3:*", "Resource": "*"}),
+            json!({"Effect": "Deny", "Action": action, "Resource": "*"}),
+        ])
+    };
+    let credentials = [
+        (
+            ADMIN,
+            policy(&[json!({"Effect": "Allow", "Action": "*", "Resource": "*"})]),
+        ),
+        (NO_PUT_TAGS, all_but("s3:PutObjectTagging")),
+        (NO_GET_TAGS, all_but("s3:GetObjectTagging")),
+    ]
+    .into_iter()
+    .fold(
+        StaticCredentials::new(),
+        |credentials, (id, permissions)| {
+            credentials.with_key(
+                id,
+                SecretAccessKey::new(SECRET),
+                Principal::new(id, permissions),
+            )
+        },
+    );
+    let gateway = gateway(config(""), credentials).await;
+    let send = async |method, uri: &str, headers: &[(&str, &str)], key| {
+        let signing = Signing {
+            key,
+            secret: SECRET,
+            ..Signing::default()
+        };
+        // Only a PutObject has a body.
+        let uploads = method == Method::PUT
+            && uri.starts_with("/bucket/")
+            && headers.iter().all(|(name, _)| *name != "x-amz-copy-source");
+        let body: &[u8] = if uploads { b"data" } else { b"" };
+        answer(
+            gateway
+                .handle(sdk_signed(method, uri, headers, body, signing))
+                .await,
+        )
+        .await
+    };
+    send(Method::PUT, "/bucket", &[(MODE_HEADER, "local")], ADMIN)
+        .await
+        .assert(200, None);
+    send(
+        Method::PUT,
+        "/bucket/tagged",
+        &[("x-amz-tagging", "s=source")],
+        ADMIN,
+    )
+    .await
+    .assert(200, None);
+    send(Method::PUT, "/bucket/plain", &[], ADMIN)
+        .await
+        .assert(200, None);
+
+    let copy = |source| [("x-amz-copy-source", source)];
+    let replace = |source| {
+        [
+            ("x-amz-copy-source", source),
+            ("x-amz-tagging-directive", "REPLACE"),
+        ]
+    };
+    let replace_tags = |tags| {
+        [
+            ("x-amz-copy-source", "bucket/plain"),
+            ("x-amz-tagging-directive", "REPLACE"),
+            ("x-amz-tagging", tags),
+        ]
+    };
+    // Denied writes give the tag `d=denied`, or copy `s=source`.
+    let tagged = [("x-amz-tagging", "d=denied")];
+    let denied = (403, Some("AccessDenied"));
+    // The caller, the request, and the answer.
+    type Write<'a> = (
+        &'a str,
+        Method,
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        (u16, Option<&'a str>),
+    );
+    let cases: &[Write] = &[
+        // Writes without tags need no tagging action.
+        (NO_PUT_TAGS, Method::PUT, "/bucket/k", &[], (200, None)),
+        (
+            NO_PUT_TAGS,
+            Method::POST,
+            "/bucket/k?uploads",
+            &[],
+            (200, None),
+        ),
+        (
+            NO_PUT_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &copy("bucket/plain"),
+            (200, None),
+        ),
+        (
+            NO_GET_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &copy("bucket/plain"),
+            (200, None),
+        ),
+        (
+            NO_PUT_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &replace("bucket/tagged"),
+            (200, None),
+        ),
+        (
+            NO_GET_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &replace("bucket/tagged"),
+            (200, None),
+        ),
+        (
+            NO_GET_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &replace_tags("a=allowed"),
+            (200, None),
+        ),
+        // Writes that give or copy tags need them.
+        (NO_PUT_TAGS, Method::PUT, "/bucket/k", &tagged, denied),
+        (
+            NO_PUT_TAGS,
+            Method::POST,
+            "/bucket/k?uploads",
+            &tagged,
+            denied,
+        ),
+        (
+            NO_PUT_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &replace_tags("d=denied"),
+            denied,
+        ),
+        (
+            NO_PUT_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &copy("bucket/tagged"),
+            denied,
+        ),
+        (
+            NO_GET_TAGS,
+            Method::PUT,
+            "/bucket/k",
+            &copy("bucket/tagged"),
+            denied,
+        ),
+    ];
+    for (key, method, uri, headers, (status, code)) in cases {
+        let answer = send(method.clone(), uri, headers, key).await;
+        answer.assert(*status, *code);
+    }
+    // The denied writes stored nothing: `k` keeps the tag of the last
+    // allowed one.
+    let tags = send(Method::GET, "/bucket/k?tagging", &[], ADMIN).await;
+    tags.assert(200, None);
+    assert!(
+        tags.body
+            .contains("<TagSet><Tag><Key>a</Key><Value>allowed</Value></Tag></TagSet>"),
+        "{tags:?}"
+    );
 }
 
 /// Authentication answers before authorization: a signed request that
