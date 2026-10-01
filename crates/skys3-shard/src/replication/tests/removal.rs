@@ -191,7 +191,7 @@ fn a_primary_removes_a_member_that_stops_responding() {
 async fn removal() {
     let pki = Pki::new();
     let (address2, member2) = member(&pki, 2).await;
-    let (address3, _member3) = member(&pki, 3).await;
+    let (address3, member3) = member(&pki, 3).await;
     let (proxy2, proxy3) = (Proxy::to(address2).await, Proxy::to(address3).await);
     let store = MemoryControlStore::new();
     let key = TypedKey::shard(&BucketId::new("b-1").unwrap(), ShardId::new(0));
@@ -242,6 +242,17 @@ async fn removal() {
     let replica2 = member2.set().get(&shard()).await.unwrap();
     until(|| replica2.sequencing() == Epoch::new(2) && leader.holds_leases()).await;
     assert!(primary.entry("b").await.unwrap().is_some());
+    // Members serve no client request. Node 2 redirects with the new
+    // configuration; the removed node 3 still names epoch 1, a hint no
+    // gateway that has seen epoch 2 follows.
+    let not_primary = |replica: &Shard<SimMount>| match replica.check_readable() {
+        Err(ShardError::NotPrimary { primary, epoch, .. }) => Some((primary, epoch)),
+        _ => None,
+    };
+    let replica3 = member3.set().get(&shard()).await.unwrap();
+    until(|| replica2.config().epoch == Epoch::new(2)).await;
+    assert_eq!(not_primary(&replica2), Some((node(1), Epoch::new(2))));
+    assert_eq!(not_primary(&replica3), Some((node(1), Epoch::new(1))));
     // Later writes are not held up.
     let (written, took) = timed_put(&primary, "c").await;
     written.unwrap();

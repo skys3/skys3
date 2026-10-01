@@ -2836,6 +2836,18 @@ of this file. A task with nothing unexpected keeps "None."
   shard and report; the age restarts with the node, since the register
   keeps no removal time. `docs/skys3-metrics.md` lists them as defined,
   not exported: the binary does not run replication yet.
+- **With routing (M2-08).** `ShardError::UnderReplicated` reaches the
+  gateway as `NotAcknowledged` without a position, so clients get
+  `503 SlowDown` as §6.4 asks, and it crosses the forward wire as outcome
+  7. A removal shows in the shard maps without further changes: the
+  primary serves in epoch e+1 once it adopted it, so a gateway asking in
+  epoch e learns it from the reply's hint, and the members that remain
+  redirect with e+1 once they follow. The removed member stays a member
+  of epoch e: it serves no routed request and redirects with epoch e,
+  which a gateway that knows e+1 ignores. A primary deposed by its
+  register refuses with `503` instead of redirecting; M2-12 decides what
+  it answers. The routing scenarios now check served requests against the
+  register, since a removal moves the epoch past the placement's.
 - **Left for later.** Wiring (`member_suspect_after_ms` maps onto
   `ReplicationConfig::member_suspect_after`, and `with_removal` takes the
   node's control store) comes with replication in the binary. A removal
