@@ -760,6 +760,90 @@ async fn a_lost_conditional_create_is_recognized_by_its_write_identity() {
     assert_eq!(head.metadata.write_identity(), Some("c/b/1/2.3"));
 }
 
+#[tokio::test]
+async fn stale_reads_answer_from_before_the_latest_write() {
+    let store = store();
+    // A key never written reads the same, stale or not.
+    store.inject(Operation::GetObject, Fault::StaleRead);
+    assert_eq!(
+        kind(store.get_object(GetObject::new("k")).await),
+        S3ErrorKind::NoSuchKey
+    );
+    let first = put(&store, "k", "one").await;
+    store.inject(Operation::GetObject, Fault::StaleRead);
+    assert_eq!(
+        kind(store.get_object(GetObject::new("k")).await),
+        S3ErrorKind::NoSuchKey,
+        "a stale read of a new key finds nothing"
+    );
+    put(&store, "k", "two").await;
+    store.inject(Operation::GetObject, Fault::StaleRead);
+    let stale = store.get_object(GetObject::new("k")).await.unwrap();
+    assert_eq!(
+        (stale.body, stale.info.etag),
+        (Bytes::from("one"), first.etag.clone())
+    );
+    store.inject(Operation::HeadObject, Fault::StaleRead);
+    let head = store.head_object(HeadObject::new("k")).await.unwrap();
+    assert_eq!(head.etag, first.etag);
+    // Without the fault, reads are current.
+    assert_eq!(
+        store.get_object(GetObject::new("k")).await.unwrap().body,
+        Bytes::from("two")
+    );
+    // A failed write leaves the previous state alone.
+    let failed = store
+        .put_object(PutObject::new("k", "three").with_precondition(WritePrecondition::IfAbsent))
+        .await;
+    assert_eq!(kind(failed), S3ErrorKind::PreconditionFailed);
+    store.inject(Operation::GetObject, Fault::StaleRead);
+    let stale = store.get_object(GetObject::new("k")).await.unwrap();
+    assert_eq!(stale.body, Bytes::from("one"));
+    // A deleted key still reads, stale.
+    store.delete_object(DeleteObject::new("k")).await.unwrap();
+    store.inject(Operation::GetObject, Fault::StaleRead);
+    let stale = store.get_object(GetObject::new("k")).await.unwrap();
+    assert_eq!(stale.body, Bytes::from("two"));
+}
+
+#[tokio::test]
+async fn stale_reads_on_a_versioned_bucket_name_the_old_version() {
+    let store = versioned();
+    let first = put(&store, "k", "one").await;
+    put(&store, "k", "two").await;
+    store.inject(Operation::GetObject, Fault::StaleRead);
+    let stale = store.get_object(GetObject::new("k")).await.unwrap();
+    assert_eq!(stale.info.version_id, first.version_id);
+    // Reads of a specific version are never stale.
+    let second = store.versions()[1].1.clone().unwrap();
+    store.inject(Operation::GetObject, Fault::StaleRead);
+    let read = store
+        .get_object(GetObject::new("k").with_version_id(second.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (read.body, read.info.version_id),
+        (Bytes::from("two"), Some(second))
+    );
+}
+
+#[tokio::test]
+async fn random_stale_reads_follow_their_probability() {
+    let store = store();
+    put(&store, "k", "one").await;
+    put(&store, "k", "two").await;
+    store.set_faults(SimS3Faults {
+        stale_read_probability: 0.5,
+        ..SimS3Faults::NONE
+    });
+    let mut stale = 0;
+    for _ in 0..200 {
+        let read = store.get_object(GetObject::new("k")).await.unwrap();
+        stale += usize::from(read.body == "one");
+    }
+    assert!((60..140).contains(&stale), "{stale}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn delays_hold_both_legs_of_a_request() {
     let store = store();

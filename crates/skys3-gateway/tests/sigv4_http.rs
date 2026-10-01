@@ -309,6 +309,38 @@ async fn the_aws_sdk_reads_and_writes_objects() {
     let body = ranged.body.collect().await.unwrap().into_bytes();
     assert_eq!(body, large[1_048_570..1_048_586]);
 
+    // Response header overrides, signed into the query, replace the stored
+    // headers on GetObject and HeadObject alike.
+    let got = client
+        .get_object()
+        .bucket("photos")
+        .key("small")
+        .response_content_type("text/plain")
+        .response_content_disposition("attachment; filename=\"small.txt\"")
+        .response_cache_control("no-cache")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.content_type(), Some("text/plain"));
+    assert_eq!(
+        got.content_disposition(),
+        Some("attachment; filename=\"small.txt\"")
+    );
+    assert_eq!(got.cache_control(), Some("no-cache"));
+    assert_eq!(got.storage_class(), None);
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body, small);
+    let head = client
+        .head_object()
+        .bucket("photos")
+        .key("small")
+        .response_content_language("fr")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_language(), Some("fr"));
+    assert_eq!(head.content_type(), Some("application/octet-stream"));
+
     // A conditional PUT must not overwrite, and may create.
     let error = client
         .put_object()

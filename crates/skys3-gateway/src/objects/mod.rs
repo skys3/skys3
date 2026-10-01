@@ -26,7 +26,10 @@
 //! the object cannot satisfy. A `Range` header that does not parse as one
 //! range, such as a list of ranges, is ignored, as S3 does
 //! ([`ignore_unsupported_range`]). Stored checksums are returned with
-//! `x-amz-checksum-mode: ENABLED` for a whole object.
+//! `x-amz-checksum-mode: ENABLED` for a whole object, and the stored storage
+//! class unless it is `STANDARD`. The `response-*` query parameters replace
+//! the stored headers they name; S3 refuses them in an anonymous request,
+//! and so does SkyS3.
 //!
 //! **DeleteObject** commits a tombstone, also for a key with no object,
 //! and answers `204` either way. In a `local` bucket, which is never
@@ -56,7 +59,7 @@ use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums};
 use crate::conditions::{Precondition, ReadConditions, last_modified, no_such_key, s3_etag};
 use crate::shard::{ShardRef, Shards};
-use crate::sigv4::{BodyError, Trailers};
+use crate::sigv4::{Authenticated, BodyError, Trailers};
 use upload::Upload;
 
 /// The largest object a single PUT stores: 5 GiB, S3's limit.
@@ -100,9 +103,24 @@ macro_rules! set_checksums {
     }};
 }
 
-/// Fills a GetObject or HeadObject output from a resolved read.
+/// The [`Overrides`] of a GetObject or HeadObject input.
+macro_rules! overrides {
+    ($input:expr) => {
+        Overrides {
+            cache_control: $input.response_cache_control.as_deref(),
+            content_disposition: $input.response_content_disposition.as_deref(),
+            content_encoding: $input.response_content_encoding.as_deref(),
+            content_language: $input.response_content_language.as_deref(),
+            content_type: $input.response_content_type.as_deref(),
+            expires: $input.response_expires.as_ref(),
+        }
+    };
+}
+
+/// Fills a GetObject or HeadObject output from a resolved read, then
+/// replaces the headers the request overrides.
 macro_rules! describe {
-    ($output:expr, $found:expr, $checksum_mode:expr) => {{
+    ($output:expr, $found:expr, $checksum_mode:expr, $overrides:expr) => {{
         let found: &Found = &$found;
         let object = &found.object;
         let header = |name: &str| object.metadata.get(name).cloned();
@@ -118,8 +136,24 @@ macro_rules! describe {
         $output.content_range = found.content_range.clone();
         $output.e_tag = Some(s3_etag(object));
         $output.last_modified = Some(last_modified(object));
+        $output.storage_class = storage_class(object);
         let metadata: s3s::dto::Metadata = user_metadata(&object.metadata).collect();
         $output.metadata = (!metadata.is_empty()).then_some(metadata);
+        let overrides: Checked = $overrides;
+        let replace = |field: &mut Option<String>, value: Option<String>| {
+            if value.is_some() {
+                *field = value;
+            }
+        };
+        replace(&mut $output.cache_control, overrides.cache_control);
+        replace(
+            &mut $output.content_disposition,
+            overrides.content_disposition,
+        );
+        replace(&mut $output.content_encoding, overrides.content_encoding);
+        replace(&mut $output.content_language, overrides.content_language);
+        replace(&mut $output.content_type, overrides.content_type);
+        replace(&mut $output.expires, overrides.expires);
         let enabled = $checksum_mode
             .as_ref()
             .is_some_and(|mode| mode.as_str() == s3s::dto::ChecksumMode::ENABLED);
@@ -240,6 +274,7 @@ impl<H: Shards> Objects<H> {
         req: S3Request<GetObjectInput>,
     ) -> S3Result<GetObjectOutput> {
         let input = &req.input;
+        let overrides = overrides!(input).check(&req.extensions)?;
         let conditions = ReadConditions {
             if_match: input.if_match.as_ref(),
             if_none_match: input.if_none_match.as_ref(),
@@ -266,7 +301,7 @@ impl<H: Shards> Objects<H> {
             body: Some(body),
             ..GetObjectOutput::default()
         };
-        describe!(output, found, input.checksum_mode);
+        describe!(output, found, input.checksum_mode, overrides);
         Ok(output)
     }
 
@@ -276,6 +311,7 @@ impl<H: Shards> Objects<H> {
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<HeadObjectOutput> {
         let input = &req.input;
+        let overrides = overrides!(input).check(&req.extensions)?;
         let conditions = ReadConditions {
             if_match: input.if_match.as_ref(),
             if_none_match: input.if_none_match.as_ref(),
@@ -292,7 +328,7 @@ impl<H: Shards> Objects<H> {
             )
             .await?;
         let mut output = HeadObjectOutput::default();
-        describe!(output, found, input.checksum_mode);
+        describe!(output, found, input.checksum_mode, overrides);
         Ok(output)
     }
 
@@ -402,6 +438,93 @@ struct Found {
     bytes: std::ops::Range<u64>,
     /// `Content-Range`, for a range request.
     content_range: Option<String>,
+}
+
+/// The response headers a GetObject or HeadObject request overrides with
+/// its `response-*` query parameters.
+struct Overrides<'a> {
+    cache_control: Option<&'a str>,
+    content_disposition: Option<&'a str>,
+    content_encoding: Option<&'a str>,
+    content_language: Option<&'a str>,
+    content_type: Option<&'a str>,
+    expires: Option<&'a s3s::dto::Timestamp>,
+}
+
+/// [`Overrides`] checked, as the header values they become.
+#[derive(Default)]
+struct Checked {
+    cache_control: Option<String>,
+    content_disposition: Option<String>,
+    content_encoding: Option<String>,
+    content_language: Option<String>,
+    content_type: Option<String>,
+    expires: Option<String>,
+}
+
+impl Overrides<'_> {
+    /// Checks the overrides of a request.
+    ///
+    /// # Errors
+    ///
+    /// `400 InvalidRequest` for overrides in an anonymous request, as S3
+    /// answers, and for a value that is not a valid header value.
+    fn check(self, extensions: &http::Extensions) -> S3Result<Checked> {
+        let texts = [
+            self.cache_control,
+            self.content_disposition,
+            self.content_encoding,
+            self.content_language,
+            self.content_type,
+        ];
+        if texts.iter().all(Option::is_none) && self.expires.is_none() {
+            return Ok(Checked::default());
+        }
+        if extensions.get::<Authenticated>().is_none() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Request specific response headers cannot be used for anonymous GET requests."
+            ));
+        }
+        let value = |text: Option<&str>| -> S3Result<Option<String>> {
+            let Some(text) = text else { return Ok(None) };
+            http::HeaderValue::from_str(text).map_err(|_| {
+                s3_error!(
+                    InvalidRequest,
+                    "A response header override is not a valid header value"
+                )
+            })?;
+            Ok(Some(text.to_owned()))
+        };
+        let expires = match self.expires {
+            Some(expires) => {
+                let mut date = Vec::new();
+                expires
+                    .format(s3s::dto::TimestampFormat::HttpDate, &mut date)
+                    .map_err(|_| s3_error!(InvalidRequest, "response-expires is out of range"))?;
+                Some(String::from_utf8_lossy(&date).into_owned())
+            }
+            None => None,
+        };
+        Ok(Checked {
+            cache_control: value(self.cache_control)?,
+            content_disposition: value(self.content_disposition)?,
+            content_encoding: value(self.content_encoding)?,
+            content_language: value(self.content_language)?,
+            content_type: value(self.content_type)?,
+            expires,
+        })
+    }
+}
+
+/// The storage class a GetObject or HeadObject answers: the stored one,
+/// left out for `STANDARD`, as S3 does.
+fn storage_class(object: &ObjectVersion) -> Option<s3s::dto::StorageClass> {
+    object
+        .storage_class
+        .as_deref()
+        .filter(|class| *class != s3s::dto::StorageClass::STANDARD)
+        .map(|class| s3s::dto::StorageClass::from(class.to_owned()))
 }
 
 /// The metadata a PUT stores: the standard headers S3 keeps, and user

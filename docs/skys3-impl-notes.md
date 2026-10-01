@@ -1010,6 +1010,12 @@ of this file. A task with nothing unexpected keeps "None."
   answers GET with `503` until read-through fill (M1-20). The extents of
   a failed upload stay in bulk segments until compaction (M1-22) reclaims
   unreferenced ones. `x-amz-storage-class` is accepted and ignored.
+- **Response header overrides.** `s3s` applies GetObject's `response-*`
+  query parameters to the response itself, but parses HeadObject's and
+  never applies them, and neither refuses them on anonymous requests. The
+  gateway applies them to both outputs and refuses them, and values that
+  are not header values, with `400 InvalidRequest` before reading the
+  object.
 
 ### M1-11 Listing
 
@@ -1245,6 +1251,18 @@ of this file. A task with nothing unexpected keeps "None."
   signs with the node's manual clock as the SDK's time source, so advancing
   the clock past expiry makes the SDK's identity cache refresh the session
   through the chain.
+- **Review: the identity copy was read before a wait.** The endpoint took
+  its snapshot before validating the token, which can wait seconds for an
+  issuer's discovery document and keys. A sync during the wait that removed
+  the provider or the role, or narrowed the trust policy, did not stop the
+  session, and the copy could pass `identity_max_staleness` unnoticed. The
+  endpoint now checks freshness before validation (so a stale node fetches
+  nothing) and reads the copy again after it, deciding the provider
+  (`OidcProvider::accepts`), the role, and the trust policy on that. A test
+  holds the key fetch open with a gated fetcher and changes the
+  configuration meanwhile. The session record is stored after these checks,
+  so a sync between the checks and the insert can still race; that window
+  holds no await on a remote service.
 - **Test support moved behind a feature.** The token-minting `testkit`
   was `cfg(test)`; it is now behind `skys3-sts`'s `test-util` feature so
   the integration tests can mint tokens.
@@ -1309,3 +1327,67 @@ of this file. A task with nothing unexpected keeps "None."
   not find a `-config` file outside the specification's directory, so the
   script copies the specification and its generated configuration into a
   temporary directory. TLC keeps its search queue on disk there.
+
+### M2-04 S3 control-store backend
+
+- **The trait has no conditional read.** `ChangeFeed` polls through `get`,
+  so an `If-None-Match` poll could not go through it unchanged. The S3
+  backend's change stream is the shared polling feed over a private view of
+  the store that reads `cluster.json` with `If-None-Match` on the copy it
+  last read and answers a `304` from that copy; the delivery rules stay
+  shared with every backend.
+- **One probe for every backend.** The plan describes the startup probe as
+  part of the S3 backend. It is `ControlProbe`, generic over
+  `ControlStore`, so the conformance suite (M2-06) can run it against
+  etcd and the in-memory store too. Its writers go through `propose`, so
+  the probe also tests the `409` retries and the lost-response rule that
+  production writes use: mapping a lost S3 response to "nothing applied"
+  makes it fail in the first seed of the simulation.
+- **"Writers on different nodes".** A node probes alone at startup, so the
+  probe races one writer per store handle the caller passes, at least two,
+  as concurrent requests; per-run nonces keep probes of different nodes
+  on different registers. The simulation scenario runs five nodes' probes
+  concurrently against one faulty simulated bucket.
+- **Conditional deletes: refuse rather than fall back.** M1-06 asked what
+  `delete_if` does on a store without conditional `DeleteObject`. A
+  tombstone fallback (conditional PUT of a tombstone, then unconditional
+  DELETE) has an ABA race, since equal tombstones share an ETag, and
+  permanent tombstones are what M1-06 already rejected. Such stores are
+  refused; design §6.1 records why. R2 qualifies only if the probe finds
+  it honors `If-Match` on `DeleteObject`.
+- **Permanent errors had no `ControlError`.** `403 AccessDenied`, a
+  missing bucket, or `501 NotImplemented` would have been `Unavailable`
+  and retried for seconds. `ControlError::Rejected` is not retried; the
+  gateway answers it with `500`. A `409` to a read or listing, which
+  `skys3-remote` does not class as transient, is `Unavailable` there.
+- **`SimS3` could not read stale.** `Fault::StaleRead` and
+  `SimS3Faults::stale_read_probability` answer `GetObject` and
+  `HeadObject` with the key's state from before its latest write. The
+  probability is drawn only when it is non-zero, so seeds recorded for
+  existing profiles replay unchanged. Listings are never stale.
+- **Probe history on versioned control buckets.** The `ControlStore`
+  interface has no delete by version ID, so on a versioned control bucket,
+  which design §12 recommends for audit, each probe leaves its writes as
+  noncurrent versions and delete markers, as every overwritten register
+  does; a noncurrent-version lifecycle rule removes them.
+- **Conditional deletes of missing keys on AWS.** The simulator answers
+  `If-Match` on a key without a current object with `404`, which the
+  backend maps to a failed precondition. If AWS answers `204`, as the
+  older pages M0-05 found suggest, deleting an absent register reports
+  success: harmless for `propose_delete`, which counts an absent register
+  as deleted, but the conformance check that a second delete fails would
+  not hold. M1-26 and the M2-06 nightly runs must confirm it.
+- **The validator.** M0-03 already refused an S3 control store in a backup
+  target's failure scope. Snapshot targets are now checked too (once when
+  one defaults to the backup target), and a target in the control bucket
+  whose prefix overlaps the control prefix is refused even with
+  `allow_correlated_control_store`, the part of credential scoping SkyS3
+  can enforce. Scoping the credential itself is the operator's; design
+  §6.1 and the configuration reference give the policy.
+- **No credential key yet.** §14 names no credential source for the
+  control store, and nothing wires the S3 backend into the binary (rule
+  1.1). The PR that does adds that key with the region and addressing
+  keys M1-15 also left to the attach path.
+- **No fuzz target.** The backend parses nothing new: listed keys go
+  through the existing `RegisterKey` grammar, and values through the
+  existing document parsing.
