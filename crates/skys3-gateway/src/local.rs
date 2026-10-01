@@ -93,6 +93,13 @@ fn convert(shard: &ShardRef, error: skys3_shard::ShardError) -> ShardError {
             shard: shard.clone(),
             reason,
         },
+        skys3_shard::ShardError::NotAcknowledged {
+            position, reason, ..
+        } => ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position,
+            reason,
+        },
         other => ShardError::Unavailable {
             shard: shard.clone(),
             reason: other.to_string(),

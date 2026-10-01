@@ -188,7 +188,9 @@ impl<D: Disk> ShardSet<D> {
 
     /// Closes every open shard ([`Shard::close`]): each stops once the
     /// records it sequenced are applied, so nothing is in flight when the
-    /// node checkpoints and exits. The shards stay in the set, closed.
+    /// node checkpoints and exits, or, on a replicated shard, once its
+    /// [`AckTimeout`](crate::AckTimeout) gave up on its members. The shards
+    /// stay in the set, closed.
     ///
     /// # Errors
     ///

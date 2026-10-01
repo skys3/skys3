@@ -2494,3 +2494,61 @@ of this file. A task with nothing unexpected keeps "None."
   echoes stamps as long as it follows the primary. The lease timings sit
   in `ReplicationConfig` with the design's defaults; the configuration
   keys exist (M0-03) but are wired in only with replication itself.
+
+### M2-10 Acknowledgement timeout modes
+
+- **The history checker assumed a failed write lands before its answer.**
+  `Outcome::Failed` let a write take effect only between its call and its
+  `503`, which held while failures came from crashes. With the timeout, a
+  record commits after its writer was told it failed, so a read sent
+  after the failure can miss it and a later read see it: allowed by §5.2,
+  but flagged by the checker. A failed write's answer now holds back only
+  writes that may have written: it is ordered after its call and before
+  every such write sent after its answer, which is exactly "never
+  resurfaces over a later PUT or DELETE". Writes refused for their
+  condition count as reads, because the gateway refuses them on a plain
+  read before it writes anything. Checker tests cover both sides.
+- **Fail fast needed a rule.** §5.2 says requests fail "as soon as a member
+  is late" without saying how a primary knows. Once a request times out,
+  a fail-fast shard refuses new writes at once, unsequenced, until every
+  record sequenced before the timeout is applied; wait-through shards take
+  every write and let each wait its own timeout. Design §5.2 records it,
+  together with what the timeout covers (conditional writes waiting for
+  an earlier write of their key, and seals).
+- **Closing a shard (decided, design §5.2).** `Shard::close` waits for its
+  barrier at most `replica_ack_timeout`, then abandons the records still
+  waiting: the pipeline stops, drops them unapplied and fails their
+  waiters. They stay in the log, and the next opening rolls them forward
+  in the primary's epoch (or M2-12's reconciliation discards them). A
+  member closes the same way when its primary is gone; a shard alone keeps
+  waiting for its disk. Every writer's own timeout starts before the
+  close does, so in practice the writers have timed out already and the
+  abandon only answers barriers.
+- **Seeing that failed writes really apply.** A history alone rarely shows
+  it: the next operation on the key is usually another write. So the
+  `NotAcknowledged` error carries the position its record took, and
+  `ReplicatedServices::late_writes` counts the failed writes a primary
+  committed later. Over 10 seeds of the new `acks` scenarios (partitions
+  between every pair of nodes), wait-through with 600 ms had 207 writes
+  fail after getting a position and 205 commit later, and fail-fast with
+  300 ms had 93 and 74; the rest were still waiting for a member when the
+  run ended. The linearizability and durability checks pass on all of
+  them. A seeded bug that resends each failed write a second later (as a
+  gateway retrying on its own would) is caught in 10 of 10 seeds.
+- **The lease scenarios use the default 2 s client timeout again.** They
+  use fail-fast with 300 ms, so writes stalled by a partition fail at
+  once and clients keep reading. Drift beyond `ρ` is still caught (230
+  flagged reads over 10 seeds), and the within-`ρ` scenario still sees
+  served and refused reads and no stale one.
+- **The simulated wait-through timeout is below the design's minimum.**
+  Configuration loading requires `replica_ack_timeout > member_suspect_after
+  + 1 s` in wait-through mode, so that the removal (M2-11) fits inside it.
+  Nothing removes members yet, so the scenarios use 600 ms to get answers
+  before the clients' 2 s timeout.
+- **Left for later.** `ReplicationConfig::ack_timeout` defaults to the
+  design's 5 s wait-through; the `replica_ack_timeout_ms` and
+  `replica_ack_timeout_mode` keys are mapped onto it when replication is
+  wired into the binary. Until M2-11 removes a dead member, wait-through
+  writes on its shards each wait the full timeout and their records pile
+  up in the primary's memory and log until the member returns; fail-fast
+  bounds that to the records sequenced before the first timeout.
