@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true

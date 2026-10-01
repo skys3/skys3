@@ -1627,7 +1627,10 @@ dependencies = [
  "serde_urlencoded",
  "skys3-config",
  "skys3-control",
+ "skys3-index",
  "skys3-io",
+ "skys3-log",
+ "skys3-shard",
  "skys3-types",
  "thiserror",
  "tokio",
@@ -1683,6 +1686,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "skys3-shard"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "skys3-index",
+ "skys3-io",
+ "skys3-log",
+ "skys3-types",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
