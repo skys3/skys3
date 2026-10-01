@@ -2303,11 +2303,13 @@ dependencies = [
  "serde_json",
  "skys3-config",
  "skys3-control",
+ "skys3-flush",
  "skys3-gateway",
  "skys3-index",
  "skys3-io",
  "skys3-log",
  "skys3-obs",
+ "skys3-remote",
  "skys3-shard",
  "skys3-sts",
  "skys3-types",
@@ -2345,6 +2347,28 @@ dependencies = [
  "thiserror",
  "tokio",
  "turmoil",
+]
+
+[[package]]
+name = "skys3-flush"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "md-5",
+ "prometheus-client",
+ "rand",
+ "skys3-config",
+ "skys3-index",
+ "skys3-io",
+ "skys3-log",
+ "skys3-obs",
+ "skys3-remote",
+ "skys3-shard",
+ "skys3-sim",
+ "skys3-types",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2516,6 +2540,7 @@ dependencies = [
 name = "skys3-sim"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "md-5",
  "proptest",

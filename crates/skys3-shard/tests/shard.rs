@@ -676,3 +676,80 @@ fn shards_stay_on_the_disk_their_hash_picks() {
         set.close_all().await.unwrap_err();
     });
 }
+
+#[test]
+fn subscribers_see_applied_client_writes() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let mut changes = shard.subscribe();
+        let first = shard.commit(put("a", 3, 1)).await.unwrap();
+        let tagged = shard.commit(tags("a", "x")).await.unwrap();
+        let deleted = shard.commit(delete("b")).await.unwrap();
+        // A rejected TAGS and a FLUSHED change no version and are not
+        // reported. The lazy FLUSHED rides the next commit's group.
+        shard.commit(tags("missing", "x")).await.unwrap();
+        let lazy = shard.commit_lazy(flushed("a", tagged.position.seq.get(), false));
+        let (lazy, next) = tokio::join!(lazy, shard.commit(put("c", 1, 2)));
+        assert!(lazy.unwrap().outcome.is_applied());
+        let next = next.unwrap();
+        let expected = [
+            ("a", first.position, Some(3)),
+            ("a", tagged.position, None),
+            ("b", deleted.position, Some(0)),
+            ("c", next.position, Some(1)),
+        ];
+        for (key, position, size) in expected {
+            let change = changes.recv().await.unwrap();
+            assert_eq!(
+                (change.key.as_str(), change.position, change.size),
+                (key, position, size)
+            );
+        }
+        let entries = shard.entries(None, 10).await.unwrap();
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+        assert_eq!(shard.entries(Some("a".into()), 1).await.unwrap()[0].0, "b");
+
+        // A new subscription ends the old one, and closing ends both.
+        let mut newer = shard.subscribe();
+        assert!(changes.recv().await.is_none());
+        assert!(!shard.is_stopped());
+        shard.close().await.unwrap();
+        assert!(shard.is_stopped());
+        assert!(newer.recv().await.is_none());
+        assert!(shard.subscribe().recv().await.is_none());
+    });
+}
+
+#[test]
+fn a_pending_flushed_does_not_hold_up_conditional_writes() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let first = shard.commit(put("a", 3, 1)).await.unwrap();
+        // Nothing else is written, so the FLUSHED waits up to a second.
+        let lazy = tokio::spawn({
+            let shard = shard.clone();
+            let body = flushed("a", first.position.seq.get(), false);
+            async move { shard.commit_lazy(body).await }
+        });
+        tokio::task::yield_now().await;
+        let started = std::time::Instant::now();
+        let written = shard
+            .commit_if(put("a", 4, 2), |entry| match entry {
+                Some(_) => Ok(()),
+                None => Err("missing"),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < skys3_log::LAZY_MAX_DELAY);
+        assert!(written.outcome.is_applied());
+        // The FLUSHED came first, and rode the conditional write's group.
+        assert_eq!(
+            lazy.await.unwrap().unwrap().outcome,
+            Outcome::Applied(Effect::Cleaned)
+        );
+    });
+}

@@ -84,9 +84,18 @@ under `ack_policy = "local"`.
 
 | Name | Type | Labels | Status | Description |
 |---|---|---|---|---|
-| `skys3_dirty_bytes` | gauge | decided in M1-16 | planned (M1-16) | Bytes of committed data not yet flushed to the remote target (`dirty_bytes`). |
-| `skys3_oldest_dirty_age_seconds` | gauge | decided in M1-16 | planned (M1-16) | Age of the oldest dirty entry (`oldest_dirty_age`). |
-| `skys3_flush_lag_seconds` | gauge | decided in M1-16 | planned (M1-16) | How far flushing trails ingest (`flush_lag_seconds`). |
+| `skys3_dirty_bytes` | gauge | `bucket` | exported (M1-16) | Bytes of committed versions not yet at the remote target (`dirty_bytes`), from the flushers of the bucket's shards on this node: the size of each dirty key's latest version, tombstones counting 0, keys held in conflict included. |
+| `skys3_oldest_dirty_age_seconds` | gauge | `bucket` | exported (M1-16) | Age of the oldest committed change not yet at the remote (`oldest_dirty_age`), conflicts included: the loss exposure if every member of a shard were lost now. A key's age runs from the first change after its last flush; a key found dirty at startup counts from its `Last-Modified` (a tombstone from the start). 0 when nothing is dirty. |
+| `skys3_flush_lag_seconds` | gauge | `bucket` | exported (M1-16) | Age of the oldest change the flushers are still working on (`flush_lag_seconds`): `oldest_dirty_age` without keys held in conflict, which never drain without an operator. A lag that keeps growing means flushing does not keep up with ingest or the remote is failing. |
+| `skys3_conflicted_keys` | gauge | `bucket` | exported (M1-16) | Keys held in conflict under the `hold` policy: a flush found an out-of-band remote write (design section 7.2). The admin API lists them. |
+| `skys3_flush_conflicts_total` | counter | `bucket` | exported (M1-16) | Flushes that found an out-of-band remote write and put their key in conflict. A restarted flusher finds a held conflict again and counts it again. |
+| `skys3_flushes_total` | counter | `bucket` | exported (M1-16) | Versions flushed: the remote accepted them, or a retry found them there by their write identity. |
+| `skys3_flush_retries_total` | counter | `bucket` | exported (M1-16) | Flush attempts that failed (`5xx`, `503 SlowDown`, a lost response, another error) and are retried after a backoff. |
+
+The `bucket` label is the bucket's name. A node exports the gauges for every
+`write_back` bucket it knows, counting the shards open on it, and the counters
+once the bucket's target passed its capability probe. A bucket's gauges
+disappear when it is deleted.
 
 ### 3.3 Replication
 

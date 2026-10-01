@@ -1221,6 +1221,111 @@ of this file. A task with nothing unexpected keeps "None."
   behind are ordinary objects to a later import (M1-18), which may want to
   skip `.skys3-probe/`.
 
+### M1-16 Flusher
+
+- **"Never triggers an fsync of its own" needed a log primitive.** The
+  group committer started a group with whatever arrived first, so a
+  `FLUSHED` alone cost a sync. `SegmentLog::append_lazy` queues a record
+  that waits for the next group another record starts, in queue order, and
+  `Shard::commit_lazy` uses it. A disk with nothing else to write would
+  keep such records forever, holding entries dirty and delaying the seal of
+  a DeleteBucket, so a lazy record commits on its own after
+  `LAZY_MAX_DELAY` (1 s): at most one extra sync per second on an idle
+  disk, none on a busy one. Design §7.1 says so. The flusher does not wait
+  for the record: its slot is free once the remote answered, and the next
+  version of the key is conditioned on the ETag kept in memory until the
+  record is applied. Waiting would have drained a backlog after an outage
+  at one batch of `FLUSHED` records per second.
+- **A lazy `FLUSHED` must not stall conditional writes.** `commit_if` waits
+  for every unapplied record of its key, so a conditional PUT right after a
+  flush would have waited up to a second. A `FLUSHED` changes the entry's
+  state and remote fields but never its object version, which is all a
+  conditional request checks, so `FLUSHED` records are no longer tracked
+  for it.
+- **Flushing and Conflict stay out of the index.** M1-04 asked whether the
+  flusher would make them replayable. They have no record kind, so they
+  are the primary flusher's in-memory view; the index shows such entries
+  as dirty. A restarted flusher flushes them again, which is conditional:
+  it finds a held conflict again (counted again in
+  `skys3_flush_conflicts_total`) and an earlier success by its identity.
+  Design §4.2 records it. Nothing resolves a held conflict yet except
+  writing it out of band again; the `overwrite` and `discard_local`
+  policies are plan M4, and the node logs a warning and holds when a bucket
+  is configured with either.
+- **The 412 rule as written turned crashes into false conflicts.** After a
+  `FLUSHED` is lost (a crash or a flusher restart) while a newer version
+  committed, the next flush is conditioned on stale knowledge, gets 412,
+  and the HEAD finds an identity, but an older one of the same shard, not
+  the one being flushed: "anything else" made it a conflict, and the hold
+  policy would never flush the acknowledged newer write. The flusher now
+  supersedes an object whose identity names an earlier position of the
+  same shard, conditioned on its ETag; bucket IDs are never reused, so no
+  other writer carries such an identity. Likewise a PUT whose HEAD finds no
+  object (the object it was conditioned on was deleted, perhaps by its own
+  delete whose answer was lost) creates the version with
+  `If-None-Match: *`, since nothing can be overwritten, and a tombstone
+  without a known remote ETag HEADs first, because an earlier flush may
+  have landed without its record. The simulation found the first case at
+  once when the rule was taken out (seed 4); design §7.2 records all
+  three.
+- **Tag-only changes re-PUT the object (plan section 14).**
+  `PutObjectTagging` takes no precondition and would give the version no
+  write identity, so a `TAGS` version is flushed like any version: a
+  conditional `PutObject` of the bytes with the new tags and the `TAGS`
+  record's identity. It needed no code of its own in the flusher, so M1-10
+  merges without touching it. `PutObject` in `skys3-remote` gained `tags`
+  (`x-amz-tagging`), the standard headers other than `Content-Type`, and
+  `Content-MD5`; the simulator keeps tags (`SimS3::tags`) and checks
+  `Content-MD5`.
+- **Checksums are not forwarded; `Content-MD5` is (M1-08's question).**
+  The stored `x-amz-checksum-*` values would break providers that reject
+  flexible checksums (M1-15), so a single PUT carries `Content-MD5`, which
+  its MD5 ETag already is and every provider verifies. A copy carries none,
+  since its ETag need not be its bytes' MD5. Design §7.4 now says so.
+- **Region and credentials for targets.** M1-15 left the region to the
+  attach path. `[flush] target_region` (default `us-east-1`, `auto` for R2)
+  is a node-wide key in §14 and the configuration reference; credentials
+  come from the `aws-config` default chain. Each request has a 10-minute
+  attempt timeout, so a hung connection cannot hold a flush slot forever.
+- **Where the probe runs.** `FlushService` probes each `write_back`
+  target when the node first sees the bucket, retrying with backoff, and
+  starts the shard flushers only once it succeeds; the admin API shows
+  `probe: running` with the last error meanwhile. The node follows its
+  buckets and open shards every second rather than hooking bucket creation
+  in the gateway.
+- **Metrics and status.** `dirty_bytes`, `oldest_dirty_age_seconds`, and
+  `flush_lag_seconds` are gauges by bucket name, set every second from the
+  flushers' status; flush lag is the oldest dirty age without held
+  conflicts, so it measures whether flushing keeps up, while the dirty age
+  measures loss exposure. Conflicts are a gauge (`conflicted_keys`) and a
+  counter. The admin API's bucket status gained a `flush` object that lists
+  conflicts. The `objects` and `unflushed` counts still scan the index, as
+  M1-13 left them: the flusher counts dirty keys, but objects need per-shard
+  counters in the shard, which no task owns yet.
+- **The binary's flush path is not exercised end to end.** No S3 server
+  that honors preconditions and keeps `x-amz-meta-skys3-wid` runs in tests
+  (SkyS3 itself refuses that header), so the node test checks only the
+  wiring with an unreachable target. The flusher, service, and probe run
+  against `SimS3`; M1-26 runs them against real providers.
+- **The simulation checks itself.** `crates/skys3-flush/tests/simulation.rs`
+  (300 seeds in about 40 s) fails within the first few seeds under each of
+  three deliberate mutations: not recognizing the flush's own identity
+  after a lost response, treating a foreign object as one to supersede,
+  and not superseding the shard's own earlier writes. No fuzz target was
+  added: the flusher parses nothing new (write identities go through the
+  existing `WriteIdentity` parser).
+- **Left open.** Multipart objects (M1-16b) and copies flushed as
+  `CopyObject` (§7.2's copy row; a copy is flushed as a `PutObject` of its
+  bytes, which is correct but transfers them) are not done. A version
+  without local bytes (a `TAGS` on an imported or evicted stub) is retried
+  with an error until read-through fill (M1-20) can supply them. The
+  import (M1-18) plugs into `ImportProgress`, which today says every key is
+  passed. Whole objects are read into memory for a PUT, bounded by
+  `flush_max_inflight_bytes_per_target` per target; streaming arrives with
+  M4-03. Concurrency is fixed at `flush_min_concurrency_per_shard` until
+  M4-10. A conflict is not persisted, so after a restart it is
+  re-detected rather than remembered.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named

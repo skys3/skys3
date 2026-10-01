@@ -15,7 +15,7 @@ use skys3_types::{Epoch, EpochSeq, Seq, ShardConfig};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ShardError;
-use crate::machine::{Outcome, Recorder, StateMachine};
+use crate::machine::{Effect, Outcome, Recorder, StateMachine};
 use crate::pipeline::{Durable, Pipeline, Ready};
 
 /// How many entries a summary reads per index transaction.
@@ -29,6 +29,19 @@ pub struct Committed {
     /// What applying the record did. A rejected record is committed too: it
     /// is in the log, and every replica rejects it alike.
     pub outcome: Outcome,
+}
+
+/// A client write the shard applied, as [`Shard::subscribe`] reports it:
+/// a `PUT`, `DELETE`, or `TAGS` that stored a new version of its key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    /// The key written.
+    pub key: String,
+    /// The position of the record, which is the new version's.
+    pub position: EpochSeq,
+    /// The new version's size: the object's for a `PUT`, 0 for a `DELETE`,
+    /// and `None` for a `TAGS`, which keeps the size it had.
+    pub size: Option<u64>,
 }
 
 /// What a shard holds, as deleting its bucket needs to know (§4.1).
@@ -82,6 +95,8 @@ struct Sequencer {
     /// Conditional reads in progress, counted by the position the next
     /// record had when each began.
     readers: BTreeMap<EpochSeq, usize>,
+    /// Where applied client writes are reported, if anyone subscribed.
+    subscriber: Option<mpsc::UnboundedSender<Change>>,
 }
 
 struct Inner<D: Disk> {
@@ -203,6 +218,7 @@ impl<D: Disk> Shard<D> {
             stopped: None,
             writes: BTreeMap::new(),
             readers: BTreeMap::new(),
+            subscriber: None,
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
         let task = PipelineTask {
@@ -273,7 +289,26 @@ impl<D: Disk> Shard<D> {
     /// `CONFIG` or `TRUNCATE`, which a replica appends for itself; and
     /// [`ShardError::Unavailable`] if the shard stopped.
     pub async fn commit(&self, body: RecordBody) -> Result<Committed, ShardError> {
-        let reply = self.submit(body)?;
+        let reply = self.submit_locked(&mut self.sequencer(), body, false)?;
+        reply
+            .await
+            .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
+    }
+
+    /// Commits `body` like [`Shard::commit`], but lets its record ride the
+    /// next group commit of the shard's disk instead of starting one
+    /// ([`SegmentLog::append_lazy`]). The flusher commits `FLUSHED` records
+    /// this way, so they never cost a sync of their own (§7.1).
+    ///
+    /// Records after it are applied only after it, so it can delay their
+    /// answers by at most [`skys3_log::LAZY_MAX_DELAY`], and only while
+    /// nothing else is written to the disk.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::commit`].
+    pub async fn commit_lazy(&self, body: RecordBody) -> Result<Committed, ShardError> {
+        let reply = self.submit_locked(&mut self.sequencer(), body, true)?;
         reply
             .await
             .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
@@ -295,20 +330,14 @@ impl<D: Disk> Shard<D> {
         })
     }
 
-    /// Sequences `body` and starts its append, under the sequencer's lock, so
-    /// records reach the pipeline in position order.
-    fn submit(
-        &self,
-        body: RecordBody,
-    ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
-        self.submit_locked(&mut self.sequencer(), body)
-    }
-
-    /// [`Shard::submit`], for a caller that holds the sequencer's lock.
+    /// Sequences `body` and starts its append, lazily if `lazy`, under the
+    /// sequencer's lock, which the caller holds, so records reach the
+    /// pipeline in position order.
     fn submit_locked(
         &self,
         sequencer: &mut Sequencer,
         body: RecordBody,
+        lazy: bool,
     ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
         let shard = self.shard();
         sequencer.check_running(shard)?;
@@ -340,8 +369,12 @@ impl<D: Disk> Shard<D> {
             .seq
             .checked_next()
             .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
-        let key = entry_key(&body).map(str::to_owned);
-        let receiver = self.sequence(position, body)?;
+        // A `FLUSHED` changes no object version, so conditional checks
+        // need not wait for it (see `commit_if`).
+        let key = entry_key(&body)
+            .filter(|_| !matches!(body, RecordBody::Flushed(_)))
+            .map(str::to_owned);
+        let receiver = self.sequence(position, body, lazy)?;
         sequencer.next = EpochSeq::new(position.epoch, next);
         if let Some(key) = key {
             sequencer.writes.insert(key, position);
@@ -356,6 +389,9 @@ impl<D: Disk> Shard<D> {
     ///
     /// The check and the record's position are therefore linearizable with
     /// every other write of the key, as conditional requests need (§5.1).
+    /// A `FLUSHED` record is the exception: it changes the entry's state and
+    /// remote fields but never its object version, which is all a
+    /// conditional request checks, so the check does not wait for it.
     /// While a record of the key is sequenced but not yet applied, the check
     /// waits until it is. `check` may run more than once, and runs under the
     /// sequencer's lock, so it must be quick.
@@ -413,7 +449,7 @@ impl<D: Disk> Shard<D> {
                 let Some(body) = body.take() else {
                     unreachable!("the record is sequenced at most once");
                 };
-                self.submit_locked(&mut sequencer, body)?
+                self.submit_locked(&mut sequencer, body, false)?
             };
             return reply
                 .await
@@ -544,7 +580,7 @@ impl<D: Disk> Shard<D> {
             // record at `seq` 0 or later.
             let last = Seq::new(sequencer.next.seq.get() - 1);
             let position = EpochSeq::new(config.epoch, last);
-            let reply = self.sequence(position, RecordBody::Config(config.clone()))?;
+            let reply = self.sequence(position, RecordBody::Config(config.clone()), false)?;
             sequencer.next = EpochSeq::new(config.epoch, sequencer.next.seq);
             sequencer.config = config.clone();
             reply
@@ -561,6 +597,7 @@ impl<D: Disk> Shard<D> {
         &self,
         position: EpochSeq,
         body: RecordBody,
+        lazy: bool,
     ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
         let shard = self.shard();
         let record = LogRecord {
@@ -579,7 +616,12 @@ impl<D: Disk> Shard<D> {
             .map_err(|_| self.unavailable("the shard's pipeline stopped"))?;
         let (log, pipeline) = (self.inner.log.clone(), self.inner.pipeline.clone());
         tokio::spawn(async move {
-            let result = match log.append(&record).await {
+            let appended = if lazy {
+                log.append_lazy(&record).await
+            } else {
+                log.append(&record).await
+            };
+            let result = match appended {
                 Ok(location) => Ok(Box::new((record, location))),
                 Err(error) => Err(error.to_string()),
             };
@@ -587,6 +629,45 @@ impl<D: Disk> Shard<D> {
             let _ = pipeline.send(Message::Appended { position, result });
         });
         Ok(receiver)
+    }
+
+    /// Up to `limit` entries of the shard in key order, after `start_after`
+    /// if given, tombstones included, as the index holds them.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn entries(
+        &self,
+        start_after: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<(String, Entry)>, ShardError> {
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.entries(&shard, start_after.as_deref(), limit)
+        })
+        .await
+    }
+
+    /// Reports every client write applied from now on: each `PUT`,
+    /// `DELETE`, and `TAGS` that stored a new version, in position order.
+    /// The shard's flusher follows it (§7.1). A shard has one subscriber; a
+    /// new subscription replaces the previous one, whose stream then ends.
+    /// The stream also ends when the shard stops.
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Change> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut sequencer = self.sequencer();
+        if sequencer.stopped.is_none() {
+            sequencer.subscriber = Some(sender);
+        }
+        receiver
+    }
+
+    /// Whether the shard stopped: it was closed, or a record failed. A
+    /// stopped shard refuses every request until the node reopens it.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.sequencer().stopped.is_some()
     }
 
     /// Seals the shard and reports what it holds (§4.1).
@@ -630,6 +711,7 @@ impl<D: Disk> Shard<D> {
             let mut sequencer = self.sequencer();
             sequencer.check_running(self.shard())?;
             sequencer.stopped = Some("the shard was closed".to_owned());
+            sequencer.subscriber = None;
             self.barrier()
         };
         barrier.await
@@ -743,6 +825,40 @@ fn entry_key(body: &RecordBody) -> Option<&str> {
     }
 }
 
+/// The change a client write would report once applied, by position.
+fn change(record: &LogRecord) -> Option<(EpochSeq, Change)> {
+    let (key, size) = match &record.body {
+        RecordBody::Put(put) => (&put.key, Some(put.size)),
+        RecordBody::Delete(delete) => (&delete.key, Some(0)),
+        RecordBody::Tags(tags) => (&tags.key, None),
+        _ => return None,
+    };
+    let change = Change {
+        key: key.clone(),
+        position: record.position,
+        size,
+    };
+    Some((record.position, change))
+}
+
+/// Sends the subscriber each change whose record stored a new version.
+fn report(
+    subscriber: &mpsc::UnboundedSender<Change>,
+    outcomes: &BTreeMap<EpochSeq, Outcome>,
+    changes: &mut BTreeMap<EpochSeq, Change>,
+) {
+    for (position, outcome) in outcomes {
+        let stored = matches!(
+            outcome,
+            Outcome::Applied(Effect::Stored { .. } | Effect::Tombstoned { .. })
+        );
+        if let Some(change) = changes.remove(position).filter(|_| stored) {
+            // A subscriber that went away needs nothing.
+            let _ = subscriber.send(change);
+        }
+    }
+}
+
 /// Ends a conditional read, also when its future is dropped.
 struct ReadGuard<'a, D: Disk> {
     shard: &'a Shard<D>,
@@ -853,6 +969,11 @@ impl PipelineTask {
                     .map(|(durable, reply)| (*durable, reply))
                     .unzip();
                 let positions: Vec<_> = records.iter().map(|(record, _)| record.position).collect();
+                let subscriber = lock(&self.sequencer).subscriber.clone();
+                let mut changes: BTreeMap<EpochSeq, Change> = match &subscriber {
+                    Some(_) => records.iter().filter_map(|(r, _)| change(r)).collect(),
+                    None => BTreeMap::new(),
+                };
                 let index = Arc::clone(&self.index);
                 let applied = run(&self.pool, &self.shard, move || {
                     let recorder = Recorder::default();
@@ -870,6 +991,9 @@ impl PipelineTask {
                         // Every record is past the applied position, so none
                         // was skipped and each has an outcome.
                         let mut outcomes: BTreeMap<_, _> = outcomes.into_iter().collect();
+                        if let Some(subscriber) = subscriber {
+                            report(&subscriber, &outcomes, &mut changes);
+                        }
                         for (position, reply) in positions.into_iter().zip(replies) {
                             let committed = outcomes
                                 .remove(&position)
@@ -898,6 +1022,7 @@ impl PipelineTask {
             .get_or_insert_with(|| {
                 let mut sequencer = lock(&self.sequencer);
                 sequencer.stopped.get_or_insert_with(|| reason.clone());
+                sequencer.subscriber = None;
                 ShardError::unavailable(&self.shard, reason)
             })
             .clone()

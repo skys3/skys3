@@ -1073,3 +1073,18 @@ fn attached_targets_must_not_share_the_control_stores_scope() {
     let error = s3(true).check_target_independence(&control).unwrap_err();
     assert!(error.contains("overlap"), "{error}");
 }
+
+#[test]
+fn target_regions_are_names() {
+    for bad in ["", "us east", "us-east-1/x"] {
+        let violations = violations_of(&format!("{BASE}\n[flush]\ntarget_region = {bad:?}"));
+        assert!(
+            violations.contains_key("flush.target_region"),
+            "{violations}"
+        );
+    }
+    let config: skys3_config::Config = format!("{BASE}\n[flush]\ntarget_region = \"auto\"")
+        .parse()
+        .unwrap();
+    assert_eq!(config.flush().target_region, "auto");
+}
