@@ -7,6 +7,7 @@
 //! control-store reader.
 
 use serde::{Deserialize, Serialize};
+use skys3_types::{InvalidRegister, ProposalId, RegisterDocument};
 use thiserror::Error;
 
 use crate::jwt::Algorithm;
@@ -99,6 +100,63 @@ impl OidcProvider {
             return Err(ProviderError::NoAlgorithms(issuer()));
         }
         Ok(())
+    }
+}
+
+/// `identity/providers/<name>.json`: the register that allowlists one
+/// [`OidcProvider`] (design §6.1). It holds the provider's fields and the
+/// `proposal_id` every register carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDocument {
+    /// [`OidcProvider::issuer`].
+    pub issuer: String,
+    /// [`OidcProvider::audiences`].
+    pub audiences: Vec<String>,
+    /// [`OidcProvider::authorized_parties`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_parties: Vec<String>,
+    /// [`OidcProvider::algorithms`].
+    #[serde(default = "default_algorithms")]
+    pub algorithms: Vec<Algorithm>,
+    /// The proposal ID of the write that stored this document.
+    pub proposal_id: ProposalId,
+}
+
+impl ProviderDocument {
+    /// The register document for `provider`.
+    pub fn new(provider: OidcProvider, proposal_id: ProposalId) -> Self {
+        ProviderDocument {
+            issuer: provider.issuer,
+            audiences: provider.audiences,
+            authorized_parties: provider.authorized_parties,
+            algorithms: provider.algorithms,
+            proposal_id,
+        }
+    }
+
+    /// The provider the document allowlists.
+    pub fn provider(&self) -> OidcProvider {
+        OidcProvider {
+            issuer: self.issuer.clone(),
+            audiences: self.audiences.clone(),
+            authorized_parties: self.authorized_parties.clone(),
+            algorithms: self.algorithms.clone(),
+        }
+    }
+}
+
+impl RegisterDocument for ProviderDocument {
+    const KIND: &'static str = "OIDC provider";
+
+    fn proposal_id(&self) -> &ProposalId {
+        &self.proposal_id
+    }
+
+    fn validate(&self) -> Result<(), InvalidRegister> {
+        self.provider()
+            .check()
+            .map_err(|error| InvalidRegister::Document(error.to_string()))
     }
 }
 
@@ -207,6 +265,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&minimal).unwrap(),
             r#"{"issuer":"https://i","audiences":["a"],"algorithms":["RS256"]}"#
+        );
+
+        let id = ProposalId::from_u128(7);
+        let document = ProviderDocument::new(provider.clone(), id.clone());
+        let json = document.to_json().unwrap();
+        assert_eq!(ProviderDocument::from_json(&json).unwrap(), document);
+        assert_eq!(document.provider(), provider);
+        assert_eq!(document.proposal_id(), &id);
+        let invalid = ProviderDocument::new(OidcProvider::new("https://i", [""]), id);
+        assert!(
+            invalid
+                .to_json()
+                .unwrap_err()
+                .to_string()
+                .contains("audience")
+        );
+        assert!(
+            ProviderDocument::from_json(br#"{"issuer":"https://i","audiences":["a"]}"#).is_err()
         );
 
         for bad in [

@@ -141,6 +141,7 @@ dependencies = [
  "http-body",
  "percent-encoding",
  "pin-project-lite",
+ "regex-lite",
  "tracing",
  "uuid",
 ]
@@ -2310,7 +2311,13 @@ dependencies = [
 name = "skys3-sts"
 version = "0.1.0"
 dependencies = [
+ "aws-config",
+ "aws-credential-types",
  "aws-lc-rs",
+ "aws-sdk-s3",
+ "aws-smithy-async",
+ "aws-smithy-http-client",
+ "aws-types",
  "base64",
  "bytes",
  "http",
@@ -2321,13 +2328,22 @@ dependencies = [
  "proptest",
  "rustls",
  "rustls-native-certs",
+ "s3s",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "skys3-config",
+ "skys3-control",
+ "skys3-gateway",
  "skys3-io",
+ "skys3-sts",
+ "skys3-types",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
