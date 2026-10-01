@@ -73,6 +73,49 @@ fn a_real_file_keeps_what_a_checkpoint_made_durable() {
 }
 
 #[test]
+fn removing_a_shard_keeps_every_other_shard() {
+    let disk = SimDisk::new(5);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let extent = |shard_no: u8, seq: u64| {
+        let (mut record, location) = delete(shard_no, seq, "big");
+        record.body = RecordBody::Extent(skys3_log::record::Extent {
+            key: "big".into(),
+            offset: 0,
+            data: Bytes::from_static(b"bytes"),
+        });
+        (record, location)
+    };
+    // Shard 255 is the last of its bucket, so its keys end in 0xff; 253 is
+    // in the same bucket, and 254 in another.
+    for n in [253, 254, 255] {
+        index
+            .apply(
+                &TestApplier,
+                &[delete(n, 1, "a"), extent(n, 2), delete(n, 3, "z")],
+            )
+            .unwrap();
+    }
+    index.remove_shard(&shard(255)).unwrap();
+    let dump = index.read().unwrap().dump().unwrap();
+    for n in [253, 254] {
+        assert_eq!(
+            dump.entries.keys().filter(|(s, _)| *s == shard(n)).count(),
+            2
+        );
+        assert!(dump.locations.contains_key(&(shard(n), position(2))));
+        assert_eq!(dump.applied.get(&shard(n)), Some(&position(3)));
+    }
+    assert!(dump.entries.keys().all(|(s, _)| *s != shard(255)));
+    assert!(dump.locations.keys().all(|(s, _)| *s != shard(255)));
+    assert!(!dump.applied.contains_key(&shard(255)));
+    // The shard starts afresh.
+    assert_eq!(
+        index.apply(&TestApplier, &[delete(255, 1, "a")]).unwrap(),
+        1
+    );
+}
+
+#[test]
 fn rejects_an_index_of_another_format() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.redb");

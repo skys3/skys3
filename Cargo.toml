@@ -47,6 +47,7 @@ skys3-index = { path = "crates/skys3-index" }
 skys3-io = { path = "crates/skys3-io" }
 skys3-log = { path = "crates/skys3-log" }
 skys3-remote = { path = "crates/skys3-remote" }
+skys3-shard = { path = "crates/skys3-shard" }
 skys3-sim = { path = "crates/skys3-sim" }
 skys3-types = { path = "crates/skys3-types" }
 tempfile = { version = "3.27.0", default-features = false }
