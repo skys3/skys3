@@ -412,6 +412,80 @@ of this file. A task with nothing unexpected keeps "None."
   commits for 12,800 records, about 15,000 records per second). A single
   writer gets one record per commit.
 
+### M1-03 Index and checkpoints
+
+- **redb 4.3, not the 2.x API the design was written against.** The
+  `StorageBackend` trait, `Durability::None` and `Durability::Immediate`
+  remain. Checkpoint commits also enable quick repair, which commits in two
+  phases and saves the allocator state. Without it, reopening after a crash
+  walks the whole database to rebuild the allocator, which would be slow
+  for a large namespace mirror.
+- **redb cannot run on the `Disk` trait.** `Disk` is append-only and async,
+  and redb needs synchronous writes at any offset. The simulated disk now
+  also holds random-access block files (`SimBlockFile`), and
+  `Index::open_sim` runs redb on one through a `StorageBackend`. One
+  `SimDisk::crash` reverts the log and the index together. A crash keeps the
+  synced image plus each unsynced write with the torn-write probability, as
+  a random prefix. A failed sync loses its writes and takes the file out of
+  service. Nodes use redb's own file backend (`Index::open`), which does
+  not sync the directory of a new file, so `Index::open` does that itself.
+- **Dropping a redb database makes it durable.** `Drop` commits the
+  allocator state durably and writes a clean-shutdown header, which would
+  turn a simulated crash into a checkpoint. The scenarios therefore crash
+  the disk before they drop the index (power loss: its I/O then fails), or
+  leak it with `mem::forget` (a killed process: the disk keeps every write).
+- **Applied positions do not say where replay must start.** They name what
+  each shard applied, not where its later records are. A record can also be
+  acknowledged and not yet applied when a checkpoint runs. The log
+  therefore keeps a summary of each segment: the highest position of each
+  shard among the records it acknowledged there (`SegmentSummary`). Each
+  checkpoint stores the summaries in its durable commit and releases a
+  segment once every summarized position is behind it
+  (`SegmentLog::release`). Replay reads a segment from where its summary
+  ends, or from the start if the summary is not behind the checkpoint.
+  Design §10.2 records the rules. Summaries cover acknowledged records only,
+  so a crash cannot take back what they claim. The log's changes:
+  requests carry their shard and position, and the log gains `summaries`,
+  `release`, `released`, and `scan_range`. Removing released segments
+  stays with M1-22.
+- **A shard's extents and its other records are in different segments.**
+  Replay reads segment by segment, so a `PUT` can come before the extents
+  it references. Replay sorts each shard's records by position. A mutation
+  that dropped the sort failed the simulation. For M1-04: a shard's applied
+  position must mean that every earlier record of the shard was applied,
+  `EXTENT` records included. The state machine cannot apply a small `PUT`
+  while the extents of an earlier-sequenced upload are still unapplied.
+- **A shard's records can span a node's disks.** Review found that replay
+  ordered each shard's records within one disk at a time. A record on the
+  first disk could then advance the applied position past an earlier
+  record on a later disk, which replay skipped. Nothing in the design pins
+  a shard replica to one disk, so replay now collects every disk's
+  records before it orders each shard's. A unit test and the simulation,
+  which now runs some seeds with two disks, fail without the fix. The
+  location map names no disk yet; M1-13, which places replicas on disks,
+  must add it or keep a replica's payload on one disk (design §10.2).
+- **Entries name payload by position.** Payload named by node-local
+  location would make entries differ between replicas. Entries name the
+  record that holds the payload, and the location map resolves inline
+  `PUT` records as well as extents (design §10.2).
+- **Control state is not in the log,** so replay cannot restore it. Each
+  change to the local copy commits durably at once (design §10.2).
+- **The tests check themselves.** The seeded scenario
+  (`crates/skys3-index/tests/simulation.rs`, run by CI's simulation job)
+  checks that each restart reverts to the last durable commit, that replay
+  reproduces the index exactly, that replay reads nothing of a released
+  segment, and that released segments hold only records behind the
+  checkpoint. Four deliberate mutations each fail it: dropping the replay
+  sort, replaying from a summary that is not behind the checkpoint,
+  releasing without comparing positions, and checkpointing without
+  durability.
+- **Left open.** A shard that stops applying, for example one dropped from
+  the node, holds its segments forever; dropping a shard (M2, M3) must
+  clear its summaries. The design asks checkpoints to keep each shard's
+  latest `CONFIG` record reachable. The index does not store configurations
+  yet, so reclaiming segments (M1-22) or the local control-state copies
+  (M2-16) must keep it.
+
 ### M1-05 Control store interface and local backends
 
 - **Which ID keys a bucket register.** The layout said `buckets/<bucket>.json`
