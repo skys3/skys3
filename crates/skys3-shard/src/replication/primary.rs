@@ -96,10 +96,10 @@ impl<N: Network, D: Disk> Link<N, D> {
     }
 
     /// Sends the member every record after `cursor` as the primary holds
-    /// it, and beacons with the commit watermark in between: every
-    /// `beacon_interval` while there is nothing to send, and at least every
-    /// `lease_renew_interval` while there is, so the member renews the
-    /// primary's lease even while its log is slow to sync (§5.4).
+    /// it, and beacons with the commit watermark in between, at least as
+    /// often as [`ReplicationConfig::beacon_every`] says, so the member
+    /// renews the primary's lease, and the link stays up, even while its
+    /// log is slow to sync (§5.4).
     async fn send<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         sender: &mut Sender<S>,
@@ -124,11 +124,7 @@ impl<N: Network, D: Disk> Link<N, D> {
             if records.is_empty() && self.shard.is_stopped() {
                 return Ok(());
             }
-            let interval = if records.is_empty() {
-                self.config.beacon_interval
-            } else {
-                self.config.lease_renew_interval
-            };
+            let interval = self.config.beacon_every(records.is_empty());
             if last_beacon.is_none_or(|at| Instant::now() >= at + interval) {
                 let beacon = Beacon {
                     epoch,
@@ -143,8 +139,8 @@ impl<N: Network, D: Disk> Link<N, D> {
             if records.is_empty() {
                 // Woken by a new record, or for the next beacon. The
                 // watermark waits for either.
-                let due =
-                    last_beacon.map_or_else(Instant::now, |at| at + self.config.beacon_interval);
+                let every = self.config.beacon_every(true);
+                let due = last_beacon.map_or_else(Instant::now, |at| at + every);
                 let _ = tokio::time::timeout_at(due, changes.changed()).await;
                 continue;
             }

@@ -2556,6 +2556,15 @@ of this file. A task with nothing unexpected keeps "None."
   with every acknowledgement after its first stamp, also when it repeats
   an old stamp; that only restarts its grace later. Design §5.4 records
   the details, and that unconditional writes need no lease.
+- **The renewal interval equalled the link timeout.** Both default to 1 s.
+  On a busy link whose member's log stalls, the answers to renewal
+  beacons were all the primary heard, one per timeout, so the link
+  dropped and reconnected over and over, and a reconnect waits for the
+  member's slow sync, so leases could lapse. Review caught it.
+  `ReplicationConfig::beacon_every` now caps every beacon interval at a
+  quarter of `link_timeout`; a test with a member that answers beacons
+  and acknowledges no record keeps one session and its lease through
+  three timeouts.
 - **Left for later.** R1 needs a member to stop granting leases before it
   proposes (M2-12): `Grace` has no such switch yet, and the member's link
   echoes stamps as long as it follows the primary. The lease timings sit
