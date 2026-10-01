@@ -5,10 +5,20 @@
 //!   nothing.
 //! - [`check_durable`]: every acknowledged write is still present on a
 //!   surviving copy of its key, or flushed to the remote store, unless a
-//!   later write may have superseded it, or it was reported lost.
+//!   later write may have superseded it, or it was reported lost. In a
+//!   `write_back` bucket a copy counts only while it is dirty: a clean
+//!   copy says the remote store holds its value, so the remote must.
 //!
 //! Both take the operations of a [`History`](crate::history::History). A
 //! failure is a [`Violation`] that names the key and lists its operations.
+//!
+//! Together they enforce the crash-consistency rule of design §5.2: every
+//! acknowledged write survives recovery unless a later write superseded
+//! it, and no unacknowledged write resurfaces over a later acknowledged
+//! one. The second half needs to know when an unanswered write stopped
+//! being able to take effect, which a server's crash decides
+//! ([`History::crashed`](crate::history::History::crashed)): a write that
+//! may take effect at any time could always explain a resurfaced value.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
@@ -312,6 +322,12 @@ pub struct Survivors {
     /// shard whose disks survived, after recovery; `None` where the copy
     /// holds no value.
     pub copies: Vec<Option<String>>,
+    /// For a `write_back` bucket, whether each copy, by position in
+    /// `copies`, is clean: its entry says the remote store holds its value.
+    /// A clean copy keeps no write by itself; only the remote store
+    /// ([`Survivors::flushed`]) counts for it. Copies past the end of this
+    /// list are dirty, as every copy in a `local` bucket is.
+    pub clean: Vec<bool>,
     /// The key's value in the remote store, if the bucket flushes to one:
     /// `Some(None)` if the remote store holds no object.
     pub flushed: Option<Option<String>>,
@@ -319,12 +335,16 @@ pub struct Survivors {
     pub reported_lost: bool,
 }
 
-/// Checks that every acknowledged write survived: for each key, a
+/// Checks that every acknowledged write survived: for each key, a dirty
 /// surviving copy or the remote store holds the write's value or the
 /// value of a write that may have come after it, or the key was reported
 /// lost. A write *may come after* an acknowledged write unless it was
-/// answered before the acknowledged one was called. A key missing from
-/// `survivors` has no surviving copy.
+/// answered before the acknowledged one was called, or its server crashed
+/// first. A key missing from `survivors` has no surviving copy.
+///
+/// In a `write_back` bucket this is the rule that every acknowledged write
+/// is either flushed or still dirty locally: a copy marked clean in
+/// [`Survivors::clean`] does not count.
 ///
 /// # Errors
 ///
@@ -340,11 +360,13 @@ pub fn check_durable(
         if survivor.reported_lost {
             continue;
         }
-        let held: Vec<&Option<String>> = survivor
+        let dirty = survivor
             .copies
             .iter()
-            .chain(survivor.flushed.as_ref())
-            .collect();
+            .enumerate()
+            .filter(|(position, _)| !survivor.clean.get(*position).copied().unwrap_or(false))
+            .map(|(_, value)| value);
+        let held: Vec<&Option<String>> = dirty.chain(survivor.flushed.as_ref()).collect();
         let writes: Vec<&Operation> = operations
             .iter()
             .copied()

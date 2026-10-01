@@ -20,6 +20,7 @@ use skys3_io::SimMount;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_net::{Frame, Header, MessageKind};
+use skys3_sim::s3::SimS3Faults;
 use skys3_sim::{Runner, SimContext};
 
 use crate::COST;
@@ -45,11 +46,23 @@ fn a_seed_replays_exactly() {
     let run = |seed| {
         let mut context = SimContext::new(seed);
         let (config, workload) = small();
+        // A second bucket flushes to a remote store with faults, so the
+        // flusher replays too.
+        let config = ClusterConfig {
+            buckets: 2,
+            write_back_buckets: 1,
+            remote_faults: SimS3Faults {
+                max_delay: Duration::from_millis(20),
+                internal_error_probability: 0.05,
+                lost_response_probability: 0.05,
+                ..SimS3Faults::default()
+            },
+            ..config
+        };
         let plan = FaultPlan::random(context.rng(), &FaultProfile::default(), 2, 2, 2);
         Cluster::new(config)
             .run(&mut context, &workload, &plan)
             .unwrap()
-            .history
     };
     Runner::with_cost(1, COST).run(|context| {
         assert_eq!(run(context.seed()), run(context.seed()));

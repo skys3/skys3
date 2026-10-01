@@ -12,9 +12,10 @@ use skys3_control::{
     Expected, ProposalIds, ProposalOutcome, RetryPolicy, S3ControlStore, S3StoreConfig, TypedKey,
     bootstrap, bump_generation, propose_document,
 };
+use skys3_flush::FlushSettings;
 use skys3_gateway::{GatewayConfig, ShardRef};
-use skys3_index::Index;
-use skys3_io::{Drift, MonotonicClock, SimDiskFaults};
+use skys3_index::{EntryState, Index};
+use skys3_io::{Drift, MonotonicClock, SimDiskFaults, SyncCut};
 use skys3_log::LogConfig;
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
 use skys3_sim::history::{History, Operation, Outcome};
@@ -22,7 +23,7 @@ use skys3_sim::s3::{SimS3Config, SimS3Faults};
 use skys3_sim::{SimContext, SimS3};
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, BucketName, ClusterId, Epoch, Label, NodeAddress, NodeId,
-    ShardConfig, ShardCount,
+    RemoteTarget, ShardConfig, ShardCount,
 };
 
 use crate::faults::{Endpoint, Fault, FaultPlan};
@@ -40,8 +41,11 @@ pub struct ClusterConfig {
     pub nodes: usize,
     /// Disks per node. The first also holds the index.
     pub disks_per_node: usize,
-    /// Buckets, all `local`.
+    /// Buckets.
     pub buckets: usize,
+    /// How many of the buckets, the last ones, are `write_back` buckets
+    /// whose nodes flush them to the remote store. The others are `local`.
+    pub write_back_buckets: usize,
     /// Shards per bucket.
     pub shards_per_bucket: u32,
     /// Members of each shard's configuration in the static placement. The
@@ -62,6 +66,8 @@ pub struct ClusterConfig {
     pub control_rates: FaultRates,
     /// The shortest and longest latency of each network message.
     pub latency: (Duration, Duration),
+    /// Faults of the remote store that `write_back` buckets flush to.
+    pub remote_faults: SimS3Faults,
 }
 
 impl Default for ClusterConfig {
@@ -70,6 +76,7 @@ impl Default for ClusterConfig {
             nodes: 3,
             disks_per_node: 2,
             buckets: 2,
+            write_back_buckets: 0,
             shards_per_bucket: 4,
             replicas: 1,
             every_member_durable: false,
@@ -86,6 +93,7 @@ impl Default for ClusterConfig {
                 ..FaultRates::default()
             },
             latency: (Duration::from_millis(1), Duration::from_millis(5)),
+            remote_faults: SimS3Faults::default(),
         }
     }
 }
@@ -133,6 +141,16 @@ pub struct Report {
     pub faults: usize,
     /// Node lives started, restarts included.
     pub lives: u64,
+    /// The syncs each node's disks performed before the final power loss,
+    /// by node: the sync boundaries [`Cluster::power_loss_at_sync`] can
+    /// pick from on another run of the same seed.
+    pub syncs: Vec<u64>,
+    /// Power losses planned with [`Cluster::power_loss_at_sync`] that
+    /// happened.
+    pub power_cuts: usize,
+    /// Keys of `write_back` buckets that the remote store holds an object
+    /// for at the end.
+    pub flushed: usize,
     /// Power-loss restarts the driver forced on nodes whose sync failed
     /// and that had not been restarted otherwise.
     pub fences: usize,
@@ -185,6 +203,15 @@ pub struct Cluster<S: NodeServices = LocalServices> {
     config: ClusterConfig,
     services: S,
     invariants: Vec<Box<dyn Invariant<S>>>,
+    cut: Option<SyncPowerLoss>,
+}
+
+/// A power loss planned at one sync of one node.
+#[derive(Clone, Copy, Debug)]
+struct SyncPowerLoss {
+    node: usize,
+    sync: u64,
+    cut: SyncCut,
 }
 
 impl Cluster<LocalServices> {
@@ -203,6 +230,8 @@ const TIME_LIMIT: Duration = Duration::from_secs(3600);
 const STARTUP_LIMIT: Duration = Duration::from_secs(60);
 /// How long a node that stopped by itself stays down before it restarts.
 const SUPERVISOR_DELAY: Duration = Duration::from_millis(500);
+/// How long a node stays down after a planned power loss at a sync.
+const CUT_DOWNTIME: Duration = Duration::from_millis(300);
 /// How long after a failed sync the node is restarted with a power loss.
 const FENCE_DELAY: Duration = Duration::from_secs(1);
 /// Attempts of each final read.
@@ -318,6 +347,7 @@ impl<S: NodeServices> Cluster<S> {
             config,
             services,
             invariants: Vec::new(),
+            cut: None,
         }
     }
 
@@ -325,6 +355,19 @@ impl<S: NodeServices> Cluster<S> {
     #[must_use]
     pub fn invariant(mut self, invariant: impl Invariant<S>) -> Self {
         self.invariants.push(Box::new(invariant));
+        self
+    }
+
+    /// Cuts the power of node `node` at its sync numbered `sync`, counting
+    /// from 0 over every sync of the node's disks since the run began
+    /// (startup included), just before or just after the sync takes
+    /// effect. The node then restarts, as after a [`Fault::Crash`] with a
+    /// power loss. [`Report::syncs`] gives the number of syncs of a run of
+    /// the same seed without the cut; since a seed replays exactly, each
+    /// of them is a boundary this run reaches.
+    #[must_use]
+    pub fn power_loss_at_sync(mut self, node: usize, sync: u64, cut: SyncCut) -> Self {
+        self.cut = Some(SyncPowerLoss { node, sync, cut });
         self
     }
 
@@ -343,6 +386,11 @@ impl<S: NodeServices> Cluster<S> {
         plan: &FaultPlan,
     ) -> Result<Report, RunError> {
         let world = World::build(context, &self.config, self.services.clone())?;
+        if let Some(planned) = self.cut {
+            world.slots[planned.node]
+                .power
+                .cut_at_sync(planned.sync, planned.cut);
+        }
         let history = History::new();
         let mut builder = context.builder();
         builder
@@ -366,6 +414,8 @@ impl<S: NodeServices> Cluster<S> {
         }
         let mut driver = Driver {
             world: &world,
+            history: history.clone(),
+            cut: vec![false; world.slots.len()],
             plan: plan.faults().iter().cloned().collect(),
             origin: None,
             heals: Vec::new(),
@@ -416,6 +466,7 @@ impl<S: NodeServices> Cluster<S> {
         self.drive(&mut sim, &mut driver, &history, true)?;
 
         // Power loss everywhere: what survives is what the checkers see.
+        let syncs = world.slots.iter().map(|slot| slot.power.syncs()).collect();
         for slot in &world.slots {
             slot.stop_disks(true);
             sim.crash(slot.host.as_str());
@@ -445,6 +496,12 @@ impl<S: NodeServices> Cluster<S> {
             history: operations,
             faults: driver.faults,
             lives: world.slots.iter().map(|slot| slot.lives()).sum(),
+            syncs,
+            power_cuts: driver.cut.iter().filter(|cut| **cut).count(),
+            flushed: survivors
+                .values()
+                .filter(|survivor| matches!(survivor.flushed, Some(Some(_))))
+                .count(),
             fences: driver.fences,
         })
     }
@@ -514,6 +571,7 @@ struct World<S> {
     control: SimS3,
     base_control: SimS3Faults,
     rates: FaultRates,
+    remote: SimS3,
 }
 
 impl<S: NodeServices> World<S> {
@@ -528,6 +586,7 @@ impl<S: NodeServices> World<S> {
         let cluster = ClusterId::new(CLUSTER)?;
         let control = context.s3(SimS3Config::default());
         let remote = context.s3(SimS3Config::default());
+        remote.set_faults(config.remote_faults.clone());
         let settings = settings(&cluster)?;
         let store = S3ControlStore::new(
             control.clone(),
@@ -586,17 +645,20 @@ impl<S: NodeServices> World<S> {
                 services,
                 peers,
                 placement: Arc::clone(&placement),
-                remote,
+                remote: remote.clone(),
             }),
             routes: Routes { buckets, placement },
             base_control: control.faults(),
             control,
             rates: config.control_rates,
+            remote,
         })
     }
 
     /// Recovers every node from its disks, outside the simulation, and
-    /// reads each key's value on every member of its shard.
+    /// reads each key's value on every member of its shard and, for a
+    /// `write_back` bucket, whether the member's entry is clean, and the
+    /// key's value in the remote store.
     fn survivors(&self, keys: usize) -> Result<BTreeMap<String, Survivors>, BoxError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -624,19 +686,29 @@ impl<S: NodeServices> World<S> {
         for (name, bucket, key) in self.routes.keys(keys) {
             let shard = ShardRef::for_key(&bucket, &key);
             let members = &self.routes.placement[&shard].members;
-            let mut copies = Vec::new();
+            let write_back = bucket.mode == BucketMode::WriteBack;
+            let mut survivor = Survivors::default();
             for member in members {
                 let entry = indexes[member].read()?.entry(&(&shard).into(), &key)?;
-                copies.push(
+                // No entry claims what a clean one does: the remote store
+                // matches, here by holding nothing.
+                let clean = entry.as_ref().is_none_or(|entry| {
+                    matches!(entry.state, EntryState::Clean | EntryState::Evicted)
+                });
+                survivor.copies.push(
                     entry
                         .and_then(|entry| entry.object)
                         .map(|o| o.local_etag.to_string()),
                 );
+                if write_back {
+                    survivor.clean.push(clean);
+                }
             }
-            let survivor = Survivors {
-                copies,
-                ..Survivors::default()
-            };
+            if write_back {
+                let remote_key = format!("{}{key}", remote_prefix(&bucket));
+                let object = self.remote.object(&remote_key);
+                survivor.flushed = Some(object.map(|o| o.info.etag.to_string()));
+            }
             survivors.insert(name, survivor);
         }
         Ok(survivors)
@@ -670,6 +742,12 @@ fn settings(cluster: &ClusterId) -> Result<NodeSettings, BoxError> {
         },
         retry: gateway.retry,
         gateway,
+        flush: FlushSettings {
+            concurrency: 2,
+            min_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_secs(1),
+            ..FlushSettings::default()
+        },
         checkpoint_interval: Duration::from_secs(1),
         drift: Drift::NONE,
         poll_interval: Duration::from_millis(500),
@@ -688,16 +766,28 @@ fn registers(
     let replicas = config.replicas.clamp(1, nodes.len());
     let mut buckets = Vec::new();
     let mut placement = BTreeMap::new();
+    let local_buckets = config.buckets.saturating_sub(config.write_back_buckets);
     for b in 0..config.buckets {
+        let name = BucketName::new(format!("bucket-{b}"))?;
+        let (mode, target) = if b < local_buckets {
+            (BucketMode::Local, None)
+        } else {
+            let target = RemoteTarget {
+                endpoint: "https://remote.sim.internal".to_owned(),
+                bucket: "remote".to_owned(),
+                prefix: Some(format!("{name}/")),
+            };
+            (BucketMode::WriteBack, Some(target))
+        };
         let bucket = BucketDocument {
             bucket_id: BucketId::new(format!("b-sim{b}"))?,
-            name: BucketName::new(format!("bucket-{b}"))?,
-            mode: BucketMode::Local,
+            name,
+            mode,
             shards,
             replicas: u8::try_from(replicas)?,
             min_write_replicas: 1,
             clean_copies: 1,
-            target: None,
+            target,
             created_unix_ms: 0,
             proposal_id: ids.next_id(),
         };
@@ -723,6 +813,15 @@ fn registers(
         buckets.push(bucket);
     }
     Ok((buckets, placement))
+}
+
+/// The key prefix of a `write_back` bucket in the remote store.
+fn remote_prefix(bucket: &BucketDocument) -> &str {
+    bucket
+        .target
+        .as_ref()
+        .and_then(|target| target.prefix.as_deref())
+        .unwrap_or_default()
 }
 
 /// Writes `cluster.json`, every bucket register, and every shard register,
@@ -759,6 +858,10 @@ fn accepted(outcome: ProposalOutcome) -> Result<(), BoxError> {
 /// that stopped.
 struct Driver<'a, S> {
     world: &'a World<S>,
+    /// The history, whose operations a node's crash ends.
+    history: History,
+    /// Nodes whose planned power loss at a sync happened.
+    cut: Vec<bool>,
     plan: std::collections::VecDeque<crate::faults::ScheduledFault>,
     /// When the workload started, which the plan's times count from.
     origin: Option<Duration>,
@@ -811,6 +914,14 @@ impl<S: NodeServices> Driver<'_, S> {
             self.heal(sim, now, heal, heal_all);
         }
         for index in 0..self.world.slots.len() {
+            if !self.cut[index] && self.world.slots[index].power.is_cut() {
+                // The disks lost power inside a sync; the host goes with
+                // them now.
+                self.cut[index] = true;
+                self.crash(sim, now, index, true, CUT_DOWNTIME);
+            }
+        }
+        for index in 0..self.world.slots.len() {
             let host = self.world.slots[index].host.as_str();
             match self.down[index] {
                 Some(at) if heal_all || at <= now => {
@@ -822,6 +933,7 @@ impl<S: NodeServices> Driver<'_, S> {
                     // The node stopped by itself, as a failed start or
                     // checkpoint stops it: a supervisor restarts it, after
                     // a power loss in case a disk went out of service.
+                    self.history.crashed(host);
                     self.world.slots[index].stop_disks(true);
                     self.fenced[index] = false;
                     self.life[index] += 1;
@@ -847,6 +959,7 @@ impl<S: NodeServices> Driver<'_, S> {
         let slot = &self.world.slots[node];
         slot.stop_disks(power_loss);
         sim.crash(slot.host.as_str());
+        self.history.crashed(&slot.host);
         self.life[node] += 1;
         self.down[node] = Some(now + downtime);
     }

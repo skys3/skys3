@@ -148,8 +148,9 @@ pub trait ChangeStream: Send {
 /// Like `skys3-remote`'s `ObjectStore`, the methods return
 /// `impl Future + Send`, so the trait is used through generics.
 pub trait ControlStore: fmt::Debug + Clone + Send + Sync + 'static {
-    /// The stream [`ControlStore::changes`] returns.
-    type Changes: ChangeStream;
+    /// The stream [`ControlStore::changes`] returns. It owns what it
+    /// reads, so a task can consume it.
+    type Changes: ChangeStream + 'static;
 
     /// Reads a register, or `None` if it does not exist.
     ///

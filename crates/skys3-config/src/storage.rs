@@ -39,6 +39,10 @@ pub struct StorageConfig {
     /// `read_registration_renew_interval_seconds`: how often a streaming
     /// gateway renews its read registrations (§8.7).
     pub read_registration_renew_interval_seconds: u64,
+    /// `disk_min_free_bytes`: below this much free space on a log disk, or
+    /// on the data directory's file system, new writes get `503 SlowDown`
+    /// (§13). 0 turns the check off.
+    pub disk_min_free_bytes: u64,
 }
 
 impl Default for StorageConfig {
@@ -53,6 +57,7 @@ impl Default for StorageConfig {
             compaction_live_threshold: 0.5,
             read_registration_ttl_seconds: 30,
             read_registration_renew_interval_seconds: 10,
+            disk_min_free_bytes: GIB,
         }
     }
 }

@@ -6,7 +6,8 @@
 //! ([`skys3::storage::recover`]), opens the control store or falls back to
 //! the copy the index kept ([`skys3::control::open`]), builds the gateway,
 //! and opens every bucket's shards. Then it serves S3 on the simulated
-//! network, takes checkpoints, and keeps trying the control store while it
+//! network, takes checkpoints, flushes `write_back` buckets to the remote
+//! store ([`FlushService`]), and keeps trying the control store while it
 //! runs from its copy. What differs from the binary is the environment:
 //! simulated disks, a drifting clock, a fault-injecting control store, an
 //! inline blocking pool, and an authenticator that trusts every request.
@@ -24,11 +25,15 @@ use skys3::control::{self, NodeStore};
 use skys3::storage;
 use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
+use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{Gateway, GatewayConfig, IdSource, LocalShards, ShardRef, Shards, TrustAll};
 use skys3_index::{Index, IndexConfig};
-use skys3_io::{BlockingPool, Clock, Drift, MonotonicClock, SimDisk, SimMount};
+use skys3_io::{
+    BlockingPool, Clock, Drift, MonotonicClock, SimDisk, SimMount, SimPower, WallClock,
+};
 use skys3_log::LogConfig;
 use skys3_net::{Credentials, Transport, TurmoilNetwork};
+use skys3_obs::MetricsRegistry;
 use skys3_sim::{NodeClock, SimS3};
 use skys3_types::{BucketDocument, ClusterId, Generation, Label, NodeAddress, NodeId, ShardConfig};
 
@@ -123,6 +128,7 @@ pub(crate) struct NodeSettings {
     pub drift: Drift,
     pub retry: RetryPolicy,
     pub poll_interval: Duration,
+    pub flush: FlushSettings,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -131,6 +137,8 @@ pub(crate) struct NodeSlot {
     pub position: usize,
     pub host: String,
     pub disks: Vec<(Label, SimDisk)>,
+    /// The power supply of the node's disks, which numbers their syncs.
+    pub power: SimPower,
     pub control: ControlHandle,
     pub credentials: Credentials,
     /// Draws for each life: its clock and seeds.
@@ -149,11 +157,16 @@ impl NodeSlot {
         credentials: Credentials,
         seed: u64,
     ) -> Self {
+        let power = SimPower::new();
+        for (_, disk) in &disks {
+            disk.set_power(&power);
+        }
         Self {
             host: id.to_string(),
             id,
             position,
             disks,
+            power,
             control,
             credentials,
             rng: Mutex::new(SmallRng::seed_from_u64(seed)),
@@ -274,6 +287,11 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
     open_shards(&shards, &gateway.buckets()).await?;
+    {
+        let flush = flush_service(settings, &shared.remote);
+        let (gateway, local) = (gateway.clone(), recovered.shards.clone());
+        tokio::spawn(async move { follow_flushes(&flush, &gateway, &local).await });
+    }
 
     let checkpointer = Arc::clone(&recovered.checkpointer);
     let interval = settings.checkpoint_interval;
@@ -311,6 +329,47 @@ async fn open_shards<H: Shards>(shards: &H, buckets: &[BucketDocument]) -> Resul
         }
     }
     Ok(())
+}
+
+/// The node's flushers: every `write_back` bucket flushes to `remote`, the
+/// harness's one remote store, whatever its target names; bucket prefixes
+/// keep their keys apart.
+fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3, SimMount> {
+    let remote = remote.clone();
+    FlushService::new(
+        settings.cluster.clone(),
+        settings.flush.clone(),
+        Box::new(move |_| remote.clone()),
+        FlushMetrics::register(&MetricsRegistry::new()),
+    )
+    .with_wall_clock(Arc::new(SimWallClock))
+}
+
+/// Keeps a flusher on every `write_back` bucket shard open on the node, as
+/// the node binary does (§7.1).
+async fn follow_flushes(
+    flush: &FlushService<SimS3, SimMount>,
+    gateway: &Gateway<TrustAll>,
+    shards: &LocalShards<SimMount>,
+) {
+    loop {
+        flush.reconcile(&gateway.buckets(), shards.set()).await;
+        tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+    }
+}
+
+/// How often a node checks which shards it flushes: more often than the
+/// node binary's second, so that flushes start within a short workload.
+const FLUSH_FOLLOW_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Wall-clock time in the simulation, for dirty ages.
+#[derive(Debug, Clone, Copy)]
+struct SimWallClock;
+
+impl WallClock for SimWallClock {
+    fn now(&self) -> Duration {
+        wall_now()
+    }
 }
 
 /// Keeps the node's copy of control state current, as the node binary's

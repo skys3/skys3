@@ -294,10 +294,11 @@ jobs:
           SKYS3_SIM_SEEDS: 256
 
   # The etcd control-store backend against a real etcd (plan M2-05): the
-  # conformance suite, the startup probe, paged listings, and watches. The
-  # tests skip themselves when SKYS3_ETCD_ENDPOINTS is unset, as in the
-  # other jobs. The image runs as root in /var/lib/etcd; it has no shell
-  # for a container health check, so the job waits on /health itself.
+  # conformance suite (M2-06), which includes the startup probe, and paged
+  # listings, endpoint failover, and watches. The etcd tests skip
+  # themselves when SKYS3_ETCD_ENDPOINTS is unset, as in the other jobs.
+  # The image runs as root in /var/lib/etcd; it has no shell for a
+  # container health check, so the job waits on /health itself.
   etcd:
     name: etcd integration
     needs: changes
@@ -321,7 +322,7 @@ jobs:
           rustup default stable
 
       - name: Build the etcd tests
-        run: cargo test -p skys3-control --all-features --test etcd --no-run
+        run: cargo test -p skys3-control --all-features --test etcd --test conformance --no-run
 
       - name: Wait for etcd
         run: |
@@ -333,7 +334,9 @@ jobs:
           exit 1
 
       - name: Run the etcd tests
-        run: cargo test -p skys3-control --all-features --test etcd -- --nocapture
+        run: |
+          cargo test -p skys3-control --all-features --test etcd -- --nocapture
+          cargo test -p skys3-control --all-features --test conformance the_etcd_store_conforms -- --nocapture
         env:
           SKYS3_ETCD_ENDPOINTS: http://127.0.0.1:2379
 
