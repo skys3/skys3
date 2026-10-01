@@ -144,6 +144,8 @@ pub struct Audit {
     pub sync_failed_files: BTreeSet<String>,
     /// Files created since the last successful directory sync.
     pub undurable_entries: BTreeSet<String>,
+    /// How long each sync takes, in the runtime's time.
+    pub sync_delay: Duration,
 }
 
 /// A mount of a [`SimDisk`] that crashes the device, or fails a sync, at a
@@ -193,6 +195,10 @@ impl AuditedMount {
     /// Counts a sync, arranging for it to fail if it is the planned one.
     async fn sync(&self) -> io::Result<bool> {
         self.op().await?;
+        let delay = self.audit().sync_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let mut audit = self.audit();
         let fail = audit.fail_sync_at == Some(audit.syncs);
         audit.syncs += 1;

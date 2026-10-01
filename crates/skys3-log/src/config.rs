@@ -23,7 +23,8 @@ pub struct LogConfig {
     pub segment_bytes: u64,
     /// `group_commit_max_delay_us`: how long a group commit waits, from the
     /// arrival of its first record, for more records before it writes and
-    /// syncs. Zero commits whatever is queued at once.
+    /// syncs. Records already queued join the group without a wait even
+    /// after that. Zero commits whatever is queued at once.
     pub group_commit_max_delay: Duration,
     /// `group_commit_max_bytes`: the bytes after which a group commit stops
     /// waiting for more records. A commit holds less than this plus one

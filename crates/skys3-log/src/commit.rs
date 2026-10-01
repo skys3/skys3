@@ -45,11 +45,13 @@ struct Active<F> {
 /// The task that owns the disk's write path.
 ///
 /// It takes queued records in arrival order and commits them in groups:
-/// it waits from a group's first record until `group_commit_max_delay`
-/// passes or the group reaches `group_commit_max_bytes`, then appends each
-/// class's records to its segment with one write, syncs every file written
-/// (and the directory, if it created a file), and only then acknowledges
-/// the group. Records that arrive meanwhile wait for the next group.
+/// it takes every record already queued, waits for more until
+/// `group_commit_max_delay` after the group's first record arrived, and
+/// stops once the group reaches `group_commit_max_bytes`. Then it appends
+/// each class's records to its segment with one write, syncs every file
+/// written (and the directory, if it created a file), and only then
+/// acknowledges the group. Records that arrive meanwhile wait for the next
+/// group.
 ///
 /// The first I/O error ends the write path for good: the committer fails
 /// the group it was committing and every record queued after it, and the
@@ -137,6 +139,16 @@ impl<D: Disk> Committer<D> {
     /// Collects a group starting with `first`: records already queued, and
     /// those that arrive before the group's deadline, until it holds
     /// `group_commit_max_bytes`.
+    ///
+    /// The deadline bounds only how long the group *waits*. Records that are
+    /// already queued join without a wait even if they arrived after it, as
+    /// when they queued behind a slow sync of the previous group. Taking
+    /// them costs the group's first record no wait and at most
+    /// `group_commit_max_bytes` of writing, and it lets a group cover
+    /// everything that queued during the previous sync. Closing the group
+    /// at the deadline instead would commit only the records of one delay
+    /// window per sync, so once syncs take longer than the delay, the queue
+    /// would grow without bound.
     async fn gather(&mut self, first: Request, group: &mut Vec<Request>) {
         let deadline = first
             .arrival
