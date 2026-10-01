@@ -85,7 +85,9 @@ mod registry;
 mod testing;
 
 pub use admin::AdminEndpoint;
-pub use change::{Applied, ChangeError, ChangeSet, Write, apply};
+pub use change::{
+    Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
+};
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
 pub use heartbeat::{
     Heartbeat, HeartbeatAck, HeartbeatConfig, HeartbeatError, HeartbeatStatus, Heartbeater,

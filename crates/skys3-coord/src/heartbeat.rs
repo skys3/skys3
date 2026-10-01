@@ -33,6 +33,7 @@ use skys3_net::{Connection, Frame, Header, MessageKind, Network, Transport};
 use skys3_types::{ClusterId, NodeAddress, NodeId};
 use tokio::sync::watch;
 
+use crate::change::{Pending, settle};
 use crate::join::{NodeProfile, Registered, RegistrationError, register};
 use crate::lease::Leadership;
 use crate::registry::NodeRegistry;
@@ -207,6 +208,8 @@ pub struct Heartbeater<S, N: Network> {
     target: Option<Target<N::Stream>>,
     looked_up: Option<MonoTime>,
     registered: bool,
+    /// A registration write still to be settled and announced.
+    unsettled: Option<Pending>,
     requests: u64,
     status: watch::Sender<HeartbeatStatus>,
 }
@@ -247,6 +250,7 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
             target: None,
             looked_up: None,
             registered: false,
+            unsettled: None,
             requests: 1,
             status: watch::channel(HeartbeatStatus::default()).0,
         }
@@ -294,8 +298,27 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
     ///
     /// # Errors
     ///
-    /// [`RegistrationError`]; [`Heartbeater::run`] keeps trying.
+    /// [`RegistrationError`]; [`Heartbeater::run`] keeps trying. A write
+    /// left unsettled is kept and settled before the next attempt, so that
+    /// a registration that lands late is still announced.
     pub async fn register(&mut self) -> Result<Registered, RegistrationError> {
+        if let Some(pending) = &self.unsettled {
+            let settled = settle(
+                &self.store,
+                &self.cluster,
+                pending,
+                &mut self.proposals,
+                &self.config.retry,
+            )
+            .await;
+            if let Err(source) = settled {
+                return Err(RegistrationError::Unsettled {
+                    pending: Box::new(pending.clone()),
+                    source,
+                });
+            }
+            self.unsettled = None;
+        }
         let registered = register(
             &self.store,
             &self.cluster,
@@ -303,7 +326,14 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
             &mut self.proposals,
             &self.config.retry,
         )
-        .await?;
+        .await;
+        let registered = match registered {
+            Err(RegistrationError::Unsettled { pending, source }) => {
+                self.unsettled = Some((*pending).clone());
+                return Err(RegistrationError::Unsettled { pending, source });
+            }
+            registered => registered?,
+        };
         self.registered = true;
         self.status.send_modify(|status| status.registrations += 1);
         Ok(registered)

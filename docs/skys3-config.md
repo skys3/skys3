@@ -181,7 +181,7 @@ Erasure coding of `local` buckets (§8).
 | `replicas` | integer | `3` | From 1 to 255. |
 | `min_write_replicas` | integer | `2` | From 1 to `replicas` (§6.4). |
 | `clean_copies` | integer | `1` | From 0 to `replicas` (§9.3). |
-| `import_parallel_streams` | integer | `32` | Positive (§9.1). |
+| `import_parallel_streams` | integer | `32` | From 1 to 256. Key ranges a new namespace import lists in parallel, each with its own checkpoint; one rate limit, `import_max_keys_per_second`, covers them all (§9.1). |
 | `ec_min_object_bytes` | integer | `4194304` (4 MiB) | Positive (§8.2). |
 | `ec_stripe_data_bytes` | integer | `67108864` (64 MiB) | Positive. |
 | `ec_after_seconds` | integer | `600` | May be 0. |

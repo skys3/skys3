@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! primary                                  member
-//!   Sync(config, primary's last seq)      ->
+//!   Sync(config, primary's last seq, sequencing epoch) ->
 //!                                          <- SyncAck(last, record)*   records past the primary's last seq
 //!                                          <- SyncAck(last, done)
 //!   Append(epoch, commit, lazy, lease) + record ->
@@ -20,6 +20,11 @@
 //! the frame. An acknowledgement echoes the latest stamp the member received
 //! in the session, which grants the primary a lease until the stamp plus
 //! `primary_lease`, on the primary's clock.
+//!
+//! A `Sync` may carry a newer configuration than the member's, after a
+//! member removal (§6.4). Its `sequencing` epoch tells the member whether
+//! the primary has appended that configuration's `CONFIG` record, and so
+//! where the member appends its own (§5.1).
 
 use bytes::Bytes;
 use prost::Message;
@@ -37,6 +42,10 @@ pub struct Sync {
     /// holds after it.
     #[prost(uint64, tag = "2")]
     pub primary_last: u64,
+    /// The epoch the primary sequences records in: the configuration's
+    /// once it has appended its `CONFIG` record, an earlier one before.
+    #[prost(uint64, tag = "3")]
+    pub sequencing: u64,
 }
 
 impl Sync {
@@ -177,7 +186,9 @@ mod tests {
         let sync = Sync {
             config: b"{}".to_vec(),
             primary_last: 7,
+            sequencing: 2,
         };
+
         assert!(sync.configuration().is_err());
         let sent = frame(MessageKind::Sync, &sync, Bytes::new());
         assert_eq!(body::<Sync>(&sent, MessageKind::Sync), Ok(sync));

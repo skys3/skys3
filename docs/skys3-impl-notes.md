@@ -1839,6 +1839,62 @@ of this file. A task with nothing unexpected keeps "None."
   for 100 million objects. The log's `IMPORT` records come on top until
   their segments are released.
 
+### M1-19 Parallel import
+
+- **"Passed" stopped being a prefix of the key space.** M1-18's gateway
+  took the import's position as "the index holds every key up to here",
+  for both reads and listings. With ranges, a later range passes keys
+  long before the first range gets there. The position the gateway gets
+  is now the end of the gapless part (`ImportRanges::position`), which
+  keeps the merge sound, and `RemoteReads::passed` (default: the
+  position) answers per key. Both reads and listings ask it: had only
+  reads used it, a key added out of band in a passed range would list
+  but answer `404` to a HEAD.
+- **Checkpoints are one value per bucket, rewritten per page.** Splitting
+  the `imports` table's key per range would change its key layout; the
+  ranges instead share the bucket's value (tag 2 in the codec), and one
+  range still encodes exactly as M1-18 stored it, so existing checkpoints
+  resume, and a stored single-stream checkpoint is split after its
+  position. Since the whole value is rewritten after every page, streams
+  that finish pages together share one sync, and `import_parallel_streams`
+  gained an upper bound of 256 (it had none). A build from before this
+  one rejects a multi-range value, so it cannot resume such an import.
+- **The token bucket had to become a reservation.** M1-18's throttle was
+  owned by the one stream and slept with `&mut self`. Shared by streams,
+  each page now reserves its keys under a lock, the bucket going negative
+  while pages wait, and sleeps outside it; the `rate * (t + 1)` bound
+  holds over all streams.
+- **Simulated durations depended on real disk speed.** Under a paused
+  clock, Tokio advances time to the next timer whenever the runtime waits
+  on a blocking-pool thread, so each commit cost a few polling intervals
+  of simulated time, more on a slower machine. The scaling test runs the
+  index on `BlockingPool::inline`, and the import rate is then a pure
+  function of the remote's 100 ms round trip: 4.1 s with one stream for
+  4,000 keys in pages of 100, 2.6 s, 1.3 s, and 0.8 s with two, four, and
+  eight.
+- **Shutdown left import streams running.** The flush service aborted the
+  import task on drop without waiting, and with streams spawned in a
+  `JoinSet` a stream could still store a checkpoint after `shutdown`
+  returned, which made the restart test racy. The first fix, awaiting the
+  aborted task, was not enough (review on the PR): a stream aborted while
+  it awaited `set_import_ranges` had already queued the write on the
+  index's `BlockingPool`, which runs a queued job whether or not anyone
+  still waits for it. On a pool of several threads, a late write could
+  then land after a restarted import's and move the stored progress back.
+  Imports now stop cooperatively: a stop signal is checked between steps
+  and interrupts listings, throttle waits, commits, and backoffs, but
+  never a checkpoint write, and `shutdown` raises it and awaits the task.
+  A bucket that stops being followed is told to stop the same way, and
+  its next import waits for the old task before reading the checkpoint.
+  `shutdown_waits_for_a_checkpoint_write_in_flight` holds the pool with a
+  blocking job while a write is queued; with the abort it fails, as
+  `shutdown` returns before the write lands.
+- **The discovery budget first counted every node as sampled.** Charging
+  a level its worst case, a listing and 96 probes per node, before
+  sending anything stopped discovery from listing twelve small folders.
+  A level is now charged its listings, then its probes, and abandoned
+  only if what it actually needs exceeds the budget.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named
@@ -2517,6 +2573,128 @@ of this file. A task with nothing unexpected keeps "None."
     plan's 1,500. Splitting would have left the data path without its
     checks, so it stays one task.
 
+### M2-08 Shard map and routing
+
+- **A forwarded record cannot travel at position `(0, 0)`.** A write's
+  record crosses the wire in the log record format, but the encoder
+  refuses a `PUT` or an `MPU_PART` that names an extent or an upload at or
+  after its own position. Records travel at the last position,
+  `(2⁶⁴−1, 2⁶⁴−1)`, and the replica sequences them as usual. The fault
+  scenarios first passed with every such write failing, since a forwarded
+  write that fails is recorded as unknown; the fault-free scenario, which
+  asserts no unknown outcome, caught it.
+- **Members served payloads and seals.** `Shard::payload` and `Shard::seal`
+  never checked the replica's role; only reads and writes did, through
+  `check_readable`. `LocalShards` now checks it for both, and maps the
+  replica's `NotPrimary` to a new gateway `ShardError::NotPrimary`, which
+  the forward server turns into a redirect hint. The replica's own check
+  stays the only authority on who serves, so the server does not repeat
+  it.
+- **A forwarded write can outlive its gateway.** The harness ends an
+  unanswered operation when the node it was sent to crashes, which is
+  sound only if that node applies it. A gateway can forward a write and
+  crash, or give up on it with `503`, while the primary still commits it.
+  `Workload::any_gateway` records operations without a server and writes
+  answered with a server error as unknown; the scenarios that send to the
+  primary are unchanged.
+- **Concurrent register reads failed requests.** Register reads were first
+  rate-limited per shard, so every request that arrived while another was
+  reading a shard's register failed. Reads of one node now wait for each
+  other and look at the map again before reading, so concurrent requests
+  share one read. A review then found that the interval was timed from
+  the start of a read: a read slower than the interval, or one that
+  failed, left every waiting request to read again in turn. The interval
+  now runs from when a read finishes, and the requests within it take
+  its result, its error included.
+- **No new index format for the shard map.** The map is a new `shard_map`
+  table, keyed like `shards`, holding each configuration's register JSON.
+  It is a cache that is safe when stale, so it takes no index format of
+  its own (the format is 3, from M1-18's `imports` table): an older build
+  ignores the table, and opening an index that lacks it, of any supported
+  format, adds it. It is kept apart from the control-state copy, which each sync
+  replaces whole.
+- **A pooled connection the peer dropped fails one write.** The gateway
+  keeps idle connections per node (at most 8, for at most 60 s; the server
+  drops a connection idle for 5 min). After a node restarts, the first
+  write on each connection to it fails with `503`, because the gateway
+  cannot tell whether the request arrived; a read moves to the next
+  member. Probing a connection before reuse would cost a round trip on
+  every request.
+- **Primary-only flushing.** `FlushService::reconcile` starts flushers
+  only on shards this node is the primary of, which M2-07 left open: a
+  member refuses the `FLUSHED` records its primary does not send. The
+  routing scenarios include a replicated `write_back` bucket.
+- **Lazy `FLUSHED` records outlast short forwarding timeouts.** A write
+  to a `write_back` shard can wait behind a lazy `FLUSHED` record on its
+  primary for up to `LAZY_MAX_DELAY` (1 s), which M2-07 named as a risk. A
+  routing scenario with a 1 s forwarding timeout failed writes that way;
+  the scenarios now give forwarded requests 4 s, and the default is 30 s.
+- **Leases and acknowledgement timeouts cross the wire as refusals.** A
+  primary that lacks a lease from some member (M2-09), or a stopped one,
+  refuses a forwarded read as unavailable, and the gateway answers `503`
+  at once rather than asking other members, which would only redirect it
+  back. A write that was not acknowledged in time (M2-10) travels as its
+  own outcome, with the position it took, so the gateway answers it as
+  the local path does.
+- **Seals across nodes.** The design left them to this task. The gateway
+  forwards seal and unseal to the primary, which holds a seal until it is
+  lifted or it restarts. Lifting the seals of a crashed gateway, and seals
+  across a primary change, go to M3-04, the first task that deletes
+  buckets on several nodes; §4.1 says so.
+- **How the simulation checks it.** `RoutedServices` puts a routing
+  gateway on every node and starts each map stale, with the placement in
+  epoch 3: a third of the shards known in epoch 2 with a member as
+  primary (a redirect corrects it), a third in epoch 2 with only a node
+  that does not exist (no member answers, so the gateway reads the
+  register), and a third unknown. Clients send every request to a random
+  node. An observer on every node's forward server records which replica
+  served each request in which epoch, as it serves it, and an invariant
+  fails the run if any was not the current primary in the current epoch.
+  The observer first sat in the gateway, after the answer arrived, and so
+  missed a request served by the wrong replica whose answer was lost; a
+  review caught it. A seeded bug, members that
+  answer reads from their own index, trips it; that scenario starts every
+  map with a member as each shard's primary, since with the mixed maps a
+  write's redirect could correct a map before any read reached the
+  member, and one seed in 4,096 missed the bug. Scenarios cover no
+  faults, random crashes, partitions, and message loss, and every node
+  restarting in turn; each passed 4,096 seeds (`SKYS3_SIM_SEEDS=4096`).
+- **A `GET` can fail when it races an overwrite.** A read that finds its
+  object replaced between the entry and the payload answers a retryable
+  `503`. Forwarding both calls widens that window, so the fault-free
+  scenario allows a few failed reads; it still allows no failed write.
+- **A replication seed failed before this task, and passes after the
+  merge with M2-10, for no identified reason.**
+  `replicated_writes_under_crashes_and_message_loss` with
+  `SKYS3_SIM_SEED=86` found a history no order explains on
+  `bucket-1/key-1`, on the M2-07 head (a4e1066) as well, so not through
+  routing. It passes once M2-07's review fixes, M2-09, M1-18 and M2-10
+  are merged in. It is not M2-10's relaxed rule for failed writes: the
+  seed passes with a4e1066's checker too. The merged changes also change
+  what the replicas do, and so the run that seed draws; the case the
+  seed found may still exist, unexplained, under another seed.
+- **Left for later.**
+  - **Binary wiring.** Not done: the routing code alone is about 2,000
+    lines of non-test library code, over the plan's 1,500, before any
+    wiring. Running replicated shards in the binary also needs: a shared
+    control store (the binary refuses anything but the file store, which
+    a second node cannot open), peers' transport addresses (node
+    registration is M3-02, so a static list in the configuration until
+    then), shard registers for a static placement (no bootstrap command
+    writes them yet; M3-04 makes CreateBucket write them), loading the
+    `[transport]` credentials, opening replicas from the registers, the
+    `serve_peers` listener, and configuration keys for the replication
+    timing (`ReplicationConfig`) and `RoutingConfig`. A follow-up task
+    (M2-08b) should take these; until then the binary serves every shard
+    alone, as before.
+  - **Multiplexing.** One request per connection at a time, with a small
+    pool per node. Request IDs are on the wire, so a connection can carry
+    several requests later.
+  - **Coordinator pushes** of configurations (§6.2) come with M3-01.
+  - **Size.** About 2,000 lines of non-test library code, most of it
+    the forwarding messages and their checks, plus about 350 in the
+    simulation harness.
+
 ### M2-09 Leases and strong reads
 
 - **No takeover yet, so no read can really be stale.** Placements are
@@ -2633,6 +2811,120 @@ of this file. A task with nothing unexpected keeps "None."
   up in the primary's memory and log until the member returns; fail-fast
   bounds that to the records sequenced before the first timeout.
 
+### M2-11 Member removal
+
+- **A replica cannot switch epochs at its own last `seq`.** M2-07 appended
+  a `CONFIG` record at `(epoch, last seq)` of whichever replica adopted a
+  configuration. A member behind its primary (say at seq 95 while the
+  primary's `CONFIG` record follows seq 100) would then hold `(e+1, 95)`
+  and next be sent `(e, 96)`: positions running backwards. Every replica
+  now switches at the `seq` of the primary's `CONFIG` record. A `Sync`
+  carries the epoch the primary sequences in, besides its configuration;
+  a member that learned a newer configuration keeps sequencing in its old
+  epoch, takes that epoch's tail, and appends its own `CONFIG` record just
+  before the first record of the new epoch, or once it holds the
+  primary's last record if all of those are older. This is the deliberate
+  relaxation of "one epoch per record" M2-07 left for this task. A
+  primary appends its `CONFIG` record only once every member of the new
+  configuration has reported its log in this life, so no member holds an
+  older-epoch record the primary lacks; until then the record waits, and
+  the link of the last member to report appends it
+  (`Shard::align`). Design §5.1 records the rules.
+- **Restarting into a newer epoch had the same problem.** `Shard::open`
+  appended the `CONFIG` record at once whenever the configuration was
+  newer than the log. A replicated replica now opens in its log's epoch
+  and aligns as above (`Shard::sequencing`). The node keeps no copy of
+  the configuration of its log's epoch until M2-16, so a primary opened
+  this way commits that epoch's tail under the newer configuration's
+  rule: safe, since the register already holds it and a removal only
+  shrinks the members.
+- **When the commit rule changes.** The primary could drop the member as
+  soon as its compare-and-swap landed, or once its `CONFIG` record is
+  durable. It waits for the record (`Leader::adopt`, called by the
+  pipeline when the record is durable), as §5.1 asks of every replica
+  before it acts in a new epoch; it costs one group commit on the
+  primary's own disk. The watchdog adopts without waiting for the record
+  to *commit* (`Shard::begin_reconfigure`): a second late member would
+  hold that up, and the watchdog would never get to remove it too.
+- **A removal needs no durable proposal (decided, design §6.3).** §6.3
+  makes every proposer record its proposal and act as if it succeeded.
+  For a removal, acting as if it failed is the safe side: the primary
+  keeps needing the member's acknowledgements and lease until it knows,
+  and finds a lost answer in the register later, which it adopts if it
+  keeps the primary and only removes members. A register naming another
+  primary, or gone, stops the primary (`Shard::depose`); M2-12 refines
+  what a deposed primary does.
+- **"Unresponsive" was not defined (decided, design §6.4).** A member
+  responds while its acknowledgements advance, or, once it holds what the
+  primary had sequenced a moment earlier, while it answers anything. A
+  member whose disk is stuck still answers beacons, so "heard from
+  recently" was not enough. A member that never reports its log after the
+  primary starts is suspected too, so a primary that restarts while a
+  member is dead does not wait for it forever.
+- **Pending writes and `min_write_replicas` (decided, design §6.4).** The
+  design rejects new writes once fewer copies remain, but said nothing of
+  the writes in flight that then commit with too few copies. They are
+  applied, and their writers get `ShardError::UnderReplicated` (`503`):
+  not acknowledged, as §5.2 allows. `FLUSHED`, `IMPORT`, and `ADOPT` are
+  not client writes and go on, as under a seal.
+- **The simulation assumed static placements in three places.** The
+  every-member durability check read the members of each shard from the
+  placement, the commit audit took them from it at acknowledgement time,
+  and restarted nodes reopened every shard in epoch 1, which a replica
+  past epoch 1 refuses. The harness now reads the registers straight from
+  the control bucket, without requests or faults, as a stand-in for the
+  shard map (M2-08) and the local copies (M2-16): nodes open a shard in
+  its register's configuration (a removed member does not reopen it), the
+  audit checks each acknowledgement against the register's members at
+  that moment (so a primary dropping a member before its compare-and-swap
+  landed is still caught), and the final check reads every member of the
+  final configurations. The every-member check also split survivors by
+  member index, which left shards with fewer members with no copy at all;
+  their last member now stands in. The removal's compare-and-swap goes
+  through each node's faulty control store, with lost answers and `409`s.
+- **Measured.** Ten seeds of node 3 cut off from both other nodes
+  for 8 s, with the defaults (3 s suspicion, 5 s wait-through timeout) and
+  the control store losing, conflicting, or refusing 2 % of requests each:
+  no write failed or went unanswered, and the slowest acknowledged write
+  took 3.02 to 3.10 s, `member_suspect_after` plus the watchdog's check
+  interval (100 ms), the compare-and-swap, and the `CONFIG` record's group
+  commit. In fail-fast mode (2 s), every write that failed after taking a
+  position, 2 to 6 per seed, later committed under the new epoch. The
+  loopback test in `skys3-shard` sees the same with 300 ms.
+- **The protocol model needed no change.** `RemoveMember` and the
+  same-primary branch of `Adopt` in `spec/ShardProtocol.tla` already keep
+  acknowledgements across the change and let a removed member grant
+  leases only in its own epoch. The implementation refines them: between
+  the compare-and-swap and the durable `CONFIG` record it needs the old,
+  larger set of acknowledgements and leases, which only removes behaviors.
+- **Metrics.** `under_replicated_bytes` and `oldest_under_replicated_age`
+  have no labels: a node counts the shards it leads, so the sum over nodes
+  counts each shard once (`Replication::exposure`,
+  `ReplicationMetrics`). The bytes are an index scan per under-replicated
+  shard and report; the age restarts with the node, since the register
+  keeps no removal time. `docs/skys3-metrics.md` lists them as defined,
+  not exported: the binary does not run replication yet.
+- **With routing (M2-08).** `ShardError::UnderReplicated` reaches the
+  gateway as `NotAcknowledged` without a position, so clients get
+  `503 SlowDown` as §6.4 asks, and it crosses the forward wire as outcome
+  7. A removal shows in the shard maps without further changes: the
+  primary serves in epoch e+1 once it adopted it, so a gateway asking in
+  epoch e learns it from the reply's hint, and the members that remain
+  redirect with e+1 once they follow. The removed member stays a member
+  of epoch e: it serves no routed request and redirects with epoch e,
+  which a gateway that knows e+1 ignores. A primary deposed by its
+  register refuses with `503` instead of redirecting; M2-12 decides what
+  it answers. The routing scenarios now check served requests against the
+  register, since a removal moves the epoch past the placement's.
+- **Left for later.** Wiring (`member_suspect_after_ms` maps onto
+  `ReplicationConfig::member_suspect_after`, and `with_removal` takes the
+  node's control store) comes with replication in the binary. A removal
+  does not bump the generation in `cluster.json`; nodes learn of it from
+  sessions, and the removed member keeps its replica open in the old
+  epoch until it restarts or rejoins as a learner (M2-15, M2-16).
+  `skys3-shard` now depends on `skys3-control`, `skys3-obs`, and
+  `prometheus-client`.
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation
@@ -2681,6 +2973,26 @@ of this file. A task with nothing unexpected keeps "None."
   skipping those within the bound before a node went down or a second
   after it came back, and announcements from different coordinators can
   arrive out of order, so a newer pushed generation counts.
+- **An unanswered write was announced before it could land (review).**
+  `apply` incremented the generation as soon as a write's retries ran out
+  without an answer. A request still in flight (FaultyStore's
+  `LateRequest`) could then land after the increment, and a node that
+  had already listed the registers at that generation would miss it
+  until some later change. Such a write is now kept as a `Pending` and
+  settled before it is announced (§6.7): `settle` resends it under the
+  same precondition until an answer comes, reading the register for its
+  `proposal_id` after a failed precondition. After that answer no attempt
+  can land, since versions are never reused. The coordinator plans
+  nothing else until it has settled, and keeps settling after its tenure
+  ends. Tests with a late request (a create and a delete) fail without
+  the change.
+- **A partly applied change was never pushed (review).** When a later
+  write failed, `apply` returned only the error, which dropped the
+  generation that announced the writes before it, so the coordinator
+  never pushed them. `apply` now fails with `ChangeFailed`, which carries
+  the `Applied` prefix and its generation. The coordinator pushes that
+  generation and reports the prefix to the placement. A generation
+  increment that fails after writes landed becomes a `Pending` too.
 - **The placement stand-in.** Placement proper is M3-02 to M3-06, so the
   simulated coordinator moves shard registers of a bucket no gateway
   serves through their epochs, as membership changes will. The
@@ -2719,19 +3031,49 @@ of this file. A task with nothing unexpected keeps "None."
   register names as primary, member, or learner, rereading only registers
   whose version changed. A shard register that does not parse keeps every
   departing node. Re-homing itself is M3-03 and M3-05, which read the
-  states from `NodeRegistry::entries`. The delete is `If-Match` on the
-  registration version the registry read, so a node that registered again
-  meanwhile is kept.
+  states from `NodeRegistry::entries`.
+- **Scanning and then deleting raced with an overlapping coordinator.**
+  Review found that the first version scanned the shards and deleted the
+  registration in one round. A second coordinator (M3-01 allows brief
+  overlaps, and a stale one keeps writing) could add the node to a shard
+  between the scan and the delete. The two writes go to different
+  registers, so both CASes succeeded, and a shard was left naming an
+  unregistered node. Forgetting now takes two rounds. The first marks the
+  registration `departing` by a CAS, and placement never assigns a marked
+  node. The second, whose listing read the mark, scans the shards and
+  deletes under `If-Match` on the marked version. So an assignment of the
+  node comes from a planner that read it before the mark, and lands before
+  the scan, which sees it. The exception is a planner that stalls across a
+  whole round. No CAS can close that window without transactions across
+  registers, which the design rules out. The result is then a shard member
+  on a lost node, which member removal (§6.4) and replacement handle. A
+  unit test, which fails when the two rounds are merged, runs a competing
+  placement right after the scan. The mark is a new optional
+  `NodeRegistration` field (`departing`, written only when set). It is
+  added under format version 1, as M1-06 added `created_unix_ms`, because
+  no release has shipped it. A marked registration no longer describes its
+  node, so a node that returns clears the mark by registering again, and
+  the heartbeat answer tells a marked node to do so. Silence is not reset
+  by the coordinator's own mark. Recorded in design §6.7.
+- **Registrations settle unanswered writes before announcing them.**
+  M3-01's change path now hands back a write that may still land as a
+  `Pending`, and announces it only once `settle` knows that it landed.
+  `register` settles it at once. If settling fails too, the `Pending`
+  goes back to the node's `Heartbeater` (`RegistrationError::Unsettled`),
+  which settles it before it registers again, so a registration that lands
+  late is still announced, and only once it has landed. A node that
+  restarts in between loses the `Pending`. That leaves at most an
+  unannounced registration, which the coordinator finds by listing and the
+  next increment announces. The coordinator settles its own pending marks
+  and deletes, as it settles every change.
 - **A restart that changes nothing writes nothing.** The design said a
   restart updates the record under `If-Match`; rewriting an identical
   record would cost a CAS and a generation increment per restart. A node
   that crashed between its registration CAS and the increment leaves the
   write unannounced, which is harmless: the coordinator lists `nodes/` on
   every round rather than relying on change streams, and the next
-  increment of any change announces it to the other nodes. Registration
-  reuses the coordinator's change path (`apply`), so a write that may have
-  landed is announced too. Recorded in design §6.7, with heartbeat and
-  registry traffic in the §6.1 table.
+  increment of any change announces it to the other nodes. Recorded in
+  design §6.7, with heartbeat and registry traffic in the §6.1 table.
 - **Pushes and heartbeats share one endpoint.** `ControlHints::serve`
   refused every frame but `ControlChanged`. `AdminEndpoint` now dispatches
   by kind, answering `NodeHeartbeat` only from node certificates (an

@@ -428,3 +428,47 @@ async fn the_endpoint_answers_heartbeats_only_from_nodes() {
             .contains("Beacon")
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_registration_left_unsettled_is_settled_before_the_next_attempt() {
+    use skys3_control::faults::{Fault, FaultyStore};
+
+    let pki = Pki::new();
+    let inner = store(&pki, 1).await;
+    let store = FaultyStore::new(inner.clone());
+    // The read passes, the create lands without an answer, and neither its
+    // retries nor the settling get one.
+    let mut faults = vec![Fault::Pass, Fault::LoseResponse];
+    faults.extend(std::iter::repeat_n(Fault::Unavailable, 7));
+    store.script(faults);
+    let mut heartbeater = Heartbeater::new(
+        store.clone(),
+        pki.transport(&node(9)),
+        pki.cluster.clone(),
+        profile(9, "127.0.0.1:7009".parse().unwrap()),
+        clock(),
+        config(),
+        ProposalIds::seeded(9),
+    );
+    let error = heartbeater.register().await.unwrap_err();
+    assert!(
+        matches!(error, RegistrationError::Unsettled { .. }),
+        "{error}"
+    );
+    let before = skys3_control::read_cluster(&inner, &pki.cluster, &retry())
+        .await
+        .unwrap()
+        .value
+        .generation;
+    // The store answers again: the landed write is settled and announced
+    // first, and the registration then finds it in place.
+    let registered = heartbeater.register().await.unwrap();
+    assert_eq!(registered.registration, crate::Registration::Unchanged);
+    let after = skys3_control::read_cluster(&inner, &pki.cluster, &retry())
+        .await
+        .unwrap()
+        .value
+        .generation;
+    assert!(after > before);
+    assert_eq!(heartbeater.subscribe().borrow().registrations, 1);
+}
