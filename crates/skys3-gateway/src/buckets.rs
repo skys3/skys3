@@ -13,9 +13,13 @@
 //! `[buckets.<name>]` table or `[buckets.defaults]`, and a `write_back`
 //! bucket's target with [`TARGET_HEADER`], a path-style URL. The shard count
 //! and replication settings come from the configuration. The bucket gets a
-//! fresh random ID, and its shards are opened before its register is
-//! created with `If-None-Match: *`, so a bucket is never visible without
-//! its shards.
+//! fresh random ID. Where its shards live is the [`ShardPlacement`]: on a
+//! single node, its shards are opened before its register is created with
+//! `If-None-Match: *`, so a bucket is never visible without its shards; on
+//! a cluster, the shards are placed on the registered nodes and their
+//! registers follow the bucket register in the same change
+//! ([`skys3_coord::create_bucket`]), and every node opens its replicas
+//! when it learns of the bucket.
 //!
 //! **Deletion detaches.** The remote is never touched. DeleteBucket seals
 //! every shard, so no client write commits while it decides, and refuses
@@ -37,12 +41,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use s3s::{S3Error, s3_error};
-use skys3_config::{BucketsConfig, Config, ControlStoreConfig, IdentityConfig, parse_target};
+use skys3_config::{
+    BucketsConfig, Config, ControlStoreConfig, FailureDomain, IdentityConfig, parse_target,
+};
 use skys3_control::{
     ControlError, ControlStore, DeletionOutcome, Expected, KeyPrefix, ProposalIds, ProposalOutcome,
     RegisterKind, RetryPolicy, TypedKey, Version, Versioned, bump_generation, propose_delete,
     propose_document, read, read_with_retries,
 };
+use skys3_coord::{Creation, CreationError, create_bucket};
 use skys3_io::BlockingPool;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
@@ -103,6 +110,24 @@ pub struct GatewayConfig {
     /// namespace import has not reached and lazily loaded metadata use
     /// (§9.1). [`GatewayConfig::new`] has none: every read is local.
     pub remote: Option<Arc<dyn RemoteReads>>,
+    /// Where new buckets' shards live. [`GatewayConfig::new`] keeps them
+    /// on this node, as a single-node cluster does.
+    pub placement: ShardPlacement,
+}
+
+/// Where CreateBucket puts a new bucket's shards (design §4.1, §6.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShardPlacement {
+    /// On this node, the only one: it opens every shard before it creates
+    /// the bucket register, and writes no shard registers.
+    #[default]
+    Local,
+    /// On the nodes registered under `nodes/`, never two members of a
+    /// shard in one domain at this `failure_domain` level: the bucket
+    /// register and its shard registers are created in one change, and a
+    /// node opens its replicas when it learns of the bucket.
+    Cluster(FailureDomain),
 }
 
 impl GatewayConfig {
@@ -124,6 +149,7 @@ impl GatewayConfig {
             list_token_keys: ListTokenKeys::generate(),
             admission: Arc::new(AdmitAll),
             remote: None,
+            placement: ShardPlacement::Local,
         }
     }
 }
@@ -356,6 +382,9 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             created_unix_ms: unix_ms(SystemTime::now()),
             proposal_id,
         };
+        if let ShardPlacement::Cluster(level) = self.config.placement {
+            return self.create_placed(bucket, level).await;
+        }
 
         let shards: Vec<_> = ShardRef::all(&bucket).collect();
         for (opened, shard) in shards.iter().enumerate() {
@@ -374,18 +403,7 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             }
             Ok(ProposalOutcome::Rejected) => {
                 self.remove_shards(&shards).await;
-                if let Ok(current) = read(&self.store, &key).await {
-                    let found = current.is_some();
-                    self.remember(&name, current.map(|current| current.value));
-                    // The bucket may be one whose creation landed but whose
-                    // answers were lost, here or on another gateway, before
-                    // it was announced. Announcing again costs other nodes
-                    // only a re-read.
-                    if found {
-                        self.announce().await;
-                    }
-                }
-                Err(already_owned())
+                Err(self.taken(&name).await)
             }
             Err(error) => {
                 // A write that may still land keeps its shards, so the
@@ -397,6 +415,52 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 Err(control_error(&error))
             }
         }
+    }
+
+    /// Creates `bucket` with its shards placed on the cluster's registered
+    /// nodes at `level`.
+    async fn create_placed(
+        &self,
+        bucket: BucketDocument,
+        level: FailureDomain,
+    ) -> Result<BucketDocument, S3Error> {
+        let mut ids = lock(&self.ids).proposal_ids();
+        let (cluster, retry) = (&self.config.cluster_id, &self.config.retry);
+        match create_bucket(&self.store, cluster, &bucket, level, &mut ids, retry).await {
+            Ok(Creation::Created { complete }) => {
+                if !complete {
+                    tracing::warn!(bucket = %bucket.name, "created a bucket whose shard registers the coordinator completes");
+                }
+                self.remember(&bucket.name, Some(bucket.clone()));
+                Ok(bucket)
+            }
+            Ok(Creation::Taken) => Err(self.taken(&bucket.name).await),
+            Err(CreationError::Unsatisfiable(unsatisfiable)) => Err(s3_error!(
+                InvalidRequest,
+                "The cluster cannot place the bucket's shards: {unsatisfiable}"
+            )),
+            Err(CreationError::Control(error)) => Err(control_error(&error)),
+            Err(error) => {
+                tracing::error!(%error, "a new bucket's registers are invalid");
+                Err(s3_error!(InternalError))
+            }
+        }
+    }
+
+    /// The answer to a CreateBucket whose name is taken, after reading the
+    /// register that holds it into the local copy.
+    async fn taken(&self, name: &BucketName) -> S3Error {
+        if let Ok(current) = read(&self.store, &TypedKey::bucket(name)).await {
+            let found = current.is_some();
+            self.remember(name, current.map(|current| current.value));
+            // The bucket may be one whose creation landed but whose answers
+            // were lost, here or on another gateway, before it was
+            // announced. Announcing again costs other nodes only a re-read.
+            if found {
+                self.announce().await;
+            }
+        }
+        already_owned()
     }
 
     /// Deletes (detaches) a bucket.

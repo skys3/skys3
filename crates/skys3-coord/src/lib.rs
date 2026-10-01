@@ -33,6 +33,17 @@
 //!   nodes, with health from heartbeats as advice only. It keeps the
 //!   [`Pusher`]'s nodes current, and forgets a node silent for
 //!   `node_forget_after` once its [`Rehoming`] says no shard names it.
+//! - [`Topology`]: the placement engine, a pure function from the nodes,
+//!   their labels and capacity, and a bucket's policy to shard members,
+//!   never two in one domain at the `failure_domain` level. A policy the
+//!   cluster cannot satisfy is [`Unsatisfiable`].
+//! - [`PolicyWatch`] and [`report`]: the coordinator judges which buckets
+//!   the cluster does not satisfy now, and publishes a [`PolicyReport`]
+//!   through [`PlacementHealth`] for cluster health.
+//! - [`create_bucket`] and [`BucketShards`]: a gateway creates a bucket's
+//!   register and its placed shard registers in one change, and the
+//!   coordinator finishes a creation cut short and drops the shard
+//!   registers of deleted buckets.
 //! - [`AdminEndpoint`]: serves pushes and heartbeats on a node.
 //!
 //! ```
@@ -65,17 +76,23 @@
 //! ```
 
 mod admin;
+mod buckets;
 mod change;
 mod coordinator;
 mod heartbeat;
 mod join;
 mod lease;
+mod place;
+mod policy;
 mod push;
 mod registry;
 #[cfg(test)]
 mod testing;
 
 pub use admin::AdminEndpoint;
+pub use buckets::{
+    BucketShards, Creation, CreationError, create_bucket, first_config, registrations,
+};
 pub use change::{
     Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
 };
@@ -85,6 +102,11 @@ pub use heartbeat::{
 };
 pub use join::{NodeProfile, Registered, Registration, RegistrationError, register};
 pub use lease::{Elector, Leadership, LeaseConfig, LeaseConfigError};
+pub use place::{Candidate, Domain, NewShard, Placed, ShardRequest, Topology, Unsatisfiable};
+pub use policy::{
+    BucketPolicy, ClusterScan, CoLocated, PlacementHealth, PolicyReport, PolicyWatch, ShortShard,
+    report,
+};
 pub use push::{
     Announce, ControlChanged, ControlHints, HintError, PUSH_IDLE_TIMEOUT, PushError, Pushed, Pusher,
 };
