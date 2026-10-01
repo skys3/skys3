@@ -60,7 +60,9 @@ mod coordinator;
 mod lease;
 mod push;
 
-pub use change::{Applied, ChangeError, ChangeSet, Write, apply};
+pub use change::{
+    Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
+};
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
 pub use lease::{Elector, Leadership, LeaseConfig, LeaseConfigError};
 pub use push::{

@@ -2973,6 +2973,26 @@ of this file. A task with nothing unexpected keeps "None."
   skipping those within the bound before a node went down or a second
   after it came back, and announcements from different coordinators can
   arrive out of order, so a newer pushed generation counts.
+- **An unanswered write was announced before it could land (review).**
+  `apply` incremented the generation as soon as a write's retries ran out
+  without an answer. A request still in flight (FaultyStore's
+  `LateRequest`) could then land after the increment, and a node that
+  had already listed the registers at that generation would miss it
+  until some later change. Such a write is now kept as a `Pending` and
+  settled before it is announced (§6.7): `settle` resends it under the
+  same precondition until an answer comes, reading the register for its
+  `proposal_id` after a failed precondition. After that answer no attempt
+  can land, since versions are never reused. The coordinator plans
+  nothing else until it has settled, and keeps settling after its tenure
+  ends. Tests with a late request (a create and a delete) fail without
+  the change.
+- **A partly applied change was never pushed (review).** When a later
+  write failed, `apply` returned only the error, which dropped the
+  generation that announced the writes before it, so the coordinator
+  never pushed them. `apply` now fails with `ChangeFailed`, which carries
+  the `Applied` prefix and its generation. The coordinator pushes that
+  generation and reports the prefix to the placement. A generation
+  increment that fails after writes landed becomes a `Pending` too.
 - **The placement stand-in.** Placement proper is M3-02 to M3-06, so the
   simulated coordinator moves shard registers of a bucket no gateway
   serves through their epochs, as membership changes will. The
