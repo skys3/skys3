@@ -3220,6 +3220,26 @@ of this file. A task with nothing unexpected keeps "None."
   `create_bucket` settles it, which sends it again and writes it. The
   writes after it are never sent, and the coordinator completes the
   bucket. The test now expects this.
+- **A creation reported done could leave its announcement owed
+  (review).** `create_bucket` settled a `Pending` once. If that failed
+  too, for example a generation increment that ran out of retries, it
+  only logged the error and still returned `Created`. The gateway then
+  answered `200` and dropped the only handle on the owed announcement.
+  Nodes refresh only when the generation moves, so they could miss the
+  bucket, or a late shard register, until some unrelated change. Such a
+  creation is now `CreationError::Unsettled`, carrying the `Pending`.
+  The gateway answers `503` and keeps settling it in a background task,
+  pausing from the retry policy's longest backoff up to 30 s, until the
+  generation is incremented. A retried CreateBucket finds the register
+  and announces it as well. The same gap was in every other gateway
+  announcement, DeleteBucket's included, and in the M1 path, whose
+  failed increments were left for "the next change". All of them now
+  retry in the background. What is owed lives in memory and ends with
+  the process, as after a crash between a write and its increment.
+  Making it durable would need a record of owed announcements. That is
+  left open, as is the coordinator's own pending list (M3-01). The
+  coordinator test fails without the fix, and so do the gateway tests,
+  one for a creation and one for a deletion. Recorded in §11.
 - **DeleteBucket is unchanged on the gateway; detaching drops shards in
   two places.** The gateway seals, refuses, and deletes the bucket
   register as before. The shard registers go when the coordinator deletes

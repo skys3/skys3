@@ -264,6 +264,57 @@ async fn a_bucket_register_without_an_answer_is_settled() {
     assert!(matches!(error, CreationError::Control(_)), "{error:?}");
 }
 
+#[tokio::test]
+async fn a_creation_whose_announcement_is_owed_is_not_reported_done() {
+    // Every write lands, but neither the change's generation increment
+    // nor its settlement does: the creation must not be reported done,
+    // and the caller gets what is owed.
+    let faulty = FaultyStore::new(store(3).await);
+    let new = bucket(1, 1, 2);
+    let before = generation(faulty.inner()).await;
+    faulty.script(
+        std::iter::repeat_n(Fault::Pass, 6).chain(std::iter::repeat_n(Fault::Unavailable, 64)),
+    );
+    let error = create(&faulty, &new).await.unwrap_err();
+    let CreationError::Unsettled { pending, .. } = error else {
+        panic!("{error:?}");
+    };
+    assert!(
+        read(faulty.inner(), &TypedKey::bucket(&new.name))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(shard_register(faulty.inner(), &new, 0).await.is_some());
+    assert_eq!(generation(faulty.inner()).await, before);
+
+    // Settling it later announces the creation.
+    let mut ids = ProposalIds::seeded(12);
+    let settled = settle(faulty.inner(), &cluster(), &pending, &mut ids, &retry())
+        .await
+        .unwrap();
+    assert!(settled.generation.is_some());
+    assert_eq!(generation(faulty.inner()).await, before + 1);
+
+    // A bucket register write without an answer, whose settlement gets
+    // none either, is owed too.
+    let faulty = FaultyStore::new(store(3).await);
+    faulty.script(
+        std::iter::repeat_n(Fault::Pass, 4)
+            .chain(std::iter::repeat_n(Fault::LoseResponse, 3))
+            .chain(std::iter::repeat_n(Fault::Unavailable, 64)),
+    );
+    let other = bucket(2, 1, 2);
+    let error = create(&faulty, &other).await.unwrap_err();
+    let CreationError::Unsettled { pending, .. } = error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(
+        pending.unsettled(),
+        Some(TypedKey::bucket(&other.name).key())
+    );
+}
+
 fn registry() -> NodeRegistry {
     NodeRegistry::new(
         Arc::new(MonotonicClock::new()),

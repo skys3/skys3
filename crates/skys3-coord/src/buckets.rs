@@ -31,7 +31,7 @@ use skys3_types::{
     BucketDocument, BucketId, ClusterId, Epoch, NodeRegistration, ProposalId, ShardConfig, ShardId,
 };
 
-use crate::change::{Applied, ChangeError, ChangeFailed, ChangeSet, apply, settle};
+use crate::change::{Applied, ChangeError, ChangeFailed, ChangeSet, Pending, apply, settle};
 use crate::coordinator::{NoPlacement, Placement};
 use crate::place::{Candidate, NewShard, ShardRequest, Topology, Unsatisfiable};
 use crate::policy::ClusterScan;
@@ -68,6 +68,19 @@ pub enum CreationError {
     /// still land, and the coordinator then creates its shard registers.
     #[error(transparent)]
     Control(#[from] ControlError),
+    /// A write of the creation got no answer, or the generation increment
+    /// that announces it failed, and settling it failed too. The bucket
+    /// may exist. Its announcement is owed until `pending` is settled
+    /// ([`settle`]): the caller keeps settling it, and does not report the
+    /// creation as done (design §6.7).
+    #[error("a write of a new bucket is unsettled: {source}")]
+    Unsettled {
+        /// What is still to be settled and announced.
+        pending: Box<Pending>,
+        /// Why settling it failed.
+        #[source]
+        source: ControlError,
+    },
 }
 
 /// The registration of every node under `nodes/`. A registration that
@@ -126,9 +139,11 @@ pub fn first_config(bucket: &BucketDocument, shard: NewShard, proposal: Proposal
 ///
 /// # Errors
 ///
-/// [`CreationError`]. Once the bucket register is known to exist, a failed
-/// shard register write is not an error: the coordinator creates what is
-/// missing, and [`Creation::Created`] says the creation is incomplete.
+/// [`CreationError`]. Once the bucket register is known to exist and every
+/// write that landed is announced, a failed shard register write is not an
+/// error: the coordinator creates what is missing, and
+/// [`Creation::Created`] says the creation is incomplete. A write or an
+/// announcement still owed is [`CreationError::Unsettled`].
 pub async fn create_bucket<S: ControlStore>(
     store: &S,
     cluster: &ClusterId,
@@ -182,7 +197,9 @@ pub async fn create_bucket<S: ControlStore>(
 
 /// What a creation that failed part of the way did: whether its bucket
 /// register is known to exist, once the write that got no answer, if any,
-/// is settled.
+/// is settled and what landed is announced. If settling fails, the
+/// creation is [`CreationError::Unsettled`], whatever it wrote: reporting
+/// it done would drop the only handle on an announcement still owed.
 async fn settled<S: ControlStore>(
     store: &S,
     cluster: &ClusterId,
@@ -194,11 +211,15 @@ async fn settled<S: ControlStore>(
     let ChangeFailed { source, applied } = *failed;
     let wrote = |key: &RegisterKey| key == bucket_key.key();
     let mut created = applied.written.iter().any(|(key, _)| wrote(key));
-    if let Some(pending) = &applied.pending {
-        match settle(store, cluster, pending, proposals, policy).await {
+    if let Some(pending) = applied.pending {
+        match settle(store, cluster, &pending, proposals, policy).await {
             Ok(settled) => created |= settled.written.is_some_and(|(key, _)| wrote(&key)),
             Err(error) => {
                 tracing::warn!(%error, register = ?pending.unsettled(), "a write of a new bucket is unsettled");
+                return Err(CreationError::Unsettled {
+                    pending: Box::new(pending),
+                    source: error,
+                });
             }
         }
     }
