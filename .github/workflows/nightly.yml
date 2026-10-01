@@ -65,6 +65,36 @@ jobs:
           SKYS3_SIM_SEEDS: 1024
           SKYS3_SIM_SCALE: 4
 
+  # `kill -9` loops against the real binary on a real file system
+  # (crates/skys3/tests/kill.rs): many more kills than the few every pull
+  # request runs, with a seed for the clients' choices that changes every
+  # night. A failure prints the seed and the end of the node's log.
+  kill-loops:
+    name: Kill loops against the binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+      CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Draw the seed
+        run: |
+          seed="$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+          echo "Seed: $seed"
+          echo "SKYS3_KILL_SEED=$seed" >> "$GITHUB_ENV"
+
+      - name: Run the kill loops
+        run: cargo test --release -p skys3 --test kill -- --nocapture
+        env:
+          SKYS3_KILL_ROUNDS: 200
+
   # The control-store conformance suite (plan M2-06) against real S3
   # providers: an S3 control store in a bucket of each, under a fresh
   # prefix per run, which the test empties afterwards. A provider runs only
