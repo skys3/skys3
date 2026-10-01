@@ -57,7 +57,7 @@ pub use params::AuthMethod;
 use self::body::Payload;
 use self::canonical::Head;
 use self::chunked::ChunkSigner;
-use self::params::{PRESIGNED_PARAMS, Signed, decode_pair};
+use self::params::{PRESIGNED_PARAMS, Signed, decode_pair, query_params};
 use crate::service::Authenticator;
 
 /// How far a header-signed request's time may be from the node's clock
@@ -234,6 +234,7 @@ impl<L: CredentialLookup> Authenticator for SigV4Authenticator<L> {
         };
         self.check_time(&signed)?;
         check_signed_headers(&parts, &signed)?;
+        check_unique_parameters(&parts)?;
         let declared = Payload::declared(&parts.headers)?;
         let (payload, payload_hash) = match (signed.method, declared) {
             (AuthMethod::Header, None) => {
@@ -333,6 +334,22 @@ fn not_signed() -> S3Error {
         AccessDenied,
         "There were headers present in the request which were not signed"
     )
+}
+
+/// Checks that no query parameter, decoded as `s3s` decodes it, appears
+/// twice. The canonical query sorts repeated parameters by value, so their
+/// order is not signed, while `s3s` keeps the order received.
+fn check_unique_parameters(parts: &Parts) -> Result<(), S3Error> {
+    let mut names = std::collections::HashSet::new();
+    for (_, name, _) in query_params(parts.uri.query().unwrap_or("")) {
+        if !names.insert(name) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "A query parameter appears more than once in a signed request."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Checks that `host`, and every `x-amz-*` and `x-skys3-*` header the

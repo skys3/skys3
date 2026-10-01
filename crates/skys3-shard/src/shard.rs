@@ -1,6 +1,7 @@
 //! A shard replica on one node: sequencing, the commit pipeline, and seals
 //! (§5.1, §4.1).
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -68,6 +69,8 @@ struct Sequencer {
     applied: EpochSeq,
     /// How many seals are held (§4.1).
     seals: u32,
+    /// The configuration the shard is in: `next` is in its epoch.
+    config: ShardConfig,
     /// Why the shard stopped, once it has.
     stopped: Option<String>,
 }
@@ -146,12 +149,7 @@ impl<D: Disk> Shard<D> {
         pool: BlockingPool,
     ) -> Result<Self, ShardError> {
         let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
-        if config.members.len() != 1 || !config.learners.is_empty() {
-            return Err(ShardError::configuration(
-                &shard,
-                "only a single member without learners is supported",
-            ));
-        }
+        check_config(&shard, config)?;
         let applied = {
             let (index, key) = (Arc::clone(&index), shard.clone());
             run(&pool, &shard, move || index.read()?.applied(&key)).await?
@@ -192,6 +190,7 @@ impl<D: Disk> Shard<D> {
             next: EpochSeq::new(epoch, next),
             applied: last,
             seals: 0,
+            config: config.clone(),
             stopped: None,
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -232,6 +231,12 @@ impl<D: Disk> Shard<D> {
     #[must_use]
     pub fn applied(&self) -> EpochSeq {
         self.sequencer().applied
+    }
+
+    /// The configuration the shard is in.
+    #[must_use]
+    pub fn config(&self) -> ShardConfig {
+        self.sequencer().config.clone()
     }
 
     /// Whether any seal is held.
@@ -312,6 +317,89 @@ impl<D: Disk> Shard<D> {
             ));
         }
         let position = sequencer.next;
+        let next = position
+            .seq
+            .checked_next()
+            .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
+        let receiver = self.sequence(position, body)?;
+        sequencer.next = EpochSeq::new(position.epoch, next);
+        Ok(receiver)
+    }
+
+    /// Adopts `config`, a newer epoch of the shard, in order with its
+    /// writes, and returns once its `CONFIG` record is durable and applied.
+    ///
+    /// The `CONFIG` record takes the position `(epoch, last seq)`, after
+    /// every record sequenced so far, and every later record is sequenced in
+    /// the new epoch (§10.1). As every record, it is applied, and the writers
+    /// of the records after it answered, only once it is durable, so nothing
+    /// is acknowledged in the new epoch before the configuration is. The
+    /// configuration the shard is in already changes nothing, even on a
+    /// stopped shard.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Configuration`] if `config` is of another shard, is
+    /// older than the shard's epoch, differs from the shard's configuration
+    /// in the same epoch, or cannot open (see [`Shard::open`]);
+    /// [`ShardError::Unavailable`] if the shard stopped, and otherwise as
+    /// [`Shard::commit`].
+    pub async fn reconfigure(&self, config: &ShardConfig) -> Result<(), ShardError> {
+        let shard = self.shard();
+        let reply = {
+            let mut sequencer = self.sequencer();
+            let target = ShardRef::new(config.bucket_id.clone(), config.shard);
+            if target != *shard {
+                return Err(ShardError::configuration(
+                    shard,
+                    format!("the configuration is of shard {target}"),
+                ));
+            }
+            let epoch = sequencer.next.epoch;
+            match config.epoch.cmp(&epoch) {
+                Ordering::Less => {
+                    return Err(ShardError::configuration(
+                        shard,
+                        format!(
+                            "epoch {} is older than the shard's epoch {epoch}",
+                            config.epoch
+                        ),
+                    ));
+                }
+                Ordering::Equal if *config == sequencer.config => return Ok(()),
+                Ordering::Equal => {
+                    return Err(ShardError::configuration(
+                        shard,
+                        format!("the configuration differs from the shard's in epoch {epoch}"),
+                    ));
+                }
+                Ordering::Greater => {}
+            }
+            sequencer.check_running(shard)?;
+            check_config(shard, config)?;
+            // `next.seq` is at least 1: opening starts it after the CONFIG
+            // record at `seq` 0 or later.
+            let last = Seq::new(sequencer.next.seq.get() - 1);
+            let position = EpochSeq::new(config.epoch, last);
+            let reply = self.sequence(position, RecordBody::Config(config.clone()))?;
+            sequencer.next = EpochSeq::new(config.epoch, sequencer.next.seq);
+            sequencer.config = config.clone();
+            reply
+        };
+        reply
+            .await
+            .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
+            .map(drop)
+    }
+
+    /// Gives `body` the position `position` and starts its append; the
+    /// caller holds the sequencer's lock and advances `next` on success.
+    fn sequence(
+        &self,
+        position: EpochSeq,
+        body: RecordBody,
+    ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
+        let shard = self.shard();
         let record = LogRecord {
             shard: shard.clone(),
             position,
@@ -321,16 +409,11 @@ impl<D: Disk> Shard<D> {
             .log
             .check(&record)
             .map_err(|error| ShardError::invalid(shard, error))?;
-        let next = position
-            .seq
-            .checked_next()
-            .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
         let (reply, receiver) = oneshot::channel();
         self.inner
             .pipeline
             .send(Message::Sequenced { position, reply })
             .map_err(|_| self.unavailable("the shard's pipeline stopped"))?;
-        sequencer.next = EpochSeq::new(position.epoch, next);
         let (log, pipeline) = (self.inner.log.clone(), self.inner.pipeline.clone());
         tokio::spawn(async move {
             let result = match log.append(&record).await {
@@ -455,6 +538,18 @@ impl Sequencer {
             None => Ok(()),
         }
     }
+}
+
+/// Checks that this build can serve `config`: a single member without
+/// learners, until replication arrives in M2.
+fn check_config(shard: &ShardRef, config: &ShardConfig) -> Result<(), ShardError> {
+    if config.members.len() != 1 || !config.learners.is_empty() {
+        return Err(ShardError::configuration(
+            shard,
+            "only a single member without learners is supported",
+        ));
+    }
+    Ok(())
 }
 
 fn lock(sequencer: &Mutex<Sequencer>) -> MutexGuard<'_, Sequencer> {

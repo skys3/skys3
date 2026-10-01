@@ -9,10 +9,22 @@ use skys3_index::Index;
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::{SegmentLog, ShardRef};
 use skys3_types::ShardConfig;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard, watch};
 
 use crate::error::ShardError;
 use crate::shard::{Shard, ShardSummary};
+
+/// A shard's place in the set.
+enum Slot<D: Disk> {
+    /// The shard is open.
+    Open(Shard<D>),
+    /// The shard is being removed: it is not open, and cannot open again
+    /// until the removal finished. The receiver turns `true` then, and
+    /// closes if the removal task died first.
+    Removing(watch::Receiver<bool>),
+}
+
+type Slots<D> = BTreeMap<ShardRef, Slot<D>>;
 
 /// The shard replicas open on one node, all on one disk's log.
 ///
@@ -24,7 +36,7 @@ pub struct ShardSet<D: Disk> {
     index: Arc<Index>,
     log: SegmentLog<D>,
     pool: BlockingPool,
-    shards: Mutex<BTreeMap<ShardRef, Shard<D>>>,
+    shards: Arc<Mutex<Slots<D>>>,
 }
 
 impl<D: Disk> fmt::Debug for ShardSet<D> {
@@ -42,20 +54,30 @@ impl<D: Disk> ShardSet<D> {
             index,
             log,
             pool,
-            shards: Mutex::default(),
+            shards: Arc::default(),
         }
     }
 
     /// Opens the shard of `config`, or returns it if it is open already.
     ///
+    /// An open shard is compared with `config` by epoch (§5.1). In the same
+    /// configuration it is returned as it is. In an older epoch it first
+    /// adopts `config` in order with its writes (see
+    /// [`Shard::reconfigure`]). A `config` older than the shard's epoch, or
+    /// another configuration in the same epoch, is refused. A shard that is
+    /// being removed opens only once its removal finished.
+    ///
     /// # Errors
     ///
-    /// As [`Shard::open`].
+    /// As [`Shard::open`] and [`Shard::reconfigure`];
+    /// [`ShardError::Unavailable`] if the shard's removal did not finish.
     pub async fn open(&self, config: &ShardConfig) -> Result<Shard<D>, ShardError> {
         let key = ShardRef::new(config.bucket_id.clone(), config.shard);
-        // Held across the open, so a shard never gets two sequencers.
-        let mut shards = self.shards.lock().await;
-        if let Some(shard) = shards.get(&key) {
+        // Held across the open and any epoch change, so a shard never gets
+        // two sequencers, and two opens in a newer epoch append one CONFIG.
+        let mut shards = self.settled(&key).await?;
+        if let Some(Slot::Open(shard)) = shards.get(&key) {
+            shard.reconfigure(config).await?;
             return Ok(shard.clone());
         }
         let shard = Shard::open(
@@ -65,18 +87,27 @@ impl<D: Disk> ShardSet<D> {
             self.pool.clone(),
         )
         .await?;
-        shards.insert(key, shard.clone());
+        shards.insert(key, Slot::Open(shard.clone()));
         Ok(shard)
     }
 
     /// Returns the open shard `shard`.
     pub async fn get(&self, shard: &ShardRef) -> Option<Shard<D>> {
-        self.shards.lock().await.get(shard).cloned()
+        match self.shards.lock().await.get(shard) {
+            Some(Slot::Open(open)) => Some(open.clone()),
+            Some(Slot::Removing(_)) | None => None,
+        }
     }
 
     /// The open shards, in order.
     pub async fn shards(&self) -> Vec<ShardRef> {
-        self.shards.lock().await.keys().cloned().collect()
+        self.shards
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, slot)| matches!(slot, Slot::Open(_)))
+            .map(|(shard, _)| shard.clone())
+            .collect()
     }
 
     /// Seals `shard`; see [`Shard::seal`].
@@ -102,21 +133,64 @@ impl<D: Disk> ShardSet<D> {
     /// Closes `shard` and removes everything the index holds for it. A
     /// shard that is not open has its index state removed all the same.
     ///
+    /// The shard cannot open again until its removal finished, so a shard
+    /// opened afterwards starts from an index that holds nothing of it. The
+    /// removal runs to the end even if the returned future is dropped.
+    ///
     /// # Errors
     ///
     /// [`ShardError::Unavailable`] if the index fails; startup recovery
     /// then reclaims the shard (§4.1).
     pub async fn remove(&self, shard: &ShardRef) -> Result<(), ShardError> {
-        let removed = self.shards.lock().await.remove(shard);
-        if let Some(removed) = removed {
-            // A shard that stopped already has nothing left to apply.
-            let _ = removed.close().await;
-        }
-        let (index, key) = (Arc::clone(&self.index), shard.clone());
-        match self.pool.run(move || index.remove_shard(&key)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(ShardError::unavailable(shard, error)),
-            Err(error) => Err(ShardError::unavailable(shard, error)),
+        let (done, removing) = watch::channel(false);
+        let removed = match self
+            .settled(shard)
+            .await?
+            .insert(shard.clone(), Slot::Removing(removing))
+        {
+            Some(Slot::Open(removed)) => Some(removed),
+            Some(Slot::Removing(_)) | None => None,
+        };
+        let shards = Arc::clone(&self.shards);
+        let (index, pool, key) = (Arc::clone(&self.index), self.pool.clone(), shard.clone());
+        let removal = tokio::spawn(async move {
+            if let Some(removed) = removed {
+                // A shard that stopped already has nothing left to apply.
+                let _ = removed.close().await;
+            }
+            let removed = {
+                let key = key.clone();
+                pool.run(move || index.remove_shard(&key)).await
+            };
+            shards.lock().await.remove(&key);
+            // Nobody may be waiting.
+            let _ = done.send(true);
+            match removed {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(ShardError::unavailable(&key, error)),
+                Err(error) => Err(ShardError::unavailable(&key, error)),
+            }
+        });
+        removal
+            .await
+            .unwrap_or_else(|error| Err(ShardError::unavailable(shard, error)))
+    }
+
+    /// Locks the set once `shard` is not being removed.
+    async fn settled(&self, shard: &ShardRef) -> Result<MutexGuard<'_, Slots<D>>, ShardError> {
+        loop {
+            let shards = self.shards.lock().await;
+            let Some(Slot::Removing(removing)) = shards.get(shard) else {
+                return Ok(shards);
+            };
+            let mut removing = removing.clone();
+            drop(shards);
+            if removing.wait_for(|done| *done).await.is_err() {
+                return Err(ShardError::unavailable(
+                    shard,
+                    "the shard's removal did not finish",
+                ));
+            }
         }
     }
 
