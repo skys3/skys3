@@ -34,10 +34,6 @@ pub enum Phase {
     /// A flush found the remote changed out of band; the key is held
     /// (§7.2).
     Conflict(Conflict),
-    /// The latest version is a completed multipart upload, which waits for
-    /// multipart flush (plan M1-16b, §7.4). The key stays dirty, out of
-    /// line, until a newer version replaces it.
-    AwaitsMultipart,
 }
 
 /// A dirty key the flusher tracks.
@@ -76,8 +72,7 @@ pub struct ConflictStatus {
 /// A shard flusher's state at one moment.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ShardStatus {
-    /// Keys whose latest change is not at the remote, excluding conflicts
-    /// and keys awaiting multipart flush.
+    /// Keys whose latest change is not at the remote, excluding conflicts.
     pub dirty: u64,
     /// Of those, the keys being flushed.
     pub flushing: u64,
@@ -87,13 +82,10 @@ pub struct ShardStatus {
     /// included, on the wall clock.
     pub oldest_dirty: Option<Duration>,
     /// When the oldest change the flusher is still working on was made:
-    /// conflicts and keys awaiting multipart flush excluded.
+    /// conflicts excluded.
     pub oldest_pending: Option<Duration>,
     /// Keys held in conflict.
     pub conflicts: Vec<ConflictStatus>,
-    /// Keys whose latest version is a multipart object that waits for
-    /// multipart flush (plan M1-16b), in key order.
-    pub awaiting_multipart: Vec<String>,
     /// The latest error a flush attempt hit, if the key has not been
     /// flushed since.
     pub last_error: Option<String>,
@@ -149,18 +141,8 @@ impl State {
             self.dirty_bytes = self.dirty_bytes - tracked.size + size;
             tracked.size = size;
         }
-        match tracked.phase {
-            Phase::Flushing => {
-                tracked.newer_since.get_or_insert(since);
-            }
-            // A newer version may be one the flusher can send.
-            Phase::AwaitsMultipart => {
-                tracked.phase = Phase::Dirty;
-                tracked.order = position;
-                self.ready.insert(position, key.to_owned());
-                self.pending.insert((tracked.since, key.to_owned()));
-            }
-            _ => {}
+        if tracked.phase == Phase::Flushing {
+            tracked.newer_since.get_or_insert(since);
         }
     }
 
@@ -225,24 +207,6 @@ impl State {
         }
     }
 
-    /// Ends the flush of `key` whose version awaits multipart flush: it
-    /// leaves the line, unless a newer version arrived meanwhile.
-    fn deferred(&mut self, key: &str, dispatched: EpochSeq) {
-        self.flushing -= 1;
-        let Some(tracked) = self.keys.get_mut(key) else {
-            return;
-        };
-        tracked.newer_since = None;
-        if tracked.latest > dispatched {
-            tracked.phase = Phase::Dirty;
-            tracked.order = tracked.latest;
-            self.ready.insert(tracked.order, key.to_owned());
-        } else {
-            self.pending.remove(&(tracked.since, key.to_owned()));
-            tracked.phase = Phase::AwaitsMultipart;
-        }
-    }
-
     /// Ends the flush of `key` in conflict: it is held, and no longer in
     /// line.
     fn conflicted(&mut self, key: &str, conflict: Conflict) {
@@ -278,7 +242,6 @@ impl State {
                     remote_etag: conflict.remote_etag.clone(),
                     remote_identity: conflict.remote_identity.clone(),
                 }),
-                Phase::AwaitsMultipart => status.awaiting_multipart.push(key.clone()),
                 _ => {
                     status.dirty += 1;
                     continue;
@@ -291,7 +254,6 @@ impl State {
             );
         }
         status.conflicts.sort_by(|a, b| a.key.cmp(&b.key));
-        status.awaiting_multipart.sort();
         status
     }
 }
@@ -548,7 +510,6 @@ fn finish<S, D: Disk>(
             }
         }
         Outcome::Settled => state.finished(&key, dispatched),
-        Outcome::AwaitsMultipart => state.deferred(&key, dispatched),
         Outcome::Conflict(conflict) => {
             target.counters.conflicts.inc();
             tracing::warn!(shard = %shard.shard(), key, seq = %conflict.seq,

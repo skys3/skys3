@@ -1535,6 +1535,66 @@ of this file. A task with nothing unexpected keeps "None."
   M4-10. A conflict is not persisted, so after a restart it is
   re-detected rather than remembered.
 
+### M1-16b Multipart flush after commit
+
+- **The remote upload ID stays in memory.** Design §7.3 keeps remote
+  upload IDs in the shard log, but that is for streaming (M4-02), where an
+  upload outlives the request that opened it. A flush after commit opens,
+  fills, and completes its upload within one attempt, so it logs nothing.
+  A Complete whose answer is lost is resolved by aborting the upload:
+  `404 NoSuchUpload` means it is gone, and a HEAD that finds the version's
+  `MPU_CREATE` identity means the flush is done, without a retry that
+  would upload every part again. When the abort fails too, the next
+  attempt completes a new upload conditioned on the old ETag, gets `412`,
+  and the HEAD finds the identity (§7.2); a test scripts both paths.
+- **Abandoned remote uploads cannot be found by identity.** The plan
+  suggested listing them. `ObjectStore` has no `ListMultipartUploads`, and
+  S3's answer to it carries the key, upload ID, and initiation time but no
+  user metadata, so it could not tell SkyS3's uploads from another
+  writer's. The target instead keeps the uploads it knows are open: an
+  abort that failed, and, through a drop guard, the upload of an attempt
+  that was cancelled because its flusher stopped. The next multipart
+  flush to the target aborts up to 16 of them first. What is lost with the
+  node's memory, or was never known (a lost `CreateMultipartUpload`
+  answer), is left to the abort-incomplete-uploads lifecycle rule of
+  §7.3, as the design already says; M4-02's logged upload IDs cover the
+  streaming case. M5-10 is cleanup for local buckets and does not apply.
+- **The awaiting-multipart status was repurposed.** With multipart
+  objects flushed, nothing waits. `Phase::AwaitsMultipart` and the
+  admin field `awaiting_multipart` are gone. The admin field was added in
+  M1-16 and never released, so removing it does not break the rule that
+  admin fields are only added (§12). The gauge became
+  `skys3_flush_orphaned_uploads`, the uploads the target holds to abort,
+  and the admin flush status shows the same count as `orphaned_uploads`.
+- **The remote model was missing fields.** `CreateMultipartUpload` had no
+  standard headers or tags, and `UploadPart` no `Content-MD5`, so a
+  multipart flush could not carry what a `PutObject` carries. Both gained
+  them, in the AWS client and in `SimS3`, which also dropped the tags of
+  a completed upload. Each part is sent with the `Content-MD5` its local
+  part ETag already is. A `TAGS` change of a multipart object uploads its
+  parts again as a multipart upload with the `TAGS` identity, so its ETag
+  stays; §7.2's table says so.
+- **The simulation rarely reached the 412 recovery.** The abort resolves
+  most lost Complete answers at once, so treating a found
+  `MPU_CREATE` identity as a conflict failed only at seed 295. The
+  scenario now loses the answer to a third of its multipart completions,
+  half of them with a failed abort as well, and that mutation fails at
+  seed 9. To check aborts exactly, `SimS3::unanswered(operation)` counts
+  successful requests whose answer never reached the caller (lost, or
+  abandoned by a caller that stopped waiting); at the end, the open
+  remote uploads must be exactly the unanswered `CreateMultipartUpload`
+  requests. Not aborting after a failed part, and not handing a cancelled
+  attempt's upload to the target, each fail at seed 0. 300 seeds take
+  about 50 seconds.
+- **Left open.** Parts are uploaded one at a time from the local log,
+  each within the in-flight budget; concurrent parts and resuming a
+  partly uploaded object belong to the streaming PRs (M4-02, M4-03). Some
+  S3-compatible providers constrain parts beyond S3's 5 MiB minimum (R2
+  documents that every part but the last must have the same size); a
+  client upload that breaks such a rule cannot be reproduced there, and
+  its flush is retried with the provider's error. The provider tests of
+  M1-26 should cover it.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named

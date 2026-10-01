@@ -71,7 +71,11 @@ async fn reconcile_until_probed(
 fn flushes_write_back_buckets_under_their_prefix() {
     runtime().block_on(async {
         let node = Node::open(20).await;
-        let store = SimS3::new(20, SimS3Config::default());
+        let config = SimS3Config {
+            min_part_size: 1,
+            ..SimS3Config::default()
+        };
+        let store = SimS3::new(20, config);
         let registry = MetricsRegistry::new();
         let wall = Arc::new(ManualWallClock::new(Duration::from_secs(1_700_000_100)));
         let service = service(&store, &registry).with_wall_clock(wall.clone());
@@ -100,8 +104,8 @@ fn flushes_write_back_buckets_under_their_prefix() {
         // The probe cleaned up after itself.
         assert_eq!(store.keys(), ["team/cat.jpg"]);
 
-        // A conflict and a multipart object show in the status and the
-        // metrics.
+        // A conflict shows in the status and the metrics; a multipart
+        // object is flushed.
         let mut metadata = skys3_remote::UserMetadata::new();
         metadata.insert("writer", "other").unwrap();
         skys3_remote::ObjectStore::put_object(
@@ -113,9 +117,12 @@ fn flushes_write_back_buckets_under_their_prefix() {
         node.put("dog.jpg", "bark").await;
         node.multipart("clip.mp4", &["ab", "cd"]).await;
         let status = loop {
+            // Once the object is there, a status without dirty keys has
+            // seen its flush end.
+            let flushed = store.object("team/clip.mp4").is_some();
             let status = service.status(&bucket.bucket_id).unwrap();
             let shard = &status.shards[0].1;
-            if shard.conflicts.len() == 1 && shard.awaiting_multipart.len() == 1 {
+            if shard.conflicts.len() == 1 && shard.dirty == 0 && flushed {
                 break status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -125,18 +132,18 @@ fn flushes_write_back_buckets_under_their_prefix() {
         wall.advance(Duration::from_secs(100));
         let gauges = status.gauges(wall.now());
         assert_eq!(gauges.conflicted_keys, 1);
-        assert_eq!(gauges.awaiting_multipart_keys, 1);
-        assert_eq!(gauges.dirty_bytes, 8);
+        assert_eq!(gauges.orphaned_uploads, 0);
+        assert_eq!(gauges.dirty_bytes, 4);
         assert_eq!(gauges.flush_lag, 0.0);
         assert_eq!(gauges.oldest_dirty_age, 100.0);
         service.refresh_metrics();
         let text = registry.encode().unwrap();
         for line in [
-            "skys3_dirty_bytes{bucket=\"photos\"} 8",
+            "skys3_dirty_bytes{bucket=\"photos\"} 4",
             "skys3_conflicted_keys{bucket=\"photos\"} 1",
-            "skys3_awaiting_multipart_flush_keys{bucket=\"photos\"} 1",
+            "skys3_flush_orphaned_uploads{bucket=\"photos\"} 0",
             "skys3_flush_conflicts_total{bucket=\"photos\"} 1",
-            "skys3_flushes_total{bucket=\"photos\"} 1",
+            "skys3_flushes_total{bucket=\"photos\"} 2",
             "skys3_oldest_dirty_age_seconds{bucket=\"photos\"} 100.0",
             "skys3_flush_lag_seconds{bucket=\"photos\"} 0.0",
         ] {

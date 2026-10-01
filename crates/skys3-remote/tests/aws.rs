@@ -523,29 +523,39 @@ async fn multipart_uploads_round_trip() {
     ));
     let mut metadata = UserMetadata::new();
     metadata.insert("skys3-wid", "c/b/1/7.1").unwrap();
-    let created = store
-        .create_multipart_upload(CreateMultipartUpload::new("k").with_metadata(metadata))
-        .await
-        .unwrap();
+    let create = CreateMultipartUpload::new("k")
+        .with_metadata(metadata)
+        .with_headers(BTreeMap::from([
+            ("cache-control".to_owned(), "no-cache".to_owned()),
+            (
+                "expires".to_owned(),
+                "Thu, 01 Dec 1994 16:00:00 GMT".to_owned(),
+            ),
+        ]))
+        .with_tags(BTreeMap::from([("team".to_owned(), "a b".to_owned())]));
+    let created = store.create_multipart_upload(create).await.unwrap();
     assert_eq!(created, upload);
     let create = mock.only_request();
     assert_eq!(create.method, Method::POST);
     assert_eq!(create.path(), "/bucket/k");
     assert_eq!(create.query(), ["uploads"]);
     assert_eq!(create.header("x-amz-meta-skys3-wid"), Some("c/b/1/7.1"));
+    assert_eq!(create.header("cache-control"), Some("no-cache"));
+    assert_eq!(
+        create.header("expires"),
+        Some("Thu, 01 Dec 1994 16:00:00 GMT")
+    );
+    assert_eq!(create.header("x-amz-tagging"), Some("team=a%20b"));
 
     mock.reply(ok(&[("etag", "\"p1\"")], ""));
-    let part = UploadPart {
-        key: "k".to_owned(),
-        upload_id: upload.clone(),
-        part_number: 1,
-        body: Bytes::from_static(b"hello"),
-    };
+    let part = UploadPart::new("k", upload.clone(), 1, Bytes::from_static(b"hello"))
+        .with_content_md5("XUFAKrxLKna5cZ2REBfFkg==");
     assert_eq!(store.upload_part(part).await.unwrap(), etag("p1"));
     let put = mock.only_request();
     assert_eq!(put.method, Method::PUT);
     assert_eq!(put.query(), ["partNumber=1", "uploadId=up%2F1"]);
     assert_eq!(put.header("x-amz-content-sha256"), Some(HELLO_SHA256));
+    assert_eq!(put.header("content-md5"), Some("XUFAKrxLKna5cZ2REBfFkg=="));
 
     mock.reply(ok(
         &[("x-amz-version-id", "v3")],

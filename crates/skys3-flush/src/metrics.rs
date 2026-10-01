@@ -36,8 +36,8 @@ pub struct Gauges {
     pub flush_lag: f64,
     /// Keys held in conflict.
     pub conflicted_keys: u64,
-    /// Keys whose latest version waits for multipart flush.
-    pub awaiting_multipart_keys: u64,
+    /// Remote multipart uploads flushes left open that wait to be aborted.
+    pub orphaned_uploads: u64,
 }
 
 /// The flush metrics of a node.
@@ -47,7 +47,7 @@ pub struct FlushMetrics {
     oldest_dirty_age: Family<Labels, Gauge<f64, AtomicU64>>,
     flush_lag: Family<Labels, Gauge<f64, AtomicU64>>,
     conflicted_keys: Family<Labels, Gauge>,
-    awaiting_multipart_keys: Family<Labels, Gauge>,
+    orphaned_uploads: Family<Labels, Gauge>,
     flushes: Family<Labels, Counter>,
     retries: Family<Labels, Counter>,
     conflicts: Family<Labels, Counter>,
@@ -84,10 +84,10 @@ impl FlushMetrics {
             metrics.conflicted_keys.clone(),
         );
         registry.register(
-            "awaiting_multipart_flush_keys",
-            "Dirty keys whose latest version is a multipart object, which waits for multipart \
-             flush.",
-            metrics.awaiting_multipart_keys.clone(),
+            "flush_orphaned_uploads",
+            "Remote multipart uploads that flushes left open, because an abort failed or a \
+             flusher stopped, and that wait to be aborted.",
+            metrics.orphaned_uploads.clone(),
         );
         registry.register(
             "flushes",
@@ -132,9 +132,9 @@ impl FlushMetrics {
         self.conflicted_keys
             .get_or_create(&labels)
             .set(saturate(gauges.conflicted_keys));
-        self.awaiting_multipart_keys
+        self.orphaned_uploads
             .get_or_create(&labels)
-            .set(saturate(gauges.awaiting_multipart_keys));
+            .set(saturate(gauges.orphaned_uploads));
     }
 
     /// Forgets `bucket`'s series, once it is no longer flushed here.
@@ -144,7 +144,7 @@ impl FlushMetrics {
         self.oldest_dirty_age.remove(&labels);
         self.flush_lag.remove(&labels);
         self.conflicted_keys.remove(&labels);
-        self.awaiting_multipart_keys.remove(&labels);
+        self.orphaned_uploads.remove(&labels);
     }
 }
 

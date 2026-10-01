@@ -24,8 +24,8 @@
 //!   the same names;
 //! - `conflicts`: each key held in conflict, with the local `seq` and the
 //!   remote object's ETag and write identity;
-//! - `awaiting_multipart`: the keys whose latest version is a multipart
-//!   object, which waits for multipart flush (plan M1-16b);
+//! - `orphaned_uploads`: remote multipart uploads that flushes left open
+//!   and that wait to be aborted, as the metric of the same name;
 //! - `errors`: the latest flush error of each shard that has one.
 //!
 //! Placement (M3-03) adds shard members, and M4-06 its own fields.
@@ -238,10 +238,6 @@ fn flush_status(status: &BucketStatus) -> Value {
             })
         })
         .collect();
-    let awaiting_multipart: Vec<_> = shards
-        .clone()
-        .flat_map(|shard| &shard.awaiting_multipart)
-        .collect();
     let errors: Vec<_> = shards
         .clone()
         .filter_map(|shard| shard.last_error.clone())
@@ -264,7 +260,7 @@ fn flush_status(status: &BucketStatus) -> Value {
         "oldest_dirty_age_seconds": gauges.oldest_dirty_age,
         "flush_lag_seconds": gauges.flush_lag,
         "conflicts": conflicts,
-        "awaiting_multipart": awaiting_multipart,
+        "orphaned_uploads": gauges.orphaned_uploads,
         "errors": errors,
     })
 }

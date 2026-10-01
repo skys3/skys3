@@ -342,6 +342,7 @@ impl Flusher {
                 upload_id: upload_id.clone(),
                 part_number,
                 body: chunk,
+                content_md5: None,
             };
             let etag = with_retries(&mut self.rng, || store.upload_part(request.clone())).await?;
             parts.push(CompletedPart { part_number, etag });
