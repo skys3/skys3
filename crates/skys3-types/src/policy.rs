@@ -29,7 +29,9 @@
 //!   prefix. A `*` also matches `/`, as in IAM. Resources match with case.
 //!   Policy variables (`${...}`) are refused, not matched literally.
 //! - `Principal`, `NotPrincipal`, and `Condition` are refused, as is any
-//!   other key. Refusing an element is safe: ignoring a `Condition` would
+//!   other key. Trust policies, which say who may assume a role, are a
+//!   separate language with a `Principal` and conditions on token claims
+//!   ([`trust`]). Refusing an element is safe: ignoring a `Condition` would
 //!   widen an `Allow`, and a later version can accept more without
 //!   changing what an accepted policy means.
 //! - A policy holds at most [`MAX_POLICY_BYTES`] of text (its string
@@ -64,12 +66,15 @@
 //! # Ok::<(), skys3_types::policy::PolicyError>(())
 //! ```
 
+pub mod trust;
+
 use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The only policy language version SkyS3 accepts.
 pub const VERSION: &str = "2012-10-17";
@@ -95,7 +100,7 @@ pub const S3_ARN_PREFIX: &str = "arn:aws:s3:::";
 pub struct PolicyError(String);
 
 impl PolicyError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
@@ -109,9 +114,23 @@ pub struct Policy {
 
 /// Whether a statement grants or denies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Effect {
+pub(crate) enum Effect {
     Allow,
     Deny,
+}
+
+impl Effect {
+    /// The effect an `Effect` value names.
+    pub(crate) fn parse(effect: Option<&str>) -> Result<Self, PolicyError> {
+        match effect {
+            Some("Allow") => Ok(Effect::Allow),
+            Some("Deny") => Ok(Effect::Deny),
+            Some(other) => Err(PolicyError::new(format!(
+                "Effect is {other:?}; it must be \"Allow\" or \"Deny\""
+            ))),
+            None => Err(PolicyError::new("Effect is required")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,12 +267,81 @@ impl FromStr for Policy {
     }
 }
 
+/// A policy language whose documents a [`PolicyDocument`] can hold.
+pub trait PolicyLanguage: Sized {
+    /// Parses a JSON document of at most [`MAX_POLICY_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// If the document is not a valid policy of this language.
+    fn parse_document(json: &str) -> Result<Self, PolicyError>;
+}
+
+impl PolicyLanguage for Policy {
+    fn parse_document(json: &str) -> Result<Self, PolicyError> {
+        Self::parse(json)
+    }
+}
+
+/// A parsed policy kept with the JSON text it was parsed from.
+///
+/// Registers and session records store policies this way, as a JSON string
+/// holding the document, as IAM's API and SkyS3's configuration do. It
+/// serializes as that string and deserializes by parsing it, so a stored
+/// policy is always valid and always reads back the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDocument<P> {
+    text: Arc<str>,
+    policy: Arc<P>,
+}
+
+impl<P: PolicyLanguage> PolicyDocument<P> {
+    /// Parses `json`.
+    ///
+    /// # Errors
+    ///
+    /// If `json` is not a valid document of the language.
+    pub fn parse(json: &str) -> Result<Self, PolicyError> {
+        Ok(Self {
+            policy: Arc::new(P::parse_document(json)?),
+            text: Arc::from(json),
+        })
+    }
+}
+
+impl<P> PolicyDocument<P> {
+    /// The document as it was given.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The parsed policy.
+    #[must_use]
+    pub fn policy(&self) -> &Arc<P> {
+        &self.policy
+    }
+}
+
+impl<P> Serialize for PolicyDocument<P> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.text)
+    }
+}
+
+impl<'de, P: PolicyLanguage> Deserialize<'de> for PolicyDocument<P> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(de::Error::custom)
+    }
+}
+
 /// Whether `text` matches `pattern`, where `*` matches any run of
 /// characters and `?` exactly one.
 ///
 /// Greedy matching that backtracks only to the last `*`: O(pattern ×
 /// text) at worst, never exponential.
-fn wildcard_match(pattern: &[char], text: &[char], fold_case: bool) -> bool {
+pub(crate) fn wildcard_match(pattern: &[char], text: &[char], fold_case: bool) -> bool {
     let same = |a: char, b: char| {
         if fold_case {
             a.eq_ignore_ascii_case(&b)
@@ -332,15 +420,7 @@ impl TryFrom<RawPolicy> for Policy {
     type Error = PolicyError;
 
     fn try_from(raw: RawPolicy) -> Result<Self, PolicyError> {
-        match raw.version.as_deref() {
-            Some(VERSION) => {}
-            Some(other) => {
-                return Err(PolicyError::new(format!(
-                    "Version is {other:?}; only {VERSION:?} is supported"
-                )));
-            }
-            None => return Err(PolicyError::new(format!("Version {VERSION:?} is required"))),
-        }
+        check_version(raw.version.as_deref())?;
         let statements = raw
             .statement
             .ok_or_else(|| PolicyError::new("Statement is required"))?
@@ -348,11 +428,7 @@ impl TryFrom<RawPolicy> for Policy {
         let text = VERSION.len()
             + raw.id.as_ref().map_or(0, String::len)
             + statements.iter().map(RawStatement::text_len).sum::<usize>();
-        if text > MAX_POLICY_BYTES {
-            return Err(PolicyError::new(format!(
-                "the policy holds {text} bytes of text; at most {MAX_POLICY_BYTES} are allowed"
-            )));
-        }
+        check_text(text)?;
         let statements = statements
             .into_iter()
             .enumerate()
@@ -366,14 +442,32 @@ impl TryFrom<RawPolicy> for Policy {
     }
 }
 
+/// Checks a document's `Version`.
+pub(crate) fn check_version(version: Option<&str>) -> Result<(), PolicyError> {
+    match version {
+        Some(VERSION) => Ok(()),
+        Some(other) => Err(PolicyError::new(format!(
+            "Version is {other:?}; only {VERSION:?} is supported"
+        ))),
+        None => Err(PolicyError::new(format!("Version {VERSION:?} is required"))),
+    }
+}
+
+/// Checks the bytes of text a policy holds, its string values together.
+pub(crate) fn check_text(text: usize) -> Result<(), PolicyError> {
+    if text > MAX_POLICY_BYTES {
+        return Err(PolicyError::new(format!(
+            "the policy holds {text} bytes of text; at most {MAX_POLICY_BYTES} are allowed"
+        )));
+    }
+    Ok(())
+}
+
 impl RawStatement {
     /// The bytes of text in the statement's string values.
     fn text_len(&self) -> usize {
-        let strings = |values: &Option<OneOrMany<String>>| match values {
-            None => 0,
-            Some(OneOrMany::One(value)) => value.len(),
-            Some(OneOrMany::Many(values)) => values.iter().map(String::len).sum(),
-        };
+        let strings =
+            |values: &Option<OneOrMany<String>>| values.as_ref().map_or(0, OneOrMany::text_len);
         self.sid.as_ref().map_or(0, String::len)
             + self.effect.as_ref().map_or(0, String::len)
             + strings(&self.action)
@@ -392,16 +486,7 @@ impl RawStatement {
                 return Err(PolicyError::new(format!("{name} is not supported")));
             }
         }
-        let effect = match self.effect.as_deref() {
-            Some("Allow") => Effect::Allow,
-            Some("Deny") => Effect::Deny,
-            Some(other) => {
-                return Err(PolicyError::new(format!(
-                    "Effect is {other:?}; it must be \"Allow\" or \"Deny\""
-                )));
-            }
-            None => return Err(PolicyError::new("Effect is required")),
-        };
+        let effect = Effect::parse(self.effect.as_deref())?;
         let actions = selector(
             ("Action", self.action),
             ("NotAction", self.not_action),
@@ -449,7 +534,7 @@ fn selector(
     Ok(Selector { negated, patterns })
 }
 
-fn bounded(pattern: &str) -> Result<(), String> {
+pub(crate) fn bounded(pattern: &str) -> Result<(), String> {
     if pattern.len() > MAX_PATTERN_BYTES {
         Err(format!("is longer than {MAX_PATTERN_BYTES} bytes"))
     } else {
@@ -459,7 +544,7 @@ fn bounded(pattern: &str) -> Result<(), String> {
 
 /// Checks an action pattern: `*`, or `service:name` with an alphanumeric
 /// service (and `-`) and a name of alphanumerics and wildcards.
-fn action_pattern(pattern: &str) -> Result<Box<[char]>, String> {
+pub(crate) fn action_pattern(pattern: &str) -> Result<Box<[char]>, String> {
     bounded(pattern)?;
     if pattern != "*" {
         let (service, name) = pattern
@@ -502,13 +587,23 @@ fn resource_pattern(pattern: &str) -> Result<Box<[char]>, String> {
 }
 
 /// A JSON value that is one item or an array of them.
-enum OneOrMany<T> {
+pub(crate) enum OneOrMany<T> {
     One(T),
     Many(Vec<T>),
 }
 
+impl OneOrMany<String> {
+    /// The bytes of text in the values.
+    pub(crate) fn text_len(&self) -> usize {
+        match self {
+            OneOrMany::One(value) => value.len(),
+            OneOrMany::Many(values) => values.iter().map(String::len).sum(),
+        }
+    }
+}
+
 impl<T> OneOrMany<T> {
-    fn non_empty(self, key: &str) -> Result<Vec<T>, PolicyError> {
+    pub(crate) fn non_empty(self, key: &str) -> Result<Vec<T>, PolicyError> {
         match self {
             OneOrMany::One(item) => Ok(vec![item]),
             OneOrMany::Many(items) if items.is_empty() => {
