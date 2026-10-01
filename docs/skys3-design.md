@@ -155,6 +155,8 @@ Each **bucket** has a mode, fixed at creation:
 
 Attaching a `write_back` bucket imports the remote namespace (section 9.1). Deleting a SkyS3 bucket detaches it and leaves any remote untouched.
 
+**Detaching.** DeleteBucket first seals every shard of the bucket. A sealed shard commits no client write, and reports what it holds, counting every write committed before the seal; flushing continues. A `write_back` bucket is refused with `409 BucketNotEmpty` while any entry is dirty, flushing, or in conflict, delete tombstones included: those changes exist nowhere else. Clean and evicted entries do not block, since their system of record is the remote. A `local` bucket is refused while it holds any object, as S3 refuses a non-empty bucket. A refusal lifts the seals, and the client retries once the flusher has drained the bucket. Detaching never waits for a drain itself, because a conflict held by the `hold` policy (section 7.2) may never drain without an operator. Otherwise the bucket register is deleted at the version read before sealing, and the shards are dropped. If the register changed in between, the seals are lifted and the request fails with `409 OperationAborted`. If the delete's outcome is unknown, the shards stay sealed, so no write is acknowledged into a bucket that may be gone, until a retried DeleteBucket or a restart. Seals nest, so concurrent DeleteBucket requests cannot lift each other's. In M1 the gateway and every shard share a process, so a crash lifts the seals with everything else; a seal held across nodes is specified with the shard map (plan M2-08). Shards whose bucket ID no register names, left by a creation or deletion whose outcome was unknown, are reclaimed by startup recovery (plan M1-13).
+
 Replication is configured per bucket, because every shard belongs to exactly one bucket:
 
 - `replicas`: the number of shard members, and so of copies of every write until it reaches its durable home (default 3).
@@ -284,6 +286,8 @@ trait ControlStore {
     async fn get(&self, key: &str) -> Result<Option<(Bytes, Version)>>;
     /// Write only if the register is still at `expected`, or still absent.
     async fn put_if(&self, key: &str, expected: Expected, value: Bytes) -> Result<PutOutcome>;
+    /// Delete only if the register is still at `expected`.
+    async fn delete_if(&self, key: &str, expected: Version) -> Result<DeleteOutcome>;
     /// List registers under a prefix, for bootstrap and recovery.
     async fn list(&self, prefix: &str) -> Result<Vec<(String, Version)>>;
     /// Stream changes after a generation, from a native watch or by polling.
@@ -291,7 +295,7 @@ trait ControlStore {
 }
 ```
 
-`put_if` must be linearizable per key. Nothing else is required: SkyS3 needs no transactions across registers, and the coordinator lease (section 6.7) is built from `put_if` plus local timers.
+`put_if` and `delete_if` must be linearizable per key, and every value a register holds, across deletions and re-creations, has a version of its own. Nothing else is required: SkyS3 needs no transactions across registers, and the coordinator lease (section 6.7) is built from `put_if` plus local timers.
 
 | Backend | Compare-and-swap | Change notification | Status |
 |---|---|---|---|
@@ -317,11 +321,13 @@ Every backend uses the same register layout:
   identity/                     OIDC providers, roles, trust and session policies
 ```
 
-**S3 backends.** Registers are objects in a control bucket. They are updated with `PutObject` and `If-Match: <etag>`, or created with `If-None-Match: *`. A precondition failure (412) means someone else won. A `409 ConditionalRequestConflict` means a concurrent conditional write was in progress, and the caller retries after re-reading[^s3-cond]. At startup, each node probes an S3 control store. It runs 100 rounds across several scratch keys, racing conditional writers on different nodes, and requires exactly one winner in every round. After each round, the losers read the register and must see the winner's value, because the lost-response rule below depends on read-after-write. A store that fails any round is refused. The conformance suite (section 16.1) runs the same probe against every backend, not only at startup.
+**S3 backends.** Registers are objects in a control bucket. They are updated with `PutObject` and `If-Match: <etag>`, created with `If-None-Match: *`, and deleted with `DeleteObject` and `If-Match: <etag>`. A precondition failure (412) means someone else won. A `409 ConditionalRequestConflict` means a concurrent conditional write was in progress, and the caller retries after re-reading[^s3-cond]. At startup, each node probes an S3 control store. It runs 100 rounds across several scratch keys, racing conditional writers on different nodes, and requires exactly one winner in every round. After each round, the losers read the register and must see the winner's value, because the lost-response rule below depends on read-after-write. A store that fails any round is refused. The conformance suite (section 16.1) runs the same probe against every backend, not only at startup.
 
 A bucket register is keyed by the bucket's S3 name, which requests use to find it. Its shards are keyed by the bucket ID, which is never reused (section 4.1), so a bucket recreated under the same name never inherits an old shard register. Keys are `/`-separated segments of ASCII letters, digits, `-`, `_`, and `.`, none empty or starting with `.`, so every backend can store them as object keys, etcd keys, or file paths.
 
 **Lost responses.** Each write includes a unique `proposal_id` in the value. If a response is lost and the retry fails its precondition, the proposer re-reads the register. If the register contains its own `proposal_id`, the write succeeded. This applies to every backend. The retry sends the same value under the same precondition, so at most one attempt can apply, even one still in flight. A `409` or an outage applied nothing, and the request is sent again as it is. A write that landed and was overwritten before the re-read cannot be told from a lost race, and is treated as one: the proposer acts on the register's current value, as a loser would. For bootstrap, this means a node may not learn that it created `cluster.json`, which is harmless because bootstrap is idempotent.
+
+A deleted register holds no `proposal_id`, so a lost delete response is resolved by the register's absence. The retry sends the same conditional delete, which can apply only while the register is still at the version the proposer read. If it fails its precondition after an unanswered attempt, the proposer re-reads: an absent register counts as deleted, whether by this proposal or by another proposer, since either way the version it read is gone. A present register means the delete did not apply, or applied before the register was created again; both are treated as a lost race. Tombstone values carrying a `proposal_id` were rejected: registers would never disappear, and every reader and lister would have to skip them.
 
 An example shard register:
 
@@ -343,11 +349,12 @@ Register values are JSON objects. Readers reject unknown fields and invalid valu
 
 #### Traffic and latency
 
-**No client request reads or writes the control store.** Routing, leases, commits, and reads all stay inside the cluster. The control store sees background traffic, plus bursts when membership changes:
+**No object request reads or writes the control store.** Routing, leases, commits, and reads all stay inside the cluster. Of the bucket operations, only CreateBucket and DeleteBucket do: they write the bucket register and increment the generation, and DeleteBucket reads the register first. HeadBucket, ListBuckets, and GetBucketLocation are answered from the node's local copy (section 6.2). The control store sees background traffic, plus bursts when membership changes:
 
 | Activity | Control-store requests | Effect of a 100 ms round trip |
 |---|---|---|
-| Any client request | 0 | None |
+| Any object request | 0 | None |
+| CreateBucket, DeleteBucket | 2 to 4 (read, CAS, generation increment) | Adds a few round trips to an operation that is rare |
 | Primary leases | 0 (granted by backups, section 5.4) | None |
 | Coordinator lease renewal | 1 conditional PUT every `coordinator_lease / 3` | None while renewal fits well inside the lease |
 | Configuration propagation (section 6.2) | S3 backends: 1 conditional GET per node every `config_poll_interval`, usually `304 Not Modified`. etcd: a watch. | None |
@@ -961,6 +968,22 @@ A member acknowledges a record only after `fdatasync` covers it. New segment fil
 
 S3 parsing and serialization use `s3s`[^s3s]. SkyS3 implements authentication, authorization, and resource limits itself.
 
+**Creating a bucket.** S3 has no field for a mode or a target, so CreateBucket takes them from two SkyS3 headers. `x-skys3-bucket-mode` is `write_back`, `local`, or `read_only`; without it, the bucket's `[buckets.<name>]` table or `[buckets.defaults]` decides (section 14). `x-skys3-bucket-target` is a `write_back` bucket's target, a path-style URL in the form of `backup_target`: `https://host[:port]/bucket[/prefix]`. A `write_back` bucket without a target, and a `local` bucket with one, are refused with `400 InvalidArgument`, as is a target in the control store's failure scope (section 6.1). `read_only` answers `501 NotImplemented` until read-only buckets land. The shard count and replication settings come from the configuration. A new bucket gets a random ID, `b-` and 23 base-32 characters (115 bits), so IDs are never reused without a registry of every ID ever issued. Its shards are opened before its register is created with `If-None-Match: *`, so a bucket is never visible without them. A name that exists answers `409 BucketAlreadyOwnedByYou`. The headers are not `x-amz-` headers, so SigV4 covers them only when the client signs them; the authenticator requires that they be signed (plan M1-07a). Any `LocationConstraint` is accepted and ignored: SkyS3 has no regions, and GetBucketLocation answers as for `us-east-1`. Requests are path-style (`/bucket/key`).
+
+**Rejected features.** Headers that ask for a rejected feature are refused on every operation, so object operations need no checks of their own. Each answer is the one S3 gives where it has one:
+
+| Request | Answer |
+|---|---|
+| `x-amz-server-side-encryption*` headers (SSE-S3, SSE-KMS, SSE-C, and the copy-source SSE-C headers); PutBucketEncryption | `501 NotImplemented` |
+| GetBucketEncryption | `400 ServerSideEncryptionConfigurationNotFoundError` |
+| `x-amz-bucket-object-lock-enabled: true`; PutObjectLockConfiguration | `501 NotImplemented` |
+| `x-amz-object-lock-*` headers; Put and Get of object retention and legal hold | `400 InvalidRequest`, as for a bucket without Object Lock |
+| GetObjectLockConfiguration | `404 ObjectLockConfigurationNotFoundError` |
+| PutBucketVersioning; ListObjectVersions | `501 NotImplemented` |
+| `versionId` other than `null` | `400 InvalidArgument`, as for an unversioned bucket; GetBucketVersioning reports no status |
+| `x-amz-grant-*` headers, an `x-amz-acl` other than `private` or `bucket-owner-full-control`, or an ACL body | `400 InvalidBucketAclWithObjectOwnership` on CreateBucket, otherwise `400 AccessControlListNotSupported`, as for a bucket-owner-enforced bucket |
+| Object ownership other than `BucketOwnerEnforced`, on CreateBucket or PutBucketOwnershipControls | `501 NotImplemented` |
+
 CopyObject within the cluster copies the bytes into the destination shard and commits a `PUT` that records its source (section 10.1). If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth. The remote copy must carry the copy's own write identity. With the default `COPY` metadata directive, it would keep the source's identity, and the 412 recovery rule (section 7.2) would report a successful flush as a conflict. So the flush sends `x-amz-metadata-directive: REPLACE` with the full metadata and the copy's write identity, `x-amz-tagging-directive: REPLACE` with the tags, `x-amz-copy-source-if-match: <source remote_etag>` so the source has not changed, and the destination precondition. A target that does not support all of these gets a regular upload instead.
 
 **Workload identity.** STS implements `AssumeRoleWithWebIdentity`[^sts-wif]. It validates the JWT signature against allowlisted issuers (discovery and JWKS fetched with bounded size and rate), and checks `iss`, `aud`, `sub`, `exp`, `nbf`, and `azp` where required, using an algorithm allowlist. It then issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`. Trust policies and roles live in the control store. Each node validates against its local copy, and stops issuing new sessions once that copy is older than `identity_max_staleness` (section 6.2). Session records live in an internal, local-only system bucket that is replicated like any shard and never flushed. Session tokens are stored hashed. Secrets needed for SigV4 are held in memory with `secrecy`/`zeroize`.
@@ -981,6 +1004,7 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 ## 12. Security
 
 - Clients, headers, XML, chunk framing, and keys are untrusted. XML depth, header sizes, part counts, and ranges are bounded. Canonical request bytes are kept intact for SigV4.
+- The gateway checks each request's head before authentication: at most 100 header fields and 16 KiB of header names and values, a request target of at most 16 KiB, keys of at most 1,024 bytes, part numbers from 1 to 10,000, and a `Range` header of at most 64 bytes, which `s3s` parses as a single range with offsets below 2⁶³. A request whose body is not object data has an XML body, which is read up to 4 MiB and must nest at most 32 elements deep, with no document type declaration, before `s3s` parses it. These are constants of `skys3-gateway`, not configuration keys.
 - Internal traffic uses mutual TLS with node identities issued by the operator's PKI. Replication, lease, and admin messages are authenticated per node and per role.
 - The admin HTTP listener (metrics, health, and the admin API) binds to loopback by default (`[admin] listen = "127.0.0.1:7490"`). On a non-loopback address, callers present a bearer token read from `[admin] token_file` (`Authorization: Bearer`); configuration validation rejects a non-loopback `listen` without one. A configured token also applies on loopback. `/healthz` and `/readyz` never require it, so load balancers and orchestrators can probe them; they disclose only which components are not ready. The token is at least 32 bytes and compared in constant time. A bearer token rather than client certificates, because scrapers and operator tools send one from a file with no PKI enrollment, and node certificates identify nodes, not people. Until the listener serves TLS, the token crosses the network in cleartext, so a non-loopback listener belongs on a management network or behind a TLS-terminating proxy. TLS for the admin listener (`tls_cert_file`, `tls_key_file`), and client certificates as an alternative to the token, are added with the node PKI (plan M2-02).
 - The control store is a trust anchor. Whoever can write it can reassign shards. It gets a dedicated bucket or prefix, least-privilege credentials, and remote-side versioning for audit.

@@ -309,6 +309,7 @@ const BUCKET_EXAMPLE: &str = r#"{
     "bucket": "example-photos",
     "prefix": "skys3/"
   },
+  "created_unix_ms": 1790812800000,
   "proposal_id": "01J8Z6K3V2Q8"
 }"#;
 
@@ -322,6 +323,7 @@ fn bucket_document_round_trips() {
     assert_eq!(bucket.name.as_str(), "photos");
     assert_eq!(bucket.mode, BucketMode::WriteBack);
     assert_eq!(bucket.shards.get(), 8);
+    assert_eq!(bucket.created_unix_ms, 1_790_812_800_000);
     assert_eq!(
         bucket.replication(),
         ReplicationSettings {
