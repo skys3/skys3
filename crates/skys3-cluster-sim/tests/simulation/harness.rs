@@ -181,6 +181,36 @@ fn the_checkers_catch_acknowledged_writes_that_were_never_made() {
 }
 
 #[test]
+fn a_failed_sync_is_fenced_once() {
+    Runner::with_cost(1, COST).run(|context| {
+        let (config, workload) = small();
+        let fail = Fault::FailSync { node: 0, disk: 0 };
+        // The node crashes before its fallback fence is due: that crash is
+        // its power-loss restart, and the fence leaves the next process
+        // alone.
+        let crash = Fault::Crash {
+            node: 0,
+            power_loss: false,
+            downtime: Duration::from_millis(200),
+        };
+        let plan = FaultPlan::none()
+            .with(Duration::from_millis(500), fail.clone())
+            .with(Duration::from_millis(600), crash);
+        let report = Cluster::new(config.clone()).run(context, &workload, &plan)?;
+        assert_eq!(report.fences, 0);
+        assert!(report.lives >= 3, "{}", report.lives);
+
+        // Alone, the failed sync is fenced, unless the node stopped by
+        // itself first and its supervisor restarted it.
+        let plan = FaultPlan::none().with(Duration::from_millis(500), fail);
+        let report = Cluster::new(config).run(context, &workload, &plan)?;
+        let restarts = usize::try_from(report.lives - 2)?;
+        assert!(report.fences <= 1 && restarts >= 1, "{report:?}");
+        Ok(())
+    });
+}
+
+#[test]
 fn invariants_run_after_every_step() {
     Runner::with_cost(1, COST).run(|context| {
         let (config, workload) = small();

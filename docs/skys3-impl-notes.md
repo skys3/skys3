@@ -1742,6 +1742,19 @@ of this file. A task with nothing unexpected keeps "None."
   that; the driver kills or crashes the disks before it crashes the host.
   A node with a failed sync is always restarted with a power loss, as
   M1-02 requires.
+- **Heals must end their own fault.** Review found that the driver's
+  heals were not scoped: the fallback power-loss restart of a failed sync
+  (the fence) also hit the process that replaced the failed one after a
+  crash or a supervisor restart, overlapping control-store windows that
+  ended out of start order removed the oldest one's effect instead of
+  their own, and the end of any message-loss window stopped all loss. The
+  driver now counts each node's processes and a fence applies only to
+  the process whose sync failed (moving to the next one if the node was
+  down when the sync failed), and each loss or control-store window has
+  an identity and ends on its own; what is in force is recomputed from
+  the windows still open. Overlapping loss windows give the highest rate,
+  as overlapping lost-response windows give the highest probability.
+  `Report::fences` counts the fences a run forced.
 - **A transient control-store error fails a node's start.**
   `Buckets::reload`, which `Gateway::new` calls, lists `buckets/` without
   retries, so one lost answer stops a starting node. The node binary has
