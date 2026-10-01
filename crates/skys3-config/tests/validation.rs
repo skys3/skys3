@@ -315,6 +315,7 @@ fn durations_and_sizes_must_be_positive() {
         ("flush", "flush_max_inflight_bytes_per_target"),
         ("flush", "streaming_flush_min_bytes"),
         ("flush", "max_dirty_bytes"),
+        ("flush", "import_max_keys_per_second"),
         ("ec", "max_data_fragments"),
         ("ec", "fragment_orphan_after_seconds"),
         ("ec", "repair_bytes_per_second_per_node"),

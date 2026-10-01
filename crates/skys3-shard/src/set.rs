@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use skys3_index::Index;
+use skys3_index::{ImportCheckpoint, Index, IndexError};
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::{SegmentLog, ShardRef};
-use skys3_types::{KeyHash, Label, NodeId, ShardConfig};
+use skys3_types::{BucketId, KeyHash, Label, NodeId, ShardConfig};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
 use crate::error::ShardError;
@@ -173,6 +173,39 @@ impl<D: Disk> ShardSet<D> {
             Some(Slot::Open(open)) => Some(open.clone()),
             Some(Slot::Removing(_)) | None => None,
         }
+    }
+
+    /// The namespace import checkpoint of `bucket` on this node (§9.1),
+    /// read on the index's pool.
+    ///
+    /// # Errors
+    ///
+    /// An [`IndexError`] if the index fails.
+    pub async fn import_checkpoint(
+        &self,
+        bucket: &BucketId,
+    ) -> Result<Option<ImportCheckpoint>, IndexError> {
+        let (index, bucket) = (Arc::clone(&self.index), bucket.clone());
+        self.pool
+            .run(move || index.import_checkpoint(&bucket))
+            .await?
+    }
+
+    /// Stores the namespace import checkpoint of `bucket` durably, or
+    /// removes it, on the index's pool ([`Index::set_import_checkpoint`]).
+    ///
+    /// # Errors
+    ///
+    /// An [`IndexError`] if the index fails; nothing changes then.
+    pub async fn set_import_checkpoint(
+        &self,
+        bucket: &BucketId,
+        checkpoint: Option<ImportCheckpoint>,
+    ) -> Result<(), IndexError> {
+        let (index, bucket) = (Arc::clone(&self.index), bucket.clone());
+        self.pool
+            .run(move || index.set_import_checkpoint(&bucket, checkpoint.as_ref()))
+            .await?
     }
 
     /// The open shards, in order.
