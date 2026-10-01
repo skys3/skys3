@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -14,6 +15,25 @@ use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use skys3_net::{CertificateDer, Credentials, PrivateKeyDer};
 use skys3_types::ClusterId;
+
+/// The longest a test waits on the network before it fails.
+pub const WAIT: Duration = Duration::from_secs(30);
+
+/// Bounds a network wait, so a test that would hang fails instead.
+pub trait Bounded: Future + Sized {
+    /// Waits at most [`WAIT`] for the future, panicking after that.
+    #[track_caller]
+    fn bounded(self) -> impl Future<Output = Self::Output> {
+        let caller = std::panic::Location::caller();
+        async move {
+            tokio::time::timeout(WAIT, self)
+                .await
+                .unwrap_or_else(|_| panic!("a network wait at {caller} took over {WAIT:?}"))
+        }
+    }
+}
+
+impl<F: Future> Bounded for F {}
 
 /// The cluster every test uses unless it tests another.
 pub const CLUSTER: &str = "test-cluster";
