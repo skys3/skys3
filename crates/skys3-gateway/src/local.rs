@@ -6,11 +6,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use skys3_index::Entry;
+use skys3_index::{Entry, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{Shard, ShardSet};
+use skys3_shard::{Outcome, Rejection, Shard, ShardSet};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -143,6 +143,47 @@ impl<D: Disk> Shards for LocalShards<D> {
             .map_err(|error| convert(shard, error))
     }
 
+    async fn upload(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+    ) -> Result<Option<Upload>, ShardError> {
+        let local = self.find(shard).await?;
+        local
+            .upload(key, upload)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
+    async fn uploads(
+        &self,
+        shard: &ShardRef,
+        prefix: &str,
+        after: Option<(String, Option<EpochSeq>)>,
+        limit: usize,
+    ) -> Result<Vec<(String, EpochSeq, Upload)>, ShardError> {
+        let local = self.find(shard).await?;
+        local
+            .uploads(prefix, after, limit)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
+    async fn parts(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Vec<(u16, Part)>, ShardError> {
+        let local = self.find(shard).await?;
+        local
+            .parts(upload, after, limit)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
         let local = self.find(shard).await?;
         local
@@ -176,6 +217,12 @@ impl<D: Disk> Shards for LocalShards<D> {
             local.commit_if(body, |entry| condition.check(entry)).await
         };
         let committed = committed.map_err(|error| convert(shard, error))?;
-        Ok(committed.map(|committed| committed.position))
+        Ok(committed.and_then(|committed| match committed.outcome {
+            Outcome::Rejected(Rejection::NoSuchUpload) => Err(ConditionFailed::NoSuchUpload),
+            Outcome::Rejected(Rejection::PartChanged { .. }) => Err(ConditionFailed::InvalidPart),
+            // Other rejections are of records only the node writes, such as
+            // a `FLUSHED` that lost a race, which their writer expects.
+            _ => Ok(committed.position),
+        }))
     }
 }

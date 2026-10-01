@@ -27,6 +27,12 @@
 //!   larger one as `EXTENT` records while it arrives, and a PUT is answered
 //!   only once its record is durable and applied. User metadata is limited
 //!   to [`MAX_USER_METADATA_BYTES`].
+//! - Multipart uploads: CreateMultipartUpload, UploadPart,
+//!   CompleteMultipartUpload, AbortMultipartUpload, ListParts, and
+//!   ListMultipartUploads, as `MPU_*` records in the key's shard. An
+//!   upload's ID ([`upload_id`]) is the position of its `MPU_CREATE`, the
+//!   write identity of the object it completes, which keeps its parts'
+//!   boundaries for GetObject's `partNumber` and the multipart ETag.
 //! - [`Shards`] and [`ShardRef`]: the shard interface the gateway calls,
 //!   and routing of each key to its shard with the frozen hash. On a single
 //!   node every shard is local: [`LocalShards`] serves the interface from
@@ -47,7 +53,7 @@
 //! - [`checksum`]: checksum validation of request bodies, on a blocking
 //!   pool, for CRC32, CRC32C, CRC64NVME, SHA1, SHA256, and `Content-MD5`
 //!   (trailing checksums included), MD5 ETags, and multipart ETags and
-//!   checksums. PutObject uses it.
+//!   checksums. PutObject and the multipart operations use it.
 //!
 //! The gateway serves path-style requests. The node binary does not serve
 //! it yet (plan M1-13).
@@ -119,7 +125,10 @@ pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, Stati
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
 pub use local::LocalShards;
-pub use objects::{MAX_OBJECT_BYTES, MAX_USER_METADATA_BYTES};
+pub use objects::{
+    MAX_MULTIPART_OBJECT_BYTES, MAX_OBJECT_BYTES, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
+    parse_upload_id, upload_id,
+};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};

@@ -7,9 +7,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use skys3_index::{Entry, EntryState, Index, IndexError};
+use skys3_index::{Entry, EntryState, Index, IndexError, Part, Upload};
 use skys3_io::{BlockingPool, Disk};
-use skys3_log::record::{Extent, ExtentRef, Put, PutData};
+use skys3_log::record::{Extent, ExtentRef, MpuPart, Put, PutData};
 use skys3_log::{LogRecord, RecordBody, SegmentLog, ShardRef};
 use skys3_types::{Epoch, EpochSeq, Seq, ShardConfig};
 use tokio::sync::{mpsc, oneshot};
@@ -259,10 +259,11 @@ impl<D: Disk> Shard<D> {
     /// Commits `body` as the shard's next record, and returns its position
     /// and what applying it did, once it is durable and applied.
     ///
-    /// Client writes (`PUT`, `DELETE`, `TAGS`, and `EXTENT`) are refused
-    /// while the shard is sealed; `FLUSHED`, `IMPORT`, and `ADOPT` are not.
-    /// A `PUT` that references extents is accepted only once each of them is
-    /// applied: append them with [`Shard::append_extent`] first (§10.1).
+    /// Client writes (`PUT`, `DELETE`, `TAGS`, `EXTENT`, and the multipart
+    /// records) are refused while the shard is sealed; `FLUSHED`, `IMPORT`,
+    /// and `ADOPT` are not. A `PUT` or `MPU_PART` that references extents is
+    /// accepted only once each of them is applied: append them with
+    /// [`Shard::append_extent`] first (§10.1).
     ///
     /// The record is appended even if the returned future is dropped.
     ///
@@ -315,6 +316,10 @@ impl<D: Disk> Shard<D> {
         let client_write = match &body {
             RecordBody::Put(_) | RecordBody::Delete(_) | RecordBody::Tags(_) => true,
             RecordBody::Extent(_) => true,
+            RecordBody::MpuCreate(_)
+            | RecordBody::MpuPart(_)
+            | RecordBody::MpuComplete(_)
+            | RecordBody::MpuAbort(_) => true,
             RecordBody::Config(_) | RecordBody::Truncate => {
                 return Err(ShardError::invalid(
                     shard,
@@ -326,8 +331,13 @@ impl<D: Disk> Shard<D> {
         if client_write && sequencer.seals > 0 {
             return Err(ShardError::Sealed(shard.clone()));
         }
-        if let RecordBody::Put(put) = &body
-            && let PutData::Extents(extents) = &put.data
+        let data = match &body {
+            RecordBody::Put(Put { data, .. }) | RecordBody::MpuPart(MpuPart { data, .. }) => {
+                Some(data)
+            }
+            _ => None,
+        };
+        if let Some(PutData::Extents(extents)) = data
             && let Some(extent) = extents.iter().find(|e| e.position > sequencer.applied)
         {
             return Err(ShardError::invalid(
@@ -440,8 +450,71 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
-    /// The payload of the record at `position`, as an entry names it: an
-    /// `EXTENT`'s data, or a `PUT`'s inline bytes.
+    /// The open upload of `key` opened at `upload`, as the index holds it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn upload(&self, key: &str, upload: EpochSeq) -> Result<Option<Upload>, ShardError> {
+        let (index, shard, key) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.upload(&shard, &key, upload)
+        })
+        .await
+    }
+
+    /// Up to `limit` open uploads whose keys start with `prefix`, by key and
+    /// age, after `after` (see
+    /// [`IndexReader::uploads`](skys3_index::IndexReader::uploads)).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn uploads(
+        &self,
+        prefix: &str,
+        after: Option<(String, Option<EpochSeq>)>,
+        limit: usize,
+    ) -> Result<Vec<(String, EpochSeq, Upload)>, ShardError> {
+        let (index, shard, prefix) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            prefix.to_owned(),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            let after = after.as_ref().map(|(key, upload)| (key.as_str(), *upload));
+            index.read()?.uploads(&shard, &prefix, after, limit)
+        })
+        .await
+    }
+
+    /// Up to `limit` parts of the upload opened at `upload`, open or
+    /// completed, in part order after part `after` (0 for the first), all
+    /// read at one point in the shard's history.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn parts(
+        &self,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Vec<(u16, Part)>, ShardError> {
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.parts(&shard, upload, after, limit)
+        })
+        .await
+    }
+
+    /// The payload of the record at `position`, as an entry or a part names
+    /// it: an `EXTENT`'s data, or the inline bytes of a `PUT` or an
+    /// `MPU_PART`.
     ///
     /// # Errors
     ///
@@ -468,6 +541,10 @@ impl<D: Disk> Shard<D> {
         match record.body {
             RecordBody::Extent(Extent { data, .. })
             | RecordBody::Put(Put {
+                data: PutData::Inline(data),
+                ..
+            })
+            | RecordBody::MpuPart(MpuPart {
                 data: PutData::Inline(data),
                 ..
             }) if record.shard == *shard && record.position == position => Ok(data),
@@ -717,10 +794,14 @@ impl Sequencer {
 }
 
 /// The key of the entry `body` changes: every record that names a key
-/// except an `EXTENT`, which changes only the location map.
+/// except an `EXTENT`, which changes only the location map, and the
+/// multipart records other than `MPU_COMPLETE`, which change only uploads.
 fn entry_key(body: &RecordBody) -> Option<&str> {
     match body {
-        RecordBody::Extent(_) => None,
+        RecordBody::Extent(_)
+        | RecordBody::MpuCreate(_)
+        | RecordBody::MpuPart(_)
+        | RecordBody::MpuAbort(_) => None,
         other => other.key(),
     }
 }

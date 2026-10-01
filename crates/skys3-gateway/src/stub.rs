@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_index::{Checkpointer, Entry, EntryState as IndexState, Index, IndexConfig};
+use skys3_index::{
+    Checkpointer, Entry, EntryState as IndexState, Index, IndexConfig, Part, Upload,
+};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Delete, Extent, ExtentRef, Flushed, Put, PutData};
 use skys3_log::{LogConfig, RecordBody, SegmentLog};
@@ -262,6 +264,38 @@ impl Shards for MemoryShards {
     async fn entry(&self, shard: &ShardRef, key: &str) -> Result<Option<Entry>, ShardError> {
         self.check(shard)?;
         self.local.entry(shard, key).await
+    }
+
+    async fn upload(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+    ) -> Result<Option<Upload>, ShardError> {
+        self.check(shard)?;
+        self.local.upload(shard, key, upload).await
+    }
+
+    async fn uploads(
+        &self,
+        shard: &ShardRef,
+        prefix: &str,
+        after: Option<(String, Option<EpochSeq>)>,
+        limit: usize,
+    ) -> Result<Vec<(String, EpochSeq, Upload)>, ShardError> {
+        self.check(shard)?;
+        self.local.uploads(shard, prefix, after, limit).await
+    }
+
+    async fn parts(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Vec<(u16, Part)>, ShardError> {
+        self.check(shard)?;
+        self.local.parts(shard, upload, after, limit).await
     }
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {

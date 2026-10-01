@@ -61,6 +61,20 @@ fn check(data: &[u8]) {
         let encoded = codec::encode_applied(applied);
         same(data, &encoded, &applied, |b| codec::decode_applied(b).ok());
     }
+    if let Ok(upload) = codec::decode_upload(data) {
+        let encoded = codec::encode_upload(&upload).expect("a decoded upload encodes");
+        same(data, &encoded, &upload, |b| codec::decode_upload(b).ok());
+    }
+    if let Ok(part) = codec::decode_part(data) {
+        let encoded = codec::encode_part(&part).expect("a decoded part encodes");
+        same(data, &encoded, &part, |b| codec::decode_part(b).ok());
+    }
+    if let Ok((shard, key, upload)) = codec::decode_upload_key(data) {
+        assert_eq!(codec::upload_key(&shard, &key, upload), data);
+    }
+    if let Ok((shard, upload, number)) = codec::decode_part_key(data) {
+        assert_eq!(codec::part_key(&shard, upload, number), data);
+    }
     if let Ok((shard, key)) = codec::decode_entry_key(data) {
         assert_eq!(codec::entry_key(&shard, &key), data);
     }

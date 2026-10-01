@@ -465,7 +465,7 @@ fn outcomes_describe_themselves() {
         "applied: Cleaned"
     );
     assert_eq!(
-        Rejection::Unsupported(RecordKind::MpuCreate).to_string(),
-        "MpuCreate records are not applied by this build"
+        Rejection::Unsupported(RecordKind::UploadBegin).to_string(),
+        "UploadBegin records are not applied by this build"
     );
 }

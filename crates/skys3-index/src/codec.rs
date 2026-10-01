@@ -2,13 +2,16 @@
 //!
 //! redb stores raw bytes; this module defines what they mean. Every value
 //! starts with a format byte ([`VALUE_FORMAT`]) so a later build can change
-//! a layout without guessing. This build writes format 2 and reads formats
-//! 1 and 2 ([`MIN_VALUE_FORMAT`]); any other format byte is rejected. Format
+//! a layout without guessing. This build writes format 3 and reads formats
+//! 1 to 3 ([`MIN_VALUE_FORMAT`]); any other format byte is rejected. Format
 //! 2 adds a `u16` part count after each checksum digest of an [`Entry`],
 //! zero for a `FULL_OBJECT` checksum; a format 1 checksum has none and is
-//! `FULL_OBJECT`. Every other value is the same in both. Integers in values are little-endian. Keys
-//! use big-endian integers so that redb's byte order sorts them
-//! numerically:
+//! `FULL_OBJECT`. Format 3 adds the payload of a multipart object (tag 3:
+//! the upload's position, a `u16` part count, and each part's number
+//! (`u16`) and size (`u64`)), and the [`Upload`] and [`Part`] values, which
+//! only it has. Every other value is the same in all three. Integers in
+//! values are little-endian. Keys use big-endian integers so that redb's
+//! byte order sorts them numerically:
 //!
 //! | Table | Key | Value |
 //! |---|---|---|
@@ -17,6 +20,11 @@
 //! | shards | shard | applied position: epoch, seq |
 //! | coverage | disk label (`u8` length and bytes), segment id | [`SegmentSummary`] from offset zero |
 //! | control | register key (UTF-8) | [`ControlEntry`] |
+//! | uploads | shard, the object key's bytes, a zero byte, then the upload's epoch and seq | [`Upload`] |
+//! | parts | shard, the upload's epoch and seq, part number (`u16`) | [`Part`] |
+//!
+//! An upload key ends with a fixed 17 bytes, so it decodes whatever bytes
+//! the object key holds, and a shard's uploads sort by key, then by age.
 //!
 //! A shard is encoded as the bucket ID's length (`u8`), its bytes, and the
 //! shard number (`u8`), so all of a shard's keys share a prefix and sort
@@ -34,26 +42,32 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use skys3_log::record::{
-    Checksum, ChecksumAlgorithm, Checksums, CopySource, ExtentRef, MAX_EXTENTS, MAX_KEY_LEN,
-    MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
-    MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, ShardRef, TagSet,
+    Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, MAX_EXTENTS,
+    MAX_KEY_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
+    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, ShardRef, TagSet, UploadChecksum,
 };
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
+use skys3_types::limits::MAX_PARTS;
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, Generation, Label, Seq, ShardId, VersionIdentity,
 };
 
-use crate::entry::{ControlEntry, Entry, EntryState, ObjectVersion, Payload};
+use crate::entry::{
+    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
+};
 
 /// The format byte every value this build writes starts with, and the
 /// newest format it reads.
-pub const VALUE_FORMAT: u8 = 2;
+pub const VALUE_FORMAT: u8 = 3;
 
 /// The oldest value format this build reads.
 pub const MIN_VALUE_FORMAT: u8 = 1;
 
 /// The first value format with a part count after each checksum digest.
 const PART_COUNTS_SINCE: u8 = 2;
+
+/// The first value format with multipart uploads.
+const UPLOADS_SINCE: u8 = 3;
 
 /// The longest control-state value kept locally, in bytes.
 pub const MAX_CONTROL_VALUE_LEN: usize = 1 << 20;
@@ -67,6 +81,11 @@ const MAX_SUMMARY_SHARDS: usize = 1 << 20;
 const PAYLOAD_NONE: u8 = 0;
 const PAYLOAD_INLINE: u8 = 1;
 const PAYLOAD_EXTENTS: u8 = 2;
+const PAYLOAD_PARTS: u8 = 3;
+
+/// The bytes after an upload key's object key: a zero byte, then the
+/// upload's position.
+const UPLOAD_KEY_SUFFIX_LEN: usize = 1 + 16;
 
 /// Bytes the index cannot decode, or a value it cannot encode.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -612,6 +631,223 @@ pub fn decode_entry(bytes: &[u8]) -> Result<Entry> {
     })
 }
 
+/// Returns the uploads-table key of the upload of `key` opened at `upload`
+/// in `shard`.
+#[must_use]
+pub fn upload_key(shard: &ShardRef, key: &str, upload: EpochSeq) -> Vec<u8> {
+    let mut bytes = entry_key(shard, key);
+    bytes.push(0);
+    push_position(&mut bytes, upload);
+    bytes
+}
+
+/// Decodes an uploads-table key into its shard, object key, and upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the shard is malformed, the object key is
+/// empty, too long, or not UTF-8, or the suffix is not a zero byte and a
+/// position.
+pub fn decode_upload_key(bytes: &[u8]) -> Result<(ShardRef, String, EpochSeq)> {
+    let field = "upload key";
+    let mut r = Reader(bytes, VALUE_FORMAT);
+    let shard = r.shard(field)?;
+    let Some(key_len) = r.0.len().checked_sub(UPLOAD_KEY_SUFFIX_LEN) else {
+        return Err(CodecError::new(field, "truncated"));
+    };
+    if key_len == 0 {
+        return Err(CodecError::new(field, "empty"));
+    }
+    Reader::check(field, key_len, MAX_KEY_LEN)?;
+    let key = Reader::text(field, r.take(field, key_len)?)?;
+    if r.u8(field)? != 0 {
+        return Err(CodecError::new(field, "no separator"));
+    }
+    let upload = read_key_position(&mut r, field)?;
+    r.finish(field)?;
+    Ok((shard, key, upload))
+}
+
+/// Returns the parts-table key of part `number` of the upload opened at
+/// `upload` in `shard`.
+#[must_use]
+pub fn part_key(shard: &ShardRef, upload: EpochSeq, number: u16) -> Vec<u8> {
+    let mut bytes = upload_parts_prefix(shard, upload);
+    bytes.extend_from_slice(&number.to_be_bytes());
+    bytes
+}
+
+/// Returns the prefix of every parts-table key of the upload opened at
+/// `upload` in `shard`.
+#[must_use]
+pub fn upload_parts_prefix(shard: &ShardRef, upload: EpochSeq) -> Vec<u8> {
+    let mut bytes = shard_key(shard);
+    push_position(&mut bytes, upload);
+    bytes
+}
+
+/// Decodes a parts-table key into its shard, upload, and part number.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not a shard, a position, and a
+/// part number.
+pub fn decode_part_key(bytes: &[u8]) -> Result<(ShardRef, EpochSeq, u16)> {
+    let field = "part key";
+    let mut r = Reader(bytes, VALUE_FORMAT);
+    let shard = r.shard(field)?;
+    let upload = read_key_position(&mut r, field)?;
+    let number = u16::from_be_bytes(r.array(field)?);
+    r.finish(field)?;
+    Ok((shard, upload, number))
+}
+
+fn push_position(bytes: &mut Vec<u8>, position: EpochSeq) {
+    bytes.extend_from_slice(&position.epoch.get().to_be_bytes());
+    bytes.extend_from_slice(&position.seq.get().to_be_bytes());
+}
+
+fn read_key_position(r: &mut Reader<'_>, field: &'static str) -> Result<EpochSeq> {
+    let epoch = u64::from_be_bytes(r.array(field)?);
+    let seq = u64::from_be_bytes(r.array(field)?);
+    Ok(EpochSeq::new(Epoch::new(epoch), Seq::new(seq)))
+}
+
+/// Encodes an open multipart upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if a field is out of the bounds the log record
+/// format sets (§10.1), exactly when decoding would reject the result.
+pub fn encode_upload(upload: &Upload) -> Result<Vec<u8>> {
+    let mut w = Writer::value();
+    w.u64(upload.initiated_ms);
+    write_metadata(&mut w, &upload.metadata)?;
+    write_tags(&mut w, &upload.tags)?;
+    w.present(upload.checksum.is_some());
+    if let Some(checksum) = upload.checksum {
+        if !checksum.is_valid() {
+            return Err(CodecError::new(
+                "upload.checksum",
+                "not a multipart checksum",
+            ));
+        }
+        w.u8(checksum.algorithm.code());
+        w.u8(u8::from(checksum.checksum_type == ChecksumType::Composite));
+    }
+    Ok(w.0)
+}
+
+/// Decodes an open multipart upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded upload of a format
+/// that has uploads.
+pub fn decode_upload(bytes: &[u8]) -> Result<Upload> {
+    let mut r = Reader::value(bytes, "upload")?;
+    check_has_uploads(&r, "upload")?;
+    let initiated_ms = r.u64("upload.initiated_ms")?;
+    let metadata = read_metadata(&mut r)?;
+    let tags = read_tags(&mut r)?;
+    let checksum = if r.present("upload.checksum")? {
+        let code = r.u8("upload.checksum")?;
+        let algorithm = ChecksumAlgorithm::from_code(code).ok_or_else(|| {
+            CodecError::new("upload.checksum", format_args!("invalid algorithm {code}"))
+        })?;
+        let checksum_type = match r.u8("upload.checksum")? {
+            0 => ChecksumType::FullObject,
+            1 => ChecksumType::Composite,
+            tag => {
+                return Err(CodecError::new(
+                    "upload.checksum",
+                    format_args!("invalid type {tag}"),
+                ));
+            }
+        };
+        let checksum = UploadChecksum {
+            algorithm,
+            checksum_type,
+        };
+        if !checksum.is_valid() {
+            return Err(CodecError::new(
+                "upload.checksum",
+                "not a multipart checksum",
+            ));
+        }
+        Some(checksum)
+    } else {
+        None
+    };
+    r.finish("upload")?;
+    Ok(Upload {
+        initiated_ms,
+        metadata,
+        tags,
+        checksum,
+    })
+}
+
+/// Encodes a part of a multipart upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if a field is out of bounds, or the payload is
+/// neither inline nor in extents.
+pub fn encode_part(part: &Part) -> Result<Vec<u8>> {
+    if !matches!(part.payload, Payload::Inline(_) | Payload::Extents(_)) {
+        return Err(CodecError::new(
+            "part.payload",
+            "a part's bytes are inline or in extents",
+        ));
+    }
+    let mut w = Writer::value();
+    w.position(part.position);
+    w.u64(part.size);
+    w.u64(part.last_modified_ms);
+    write_etag(&mut w, "part.etag", &part.etag)?;
+    write_checksums(&mut w, &part.checksums)?;
+    write_payload(&mut w, &part.payload)?;
+    Ok(w.0)
+}
+
+/// Decodes a part of a multipart upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded part of a format
+/// that has uploads.
+pub fn decode_part(bytes: &[u8]) -> Result<Part> {
+    let mut r = Reader::value(bytes, "part")?;
+    check_has_uploads(&r, "part")?;
+    let part = Part {
+        position: r.position("part.position")?,
+        size: r.u64("part.size")?,
+        last_modified_ms: r.u64("part.last_modified_ms")?,
+        etag: r.etag("part.etag")?,
+        checksums: read_checksums(&mut r)?,
+        payload: read_payload(&mut r)?,
+    };
+    if !matches!(part.payload, Payload::Inline(_) | Payload::Extents(_)) {
+        return Err(CodecError::new(
+            "part.payload",
+            "a part's bytes are inline or in extents",
+        ));
+    }
+    r.finish("part")?;
+    Ok(part)
+}
+
+fn check_has_uploads(r: &Reader<'_>, field: &'static str) -> Result<()> {
+    if r.1 < UPLOADS_SINCE {
+        return Err(CodecError::new(
+            field,
+            format_args!("value format {} has no uploads", r.1),
+        ));
+    }
+    Ok(())
+}
+
 fn write_etag(w: &mut Writer, field: &'static str, etag: &ETag) -> Result<()> {
     w.str16(field, etag.as_str(), ETag::MAX_LEN)
 }
@@ -651,7 +887,11 @@ fn write_object(w: &mut Writer, object: &ObjectVersion) -> Result<()> {
             source.remote_etag.as_ref(),
         )?;
     }
-    match &object.payload {
+    write_payload(w, &object.payload)
+}
+
+fn write_payload(w: &mut Writer, payload: &Payload) -> Result<()> {
+    match payload {
         Payload::None => w.u8(PAYLOAD_NONE),
         Payload::Inline(position) => {
             w.u8(PAYLOAD_INLINE);
@@ -666,6 +906,72 @@ fn write_object(w: &mut Writer, object: &ObjectVersion) -> Result<()> {
                 w.u32(extent.len);
             }
         }
+        Payload::Parts { upload, parts } => {
+            w.u8(PAYLOAD_PARTS);
+            w.position(*upload);
+            w.len16("object.parts", parts.len(), MAX_PARTS as usize)?;
+            let mut previous = 0;
+            for part in parts {
+                check_part_number(part.number, previous)?;
+                previous = part.number;
+                w.u16(part.number);
+                w.u64(part.size);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_payload(r: &mut Reader<'_>) -> Result<Payload> {
+    Ok(match r.u8("object.payload")? {
+        PAYLOAD_NONE => Payload::None,
+        PAYLOAD_INLINE => Payload::Inline(r.position("object.payload")?),
+        PAYLOAD_EXTENTS => {
+            let count = r.len32("object.extents", MAX_EXTENTS)?;
+            r.check_count("object.extents", count, 20)?;
+            let mut extents = Vec::with_capacity(count);
+            for _ in 0..count {
+                let position = r.position("object.extents")?;
+                let len = r.u32("object.extents")?;
+                check_extent_len(len)?;
+                extents.push(ExtentRef { position, len });
+            }
+            Payload::Extents(extents)
+        }
+        PAYLOAD_PARTS if r.1 >= UPLOADS_SINCE => {
+            let upload = r.position("object.parts")?;
+            let count = r.len16("object.parts", MAX_PARTS as usize)?;
+            // A part is a number and a size.
+            r.check_count("object.parts", count, 10)?;
+            let mut parts = Vec::with_capacity(count);
+            let mut previous = 0;
+            for _ in 0..count {
+                let number = r.u16("object.parts")?;
+                check_part_number(number, previous)?;
+                previous = number;
+                parts.push(ObjectPart {
+                    number,
+                    size: r.u64("object.parts")?,
+                });
+            }
+            Payload::Parts { upload, parts }
+        }
+        tag => {
+            return Err(CodecError::new(
+                "object.payload",
+                format_args!("invalid tag {tag}"),
+            ));
+        }
+    })
+}
+
+/// Checks that a part number is valid and follows `previous`.
+fn check_part_number(number: u16, previous: u16) -> Result<()> {
+    if number <= previous || u32::from(number) > MAX_PARTS {
+        return Err(CodecError::new(
+            "object.parts",
+            format_args!("part {number} after part {previous}"),
+        ));
     }
     Ok(())
 }
@@ -704,28 +1010,7 @@ fn read_object(r: &mut Reader<'_>) -> Result<ObjectVersion> {
     } else {
         None
     };
-    let payload = match r.u8("object.payload")? {
-        PAYLOAD_NONE => Payload::None,
-        PAYLOAD_INLINE => Payload::Inline(r.position("object.payload")?),
-        PAYLOAD_EXTENTS => {
-            let count = r.len32("object.extents", MAX_EXTENTS)?;
-            r.check_count("object.extents", count, 20)?;
-            let mut extents = Vec::with_capacity(count);
-            for _ in 0..count {
-                let position = r.position("object.extents")?;
-                let len = r.u32("object.extents")?;
-                check_extent_len(len)?;
-                extents.push(ExtentRef { position, len });
-            }
-            Payload::Extents(extents)
-        }
-        tag => {
-            return Err(CodecError::new(
-                "object.payload",
-                format_args!("invalid tag {tag}"),
-            ));
-        }
-    };
+    let payload = read_payload(r)?;
     Ok(ObjectVersion {
         size,
         last_modified_ms,

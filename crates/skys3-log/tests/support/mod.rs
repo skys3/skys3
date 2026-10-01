@@ -9,8 +9,10 @@ use proptest::prelude::*;
 use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
-    Adopt, Checksum, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed,
-    Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
+    Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
+    Extent, ExtentRef, Flushed, Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
+    MpuComplete, MpuCreate, MpuPart, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
+    UploadChecksum,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -132,6 +134,94 @@ fn put_data(position: EpochSeq) -> impl Strategy<Value = PutData> {
     ]
 }
 
+fn data_size(data: &PutData) -> u64 {
+    match data {
+        PutData::Inline(bytes) => bytes.len() as u64,
+        PutData::Extents(extents) => extents.iter().map(|e| u64::from(e.len)).sum(),
+    }
+}
+
+/// A checksum S3 defines for multipart uploads.
+pub fn upload_checksum() -> impl Strategy<Value = UploadChecksum> {
+    (
+        proptest::sample::select(ChecksumAlgorithm::FLEXIBLE.to_vec()),
+        prop_oneof![
+            Just(ChecksumType::Composite),
+            Just(ChecksumType::FullObject)
+        ],
+    )
+        .prop_map(|(algorithm, checksum_type)| UploadChecksum {
+            algorithm,
+            checksum_type,
+        })
+        .prop_filter("defined by S3", |checksum| checksum.is_valid())
+}
+
+fn mpu_create() -> impl Strategy<Value = MpuCreate> {
+    (
+        key(),
+        any::<u64>(),
+        metadata(),
+        tags(),
+        proptest::option::of(upload_checksum()),
+    )
+        .prop_map(|(key, initiated_ms, metadata, tags, checksum)| MpuCreate {
+            key,
+            initiated_ms,
+            metadata,
+            tags,
+            checksum,
+        })
+}
+
+fn mpu_part(position: EpochSeq) -> impl Strategy<Value = MpuPart> {
+    (
+        (key(), position_before(position), 1..=10_000_u16),
+        (any::<u64>(), etag(), checksums()),
+        put_data(position),
+    )
+        .prop_map(
+            |((key, upload, part_number), (last_modified_ms, etag, checksums), data)| MpuPart {
+                key,
+                upload,
+                part_number,
+                size: data_size(&data),
+                last_modified_ms,
+                etag,
+                checksums,
+                data,
+            },
+        )
+}
+
+fn mpu_complete(position: EpochSeq) -> impl Strategy<Value = MpuComplete> {
+    (
+        (key(), position_before(position)),
+        (any::<u64>(), any::<u64>(), etag(), checksums()),
+        btree_map(1..=10_000_u16, 1..=1_000_u64, 1..20),
+    )
+        .prop_filter("parts fit after the upload", |((_, upload), _, _)| {
+            upload.seq.get() < u64::MAX - 1_000
+        })
+        .prop_map(
+            |((key, upload), (last_modified_ms, size, etag, checksums), parts)| MpuComplete {
+                key,
+                upload,
+                last_modified_ms,
+                size,
+                etag,
+                checksums,
+                parts: parts
+                    .into_iter()
+                    .map(|(number, offset)| CompletedPart {
+                        number,
+                        position: EpochSeq::new(upload.epoch, Seq::new(upload.seq.get() + offset)),
+                    })
+                    .collect(),
+            },
+        )
+}
+
 fn put(position: EpochSeq) -> impl Strategy<Value = Put> {
     (
         (key(), any::<u64>(), etag()),
@@ -148,13 +238,9 @@ fn put(position: EpochSeq) -> impl Strategy<Value = Put> {
                 copy_source,
                 data,
             )| {
-                let size = match &data {
-                    PutData::Inline(bytes) => bytes.len() as u64,
-                    PutData::Extents(extents) => extents.iter().map(|e| u64::from(e.len)).sum(),
-                };
                 Put {
                     key,
-                    size,
+                    size: data_size(&data),
                     last_modified_ms,
                     etag,
                     inherited_identity,
@@ -218,6 +304,11 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
                 offset,
                 data: data.into(),
             })),
+        mpu_create().prop_map(RecordBody::MpuCreate),
+        mpu_part(position).prop_map(RecordBody::MpuPart),
+        mpu_complete(position).prop_map(RecordBody::MpuComplete),
+        (key(), position_before(position))
+            .prop_map(|(key, upload)| RecordBody::MpuAbort(MpuAbort { key, upload })),
         (key(), tags()).prop_map(|(key, tags)| RecordBody::Tags(Tags { key, tags })),
         (
             key(),

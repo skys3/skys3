@@ -50,7 +50,11 @@ mod index;
 mod tables;
 
 pub use checkpointer::{Checkpointer, ReplayReport};
-pub use entry::{ControlEntry, Entry, EntryState, ObjectVersion, Payload};
+pub use entry::{
+    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
+};
 pub use error::IndexError;
-pub use index::{Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState};
+pub use index::{
+    Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
+};
 pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter};

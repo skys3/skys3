@@ -53,6 +53,8 @@ const OBJECT_LOCK: &[u8] = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled
     </ObjectLockEnabled></ObjectLockConfiguration>";
 const RETENTION: &[u8] = b"<Retention><Mode>GOVERNANCE</Mode>\
     <RetainUntilDate>2030-01-01T00:00:00Z</RetainUntilDate></Retention>";
+const COMPLETE: &[u8] = b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+    <ETag>\"8d777f385d3dfec8815d20f7496026dc\"</ETag></Part></CompleteMultipartUpload>";
 const LEGAL_HOLD: &[u8] = b"<LegalHold><Status>ON</Status></LegalHold>";
 const OWNERSHIP: &[u8] = b"<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced\
     </ObjectOwnership></Rule></OwnershipControls>";
@@ -302,6 +304,66 @@ const CASES: &[Case] = &[
         actions: &["s3:DeleteObject"],
         resource: OBJECT,
         allowed: (204, None),
+    },
+    Case {
+        operation: "CreateMultipartUpload",
+        method: Method::POST,
+        uri: "/bucket/k?uploads",
+        headers: &[],
+        body: b"",
+        actions: &["s3:PutObject"],
+        resource: OBJECT,
+        allowed: (200, None),
+    },
+    Case {
+        operation: "UploadPart",
+        method: Method::PUT,
+        uri: "/bucket/k?partNumber=1&uploadId=00000000000000010000000000000001",
+        headers: &[],
+        body: b"data",
+        actions: &["s3:PutObject"],
+        resource: OBJECT,
+        allowed: (404, Some("NoSuchUpload")),
+    },
+    Case {
+        operation: "CompleteMultipartUpload",
+        method: Method::POST,
+        uri: "/bucket/k?uploadId=00000000000000010000000000000001",
+        headers: &[],
+        body: COMPLETE,
+        actions: &["s3:PutObject"],
+        resource: OBJECT,
+        allowed: (404, Some("NoSuchUpload")),
+    },
+    Case {
+        operation: "AbortMultipartUpload",
+        method: Method::DELETE,
+        uri: "/bucket/k?uploadId=00000000000000010000000000000001",
+        headers: &[],
+        body: b"",
+        actions: &["s3:AbortMultipartUpload"],
+        resource: OBJECT,
+        allowed: (404, Some("NoSuchUpload")),
+    },
+    Case {
+        operation: "ListParts",
+        method: Method::GET,
+        uri: "/bucket/k?uploadId=00000000000000010000000000000001",
+        headers: &[],
+        body: b"",
+        actions: &["s3:ListMultipartUploadParts"],
+        resource: OBJECT,
+        allowed: (404, Some("NoSuchUpload")),
+    },
+    Case {
+        operation: "ListMultipartUploads",
+        method: Method::GET,
+        uri: "/bucket?uploads",
+        headers: &[],
+        body: b"",
+        actions: &["s3:ListBucketMultipartUploads"],
+        resource: BUCKET,
+        allowed: (200, None),
     },
 ];
 
