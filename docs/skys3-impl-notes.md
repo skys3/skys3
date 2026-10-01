@@ -1190,3 +1190,47 @@ of this file. A task with nothing unexpected keeps "None."
   not find a `-config` file outside the specification's directory, so the
   script copies the specification and its generated configuration into a
   temporary directory. TLC keeps its search queue on disk there.
+
+### M2-02 Intra-cluster transport
+
+- **No TLS settings existed.** M0-03's configuration had no certificate
+  keys and no node ID. The PR adds `[transport]` (`listen`, default
+  `0.0.0.0:7400`, and `tls_cert_file`, `tls_key_file`, `tls_ca_file`, set
+  together or not at all) to §14 and the configuration reference. A node's
+  ID is the one its certificate's SPIFFE ID names, so no `node_id` key is
+  needed and a node cannot claim an ID its PKI did not issue.
+- **Admin listener TLS was pointed at this PR.** §12 said TLS for the admin
+  HTTP listener and client certificates in place of its token "are added
+  with the node PKI (plan M2-02)". This PR defines the PKI and the `admin`
+  certificate role, but serving the admin listener over TLS belongs with
+  the binary's wiring, not the transport crate, so it is a new row of plan
+  section 14 (proposed for M3-02) and §12 says it is not built yet.
+- **rustls's own verifiers cannot check SPIFFE IDs.** `WebPkiServerVerifier`
+  insists on a DNS name or IP address, and rustls keeps its mapping from
+  `webpki` errors to TLS errors private. Both directions therefore use one
+  custom verifier built on `rustls-webpki` (`verify_for_usage` and
+  `valid_uri_names`, already in the tree through rustls), with a small
+  error mapping of its own so alerts still say "unknown CA" or "expired".
+  A numeric node ID is not a valid TLS server name, so the client checks
+  that it reached the node it meant after the handshake, not through the
+  server name.
+- **TLS 1.3 reports a refused client late.** The server checks the
+  client's certificate after the client has finished its half of the
+  handshake, so a refused client's `connect` succeeds and the refusal
+  (an alert) arrives on its first receive. Tests check the server's
+  verdict, and `Transport::connect` documents it.
+- **turmoil's reset outruns in-flight data.** Under random per-message
+  latency, a segment arriving for a socket the peer has already dropped
+  draws an RST that can overtake the peer's last data and close
+  notification, so the receiver sees "connection reset" where real TCP
+  would deliver the data. The simulation scenario closes its side without
+  waiting for the node's close. turmoil's default 10 s simulation limit
+  equals the handshake timeout, so the scenario raises it, and only every
+  sixteenth seed waits out a handshake timeout, which costs about 10,000
+  simulated ticks.
+- **rcgen without its defaults.** rcgen's default features pull `ring`, a
+  second crypto provider; the workspace entry enables only `aws_lc_rs`, and
+  tests write PEM with the workspace's `base64` instead of rcgen's `pem`
+  feature. `Cargo.lock` still lists rcgen's optional `x509-parser` chain
+  and `untrusted` 0.7, which are never built; `cargo deny` checks the built
+  graph and passes without new skips.

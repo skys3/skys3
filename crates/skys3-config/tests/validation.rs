@@ -562,6 +562,31 @@ fn admin_listener_off_loopback_needs_a_token() {
     );
 }
 
+#[test]
+fn transport_certificate_files_are_set_together() {
+    let config = load("").unwrap();
+    assert_eq!(config.transport().listen.to_string(), "0.0.0.0:7400");
+    assert_eq!(config.transport().tls_files(), None);
+
+    let all = "tls_cert_file = \"/etc/skys3/node.crt\"\n\
+               tls_key_file = \"/etc/skys3/node.key\"\n\
+               tls_ca_file = \"/etc/skys3/ca.crt\"";
+    let config = load(&format!("[transport]\nlisten = \"10.0.0.5:7400\"\n{all}")).unwrap();
+    let files = config.transport().tls_files().unwrap();
+    assert_eq!(files.cert, std::path::Path::new("/etc/skys3/node.crt"));
+    assert_eq!(files.key, std::path::Path::new("/etc/skys3/node.key"));
+    assert_eq!(files.ca, std::path::Path::new("/etc/skys3/ca.crt"));
+
+    assert_violations(
+        "[transport]\ntls_cert_file = \"/etc/skys3/node.crt\"",
+        &["transport.tls_key_file", "transport.tls_ca_file"],
+    );
+    assert_violations(
+        &format!("[transport]\n{}", all.replace("/etc/skys3/node.key", "")),
+        &["transport.tls_key_file"],
+    );
+}
+
 // [control_store]
 
 fn control_store(body: &str) -> String {

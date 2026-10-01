@@ -9,6 +9,7 @@ Every SkyS3 node reads one TOML file. This reference lists every key with its ty
 - [Loading and errors](#loading-and-errors)
 - [`[cluster]`](#cluster)
 - [`[control_store]`](#control_store)
+- [`[transport]`](#transport)
 - [`[replication]`](#replication)
 - [`[storage]`](#storage)
 - [`[cache]`](#cache)
@@ -60,6 +61,19 @@ Where the cluster's registers live (§6.1).
 | `config_poll_interval_seconds` | integer | `30` | Positive. How often a node polls `cluster.json` as a backstop to pushes (§6.2). |
 
 **Independence from data targets.** With `backend = "s3"`, loading refuses a control-store `endpoint` in the same failure scope as a bucket's `backup_target`, unless `allow_correlated_control_store = true` (§6.1). Two endpoints share a scope when they have the same host name or IP address, whatever their ports, or are AWS S3 endpoints in the same region. IP addresses are compared as addresses: every spelling of an IPv6 address, and an IPv4 address and its IPv4-mapped IPv6 form, are the same. Write-back targets are bound when a bucket is attached, and the attach path applies the same check.
+
+## `[transport]`
+
+The intra-cluster transport: TCP with mutual TLS between the nodes of the cluster (design §12). Certificates come from the operator's PKI. The node certificate names the node with the URI subject alternative name `spiffe://<cluster_id>/node/<node-id>`, and the node's ID is the one its certificate names. The files are read when the node starts.
+
+| Key | Type | Default | Rules |
+|---|---|---|---|
+| `listen` | socket address | `"0.0.0.0:7400"` | |
+| `tls_cert_file` | path | none | The node's certificate chain in PEM, leaf first. Not empty. |
+| `tls_key_file` | path | none | The leaf's private key in PEM (PKCS #8, PKCS #1, or SEC1). Not empty. |
+| `tls_ca_file` | path | none | The CA certificates every peer's chain must lead to, in PEM. Not empty. |
+
+The three files are set together or not at all. A node without them runs alone and does not open the transport.
 
 ## `[replication]`
 

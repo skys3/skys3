@@ -1,0 +1,39 @@
+[package]
+name = "skys3-net"
+description = "SkyS3 intra-cluster transport: mutual TLS over TCP, node identities, and authorized frames."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# A `Network` over turmoil's simulated TCP, for simulation tests.
+turmoil = ["dep:turmoil"]
+
+[dependencies]
+bytes.workspace = true
+prost.workspace = true
+rustls = { workspace = true, features = ["aws_lc_rs", "std"] }
+rustls-webpki.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
+tokio-rustls.workspace = true
+turmoil = { workspace = true, optional = true }
+zeroize.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+proptest.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+# Enables the `turmoil` network for this crate's own tests.
+skys3-net = { path = ".", features = ["turmoil"] }
+skys3-sim.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "time"] }
