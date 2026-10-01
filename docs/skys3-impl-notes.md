@@ -1639,6 +1639,38 @@ of this file. A task with nothing unexpected keeps "None."
   its flush is retried with the provider's error. The provider tests of
   M1-26 should cover it.
 
+### M1-17 Dirty budget and admission control
+
+- **Flushers waited for the capability probe.** M1-16's service started a
+  bucket's shard flushers only once its target's probe succeeded. A node
+  restarted during a remote outage then tracked no dirty bytes at all, so
+  the budget would never have engaged, and `skys3_dirty_bytes` read 0. The
+  flushers now start with their shards, scan and track at once, and begin
+  flushing when the probe task publishes the target on a `watch` channel.
+  A test writes during a failing probe and sees the bytes counted, then
+  flushed once the probe succeeds.
+- **Counting comes from the flushers, not the index.** The shard's own
+  summary scans the whole index, too slow for every request. Each flusher
+  already keeps its dirty bytes incrementally, so it moves a pair of atomic
+  counters (its bucket's and the cluster's) with them, and gives its bytes
+  back when it stops, since a new flusher of the shard scans and counts
+  them again. Seeded scenarios with a faulty remote, outages, and flusher
+  restarts check after every step that the budget equals what the flushers
+  hold, and that a PUT is refused exactly when the budget says so.
+- **Free space needs `statvfs`, which `std` lacks.** `libc` would need
+  `unsafe`. `rustix` (already in the lock file through `tempfile`) has a
+  safe `statvfs` behind its `fs` feature, so it became a direct dependency
+  of `skys3-io` at the same version, adding no duplicate.
+- **Two keys §14 did not name.** A per-bucket `max_dirty_bytes`
+  (defaulting to `flush.max_dirty_bytes`) and `storage.disk_min_free_bytes`
+  (default 1 GiB; 0 turns the check off) were added to §14 and the
+  configuration reference. The free-space margin matters because, since
+  M1-02, any write error takes a disk out of service until the host
+  restarts.
+- **Only `write_back` buckets have dirty bytes in M1.** A `local` bucket's
+  writes are never flushed yet, so the budget does not limit them; they
+  will count once flushing to a backup target (plan M5) exists.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named

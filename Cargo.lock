@@ -2394,10 +2394,14 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
+ "http",
  "md-5",
  "prometheus-client",
  "rand",
+ "s3s",
  "skys3-config",
+ "skys3-control",
+ "skys3-gateway",
  "skys3-index",
  "skys3-io",
  "skys3-log",
@@ -2478,6 +2482,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "rand",
+ "rustix",
  "tempfile",
  "tokio",
 ]

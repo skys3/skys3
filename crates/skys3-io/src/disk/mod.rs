@@ -18,9 +18,11 @@
 //!
 //! [`RealDisk`] runs every operation on a [`BlockingPool`](crate::BlockingPool).
 //! [`SimDisk`] keeps files in memory and injects crashes and faults.
+//! [`available_bytes`] reads a file system's free space.
 
 mod real;
 mod sim;
+mod space;
 
 use std::fmt;
 use std::future::Future;
@@ -30,6 +32,7 @@ use bytes::Bytes;
 
 pub use real::{RealDisk, RealFile};
 pub use sim::{SimBlockFile, SimDisk, SimDiskFaults, SimFile, SimFileInfo, SimMount};
+pub use space::available_bytes;
 
 /// The longest file name a disk accepts, in bytes.
 pub const MAX_NAME_LEN: usize = 255;

@@ -1,5 +1,6 @@
 //! A node started in process: recovery across restarts, the local copy of
-//! control state, reclaiming orphaned shards, TLS, STS, and the admin API.
+//! control state, reclaiming orphaned shards, TLS, STS, the admin API, and
+//! admission control.
 
 mod support;
 
@@ -326,6 +327,111 @@ async fn write_back_buckets_get_flushers() {
     );
     // A bucket with unflushed writes cannot be detached.
     assert!(s3.delete_bucket().bucket("archive").send().await.is_err());
+    node.shutdown().await.unwrap();
+}
+
+/// The S3 error code and HTTP status of a PUT of `data` as `bucket/key`
+/// that must fail.
+async fn refused_put(s3: &aws_sdk_s3::Client, bucket: &str, key: &str) -> (String, u16) {
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let error = s3
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(b"refused".to_vec().into())
+        .send()
+        .await
+        .expect_err("the PUT is refused");
+    let status = error.raw_response().map(|r| r.status().as_u16());
+    (error.code().unwrap_or_default().to_owned(), status.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_control_refuses_writes_past_the_budget_or_the_free_space() {
+    let dir = tempfile::tempdir().unwrap();
+    // A budget of ten bytes, and a target nothing listens on: an outage
+    // from the start, so nothing drains.
+    let node = start(dir.path(), "[flush]\nmax_dirty_bytes = 10").await;
+    let s3 = client(&endpoint(&node));
+    s3.create_bucket()
+        .bucket("archive")
+        .customize()
+        .mutate_request(|request| {
+            let headers = request.headers_mut();
+            headers.insert("x-skys3-bucket-mode", "write_back");
+            headers.insert("x-skys3-bucket-target", "http://127.0.0.1:9/remote/team");
+        })
+        .send()
+        .await
+        .unwrap();
+    s3.create_bucket().bucket("local").send().await.unwrap();
+    let admin = node.admin_addr().to_string();
+    let dirty_bytes = || async {
+        let status = admin_json(&admin, "/v1/buckets/archive").await;
+        status["flush"]["dirty_bytes"].as_u64()
+    };
+    eventually("the bucket has flushers", || async {
+        dirty_bytes().await == Some(0)
+    })
+    .await;
+    put(&s3, "archive", "a", b"0123456789").await;
+    eventually("the write is counted", || async {
+        dirty_bytes().await == Some(10)
+    })
+    .await;
+    let status = admin_json(&admin, "/v1/buckets/archive").await;
+    assert_eq!(status["flush"]["probe"], "running");
+    assert_eq!(status["flush"]["dirty_budget_bytes"], 10);
+    assert_eq!(
+        refused_put(&s3, "archive", "b").await,
+        ("SlowDown".to_owned(), 503)
+    );
+    // A local bucket has no dirty data.
+    put(&s3, "local", "x", b"0123456789").await;
+    // A delete shrinks the dirty set, and writes resume.
+    s3.delete_object()
+        .bucket("archive")
+        .key("a")
+        .send()
+        .await
+        .unwrap();
+    eventually("the delete is counted", || async {
+        dirty_bytes().await == Some(0)
+    })
+    .await;
+    put(&s3, "archive", "b", b"0").await;
+    let (_, metrics) = http_get(&admin, "/metrics").await.unwrap();
+    for line in [
+        "skys3_admission_refusals_total{reason=\"bucket_budget\"} 1",
+        "skys3_dirty_budget_bytes{bucket=\"archive\"} 10",
+    ] {
+        assert!(metrics.contains(line), "{line} is not in {metrics}");
+    }
+    node.shutdown().await.unwrap();
+
+    // A node with less free space than it requires refuses writes that add
+    // data, and admits deletes.
+    let text = config_text(dir.path(), "127.0.0.1:0", "127.0.0.1:0", "").replace(
+        "index_checkpoint_interval_seconds = 1",
+        "index_checkpoint_interval_seconds = 1\ndisk_min_free_bytes = 9223372036854775807",
+    );
+    let node = Node::start(text.parse().unwrap()).await.unwrap();
+    let s3 = client(&endpoint(&node));
+    assert_eq!(
+        refused_put(&s3, "local", "y").await,
+        ("SlowDown".to_owned(), 503)
+    );
+    s3.delete_object()
+        .bucket("local")
+        .key("x")
+        .send()
+        .await
+        .unwrap();
+    let (_, metrics) = http_get(&node.admin_addr().to_string(), "/metrics")
+        .await
+        .unwrap();
+    let line = "skys3_admission_refusals_total{reason=\"disk_space\"} 1";
+    assert!(metrics.contains(line), "{line} is not in {metrics}");
     node.shutdown().await.unwrap();
 }
 

@@ -139,6 +139,11 @@ fn the_defaults_are_the_design_example_values() {
     assert_eq!(minimal.logging().filter, "info");
     assert_eq!(minimal.logging().format, LogFormat::Text);
     assert_eq!(minimal.buckets().defaults.ack_policy, AckPolicy::Local);
+    assert_eq!(
+        minimal.buckets().defaults.max_dirty_bytes,
+        minimal.flush().max_dirty_bytes,
+        "a bucket's budget defaults to the cluster's"
+    );
 }
 
 /// A configuration that sets every key the schema accepts, each to a
@@ -193,6 +198,7 @@ index_checkpoint_interval_seconds = 5
 compaction_live_threshold = 0.4
 read_registration_ttl_seconds = 60
 read_registration_renew_interval_seconds = 20
+disk_min_free_bytes = 0
 
 [cache]
 hot_cache_bytes_per_node = 1073741824
@@ -231,6 +237,7 @@ ec_after_seconds = 300
 backup_ack = "write_through"
 index_snapshot_interval_seconds = 600
 target_transport = "s3"
+max_dirty_bytes = 107374182400
 
 [buckets."logs.example"]
 mode = "write_back"
@@ -245,6 +252,7 @@ ec_after_seconds = 60
 backup_ack = "local"
 index_snapshot_interval_seconds = 60
 target_transport = "native"
+max_dirty_bytes = 1073741824
 ack_policy = "local"
 flush_conflict_policy = "discard_local"
 snapshot_target = "https://snapshots.example/snaps/logs/"
@@ -319,6 +327,8 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(defaults.ack_policy, AckPolicy::WriteThrough, "from [flush]");
     assert_eq!(defaults.ec_after().as_secs(), 300);
     assert_eq!(defaults.index_snapshot_interval().as_secs(), 600);
+    assert_eq!(defaults.max_dirty_bytes, 100 << 30);
+    assert_eq!(config.storage().disk_min_free_bytes, 0);
 
     let logs = config
         .buckets()
@@ -328,6 +338,7 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(logs.ack_policy, AckPolicy::Local);
     assert_eq!(logs.backup_target, None);
     assert_eq!(logs.snapshot_target.as_ref().unwrap().bucket, "snaps");
+    assert_eq!(logs.max_dirty_bytes, 1 << 30);
 
     let mirror = config.buckets().get(&BucketName::new("mirror").unwrap());
     assert_eq!(
