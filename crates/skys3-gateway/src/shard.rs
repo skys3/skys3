@@ -12,7 +12,7 @@ use std::fmt;
 use std::future::Future;
 
 use bytes::Bytes;
-use skys3_index::Entry;
+use skys3_index::{Entry, ListPage, ListQuery};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_types::{BucketDocument, BucketId, EpochSeq, ShardId, shard_for_key};
@@ -153,6 +153,20 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         shard: &ShardRef,
         key: &str,
     ) -> impl Future<Output = Result<Option<Entry>, ShardError>> + Send;
+
+    /// One page of the shard's listing (§9.4): its live objects and common
+    /// prefixes in key order, after `query.start_after`, at most
+    /// `query.max_items` of them, read from its index. Delete tombstones are
+    /// skipped. Every write acknowledged before the call is in it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] or [`ShardError::Unavailable`].
+    fn list(
+        &self,
+        shard: &ShardRef,
+        query: &ListQuery,
+    ) -> impl Future<Output = Result<ListPage, ShardError>> + Send;
 
     /// The payload of the record at `position`, as an entry's
     /// [`Payload`](skys3_index::Payload) names it: an `EXTENT`'s bytes, or

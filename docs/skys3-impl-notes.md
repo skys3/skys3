@@ -1011,6 +1011,56 @@ of this file. A task with nothing unexpected keeps "None."
   a failed upload stay in bulk segments until compaction (M1-22) reclaims
   unreferenced ones. `x-amz-storage-class` is accepted and ignored.
 
+### M1-11 Listing
+
+- **A page resumes after an item, not a key.** V1's `NextMarker` can be
+  a common prefix, and so can the last item of a V2 page. Resuming after
+  it as a key would list the prefix again, from its keys that sort after
+  it. The shard page therefore compares items: a common prefix at or
+  before `start_after` is skipped whole, even where some of its keys sort
+  after it. The design said only that the token holds the last key;
+  §9.4 now defines items and this rule.
+- **The index paged by key.** `IndexReader::entries` reads every key,
+  tombstones included, and a delimiter listing would have read all of a
+  common prefix's keys to emit it once. `IndexReader::list` (with
+  `ListQuery`, `ListPage`, `ListItem`) seeks past each common prefix once
+  it has a live key, so a page costs about one redb range read per item.
+  A common prefix whose keys are all tombstones is not listed. The page
+  carries each object's `ObjectVersion`, boxed, which clippy asks for.
+- **Asking every shard for a whole page would cost shards × `max-keys`.**
+  The merge asks each shard for about its share (at least 16 items), and
+  asks a shard for more only when its page is used up before the merged
+  page is full; it never takes an item while such a shard is unasked, so
+  the result is the same as asking for everything. The proptest runs
+  batches down to one item so that refills happen; a mutation that refills
+  only once every shard is used up fails it. The fan-out uses a
+  `JoinSet`, since the workspace has no `futures` crate; a panicking shard
+  task is resumed in the request.
+- **Where the token key lives (design gap, §9.4).** `GatewayConfig` holds
+  `ListTokenKeys`: a signing key and older keys that still verify.
+  `GatewayConfig::new` generates a random key, which is what a single node
+  (M1-13) uses: its tokens die with a restart, and the client gets
+  `400 InvalidArgument` and starts over. With several nodes (M2), any
+  gateway must accept another's tokens, so §9.4 records that the ring is
+  then read from shared secret files named in configuration, with no
+  configuration key added yet (no node serves the S3 API until M1-13).
+  The key is not in the control store, which holds no secrets. Tokens are
+  bound to the bucket ID, prefix, and delimiter, and carry a version byte
+  for richer state later. The HMAC is `aws-lc-rs`'s, as SigV4 uses.
+- **s3s echoes `encoding-type` but encodes nothing.** The gateway encodes
+  keys, prefixes, delimiters, and markers itself, as form values with `/`
+  kept, which is what S3 sends and what the SDKs decode.
+- **Objects need an owner, and SkyS3 has no accounts.** V1 always returns
+  `Owner`. Every object is owned by the bucket owner (bucket-owner-
+  enforced), and the owner's ID is the cluster ID (§11).
+- **Fuzzing.** `gateway_list_token` opens arbitrary tokens, and checks
+  that each item round-trips through its own token and that a token
+  changed in one character is refused. A 30-second run executed about
+  850,000 inputs with no failure.
+- **Left open.** During a `write_back` import the listing must merge the
+  remote's listing (§9.1); the import task adds that. The configuration
+  key for shared token keys comes with multi-node gateways.
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
