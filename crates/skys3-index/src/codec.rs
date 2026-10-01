@@ -22,6 +22,7 @@
 //! | control | register key (UTF-8) | [`ControlEntry`] |
 //! | uploads | shard, the object key's bytes, a zero byte, then the upload's epoch and seq | [`Upload`] |
 //! | parts | shard, the upload's epoch and seq, part number (`u16`) | [`Part`] |
+//! | shard_map | shard | the gateway's [`ShardConfig`], as its register's JSON |
 //! | imports | bucket ID (UTF-8) | [`ImportCheckpoint`]: a tag (0 running, 1 done), and for a running import the last key imported, as an option |
 //!
 //! An upload key ends with a fixed 17 bytes, so it decodes whatever bytes
@@ -50,7 +51,8 @@ use skys3_log::record::{
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::limits::MAX_PARTS;
 use skys3_types::{
-    BucketId, ETag, Epoch, EpochSeq, Generation, Label, Seq, ShardId, VersionIdentity,
+    BucketId, ETag, Epoch, EpochSeq, Generation, Label, RegisterDocument, Seq, ShardConfig,
+    ShardId, VersionIdentity,
 };
 
 use crate::entry::{
@@ -561,6 +563,36 @@ pub fn encode_control(entry: &ControlEntry) -> Result<Vec<u8>> {
     w.len32("control.value", entry.value.len(), MAX_CONTROL_VALUE_LEN)?;
     w.0.extend_from_slice(&entry.value);
     Ok(w.0)
+}
+
+/// Encodes a configuration of the gateway's shard map (§6.2).
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if its JSON is longer than
+/// [`MAX_CONTROL_VALUE_LEN`].
+pub fn encode_route(config: &ShardConfig) -> Result<Vec<u8>> {
+    let json = config
+        .to_json()
+        .map_err(|error| CodecError::new("shard_map.config", error))?;
+    let mut w = Writer::value();
+    w.len32("shard_map.config", json.len(), MAX_CONTROL_VALUE_LEN)?;
+    w.0.extend_from_slice(&json);
+    Ok(w.0)
+}
+
+/// Decodes a configuration of the gateway's shard map, checked as a shard
+/// register is.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded configuration.
+pub fn decode_route(bytes: &[u8]) -> Result<ShardConfig> {
+    let mut r = Reader::value(bytes, "shard_map")?;
+    let len = r.len32("shard_map.config", MAX_CONTROL_VALUE_LEN)?;
+    let json = r.take("shard_map.config", len)?;
+    r.finish("shard_map")?;
+    ShardConfig::from_json(json).map_err(|error| CodecError::new("shard_map.config", error))
 }
 
 /// Decodes a control-state copy.

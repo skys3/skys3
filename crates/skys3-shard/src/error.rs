@@ -64,6 +64,22 @@ pub enum ShardError {
         /// Why.
         reason: String,
     },
+    /// The shard has fewer members, and so fewer acknowledging copies, than
+    /// its `min_write_replicas`, after members were removed (§6.4). It
+    /// stays readable and refuses client writes until learners bring the
+    /// copies back. Clients get `503 SlowDown`.
+    #[error(
+        "shard {shard} has {copies} acknowledging copies, fewer than its min_write_replicas \
+         ({min_write_replicas})"
+    )]
+    UnderReplicated {
+        /// The shard.
+        shard: ShardRef,
+        /// The members that acknowledge every write, the primary included.
+        copies: usize,
+        /// The fewest copies a write must reach.
+        min_write_replicas: u8,
+    },
     /// The shard stopped: its disk is out of service, its index failed, or
     /// it was removed. Nothing is acknowledged on it until the node reopens
     /// it, after replaying its log.

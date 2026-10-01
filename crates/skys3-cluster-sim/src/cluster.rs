@@ -32,6 +32,7 @@ use crate::node::{
     Shared, TRANSPORT_PORT,
 };
 use crate::pki::Pki;
+use crate::replication::register;
 use crate::workload::{Client, Routes, Workload};
 
 /// The shape of a simulated cluster.
@@ -53,6 +54,9 @@ pub struct ClusterConfig {
     /// [`ReplicatedServices`](crate::ReplicatedServices) keep one on every
     /// member.
     pub replicas: usize,
+    /// The epoch of every shard's configuration in the static placement.
+    /// Above 1, gateways can be given maps of older epochs.
+    pub placement_epoch: u64,
     /// Whether every member of a shard, not only one, must hold each
     /// acknowledged write after recovery, as the all-member commit rule
     /// promises (§5.1).
@@ -83,6 +87,7 @@ impl Default for ClusterConfig {
             write_back_buckets: 0,
             shards_per_bucket: 4,
             replicas: 1,
+            placement_epoch: 1,
             every_member_durable: false,
             drift: Drift::from_ppm(1_000).expect("the drift is valid"),
             node_drifts: Vec::new(),
@@ -486,7 +491,10 @@ impl<S: NodeServices> Cluster<S> {
                 let one: BTreeMap<String, Survivors> = survivors
                     .iter()
                     .map(|(key, survivor)| {
-                        let copies = survivor.copies.get(member).cloned().into_iter().collect();
+                        // A shard that lost members (§6.4) has fewer:
+                        // its last one stands in for the missing ones.
+                        let copy = survivor.copies.get(member).or(survivor.copies.last());
+                        let copies = copy.cloned().into_iter().collect();
                         let one = Survivors {
                             copies,
                             ..survivor.clone()
@@ -574,6 +582,9 @@ struct World<S> {
     shared: Arc<Shared<S>>,
     routes: Routes,
     control: SimS3,
+    /// The control store over `control`, without faults, for reading the
+    /// registers at the end.
+    registers: S3ControlStore<SimS3>,
     base_control: SimS3Faults,
     rates: FaultRates,
     remote: SimS3,
@@ -653,9 +664,14 @@ impl<S: NodeServices> World<S> {
                 placement: Arc::clone(&placement),
                 remote: remote.clone(),
             }),
-            routes: Routes { buckets, placement },
+            routes: Routes {
+                buckets,
+                placement,
+                nodes: node_ids,
+            },
             base_control: control.faults(),
             control,
+            registers: store,
             rates: config.control_rates,
             remote,
         })
@@ -691,10 +707,16 @@ impl<S: NodeServices> World<S> {
         let mut survivors = BTreeMap::new();
         for (name, bucket, key) in self.routes.keys(keys) {
             let shard = ShardRef::for_key(&bucket, &key);
-            let members = &self.routes.placement[&shard].members;
+            // The members now: a member removed (§6.4) misses the writes
+            // committed after its removal.
+            let members = register(&self.registers, &shard).map_or_else(
+                || self.routes.placement[&shard].members.clone(),
+                |c| c.members,
+            );
+
             let write_back = bucket.mode == BucketMode::WriteBack;
             let mut survivor = Survivors::default();
-            for member in members {
+            for member in &members {
                 let entry = indexes[member].read()?.entry(&(&shard).into(), &key)?;
                 // No entry claims what a clean one does: the remote store
                 // matches, here by holding nothing.
@@ -806,7 +828,7 @@ fn registers(
             let shard_config = ShardConfig {
                 bucket_id: bucket.bucket_id.clone(),
                 shard: shard.shard,
-                epoch: Epoch::new(1),
+                epoch: Epoch::new(config.placement_epoch),
                 primary: members[0].clone(),
                 members,
                 learners: Vec::new(),

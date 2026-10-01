@@ -29,6 +29,7 @@ http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["http1", "server", "server-graceful", "tokio"] }
 md-5.workspace = true
+prost.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
@@ -40,6 +41,7 @@ skys3-control.workspace = true
 skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
+skys3-net.workspace = true
 skys3-shard.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
@@ -55,6 +57,7 @@ aws-sigv4.workspace = true
 aws-smithy-http-client.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 proptest.workspace = true
+rcgen.workspace = true
 serde_json.workspace = true
 # Enables `test-util` for this crate's own tests.
 skys3-gateway = { path = ".", features = ["test-util"] }
