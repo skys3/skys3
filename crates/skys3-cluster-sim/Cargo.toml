@@ -1,0 +1,39 @@
+[package]
+name = "skys3-cluster-sim"
+description = "SkyS3 cluster simulation harness: several real nodes in one deterministic simulation, with faults, a history recorder, and the history checkers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+md-5.workspace = true
+rand.workspace = true
+rcgen.workspace = true
+s3s.workspace = true
+skys3.workspace = true
+skys3-config.workspace = true
+# `test-util` for the fault-injecting control store.
+skys3-control = { workspace = true, features = ["test-util"] }
+# `test-util` for the authenticator that trusts every request.
+skys3-gateway = { workspace = true, features = ["test-util"] }
+skys3-index.workspace = true
+skys3-io.workspace = true
+skys3-log.workspace = true
+# `turmoil` for the transport over the simulated network.
+skys3-net = { workspace = true, features = ["turmoil"] }
+skys3-sim.workspace = true
+skys3-types.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+tracing.workspace = true
+turmoil.workspace = true

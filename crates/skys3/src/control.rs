@@ -18,10 +18,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_control::{
     ControlError, ControlStore, DeleteOutcome, Expected, KeyPrefix, PutOutcome, RegisterKey,
-    RetryPolicy, Version, Versioned, read_cluster,
+    RetryPolicy, Version, Versioned, bootstrap, read_cluster,
 };
 use skys3_index::{ControlEntry, Index, IndexError};
-use skys3_types::{ClusterId, Generation};
+use skys3_io::BlockingPool;
+use skys3_types::{ClusterId, Generation, ProposalId};
+
+use crate::node::StartError;
+use crate::storage::on_pool;
 
 /// The prefixes of the registers the node copies.
 fn copied() -> [KeyPrefix; 2] {
@@ -125,6 +129,74 @@ impl ControlCopy {
             control.set_generation(self.generation)
         })
     }
+}
+
+/// Opens the node's view of `store` at startup: bootstraps `cluster.json`
+/// with `proposal` if it is missing, reads a fresh copy of the control
+/// state, and keeps it in `index`. If the store does not answer, the node
+/// runs from the copy `index` kept, if it has one (§6.2). `started` is the
+/// wall time at which the sync started. Index work runs on `pool`.
+///
+/// # Errors
+///
+/// [`StartError::Control`] if the store does not answer and the index kept
+/// no copy, and [`StartError::Index`] if the index fails.
+pub async fn open<C: ControlStore>(
+    store: C,
+    cluster: &ClusterId,
+    proposal: ProposalId,
+    retry: &RetryPolicy,
+    index: &Arc<Index>,
+    pool: &BlockingPool,
+    started: Duration,
+) -> Result<(NodeStore<C>, ControlCopy), StartError> {
+    let fetched = async {
+        bootstrap(&store, cluster, proposal, retry).await?;
+        ControlCopy::fetch(&store, cluster, retry, started).await
+    }
+    .await;
+    let kept = {
+        let index = Arc::clone(index);
+        on_pool(pool, move || ControlCopy::load(&index)).await?
+    };
+    match (fetched, kept) {
+        (Ok(copy), _) => {
+            let (index, saved) = (Arc::clone(index), copy.clone());
+            on_pool(pool, move || saved.save(&index)).await?;
+            Ok((NodeStore::live(store), copy))
+        }
+        (Err(error), Some(kept)) => {
+            tracing::warn!(
+                %error,
+                generation = %kept.generation,
+                "the control store does not answer; running from the local copy"
+            );
+            Ok((NodeStore::from_copy(store, kept.clone()), kept))
+        }
+        (Err(error), None) => Err(error.into()),
+    }
+}
+
+/// Reads a fresh copy of the control state from `store` and keeps it in
+/// `index`, as each sync after startup does. `started` is the wall time
+/// at which the sync started.
+///
+/// # Errors
+///
+/// [`StartError::Control`] if the store fails, and [`StartError::Index`]
+/// if the index does; the kept copy is then unchanged.
+pub async fn refresh<C: ControlStore>(
+    store: &C,
+    cluster: &ClusterId,
+    retry: &RetryPolicy,
+    index: &Arc<Index>,
+    pool: &BlockingPool,
+    started: Duration,
+) -> Result<ControlCopy, StartError> {
+    let copy = ControlCopy::fetch(store, cluster, retry, started).await?;
+    let (index, kept) = (Arc::clone(index), copy.clone());
+    on_pool(pool, move || kept.save(&index)).await?;
+    Ok(copy)
 }
 
 /// Runs `request` until it succeeds, fails for good, or `policy` is

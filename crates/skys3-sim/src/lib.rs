@@ -10,9 +10,13 @@
 //! - [`s3`]: the simulated S3 store, which implements `skys3-remote`'s
 //!   `ObjectStore` for remote targets and the S3 control store, with
 //!   conditional writes, provider profiles, and seeded faults.
+//! - [`history`] and [`check`]: histories of client operations on keys,
+//!   and the checkers that judge them: per-key linearizability, and that
+//!   every acknowledged write survives.
 //!
-//! The cluster harness and history checkers (plan M2-03) are added later as
-//! modules beside these.
+//! The cluster harness, which runs several nodes in one simulation, is the
+//! `skys3-cluster-sim` crate: it needs the node's crates, which use this one
+//! in their own tests.
 //!
 //! # Conventions
 //!
@@ -24,6 +28,12 @@
 //! ```text
 //! SKYS3_SIM_SEEDS=256 cargo test --workspace --all-features --test simulation
 //! ```
+//!
+//! A scenario whose seeds are much slower than most declares its cost with
+//! [`Runner::with_cost`], which divides that count. The nightly job runs the
+//! same targets with random seeds (`SKYS3_SIM_FIRST_SEED`) and longer runs
+//! (`SKYS3_SIM_SCALE`). A seed that fails there becomes a regression test
+//! that runs it with [`Runner::with_seeds`].
 //!
 //! # Example
 //!
@@ -41,6 +51,8 @@
 //! });
 //! ```
 
+pub mod check;
+pub mod history;
 pub mod runner;
 pub mod s3;
 

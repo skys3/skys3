@@ -6,6 +6,11 @@
 //! could occupy it. Each [`BlockingPool`] owns a fixed set of named threads.
 //! A node runs one pool per disk, so a stalled disk holds up only its own
 //! queue, and a separate pool for hashing (design §15).
+//!
+//! Deterministic simulation (design §16.1) uses [`BlockingPool::inline`]
+//! instead: worker threads finish at times no seed controls, so a
+//! simulated runtime that waits for one would advance its clock by
+//! different amounts on each run.
 
 use std::any::Any;
 use std::fmt;
@@ -39,6 +44,8 @@ struct Inner {
     threads: usize,
     /// `None` once the pool is shut down.
     sender: Mutex<Option<Sender<Job>>>,
+    /// Whether jobs run on the caller's thread instead (no workers).
+    inline: bool,
 }
 
 impl BlockingPool {
@@ -63,8 +70,25 @@ impl BlockingPool {
                 name: name.to_owned(),
                 threads: threads.get(),
                 sender: Mutex::new(Some(sender)),
+                inline: false,
             }),
         })
+    }
+
+    /// Returns a pool without threads that runs each job on the caller's
+    /// thread, at once, when it is queued: for deterministic simulation,
+    /// where only the simulation may decide how long a job takes. Jobs must
+    /// not wait for the caller's runtime. [`BlockingPool::threads`] is zero.
+    pub fn inline(name: &str) -> Self {
+        let (sender, _) = mpsc::channel::<Job>();
+        BlockingPool {
+            inner: Arc::new(Inner {
+                name: name.to_owned(),
+                threads: 0,
+                sender: Mutex::new(Some(sender)),
+                inline: true,
+            }),
+        }
     }
 
     /// Returns the pool's name.
@@ -72,7 +96,7 @@ impl BlockingPool {
         &self.inner.name
     }
 
-    /// Returns the number of worker threads.
+    /// Returns the number of worker threads, zero for an inline pool.
     pub fn threads(&self) -> usize {
         self.inner.threads
     }
@@ -102,13 +126,23 @@ impl BlockingPool {
             // The caller may have stopped waiting; the result is then unused.
             let _ = result_tx.send(result);
         });
-        let queued = self
-            .inner
-            .sender
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|sender| sender.send(wrapped).is_ok());
+        let queued = {
+            let sender = self
+                .inner
+                .sender
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match sender.as_ref() {
+                None => false,
+                Some(_) if self.inner.inline => {
+                    // Not under the lock: the job may queue more jobs.
+                    drop(sender);
+                    wrapped();
+                    true
+                }
+                Some(sender) => sender.send(wrapped).is_ok(),
+            }
+        };
         async move {
             if !queued {
                 return Err(PoolClosed);
@@ -251,6 +285,30 @@ mod tests {
         let caught = tokio::spawn(job).await.unwrap_err();
         assert!(caught.is_panic());
         assert_eq!(pool.run(|| 5).await, Ok(5));
+    }
+
+    #[tokio::test]
+    async fn inline_pools_run_jobs_on_the_caller_when_queued() {
+        let pool = BlockingPool::inline("sim");
+        assert_eq!((pool.name(), pool.threads()), ("sim", 0));
+        let caller = thread::current().id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = pool.run(move || {
+            tx.send(()).unwrap();
+            thread::current().id()
+        });
+        // The job ran before its future was polled.
+        rx.try_recv().unwrap();
+        assert_eq!(job.await, Ok(caller));
+        let inner = pool.clone();
+        assert_eq!(pool.run(move || inner.threads()).await, Ok(0));
+
+        let caught = tokio::spawn(pool.run(|| -> u32 { panic!("job failed") }))
+            .await
+            .unwrap_err();
+        assert!(caught.is_panic());
+        pool.shutdown();
+        assert_eq!(pool.run(|| 2).await, Err(PoolClosed));
     }
 
     #[tokio::test]
