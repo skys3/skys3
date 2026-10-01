@@ -560,6 +560,8 @@ The coordinator holds `coordinator.lease`. It renews every `coordinator_lease / 
 
 Every change the coordinator makes is a CAS, so two nodes that briefly both believe they are coordinator, which happens only beyond `ρ` or after a process pause, can only compete. They cannot corrupt state. Each write of a change is conditional on the version its planner read, the change stops at the first write that loses, and the generation increment follows whatever was written.
 
+The coordinator announces and pushes what a change wrote, also when a later write of the change failed. A write that got no answer to settle it may still land, so it is announced only once its outcome is known. Announcing it earlier would let a node read the new generation and list the registers before the write lands, and miss it until some later change. The coordinator sends the write again under the same precondition until an answer comes, and after a failed precondition reads the register for the write's `proposal_id` (section 6.1). After that answer no attempt can land any more, because the register has moved past the version the write expected. The coordinator then increments the generation if the write took effect, and it plans no other change until it has done so. It keeps settling after its tenure ends, since it is resending a proposal it already made rather than deciding anything new. A failed generation increment is retried the same way.
+
 The coordinator:
 
 - Tracks node health from heartbeats it receives directly. This is advisory only. Shard failover never depends on it.
