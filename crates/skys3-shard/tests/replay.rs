@@ -14,7 +14,8 @@ use skys3_log::{LogRecord, RecordBody};
 use skys3_shard::StateMachine;
 use skys3_types::{Epoch, EpochSeq, Seq};
 use support::{
-    adopt, delete, fill, flushed, import, index_config, location, put, put_extents, record, tags,
+    adopt, delete, fill, flushed, import, index_config, location, mpu_abort, mpu_complete,
+    mpu_create, mpu_part, put, put_extents, record, tags,
 };
 
 /// One step of a shard's history.
@@ -47,6 +48,29 @@ enum Op {
     },
     /// A new epoch, which starts with a `TRUNCATE`.
     NewEpoch,
+    /// An `MPU_CREATE`.
+    Create {
+        key: u8,
+    },
+    /// An `MPU_PART` of one of the key's uploads, picked by `pick`, inline
+    /// or with this many extents before it.
+    Part {
+        key: u8,
+        pick: u8,
+        number: u16,
+        extents: u8,
+    },
+    /// An `MPU_COMPLETE` of one of the key's uploads, listing the parts the
+    /// history stored for it, some of them perhaps replaced since.
+    Complete {
+        key: u8,
+        pick: u8,
+    },
+    /// An `MPU_ABORT` of one of the key's uploads.
+    Abort {
+        key: u8,
+        pick: u8,
+    },
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -58,9 +82,31 @@ fn op() -> impl Strategy<Value = Op> {
         4 => (key.clone(), any::<u8>(), any::<bool>())
             .prop_map(|(key, pick, deleted)| Op::Flushed { key, pick, deleted }),
         2 => key.clone().prop_map(|key| Op::Import { key }),
-        2 => (key, any::<u8>()).prop_map(|(key, pick)| Op::Adopt { key, pick }),
+        2 => (key.clone(), any::<u8>()).prop_map(|(key, pick)| Op::Adopt { key, pick }),
         1 => Just(Op::NewEpoch),
+        2 => key.clone().prop_map(|key| Op::Create { key }),
+        4 => (key.clone(), any::<u8>(), 1..4u16, 0..3u8)
+            .prop_map(|(key, pick, number, extents)| Op::Part { key, pick, number, extents }),
+        2 => (key.clone(), any::<u8>()).prop_map(|(key, pick)| Op::Complete { key, pick }),
+        1 => (key, any::<u8>()).prop_map(|(key, pick)| Op::Abort { key, pick }),
     ]
+}
+
+/// Appends `count` `EXTENT` records of `key` and returns their references.
+fn extents(out: &mut Vec<LogRecord>, next: &mut EpochSeq, key: &str, count: u8) -> Vec<ExtentRef> {
+    (0..count)
+        .map(|i| {
+            let position = *next;
+            next.seq = next.seq.checked_next().unwrap();
+            let body = RecordBody::Extent(Extent {
+                key: key.to_owned(),
+                offset: u64::from(i) * 300,
+                data: fill(300),
+            });
+            out.push(record(position, body));
+            ExtentRef { position, len: 300 }
+        })
+        .collect()
 }
 
 /// Turns operations into records with positions. `FLUSHED` and `ADOPT`
@@ -82,6 +128,8 @@ fn records(ops: &[Op]) -> Vec<LogRecord> {
             _ => (u64::from(pick % 8), false),
         }
     };
+    let mut uploads: BTreeMap<u8, Vec<EpochSeq>> = BTreeMap::new();
+    let mut parts: BTreeMap<EpochSeq, BTreeMap<u16, EpochSeq>> = BTreeMap::new();
     let mut out = Vec::new();
     for op in ops {
         let name = |key: &u8| format!("key-{key}");
@@ -160,9 +208,59 @@ fn records(ops: &[Op]) -> Vec<LogRecord> {
                 ));
                 next = EpochSeq::new(epoch, position.seq.checked_next().unwrap());
             }
+            Op::Create { key } => {
+                let position = take(&mut next);
+                out.push(record(position, mpu_create(&name(key))));
+                uploads.entry(*key).or_default().push(position);
+            }
+            Op::Part {
+                key,
+                pick: which,
+                number,
+                extents: count,
+            } => {
+                let upload = pick_upload(&uploads, *key, *which);
+                let refs = extents(&mut out, &mut next, &name(key), *count);
+                let position = take(&mut next);
+                let len = usize::from(*number) * 7;
+                out.push(record(
+                    position,
+                    mpu_part(&name(key), upload, *number, len, refs),
+                ));
+                parts.entry(upload).or_default().insert(*number, position);
+            }
+            Op::Complete { key, pick: which } => {
+                let upload = pick_upload(&uploads, *key, *which);
+                // A record lists at least one part: without any, one that
+                // cannot be the upload's.
+                let listed: Vec<_> = match parts.get(&upload) {
+                    Some(parts) => parts.iter().map(|(n, p)| (*n, *p)).collect(),
+                    None => vec![(1, upload)],
+                };
+                let position = take(&mut next);
+                let body = mpu_complete(&name(key), upload, &listed, 1);
+                out.push(record(position, body));
+                versions
+                    .entry(*key)
+                    .or_default()
+                    .push((position.seq.get(), false));
+            }
+            Op::Abort { key, pick: which } => {
+                let upload = pick_upload(&uploads, *key, *which);
+                out.push(record(take(&mut next), mpu_abort(&name(key), upload)));
+            }
         }
     }
     out
+}
+
+/// One of the uploads `key` had, open or not, or a position that never
+/// opened one.
+fn pick_upload(uploads: &BTreeMap<u8, Vec<EpochSeq>>, key: u8, pick: u8) -> EpochSeq {
+    match uploads.get(&key) {
+        Some(list) if !pick.is_multiple_of(8) => list[usize::from(pick) % list.len()],
+        _ => EpochSeq::new(Epoch::new(1), Seq::new(u64::from(pick))),
+    }
 }
 
 /// Applies `records` in batches of `batch`, as the write path or replay

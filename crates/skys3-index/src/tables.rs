@@ -12,7 +12,7 @@ use skys3_log::record::ShardRef;
 use skys3_types::{EpochSeq, Generation};
 
 use crate::codec;
-use crate::entry::{ControlEntry, Entry};
+use crate::entry::{ControlEntry, Entry, Part, Upload};
 use crate::error::IndexError;
 use crate::listing::{self, ListPage, ListQuery};
 
@@ -24,6 +24,11 @@ pub(crate) const NAMESPACE: TableDefinition<Bytes, Bytes> = TableDefinition::new
 pub(crate) const LOCATIONS: TableDefinition<Bytes, Bytes> = TableDefinition::new("locations");
 /// Each shard's applied position.
 pub(crate) const SHARDS: TableDefinition<Bytes, Bytes> = TableDefinition::new("shards");
+/// Each shard's open multipart uploads, keyed by shard, key, and upload.
+pub(crate) const UPLOADS: TableDefinition<Bytes, Bytes> = TableDefinition::new("uploads");
+/// The parts of open uploads and of multipart objects, keyed by shard,
+/// upload, and part number.
+pub(crate) const PARTS: TableDefinition<Bytes, Bytes> = TableDefinition::new("parts");
 /// What each log segment holds, as of the durable checkpoint.
 pub(crate) const COVERAGE: TableDefinition<Bytes, Bytes> = TableDefinition::new("coverage");
 /// The node's local copy of control state, keyed by register key.
@@ -63,6 +68,49 @@ fn location<T: ReadableTable<Bytes, Bytes>>(
     codec::decode_location(value.value())
         .map(Some)
         .map_err(IndexError::codec("locations"))
+}
+
+fn upload<T: ReadableTable<Bytes, Bytes>>(
+    table: &T,
+    shard: &ShardRef,
+    key: &str,
+    upload: EpochSeq,
+) -> Result<Option<Upload>, IndexError> {
+    let Some(value) = table.get(codec::upload_key(shard, key, upload).as_slice())? else {
+        return Ok(None);
+    };
+    codec::decode_upload(value.value())
+        .map(Some)
+        .map_err(IndexError::codec("uploads"))
+}
+
+/// Up to `limit` parts of the upload opened at `upload`, in part order,
+/// after part `after` (0 for the first).
+fn parts<T: ReadableTable<Bytes, Bytes>>(
+    table: &T,
+    shard: &ShardRef,
+    upload: EpochSeq,
+    after: u16,
+    limit: usize,
+) -> Result<Vec<(u16, Part)>, IndexError> {
+    let prefix = codec::upload_parts_prefix(shard, upload);
+    let end = prefix_end(&prefix);
+    let Some(first) = after.checked_add(1) else {
+        return Ok(Vec::new());
+    };
+    let start = codec::part_key(shard, upload, first);
+    let mut page = Vec::new();
+    for row in table.range(start.as_slice()..end.as_slice())? {
+        if page.len() == limit {
+            break;
+        }
+        let (key, value) = row?;
+        let (_, _, number) =
+            codec::decode_part_key(key.value()).map_err(IndexError::codec("parts"))?;
+        let part = codec::decode_part(value.value()).map_err(IndexError::codec("parts"))?;
+        page.push((number, part));
+    }
+    Ok(page)
 }
 
 fn applied<T: ReadableTable<Bytes, Bytes>>(
@@ -121,6 +169,8 @@ pub struct IndexWriter<'txn> {
     namespace: Table<'txn, Bytes, Bytes>,
     locations: Table<'txn, Bytes, Bytes>,
     shards: Table<'txn, Bytes, Bytes>,
+    uploads: Table<'txn, Bytes, Bytes>,
+    parts: Table<'txn, Bytes, Bytes>,
 }
 
 impl<'txn> IndexWriter<'txn> {
@@ -129,7 +179,133 @@ impl<'txn> IndexWriter<'txn> {
             namespace: txn.open_table(NAMESPACE)?,
             locations: txn.open_table(LOCATIONS)?,
             shards: txn.open_table(SHARDS)?,
+            uploads: txn.open_table(UPLOADS)?,
+            parts: txn.open_table(PARTS)?,
         })
+    }
+
+    /// Returns the open upload of `key` in `shard` opened at `upload`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn upload(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+    ) -> Result<Option<Upload>, IndexError> {
+        self::upload(&self.uploads, shard, key, upload)
+    }
+
+    /// Stores the open upload of `key` in `shard` opened at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the upload cannot be encoded or written.
+    pub fn put_upload(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        position: EpochSeq,
+        upload: &Upload,
+    ) -> Result<(), IndexError> {
+        let value = codec::encode_upload(upload).map_err(IndexError::codec("uploads"))?;
+        self.uploads.insert(
+            codec::upload_key(shard, key, position).as_slice(),
+            value.as_slice(),
+        )?;
+        Ok(())
+    }
+
+    /// Removes an open upload, but not its parts, returning whether it
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn remove_upload(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+    ) -> Result<bool, IndexError> {
+        Ok(self
+            .uploads
+            .remove(codec::upload_key(shard, key, upload).as_slice())?
+            .is_some())
+    }
+
+    /// Returns part `number` of the upload opened at `upload`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn part(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        number: u16,
+    ) -> Result<Option<Part>, IndexError> {
+        let key = codec::part_key(shard, upload, number);
+        let Some(value) = self.parts.get(key.as_slice())? else {
+            return Ok(None);
+        };
+        codec::decode_part(value.value())
+            .map(Some)
+            .map_err(IndexError::codec("parts"))
+    }
+
+    /// Returns every part of the upload opened at `upload`, in part order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn parts(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+    ) -> Result<Vec<(u16, Part)>, IndexError> {
+        parts(&self.parts, shard, upload, 0, usize::MAX)
+    }
+
+    /// Stores part `number` of the upload opened at `upload`, replacing any
+    /// other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the part cannot be encoded or written.
+    pub fn put_part(
+        &mut self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        number: u16,
+        part: &Part,
+    ) -> Result<(), IndexError> {
+        let value = codec::encode_part(part).map_err(IndexError::codec("parts"))?;
+        self.parts.insert(
+            codec::part_key(shard, upload, number).as_slice(),
+            value.as_slice(),
+        )?;
+        Ok(())
+    }
+
+    /// Removes part `number` of the upload opened at `upload`, returning
+    /// whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn remove_part(
+        &mut self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        number: u16,
+    ) -> Result<bool, IndexError> {
+        Ok(self
+            .parts
+            .remove(codec::part_key(shard, upload, number).as_slice())?
+            .is_some())
     }
 
     /// Returns the entry of `key` in `shard`.
@@ -229,7 +405,7 @@ impl<'txn> IndexWriter<'txn> {
     }
 
     /// Removes everything the index holds for `shard`: its entries, its
-    /// record locations, and its applied position.
+    /// record locations, its uploads and parts, and its applied position.
     ///
     /// # Errors
     ///
@@ -237,7 +413,12 @@ impl<'txn> IndexWriter<'txn> {
     pub fn remove_shard(&mut self, shard: &ShardRef) -> Result<(), IndexError> {
         let prefix = codec::shard_key(shard);
         let end = prefix_end(&prefix);
-        for table in [&mut self.namespace, &mut self.locations] {
+        for table in [
+            &mut self.namespace,
+            &mut self.locations,
+            &mut self.uploads,
+            &mut self.parts,
+        ] {
             let range = prefix.as_slice()..end.as_slice();
             table.retain_in(range, |key, _| !key.starts_with(&prefix))?;
         }
@@ -368,6 +549,10 @@ pub struct IndexDump {
     pub locations: BTreeMap<(ShardRef, EpochSeq), RecordLocation>,
     /// Each shard's applied position.
     pub applied: BTreeMap<ShardRef, EpochSeq>,
+    /// Open multipart uploads by shard, key, and upload.
+    pub uploads: BTreeMap<(ShardRef, String, EpochSeq), Upload>,
+    /// Parts by shard, upload, and part number.
+    pub parts: BTreeMap<(ShardRef, EpochSeq, u16), Part>,
     /// The local copy of control state, by register key.
     pub control: BTreeMap<String, ControlEntry>,
     /// The generation the control-state copy is complete up to.
@@ -379,6 +564,8 @@ pub struct IndexReader {
     namespace: ReadOnlyTable<Bytes, Bytes>,
     locations: ReadOnlyTable<Bytes, Bytes>,
     shards: ReadOnlyTable<Bytes, Bytes>,
+    uploads: ReadOnlyTable<Bytes, Bytes>,
+    parts: ReadOnlyTable<Bytes, Bytes>,
     control: ReadOnlyTable<&'static str, Bytes>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
@@ -389,9 +576,99 @@ impl IndexReader {
             namespace: txn.open_table(NAMESPACE)?,
             locations: txn.open_table(LOCATIONS)?,
             shards: txn.open_table(SHARDS)?,
+            uploads: txn.open_table(UPLOADS)?,
+            parts: txn.open_table(PARTS)?,
             control: txn.open_table(CONTROL)?,
             meta: txn.open_table(META)?,
         })
+    }
+
+    /// Returns the open upload of `key` in `shard` opened at `upload`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn upload(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+    ) -> Result<Option<Upload>, IndexError> {
+        self::upload(&self.uploads, shard, key, upload)
+    }
+
+    /// Returns up to `limit` open uploads of `shard` whose keys start with
+    /// `prefix`, in key order and, for one key, in the order they were
+    /// opened: one page of ListMultipartUploads. With `after`, the page
+    /// starts after that key and upload, or after every upload of that key
+    /// if the upload is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn uploads(
+        &self,
+        shard: &ShardRef,
+        prefix: &str,
+        after: Option<(&str, Option<EpochSeq>)>,
+        limit: usize,
+    ) -> Result<Vec<(String, EpochSeq, Upload)>, IndexError> {
+        let shard_prefix = codec::shard_key(shard);
+        let mut start = codec::entry_key(shard, prefix);
+        // Whether the row at `start` itself is excluded.
+        let mut exclusive = false;
+        if let Some((key, upload)) = after {
+            let after_start = match upload {
+                Some(upload) => codec::upload_key(shard, key, upload),
+                // Past every upload of `key`: its zero byte, then any
+                // position, sort before this.
+                None => [codec::entry_key(shard, key).as_slice(), &[1]].concat(),
+            };
+            if after_start > start {
+                exclusive = upload.is_some();
+                start = after_start;
+            }
+        }
+        let mut page = Vec::new();
+        for row in self.uploads.range(start.as_slice()..)? {
+            if page.len() == limit {
+                break;
+            }
+            let (row_key, value) = row?;
+            let row_key = row_key.value();
+            if !row_key.starts_with(&shard_prefix) {
+                break;
+            }
+            if exclusive && row_key == start.as_slice() {
+                continue;
+            }
+            let (_, key, upload) =
+                codec::decode_upload_key(row_key).map_err(IndexError::codec("uploads"))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let value =
+                codec::decode_upload(value.value()).map_err(IndexError::codec("uploads"))?;
+            page.push((key, upload, value));
+        }
+        Ok(page)
+    }
+
+    /// Returns up to `limit` parts of the upload opened at `upload`, in
+    /// part order, after part `after` (0 for the first): one page of
+    /// ListParts, or the parts a read of a multipart object needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn parts(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Vec<(u16, Part)>, IndexError> {
+        parts(&self.parts, shard, upload, after, limit)
     }
 
     /// Returns the entry of `key` in `shard`.
@@ -560,6 +837,18 @@ impl IndexReader {
                 codec::decode_location,
             )?,
             applied: self.applied_positions()?,
+            uploads: read_all(
+                &self.uploads,
+                "uploads",
+                codec::decode_upload_key,
+                codec::decode_upload,
+            )?,
+            parts: read_all(
+                &self.parts,
+                "parts",
+                codec::decode_part_key,
+                codec::decode_part,
+            )?,
             control,
             control_generation: self.control_generation()?,
         })

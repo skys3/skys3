@@ -1,7 +1,7 @@
-//! The values the index stores: namespace entries and control-state
-//! copies.
+//! The values the index stores: namespace entries, multipart uploads and
+//! their parts, and control-state copies.
 
-use skys3_log::record::{Checksums, CopySource, ExtentRef, Metadata, TagSet};
+use skys3_log::record::{Checksums, CopySource, ExtentRef, Metadata, TagSet, UploadChecksum};
 use skys3_types::{ETag, EpochSeq, Generation};
 
 /// Where an entry is in its life cycle (§4.2).
@@ -114,6 +114,56 @@ pub enum Payload {
     Inline(EpochSeq),
     /// In these `EXTENT` records, in object order.
     Extents(Vec<ExtentRef>),
+    /// In the parts of the completed multipart upload opened at `upload`,
+    /// in object order. Each part's [`Part`] row says where its bytes are.
+    Parts {
+        /// The position of the upload's `MPU_CREATE`.
+        upload: EpochSeq,
+        /// The object's parts, in increasing part number.
+        parts: Vec<ObjectPart>,
+    },
+}
+
+/// One part of a multipart object, as its entry lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectPart {
+    /// The part number the client uploaded it as.
+    pub number: u16,
+    /// The part's size in bytes.
+    pub size: u64,
+}
+
+/// An open multipart upload: what its `MPU_CREATE` fixed (§7.4). The
+/// upload is named by that record's position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upload {
+    /// When the upload was opened, in milliseconds since the Unix epoch.
+    pub initiated_ms: u64,
+    /// The completed object's metadata.
+    pub metadata: Metadata,
+    /// The completed object's tags.
+    pub tags: TagSet,
+    /// The checksum the client chose, if any.
+    pub checksum: Option<UploadChecksum>,
+}
+
+/// A part of a multipart upload: of an open upload, or of the object a
+/// completed upload made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    /// The position of the `MPU_PART` record that stored the part.
+    pub position: EpochSeq,
+    /// The part's size in bytes.
+    pub size: u64,
+    /// When the part was stored, in milliseconds since the Unix epoch.
+    pub last_modified_ms: u64,
+    /// The part's ETag: the MD5 of its bytes.
+    pub etag: ETag,
+    /// The part's checksums.
+    pub checksums: Checksums,
+    /// Where the part's bytes are: [`Payload::Inline`] in its `MPU_PART`
+    /// record, or [`Payload::Extents`].
+    pub payload: Payload,
 }
 
 /// A node's local copy of one control-store register (§6.2).

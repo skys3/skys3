@@ -2364,6 +2364,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "skys3-config",
  "skys3-control",
  "skys3-io",
  "skys3-remote",

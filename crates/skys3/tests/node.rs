@@ -142,6 +142,135 @@ async fn a_node_runs_from_its_copy_while_the_control_store_fails() {
     node.shutdown().await.unwrap();
 }
 
+/// Health's `control_store.live`.
+async fn live(node: &Node) -> bool {
+    let health = admin_json(&node.admin_addr().to_string(), "/v1/health").await;
+    health["control_store"]["live"] == true
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_control_store_is_never_bootstrapped_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), "").await;
+    let s3 = client(&endpoint(&node));
+    s3.create_bucket().bucket("kept").send().await.unwrap();
+    put(&s3, "kept", "a", b"alpha").await;
+    node.shutdown().await.unwrap();
+
+    // The control store's volume is not mounted: its directory is gone.
+    let control = dir.path().join("data/control");
+    let moved = dir.path().join("control-elsewhere");
+    std::fs::rename(&control, &moved).unwrap();
+    let node = start(dir.path(), "").await;
+    assert!(!live(&node).await);
+    assert!(!control.exists(), "the directory is not created again");
+    let s3 = client(&endpoint(&node));
+    assert_eq!(get(&s3, "kept", "a").await, b"alpha");
+    assert!(s3.create_bucket().bucket("new").send().await.is_err());
+    let health = admin_json(&node.admin_addr().to_string(), "/v1/health").await;
+    assert_eq!(health["shards_open"], 5, "no shard is reclaimed");
+    node.shutdown().await.unwrap();
+
+    // An empty directory in its place is not claimed or bootstrapped.
+    std::fs::create_dir(&control).unwrap();
+    let node = start(dir.path(), "").await;
+    assert!(!live(&node).await);
+    assert!(!control.join("cluster.json").exists());
+    assert!(!control.join(".owner.json").exists());
+    let s3 = client(&endpoint(&node));
+    assert_eq!(get(&s3, "kept", "a").await, b"alpha");
+    node.shutdown().await.unwrap();
+
+    // Nor is the node's own store once its registers are gone.
+    std::fs::remove_dir_all(&control).unwrap();
+    std::fs::rename(&moved, &control).unwrap();
+    let cluster = control.join("cluster.json");
+    let original = std::fs::read(&cluster).unwrap();
+    std::fs::remove_file(&cluster).unwrap();
+    let node = start(dir.path(), "").await;
+    assert!(!live(&node).await);
+    assert!(!cluster.exists());
+    node.shutdown().await.unwrap();
+
+    // The real store, back in place, is used again with every bucket.
+    std::fs::write(&cluster, original).unwrap();
+    let node = start(dir.path(), "").await;
+    assert!(live(&node).await);
+    let s3 = client(&endpoint(&node));
+    assert_eq!(get(&s3, "kept", "a").await, b"alpha");
+    s3.create_bucket().bucket("new").send().await.unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_runs_from_its_copy_until_the_store_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), "").await;
+    let s3 = client(&endpoint(&node));
+    s3.create_bucket().bucket("kept").send().await.unwrap();
+    put(&s3, "kept", "a", b"alpha").await;
+    node.shutdown().await.unwrap();
+
+    // A path the store cannot be opened at: an I/O error, not a reset.
+    let control = dir.path().join("data/control");
+    let moved = dir.path().join("control-elsewhere");
+    std::fs::rename(&control, &moved).unwrap();
+    std::fs::write(&control, b"not a directory").unwrap();
+    let node = start(dir.path(), "").await;
+    assert!(!live(&node).await);
+    let s3 = client(&endpoint(&node));
+    assert_eq!(get(&s3, "kept", "a").await, b"alpha");
+    assert!(s3.create_bucket().bucket("new").send().await.is_err());
+
+    // Once the store can be opened, the running node uses it.
+    std::fs::remove_file(&control).unwrap();
+    std::fs::rename(&moved, &control).unwrap();
+    eventually("the node opens the control store", || live(&node)).await;
+    s3.create_bucket().bucket("new").send().await.unwrap();
+    put(&s3, "new", "b", b"beta").await;
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_control_store_serves_only_its_node() {
+    let first = tempfile::tempdir().unwrap();
+    let node = start(first.path(), "").await;
+    let node_id = node.node_id().clone();
+    let s3 = client(&endpoint(&node));
+    s3.create_bucket().bucket("mine").send().await.unwrap();
+    node.shutdown().await.unwrap();
+    let control = first.path().join("data/control");
+
+    // Another node, with its own data directory, pointed at the store.
+    let second = tempfile::tempdir().unwrap();
+    let pointed = |node_id: Option<&str>| {
+        let text = config_text(second.path(), "127.0.0.1:0", "127.0.0.1:0", "").replace(
+            "backend = \"file\"",
+            &format!("backend = \"file\"\ndirectory = \"{}\"", control.display()),
+        );
+        let text = match node_id {
+            Some(id) => text.replace("[node]\n", &format!("[node]\nnode_id = \"{id}\"\n")),
+            None => text,
+        };
+        text.parse::<Config>().unwrap()
+    };
+    let refused = Node::start(pointed(None)).await.unwrap_err();
+    assert!(matches!(refused, StartError::ControlStore(_)), "{refused}");
+    // The same node ID with another data directory is another node too.
+    for created in ["data", "disk-a", "disk-b"] {
+        std::fs::remove_dir_all(second.path().join(created)).unwrap();
+    }
+    let refused = Node::start(pointed(Some(node_id.as_str())))
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("instance"), "{refused}");
+    // A store that names no owner is claimed only while empty.
+    std::fs::remove_file(control.join(".owner.json")).unwrap();
+    let refused = Node::start(pointed(None)).await.unwrap_err();
+    assert!(refused.to_string().contains("names no owner"), "{refused}");
+    assert!(!control.join(".owner.json").exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shards_of_a_bucket_without_a_register_are_reclaimed() {
     let dir = tempfile::tempdir().unwrap();

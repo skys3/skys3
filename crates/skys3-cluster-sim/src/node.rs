@@ -230,8 +230,10 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
 
+    let kept = control::kept_copy(&recovered.index, &pool).await?;
     let (store, copy) = control::open(
         slot.control.clone(),
+        kept,
         &settings.cluster,
         ProposalIds::seeded(seed).next_id(),
         &settings.retry,
@@ -320,15 +322,17 @@ async fn follow_control_store<H: Shards>(
 ) {
     loop {
         tokio::time::sleep(settings.poll_interval).await;
-        let Ok(current) = read_cluster(store.store(), &settings.cluster, &settings.retry).await
-        else {
+        let Some(handle) = store.store() else {
+            continue;
+        };
+        let Ok(current) = read_cluster(&handle, &settings.cluster, &settings.retry).await else {
             continue;
         };
         if store.is_live() && Some(current.value.generation) == known {
             continue;
         }
         let refreshed = control::refresh(
-            store.store(),
+            &handle,
             &settings.cluster,
             &settings.retry,
             index,

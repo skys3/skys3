@@ -13,8 +13,9 @@ use skys3_cluster_sim::{
 };
 use skys3_gateway::{
     ConditionFailed, LocalShards, Precondition, ShardError, ShardRef, ShardSummary, Shards,
+    UploadParts,
 };
-use skys3_index::{Entry, ListPage, ListQuery};
+use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::SimMount;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
@@ -56,8 +57,8 @@ fn a_seed_replays_exactly() {
     });
 }
 
-/// Shards with a seeded bug: every unconditional `PUT` is acknowledged
-/// without being made.
+/// Shards with a seeded bug: every unconditional `PUT` and multipart
+/// completion is acknowledged without being made.
 #[derive(Debug, Clone)]
 struct LosingShards {
     inner: LocalShards<SimMount>,
@@ -88,6 +89,37 @@ impl Shards for LosingShards {
         self.inner.list(shard, query).await
     }
 
+    async fn upload(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Option<UploadParts>, ShardError> {
+        self.inner.upload(shard, key, upload, after, limit).await
+    }
+
+    async fn uploads(
+        &self,
+        shard: &ShardRef,
+        prefix: &str,
+        after: Option<(String, Option<EpochSeq>)>,
+        limit: usize,
+    ) -> Result<Vec<(String, EpochSeq, Upload)>, ShardError> {
+        self.inner.uploads(shard, prefix, after, limit).await
+    }
+
+    async fn parts(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Vec<(u16, Part)>, ShardError> {
+        self.inner.parts(shard, upload, after, limit).await
+    }
+
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
         self.inner.payload(shard, position).await
     }
@@ -106,7 +138,8 @@ impl Shards for LosingShards {
         body: RecordBody,
         condition: Precondition,
     ) -> Result<Result<EpochSeq, ConditionFailed>, ShardError> {
-        let put = matches!(body, RecordBody::Put(_)) && condition == Precondition::None;
+        let put = matches!(body, RecordBody::Put(_) | RecordBody::MpuComplete(_))
+            && condition == Precondition::None;
         if put {
             return Ok(Ok(EpochSeq::default()));
         }

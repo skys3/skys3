@@ -12,6 +12,12 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use http::HeaderMap;
 use s3s::dto::{
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput,
+    CompleteMultipartUploadOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput,
+    UploadPartInput, UploadPartOutput,
+};
+use s3s::dto::{
     Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
     DeleteObjectInput, DeleteObjectOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
     GetBucketLocationInput, GetBucketLocationOutput, GetBucketOwnershipControlsInput,
@@ -207,6 +213,54 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = self.bucket(&req.input.bucket)?;
         ok(self.objects.delete(&bucket, req).await?)
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.create_upload(&bucket, req).await?)
+    }
+
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.upload_part(&bucket, req).await?)
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.complete_upload(&bucket, req).await?)
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.abort_upload(&bucket, req).await?)
+    }
+
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.list_parts(&bucket, req).await?)
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.list_uploads(&bucket, req).await?)
     }
 
     async fn list_objects_v2(

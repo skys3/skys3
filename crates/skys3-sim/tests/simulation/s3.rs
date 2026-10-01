@@ -55,6 +55,7 @@ const FAULTS: SimS3Faults = SimS3Faults {
     lost_request_probability: 0.04,
     lost_response_probability: 0.06,
     stale_read_probability: 0.0,
+    stale_list_probability: 0.0,
 };
 
 /// Gives up on a request after this many attempts, so a livelock fails the

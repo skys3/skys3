@@ -1,7 +1,13 @@
 //! The client workload of M1: concurrent `PUT`s (small ones stored inline,
-//! larger ones as extents), conditional `PUT`s, `GET`, `HEAD`, and
-//! `DELETE` on a small set of keys, each sent to the primary of its shard
-//! and recorded in the history.
+//! larger ones as extents), conditional `PUT`s, multipart uploads, `GET`,
+//! `HEAD`, and `DELETE` on a small set of keys, each sent to the primary of
+//! its shard and recorded in the history.
+//!
+//! A multipart upload has one part: S3 wants every part but the last to
+//! hold at least 5 MiB, more than a simulated cluster should move. Only
+//! its completion is recorded, as a `PUT` of the multipart ETag; an
+//! upload whose creation or part gets no answer is left open, which no
+//! read sees.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -93,6 +99,35 @@ pub(crate) fn etag_of(body: &[u8]) -> String {
     hex
 }
 
+/// The ETag S3 gives a multipart object of the single part `body`: the
+/// MD5 of the part's MD5, in hex, and the part count.
+pub(crate) fn multipart_etag_of(body: &[u8]) -> String {
+    let mut hex = String::with_capacity(34);
+    for byte in Md5::digest(Md5::digest(body)) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex.push_str("-1");
+    hex
+}
+
+/// Whether `body` is the object `etag` names, of a single-part `PUT` or a
+/// one-part multipart upload.
+fn body_matches(body: &[u8], etag: &str) -> bool {
+    if etag.ends_with("-1") {
+        multipart_etag_of(body) == etag
+    } else {
+        etag_of(body) == etag
+    }
+}
+
+/// The text of the first `<tag>` element in `xml`.
+fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&format!("</{tag}>"))?;
+    Some(&xml[start..end])
+}
+
 /// An ETag header without its quotes.
 fn unquote(etag: &str) -> &str {
     etag.trim_matches('"')
@@ -104,6 +139,19 @@ fn etags_are_md5_in_hex() {
     assert_eq!(etag_of(b""), "d41d8cd98f00b204e9800998ecf8427e");
     assert_eq!(unquote("\"abc\""), "abc");
     assert_eq!(unquote("abc"), "abc");
+}
+
+#[cfg(test)]
+#[test]
+fn multipart_etags_digest_the_part_digests() {
+    // The MD5 of the empty part's 16-byte MD5.
+    assert_eq!(multipart_etag_of(b""), "59adb24ef3cdbe0297f05b395827453f-1");
+    assert!(body_matches(b"", &multipart_etag_of(b"")));
+    assert!(body_matches(b"", &etag_of(b"")));
+    assert!(!body_matches(b"x", &multipart_etag_of(b"")));
+    let xml = "<R><UploadId>abc</UploadId><UploadId>d</UploadId></R>";
+    assert_eq!(element(xml, "UploadId"), Some("abc"));
+    assert_eq!(element(xml, "Key"), None);
 }
 
 /// An answer the workload does not expect, which fails the simulation.
@@ -156,7 +204,12 @@ impl Client {
             let bucket = self.routes.buckets[bucket].clone();
             let key = format!("key-{}", self.rng.random_range(0..self.workload.keys));
             match self.rng.random_range(0..100) {
-                0..30 => self.put(&bucket, &key, n, Condition::None).await?,
+                0..24 => self.put(&bucket, &key, n, Condition::None).await?,
+                24..27 => self.multipart(&bucket, &key, n, Condition::None).await?,
+                27..30 => {
+                    self.multipart(&bucket, &key, n, Condition::IfAbsent)
+                        .await?;
+                }
                 30..38 => self.put(&bucket, &key, n, Condition::IfAbsent).await?,
                 38..46 => {
                     let expected = self.seen.get(&history_key(&bucket, &key)).cloned();
@@ -244,6 +297,79 @@ impl Client {
         Ok(())
     }
 
+    /// Uploads a body as a one-part multipart upload and completes it with
+    /// `condition`, which the history records as a `PUT` of its multipart
+    /// ETag. Creating the upload and sending its part are not recorded:
+    /// neither changes what a read sees.
+    async fn multipart(
+        &mut self,
+        bucket: &BucketDocument,
+        key: &str,
+        n: usize,
+        condition: Condition,
+    ) -> turmoil::Result {
+        let host = self.routes.primary(bucket, key);
+        let path = format!("/{}/{key}", bucket.name);
+        let request = Request::post(format!("{path}?uploads")).body(Full::default())?;
+        let response = match self.send(&host, request).await {
+            Ok(response) if response.status().is_server_error() => return Ok(()),
+            Ok(response) if response.status() == StatusCode::OK => response,
+            Ok(response) => return Err(unexpected("a CreateMultipartUpload", &response)),
+            Err(_) => return Ok(()),
+        };
+        let body = String::from_utf8_lossy(response.body());
+        let Some(id) = element(&body, "UploadId").map(str::to_owned) else {
+            return Err(unexpected(
+                "a CreateMultipartUpload without an UploadId",
+                &response,
+            ));
+        };
+
+        let part = self.body(n);
+        let part_etag = etag_of(&part);
+        let value = multipart_etag_of(&part);
+        let request =
+            Request::put(format!("{path}?partNumber=1&uploadId={id}")).body(Full::new(part))?;
+        match self.send(&host, request).await {
+            Ok(response) if response.status().is_server_error() => return Ok(()),
+            Ok(response) if response.status() == StatusCode::OK => {}
+            Ok(response) => return Err(unexpected("an UploadPart", &response)),
+            Err(_) => return Ok(()),
+        }
+
+        let completion = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>\
+             <ETag>\"{part_etag}\"</ETag></Part></CompleteMultipartUpload>"
+        );
+        let mut request = Request::post(format!("{path}?uploadId={id}"));
+        if condition == Condition::IfAbsent {
+            request = request.header("if-none-match", "*");
+        }
+        let request = request.body(Full::new(Bytes::from(completion)))?;
+        let name = history_key(bucket, key);
+        let call = Call::Put {
+            value: value.clone(),
+            condition: condition.clone(),
+        };
+        let pending = self.history.call(&self.process, &name, call);
+        let outcome = match self.send(&host, request).await {
+            Ok(response) => match response.status() {
+                StatusCode::OK if String::from_utf8_lossy(response.body()).contains(&value) => {
+                    self.seen.insert(name, value);
+                    Outcome::Done
+                }
+                StatusCode::PRECONDITION_FAILED if condition != Condition::None => {
+                    Outcome::ConditionFailed
+                }
+                status if status.is_server_error() => Outcome::Failed,
+                _ => return Err(unexpected("a CompleteMultipartUpload", &response)),
+            },
+            Err(_) => Outcome::Unknown,
+        };
+        self.history.answer(pending, outcome);
+        Ok(())
+    }
+
     /// Reads `key` with `GET` or `HEAD` and records the answer. Returns
     /// whether the answer was definite.
     pub(crate) async fn read(
@@ -267,7 +393,7 @@ impl Client {
                         .and_then(|etag| etag.to_str().ok())
                         .map(|etag| unquote(etag).to_owned())
                         .ok_or_else(|| unexpected("a read without an ETag", &response))?;
-                    if method == Method::GET && etag_of(response.body()) != etag {
+                    if method == Method::GET && !body_matches(response.body(), &etag) {
                         return Err(unexpected("a GET whose body does not match", &response));
                     }
                     self.seen.insert(name, etag.clone());

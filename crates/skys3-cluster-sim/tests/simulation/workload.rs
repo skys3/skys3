@@ -26,6 +26,8 @@ fn workload(context: &SimContext) -> Workload {
 
 #[test]
 fn m1_workload_without_faults() {
+    // Seeds that ran, that completed a multipart upload, and that read one.
+    let (mut runs, mut completed, mut read) = (0, 0, 0);
     Runner::with_cost(2, COST).run(|context| {
         let workload = workload(context);
         let config = ClusterConfig {
@@ -39,8 +41,28 @@ fn m1_workload_without_faults() {
         assert!(report.history.len() >= workload.clients * workload.operations);
         assert_eq!(report.lives, 3);
         assert_eq!(report.faults, 0);
+        let multipart = |value: Option<&str>| value.is_some_and(|v| v.ends_with("-1"));
+        runs += 1;
+        completed += usize::from(
+            report
+                .history
+                .iter()
+                .any(|op| op.outcome == Outcome::Done && multipart(op.written())),
+        );
+        read += usize::from(report.history.iter().any(|op| match &op.outcome {
+            Outcome::Read(value) => multipart(value.as_deref()),
+            _ => false,
+        }));
         Ok(())
     });
+    // A seed may complete no multipart upload, or overwrite each before a
+    // read, so the check is over every seed.
+    if runs >= 4 {
+        assert!(
+            completed > 0 && read > 0,
+            "{completed} of {runs} seeds completed a multipart upload and {read} read one"
+        );
+    }
 }
 
 #[test]

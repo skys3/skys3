@@ -12,7 +12,7 @@ use std::fmt;
 use std::future::Future;
 
 use bytes::Bytes;
-use skys3_index::{Entry, ListPage, ListQuery};
+use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_types::{BucketDocument, BucketId, EpochSeq, ShardId, shard_for_key};
@@ -91,6 +91,10 @@ impl ShardSummary {
     }
 }
 
+/// An open upload and a page of its parts, by part number, as
+/// [`Shards::upload`] reads them.
+pub type UploadParts = (Upload, Vec<(u16, Part)>);
+
 /// The shard primaries, as the gateway sees them.
 ///
 /// Calls go to a shard's current primary, which orders them with the
@@ -168,9 +172,58 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         query: &ListQuery,
     ) -> impl Future<Output = Result<ListPage, ShardError>> + Send;
 
+    /// The open multipart upload of `key` opened at `upload`, with up to
+    /// `limit` of its parts in part order after part `after` (0 for the
+    /// first), or `None` if it was never opened, or is completed or aborted.
+    /// The upload and its parts are read at one point in the shard's
+    /// history, and every write acknowledged before the call is in it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] or [`ShardError::Unavailable`].
+    fn upload(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> impl Future<Output = Result<Option<UploadParts>, ShardError>> + Send;
+
+    /// Up to `limit` open uploads of the shard whose keys start with
+    /// `prefix`, by key and then age: with `after`, those after that key and
+    /// upload, or after every upload of that key if the upload is `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] or [`ShardError::Unavailable`].
+    fn uploads(
+        &self,
+        shard: &ShardRef,
+        prefix: &str,
+        after: Option<(String, Option<EpochSeq>)>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<(String, EpochSeq, Upload)>, ShardError>> + Send;
+
+    /// Up to `limit` parts of the upload opened at `upload`, open or
+    /// completed, in part order after part `after` (0 for the first), read
+    /// at one point in the shard's history.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] or [`ShardError::Unavailable`].
+    fn parts(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<(u16, Part)>, ShardError>> + Send;
+
     /// The payload of the record at `position`, as an entry's
-    /// [`Payload`](skys3_index::Payload) names it: an `EXTENT`'s bytes, or
-    /// a `PUT`'s inline bytes. A position's payload never changes.
+    /// [`Payload`](skys3_index::Payload) or a [`Part`] names it: an
+    /// `EXTENT`'s bytes, or the inline bytes of a `PUT` or an `MPU_PART`. A
+    /// position's payload never changes.
     ///
     /// # Errors
     ///
@@ -194,19 +247,23 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         extent: Extent,
     ) -> impl Future<Output = Result<ExtentRef, ShardError>> + Send;
 
-    /// Commits `body`, a record that names a key (a `PUT`, a `DELETE`, or a
-    /// `FLUSHED`), if `condition` holds of the key's entry when the record
-    /// is sequenced, and returns the record's position once it is durable
-    /// and applied. The condition sees every write of the key sequenced
-    /// before the record, acknowledged or not, so conditional writes are
-    /// linearizable. A `PUT` that references extents is accepted only once
-    /// every one is applied.
+    /// Commits `body`, a record that names a key (a `PUT`, a `DELETE`, a
+    /// `FLUSHED`, or a multipart record), if `condition` holds of the key's
+    /// entry when the record is sequenced, and returns the record's
+    /// position once it is durable and applied. The condition sees every
+    /// write of the key sequenced before the record, acknowledged or not, so
+    /// conditional writes are linearizable. Only a `PUT`, a `DELETE`, and an
+    /// `MPU_COMPLETE` take a condition. A `PUT` or `MPU_PART` that
+    /// references extents is accepted only once every one is applied.
     ///
     /// # Errors
     ///
     /// The outer error as [`Shards::append_extent`], and
     /// [`ShardError::Invalid`] for a record the shard refuses; the inner one
-    /// says why `condition` did not hold, and then nothing was written.
+    /// says why `condition` did not hold, and then nothing was written, or
+    /// why a multipart record named an upload it could not apply to
+    /// ([`ConditionFailed::NoSuchUpload`], [`ConditionFailed::InvalidPart`]),
+    /// which is then in the log and changed nothing.
     fn write(
         &self,
         shard: &ShardRef,

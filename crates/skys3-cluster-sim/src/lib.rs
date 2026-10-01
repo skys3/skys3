@@ -21,9 +21,10 @@
 //!   backend), which every node reaches through its own fault injection;
 //!   another is the remote store for `write_back` buckets.
 //! - **Clients.** The [`Workload`] of M1: concurrent `PUT`s, inline and as
-//!   extents, conditional `PUT`s, `GET`, `HEAD`, and `DELETE`, each sent
-//!   to the primary of its key's shard under the static placement the
-//!   harness writes to the control store (`shards/` registers).
+//!   extents, conditional `PUT`s, one-part multipart uploads, `GET`, `HEAD`,
+//!   and `DELETE`, each sent to the primary of its key's shard under the
+//!   static placement the harness writes to the control store (`shards/`
+//!   registers).
 //! - **Faults.** A [`FaultPlan`]: crashes with or without power loss,
 //!   partitions, held links (delay and reordering), random message loss,
 //!   failed syncs, control-store outages, control-store round trips of
