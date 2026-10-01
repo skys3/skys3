@@ -6,7 +6,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use skys3_flush::{FlushMetrics, FlushService, ProbeStatus};
+use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, ProbeStatus};
 use skys3_io::{ManualWallClock, SimMount, WallClock};
 use skys3_obs::MetricsRegistry;
 use skys3_remote::probe::ConditionalOperation;
@@ -233,7 +233,8 @@ fn other_buckets_and_closed_shards_are_not_flushed() {
         let node = Node::open(22).await;
         let store = SimS3::new(22, SimS3Config::default());
         let registry = MetricsRegistry::new();
-        let service = service(&store, &registry);
+        let budget = Arc::new(DirtyBudget::new(1000));
+        let service = service(&store, &registry).with_budget(Arc::clone(&budget));
         for mode in [BucketMode::Local, BucketMode::ReadOnly] {
             service.reconcile(&[bucket(mode)], &node.set).await;
             assert!(service.status(&shard_ref().bucket).is_none());
@@ -245,6 +246,18 @@ fn other_buckets_and_closed_shards_are_not_flushed() {
             .reconcile(std::slice::from_ref(&bucket), &node.set)
             .await;
         assert!(service.status(&bucket.bucket_id).unwrap().shards.is_empty());
+        // Without a flusher here, the bucket's writes are not limited, and
+        // its shard still counts in the cluster's share.
+        assert_eq!(budget.check(&bucket.bucket_id), Ok(()));
+        assert_eq!(budget.usage(&bucket.bucket_id), None);
+        assert_eq!(budget.cluster_usage().share, 0);
+        let other = BucketDocument {
+            bucket_id: "b-away".parse().unwrap(),
+            name: BucketName::new("away").unwrap(),
+            ..bucket.clone()
+        };
+        service.reconcile(&[bucket, other.clone()], &node.set).await;
+        assert_eq!(budget.check(&other.bucket_id), Ok(()));
         assert!(format!("{service:?}").contains("FlushService"));
     });
 }

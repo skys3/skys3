@@ -103,8 +103,9 @@ impl Charge {
 /// node therefore enforces a share of every budget in proportion to the
 /// shards whose primary it is: `max_dirty_bytes × held ÷ shards` of a
 /// bucket's budget, and of the cluster's the same fraction over the shards
-/// of every `write_back` bucket. The shares never add up to more than the
-/// budget, and no write waits for another node. With all primaries on one
+/// of every `write_back` bucket, rounded down but at least one byte
+/// ([`share`]). The shares add up to at most the budget plus a byte per
+/// node, and no write waits for another node. With all primaries on one
 /// node, as in a single-node cluster, its share is the whole budget.
 ///
 /// The check is made when a write arrives and the bytes are counted once
@@ -204,14 +205,19 @@ impl DirtyBudget {
         let mut kept = HashMap::with_capacity(accounts.len());
         for (bucket, open) in buckets {
             let shards = bucket.shards.get();
+            held += u64::from(open.min(shards));
+            total += u64::from(shards);
+            // A bucket without flushers here has nothing dirty here, and
+            // stays unlimited: a zero share would refuse all its writes.
+            if open == 0 {
+                continue;
+            }
             let share = share(self.bucket_limit(&bucket.name), open, shards);
             let account = accounts
                 .remove(&bucket.bucket_id)
                 .unwrap_or_else(|| Arc::new(Account::new(share)));
             account.share.store(share, Ordering::Relaxed);
             kept.insert(bucket.bucket_id.clone(), account);
-            held += u64::from(open.min(shards));
-            total += u64::from(shards);
         }
         *accounts = kept;
         let cluster = if total == 0 {
@@ -243,7 +249,9 @@ impl DirtyBudget {
 
 /// A node's share of a `limit`-byte budget over `shards` shards, `held` of
 /// which have their primary on the node: `limit × held ÷ shards`, rounded
-/// down, and the whole budget when it holds them all.
+/// down but at least one byte when it holds any, so a node with a shard
+/// can always admit a write while nothing is dirty; the whole budget when
+/// it holds them all.
 #[must_use]
 pub fn share(limit: u64, held: u32, shards: u32) -> u64 {
     if shards == 0 {
@@ -255,7 +263,12 @@ pub fn share(limit: u64, held: u32, shards: u32) -> u64 {
 fn scale(limit: u64, part: u64, whole: u64) -> u64 {
     let scaled = u128::from(limit) * u128::from(part) / u128::from(whole);
     // `part` is at most `whole`, so the result fits.
-    u64::try_from(scaled).unwrap_or(limit)
+    let scaled = u64::try_from(scaled).unwrap_or(limit);
+    if part > 0 {
+        scaled.max(limit.min(1))
+    } else {
+        scaled
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +297,11 @@ mod tests {
         assert_eq!(share(1000, 8, 8), 1000);
         assert_eq!(share(1000, 3, 8), 375);
         assert_eq!(share(1000, 0, 8), 0);
+        assert_eq!(
+            share(10, 1, 256),
+            1,
+            "a share rounds down to at least a byte"
+        );
         assert_eq!(share(1000, 9, 8), 1000, "never more than the budget");
         assert_eq!(share(1000, 1, 0), 0);
         assert_eq!(share(u64::MAX, 1, 2), u64::MAX / 2, "no overflow");
@@ -347,6 +365,31 @@ mod tests {
         assert_eq!(budget.cluster_usage().share, 1000);
         budget.plan([]);
         assert_eq!(budget.cluster_usage().share, 1000);
+    }
+
+    #[test]
+    fn buckets_without_flushers_here_are_not_limited() {
+        let budget = DirtyBudget::new(1000);
+        let (away, here) = (bucket("b-1", "away", 4), bucket("b-2", "here", 4));
+        // No primary of `away` is on this node, half of `here`'s are.
+        budget.plan([(&away, 0), (&here, 2)]);
+        assert_eq!(budget.usage(&away.bucket_id), None);
+        assert_eq!(budget.check(&away.bucket_id), Ok(()));
+        assert_eq!(budget.check(&here.bucket_id), Ok(()));
+        // Both buckets' shards still count in the cluster's share.
+        assert_eq!(budget.cluster_usage().share, 250);
+        // A node with no write_back primary at all limits nothing.
+        budget.plan([(&away, 0), (&here, 0)]);
+        assert_eq!(budget.cluster_usage().share, 0);
+        assert_eq!(budget.check(&away.bucket_id), Ok(()));
+        assert_eq!(budget.check(&here.bucket_id), Ok(()));
+        // A share that rounds down to nothing still admits one write.
+        let tiny = DirtyBudget::new(10);
+        tiny.plan([(&here, 1), (&bucket("b-3", "wide", 256), 0)]);
+        assert_eq!(tiny.cluster_usage().share, 1);
+        assert_eq!(tiny.check(&here.bucket_id), Ok(()));
+        tiny.charge(&here.bucket_id).adjust(0, 1);
+        assert_eq!(tiny.check(&here.bucket_id), Err(Exhausted::Cluster));
     }
 
     #[test]
