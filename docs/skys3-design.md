@@ -300,6 +300,8 @@ trait ControlStore {
 | Other S3-compatible stores | The same headers | Poll `cluster.json` | Only if the probe passes |
 | etcd v3 | A transaction that compares the key's `mod_revision`[^etcd-api] | Native watch | First release |
 | Embedded Raft on SkyS3 nodes | Compare-and-swap applied from the Raft log | Push | Future, for air-gapped sites |
+| Local directory | Under an exclusive lock on the directory: write a temporary file, `fsync`, rename, `fsync` the directory | In-process | Single-node development; refuses to open once a second node is registered |
+| In memory | A map under a lock | In-process | Tests and simulation |
 
 etcd and embedded Raft are consensus systems themselves. They need no external service, but if a majority of their voters is lost permanently, recovering them needs an operator. An S3 or R2 backend has no voters to lose, but its provider must be reachable for membership to change (section 6.10).
 
@@ -310,14 +312,16 @@ Every backend uses the same register layout:
   cluster.json                  cluster id, format version, generation, global settings
   coordinator.lease             coordinator lease register
   nodes/<node-id>.json          node registration: address, failure domain, disks
-  buckets/<bucket>.json         bucket mode, target binding, shard count, replication settings
-  shards/<bucket>/<n>.json      shard configuration register
+  buckets/<bucket-name>.json    bucket mode, target binding, shard count, replication settings
+  shards/<bucket-id>/<n>.json   shard configuration register
   identity/                     OIDC providers, roles, trust and session policies
 ```
 
 **S3 backends.** Registers are objects in a control bucket. They are updated with `PutObject` and `If-Match: <etag>`, or created with `If-None-Match: *`. A precondition failure (412) means someone else won. A `409 ConditionalRequestConflict` means a concurrent conditional write was in progress, and the caller retries after re-reading[^s3-cond]. At startup, each node probes an S3 control store. It runs 100 rounds across several scratch keys, racing conditional writers on different nodes, and requires exactly one winner in every round. After each round, the losers read the register and must see the winner's value, because the lost-response rule below depends on read-after-write. A store that fails any round is refused. The conformance suite (section 16.1) runs the same probe against every backend, not only at startup.
 
-**Lost responses.** Each write includes a unique `proposal_id` in the value. If a response is lost and the retry fails its precondition, the proposer re-reads the register. If the register contains its own `proposal_id`, the write succeeded. This applies to every backend.
+A bucket register is keyed by the bucket's S3 name, which requests use to find it. Its shards are keyed by the bucket ID, which is never reused (section 4.1), so a bucket recreated under the same name never inherits an old shard register. Keys are `/`-separated segments of ASCII letters, digits, `-`, `_`, and `.`, none empty or starting with `.`, so every backend can store them as object keys, etcd keys, or file paths.
+
+**Lost responses.** Each write includes a unique `proposal_id` in the value. If a response is lost and the retry fails its precondition, the proposer re-reads the register. If the register contains its own `proposal_id`, the write succeeded. This applies to every backend. The retry sends the same value under the same precondition, so at most one attempt can apply, even one still in flight. A `409` or an outage applied nothing, and the request is sent again as it is. A write that landed and was overwritten before the re-read cannot be told from a lost race, and is treated as one: the proposer acts on the register's current value, as a loser would. For bootstrap, this means a node may not learn that it created `cluster.json`, which is harmless because bootstrap is idempotent.
 
 An example shard register:
 
@@ -375,6 +379,14 @@ Every node also keeps a durable local copy of the control state it uses:
 | Bucket bindings, identity and trust configuration, node registry | Node-local index, tagged with a configuration generation | Coordinator pushes, plus polling of `cluster.json` |
 
 **Propagation.** Every control-store change the coordinator makes also increments the generation number in `cluster.json`, and the coordinator pushes the change to every node. As a backstop, each node polls `cluster.json` every `config_poll_interval` with `If-None-Match: <etag>`, and refetches changed objects only when the generation moves.
+
+`cluster.json` is created at generation 1 with `If-None-Match: *`. The generation is incremented after the writes it announces, never before, so a node that sees the new generation and then lists the registers finds them. An increment that loses its CAS to another increment needs no retry: the winner wrote after the loser's changes, so its generation announces them.
+
+`changes(after)` delivers reports with these semantics, for every backend:
+
+- It reports when it observes a generation other than the one it last reported, or than `after` before its first report. The first report is a snapshot: every register under `nodes/`, `buckets/`, `shards/`, and `identity/`, with its version. Later reports list the registers whose version changed since the previous report. `cluster.json` and `coordinator.lease` are not reported.
+- A write announced by generation `g` is reported, at its version or a later one, no later than the first report at or after `g`. A write never followed by an increment may be reported early, or never.
+- Reports are coalesced and at least once: a register written several times between reports appears once, at its latest version, and the reader acts on the value it reads, not on the reported version. A node with no local copy passes generation 0 and receives a snapshot at once.
 
 **Stale routing.** A shard replica that is not the current primary rejects a forwarded request with its current configuration (epoch, primary, members). The gateway updates its shard map from that hint and retries, without touching the control store. It reads the shard register directly only if no member of the configuration it knows answers.
 
@@ -897,6 +909,16 @@ Each disk has append-only segment files shared by every shard replica on that di
 
 Record header: magic, format version, record kind, shard id, epoch, seq, key hash, header and payload lengths, and CRC32C. Record kinds are `PUT`, `DELETE`, `EXTENT`, `MPU_CREATE`, `MPU_PART`, `MPU_COMPLETE`, `MPU_ABORT`, `UPLOAD_BEGIN`, `FLUSHED`, `PART_FLUSHED`, `TAGS`, `IMPORT`, `ADOPT`, `EC_PUBLISH`, `EC_RELOCATE`, `EC_RELEASE`, `TRUNCATE`, and `CONFIG`.
 
+**Record format, version 1.** The `skys3-log` crate's `record` module specifies the layout byte for byte. It is fixed and little-endian, with no serialization framework:
+
+- An 80-byte fixed header, then a kind-specific header, then the payload. `header_len` counts both headers and is at most 2 MiB; `payload_len` counts the inline body or the one extent and is at most 16 MiB. Configuration loading keeps `inline_max_bytes` at most 16 MiB and `extent_bytes` from 64 KiB to 16 MiB, so a 5 GiB PUT references at most 81,920 extents. Every text field, map, and list in a body has its own bound.
+- Segments are shared by every shard on a disk, so the shard id is the bucket ID and the shard number. The key hash is the §4.1 hash of the record's key, and zero for `CONFIG` and `TRUNCATE`, which name no key.
+- The CRC32C covers every byte after the magic and the CRC field: the rest of the fixed header, the kind-specific header, and the payload. A reader checks the magic, the version, and both lengths, then the CRC, and only then interprets other fields.
+- The format version covers the fixed header and every defined body, and any change to them takes a new version. Readers reject versions they do not know. Kind codes follow the order of the list above, from `PUT` = 1 to `CONFIG` = 18. A reserved kind whose body a build does not define is rejected as unsupported and never parsed. Defining it later needs no new version.
+- Every record, `EXTENT` included, has its own `(epoch, seq)`. A `PUT` references its extents by position and length. `CONFIG` and `TRUNCATE` are appended by a replica for itself and take no sequence number of their own. A `TRUNCATE(shard, epoch, seq)` is exactly its header, with `seq` the last valid record. A `CONFIG`'s `seq` is the replica's last `seq` when it adopted the configuration.
+- A `PUT` carries the key, size, `Last-Modified` from the primary's clock (so every replica reports the same), the local ETag, the position of an inherited write identity (`UPLOAD_BEGIN`, section 7.2), stored metadata (standard headers and `x-amz-meta-*`), tags, client checksums (section 7.4), the optional copy source, and either inline data or extent references. `FLUSHED`, `IMPORT`, and `ADOPT` carry the fields of sections 7.1, 9.1, and 9.2. `ADOPT` also carries the `seq` the read plan named, the size, and `Last-Modified`.
+- Decoding errors are classified. An incomplete or corrupt record can be a torn tail. A record that is unsupported (an unknown version or kind) or invalid (a verified CRC but broken content) is a whole record this build cannot use, not a torn tail.
+
 A copy has no record kind of its own. It commits as a `PUT` that records its source: bucket, key, version identity, and the source's `remote_etag`. The flusher uses that source reference to choose a remote `CopyObject` with `x-amz-copy-source-if-match` (section 11).
 
 A `CONFIG` record holds a full shard configuration: epoch, primary, members, learners, and replica targets. A replica appends one, and group commit makes it durable, whenever it adopts a new epoch, before it acknowledges or serves anything in that epoch. Checkpoints keep each shard's latest `CONFIG` record reachable, so it survives log reclamation. It is the replica's local copy of its membership (section 6.2).
@@ -944,6 +966,15 @@ S3 parsing and serialization use `s3s`[^s3s]. SkyS3 implements authentication, a
 CopyObject within the cluster copies the bytes into the destination shard and commits a `PUT` that records its source (section 10.1). If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth. The remote copy must carry the copy's own write identity. With the default `COPY` metadata directive, it would keep the source's identity, and the 412 recovery rule (section 7.2) would report a successful flush as a conflict. So the flush sends `x-amz-metadata-directive: REPLACE` with the full metadata and the copy's write identity, `x-amz-tagging-directive: REPLACE` with the tags, `x-amz-copy-source-if-match: <source remote_etag>` so the source has not changed, and the destination precondition. A target that does not support all of these gets a regular upload instead.
 
 **Workload identity.** STS implements `AssumeRoleWithWebIdentity`[^sts-wif]. It validates the JWT signature against allowlisted issuers (discovery and JWKS fetched with bounded size and rate), and checks `iss`, `aud`, `sub`, `exp`, `nbf`, and `azp` where required, using an algorithm allowlist. It then issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`. Trust policies and roles live in the control store. Each node validates against its local copy, and stops issuing new sessions once that copy is older than `identity_max_staleness` (section 6.2). Session records live in an internal, local-only system bucket that is replicated like any shard and never flushed. Session tokens are stored hashed. Secrets needed for SigV4 are held in memory with `secrecy`/`zeroize`.
+
+**Token validation rules.**
+
+- **Issuer allowlist.** Each OIDC provider is a record under `identity/` with `issuer`, `audiences`, optional `authorized_parties`, and `algorithms` (default `["RS256"]`). A token's `iss` must equal an `issuer` exactly.
+- **Algorithms.** RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, and EdDSA (Ed25519). `none` and the HMAC algorithms are never accepted, so a public key can never serve as an HMAC secret. A key verifies only the algorithms of its own type and curve, and only its JWK `alg` if it has one. RSA keys have 2048 to 8192 bits. Keys marked `use: enc`, symmetric keys, and malformed keys are skipped.
+- **Claims.** `exp` is required; `nbf` and `iat`, when present, must not be in the future. All three allow `[identity] oidc_clock_skew_seconds` (default 60, at most 300). `sub` must be present and not empty, and `aud` must contain an accepted audience.
+- **`azp`.** It is checked only when the provider lists `authorized_parties`: then it is required and must be one of them. It never stands in for `aud`. In workload tokens `azp` often names the calling workload (Google ID tokens put the service account there), so the OpenID Connect Core rule that it names the relying party does not hold. Trust policies can still set conditions on it.
+- **Keys.** Discovery is fetched from `<issuer>/.well-known/openid-configuration`, and its `issuer` must equal the provider's. Discovery documents and key sets are at most 64 KiB, key sets at most 100 keys, and fetches use HTTPS (plain HTTP only in tests, never through configuration) with a 10 s timeout and no redirects. Server certificates are checked against the system roots; the fetcher also accepts extra roots, for an issuer with a private CA. Keys are cached for an hour and discovery for a day. A token with an unknown `kid` triggers a refresh, since the issuer may have rotated its keys. At most one refresh is attempted per issuer every 30 s, so tokens with made-up key IDs cannot make SkyS3 flood an issuer. If a refresh fails, cached keys stay in use until they are a day old. These limits are constants, not configuration keys.
+- **Implementation.** Tokens and key sets are parsed by SkyS3 (`skys3-sts`), and signatures are verified with `aws-lc-rs`, the provider rustls already uses. `openidconnect` is built for relying parties that run login flows, not for validating bearer tokens on a server. `jsonwebtoken` selects its crypto backend through a process-wide provider chosen by Cargo features, which panics when feature unification enables both backends. The parsing a validator needs is small enough to own and fuzz.
 
 Clients point both `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL_STS` at SkyS3. The SDK matrix (section 16.2) verifies that each SDK's web-identity provider honors them.
 
@@ -1084,6 +1115,7 @@ sts_web_identity = true
 session_default_seconds = 3600
 session_maximum_seconds = 3600
 identity_max_staleness_hours = 24
+oidc_clock_skew_seconds = 60
 
 [admin]                       # metrics, health checks, admin API (section 12)
 listen = "127.0.0.1:7490"     # a non-loopback address requires token_file
@@ -1106,7 +1138,7 @@ format = "text"               # "text" or "json"
 | etcd control store | `etcd-client` | Transactions and watches |
 | Erasure coding | `reed-solomon-simd` behind a versioned `EcCodec` trait | The codec ID is stored with every stripe[^rs-simd] |
 | Intra-cluster transport | TCP with `rustls`/`tokio-rustls`, `prost` headers, raw payload frames | Simple on a LAN. Traffic between clusters uses QUIC. |
-| Identity | `openidconnect`, `jsonwebtoken` or equivalent, `secrecy`, `zeroize` | Workload-token profile with explicit `azp` handling |
+| Identity | `aws-lc-rs` for signatures, `hyper-rustls` for discovery and key sets, `secrecy`, `zeroize` | Workload-token profile with explicit `azp` handling. SkyS3 parses tokens and key sets itself (section 11). |
 | Integrity | `crc32c`, `md-5`, `sha1`, `sha2`, a CRC64NVME implementation | Checksums are validated at the protocol boundary |
 | Config and observability | `serde`, `toml`, `serde_json`, `tracing`, `tracing-subscriber`, `prometheus-client` | Per-node metrics registry, not a process-global one, so simulated nodes in one process keep separate metrics. The admin listener runs on `hyper`. |
 | Testing | `turmoil`, `proptest`, `cargo-fuzz` | Deterministic simulation of network, disk, and clocks[^turmoil] |

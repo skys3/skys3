@@ -1,0 +1,34 @@
+[package]
+name = "skys3-sts"
+description = "SkyS3 workload identity: OIDC token validation for STS."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+base64.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-rustls = { workspace = true, features = ["aws-lc-rs", "http1", "tls12"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+tokio-rustls.workspace = true

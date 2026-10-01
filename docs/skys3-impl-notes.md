@@ -291,6 +291,120 @@ of this file. A task with nothing unexpected keeps "None."
 
 ## M1 Single node
 
+### M1-01 Log record format
+
+- **A shard number alone does not name a shard.** The plan and §10.1 put
+  a "shard id" in the record header. `ShardId` is a shard's number within
+  its bucket (0 to 255), and segments are shared by every shard on a
+  disk, across buckets. So the fixed header holds the bucket ID (up to 25
+  bytes, in a zero-padded 32-byte field) and the shard number. The header
+  is 80 bytes.
+- **Record payloads needed bounds that configuration did not enforce.**
+  `inline_max_bytes` and `extent_bytes` had no upper bound, and
+  `extent_bytes` had no lower bound. Without one, a 5 GiB PUT could need
+  any number of extent references. The format bounds payloads at 16 MiB
+  and extent references per `PUT` at 81,920. Configuration loading now
+  checks `inline_max_bytes` against the same bound and `extent_bytes`
+  against 64 KiB to 16 MiB. The shared constants live in
+  `skys3_types::limits`, which both `skys3-log` and `skys3-config` read.
+  An earlier draft had `skys3-config` depend on `skys3-log`, but
+  configuration is a lower layer: the segment and group-commit code
+  (M1-02) will want configuration types, which would make a cycle. One
+  existing test used
+  `inline_max_bytes = 512 MiB` to break the segment-size rule, and now
+  uses values within the new bounds.
+- **Records the design lists fields for needed more.** `PUT` also needs
+  `Last-Modified`, so every replica reports the same time; the
+  inherited write-identity position (§7.2); and client checksums (§7.4).
+  `ADOPT` needs the `seq` its read plan named (§9.2), the size, and
+  `Last-Modified`. `EXTENT` records take their own `(epoch, seq)`, so a
+  `PUT` references them by position. A `seq` can be reused in a new epoch
+  after truncation, so a reference uses the full position. `CONFIG` and
+  `TRUNCATE` take no sequence number. Their `seq` field holds the position
+  they refer to, and `TRUNCATE` needs no body. These are recorded in §10.1.
+- **A torn tail and a record from a newer build look alike.** Recovery
+  (M1-02) cuts a torn tail back to the last record whose CRC verifies. A
+  whole record with an unknown version or reserved kind is not damage,
+  and cutting it would lose data. `DecodeError::class` separates
+  incomplete or corrupt records from unsupported or invalid ones, so
+  M1-02 can refuse to start instead of truncating.
+- **Fuzzing past the CRC.** Random inputs almost never carry a valid
+  CRC, so the `log_record` target also decodes a copy of each input with
+  the CRC recomputed, which reaches the kind-specific parsers. It checks
+  that every accepted input re-encodes to the same bytes, since the
+  encoding is canonical. A 60-second run executed about 7.9 million
+  inputs without a failure. The proptests do the same with valid records
+  that are mutated and then resealed.
+- **The fuzz smoke job.** The CI job finds targets with
+  `cargo +nightly fuzz list` and runs each for 30 seconds. It installs
+  cargo-fuzz with `taiki-e/install-action` and caches `fuzz/target`
+  with `Swatinem/rust-cache`. It uploads `fuzz/artifacts/` when a target
+  fails.
+
+### M1-05 Control store interface and local backends
+
+- **Which ID keys a bucket register.** The layout said `buckets/<bucket>.json`
+  and `shards/<bucket>/<n>.json`, which could mean the S3 name or the bucket
+  ID for either. Bucket registers are keyed by name, which requests use to
+  find them, and shard registers by bucket ID, which is never reused, so a
+  bucket recreated under the same name never inherits old shards. Design
+  §6.1 now says so, with the key grammar every backend can store.
+- **The lost-response rule cannot see a superseded write.** The simulation
+  found seeds where no node reported creating `cluster.json`: the creator's
+  answer was lost, and another node incremented the generation, replacing
+  the creator's `proposal_id`, before the creator re-read. The rule then
+  sees another writer's value and reports a lost race. That is safe, since
+  the proposer acts on the current value as a loser would, but "exactly one
+  node reports creating it" holds only without lost responses. Design §6.1
+  now states the limit; the simulation checks that at most one node reports
+  creating it and that all agree on the document, and the fault-free
+  conformance suite checks exactly one.
+- **Change semantics were open.** Design §6.2 now defines them:
+  generation-driven, a snapshot first, then coalesced differences, at
+  least once, and never `cluster.json` or `coordinator.lease`. They are the
+  weakest a polling S3 backend can give, so every backend shares one
+  implementation, `ChangeFeed`, built from `get` and `list` and woken by
+  in-process notifications or a timer. M2-04 can use the polling feed as it
+  is; the trait has no conditional `get`, so a feed that sends
+  `If-None-Match` would be backend-specific. The increment comes after the
+  writes it announces, and a lost increment race needs no retry, because
+  the winning increment came after the loser's writes.
+- **Reads need retries too.** The first simulation runs failed on a
+  transient error in bootstrap's read of an existing `cluster.json`, which
+  `propose` did not cover. `read_with_retries` retries reads under the same
+  policy, and bootstrap and the generation increment use it.
+- **No delete.** The plan's trait has none, but M1-06 (DeleteBucket) and
+  M3-02 (forgetting nodes) will need one. Change reports already carry
+  removals. Whoever adds `delete_if` must decide how a lost response is
+  resolved, since a deleted register carries no `proposal_id`.
+- **File I/O uses `std::fs`, not `skys3-io`'s `Disk`.** `Disk` models one
+  flat directory of append-only segments, with no rename and no
+  subdirectories, so it cannot do temp-file, `fsync`, rename, directory
+  `fsync`. The file store runs `std::fs` on a caller-supplied
+  `BlockingPool`, and a whole write, precondition check included, is one
+  pool job, so a dropped future cannot leave the in-memory copy behind the
+  files. One process owns the directory through `File::try_lock` (stable
+  since Rust 1.89). Versions are content hashes, as S3 ETags are. Crashes
+  cannot be simulated through `SimDisk`, so crash safety rests on the
+  write protocol; a test checks that leftover temporary files are removed
+  at open.
+- **Faults as a wrapper, not a hook in the memory store.** `FaultyStore`
+  wraps any backend, so the conformance suite can inject lost responses,
+  late requests (applied after the error was returned, like a timed-out
+  request in flight), conflicts, and outages into every backend, not only
+  the in-memory one. Test support sits behind a `test-util` feature, which
+  the crate's own tests enable through a dev-dependency on itself.
+- **Where the simulation scenario lives.** It is in `skys3-control`'s own
+  `simulation` test target, following the `skys3-sim` convention that
+  scenarios live in the crate whose code they exercise; CI's
+  `--workspace --test simulation` job runs it. Two deliberate mutations of
+  the rule (treating a lost answer as success, and skipping the re-read)
+  each fail the scenario on the first seeds.
+- **No configuration key for the file backend yet.** §14's
+  `[control_store] backend` offers `etcd` and `s3`. The file backend is not
+  wired into the binary (rule 1.1); the task that wires the control store
+  into the node (M1-13) adds `backend = "file"` and its directory key.
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
@@ -350,3 +464,57 @@ of this file. A task with nothing unexpected keeps "None."
   into the binary adds the keys. Scratch keys that a failed cleanup leaves
   behind are ordinary objects to a later import (M1-18), which may want to
   skip `.skys3-probe/`.
+
+### M1-23 OIDC token validation
+
+- **`jsonwebtoken` was not a good fit after all.** Design §15 named
+  `openidconnect` or `jsonwebtoken`. `openidconnect` is a relying-party
+  client for login flows. `jsonwebtoken` 11 has no `ring` backend, only
+  `aws_lc_rs` and `rust_crypto`, picked by a process-wide `CryptoProvider`
+  that panics at the first verification if feature unification ever enables
+  both. Its `rust_crypto` backend uses the `rsa` crate, which carries an
+  unpatched RustSec advisory (RUSTSEC-2023-0071) that `cargo deny` would
+  reject. Once tokens and key
+  sets were parsed by SkyS3 (to bound them, skip unusable keys, and fuzz
+  them), `jsonwebtoken` contributed only the call into the crypto library.
+  `skys3-sts` calls `aws-lc-rs`, the provider rustls and the AWS SDK use by
+  default, directly. Design §11 and §15 record the decision.
+- **`aws-lc-rs` default features duplicate `untrusted`.** Its `ring-io` and
+  `ring-sig-verify` features pull `untrusted` 0.7, while `rustls-webpki`
+  uses 0.9. `aws-lc-rs` is declared with `default-features = false`, which
+  removes the duplicate. Without `ring-io`, a generated RSA key pair does not
+  expose its modulus and exponent, so the test kit reads them from the
+  PKCS#1 DER encoding.
+- **Duplicates outside the target platforms.** `aws-lc-sys` builds with
+  `cc`, whose `jobserver` uses `getrandom` 0.4 on Windows, which uses `r-efi`
+  6 on UEFI; `rand` 0.9 uses `getrandom` 0.3 and `r-efi` 5. `cargo deny`
+  checks every target, so `deny.toml` skips `getrandom@0.4` and `r-efi@6`
+  with that reason.
+- **The node clock cannot check token lifetimes.** `skys3_io::Clock` is
+  monotonic with a per-node origin, so it cannot be compared with `exp`.
+  `skys3-sts` has its own `WallClock` trait, with `SystemClock` and a
+  `ManualClock` for tests. Key-cache ages use the same clock, and a reading
+  that goes backwards counts as "long ago", so a stepped clock refreshes
+  keys early rather than late.
+- **The issuer allowlist is not node configuration.** The task suggested
+  adding configuration keys for issuers and audiences, but design §6.1
+  places OIDC providers in the control store under `identity/`, with roles
+  and trust policies. `OidcProvider` is that record's schema (unknown fields
+  rejected, like other control-store readers), and
+  `OidcValidator::set_providers` replaces the allowlist when the node's copy
+  changes. The only new key is `[identity] oidc_clock_skew_seconds`, because
+  skew is a property of the node. Fetch limits and cache lifetimes are
+  constants in `ValidatorSettings`.
+- **Checked-in test certificates.** The TLS tests of `HttpsFetcher` use a
+  test CA and a server certificate for `127.0.0.1` that are valid for 100
+  years, generated once with `openssl`, under
+  `crates/skys3-sts/tests/data/`. Generating them at test time would need
+  `rcgen` and its dependencies.
+- **The first fuzz build is slow.** `cargo +nightly fuzz build` compiles
+  `aws-lc-sys` with the sanitizer flags, which took about 3.5 minutes.
+  `sts_jwt` ran about 4.3 million inputs in 30 s and `sts_jwks` about 1.9
+  million, with no failures.
+- **`base64` 0.22 would duplicate the AWS SDK's 0.23.** `hyper-util`'s
+  client features, which the AWS SDK's HTTP client enables (M1-15), pull in
+  `base64` 0.23. Stacking M1-15 on this PR failed the duplicate-version ban,
+  so the workspace uses `base64` 0.23; its API is unchanged for our use.
