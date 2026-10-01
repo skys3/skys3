@@ -1,6 +1,6 @@
 //! Starting, running, and stopping a node (design §3, §6.2, §10).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -9,11 +9,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
-use skys3_config::{Config, ControlStoreBackend, LogFormat};
+use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
-use skys3_control::{
-    ControlError, FileControlStore, ProposalIds, RetryPolicy, bootstrap, read_cluster,
-};
+use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
+use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     CredentialError, Gateway, GatewayConfig, GatewayListener, IdSource, LocalShards, ShardRef,
     Shards, SigV4Authenticator, StaticCredentials, StsService,
@@ -22,7 +21,7 @@ use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
-use skys3_shard::{ShardSet, StateMachine};
+use skys3_remote::aws::{AwsS3, default_credentials};
 use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
@@ -34,9 +33,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
-use crate::control::{ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
+use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
+use crate::storage::{self, on_pool};
 
 /// Worker threads per disk for log I/O (§10.4).
 const DISK_THREADS: usize = 4;
@@ -46,6 +46,12 @@ const INDEX_THREADS: usize = 4;
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// How often the node checks whether a disk went out of service.
 const DISK_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the flushers follow the node's buckets and shards, and their
+/// gauges are refreshed.
+const FLUSH_FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
+/// The longest one request to a remote target may take, a whole PUT body
+/// included, before the flusher gives up on it and retries.
+const FLUSH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The shards of a running node.
 type NodeShards = LocalShards<RealDisk>;
@@ -59,6 +65,8 @@ type Sts = StsEndpoint<HttpsFetcher, Sessions>;
 type NodeAuth = SigV4Authenticator<NodeCredentials<Sessions>>;
 /// The gateway.
 type NodeGateway = Gateway<NodeAuth>;
+/// The flushers of `write_back` buckets.
+pub(crate) type NodeFlush = FlushService<AwsS3, RealDisk>;
 
 /// Why a node could not start.
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +190,7 @@ struct Shared {
     sts: Option<Arc<Sts>>,
     control: Arc<Mutex<ControlState>>,
     control_live: Gauge,
+    flush: Arc<NodeFlush>,
 }
 
 impl Shared {
@@ -219,13 +228,10 @@ impl Shared {
 
     /// Reads a fresh copy from the store and keeps it in the index.
     async fn refresh_copy(&self) -> Result<ControlCopy, StartError> {
-        let started = self.wall.now();
         let cluster = &self.config.cluster().cluster_id;
         let store = self.store.store().ok_or_else(no_store)?;
-        let copy = ControlCopy::fetch(&store, cluster, &self.retry, started).await?;
-        let (index, kept) = (Arc::clone(&self.index), copy.clone());
-        on_pool(&self.pools.index, move || kept.save(&index)).await?;
-        Ok(copy)
+        let (pool, started) = (&self.pools.index, self.wall.now());
+        control::refresh(&store, cluster, &self.retry, &self.index, pool, started).await
     }
 
     /// The generation of the node's copy.
@@ -306,6 +312,29 @@ impl Shared {
         }
     }
 
+    /// Keeps a flusher on every `write_back` bucket shard open on the node
+    /// (§7.1), and refreshes the flush gauges.
+    async fn follow_flushes(self: Arc<Self>) {
+        let mut warned = BTreeSet::new();
+        loop {
+            let buckets = self.gateway.buckets();
+            for bucket in &buckets {
+                let policy = self
+                    .config
+                    .buckets()
+                    .get(&bucket.name)
+                    .flush_conflict_policy;
+                if policy != ConflictPolicy::Hold && warned.insert(bucket.bucket_id.clone()) {
+                    tracing::warn!(bucket = %bucket.name, ?policy,
+                        "only the hold conflict policy is implemented; conflicts are held");
+                }
+            }
+            self.flush.reconcile(&buckets, self.shards.set()).await;
+            self.flush.refresh_metrics();
+            tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+        }
+    }
+
     /// Opens the control store for a node that runs from its copy without
     /// one, and gives it to the node store.
     async fn reopen(&self) -> Option<FileControlStore> {
@@ -374,22 +403,6 @@ async fn watch_disks(
     }
 }
 
-/// Runs blocking `job` on `pool`.
-async fn on_pool<T, E>(
-    pool: &BlockingPool,
-    job: impl FnOnce() -> Result<T, E> + Send + 'static,
-) -> Result<T, StartError>
-where
-    T: Send + 'static,
-    E: Send + 'static,
-    StartError: From<E>,
-{
-    match pool.run(job).await {
-        Ok(result) => result.map_err(StartError::from),
-        Err(closed) => Err(io_error(format!("the {} pool", pool.name()))(closed.into())),
-    }
-}
-
 /// The node's metrics beyond the admin listener's own.
 struct NodeMetrics {
     registry: MetricsRegistry,
@@ -430,15 +443,16 @@ struct Storage {
 }
 
 /// Recovers each disk's log, opens the index, and replays the logs into
-/// it (§10.1, §10.2). The index is kept in `opened` as soon as it is open.
+/// Opens each disk and the index, recovers each disk's log, and replays the
+/// logs into the index (§10.1, §10.2). The index is kept in `opened` as
+/// soon as it is open.
 async fn open_storage(
     config: &Config,
     data_dir: &DataDir,
     pools: &mut Pools,
     opened: &mut Option<Arc<Index>>,
 ) -> Result<Storage, StartError> {
-    let clock = Arc::new(MonotonicClock::new());
-    let mut logs = BTreeMap::new();
+    let mut dirs = Vec::new();
     let mut disks = Vec::new();
     for disk in data_dir.disks() {
         let disk_pool = pool(&format!("disk-{}", disk.label), DISK_THREADS)?;
@@ -446,34 +460,34 @@ async fn open_storage(
         let real = RealDisk::open(&disk.path, disk_pool)
             .await
             .map_err(io_error(format!("opening {}", disk.path.display())))?;
-        let log_config = LogConfig::from_storage(config.storage());
-        let (log, report) = SegmentLog::open(real, log_config, clock.clone())
-            .await
-            .map_err(|source| StartError::Recovery {
-                disk: disk.label.clone(),
-                source,
-            })?;
-        tracing::info!(disk = %disk.label, ?report, "recovered the log");
-        logs.insert(disk.label.clone(), log.clone());
-        disks.push((disk.clone(), log));
+        dirs.push(disk.clone());
+        disks.push((disk.label.clone(), real));
     }
     let path = data_dir.path().join("index.redb");
     let index_config = IndexConfig::from_storage(config.storage());
     let index = on_pool(&pools.index, move || Index::open(&path, &index_config)).await?;
     let index = Arc::clone(opened.insert(Arc::new(index)));
-    let checkpointer = Arc::new(Checkpointer::new(
-        Arc::clone(&index),
-        logs.clone(),
+    let recovered = storage::recover(
+        disks,
+        LogConfig::from_storage(config.storage()),
+        Arc::new(MonotonicClock::new()),
+        index,
         pools.index.clone(),
-    ));
-    let replayed = checkpointer.replay(Arc::new(StateMachine)).await?;
-    tracing::info!(records = replayed.applied, "replayed the logs");
-    let set = ShardSet::with_disks(Arc::clone(&index), logs, pools.index.clone());
+        data_dir.node_id().clone(),
+    )
+    .await?;
+    let disks = dirs
+        .into_iter()
+        .map(|dir| {
+            let log = recovered.logs[&dir.label].clone();
+            (dir, log)
+        })
+        .collect();
     Ok(Storage {
         disks,
-        index,
-        checkpointer,
-        shards: LocalShards::new(set, data_dir.node_id().clone()),
+        index: recovered.index,
+        checkpointer: recovered.checkpointer,
+        shards: recovered.shards,
     })
 }
 
@@ -501,10 +515,7 @@ async fn open_control(
 ) -> Result<OpenedControl, StartError> {
     let cluster = &config.cluster().cluster_id;
     let retry = RetryPolicy::default();
-    let kept = {
-        let index = Arc::clone(index);
-        on_pool(&pools.index, move || ControlCopy::load(&index)).await?
-    };
+    let kept = control::kept_copy(index, &pools.index).await?;
     let initialized = kept.is_some();
     let opened = match open_file_store(directory, owner, initialized, &pools.control).await {
         Ok(opened) => opened,
@@ -536,41 +547,23 @@ async fn open_control(
             });
         }
     };
-    let store = opened.store;
-    let fetched = async {
-        // A node that synced before never bootstraps: its store must
-        // already hold cluster.json (open_file_store checked).
-        if !initialized {
-            let proposal = ProposalIds::from_os_rng().next_id();
-            bootstrap(&store, cluster, proposal, &retry).await?;
-        }
-        ControlCopy::fetch(&store, cluster, &retry, started).await
-    }
-    .await;
-    match (fetched, kept) {
-        (Ok(copy), _) => {
-            let (index, saved) = (Arc::clone(index), copy.clone());
-            on_pool(&pools.index, move || saved.save(&index)).await?;
-            Ok(OpenedControl {
-                store: NodeStore::live(store),
-                copy,
-                reclaim: !opened.claimed,
-            })
-        }
-        (Err(error), Some(kept)) => {
-            tracing::warn!(
-                %error,
-                generation = %kept.generation,
-                "the control store does not answer; running from the local copy"
-            );
-            Ok(OpenedControl {
-                store: NodeStore::from_copy(Some(store), kept.clone()),
-                copy: kept,
-                reclaim: false,
-            })
-        }
-        (Err(error), None) => Err(error.into()),
-    }
+    let proposal = ProposalIds::from_os_rng().next_id();
+    let (store, copy) = control::open(
+        opened.store,
+        kept,
+        cluster,
+        proposal,
+        &retry,
+        index,
+        &pools.index,
+        started,
+    )
+    .await?;
+    Ok(OpenedControl {
+        reclaim: store.is_live() && !opened.claimed,
+        store,
+        copy,
+    })
 }
 
 /// The error a node without a control store gives for what needs one.
@@ -660,11 +653,14 @@ struct Opened {
 ///    (§4.1). This needs a copy read from the store itself.
 /// 6. Serve the gateway (HTTPS when `[gateway]` names a certificate) and
 ///    the admin listener, and start the background work: checkpoints,
-///    control-store polling, session expiry, and disk fencing.
+///    control-store polling, session expiry, disk fencing, and the
+///    flushers of `write_back` buckets, which probe each target first
+///    (`skys3_flush`).
 ///
 /// [`Node::shutdown`] stops accepting requests, drains those in flight,
-/// stops every shard once its sequenced records are applied, and takes a
-/// final checkpoint, so the next start replays little.
+/// stops the flushers, stops every shard once its sequenced records are
+/// applied, and takes a final checkpoint, so the next start replays
+/// little.
 pub struct Node {
     node_id: NodeId,
     gateway_addr: SocketAddr,
@@ -829,6 +825,21 @@ impl Node {
         if let Some(sts) = &sts {
             gateway = gateway.with_sts(Arc::clone(sts) as Arc<dyn StsService>);
         }
+        let flush = {
+            let region = config.flush().target_region.clone();
+            let credentials = default_credentials(&region).await;
+            let connect = move |target: &skys3_types::RemoteTarget| {
+                AwsS3::builder(target, region.clone(), credentials.clone())
+                    .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
+                    .build()
+            };
+            Arc::new(FlushService::new(
+                cluster.clone(),
+                FlushSettings::from_config(config.flush()),
+                Box::new(connect),
+                FlushMetrics::register(&metrics.registry),
+            ))
+        };
         let shared = Arc::new(Shared {
             config,
             retry,
@@ -844,6 +855,7 @@ impl Node {
             sts,
             control: Arc::clone(&control),
             control_live: metrics.control_store_live.clone(),
+            flush: Arc::clone(&flush),
         });
         shared.sync_identity(copy.synced_at).await?;
         shared.open_bucket_shards().await?;
@@ -875,6 +887,7 @@ impl Node {
             disks: storage.disks.clone(),
             control,
             health: health.clone(),
+            flush: Arc::new(move |bucket| flush.status(bucket)),
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?
@@ -900,6 +913,7 @@ impl Node {
         let mut background = JoinSet::new();
         background.spawn(Arc::clone(&shared).follow_control_store());
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
+        background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(watch_disks(
             storage.disks,
             pools.index.clone(),
@@ -996,6 +1010,7 @@ impl Node {
         background.shutdown().await;
         checkpoints.abort();
         let _ = checkpoints.await;
+        shared.flush.shutdown().await;
         if let Err(error) = shared.shards.set().close_all().await {
             tracing::warn!(%error, "a shard stopped with an error");
         }

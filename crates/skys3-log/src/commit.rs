@@ -11,7 +11,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::LogConfig;
-use crate::log::Shared;
+use crate::log::{LAZY_MAX_DELAY, Shared};
 use crate::record::ShardRef;
 use crate::segment::{RecordLocation, SegmentClass, SegmentId, file_name};
 
@@ -29,6 +29,9 @@ pub(crate) struct Request {
     pub(crate) position: EpochSeq,
     /// When the record was queued, on the log's clock.
     pub(crate) arrival: MonoTime,
+    /// Whether the record waits for another to start a group commit
+    /// ([`SegmentLog::append_lazy`](crate::SegmentLog::append_lazy)).
+    pub(crate) lazy: bool,
     pub(crate) reply: oneshot::Sender<Reply>,
 }
 
@@ -52,6 +55,10 @@ struct Active<F> {
 /// written (and the directory, if it created a file), and only then
 /// acknowledges the group. Records that arrive meanwhile wait for the next
 /// group.
+///
+/// A lazy record does not start a group: it waits, in queue order, until
+/// another record starts one and joins it, or until it has waited
+/// [`LAZY_MAX_DELAY`], and then commits with the lazy records queued so far.
 ///
 /// The first I/O error ends the write path for good: the committer fails
 /// the group it was committing and every record queued after it, and the
@@ -104,39 +111,74 @@ impl<D: Disk> Committer<D> {
     /// first I/O error.
     pub(crate) async fn run(mut self) {
         let mut group = Vec::new();
-        while let Some(first) = self.requests.recv().await {
-            self.gather(first, &mut group).await;
-            match self.commit(&group).await {
-                Ok(locations) => {
-                    let bytes = group.iter().map(|r| r.bytes.len() as u64).sum();
-                    self.shared.stats.record_commit(group.len() as u64, bytes);
-                    self.shared.summarize(
-                        group.iter().zip(&locations).map(|(request, location)| {
-                            (&request.shard, request.position, location)
-                        }),
-                    );
-                    for (request, location) in group.drain(..).zip(locations) {
-                        // The appender may have stopped waiting; the record
-                        // is durable either way.
-                        let _ = request.reply.send(Ok(location));
-                    }
+        // Lazy records waiting for a group, in queue order.
+        let mut waiting: Vec<Request> = Vec::new();
+        loop {
+            let next = match waiting.first() {
+                None => self.requests.recv().await,
+                Some(oldest) => {
+                    let deadline = oldest.arrival.saturating_add(LAZY_MAX_DELAY);
+                    let at = self.clock.runtime_deadline(deadline);
+                    tokio::time::timeout_at(at, self.requests.recv())
+                        .await
+                        .unwrap_or(None)
                 }
-                Err(error) => {
-                    let error = self.shared.take_out_of_service(error);
-                    for request in group.drain(..) {
-                        let _ = request.reply.send(Err(Arc::clone(&error)));
-                    }
-                    self.requests.close();
-                    while let Some(request) = self.requests.recv().await {
-                        let _ = request.reply.send(Err(Arc::clone(&error)));
-                    }
-                    return;
+            };
+            match next {
+                Some(request) if request.lazy => {
+                    waiting.push(request);
+                    continue;
                 }
+                Some(first) => {
+                    group.append(&mut waiting);
+                    self.gather(first, &mut group).await;
+                }
+                // Lazy records waited long enough, or every handle is gone.
+                None if !waiting.is_empty() => group.append(&mut waiting),
+                None => return,
+            }
+            if !self.commit_group(&mut group).await {
+                return;
             }
         }
     }
 
-    /// Collects a group starting with `first`: records already queued, and
+    /// Commits `group` and answers its appenders. Returns `false` once an
+    /// I/O error ended the write path, after failing every queued record.
+    async fn commit_group(&mut self, group: &mut Vec<Request>) -> bool {
+        match self.commit(group).await {
+            Ok(locations) => {
+                let bytes = group.iter().map(|r| r.bytes.len() as u64).sum();
+                self.shared.stats.record_commit(group.len() as u64, bytes);
+                self.shared.summarize(
+                    group
+                        .iter()
+                        .zip(&locations)
+                        .map(|(request, location)| (&request.shard, request.position, location)),
+                );
+                for (request, location) in group.drain(..).zip(locations) {
+                    // The appender may have stopped waiting; the record
+                    // is durable either way.
+                    let _ = request.reply.send(Ok(location));
+                }
+                true
+            }
+            Err(error) => {
+                let error = self.shared.take_out_of_service(error);
+                for request in group.drain(..) {
+                    let _ = request.reply.send(Err(Arc::clone(&error)));
+                }
+                self.requests.close();
+                while let Some(request) = self.requests.recv().await {
+                    let _ = request.reply.send(Err(Arc::clone(&error)));
+                }
+                false
+            }
+        }
+    }
+
+    /// Collects a group started by `first`, after the lazy records already
+    /// in `group`: records already queued, and
     /// those that arrive before the group's deadline, until it holds
     /// `group_commit_max_bytes`.
     ///
@@ -153,8 +195,8 @@ impl<D: Disk> Committer<D> {
         let deadline = first
             .arrival
             .saturating_add(self.config.group_commit_max_delay);
-        let mut bytes = first.bytes.len() as u64;
         group.push(first);
+        let mut bytes: u64 = group.iter().map(|r| r.bytes.len() as u64).sum();
         while bytes < self.config.group_commit_max_bytes {
             let next = match self.requests.try_recv() {
                 Ok(request) => Some(request),

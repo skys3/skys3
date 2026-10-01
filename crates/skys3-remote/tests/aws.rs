@@ -2,7 +2,7 @@
 //! construction (addressing, conditional headers, metadata, signing),
 //! response parsing, and error mapping. No request leaves the host.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -241,6 +241,40 @@ async fn put_object_sends_a_signed_conditional_put() {
         "{:?}",
         put.headers
     );
+}
+
+#[tokio::test]
+async fn put_object_sends_headers_tags_and_content_md5() {
+    let mock = Mock::start().await;
+    let store = mock.client();
+    mock.reply(ok(&[("etag", "\"5d41402abc4b2a76b9719d911017c592\"")], ""));
+    let headers = BTreeMap::from([
+        ("cache-control".to_owned(), "no-cache".to_owned()),
+        ("content-disposition".to_owned(), "inline".to_owned()),
+        ("content-encoding".to_owned(), "identity".to_owned()),
+        ("content-language".to_owned(), "en".to_owned()),
+        (
+            "expires".to_owned(),
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_owned(),
+        ),
+    ]);
+    let tags = BTreeMap::from([
+        ("team".to_owned(), "a b".to_owned()),
+        ("x&y".to_owned(), "1=2".to_owned()),
+    ]);
+    let request = PutObject::new("k", "hello")
+        .with_headers(headers)
+        .with_tags(tags)
+        .with_content_md5("XUFAKrxLKna5cZ2REBfFkg==");
+    store.put_object(request).await.unwrap();
+    let put = mock.only_request();
+    assert_eq!(put.header("cache-control"), Some("no-cache"));
+    assert_eq!(put.header("content-disposition"), Some("inline"));
+    assert_eq!(put.header("content-encoding"), Some("identity"));
+    assert_eq!(put.header("content-language"), Some("en"));
+    assert_eq!(put.header("expires"), Some("Wed, 21 Oct 2015 07:28:00 GMT"));
+    assert_eq!(put.header("x-amz-tagging"), Some("team=a%20b&x%26y=1%3D2"));
+    assert_eq!(put.header("content-md5"), Some("XUFAKrxLKna5cZ2REBfFkg=="));
 }
 
 #[tokio::test]
