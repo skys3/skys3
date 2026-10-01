@@ -454,6 +454,166 @@ fn the_node_opens_seals_and_removes_shards() {
 }
 
 #[test]
+fn a_shard_being_removed_opens_again_only_once_removed() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let set = Arc::new(node.set());
+        let opened = set.open(&config(&shard(0), 1)).await.unwrap();
+        opened.commit(put("a", 1, 1)).await.unwrap();
+
+        // Hold the index's only thread: the next write cannot be applied,
+        // so the removal cannot close the shard, and nothing can read or
+        // change the index.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let held = node.pool.run(move || gate.recv().unwrap());
+        let write = tokio::spawn({
+            let opened = opened.clone();
+            async move { opened.commit(put("b", 1, 2)).await }
+        });
+        let removal = tokio::spawn({
+            let set = Arc::clone(&set);
+            async move { set.remove(&shard(0)).await }
+        });
+        while set.get(&shard(0)).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert!(set.shards().await.is_empty());
+        let reopen = tokio::spawn({
+            let set = Arc::clone(&set);
+            async move { set.open(&config(&shard(0), 1)).await }
+        });
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!removal.is_finished());
+        assert!(!reopen.is_finished(), "the shard reopened mid-removal");
+
+        release.send(()).unwrap();
+        held.await.unwrap();
+        // Acknowledged before the removal finished, and removed with it.
+        assert_eq!(write.await.unwrap().unwrap().position, at(2));
+        removal.await.unwrap().unwrap();
+        let reopened = reopen.await.unwrap().unwrap();
+        // The reopened shard starts afresh, and the index agrees.
+        assert_eq!(reopened.applied(), at(0));
+        let dump = node.dump();
+        assert_eq!(dump.applied.get(&shard(0)), Some(&at(0)));
+        assert!(dump.entries.keys().all(|(s, _)| *s != shard(0)));
+        let committed = reopened.commit(put("c", 1, 3)).await.unwrap();
+        assert_eq!(committed.position, at(1));
+        assert_eq!(node.dump().applied.get(&shard(0)), Some(&at(1)));
+    });
+}
+
+#[test]
+fn an_abandoned_removal_still_finishes() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let set = node.set();
+        let opened = set.open(&config(&shard(0), 1)).await.unwrap();
+        opened.commit(put("a", 1, 1)).await.unwrap();
+        let shard0 = shard(0);
+        tokio::select! {
+            biased;
+            _ = set.remove(&shard0) => panic!("the removal cannot finish at once"),
+            () = std::future::ready(()) => {}
+        }
+        let reopened = set.open(&config(&shard(0), 1)).await.unwrap();
+        assert_eq!(reopened.applied(), at(0));
+        assert!(node.dump().entries.keys().all(|(s, _)| *s != shard(0)));
+    });
+}
+
+#[test]
+fn opening_an_open_shard_compares_epochs() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let set = node.set();
+        let epoch = |epoch, seq| EpochSeq::new(Epoch::new(epoch), Seq::new(seq));
+        let opened = set.open(&config(&shard(0), 1)).await.unwrap();
+        opened.commit(put("a", 1, 1)).await.unwrap();
+
+        // A newer epoch: the open shard adopts it after the write sequenced
+        // before, with a CONFIG at (2, 2), and continues at (2, 3).
+        let epoch2 = config(&shard(0), 2);
+        let (write, again) = tokio::join!(opened.commit(put("b", 1, 2)), set.open(&epoch2));
+        assert_eq!(write.unwrap().position, at(2));
+        let again = again.unwrap();
+        assert_eq!(again.applied(), epoch(2, 2));
+        assert_eq!(again.config(), config(&shard(0), 2));
+        assert_eq!(
+            opened.commit(put("c", 1, 3)).await.unwrap().position,
+            epoch(2, 3)
+        );
+
+        // The same configuration changes nothing.
+        set.open(&config(&shard(0), 2)).await.unwrap();
+        assert_eq!(opened.applied(), epoch(2, 3));
+
+        // An older epoch, or another configuration in the same one, is
+        // refused.
+        let mut other = config(&shard(0), 2);
+        other.replicas = 3;
+        for (config, reason) in [
+            (
+                config(&shard(0), 1),
+                "epoch 1 is older than the shard's epoch 2",
+            ),
+            (other, "differs from the shard's in epoch 2"),
+        ] {
+            let error = set.open(&config).await.unwrap_err();
+            assert!(matches!(error, ShardError::Configuration { .. }), "{error}");
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+
+        // A sealed shard adopts a newer epoch too, and two opens in it
+        // append one CONFIG.
+        set.seal(&shard(0)).await.unwrap();
+        let epoch4 = config(&shard(0), 4);
+        let (first, second) = tokio::join!(set.open(&epoch4), set.open(&epoch4));
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(opened.applied(), epoch(4, 3));
+        assert!(opened.is_sealed());
+        set.unseal(&shard(0)).await.unwrap();
+        assert_eq!(
+            opened.commit(put("d", 1, 4)).await.unwrap().position,
+            epoch(4, 4)
+        );
+
+        // Replay finds the same: reopening after a restart continues in
+        // epoch 4.
+        opened.close().await.unwrap();
+        let reopened = node.open(4).await.unwrap();
+        assert_eq!(reopened.applied(), epoch(4, 4));
+    });
+}
+
+#[test]
+fn reconfiguring_checks_the_configuration() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard0 = node.open(1).await.unwrap();
+        let mut two = config(&shard(0), 2);
+        two.members.push("node-2".parse::<NodeId>().unwrap());
+        let error = shard0.reconfigure(&two).await.unwrap_err();
+        assert!(matches!(error, ShardError::Configuration { .. }), "{error}");
+        let error = shard0.reconfigure(&config(&shard(1), 2)).await.unwrap_err();
+        assert!(
+            error.to_string().contains("is of shard b-test/1"),
+            "{error}"
+        );
+        assert_eq!(shard0.applied(), at(0));
+
+        // A stopped shard keeps its configuration, and adopts no newer one.
+        shard0.close().await.unwrap();
+        shard0.reconfigure(&config(&shard(0), 1)).await.unwrap();
+        let error = shard0.reconfigure(&config(&shard(0), 2)).await.unwrap_err();
+        assert!(matches!(error, ShardError::Unavailable { .. }), "{error}");
+    });
+}
+
+#[test]
 fn errors_name_the_shard() {
     let error = ShardError::Unavailable {
         shard: shard(2),
