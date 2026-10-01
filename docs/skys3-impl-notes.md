@@ -418,6 +418,13 @@ of this file. A task with nothing unexpected keeps "None."
   the binary has one crypto stack with the OIDC validation of M1-23, whose
   `getrandom@0.4` and `r-efi@6` skips it shares. The SDK adds 144 crates to
   the lock file; a clean debug build of `skys3-remote` takes about a minute.
+- **Turning off aws-config's defaults drops `credential_process`.** The
+  feature is `credentials-process`, and without it the default chain still
+  builds; a profile that uses `credential_process` fails only when
+  credentials are loaded, with an `InvalidConfiguration` error. The
+  feature is on (it adds only tokio's `process` feature), and a unit test
+  loads credentials from such a profile. `sso` and `credentials-login`
+  stay off: they pull in the SSO and sign-in SDK clients.
 - **`digest` 0.10 through the SDK's checksums.** `aws-smithy-checksums`
   uses `crc-fast`, whose default `std` feature needs `digest` 0.10, while
   everything else is on 0.11. It cannot be turned off from outside, so

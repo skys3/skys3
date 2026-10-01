@@ -56,10 +56,17 @@ fn uniform(support: PreconditionSupport) -> ConditionalWrites {
     }
 }
 
-/// Checks that the probe left nothing in `store`.
+/// Checks that the probe left nothing in `store`: no object, no version or
+/// delete marker, and no upload.
 fn assert_clean(store: &SimS3) {
     assert_eq!(store.keys(), Vec::<String>::new());
+    assert_eq!(store.versions(), Vec::new());
     assert_eq!(store.uploads(), Vec::new());
+}
+
+/// A scratch key of [`probe`].
+fn scratch(name: &str) -> String {
+    format!("tenant/.skys3-probe/000000000000feed/{name}")
 }
 
 #[tokio::test]
@@ -300,6 +307,159 @@ async fn unaborted_uploads_are_aborted_by_the_cleanup() {
 }
 
 #[tokio::test]
+async fn lost_responses_on_versioned_buckets_are_found() {
+    // Lose the response to each write of the probe in turn, on a versioned
+    // bucket: whether or not the write was applied, the cleanup finds what
+    // it created and leaves no version behind.
+    // R2 ignores the completes' preconditions, so the probe sends it one
+    // complete fewer.
+    for (conditionals, completes) in [(Conditionals::AWS_S3, 4), (Conditionals::R2, 3)] {
+        let operations = [
+            (Operation::PutObject, 5),
+            (Operation::CompleteMultipartUpload, completes),
+        ];
+        for (operation, requests) in operations {
+            for skip in 0..requests {
+                let store = store(conditionals, true);
+                for _ in 0..skip {
+                    store.inject(operation, Fault::Delay(Duration::ZERO));
+                }
+                store.inject(operation, Fault::LostResponse);
+                let error = probe().run(&store).await.unwrap_err();
+                assert!(error.error.may_have_applied(), "{operation:?} {skip}");
+                assert!(error.leftovers.is_empty(), "{operation:?} {skip}: {error}");
+                assert_clean(&store);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unfound_versions_are_reported() {
+    // The fourth complete, with If-Match with the current ETag, is applied
+    // and its response lost. The cleanup's delete of the first complete's
+    // version fails (after the two put-object versions), so the key's
+    // current object is the lost version: the cleanup deletes it, then
+    // finds the version it reported and stops.
+    let store = store(Conditionals::AWS_S3, true);
+    for _ in 0..3 {
+        store.inject(
+            Operation::CompleteMultipartUpload,
+            Fault::Delay(Duration::ZERO),
+        );
+    }
+    store.inject(Operation::CompleteMultipartUpload, Fault::LostResponse);
+    store.inject(Operation::DeleteObject, Fault::Delay(Duration::ZERO));
+    store.inject(Operation::DeleteObject, Fault::Delay(Duration::ZERO));
+    store.inject(Operation::DeleteObject, Fault::InternalError);
+    let error = probe().run(&store).await.unwrap_err();
+    assert_eq!(
+        error.step,
+        "CompleteMultipartUpload with If-Match with the current ETag"
+    );
+    let key = scratch("complete-multipart-upload");
+    let versions = store.versions();
+    assert_eq!(versions.len(), 1, "{versions:?}");
+    let (left, Some(version), false) = &versions[0] else {
+        panic!("{versions:?}");
+    };
+    assert_eq!(left, &key);
+    assert_eq!(error.leftovers, [format!("{key} (version {version})")]);
+
+    // If HeadObject fails, the version is reported as unfound.
+    let store = self::store(Conditionals::AWS_S3, true);
+    store.inject(Operation::CompleteMultipartUpload, Fault::LostResponse);
+    store.inject(Operation::HeadObject, Fault::InternalError);
+    let error = probe().run(&store).await.unwrap_err();
+    assert_eq!(
+        error.leftovers,
+        [format!("{key} (a version the probe could not find)")]
+    );
+    assert_eq!(store.keys(), [key]);
+}
+
+#[tokio::test]
+async fn lost_deletes_may_leave_a_delete_marker() {
+    // On a versioned bucket, the probe cannot find the delete marker a lost
+    // delete may have added, so it reports it, whether or not the delete
+    // was applied.
+    let key = scratch("delete-object");
+    let reported = [format!(
+        "{key} (a delete marker, if the delete was applied)"
+    )];
+    for applied in [false, true] {
+        let store = store(Conditionals::AWS_S3, true);
+        if applied {
+            // The second delete, with the current ETag, is applied.
+            store.inject(Operation::DeleteObject, Fault::Delay(Duration::ZERO));
+        }
+        store.inject(Operation::DeleteObject, Fault::LostResponse);
+        let error = probe().run(&store).await.unwrap_err();
+        assert_eq!(error.leftovers, reported, "applied: {applied}");
+        let markers: Vec<_> = store.versions().into_iter().map(|v| (v.0, v.2)).collect();
+        if applied {
+            assert_eq!(markers, [(key.clone(), true)]);
+        } else {
+            assert_eq!(markers, []);
+        }
+        assert!(store.keys().is_empty());
+    }
+
+    // On an unversioned bucket, a delete leaves nothing behind.
+    let store = store(Conditionals::AWS_S3, false);
+    store.inject(Operation::DeleteObject, Fault::Delay(Duration::ZERO));
+    store.inject(Operation::DeleteObject, Fault::LostResponse);
+    let error = probe().run(&store).await.unwrap_err();
+    assert!(error.leftovers.is_empty(), "{error}");
+    assert_clean(&store);
+}
+
+#[tokio::test]
+async fn lost_upload_ids_are_reported() {
+    // The upload a lost CreateMultipartUpload response may have started
+    // cannot be found without its ID, so the probe reports it.
+    let key = scratch("complete-multipart-upload");
+    for fault in [Fault::LostResponse, Fault::LostRequest] {
+        let store = store(Conditionals::AWS_S3, false);
+        store.inject(Operation::CreateMultipartUpload, fault);
+        let error = probe().run(&store).await.unwrap_err();
+        assert_eq!(
+            error.step,
+            "CompleteMultipartUpload with If-None-Match: * on a missing key"
+        );
+        assert_eq!(
+            error.leftovers,
+            [format!("{key} (an upload, if it was created)")]
+        );
+        assert!(
+            error
+                .to_string()
+                .ends_with("(an upload, if it was created)")
+        );
+        assert!(store.keys().is_empty());
+        let uploads = store.uploads();
+        if fault == Fault::LostResponse {
+            assert_eq!(uploads.len(), 1);
+            assert_eq!(uploads[0].1, key);
+        } else {
+            assert!(uploads.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn writes_without_versions_on_versioned_buckets_are_found() {
+    // A store that reports versions for PutObject but not for
+    // CompleteMultipartUpload: the cleanup finds the completes' versions.
+    for conditionals in [Conditionals::AWS_S3, Conditionals::R2] {
+        let mut recording = Recording::new(store(conditionals, true));
+        recording.hide_complete_versions = true;
+        probe().run(&recording).await.unwrap();
+        assert_clean(&recording.inner);
+    }
+}
+
+#[tokio::test]
 async fn other_refusals_count_as_rejections() {
     // A 400 without a known code, and a 412 even when the precondition
     // holds, both reject the header.
@@ -310,6 +470,20 @@ async fn other_refusals_count_as_rejections() {
     for refusal in [bad_request, always_412] {
         let mut recording = Recording::new(store(Conditionals::AWS_S3, false));
         recording.refuse_conditionals = Some(refusal);
+        let writes = probe().run(&recording).await.unwrap();
+        assert_eq!(writes, uniform(Rejected));
+        assert_clean(&recording.inner);
+    }
+
+    // A 501 without a known code rejects the header too, and is not taken
+    // for a write that may have been applied.
+    let not_implemented = S3Error::new(S3ErrorKind::Other, "unsupported")
+        .with_status(501)
+        .with_code("Unsupported");
+    assert!(not_implemented.may_have_applied());
+    for versioning in [false, true] {
+        let mut recording = Recording::new(store(Conditionals::AWS_S3, versioning));
+        recording.refuse_conditionals = Some(not_implemented.clone());
         let writes = probe().run(&recording).await.unwrap();
         assert_eq!(writes, uniform(Rejected));
         assert_clean(&recording.inner);
@@ -367,6 +541,8 @@ struct Recording {
     inner: SimS3,
     log: Mutex<Log>,
     refuse_conditionals: Option<S3Error>,
+    /// Whether `CompleteMultipartUpload` answers without the version.
+    hide_complete_versions: bool,
 }
 
 impl Recording {
@@ -375,6 +551,7 @@ impl Recording {
             inner,
             log: Mutex::default(),
             refuse_conditionals: None,
+            hide_complete_versions: false,
         }
     }
 
@@ -458,8 +635,11 @@ impl ObjectStore for Recording {
         self.saw(&request.key);
         self.refuse(request.precondition.is_some())?;
         let key = request.key.clone();
-        let output = self.inner.complete_multipart_upload(request).await?;
+        let mut output = self.inner.complete_multipart_upload(request).await?;
         self.created(&key, output.version_id.as_ref());
+        if self.hide_complete_versions {
+            output.version_id = None;
+        }
         Ok(output)
     }
 

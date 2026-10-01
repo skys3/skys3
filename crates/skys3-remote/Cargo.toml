@@ -20,6 +20,7 @@ skys3-types.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+aws-runtime.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }

@@ -29,9 +29,16 @@
 //! The probe removes everything it created before it returns, whether or
 //! not it succeeded: each version it wrote and each delete marker it added
 //! on a versioned bucket, the keys themselves on an unversioned one, and any
-//! multipart upload it left open. What it could not remove is reported in
-//! [`ProbeError::leftovers`]. It does not retry: a transient error fails the
-//! probe, and the caller probes again.
+//! multipart upload it left open. A write whose response was lost may have
+//! been applied: the probe finds the version it may have created with
+//! `HeadObject` and deletes it. Two things it cannot find without listing,
+//! which the [`ObjectStore`] trait does not offer: the delete marker a lost
+//! `DeleteObject` may have added on a versioned bucket, and the upload a
+//! lost `CreateMultipartUpload` may have started (the abort-incomplete-
+//! uploads lifecycle rule of design §7.3 removes it). What it could not
+//! remove, or may have left, is reported in [`ProbeError::leftovers`]. It
+//! does not retry: a transient error fails the probe, and the caller probes
+//! again.
 //!
 //! ```
 //! use skys3_remote::probe::ConditionalProbe;
@@ -49,7 +56,8 @@ use skys3_types::ETag;
 
 use crate::model::{
     AbortMultipartUpload, CompleteMultipartUpload, CompletedPart, CreateMultipartUpload,
-    DeleteObject, PutObject, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
+    DeleteObject, HeadObject, PutObject, UploadId, UploadPart, VersionId, WriteOutput,
+    WritePrecondition,
 };
 use crate::{ObjectStore, S3Error, S3ErrorKind, S3Result};
 
@@ -206,7 +214,9 @@ pub struct ProbeError {
     /// The store's error.
     pub error: S3Error,
     /// What the probe created and could not remove: keys, versions, and
-    /// uploads, one per entry.
+    /// uploads, one per entry. An entry ending "if the delete was applied"
+    /// or "if it was created" names what a request whose response was lost
+    /// may have left, which the probe cannot find.
     pub leftovers: Vec<String>,
 }
 
@@ -309,7 +319,7 @@ impl fmt::Display for Step {
 /// A failed probe step and the store's error.
 type StepError = (Step, S3Error);
 
-/// Something the probe created, to remove at the end.
+/// Something the probe created, or may have created, to remove at the end.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Created {
     /// A key the probe wrote, and the version or delete marker the write
@@ -317,6 +327,28 @@ enum Created {
     Version(String, Option<VersionId>),
     /// A multipart upload the probe could not abort.
     Upload(String, UploadId),
+    /// A key a write may have created a version of that the probe does not
+    /// know, because the write's response was lost.
+    Unknown(String),
+    /// A key a `DeleteObject` may have added a delete marker to, because
+    /// its response was lost. Finding the marker would take
+    /// `ListObjectVersions`, so the probe reports it on a versioned bucket,
+    /// with the error that lost the response.
+    UnknownMarker(String, S3Error),
+    /// A key a `CreateMultipartUpload` may have started an upload for,
+    /// because its response, and so the upload ID, was lost. Finding the
+    /// upload would take `ListMultipartUploads`, so the probe reports it,
+    /// with the error that lost the response; the abort-incomplete-uploads
+    /// lifecycle rule removes it (design §7.3).
+    UnknownUpload(String, S3Error),
+}
+
+impl Created {
+    /// Whether the cleanup has to find the item, which it does after
+    /// removing what it knows.
+    fn is_unknown(&self) -> bool {
+        !matches!(self, Created::Version(..) | Created::Upload(..))
+    }
 }
 
 impl fmt::Display for Created {
@@ -325,6 +357,13 @@ impl fmt::Display for Created {
             Created::Version(key, None) => write!(f, "{key}"),
             Created::Version(key, Some(version)) => write!(f, "{key} (version {version})"),
             Created::Upload(key, upload) => write!(f, "{key} (upload {upload})"),
+            Created::Unknown(key) => write!(f, "{key} (a version the probe could not find)"),
+            Created::UnknownMarker(key, _) => {
+                write!(f, "{key} (a delete marker, if the delete was applied)")
+            }
+            Created::UnknownUpload(key, _) => {
+                write!(f, "{key} (an upload, if it was created)")
+            }
         }
     }
 }
@@ -541,11 +580,16 @@ impl<S: ObjectStore> Run<'_, S> {
         precondition: WritePrecondition,
     ) -> Result<S3Result<WriteOutput>, StepError> {
         let create = CreateMultipartUpload::new(key).with_content_type("text/plain");
-        let upload_id = self
-            .store
-            .create_multipart_upload(create)
-            .await
-            .map_err(|error| (step, error))?;
+        let upload_id = match self.store.create_multipart_upload(create).await {
+            Ok(upload_id) => upload_id,
+            Err(error) => {
+                if may_have_applied(&error) {
+                    let unknown = Created::UnknownUpload(key.to_owned(), error.clone());
+                    self.created.push(unknown);
+                }
+                return Err((step, error));
+            }
+        };
         let part = UploadPart {
             key: key.to_owned(),
             upload_id: upload_id.clone(),
@@ -596,7 +640,10 @@ impl<S: ObjectStore> Run<'_, S> {
                 Ok(())
             }
             Err(error) => {
-                self.record_unknown(key, &error);
+                if may_have_applied(&error) {
+                    let unknown = Created::UnknownMarker(key.to_owned(), error.clone());
+                    self.created.push(unknown);
+                }
                 Err(error)
             }
         }
@@ -610,13 +657,10 @@ impl<S: ObjectStore> Run<'_, S> {
                 let version = output.version_id.clone();
                 self.created.push(Created::Version(key.to_owned(), version));
             }
-            Err(error) => self.record_unknown(key, error),
-        }
-    }
-
-    fn record_unknown(&mut self, key: &str, error: &S3Error) {
-        if error.may_have_applied() {
-            self.created.push(Created::Version(key.to_owned(), None));
+            Err(error) if may_have_applied(error) => {
+                self.created.push(Created::Unknown(key.to_owned()));
+            }
+            Err(_) => {}
         }
     }
 
@@ -626,6 +670,8 @@ impl<S: ObjectStore> Run<'_, S> {
     /// On a versioned bucket, where writes report versions, it deletes each
     /// version and delete marker by ID; deleting a key there would only add
     /// a delete marker. On an unversioned bucket it deletes each key once.
+    /// Then it finds what writes with lost responses may have created
+    /// ([`Run::remove_unknown`]), and reports what it cannot find.
     async fn clean_up(&mut self) -> Result<(), (S3Error, Vec<String>)> {
         let created = std::mem::take(&mut self.created);
         let versioned = created
@@ -633,19 +679,23 @@ impl<S: ObjectStore> Run<'_, S> {
             .any(|c| matches!(c, Created::Version(_, Some(_))));
         let mut removals: Vec<Created> = Vec::new();
         for item in created {
-            let wanted = match &item {
-                Created::Version(_, None) => !versioned,
-                _ => true,
+            let item = match item {
+                // A write that reported no version on a bucket whose other
+                // writes did: its version is found like a lost one's.
+                Created::Version(key, None) if versioned => Created::Unknown(key),
+                item => item,
             };
-            if wanted && !removals.contains(&item) {
+            if !removals.contains(&item) {
                 removals.push(item);
             }
         }
+        // Stable, so known items keep their order and come first.
+        removals.sort_by_key(Created::is_unknown);
 
         let mut first_error = None;
         let mut leftovers = Vec::new();
-        for removal in removals {
-            let result = match &removal {
+        for removal in &removals {
+            let result = match removal {
                 Created::Version(key, version) => {
                     let mut request = DeleteObject::new(key.clone());
                     request.version_id = version.clone();
@@ -661,6 +711,12 @@ impl<S: ObjectStore> Run<'_, S> {
                         result => result,
                     }
                 }
+                Created::Unknown(key) => self.remove_unknown(key, &removals).await,
+                // On an unversioned bucket a delete leaves nothing behind.
+                Created::UnknownMarker(..) if !versioned => Ok(()),
+                Created::UnknownMarker(_, error) | Created::UnknownUpload(_, error) => {
+                    Err(error.clone())
+                }
             };
             if let Err(error) = result {
                 leftovers.push(removal.to_string());
@@ -672,6 +728,50 @@ impl<S: ObjectStore> Run<'_, S> {
             Some(error) => Err((error, leftovers)),
         }
     }
+
+    /// Removes the version a write to `key` with a lost response may have
+    /// created, once the versions the cleanup knows are gone (`known`).
+    ///
+    /// The probe sends nothing to a key after such a write, and nothing
+    /// else writes under its scratch prefix, so that version, if the write
+    /// was applied, is the key's current object: `HeadObject` names it, and
+    /// the cleanup deletes it by ID, or the key on an unversioned bucket.
+    /// It repeats until the key has no current object, or its current
+    /// object is a version the cleanup already tried to delete: a known one
+    /// whose delete failed, which is reported already.
+    async fn remove_unknown(&self, key: &str, known: &[Created]) -> S3Result<()> {
+        let mut tried: Vec<VersionId> = known
+            .iter()
+            .filter_map(|item| match item {
+                Created::Version(k, Some(version)) if k == key => Some(version.clone()),
+                _ => None,
+            })
+            .collect();
+        loop {
+            let info = match self.store.head_object(HeadObject::new(key)).await {
+                Ok(info) => info,
+                Err(error) if error.kind() == S3ErrorKind::NoSuchKey => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let mut request = DeleteObject::new(key);
+            match info.version_id {
+                Some(version) if tried.contains(&version) => return Ok(()),
+                Some(version) => {
+                    request.version_id = Some(version.clone());
+                    tried.push(version);
+                }
+                None => return self.store.delete_object(request).await.map(drop),
+            }
+            self.store.delete_object(request).await?;
+        }
+    }
+}
+
+/// Whether a failed request may have created something the cleanup has to
+/// remove. A store that rejects a header did not apply the request,
+/// whatever its status.
+fn may_have_applied(error: &S3Error) -> bool {
+    error.may_have_applied() && !is_rejection(error)
 }
 
 /// The body of every object and part the probe writes.

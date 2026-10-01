@@ -346,4 +346,29 @@ mod tests {
         assert!(path.is_path_style());
         assert_eq!(path.bucket(), "bucket");
     }
+
+    /// `credential_process` profiles, which the default chain reads, need
+    /// aws-config's `credentials-process` feature; without it the profile
+    /// provider fails at run time, not at build time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_process_profiles_are_supported() {
+        use aws_config::profile::ProfileFileCredentialsProvider;
+        use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
+
+        let profile = r#"[profile skys3]
+credential_process = echo '{"Version": 1, "AccessKeyId": "AKIDPROCESS", "SecretAccessKey": "secret"}'
+"#;
+        let files = EnvConfigFiles::builder()
+            .with_contents(EnvConfigFileKind::Config, profile)
+            .build();
+        let provider = ProfileFileCredentialsProvider::builder()
+            .configure(&provider_config("us-east-1"))
+            .profile_files(files)
+            .profile_name("skys3")
+            .build();
+        let credentials = provider.provide_credentials().await.unwrap();
+        assert_eq!(credentials.access_key_id(), "AKIDPROCESS");
+        assert_eq!(credentials.secret_access_key(), "secret");
+    }
 }
