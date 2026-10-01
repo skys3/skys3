@@ -340,6 +340,15 @@ of this file. A task with nothing unexpected keeps "None."
   cargo-fuzz with `taiki-e/install-action` and caches `fuzz/target`
   with `Swatinem/rust-cache`. It uploads `fuzz/artifacts/` when a target
   fails.
+- **The prebuilt cargo-fuzz built for musl.** The first CI runs of the
+  fuzz job failed before compiling anything: "sanitizer is incompatible
+  with statically linked libc". `taiki-e/install-action` ships a
+  cargo-fuzz built for `x86_64-unknown-linux-musl`. cargo-fuzz defaults
+  `--target` to the triple it was built for, so it asked for a musl
+  AddressSanitizer build, which Rust does not support. The job now passes
+  `--target x86_64-unknown-linux-gnu` to `fuzz build` and `fuzz run`.
+  A locally built cargo-fuzz never shows this, because its own triple is
+  already the gnu host.
 
 ### M1-05 Control store interface and local backends
 
