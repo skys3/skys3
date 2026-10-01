@@ -228,26 +228,32 @@ proptest! {
     }
 
     /// Decoders never panic, and whatever decodes re-encodes to the same
-    /// bytes.
+    /// bytes: every key, and every value of the current format. A value of
+    /// an older format re-encodes in the current one, to the same value.
     #[test]
     fn arbitrary_bytes_decode_canonically(mut bytes in vec(any::<u8>(), 0..200), format in any::<bool>()) {
         if format && !bytes.is_empty() {
             bytes[0] = VALUE_FORMAT;
         }
         if let Ok(entry) = codec::decode_entry(&bytes) {
-            prop_assert_eq!(codec::encode_entry(&entry).unwrap(), bytes.clone());
+            let encoded = codec::encode_entry(&entry).unwrap();
+            same(&bytes, &encoded, &entry, |b| codec::decode_entry(b).ok())?;
         }
         if let Ok(summary) = codec::decode_summary(&bytes) {
-            prop_assert_eq!(codec::encode_summary(&summary).unwrap(), bytes.clone());
+            let encoded = codec::encode_summary(&summary).unwrap();
+            same(&bytes, &encoded, &summary, |b| codec::decode_summary(b).ok())?;
         }
         if let Ok(control) = codec::decode_control(&bytes) {
-            prop_assert_eq!(codec::encode_control(&control).unwrap(), bytes.clone());
+            let encoded = codec::encode_control(&control).unwrap();
+            same(&bytes, &encoded, &control, |b| codec::decode_control(b).ok())?;
         }
         if let Ok(location) = codec::decode_location(&bytes) {
-            prop_assert_eq!(codec::encode_location(&location), bytes.clone());
+            let encoded = codec::encode_location(&location);
+            same(&bytes, &encoded, &location, |b| codec::decode_location(b).ok())?;
         }
         if let Ok(import) = codec::decode_import(&bytes) {
-            prop_assert_eq!(codec::encode_import(&import).unwrap(), bytes.clone());
+            let encoded = codec::encode_import(&import).unwrap();
+            same(&bytes, &encoded, &import, |b| codec::decode_import(b).ok())?;
         }
         if let Ok((shard, key)) = codec::decode_entry_key(&bytes) {
             prop_assert_eq!(codec::entry_key(&shard, &key), bytes.clone());
@@ -255,6 +261,50 @@ proptest! {
         if let Ok((disk, segment)) = codec::decode_coverage_key(&bytes) {
             prop_assert_eq!(codec::coverage_key(&disk, segment), bytes.clone());
         }
+    }
+}
+
+/// Checks that `decoded`, read from the value `bytes`, re-encoded as
+/// `encoded`: exactly `bytes` if they are in the current format, and
+/// otherwise a value of the current format that decodes to the same.
+fn same<T: PartialEq + std::fmt::Debug>(
+    bytes: &[u8],
+    encoded: &[u8],
+    decoded: &T,
+    decode: impl Fn(&[u8]) -> Option<T>,
+) -> Result<(), TestCaseError> {
+    if bytes.first() == Some(&VALUE_FORMAT) {
+        prop_assert_eq!(encoded, bytes);
+    } else {
+        prop_assert_eq!(encoded.first(), Some(&VALUE_FORMAT));
+        let again = decode(encoded);
+        prop_assert_eq!(again.as_ref(), Some(decoded));
+    }
+    Ok(())
+}
+
+/// The case `arbitrary_bytes_decode_canonically` once failed on: a
+/// location of format 1, which is any 20 bytes behind the format byte, and
+/// re-encodes in the current format. No import decodes from it.
+#[test]
+fn an_older_format_value_re_encodes_in_the_current_one() {
+    let mut bytes = vec![0; 21];
+    bytes[0] = MIN_VALUE_FORMAT;
+    let location = codec::decode_location(&bytes).unwrap();
+    let encoded = codec::encode_location(&location);
+    assert_eq!(encoded[0], VALUE_FORMAT);
+    assert_eq!(encoded[1..], bytes[1..]);
+    assert_eq!(codec::decode_location(&encoded).unwrap(), location);
+    assert!(codec::decode_import(&bytes).is_err());
+
+    // An import checkpoint of an older format, done or running.
+    for (old, current) in [
+        (vec![MIN_VALUE_FORMAT, 1], vec![VALUE_FORMAT, 1]),
+        (vec![MIN_VALUE_FORMAT, 0, 0], vec![VALUE_FORMAT, 0, 0]),
+    ] {
+        let import = codec::decode_import(&old).unwrap();
+        assert_eq!(codec::encode_import(&import).unwrap(), current);
+        assert_eq!(codec::decode_import(&current).unwrap(), import);
     }
 }
 
