@@ -2709,7 +2709,11 @@ of this file. A task with nothing unexpected keeps "None."
   member closes the same way when its primary is gone; a shard alone keeps
   waiting for its disk. Every writer's own timeout starts before the
   close does, so in practice the writers have timed out already and the
-  abandon only answers barriers.
+  abandon only answers barriers. `ShardSet::close_all` first closed the
+  shards one after another, so a node whose shards had all lost a member
+  paid the timeout once per shard before its final checkpoint (40 s for
+  eight shards at the default 5 s; review finding). It now closes them
+  concurrently and returns once all are closed, in about one timeout.
 - **Seeing that failed writes really apply.** A history alone rarely shows
   it: the next operation on the key is usually another write. So the
   `NotAcknowledged` error carries the position its record took, and
