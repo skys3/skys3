@@ -23,7 +23,9 @@ use rand::{Rng, SeedableRng};
 use skys3_types::Generation;
 
 use crate::key::{KeyPrefix, RegisterKey};
-use crate::store::{ControlError, ControlStore, Expected, PutOutcome, Version, Versioned};
+use crate::store::{
+    ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+};
 
 type HookFn = dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync;
 
@@ -348,6 +350,23 @@ impl<S: ControlStore> ControlStore for FaultyStore<S> {
         .await
     }
 
+    async fn delete_if(
+        &self,
+        key: &RegisterKey,
+        expected: &Version,
+    ) -> Result<DeleteOutcome, ControlError> {
+        let late = |delay| {
+            let (inner, key, expected) = (self.inner.clone(), key.clone(), expected.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                // Nobody waits for the answer of a timed-out request.
+                let _ = inner.delete_if(&key, &expected).await;
+            });
+        };
+        self.inject(Some(key), || self.inner.delete_if(key, expected), late)
+            .await
+    }
+
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<(RegisterKey, Version)>, ControlError> {
         self.inject(None, || self.inner.list(prefix), drop).await
     }
@@ -404,14 +423,21 @@ mod tests {
         assert_eq!(store.get(&key).await.unwrap().unwrap().value, value("b"));
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(store.get(&key).await.unwrap().unwrap().value, value("late"));
+        let current = store.get(&key).await.unwrap().unwrap();
+        store.script([Fault::LateRequest(Duration::from_secs(1))]);
+        let late = store.delete_if(&key, &current.version).await;
+        assert!(matches!(late, Err(ControlError::Indeterminate(_))));
+        assert!(store.get(&key).await.unwrap().is_some());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(store.get(&key).await.unwrap().is_none());
         let stats = store.stats();
         assert_eq!(
             stats,
             FaultStats {
-                requests: 9,
+                requests: 13,
                 lost_requests: 1,
                 lost_responses: 1,
-                late_requests: 1,
+                late_requests: 2,
                 conflicts: 2,
                 unavailable: 1,
             }

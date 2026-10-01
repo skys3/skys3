@@ -414,6 +414,98 @@ of this file. A task with nothing unexpected keeps "None."
   wired into the binary (rule 1.1); the task that wires the control store
   into the node (M1-13) adds `backend = "file"` and its directory key.
 
+### M1-06 Gateway skeleton and bucket operations
+
+- **The s3s dependency tree.** `s3s` 0.17 is on hyper 1 and http 1, like the
+  workspace, but brings `crc-fast`, whose default features (which `s3s`
+  turns on) implement `digest` 0.10's traits while everything else is on
+  0.11, and `xxhash-rust`, licensed BSL-1.0. `deny.toml` skips
+  `digest@0.10` and `crypto-common@0.1` with that reason, and allows
+  BSL-1.0, a permissive license that asks nothing of binary distributions.
+  `crc-fast` also gives M1-08 a CRC64NVME implementation.
+- **s3s rejects signed requests without its own authenticator.** With no
+  `S3Auth` set, `s3s` accepts unsigned requests, skips its access hook
+  entirely, and answers any signed request with `501 NotImplemented`. The
+  gateway's `Authenticator` stage returns the request to route, so SigV4
+  (M1-07a), which SkyS3 verifies itself, must hand `s3s` a request it
+  takes as anonymous: signature headers or query parameters removed and an
+  `aws-chunked` body already decoded. Its access hook is unused; M1-07b
+  authorizes in the pipeline.
+- **Bounding XML before s3s parses it.** `s3s` reads a body only after
+  routing, so the gateway decides from the method, path, and query whether
+  a body is object data, which streams on, or XML, which it reads up to
+  4 MiB and scans for depth and document type declarations with
+  `quick-xml`, the version `s3s` already uses, so the tree gains nothing.
+  `s3s`'s own XML deserializer follows each operation's schema and skips
+  unknown elements without recursion, so depth was never a stack risk; the
+  scan is defense in depth, and the size bound is what bounds memory. The
+  classification assumes path-style requests. Virtual-hosted-style needs
+  the service's domain, which no configuration key names yet.
+- **How a request sets a bucket's mode and target.** S3 has no field for
+  either, and configuration has no `target` key for `write_back` buckets
+  (they are bound at attach time). CreateBucket takes them from
+  `x-skys3-bucket-mode` and `x-skys3-bucket-target`, with the mode
+  defaulting to the bucket's configured `mode`; design §11 records it. They
+  are not `x-amz-` headers, so M1-07a must require them to be signed.
+- **No delete in the control store.** `ControlStore` gained `delete_if`,
+  conditional on a version, in both backends, the fault wrapper, and the
+  conformance suite, with `propose_delete` for retries. A lost delete
+  response is resolved by re-reading: an absent register counts as
+  deleted. Tombstone values with a `proposal_id` were the alternative, but
+  every reader and lister would have to skip them. Design §6.1 records the
+  rule and that S3 backends delete with `DeleteObject` and `If-Match`; AWS
+  supports it, Cloudflare R2 lists conditional headers only on `PutObject`,
+  so the M2-04 probe must check conditional deletes too.
+- **Detaching needs a fence in the shard.** Checking for dirty entries and
+  then deleting the register races with writes in between, and two
+  concurrent DeleteBucket requests could lift each other's fence. The shard
+  interface has nesting `seal` and `unseal`, which the stub implements and
+  the shard state machine (M1-04) must order with the shard's writes. A
+  seal held across nodes, and lifted if its gateway fails, is left to the
+  shard map (M2-08). Shards left behind by a creation or deletion whose
+  outcome was unknown are for startup recovery (M1-13) to reclaim.
+- **Bucket registers had no creation time.** ListBuckets reports
+  `CreationDate`, which the AWS CLI's `s3 ls` reads unconditionally.
+  `BucketDocument` gained `created_unix_ms`, without a format version bump
+  since no register has been written by a release.
+- **Bucket operations do touch the control store.** Design §6.1 said no
+  client request reads or writes it. CreateBucket and DeleteBucket must;
+  §6.1 now says so, and HeadBucket, ListBuckets, and GetBucketLocation are
+  answered from the gateway's local copy, which `Gateway::reload_buckets`
+  refreshes for changes other nodes make.
+- **Configuration helpers.** Attaching a target must apply the control-store
+  independence check, which was private to configuration loading.
+  `skys3-config` now exports `parse_target` and
+  `ControlStoreConfig::check_target_independence`.
+- **ServerSideEncryptionConfigurationNotFoundError is a 400.** S3 (and
+  `s3s`) answer it with 400, not 404 like the Object Lock equivalent.
+- **Fuzzing found an unanswerable error.** The `gateway_request` target
+  drives arbitrary requests, and arbitrary XML bodies for 14 operations,
+  through the whole pipeline. Its first run found that the XML scan's
+  error message quoted the parser's error, which quoted a NUL byte from the
+  body; `s3s` cannot write that as XML, and the request got an empty
+  `500`. Messages no longer quote request bytes, and an error whose message
+  cannot be written is answered with its code alone. A later 60-second run
+  executed about 250,000 inputs without a failure. The target asserts that
+  no input gets a `500` and that responses stay under 64 KiB; memory is
+  bounded with libFuzzer's `-rss_limit_mb`.
+- **The checks must decode what s3s decodes (review).** The first version
+  read raw query pairs and split the raw path, while `s3s` decodes the
+  path before splitting off the bucket and decodes query names and
+  values. `?part%4Eumber=10001` skipped the part-number check, `?a%63l`
+  made an ACL body look like object data and skipped the XML checks, and
+  `/b%2Fk` looked like a bucket request. `s3s`'s query parser
+  (`OrderedQs`) is public only under `cfg(fuzzing)`, so the gateway parses
+  queries with `serde_urlencoded` directly, as `s3s` does, and decodes the
+  path the same way before splitting it.
+- **Lost answers also lose the announcement (review).** A create or delete
+  that landed with every answer lost returned `503` before incrementing
+  the generation, and the retry, finding the work done, did not increment
+  it either, so other gateways never learned of the change; a lost delete
+  also left its sealed shards behind. Retries now announce what they find
+  done, and a gateway remembers its deletions of unknown outcome (at most
+  256) so a retry can finish them; design §4.1 and §6.1 record the rule.
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
