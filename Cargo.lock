@@ -2166,11 +2166,13 @@ dependencies = [
  "aws-sigv4",
  "aws-smithy-http-client",
  "bytes",
+ "crc-fast",
  "http",
  "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "md-5",
  "proptest",
  "quick-xml",
  "rand",
@@ -2274,6 +2276,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "skys3-shard"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "rand",
+ "skys3-index",
+ "skys3-io",
+ "skys3-log",
+ "skys3-sim",
+ "skys3-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "skys3-sim"
 version = "0.1.0"
 dependencies = [
@@ -2316,6 +2334,7 @@ dependencies = [
 name = "skys3-types"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "proptest",
  "serde",
  "serde_json",

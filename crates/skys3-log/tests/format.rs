@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use skys3_log::record::{
-    ChecksumAlgorithm, DecodeError, Delete, EncodeError, ErrorClass, Extent, ExtentRef,
+    Checksum, ChecksumAlgorithm, DecodeError, Delete, EncodeError, ErrorClass, Extent, ExtentRef,
     FORMAT_VERSION, FieldError, LogRecord, MAGIC, MAX_HEADER_LEN, MAX_PAYLOAD_LEN, MAX_TAGS,
     Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef,
 };
@@ -52,8 +52,13 @@ fn malformed(bytes: &[u8]) -> FieldError {
     }
 }
 
+/// Returns why `body` does not encode, checking that `check` refuses it
+/// for the same reason.
 fn encode_err(body: RecordBody) -> FieldError {
-    record(body).to_bytes().unwrap_err().0
+    let record = record(body);
+    let error = record.to_bytes().unwrap_err();
+    assert_eq!(record.check().unwrap_err(), error);
+    error.0
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -540,7 +545,14 @@ fn put_maps_must_be_canonical() {
     );
 
     let crc32 = [1, 2, 3, 4];
-    let checksums = Body::default().u8(2).u8(2).raw(&crc32).u8(1).raw(&crc32);
+    let checksums = Body::default()
+        .u8(2)
+        .u8(2)
+        .raw(&crc32)
+        .u16(0)
+        .u8(1)
+        .raw(&crc32)
+        .u16(0);
     assert_eq!(
         err(fields(none16(), none8(), checksums)).problem,
         Problem::Unsorted
@@ -555,6 +567,19 @@ fn put_maps_must_be_canonical() {
         err(fields(none16(), none8(), short)).problem,
         Problem::Truncated
     );
+    // A part count makes a composite checksum, which CRC64NVME cannot be,
+    // and is at most 10,000.
+    let crc64 = [0; 8];
+    let composite = Body::default().u8(1).u8(3).raw(&crc64).u16(2);
+    assert!(matches!(
+        err(fields(none16(), none8(), composite)).problem,
+        Problem::Invalid(_)
+    ));
+    let too_many = Body::default().u8(1).u8(1).raw(&crc32).u16(10_001);
+    assert!(matches!(
+        err(fields(none16(), none8(), too_many)).problem,
+        Problem::Invalid(_)
+    ));
 }
 
 #[test]
@@ -749,7 +774,10 @@ fn the_encoder_rejects_what_the_decoder_would() {
         Problem::Invalid(_)
     ));
     let mut bad = put.clone();
-    bad.checksums.insert(ChecksumAlgorithm::Sha256, vec![0; 4]);
+    bad.checksums.insert(
+        ChecksumAlgorithm::Sha256,
+        Checksum::full_object(ChecksumAlgorithm::Crc32, &[0; 4]).unwrap(),
+    );
     assert_eq!(encode_err(RecordBody::Put(bad)).field, "put.checksums");
     let mut bad = put.clone();
     bad.tags = (0..=MAX_TAGS)

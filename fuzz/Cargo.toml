@@ -35,6 +35,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "gateway_checksums"
+path = "fuzz_targets/gateway_checksums.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "gateway_request"
 path = "fuzz_targets/gateway_request.rs"
 test = false

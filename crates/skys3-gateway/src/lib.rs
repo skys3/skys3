@@ -33,6 +33,11 @@
 //!   [`Principal`] and [`Permissions`] a request is authorized against,
 //!   built from policies in the subset of `skys3_types::policy`.
 //!
+//! - [`checksum`]: checksum validation of request bodies, on a blocking
+//!   pool, for CRC32, CRC32C, CRC64NVME, SHA1, SHA256, and `Content-MD5`
+//!   (trailing checksums included), MD5 ETags, and multipart ETags and
+//!   checksums. Object operations (plan M1-09) use it.
+//!
 //! The gateway serves path-style requests. The node binary does not serve
 //! it yet (plan M1-13).
 //!
@@ -73,6 +78,7 @@
 mod api;
 pub mod authz;
 mod buckets;
+pub mod checksum;
 mod credentials;
 mod features;
 #[cfg(feature = "test-util")]

@@ -9,8 +9,8 @@ use proptest::prelude::*;
 use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
-    Adopt, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed, Import,
-    LogRecord, MAX_PAYLOAD_LEN, Metadata, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
+    Adopt, Checksum, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed,
+    Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -86,7 +86,18 @@ pub fn checksums() -> impl Strategy<Value = Checksums> {
     .prop_flat_map(|algorithms| {
         algorithms
             .into_iter()
-            .map(|a| vec(any::<u8>(), a.digest_len()).prop_map(move |digest| (a, digest)))
+            .map(|a| {
+                (vec(any::<u8>(), a.digest_len()), 0..=10_000_u32).prop_map(
+                    move |(digest, parts)| {
+                        let checksum = if parts == 0 || !a.supports_composite() {
+                            Checksum::full_object(a, &digest)
+                        } else {
+                            Checksum::composite(a, &digest, parts)
+                        };
+                        (a, checksum.unwrap())
+                    },
+                )
+            })
             .collect::<Vec<_>>()
             .prop_map(|entries| entries.into_iter().collect::<Checksums>())
     })

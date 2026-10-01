@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use skys3_log::record::{
-    ChecksumAlgorithm, Checksums, CopySource, ExtentRef, MAX_EXTENTS, MAX_KEY_LEN,
+    Checksum, ChecksumAlgorithm, Checksums, CopySource, ExtentRef, MAX_EXTENTS, MAX_KEY_LEN,
     MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
     MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, ShardRef, TagSet,
 };
@@ -94,6 +94,10 @@ impl Writer {
         self.0.push(value);
     }
 
+    fn u16(&mut self, value: u16) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
     fn u32(&mut self, value: u32) {
         self.0.extend_from_slice(&value.to_le_bytes());
     }
@@ -125,8 +129,8 @@ impl Writer {
     }
 
     fn len16(&mut self, field: &'static str, len: usize, max: usize) -> Result<()> {
-        let len: u16 = Self::len(field, len, max)?;
-        self.0.extend_from_slice(&len.to_le_bytes());
+        let len = Self::len(field, len, max)?;
+        self.u16(len);
         Ok(())
     }
 
@@ -191,6 +195,10 @@ impl<'a> Reader<'a> {
         Ok(self.array::<1>(field)?[0])
     }
 
+    fn u16(&mut self, field: &'static str) -> Result<u16> {
+        self.array(field).map(u16::from_le_bytes)
+    }
+
     fn u32(&mut self, field: &'static str) -> Result<u32> {
         self.array(field).map(u32::from_le_bytes)
     }
@@ -224,7 +232,7 @@ impl<'a> Reader<'a> {
     }
 
     fn len16(&mut self, field: &'static str, max: usize) -> Result<usize> {
-        let len = u16::from_le_bytes(self.array(field)?);
+        let len = self.u16(field)?;
         Self::check(field, len.into(), max)
     }
 
@@ -778,19 +786,20 @@ fn read_tags(r: &mut Reader<'_>) -> Result<TagSet> {
 fn write_checksums(w: &mut Writer, checksums: &Checksums) -> Result<()> {
     let field = "object.checksums";
     w.len8(field, checksums.len(), ChecksumAlgorithm::ALL.len())?;
-    for (&algorithm, digest) in checksums {
-        if digest.len() != algorithm.digest_len() {
-            return Err(CodecError::new(
-                field,
-                format_args!("a {algorithm:?} digest of {} bytes", digest.len()),
-            ));
-        }
+    for (&algorithm, checksum) in checksums {
+        checksum
+            .check(algorithm)
+            .map_err(|e| CodecError::new(field, e))?;
         w.u8(algorithm.code());
-        w.0.extend_from_slice(digest);
+        w.0.extend_from_slice(checksum.digest());
+        w.u16(checksum.parts().unwrap_or(0));
     }
     Ok(())
 }
 
+/// Reads checksums: a count, then for each its algorithm's code, the
+/// digest, and the part count of a composite checksum (zero for
+/// `FULL_OBJECT`).
 fn read_checksums(r: &mut Reader<'_>) -> Result<Checksums> {
     let field = "object.checksums";
     let count = r.len8(field, ChecksumAlgorithm::ALL.len())?;
@@ -799,8 +808,13 @@ fn read_checksums(r: &mut Reader<'_>) -> Result<Checksums> {
         let code = r.u8(field)?;
         let algorithm = ChecksumAlgorithm::from_code(code)
             .ok_or_else(|| CodecError::new(field, format_args!("invalid algorithm {code}")))?;
-        let digest = r.take(field, algorithm.digest_len())?.to_vec();
-        insert_sorted(field, &mut checksums, algorithm, digest)?;
+        let digest = r.take(field, algorithm.digest_len())?;
+        let checksum = match r.u16(field)? {
+            0 => Checksum::full_object(algorithm, digest),
+            parts => Checksum::composite(algorithm, digest, parts.into()),
+        }
+        .map_err(|e| CodecError::new(field, e))?;
+        insert_sorted(field, &mut checksums, algorithm, checksum)?;
     }
     Ok(checksums)
 }

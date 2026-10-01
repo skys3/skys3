@@ -396,6 +396,84 @@ async fn sdk_signed_requests_are_accepted() {
 }
 
 #[tokio::test]
+async fn a_raw_plus_in_the_query_is_signed_as_a_space() {
+    let (auth, _) = authenticator(NOW);
+    let presigned = Signing {
+        presigned: Some(Duration::from_secs(3600)),
+        ..Signing::default()
+    };
+    // `%2B` is a plus and a raw `+` a space, to s3s as in any form
+    // decoding, so swapping one for the other must break the signature.
+    let signed = sdk_signed(
+        Method::GET,
+        "/b?prefix=private%2Badmin",
+        &[],
+        b"",
+        presigned,
+    );
+    let target = signed.uri().to_string();
+    assert!(target.contains("prefix=private%2Badmin"), "{target}");
+    auth.authenticate(signed).await.unwrap();
+    let mut tampered = sdk_signed(
+        Method::GET,
+        "/b?prefix=private%2Badmin",
+        &[],
+        b"",
+        presigned,
+    );
+    *tampered.uri_mut() = target
+        .replace("private%2Badmin", "private+admin")
+        .parse()
+        .unwrap();
+    assert_code(
+        auth.authenticate(tampered).await,
+        S3ErrorCode::SignatureDoesNotMatch,
+    );
+    // The SDK's signer reads a raw `+` as a space, as s3s does, and so does
+    // the gateway, for header signatures and presigned URLs alike.
+    for signing in [Signing::default(), presigned] {
+        let signed = sdk_signed(Method::GET, "/b?prefix=a+b", &[], b"", signing);
+        let accepted = auth.authenticate(signed).await.unwrap();
+        assert!(accepted.uri().to_string().contains("prefix=a+b"));
+        let mut swapped = sdk_signed(Method::GET, "/b?prefix=a+b", &[], b"", signing);
+        let target = swapped.uri().to_string().replace("a+b", "a%2Bb");
+        *swapped.uri_mut() = target.parse().unwrap();
+        assert_code(
+            auth.authenticate(swapped).await,
+            S3ErrorCode::SignatureDoesNotMatch,
+        );
+        // `%20` means the same as `+`, and verifies the same.
+        let mut spaced = sdk_signed(Method::GET, "/b?prefix=a+b", &[], b"", signing);
+        let target = spaced.uri().to_string().replace("a+b", "a%20b");
+        *spaced.uri_mut() = target.parse().unwrap();
+        auth.authenticate(spaced).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn signed_queries_may_not_repeat_a_parameter() {
+    // Signing sorts repeated parameters by value, so their order is not
+    // signed; s3s would see them in the order received.
+    let (auth, _) = authenticator(NOW);
+    for uri in ["/b?a=1&a=2", "/b?a=1&%61=2", "/b?tagging&tagging"] {
+        let signed = sdk_signed(Method::GET, uri, &[], b"", Signing::default());
+        assert_code(
+            auth.authenticate(signed).await,
+            S3ErrorCode::InvalidArgument,
+        );
+    }
+    let presigned = Signing {
+        presigned: Some(Duration::from_secs(60)),
+        ..Signing::default()
+    };
+    let signed = sdk_signed(Method::GET, "/b?a=1&a=2", &[], b"", presigned);
+    assert_code(
+        auth.authenticate(signed).await,
+        S3ErrorCode::InvalidArgument,
+    );
+}
+
+#[tokio::test]
 async fn sdk_presigned_urls_are_accepted_and_stripped() {
     let (auth, clock) = authenticator(NOW);
     let presigned = Signing {

@@ -7,7 +7,7 @@
 //! operations, over a fresh in-memory control store and shard stub.
 //! [`Harness::sigv4`] drives requests through SigV4 canonicalization and
 //! verification, and [`aws_chunked`] drives bodies through the chunk
-//! decoder.
+//! decoder. [`checksums`] reads checksum headers and values.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +19,10 @@ use s3s::Body;
 use skys3_config::Config;
 use skys3_control::{MemoryControlStore, ProposalIds, RetryPolicy, bootstrap};
 use skys3_io::ManualWallClock;
+use skys3_types::checksum::{Checksum, ChecksumAlgorithm};
 
 use crate::buckets::{GatewayConfig, IdSource, MODE_HEADER};
+use crate::checksum::{ExpectedChecksum, ExpectedChecksums};
 use crate::service::{Authenticator, Gateway, TrustAll};
 use crate::sigv4::body::BodyError;
 use crate::sigv4::canonical::{self, Head};
@@ -171,6 +173,13 @@ impl Harness {
             &mut again,
         );
         assert_eq!(query, again, "canonical queries are stable");
+        // The canonical query means what the query means to s3s, so two
+        // queries s3s reads differently never share a canonical form.
+        assert_eq!(
+            canonical::query_meaning(std::str::from_utf8(&query).expect("ASCII")),
+            canonical::query_meaning(head.query),
+            "a canonical query means what its query means"
+        );
 
         let auth = SigV4Authenticator::new(
             MemoryCredentials::new().with_key(FUZZ_KEY, FUZZ_SECRET, None),
@@ -189,16 +198,21 @@ impl Harness {
         let mut signed = decode(data)?;
         sign(&mut signed);
         let query = signed.uri().query().unwrap_or("");
-        let must_pass = !crate::sigv4::params::query_params(query).any(|(_, name, _)| {
-            matches!(
-                name.as_str(),
-                "X-Amz-Algorithm"
-                    | "X-Amz-Credential"
-                    | "X-Amz-Signature"
-                    | "AWSAccessKeyId"
-                    | "Signature"
-            )
-        });
+        // A signed query may not repeat a parameter.
+        let mut names = std::collections::HashSet::new();
+        let repeats =
+            !crate::sigv4::params::query_params(query).all(|(_, name, _)| names.insert(name));
+        let must_pass = !repeats
+            && !crate::sigv4::params::query_params(query).any(|(_, name, _)| {
+                matches!(
+                    name.as_str(),
+                    "X-Amz-Algorithm"
+                        | "X-Amz-Credential"
+                        | "X-Amz-Signature"
+                        | "AWSAccessKeyId"
+                        | "Signature"
+                )
+            });
         let resigned = self.runtime.block_on(auth.authenticate(signed));
         if must_pass && let Err(error) = &resigned {
             panic!("a request the harness signed was refused: {error:?}");
@@ -315,6 +329,69 @@ pub fn aws_chunked(data: &[u8]) -> Option<ChunkedOutcome> {
         }
         Err(_) => ChunkedOutcome::Refused,
     })
+}
+
+/// The header names [`checksums`] picks from.
+const CHECKSUM_HEADERS: [&str; 12] = [
+    "content-md5",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+    "x-amz-checksum-sha512",
+    "x-amz-checksum-type",
+    "x-amz-sdk-checksum-algorithm",
+    "x-amz-trailer",
+    "x-amz-checksum-",
+    "content-type",
+];
+
+/// Reads checksum headers and values from untrusted input.
+///
+/// The input is lines: each line's first byte picks a header name from a
+/// fixed list and the rest is its value. The headers are read as
+/// [`ExpectedChecksums`]; every line is also parsed as a stored checksum
+/// value of every algorithm, which must print back to a value that parses
+/// to the same checksum. Returns whether the headers were accepted.
+///
+/// # Panics
+///
+/// If a property fails.
+#[must_use]
+pub fn checksums(data: &[u8]) -> bool {
+    let mut headers = HeaderMap::new();
+    for line in data.split(|&b| b == b'\n') {
+        let Some((&pick, value)) = line.split_first() else {
+            continue;
+        };
+        if let Ok(text) = std::str::from_utf8(value) {
+            for algorithm in ChecksumAlgorithm::ALL {
+                if let Ok(checksum) = Checksum::parse(algorithm, text) {
+                    let printed = checksum.to_string();
+                    assert_eq!(Checksum::parse(algorithm, &printed), Ok(checksum.clone()));
+                    assert!(checksum.check(algorithm).is_ok());
+                }
+            }
+        }
+        let name = CHECKSUM_HEADERS[usize::from(pick) % CHECKSUM_HEADERS.len()];
+        if let Ok(value) = HeaderValue::from_bytes(value) {
+            headers.append(HeaderName::from_static(name), value);
+        }
+    }
+    match ExpectedChecksums::from_headers(&headers) {
+        Ok(expected) => {
+            if let Some(ExpectedChecksum::Header(algorithm, digest)) = expected.checksum() {
+                assert_eq!(digest.len(), algorithm.digest_len());
+            }
+            true
+        }
+        Err(error) => {
+            // Every refusal has an S3 answer.
+            let _ = error.to_s3_error();
+            false
+        }
+    }
 }
 
 /// Decodes `body` delivered in reads of `split` bytes, checking that no
@@ -438,12 +515,24 @@ mod tests {
             .unwrap();
         assert_eq!(unsupported.raw, Some(400));
         assert!(!unsupported.must_pass);
+        // A repeated parameter is refused even when signed.
+        let repeated = harness.sigv4(b"//?h&/&/").unwrap();
+        assert!(!repeated.must_pass && !repeated.resigned);
         let forged = harness
             .sigv4(
                 b"\x00/\nauthorization: AWS4-HMAC-SHA256 Credential=AKIDFUZZ/20261001/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000\nx-amz-date: 20261001T000000Z\nhost: h\nx-amz-content-sha256: UNSIGNED-PAYLOAD",
             )
             .unwrap();
         assert_eq!(forged.raw, Some(403));
+    }
+
+    #[test]
+    fn checksum_inputs_are_read_or_refused() {
+        assert!(checksums(b""));
+        assert!(checksums(b"\x01NSRBwg==\n\x08crc32"));
+        assert!(!checksums(b"\x01NSRBwg==\n\x02NSRBwg=="));
+        assert!(!checksums(b"\x00short"));
+        assert!(checksums(b"\x0bignored\n\x0bMDaLrw==-3"));
     }
 
     #[test]

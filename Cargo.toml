@@ -24,6 +24,7 @@ aws-sigv4 = { version = "1.6.0", default-features = false, features = ["http1", 
 aws-smithy-http-client = { version = "1.5.0", default-features = false, features = ["rustls-aws-lc"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
+crc-fast = { version = "1.10.0", default-features = false }
 crc32c = "0.6.8"
 http = "1.5.0"
 http-body = "1.1.0"
@@ -51,6 +52,7 @@ skys3-index = { path = "crates/skys3-index" }
 skys3-io = { path = "crates/skys3-io" }
 skys3-log = { path = "crates/skys3-log" }
 skys3-remote = { path = "crates/skys3-remote" }
+skys3-shard = { path = "crates/skys3-shard" }
 skys3-sim = { path = "crates/skys3-sim" }
 skys3-types = { path = "crates/skys3-types" }
 tempfile = { version = "3.27.0", default-features = false }

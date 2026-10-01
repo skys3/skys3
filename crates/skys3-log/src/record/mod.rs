@@ -94,13 +94,13 @@ use bytes::Bytes;
 use skys3_types::{EpochSeq, KeyHash, limits};
 
 pub use body::{
-    Adopt, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed, Import,
-    MAX_EXTENTS, MAX_KEY_LEN, MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
-    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet,
-    Tags,
+    Adopt, CopySource, Delete, Extent, ExtentRef, Flushed, Import, MAX_EXTENTS, MAX_KEY_LEN,
+    MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS,
+    MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet, Tags,
 };
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
+pub use skys3_types::checksum::{Checksum, ChecksumAlgorithm, ChecksumType, Checksums};
 
 use wire::Writer;
 
@@ -184,6 +184,15 @@ impl LogRecord {
     }
 
     fn encode_at(&self, out: &mut Vec<u8>, start: usize) -> Result<(), EncodeError> {
+        let (header_len, payload_len) = self.encode_headers(out, start)?;
+        out.extend_from_slice(self.body.payload());
+        header::seal(&mut out[start..], header_len, payload_len);
+        Ok(())
+    }
+
+    /// Writes the fixed and kind-specific headers, unsealed, and returns
+    /// `header_len` and `payload_len`.
+    fn encode_headers(&self, out: &mut Vec<u8>, start: usize) -> Result<(u32, u32), EncodeError> {
         RecordHeader::write_unsealed(
             out,
             self.kind(),
@@ -194,11 +203,18 @@ impl LogRecord {
         self.body
             .encode(&mut Writer::new(out), &self.shard, self.position)?;
         let header_len = frame_len("header_len", out.len() - start, MAX_HEADER_LEN)?;
-        let payload = self.body.payload();
-        let payload_len = frame_len("payload_len", payload.len(), MAX_PAYLOAD_LEN)?;
-        out.extend_from_slice(payload);
-        header::seal(&mut out[start..], header_len, payload_len);
-        Ok(())
+        let payload_len = frame_len("payload_len", self.body.payload().len(), MAX_PAYLOAD_LEN)?;
+        Ok((header_len, payload_len))
+    }
+
+    /// Checks that the record can be encoded, without copying its payload:
+    /// it fails exactly when [`LogRecord::encode`] would.
+    ///
+    /// # Errors
+    ///
+    /// As [`LogRecord::encode`].
+    pub fn check(&self) -> Result<(), EncodeError> {
+        self.encode_headers(&mut Vec::new(), 0).map(drop)
     }
 
     /// Encodes the record into a new buffer.

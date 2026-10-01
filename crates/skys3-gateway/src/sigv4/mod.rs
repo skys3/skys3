@@ -17,7 +17,8 @@
 //! 5. builds the canonical request from the bytes received (see
 //!    `canonical`) and compares signatures in constant time;
 //! 6. removes the signature, so `s3s` takes the request as anonymous, and
-//!    wraps the body: a declared SHA-256 is checked when the body ends, and
+//!    wraps the body: a declared SHA-256 is checked when the body ends
+//!    (computed on the hashing pool, if the authenticator has one), and
 //!    an `aws-chunked` body is decoded, its chunk and trailer signatures
 //!    checked, and its trailers published in a [`Trailers`] extension;
 //! 7. records the caller in an [`Authenticated`] extension, which
@@ -48,7 +49,7 @@ use http::uri::PathAndQuery;
 use http::{Request, Uri};
 use s3s::{Body, S3Error, s3_error};
 use secrecy::{ExposeSecret, SecretBox};
-use skys3_io::WallClock;
+use skys3_io::{BlockingPool, WallClock};
 
 pub use body::{BodyError, BodyErrorKind};
 pub use chunked::{MAX_CHUNK_LINE_BYTES, MAX_TRAILER_BYTES, MAX_TRAILERS, Trailers};
@@ -57,7 +58,7 @@ pub use params::AuthMethod;
 use self::body::Payload;
 use self::canonical::Head;
 use self::chunked::ChunkSigner;
-use self::params::{PRESIGNED_PARAMS, Signed, decode_pair};
+use self::params::{PRESIGNED_PARAMS, Signed, decode_pair, query_params};
 use crate::authz::Principal;
 use crate::service::Authenticator;
 
@@ -178,13 +179,27 @@ pub struct Authenticated {
 pub struct SigV4Authenticator<L> {
     lookup: L,
     clock: Arc<dyn WallClock>,
+    hashing: Option<BlockingPool>,
 }
 
 impl<L> SigV4Authenticator<L> {
     /// An authenticator that finds credentials with `lookup` and reads the
-    /// time from `clock`.
+    /// time from `clock`. It hashes payloads inline until it is given a
+    /// hashing pool.
     pub fn new(lookup: L, clock: Arc<dyn WallClock>) -> Self {
-        Self { lookup, clock }
+        Self {
+            lookup,
+            clock,
+            hashing: None,
+        }
+    }
+
+    /// Computes the SHA-256 that `x-amz-content-sha256` declares on `pool`,
+    /// off the reactor (design §15). A node passes its hashing pool.
+    #[must_use]
+    pub fn with_hashing_pool(mut self, pool: BlockingPool) -> Self {
+        self.hashing = Some(pool);
+        self
     }
 }
 
@@ -192,6 +207,7 @@ impl<L> fmt::Debug for SigV4Authenticator<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SigV4Authenticator")
             .field("clock", &self.clock)
+            .field("hashing", &self.hashing)
             .finish_non_exhaustive()
     }
 }
@@ -208,13 +224,16 @@ impl<L: CredentialLookup> Authenticator for SigV4Authenticator<L> {
                 return Err(not_signed());
             }
             let body = match Payload::declared(&parts.headers)? {
-                Some(payload) => body::wrap(&mut parts, body, payload, None)?,
+                Some(payload) => {
+                    body::wrap(&mut parts, body, payload, None, self.hashing.as_ref())?
+                }
                 None => body,
             };
             return Ok(Request::from_parts(parts, body));
         };
         self.check_time(&signed)?;
         check_signed_headers(&parts, &signed)?;
+        check_unique_parameters(&parts)?;
         let declared = Payload::declared(&parts.headers)?;
         let (payload, payload_hash) = match (signed.method, declared) {
             (AuthMethod::Header, None) => {
@@ -273,7 +292,13 @@ impl<L: CredentialLookup> Authenticator for SigV4Authenticator<L> {
         }
         strip_signature(&mut parts, signed.method)?;
         let signer = ChunkSigner::new(key, &signed.timestamp, &scope, signed.signature);
-        let body = body::wrap(&mut parts, body, payload, Some(signer))?;
+        let body = body::wrap(
+            &mut parts,
+            body,
+            payload,
+            Some(signer),
+            self.hashing.as_ref(),
+        )?;
         parts.extensions.insert(Authenticated {
             principal: credential.principal,
             access_key_id: signed.access_key_id,
@@ -308,6 +333,22 @@ fn not_signed() -> S3Error {
         AccessDenied,
         "There were headers present in the request which were not signed"
     )
+}
+
+/// Checks that no query parameter, decoded as `s3s` decodes it, appears
+/// twice. The canonical query sorts repeated parameters by value, so their
+/// order is not signed, while `s3s` keeps the order received.
+fn check_unique_parameters(parts: &Parts) -> Result<(), S3Error> {
+    let mut names = std::collections::HashSet::new();
+    for (_, name, _) in query_params(parts.uri.query().unwrap_or("")) {
+        if !names.insert(name) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "A query parameter appears more than once in a signed request."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Checks that `host`, and every `x-amz-*` and `x-skys3-*` header the

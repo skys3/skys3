@@ -438,6 +438,28 @@ async fn operations_without_an_action_are_denied_to_everyone() {
     answer.assert(403, Some("AccessDenied"));
 }
 
+/// Authentication answers before authorization: a signed request that
+/// repeats a query parameter is refused as malformed (plan M1-07a) whoever
+/// signed it, while an unsigned one is refused as anonymous.
+#[tokio::test]
+async fn authentication_failures_come_before_authorization() {
+    let gateway = gateway(config(""), credentials(&CASES[0])).await;
+    let uri = "/bucket?location&x=1&x=2";
+    for key in [ADMIN, OTHER_ACTIONS] {
+        let signing = Signing {
+            key,
+            secret: SECRET,
+            ..Signing::default()
+        };
+        let repeated = sdk_signed(Method::GET, uri, &[], b"", signing);
+        let answer = answer(gateway.handle(repeated).await).await;
+        answer.assert(400, Some("InvalidArgument"));
+    }
+    let anonymous = request(Method::GET, uri, &[("host", HOST)], bytes::Bytes::new());
+    let answer = answer(gateway.handle(anonymous).await).await;
+    answer.assert(403, Some("AccessDenied"));
+}
+
 #[tokio::test]
 async fn unimplemented_operations_are_authorized_first() {
     let gateway = gateway(config(""), credentials(&CASES[0])).await;
