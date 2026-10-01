@@ -520,6 +520,246 @@ async fn the_aws_sdk_pages_through_listings() {
     server.stop().await;
 }
 
+/// The SDK tags, copies, and batch-deletes objects: the request forms and
+/// checksums it sends for each operation, and the answers it parses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_aws_sdk_tags_copies_and_deletes_objects() {
+    let server = Server::start(Arc::new(SystemWallClock)).await;
+    let client = server.client(SECRET);
+    for bucket in ["photos", "archive"] {
+        client.create_bucket().bucket(bucket).send().await.unwrap();
+    }
+    let body = vec![7u8; 3 << 20];
+    let put = client
+        .put_object()
+        .bucket("photos")
+        .key("cat.jpg")
+        .content_type("image/jpeg")
+        .metadata("color", "tabby")
+        .tagging("kind=cat&size=small")
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .unwrap();
+    let etag = put.e_tag().unwrap().to_owned();
+
+    // Tagging.
+    let tags = |output: &aws_sdk_s3::operation::get_object_tagging::GetObjectTaggingOutput| {
+        output
+            .tag_set()
+            .iter()
+            .map(|tag| (tag.key().to_owned(), tag.value().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    let got = client
+        .get_object_tagging()
+        .bucket("photos")
+        .key("cat.jpg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        tags(&got),
+        [
+            ("kind".to_owned(), "cat".to_owned()),
+            ("size".to_owned(), "small".to_owned())
+        ]
+    );
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key("color")
+                .value("grey")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    client
+        .put_object_tagging()
+        .bucket("photos")
+        .key("cat.jpg")
+        .tagging(tagging)
+        .send()
+        .await
+        .unwrap();
+    let head = client
+        .head_object()
+        .bucket("photos")
+        .key("cat.jpg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.e_tag(), Some(etag.as_str()), "tags leave the ETag");
+    let object = client
+        .get_object()
+        .bucket("photos")
+        .key("cat.jpg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(object.tag_count(), Some(1));
+    let too_many = aws_sdk_s3::types::Tagging::builder()
+        .set_tag_set(Some(
+            (0..11)
+                .map(|n| {
+                    aws_sdk_s3::types::Tag::builder()
+                        .key(format!("k{n}"))
+                        .value("v")
+                        .build()
+                        .unwrap()
+                })
+                .collect(),
+        ))
+        .build()
+        .unwrap();
+    let error = client
+        .put_object_tagging()
+        .bucket("photos")
+        .key("cat.jpg")
+        .tagging(too_many)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some("InvalidTag"), "{error:?}");
+
+    // Copies within a bucket and across buckets, with both directives.
+    let copied = client
+        .copy_object()
+        .bucket("photos")
+        .key("copy.jpg")
+        .copy_source("photos/cat.jpg")
+        .send()
+        .await
+        .unwrap();
+    let result = copied.copy_object_result().unwrap();
+    assert_eq!(result.e_tag(), Some(etag.as_str()));
+    let copy = client
+        .get_object()
+        .bucket("photos")
+        .key("copy.jpg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(copy.content_type(), Some("image/jpeg"));
+    assert_eq!(copy.metadata().unwrap()["color"], "tabby");
+    assert_eq!(copy.tag_count(), Some(1));
+    let bytes = copy.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.len(), body.len());
+    assert!(bytes.iter().all(|&b| b == 7));
+
+    client
+        .copy_object()
+        .bucket("archive")
+        .key("nested/cat copy.jpg")
+        .copy_source("photos/cat.jpg")
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .content_type("image/png")
+        .tagging_directive(aws_sdk_s3::types::TaggingDirective::Replace)
+        .tagging("archived=yes")
+        .send()
+        .await
+        .unwrap();
+    let archived = client
+        .head_object()
+        .bucket("archive")
+        .key("nested/cat copy.jpg")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(archived.content_type(), Some("image/png"));
+    assert_eq!(archived.metadata().map(|m| m.len()), Some(0));
+    assert_eq!(archived.content_length(), Some(3 << 20));
+    let error = client
+        .copy_object()
+        .bucket("photos")
+        .key("cat.jpg")
+        .copy_source("photos/cat.jpg")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some("InvalidRequest"), "{error:?}");
+    let error = client
+        .copy_object()
+        .bucket("photos")
+        .key("copy.jpg")
+        .copy_source("photos/cat.jpg")
+        .copy_source_if_none_match(&etag)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some("PreconditionFailed"), "{error:?}");
+
+    client
+        .delete_object_tagging()
+        .bucket("photos")
+        .key("cat.jpg")
+        .send()
+        .await
+        .unwrap();
+    let got = client
+        .get_object_tagging()
+        .bucket("photos")
+        .key("cat.jpg")
+        .send()
+        .await
+        .unwrap();
+    assert!(got.tag_set().is_empty());
+
+    // DeleteObjects, with the checksum the SDK computes for it.
+    let identifiers = ["cat.jpg", "copy.jpg", "never-written"]
+        .into_iter()
+        .map(|key| {
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key(key)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let delete = aws_sdk_s3::types::Delete::builder()
+        .set_objects(Some(identifiers))
+        .build()
+        .unwrap();
+    let deleted = client
+        .delete_objects()
+        .bucket("photos")
+        .delete(delete)
+        .send()
+        .await
+        .unwrap();
+    let mut keys: Vec<_> = deleted.deleted().iter().filter_map(|d| d.key()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["cat.jpg", "copy.jpg", "never-written"]);
+    assert!(deleted.errors().is_empty());
+    let listed = client
+        .list_objects_v2()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.key_count(), Some(0));
+
+    let quiet = aws_sdk_s3::types::Delete::builder()
+        .objects(
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key("nested/cat copy.jpg")
+                .build()
+                .unwrap(),
+        )
+        .quiet(true)
+        .build()
+        .unwrap();
+    let deleted = client
+        .delete_objects()
+        .bucket("archive")
+        .delete(quiet)
+        .send()
+        .await
+        .unwrap();
+    assert!(deleted.deleted().is_empty() && deleted.errors().is_empty());
+    server.stop().await;
+}
+
 /// An `aws-chunked` object body whose last chunk was tampered with is
 /// refused, and nothing is stored, although its first extents were written
 /// while it arrived.

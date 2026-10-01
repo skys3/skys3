@@ -1017,6 +1017,66 @@ of this file. A task with nothing unexpected keeps "None."
   are not header values, with `400 InvalidRequest` before reading the
   object.
 
+### M1-10 DeleteObjects, tagging, and CopyObject
+
+- **No format change was needed.** M1-01 had already defined `TAGS`, a
+  `PUT` with tags, and a `PUT`'s copy source (bucket ID, key, `seq` and
+  ETag of the version, optional `remote_etag`), and M1-04 applies `TAGS`.
+  The log stays at version 2 and index values at format 2. The open choice
+  was where tags given at upload go: they are part of the `PUT` record, so
+  an object and its tags commit as one record under one write identity,
+  rather than a `PUT` followed by a `TAGS` that a crash could separate.
+  Design §10.1 records it. A `TAGS` is committed with an "object exists"
+  precondition, so a tagging request racing a delete answers `404` instead
+  of committing a record the state machine silently rejects.
+- **The authorizer checked one resource per request.** DeleteObjects names
+  a bucket in its path but needs `s3:DeleteObject` on each key of its body,
+  and S3 answers a key the caller may not delete with an `AccessDenied`
+  entry while deleting the others. `s3s` calls a per-operation access hook
+  after parsing the input, so the request-level check lets DeleteObjects
+  through (`authz::is_per_key`), and its hook stores a decision per key
+  in a `KeyDecisions` request extension. The operation fails closed
+  without one, and the gateway strips one that arrives with a request.
+  CopyObject's `copy_object` hook checks `s3:GetObject` on the source
+  (`authz::source_actions`). The authorization table gained a source
+  column, a caller denied only the source, and, for key-by-key operations,
+  a denied answer of `200` with an `AccessDenied` entry.
+- **XML bodies were never checked against their digest.** `s3s` does not
+  verify `Content-MD5`, and the gateway buffered XML bodies without
+  checking them. It now checks every XML body that carries `Content-MD5`
+  or an `x-amz-checksum-*` value before `s3s` parses it, with the same
+  validator as object bodies, and DeleteObjects requires one, as S3 does
+  (the AWS SDK for Rust sends `x-amz-checksum-crc32`). The answer to a
+  DeleteObjects without one is `400 InvalidRequest` with S3's message;
+  the S3 documentation was unreachable from the sandbox (as in M1-08), so
+  the SDK matrix (M1-25) should confirm the code against S3.
+- **A copy keeps its source's ETag rather than hashing its bytes again.**
+  That is S3's result for an object stored by a single PUT, the only kind
+  until multipart uploads (M1-12) land. A copy of a multipart object would
+  carry a multipart ETag without part boundaries, which a regular-upload
+  flush cannot reproduce; M1-12 or M1-16b must decide whether such a copy
+  is hashed again or keeps its source's parts. With
+  `x-amz-checksum-algorithm`, the copy's checksum is computed on the
+  hashing pool while the bytes are copied.
+- **Imported and adopted objects can carry a write identity.** Their
+  metadata comes from the remote, so a `COPY` directive would have copied
+  `x-amz-meta-skys3-wid` into the copy, naming another write. Copies drop
+  it.
+- **The fuzz harness could not reach DeleteObjects.** Its structured mode
+  sends a fixed set of XML operations, which now include a working
+  DeleteObjects; without a digest every input was refused before parsing.
+  The harness adds the body's `Content-MD5` to every structured request.
+  A new target, `gateway_tagging`, parses `x-amz-tagging` headers and
+  checks that accepted sets keep S3's limits and round-trip through the
+  header and PutObjectTagging forms. A 30-second run executed about
+  670,000 inputs, and a 60-second run of `gateway_request` about 3,000,
+  with no failure.
+- **Left open.** How a `TAGS` flushes is M1-16's (plan section 14). A
+  copy reads its source's payload by position after reading the entry, as
+  a GET does; compaction (M1-22) must not reclaim payload a read in
+  progress still uses after an overwrite. UploadPartCopy, with copy-source
+  ranges, is M4-05's.
+
 ### M1-11 Listing
 
 - **A page resumes after an item, not a key.** V1's `NextMarker` can be

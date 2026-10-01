@@ -66,6 +66,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "gateway_tagging"
+path = "fuzz_targets/gateway_tagging.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "index_codec"
 path = "fuzz_targets/index_codec.rs"
 test = false

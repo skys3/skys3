@@ -1,5 +1,6 @@
-//! Object operations: PutObject, GetObject, HeadObject, and DeleteObject
-//! (design §5.1, §7.2, §9.2, §11).
+//! Object operations: PutObject, GetObject, HeadObject, DeleteObject,
+//! DeleteObjects, CopyObject, and object tagging (design §5.1, §7.2, §9.2,
+//! §10.1, §11).
 //!
 //! **PutObject.** The body streams through the [`ChecksumValidator`] and
 //! into the key's shard: a body up to `inline_max_bytes` goes inline in
@@ -18,7 +19,9 @@
 //! its full `x-amz-meta-` name. User metadata, names and values, is limited
 //! to 2 KiB less the bytes reserved for the write identity (§7.2), and the
 //! identity's own name, `x-amz-meta-skys3-wid`, is refused on input and left
-//! out of responses.
+//! out of responses. Tags given with `x-amz-tagging` are part of the `PUT`
+//! record, so an object and its tags commit together and share one write
+//! identity (`tagging`).
 //!
 //! **GetObject and HeadObject** resolve the key in its shard's index,
 //! evaluate the conditional headers ([`ReadConditions`]), and serve a single
@@ -29,11 +32,11 @@
 //! `x-amz-checksum-mode: ENABLED` for a whole object, and the stored storage
 //! class unless it is `STANDARD`. The `response-*` query parameters replace
 //! the stored headers they name; S3 refuses them in an anonymous request,
-//! and so does SkyS3.
+//! and so does SkyS3. An object with tags reports their number in
+//! `x-amz-tagging-count`.
 //!
-//! **DeleteObject** commits a tombstone, also for a key with no object,
-//! and answers `204` either way. In a `local` bucket, which is never
-//! flushed, a `FLUSHED` record follows that removes the tombstone (§4.2).
+//! DeleteObject and DeleteObjects are in `delete`, CopyObject in `copy`, and
+//! GetObjectTagging, PutObjectTagging, and DeleteObjectTagging in `tagging`.
 
 mod download;
 mod upload;
@@ -43,23 +46,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use http::request::Parts;
 use http_body_util::BodyExt;
 use s3s::dto::{
-    ChecksumType as S3ChecksumType, DeleteObjectInput, DeleteObjectOutput, GetObjectInput,
-    GetObjectOutput, HeadObjectInput, HeadObjectOutput, PutObjectInput, PutObjectOutput, Range,
-    StreamingBlob,
+    GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, PutObjectInput,
+    PutObjectOutput, Range, StreamingBlob,
 };
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
 use skys3_index::ObjectVersion;
 use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
-use skys3_log::record::{Delete, Flushed, MAX_METADATA_LEN, Metadata, Put};
+use skys3_log::record::{MAX_METADATA_LEN, Metadata, Put};
 use skys3_types::checksum::{ChecksumAlgorithm, Checksums};
-use skys3_types::{BucketDocument, BucketMode, WriteIdentity};
+use skys3_types::{BucketDocument, WriteIdentity};
 
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums};
 use crate::conditions::{Precondition, ReadConditions, last_modified, no_such_key, s3_etag};
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
+pub(crate) use copy::copy_source;
+pub use delete::MAX_DELETE_KEYS;
+pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};
 use upload::Upload;
 
 /// The largest object a single PUT stores: 5 GiB, S3's limit.
@@ -96,11 +103,26 @@ macro_rules! set_checksums {
                 ChecksumAlgorithm::Sha256 => $output.checksum_sha256 = value,
                 ChecksumAlgorithm::Md5 => continue,
             }
-            $output.checksum_type = Some(S3ChecksumType::from_static(
+            $output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
                 checksum.checksum_type().as_str(),
             ));
         }
     }};
+}
+
+/// The standard headers of a PutObject or CopyObject input that the object
+/// stores, by stored name, for [`stored_metadata`].
+macro_rules! standard_headers {
+    ($input:expr) => {
+        [
+            ("cache-control", $input.cache_control.as_ref()),
+            ("content-disposition", $input.content_disposition.as_ref()),
+            ("content-encoding", $input.content_encoding.as_ref()),
+            ("content-language", $input.content_language.as_ref()),
+            ("content-type", $input.content_type.as_ref()),
+            ("expires", $input.expires.as_ref()),
+        ]
+    };
 }
 
 /// The [`Overrides`] of a GetObject or HeadObject input.
@@ -139,6 +161,9 @@ macro_rules! describe {
         $output.storage_class = storage_class(object);
         let metadata: s3s::dto::Metadata = user_metadata(&object.metadata).collect();
         $output.metadata = (!metadata.is_empty()).then_some(metadata);
+        $output.tag_count = i32::try_from(object.tags.len())
+            .ok()
+            .filter(|&count| count > 0);
         let overrides: Checked = $overrides;
         let replace = |field: &mut Option<String>, value: Option<String>| {
             if value.is_some() {
@@ -162,6 +187,10 @@ macro_rules! describe {
         }
     }};
 }
+
+mod copy;
+mod delete;
+mod tagging;
 
 /// The object operations, over the shards.
 pub(crate) struct Objects<H> {
@@ -192,10 +221,10 @@ impl<H: Shards> Objects<H> {
             extensions,
             ..
         } = req;
-        if input.tagging.is_some() || input.write_offset_bytes.is_some() {
+        if input.write_offset_bytes.is_some() {
             return Err(s3_error!(
                 NotImplemented,
-                "x-amz-tagging and x-amz-write-offset-bytes are not supported yet"
+                "x-amz-write-offset-bytes is not supported"
             ));
         }
         if input
@@ -204,7 +233,13 @@ impl<H: Shards> Objects<H> {
         {
             return Err(entity_too_large());
         }
-        let metadata = stored_metadata(&input)?;
+        let metadata = stored_metadata(standard_headers!(input), input.metadata.as_ref())?;
+        let tags = input
+            .tagging
+            .as_deref()
+            .map(tagging::parse_tagging_header)
+            .transpose()?
+            .unwrap_or_default();
         let condition =
             Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         let shard = ShardRef::for_key(bucket, &input.key);
@@ -250,7 +285,7 @@ impl<H: Shards> Objects<H> {
             etag: verified.etag.clone(),
             inherited_identity: None,
             metadata,
-            tags: Default::default(),
+            tags,
             checksums: verified.checksums,
             copy_source: None,
             data,
@@ -330,49 +365,6 @@ impl<H: Shards> Objects<H> {
         let mut output = HeadObjectOutput::default();
         describe!(output, found, input.checksum_mode, overrides);
         Ok(output)
-    }
-
-    pub(crate) async fn delete(
-        &self,
-        bucket: &BucketDocument,
-        req: S3Request<DeleteObjectInput>,
-    ) -> S3Result<DeleteObjectOutput> {
-        let input = req.input;
-        if input.if_match_last_modified_time.is_some() || input.if_match_size.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "x-amz-if-match-last-modified-time and x-amz-if-match-size are not supported"
-            ));
-        }
-        let condition = Precondition::of_write(input.if_match.as_ref(), None)?;
-        let shard = ShardRef::for_key(bucket, &input.key);
-        let delete = RecordBody::Delete(Delete {
-            key: input.key.clone(),
-        });
-        let position = self
-            .shards
-            .write(&shard, delete, condition)
-            .await
-            .map_err(shard_error)??;
-        if bucket.mode == BucketMode::Local {
-            // Nothing flushes a local bucket, so its tombstone would stay
-            // forever. The `FLUSHED` removes it if no later write of the key
-            // came first; it is not part of the answer, and if a crash loses
-            // it, the tombstone only takes space.
-            let shards = self.shards.clone();
-            let flushed = RecordBody::Flushed(Flushed {
-                key: input.key,
-                seq: position.seq,
-                remote_etag: None,
-                remote_version_id: None,
-            });
-            tokio::spawn(async move {
-                if let Err(error) = shards.write(&shard, flushed, Precondition::None).await {
-                    tracing::debug!(%error, "a local tombstone was not removed");
-                }
-            });
-        }
-        Ok(DeleteObjectOutput::default())
     }
 
     /// Resolves a read: the key's object, the conditions checked, and the
@@ -527,29 +519,25 @@ fn storage_class(object: &ObjectVersion) -> Option<s3s::dto::StorageClass> {
         .map(|class| s3s::dto::StorageClass::from(class.to_owned()))
 }
 
-/// The metadata a PUT stores: the standard headers S3 keeps, and user
-/// metadata under its full header name.
+/// The metadata a PUT or a copy with the `REPLACE` directive stores: the
+/// standard headers S3 keeps ([`standard_headers`]), and user metadata
+/// under its full header name.
 ///
 /// # Errors
 ///
 /// `400 InvalidArgument` for the write identity's reserved name, and
 /// `400 MetadataTooLarge` for user metadata over
 /// [`MAX_USER_METADATA_BYTES`] or metadata over what a record holds.
-fn stored_metadata(input: &PutObjectInput) -> S3Result<Metadata> {
-    let standard = [
-        ("cache-control", &input.cache_control),
-        ("content-disposition", &input.content_disposition),
-        ("content-encoding", &input.content_encoding),
-        ("content-language", &input.content_language),
-        ("content-type", &input.content_type),
-        ("expires", &input.expires),
-    ];
+fn stored_metadata(
+    standard: [(&str, Option<&String>); 6],
+    user: Option<&s3s::dto::Metadata>,
+) -> S3Result<Metadata> {
     let mut metadata: Metadata = standard
         .into_iter()
-        .filter_map(|(name, value)| Some((name.to_owned(), value.clone()?)))
+        .filter_map(|(name, value)| Some((name.to_owned(), value?.clone())))
         .collect();
     let mut user_bytes = 0;
-    for (name, value) in input.metadata.iter().flatten() {
+    for (name, value) in user.into_iter().flatten() {
         let name = name.to_ascii_lowercase();
         if name == WriteIdentity::METADATA_KEY {
             return Err(s3_error!(

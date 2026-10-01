@@ -178,7 +178,7 @@ fn matches_weakly(condition: &ETagCondition, etag: &str) -> bool {
     }
 }
 
-fn precondition_failed() -> S3Error {
+pub(crate) fn precondition_failed() -> S3Error {
     s3_error!(
         PreconditionFailed,
         "At least one of the preconditions you specified did not hold."

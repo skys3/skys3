@@ -19,19 +19,27 @@
 //! request, the anonymous principal whose permissions come from
 //! `anonymous_policy`.
 //!
-//! Operations whose authorization depends on their input check it in the
-//! matching `S3Access` method when they are implemented: CopyObject and
-//! UploadPartCopy also need `s3:GetObject` on the source (plan M1-10,
-//! M4-05), and DeleteObjects needs `s3:DeleteObject` on each key (plan
-//! M1-10), so it has no entry in [`s3_actions`] until then.
+//! Operations whose authorization depends on their input are checked again
+//! in the matching `S3Access` method, once `s3s` has parsed the input:
+//!
+//! - CopyObject also needs its [`source_actions`], `s3:GetObject`, on the
+//!   object `x-amz-copy-source` names, so a copy reads nothing its caller
+//!   could not GET. UploadPartCopy will need the same (plan M4-05).
+//! - DeleteObjects names a bucket in its path but deletes the keys its body
+//!   lists, so it is authorized key by key ([`is_per_key`]): each key needs
+//!   `s3:DeleteObject` on `arn:aws:s3:::bucket/key`. A key its caller may
+//!   not delete gets an `AccessDenied` entry in the answer, as in S3, and
+//!   the other keys are deleted. The decisions reach the operation in a
+//!   [`KeyDecisions`] request extension.
 
 use std::fmt;
 use std::sync::Arc;
 
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
+use s3s::dto::{CopyObjectInput, CopySource, DeleteObjectsInput};
 use s3s::path::S3Path;
-use s3s::{S3Error, S3Result, s3_error};
+use s3s::{S3Error, S3Request, S3Result, s3_error};
 use skys3_types::policy::{Decision, Policy, RequestContext, S3_ARN_PREFIX};
 
 use crate::sigv4::Authenticated;
@@ -175,6 +183,7 @@ const ACTIONS: &[(&str, &[&str])] = &[
     ("DeleteBucketWebsite", &["s3:DeleteBucketWebsite"]),
     ("DeleteObject", &["s3:DeleteObject"]),
     ("DeleteObjectTagging", &["s3:DeleteObjectTagging"]),
+    ("DeleteObjects", &["s3:DeleteObject"]),
     (
         "DeletePublicAccessBlock",
         &["s3:PutBucketPublicAccessBlock"],
@@ -319,14 +328,48 @@ const ACTIONS: &[(&str, &[&str])] = &[
     ("UploadPartCopy", &["s3:PutObject"]),
 ];
 
+/// Operations whose [`s3_actions`] apply to each key of their input rather
+/// than to the resource their path names.
+const PER_KEY: &[&str] = &["DeleteObjects"];
+
 /// The IAM actions an S3 operation needs, by its `s3s` operation name, or
-/// `None` for an operation no policy can allow.
+/// `None` for an operation no policy can allow. For an operation that
+/// [`is_per_key`], they apply to each key it names; otherwise to the
+/// resource its path names.
 #[must_use]
 pub fn s3_actions(operation: &str) -> Option<&'static [&'static str]> {
     ACTIONS
         .binary_search_by(|(name, _)| (*name).cmp(operation))
         .ok()
         .map(|index| ACTIONS[index].1)
+}
+
+/// Whether an operation is authorized key by key (DeleteObjects), rather
+/// than on the resource its path names.
+#[must_use]
+pub fn is_per_key(operation: &str) -> bool {
+    PER_KEY.contains(&operation)
+}
+
+/// The IAM actions an operation needs on the object it copies from, besides
+/// its [`s3_actions`] on its own resource: `s3:GetObject` for CopyObject.
+#[must_use]
+pub fn source_actions(operation: &str) -> Option<&'static [&'static str]> {
+    (operation == "CopyObject").then_some(&["s3:GetObject"])
+}
+
+/// Which keys of a DeleteObjects request its caller may delete, in the
+/// order of the request's `<Object>` elements. The access hook sets it; an
+/// operation that finds none deletes nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyDecisions(Vec<bool>);
+
+impl KeyDecisions {
+    /// Whether the caller may delete the key at `index`.
+    #[must_use]
+    pub fn allows(&self, index: usize) -> bool {
+        self.0.get(index).copied().unwrap_or(false)
+    }
 }
 
 /// The ARN of the resource a request's path names.
@@ -353,11 +396,25 @@ pub(crate) fn authorize(
     operation: &str,
     resource: &str,
 ) -> S3Result<()> {
+    let actions = s3_actions(operation);
+    authorize_actions(principal, anonymous, operation, actions, resource)
+}
+
+/// Decides whether `principal`, or the anonymous caller when it is `None`,
+/// may perform every one of `actions` on `resource` for `operation`. No
+/// actions means that no policy can allow it.
+fn authorize_actions(
+    principal: Option<&Principal>,
+    anonymous: Option<&Permissions>,
+    operation: &str,
+    actions: Option<&[&str]>,
+    resource: &str,
+) -> S3Result<()> {
     let permissions = match principal {
         Some(principal) => principal.permissions(),
         None => anonymous.ok_or_else(access_denied)?,
     };
-    let decision = match s3_actions(operation) {
+    let decision = match actions {
         None => Decision::ImplicitDeny,
         Some(actions) => actions
             .iter()
@@ -398,7 +455,60 @@ impl S3Access for Access {
             .extensions_mut()
             .get::<Authenticated>()
             .map(|caller| &caller.principal);
+        if is_per_key(&operation) {
+            // Each key is checked once the input is parsed. Here the caller
+            // only has to be one that policies apply to.
+            return match (principal, &self.anonymous) {
+                (None, None) => Err(access_denied()),
+                _ => Ok(()),
+            };
+        }
         authorize(principal, self.anonymous.as_ref(), &operation, &resource)
+    }
+
+    async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
+        let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source else {
+            return Err(s3_error!(
+                NotImplemented,
+                "x-amz-copy-source must name a bucket and a key; \
+                 access points and outposts are not supported"
+            ));
+        };
+        let resource = format!("{S3_ARN_PREFIX}{bucket}/{key}");
+        let principal = req
+            .extensions
+            .get::<Authenticated>()
+            .map(|caller| &caller.principal);
+        let operation = "CopyObject";
+        let actions = source_actions(operation);
+        authorize_actions(
+            principal,
+            self.anonymous.as_ref(),
+            operation,
+            actions,
+            &resource,
+        )
+    }
+
+    async fn delete_objects(&self, req: &mut S3Request<DeleteObjectsInput>) -> S3Result<()> {
+        let principal = req
+            .extensions
+            .get::<Authenticated>()
+            .map(|caller| &caller.principal);
+        let bucket = &req.input.bucket;
+        let decisions = req
+            .input
+            .delete
+            .objects
+            .iter()
+            .map(|object| {
+                let resource = format!("{S3_ARN_PREFIX}{bucket}/{}", object.key);
+                let operation = "DeleteObjects";
+                authorize(principal, self.anonymous.as_ref(), operation, &resource).is_ok()
+            })
+            .collect();
+        req.extensions.insert(KeyDecisions(decisions));
+        Ok(())
     }
 }
 
@@ -530,7 +640,10 @@ mod tests {
                 assert!(only.evaluate(&request).is_allowed(), "{operation}");
             }
         }
-        assert_eq!(s3_actions("DeleteObjects"), None, "authorized per key");
+        assert!(is_per_key("DeleteObjects"));
+        assert!(!is_per_key("DeleteObject"));
+        assert_eq!(source_actions("CopyObject"), Some(&["s3:GetObject"][..]));
+        assert_eq!(source_actions("PutObject"), None);
         assert_eq!(s3_actions("PostObject"), None);
     }
 

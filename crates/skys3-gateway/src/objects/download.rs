@@ -59,11 +59,17 @@ pub(crate) async fn read<H: Shards>(
             };
             Ok(StreamingBlob::from(s3s::Body::http_body(body)))
         }
-        Payload::None => Err(s3_error!(
-            ServiceUnavailable,
-            "The object's bytes are not cached on this cluster"
-        )),
+        Payload::None => Err(not_cached()),
     }
+}
+
+/// The answer to a read of an object whose bytes this cluster does not
+/// hold, until read-through fill (plan M1-20) fetches them.
+pub(super) fn not_cached() -> s3s::S3Error {
+    s3_error!(
+        ServiceUnavailable,
+        "The object's bytes are not cached on this cluster"
+    )
 }
 
 /// Reads the parts of `extents` that overlap `range`, in order, into

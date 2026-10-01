@@ -12,22 +12,24 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use http::HeaderMap;
 use s3s::dto::{
-    Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteObjectInput, DeleteObjectOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
-    GetBucketLocationInput, GetBucketLocationOutput, GetBucketOwnershipControlsInput,
-    GetBucketOwnershipControlsOutput, GetBucketVersioningInput, GetBucketVersioningOutput,
-    GetObjectInput, GetObjectLegalHoldInput, GetObjectLegalHoldOutput,
-    GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectOutput,
-    GetObjectRetentionInput, GetObjectRetentionOutput, HeadBucketInput, HeadBucketOutput,
-    HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, ObjectOwnership, OwnershipControls,
-    OwnershipControlsRule, PutBucketAclInput, PutBucketAclOutput, PutBucketEncryptionInput,
-    PutBucketEncryptionOutput, PutBucketOwnershipControlsInput, PutBucketOwnershipControlsOutput,
-    PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
-    PutObjectInput, PutObjectLegalHoldInput, PutObjectLegalHoldOutput,
-    PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput, PutObjectOutput,
-    PutObjectRetentionInput, PutObjectRetentionOutput, Timestamp,
+    Bucket, CopyObjectInput, CopyObjectOutput, CreateBucketInput, CreateBucketOutput,
+    DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput,
+    DeleteObjectTaggingInput, DeleteObjectTaggingOutput, DeleteObjectsInput, DeleteObjectsOutput,
+    GetBucketEncryptionInput, GetBucketEncryptionOutput, GetBucketLocationInput,
+    GetBucketLocationOutput, GetBucketOwnershipControlsInput, GetBucketOwnershipControlsOutput,
+    GetBucketVersioningInput, GetBucketVersioningOutput, GetObjectInput, GetObjectLegalHoldInput,
+    GetObjectLegalHoldOutput, GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput,
+    GetObjectOutput, GetObjectRetentionInput, GetObjectRetentionOutput, GetObjectTaggingInput,
+    GetObjectTaggingOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
+    ListBucketsInput, ListBucketsOutput, ListObjectVersionsInput, ListObjectVersionsOutput,
+    ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, ObjectOwnership,
+    OwnershipControls, OwnershipControlsRule, PutBucketAclInput, PutBucketAclOutput,
+    PutBucketEncryptionInput, PutBucketEncryptionOutput, PutBucketOwnershipControlsInput,
+    PutBucketOwnershipControlsOutput, PutBucketVersioningInput, PutBucketVersioningOutput,
+    PutObjectAclInput, PutObjectAclOutput, PutObjectInput, PutObjectLegalHoldInput,
+    PutObjectLegalHoldOutput, PutObjectLockConfigurationInput, PutObjectLockConfigurationOutput,
+    PutObjectOutput, PutObjectRetentionInput, PutObjectRetentionOutput, PutObjectTaggingInput,
+    PutObjectTaggingOutput, Timestamp,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use skys3_control::ControlStore;
@@ -39,7 +41,7 @@ use crate::features::{
     ownership_not_implemented, sse_not_implemented, versioning_not_implemented,
 };
 use crate::listing::Listings;
-use crate::objects::Objects;
+use crate::objects::{Objects, copy_source};
 use crate::shard::Shards;
 
 /// The most buckets one ListBuckets page returns (the S3 limit).
@@ -207,6 +209,48 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = self.bucket(&req.input.bucket)?;
         ok(self.objects.delete(&bucket, req).await?)
+    }
+
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.delete_objects(&bucket, req).await?)
+    }
+
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        let (source, _) = copy_source(&req.input)?;
+        let source = self.bucket(source)?;
+        ok(self.objects.copy(&bucket, &source, req).await?)
+    }
+
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.get_tagging(&bucket, req.input).await?)
+    }
+
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.put_tagging(&bucket, req.input).await?)
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.objects.delete_tagging(&bucket, req.input).await?)
     }
 
     async fn list_objects_v2(
