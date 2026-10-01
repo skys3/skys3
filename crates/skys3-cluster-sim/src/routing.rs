@@ -38,7 +38,8 @@ pub type RoutingShards =
 /// epoch `e − 1` with the next member as its primary, so that a gateway
 /// asks a member before the primary for every shard.
 ///
-/// An audit records every request a replica served, and
+/// An audit records every request a replica served, as the replica
+/// serves it, so a request whose answer is lost is recorded too, and
 /// [`RoutedServices::check_served`] finds any that the shard's primary in
 /// the current configuration did not serve.
 #[derive(Clone)]
@@ -117,9 +118,9 @@ impl RoutedServices {
         &self.replicated
     }
 
-    /// Checks that every request a gateway accepted was served by the
+    /// Checks that every request a replica served was served by the
     /// primary of its shard's current configuration, in that
-    /// configuration's epoch.
+    /// configuration's epoch, whether or not its answer arrived.
     ///
     /// # Errors
     ///
@@ -202,11 +203,7 @@ impl NodeServices for RoutedServices {
             map.learn(config).await;
         }
         let replication = local.replication.clone();
-        let (audit, placement, node) = (
-            Arc::clone(&self.audit),
-            Arc::clone(&env.placement),
-            env.node.clone(),
-        );
+        let (audit, placement) = (Arc::clone(&self.audit), Arc::clone(&env.placement));
         let shards = RoutedShards::new(
             env.node,
             local,
@@ -223,9 +220,9 @@ impl NodeServices for RoutedServices {
             let current = &placement[&served.shard];
             if served.node != current.primary || served.epoch != current.epoch {
                 audit.wrong.push(format!(
-                    "{node}'s gateway was served on shard {} by {} in epoch {}, but its primary \
-                     is {} in epoch {}",
-                    served.shard, served.node, served.epoch, current.primary, current.epoch
+                    "{} served a request on shard {} in epoch {}, but its primary is {} in \
+                     epoch {}",
+                    served.node, served.shard, served.epoch, current.primary, current.epoch
                 ));
             }
         });

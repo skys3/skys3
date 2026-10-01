@@ -10,8 +10,8 @@ use skys3_cluster_sim::{
     RoutedServices, RunError, View, Workload,
 };
 use skys3_gateway::routing::RoutingConfig;
-use skys3_sim::Runner;
 use skys3_sim::history::Outcome;
+use skys3_sim::{Runner, SimContext};
 
 use crate::COST;
 
@@ -145,26 +145,46 @@ fn routing_while_a_primary_restarts() {
 
 #[test]
 fn the_audit_catches_a_member_that_serves_reads() {
+    Runner::with_cost(1, COST)
+        .run(|context| audit_catches_members_serving_reads(context, &FaultPlan::none()));
+}
+
+/// The audit observes a request as the replica serves it, so a read a
+/// member served is caught even when its answer is lost on the way back.
+#[test]
+fn the_audit_catches_a_member_that_serves_reads_while_answers_are_lost() {
     Runner::with_cost(1, COST).run(|context| {
-        let config = ClusterConfig {
-            control_rates: FaultRates::default(),
-            ..config()
+        let loss = Fault::MessageLoss {
+            rate: 0.05,
+            duration: Duration::from_secs(60),
         };
-        let workload = Workload {
-            clients: 2,
-            operations: 30,
-            ..workload()
-        };
-        // Every gateway asks a member first, which serves a read where it
-        // should redirect.
-        let services = services(ReplicatedServices::members_serving_reads()).members_first();
-        let outcome = cluster(config, &services).run(context, &workload, &FaultPlan::none());
-        match outcome {
-            Err(RunError::Simulation(error)) => {
-                assert!(error.contains("but its primary is"), "{error}");
-                Ok(())
-            }
-            other => Err(format!("a member serving reads went unnoticed: {other:?}").into()),
-        }
+        let plan = FaultPlan::none().with(Duration::ZERO, loss);
+        audit_catches_members_serving_reads(context, &plan)
     });
+}
+
+fn audit_catches_members_serving_reads(
+    context: &mut SimContext,
+    plan: &FaultPlan,
+) -> turmoil::Result {
+    let config = ClusterConfig {
+        control_rates: FaultRates::default(),
+        ..config()
+    };
+    let workload = Workload {
+        clients: 2,
+        operations: 30,
+        ..workload()
+    };
+    // Every gateway asks a member first, which serves a read where it
+    // should redirect.
+    let services = services(ReplicatedServices::members_serving_reads()).members_first();
+    let outcome = cluster(config, &services).run(context, &workload, plan);
+    match outcome {
+        Err(RunError::Simulation(error)) => {
+            assert!(error.contains("but its primary is"), "{error}");
+            Ok(())
+        }
+        other => Err(format!("a member serving reads went unnoticed: {other:?}").into()),
+    }
 }

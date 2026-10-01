@@ -39,9 +39,9 @@ use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_types::{Epoch, EpochSeq, ShardConfig};
 
-pub use client::{RoutedShards, RoutingConfig, RoutingStats, Served};
+pub use client::{RoutedShards, RoutingConfig, RoutingStats};
 pub use map::ShardMap;
-pub use server::{ForwardServer, serve_peers};
+pub use server::{ForwardServer, Served, serve_peers};
 
 use crate::conditions::{ConditionFailed, Precondition};
 use crate::shard::{ShardError, ShardSummary, UploadParts};

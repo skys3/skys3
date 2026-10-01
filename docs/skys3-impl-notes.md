@@ -2545,7 +2545,11 @@ of this file. A task with nothing unexpected keeps "None."
   rate-limited per shard, so every request that arrived while another was
   reading a shard's register failed. Reads of one node now wait for each
   other and look at the map again before reading, so concurrent requests
-  share one read.
+  share one read. A review then found that the interval was timed from
+  the start of a read: a read slower than the interval, or one that
+  failed, left every waiting request to read again in turn. The interval
+  now runs from when a read finishes, and the requests within it take
+  its result, its error included.
 - **No new index format for the shard map.** The map is a new `shard_map`
   table, keyed like `shards`, holding each configuration's register JSON.
   It is a cache that is safe when stale, so it takes no index format of
@@ -2587,9 +2591,12 @@ of this file. A task with nothing unexpected keeps "None."
   primary (a redirect corrects it), a third in epoch 2 with only a node
   that does not exist (no member answers, so the gateway reads the
   register), and a third unknown. Clients send every request to a random
-  node. An observer on every gateway records which node served each
-  request in which epoch, and an invariant fails the run if any was not
-  the current primary in the current epoch. A seeded bug, members that
+  node. An observer on every node's forward server records which replica
+  served each request in which epoch, as it serves it, and an invariant
+  fails the run if any was not the current primary in the current epoch.
+  The observer first sat in the gateway, after the answer arrived, and so
+  missed a request served by the wrong replica whose answer was lost; a
+  review caught it. A seeded bug, members that
   answer reads from their own index, trips it; that scenario starts every
   map with a member as each shard's primary, since with the mixed maps a
   write's redirect could correct a map before any read reached the
@@ -2600,11 +2607,16 @@ of this file. A task with nothing unexpected keeps "None."
   object replaced between the entry and the payload answers a retryable
   `503`. Forwarding both calls widens that window, so the fault-free
   scenario allows a few failed reads; it still allows no failed write.
-- **A replication scenario fails on one seed in 4,096, before this
-  task.** `replicated_writes_under_crashes_and_message_loss` with
-  `SKYS3_SIM_SEED=86` finds a history no order explains on
-  `bucket-1/key-1`. It fails the same way on the M2-07 head, so it is not
-  routing; it is left to the replication tasks.
+- **A replication seed failed before this task, and passes after the
+  merge with M2-10, for no identified reason.**
+  `replicated_writes_under_crashes_and_message_loss` with
+  `SKYS3_SIM_SEED=86` found a history no order explains on
+  `bucket-1/key-1`, on the M2-07 head (a4e1066) as well, so not through
+  routing. It passes once M2-07's review fixes, M2-09, M1-18 and M2-10
+  are merged in. It is not M2-10's relaxed rule for failed writes: the
+  seed passes with a4e1066's checker too. The merged changes also change
+  what the replicas do, and so the run that seed draws; the case the
+  seed found may still exist, unexplained, under another seed.
 - **Left for later.**
   - **Binary wiring.** Not done: the routing code alone is about 2,000
     lines of non-test library code, over the plan's 1,500, before any
