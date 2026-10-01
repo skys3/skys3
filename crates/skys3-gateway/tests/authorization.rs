@@ -20,8 +20,9 @@ use http::{Method, Request};
 use s3s::Body;
 use serde_json::json;
 use skys3_gateway::authz::s3_actions;
+use skys3_gateway::sigv4::AuthMethod;
 use skys3_gateway::{
-    Gateway, GatewayConfig, MODE_HEADER, Permissions, Principal, SecretAccessKey,
+    Authenticated, Gateway, GatewayConfig, MODE_HEADER, Permissions, Principal, SecretAccessKey,
     SigV4Authenticator, StaticCredentials,
 };
 use skys3_io::ManualWallClock;
@@ -457,6 +458,38 @@ async fn authentication_failures_come_before_authorization() {
     }
     let anonymous = request(Method::GET, uri, &[("host", HOST)], bytes::Bytes::new());
     let answer = answer(gateway.handle(anonymous).await).await;
+    answer.assert(403, Some("AccessDenied"));
+}
+
+/// Only the gateway's own authenticator may say who a caller is: an
+/// `Authenticated` extension that arrives with the request is discarded.
+#[tokio::test]
+async fn forged_principals_are_ignored() {
+    let gateway = gateway(config(""), credentials(&CASES[0])).await;
+    let forged = || {
+        let mut forged = request(
+            Method::PUT,
+            "/forged",
+            &[("host", HOST)],
+            bytes::Bytes::new(),
+        );
+        forged.extensions_mut().insert(Authenticated {
+            principal: Principal::new("intruder", Permissions::allow_all()),
+            access_key_id: ADMIN.to_owned(),
+            method: AuthMethod::Header,
+        });
+        forged
+    };
+    let answer = answer(gateway.handle(forged()).await).await;
+    answer.assert(403, Some("AccessDenied"));
+
+    // With anonymous access on, the request is anonymous, not the forger's.
+    let read_only = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": "*"}}"#;
+    let config = config(&format!(
+        "[identity]\nanonymous_access = true\nanonymous_policy = '{read_only}'\n"
+    ));
+    let gateway = self::gateway(config, StaticCredentials::new()).await;
+    let answer = common::answer(gateway.handle(forged()).await).await;
     answer.assert(403, Some("AccessDenied"));
 }
 

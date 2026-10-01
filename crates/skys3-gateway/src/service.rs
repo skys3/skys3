@@ -18,7 +18,7 @@ use crate::buckets::{Buckets, GatewayConfig, IdSource};
 use crate::features;
 use crate::limits::{BodyKind, RequestLimits};
 use crate::shard::Shards;
-use crate::sigv4::{Authenticated, BodyError};
+use crate::sigv4::{Authenticated, BodyError, Trailers};
 
 /// Authenticates requests before they are routed.
 ///
@@ -177,7 +177,8 @@ impl<A: Authenticator> Gateway<A> {
 
     async fn process(&self, request: Request<Body>) -> Result<Response<Body>, S3Error> {
         let inner = &*self.inner;
-        let (parts, body) = request.into_parts();
+        let (mut parts, body) = request.into_parts();
+        strip_trusted_extensions(&mut parts.extensions);
         let shape = inner.limits.check_head(&parts)?;
         let request = inner
             .auth
@@ -205,6 +206,15 @@ impl<A: Authenticator> Gateway<A> {
                 s3_error!(InternalError)
             })
     }
+}
+
+/// Removes the extensions the pipeline trusts, which only its own stages
+/// may set: who signed the request ([`Authenticated`]) and its verified
+/// trailers ([`Trailers`]). A request that arrives with them, from an
+/// embedding or middleware, would otherwise skip authentication.
+fn strip_trusted_extensions(extensions: &mut http::Extensions) {
+    extensions.remove::<Authenticated>();
+    extensions.remove::<Trailers>();
 }
 
 /// The S3 error for a request body that could not be read.
@@ -268,5 +278,21 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let unwritable = error_response(s3_error!(MalformedXML, "quoted \0 byte"));
         assert_eq!(unwritable.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn incoming_trust_extensions_are_removed() {
+        let mut extensions = http::Extensions::new();
+        extensions.insert(Authenticated {
+            principal: crate::Principal::new("forged", Permissions::allow_all()),
+            access_key_id: "AKID".to_owned(),
+            method: crate::sigv4::AuthMethod::Header,
+        });
+        extensions.insert(Trailers::default());
+        extensions.insert(7_u32);
+        strip_trusted_extensions(&mut extensions);
+        assert!(extensions.get::<Authenticated>().is_none());
+        assert!(extensions.get::<Trailers>().is_none());
+        assert_eq!(extensions.get::<u32>(), Some(&7), "others are kept");
     }
 }

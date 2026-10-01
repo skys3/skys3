@@ -32,8 +32,14 @@
 //!   other key. Refusing an element is safe: ignoring a `Condition` would
 //!   widen an `Allow`, and a later version can accept more without
 //!   changing what an accepted policy means.
-//! - A document is at most [`MAX_POLICY_BYTES`] and each pattern at most
-//!   [`MAX_PATTERN_BYTES`], which also bounds the cost of matching.
+//! - A policy holds at most [`MAX_POLICY_BYTES`] of text (its string
+//!   values together, so whitespace and escaping do not count), each
+//!   pattern at most [`MAX_PATTERN_BYTES`], and each array at most
+//!   [`MAX_ARRAY_LEN`] values. That also bounds the cost of matching.
+//!
+//! [`Policy::parse`] reads a policy as a document, and `Deserialize` reads
+//! one embedded in another document, such as a register; both apply the
+//! same rules, so they accept exactly the same policies.
 //!
 //! [`Policy::evaluate`] gives the [`Decision`] for one action on one
 //! resource: an explicit deny if any applicable statement denies, else an
@@ -68,13 +74,17 @@ use serde::{Deserialize, Deserializer};
 /// The only policy language version SkyS3 accepts.
 pub const VERSION: &str = "2012-10-17";
 
-/// The largest policy document [`Policy::parse`] accepts, in bytes: the
-/// IAM limit for a role's inline policies.
+/// The most text a policy may hold, in bytes: the lengths of its string
+/// values together. The IAM limit for a role's inline policies.
 pub const MAX_POLICY_BYTES: usize = 10_240;
 
 /// The longest action or resource pattern, in bytes: room for the S3 ARN
 /// prefix, a 63-byte bucket name, and a 1,024-byte key.
 pub const MAX_PATTERN_BYTES: usize = 1_280;
+
+/// The most values an array in a policy may hold: statements, actions, or
+/// resources.
+pub const MAX_ARRAY_LEN: usize = 100;
 
 /// The prefix of every S3 resource ARN.
 pub const S3_ARN_PREFIX: &str = "arn:aws:s3:::";
@@ -178,19 +188,14 @@ impl RequestContext {
 }
 
 impl Policy {
-    /// Parses a JSON policy document of at most [`MAX_POLICY_BYTES`].
+    /// Parses a JSON policy document. It accepts exactly what
+    /// deserializing a `Policy` accepts.
     ///
     /// # Errors
     ///
-    /// If the document is too large, is not JSON, or is outside the subset
+    /// If the document is not JSON, or is outside the subset or the limits
     /// the [module documentation](self) describes.
     pub fn parse(json: &str) -> Result<Self, PolicyError> {
-        if json.len() > MAX_POLICY_BYTES {
-            return Err(PolicyError::new(format!(
-                "the document is {} bytes; at most {MAX_POLICY_BYTES} are allowed",
-                json.len()
-            )));
-        }
         let raw: RawPolicy =
             serde_json::from_str(json).map_err(|error| PolicyError::new(error.to_string()))?;
         Self::try_from(raw)
@@ -293,7 +298,7 @@ struct RawPolicy {
     #[serde(rename = "Version")]
     version: Option<String>,
     #[serde(rename = "Id")]
-    _id: Option<String>,
+    id: Option<String>,
     #[serde(rename = "Statement")]
     statement: Option<OneOrMany<RawStatement>>,
 }
@@ -302,7 +307,7 @@ struct RawPolicy {
 #[serde(deny_unknown_fields)]
 struct RawStatement {
     #[serde(rename = "Sid")]
-    _sid: Option<String>,
+    sid: Option<String>,
     #[serde(rename = "Effect")]
     effect: Option<String>,
     #[serde(rename = "Action")]
@@ -340,6 +345,14 @@ impl TryFrom<RawPolicy> for Policy {
             .statement
             .ok_or_else(|| PolicyError::new("Statement is required"))?
             .non_empty("Statement")?;
+        let text = VERSION.len()
+            + raw.id.as_ref().map_or(0, String::len)
+            + statements.iter().map(RawStatement::text_len).sum::<usize>();
+        if text > MAX_POLICY_BYTES {
+            return Err(PolicyError::new(format!(
+                "the policy holds {text} bytes of text; at most {MAX_POLICY_BYTES} are allowed"
+            )));
+        }
         let statements = statements
             .into_iter()
             .enumerate()
@@ -354,6 +367,21 @@ impl TryFrom<RawPolicy> for Policy {
 }
 
 impl RawStatement {
+    /// The bytes of text in the statement's string values.
+    fn text_len(&self) -> usize {
+        let strings = |values: &Option<OneOrMany<String>>| match values {
+            None => 0,
+            Some(OneOrMany::One(value)) => value.len(),
+            Some(OneOrMany::Many(values)) => values.iter().map(String::len).sum(),
+        };
+        self.sid.as_ref().map_or(0, String::len)
+            + self.effect.as_ref().map_or(0, String::len)
+            + strings(&self.action)
+            + strings(&self.not_action)
+            + strings(&self.resource)
+            + strings(&self.not_resource)
+    }
+
     fn validate(self) -> Result<Statement, PolicyError> {
         for (name, present) in [
             ("Principal", self.principal.is_some()),
@@ -513,6 +541,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for OneOrMany<T> {
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut items = Vec::new();
                 while let Some(item) = seq.next_element()? {
+                    if items.len() == MAX_ARRAY_LEN {
+                        return Err(de::Error::custom(format!(
+                            "an array may hold at most {MAX_ARRAY_LEN} values"
+                        )));
+                    }
                     items.push(item);
                 }
                 Ok(OneOrMany::Many(items))
@@ -731,25 +764,71 @@ mod tests {
         }
     }
 
+    /// The policy in `json` by both paths: parsed as a document, and
+    /// deserialized as a value inside another document.
+    fn both_paths(json: &str) -> (Result<Policy, String>, Result<Policy, String>) {
+        #[derive(Deserialize)]
+        struct Role {
+            policy: Policy,
+        }
+        let parsed = Policy::parse(json).map_err(|error| error.to_string());
+        let embedded = serde_json::from_str::<Role>(&format!(r#"{{"policy":{json}}}"#))
+            .map(|role| role.policy)
+            .map_err(|error| error.to_string());
+        (parsed, embedded)
+    }
+
+    #[track_caller]
+    fn refused_by_both(json: &str, expected: &str) {
+        let (parsed, embedded) = both_paths(json);
+        for error in [parsed.unwrap_err(), embedded.unwrap_err()] {
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    fn resources(patterns: &[String]) -> String {
+        let patterns: Vec<String> = patterns.iter().map(|p| format!("{p:?}")).collect();
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":{{"Effect":"Allow","Action":"*","Resource":[{}]}}}}"#,
+            patterns.join(",")
+        )
+    }
+
     #[test]
-    fn sizes_are_bounded() {
+    fn sizes_are_bounded_on_both_paths() {
         let long = format!("arn:aws:s3:::b/{}", "k".repeat(MAX_PATTERN_BYTES));
-        let json = format!(
-            r#"{{"Version":"2012-10-17","Statement":{{"Effect":"Allow","Action":"*","Resource":"{long}"}}}}"#
+        refused_by_both(&resources(&[long]), "longer");
+
+        // Many patterns, each short enough, but too much text together.
+        let pattern = format!("arn:aws:s3:::b/{}", "k".repeat(1_000));
+        let at_limit = vec![pattern.clone(); MAX_POLICY_BYTES / pattern.len() - 1];
+        let (parsed, embedded) = both_paths(&resources(&at_limit));
+        assert_eq!(parsed.unwrap(), embedded.unwrap());
+        let over = vec![pattern; MAX_POLICY_BYTES / 1_000 + 1];
+        refused_by_both(&resources(&over), "at most 10240 are allowed");
+
+        // Arrays are bounded as they are read.
+        let star = vec!["*".to_owned(); MAX_ARRAY_LEN + 1];
+        refused_by_both(&resources(&star), "at most 100 values");
+        let statement = r#"{"Effect":"Allow","Action":"*","Resource":"*"}"#;
+        let statements = vec![statement; MAX_ARRAY_LEN + 1].join(",");
+        refused_by_both(
+            &format!(r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#),
+            "at most 100 values",
         );
-        assert!(
-            Policy::parse(&json)
-                .unwrap_err()
-                .to_string()
-                .contains("longer")
+        let statements = vec![statement; MAX_ARRAY_LEN].join(",");
+        let (parsed, embedded) = both_paths(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{statements}]}}"#
+        ));
+        assert_eq!(parsed.unwrap(), embedded.unwrap());
+
+        // Whitespace is not policy text, on either path.
+        let padded = format!(
+            "{{{}\"Version\":\"2012-10-17\",\"Statement\":{statement}}}",
+            " ".repeat(2 * MAX_POLICY_BYTES)
         );
-        let huge = format!("{json}{}", " ".repeat(MAX_POLICY_BYTES));
-        assert!(
-            Policy::parse(&huge)
-                .unwrap_err()
-                .to_string()
-                .contains("bytes")
-        );
+        let (parsed, embedded) = both_paths(&padded);
+        assert_eq!(parsed.unwrap(), embedded.unwrap());
     }
 
     #[test]

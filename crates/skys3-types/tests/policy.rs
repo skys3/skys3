@@ -78,6 +78,22 @@ fn model_decision(statements: &[ModelStatement], action: &str, resource: &str) -
     }
 }
 
+/// Asserts that `text` parses as a document exactly as it deserializes
+/// as a value: both refuse it, or both give the same policy.
+fn assert_paths_agree(text: &str) {
+    let parsed = Policy::parse(text).ok();
+    // Only text that is one JSON value can be embedded; anything else is
+    // refused by both paths' JSON parser.
+    if serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok() {
+        let embedded = serde_json::from_str::<Vec<Policy>>(&format!("[{text}]"))
+            .ok()
+            .map(|mut policies| policies.remove(0));
+        assert_eq!(parsed, embedded, "{text}");
+    } else {
+        assert!(parsed.is_none(), "{text}");
+    }
+}
+
 fn document(statements: &[ModelStatement]) -> String {
     let statements: Vec<Value> = statements.iter().map(ModelStatement::to_json).collect();
     json!({"Version": "2012-10-17", "Statement": statements}).to_string()
@@ -167,11 +183,11 @@ proptest! {
 
     #[test]
     fn arbitrary_text_never_panics(text in any::<String>()) {
-        let _ = Policy::parse(&text);
+        assert_paths_agree(&text);
     }
 
     #[test]
-    fn mutated_documents_never_panic(
+    fn mutated_documents_parse_alike_on_both_paths(
         statements in prop::collection::vec(statement(), 1..3),
         cut in any::<prop::sample::Index>(),
         insert in "[\\[\\]{}\",:*a-zA-Z0-9 ]{0,4}",
@@ -180,6 +196,7 @@ proptest! {
         let at = cut.index(text.len() + 1);
         if text.is_char_boundary(at) {
             text.insert_str(at, &insert);
+            assert_paths_agree(&text);
             if let Ok(policy) = Policy::parse(&text) {
                 let _ = policy.evaluate(&RequestContext::new("s3:GetObject", "arn:aws:s3:::a/b"));
             }

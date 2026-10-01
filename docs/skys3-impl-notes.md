@@ -835,6 +835,21 @@ of this file. A task with nothing unexpected keeps "None."
   visible ASCII characters. `SecretAccessKey` became an
   `Arc<SecretBox<[u8]>>`, zeroed when its last clone is dropped. The
   signing key SigV4 derives from it per request is not yet zeroized.
+- **Requests could arrive already authenticated (review).** The
+  authenticator leaves an unsigned request's extensions alone, so an
+  `Authenticated` extension set by an embedding or middleware passed the
+  anonymous gate and was authorized as given. The gateway now removes
+  `Authenticated` and `Trailers`, the extensions its own stages set and
+  trust, from every request before authentication, whatever the
+  `Authenticator`.
+- **Policy limits held only for documents (review).** `Policy::parse`
+  checked the document's byte length, but `Deserialize`, the path for
+  policies embedded in registers, did not, and the two could disagree on
+  whitespace. Both now apply the same limits after reading: at most
+  10,240 bytes of text in the policy's string values, 1,280 per pattern,
+  and 100 values per array, the last checked while the array is read.
+  Proptests and the `types_policy` fuzz target check that both paths
+  accept the same policies.
 - **The test authenticator had to authenticate.** M1-06's
   `Unauthenticated` let anonymous requests through, which are now
   refused; it is renamed `TrustAll` and attaches a principal allowed
