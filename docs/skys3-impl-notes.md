@@ -2628,3 +2628,105 @@ of this file. A task with nothing unexpected keeps "None."
   writes on its shards each wait the full timeout and their records pile
   up in the primary's memory and log until the member returns; fail-fast
   bounds that to the records sequenced before the first timeout.
+
+### M2-11 Member removal
+
+- **A replica cannot switch epochs at its own last `seq`.** M2-07 appended
+  a `CONFIG` record at `(epoch, last seq)` of whichever replica adopted a
+  configuration. A member behind its primary (say at seq 95 while the
+  primary's `CONFIG` record follows seq 100) would then hold `(e+1, 95)`
+  and next be sent `(e, 96)`: positions running backwards. Every replica
+  now switches at the `seq` of the primary's `CONFIG` record. A `Sync`
+  carries the epoch the primary sequences in, besides its configuration;
+  a member that learned a newer configuration keeps sequencing in its old
+  epoch, takes that epoch's tail, and appends its own `CONFIG` record just
+  before the first record of the new epoch, or once it holds the
+  primary's last record if all of those are older. This is the deliberate
+  relaxation of "one epoch per record" M2-07 left for this task. A
+  primary appends its `CONFIG` record only once every member of the new
+  configuration has reported its log in this life, so no member holds an
+  older-epoch record the primary lacks; until then the record waits, and
+  the link of the last member to report appends it
+  (`Shard::align`). Design §5.1 records the rules.
+- **Restarting into a newer epoch had the same problem.** `Shard::open`
+  appended the `CONFIG` record at once whenever the configuration was
+  newer than the log. A replicated replica now opens in its log's epoch
+  and aligns as above (`Shard::sequencing`). The node keeps no copy of
+  the configuration of its log's epoch until M2-16, so a primary opened
+  this way commits that epoch's tail under the newer configuration's
+  rule: safe, since the register already holds it and a removal only
+  shrinks the members.
+- **When the commit rule changes.** The primary could drop the member as
+  soon as its compare-and-swap landed, or once its `CONFIG` record is
+  durable. It waits for the record (`Leader::adopt`, called by the
+  pipeline when the record is durable), as §5.1 asks of every replica
+  before it acts in a new epoch; it costs one group commit on the
+  primary's own disk. The watchdog adopts without waiting for the record
+  to *commit* (`Shard::begin_reconfigure`): a second late member would
+  hold that up, and the watchdog would never get to remove it too.
+- **A removal needs no durable proposal (decided, design §6.3).** §6.3
+  makes every proposer record its proposal and act as if it succeeded.
+  For a removal, acting as if it failed is the safe side: the primary
+  keeps needing the member's acknowledgements and lease until it knows,
+  and finds a lost answer in the register later, which it adopts if it
+  keeps the primary and only removes members. A register naming another
+  primary, or gone, stops the primary (`Shard::depose`); M2-12 refines
+  what a deposed primary does.
+- **"Unresponsive" was not defined (decided, design §6.4).** A member
+  responds while its acknowledgements advance, or, once it holds what the
+  primary had sequenced a moment earlier, while it answers anything. A
+  member whose disk is stuck still answers beacons, so "heard from
+  recently" was not enough. A member that never reports its log after the
+  primary starts is suspected too, so a primary that restarts while a
+  member is dead does not wait for it forever.
+- **Pending writes and `min_write_replicas` (decided, design §6.4).** The
+  design rejects new writes once fewer copies remain, but said nothing of
+  the writes in flight that then commit with too few copies. They are
+  applied, and their writers get `ShardError::UnderReplicated` (`503`):
+  not acknowledged, as §5.2 allows. `FLUSHED`, `IMPORT`, and `ADOPT` are
+  not client writes and go on, as under a seal.
+- **The simulation assumed static placements in three places.** The
+  every-member durability check read the members of each shard from the
+  placement, the commit audit took them from it at acknowledgement time,
+  and restarted nodes reopened every shard in epoch 1, which a replica
+  past epoch 1 refuses. The harness now reads the registers straight from
+  the control bucket, without requests or faults, as a stand-in for the
+  shard map (M2-08) and the local copies (M2-16): nodes open a shard in
+  its register's configuration (a removed member does not reopen it), the
+  audit checks each acknowledgement against the register's members at
+  that moment (so a primary dropping a member before its compare-and-swap
+  landed is still caught), and the final check reads every member of the
+  final configurations. The every-member check also split survivors by
+  member index, which left shards with fewer members with no copy at all;
+  their last member now stands in. The removal's compare-and-swap goes
+  through each node's faulty control store, with lost answers and `409`s.
+- **Measured.** Ten seeds of node 3 cut off from both other nodes
+  for 8 s, with the defaults (3 s suspicion, 5 s wait-through timeout) and
+  the control store losing, conflicting, or refusing 2 % of requests each:
+  no write failed or went unanswered, and the slowest acknowledged write
+  took 3.02 to 3.10 s, `member_suspect_after` plus the watchdog's check
+  interval (100 ms), the compare-and-swap, and the `CONFIG` record's group
+  commit. In fail-fast mode (2 s), every write that failed after taking a
+  position, 2 to 6 per seed, later committed under the new epoch. The
+  loopback test in `skys3-shard` sees the same with 300 ms.
+- **The protocol model needed no change.** `RemoveMember` and the
+  same-primary branch of `Adopt` in `spec/ShardProtocol.tla` already keep
+  acknowledgements across the change and let a removed member grant
+  leases only in its own epoch. The implementation refines them: between
+  the compare-and-swap and the durable `CONFIG` record it needs the old,
+  larger set of acknowledgements and leases, which only removes behaviors.
+- **Metrics.** `under_replicated_bytes` and `oldest_under_replicated_age`
+  have no labels: a node counts the shards it leads, so the sum over nodes
+  counts each shard once (`Replication::exposure`,
+  `ReplicationMetrics`). The bytes are an index scan per under-replicated
+  shard and report; the age restarts with the node, since the register
+  keeps no removal time. `docs/skys3-metrics.md` lists them as defined,
+  not exported: the binary does not run replication yet.
+- **Left for later.** Wiring (`member_suspect_after_ms` maps onto
+  `ReplicationConfig::member_suspect_after`, and `with_removal` takes the
+  node's control store) comes with replication in the binary. A removal
+  does not bump the generation in `cluster.json`; nodes learn of it from
+  sessions, and the removed member keeps its replica open in the old
+  epoch until it restarts or rejoins as a learner (M2-15, M2-16).
+  `skys3-shard` now depends on `skys3-control`, `skys3-obs`, and
+  `prometheus-client`.

@@ -149,12 +149,14 @@ fn roles_follow_the_configuration() {
             member.entry("k").await,
             Err(ShardError::NotPrimary { .. })
         ));
-        // A replicated shard keeps its configuration.
-        let newer = ShardConfig {
+        // A replicated shard changes only by removing members (§6.4).
+        let takeover = ShardConfig {
             epoch: Epoch::new(2),
+            primary: node(2),
             ..shared.clone()
         };
-        assert!(configuration_error(member.reconfigure(&newer).await).contains("keeps"));
+        let reason = configuration_error(member.reconfigure(&takeover).await);
+        assert!(reason.contains("takes over"), "{reason}");
         member.close().await.unwrap();
 
         // A single member is alone, whether or not it is named.
@@ -272,7 +274,10 @@ fn a_member_takes_its_primarys_records_in_order() {
 
         // The log gives the records back by seq.
         let tail = member.read_tail(Seq::ZERO, Seq::new(2)).await.unwrap();
-        let seqs: Vec<u64> = tail.iter().map(|(seq, _)| seq.get()).collect();
+        let seqs: Vec<u64> = tail
+            .iter()
+            .map(|(position, _)| position.seq.get())
+            .collect();
         assert_eq!(seqs, [1, 2]);
         assert_eq!(LogRecord::decode(&tail[0].1).unwrap().0.position, at(1));
         let missing = member.read_tail(Seq::ZERO, Seq::new(3)).await;

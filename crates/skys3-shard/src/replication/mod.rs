@@ -27,26 +27,44 @@
 //!   echoes the latest lease stamp, which grants the primary a lease, and
 //!   restarts the member's [`Grace`] for the shard
 //!   ([`Replication::grace`], §5.4).
+//! - **Removing members** (§6.4), once [`Replication::with_removal`] gives
+//!   the node the shard registers: a primary removes a member that stays
+//!   unresponsive for [`ReplicationConfig::member_suspect_after`], by a
+//!   compare-and-swap of the shard's register to the next epoch without
+//!   it. The records the member held back commit under the new epoch once
+//!   the primary's `CONFIG` record is durable, and a shard left with fewer
+//!   members than its `min_write_replicas` stays readable and refuses
+//!   writes. [`Replication::exposure`] reports what then has fewer copies
+//!   than `replicas`.
 //!
-//! Configurations are static here: a configuration change (plan M2-08
-//! onward) needs the `CONFIG` handling of a newer epoch on both ends.
+//! A configuration change switches epochs at the same `seq` on every
+//! replica (§5.1): a primary's session carries its newest configuration
+//! and the epoch it sequences in, and a member in an earlier epoch takes
+//! that epoch's tail before it appends its own `CONFIG` record where the
+//! primary's is. A link whose primary changes configuration opens a new
+//! session; one to a member the configuration leaves out ends.
 
+mod exposure;
 mod member;
 mod primary;
+mod removal;
 #[cfg(test)]
 mod tests;
 pub mod wire;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use skys3_io::{Clock, Disk};
+use skys3_control::ProposalIds;
+use skys3_io::{Clock, Disk, MonoTime};
 use skys3_log::ShardRef;
 use skys3_net::{Frame, Listener, Network, Receiver, Transport, TransportError};
 use skys3_types::{NodeAddress, NodeId, ShardConfig};
 
+pub use self::exposure::{Exposure, ReplicationMetrics};
+pub use self::removal::{BoxFuture, ControlRegisters, Replaced, ShardRegisters};
 use crate::ack::AckTimeout;
 use crate::error::ShardError;
 use crate::lease::Grace;
@@ -85,6 +103,10 @@ pub struct ReplicationConfig {
     /// `replica_ack_timeout` and its mode: how long a replicated shard's
     /// requests wait for its members (§5.2, [`Shard::set_ack_timeout`]).
     pub ack_timeout: AckTimeout,
+    /// `member_suspect_after`: how long a member may stay unresponsive
+    /// before its primary removes it (§6.4), once the node removes members
+    /// at all ([`Replication::with_removal`]).
+    pub member_suspect_after: Duration,
 }
 
 impl Default for ReplicationConfig {
@@ -98,6 +120,7 @@ impl Default for ReplicationConfig {
             primary_lease: Duration::from_secs(4),
             primary_grace: Duration::from_secs(6),
             ack_timeout: AckTimeout::DEFAULT,
+            member_suspect_after: Duration::from_secs(3),
         }
     }
 }
@@ -135,6 +158,11 @@ struct Inner<N: Network, D: Disk> {
     config: ReplicationConfig,
     /// The grace of each shard this node is a member of, in this life.
     graces: Mutex<BTreeMap<ShardRef, Arc<Grace>>>,
+    /// What primaries remove members through, if they do.
+    removal: OnceLock<Arc<removal::Removal>>,
+    /// Since when each under-replicated shard this node leads has been so,
+    /// as far as this life saw.
+    under: Arc<Mutex<BTreeMap<ShardRef, MonoTime>>>,
 }
 
 impl<N: Network, D: Disk> Inner<N, D> {
@@ -189,8 +217,26 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 clock,
                 config,
                 graces: Mutex::default(),
+                removal: OnceLock::new(),
+                under: Arc::default(),
             }),
         }
+    }
+
+    /// Lets this node's primaries remove members that stay unresponsive
+    /// for [`ReplicationConfig::member_suspect_after`] (§6.4), by replacing
+    /// their shard's register in `registers`, under proposal IDs from
+    /// `ids`. Primaries opened from then on remove members; without it,
+    /// configurations change only when the node opens a newer one. A second
+    /// call changes nothing.
+    #[must_use]
+    pub fn with_removal(self, registers: impl ShardRegisters, ids: ProposalIds) -> Self {
+        let removal = removal::Removal {
+            registers: Box::new(registers),
+            ids: Mutex::new(ids),
+        };
+        let _ = self.inner.removal.set(Arc::new(removal));
+        self
     }
 
     /// The node's shard replicas.
@@ -211,9 +257,11 @@ impl<N: Network, D: Disk> Replication<N, D> {
     }
 
     /// Opens this node's replica in the shard of `config`, or returns it if
-    /// it is open. As the primary of a replicated shard, it starts its
-    /// links to the members on the current Tokio runtime, which run until
-    /// the shard stops, and its leases. As a member, it starts the shard's
+    /// it is open, adopting `config` if it is newer
+    /// ([`ShardSet::open_replica`]). As the primary of a replicated shard,
+    /// it starts its links to the members on the current Tokio runtime,
+    /// which run until the shard stops, its leases, and, if the node removes
+    /// members, the watch over them. As a member, it starts the shard's
     /// grace, unless it is running: opening counts as granting a lease,
     /// since this life does not know when the node last granted one. Either
     /// way its requests wait for the members at most
@@ -231,15 +279,26 @@ impl<N: Network, D: Disk> Replication<N, D> {
         }
         if let Some(leader) = shard.leader().filter(|leader| leader.claim_links()) {
             leader.start_leases(Arc::clone(&inner.clock), inner.config.primary_lease);
+            if let Some(removal) = inner.removal.get() {
+                let watchdog = removal::Watchdog {
+                    shard: shard.clone(),
+                    leader: Arc::clone(leader),
+                    node: inner.node.clone(),
+                    removal: Arc::clone(removal),
+                    config: inner.config,
+                    adopted: self.on_adopted(),
+                };
+                tokio::spawn(watchdog.run());
+            }
             for member in leader.members() {
-                let Some(address) = inner.peers.get(member) else {
+                let Some(address) = inner.peers.get(&member) else {
                     tracing::warn!(shard = %leader.shard(), %member, "no address for a member");
                     continue;
                 };
                 let link = primary::Link {
                     shard: shard.clone(),
                     leader: Arc::clone(leader),
-                    member: member.clone(),
+                    member,
                     address: address.clone(),
                     transport: inner.transport.clone(),
                     config: inner.config,
@@ -247,7 +306,73 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 tokio::spawn(link.run());
             }
         }
+        if shard.role() != Role::Member && is_under_replicated(&shard.config()) {
+            self.on_adopted()(&shard.config());
+        }
         Ok(shard)
+    }
+
+    /// What the watchdog of a primary calls with each configuration it
+    /// adopts: notes since when the shard is under-replicated.
+    fn on_adopted(&self) -> Box<dyn Fn(&ShardConfig) + Send + Sync> {
+        let (under, clock) = (Arc::clone(&self.inner.under), Arc::clone(&self.inner.clock));
+        Box::new(move |config| {
+            let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+            let mut under = under.lock().unwrap_or_else(PoisonError::into_inner);
+            if is_under_replicated(config) {
+                under.entry(shard).or_insert_with(|| clock.now());
+            } else {
+                under.remove(&shard);
+            }
+        })
+    }
+
+    /// What the shards this node leads hold with fewer copies than their
+    /// `replicas`, and since when (§6.4): the metrics
+    /// `under_replicated_bytes` and `oldest_under_replicated_age`. A shard
+    /// counts while its configuration has fewer members than `replicas`.
+    /// It reads the index of each such shard, so it is for a periodic
+    /// report, not for every request.
+    pub async fn exposure(&self) -> Exposure {
+        let set = &self.inner.set;
+        let mut counted = Vec::new();
+        let mut exposure = Exposure::default();
+        for shard in set.shards().await {
+            let Some(replica) = set.get(&shard).await else {
+                continue;
+            };
+            let config = replica.config();
+            if replica.role() == Role::Member || !is_under_replicated(&config) {
+                continue;
+            }
+            match replica.stored_bytes().await {
+                Ok(bytes) => exposure.bytes = exposure.bytes.saturating_add(bytes),
+                Err(error) => tracing::debug!(%shard, %error, "a shard's bytes are not known"),
+            }
+            exposure.shards += 1;
+            counted.push(shard);
+        }
+        let now = self.inner.clock.now();
+        let mut under = self
+            .inner
+            .under
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        under.retain(|shard, _| counted.contains(shard));
+        for shard in counted {
+            let since = *under.entry(shard).or_insert(now);
+            exposure.oldest = exposure.oldest.max(now.saturating_duration_since(since));
+        }
+        exposure
+    }
+
+    /// Sets `metrics` to [`Replication::exposure`] every `interval`, until
+    /// the returned future is dropped.
+    pub async fn report_exposure(&self, metrics: &ReplicationMetrics, interval: Duration) {
+        loop {
+            metrics.set(self.exposure().await);
+            tokio::time::sleep(interval).await;
+        }
     }
 
     /// Accepts links from primaries on `listener` until it fails, serving
@@ -279,9 +404,17 @@ impl<N: Network, D: Disk> Replication<N, D> {
     }
 }
 
+/// Whether `config` has fewer members than its `replicas` (§6.4).
+fn is_under_replicated(config: &ShardConfig) -> bool {
+    config.members.len() < usize::from(config.replicas)
+}
+
 /// Why a link ended.
 #[derive(Debug, thiserror::Error)]
 enum LinkError {
+    #[error("the primary changed its configuration")]
+    Reconfigured,
+
     #[error(transparent)]
     Transport(#[from] TransportError),
     #[error("no frame came within {0:?}")]

@@ -1,7 +1,8 @@
-//! Node services that replicate every shard to the members of its static
+//! Node services that replicate every shard to the members of its
 //! placement (plan M2-07), with the audits the replication scenarios check:
 //! commits (M2-07) and reads under leases (M2-09). Writes wait for the
-//! members at most the configured acknowledgement timeout (M2-10).
+//! members at most the configured acknowledgement timeout (M2-10), and
+//! primaries remove members that stop responding (M2-11).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -9,6 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
+use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, TypedKey};
 use skys3_gateway::{
     ConditionFailed, LocalShards, Precondition, ShardError, ShardRef, ShardSummary, Shards,
     UploadParts,
@@ -18,16 +20,24 @@ use skys3_io::{Clock, MonoTime, MonotonicClock, SimMount};
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_log::{LogStats, RecordBody, SegmentLog};
 use skys3_net::TurmoilNetwork;
-use skys3_shard::replication::{Replication, ReplicationConfig};
+use skys3_shard::replication::{ControlRegisters, Replication, ReplicationConfig};
 use skys3_shard::{Grace, Shard};
-use skys3_types::{BucketDocument, EpochSeq, NodeId, Seq, ShardConfig};
+use skys3_sim::SimS3;
+use skys3_types::{BucketDocument, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
 
 use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
 
 /// Replicated node services: every node opens its replica of each shard
-/// whose static placement names it, as primary or member, and the
-/// gateway's writes on a primary commit once every member holds them
-/// durably (§5.1).
+/// whose register names it, as primary or member, and the gateway's
+/// writes on a primary commit once every member holds them durably
+/// (§5.1). A primary removes a member that stays unresponsive for
+/// `member_suspect_after` by a compare-and-swap of the shard's register,
+/// through the node's control store and its faults (§6.4).
+///
+/// Nodes read the registers straight from the control bucket, where the
+/// harness wrote the static placement, when they open a shard: a stand-in
+/// for the shard map (plan M2-08) and the local copies of control state
+/// (M2-16).
 ///
 /// The services remember every replica and log of every life, so checks
 /// can compare what primaries committed with what members made durable
@@ -50,6 +60,21 @@ pub struct ReplicatedServices {
     /// A seeded bug: writes that were not acknowledged are sent again.
     resubmit: bool,
     audit: Arc<Mutex<Audit>>,
+}
+
+/// How the services' register writes retry.
+const REGISTER_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 5,
+    initial_backoff: Duration::from_millis(20),
+    max_backoff: Duration::from_millis(200),
+};
+
+/// The configuration the register of `shard` holds now, read without a
+/// request or a fault, or `None` if it holds none.
+pub(crate) fn register(store: &S3ControlStore<SimS3>, shard: &ShardRef) -> Option<ShardConfig> {
+    let key = TypedKey::shard(&shard.bucket, shard.shard);
+    let object = store.objects().object(&store.object_key(key.key()))?;
+    ShardConfig::from_json(&object.body).ok()
 }
 
 /// How long the seeded bug of
@@ -84,6 +109,8 @@ struct Audit {
     /// Writes that were not acknowledged in time after they got a
     /// position, by shard.
     late: Vec<(ShardRef, EpochSeq)>,
+    /// The longest a write took to be acknowledged, in simulated time.
+    slowest: Duration,
 }
 
 /// Writes that were not acknowledged in time over a run (§5.2), as the
@@ -176,7 +203,7 @@ impl ReplicatedServices {
             };
             let commit = leader.commit();
             for member in leader.members() {
-                let durable = audit.durable(member, config);
+                let durable = audit.durable(&member, config);
                 if commit > durable {
                     return Err(format!(
                         "{node} committed shard {} through seq {commit}, but {member} holds \
@@ -223,6 +250,29 @@ impl ReplicatedServices {
     #[must_use]
     pub fn leases(&self) -> LeaseCounts {
         self.audit().leases
+    }
+
+    /// The longest an acknowledged write took, in simulated time: a write
+    /// waits for a member until its removal (§6.4).
+    #[must_use]
+    pub fn slowest_write(&self) -> Duration {
+        self.audit().slowest
+    }
+
+    /// How many shards a primary has reconfigured since the placement,
+    /// by removing members (§6.4).
+    #[must_use]
+    pub fn reconfigured(&self) -> usize {
+        let audit = self.audit();
+        let shards: BTreeSet<_> = audit
+            .replicas
+            .iter()
+            .filter(|(_, config, replica)| {
+                replica.leader().is_some() && replica.config().epoch > config.epoch
+            })
+            .map(|(_, _, replica)| replica.shard().clone())
+            .collect();
+        shards.len()
     }
 
     /// The writes that were not acknowledged in time after they got a
@@ -318,7 +368,7 @@ impl NodeServices for ReplicatedServices {
         self.audit()
             .logs
             .extend(set.logs().map(|(_, log)| log.clone()));
-        let replication = Replication::new(
+        let mut replication = Replication::new(
             env.node.clone(),
             set,
             env.transport.clone(),
@@ -326,6 +376,11 @@ impl NodeServices for ReplicatedServices {
             Arc::clone(&env.clock) as Arc<dyn Clock>,
             self.config,
         );
+        let store = env.control.store();
+        if let Some(store) = &store {
+            let registers = ControlRegisters::new(store.clone(), REGISTER_RETRY);
+            replication = replication.with_removal(registers, ProposalIds::seeded(env.seed));
+        }
         let listener = env
             .transport
             .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
@@ -335,6 +390,7 @@ impl NodeServices for ReplicatedServices {
         Ok(ReplicatedShards {
             local: env.shards,
             replication,
+            registers: store.map(|store| store.inner().clone()),
             placement: env.placement,
             node: env.node,
             clock: env.clock,
@@ -353,6 +409,9 @@ impl NodeServices for ReplicatedServices {
 pub struct ReplicatedShards {
     local: LocalShards<SimMount>,
     replication: Replication<TurmoilNetwork, SimMount>,
+    /// The control store without the node's faults, for reading registers.
+    registers: Option<S3ControlStore<SimS3>>,
+    /// The placement the harness wrote, epoch 1 of every shard.
     placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
     node: NodeId,
     /// The node's clock in this life.
@@ -373,12 +432,25 @@ impl fmt::Debug for ReplicatedShards {
 }
 
 impl ReplicatedShards {
+    /// The shard's configuration now: its register's, or the placement's
+    /// if the register cannot be read.
+    fn current(&self, shard: &ShardRef) -> Option<ShardConfig> {
+        self.registers
+            .as_ref()
+            .and_then(|store| register(store, shard))
+            .or_else(|| self.placement.get(shard).cloned())
+    }
+
     /// Records an acknowledgement of `position` that some member of the
-    /// shard did not hold durably.
+    /// shard did not hold durably. The members are those of the register
+    /// now: a removal takes effect only once its compare-and-swap landed,
+    /// and only removes members, so every member it names must hold every
+    /// write acknowledged so far.
     fn audit_acknowledged(&self, shard: &ShardRef, position: EpochSeq) {
-        let Some(config) = self.placement.get(shard) else {
+        let Some(config) = self.current(shard) else {
             return;
         };
+        let config = &config;
         let mut audit = lock(&self.audit);
         for member in &config.members {
             let durable = audit.durable(member, config);
@@ -455,17 +527,16 @@ impl Shards for ReplicatedShards {
         if self.alone {
             return self.local.open(shard, bucket).await;
         }
-        let Some(config) = self
-            .placement
-            .get(shard)
-            .filter(|c| c.is_member(&self.node))
-        else {
-            // Another node's shard.
+        if self.replication.set().get(&shard.into()).await.is_some() {
+            return Ok(());
+        }
+        let Some(config) = self.current(shard).filter(|c| c.is_member(&self.node)) else {
+            // Another node's shard, or one this node was removed from.
             return Ok(());
         };
         let replica =
             self.replication
-                .open(config)
+                .open(&config)
                 .await
                 .map_err(|error| ShardError::Unavailable {
                     shard: shard.clone(),
@@ -480,9 +551,7 @@ impl Shards for ReplicatedShards {
             .iter()
             .any(|(_, _, open)| open.durable().same_channel(&replica.durable()))
         {
-            audit
-                .replicas
-                .push((self.node.clone(), config.clone(), replica));
+            audit.replicas.push((self.node.clone(), config, replica));
         }
         Ok(())
     }
@@ -563,7 +632,11 @@ impl Shards for ReplicatedShards {
         condition: Precondition,
     ) -> Result<Result<EpochSeq, ConditionFailed>, ShardError> {
         let again = self.resubmit.then(|| (body.clone(), condition.clone()));
+        let started = turmoil::sim_elapsed().unwrap_or_default();
         let written = self.local.write(shard, body, condition).await;
+        let took = turmoil::sim_elapsed()
+            .unwrap_or_default()
+            .saturating_sub(started);
         if let (Err(ShardError::NotAcknowledged { .. }), Some((body, condition))) =
             (&written, again)
         {
@@ -582,6 +655,10 @@ impl Shards for ReplicatedShards {
         }
         let written = written?;
         if let Ok(position) = written {
+            let mut audit = lock(&self.audit);
+            audit.slowest = audit.slowest.max(took);
+            drop(audit);
+
             self.audit_acknowledged(shard, position);
         }
         Ok(written)

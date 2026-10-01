@@ -32,6 +32,7 @@ use crate::node::{
     Shared, TRANSPORT_PORT,
 };
 use crate::pki::Pki;
+use crate::replication::register;
 use crate::workload::{Client, Routes, Workload};
 
 /// The shape of a simulated cluster.
@@ -486,7 +487,10 @@ impl<S: NodeServices> Cluster<S> {
                 let one: BTreeMap<String, Survivors> = survivors
                     .iter()
                     .map(|(key, survivor)| {
-                        let copies = survivor.copies.get(member).cloned().into_iter().collect();
+                        // A shard that lost members (§6.4) has fewer:
+                        // its last one stands in for the missing ones.
+                        let copy = survivor.copies.get(member).or(survivor.copies.last());
+                        let copies = copy.cloned().into_iter().collect();
                         let one = Survivors {
                             copies,
                             ..survivor.clone()
@@ -574,6 +578,9 @@ struct World<S> {
     shared: Arc<Shared<S>>,
     routes: Routes,
     control: SimS3,
+    /// The control store over `control`, without faults, for reading the
+    /// registers at the end.
+    registers: S3ControlStore<SimS3>,
     base_control: SimS3Faults,
     rates: FaultRates,
     remote: SimS3,
@@ -656,6 +663,7 @@ impl<S: NodeServices> World<S> {
             routes: Routes { buckets, placement },
             base_control: control.faults(),
             control,
+            registers: store,
             rates: config.control_rates,
             remote,
         })
@@ -691,10 +699,16 @@ impl<S: NodeServices> World<S> {
         let mut survivors = BTreeMap::new();
         for (name, bucket, key) in self.routes.keys(keys) {
             let shard = ShardRef::for_key(&bucket, &key);
-            let members = &self.routes.placement[&shard].members;
+            // The members now: a member removed (§6.4) misses the writes
+            // committed after its removal.
+            let members = register(&self.registers, &shard).map_or_else(
+                || self.routes.placement[&shard].members.clone(),
+                |c| c.members,
+            );
+
             let write_back = bucket.mode == BucketMode::WriteBack;
             let mut survivor = Survivors::default();
-            for member in members {
+            for member in &members {
                 let entry = indexes[member].read()?.entry(&(&shard).into(), &key)?;
                 // No entry claims what a clean one does: the remote store
                 // matches, here by holding nothing.

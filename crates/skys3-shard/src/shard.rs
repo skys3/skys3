@@ -133,8 +133,17 @@ pub(crate) struct Sequencer {
     session: u64,
     /// How many seals are held (§4.1).
     seals: u32,
-    /// The configuration the shard is in: `next` is in its epoch.
+    /// The newest configuration of the shard the replica knows. `next` is
+    /// in its epoch once the replica has appended its `CONFIG` record; until
+    /// then the replica aligns with its members or its primary (see
+    /// [`Shard::follow`] and [`Shard::reconfigure`]).
     config: ShardConfig,
+    /// The node the replica runs on, if it was opened for a named node.
+    node: Option<NodeId>,
+    /// On a member that is not aligned, whose primary sequences in the
+    /// newest configuration's epoch already: the `seq` of the primary's
+    /// `CONFIG` record, unless a record of the new epoch shows it first.
+    adopt_after: Option<Seq>,
     /// Why the shard stopped, once it has.
     stopped: Option<String>,
     /// The position of the latest record sequenced for each key, other than
@@ -196,6 +205,12 @@ struct Inner<D: Disk> {
 ///   then anyway (§10.4).
 /// - **Seals** ([`Shard::seal`], [`Shard::unseal`]) are ordered with the
 ///   shard's writes, as deleting a bucket requires (§4.1).
+/// - **Configurations** ([`Shard::reconfigure`]) change in order with the
+///   writes too: a `CONFIG` record at `(epoch, last seq)` switches the
+///   replica to the new epoch, at the same `seq` on every replica of a
+///   replicated shard (§5.1). A replicated shard changes by removing
+///   members (§6.4), and refuses client writes while it has fewer members
+///   than its `min_write_replicas`.
 ///
 /// Cloning a shard returns another handle to the same replica.
 pub struct Shard<D: Disk> {
@@ -257,7 +272,15 @@ impl<D: Disk> Shard<D> {
     /// log has no holes, so the records it holds, committed or not, are a
     /// prefix of the primary's.
     ///
+    /// A replica whose log holds records of an older epoch than `config`'s,
+    /// after its shard changed configuration while it was down, opens in
+    /// its log's epoch ([`Shard::sequencing`]) and switches to `config`'s at
+    /// the same `seq` as its primary: a member as its primary's sessions
+    /// show it ([`Shard::follow`]), a primary once every member has reported
+    /// its log ([`Shard::align`]).
+    ///
     /// # Errors
+
     ///
     /// As [`Shard::open`], and [`ShardError::Configuration`] if `node` is
     /// not a member of `config` or `config` has learners (plan M2-14).
@@ -285,6 +308,12 @@ impl<D: Disk> Shard<D> {
             run(&pool, &shard, move || index.read()?.applied(&key)).await?
         };
         let epoch = config.epoch;
+        // A replicated replica that holds records of an older epoch cannot
+        // tell alone where the new epoch starts: a member learns it from
+        // its primary's session, and a primary appends its `CONFIG` record
+        // once every member has reported its log (§5.1). Both open in the
+        // epoch of their last record, and align later.
+        let aligning = role != Role::Alone && applied.is_some_and(|a| a.epoch < epoch);
         let mut last = match applied {
             Some(applied) if applied.epoch > epoch => {
                 return Err(ShardError::configuration(
@@ -295,7 +324,7 @@ impl<D: Disk> Shard<D> {
             Some(applied) => applied,
             None => EpochSeq::new(Epoch::ZERO, Seq::ZERO),
         };
-        if applied.is_none_or(|applied| applied.epoch < epoch) {
+        if !aligning && applied.is_none_or(|applied| applied.epoch < epoch) {
             let record = LogRecord {
                 shard: shard.clone(),
                 position: EpochSeq::new(epoch, last.seq),
@@ -317,13 +346,15 @@ impl<D: Disk> Shard<D> {
             .checked_next()
             .ok_or_else(|| ShardError::configuration(&shard, "the shard's seq is exhausted"))?;
         let sequencer = Arc::new(Mutex::new(Sequencer {
-            next: EpochSeq::new(epoch, next),
+            next: EpochSeq::new(last.epoch, next),
             applied: last,
             role,
             serving: role == Role::Alone,
             session: 0,
             seals: 0,
             config: config.clone(),
+            node: node.cloned(),
+            adopt_after: None,
             stopped: None,
             writes: BTreeMap::new(),
             readers: BTreeMap::new(),
@@ -400,10 +431,19 @@ impl<D: Disk> Shard<D> {
         self.sequencer().applied
     }
 
-    /// The configuration the shard is in.
+    /// The newest configuration of the shard this replica knows. It
+    /// sequences in it once [`Shard::sequencing`] reaches its epoch.
     #[must_use]
     pub fn config(&self) -> ShardConfig {
         self.sequencer().config.clone()
+    }
+
+    /// The epoch the replica sequences records in: its configuration's,
+    /// unless it still aligns with its primary or members after learning a
+    /// newer one (§5.1).
+    #[must_use]
+    pub fn sequencing(&self) -> Epoch {
+        self.sequencer().next.epoch
     }
 
     /// Whether any seal is held.
@@ -576,23 +616,20 @@ impl<D: Disk> Shard<D> {
         let shard = self.shard();
         sequencer.check_serving(shard)?;
         sequencer.check_late(shard)?;
-        let client_write = match &body {
-            RecordBody::Put(_) | RecordBody::Delete(_) | RecordBody::Tags(_) => true,
-            RecordBody::Extent(_) => true,
-            RecordBody::MpuCreate(_)
-            | RecordBody::MpuPart(_)
-            | RecordBody::MpuComplete(_)
-            | RecordBody::MpuAbort(_) => true,
-            RecordBody::Config(_) | RecordBody::Truncate => {
-                return Err(ShardError::invalid(
-                    shard,
-                    "CONFIG and TRUNCATE records are appended by the replica itself",
-                ));
-            }
-            _ => false,
-        };
+        if matches!(body, RecordBody::Config(_) | RecordBody::Truncate) {
+            return Err(ShardError::invalid(
+                shard,
+                "CONFIG and TRUNCATE records are appended by the replica itself",
+            ));
+        }
+        let client_write = is_client_write(&body);
         if client_write && sequencer.seals > 0 {
             return Err(ShardError::Sealed(shard.clone()));
+        }
+        // A shard left with fewer members than `min_write_replicas` stays
+        // readable and refuses client writes (§6.4).
+        if client_write && let Some(error) = sequencer.under_replicated(shard) {
+            return Err(error);
         }
         let data = match &body {
             RecordBody::Put(Put { data, .. }) | RecordBody::MpuPart(MpuPart { data, .. }) => {
@@ -640,15 +677,24 @@ impl<D: Disk> Shard<D> {
     /// primary can roll forward records several members send it (§6.6).
     /// Returns whether the record was taken.
     ///
+    /// A record must be of the epoch the replica sequences in
+    /// ([`Shard::sequencing`]). A member that still sequences in an earlier
+    /// epoch than its configuration's takes that epoch's tail, and appends
+    /// its `CONFIG` record just before the first record of the new epoch,
+    /// or once it reaches its primary's `CONFIG` record (see
+    /// [`Shard::follow`]), so that it switches epochs at the same `seq` as
+    /// its primary (§5.1).
+    ///
     /// # Errors
     ///
-    /// [`ShardError::Configuration`] if `epoch` is not the shard's (rule
-    /// R2 refuses older ones; a newer one needs the configuration first),
-    /// or the session is not the current one; [`ShardError::InvalidRecord`]
-    /// if the record is of another shard, is a `CONFIG` or `TRUNCATE`, which
-    /// a replica appends for itself, is of another epoch than the shard's,
-    /// cannot be appended, or does not follow the last record held; [`ShardError::Unavailable`] if the shard
-    /// stopped.
+    /// [`ShardError::Configuration`] if `epoch` is not the epoch of the
+    /// shard's configuration (rule R2 refuses older ones; a newer one needs
+    /// the configuration first), or the session is not the current one;
+    /// [`ShardError::InvalidRecord`] if the record is of another shard, is a
+    /// `CONFIG` or `TRUNCATE`, which a replica appends for itself, is of
+    /// another epoch than the one the replica sequences in, cannot be
+    /// appended, or does not follow the last record held;
+    /// [`ShardError::Unavailable`] if the shard stopped.
     pub fn receive(
         &self,
         session: Option<u64>,
@@ -686,17 +732,32 @@ impl<D: Disk> Shard<D> {
             ));
         }
         let position = record.position;
+        let next = sequencer.next.seq;
+        // A replica still in an earlier epoch switches at the first record
+        // of its configuration's epoch: the primary that sequenced it
+        // appended its CONFIG record at the `seq` before. A member whose
+        // primary's CONFIG record is earlier than that holds records of
+        // the earlier epoch its primary does not, and never switches.
+        if !sequencer.is_aligned()
+            && position.epoch == ours
+            && position.seq == next
+            && sequencer
+                .adopt_after
+                .is_none_or(|after| sequencer.last_sequenced().seq <= after)
+        {
+            drop(self.adopt_locked(&mut sequencer)?);
+        }
         // The record's own epoch, not only the message's: a record of
         // another epoch would move the sequencer away from the
-        // configuration. Configurations are static, so every record a
-        // replica takes is of its epoch (§5.1).
-        if position.epoch != ours {
+        // configuration. Only the tail of the epoch a replica still
+        // sequences in can arrive in a session of a newer one (§5.1).
+        let sequencing = sequencer.next.epoch;
+        if position.epoch != sequencing {
             return Err(ShardError::invalid(
                 shard,
-                format!("the record at {position} is not of the replica's epoch {ours}"),
+                format!("the record at {position} is not of the replica's epoch {sequencing}"),
             ));
         }
-        let next = sequencer.next.seq;
         match position.seq.cmp(&next) {
             Ordering::Less => return Ok(false),
             Ordering::Greater => {
@@ -712,8 +773,91 @@ impl<D: Disk> Shard<D> {
             .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
         let body = record.body;
         drop(self.sequence(position, body, Some(encoded), lazy)?);
-        sequencer.next = EpochSeq::new(ours, after);
+        sequencer.next = EpochSeq::new(sequencing, after);
+        self.adopt_if_due(&mut sequencer)?;
         Ok(true)
+    }
+
+    /// Tells a member how far its primary has come, as the primary's
+    /// session reported it: the epoch the primary sequences in, and its
+    /// last `seq`. A member whose configuration is newer than the epoch it
+    /// sequences in, and whose primary sequences in that configuration's
+    /// epoch already, appends its own `CONFIG` record at the `seq` of the
+    /// primary's: before the first record of the new epoch, or once it
+    /// holds the primary's last record if all of them are of the earlier
+    /// epoch (§5.1). Anything else changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the shard stopped, and
+    /// [`ShardError::InvalidRecord`] if the `CONFIG` record cannot be
+    /// appended.
+    pub fn follow(&self, sequencing: Epoch, primary_last: Seq) -> Result<(), ShardError> {
+        let mut sequencer = self.sequencer();
+        sequencer.check_running(self.shard())?;
+        if sequencer.role != Role::Member || sequencer.is_aligned() {
+            return Ok(());
+        }
+        sequencer.adopt_after = (sequencing == sequencer.config.epoch).then_some(primary_last);
+        self.adopt_if_due(&mut sequencer)
+    }
+
+    /// Appends a member's `CONFIG` record once it holds every record up to
+    /// its primary's `CONFIG` record; the caller holds the sequencer's
+    /// lock. A member that holds records past it diverged from its primary
+    /// and never adopts: it refuses the new epoch's records, and its
+    /// primary removes it (§6.4).
+    fn adopt_if_due(&self, sequencer: &mut Sequencer) -> Result<(), ShardError> {
+        let due = sequencer.role == Role::Member
+            && !sequencer.is_aligned()
+            && sequencer.adopt_after == Some(sequencer.last_sequenced().seq);
+        if due {
+            drop(self.adopt_locked(sequencer)?);
+        }
+        Ok(())
+    }
+
+    /// Appends the `CONFIG` record of the replica's newest configuration at
+    /// `(epoch, last seq)`, after every record sequenced so far, and
+    /// sequences later records in its epoch (§10.1); the caller holds the
+    /// sequencer's lock. Returns what the record's writer waits on.
+    fn adopt_locked(&self, sequencer: &mut Sequencer) -> Result<WriteReceiver, ShardError> {
+        let config = sequencer.config.clone();
+        let position = EpochSeq::new(config.epoch, sequencer.last_sequenced().seq);
+        let reply = self.sequence(position, RecordBody::Config(config), None, false)?;
+        sequencer.next = EpochSeq::new(position.epoch, sequencer.next.seq);
+        sequencer.adopt_after = None;
+        Ok(reply)
+    }
+
+    /// Appends a primary's `CONFIG` record of its newest configuration, if
+    /// it does not sequence in it yet and every member of it has reported
+    /// its log in this life, so that no member holds a record of the
+    /// earlier epoch past it (§5.1). A primary's links call it as members
+    /// report. Returns whether it appended the record.
+    pub fn align(&self) -> bool {
+        self.align_now().is_some()
+    }
+
+    /// [`Shard::align`], returning what the record's writer waits on, if
+    /// the record was appended.
+    fn align_now(&self) -> Option<WriteReceiver> {
+        let leader = self.leader()?;
+        let config = self.config();
+        if !leader.synced_all(&config) {
+            return None;
+        }
+        let mut sequencer = self.sequencer();
+        if sequencer.config != config || sequencer.is_aligned() || sequencer.stopped.is_some() {
+            return None;
+        }
+        match self.adopt_locked(&mut sequencer) {
+            Ok(reply) => Some(reply),
+            Err(error) => {
+                tracing::warn!(shard = %self.shard(), %error, "appending a CONFIG record failed");
+                None
+            }
+        }
     }
 
     /// Starts a member's new session with its primary, after which appends
@@ -760,7 +904,7 @@ impl<D: Disk> Shard<D> {
         &self,
         after: Seq,
         through: Seq,
-    ) -> Result<Vec<(Seq, Bytes)>, ShardError> {
+    ) -> Result<Vec<(EpochSeq, Bytes)>, ShardError> {
         let shard = self.shard();
         let log = &self.inner.log;
         let failed = |error: &dyn fmt::Display| ShardError::unavailable(shard, error);
@@ -775,7 +919,7 @@ impl<D: Disk> Shard<D> {
                     && seq <= through
                     && !matches!(header.kind, RecordKind::Config | RecordKind::Truncate)
                 {
-                    found.insert(seq, record.bytes);
+                    found.insert(seq, (header.position, record.bytes));
                 }
             }
         }
@@ -786,7 +930,7 @@ impl<D: Disk> Shard<D> {
                 found.len()
             )));
         }
-        Ok(found.into_iter().collect())
+        Ok(found.into_values().collect())
     }
 
     /// Commits `body`, a record that names a key, if `check` accepts the
@@ -1047,7 +1191,7 @@ impl<D: Disk> Shard<D> {
     }
 
     /// Adopts `config`, a newer epoch of the shard, in order with its
-    /// writes, and returns once its `CONFIG` record is durable and applied.
+    /// writes.
     ///
     /// The `CONFIG` record takes the position `(epoch, last seq)`, after
     /// every record sequenced so far, and every later record is sequenced in
@@ -1057,14 +1201,46 @@ impl<D: Disk> Shard<D> {
     /// configuration the shard is in already changes nothing, even on a
     /// stopped shard.
     ///
+    /// On a replicated shard the configuration keeps its primary and adds
+    /// no member: it removes members (§6.4). The epoch must switch at the
+    /// same `seq` on every replica (§5.1), so:
+    ///
+    /// - **A primary** appends the record once every member of `config`
+    ///   has reported its log in this life, at once if they have, and
+    ///   returns once it is durable and applied; otherwise it returns at
+    ///   once, and its link to the last member to report appends it. The
+    ///   members `config` leaves out stop counting for commits and leases
+    ///   once the record is durable here ([`Leader`]), so the records they
+    ///   held back commit under the new epoch.
+    /// - **A member** returns at once, and appends the record where its
+    ///   primary's session shows the primary's is ([`Shard::follow`]).
+    ///   Meanwhile it refuses appends of the older epoch (rule R2).
+    ///
     /// # Errors
     ///
     /// [`ShardError::Configuration`] if `config` is of another shard, is
-    /// older than the shard's epoch, differs from the shard's configuration
-    /// in the same epoch, or cannot open (see [`Shard::open`]);
+    /// older than the shard's configuration, differs from it in the same
+    /// epoch, cannot open (see [`Shard::open`]), or makes a change a
+    /// replicated shard does not support: a new primary (plan M2-12), a new
+    /// member or a learner (M2-14), or this replica's removal;
     /// [`ShardError::Unavailable`] if the shard stopped, and otherwise as
     /// [`Shard::commit`].
     pub async fn reconfigure(&self, config: &ShardConfig) -> Result<(), ShardError> {
+        match self.begin_reconfigure(config)? {
+            Some(reply) => reply
+                .await
+                .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
+                .map(drop),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Shard::reconfigure`] up to its `CONFIG` record's append: returns
+    /// what the record's writer waits on, if the replica appended it now.
+    pub(crate) fn begin_reconfigure(
+        &self,
+        config: &ShardConfig,
+    ) -> Result<Option<WriteReceiver>, ShardError> {
         let shard = self.shard();
         let reply = {
             let mut sequencer = self.sequencer();
@@ -1075,7 +1251,7 @@ impl<D: Disk> Shard<D> {
                     format!("the configuration is of shard {target}"),
                 ));
             }
-            let epoch = sequencer.next.epoch;
+            let epoch = sequencer.config.epoch;
             match config.epoch.cmp(&epoch) {
                 Ordering::Less => {
                     return Err(ShardError::configuration(
@@ -1086,7 +1262,7 @@ impl<D: Disk> Shard<D> {
                         ),
                     ));
                 }
-                Ordering::Equal if *config == sequencer.config => return Ok(()),
+                Ordering::Equal if *config == sequencer.config => return Ok(None),
                 Ordering::Equal => {
                     return Err(ShardError::configuration(
                         shard,
@@ -1096,26 +1272,32 @@ impl<D: Disk> Shard<D> {
                 Ordering::Greater => {}
             }
             sequencer.check_running(shard)?;
-            if sequencer.role != Role::Alone {
-                return Err(ShardError::configuration(
-                    shard,
-                    "a replicated shard keeps its configuration: changes are not supported yet",
-                ));
+            if sequencer.role == Role::Alone {
+                if check_config(shard, config, sequencer.node.as_ref())? != Role::Alone {
+                    return Err(ShardError::configuration(
+                        shard,
+                        "a shard alone gains members only through learners (plan M2-14)",
+                    ));
+                }
+                sequencer.config = config.clone();
+                Some(self.adopt_locked(&mut sequencer)?)
+            } else {
+                sequencer.check_change(shard, config)?;
+                sequencer.config = config.clone();
+                sequencer.adopt_after = None;
+                None
             }
-            check_config(shard, config, None)?;
-            // `next.seq` is at least 1: opening starts it after the CONFIG
-            // record at `seq` 0 or later.
-            let last = Seq::new(sequencer.next.seq.get() - 1);
-            let position = EpochSeq::new(config.epoch, last);
-            let reply = self.sequence(position, RecordBody::Config(config.clone()), None, false)?;
-            sequencer.next = EpochSeq::new(config.epoch, sequencer.next.seq);
-            sequencer.config = config.clone();
-            reply
         };
-        reply
-            .await
-            .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
-            .map(drop)
+        Ok(reply.or_else(|| self.align_now()))
+    }
+
+    /// Stops a primary that learned it no longer leads the shard: its
+    /// register holds a configuration it cannot adopt (§6.5). Its writers
+    /// still waiting are not acknowledged.
+    pub(crate) fn depose(&self, reason: &str) {
+        let mut sequencer = self.sequencer();
+        sequencer.stopped.get_or_insert_with(|| reason.to_owned());
+        sequencer.subscriber = None;
     }
 
     /// Gives `body` the position `position` and queues its append, as
@@ -1290,23 +1472,51 @@ impl<D: Disk> Shard<D> {
     ///
     /// [`ShardError::Unavailable`] if the index fails.
     pub async fn summary(&self) -> Result<ShardSummary, ShardError> {
+        self.fold_entries(ShardSummary::default(), |mut summary, entry| {
+            summary.objects += u64::from(entry.object.is_some());
+            summary.unflushed += u64::from(!matches!(
+                entry.state,
+                EntryState::Clean | EntryState::Evicted
+            ));
+            summary
+        })
+        .await
+    }
+
+    /// The bytes of the object versions the shard holds, as of the writes
+    /// applied so far: what has fewer copies than `replicas` while the
+    /// shard has fewer members (`under_replicated_bytes`, §6.4).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn stored_bytes(&self) -> Result<u64, ShardError> {
+        self.fold_entries(0, |bytes: u64, entry| {
+            bytes.saturating_add(entry.object.as_ref().map_or(0, |object| object.size))
+        })
+        .await
+    }
+
+    /// Folds every entry of the shard into `init`, a page of entries per
+    /// index transaction.
+    async fn fold_entries<T: Send + 'static>(
+        &self,
+        init: T,
+        fold: impl Fn(T, &Entry) -> T + Send + 'static,
+    ) -> Result<T, ShardError> {
         let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
             let reader = index.read()?;
-            let mut summary = ShardSummary::default();
+            let mut folded = init;
             let mut after = None;
             loop {
                 let page = reader.entries(&shard, after.as_deref(), SUMMARY_PAGE)?;
                 for (_, entry) in &page {
-                    summary.objects += u64::from(entry.object.is_some());
-                    summary.unflushed += u64::from(!matches!(
-                        entry.state,
-                        EntryState::Clean | EntryState::Evicted
-                    ));
+                    folded = fold(folded, entry);
                 }
                 match page.into_iter().last() {
                     Some((key, _)) => after = Some(key),
-                    None => return Ok(summary),
+                    None => return Ok(folded),
                 }
             }
         })
@@ -1385,6 +1595,53 @@ impl Sequencer {
         self.check_role(shard)
     }
 
+    /// Whether the replica sequences in its newest configuration's epoch:
+    /// it appended that configuration's `CONFIG` record.
+    pub(crate) fn is_aligned(&self) -> bool {
+        self.next.epoch == self.config.epoch
+    }
+
+    /// The error a client write gets while the configuration has fewer
+    /// members, and so acknowledging copies, than its `min_write_replicas`
+    /// (§6.4), or `None`.
+    fn under_replicated(&self, shard: &ShardRef) -> Option<ShardError> {
+        let config = &self.config;
+        (config.members.len() < usize::from(config.min_write_replicas)).then(|| {
+            ShardError::UnderReplicated {
+                shard: shard.clone(),
+                copies: config.members.len(),
+                min_write_replicas: config.min_write_replicas,
+            }
+        })
+    }
+
+    /// Checks that a replicated shard supports changing to `config`, a
+    /// newer configuration: the same primary, no new member nor learner,
+    /// and this replica still a member (§6.4).
+    fn check_change(&self, shard: &ShardRef, config: &ShardConfig) -> Result<(), ShardError> {
+        let refuse = |reason: &str| Err(ShardError::configuration(shard, reason));
+        if config.primary != self.config.primary {
+            return refuse("a new primary takes over by reconciling (plan M2-12)");
+        }
+        if !config.learners.is_empty() {
+            return refuse("learners are not supported yet");
+        }
+        if !config.is_member(&config.primary) {
+            return refuse("the primary is not a member");
+        }
+        if config.members.iter().any(|m| !self.config.is_member(m)) {
+            return refuse("a member joins only as a learner (plan M2-14)");
+        }
+        if self
+            .node
+            .as_ref()
+            .is_some_and(|node| !config.is_member(node))
+        {
+            return refuse("this node is not a member");
+        }
+        Ok(())
+    }
+
     /// Checks that no write is late on a fail-fast shard: one timed out,
     /// and a record sequenced before it is not applied yet.
     fn check_late(&mut self, shard: &ShardRef) -> Result<(), ShardError> {
@@ -1434,6 +1691,22 @@ impl Sequencer {
         self.writes
             .retain(|_, position| *position > applied || oldest.is_some_and(|o| *position >= o));
     }
+}
+
+/// Whether `body` is a client write: what seals and too few members refuse
+/// (§4.1, §6.4). `FLUSHED`, `IMPORT`, and `ADOPT` are not.
+fn is_client_write(body: &RecordBody) -> bool {
+    matches!(
+        body,
+        RecordBody::Put(_)
+            | RecordBody::Delete(_)
+            | RecordBody::Tags(_)
+            | RecordBody::Extent(_)
+            | RecordBody::MpuCreate(_)
+            | RecordBody::MpuPart(_)
+            | RecordBody::MpuComplete(_)
+            | RecordBody::MpuAbort(_)
+    )
 }
 
 /// The key of the entry `body` changes: every record that names a key
@@ -1589,7 +1862,17 @@ impl PipelineTask {
     fn accept(&mut self, message: Message) {
         match message {
             Message::Sequenced { position, reply } => self.pipeline.sequenced(position, reply),
-            Message::Appended { position, result } => self.pipeline.resolved(position, result),
+            Message::Appended { position, result } => {
+                // A primary's CONFIG record of a configuration without some
+                // members is durable: the commit rule and the leases stop
+                // needing them (§6.4).
+                if let (Some(leader), Ok(durable)) = (&self.leader, &result)
+                    && let RecordBody::Config(config) = &durable.0.body
+                {
+                    leader.adopt(config);
+                }
+                self.pipeline.resolved(position, result);
+            }
             Message::Barrier(reply) => self.pipeline.barrier(reply),
             Message::Commit(seq) => self.pipeline.commit_through(seq),
             Message::Abandon(reply) => {
@@ -1644,7 +1927,10 @@ impl PipelineTask {
                     .into_iter()
                     .map(|(durable, reply)| (*durable, reply))
                     .unzip();
-                let positions: Vec<_> = records.iter().map(|(record, _)| record.position).collect();
+                let positions: Vec<_> = records
+                    .iter()
+                    .map(|(record, _)| (record.position, is_client_write(&record.body)))
+                    .collect();
                 let mut changes: BTreeMap<EpochSeq, Change> =
                     records.iter().filter_map(|(r, _)| change(r)).collect();
                 let index = Arc::clone(&self.index);
@@ -1661,13 +1947,14 @@ impl PipelineTask {
                         // they were applied may have scanned the index
                         // without them, so it must hear of them; one that
                         // subscribes later finds them in the index.
-                        let subscriber = {
+                        let (subscriber, under) = {
                             let mut sequencer = lock(&self.sequencer);
-                            if let Some(&last) = positions.last() {
+                            if let Some(&(last, _)) = positions.last() {
                                 sequencer.applied = last;
                                 sequencer.forget_applied();
                             }
-                            sequencer.subscriber.clone()
+                            let under = sequencer.under_replicated(&self.shard);
+                            (sequencer.subscriber.clone(), under)
                         };
                         // Every record is past the applied position, so none
                         // was skipped and each has an outcome.
@@ -1675,13 +1962,21 @@ impl PipelineTask {
                         if let Some(subscriber) = subscriber {
                             report(&subscriber, &outcomes, &mut changes);
                         }
-                        for (position, reply) in positions.into_iter().zip(replies) {
+                        for ((position, client), reply) in positions.into_iter().zip(replies) {
                             let committed = outcomes
                                 .remove(&position)
                                 .map(|outcome| Committed { position, outcome })
                                 .ok_or_else(|| {
                                     ShardError::unavailable(&self.shard, "a record was skipped")
                                 });
+                            // A client write that commits once too few
+                            // members are left had fewer copies than
+                            // min_write_replicas: applied, but not
+                            // acknowledged (§5.2, §6.4).
+                            let committed = match &under {
+                                Some(error) if client => Err(error.clone()),
+                                _ => committed,
+                            };
                             let _ = reply.send(committed);
                         }
                     }
@@ -1764,9 +2059,13 @@ impl<D: Disk> Appender<D> {
             Ok(encoded) => encoded,
             Err(error) => return self.resolved(position, Err(error.to_string())),
         };
-        if let Some(leader) = &self.leader {
-            leader.push(position.seq, encoded.clone(), lazy);
+        // Members append their CONFIG records for themselves.
+        if let Some(leader) = &self.leader
+            && !matches!(record.body, RecordBody::Config(_))
+        {
+            leader.push(position, encoded.clone(), lazy);
         }
+
         let class = SegmentClass::of(record.kind());
         if self.ordered && class != self.class {
             self.drain().await;
