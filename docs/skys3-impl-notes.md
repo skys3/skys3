@@ -526,6 +526,15 @@ of this file. A task with nothing unexpected keeps "None."
   loss can keep a later unacknowledged record without an earlier one.
   Replay applies what is there, which is correct with one replica. M2-07
   must queue a shard's records in order or rely on reconciliation (§6.6).
+- **Removing a shard must not be cancellable halfway.** Review found
+  that `ShardSet::remove` let the shard reopen while it still waited for
+  the old pipeline, and the removal then deleted the new shard's index
+  state. Holding a `Removing` slot fixes that only if the removal
+  finishes: a dropped `remove` would leave the old pipeline applying
+  records under a reopened shard. The removal therefore runs in its own
+  task. Review also found that `open` ignored a newer epoch on an open
+  shard; `Shard::reconfigure` now adopts it in order with writes, and a
+  different configuration in the same epoch is refused.
 - **Left open.** `Flushing` and `Conflict` have no record kind, so the
   flusher (M1-16) must keep those transitions out of the replayed index
   or make them replayable. Nothing flushes a `local` bucket in M1, so its
