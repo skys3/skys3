@@ -86,8 +86,10 @@ pub struct ShardStatus {
     pub oldest_pending: Option<Duration>,
     /// Keys held in conflict.
     pub conflicts: Vec<ConflictStatus>,
-    /// The latest error a flush attempt hit, if the key has not been
-    /// flushed since.
+    /// The latest error a flush attempt hit, as `key: error`, among the
+    /// keys whose flush has not got past its error since: a key's error is
+    /// cleared once a later attempt flushes or settles the key, or finds it
+    /// in conflict.
     pub last_error: Option<String>,
     /// Whether the flusher stopped, because its shard did.
     pub stopped: bool,
@@ -108,7 +110,11 @@ struct State {
     recording: HashMap<String, Remote>,
     dirty_bytes: u64,
     flushing: u64,
-    last_error: Option<String>,
+    /// The latest unresolved error of each key, numbered by when it
+    /// happened.
+    errors: HashMap<String, (u64, String)>,
+    /// The number of the next error.
+    next_error: u64,
     stopped: bool,
 }
 
@@ -180,6 +186,7 @@ impl State {
     /// which case it is dirty again from that version on.
     fn finished(&mut self, key: &str, dispatched: EpochSeq) {
         self.flushing -= 1;
+        self.errors.remove(key);
         let Some(tracked) = self.keys.get_mut(key) else {
             return;
         };
@@ -200,7 +207,7 @@ impl State {
     /// Ends the flush of `key` with a failure: it retries at `at`.
     fn failed(&mut self, key: &str, error: String, at: Instant) {
         self.flushing -= 1;
-        self.last_error = Some(format!("{key}: {error}"));
+        self.record_error(key, error);
         if let Some(tracked) = self.keys.get_mut(key) {
             tracked.phase = Phase::Backoff(at);
             self.backoff.insert((at, tracked.order), key.to_owned());
@@ -211,13 +218,21 @@ impl State {
     /// line.
     fn conflicted(&mut self, key: &str, conflict: Conflict) {
         self.flushing -= 1;
+        self.errors.remove(key);
         if let Some(tracked) = self.keys.get_mut(key) {
             self.pending.remove(&(tracked.since, key.to_owned()));
             tracked.phase = Phase::Conflict(conflict);
         }
     }
 
+    /// Records `error` as `key`'s latest.
+    fn record_error(&mut self, key: &str, error: String) {
+        self.errors.insert(key.to_owned(), (self.next_error, error));
+        self.next_error += 1;
+    }
+
     fn untrack(&mut self, key: &str) {
+        self.errors.remove(key);
         if let Some(tracked) = self.keys.remove(key) {
             self.dirty_bytes -= tracked.size;
             self.pending.remove(&(tracked.since, key.to_owned()));
@@ -229,7 +244,11 @@ impl State {
             flushing: self.flushing,
             dirty_bytes: self.dirty_bytes,
             oldest_pending: self.pending.first().map(|(since, _)| *since),
-            last_error: self.last_error.clone(),
+            last_error: self
+                .errors
+                .iter()
+                .max_by_key(|(_, (number, _))| *number)
+                .map(|(key, (_, error))| format!("{key}: {error}")),
             stopped: self.stopped,
             ..ShardStatus::default()
         };
@@ -540,7 +559,7 @@ fn recorded_flush(state: &Mutex<State>, (key, seq, result): Recorded) -> bool {
     }
     if let Err(error) = &result {
         tracing::warn!(key, %error, "a FLUSHED was not committed; the flusher stops");
-        state.last_error = Some(format!("{key}: {error}"));
+        state.record_error(&key, error.to_string());
     }
     result.is_ok()
 }

@@ -65,6 +65,7 @@ async fn assert_flushed(node: &Node, store: &SimS3, key: &str, object: &Multipar
 fn assert_quiet(flusher: &ShardFlusher, store: &SimS3) {
     let status = flusher.status();
     assert!(status.conflicts.is_empty(), "{status:?}");
+    assert_eq!(status.last_error, None);
     assert_eq!((status.dirty, status.dirty_bytes), (0, 0));
     assert!(store.uploads().is_empty(), "{:?}", store.uploads());
 }
@@ -175,8 +176,12 @@ fn uploads_that_fail_are_aborted() {
         })
         .await;
         assert!(store.uploads().is_empty());
+        // The failure is the key's error until the key is flushed.
+        let error = flusher.status().last_error.unwrap();
+        assert!(error.starts_with("a: "), "{error}");
         node.settle(&flusher).await;
         assert_flushed(&node, &store, "a", &first, "abc").await;
+        assert_eq!(flusher.status().last_error, None);
 
         // An abort that fails leaves the upload to the target, and the
         // next multipart flush aborts it first.

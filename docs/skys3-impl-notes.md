@@ -1066,6 +1066,30 @@ of this file. A task with nothing unexpected keeps "None."
   compare. With `x-amz-checksum-algorithm`, the copy stores that
   algorithm's checksum, reused from the source only when it is a
   full-object one. Design §11 records it.
+- **Writes could store and copy tags without the tagging actions.**
+  Review found that PutObject and CreateMultipartUpload with
+  `x-amz-tagging`, and CopyObject, needed only `s3:PutObject`, so a caller
+  denied `s3:PutObjectTagging` could still set tags, and one denied
+  `s3:GetObjectTagging` could copy a source's tags. As in S3, a write that
+  gives tags now also needs `s3:PutObjectTagging`, checked in the
+  operation's access hook, and a copy of a tagged source with the `COPY`
+  tagging directive also needs `s3:GetObjectTagging` on the source and
+  `s3:PutObjectTagging` on the copy. Whether the source has tags is known
+  only once the operation reads it, so the hook leaves its decision in a
+  `CopiedTags` extension, stripped from incoming requests like
+  `KeyDecisions`; the copy fails closed without it. An empty
+  `x-amz-tagging` still needs the action, and copies of untagged sources
+  need neither. The S3 documentation was unreachable from the sandbox; the
+  rule follows the AWS guidance that copying tagged objects needs both
+  tagging actions, and the SDK matrix (M1-25) should confirm it. The
+  authorization table gained rows for tagged writes and copies, and a test
+  checks that callers denied the tagging actions still write untagged
+  objects.
+- **A self-copy that only set a storage class or website redirect was
+  accepted and lost.** S3 counts either as a change, but SkyS3 stores
+  neither (PutObject accepts and ignores them, M1-09), so such a copy
+  answered success and changed nothing. It is now refused like any copy
+  onto itself that does not replace the metadata.
 - **Imported and adopted objects can carry a write identity.** Their
   metadata comes from the remote, so a `COPY` directive would have copied
   `x-amz-meta-skys3-wid` into the copy, naming another write. Copies drop
@@ -1505,6 +1529,26 @@ of this file. A task with nothing unexpected keeps "None."
   and not superseding the shard's own earlier writes. No fuzz target was
   added: the flusher parses nothing new (write identities go through the
   existing `WriteIdentity` parser).
+- **Subscribing cannot miss a write being applied (PR review).** The
+  apply pipeline used to take the shard's subscriber before applying a
+  batch. A flusher that subscribed and scanned while the batch was applied
+  then found the write neither in the index nor in its stream, and never
+  flushed it. The pipeline now takes the subscriber after the index holds
+  the batch, under the same lock that advances the applied position.
+  - A subscriber that was there by then hears of the write.
+  - A later subscriber's scan finds the write in the index.
+  - A write may reach a subscriber both ways; the flusher ignores a
+    version it already tracks.
+  - The test `a_subscription_during_an_apply_hears_of_it` holds the
+    index's write lock so that an apply stays in flight, then subscribes
+    and scans. It fails without the fix.
+- **Errors clear once their key gets past them (PR review).** The status
+  kept the latest flush error forever, even after its key had flushed.
+  The flusher now keeps each key's latest error. It drops that error when
+  a later attempt flushes or settles the key, or finds it in conflict or
+  awaiting multipart flush, and when the key is no longer tracked.
+  `last_error` is the newest error still held, so one key's recovery does
+  not hide another key that is still failing.
 - **Multipart objects wait for M1-16b.** The flusher's branch merges M1-12.
   A completed multipart object (`Payload::Parts`) cannot be flushed as one
   `PutObject`: that would give it an MD5 ETag rather than the multipart
@@ -1883,6 +1927,19 @@ of this file. A task with nothing unexpected keeps "None."
   that; the driver kills or crashes the disks before it crashes the host.
   A node with a failed sync is always restarted with a power loss, as
   M1-02 requires.
+- **Heals must end their own fault.** Review found that the driver's
+  heals were not scoped: the fallback power-loss restart of a failed sync
+  (the fence) also hit the process that replaced the failed one after a
+  crash or a supervisor restart, overlapping control-store windows that
+  ended out of start order removed the oldest one's effect instead of
+  their own, and the end of any message-loss window stopped all loss. The
+  driver now counts each node's processes and a fence applies only to
+  the process whose sync failed (moving to the next one if the node was
+  down when the sync failed), and each loss or control-store window has
+  an identity and ends on its own; what is in force is recomputed from
+  the windows still open. Overlapping loss windows give the highest rate,
+  as overlapping lost-response windows give the highest probability.
+  `Report::fences` counts the fences a run forced.
 - **A transient control-store error fails a node's start.**
   `Buckets::reload`, which `Gateway::new` calls, lists `buckets/` without
   retries, so one lost answer stops a starting node. The node binary has

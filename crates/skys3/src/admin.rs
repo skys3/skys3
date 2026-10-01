@@ -26,7 +26,8 @@
 //!   remote object's ETag and write identity;
 //! - `orphaned_uploads`: remote multipart uploads that flushes left open
 //!   and that wait to be aborted, as the metric of the same name;
-//! - `errors`: the latest flush error of each shard that has one.
+//! - `errors`: the latest flush error of each shard that has one, until
+//!   a later attempt gets its key past it.
 //!
 //! Placement (M3-03) adds shard members, and M4-06 its own fields.
 

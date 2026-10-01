@@ -761,3 +761,54 @@ fn a_pending_flushed_does_not_hold_up_conditional_writes() {
         );
     });
 }
+
+#[test]
+fn a_subscription_during_an_apply_hears_of_it() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        // Two pool threads: one for the held apply, one for the scan.
+        let pool = BlockingPool::new("index", std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+        let shard = Shard::open(
+            &config(&shard(0), 1),
+            node.log.clone(),
+            Arc::clone(&node.index),
+            pool,
+        )
+        .await
+        .unwrap();
+
+        // Hold the index's write lock, so the next apply waits for it.
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let index = Arc::clone(&node.index);
+        let holder = std::thread::spawn(move || {
+            index
+                .update_control(|_| {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        holding.recv().unwrap();
+        let writer = shard.clone();
+        let commit = tokio::spawn(async move { writer.commit(put("a", 3, 1)).await });
+        // The record becomes durable, and its apply waits for the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!commit.is_finished());
+
+        // A subscriber that scans now finds nothing: the write is not in
+        // the index yet, so it must be reported.
+        let mut changes = shard.subscribe();
+        assert!(shard.entries(None, 10).await.unwrap().is_empty());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let committed = commit.await.unwrap().unwrap();
+        assert!(committed.outcome.is_applied());
+        let change = changes.try_recv().expect("the write is reported");
+        assert_eq!(
+            (change.key.as_str(), change.position, change.size),
+            ("a", committed.position, Some(3))
+        );
+    });
+}
