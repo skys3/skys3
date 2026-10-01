@@ -1,9 +1,7 @@
 use std::sync::Mutex;
 
 use skys3_control::faults::{Fault, FaultRates, FaultyStore};
-use skys3_control::{
-    MemoryControlStore, TypedKey, Version, bootstrap, read, read_cluster,
-};
+use skys3_control::{MemoryControlStore, TypedKey, Version, bootstrap, read, read_cluster};
 use skys3_io::MonotonicClock;
 use skys3_types::{BucketId, Epoch, Generation, NodeId, ShardConfig, ShardId};
 

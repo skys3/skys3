@@ -165,10 +165,7 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
     /// Plans and applies changes until the tenure ends.
     async fn serve_tenure(&mut self) {
         while let Some(until) = self.tenure() {
-            let planned = self
-                .placement
-                .plan(&self.store, &mut self.proposals)
-                .await;
+            let planned = self.placement.plan(&self.store, &mut self.proposals).await;
             match planned {
                 Ok(Some(change)) if !change.is_empty() => {
                     if self.tenure().is_none() {

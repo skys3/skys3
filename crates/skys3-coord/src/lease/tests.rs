@@ -32,7 +32,13 @@ fn clock() -> Arc<dyn Clock> {
 
 fn elector<S: ControlStore>(store: S, n: u8, clock: &Arc<dyn Clock>) -> Elector<S> {
     let clock = Arc::clone(clock);
-    Elector::new(store, node(n), clock, config(), ProposalIds::seeded(n.into()))
+    Elector::new(
+        store,
+        node(n),
+        clock,
+        config(),
+        ProposalIds::seeded(n.into()),
+    )
 }
 
 async fn lease<S: ControlStore>(store: &S) -> Option<Versioned<CoordinatorLease>> {
@@ -288,7 +294,7 @@ async fn a_rejected_renewal_steps_down_at_once() {
     assert!(matches!(written, PutOutcome::Written(_)));
 
     let wake = first.round().await;
-        first.clock.sleep_until(wake).await;
+    first.clock.sleep_until(wake).await;
     let next = first.round().await;
     assert_eq!(first.leadership(), Leadership::Follower { holder: None });
     assert_eq!(next, first.clock.now());
@@ -358,7 +364,9 @@ async fn of_two_candidates_one_takes_over_and_the_other_follows_it() {
     // Both observe the same version now, so both are due together.
     second.round().await;
     third.round().await;
-    clock.sleep(config().takeover_after() + Duration::from_millis(1)).await;
+    clock
+        .sleep(config().takeover_after() + Duration::from_millis(1))
+        .await;
     second.round().await;
     third.round().await;
     let winner = lease(&store).await.unwrap().value.holder;
@@ -386,11 +394,18 @@ async fn an_unreadable_lease_is_read_again_later() {
     store.script([Fault::Unavailable]);
     let start = first.clock.now();
     let retry_at = first.round().await;
-    assert_eq!(retry_at, start.saturating_add(config().renew_interval() / 4));
+    assert_eq!(
+        retry_at,
+        start.saturating_add(config().renew_interval() / 4)
+    );
     assert_eq!(first.leadership(), Leadership::Follower { holder: None });
 
     // A takeover that gets no answer is retried later too.
-    store.script([Fault::Pass].into_iter().chain(std::iter::repeat_n(Fault::Unavailable, 3)));
+    store.script(
+        [Fault::Pass]
+            .into_iter()
+            .chain(std::iter::repeat_n(Fault::Unavailable, 3)),
+    );
     first.clock.sleep_until(retry_at).await;
     let retry_at = first.round().await;
     assert!(retry_at > first.clock.now());

@@ -392,8 +392,14 @@ impl<S: ControlStore> Elector<S> {
             },
         };
         let key = TypedKey::coordinator_lease();
-        let outcome =
-            propose_document(&self.store, &key, expected, &pending.lease, &self.config.retry).await;
+        let outcome = propose_document(
+            &self.store,
+            &key,
+            expected,
+            &pending.lease,
+            &self.config.retry,
+        )
+        .await;
         match outcome {
             Ok(ProposalOutcome::Accepted(version)) => Ok(Some((version, pending.sent))),
             Ok(ProposalOutcome::Rejected) => {

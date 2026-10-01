@@ -64,6 +64,5 @@ pub use change::{Applied, ChangeError, ChangeSet, Write, apply};
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
 pub use lease::{Elector, Leadership, LeaseConfig, LeaseConfigError};
 pub use push::{
-    Announce, ControlChanged, ControlHints, HintError, PUSH_IDLE_TIMEOUT, PushError, Pushed,
-    Pusher,
+    Announce, ControlChanged, ControlHints, HintError, PUSH_IDLE_TIMEOUT, PushError, Pushed, Pusher,
 };

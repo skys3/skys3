@@ -67,7 +67,10 @@ fn a_node_that_wrongly_believes_it_coordinates_only_competes() {
             .run(context, &workload(context), &FaultPlan::none())?;
         checked(&services)?;
         let made = services.changes();
-        assert!(made.iter().any(|change| change.stale), "the stale node changed nothing");
+        assert!(
+            made.iter().any(|change| change.stale),
+            "the stale node changed nothing"
+        );
         assert!(
             made.iter().any(|change| !change.stale),
             "the lease holder changed nothing"
@@ -122,7 +125,10 @@ fn coordinator_failover_delays_only_placement_work() {
         assert!(services.coordinators().len() >= 2);
         let pause = services.longest_pause(at.saturating_sub(interval * 2));
         let bound = lease.takeover_after() + lease.renew_interval() * 2 + interval * 3;
-        assert!(pause <= bound, "placement paused for {pause:?}, over {bound:?}");
+        assert!(
+            pause <= bound,
+            "placement paused for {pause:?}, over {bound:?}"
+        );
         pauses.push(pause);
 
         let failed = report.count(|o| matches!(o, Outcome::Failed | Outcome::Unknown));

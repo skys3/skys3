@@ -359,7 +359,12 @@ mod tests {
             .create(&shard_key(1), &shard(1, &mut ids))
             .unwrap();
         assert_eq!(change.writes().len(), 2);
-        assert!(change.writes().iter().all(|w| w.expected() == Expected::Absent));
+        assert!(
+            change
+                .writes()
+                .iter()
+                .all(|w| w.expected() == Expected::Absent)
+        );
         let applied = apply(&store, &cluster(), &change, &mut ids, &quick())
             .await
             .unwrap();

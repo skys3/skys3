@@ -106,7 +106,11 @@ fn frames_carry_the_generation_and_nothing_else() {
     malformed.header.body = Bytes::from_static(&[0x08]);
     let error = ControlChanged::from_frame(&malformed).unwrap_err();
     assert!(matches!(error, HintError::Malformed(_)), "{error}");
-    assert!(error.to_string().starts_with("malformed ControlChanged body"));
+    assert!(
+        error
+            .to_string()
+            .starts_with("malformed ControlChanged body")
+    );
 }
 
 proptest! {
@@ -151,7 +155,10 @@ async fn hints_keep_the_newest_generation() {
     assert_eq!(woken, Generation::new(5));
     assert_eq!(hints.latest(), Generation::new(5));
     // Already newer: no wait.
-    assert_eq!(hints.newer_than(Generation::new(4)).await, Generation::new(5));
+    assert_eq!(
+        hints.newer_than(Generation::new(4)).await,
+        Generation::new(5)
+    );
 }
 
 #[tokio::test]
@@ -227,7 +234,10 @@ async fn a_push_to_an_impostor_or_a_silent_node_fails() {
         .unwrap();
     assert!(pushed.delivered.is_empty());
     assert!(pushed.failed[&node(2)].contains("node-3"), "{pushed:?}");
-    assert!(pushed.failed[&node(5)].contains("no acknowledgement"), "{pushed:?}");
+    assert!(
+        pushed.failed[&node(5)].contains("no acknowledgement"),
+        "{pushed:?}"
+    );
     tokio::time::timeout(WAIT, pusher.announce(Generation::new(3)))
         .await
         .unwrap();
@@ -262,7 +272,10 @@ async fn a_node_refuses_anything_but_pushes() {
 
     // Anything else ends the connection.
     connection
-        .send(&Frame::new(Header::new(MessageKind::NodeHeartbeat), Bytes::new()))
+        .send(&Frame::new(
+            Header::new(MessageKind::NodeHeartbeat),
+            Bytes::new(),
+        ))
         .await
         .unwrap();
     let closed = tokio::time::timeout(WAIT, connection.recv()).await.unwrap();
@@ -276,7 +289,9 @@ async fn a_push_connection_ends_on_a_failed_handshake_or_an_answer_out_of_turn()
     let (addr, hints) = listening(&pki, 2).await;
     // A plain TCP client that sends garbage fails the handshake; the
     // listener keeps serving.
-    let mut stream = tokio::net::TcpStream::connect(addr.to_string()).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(addr.to_string())
+        .await
+        .unwrap();
     tokio::io::AsyncWriteExt::write_all(&mut stream, b"not tls")
         .await
         .unwrap();
@@ -309,5 +324,8 @@ async fn a_push_connection_ends_on_a_failed_handshake_or_an_answer_out_of_turn()
     let pushed = tokio::time::timeout(WAIT, pusher.push(Generation::new(4)))
         .await
         .unwrap();
-    assert!(pushed.failed[&node(6)].contains("unexpected answer"), "{pushed:?}");
+    assert!(
+        pushed.failed[&node(6)].contains("unexpected answer"),
+        "{pushed:?}"
+    );
 }

@@ -322,11 +322,7 @@ impl<S: NodeServices> CoordinatedServices<S> {
     /// # Errors
     ///
     /// The first announcement a running node did not hear of in time.
-    pub fn check_pushes(
-        &self,
-        bound: Duration,
-        restart: Duration,
-    ) -> Result<PushDelays, String> {
+    pub fn check_pushes(&self, bound: Duration, restart: Duration) -> Result<PushDelays, String> {
         let audit = self.audit();
         let (Some(first), Some(last)) = (audit.watched, audit.observed) else {
             return Err("observe did not run as an invariant".to_owned());
