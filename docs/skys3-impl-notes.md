@@ -3043,7 +3043,9 @@ of this file. A task with nothing unexpected keeps "None."
   from the control store, with a `primary_grace` shorter than
   `member_suspect_after` (not the defaults), can take over shards it
   cannot serve; the other members take them back a grace later. A
-  pre-vote would avoid that.
+  pre-vote would avoid that. Seals (`Shard::seal`, as DeleteBucket
+  places them) are a counter on the primary's replica only, so a new
+  primary from a takeover starts unsealed (M3-04).
 
 ## M3 Coordinator
 
