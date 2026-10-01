@@ -3065,3 +3065,100 @@ of this file. A task with nothing unexpected keeps "None."
   replacement (M3-05) removes them. Members that no registration
   describes count as domains of their own: nothing is known to share one
   with them.
+
+### M3-04 Automatic bucket and shard creation
+
+- **The gateway writes the registers, not the coordinator.** §4.1, §6.1,
+  and §11 already have CreateBucket write the bucket register from the
+  gateway, and §6.1's lost-answer rule names CreateBucket as the
+  proposer. Sending creations to the coordinator would have needed a new
+  request message, a wait on its tenure (seconds while the lease moves),
+  and a way to report the outcome back. The gateway instead reads the
+  node registrations, places the shards with M3-03's `Topology`, and
+  applies one `ChangeSet` through M3-01's change path: the bucket
+  register, then each shard register, all `If-None-Match: *`, one
+  generation increment. The cost: the gateway knows only registrations,
+  so every node counts as live and empty. Within a bucket the shards
+  still spread evenly (rendezvous ties); across buckets the load evens
+  out only with rebalancing (M3-06). Recorded in §11.
+- **The bucket register goes first, which reverses §11's single-node
+  order.** On one node, shards are opened before the register so a
+  bucket is never visible without them. Writing shard registers first on
+  a cluster would leave orphans whenever the name is taken, and a
+  creation cut short between the two would need a grace period before
+  anyone could tell an orphan from a creation in progress. With the
+  bucket register first, a lost name writes nothing, and every shard
+  register has a bucket register written before it. The coordinator's
+  `BucketShards` placement then finishes creations cut short (missing
+  shard registers) and deletes shard registers whose bucket ID no bucket
+  register names (left by DeleteBucket), acting only on what two
+  consecutive scans showed. Because `ClusterScan` lists `buckets/` before
+  `shards/`, the second scan's bucket listing comes after the first
+  scan's shard listing, so no timing assumption is needed. A creation
+  still in progress may look incomplete twice; the gateway and the
+  coordinator then race on `If-None-Match: *`, and the gateway keeps a
+  shard register another writer created and sends the rest. Recorded in
+  §6.7 and §11.
+- **A register that does not parse must stop deletions.** `ClusterScan`
+  skipped bucket registers it could not parse, so a bucket register of a
+  newer format would have made its shard registers look orphaned, and
+  the coordinator would have deleted them. The scan now counts what it
+  could not parse (`ClusterScan::unreadable`), and `BucketShards`
+  deletes nothing while that count is not zero.
+- **Settling a failed shard write can land it.** A test expected a shard
+  register whose write failed with an error to stay absent. `Fault::Fail`
+  counts as possibly applied, so `apply` keeps it as a `Pending`, and
+  `create_bucket` settles it, which sends it again and writes it. The
+  writes after it are never sent, and the coordinator completes the
+  bucket. The test now expects this.
+- **DeleteBucket is unchanged on the gateway; detaching drops shards in
+  two places.** The gateway seals, refuses, and deletes the bucket
+  register as before. The shard registers go when the coordinator deletes
+  them. Replicas go on the deleting node at once; other members drop
+  theirs only at their next start (startup recovery). Dropping them at
+  runtime when a node's catalog loses the bucket was left out: a catalog
+  read from the node's local copy can lag a bucket this gateway just
+  created, and removing shards on that evidence could lose data.
+- **Seals across nodes (§4.1 left them to this task).** A crashed
+  gateway's seals stay in place: lifting a seal without knowing whether
+  its delete applied could acknowledge a write into a deleted bucket. A
+  retried DeleteBucket through any gateway seals again (seals nest) and
+  finishes the deletion. Seals are not carried across a primary change.
+  That gap belongs with takeover (M2-12), and §4.1 says so.
+- **A policy the cluster cannot satisfy answers `400 InvalidRequest`.**
+  The design said only "rejected". S3 has no code for this. `503` would
+  have SDKs retry something that does not change until an operator adds
+  nodes.
+- **How the simulation shows it.** `ClusterConfig::create_buckets`
+  writes no bucket or shard registers. Instead, a client creates each
+  bucket through a different node's gateway (`ShardPlacement::Cluster`).
+  It retries on `503`, and accepts `409 BucketAlreadyOwnedByYou` after a
+  lost answer. It waits until every node answers HeadBucket. The workload
+  then sends every request to a random node. The services are
+  `CoordinatedServices<RoutedServices>`, with nodes that register
+  themselves and a coordinator running `BucketShards` in place of
+  M3-01's stand-in placement. The routing audit used to index the
+  static placement and now falls back to epoch 1 for created shards.
+  Without faults, no write fails, through a `local` and a `write_back`
+  bucket on four nodes with three replicas. Under control-store faults,
+  crashes, and message loss, the histories stay linearizable and
+  durable on every member. The fault-free scenario passed 40 seeds
+  and the faulty one 80 (`SKYS3_SIM_SEEDS` 256, and 1,024 from seed
+  1,000).
+- **Left for later.**
+  - **Binary wiring.** The node binary still serves every shard alone
+    (`ShardPlacement::Local`). It does not run the coordinator, register
+    nodes, or wire the transport (M2-08 and M3-01 notes). Switching it to
+    `ShardPlacement::Cluster` belongs with that wiring, and so does a
+    `failure_domain` from `[cluster]` for the gateway.
+  - **Announcing to other nodes.** A gateway's creation is announced only
+    by the generation. Only the coordinator pushes. So on S3 control
+    stores, other nodes learn of a new bucket within
+    `config_poll_interval` (30 s by default), and until then they answer
+    `404 NoSuchBucket` for it. The simulation polls every 500 ms. Pushing
+    from the gateway, or reading a missing bucket's register before
+    answering `404`, should come with the binary wiring.
+  - **Load-aware placement at creation.** See the first point.
+  - **Runtime dropping of a deleted bucket's replicas on other members**,
+    and the seal gaps above.
+

@@ -23,8 +23,12 @@
 //!   each request to its primary under crashes and partitions.
 //! - [`registry`]: nodes that join with nothing but their credentials, and
 //!   a coordinator that forgets a silent node only once no shard names it.
+//! - [`buckets`]: buckets created through a gateway, with their shards
+//!   placed on the registered nodes, serving reads and writes through
+//!   every node.
 
 mod acks;
+mod buckets;
 mod coordinator;
 mod crash;
 mod harness;
