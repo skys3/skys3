@@ -17,6 +17,11 @@ use crate::index::{Applier, Checkpoint, Index, LogState};
 /// How many records replay applies per commit.
 const REPLAY_BATCH: usize = 256;
 
+/// The records replay must apply, by shard: each record's position, and
+/// the disk, log, and location that hold it.
+type Pending<'a, D> =
+    BTreeMap<ShardRef, Vec<(EpochSeq, &'a Label, &'a SegmentLog<D>, RecordLocation)>>;
+
 /// What a replay did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReplayReport {
@@ -68,7 +73,8 @@ impl<D: Disk> Checkpointer<D> {
     /// appends anything: it reads each segment up to the length the log
     /// recovered. It skips the part of a segment that the index knows to be
     /// at or before every shard's applied position, decodes every record it
-    /// applies, and applies each shard's records in position order.
+    /// applies, and applies each shard's records in position order across
+    /// every disk, so a shard whose records span disks replays correctly.
     ///
     /// # Errors
     ///
@@ -81,44 +87,54 @@ impl<D: Disk> Checkpointer<D> {
         A: Applier + Send + Sync + 'static,
     {
         let mut report = ReplayReport::default();
+        let index = Arc::clone(&self.index);
+        let applied = self
+            .pool
+            .run(move || index.read()?.applied_positions())
+            .await??;
+        // Every disk is scanned before anything is applied: applying a
+        // shard's record advances its applied position, which would hide
+        // an earlier record of the shard on a disk not yet scanned.
+        let mut pending: Pending<'_, D> = BTreeMap::new();
         for (disk, log) in &self.logs {
-            let index = Arc::clone(&self.index);
-            let applied = self
-                .pool
-                .run(move || index.read()?.applied_positions())
-                .await??;
-            let pending = self.scan(disk, log, &applied, &mut report).await?;
-            for records in pending.into_values() {
-                for chunk in records.chunks(REPLAY_BATCH) {
-                    let mut batch = Vec::with_capacity(chunk.len());
-                    for &location in chunk {
-                        batch.push((read_record(log, location).await?, location));
-                    }
-                    let index = Arc::clone(&self.index);
-                    let applier = Arc::clone(&applier);
-                    report.applied += self
-                        .pool
-                        .run(move || index.apply(&*applier, &batch))
-                        .await??;
+            self.scan(disk, log, &applied, &mut pending, &mut report)
+                .await?;
+        }
+        for mut records in pending.into_values() {
+            // A shard's extents are in bulk segments and its other records
+            // in hot ones, possibly on several disks, so the scans find them
+            // in segment order, not position order. A record found on two
+            // disks is applied once: `Index::apply` skips the second.
+            records.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for chunk in records.chunks(REPLAY_BATCH) {
+                let mut batch = Vec::with_capacity(chunk.len());
+                for &(_, _, log, location) in chunk {
+                    batch.push((read_record(log, location).await?, location));
                 }
+                let index = Arc::clone(&self.index);
+                let applier = Arc::clone(&applier);
+                report.applied += self
+                    .pool
+                    .run(move || index.apply(&*applier, &batch))
+                    .await??;
             }
         }
         Ok(report)
     }
 
-    /// Reads the segments of `disk` that replay needs, and returns the
-    /// locations of the records to apply, by shard in position order. Updates
-    /// what the index knows about each segment.
-    async fn scan(
+    /// Reads the segments of `disk` that replay needs, adds the records to
+    /// apply to `pending`, and updates what the index knows about each
+    /// segment.
+    async fn scan<'a>(
         &self,
-        disk: &Label,
-        log: &SegmentLog<D>,
+        disk: &'a Label,
+        log: &'a SegmentLog<D>,
         applied: &BTreeMap<ShardRef, EpochSeq>,
+        pending: &mut Pending<'a, D>,
         report: &mut ReplayReport,
-    ) -> Result<BTreeMap<ShardRef, Vec<RecordLocation>>, IndexError> {
+    ) -> Result<(), IndexError> {
         let known = self.index.coverage_of(disk);
         let summaries = log.summaries();
-        let mut pending: BTreeMap<ShardRef, Vec<(EpochSeq, RecordLocation)>> = BTreeMap::new();
         let mut coverage = BTreeMap::new();
         for segment in log.segments() {
             let Some(summary) = summaries.get(&segment.id) else {
@@ -143,10 +159,12 @@ impl<D: Disk> Checkpointer<D> {
                 scanned.add(&header.shard, header.position, record.location.end());
                 let done = applied.get(&header.shard);
                 if done.is_none_or(|done| header.position > *done) {
-                    pending
-                        .entry(header.shard.clone())
-                        .or_default()
-                        .push((header.position, record.location));
+                    pending.entry(header.shard.clone()).or_default().push((
+                        header.position,
+                        disk,
+                        log,
+                        record.location,
+                    ));
                 }
             }
             if from < end {
@@ -159,19 +177,7 @@ impl<D: Disk> Checkpointer<D> {
             coverage.insert(segment.id, known_now);
         }
         self.index.set_coverage(disk, coverage);
-        Ok(pending
-            .into_iter()
-            .map(|(shard, mut records)| {
-                // A shard's extents are in bulk segments and its other
-                // records in hot ones, so the scan finds them in segment
-                // order, not position order.
-                records.sort_by_key(|&(position, _)| position);
-                (
-                    shard,
-                    records.into_iter().map(|(_, location)| location).collect(),
-                )
-            })
-            .collect())
+        Ok(())
     }
 
     /// Makes the index durable and releases the log segments that replay

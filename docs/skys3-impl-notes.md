@@ -455,6 +455,15 @@ of this file. A task with nothing unexpected keeps "None."
   position must mean that every earlier record of the shard was applied,
   `EXTENT` records included. The state machine cannot apply a small `PUT`
   while the extents of an earlier-sequenced upload are still unapplied.
+- **A shard's records can span a node's disks.** Review found that replay
+  ordered each shard's records within one disk at a time. A record on the
+  first disk could then advance the applied position past an earlier
+  record on a later disk, which replay skipped. Nothing in the design pins
+  a shard replica to one disk, so replay now collects every disk's
+  records before it orders each shard's. A unit test and the simulation,
+  which now runs some seeds with two disks, fail without the fix. The
+  location map names no disk yet; M1-13, which places replicas on disks,
+  must add it or keep a replica's payload on one disk (design §10.2).
 - **Entries name payload by position.** Payload named by node-local
   location would make entries differ between replicas. Entries name the
   record that holds the payload, and the location map resolves inline
