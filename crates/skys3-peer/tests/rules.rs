@@ -1,6 +1,7 @@
 //! The protocol's rules and limits, and which messages a session allows.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use skys3_peer::{
@@ -33,9 +34,12 @@ fn put(data: PutData, size: u64) -> Put {
     }
 }
 
+/// A commit of `key`, with a write identity no other commit has.
 fn commit(key: &str, write: Write) -> Commit {
+    static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
     Commit {
-        identity: identity(),
+        identity: format!("prod-us/b-7f3a/5/42.{seq}").parse().unwrap(),
         bucket: bucket(),
         key: key.to_owned(),
         precondition: Precondition::Absent,
@@ -286,7 +290,7 @@ fn inline_bytes_travel_only_in_batches() {
 }
 
 #[test]
-fn batches_hold_distinct_keys_within_the_limits() {
+fn batches_hold_distinct_keys_and_identities_within_the_limits() {
     refused(Message::Batch(Batch { items: vec![] }), "batch.items");
     let too_many = (0..=MAX_BATCH_ITEMS)
         .map(|i| commit(&i.to_string(), Write::Delete))
@@ -301,8 +305,23 @@ fn batches_hold_distinct_keys_within_the_limits() {
     let mut other_bucket = commit("k", Write::Delete);
     other_bucket.bucket = BucketName::new("other").unwrap();
     accepted(Message::Batch(Batch {
-        items: vec![inline("k", b"a"), other_bucket, inline("e", b"")],
+        items: vec![inline("k", b"a"), other_bucket.clone(), inline("e", b"")],
     }));
+    // Each item's APPLIED names it by its write identity alone, so two items
+    // of different keys may not share one.
+    let mut same_identity = inline("k", b"a");
+    same_identity.identity = other_bucket.identity.clone();
+    match Message::Batch(Batch {
+        items: vec![same_identity, other_bucket],
+    })
+    .encode()
+    {
+        Err(MessageError::Invalid { field, problem }) => {
+            assert_eq!(field, "batch.items");
+            assert!(problem.contains("write identity"), "{problem}");
+        }
+        other => panic!("expected a duplicate identity to be refused, got {other:?}"),
+    }
 
     let half = Bytes::from(vec![0; MAX_PAYLOAD_LEN as usize / 2 + 1]);
     let big = |key: &str| {

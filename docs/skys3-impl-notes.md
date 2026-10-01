@@ -1888,7 +1888,16 @@ of this file. A task with nothing unexpected keeps "None."
   its next import waits for the old task before reading the checkpoint.
   `shutdown_waits_for_a_checkpoint_write_in_flight` holds the pool with a
   blocking job while a write is queued; with the abort it fails, as
-  `shutdown` returns before the write lands.
+  `shutdown` returns before the write lands. Its first version expected
+  the hold to catch the second page and failed in CI on aarch64: under a
+  paused clock, the runtime advances time while it waits for the pool's
+  real thread, so a slow write lets the stream get pages further than
+  planned. The test now waits until the holding job runs, which means
+  every earlier write is done. It reads the checkpoint shown once the
+  stream is stuck behind the hold, and expects exactly the next page to
+  be stored when `shutdown` returns. It passed 200 runs alone and 200
+  more alongside eight parallel copies and the full test binary on four
+  cores.
 - **The discovery budget first counted every node as sampled.** Charging
   a level its worst case, a listing and 96 probes per node, before
   sending anything stopped discovery from listing twelve small folders.
@@ -3148,9 +3157,15 @@ of this file. A task with nothing unexpected keeps "None."
 - **Shortfalls are judged by healthy domains.** A shard is reported short
   when its members not on departing nodes span fewer than `replicas`
   domains, so a lost rack shows up once its nodes depart, before
-  replacement (M3-05) removes them. Members that no registration
-  describes count as domains of their own: nothing is known to share one
-  with them.
+  replacement (M3-05) removes them. Only members whose separation can be
+  shown count: on a registered node, not departing, with the label the
+  level needs. The first version counted an unlabeled or unregistered
+  member as a domain of its own, so two unlabeled members in a `rack`
+  cluster could make a shard look whole, contradicting the rule that an
+  unlabeled node cannot be shown to be apart from any other (found in
+  review). An unregistered member is a node the coordinator forgot,
+  which it does only after marking it departing, or one that never
+  joined, so it counts for nothing either.
 - **The `departing` mark arrived mid-task.** M3-02's review fix forgets a
   node in two rounds and marks its registration `departing` first. A
   `Candidate` built from a marked registration is `Departing` whether it
@@ -3292,3 +3307,13 @@ of this file. A task with nothing unexpected keeps "None."
   about 1,300 lines of non-test code, not counting comments. Most of it
   is the `prost` wire structs and the checked conversions to typed
   messages.
+- **Batch items could share a write identity (review).** `BATCH`
+  validation refused two items of the same key, but not two items of
+  different keys with the same write identity. Each item's `APPLIED`
+  names it only by its identity, and a destination treats a known
+  identity as a `COMMIT` replay. The second item could therefore get the
+  first one's stored result and never be applied. Validation now
+  refuses repeated identities too, on encode and decode. The proptest
+  batch generator gives each item a distinct identity. A proptest that
+  copies one item's identity onto another, and a rules test, both fail
+  without the check.

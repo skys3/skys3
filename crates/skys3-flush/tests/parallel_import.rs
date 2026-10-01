@@ -274,9 +274,9 @@ fn shutdown_waits_for_a_checkpoint_write_in_flight() {
         // Keys under the probe's scratch prefix are listed but never
         // imported, so a page uses the index only to store its
         // checkpoint, and a bucket with no shard open here has no flusher
-        // that could use it.
+        // that could use it. Far more pages than the test lets through.
         let scratch = ConditionalProbe::SCRATCH_DIR;
-        let keys: Vec<String> = (0..40).map(|n| format!("{scratch}k{n:02}")).collect();
+        let keys: Vec<String> = (0..990).map(|n| format!("{scratch}k{n:03}")).collect();
         let store = remote(95, &keys).await;
         let bucket = BucketDocument {
             bucket_id: BucketId::new("b-elsewhere").unwrap(),
@@ -285,7 +285,7 @@ fn shutdown_waits_for_a_checkpoint_write_in_flight() {
         let checkpoint = |service: &FlushService<SimS3, SimMount>| {
             service.status(&bucket.bucket_id).unwrap().import.checkpoint
         };
-        // One page of ten keys a second.
+        // About a page of ten keys a second, on the paused clock.
         let service = service(&store, 10, 10, 1);
         service
             .reconcile(std::slice::from_ref(&bucket), &node.set)
@@ -295,19 +295,39 @@ fn shutdown_waits_for_a_checkpoint_write_in_flight() {
             assert!(!patience.is_exhausted(), "{:?}", checkpoint(&service));
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let first = format!("{scratch}k09");
-        assert_eq!(
-            checkpoint(&service),
-            ImportCheckpoint::Running { after: Some(first) }
-        );
 
-        // Hold the index's pool, so the next page's checkpoint write waits
-        // in its queue, and let the next page come.
+        // Hold the index's pool with a job that runs once every job queued
+        // before it is done, and then blocks until the gate opens.
+        let (started, holding) = std::sync::mpsc::channel::<()>();
         let (open, gate) = std::sync::mpsc::channel::<()>();
         drop(node.pool.run(move || {
+            started.send(()).unwrap();
             let _ = gate.recv();
         }));
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let patience = Patience::new();
+        while holding.try_recv().is_err() {
+            assert!(!patience.is_exhausted(), "the pool never ran the hold");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Long enough for the stream to show what was stored before the
+        // hold and to queue its next page's checkpoint behind it, where it
+        // stays: the stream goes no further until that write is done.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let ImportCheckpoint::Running {
+            after: Some(before),
+        } = checkpoint(&service)
+        else {
+            panic!("the import ended: {:?}", checkpoint(&service));
+        };
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            checkpoint(&service),
+            ImportCheckpoint::Running {
+                after: Some(before.clone())
+            },
+            "a checkpoint was stored while the pool was held"
+        );
+
         let shutdown = service.shutdown();
         tokio::pin!(shutdown);
         let early = tokio::time::timeout(Duration::from_secs(5), &mut shutdown).await;
@@ -325,14 +345,14 @@ fn shutdown_waits_for_a_checkpoint_write_in_flight() {
         {
             assert!(!patience.is_exhausted(), "shutdown never finished");
         }
-        // The write landed before shutdown returned.
+        // The queued write, of the page after `before`, landed before
+        // shutdown returned, and nothing came after it.
+        let page = |key: &str| -> usize { key[key.len() - 3..].parse().unwrap() };
+        let next = format!("{scratch}k{:03}", page(&before) + 10);
         let stored = node.set.import_ranges(&bucket.bucket_id).await.unwrap();
-        let second = format!("{scratch}k19");
         assert_eq!(
             stored.map(|ranges| ranges.position()),
-            Some(ImportCheckpoint::Running {
-                after: Some(second)
-            })
+            Some(ImportCheckpoint::Running { after: Some(next) })
         );
     });
 }

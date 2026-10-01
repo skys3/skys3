@@ -67,7 +67,8 @@ pub struct BucketPolicy {
     /// When it has not, no shard can be made whole until capacity returns.
     pub placeable: bool,
     /// The shards with fewer than `replicas` members in separate domains,
-    /// counting no member on a departing node.
+    /// counting only members on registered nodes that are not departing
+    /// and carry the label `failure_domain` needs.
     pub short: Vec<ShortShard>,
     /// The shards with two or more members in one domain, which placement
     /// never does but relabeled nodes can cause.
@@ -81,7 +82,9 @@ pub struct ShortShard {
     pub shard: ShardId,
     /// Its members, by its register; empty if it has none.
     pub members: Vec<NodeId>,
-    /// The separate domains its members not departing are in.
+    /// The separate domains its members are known to be in: those on
+    /// registered nodes that are not departing and carry the label the
+    /// level needs.
     pub domains: usize,
 }
 
@@ -151,24 +154,25 @@ fn judge(
             .map(|config| config.members.clone())
             .unwrap_or_default();
         let mut by_domain: BTreeMap<Domain, Vec<NodeId>> = BTreeMap::new();
+        // Only a member whose separation can be shown counts: registered,
+        // not departing, and with the label the level needs. An unlabeled
+        // member may share a domain with any other, and an unregistered
+        // one is a node the coordinator forgot (or one that never joined),
+        // which no peer can rely on.
         let mut healthy = BTreeSet::new();
-        // A member whose domain is unknown (unregistered, or unlabeled)
-        // takes a domain of its own.
-        let mut unknown = 0_usize;
         for node in &members {
-            let Some(domain) = topology.domain(node) else {
-                unknown += 1;
+            let Some(candidate) = topology.get(node) else {
                 continue;
             };
-            let departing = topology
-                .get(node)
-                .is_some_and(|candidate| candidate.state == NodeState::Departing);
-            if !departing {
+            let Some(domain) = candidate.domain(topology.level()) else {
+                continue;
+            };
+            if candidate.state != NodeState::Departing {
                 healthy.insert(domain.clone());
             }
             by_domain.entry(domain).or_default().push(node.clone());
         }
-        let domains = healthy.len() + unknown;
+        let domains = healthy.len();
         if domains < usize::from(bucket.replicas) {
             policy.short.push(ShortShard {
                 shard,

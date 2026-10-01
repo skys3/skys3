@@ -155,14 +155,49 @@ fn losing_a_rack_leaves_buckets_unsatisfied_without_co_location() {
 }
 
 #[test]
-fn unregistered_members_count_as_domains_of_their_own() {
-    let topology = Topology::new(FailureDomain::Node, [candidate(0, 0), candidate(1, 0)]);
+fn unregistered_members_count_as_missing() {
+    // Three registered nodes, so the bucket is placeable; two of the
+    // shard's members are nodes no registration describes.
+    let topology = Topology::new(
+        FailureDomain::Node,
+        [candidate(0, 0), candidate(1, 0), candidate(2, 0)],
+    );
     let buckets = [bucket(1, 1, 3)];
     let report = report(&topology, &buckets, &[shard(1, 0, &[0, 7, 8])]);
     assert_eq!(report.unsatisfied.len(), 1);
     let bucket = &report.unsatisfied[0];
-    assert!(!bucket.placeable);
-    assert!(bucket.short.is_empty(), "{bucket:?}");
+    assert!(bucket.placeable);
+    let short: Vec<_> = bucket.short.iter().map(|s| (s.shard, s.domains)).collect();
+    assert_eq!(short, [(ShardId::new(0), 1)], "{bucket:?}");
+    assert!(bucket.co_located.is_empty());
+}
+
+#[test]
+fn unlabeled_members_count_as_missing() {
+    // Three racks, so a three-replica bucket is placeable; two of the
+    // shard's members lack rack labels, and a third, unlabeled and
+    // departing, counts for nothing either. Their separation cannot be
+    // shown, so the shard has one known domain, not three.
+    let mut unlabeled = [candidate(3, 0), candidate(4, 0), candidate(5, 0)];
+    for candidate in &mut unlabeled {
+        candidate.rack = None;
+    }
+    unlabeled[2].state = NodeState::Departing;
+    let topology = Topology::new(
+        FailureDomain::Rack,
+        [candidate(0, 0), candidate(1, 1), candidate(2, 2)]
+            .into_iter()
+            .chain(unlabeled),
+    );
+    let buckets = [bucket(1, 2, 3)];
+    let shards = [shard(1, 0, &[0, 3, 4]), shard(1, 1, &[0, 3, 5])];
+    let report = report(&topology, &buckets, &shards);
+    assert_eq!(report.unlabeled, [node(3), node(4)]);
+    let bucket = &report.unsatisfied[0];
+    assert!(bucket.placeable);
+    let short: Vec<_> = bucket.short.iter().map(|s| (s.shard, s.domains)).collect();
+    assert_eq!(short, [(ShardId::new(0), 1), (ShardId::new(1), 1)]);
+    assert!(bucket.co_located.is_empty());
 }
 
 #[test]
