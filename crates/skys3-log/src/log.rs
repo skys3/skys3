@@ -1,7 +1,7 @@
 //! The segment log: one disk's append-only segments, written by group
 //! commit and read back by location.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,17 +9,18 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use skys3_io::{Clock, Disk, SegmentFile};
+use skys3_types::EpochSeq;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::commit::{Committer, Request};
 use crate::config::LogConfig;
 use crate::record::{
     DecodeError, EncodeError, FieldError, LogRecord, MAX_HEADER_LEN, MAX_PAYLOAD_LEN, Problem,
-    RecordHeader,
+    RecordHeader, ShardRef,
 };
 use crate::recovery::{RecoveryError, RecoveryReport, recover};
 use crate::scan::SegmentScanner;
-use crate::segment::{RecordLocation, SegmentClass, SegmentId, SegmentInfo};
+use crate::segment::{RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentSummary};
 
 /// The longest record: the largest header plus the largest payload.
 pub const MAX_RECORD_LEN: u32 = MAX_HEADER_LEN + MAX_PAYLOAD_LEN;
@@ -134,9 +135,18 @@ impl Counters {
     }
 }
 
+/// What the log tracks for replay: each segment's summary, and the
+/// segments the index has released.
+#[derive(Debug, Default)]
+struct Tracking {
+    summaries: BTreeMap<SegmentId, SegmentSummary>,
+    released: BTreeSet<SegmentId>,
+}
+
 /// State shared by the log's handles and its committer.
 pub(crate) struct Shared<F> {
     segments: Mutex<BTreeMap<SegmentId, (SegmentClass, Arc<F>)>>,
+    tracking: Mutex<Tracking>,
     failure: OnceLock<Arc<io::Error>>,
     pub(crate) stats: Counters,
 }
@@ -148,8 +158,35 @@ impl<F: SegmentFile> Shared<F> {
         self.segments.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn tracking(&self) -> std::sync::MutexGuard<'_, Tracking> {
+        // Plain inserts and updates, as for `lock`.
+        self.tracking.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Adds segment `id`, whose bytes up to its current length were already
+    /// durable when the log learned of it: a recovered segment, or a new,
+    /// empty one.
     pub(crate) fn add_segment(&self, id: SegmentId, class: SegmentClass, file: Arc<F>) {
+        let len = file.len();
+        // The segment is listed before its summary, so a reader that takes
+        // summaries and then segments finds every summarized segment.
         self.lock().insert(id, (class, file));
+        self.tracking()
+            .summaries
+            .insert(id, SegmentSummary::starting_at(len));
+    }
+
+    /// Adds acknowledged records to their segments' summaries.
+    pub(crate) fn summarize<'a>(
+        &self,
+        records: impl IntoIterator<Item = (&'a ShardRef, EpochSeq, &'a RecordLocation)>,
+    ) {
+        let mut tracking = self.tracking();
+        for (shard, position, location) in records {
+            if let Some(summary) = tracking.summaries.get_mut(&location.segment) {
+                summary.add(shard, position, location.end());
+            }
+        }
     }
 
     pub(crate) fn last_segment(&self, class: SegmentClass) -> Option<(SegmentId, Arc<F>)> {
@@ -256,16 +293,15 @@ impl<D: Disk> SegmentLog<D> {
         clock: Arc<dyn Clock>,
     ) -> Result<(Self, RecoveryReport), RecoveryError> {
         let recovered = recover(&disk, &config).await?;
-        let segments = recovered
-            .segments
-            .into_iter()
-            .map(|(id, segment)| (id, (segment.class, segment.file)))
-            .collect();
         let shared = Arc::new(Shared {
-            segments: Mutex::new(segments),
+            segments: Mutex::default(),
+            tracking: Mutex::default(),
             failure: OnceLock::new(),
             stats: Counters::default(),
         });
+        for (id, segment) in recovered.segments {
+            shared.add_segment(id, segment.class, segment.file);
+        }
         let (requests, receiver) = mpsc::channel(QUEUE_LEN);
         let inline_max_bytes = config.inline_max_bytes;
         let committer = Committer::new(
@@ -303,7 +339,8 @@ impl<D: Disk> SegmentLog<D> {
         let class = SegmentClass::of(record.kind());
         self.check_inline(class, record.body.payload().len() as u64)?;
         let bytes = record.to_bytes()?;
-        self.submit(class, bytes).await
+        self.submit(class, bytes, record.shard.clone(), record.position)
+            .await
     }
 
     /// Appends one record that is already encoded, such as one received
@@ -328,7 +365,8 @@ impl<D: Disk> SegmentLog<D> {
         }
         let class = SegmentClass::of(header.kind);
         self.check_inline(class, header.payload_len.into())?;
-        self.submit(class, bytes).await
+        self.submit(class, bytes, header.shard, header.position)
+            .await
     }
 
     fn check_inline(&self, class: SegmentClass, payload_len: u64) -> Result<(), LogError> {
@@ -341,12 +379,20 @@ impl<D: Disk> SegmentLog<D> {
         Ok(())
     }
 
-    async fn submit(&self, class: SegmentClass, bytes: Bytes) -> Result<RecordLocation, LogError> {
+    async fn submit(
+        &self,
+        class: SegmentClass,
+        bytes: Bytes,
+        shard: ShardRef,
+        position: EpochSeq,
+    ) -> Result<RecordLocation, LogError> {
         self.check_in_service()?;
         let (reply, acknowledged) = oneshot::channel();
         let request = Request {
             class,
             bytes,
+            shard,
+            position,
             arrival: self.clock.now(),
             reply,
         };
@@ -399,7 +445,65 @@ impl<D: Disk> SegmentLog<D> {
     pub fn scan(&self, id: SegmentId) -> Result<SegmentScanner<D::File>, LogError> {
         self.check_in_service()?;
         let file = self.shared.file(id).ok_or(LogError::UnknownSegment(id))?;
-        Ok(SegmentScanner::new(file, id))
+        let end = file.len();
+        Ok(SegmentScanner::new(file, id, 0, end))
+    }
+
+    /// Returns a scanner over the records of segment `id` from offset
+    /// `from`, which must be where a record starts, to offset `to`, or to
+    /// the segment's current length if that is shorter.
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentLog::scan`].
+    pub fn scan_range(
+        &self,
+        id: SegmentId,
+        from: u64,
+        to: u64,
+    ) -> Result<SegmentScanner<D::File>, LogError> {
+        self.check_in_service()?;
+        let file = self.shared.file(id).ok_or(LogError::UnknownSegment(id))?;
+        let end = file.len().min(to);
+        Ok(SegmentScanner::new(file, id, from.min(end), end))
+    }
+
+    /// Returns the summary of each segment the log holds and the index has
+    /// not released, in id order (see [`SegmentSummary`]).
+    #[must_use]
+    pub fn summaries(&self) -> BTreeMap<SegmentId, SegmentSummary> {
+        let tracking = self.shared.tracking();
+        tracking
+            .summaries
+            .iter()
+            .filter(|(id, _)| !tracking.released.contains(id))
+            .map(|(&id, summary)| (id, summary.clone()))
+            .collect()
+    }
+
+    /// Records that replay no longer needs segments `ids`: every record in
+    /// them is behind the index's durable checkpoint (§10.2). A release
+    /// lasts until the log is reopened, after which the index releases the
+    /// segments again from its checkpoint. Ids the log does not hold are
+    /// ignored.
+    ///
+    /// Only released segments may be reclaimed (§10.3, M1-22), and
+    /// reclaiming must still keep the payload the index references.
+    pub fn release(&self, ids: impl IntoIterator<Item = SegmentId>) {
+        let held = self.shared.lock();
+        let mut tracking = self.shared.tracking();
+        for id in ids {
+            if held.contains_key(&id) {
+                tracking.released.insert(id);
+                tracking.summaries.remove(&id);
+            }
+        }
+    }
+
+    /// Returns the segments the index has released since the log opened.
+    #[must_use]
+    pub fn released(&self) -> BTreeSet<SegmentId> {
+        self.shared.tracking().released.clone()
     }
 
     /// Returns the log's segments in id order, which is creation order.

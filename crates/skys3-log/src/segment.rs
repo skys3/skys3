@@ -7,9 +7,12 @@
 //! order segments by creation and an id names one segment even without its
 //! class. Fixed-width ids also sort file names in id order.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::record::RecordKind;
+use skys3_types::EpochSeq;
+
+use crate::record::{RecordKind, ShardRef};
 
 /// The class of a segment, which decides the records it holds (§10.1).
 ///
@@ -191,6 +194,72 @@ pub struct SegmentInfo {
     /// written or recovered. Records in the last bytes may still await a
     /// group commit.
     pub len: u64,
+}
+
+/// The highest log position of each shard among a run of durable records
+/// in one segment: what the index needs to know to decide whether replay
+/// still needs those records (§10.2).
+///
+/// The run starts at `start` and ends at `end`. The log keeps one summary
+/// per segment for the records it acknowledges while open: a segment it
+/// recovered starts its summary at its recovered length, and a new segment
+/// at zero. Every summarized record was durable when it was added, so a
+/// crash cannot take it away.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentSummary {
+    /// Where the summarized run starts.
+    pub start: u64,
+    /// Where it ends: the end of its last record.
+    pub end: u64,
+    /// The highest position of each shard's records in the run.
+    pub positions: BTreeMap<ShardRef, EpochSeq>,
+}
+
+impl SegmentSummary {
+    /// Returns an empty summary of a run starting at `offset`.
+    #[must_use]
+    pub fn starting_at(offset: u64) -> Self {
+        Self {
+            start: offset,
+            end: offset,
+            positions: BTreeMap::new(),
+        }
+    }
+
+    /// Adds a record of `shard` at `position` that ends at `end`.
+    pub fn add(&mut self, shard: &ShardRef, position: EpochSeq, end: u64) {
+        self.end = self.end.max(end);
+        match self.positions.get_mut(shard) {
+            Some(highest) => *highest = (*highest).max(position),
+            None => {
+                self.positions.insert(shard.clone(), position);
+            }
+        }
+    }
+
+    /// Merges `other`, a summary of a run of the same segment that starts
+    /// within this run or where it ends, so that this summary covers both.
+    /// Each summary's positions bound its own run, so their maxima bound the
+    /// union. Returns `false`, changing nothing, if the runs leave a gap.
+    pub fn merge(&mut self, other: &Self) -> bool {
+        if other.start < self.start || other.start > self.end {
+            return false;
+        }
+        for (shard, &position) in &other.positions {
+            self.add(shard, position, other.end);
+        }
+        self.end = self.end.max(other.end);
+        true
+    }
+
+    /// Returns whether every summarized record is at or before its shard's
+    /// position in `applied`, which returns `None` for a shard that has
+    /// applied nothing.
+    pub fn is_behind(&self, applied: impl Fn(&ShardRef) -> Option<EpochSeq>) -> bool {
+        self.positions
+            .iter()
+            .all(|(shard, &position)| applied(shard).is_some_and(|done| position <= done))
+    }
 }
 
 #[cfg(test)]

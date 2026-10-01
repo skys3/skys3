@@ -27,6 +27,6 @@ pub mod pool;
 pub mod wall;
 
 pub use clock::{Clock, Drift, MonoTime, MonotonicClock};
-pub use disk::{Disk, RealDisk, SegmentFile, SimDisk, SimDiskFaults, SimMount};
+pub use disk::{Disk, RealDisk, SegmentFile, SimBlockFile, SimDisk, SimDiskFaults, SimMount};
 pub use pool::{BlockingPool, PoolClosed};
 pub use wall::{ManualWallClock, SystemWallClock, WallClock};

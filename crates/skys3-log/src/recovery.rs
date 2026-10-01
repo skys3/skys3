@@ -210,7 +210,7 @@ async fn cut_torn_tail<F: SegmentFile>(
     segment: SegmentId,
     config: &LogConfig,
 ) -> Result<Option<TornTail>, RecoveryError> {
-    let mut scanner = SegmentScanner::new(Arc::clone(file), segment);
+    let mut scanner = SegmentScanner::new(Arc::clone(file), segment, 0, file.len());
     let (offset, reason) = loop {
         match scanner.next().await {
             Ok(Some(_)) => {}
