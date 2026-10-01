@@ -751,6 +751,11 @@ impl<D: Disk> Shard<D> {
     /// The shard's flusher follows it (§7.1). A shard has one subscriber; a
     /// new subscription replaces the previous one, whose stream then ends.
     /// The stream also ends when the shard stops.
+    ///
+    /// A write is either in the index when `subscribe` returns or reported
+    /// to the new subscriber, also while it is being applied, so a scan
+    /// that starts after `subscribe` returns, together with the stream,
+    /// misses none. A write may show in both.
     pub fn subscribe(&self) -> mpsc::UnboundedReceiver<Change> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let mut sequencer = self.sequencer();
@@ -1071,11 +1076,8 @@ impl PipelineTask {
                     .map(|(durable, reply)| (*durable, reply))
                     .unzip();
                 let positions: Vec<_> = records.iter().map(|(record, _)| record.position).collect();
-                let subscriber = lock(&self.sequencer).subscriber.clone();
-                let mut changes: BTreeMap<EpochSeq, Change> = match &subscriber {
-                    Some(_) => records.iter().filter_map(|(r, _)| change(r)).collect(),
-                    None => BTreeMap::new(),
-                };
+                let mut changes: BTreeMap<EpochSeq, Change> =
+                    records.iter().filter_map(|(r, _)| change(r)).collect();
                 let index = Arc::clone(&self.index);
                 let applied = run(&self.pool, &self.shard, move || {
                     let recorder = Recorder::default();
@@ -1085,11 +1087,19 @@ impl PipelineTask {
                 .await;
                 match applied {
                     Ok(outcomes) => {
-                        if let Some(&last) = positions.last() {
+                        // The subscriber is the one there is now, after the
+                        // index holds the records: one that subscribed while
+                        // they were applied may have scanned the index
+                        // without them, so it must hear of them; one that
+                        // subscribes later finds them in the index.
+                        let subscriber = {
                             let mut sequencer = lock(&self.sequencer);
-                            sequencer.applied = last;
-                            sequencer.forget_applied();
-                        }
+                            if let Some(&last) = positions.last() {
+                                sequencer.applied = last;
+                                sequencer.forget_applied();
+                            }
+                            sequencer.subscriber.clone()
+                        };
                         // Every record is past the applied position, so none
                         // was skipped and each has an outcome.
                         let mut outcomes: BTreeMap<_, _> = outcomes.into_iter().collect();

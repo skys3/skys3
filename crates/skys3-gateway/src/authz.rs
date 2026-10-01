@@ -25,6 +25,17 @@
 //! - CopyObject also needs its [`source_actions`], `s3:GetObject`, on the
 //!   object `x-amz-copy-source` names, so a copy reads nothing its caller
 //!   could not GET. UploadPartCopy will need the same (plan M4-05).
+//! - Tags take their own actions, as in S3, so a caller denied them cannot
+//!   reach them through a write. PutObject, CreateMultipartUpload, and a
+//!   CopyObject with the `REPLACE` tagging directive that carry
+//!   `x-amz-tagging` also need [`TAG_WRITE_ACTIONS`], `s3:PutObjectTagging`,
+//!   on their object. A CopyObject with the `COPY` tagging directive, the
+//!   default, copies its source's tags, which needs [`TAG_READ_ACTIONS`],
+//!   `s3:GetObjectTagging`, on the source and `s3:PutObjectTagging` on the
+//!   copy. Only the operation knows whether the source has tags, so the hook
+//!   leaves its decision in a [`CopiedTags`] request extension, and a copy
+//!   of a tagged source that its caller may not copy tags of answers
+//!   `403 AccessDenied`.
 //! - DeleteObjects names a bucket in its path but deletes the keys its body
 //!   lists, so it is authorized key by key ([`is_per_key`]): each key needs
 //!   `s3:DeleteObject` on `arn:aws:s3:::bucket/key`. A key its caller may
@@ -37,7 +48,10 @@ use std::sync::Arc;
 
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
-use s3s::dto::{CopyObjectInput, CopySource, DeleteObjectsInput};
+use s3s::dto::{
+    CopyObjectInput, CopySource, CreateMultipartUploadInput, DeleteObjectsInput, PutObjectInput,
+    TaggingDirective,
+};
 use s3s::path::S3Path;
 use s3s::{S3Error, S3Request, S3Result, s3_error};
 use skys3_types::policy::{Decision, Policy, RequestContext, S3_ARN_PREFIX};
@@ -358,6 +372,30 @@ pub fn source_actions(operation: &str) -> Option<&'static [&'static str]> {
     (operation == "CopyObject").then_some(&["s3:GetObject"])
 }
 
+/// The IAM actions a write needs on its object, besides its
+/// [`s3_actions`], to store the tags its `x-amz-tagging` header gives, or,
+/// for a copy, its source's tags.
+pub const TAG_WRITE_ACTIONS: &[&str] = &["s3:PutObjectTagging"];
+
+/// The IAM actions a CopyObject needs on its source, besides its
+/// [`source_actions`], to copy the source's tags.
+pub const TAG_READ_ACTIONS: &[&str] = &["s3:GetObjectTagging"];
+
+/// Whether the caller of a CopyObject with the `COPY` tagging directive may
+/// copy its source's tags: [`TAG_READ_ACTIONS`] on the source and
+/// [`TAG_WRITE_ACTIONS`] on the copy. The access hook sets it; a copy that
+/// finds none refuses a tagged source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CopiedTags(bool);
+
+impl CopiedTags {
+    /// Whether the caller may copy the source's tags.
+    #[must_use]
+    pub fn allowed(self) -> bool {
+        self.0
+    }
+}
+
 /// Which keys of a DeleteObjects request its caller may delete, in the
 /// order of the request's `<Object>` elements. The access hook sets it; an
 /// operation that finds none deletes nothing.
@@ -380,6 +418,11 @@ pub fn resource_arn(path: &S3Path) -> String {
         S3Path::Bucket { bucket } => format!("{S3_ARN_PREFIX}{bucket}"),
         S3Path::Object { bucket, key } => format!("{S3_ARN_PREFIX}{bucket}/{key}"),
     }
+}
+
+/// The ARN of an object.
+fn object_arn(bucket: &str, key: &str) -> String {
+    format!("{S3_ARN_PREFIX}{bucket}/{key}")
 }
 
 /// The answer to a request its caller may not make. It says no more than
@@ -444,6 +487,31 @@ impl Access {
     pub(crate) fn new(anonymous: Option<Permissions>) -> Self {
         Self { anonymous }
     }
+
+    /// Authorizes the [`TAG_WRITE_ACTIONS`] on `resource` of a write that
+    /// gives tags (`tagged`).
+    fn tags_given(
+        &self,
+        extensions: &http::Extensions,
+        operation: &str,
+        tagged: bool,
+        resource: &str,
+    ) -> S3Result<()> {
+        if !tagged {
+            return Ok(());
+        }
+        let principal = extensions
+            .get::<Authenticated>()
+            .map(|caller| &caller.principal);
+        let actions = Some(TAG_WRITE_ACTIONS);
+        authorize_actions(
+            principal,
+            self.anonymous.as_ref(),
+            operation,
+            actions,
+            resource,
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -474,19 +542,58 @@ impl S3Access for Access {
                  access points and outposts are not supported"
             ));
         };
-        let resource = format!("{S3_ARN_PREFIX}{bucket}/{key}");
+        let source = object_arn(bucket, key);
+        let destination = object_arn(&req.input.bucket, &req.input.key);
         let principal = req
             .extensions
             .get::<Authenticated>()
             .map(|caller| &caller.principal);
+        let anonymous = self.anonymous.as_ref();
         let operation = "CopyObject";
         let actions = source_actions(operation);
-        authorize_actions(
-            principal,
-            self.anonymous.as_ref(),
-            operation,
-            actions,
-            &resource,
+        authorize_actions(principal, anonymous, operation, actions, &source)?;
+        let replaces = req
+            .input
+            .tagging_directive
+            .as_ref()
+            .is_some_and(|directive| directive.as_str() == TaggingDirective::REPLACE);
+        if replaces {
+            if req.input.tagging.is_some() {
+                let actions = Some(TAG_WRITE_ACTIONS);
+                authorize_actions(principal, anonymous, operation, actions, &destination)?;
+            }
+        } else {
+            // Any other directive is refused by the operation; until then it
+            // is taken as `COPY`, which needs the most.
+            let read = Some(TAG_READ_ACTIONS);
+            let write = Some(TAG_WRITE_ACTIONS);
+            let allowed = authorize_actions(principal, anonymous, operation, read, &source).is_ok()
+                && authorize_actions(principal, anonymous, operation, write, &destination).is_ok();
+            req.extensions.insert(CopiedTags(allowed));
+        }
+        Ok(())
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        req: &mut S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<()> {
+        let input = &req.input;
+        self.tags_given(
+            &req.extensions,
+            "CreateMultipartUpload",
+            input.tagging.is_some(),
+            &object_arn(&input.bucket, &input.key),
+        )
+    }
+
+    async fn put_object(&self, req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+        let input = &req.input;
+        self.tags_given(
+            &req.extensions,
+            "PutObject",
+            input.tagging.is_some(),
+            &object_arn(&input.bucket, &input.key),
         )
     }
 
@@ -502,7 +609,7 @@ impl S3Access for Access {
             .objects
             .iter()
             .map(|object| {
-                let resource = format!("{S3_ARN_PREFIX}{bucket}/{}", object.key);
+                let resource = object_arn(bucket, &object.key);
                 let operation = "DeleteObjects";
                 authorize(principal, self.anonymous.as_ref(), operation, &resource).is_ok()
             })

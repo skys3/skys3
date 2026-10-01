@@ -24,15 +24,21 @@
 //!   request's; `REPLACE` takes them from the request, with PutObject's
 //!   limits. A write identity the source carries is never copied (§7.2).
 //! - **Tags** (`x-amz-tagging-directive`): `COPY`, the default, keeps the
-//!   source's tags; `REPLACE` takes `x-amz-tagging`, or none.
+//!   source's tags; `REPLACE` takes `x-amz-tagging`, or none. Copying a
+//!   tagged source's tags needs `s3:GetObjectTagging` on the source and
+//!   `s3:PutObjectTagging` on the copy, which the access hook decided
+//!   ([`CopiedTags`]); without them the copy answers `403 AccessDenied`.
 //! - **Conditions.** `x-amz-copy-source-if-match`,
 //!   `-if-none-match`, `-if-modified-since`, and `-if-unmodified-since` are
 //!   evaluated against the source as a GET evaluates its conditions, except
 //!   that every failure answers `412 PreconditionFailed`. `If-Match` and
 //!   `If-None-Match: *` apply to the destination as on PutObject.
-//! - **Refusals, as in S3.** A copy of an object onto itself that changes
-//!   neither its metadata nor its storage class nor its website redirect
-//!   is `400 InvalidRequest`. A version ID other than `null` is
+//! - **Refusals, as in S3.** A copy of an object onto itself that does not
+//!   replace its metadata is `400 InvalidRequest`. S3 also takes a new
+//!   storage class or website redirect as a change, but SkyS3 stores
+//!   neither (a PutObject's are accepted and ignored), so such a copy would
+//!   change nothing and is refused too, rather than answer success for a
+//!   change it drops. A version ID other than `null` is
 //!   `400 InvalidArgument`, and a source larger than 5 GiB
 //!   `400 InvalidRequest`. Copying a byte range is UploadPartCopy, a
 //!   multipart operation.
@@ -49,6 +55,7 @@ use skys3_types::{BucketDocument, ETag, EpochSeq, VersionIdentity, WriteIdentity
 use super::tagging::parse_tagging_header;
 use super::upload::Upload;
 use super::{MAX_OBJECT_BYTES, Objects, USER_METADATA_PREFIX, download, metadata_of, now_ms};
+use crate::authz::{CopiedTags, access_denied};
 use crate::buckets::shard_error;
 use crate::checksum::{DEFAULT_ALGORITHM, Digests, PooledHasher, parse_algorithm};
 use crate::conditions::{
@@ -110,6 +117,10 @@ impl<H: Shards> Objects<H> {
         source_bucket: &BucketDocument,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<CopyObjectOutput> {
+        let tags_allowed = req
+            .extensions
+            .get::<CopiedTags>()
+            .is_some_and(|copied| copied.allowed());
         let input = req.input;
         let (_, source_key) = copy_source(&input)?;
         let source_key = source_key.to_owned();
@@ -121,12 +132,10 @@ impl<H: Shards> Objects<H> {
             input.tagging_directive.as_ref().map(|d| d.as_str()),
             "tagging",
         )?;
+        // A storage class or website redirect is not stored, so a copy onto
+        // itself that only sets one would change nothing.
         let onto_itself = bucket.bucket_id == source_bucket.bucket_id && input.key == source_key;
-        if onto_itself
-            && metadata_directive == Directive::Copy
-            && input.storage_class.is_none()
-            && input.website_redirect_location.is_none()
-        {
+        if onto_itself && metadata_directive == Directive::Copy {
             return Err(s3_error!(
                 InvalidRequest,
                 "This copy request is illegal because it is trying to copy an object to itself \
@@ -172,6 +181,9 @@ impl<H: Shards> Objects<H> {
         }) else {
             return Err(no_such_key());
         };
+        if tagging_directive == Directive::Copy && !object.tags.is_empty() && !tags_allowed {
+            return Err(access_denied());
+        }
         let conditions = ReadConditions {
             if_match: input.copy_source_if_match.as_ref(),
             if_none_match: input.copy_source_if_none_match.as_ref(),

@@ -369,7 +369,14 @@ async fn copies_onto_themselves_must_change_something() {
         .put("/photos/cat", SOURCE_HEADERS, Bytes::from_static(b"meow"))
         .await
         .assert(200, None);
-    for headers in [&[][..], &[("x-amz-tagging-directive", "REPLACE")][..]] {
+    // A storage class or website redirect is not stored (PutObject accepts
+    // and ignores them), so setting one would change nothing either.
+    for headers in [
+        &[][..],
+        &[("x-amz-tagging-directive", "REPLACE")][..],
+        &[("x-amz-storage-class", "STANDARD_IA")][..],
+        &[("x-amz-website-redirect-location", "/dog")][..],
+    ] {
         setup
             .copy("/photos/cat", "photos/cat", headers)
             .await
@@ -396,16 +403,6 @@ async fn copies_onto_themselves_must_change_something() {
     assert_eq!(got.body, "meow");
     assert_eq!(got.header("content-type"), Some("text/x-cat"));
     assert_eq!(got.header("x-amz-meta-color"), None);
-
-    // A change of storage class is a change too.
-    setup
-        .copy(
-            "/photos/cat",
-            "photos/cat",
-            &[("x-amz-storage-class", "STANDARD")],
-        )
-        .await
-        .assert(200, None);
 }
 
 #[tokio::test]
