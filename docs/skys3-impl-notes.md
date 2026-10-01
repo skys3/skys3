@@ -455,6 +455,15 @@ of this file. A task with nothing unexpected keeps "None."
   position must mean that every earlier record of the shard was applied,
   `EXTENT` records included. The state machine cannot apply a small `PUT`
   while the extents of an earlier-sequenced upload are still unapplied.
+- **A shard's records can span a node's disks.** Review found that replay
+  ordered each shard's records within one disk at a time. A record on the
+  first disk could then advance the applied position past an earlier
+  record on a later disk, which replay skipped. Nothing in the design pins
+  a shard replica to one disk, so replay now collects every disk's
+  records before it orders each shard's. A unit test and the simulation,
+  which now runs some seeds with two disks, fail without the fix. The
+  location map names no disk yet; M1-13, which places replicas on disks,
+  must add it or keep a replica's payload on one disk (design §10.2).
 - **Entries name payload by position.** Payload named by node-local
   location would make entries differ between replicas. Entries name the
   record that holds the payload, and the location map resolves inline
@@ -476,6 +485,58 @@ of this file. A task with nothing unexpected keeps "None."
   latest `CONFIG` record reachable. The index does not store configurations
   yet, so reclaiming segments (M1-22) or the local control-state copies
   (M2-16) must keep it.
+
+### M1-04 Shard state machine with one replica
+
+- **A stale `FLUSHED` cannot simply be dropped.** The plan says `FLUSHED`
+  cleans an entry only if its `seq` is still current. But when a newer
+  version commits during a flush, §7.1 flushes it next "conditioned on the
+  ETag the older flush produced", and dropping the older `FLUSHED` loses
+  that ETag: the next flush would send the stale `If-Match`, get 412, find
+  the older flush's write identity, and report a conflict. A `FLUSHED` of
+  an older `seq` therefore records the remote ETag and version ID and
+  leaves the newer version dirty. Design §4.2 records this and the other
+  rules the state diagram leaves open (writes to a conflicted key, `TAGS`,
+  duplicate `FLUSHED`, what `ADOPT` and `IMPORT` leave behind).
+- **The applier reports nothing.** M1-03's `Applier` returns `()`, and a
+  rejection is a no-op that still advances the applied position.
+  `StateMachine::apply` returns an `Outcome`; the `Applier` impl drops it
+  for replay, and `Recorder` keeps outcomes for the live path, so the
+  index crate did not change.
+- **A record the log refuses would leave a gap.** If a record failed to
+  encode, or carried more inline payload than `inline_max_bytes`, after it
+  got its position, the shard would have a hole in its log. `SegmentLog`
+  gained `check`, and `LogRecord` gained `check`, which encodes only the
+  headers, so a shard checks a record under its sequencer lock without
+  copying payload. A record that fails after it is appended is an I/O
+  error, which stops the shard.
+- **The simulation never reorders acknowledgements.** The log acknowledges
+  each group in queue order, and on a current-thread runtime the append
+  tasks queue in position order. A deliberate mutation that applied
+  records in acknowledgement order passed the seeded simulation and the
+  single-threaded tests; it failed a test that runs writers on worker
+  threads, which now runs 16 times. The pipeline's own unit tests cover
+  reordering deterministically.
+- **An abandoned seal leaked.** `seal` counts a seal before it waits for
+  earlier writes; a gateway request cancelled during that wait would have
+  left the shard sealed until restart. A guard lifts the seal unless
+  `seal` returns it.
+- **Holes in the durable log remain possible for unacknowledged records.**
+  On worker threads, appends can queue out of position order, so a power
+  loss can keep a later unacknowledged record without an earlier one.
+  Replay applies what is there, which is correct with one replica. M2-07
+  must queue a shard's records in order or rely on reconciliation (§6.6).
+- **Left open.** `Flushing` and `Conflict` have no record kind, so the
+  flusher (M1-16) must keep those transitions out of the replayed index
+  or make them replayable. Nothing flushes a `local` bucket in M1, so its
+  tombstones stay; M1-09 can commit a `FLUSHED` right after a local
+  `DELETE`. Conditional requests (M1-09) must check preconditions against
+  writes sequenced but not yet applied. `ShardSet` uses one disk's log;
+  choosing a disk per shard is M1-13's, as is reclaiming a removed shard
+  that replay brings back (`Index::remove_shard` is not durable, and its
+  segment summaries still hold the log, as M1-03 noted). The gateway's
+  `Shards` takes a `BucketDocument`, and `ShardSet::open` a
+  `ShardConfig`; M1-09 maps one to the other.
 
 ### M1-05 Control store interface and local backends
 
@@ -889,3 +950,61 @@ of this file. A task with nothing unexpected keeps "None."
   client features, which the AWS SDK's HTTP client enables (M1-15), pull in
   `base64` 0.23. Stacking M1-15 on this PR failed the duplicate-version ban,
   so the workspace uses `base64` 0.23; its API is unchanged for our use.
+
+## M2 Replicated shards
+
+### M2-01 Protocol model
+
+- **TLA+ rather than a Rust model checker.** The model is
+  `spec/ShardProtocol.tla`, checked by TLC. The design names TLA+ first,
+  reviewers can read it beside the design, and it models the design rather
+  than an implementation that does not exist yet; the simulation harness
+  (M2-03) is where the real code gets checked. It stays outside the Cargo
+  workspace and adds no crates. `spec/README.md` gives the full rationale.
+- **The model found four gaps in the design**, each now fixed in
+  `docs/skys3-design.md` and kept honest by a seeded bug that reintroduces
+  it: a restarted node must count the restart as a lease grant before it
+  may take over (section 5.4); a node must record a proposal durably and act
+  as if its CAS succeeded until it learns the outcome, which keeps a
+  restarted candidate from granting leases and a promoting primary from
+  dropping the learner (section 6.3); a primary with a promotion
+  outstanding needs the learner's lease, or the promoted learner can take
+  over while the primary still serves reads on the old members' leases
+  (sections 5.4 and 6.7); and reconciliation must compare records by
+  `(epoch, seq)`, not truncate past the new primary's last `seq`
+  (section 6.6). The step-down of a planned handoff must also be durable
+  and count only for the epoch it names (section 5.4).
+- **The first model was far too large.** With every feature in one
+  specification, three nodes, three epochs, and one write, TLC was still
+  growing past millions of states. Merging the R1 stop with the takeover
+  proposal (a gap between them only removes acknowledgements), dropping
+  members' commit watermarks (only primaries serve), learning
+  configurations from the register or another node instead of from a
+  history of every configuration, bounding restarts, and node symmetry
+  brought it to about a million states. A profile is now a list of small
+  models instead of one large one: two-node models reach four epochs and a
+  restart in seconds, and three-node models cover a third member and a
+  spare.
+- **A seeded bug was first "caught" by a modeling error.**
+  `truncate_by_seq_only` produced a violation that had nothing to do with
+  truncation: the model let a primary drop the learner it was promoting
+  and re-add it through the live-stream path, which credits the learner
+  with records it never received. The design says the primary keeps
+  waiting for that learner, so the model now forbids the drop, and the
+  bug's real counterexample needs a re-admitted node. To keep that from
+  recurring, each seeded bug is checked against only the invariant it is
+  meant to break, and the traces of the subtler ones were read.
+- **Integer ticks resolve the lease inequality coarsely.** Timers expire
+  only at tick boundaries, so a grace slightly short of
+  `Lease × hi / lo` can still pass: `Rates = {1, 3}` with `Lease = 2` and
+  `Grace = 4` breaks the inequality and checks clean. The checks therefore
+  use a grace with no drift allowance (`Grace = Lease`) and drift well past
+  the bound (`Rates = {1, 4}`), both of which TLC must catch. The model shows
+  the inequality is sufficient; it cannot measure a small shortfall.
+- **TLA+ tooling.** The `v1.8.0` release of `tla2tools.jar` is a rolling
+  prerelease whose jar is rebuilt nightly, so it cannot be pinned by
+  checksum; `spec/check.sh` pins 1.7.4, the last stable release, by SHA-256.
+  TLC 1.7.4 has no `-noGenerateSpecTE` (trace specs are opt-in there) and did
+  not find a `-config` file outside the specification's directory, so the
+  script copies the specification and its generated configuration into a
+  temporary directory. TLC keeps its search queue on disk there.

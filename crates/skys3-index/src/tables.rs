@@ -93,6 +93,20 @@ where
     Ok(rows)
 }
 
+/// Returns the smallest key greater than every key that starts with
+/// `prefix`. A shard key ends with its shard number and starts with a
+/// bucket ID length below 255, so it never consists of `0xff` bytes alone.
+fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            break;
+        }
+    }
+    end
+}
+
 /// Write access to the tables that applying records changes, inside one
 /// write transaction (see [`Applier`](crate::Applier)).
 ///
@@ -207,6 +221,23 @@ impl<'txn> IndexWriter<'txn> {
     /// Returns an [`IndexError`] if reading or decoding fails.
     pub fn applied(&self, shard: &ShardRef) -> Result<Option<EpochSeq>, IndexError> {
         applied(&self.shards, shard)
+    }
+
+    /// Removes everything the index holds for `shard`: its entries, its
+    /// record locations, and its applied position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn remove_shard(&mut self, shard: &ShardRef) -> Result<(), IndexError> {
+        let prefix = codec::shard_key(shard);
+        let end = prefix_end(&prefix);
+        for table in [&mut self.namespace, &mut self.locations] {
+            let range = prefix.as_slice()..end.as_slice();
+            table.retain_in(range, |key, _| !key.starts_with(&prefix))?;
+        }
+        self.shards.remove(prefix.as_slice())?;
+        Ok(())
     }
 
     pub(crate) fn applied_positions(&self) -> Result<BTreeMap<ShardRef, EpochSeq>, IndexError> {

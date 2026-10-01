@@ -16,7 +16,8 @@ use skys3_log::record::{Delete, RecordBody};
 use skys3_log::{LogRecord, RecordLocation, SegmentId};
 use skys3_types::{Epoch, EpochSeq, Generation, Seq};
 use support::{
-    TestApplier, Workload, apply, disk_label, index_config, log_of, open_node, pool, runtime, shard,
+    TestApplier, Workload, apply, disk_label, disk_label_of, index_config, log_of, open_node,
+    open_node_on, pool, runtime, shard,
 };
 
 fn position(seq: u64) -> EpochSeq {
@@ -70,6 +71,49 @@ fn a_real_file_keeps_what_a_checkpoint_made_durable() {
     assert_eq!(read.applied(&shard(0)).unwrap(), Some(position(2)));
     assert_eq!(read.applied(&shard(1)).unwrap(), None);
     assert!(format!("{index:?}").starts_with("Index"));
+}
+
+#[test]
+fn removing_a_shard_keeps_every_other_shard() {
+    let disk = SimDisk::new(5);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let extent = |shard_no: u8, seq: u64| {
+        let (mut record, location) = delete(shard_no, seq, "big");
+        record.body = RecordBody::Extent(skys3_log::record::Extent {
+            key: "big".into(),
+            offset: 0,
+            data: Bytes::from_static(b"bytes"),
+        });
+        (record, location)
+    };
+    // Shard 255 is the last of its bucket, so its keys end in 0xff; 253 is
+    // in the same bucket, and 254 in another.
+    for n in [253, 254, 255] {
+        index
+            .apply(
+                &TestApplier,
+                &[delete(n, 1, "a"), extent(n, 2), delete(n, 3, "z")],
+            )
+            .unwrap();
+    }
+    index.remove_shard(&shard(255)).unwrap();
+    let dump = index.read().unwrap().dump().unwrap();
+    for n in [253, 254] {
+        assert_eq!(
+            dump.entries.keys().filter(|(s, _)| *s == shard(n)).count(),
+            2
+        );
+        assert!(dump.locations.contains_key(&(shard(n), position(2))));
+        assert_eq!(dump.applied.get(&shard(n)), Some(&position(3)));
+    }
+    assert!(dump.entries.keys().all(|(s, _)| *s != shard(255)));
+    assert!(dump.locations.keys().all(|(s, _)| *s != shard(255)));
+    assert!(!dump.applied.contains_key(&shard(255)));
+    // The shard starts afresh.
+    assert_eq!(
+        index.apply(&TestApplier, &[delete(255, 1, "a")]).unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -383,5 +427,45 @@ fn replay_refuses_a_damaged_record() {
             IndexError::Damaged { location: at, .. } => assert_eq!(at, location),
             error => panic!("{error}"),
         }
+    });
+}
+
+#[test]
+fn replay_orders_a_shards_records_across_disks() {
+    runtime().block_on(async {
+        let disks = [SimDisk::new(6), SimDisk::new(7)];
+        let pool = pool();
+        let mounts = disks.each_ref().map(SimDisk::mount);
+        let node = open_node_on(&mounts, &pool).await;
+        // Shard 0's first record is on the second disk by label, and its
+        // second on the first, which replay reads first.
+        let (first, _) = delete(0, 1, "first");
+        let (second, _) = delete(0, 2, "second");
+        let logs = node.logs();
+        let at_1 = logs[&disk_label_of(1)].append(&first).await.unwrap();
+        let at_0 = logs[&disk_label_of(0)].append(&second).await.unwrap();
+        apply(&node, &[(first, at_1), (second, at_0)]);
+        let before = node.index().read().unwrap().dump().unwrap();
+        for disk in &disks {
+            disk.crash();
+        }
+        drop(node);
+
+        let mounts = disks.each_ref().map(SimDisk::mount);
+        let node = open_node_on(&mounts, &pool).await;
+        assert!(
+            node.index()
+                .read()
+                .unwrap()
+                .dump()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let report = node.replay(Arc::new(TestApplier)).await.unwrap();
+        assert_eq!(report.applied, 2);
+        let after = node.index().read().unwrap().dump().unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.entries.len(), 2);
     });
 }

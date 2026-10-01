@@ -701,17 +701,23 @@ fn appends_check_their_records() {
             ..small_config()
         };
         let (log, _) = open(SimDisk::new(16).mount(), config).await.unwrap();
+        // `check` refuses what `append` refuses, without appending.
+        let checked = log.check(&inline_put(0, 1, 101)).unwrap_err();
+        assert!(matches!(checked, LogError::InlineTooLarge { .. }));
         let error = log.append(&inline_put(0, 1, 101)).await.unwrap_err();
         assert!(matches!(
             error,
             LogError::InlineTooLarge { len: 101, max: 100 }
         ));
+        log.check(&inline_put(0, 1, 100)).unwrap();
+        log.check(&extent(0, 2, 1000)).unwrap();
         assert!(error.to_string().contains("inline_max_bytes"), "{error}");
         log.append(&inline_put(0, 1, 100)).await.unwrap();
         log.append(&extent(0, 2, 1000)).await.unwrap();
 
         let mut bad = delete(0, 3);
         bad.body = skys3_log::RecordBody::Delete(skys3_log::record::Delete { key: String::new() });
+        assert!(matches!(log.check(&bad), Err(LogError::Encode(_))));
         assert!(matches!(log.append(&bad).await, Err(LogError::Encode(_))));
 
         // Encoded records are verified, classified, and checked the same way.
