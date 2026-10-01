@@ -37,7 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use s3s::{S3Error, s3_error};
-use skys3_config::{BucketsConfig, Config, ControlStoreConfig, parse_target};
+use skys3_config::{BucketsConfig, Config, ControlStoreConfig, IdentityConfig, parse_target};
 use skys3_control::{
     ControlError, ControlStore, DeletionOutcome, Expected, KeyPrefix, ProposalIds, ProposalOutcome,
     RegisterKind, RetryPolicy, TypedKey, Version, Versioned, bump_generation, propose_delete,
@@ -45,6 +45,7 @@ use skys3_control::{
 };
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
+use crate::authz::Permissions;
 use crate::limits::RequestLimits;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
@@ -71,6 +72,10 @@ pub struct GatewayConfig {
     pub limits: RequestLimits,
     /// Retries of control-store requests.
     pub retry: RetryPolicy,
+    /// What unsigned requests may do: `anonymous_policy` when
+    /// `anonymous_access` is on, and `None`, which refuses them with
+    /// `403 AccessDenied`, when it is off.
+    pub anonymous: Option<Permissions>,
 }
 
 impl GatewayConfig {
@@ -84,7 +89,20 @@ impl GatewayConfig {
             control_store: config.control_store().clone(),
             limits: RequestLimits::default(),
             retry: RetryPolicy::default(),
+            anonymous: anonymous_permissions(config.identity()),
         }
+    }
+}
+
+/// What `[identity]` lets unsigned requests do.
+fn anonymous_permissions(identity: &IdentityConfig) -> Option<Permissions> {
+    if identity.anonymous_access {
+        identity
+            .anonymous_policy
+            .clone()
+            .map(Permissions::from_policy)
+    } else {
+        None
     }
 }
 

@@ -122,7 +122,10 @@ fn the_defaults_are_the_design_example_values() {
     assert_eq!(minimal.buckets().defaults, example.buckets().defaults);
     assert!(minimal.buckets().named.is_empty());
     assert_eq!(minimal.peering(), example.peering());
-    assert_eq!(minimal.identity(), example.identity());
+    let mut identity = example.identity().clone();
+    // The example's static credential has no default.
+    assert!(identity.static_credentials.remove("bootstrap").is_some());
+    assert_eq!(minimal.identity(), &identity);
 
     assert_eq!(minimal.admin().listen.to_string(), "127.0.0.1:7490");
     assert_eq!(minimal.admin().token_file, None);
@@ -238,11 +241,17 @@ peer_staging_ttl_seconds = 3600
 
 [identity]
 anonymous_access = true
+anonymous_policy = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::public/*"}}'
 sts_web_identity = false
 session_default_seconds = 900
 session_maximum_seconds = 43200
 identity_max_staleness_hours = 12
 oidc_clock_skew_seconds = 0
+
+[identity.static_credentials.bootstrap]
+access_key_id = "AKIASKYS3BOOTSTRAP"
+secret_access_key_file = "/etc/skys3/bootstrap.secret"
+policy = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}}'
 
 [admin]
 listen = "0.0.0.0:9000"
@@ -267,6 +276,10 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.control_store().coordinator_lease().as_secs(), 12);
     assert_eq!(config.control_store().config_poll_interval().as_secs(), 20);
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
+    assert!(config.identity().anonymous_policy.is_some());
+    let bootstrap = &config.identity().static_credentials["bootstrap"];
+    assert_eq!(bootstrap.access_key_id, "AKIASKYS3BOOTSTRAP");
+    assert_eq!(bootstrap.policy, skys3_types::policy::Policy::allow_all());
 
     let defaults = &config.buckets().defaults;
     assert_eq!(defaults.mode, BucketMode::Local);

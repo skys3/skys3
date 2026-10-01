@@ -790,6 +790,80 @@ of this file. A task with nothing unexpected keeps "None."
   signs and verifies many small chunks under the sanitizers) and
   `gateway_sigv4_canonical` about 440,000, with no failures.
 
+### M1-07b Authorization and static credentials
+
+- **s3s calls its access hook only with an auth provider.** M1-06 left
+  `s3s` without one, so its `S3Access` hook never ran. The gateway now
+  sets a provider that never finds a key (`authz::NoSignatures`): requests
+  reach `s3s` with their signature removed, so it is never asked, and
+  anything `s3s` still takes as signed, such as a signed POST form, is
+  refused. The hook then authorizes every routed request by operation
+  name, before `s3s` reads the operation's input.
+- **The operation is known only after routing.** `s3s` resolves it, and
+  the pipeline checks rejected-feature headers and reads XML bodies before
+  that. Unsigned requests are therefore refused right after
+  authentication, so an anonymous caller gets `AccessDenied` before
+  anything else. A signed caller outside its policy may still see a
+  rejected-feature answer, or have an XML body of at most 4 MiB read,
+  first. Design §11 records the order.
+- **The principal type became concrete.** M1-07a's `CredentialLookup` had
+  an associated `Principal` type. Authorization finds the caller in the
+  request's extensions by type, so a lookup with another type would have
+  looked anonymous. `Authenticated` and `SigningCredential` now carry a
+  `Principal` with `Permissions`: identity policies plus an optional
+  session policy, which M1-24's sessions fill in.
+- **Where the policy language lives.** Configuration must validate
+  policies at load time, and STS (M1-24) must parse session policies and
+  roles from `identity/`, so the parser and evaluator are
+  `skys3_types::policy`, next to the other control-store documents;
+  `Policy` also deserializes from a JSON object for registers.
+  `Principal`, `Permissions`, and the operation-to-action table are in the
+  gateway's `authz` module.
+- **Conditions are refused, not ignored.** Ignoring a `Condition` would
+  widen an `Allow`, so policies with `Condition`, `Principal`, policy
+  variables, or ARNs other than S3's fail to parse. Duplicate keys are
+  refused too (serde's derived visitors), so `{"Effect": "Allow",
+  "Effect": "Deny"}` cannot mean different things to different readers.
+- **`anonymous_access = true` needed a policy.** Allowing every action to
+  anonymous callers would be the only reading without one, so the new key
+  `[identity] anonymous_policy` is required when anonymous access is on
+  and refused when it is off.
+- **Static secrets live in files.** Each
+  `[identity.static_credentials.<name>]` table names a
+  `secret_access_key_file`, read at startup into a buffer that is zeroed
+  after use, like `[admin] token_file`. The secret must be 32 to 128
+  visible ASCII characters. `SecretAccessKey` became an
+  `Arc<SecretBox<[u8]>>`, zeroed when its last clone is dropped. The
+  signing key SigV4 derives from it per request is not yet zeroized.
+- **Requests could arrive already authenticated (review).** The
+  authenticator leaves an unsigned request's extensions alone, so an
+  `Authenticated` extension set by an embedding or middleware passed the
+  anonymous gate and was authorized as given. The gateway now removes
+  `Authenticated` and `Trailers`, the extensions its own stages set and
+  trust, from every request before authentication, whatever the
+  `Authenticator`.
+- **Policy limits held only for documents (review).** `Policy::parse`
+  checked the document's byte length, but `Deserialize`, the path for
+  policies embedded in registers, did not, and the two could disagree on
+  whitespace. Both now apply the same limits after reading: at most
+  10,240 bytes of text in the policy's string values, 1,280 per pattern,
+  and 100 values per array, the last checked while the array is read.
+  Proptests and the `types_policy` fuzz target check that both paths
+  accept the same policies.
+- **The test authenticator had to authenticate.** M1-06's
+  `Unauthenticated` let anonymous requests through, which are now
+  refused; it is renamed `TrustAll` and attaches a principal allowed
+  everything. `MemoryCredentials` keys are allowed everything unless
+  added `with_permissions`.
+- **DeleteObjects has no action yet.** Its path names the bucket, but
+  S3 checks `s3:DeleteObject` on each key, which needs the parsed body. Until
+  M1-10 adds that check in the `delete_objects` access hook, it is denied
+  to everyone. CopyObject's source check is left to M1-10 the same way.
+- **Fuzzing.** `types_policy` ran about 2.5 million inputs in 30 s, and
+  `gateway_request` and `gateway_sigv4_canonical`, which now go through
+  the access hook and the new principal type, ran 30 s each, with no
+  failures.
+
 ### M1-08 Checksums and ETags
 
 - **`aws-lc-rs` has no MD5.** Its `digest` module offers SHA-1

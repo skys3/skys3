@@ -22,7 +22,7 @@
 //!    an `aws-chunked` body is decoded, its chunk and trailer signatures
 //!    checked, and its trailers published in a [`Trailers`] extension;
 //! 7. records the caller in an [`Authenticated`] extension, which
-//!    authorization (plan M1-07b) reads.
+//!    authorization ([`crate::authz`]) reads.
 //!
 //! An unsigned request passes as it is, without an [`Authenticated`]
 //! extension, unless it carries `x-skys3-*` headers, which must be signed.
@@ -48,6 +48,7 @@ use http::request::Parts;
 use http::uri::PathAndQuery;
 use http::{Request, Uri};
 use s3s::{Body, S3Error, s3_error};
+use secrecy::{ExposeSecret, SecretBox};
 use skys3_io::{BlockingPool, WallClock};
 
 pub use body::{BodyError, BodyErrorKind};
@@ -58,6 +59,7 @@ use self::body::Payload;
 use self::canonical::Head;
 use self::chunked::ChunkSigner;
 use self::params::{PRESIGNED_PARAMS, Signed, decode_pair, query_params};
+use crate::authz::Principal;
 use crate::service::Authenticator;
 
 /// How far a header-signed request's time may be from the node's clock
@@ -73,21 +75,20 @@ pub const SERVICE: &str = "s3";
 /// The prefix of SkyS3's own request headers, which must be signed.
 pub const SKYS3_HEADER_PREFIX: &str = "x-skys3-";
 
-/// A secret access key.
-///
-/// Its `Debug` output is redacted. Holding secrets with `secrecy` and
-/// `zeroize` is for the credential stores (plan M1-07b, M1-24).
+/// A secret access key, held with `secrecy`: its memory is zeroed when
+/// the last clone is dropped, and its `Debug` output is redacted.
 #[derive(Clone)]
-pub struct SecretAccessKey(Box<[u8]>);
+pub struct SecretAccessKey(Arc<SecretBox<[u8]>>);
 
 impl SecretAccessKey {
-    /// Wraps a secret access key.
-    pub fn new(secret: impl Into<Vec<u8>>) -> Self {
-        Self(secret.into().into_boxed_slice())
+    /// Copies `secret` into a secret access key. Zeroing the source, if it
+    /// needs it, is the caller's job.
+    pub fn new(secret: impl AsRef<[u8]>) -> Self {
+        Self(Arc::new(SecretBox::new(Box::from(secret.as_ref()))))
     }
 
-    fn expose(&self) -> &[u8] {
-        &self.0
+    pub(crate) fn expose(&self) -> &[u8] {
+        self.0.expose_secret()
     }
 }
 
@@ -100,11 +101,11 @@ impl fmt::Debug for SecretAccessKey {
 /// What a [`CredentialLookup`] knows about an access key: its secret, and
 /// whom requests signed with it come from.
 #[derive(Debug, Clone)]
-pub struct SigningCredential<P> {
+pub struct SigningCredential {
     /// The secret access key.
     pub secret: SecretAccessKey,
     /// The principal that authorization evaluates.
-    pub principal: P,
+    pub principal: Principal,
 }
 
 /// Why a [`CredentialLookup`] found no credential.
@@ -146,12 +147,10 @@ impl LookupError {
     }
 }
 
-/// Finds the signing credential of an access key: static credentials
-/// (plan M1-07b) and STS sessions (plan M1-24).
+/// Finds the signing credential of an access key:
+/// [`StaticCredentials`](crate::StaticCredentials) and STS sessions (plan
+/// M1-24).
 pub trait CredentialLookup: Send + Sync + 'static {
-    /// Whom a credential identifies, for authorization.
-    type Principal: Clone + Send + Sync + 'static;
-
     /// Looks up `access_key_id`, with the request's session token
     /// (`x-amz-security-token` or `X-Amz-Security-Token`) if it has one.
     ///
@@ -162,14 +161,14 @@ pub trait CredentialLookup: Send + Sync + 'static {
         &self,
         access_key_id: &str,
         session_token: Option<&str>,
-    ) -> impl Future<Output = Result<SigningCredential<Self::Principal>, LookupError>> + Send;
+    ) -> impl Future<Output = Result<SigningCredential, LookupError>> + Send;
 }
 
 /// The extension a signed request carries once its signature is verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Authenticated<P> {
+pub struct Authenticated {
     /// Whom the credential identifies.
-    pub principal: P,
+    pub principal: Principal,
     /// The access key the request was signed with.
     pub access_key_id: String,
     /// Where the signature was.
@@ -395,11 +394,11 @@ fn strip_signature(parts: &mut Parts, method: AuthMethod) -> Result<(), S3Error>
 }
 
 /// A [`CredentialLookup`] over a fixed set of keys, for tests and fuzzing.
-/// Each principal is the key's name.
+/// Each principal is named after its access key.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Clone, Default)]
 pub struct MemoryCredentials {
-    keys: std::collections::HashMap<String, (SecretAccessKey, Option<String>)>,
+    keys: std::collections::HashMap<String, (SigningCredential, Option<String>)>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -410,21 +409,30 @@ impl MemoryCredentials {
         Self::default()
     }
 
-    /// Adds a key. A key with a `session_token` accepts only requests that
-    /// carry that token.
+    /// Adds a key whose principal may do anything. A key with a
+    /// `session_token` accepts only requests that carry that token.
     #[must_use]
-    pub fn with_key(
+    pub fn with_key(self, access_key_id: &str, secret: &str, session_token: Option<&str>) -> Self {
+        let permissions = crate::authz::Permissions::allow_all();
+        self.with_permissions(access_key_id, secret, session_token, permissions)
+    }
+
+    /// Adds a key whose principal has `permissions`.
+    #[must_use]
+    pub fn with_permissions(
         mut self,
         access_key_id: &str,
         secret: &str,
         session_token: Option<&str>,
+        permissions: crate::authz::Permissions,
     ) -> Self {
+        let credential = SigningCredential {
+            secret: SecretAccessKey::new(secret),
+            principal: Principal::new(access_key_id, permissions),
+        };
         self.keys.insert(
             access_key_id.to_owned(),
-            (
-                SecretAccessKey::new(secret),
-                session_token.map(str::to_owned),
-            ),
+            (credential, session_token.map(str::to_owned)),
         );
         self
     }
@@ -432,24 +440,19 @@ impl MemoryCredentials {
 
 #[cfg(any(test, feature = "test-util"))]
 impl CredentialLookup for MemoryCredentials {
-    type Principal = String;
-
     async fn lookup(
         &self,
         access_key_id: &str,
         session_token: Option<&str>,
-    ) -> Result<SigningCredential<String>, LookupError> {
-        let (secret, token) = self
+    ) -> Result<SigningCredential, LookupError> {
+        let (credential, token) = self
             .keys
             .get(access_key_id)
             .ok_or(LookupError::UnknownAccessKey)?;
         if token.as_deref() != session_token {
             return Err(LookupError::InvalidToken);
         }
-        Ok(SigningCredential {
-            secret: secret.clone(),
-            principal: access_key_id.to_owned(),
-        })
+        Ok(credential.clone())
     }
 }
 

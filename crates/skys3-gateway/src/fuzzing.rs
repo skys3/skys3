@@ -23,7 +23,7 @@ use skys3_types::checksum::{Checksum, ChecksumAlgorithm};
 
 use crate::buckets::{GatewayConfig, IdSource, MODE_HEADER};
 use crate::checksum::{ExpectedChecksum, ExpectedChecksums};
-use crate::service::{Authenticator, Gateway, Unauthenticated};
+use crate::service::{Authenticator, Gateway, TrustAll};
 use crate::sigv4::body::BodyError;
 use crate::sigv4::canonical::{self, Head};
 use crate::sigv4::chunked::{ChunkSigner, Decoder, encode};
@@ -415,7 +415,7 @@ fn decode_body(
 }
 
 /// A gateway with bucket [`BUCKET`] over fresh in-memory state.
-async fn gateway() -> Gateway<Unauthenticated> {
+async fn gateway() -> Gateway<TrustAll> {
     let config: Config = "[cluster]\ncluster_id = \"fuzz\"\n[control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]"
         .parse()
         .expect("the configuration is valid");
@@ -435,7 +435,7 @@ async fn gateway() -> Gateway<Unauthenticated> {
         store,
         MemoryShards::new(),
         IdSource::seeded(0),
-        Unauthenticated,
+        TrustAll,
     )
     .await
     .expect("the gateway loads");
