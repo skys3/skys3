@@ -318,7 +318,9 @@ async fn the_watch_publishes_what_the_registers_say() {
     let applied = Applied {
         written: Vec::new(),
         rejected: None,
+        failed: None,
         generation: None,
+        pending: None,
     };
     watch.applied(&change, &applied);
 }

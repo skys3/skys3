@@ -147,7 +147,9 @@ pub async fn register<S: ControlStore>(
                 Registration::Created,
             ),
         };
-        let applied = apply(store, cluster, &change, proposals, policy).await?;
+        let applied = apply(store, cluster, &change, proposals, policy)
+            .await
+            .map_err(|failed| failed.source)?;
         if let Some((_, Some(version))) = applied.written.into_iter().next() {
             tracing::info!(node = %profile.node, ?registration, "registered the node");
             return Ok(Registered {

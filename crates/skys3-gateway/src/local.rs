@@ -82,6 +82,17 @@ impl<D: Disk> LocalShards<D> {
             .await
             .ok_or_else(|| ShardError::NotFound(shard.clone()))
     }
+
+    /// The replica of `shard`, if it serves client requests: a member
+    /// refuses with [`ShardError::NotPrimary`] (§5.1). Reads and writes
+    /// check this in the replica; payloads and seals check it here.
+    async fn serving(&self, shard: &ShardRef) -> Result<Shard<D>, ShardError> {
+        let local = self.find(shard).await?;
+        local
+            .check_readable()
+            .map_err(|error| convert(shard, error))?;
+        Ok(local)
+    }
 }
 
 /// The gateway's view of a shard error.
@@ -93,12 +104,25 @@ fn convert(shard: &ShardRef, error: skys3_shard::ShardError) -> ShardError {
             shard: shard.clone(),
             reason,
         },
+        skys3_shard::ShardError::NotPrimary { primary, epoch, .. } => ShardError::NotPrimary {
+            shard: shard.clone(),
+            primary,
+            epoch,
+        },
         skys3_shard::ShardError::NotAcknowledged {
             position, reason, ..
         } => ShardError::NotAcknowledged {
             shard: shard.clone(),
             position,
             reason,
+        },
+        // Too few members left to take writes (§6.4): not acknowledged,
+        // `503 SlowDown`, here and across the forward wire. A pending write
+        // refused so was applied, as a write not acknowledged may be (§5.2).
+        error @ skys3_shard::ShardError::UnderReplicated { .. } => ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position: None,
+            reason: error.to_string(),
         },
         other => ShardError::Unavailable {
             shard: shard.clone(),
@@ -118,8 +142,9 @@ impl<D: Disk> Shards for LocalShards<D> {
 
     async fn seal(&self, shard: &ShardRef) -> Result<ShardSummary, ShardError> {
         let summary = self
-            .set
-            .seal(&shard.into())
+            .serving(shard)
+            .await?
+            .seal()
             .await
             .map_err(|error| convert(shard, error))?;
         Ok(ShardSummary {
@@ -129,10 +154,8 @@ impl<D: Disk> Shards for LocalShards<D> {
     }
 
     async fn unseal(&self, shard: &ShardRef) -> Result<(), ShardError> {
-        self.set
-            .unseal(&shard.into())
-            .await
-            .map_err(|error| convert(shard, error))
+        self.serving(shard).await?.unseal();
+        Ok(())
     }
 
     async fn remove(&self, shard: &ShardRef) -> Result<(), ShardError> {
@@ -202,7 +225,7 @@ impl<D: Disk> Shards for LocalShards<D> {
     }
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
-        let local = self.find(shard).await?;
+        let local = self.serving(shard).await?;
         local
             .payload(position)
             .await
@@ -241,5 +264,34 @@ impl<D: Disk> Shards for LocalShards<D> {
             // a `FLUSHED` that lost a race, which their writer expects.
             _ => Ok(committed.position),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_types::{BucketId, ShardId};
+
+    use super::*;
+
+    #[test]
+    fn too_few_members_is_not_acknowledged() {
+        let shard = ShardRef {
+            bucket: BucketId::new("b-1").unwrap(),
+            shard: ShardId::new(0),
+        };
+        let error = skys3_shard::ShardError::UnderReplicated {
+            shard: (&shard).into(),
+            copies: 1,
+            min_write_replicas: 2,
+        };
+        let converted = convert(&shard, error);
+        assert!(
+            matches!(
+                &converted,
+                ShardError::NotAcknowledged { position: None, reason, .. }
+                    if reason.contains("min_write_replicas")
+            ),
+            "{converted:?}"
+        );
     }
 }

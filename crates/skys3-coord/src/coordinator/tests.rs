@@ -404,3 +404,121 @@ async fn a_change_planned_as_the_tenure_ends_is_dropped() {
     assert_eq!(generation(&store).await, Generation::new(1));
     running.abort();
 }
+
+/// Plans one change once: creates of the given shard registers.
+struct Once(Option<Vec<u8>>);
+
+impl Placement for Once {
+    async fn plan<S: ControlStore>(
+        &mut self,
+        _store: &S,
+        proposals: &mut ProposalIds,
+    ) -> Result<Option<ChangeSet>, ControlError> {
+        let Some(shards) = self.0.take() else {
+            return Ok(None);
+        };
+        let mut change = ChangeSet::new();
+        for shard in shards {
+            let document = ShardConfig {
+                bucket_id: BucketId::new("b-1").unwrap(),
+                shard: ShardId::new(shard),
+                epoch: Epoch::new(1),
+                primary: node(1),
+                members: vec![node(1)],
+                learners: Vec::new(),
+                min_write_replicas: 1,
+                replicas: 1,
+                proposal_id: proposals.next_id(),
+            };
+            let key = TypedKey::shard(&BucketId::new("b-1").unwrap(), ShardId::new(shard));
+            change = change.create(&key, &document).unwrap();
+        }
+        Ok(Some(change))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_part_of_a_failed_change_that_landed_is_pushed() {
+    let memory = store().await;
+    let store = FaultyStore::new(memory.clone());
+    // The first write lands; the second is refused on every attempt.
+    store.script(
+        [Fault::Pass]
+            .into_iter()
+            .chain(std::iter::repeat_n(Fault::Unavailable, 3)),
+    );
+    let (_leadership, believer) = forged();
+    let hints = ControlHints::new();
+    let coordinator = Coordinator::new(
+        store,
+        clock(),
+        believer,
+        Once(Some(vec![0, 1])),
+        hints.clone(),
+        config(),
+        ProposalIds::seeded(1),
+    );
+    let running = tokio::spawn(coordinator.run());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(read(&memory, &key()).await.unwrap().is_some());
+    assert_eq!(generation(&memory).await, Generation::new(2));
+    assert_eq!(hints.latest(), Generation::new(2));
+    running.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_that_may_still_land_is_announced_only_after_it_did() {
+    let memory = store().await;
+    let store = FaultyStore::new(memory.clone());
+    // The first attempt lands a second late; the retries are lost.
+    store.script([
+        Fault::LateRequest(Duration::from_secs(1)),
+        Fault::LoseRequest,
+        Fault::LoseRequest,
+    ]);
+    let clock = clock();
+    // The tenure ends before the write's outcome is known: it is settled
+    // all the same.
+    let (leadership, believer) = watch::channel(Leadership::Coordinator {
+        version: Version::new("1"),
+        until: clock.now().saturating_add(Duration::from_millis(50)),
+    });
+    let hints = ControlHints::new();
+    let coordinator = Coordinator::new(
+        store.clone(),
+        Arc::clone(&clock),
+        believer,
+        Once(Some(vec![0])),
+        hints.clone(),
+        config(),
+        ProposalIds::seeded(1),
+    );
+    // The store answers nothing for a while, so settling has to wait.
+    store.set_rates(FaultRates {
+        unavailable: 1.0,
+        ..FaultRates::default()
+    });
+    let running = tokio::spawn(coordinator.run());
+    let end = clock.now().saturating_add(Duration::from_secs(3));
+    let heal = clock.now().saturating_add(Duration::from_secs(1));
+    let mut healed = false;
+    while clock.now() < end {
+        // Whenever the generation has moved, the write it announces is
+        // there to be listed.
+        if generation(&memory).await > Generation::new(1) {
+            assert!(read(&memory, &key()).await.unwrap().is_some());
+        }
+        if !healed && clock.now() >= heal {
+            store.set_rates(FaultRates::default());
+            healed = true;
+        }
+        clock.sleep(Duration::from_millis(5)).await;
+    }
+    assert!(read(&memory, &key()).await.unwrap().is_some());
+    assert_eq!(generation(&memory).await, Generation::new(2));
+    assert_eq!(hints.latest(), Generation::new(2));
+
+    // With nothing left to settle, the coordinator ends with its elector.
+    drop(leadership);
+    tokio::time::timeout(WAIT, running).await.unwrap().unwrap();
+}

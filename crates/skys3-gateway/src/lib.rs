@@ -55,7 +55,9 @@
 //! - [`Shards`] and [`ShardRef`]: the shard interface the gateway calls,
 //!   and routing of each key to its shard with the frozen hash. On a single
 //!   node every shard is local: [`LocalShards`] serves the interface from
-//!   the node's `skys3_shard::ShardSet`.
+//!   the node's `skys3_shard::ShardSet`. With replication, [`routing`]
+//!   sends each call to its shard's primary, on this node or another, by
+//!   the gateway's shard map, and serves the calls other gateways send.
 //!
 //! - [`sigv4`]: SigV4 authentication with the `Authorization` header or a
 //!   presigned URL, session tokens, and `aws-chunked` bodies with signed
@@ -134,6 +136,7 @@ mod listing;
 mod local;
 mod objects;
 mod remote;
+pub mod routing;
 mod service;
 mod shard;
 pub mod sigv4;

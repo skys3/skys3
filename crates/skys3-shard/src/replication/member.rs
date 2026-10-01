@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 use bytes::Bytes;
 use skys3_io::Disk;
 use skys3_log::{LogRecord, ShardRef};
-use skys3_net::{Connection, MessageKind, Network, PeerIdentity, Receiver, Sender};
+use skys3_net::{Frame, MessageKind, Network, PeerIdentity, Receiver, Sender};
 use skys3_types::{Epoch, Seq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
@@ -16,10 +16,11 @@ use crate::lease::Grace;
 use crate::set::ShardSet;
 use crate::shard::{Role, Shard};
 
-/// Serves one link from a primary: a session for one shard, until the link
-/// fails or a later session replaces it.
+/// Serves one link from a primary, whose first frame is `frame`: a session
+/// for one shard, until the link fails or a later session replaces it.
 pub(super) async fn serve<S, N, D>(
-    connection: Connection<S>,
+    (mut receiver, mut sender): (Receiver<S>, Sender<S>),
+    frame: Frame,
     inner: &Inner<N, D>,
 ) -> Result<(), LinkError>
 where
@@ -28,8 +29,6 @@ where
     D: Disk,
 {
     let config = inner.config;
-    let (mut receiver, mut sender) = connection.into_split();
-    let frame = recv(&mut receiver, config.link_timeout).await?;
     let request: Sync = wire::body(&frame, MessageKind::Sync).map_err(LinkError::Protocol)?;
     let (shard, epoch) = match accept(&request, receiver.peer(), &inner.set).await {
         Ok(accepted) => accepted,
@@ -61,6 +60,8 @@ where
             sender.send(&frame).await?;
         }
     }
+    // A newer configuration's CONFIG record goes where the primary's is.
+    shard.follow(Epoch::new(request.sequencing), primary_last)?;
     sender
         .send(&wire::frame(
             MessageKind::SyncAck,
@@ -104,8 +105,10 @@ where
 }
 
 /// Finds the shard a `Sync` names, which must be open on this node as a
-/// member, and checks that the peer is its primary in its epoch. A refusal
-/// carries the member's epoch, if it knows the shard, and why.
+/// member, and checks that the peer is its primary in its epoch. A newer
+/// configuration that keeps the primary and this member is adopted
+/// ([`Shard::reconfigure`]): its primary removed other members (§6.4). A
+/// refusal carries the member's epoch, if it knows the shard, and why.
 async fn accept<D: Disk>(
     request: &Sync,
     peer: &PeerIdentity,
@@ -130,13 +133,16 @@ async fn accept<D: Disk>(
     if theirs.epoch < ours.epoch {
         return refuse(ours.epoch, "the primary's epoch is older than the member's");
     }
-    if theirs != ours {
+    if theirs.epoch == ours.epoch && theirs != ours {
         return refuse(
             ours.epoch,
             "the primary's configuration differs from the member's",
         );
     }
-    Ok((replica, ours.epoch))
+    if let Err(error) = replica.reconfigure(&theirs).await {
+        return refuse(ours.epoch, &error.to_string());
+    }
+    Ok((replica, theirs.epoch))
 }
 
 /// Why following a primary stopped.
