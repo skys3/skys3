@@ -2628,3 +2628,65 @@ of this file. A task with nothing unexpected keeps "None."
   writes on its shards each wait the full timeout and their records pile
   up in the primary's memory and log until the member returns; fail-fast
   bounds that to the records sequenced before the first timeout.
+
+## M3 Coordinator
+
+### M3-01 Coordinator lease and change propagation
+
+- **The takeover wait alone does not keep tenures apart.** §6.7 gave only
+  the candidate's rule, `coordinator_lease × (1+ρ)` after it first sees a
+  lease version. A holder that acts for a whole `coordinator_lease` after
+  each renewal can outlast that wait when its clock runs slow by `ρ` and
+  the candidate's fast by `ρ`: by about `2ρ` of the lease. The holder now
+  acts only for `coordinator_lease × (1−ρ)` after sending its renewal,
+  counted from the first attempt of a write retried after a lost answer,
+  and the candidate counts from when its read returned, which is after
+  the write. Recorded in §6.7. Safety never rested on it (every change is
+  a compare-and-swap), but it makes "two coordinators at once" a fault
+  beyond `ρ` rather than routine, and the simulation checks it: no two
+  tenures overlap in simulated time, and a seeded bug, one node with a
+  quarter-length lease, is caught.
+- **A lease write whose answer was lost spans calls.** `propose` applies
+  the lost-response rule within one call; a renewal or takeover that ran
+  out of attempts and is sent again in a later round would see its own
+  landed write as a lost race. The elector keeps the pending lease write
+  and resends the same value under the same precondition, and adopts it
+  when a later read finds its `proposal_id`, with the tenure counted from
+  the first attempt (so an old adoption is renewed before the node acts).
+- **A holder whose tenure lapsed keeps renewing its own version.**
+  Stepping down to a candidate would make it wait out its own lease
+  (`coordinator_lease × (1+ρ)`) after a store outage longer than the
+  tenure. It keeps the version it holds and renews by `If-Match`: if
+  nobody took over, the renewal lands and it acts again at once; if
+  someone did, the renewal is rejected and it follows the new holder.
+- **Pushes have a port of their own in the simulation.** Replication's
+  listener owns the transport port and serves only replication links, and
+  the node binary does not wire the transport yet. The harness serves
+  pushes (`ControlChanged`, acknowledged by `AdminReply`) on port 7401;
+  serving both on one port needs a dispatch by message class when the
+  transport is wired into the binary.
+- **Pushes do not wake the node's sync yet.** `ControlHints::newer_than`
+  is the hook beside the change stream in the node's sync loop, which
+  M2-16 rewrites; the simulation records and checks delivery instead. A
+  push is a hint, so a forged one from an admin certificate costs a read.
+- **The push audit had to learn when nodes run.** Injected control-store
+  faults stop a node during startup now and then, and the supervisor
+  restarts it 500 ms later; invariants only run once clients start, and
+  the harness restarts every node at the end. The check covers
+  announcements from when the clients start until the final restart,
+  skipping those within the bound before a node went down or a second
+  after it came back, and announcements from different coordinators can
+  arrive out of order, so a newer pushed generation counts.
+- **The placement stand-in.** Placement proper is M3-02 to M3-06, so the
+  simulated coordinator moves shard registers of a bucket no gateway
+  serves through their epochs, as membership changes will. The
+  `Placement` trait is the extension point; `NoPlacement` changes
+  nothing. The `ControlStore` trait is unchanged.
+- **Numbers.** Over 32 seeds with a 1.2 s lease and `ρ` = 1%: placement
+  paused at most 1.32 s when the coordinator lost the control store,
+  against a bound of the takeover wait plus two read intervals and three
+  placement intervals (2.31 s), and no client request failed; a node
+  acting without the lease beside the holder made 8,712 changes with
+  the holder, 325 of which lost a race and none of which wrote an epoch
+  twice; the quarter-length-lease bug was caught in 20 of 32 seeds (in
+  the rest the hasty node held the lease from the start).

@@ -57,7 +57,9 @@
 //! Protocols plug in as [`NodeServices`]: started in each life of each
 //! node with its recovered storage, clock, transport, and the placement,
 //! they return the shards the gateway calls. [`ReplicatedServices`] is
-//! replication (plan M2-07), and later protocols extend it. Their failure
+//! replication (plan M2-07), and later protocols extend it.
+//! [`CoordinatedServices`] wraps any services with the coordinator lease
+//! and change propagation (plan M3-01). Their failure
 //! cases become seeded scenarios: a
 //! [`FaultPlan`] built by hand or drawn from a [`FaultProfile`], and
 //! invariants over the state the services expose. Scenario tests live in
@@ -79,6 +81,7 @@
 //! ```
 
 mod cluster;
+mod coordination;
 mod faults;
 mod node;
 mod pki;
@@ -87,6 +90,7 @@ mod s3;
 mod workload;
 
 pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View};
+pub use coordination::{Change, CoordinatedServices, CoordinationConfig, PUSH_PORT, PushDelays};
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards};
