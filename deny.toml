@@ -56,6 +56,12 @@ skip = [
     # moves to getrandom 0.4.
     { crate = "getrandom@0.4", reason = "Windows-only build dependency of aws-lc-sys (cc, jobserver); rand 0.9 uses 0.3" },
     { crate = "r-efi@6", reason = "UEFI-only dependency of getrandom 0.4; getrandom 0.3 uses r-efi 5" },
+    # aws-smithy-checksums (through aws-sdk-s3) uses crc-fast, whose default
+    # `std` feature pulls in digest 0.10 and crypto-common 0.1, while the
+    # SDK's own hmac, sha1, sha2, and md-5 are on digest 0.11. Remove once
+    # crc-fast moves to digest 0.11.
+    { crate = "digest@0.10", reason = "crc-fast (AWS SDK checksums) is still on digest 0.10" },
+    { crate = "crypto-common@0.1", reason = "digest 0.10 through crc-fast (AWS SDK checksums)" },
 ]
 
 [sources]
