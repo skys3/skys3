@@ -237,7 +237,7 @@ impl SimBlockFile {
     /// An injected sync error, after which the file refuses further writes,
     /// and an error once the disk has crashed.
     pub fn sync(&self) -> io::Result<()> {
-        self.with(|state| {
+        self.disk.sync_with(self.incarnation, |state| {
             let fails = state.sync_fails();
             let block = self.writable(state)?;
             if fails {

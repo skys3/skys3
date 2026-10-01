@@ -1,7 +1,10 @@
 //! Shared helpers: node configurations in a temporary directory, an S3
-//! client, and plain HTTP requests to the admin listener.
+//! client, plain HTTP requests to the admin listener, and the binary as a
+//! child process ([`process`]).
 
 #![allow(dead_code)]
+
+pub mod process;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

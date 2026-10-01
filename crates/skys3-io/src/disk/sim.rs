@@ -7,9 +7,12 @@
 //! allows, except where a torn write keeps part of it.
 //!
 //! The disk also holds random-access block files ([`SimBlockFile`]) for
-//! embedded databases such as the node's index (design §10.2).
+//! embedded databases such as the node's index (design §10.2), and can
+//! share a power supply ([`SimPower`]) with other disks, which fails at a
+//! planned sync.
 
 mod block;
+mod power;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,6 +27,7 @@ use super::{Disk, SegmentFile, check_name, read_past_end, truncate_extends};
 
 use block::BlockState;
 pub use block::SimBlockFile;
+pub use power::{SimPower, SyncCut};
 
 /// Faults a [`SimDisk`] injects. Random choices come from the disk's seeded
 /// generator, so a simulation seed replays them exactly.
@@ -92,6 +96,8 @@ struct DiskState {
     /// Block files, by name. They live in their own namespace: segment file
     /// listings do not show them.
     blocks: BTreeMap<String, BlockState>,
+    /// The power supply the disk shares, which counts its syncs.
+    power: Option<SimPower>,
 }
 
 #[derive(Default)]
@@ -173,6 +179,7 @@ impl SimDisk {
                 rng: SmallRng::seed_from_u64(seed),
                 crashes: 0,
                 blocks: BTreeMap::new(),
+                power: None,
             })),
         }
     }
@@ -189,29 +196,7 @@ impl SimDisk {
     /// durable file contents (plus torn writes, if configured) and makes
     /// every mount and file handle stale.
     pub fn crash(&self) {
-        let mut state = self.lock();
-        let state = &mut *state;
-        let torn_probability = state.faults.torn_write_probability;
-        let mut files = BTreeMap::new();
-        let mut used = 0;
-        for &id in state.durable_entries.values() {
-            let file = &state.files[&id];
-            let unsynced = file.data.len() - file.synced;
-            let torn = if unsynced > 0 && chance(&mut state.rng, torn_probability) {
-                state.rng.random_range(0..=unsynced)
-            } else {
-                0
-            };
-            let image = file.crash_image(torn);
-            used += image.len() as u64;
-            files.insert(id, FileState::with_contents(image));
-        }
-        state.files = files;
-        state.used = used;
-        state.entries = state.durable_entries.clone();
-        block::crash(&mut state.blocks, &mut state.rng, torn_probability);
-        state.incarnation += 1;
-        state.crashes += 1;
+        self.lock().power_loss();
     }
 
     /// Simulates the death of the process using the disk, without a power
@@ -229,6 +214,42 @@ impl SimDisk {
         for id in ids {
             state.collect(id);
         }
+    }
+
+    /// Puts the disk on `power`, which then numbers its syncs together with
+    /// those of the supply's other disks and can cut the power of all of
+    /// them at a planned sync.
+    pub fn set_power(&self, power: &SimPower) {
+        power.attach(&self.state);
+        self.lock().power = Some(power.clone());
+    }
+
+    /// Runs one sync of a handle of `incarnation`: `sync` applies it to the
+    /// disk's state. If the disk's power supply planned a cut at this sync,
+    /// every disk on the supply crashes, before `sync` runs or after it,
+    /// and the sync fails.
+    fn sync_with(
+        &self,
+        incarnation: u64,
+        sync: impl FnOnce(&mut DiskState) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut state = self.lock_live(incarnation)?;
+        let Some(power) = state.power.clone() else {
+            return sync(&mut state);
+        };
+        let Some(cut) = power.count_sync() else {
+            return sync(&mut state);
+        };
+        if cut == SyncCut::After {
+            // Whether it fails or not, the sync is over when the power goes.
+            let _ = sync(&mut state);
+        }
+        // The disk loses power before the lock is released, so nothing
+        // reaches it after the boundary.
+        state.power_loss();
+        drop(state);
+        power.cut_others(&self.state);
+        Err(io::Error::other("simulated power loss during a sync"))
     }
 
     /// Returns the number of crashes so far.
@@ -300,6 +321,33 @@ impl fmt::Debug for SimDisk {
 }
 
 impl DiskState {
+    /// A power loss: keeps only durable directory entries and durable file
+    /// contents (plus torn writes, if configured) and makes every mount and
+    /// file handle stale.
+    fn power_loss(&mut self) {
+        let torn_probability = self.faults.torn_write_probability;
+        let mut files = BTreeMap::new();
+        let mut used = 0;
+        for &id in self.durable_entries.values() {
+            let file = &self.files[&id];
+            let unsynced = file.data.len() - file.synced;
+            let torn = if unsynced > 0 && chance(&mut self.rng, torn_probability) {
+                self.rng.random_range(0..=unsynced)
+            } else {
+                0
+            };
+            let image = file.crash_image(torn);
+            used += image.len() as u64;
+            files.insert(id, FileState::with_contents(image));
+        }
+        self.files = files;
+        self.used = used;
+        self.entries = self.durable_entries.clone();
+        block::crash(&mut self.blocks, &mut self.rng, torn_probability);
+        self.incarnation += 1;
+        self.crashes += 1;
+    }
+
     /// Decides whether this sync fails, consuming a forced failure first.
     fn sync_fails(&mut self) -> bool {
         if self.forced_sync_failures > 0 {
@@ -409,18 +457,19 @@ impl Disk for SimMount {
     }
 
     async fn sync_dir(&self) -> io::Result<()> {
-        let mut state = self.disk.lock_live(self.incarnation)?;
-        if state.sync_fails() {
-            return Err(sync_error());
-        }
-        let entries = state.entries.clone();
-        let replaced = std::mem::replace(&mut state.durable_entries, entries);
-        for id in replaced.into_values() {
-            if state.files.contains_key(&id) {
-                state.collect(id);
+        self.disk.sync_with(self.incarnation, |state| {
+            if state.sync_fails() {
+                return Err(sync_error());
             }
-        }
-        Ok(())
+            let entries = state.entries.clone();
+            let replaced = std::mem::replace(&mut state.durable_entries, entries);
+            for id in replaced.into_values() {
+                if state.files.contains_key(&id) {
+                    state.collect(id);
+                }
+            }
+            Ok(())
+        })
     }
 }
 
@@ -487,13 +536,14 @@ impl SegmentFile for SimFile {
     }
 
     async fn sync_data(&self) -> io::Result<()> {
-        let mut state = self.disk.lock_live(self.incarnation)?;
-        if state.sync_fails() {
-            state.update(self.id, FileState::fail_sync);
-            return Err(sync_error());
-        }
-        state.update(self.id, FileState::sync);
-        Ok(())
+        self.disk.sync_with(self.incarnation, |state| {
+            if state.sync_fails() {
+                state.update(self.id, FileState::fail_sync);
+                return Err(sync_error());
+            }
+            state.update(self.id, FileState::sync);
+            Ok(())
+        })
     }
 
     async fn read_at(&self, offset: u64, len: usize) -> io::Result<Bytes> {

@@ -375,3 +375,86 @@ fn recorded_histories_check() {
     )
     .unwrap();
 }
+
+#[test]
+fn clean_copies_count_only_through_the_remote() {
+    // A write_back bucket: an acknowledged write is flushed or still dirty.
+    let history = Builder::new().put("a", (1, Some(2)), Outcome::Done);
+    let copy = |clean: bool, flushed: Option<&str>| Survivors {
+        clean: vec![clean],
+        flushed: Some(flushed.map(str::to_owned)),
+        ..survivors(&[Some("a")])
+    };
+    assert!(durable(&history, copy(false, None)).is_ok());
+    assert!(durable(&history, copy(true, Some("a"))).is_ok());
+    // Clean, yet the remote never got it: eviction would lose it.
+    let violation = durable(&history, copy(true, None)).unwrap_err();
+    assert!(violation.reason.contains("is lost"), "{violation}");
+    // A second, dirty copy keeps it.
+    let two = Survivors {
+        clean: vec![true],
+        flushed: Some(None),
+        ..survivors(&[Some("a"), Some("a")])
+    };
+    assert!(durable(&history, two).is_ok());
+}
+
+fn put_call(value: &str) -> Call {
+    Call::Put {
+        value: value.into(),
+        condition: Condition::None,
+    }
+}
+
+#[test]
+fn a_crash_ends_the_operations_sent_to_the_server() {
+    let history = History::new();
+    let lost = history.call_to("c1", "node", "k", put_call("old"));
+    let elsewhere = history.call_to("c2", "other", "k", Call::Get);
+    let unnamed = history.call("c3", "k", Call::Delete);
+    let acked = history.call_to("c4", "node", "k", put_call("a"));
+    history.crashed("node");
+    // Answers that arrive after the crash were sent before it.
+    history.answer(lost, Outcome::Unknown);
+    history.answer(acked, Outcome::Done);
+    history.answer(elsewhere, Outcome::Unknown);
+    history.answer(unnamed, Outcome::Unknown);
+    let operations = history.operations();
+    assert_eq!(operations[0].outcome, Outcome::Failed);
+    assert_eq!(operations[0].answered, Some(5));
+    assert_eq!(operations[3].outcome, Outcome::Done);
+    assert_eq!(operations[3].answered, Some(5));
+    assert_eq!(operations[1].answered, None);
+    assert_eq!(operations[2].answered, None);
+}
+
+#[test]
+fn an_unacknowledged_write_must_not_resurface_over_a_later_one() {
+    // A PUT is cut off by a crash; after the restart a later PUT is
+    // acknowledged, and then the first one's value comes back.
+    let history = History::new();
+    let cut = history.call_to("c1", "node", "k", put_call("old"));
+    history.crashed("node");
+    history.answer(cut, Outcome::Unknown);
+    let later = history.call_to("c1", "node", "k", put_call("new"));
+    history.answer(later, Outcome::Done);
+    let read = history.call_to("c2", "node", "k", Call::Get);
+    history.answer(read, Outcome::Read(Some("old".into())));
+    let operations = history.operations();
+    assert!(check_linearizable(&operations).is_err());
+    let survivor = BTreeMap::from([("k".to_owned(), survivors(&[Some("old")]))]);
+    assert!(check_durable(&operations[..2], &survivor).is_err());
+
+    // Without the crash, the first PUT might still be on its way, and the
+    // same history is fine.
+    let history = History::new();
+    let open = history.call("c1", "k", put_call("old"));
+    history.answer(open, Outcome::Unknown);
+    let later = history.call("c1", "k", put_call("new"));
+    history.answer(later, Outcome::Done);
+    let read = history.call("c2", "k", Call::Get);
+    history.answer(read, Outcome::Read(Some("old".into())));
+    let operations = history.operations();
+    check_linearizable(&operations).unwrap();
+    check_durable(&operations, &survivor).unwrap();
+}

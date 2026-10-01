@@ -1,12 +1,15 @@
 //! Cluster simulation scenarios, run by CI's simulation job with a larger
 //! fixed seed set and nightly with random seeds and longer runs.
 //!
+//! - [`crash`]: power losses at every sync boundary of a node under the
+//!   M1 workload, with a `write_back` bucket (plan M1-14).
 //! - [`workload`]: the M1 workload on a cluster of real nodes, without
 //!   faults, under random faults, and through a whole-cluster restart
 //!   while the control store is unreachable.
 //! - [`harness`]: the harness itself: replay of a seed, the checkers
 //!   catching seeded bugs, invariants, and node services.
 
+mod crash;
 mod harness;
 mod workload;
 

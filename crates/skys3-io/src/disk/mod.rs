@@ -31,7 +31,9 @@ use std::io;
 use bytes::Bytes;
 
 pub use real::{RealDisk, RealFile};
-pub use sim::{SimBlockFile, SimDisk, SimDiskFaults, SimFile, SimFileInfo, SimMount};
+pub use sim::{
+    SimBlockFile, SimDisk, SimDiskFaults, SimFile, SimFileInfo, SimMount, SimPower, SyncCut,
+};
 pub use space::available_bytes;
 
 /// The longest file name a disk accepts, in bytes.

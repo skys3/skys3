@@ -64,3 +64,91 @@ jobs:
         env:
           SKYS3_SIM_SEEDS: 1024
           SKYS3_SIM_SCALE: 4
+
+  # `kill -9` loops against the real binary on a real file system
+  # (crates/skys3/tests/kill.rs): many more kills than the few every pull
+  # request runs, with a seed for the clients' choices that changes every
+  # night. A failure prints the seed and the end of the node's log.
+  kill-loops:
+    name: Kill loops against the binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+      CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Draw the seed
+        run: |
+          seed="$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+          echo "Seed: $seed"
+          echo "SKYS3_KILL_SEED=$seed" >> "$GITHUB_ENV"
+
+      - name: Run the kill loops
+        run: cargo test --release -p skys3 --test kill -- --nocapture
+        env:
+          SKYS3_KILL_ROUNDS: 200
+
+  # The control-store conformance suite (plan M2-06) against real S3
+  # providers: an S3 control store in a bucket of each, under a fresh
+  # prefix per run, which the test empties afterwards. A provider runs only
+  # when its repository secrets are set; without them its job says so and
+  # passes. For provider P (AWS or R2) they are CONTROL_STORE_P_ENDPOINT
+  # (such as https://s3.us-east-1.amazonaws.com or
+  # https://<account>.r2.cloudflarestorage.com), CONTROL_STORE_P_BUCKET,
+  # CONTROL_STORE_P_ACCESS_KEY_ID, CONTROL_STORE_P_SECRET_ACCESS_KEY, and
+  # optionally CONTROL_STORE_P_REGION. The credential needs only the
+  # control-store policy of design section 6.1 on `skys3-conformance/*`; a
+  # lifecycle rule that expires that prefix removes what a cancelled run
+  # leaves behind.
+  control-store:
+    name: Control-store conformance (${{ matrix.provider }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: AWS S3
+            secrets: AWS
+            region: us-east-1
+          - provider: R2
+            secrets: R2
+            region: auto
+    env:
+      SKYS3_CONTROL_S3_ENDPOINT: ${{ secrets[format('CONTROL_STORE_{0}_ENDPOINT', matrix.secrets)] }}
+      SKYS3_CONTROL_S3_BUCKET: ${{ secrets[format('CONTROL_STORE_{0}_BUCKET', matrix.secrets)] }}
+      SKYS3_CONTROL_S3_REGION: ${{ secrets[format('CONTROL_STORE_{0}_REGION', matrix.secrets)] || matrix.region }}
+      AWS_ACCESS_KEY_ID: ${{ secrets[format('CONTROL_STORE_{0}_ACCESS_KEY_ID', matrix.secrets)] }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets[format('CONTROL_STORE_{0}_SECRET_ACCESS_KEY', matrix.secrets)] }}
+    steps:
+      - name: Check for the provider's secrets
+        id: secrets
+        env:
+          PROVIDER: ${{ matrix.provider }}
+        run: |
+          if [ -n "$SKYS3_CONTROL_S3_ENDPOINT" ] && [ -n "$SKYS3_CONTROL_S3_BUCKET" ] &&
+            [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo configured=true >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Skipping $PROVIDER: its CONTROL_STORE_* secrets are not set."
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.secrets.outputs.configured == 'true'
+
+      - name: Install stable Rust
+        if: steps.secrets.outputs.configured == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run the conformance suite
+        if: steps.secrets.outputs.configured == 'true'
+        run: cargo test -p skys3-control --all-features --test conformance an_s3_provider_conforms -- --nocapture

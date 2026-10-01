@@ -1369,6 +1369,96 @@ of this file. A task with nothing unexpected keeps "None."
   compaction (M1-22), as M1-03 noted. The admin listener still serves
   plain HTTP (M2-02).
 
+### M1-14 Crash-consistency suite
+
+- **The first sync boundaries found a node that could never start
+  again.** redb creates a database in two synced steps, the header and
+  then its magic number, and `Database::create` refuses a non-empty file
+  without the magic number ("Not a redb database") forever. A power loss
+  just after the index's first sync, or just before its second, left the
+  simulated node unable to start: the scenario failed on its second run.
+  The real node had the same gap through `Index::open`. Both now treat a
+  file whose first bytes are each zero or the magic number's own byte, but
+  not the whole magic number, as a creation cut short, truncate it, and
+  create it again. Every later header write repeats the whole magic number,
+  so a used index never looks like that; anything else is still refused.
+  Design §10.2 records the rule, and `skys3-index` tests cover both
+  backends.
+- **Sync boundaries needed a power supply.** `SimDisk` could crash, but
+  nothing numbered syncs or crashed at one, and crashing one disk while the
+  node's other disk ran on would not be a power loss. `skys3-io` gained
+  `SimPower`, which a node's disks share: it numbers every data, directory,
+  and block-file sync of its disks in order, and `cut_at_sync` crashes all
+  of them inside the planned sync, before or after it takes effect, while
+  the syncing disk is still locked, so nothing reaches stable storage after
+  the boundary. The sync then fails like any I/O on a crashed disk. The
+  host itself is crashed by the driver at the next simulation step; until
+  then its I/O fails on stale handles. A first run of a seed counts the
+  node's syncs (`Report::syncs`), and the scenario replays the seed once
+  per boundary and side (`Cluster::power_loss_at_sync`), relying on exact
+  replay, which `a_seed_replays_exactly` now checks with a `write_back`
+  bucket and remote faults too.
+- **The checkers let a resurfaced write pass.** M2-03 keeps a write
+  without an answer open forever, since a held link may deliver it late.
+  With that rule a write cut off by a crash could resurface over a later
+  acknowledged write, and both checkers explained it by placing the old
+  write last: the plan's second rule (§5.2) was not enforced. The history
+  now knows which server each operation reached (`History::call_to`), and
+  `History::crashed` ends the unanswered ones as failed at the crash; an
+  answer the dead process sent earlier still counts. That is only sound
+  if no later life can receive the request, so the cluster workload now
+  records an operation once the node has accepted its connection: a SYN
+  held across a crash reaches the next life, but data on an accepted
+  connection reaches only the life that accepted it. Requests that never
+  connected are no longer recorded at all, since they reached no node.
+  With that, `check_durable` enforces both rules unchanged; unit tests show
+  the same resurfacing history failing with the crash and passing without.
+- **"Flushed or still dirty".** `Survivors` gained `clean`: in a
+  `write_back` bucket a copy whose entry is clean, or that has no entry,
+  claims the remote holds its value, so only the remote counts for it. The
+  harness reads `flushed` from the remote store. `check_durable` needed no
+  other change.
+- **The flusher in the harness.** Every simulated node runs a
+  `FlushService` over its shards, as the binary does, against the
+  harness's remote `SimS3`, with each bucket under its own prefix. The
+  binary re-reads its buckets every second; the harness does it every
+  200 ms, because the capability probe (about twenty requests) and a
+  second pass must finish within a workload of a few seconds before any
+  flush starts. With remote faults the probe often retried past the end of
+  such a short run, so the sync-boundary scenario uses a fault-free remote
+  and the random-fault scenario adds a `write_back` bucket with remote
+  faults. The probe's scratch-key nonce comes from the system clock, which
+  a seed cannot replay; it changes key names only, and replay stays exact.
+- **The scenario has teeth.** Shards that acknowledge an unconditional PUT
+  before its record is durable, and make every other request wait for such
+  writes, pass a run without a crash and fail at some sync boundary, as a
+  test checks.
+- **Cost.** A single-node run takes about 0.1 s in a debug build, and a
+  seed has about 40 syncs, so a seed costs about 80 runs and 15 s. The
+  scenario declares a cost of 64: one seed in a plain `cargo test`, four in
+  CI's simulation job, and sixteen at four times the length nightly.
+- **`kill -9` loops.** `crates/skys3/tests/kill.rs` runs four AWS SDK
+  clients (retries disabled, every wait bounded) against the binary,
+  kills it with `SIGKILL` at a random moment, waits for every client to
+  stop, and restarts it; the clients stop before the next life starts, so
+  ending their pending operations at the kill is exact. CI runs 3 rounds
+  with seed 0; the new nightly `kill-loops` job runs 200 in release mode
+  with a random `SKYS3_KILL_SEED`. 25 rounds in a debug build took 31 s,
+  with about 3,700 operations of which 32 writes were cut off by a kill.
+  The process helpers of `binary.rs` moved to `tests/support/process.rs`.
+- **Multipart objects are flushed now.** With M1-16b merged, the
+  harness's flusher sends completed multipart uploads to the remote store
+  instead of parking them, so the `write_back` checks also cover them: the
+  remote ETag of a flushed upload is its multipart ETag, which is the value
+  the history records. The harness needed no change for it.
+- **Left open.** The kill loop has only a `local` bucket: no S3 server in
+  the tests keeps `x-amz-meta-skys3-wid` and honors preconditions (M1-16's
+  note), so the binary's flush path stays covered by the simulation only.
+  Each sync-boundary run cuts the power once; a second cut during the
+  recovery that follows is not enumerated, though recovery's own syncs are
+  enumerated at first start and the random-fault scenario crashes nodes
+  repeatedly. Replicated sync boundaries come with M2-07.
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
@@ -2183,3 +2273,59 @@ of this file. A task with nothing unexpected keeps "None."
   that wires it adds the TLS keys (CA, client certificate and key) to
   `[control_store]` and §14. etcd's user-and-password tokens are not
   supported; client certificates are.
+
+### M2-06 Control-store conformance suite
+
+- **Most of the suite already existed.** M1-05 started
+  `skys3_control::conformance` and M2-04 and M2-05 ran it against their
+  backends, each on one shared handle and with backend-specific extras
+  (more racing writers, the probe over separate etcd connections). This
+  PR makes it the harness the plan asks for: `Backend::connect` gives
+  each racing writer, probing node, and change stream its own handle (a
+  new etcd connection, a new S3 client), `Scale` sets writers,
+  operations, and probe runs, and `run_at` runs every check with a fresh
+  store and names each check as it starts. The extras folded into it:
+  the etcd conformance and probe tests in `tests/etcd.rs`, two probe
+  tests in `tests/probe.rs` (the AWS-like profile and faults per writer),
+  and the extra racing calls in `tests/conformance.rs`.
+- **A linearizability check without a search.** The cluster harness's
+  checker (M2-03) searches over plain registers. Control-store values
+  are unique and every successful `put_if` names the version it
+  replaced, so the successful writes form one chain, which is the only
+  order a linearization can give them; each read, write, and failed
+  precondition then has a position (a lower bound for a failure), and
+  real time must not contradict the positions. The check is a sweep over
+  logical call and return ticks. An unanswered write counts once a read
+  returns its value. Unit tests feed it forked, stale, and out-of-order
+  histories, and `tests/conformance.rs` shows the suite failing on
+  simulated stores that ignore preconditions, read stale, or list stale.
+- **Change streams had to be `'static`.** Watchers run as tasks, but
+  `ControlStore::Changes` had no `'static` bound, so a generic check
+  could not move a stream into one. Every backend's stream already owns
+  what it reads; the trait now says so.
+- **The file store refuses a second node.** The watcher check first
+  wrote one `nodes/` register per writer, which the file backend rejects
+  by design (`SecondNode`); it writes `buckets/` registers instead.
+- **No provider credentials here.** The nightly job could not be run.
+  Its plumbing was checked end to end instead against SkyS3's own
+  gateway, a local node with a file control store serving the control
+  bucket over HTTP through the AWS SDK client (MinIO's download is
+  blocked by the egress proxy): the whole suite passed at the default
+  scale in 27 seconds and the cleanup left the bucket empty. The first
+  nightly runs must confirm two open questions: whether R2 honors
+  `If-Match` on `DeleteObject` (if not, the R2 job fails, which means R2
+  is refused as a control store, design §6.1), and whether AWS answers
+  `If-Match` on a missing key with `404` or `204` (M2-04's note;
+  `conditional_deletes` expects a failed precondition).
+- **Gating on secrets.** GitHub Actions cannot test secrets in a job's
+  `if:`, so the nightly job maps each provider's `CONTROL_STORE_<P>_*`
+  secrets into the environment and its first step skips the rest, with a
+  notice, when any required one is empty. The test itself also skips
+  when `SKYS3_CONTROL_S3_ENDPOINT` or `SKYS3_CONTROL_S3_BUCKET` is unset,
+  like the etcd tests. The run is a task of its own so that the cleanup
+  runs even when a check panics.
+- **Run times.** At `Scale::LARGE` the suite takes about 29 seconds
+  against a local etcd 3.6.10 (the CI job runs it after the M2-05
+  tests), and a few seconds on the simulated stores with the paused
+  clock. The file store and the fake etcd run on real time at
+  `Scale::SMALL`.
