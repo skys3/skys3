@@ -413,3 +413,57 @@ of this file. A task with nothing unexpected keeps "None."
   `[control_store] backend` offers `etcd` and `s3`. The file backend is not
   wired into the binary (rule 1.1); the task that wires the control store
   into the node (M1-13) adds `backend = "file"` and its directory key.
+
+### M1-23 OIDC token validation
+
+- **`jsonwebtoken` was not a good fit after all.** Design §15 named
+  `openidconnect` or `jsonwebtoken`. `openidconnect` is a relying-party
+  client for login flows. `jsonwebtoken` 11 has no `ring` backend, only
+  `aws_lc_rs` and `rust_crypto`, picked by a process-wide `CryptoProvider`
+  that panics at the first verification if feature unification ever enables
+  both. Its `rust_crypto` backend uses the `rsa` crate, which carries an
+  unpatched RustSec advisory (RUSTSEC-2023-0071) that `cargo deny` would
+  reject. Once tokens and key
+  sets were parsed by SkyS3 (to bound them, skip unusable keys, and fuzz
+  them), `jsonwebtoken` contributed only the call into the crypto library.
+  `skys3-sts` calls `aws-lc-rs`, the provider rustls and the AWS SDK use by
+  default, directly. Design §11 and §15 record the decision.
+- **`aws-lc-rs` default features duplicate `untrusted`.** Its `ring-io` and
+  `ring-sig-verify` features pull `untrusted` 0.7, while `rustls-webpki`
+  uses 0.9. `aws-lc-rs` is declared with `default-features = false`, which
+  removes the duplicate. Without `ring-io`, a generated RSA key pair does not
+  expose its modulus and exponent, so the test kit reads them from the
+  PKCS#1 DER encoding.
+- **Duplicates outside the target platforms.** `aws-lc-sys` builds with
+  `cc`, whose `jobserver` uses `getrandom` 0.4 on Windows, which uses `r-efi`
+  6 on UEFI; `rand` 0.9 uses `getrandom` 0.3 and `r-efi` 5. `cargo deny`
+  checks every target, so `deny.toml` skips `getrandom@0.4` and `r-efi@6`
+  with that reason.
+- **The node clock cannot check token lifetimes.** `skys3_io::Clock` is
+  monotonic with a per-node origin, so it cannot be compared with `exp`.
+  `skys3-sts` has its own `WallClock` trait, with `SystemClock` and a
+  `ManualClock` for tests. Key-cache ages use the same clock, and a reading
+  that goes backwards counts as "long ago", so a stepped clock refreshes
+  keys early rather than late.
+- **The issuer allowlist is not node configuration.** The task suggested
+  adding configuration keys for issuers and audiences, but design §6.1
+  places OIDC providers in the control store under `identity/`, with roles
+  and trust policies. `OidcProvider` is that record's schema (unknown fields
+  rejected, like other control-store readers), and
+  `OidcValidator::set_providers` replaces the allowlist when the node's copy
+  changes. The only new key is `[identity] oidc_clock_skew_seconds`, because
+  skew is a property of the node. Fetch limits and cache lifetimes are
+  constants in `ValidatorSettings`.
+- **Checked-in test certificates.** The TLS tests of `HttpsFetcher` use a
+  test CA and a server certificate for `127.0.0.1` that are valid for 100
+  years, generated once with `openssl`, under
+  `crates/skys3-sts/tests/data/`. Generating them at test time would need
+  `rcgen` and its dependencies.
+- **The first fuzz build is slow.** `cargo +nightly fuzz build` compiles
+  `aws-lc-sys` with the sanitizer flags, which took about 3.5 minutes.
+  `sts_jwt` ran about 4.3 million inputs in 30 s and `sts_jwks` about 1.9
+  million, with no failures.
+- **`base64` 0.22 would duplicate the AWS SDK's 0.23.** `hyper-util`'s
+  client features, which the AWS SDK's HTTP client enables (M1-15), pull in
+  `base64` 0.23. Stacking M1-15 on this PR failed the duplicate-version ban,
+  so the workspace uses `base64` 0.23; its API is unchanged for our use.
