@@ -1446,7 +1446,7 @@ of this file. A task with nothing unexpected keeps "None."
   with a random `SKYS3_KILL_SEED`. 25 rounds in a debug build took 31 s,
   with about 3,700 operations of which 32 writes were cut off by a kill.
   The process helpers of `binary.rs` moved to `tests/support/process.rs`.
-- **Multipart objects are flushed now.** Rebased onto M1-16b, the
+- **Multipart objects are flushed now.** With M1-16b merged, the
   harness's flusher sends completed multipart uploads to the remote store
   instead of parking them, so the `write_back` checks also cover them: the
   remote ETag of a flushed upload is its multipart ETag, which is the value
