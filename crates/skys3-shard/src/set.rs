@@ -10,6 +10,7 @@ use skys3_io::{BlockingPool, Disk};
 use skys3_log::{SegmentLog, ShardRef};
 use skys3_types::{BucketId, KeyHash, Label, NodeId, ShardConfig};
 use tokio::sync::{Mutex, MutexGuard, watch};
+use tokio::task::JoinSet;
 
 use crate::error::ShardError;
 use crate::shard::{Shard, ShardSummary};
@@ -223,11 +224,14 @@ impl<D: Disk> ShardSet<D> {
     /// records it sequenced are applied, so nothing is in flight when the
     /// node checkpoints and exits, or, on a replicated shard, once its
     /// [`AckTimeout`](crate::AckTimeout) gave up on its members. The shards
-    /// stay in the set, closed.
+    /// stay in the set, closed. The shards close concurrently, so the whole
+    /// call waits about one acknowledgement timeout, not one per shard
+    /// whose members are gone, and returns once every shard is closed.
     ///
     /// # Errors
     ///
-    /// The first shard's error; every shard is closed regardless.
+    /// The error of the first shard, in shard order, that failed to close;
+    /// every shard is closed regardless.
     pub async fn close_all(&self) -> Result<(), ShardError> {
         let open: Vec<_> = self
             .shards
@@ -239,15 +243,23 @@ impl<D: Disk> ShardSet<D> {
                 Slot::Removing(_) => None,
             })
             .collect();
-        let mut result = Ok(());
-        for shard in open {
-            if let Err(error) = shard.close().await
-                && result.is_ok()
-            {
-                result = Err(error);
+        let mut closing = JoinSet::new();
+        for (n, shard) in open.into_iter().enumerate() {
+            closing.spawn(async move { (n, shard.close().await) });
+        }
+        let mut errors = BTreeMap::new();
+        while let Some(closed) = closing.join_next().await {
+            match closed {
+                Ok((n, Err(error))) => {
+                    errors.insert(n, error);
+                }
+                Ok((_, Ok(()))) => {}
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                // Only the runtime shutting down cancels a close.
+                Err(_) => {}
             }
         }
-        result
+        errors.into_values().next().map_or(Ok(()), Err)
     }
 
     /// Seals `shard`; see [`Shard::seal`].
