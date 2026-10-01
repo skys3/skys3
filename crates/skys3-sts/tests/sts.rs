@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -413,4 +414,73 @@ async fn malformed_requests_are_refused() {
     let request = http::Request::get("/").body(s3s::Body::empty()).unwrap();
     let response = node.gateway.handle(request).await;
     assert_eq!(response.status(), 403);
+}
+
+/// Runs an `AssumeRoleWithWebIdentity` whose key fetch is held open while
+/// `change` changes the identity configuration, and returns its answer.
+async fn assume_during<F: Future<Output = ()>>(node: &Node, change: F) -> common::Answer {
+    let token = node.token(CI, json!({}));
+    let closed = node.gate.write().await;
+    let changing = async {
+        node.fetching.notified().await;
+        change.await;
+        drop(closed);
+    };
+    let (answer, ()) = tokio::join!(node.assume(&token, &[]), changing);
+    answer
+}
+
+#[tokio::test]
+async fn changes_during_validation_are_honoured() {
+    // The role's trust policy stops allowing the caller.
+    let node = Node::start(START).await;
+    let answer = assume_during(&node, async {
+        let narrowed = trust_policy().replace("system:serviceaccount:ci:*", "nobody");
+        node.put_role("deployer", &narrowed, &[&role_policy()])
+            .await;
+        node.sync().await.unwrap();
+    })
+    .await;
+    answer.assert(403, Some("AccessDenied"));
+    assert!(node.sessions.is_empty());
+
+    // The role is removed.
+    let node = Node::start(START).await;
+    let answer = assume_during(&node, async {
+        node.put_raw("identity/roles/deployer.json", "{}").await;
+        node.sync().await.unwrap();
+    })
+    .await;
+    answer.assert(403, Some("AccessDenied"));
+    assert!(node.sessions.is_empty());
+
+    // The issuer stops accepting the token's audience.
+    let node = Node::start(START).await;
+    let answer = assume_during(&node, async {
+        node.put_provider("idp", OidcProvider::new(ISSUER, ["other-audience"]))
+            .await;
+        node.sync().await.unwrap();
+    })
+    .await;
+    answer.assert(400, Some("InvalidIdentityToken"));
+    assert!(node.sessions.is_empty());
+
+    // The copy goes stale while the fetch hangs.
+    let node = Node::start(START).await;
+    let answer = assume_during(&node, async {
+        node.clock.advance(Duration::from_secs(3601));
+    })
+    .await;
+    answer.assert(503, Some("ServiceUnavailable"));
+    assert!(node.sessions.is_empty());
+
+    // An unrelated change does not stop the session.
+    let node = Node::start(START).await;
+    let answer = assume_during(&node, async {
+        node.put_role("other", &trust_policy(), &[]).await;
+        node.sync().await.unwrap();
+    })
+    .await;
+    answer.assert(200, None);
+    assert_eq!(node.sessions.len(), 1);
 }

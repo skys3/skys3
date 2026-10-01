@@ -56,6 +56,12 @@ pub enum Fault {
     /// `409 ConditionalRequestConflict` without applying the request, as if
     /// a concurrent write had raced it.
     Conflict,
+    /// A `GetObject` or `HeadObject` of a key's current object answers with
+    /// what the key held before its latest write, or `404 NoSuchKey` if it
+    /// held nothing, as an eventually consistent store may. Reads of a
+    /// specific version, reads of a key never written, and other operations
+    /// are unaffected.
+    StaleRead,
 }
 
 /// Random faults a [`SimS3`](super::SimS3) injects into every request.
@@ -63,8 +69,9 @@ pub enum Fault {
 /// Each request draws one of the error faults with the given probabilities,
 /// which must sum to at most 1, and independently two delays within
 /// `min_delay..=max_delay`: one before the store applies the request and
-/// one before the caller gets the response. The default injects nothing and
-/// never sleeps.
+/// one before the caller gets the response. A read is also stale with
+/// `stale_read_probability`, independently of the rest. The default injects
+/// nothing and never sleeps.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SimS3Faults {
     /// The shortest delay of each leg of a request.
@@ -79,6 +86,9 @@ pub struct SimS3Faults {
     pub lost_request_probability: f64,
     /// The probability of [`Fault::LostResponse`].
     pub lost_response_probability: f64,
+    /// The probability that a read is [`Fault::StaleRead`], drawn apart
+    /// from the error faults: a store without read-after-write consistency.
+    pub stale_read_probability: f64,
 }
 
 impl SimS3Faults {
@@ -90,6 +100,7 @@ impl SimS3Faults {
         slow_down_probability: 0.0,
         lost_request_probability: 0.0,
         lost_response_probability: 0.0,
+        stale_read_probability: 0.0,
     };
 
     /// A store that is down: every request fails with `500 InternalError`.
@@ -102,8 +113,8 @@ impl SimS3Faults {
     ///
     /// # Panics
     ///
-    /// Panics if a probability is outside `0..=1`, they sum to more than 1,
-    /// or `min_delay > max_delay`.
+    /// Panics if a probability is outside `0..=1`, the error faults'
+    /// probabilities sum to more than 1, or `min_delay > max_delay`.
     pub(super) fn validate(&self) {
         let probabilities = [
             self.internal_error_probability,
@@ -113,7 +124,8 @@ impl SimS3Faults {
         ];
         assert!(
             probabilities.iter().all(|p| (0.0..=1.0).contains(p))
-                && probabilities.iter().sum::<f64>() <= 1.0 + f64::EPSILON,
+                && probabilities.iter().sum::<f64>() <= 1.0 + f64::EPSILON
+                && (0.0..=1.0).contains(&self.stale_read_probability),
             "fault probabilities must be within 0..=1 and sum to at most 1: {self:?}"
         );
         assert!(
@@ -128,8 +140,12 @@ impl SimS3Faults {
 pub(super) struct Plan {
     pub(super) request_delay: Duration,
     pub(super) response_delay: Duration,
-    /// Not [`Fault::Delay`], which sets `request_delay` instead.
+    /// Not [`Fault::Delay`] or [`Fault::StaleRead`], which set
+    /// `request_delay` and `stale` instead.
     pub(super) fault: Option<Fault>,
+    /// Whether a read of a current object is answered from before the
+    /// key's latest write.
+    pub(super) stale: bool,
     /// For [`Fault::LostResponse`]: whether the caller sees a timeout rather
     /// than a server error.
     pub(super) lost_as_timeout: bool,
@@ -172,6 +188,7 @@ impl Injector {
             request_delay: delay(&mut self.rng),
             response_delay: delay(&mut self.rng),
             fault: None,
+            stale: false,
             lost_as_timeout: self.rng.random_bool(0.5),
         };
         let draw: f64 = self.rng.random();
@@ -189,11 +206,20 @@ impl Injector {
         .find(|&(cumulative, _)| draw < cumulative)
         .map(|(_, fault)| fault);
         plan.fault = random;
+        // Drawn only when enabled, so profiles without stale reads keep the
+        // generator's sequence, and the seeds recorded for them, unchanged.
+        if faults.stale_read_probability > 0.0 {
+            plan.stale = self.rng.random_bool(faults.stale_read_probability);
+        }
 
         if let Some(index) = self.scripted.iter().position(|&(op, _)| op == operation) {
             match self.scripted.remove(index).map(|(_, fault)| fault) {
                 Some(Fault::Delay(delay)) => {
                     plan.request_delay = delay;
+                    plan.fault = None;
+                }
+                Some(Fault::StaleRead) => {
+                    plan.stale = true;
                     plan.fault = None;
                 }
                 scripted => plan.fault = scripted,
@@ -234,6 +260,7 @@ mod tests {
             slow_down_probability: 0.2,
             lost_request_probability: 0.3,
             lost_response_probability: 0.4,
+            stale_read_probability: 0.0,
         });
         let mut counts = [0_u32; 4];
         for _ in 0..10_000 {
@@ -274,6 +301,37 @@ mod tests {
             injector.plan(Operation::DeleteObject).fault,
             Some(Fault::Conflict)
         );
+    }
+
+    #[test]
+    fn stale_reads_are_drawn_apart_from_errors() {
+        let mut random = injector(SimS3Faults {
+            lost_response_probability: 1.0,
+            stale_read_probability: 0.5,
+            ..SimS3Faults::NONE
+        });
+        let plans: Vec<_> = (0..1_000)
+            .map(|_| random.plan(Operation::GetObject))
+            .collect();
+        assert!(plans.iter().all(|p| p.fault == Some(Fault::LostResponse)));
+        let stale = plans.iter().filter(|p| p.stale).count();
+        assert!(stale.abs_diff(500) < 100, "{stale}");
+
+        let mut scripted = injector(SimS3Faults::NONE);
+        scripted.script(Operation::GetObject, Fault::StaleRead);
+        let plan = scripted.plan(Operation::GetObject);
+        assert!(plan.stale && plan.fault.is_none());
+        assert!(!scripted.plan(Operation::GetObject).stale);
+    }
+
+    #[test]
+    #[should_panic(expected = "fault probabilities")]
+    fn stale_read_probability_must_be_a_probability() {
+        SimS3Faults {
+            stale_read_probability: 1.5,
+            ..SimS3Faults::NONE
+        }
+        .validate();
     }
 
     #[test]

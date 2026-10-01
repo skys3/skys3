@@ -110,32 +110,53 @@ pub struct ControlStoreConfig {
 }
 
 impl ControlStoreConfig {
-    /// Checks that a data target does not share the control store's
-    /// failure scope (§6.1), as attaching a bucket requires: the target's
-    /// endpoint must not have the host name or IP address of an S3 control
-    /// store's endpoint, nor be an AWS S3 endpoint in the same region,
-    /// unless `allow_correlated_control_store` is set. An etcd control
-    /// store is never correlated with a target.
+    /// Checks a data target against an S3 control store (§6.1), as
+    /// configuration loading does for backup and snapshot targets and
+    /// attaching a bucket does for its target.
+    ///
+    /// - The target must not hold keys under the control prefix, nor the
+    ///   control prefix keys of the target: in one bucket, one prefix must
+    ///   not start with the other. Otherwise a credential for the target
+    ///   would also reach the registers. This holds even with
+    ///   `allow_correlated_control_store`.
+    /// - The target must not share the control store's failure scope: the
+    ///   host name or IP address of its endpoint, or the region of an AWS
+    ///   S3 endpoint, unless `allow_correlated_control_store` is set.
+    ///
+    /// An etcd control store passes every target.
     ///
     /// # Errors
     ///
-    /// A message naming the shared scope.
+    /// A message naming the shared bucket or scope.
     pub fn check_target_independence(&self, target: &RemoteTarget) -> Result<(), String> {
-        let ControlStoreBackend::S3 { endpoint, .. } = &self.backend else {
+        let ControlStoreBackend::S3 { endpoint, bucket } = &self.backend else {
             return Ok(());
         };
+        let Some(scope) = target::failure_scope(endpoint) else {
+            return Ok(());
+        };
+        if target::failure_scope(&target.endpoint).as_ref() != Some(&scope) {
+            return Ok(());
+        }
+        let target_prefix = target.prefix.as_deref().unwrap_or_default();
+        if target.bucket == *bucket
+            && (self.prefix.starts_with(target_prefix) || target_prefix.starts_with(&self.prefix))
+        {
+            return Err(format!(
+                "the target's keys overlap the control store's, {bucket}/{}; a credential for \
+                 the target would reach the registers (§6.1). Give the control store a prefix \
+                 of its own",
+                self.prefix
+            ));
+        }
         if self.allow_correlated_control_store {
             return Ok(());
         }
-        match target::failure_scope(endpoint) {
-            Some(scope) if target::failure_scope(&target.endpoint).as_ref() == Some(&scope) => {
-                Err(format!(
-                    "the target shares its failure scope ({scope}) with the control store; \
-                     one outage would stop both flushing and membership changes (§6.1)"
-                ))
-            }
-            _ => Ok(()),
-        }
+        Err(format!(
+            "the target shares its failure scope ({scope}) with the control store; one outage \
+             would stop both flushing and membership changes (§6.1). Move the control store, \
+             or set allow_correlated_control_store = true"
+        ))
     }
 }
 

@@ -18,7 +18,13 @@
 //! 4. The web identity token must validate against the allowlisted issuers
 //!    ([`OidcValidator`]): `InvalidIdentityToken`, `ExpiredTokenException`,
 //!    or `IDPCommunicationError` if the issuer's keys cannot be loaded.
-//! 5. The role must exist and its trust policy must allow the token's
+//! 5. Validation may wait seconds for an issuer's keys, so the identity
+//!    copy is read again afterwards, and everything below is decided on it
+//!    as it is then: it must still be fresh (`503`), and its provider for
+//!    the token's issuer must still accept the token's audience,
+//!    algorithm, and authorized party (`InvalidIdentityToken`). A sync
+//!    that revokes the provider or the role during the wait is honoured.
+//!    The role must exist and its trust policy must allow the token's
 //!    issuer, audience, subject, and authorized party; otherwise `403
 //!    AccessDenied`, the same for a role that does not exist.
 //! 6. The session is issued ([`crate::session`]), its record stored, and
@@ -51,7 +57,7 @@ use skys3_types::policy::{Policy, PolicyDocument};
 pub use self::request::{AssumeRoleRequest, MAX_FORM_BYTES, MAX_SESSION_POLICY_BYTES};
 use self::response::{AssumeRoleResult, error_xml};
 use crate::fetch::DocumentFetcher;
-use crate::identity::IdentityCopy;
+use crate::identity::{IdentityCopy, IdentitySnapshot};
 use crate::session::{IssuedSession, Session, SessionGrant, SessionStore, base32};
 use crate::validator::{OidcValidator, ValidationError, VerifiedToken};
 
@@ -289,10 +295,8 @@ impl<F: DocumentFetcher, S: SessionStore> StsEndpoint<F, S> {
                     error.to_string(),
                 )
             })?;
-        let snapshot = self.identity.fresh().map_err(|stale| {
-            tracing::warn!("refusing a new session: {stale}");
-            StsError::unavailable("The identity configuration is out of date; retry later")
-        })?;
+        // Checked before validation too, so a stale node fetches no keys.
+        self.fresh_identity()?;
         let token = self
             .validator
             .validate(&request.token)
@@ -301,6 +305,19 @@ impl<F: DocumentFetcher, S: SessionStore> StsEndpoint<F, S> {
                 tracing::debug!(%error, "rejected a web identity token");
                 StsError::token(&error)
             })?;
+        // Validation may have waited seconds for an issuer's keys, while a
+        // sync revoked the provider or the role, or the copy went stale.
+        // Everything the session rests on is decided on the copy as it is
+        // now, after the wait.
+        let snapshot = self.fresh_identity()?;
+        if !snapshot
+            .providers()
+            .iter()
+            .any(|provider| provider.accepts(&token))
+        {
+            tracing::info!(issuer = %token.issuer, "the token's provider changed during validation");
+            return Err(StsError::token(&ValidationError::UnknownIssuer));
+        }
         let identity = WebIdentity {
             issuer: &token.issuer,
             audience: &token.audience,
@@ -348,6 +365,14 @@ impl<F: DocumentFetcher, S: SessionStore> StsEndpoint<F, S> {
             ),
             issued,
             token,
+        })
+    }
+
+    /// The identity copy, if it is fresh enough to issue sessions from.
+    fn fresh_identity(&self) -> Result<Arc<IdentitySnapshot>, StsError> {
+        self.identity.fresh().map_err(|stale| {
+            tracing::warn!("refusing a new session: {stale}");
+            StsError::unavailable("The identity configuration is out of date; retry later")
         })
     }
 

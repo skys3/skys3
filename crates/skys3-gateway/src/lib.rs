@@ -27,6 +27,11 @@
 //!   larger one as `EXTENT` records while it arrives, and a PUT is answered
 //!   only once its record is durable and applied. User metadata is limited
 //!   to [`MAX_USER_METADATA_BYTES`].
+//! - Listings: ListObjectsV2 and ListObjects (V1), with prefixes,
+//!   delimiters, `start-after` and markers, and `encoding-type=url`. Each
+//!   shard returns a sorted page from its index, the gateway merges them,
+//!   and a V2 page ends with a continuation token authenticated with the
+//!   gateway's [`ListTokenKeys`].
 //! - [`Shards`] and [`ShardRef`]: the shard interface the gateway calls,
 //!   and routing of each key to its shard with the frozen hash. On a single
 //!   node every shard is local: [`LocalShards`] serves the interface from
@@ -104,6 +109,7 @@ mod features;
 pub mod fuzzing;
 mod limits;
 mod listener;
+mod listing;
 mod local;
 mod objects;
 mod service;
@@ -118,6 +124,7 @@ pub use conditions::{ConditionFailed, Precondition};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
+pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};
 pub use local::LocalShards;
 pub use objects::{MAX_OBJECT_BYTES, MAX_USER_METADATA_BYTES};
 #[cfg(any(test, feature = "test-util"))]

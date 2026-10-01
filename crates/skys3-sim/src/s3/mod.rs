@@ -24,6 +24,10 @@
 //!   MetadataTooLarge`.
 //! - **Versioning**, when enabled, keeps every version, adds delete markers,
 //!   and serves reads and deletes of specific versions.
+//! - **Read-after-write consistency**, as on AWS S3, unless
+//!   [`Fault::StaleRead`] faults make a `GetObject` or `HeadObject` answer
+//!   with what the key held before its latest write, to model a store the
+//!   control-store probe must refuse (design §6.1).
 //!
 //! Faults come from a generator seeded at creation, and the store never
 //! reads the wall clock, so a simulation seed replays them exactly. Delays
@@ -271,7 +275,10 @@ impl SimS3 {
     /// Reads the current object at `key` without a request: no faults and
     /// no delay.
     pub fn object(&self, key: &str) -> Option<GetOutput> {
-        self.state().bucket.get_object(&GetObject::new(key)).ok()
+        self.state()
+            .bucket
+            .get_object(&GetObject::new(key), false)
+            .ok()
     }
 
     /// Returns every key with a current object, in order, without a
@@ -305,12 +312,12 @@ impl SimS3 {
 
     /// Runs one request: draws its faults and delays, waits, applies it
     /// unless a fault stops it, waits again, and answers unless the
-    /// response is lost.
+    /// response is lost. `apply` learns whether a read is stale.
     async fn request<T>(
         &self,
         operation: Operation,
         tracking: Tracking<'_>,
-        apply: impl FnOnce(&mut Bucket) -> S3Result<T>,
+        apply: impl FnOnce(&mut Bucket, bool) -> S3Result<T>,
     ) -> S3Result<T> {
         let (plan, in_flight) = {
             let mut state = self.state();
@@ -349,7 +356,7 @@ impl SimS3 {
         plan: Plan,
         in_flight: Option<InFlight<'_>>,
         writes: Option<&str>,
-        apply: impl FnOnce(&mut Bucket) -> S3Result<T>,
+        apply: impl FnOnce(&mut Bucket, bool) -> S3Result<T>,
     ) -> S3Result<T> {
         let mut state = self.state();
         let conflicted = in_flight.is_some_and(|in_flight| in_flight.finish(&mut state));
@@ -386,7 +393,12 @@ impl SimS3 {
         if let Some((kind, message)) = injected {
             return Err(S3Error::new(kind, message));
         }
-        let result = apply(&mut state.bucket);
+        let result = match writes {
+            Some(key) => state
+                .bucket
+                .apply_write(key, |bucket| apply(bucket, plan.stale)),
+            None => apply(&mut state.bucket, plan.stale),
+        };
         if let (Ok(_), Some(key)) = (&result, writes) {
             for (in_flight_key, conflicted) in state.in_flight.values_mut() {
                 if in_flight_key == key {
@@ -477,7 +489,7 @@ impl ObjectStore for SimS3 {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(WritePrecondition::is_some),
         };
-        self.request(Operation::PutObject, tracking, |bucket| {
+        self.request(Operation::PutObject, tracking, |bucket, _| {
             request.precondition = gated?;
             bucket.put_object(request)
         })
@@ -485,15 +497,15 @@ impl ObjectStore for SimS3 {
     }
 
     async fn get_object(&self, request: GetObject) -> S3Result<GetOutput> {
-        self.request(Operation::GetObject, Tracking::NONE, |bucket| {
-            bucket.get_object(&request)
+        self.request(Operation::GetObject, Tracking::NONE, |bucket, stale| {
+            bucket.get_object(&request, stale)
         })
         .await
     }
 
     async fn head_object(&self, request: HeadObject) -> S3Result<ObjectInfo> {
-        self.request(Operation::HeadObject, Tracking::NONE, |bucket| {
-            bucket.head_object(&request)
+        self.request(Operation::HeadObject, Tracking::NONE, |bucket, stale| {
+            bucket.head_object(&request, stale)
         })
         .await
     }
@@ -506,7 +518,7 @@ impl ObjectStore for SimS3 {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(Option::is_some),
         };
-        self.request(Operation::DeleteObject, tracking, |bucket| {
+        self.request(Operation::DeleteObject, tracking, |bucket, _| {
             request.if_match = gated?;
             bucket.delete_object(request)
         })
@@ -514,7 +526,7 @@ impl ObjectStore for SimS3 {
     }
 
     async fn list_objects_v2(&self, request: ListObjectsV2) -> S3Result<ListObjectsV2Output> {
-        self.request(Operation::ListObjectsV2, Tracking::NONE, |bucket| {
+        self.request(Operation::ListObjectsV2, Tracking::NONE, |bucket, _| {
             bucket.list_objects_v2(&request)
         })
         .await
@@ -536,7 +548,7 @@ impl ObjectStore for SimS3 {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(|(p, _)| p.is_some()),
         };
-        self.request(Operation::CopyObject, tracking, |bucket| {
+        self.request(Operation::CopyObject, tracking, |bucket, _| {
             (request.precondition, request.source_if_match) = gated?;
             bucket.copy_object(request)
         })
@@ -544,14 +556,16 @@ impl ObjectStore for SimS3 {
     }
 
     async fn create_multipart_upload(&self, request: CreateMultipartUpload) -> S3Result<UploadId> {
-        self.request(Operation::CreateMultipartUpload, Tracking::NONE, |bucket| {
-            bucket.create_multipart_upload(request)
-        })
+        self.request(
+            Operation::CreateMultipartUpload,
+            Tracking::NONE,
+            |bucket, _| bucket.create_multipart_upload(request),
+        )
         .await
     }
 
     async fn upload_part(&self, request: UploadPart) -> S3Result<ETag> {
-        self.request(Operation::UploadPart, Tracking::NONE, |bucket| {
+        self.request(Operation::UploadPart, Tracking::NONE, |bucket, _| {
             bucket.upload_part(request)
         })
         .await
@@ -568,7 +582,7 @@ impl ObjectStore for SimS3 {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(WritePrecondition::is_some),
         };
-        self.request(Operation::CompleteMultipartUpload, tracking, |bucket| {
+        self.request(Operation::CompleteMultipartUpload, tracking, |bucket, _| {
             request.precondition = gated?;
             bucket.complete_multipart_upload(request)
         })
@@ -576,14 +590,16 @@ impl ObjectStore for SimS3 {
     }
 
     async fn abort_multipart_upload(&self, request: AbortMultipartUpload) -> S3Result<()> {
-        self.request(Operation::AbortMultipartUpload, Tracking::NONE, |bucket| {
-            bucket.abort_multipart_upload(&request)
-        })
+        self.request(
+            Operation::AbortMultipartUpload,
+            Tracking::NONE,
+            |bucket, _| bucket.abort_multipart_upload(&request),
+        )
         .await
     }
 
     async fn list_parts(&self, request: ListParts) -> S3Result<ListPartsOutput> {
-        self.request(Operation::ListParts, Tracking::NONE, |bucket| {
+        self.request(Operation::ListParts, Tracking::NONE, |bucket, _| {
             bucket.list_parts(&request)
         })
         .await

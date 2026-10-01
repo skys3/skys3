@@ -309,6 +309,38 @@ async fn the_aws_sdk_reads_and_writes_objects() {
     let body = ranged.body.collect().await.unwrap().into_bytes();
     assert_eq!(body, large[1_048_570..1_048_586]);
 
+    // Response header overrides, signed into the query, replace the stored
+    // headers on GetObject and HeadObject alike.
+    let got = client
+        .get_object()
+        .bucket("photos")
+        .key("small")
+        .response_content_type("text/plain")
+        .response_content_disposition("attachment; filename=\"small.txt\"")
+        .response_cache_control("no-cache")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.content_type(), Some("text/plain"));
+    assert_eq!(
+        got.content_disposition(),
+        Some("attachment; filename=\"small.txt\"")
+    );
+    assert_eq!(got.cache_control(), Some("no-cache"));
+    assert_eq!(got.storage_class(), None);
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body, small);
+    let head = client
+        .head_object()
+        .bucket("photos")
+        .key("small")
+        .response_content_language("fr")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_language(), Some("fr"));
+    assert_eq!(head.content_type(), Some("application/octet-stream"));
+
     // A conditional PUT must not overwrite, and may create.
     let error = client
         .put_object()
@@ -356,6 +388,135 @@ async fn the_aws_sdk_reads_and_writes_objects() {
         .send()
         .await
         .unwrap();
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_aws_sdk_pages_through_listings() {
+    let server = Server::start(Arc::new(SystemWallClock)).await;
+    let client = server.client(SECRET);
+    client
+        .create_bucket()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+    // Keys spread over the bucket's shards: five directories, loose keys,
+    // and one key whose only version is deleted.
+    let mut keys: Vec<String> = (0..5)
+        .flat_map(|dir| (0..3).map(move |n| format!("dir-{dir}/photo {n}.jpg")))
+        .chain((0..4).map(|n| format!("loose-{n}")))
+        .collect();
+    keys.push("gone".to_owned());
+    for key in &keys {
+        client
+            .put_object()
+            .bucket("photos")
+            .key(key)
+            .body(ByteStream::from_static(b"pixels"))
+            .send()
+            .await
+            .unwrap();
+    }
+    client
+        .delete_object()
+        .bucket("photos")
+        .key("gone")
+        .send()
+        .await
+        .unwrap();
+
+    // Two items a page with a delimiter: five common prefixes and four
+    // keys take five pages, each continued with the previous page's token.
+    let pages = client
+        .list_objects_v2()
+        .bucket("photos")
+        .delimiter("/")
+        .max_keys(2)
+        .into_paginator()
+        .send()
+        .try_collect()
+        .await
+        .unwrap();
+    let counts: Vec<_> = pages.iter().filter_map(|page| page.key_count()).collect();
+    assert_eq!(counts, [2, 2, 2, 2, 1]);
+    // In each page, every common prefix sorts before every key.
+    let mut items = Vec::new();
+    for page in &pages {
+        items.extend(page.common_prefixes().iter().filter_map(|p| p.prefix()));
+        items.extend(page.contents().iter().filter_map(|o| o.key()));
+    }
+    assert_eq!(
+        items,
+        [
+            "dir-0/", "dir-1/", "dir-2/", "dir-3/", "dir-4/", "loose-0", "loose-1", "loose-2",
+            "loose-3"
+        ]
+    );
+    let last = pages.last().unwrap();
+    assert_eq!(last.is_truncated(), Some(false));
+    assert_eq!(last.next_continuation_token(), None);
+
+    // Every object under one prefix, with the checksum the SDK sent.
+    let pages = client
+        .list_objects_v2()
+        .bucket("photos")
+        .prefix("dir-3/")
+        .max_keys(1)
+        .into_paginator()
+        .send()
+        .try_collect()
+        .await
+        .unwrap();
+    let objects: Vec<_> = pages.iter().flat_map(|page| page.contents()).collect();
+    let names: Vec<_> = objects.iter().filter_map(|o| o.key()).collect();
+    assert_eq!(
+        names,
+        [
+            "dir-3/photo 0.jpg",
+            "dir-3/photo 1.jpg",
+            "dir-3/photo 2.jpg"
+        ]
+    );
+    assert_eq!(objects[0].size(), Some(6));
+    assert_eq!(
+        objects[0].checksum_algorithm(),
+        [aws_sdk_s3::types::ChecksumAlgorithm::Crc32]
+    );
+
+    // ListObjects V1 resumes with its markers.
+    let v1 = client
+        .list_objects()
+        .bucket("photos")
+        .delimiter("/")
+        .max_keys(6)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(v1.common_prefixes().len(), 5);
+    assert_eq!(v1.contents().len(), 1);
+    assert_eq!(v1.next_marker(), Some("loose-0"));
+    let rest = client
+        .list_objects()
+        .bucket("photos")
+        .delimiter("/")
+        .marker("loose-0")
+        .send()
+        .await
+        .unwrap();
+    let names: Vec<_> = rest.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(names, ["loose-1", "loose-2", "loose-3"]);
+    assert_eq!(rest.is_truncated(), Some(false));
+
+    // A forged token is refused.
+    let error = client
+        .list_objects_v2()
+        .bucket("photos")
+        .continuation_token("forged")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some("InvalidArgument"), "{error:?}");
     server.stop().await;
 }
 

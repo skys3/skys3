@@ -14,6 +14,7 @@ use skys3_types::{EpochSeq, Generation};
 use crate::codec;
 use crate::entry::{ControlEntry, Entry};
 use crate::error::IndexError;
+use crate::listing::{self, ListPage, ListQuery};
 
 type Bytes = &'static [u8];
 
@@ -100,7 +101,7 @@ where
 /// Returns the smallest key greater than every key that starts with
 /// `prefix`. A shard key ends with its shard number and starts with a
 /// bucket ID length below 255, so it never consists of `0xff` bytes alone.
-fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+pub(crate) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
         if last < u8::MAX {
@@ -438,6 +439,17 @@ impl IndexReader {
             page.push((name, entry));
         }
         Ok(page)
+    }
+
+    /// Returns one page of `shard`'s listing (§9.4): its live objects and
+    /// common prefixes in order, as [`ListQuery`] describes, skipping
+    /// delete tombstones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, IndexError> {
+        listing::list(&self.namespace, shard, query)
     }
 
     /// Returns the location of the record at `position` in `shard`.

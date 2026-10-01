@@ -8,7 +8,8 @@
 //! simulated disk.
 //! [`Harness::sigv4`] drives requests through SigV4 canonicalization and
 //! verification, and [`aws_chunked`] drives bodies through the chunk
-//! decoder. [`checksums`] reads checksum headers and values.
+//! decoder. [`checksums`] reads checksum headers and values, and
+//! [`list_token`] opens continuation tokens.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -20,10 +21,13 @@ use s3s::Body;
 use skys3_config::Config;
 use skys3_control::{MemoryControlStore, ProposalIds, RetryPolicy, bootstrap};
 use skys3_io::ManualWallClock;
+use skys3_types::BucketId;
 use skys3_types::checksum::{Checksum, ChecksumAlgorithm};
 
 use crate::buckets::{GatewayConfig, IdSource, MODE_HEADER};
 use crate::checksum::{ExpectedChecksum, ExpectedChecksums};
+use crate::limits::MAX_KEY_BYTES;
+use crate::listing::{ListTokenKeys, TokenScope};
 use crate::service::{Authenticator, Gateway, TrustAll};
 use crate::sigv4::body::BodyError;
 use crate::sigv4::canonical::{self, Head};
@@ -431,6 +435,46 @@ pub fn checksums(data: &[u8]) -> bool {
     }
 }
 
+/// Opens `data` as a ListObjectsV2 continuation token, and seals it as the
+/// last item of a page and opens the token again. Returns whether `data`
+/// opened as a token, which only a forgery would.
+///
+/// # Panics
+///
+/// If a property fails: a token that opens is not one the keys sealed, an
+/// item does not survive its token, or a token changed in one character
+/// still opens.
+#[must_use]
+pub fn list_token(data: &[u8]) -> bool {
+    let keys = ListTokenKeys::new(&[0x5a; 32], &[]).expect("the key is long enough");
+    let bucket = BucketId::new("b-fuzz").expect("the bucket ID is valid");
+    // The first byte picks the listing's prefix and delimiter.
+    let (pick, data) = data.split_first().unwrap_or((&0, data));
+    let scope = TokenScope {
+        bucket: &bucket,
+        prefix: ["", "photos/", "\u{65e5}\u{672c}"][usize::from(pick % 3)],
+        delimiter: [None, Some("/"), Some("")][usize::from(pick / 3 % 3)],
+    };
+    let text = String::from_utf8_lossy(data);
+    let opened = keys.open(scope, &text);
+    if let Ok(last) = &opened {
+        assert_eq!(keys.seal(scope, last), text, "only sealed tokens open");
+    }
+    if !text.is_empty() && text.len() <= MAX_KEY_BYTES {
+        let token = keys.seal(scope, &text);
+        assert_eq!(keys.open(scope, &token).as_deref(), Ok(&*text));
+        let mut changed = token.into_bytes();
+        let at = usize::from(*pick) % changed.len();
+        changed[at] = if changed[at] == b'A' { b'B' } else { b'A' };
+        let changed = String::from_utf8(changed).expect("tokens are ASCII");
+        assert!(
+            keys.open(scope, &changed).is_err(),
+            "a changed token opened"
+        );
+    }
+    opened.is_ok()
+}
+
 /// Decodes `body` delivered in reads of `split` bytes, checking that no
 /// more than `declared` bytes come out.
 fn decode_body(
@@ -565,6 +609,35 @@ mod tests {
         assert!(!checksums(b"\x01NSRBwg==\n\x02NSRBwg=="));
         assert!(!checksums(b"\x00short"));
         assert!(checksums(b"\x0bignored\n\x0bMDaLrw==-3"));
+    }
+
+    #[test]
+    fn token_inputs_open_only_when_sealed() {
+        assert!(!list_token(b""));
+        assert!(!list_token(b"\x00photos/2024/"));
+        assert!(!list_token(b"\x05\xff\xfe"));
+        let keys = ListTokenKeys::new(&[0x5a; 32], &[]).unwrap();
+        let bucket = BucketId::new("b-fuzz").unwrap();
+        let scope = TokenScope {
+            bucket: &bucket,
+            prefix: "",
+            delimiter: None,
+        };
+        let token = keys.seal(scope, "key");
+        assert!(list_token(format!("\x00{token}").as_bytes()));
+        // The same token for another listing does not open.
+        assert!(!list_token(format!("\x01{token}").as_bytes()));
+    }
+
+    #[test]
+    fn listings_run_through_the_harness() {
+        let harness = Harness::default();
+        assert_eq!(harness.request(b"\x00/fuzz?list-type=2").unwrap().0, 200);
+        assert_eq!(harness.request(b"\x00/fuzz?delimiter=/").unwrap().0, 200);
+        let token = harness
+            .request(b"\x00/fuzz?list-type=2&continuation-token=x")
+            .unwrap();
+        assert_eq!(token.0, 400);
     }
 
     #[test]

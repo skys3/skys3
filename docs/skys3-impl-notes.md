@@ -1010,6 +1010,62 @@ of this file. A task with nothing unexpected keeps "None."
   answers GET with `503` until read-through fill (M1-20). The extents of
   a failed upload stay in bulk segments until compaction (M1-22) reclaims
   unreferenced ones. `x-amz-storage-class` is accepted and ignored.
+- **Response header overrides.** `s3s` applies GetObject's `response-*`
+  query parameters to the response itself, but parses HeadObject's and
+  never applies them, and neither refuses them on anonymous requests. The
+  gateway applies them to both outputs and refuses them, and values that
+  are not header values, with `400 InvalidRequest` before reading the
+  object.
+
+### M1-11 Listing
+
+- **A page resumes after an item, not a key.** V1's `NextMarker` can be
+  a common prefix, and so can the last item of a V2 page. Resuming after
+  it as a key would list the prefix again, from its keys that sort after
+  it. The shard page therefore compares items: a common prefix at or
+  before `start_after` is skipped whole, even where some of its keys sort
+  after it. The design said only that the token holds the last key;
+  §9.4 now defines items and this rule.
+- **The index paged by key.** `IndexReader::entries` reads every key,
+  tombstones included, and a delimiter listing would have read all of a
+  common prefix's keys to emit it once. `IndexReader::list` (with
+  `ListQuery`, `ListPage`, `ListItem`) seeks past each common prefix once
+  it has a live key, so a page costs about one redb range read per item.
+  A common prefix whose keys are all tombstones is not listed. The page
+  carries each object's `ObjectVersion`, boxed, which clippy asks for.
+- **Asking every shard for a whole page would cost shards × `max-keys`.**
+  The merge asks each shard for about its share (at least 16 items), and
+  asks a shard for more only when its page is used up before the merged
+  page is full; it never takes an item while such a shard is unasked, so
+  the result is the same as asking for everything. The proptest runs
+  batches down to one item so that refills happen; a mutation that refills
+  only once every shard is used up fails it. The fan-out uses a
+  `JoinSet`, since the workspace has no `futures` crate; a panicking shard
+  task is resumed in the request.
+- **Where the token key lives (design gap, §9.4).** `GatewayConfig` holds
+  `ListTokenKeys`: a signing key and older keys that still verify.
+  `GatewayConfig::new` generates a random key, which is what a single node
+  (M1-13) uses: its tokens die with a restart, and the client gets
+  `400 InvalidArgument` and starts over. With several nodes (M2), any
+  gateway must accept another's tokens, so §9.4 records that the ring is
+  then read from shared secret files named in configuration, with no
+  configuration key added yet (no node serves the S3 API until M1-13).
+  The key is not in the control store, which holds no secrets. Tokens are
+  bound to the bucket ID, prefix, and delimiter, and carry a version byte
+  for richer state later. The HMAC is `aws-lc-rs`'s, as SigV4 uses.
+- **s3s echoes `encoding-type` but encodes nothing.** The gateway encodes
+  keys, prefixes, delimiters, and markers itself, as form values with `/`
+  kept, which is what S3 sends and what the SDKs decode.
+- **Objects need an owner, and SkyS3 has no accounts.** V1 always returns
+  `Owner`. Every object is owned by the bucket owner (bucket-owner-
+  enforced), and the owner's ID is the cluster ID (§11).
+- **Fuzzing.** `gateway_list_token` opens arbitrary tokens, and checks
+  that each item round-trips through its own token and that a token
+  changed in one character is refused. A 30-second run executed about
+  850,000 inputs with no failure.
+- **Left open.** During a `write_back` import the listing must merge the
+  remote's listing (§9.1); the import task adds that. The configuration
+  key for shared token keys comes with multi-node gateways.
 
 ### M1-13 Node binary and startup recovery
 
@@ -1282,6 +1338,18 @@ of this file. A task with nothing unexpected keeps "None."
   signs with the node's manual clock as the SDK's time source, so advancing
   the clock past expiry makes the SDK's identity cache refresh the session
   through the chain.
+- **Review: the identity copy was read before a wait.** The endpoint took
+  its snapshot before validating the token, which can wait seconds for an
+  issuer's discovery document and keys. A sync during the wait that removed
+  the provider or the role, or narrowed the trust policy, did not stop the
+  session, and the copy could pass `identity_max_staleness` unnoticed. The
+  endpoint now checks freshness before validation (so a stale node fetches
+  nothing) and reads the copy again after it, deciding the provider
+  (`OidcProvider::accepts`), the role, and the trust policy on that. A test
+  holds the key fetch open with a gated fetcher and changes the
+  configuration meanwhile. The session record is stored after these checks,
+  so a sync between the checks and the insert can still race; that window
+  holds no await on a remote service.
 - **Test support moved behind a feature.** The token-minting `testkit`
   was `cfg(test)`; it is now behind `skys3-sts`'s `test-util` feature so
   the integration tests can mint tokens.
@@ -1346,3 +1414,111 @@ of this file. A task with nothing unexpected keeps "None."
   not find a `-config` file outside the specification's directory, so the
   script copies the specification and its generated configuration into a
   temporary directory. TLC keeps its search queue on disk there.
+
+### M2-02 Intra-cluster transport
+
+- **No TLS settings existed.** M0-03's configuration had no certificate
+  keys and no node ID. The PR adds `[transport]` (`listen`, default
+  `0.0.0.0:7400`, and `tls_cert_file`, `tls_key_file`, `tls_ca_file`, set
+  together or not at all) to §14 and the configuration reference. A node's
+  ID is the one its certificate's SPIFFE ID names, so no `node_id` key is
+  needed and a node cannot claim an ID its PKI did not issue.
+- **Admin listener TLS was pointed at this PR.** §12 said TLS for the admin
+  HTTP listener and client certificates in place of its token "are added
+  with the node PKI (plan M2-02)". This PR defines the PKI and the `admin`
+  certificate role, but serving the admin listener over TLS belongs with
+  the binary's wiring, not the transport crate, so it is a new row of plan
+  section 14 (proposed for M3-02) and §12 says it is not built yet.
+- **rustls's own verifiers cannot check SPIFFE IDs.** `WebPkiServerVerifier`
+  insists on a DNS name or IP address, and rustls keeps its mapping from
+  `webpki` errors to TLS errors private. Both directions therefore use one
+  custom verifier built on `rustls-webpki` (`verify_for_usage` and
+  `valid_uri_names`, already in the tree through rustls), with a small
+  error mapping of its own so alerts still say "unknown CA" or "expired".
+  A numeric node ID is not a valid TLS server name, so the client checks
+  that it reached the node it meant after the handshake, not through the
+  server name.
+- **TLS 1.3 reports a refused client late.** The server checks the
+  client's certificate after the client has finished its half of the
+  handshake, so a refused client's `connect` succeeds and the refusal
+  (an alert) arrives on its first receive. Tests check the server's
+  verdict, and `Transport::connect` documents it.
+- **turmoil's reset outruns in-flight data.** Under random per-message
+  latency, a segment arriving for a socket the peer has already dropped
+  draws an RST that can overtake the peer's last data and close
+  notification, so the receiver sees "connection reset" where real TCP
+  would deliver the data. The simulation scenario closes its side without
+  waiting for the node's close. turmoil's default 10 s simulation limit
+  equals the handshake timeout, so the scenario raises it, and only every
+  sixteenth seed waits out a handshake timeout, which costs about 10,000
+  simulated ticks.
+- **rcgen without its defaults.** rcgen's default features pull `ring`, a
+  second crypto provider; the workspace entry enables only `aws_lc_rs`, and
+  tests write PEM with the workspace's `base64` instead of rcgen's `pem`
+  feature. `Cargo.lock` still lists rcgen's optional `x509-parser` chain
+  and `untrusted` 0.7, which are never built; `cargo deny` checks the built
+  graph and passes without new skips.
+
+### M2-04 S3 control-store backend
+
+- **The trait has no conditional read.** `ChangeFeed` polls through `get`,
+  so an `If-None-Match` poll could not go through it unchanged. The S3
+  backend's change stream is the shared polling feed over a private view of
+  the store that reads `cluster.json` with `If-None-Match` on the copy it
+  last read and answers a `304` from that copy; the delivery rules stay
+  shared with every backend.
+- **One probe for every backend.** The plan describes the startup probe as
+  part of the S3 backend. It is `ControlProbe`, generic over
+  `ControlStore`, so the conformance suite (M2-06) can run it against
+  etcd and the in-memory store too. Its writers go through `propose`, so
+  the probe also tests the `409` retries and the lost-response rule that
+  production writes use: mapping a lost S3 response to "nothing applied"
+  makes it fail in the first seed of the simulation.
+- **"Writers on different nodes".** A node probes alone at startup, so the
+  probe races one writer per store handle the caller passes, at least two,
+  as concurrent requests; per-run nonces keep probes of different nodes
+  on different registers. The simulation scenario runs five nodes' probes
+  concurrently against one faulty simulated bucket.
+- **Conditional deletes: refuse rather than fall back.** M1-06 asked what
+  `delete_if` does on a store without conditional `DeleteObject`. A
+  tombstone fallback (conditional PUT of a tombstone, then unconditional
+  DELETE) has an ABA race, since equal tombstones share an ETag, and
+  permanent tombstones are what M1-06 already rejected. Such stores are
+  refused; design §6.1 records why. R2 qualifies only if the probe finds
+  it honors `If-Match` on `DeleteObject`.
+- **Permanent errors had no `ControlError`.** `403 AccessDenied`, a
+  missing bucket, or `501 NotImplemented` would have been `Unavailable`
+  and retried for seconds. `ControlError::Rejected` is not retried; the
+  gateway answers it with `500`. A `409` to a read or listing, which
+  `skys3-remote` does not class as transient, is `Unavailable` there.
+- **`SimS3` could not read stale.** `Fault::StaleRead` and
+  `SimS3Faults::stale_read_probability` answer `GetObject` and
+  `HeadObject` with the key's state from before its latest write. The
+  probability is drawn only when it is non-zero, so seeds recorded for
+  existing profiles replay unchanged. Listings are never stale.
+- **Probe history on versioned control buckets.** The `ControlStore`
+  interface has no delete by version ID, so on a versioned control bucket,
+  which design §12 recommends for audit, each probe leaves its writes as
+  noncurrent versions and delete markers, as every overwritten register
+  does; a noncurrent-version lifecycle rule removes them.
+- **Conditional deletes of missing keys on AWS.** The simulator answers
+  `If-Match` on a key without a current object with `404`, which the
+  backend maps to a failed precondition. If AWS answers `204`, as the
+  older pages M0-05 found suggest, deleting an absent register reports
+  success: harmless for `propose_delete`, which counts an absent register
+  as deleted, but the conformance check that a second delete fails would
+  not hold. M1-26 and the M2-06 nightly runs must confirm it.
+- **The validator.** M0-03 already refused an S3 control store in a backup
+  target's failure scope. Snapshot targets are now checked too (once when
+  one defaults to the backup target), and a target in the control bucket
+  whose prefix overlaps the control prefix is refused even with
+  `allow_correlated_control_store`, the part of credential scoping SkyS3
+  can enforce. Scoping the credential itself is the operator's; design
+  §6.1 and the configuration reference give the policy.
+- **No credential key yet.** §14 names no credential source for the
+  control store, and nothing wires the S3 backend into the binary (rule
+  1.1). The PR that does adds that key with the region and addressing
+  keys M1-15 also left to the attach path.
+- **No fuzz target.** The backend parses nothing new: listed keys go
+  through the existing `RegisterKey` grammar, and values through the
+  existing document parsing.
