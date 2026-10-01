@@ -1424,6 +1424,26 @@ of this file. A task with nothing unexpected keeps "None."
   and not superseding the shard's own earlier writes. No fuzz target was
   added: the flusher parses nothing new (write identities go through the
   existing `WriteIdentity` parser).
+- **Subscribing cannot miss a write being applied (PR review).** The
+  apply pipeline used to take the shard's subscriber before applying a
+  batch. A flusher that subscribed and scanned while the batch was applied
+  then found the write neither in the index nor in its stream, and never
+  flushed it. The pipeline now takes the subscriber after the index holds
+  the batch, under the same lock that advances the applied position.
+  - A subscriber that was there by then hears of the write.
+  - A later subscriber's scan finds the write in the index.
+  - A write may reach a subscriber both ways; the flusher ignores a
+    version it already tracks.
+  - The test `a_subscription_during_an_apply_hears_of_it` holds the
+    index's write lock so that an apply stays in flight, then subscribes
+    and scans. It fails without the fix.
+- **Errors clear once their key gets past them (PR review).** The status
+  kept the latest flush error forever, even after its key had flushed.
+  The flusher now keeps each key's latest error. It drops that error when
+  a later attempt flushes or settles the key, or finds it in conflict or
+  awaiting multipart flush, and when the key is no longer tracked.
+  `last_error` is the newest error still held, so one key's recovery does
+  not hide another key that is still failing.
 - **Multipart objects wait for M1-16b.** The flusher's branch merges M1-12.
   A completed multipart object (`Payload::Parts`) cannot be flushed as one
   `PutObject`: that would give it an MD5 ETag rather than the multipart
