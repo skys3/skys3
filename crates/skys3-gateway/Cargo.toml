@@ -30,6 +30,7 @@ hyper-util = { workspace = true, features = ["http1", "server", "server-graceful
 md-5.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 s3s.workspace = true
 secrecy.workspace = true
 serde_urlencoded.workspace = true
@@ -42,6 +43,7 @@ skys3-shard.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 tracing.workspace = true
 zeroize.workspace = true
 

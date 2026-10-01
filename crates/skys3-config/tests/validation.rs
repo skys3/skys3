@@ -624,6 +624,84 @@ fn s3_backend_rules() {
 }
 
 #[test]
+fn file_backend_rules() {
+    let config: Config = control_store("backend = \"file\"").parse().unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::File {
+            directory: "/var/lib/skys3/control".into(),
+        }
+    );
+    let config: Config = format!(
+        "{}\n[node]\ndata_dir = \"/data\"",
+        control_store("backend = \"file\"")
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::File {
+            directory: "/data/control".into(),
+        },
+        "the default follows data_dir"
+    );
+    let config: Config = control_store("backend = \"file\"\ndirectory = \"/ctl\"")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::File {
+            directory: "/ctl".into(),
+        }
+    );
+    assert_control_store_violations(
+        "backend = \"file\"\ndirectory = \"\"\netcd_endpoints = [\"http://e\"]\nbucket = \"b\"",
+        &[
+            "control_store.etcd_endpoints",
+            "control_store.bucket",
+            "control_store.directory",
+        ],
+    );
+    assert_control_store_violations(
+        "etcd_endpoints = [\"http://e\"]\ndirectory = \"/ctl\"",
+        &["control_store.directory"],
+    );
+}
+
+// [node] and [gateway]
+
+#[test]
+fn node_rules() {
+    let config = load("[node]\nnode_id = \"node-2\"\ndisks = [\"/a\", \"/b\"]").unwrap();
+    assert_eq!(config.node().node_id.as_ref().unwrap().as_str(), "node-2");
+    assert_eq!(config.node().disks.len(), 2);
+    assert_violations(
+        "[node]\nnode_id = \"Node_2\"\ndata_dir = \"\"\ndisks = [\"/a\", \"\", \"/a\"]",
+        &["node.node_id", "node.data_dir", "node.disks", "node.disks"],
+    );
+    assert_violations("[node]\ndisks = []", &["node.disks"]);
+    let many: Vec<_> = (0..65).map(|i| format!("\"/d{i}\"")).collect();
+    assert_violations(
+        &format!("[node]\ndisks = [{}]", many.join(", ")),
+        &["node.disks"],
+    );
+}
+
+#[test]
+fn gateway_rules() {
+    let config = load("[gateway]\nlisten = \"0.0.0.0:443\"").unwrap();
+    assert_eq!(config.gateway().listen.port(), 443);
+    assert_violations(
+        "[gateway]\ntls_key_file = \"/k\"",
+        &["gateway.tls_cert_file"],
+    );
+    assert_violations(
+        "[gateway]\ntls_cert_file = \"\"\ntls_key_file = \"/k\"",
+        &["gateway.tls_cert_file"],
+    );
+}
+
+#[test]
 fn prefix_rules() {
     for prefix in ["", "/", "no-slash", "/abs/", "has space/"] {
         assert_control_store_violations(

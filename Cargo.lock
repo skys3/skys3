@@ -2126,6 +2126,32 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 [[package]]
 name = "skys3"
 version = "0.1.0"
+dependencies = [
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "bytes",
+ "http",
+ "http-body-util",
+ "prometheus-client",
+ "rand",
+ "rustls",
+ "serde",
+ "serde_json",
+ "skys3-config",
+ "skys3-control",
+ "skys3-gateway",
+ "skys3-index",
+ "skys3-io",
+ "skys3-log",
+ "skys3-obs",
+ "skys3-shard",
+ "skys3-sts",
+ "skys3-types",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "skys3-config"
@@ -2177,6 +2203,7 @@ dependencies = [
  "proptest",
  "quick-xml",
  "rand",
+ "rustls",
  "s3s",
  "secrecy",
  "serde_json",
@@ -2192,6 +2219,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "zeroize",
 ]

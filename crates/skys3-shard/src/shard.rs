@@ -634,8 +634,12 @@ impl<D: Disk> Shard<D> {
         }
     }
 
-    /// Counts the shard's entries.
-    async fn summary(&self) -> Result<ShardSummary, ShardError> {
+    /// Counts the shard's entries, as of the writes applied so far.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn summary(&self) -> Result<ShardSummary, ShardError> {
         let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
             let reader = index.read()?;

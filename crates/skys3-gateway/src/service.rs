@@ -11,6 +11,7 @@ use http::{Method, Request, Response, StatusCode};
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{Body, BodySizeLimitExceeded, S3Error, s3_error};
 use skys3_control::{ControlError, ControlStore};
+use skys3_types::BucketDocument;
 
 use crate::api::Api;
 use crate::authz::{self, Access, NoSignatures, Permissions};
@@ -87,11 +88,16 @@ impl Authenticator for TrustAll {
 /// The bucket records, without their store and shard types.
 trait Catalog: Send + Sync {
     fn reload(&self) -> Pin<Box<dyn Future<Output = Result<(), ControlError>> + Send + '_>>;
+    fn list(&self) -> Vec<BucketDocument>;
 }
 
 impl<C: ControlStore, H: Shards> Catalog for Buckets<C, H> {
     fn reload(&self) -> Pin<Box<dyn Future<Output = Result<(), ControlError>> + Send + '_>> {
         Box::pin(Buckets::reload(self))
+    }
+
+    fn list(&self) -> Vec<BucketDocument> {
+        Buckets::list(self)
     }
 }
 
@@ -196,6 +202,13 @@ impl<A: Authenticator> Gateway<A> {
     /// The control store's errors; the local copy is then unchanged.
     pub async fn reload_buckets(&self) -> Result<(), ControlError> {
         self.inner.catalog.reload().await
+    }
+
+    /// Every bucket in the gateway's local copy, in name order: what
+    /// ListBuckets reports, with each bucket's ID, mode, and shard count.
+    #[must_use]
+    pub fn buckets(&self) -> Vec<BucketDocument> {
+        self.inner.catalog.list()
     }
 
     /// Answers one request.

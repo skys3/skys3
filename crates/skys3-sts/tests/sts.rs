@@ -316,6 +316,28 @@ async fn a_node_that_never_synced_issues_nothing() {
 }
 
 #[tokio::test]
+async fn a_restored_copy_keeps_its_age() {
+    let node = Node::start(START).await;
+    let now = node.clock.now();
+    // A copy synced long ago, as a restarted node loads it, is stale.
+    let long_ago = now - Duration::from_secs(48 * 3600);
+    node.sts
+        .sync_identity_as_of(&node.store, &node.retry, long_ago)
+        .await
+        .unwrap();
+    assert_eq!(node.sts.identity().snapshot().synced_at(), Some(long_ago));
+    assert!(node.sts.identity().fresh().is_err());
+    // One synced a minute ago is fresh, and keeps that start.
+    let recent = now - Duration::from_secs(60);
+    node.sts
+        .sync_identity_as_of(&node.store, &node.retry, recent)
+        .await
+        .unwrap();
+    let snapshot = node.sts.identity().fresh().unwrap();
+    assert_eq!(snapshot.synced_at(), Some(recent));
+}
+
+#[tokio::test]
 async fn sessions_expire() {
     let node = Node::start(START).await;
     let answer = node

@@ -127,6 +127,13 @@ fn the_defaults_are_the_design_example_values() {
     assert!(identity.static_credentials.remove("bootstrap").is_some());
     assert_eq!(minimal.identity(), &identity);
 
+    assert_eq!(minimal.node().node_id, None);
+    assert_eq!(
+        minimal.node().disks,
+        [std::path::Path::new("/var/lib/skys3/log")]
+    );
+    assert_eq!(minimal.gateway().listen.to_string(), "127.0.0.1:9000");
+    assert_eq!(minimal.gateway().tls(), None);
     assert_eq!(minimal.admin().listen.to_string(), "127.0.0.1:7490");
     assert_eq!(minimal.admin().token_file, None);
     assert_eq!(minimal.logging().filter, "info");
@@ -140,6 +147,16 @@ const EVERY_KEY: &str = r#"
 [cluster]
 cluster_id = "c1"
 failure_domain = "zone"
+
+[node]
+node_id = "node-7"
+data_dir = "/data/skys3"
+disks = ["/disk0", "/disk1"]
+
+[gateway]
+listen = "[::]:8443"
+tls_cert_file = "/etc/skys3/cert.pem"
+tls_key_file = "/etc/skys3/key.pem"
 
 [control_store]
 backend = "s3"
@@ -276,6 +293,12 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.control_store().coordinator_lease().as_secs(), 12);
     assert_eq!(config.control_store().config_poll_interval().as_secs(), 20);
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
+    let node = config.node();
+    assert_eq!(node.node_id.as_ref().unwrap().as_str(), "node-7");
+    assert_eq!(node.data_dir, std::path::Path::new("/data/skys3"));
+    assert_eq!(node.disks.len(), 2);
+    assert_eq!(config.gateway().listen.port(), 8443);
+    assert!(config.gateway().tls().is_some());
     assert!(config.identity().anonymous_policy.is_some());
     let bootstrap = &config.identity().static_credentials["bootstrap"];
     assert_eq!(bootstrap.access_key_id, "AKIASKYS3BOOTSTRAP");
@@ -330,6 +353,8 @@ fn the_reference_documents_every_key() {
     );
     for section in [
         "[cluster]",
+        "[node]",
+        "[gateway]",
         "[control_store]",
         "[replication]",
         "[storage]",
