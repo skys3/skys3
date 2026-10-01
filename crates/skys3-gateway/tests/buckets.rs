@@ -710,8 +710,9 @@ async fn gateways_share_buckets_through_the_control_store() {
     assert!(matches!(written.await.unwrap(), PutOutcome::Written(_)));
 }
 
-/// Registers node `node`, as it does when it starts.
-async fn register_node(setup: &common::Setup, node: usize) {
+/// Registers node `node`, as it does when it starts, or marked
+/// `departing`, as the coordinator marks a node before forgetting it.
+async fn register_node(setup: &common::Setup, node: usize, departing: bool) {
     let registration = skys3_types::NodeRegistration {
         node_id: format!("node-{node}").parse().unwrap(),
         address: format!("10.0.0.{node}:7400").parse().unwrap(),
@@ -721,6 +722,7 @@ async fn register_node(setup: &common::Setup, node: usize) {
             disk_id: "nvme0".parse().unwrap(),
             capacity_bytes: 1 << 40,
         }],
+        departing,
         proposal_id: format!("p-node-{node}").parse().unwrap(),
     };
     let key = TypedKey::node(&registration.node_id);
@@ -736,15 +738,21 @@ async fn a_cluster_places_new_buckets_on_its_registered_nodes() {
     let setup = setup_with(config).await;
 
     // Two nodes cannot hold three replicas apart.
-    register_node(&setup, 1).await;
-    register_node(&setup, 2).await;
+    register_node(&setup, 1, false).await;
+    register_node(&setup, 2, false).await;
     setup
         .create("photos", "local", None)
         .await
         .assert(400, Some("InvalidRequest"));
     assert!(setup.register("photos").await.is_none());
+    // Nor can they with a third node that is departing.
+    register_node(&setup, 3, true).await;
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(400, Some("InvalidRequest"));
 
-    register_node(&setup, 3).await;
+    register_node(&setup, 4, false).await;
     let before = setup.generation().await;
     let bucket = setup.create_local("photos").await;
     assert_eq!(setup.generation().await.get(), before.get() + 1);
@@ -757,6 +765,7 @@ async fn a_cluster_places_new_buckets_on_its_registered_nodes() {
             .value;
         assert_eq!(config.members.len(), 3);
         assert!(config.is_member(&config.primary));
+        assert!(!config.is_member(&"node-3".parse().unwrap()), "{config:?}");
     }
     // No shard is opened here: each node opens its own replicas once it
     // learns of the bucket.

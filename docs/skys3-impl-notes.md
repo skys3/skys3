@@ -1839,6 +1839,62 @@ of this file. A task with nothing unexpected keeps "None."
   for 100 million objects. The log's `IMPORT` records come on top until
   their segments are released.
 
+### M1-19 Parallel import
+
+- **"Passed" stopped being a prefix of the key space.** M1-18's gateway
+  took the import's position as "the index holds every key up to here",
+  for both reads and listings. With ranges, a later range passes keys
+  long before the first range gets there. The position the gateway gets
+  is now the end of the gapless part (`ImportRanges::position`), which
+  keeps the merge sound, and `RemoteReads::passed` (default: the
+  position) answers per key. Both reads and listings ask it: had only
+  reads used it, a key added out of band in a passed range would list
+  but answer `404` to a HEAD.
+- **Checkpoints are one value per bucket, rewritten per page.** Splitting
+  the `imports` table's key per range would change its key layout; the
+  ranges instead share the bucket's value (tag 2 in the codec), and one
+  range still encodes exactly as M1-18 stored it, so existing checkpoints
+  resume, and a stored single-stream checkpoint is split after its
+  position. Since the whole value is rewritten after every page, streams
+  that finish pages together share one sync, and `import_parallel_streams`
+  gained an upper bound of 256 (it had none). A build from before this
+  one rejects a multi-range value, so it cannot resume such an import.
+- **The token bucket had to become a reservation.** M1-18's throttle was
+  owned by the one stream and slept with `&mut self`. Shared by streams,
+  each page now reserves its keys under a lock, the bucket going negative
+  while pages wait, and sleeps outside it; the `rate * (t + 1)` bound
+  holds over all streams.
+- **Simulated durations depended on real disk speed.** Under a paused
+  clock, Tokio advances time to the next timer whenever the runtime waits
+  on a blocking-pool thread, so each commit cost a few polling intervals
+  of simulated time, more on a slower machine. The scaling test runs the
+  index on `BlockingPool::inline`, and the import rate is then a pure
+  function of the remote's 100 ms round trip: 4.1 s with one stream for
+  4,000 keys in pages of 100, 2.6 s, 1.3 s, and 0.8 s with two, four, and
+  eight.
+- **Shutdown left import streams running.** The flush service aborted the
+  import task on drop without waiting, and with streams spawned in a
+  `JoinSet` a stream could still store a checkpoint after `shutdown`
+  returned, which made the restart test racy. The first fix, awaiting the
+  aborted task, was not enough (review on the PR): a stream aborted while
+  it awaited `set_import_ranges` had already queued the write on the
+  index's `BlockingPool`, which runs a queued job whether or not anyone
+  still waits for it. On a pool of several threads, a late write could
+  then land after a restarted import's and move the stored progress back.
+  Imports now stop cooperatively: a stop signal is checked between steps
+  and interrupts listings, throttle waits, commits, and backoffs, but
+  never a checkpoint write, and `shutdown` raises it and awaits the task.
+  A bucket that stops being followed is told to stop the same way, and
+  its next import waits for the old task before reading the checkpoint.
+  `shutdown_waits_for_a_checkpoint_write_in_flight` holds the pool with a
+  blocking job while a write is queued; with the abort it fails, as
+  `shutdown` returns before the write lands.
+- **The discovery budget first counted every node as sampled.** Charging
+  a level its worst case, a listing and 96 probes per node, before
+  sending anything stopped discovery from listing twelve small folders.
+  A level is now charged its listings, then its probes, and abandoned
+  only if what it actually needs exceeds the budget.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named
@@ -2975,19 +3031,49 @@ of this file. A task with nothing unexpected keeps "None."
   register names as primary, member, or learner, rereading only registers
   whose version changed. A shard register that does not parse keeps every
   departing node. Re-homing itself is M3-03 and M3-05, which read the
-  states from `NodeRegistry::entries`. The delete is `If-Match` on the
-  registration version the registry read, so a node that registered again
-  meanwhile is kept.
+  states from `NodeRegistry::entries`.
+- **Scanning and then deleting raced with an overlapping coordinator.**
+  Review found that the first version scanned the shards and deleted the
+  registration in one round. A second coordinator (M3-01 allows brief
+  overlaps, and a stale one keeps writing) could add the node to a shard
+  between the scan and the delete. The two writes go to different
+  registers, so both CASes succeeded, and a shard was left naming an
+  unregistered node. Forgetting now takes two rounds. The first marks the
+  registration `departing` by a CAS, and placement never assigns a marked
+  node. The second, whose listing read the mark, scans the shards and
+  deletes under `If-Match` on the marked version. So an assignment of the
+  node comes from a planner that read it before the mark, and lands before
+  the scan, which sees it. The exception is a planner that stalls across a
+  whole round. No CAS can close that window without transactions across
+  registers, which the design rules out. The result is then a shard member
+  on a lost node, which member removal (§6.4) and replacement handle. A
+  unit test, which fails when the two rounds are merged, runs a competing
+  placement right after the scan. The mark is a new optional
+  `NodeRegistration` field (`departing`, written only when set). It is
+  added under format version 1, as M1-06 added `created_unix_ms`, because
+  no release has shipped it. A marked registration no longer describes its
+  node, so a node that returns clears the mark by registering again, and
+  the heartbeat answer tells a marked node to do so. Silence is not reset
+  by the coordinator's own mark. Recorded in design §6.7.
+- **Registrations settle unanswered writes before announcing them.**
+  M3-01's change path now hands back a write that may still land as a
+  `Pending`, and announces it only once `settle` knows that it landed.
+  `register` settles it at once. If settling fails too, the `Pending`
+  goes back to the node's `Heartbeater` (`RegistrationError::Unsettled`),
+  which settles it before it registers again, so a registration that lands
+  late is still announced, and only once it has landed. A node that
+  restarts in between loses the `Pending`. That leaves at most an
+  unannounced registration, which the coordinator finds by listing and the
+  next increment announces. The coordinator settles its own pending marks
+  and deletes, as it settles every change.
 - **A restart that changes nothing writes nothing.** The design said a
   restart updates the record under `If-Match`; rewriting an identical
   record would cost a CAS and a generation increment per restart. A node
   that crashed between its registration CAS and the increment leaves the
   write unannounced, which is harmless: the coordinator lists `nodes/` on
   every round rather than relying on change streams, and the next
-  increment of any change announces it to the other nodes. Registration
-  reuses the coordinator's change path (`apply`), so a write that may have
-  landed is announced too. Recorded in design §6.7, with heartbeat and
-  registry traffic in the §6.1 table.
+  increment of any change announces it to the other nodes. Recorded in
+  design §6.7, with heartbeat and registry traffic in the §6.1 table.
 - **Pushes and heartbeats share one endpoint.** `ControlHints::serve`
   refused every frame but `ControlChanged`. `AdminEndpoint` now dispatches
   by kind, answering `NodeHeartbeat` only from node certificates (an
@@ -3065,6 +3151,13 @@ of this file. A task with nothing unexpected keeps "None."
   replacement (M3-05) removes them. Members that no registration
   describes count as domains of their own: nothing is known to share one
   with them.
+- **The `departing` mark arrived mid-task.** M3-02's review fix forgets a
+  node in two rounds and marks its registration `departing` first. A
+  `Candidate` built from a marked registration is `Departing` whether it
+  comes from the registration alone (a gateway checking a new bucket) or
+  from a registry entry, so the marked node receives no member, does not
+  count towards satisfiability, and its members count as missing in the
+  health report.
 
 ### M3-04 Automatic bucket and shard creation
 
@@ -3078,7 +3171,8 @@ of this file. A task with nothing unexpected keeps "None."
   applies one `ChangeSet` through M3-01's change path: the bucket
   register, then each shard register, all `If-None-Match: *`, one
   generation increment. The cost: the gateway knows only registrations,
-  so every node counts as live and empty. Within a bucket the shards
+  so every node counts as live and empty, except one whose registration
+  M3-02 marked `departing`, which gets no member. Within a bucket the shards
   still spread evenly (rendezvous ties); across buckets the load evens
   out only with rebalancing (M3-06). Recorded in §11.
 - **The bucket register goes first, which reverses §11's single-node
@@ -3162,3 +3256,39 @@ of this file. A task with nothing unexpected keeps "None."
   - **Runtime dropping of a deleted bucket's replicas on other members**,
     and the seal gaps above.
 
+## M6 Native peer transport
+
+### M6-01 Peer protocol messages
+
+- **`DATA` "at an offset" cannot address multipart uploads.** Design §7.8
+  gives `DATA` an offset only. A multipart upload's parts arrive
+  concurrently and in any order, and the final part boundaries are not
+  known until `CompleteMultipartUpload`. A re-uploaded part must also
+  replace the old one. Staged bytes are therefore addressed by *piece* and
+  offset. A piece is the body of a single PUT, or one part, and the source
+  gives it an ID that it never reuses. `COMMIT` lists the pieces of a
+  multipart object with their part numbers, sizes, and MD5s. The decision
+  is recorded in design §7.8.
+- **The precondition needs a third case.** The design gives a `COMMIT`
+  precondition as "the destination's expected current write identity, or
+  absent". `flush_conflict_policy = "overwrite"` needs a write with no
+  condition at all, so the precondition is one of `Absent`, `Matches`, and
+  `Unconditional`.
+- **`RESUME` had no trigger.** The table says that after a reconnect the
+  destination returns its durable ranges, but no message asks for them.
+  The destination now answers every `BEGIN` with a `RESUME`. For new
+  staging the `RESUME` is empty, and a source can stream `DATA` without
+  waiting for it.
+- **`peer_frame_bytes` had no upper bound.** A destination stages each
+  frame as one log record, so the configuration now limits it to the
+  largest record payload (16 MiB), as `extent_bytes` is limited.
+- **The intra-cluster frame was not reusable.** `skys3-net`'s `Frame`
+  keys its header on `MessageKind`, a closed enum whose kinds the
+  transport authorizes per node role. The peer protocol keeps the same
+  layout, two length prefixes, a `prost` header, and a raw payload, but
+  has its own envelope: a protobuf `oneof` of the nine messages, whose
+  field numbers are never reused.
+- **Size.** The plan sizes this task S (under 500 lines). The crate has
+  about 1,300 lines of non-test code, not counting comments. Most of it
+  is the `prost` wire structs and the checked conversions to typed
+  messages.

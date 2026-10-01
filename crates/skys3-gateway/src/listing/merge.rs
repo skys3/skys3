@@ -11,10 +11,11 @@
 //! any shard has an item left, in its page or beyond it.
 //!
 //! While the bucket's namespace import runs, the remote is one more source
-//! (§9.1), for the keys after the last one the import has passed: the
-//! index holds every key up to it. A remote key lists only if the index
-//! has no entry for it, since a live entry lists from its shard and a
-//! delete tombstone hides it. A remote common prefix that no shard lists
+//! (§9.1), for the keys after the last one the import has passed without a
+//! gap: the index holds every key up to it. A remote key lists only if the
+//! import has not passed it, where a range listed in parallel is ahead,
+//! and the index has no entry for it, since a live entry lists from its
+//! shard and a delete tombstone hides it. A remote common prefix that no shard lists
 //! is checked: it lists only if a remote key under it lists. S3 leaves out
 //! a common prefix at or before the listing's start even if keys under it
 //! come after, so when the import's position is inside a common prefix the
@@ -281,6 +282,7 @@ async fn refill_remote<H: Shards>(
         .filter(|item| after.is_none_or(|after| item.name() > after))
         .filter(|item| straddled.is_none_or(|prefix| item.name() != prefix))
         .collect();
+    let items = unpassed(bucket, remote, items);
     let entries = local_entries(shards, bucket, object_keys(&items)).await?;
     cursor
         .items
@@ -320,7 +322,7 @@ async fn lists_under<H: Shards>(
             max_items: REMOTE_CHECK_BATCH,
         };
         let page = remote.remote.list(&bucket.bucket_id, listing).await?;
-        let keys = object_keys(&page.items);
+        let keys = object_keys(&unpassed(bucket, remote, page.items));
         let entries = local_entries(shards, bucket, keys.clone()).await?;
         if keys.iter().any(|key| !entries.contains(key)) {
             return Ok(true);
@@ -330,6 +332,22 @@ async fn lists_under<H: Shards>(
             None => return Ok(false),
         }
     }
+}
+
+/// `items` without the remote keys the import has passed, which the index
+/// holds as the remote listed them.
+fn unpassed(
+    bucket: &BucketDocument,
+    remote: &RemoteSide<'_>,
+    items: Vec<ListItem>,
+) -> Vec<ListItem> {
+    items
+        .into_iter()
+        .filter(|item| match item {
+            ListItem::Object { key, .. } => !remote.remote.passed(&bucket.bucket_id, key),
+            ListItem::Prefix(_) => true,
+        })
+        .collect()
 }
 
 /// The keys of the objects among `items`.

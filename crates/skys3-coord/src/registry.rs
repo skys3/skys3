@@ -14,7 +14,9 @@
 //!                  └──────────────(heard)──────────────────┤
 //!                                                (silent for node_forget_after)
 //!                                                          v
-//!   forgotten <──(no shard names it: delete by If-Match)── Departing
+//!                          Departing <──(mark: CAS departing = true)
+//!                              │
+//!   forgotten <──(a later round finds no shard naming it: delete by If-Match)
 //! ```
 //!
 //! Silence is counted on the coordinator's own clock, from the latest of
@@ -25,11 +27,18 @@
 //!
 //! [`Lifecycle`] runs the registry inside the coordinator: it wraps the
 //! coordinator's [`Placement`], refreshes the registry before each plan,
-//! hands the nodes' addresses to the [`Pusher`] ([`PeerSink`]), and
-//! forgets a departing node once its [`Rehoming`] reports that no shard
-//! names it. Re-homing the shards themselves is placement's work (plan
-//! M3-03, M3-05), which reads [`NodeRegistry::entries`] to find departing
-//! nodes.
+//! and hands the nodes' addresses to the [`Pusher`] ([`PeerSink`]).
+//! Forgetting takes two changes. The first marks the registration
+//! `departing`, by a compare-and-swap on it, which every placement that
+//! reads the registry afterwards sees: it assigns the node nothing more,
+//! and re-homes what the node holds (plan M3-03, M3-05). Only a later
+//! round, whose [`Rehoming`] scan starts after the mark landed, deletes
+//! the registration, under `If-Match` on the marked version, and only if
+//! no shard names the node. A shard assignment and the delete touch
+//! different registers, so no single compare-and-swap orders them: the
+//! mark makes a planner that read the node as assignable one that started
+//! before the mark, and the rescan catches every assignment that landed
+//! before it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -45,7 +54,7 @@ use skys3_net::Network;
 use skys3_types::{NodeAddress, NodeId, NodeRegistration, RegisterDocument, ShardConfig};
 use tokio::sync::Notify;
 
-use crate::change::{Applied, ChangeSet};
+use crate::change::{Applied, ChangeError, ChangeSet};
 use crate::coordinator::Placement;
 use crate::push::Pusher;
 
@@ -90,8 +99,9 @@ pub enum NodeState {
     /// Silent for `suspect_after`. Placement may prefer other nodes, but
     /// nothing is taken from this one.
     Suspect,
-    /// Silent for `node_forget_after`. Its shards are re-homed, and the
-    /// node is forgotten once no shard names it.
+    /// Silent for `node_forget_after`, or its registration carries the
+    /// `departing` mark. Placement assigns it nothing and re-homes its
+    /// shards, and the node is forgotten once no shard names it.
     Departing,
 }
 
@@ -181,13 +191,18 @@ impl NodeRegistry {
 
     /// Records a heartbeat from `node`. Returns `false` if the registry's
     /// latest listing, made in this tenure, has no registration for the
-    /// node: it must register again. Before that listing, every node
-    /// counts as registered.
+    /// node, or one marked `departing`: the node must register again,
+    /// which clears the mark. Before that listing, every node counts as
+    /// registered.
     pub fn heard(&self, node: &NodeId) -> bool {
         let now = self.clock.now();
         let mut state = self.state();
         state.heard.insert(node.clone(), now);
-        let registered = !state.listed || state.nodes.contains_key(node);
+        let registered = !state.listed
+            || state
+                .nodes
+                .get(node)
+                .is_some_and(|known| !known.registration.departing);
         if !registered && let Some(wake) = &state.wake {
             wake.notify_one();
         }
@@ -231,7 +246,7 @@ impl NodeRegistry {
             .flatten()
             .fold(known.seen, MonoTime::max);
         let silent_for = now.saturating_duration_since(since);
-        let state = if silent_for >= self.config.forget_after {
+        let state = if silent_for >= self.config.forget_after || known.registration.departing {
             NodeState::Departing
         } else if silent_for >= self.config.suspect_after {
             NodeState::Suspect
@@ -282,10 +297,18 @@ impl NodeRegistry {
             }
             match read(store, &TypedKey::node(&node)).await {
                 Ok(Some(current)) if current.value.node_id == node => {
+                    // A new registration counts as hearing from the node,
+                    // but a coordinator's `departing` mark does not.
+                    let seen = self
+                        .state()
+                        .nodes
+                        .get(&node)
+                        .filter(|_| current.value.departing)
+                        .map_or_else(|| self.clock.now(), |known| known.seen);
                     let known = Known {
                         registration: current.value,
                         version: current.version,
-                        seen: self.clock.now(),
+                        seen,
                     };
                     nodes.insert(node, known);
                 }
@@ -310,12 +333,11 @@ impl NodeRegistry {
         Ok(())
     }
 
-    /// The departing nodes, with the version of their registrations.
-    fn departing(&self) -> BTreeMap<NodeId, Version> {
+    /// The nodes silent for `node_forget_after`.
+    fn silent(&self) -> Vec<NodeEntry> {
         self.entries()
             .into_iter()
-            .filter(|entry| entry.state == NodeState::Departing)
-            .map(|entry| (entry.registration.node_id, entry.version))
+            .filter(|entry| entry.silent_for >= self.config.forget_after)
             .collect()
     }
 
@@ -430,29 +452,44 @@ fn names(config: ShardConfig) -> Vec<NodeId> {
 
 /// The node lifecycle as a [`Placement`]: before each plan of the
 /// placement it wraps, it refreshes the [`NodeRegistry`], hands every
-/// registered node's address to its [`PeerSink`], and forgets a departing
-/// node that its [`Rehoming`] no longer needs, by deleting the node's
-/// register under `If-Match` on the version it read.
+/// registered node's address to its [`PeerSink`], and forgets nodes silent
+/// for `node_forget_after`, in two changes made in different rounds:
 ///
-/// The delete is a change like any other ([`apply`](crate::apply)): a node
-/// that re-registered in the meantime has a new version, so it is not
-/// forgotten. One forgotten while it still runs, for example after a long
-/// partition, learns it from its next heartbeat's answer and registers
-/// again.
+/// 1. It marks the node's registration `departing`, by a compare-and-swap
+///    on the version it read. From then on every placement that reads the
+///    registry assigns the node nothing, and re-homes what it holds.
+/// 2. In a later round, whose listing read the mark, so that its
+///    [`Rehoming`] scan starts after the mark landed, it deletes the
+///    registration under `If-Match` on the marked version, once no shard
+///    names the node.
+///
+/// A node that returns clears the mark by registering again (its next
+/// heartbeat's answer tells it to), which also changes the version, so it
+/// is not deleted. One forgotten while it still runs, for example after a
+/// long partition, learns it the same way and registers again.
 pub struct Lifecycle<P, R = ShardScan> {
     registry: NodeRegistry,
     placement: P,
     rehoming: R,
     peers: Option<Box<dyn PeerSink>>,
-    /// The node whose register the change being made deletes.
-    forgetting: Option<(NodeId, Version)>,
+    /// The lifecycle change being made, if the change is one.
+    step: Option<Step>,
+}
+
+/// A change the lifecycle makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    /// Marks the node's registration `departing`.
+    Mark(NodeId),
+    /// Deletes the node's registration, at the marked version.
+    Forget(NodeId, Version),
 }
 
 impl<P, R> std::fmt::Debug for Lifecycle<P, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Lifecycle")
             .field("registry", &self.registry)
-            .field("forgetting", &self.forgetting)
+            .field("step", &self.step)
             .finish_non_exhaustive()
     }
 }
@@ -466,7 +503,7 @@ impl<P: Placement> Lifecycle<P> {
             placement,
             rehoming: ShardScan::default(),
             peers: None,
-            forgetting: None,
+            step: None,
         }
     }
 }
@@ -479,7 +516,7 @@ impl<P: Placement, R: Rehoming> Lifecycle<P, R> {
             placement: self.placement,
             rehoming,
             peers: self.peers,
-            forgetting: self.forgetting,
+            step: self.step,
         }
     }
 
@@ -496,28 +533,47 @@ impl<P: Placement, R: Rehoming> Lifecycle<P, R> {
         &self.registry
     }
 
-    /// The change that forgets a departing node, if one can be forgotten.
+    /// The next change of forgetting a silent node, if one is due: a mark
+    /// first, and a delete only in a later round.
     async fn forget<S: ControlStore>(
         &mut self,
         store: &S,
+        proposals: &mut ProposalIds,
     ) -> Result<Option<ChangeSet>, ControlError> {
-        let departing = self.registry.departing();
-        if departing.is_empty() {
+        let silent = self.registry.silent();
+        let invalid = |error: ChangeError| ControlError::Rejected(error.to_string());
+        if let Some(entry) = silent.iter().find(|entry| !entry.registration.departing) {
+            let node = entry.registration.node_id.clone();
+            let mut marked = entry.registration.clone();
+            marked.departing = true;
+            marked.proposal_id = proposals.next_id();
+            let change = ChangeSet::new()
+                .update(&TypedKey::node(&node), &entry.version, &marked)
+                .map_err(invalid)?;
+            tracing::info!(%node, "marking a silent node departing");
+            self.step = Some(Step::Mark(node));
+            return Ok(Some(change));
+        }
+        // This round's listing read every mark below, so each landed
+        // before the scan starts.
+        let marked: BTreeMap<NodeId, Version> = silent
+            .into_iter()
+            .map(|entry| (entry.registration.node_id, entry.version))
+            .collect();
+        if marked.is_empty() {
             return Ok(None);
         }
-        let nodes = departing.keys().cloned().collect();
+        let nodes = marked.keys().cloned().collect();
         let needed = self.rehoming.still_needed(store, &nodes).await?;
-        let Some((node, version)) = departing
-            .into_iter()
-            .find(|(node, _)| !needed.contains(node))
+        let Some((node, version)) = marked.into_iter().find(|(node, _)| !needed.contains(node))
         else {
             return Ok(None);
         };
         let change = ChangeSet::new()
             .delete(&TypedKey::node(&node), &version)
-            .map_err(|error| ControlError::Rejected(error.to_string()))?;
-        tracing::info!(%node, "forgetting a node that stayed silent and holds no shard");
-        self.forgetting = Some((node, version));
+            .map_err(invalid)?;
+        tracing::info!(%node, "forgetting a departing node that holds no shard");
+        self.step = Some(Step::Forget(node, version));
         Ok(Some(change))
     }
 }
@@ -533,27 +589,29 @@ impl<P: Placement, R: Rehoming> Placement for Lifecycle<P, R> {
         store: &S,
         proposals: &mut ProposalIds,
     ) -> Result<Option<ChangeSet>, ControlError> {
-        self.forgetting = None;
+        self.step = None;
         self.registry.refresh(store).await?;
         if let Some(peers) = &self.peers {
             peers.set_peers(self.registry.peers());
         }
-        if let Some(change) = self.forget(store).await? {
+        if let Some(change) = self.forget(store, proposals).await? {
             return Ok(Some(change));
         }
         self.placement.plan(store, proposals).await
     }
 
     fn applied(&mut self, change: &ChangeSet, applied: &Applied) {
-        match self.forgetting.take() {
-            Some((node, version)) if applied.is_complete() => {
+        match self.step.take() {
+            None => self.placement.applied(change, applied),
+            Some(Step::Mark(node) | Step::Forget(node, _)) if !applied.is_complete() => {
+                tracing::info!(%node, "a node's registration changed under its departure");
+            }
+            Some(Step::Forget(node, version)) => {
                 tracing::info!(%node, "forgot a node");
                 self.registry.forgot(&node, &version);
             }
-            Some((node, _)) => {
-                tracing::info!(%node, "a node registered again before it was forgotten");
-            }
-            None => self.placement.applied(change, applied),
+            // The next listing reads the mark.
+            Some(Step::Mark(_)) => {}
         }
     }
 }

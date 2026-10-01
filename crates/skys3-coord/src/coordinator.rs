@@ -154,6 +154,8 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
         loop {
             self.settle().await;
             if self.tenure().is_some() {
+                // `serve_tenure` returns only once the tenure has ended,
+                // so each call serves a new tenure.
                 self.placement.begin_tenure();
                 self.serve_tenure().await;
             } else if !self.pending.is_empty() {

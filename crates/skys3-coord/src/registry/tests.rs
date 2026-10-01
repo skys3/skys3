@@ -142,7 +142,11 @@ async fn health_follows_heartbeats_and_is_judged_afresh_each_tenure() {
         ]
     );
     assert_eq!(
-        registry.departing().into_keys().collect::<Vec<_>>(),
+        registry
+            .silent()
+            .into_iter()
+            .map(|entry| entry.registration.node_id)
+            .collect::<Vec<_>>(),
         [node(1), node(2)]
     );
 
@@ -249,12 +253,19 @@ impl PeerSink for Peers {
     }
 }
 
+/// What one lifecycle round did to a node's registration.
+#[derive(Debug, PartialEq, Eq)]
+enum Did {
+    Marked(NodeId),
+    Forgot(NodeId),
+}
+
 /// Plans with `lifecycle` and applies what it planned, as the coordinator
-/// does. Returns the registers deleted.
+/// does. Returns what the round did to node registrations.
 async fn step<P: Placement, R: Rehoming>(
     lifecycle: &mut Lifecycle<P, R>,
     store: &MemoryControlStore,
-) -> Vec<RegisterKey> {
+) -> Vec<Did> {
     let mut ids = ProposalIds::seeded(4);
     let Some(change) = lifecycle.plan(store, &mut ids).await.unwrap() else {
         return Vec::new();
@@ -266,20 +277,31 @@ async fn step<P: Placement, R: Rehoming>(
     applied
         .written
         .into_iter()
-        .filter(|(_, version)| version.is_none())
-        .map(|(key, _)| key)
+        .filter_map(|(key, version)| match (key.kind(), version) {
+            (RegisterKind::Node(node), None) => Some(Did::Forgot(node)),
+            (RegisterKind::Node(node), Some(_)) => Some(Did::Marked(node)),
+            _ => None,
+        })
         .collect()
 }
 
+/// Whether node `n`'s registration exists and carries the mark.
+async fn marked(store: &MemoryControlStore, n: u8) -> Option<bool> {
+    read(store, &TypedKey::node(&node(n)))
+        .await
+        .unwrap()
+        .map(|current| current.value.departing)
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_departing_node_is_forgotten_only_once_no_shard_names_it() {
+async fn a_silent_node_is_marked_then_forgotten_once_no_shard_names_it() {
     let store = store(&[1, 2, 3]).await;
     shard(&store, &[1, 3]).await;
     let peers = Peers::default();
     let mut lifecycle = Lifecycle::new(registry(), NoPlacement).with_peers(peers.clone());
     lifecycle.begin_tenure();
     assert!(step(&mut lifecycle, &store).await.is_empty());
-    assert_eq!(
+    let last_peers = || {
         peers
             .0
             .lock()
@@ -287,55 +309,37 @@ async fn a_departing_node_is_forgotten_only_once_no_shard_names_it() {
             .last()
             .unwrap()
             .keys()
-            .collect::<Vec<_>>(),
-        [&node(1), &node(2), &node(3)]
-    );
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(last_peers(), [node(1), node(2), node(3)]);
 
-    // Node 3 keeps sending heartbeats; nodes 1 and 2 fall silent.
+    // Node 3 keeps sending heartbeats; nodes 1 and 2 fall silent, and are
+    // marked one round each, before anything is deleted.
     for _ in 0..7 {
         tokio::time::advance(FORGET / 6).await;
         lifecycle.registry().heard(&node(3));
     }
-    assert_eq!(
-        step(&mut lifecycle, &store).await,
-        [RegisterKey::node(&node(2))]
-    );
-    assert!(
-        read(&store, &TypedKey::node(&node(2)))
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert_eq!(step(&mut lifecycle, &store).await, [Did::Marked(node(1))]);
+    assert_eq!(step(&mut lifecycle, &store).await, [Did::Marked(node(2))]);
+    assert_eq!(marked(&store, 2).await, Some(true));
+    assert_eq!(marked(&store, 3).await, Some(false));
+    // The mark is not news from the node: it stays departing.
+    assert_eq!(step(&mut lifecycle, &store).await, [Did::Forgot(node(2))]);
+    assert_eq!(marked(&store, 2).await, None);
     assert!(lifecycle.registry().get(&node(2)).is_none());
-    assert_eq!(
-        peers.0.lock().unwrap().last().unwrap().len(),
-        3,
-        "peers are set before the change"
-    );
+    assert_eq!(last_peers().len(), 3, "peers are set before the change");
 
-    // Node 1 is departing too, but shard 0 still names it.
+    // Node 1 is marked too, but shard 0 still names it.
     assert_eq!(
         lifecycle.registry().get(&node(1)).unwrap().state,
         NodeState::Departing
     );
     assert!(step(&mut lifecycle, &store).await.is_empty());
-    assert_eq!(
-        peers
-            .0
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()
-            .keys()
-            .collect::<Vec<_>>(),
-        [&node(1), &node(3)]
-    );
+    assert_eq!(last_peers(), [node(1), node(3)]);
     // Once placement re-homes the shard, node 1 is forgotten as well.
     shard(&store, &[3]).await;
-    assert_eq!(
-        step(&mut lifecycle, &store).await,
-        [RegisterKey::node(&node(1))]
-    );
+    assert_eq!(step(&mut lifecycle, &store).await, [Did::Forgot(node(1))]);
     assert!(step(&mut lifecycle, &store).await.is_empty());
     assert_eq!(
         states(&lifecycle.registry().clone()),
@@ -343,13 +347,74 @@ async fn a_departing_node_is_forgotten_only_once_no_shard_names_it() {
     );
 }
 
-/// A placement that re-registers node 1 while its forgetting is under way,
-/// as a node that restarts with a new address would.
-struct Rejoins {
+/// A competing coordinator's placement, as one that briefly overlaps this
+/// coordinator would run it: it reads node 2's registration when it plans
+/// and, unless the registration is marked `departing`, adds node 2 to
+/// shard 0. It runs right after this coordinator's rehoming scan, the
+/// worst moment for it.
+struct Competitor {
+    scan: ShardScan,
     store: MemoryControlStore,
+    assigned: bool,
 }
 
-impl Rehoming for Rejoins {
+impl Rehoming for Competitor {
+    async fn still_needed<S: ControlStore>(
+        &mut self,
+        store: &S,
+        departing: &BTreeSet<NodeId>,
+    ) -> Result<BTreeSet<NodeId>, ControlError> {
+        let needed = self.scan.still_needed(store, departing).await?;
+        if marked(&self.store, 2).await == Some(false) {
+            shard(&self.store, &[3, 2]).await;
+            self.assigned = true;
+        }
+        Ok(needed)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_competing_placement_never_assigns_a_node_being_forgotten() {
+    let store = store(&[2, 3]).await;
+    shard(&store, &[3]).await;
+    let competitor = Competitor {
+        scan: ShardScan::default(),
+        store: store.clone(),
+        assigned: false,
+    };
+    let mut lifecycle = Lifecycle::new(registry(), NoPlacement).with_rehoming(competitor);
+    lifecycle.begin_tenure();
+    assert!(step(&mut lifecycle, &store).await.is_empty());
+    for _ in 0..7 {
+        tokio::time::advance(FORGET / 6).await;
+        lifecycle.registry().heard(&node(3));
+    }
+    for _ in 0..4 {
+        let _ = step(&mut lifecycle, &store).await;
+    }
+    // The registration was marked before any scan, so the competitor saw
+    // the mark and assigned nothing, and node 2 was forgotten. Forgetting
+    // it in the round of the scan would have let the competitor add it to
+    // shard 0 just before its registration was deleted.
+    assert!(!lifecycle.rehoming.assigned);
+    assert_eq!(marked(&store, 2).await, None);
+    let key = TypedKey::shard(&BucketId::new("b-1").unwrap(), ShardId::new(0));
+    let shard = read(&store, &key).await.unwrap().unwrap().value;
+    for named in names(shard) {
+        assert!(
+            read(&store, &TypedKey::node(&named))
+                .await
+                .unwrap()
+                .is_some(),
+            "shard 0 names {named}, which is not registered"
+        );
+    }
+}
+
+/// A rehoming that needs no node.
+struct Unneeded;
+
+impl Rehoming for Unneeded {
     async fn still_needed<S: ControlStore>(
         &mut self,
         _store: &S,
@@ -362,39 +427,49 @@ impl Rehoming for Rejoins {
 #[tokio::test(start_paused = true)]
 async fn a_node_that_registers_again_is_not_forgotten() {
     let store = store(&[1]).await;
-    let mut lifecycle = Lifecycle::new(registry(), NoPlacement).with_rehoming(Rejoins {
-        store: store.clone(),
-    });
+    let mut lifecycle = Lifecycle::new(registry(), NoPlacement).with_rehoming(Unneeded);
     lifecycle.begin_tenure();
     assert!(step(&mut lifecycle, &store).await.is_empty());
     tokio::time::advance(FORGET).await;
     let mut ids = ProposalIds::seeded(5);
     let change = lifecycle.plan(&store, &mut ids).await.unwrap().unwrap();
-    // The node restarts elsewhere between the plan and the delete.
+    // The node restarts elsewhere between the plan and the mark.
     let mut moved = profile(1);
     moved.address = "10.0.9.1:7400".parse().unwrap();
-    register(
-        &lifecycle.rehoming.store,
-        &cluster(),
-        &moved,
-        &mut ids,
-        &retry(),
-    )
-    .await
-    .unwrap();
+    register(&store, &cluster(), &moved, &mut ids, &retry())
+        .await
+        .unwrap();
     let applied = apply(&store, &cluster(), &change, &mut ids, &retry())
         .await
         .unwrap();
     assert!(!applied.is_complete());
     lifecycle.applied(&change, &applied);
-    assert!(lifecycle.registry().get(&node(1)).is_some());
     // The next listing reads the new registration, which counts as
     // hearing from the node.
     assert!(step(&mut lifecycle, &store).await.is_empty());
     let entry = lifecycle.registry().get(&node(1)).unwrap();
     assert_eq!(
-        (entry.state, entry.registration.address),
-        (NodeState::Live, moved.address)
+        (entry.state, entry.registration.address.clone()),
+        (NodeState::Live, moved.address.clone())
+    );
+
+    // Silent again, it is marked; it then sends a heartbeat, is told to
+    // register again, and its registration clears the mark, so it is not
+    // forgotten.
+    tokio::time::advance(FORGET).await;
+    assert_eq!(step(&mut lifecycle, &store).await, [Did::Marked(node(1))]);
+    lifecycle.registry().refresh(&store).await.unwrap();
+    assert!(!lifecycle.registry().heard(&node(1)));
+    let again = register(&store, &cluster(), &moved, &mut ids, &retry())
+        .await
+        .unwrap();
+    assert_eq!(again.registration, crate::join::Registration::Updated);
+    assert!(step(&mut lifecycle, &store).await.is_empty());
+    assert_eq!(marked(&store, 1).await, Some(false));
+    assert!(lifecycle.registry().heard(&node(1)));
+    assert_eq!(
+        lifecycle.registry().get(&node(1)).unwrap().state,
+        NodeState::Live
     );
 }
 
