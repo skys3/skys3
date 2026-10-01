@@ -171,6 +171,13 @@ impl Harness {
             &mut again,
         );
         assert_eq!(query, again, "canonical queries are stable");
+        // The canonical query means what the query means to s3s, so two
+        // queries s3s reads differently never share a canonical form.
+        assert_eq!(
+            canonical::query_meaning(std::str::from_utf8(&query).expect("ASCII")),
+            canonical::query_meaning(head.query),
+            "a canonical query means what its query means"
+        );
 
         let auth = SigV4Authenticator::new(
             MemoryCredentials::new().with_key(FUZZ_KEY, FUZZ_SECRET, None),

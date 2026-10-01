@@ -649,6 +649,23 @@ of this file. A task with nothing unexpected keeps "None."
   The AWS Common Runtime suite agrees on every S3-relevant vector, except
   that its `post-sts-header-after` presigned form adds the session token
   after signing, which S3 does not do, so that form is skipped.
+- **A raw `+` in the query was a signature bypass.** The canonicalizer
+  first encoded a raw `+` as `%2B`, its byte, but `s3s` decodes the query
+  as a form, where `+` is a space. A presigned URL for
+  `prefix=private%2Badmin` still verified as `prefix=private+admin`, which
+  `s3s` runs with a different prefix. A raw `+` in the query is now
+  signed as `%20`, the space it means. That is also what the AWS SDKs'
+  signer does (`aws-sigv4` form-decodes the query before encoding it), so
+  refusing raw `+` would have refused correctly signed requests. An audit
+  of the other encodings found them consistent: escapes in either case,
+  invalid escapes (signed as `%25`), `;`, `=` inside values, empty names,
+  non-UTF-8 escapes, and the path (`%2F`, and `+`, which paths do not
+  decode). Repeated parameters were not: signing sorts them by value, so
+  their order, which `s3s` keeps, was unsigned; a signed query may now
+  not repeat a parameter. A proptest and the `gateway_sigv4_canonical`
+  fuzz target check that a canonical query decodes, as `s3s` decodes it,
+  to the same pairs as its query, which rules out any two queries that
+  mean different things sharing a signature.
 - **Parameter names are decoded as `s3s` decodes them.** M1-06's review
   fixes made the limit checks decode the query with `serde_urlencoded`, as
   `s3s` does. The authenticator first matched raw names, so
@@ -657,7 +674,7 @@ of this file. A task with nothing unexpected keeps "None."
   decision on a query parameter's name (presigned or SigV2, which values
   are the signing parameters, which pairs to strip, which pair the
   canonical query leaves out) now uses the pair decoded the same way;
-  values decode as in a form, so a raw `+` in a token is a space. The
+  values decode as in a form too, so a raw `+` in a token is a space. The
   canonical request still uses the pairs as received. Headers need no
   such care: their names are not escaped, and every query parameter is
   in the canonical query, so all of them are signed.
