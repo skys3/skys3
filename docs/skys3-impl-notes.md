@@ -1391,3 +1391,24 @@ of this file. A task with nothing unexpected keeps "None."
 - **No fuzz target.** The backend parses nothing new: listed keys go
   through the existing `RegisterKey` grammar, and values through the
   existing document parsing.
+- **Listings need the same consistency as reads (review).** The first
+  probe checked only reads, so a store with consistent `GetObject` but
+  lagging `ListObjectsV2` passed, and its change streams would miss writes
+  a generation announced: the feed lists once per generation, and a
+  generation does not name the registers it announces, so the feed cannot
+  tell a lagging listing from a complete one. The probe now lists the
+  scratch registers after every round and every deletion, and refuses a
+  store whose listing misses a register, shows an old version, or shows a
+  deleted one; design §6.1 records why the feed does not relist instead.
+  `SimS3` gained `stale_list_probability`, and a scripted
+  `Fault::StaleRead` now also makes a listing stale. Stale reads are now
+  drawn only for `GetObject` and `HeadObject`, which changed the draws of
+  profiles with stale reads; they were new in this PR. That change exposed
+  that the probe's cleanup stopped at a stale read showing a register as
+  absent, so the cleanup now first deletes at the version the probe knows.
+- **The prefix bound was the backend's alone (review).** The backend
+  refuses prefixes over 512 bytes (S3's 1,024-byte key limit less the
+  longest register key), which configuration accepted. Configuration now
+  applies `ControlStoreConfig::MAX_PREFIX_LEN`, and a test in
+  `skys3-control` checks that it equals the backend's bound, derived from
+  `skys3-remote`, which `skys3-config` does not depend on.

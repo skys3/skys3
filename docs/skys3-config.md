@@ -54,7 +54,7 @@ Where the cluster's registers live (§6.1).
 | `etcd_endpoints` | array of endpoint URLs | none | Required, and non-empty, for `backend = "etcd"`. Not allowed for `"s3"`. |
 | `endpoint` | endpoint URL | none | Required for `backend = "s3"`. Not allowed for `"etcd"`. |
 | `bucket` | string | none | The control bucket. Required for `backend = "s3"`: visible ASCII without `/`. Not allowed for `"etcd"`. |
-| `prefix` | string | `"<cluster_id>/"` | The prefix of every register key. Visible ASCII, ending with `/` and not starting with it. |
+| `prefix` | string | `"<cluster_id>/"` | The prefix of every register key. At most 512 bytes of visible ASCII, ending with `/` and not starting with it: S3's 1,024-byte key limit less the longest register key. |
 | `allow_correlated_control_store` | boolean | `false` | Accept an S3 control store in the failure scope of a data target (see below). |
 | `coordinator_lease_seconds` | integer | `10` | Positive. The holder renews every third of it (§6.7). |
 | `config_poll_interval_seconds` | integer | `30` | Positive. How often a node polls `cluster.json` as a backstop to pushes (§6.2). |
