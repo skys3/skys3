@@ -147,11 +147,21 @@ fn check_len(field: &'static str, len: usize, min: usize, max: usize) -> Result<
 /// every length against the bytes that remain before using it.
 pub(crate) struct Reader<'a> {
     rest: &'a [u8],
+    version: u16,
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
-        Self { rest: bytes }
+    /// A reader of a kind-specific header in format `version`.
+    pub(crate) fn new(bytes: &'a [u8], version: u16) -> Self {
+        Self {
+            rest: bytes,
+            version,
+        }
+    }
+
+    /// The format version of the record being read.
+    pub(crate) fn version(&self) -> u16 {
+        self.version
     }
 
     pub(crate) fn take(&mut self, field: &'static str, len: usize) -> Result<&'a [u8], FieldError> {

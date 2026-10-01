@@ -7,7 +7,7 @@
 //! operations, over a fresh in-memory control store and shard stub.
 //! [`Harness::sigv4`] drives requests through SigV4 canonicalization and
 //! verification, and [`aws_chunked`] drives bodies through the chunk
-//! decoder.
+//! decoder. [`checksums`] reads checksum headers and values.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +19,10 @@ use s3s::Body;
 use skys3_config::Config;
 use skys3_control::{MemoryControlStore, ProposalIds, RetryPolicy, bootstrap};
 use skys3_io::ManualWallClock;
+use skys3_types::checksum::{Checksum, ChecksumAlgorithm};
 
 use crate::buckets::{GatewayConfig, IdSource, MODE_HEADER};
+use crate::checksum::{ExpectedChecksum, ExpectedChecksums};
 use crate::service::{Authenticator, Gateway, Unauthenticated};
 use crate::sigv4::body::BodyError;
 use crate::sigv4::canonical::{self, Head};
@@ -329,6 +331,69 @@ pub fn aws_chunked(data: &[u8]) -> Option<ChunkedOutcome> {
     })
 }
 
+/// The header names [`checksums`] picks from.
+const CHECKSUM_HEADERS: [&str; 12] = [
+    "content-md5",
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+    "x-amz-checksum-sha512",
+    "x-amz-checksum-type",
+    "x-amz-sdk-checksum-algorithm",
+    "x-amz-trailer",
+    "x-amz-checksum-",
+    "content-type",
+];
+
+/// Reads checksum headers and values from untrusted input.
+///
+/// The input is lines: each line's first byte picks a header name from a
+/// fixed list and the rest is its value. The headers are read as
+/// [`ExpectedChecksums`]; every line is also parsed as a stored checksum
+/// value of every algorithm, which must print back to a value that parses
+/// to the same checksum. Returns whether the headers were accepted.
+///
+/// # Panics
+///
+/// If a property fails.
+#[must_use]
+pub fn checksums(data: &[u8]) -> bool {
+    let mut headers = HeaderMap::new();
+    for line in data.split(|&b| b == b'\n') {
+        let Some((&pick, value)) = line.split_first() else {
+            continue;
+        };
+        if let Ok(text) = std::str::from_utf8(value) {
+            for algorithm in ChecksumAlgorithm::ALL {
+                if let Ok(checksum) = Checksum::parse(algorithm, text) {
+                    let printed = checksum.to_string();
+                    assert_eq!(Checksum::parse(algorithm, &printed), Ok(checksum.clone()));
+                    assert!(checksum.check(algorithm).is_ok());
+                }
+            }
+        }
+        let name = CHECKSUM_HEADERS[usize::from(pick) % CHECKSUM_HEADERS.len()];
+        if let Ok(value) = HeaderValue::from_bytes(value) {
+            headers.append(HeaderName::from_static(name), value);
+        }
+    }
+    match ExpectedChecksums::from_headers(&headers) {
+        Ok(expected) => {
+            if let Some(ExpectedChecksum::Header(algorithm, digest)) = expected.checksum() {
+                assert_eq!(digest.len(), algorithm.digest_len());
+            }
+            true
+        }
+        Err(error) => {
+            // Every refusal has an S3 answer.
+            let _ = error.to_s3_error();
+            false
+        }
+    }
+}
+
 /// Decodes `body` delivered in reads of `split` bytes, checking that no
 /// more than `declared` bytes come out.
 fn decode_body(
@@ -459,6 +524,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(forged.raw, Some(403));
+    }
+
+    #[test]
+    fn checksum_inputs_are_read_or_refused() {
+        assert!(checksums(b""));
+        assert!(checksums(b"\x01NSRBwg==\n\x08crc32"));
+        assert!(!checksums(b"\x01NSRBwg==\n\x02NSRBwg=="));
+        assert!(!checksums(b"\x00short"));
+        assert!(checksums(b"\x0bignored\n\x0bMDaLrw==-3"));
     }
 
     #[test]

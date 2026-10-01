@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use super::{FORMAT_VERSION, RecordKind};
+use super::{FORMAT_VERSION, MIN_FORMAT_VERSION, RecordKind};
 
 /// A field that breaks the record format, found while encoding or decoding.
 ///
@@ -103,7 +103,10 @@ pub enum DecodeError {
     #[error("the bytes do not start with the log record magic")]
     BadMagic,
     /// The record has a format version this build cannot read.
-    #[error("log format version {0} is not supported; this build reads version {FORMAT_VERSION}")]
+    #[error(
+        "log format version {0} is not supported; this build reads versions \
+         {MIN_FORMAT_VERSION} to {FORMAT_VERSION}"
+    )]
     UnsupportedVersion(u16),
     /// A length in the fixed header is out of range.
     #[error("{field} is {len}; it must be from {min} to {max}")]

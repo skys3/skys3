@@ -415,7 +415,7 @@ fn recovery_refuses_records_it_cannot_use() {
         let config = small_config();
         let whole = delete(0, 3).to_bytes().unwrap().to_vec();
         let mut newer_version = whole.clone();
-        newer_version[8] = 2;
+        newer_version[8] = 3;
         reseal(&mut newer_version);
         let mut reserved_kind = whole.clone();
         reserved_kind[10] = 4; // MPU_CREATE, not defined yet

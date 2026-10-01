@@ -9,8 +9,8 @@ use proptest::prelude::*;
 use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
-    Adopt, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed, Import,
-    LogRecord, MAX_PAYLOAD_LEN, Metadata, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
+    Adopt, Checksum, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed,
+    Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -86,7 +86,18 @@ pub fn checksums() -> impl Strategy<Value = Checksums> {
     .prop_flat_map(|algorithms| {
         algorithms
             .into_iter()
-            .map(|a| vec(any::<u8>(), a.digest_len()).prop_map(move |digest| (a, digest)))
+            .map(|a| {
+                (vec(any::<u8>(), a.digest_len()), 0..=10_000_u32).prop_map(
+                    move |(digest, parts)| {
+                        let checksum = if parts == 0 || !a.supports_composite() {
+                            Checksum::full_object(a, &digest)
+                        } else {
+                            Checksum::composite(a, &digest, parts)
+                        };
+                        (a, checksum.unwrap())
+                    },
+                )
+            })
             .collect::<Vec<_>>()
             .prop_map(|entries| entries.into_iter().collect::<Checksums>())
     })
@@ -285,6 +296,7 @@ pub fn reseal(record: &mut [u8]) {
 /// The fields of a hand-built fixed header.
 #[derive(Clone)]
 pub struct Frame {
+    pub version: u16,
     pub kind: u16,
     pub bucket: &'static str,
     pub shard: u8,
@@ -297,6 +309,7 @@ impl Frame {
     /// A frame of `kind` in shard 3 of bucket `b1`, at position 5.9.
     pub fn new(kind: u16) -> Self {
         Self {
+            version: skys3_log::record::FORMAT_VERSION,
             kind,
             bucket: "b1",
             shard: 3,
@@ -318,7 +331,7 @@ impl Frame {
         let mut out = Vec::new();
         out.extend_from_slice(b"SKYL");
         out.extend_from_slice(&[0; 4]);
-        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.kind.to_le_bytes());
         out.extend_from_slice(&u32::try_from(80 + body.len()).unwrap().to_le_bytes());
         out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
