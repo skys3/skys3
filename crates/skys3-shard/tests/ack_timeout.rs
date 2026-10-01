@@ -11,7 +11,7 @@ use std::time::Duration;
 use skys3_index::Index;
 use skys3_io::{BlockingPool, SimDisk, SimMount};
 use skys3_log::SegmentLog;
-use skys3_shard::{AckMode, AckTimeout, Committed, Leader, Shard, ShardError};
+use skys3_shard::{AckMode, AckTimeout, Committed, Leader, Shard, ShardError, ShardSet};
 use skys3_types::{Epoch, NodeId, Seq, ShardConfig};
 use support::{
     at, config, delete, entry, index_config, open_log, pool, put, record, runtime, shard,
@@ -295,5 +295,60 @@ fn a_shard_alone_has_no_timeout() {
         alone.commit(put("k", 10, 1)).await.unwrap();
         assert_eq!(AckTimeout::default(), AckTimeout::DEFAULT);
         assert_eq!(AckTimeout::DEFAULT.mode, AckMode::WaitThrough);
+    });
+}
+
+/// A node closing many replicated shards whose members are gone waits
+/// about one timeout in all, not one per shard: `close_all` closes them
+/// together.
+#[test]
+fn closing_every_shard_waits_one_timeout_not_one_per_shard() {
+    const SHARDS: u8 = 8;
+    runtime().block_on(async {
+        let replica = Replica::new().await;
+        let set = ShardSet::new(
+            Arc::clone(&replica.index),
+            replica.log.clone(),
+            replica.pool.clone(),
+        );
+        let mut writers = Vec::new();
+        for n in 0..SHARDS {
+            let config = ShardConfig {
+                members: vec![node(1), node(2), node(3)],
+                replicas: 3,
+                ..config(&shard(n), 1)
+            };
+            let primary = set.open_replica(&config, &node(1)).await.unwrap();
+            primary.set_ack_timeout(AckTimeout::wait_through(TIMEOUT));
+            let leader = primary.leader().unwrap();
+            leader.synced(&node(2), Seq::ZERO);
+            leader.synced(&node(3), Seq::ZERO);
+            until(|| primary.is_serving()).await;
+            // A write the members never acknowledge.
+            writers.push(spawn_commit(&primary, put("k", 10, 1)));
+            until(|| primary.last_sequenced() == Seq::new(1)).await;
+        }
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(WAIT, set.close_all())
+            .await
+            .expect("closing every shard finished")
+            .unwrap();
+        let took = started.elapsed();
+        // One per shard would be eight timeouts.
+        assert!(took < TIMEOUT * 3, "closing took {took:?}");
+        for writer in writers {
+            not_acknowledged(writer.await.unwrap());
+        }
+        for n in 0..SHARDS {
+            let closed = set.get(&shard(n)).await.unwrap();
+            assert!(closed.is_stopped());
+            assert_eq!(closed.applied(), at(0));
+        }
+        // Closed shards stay closed: closing again fails, in shard order.
+        let again = set.close_all().await;
+        assert!(
+            matches!(&again, Err(ShardError::Unavailable { shard: s, .. }) if *s == shard(0)),
+            "{again:?}"
+        );
     });
 }
