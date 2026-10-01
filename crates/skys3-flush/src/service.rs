@@ -6,6 +6,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use skys3_config::BucketsConfig;
 use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::ObjectStore;
@@ -16,7 +17,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::budget::DirtyBudget;
-use crate::import::{self, ImportState, ImportStatus, RemoteReader};
+use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{FlushSettings, Target};
@@ -104,6 +105,8 @@ pub struct FlushService<S, D> {
     wall: Arc<dyn WallClock>,
     metrics: FlushMetrics,
     budget: Arc<DirtyBudget>,
+    /// Each bucket's settings, if the service has them.
+    bucket_settings: Option<BucketsConfig>,
     buckets: Mutex<BTreeMap<BucketId, BucketFlusher<S>>>,
     _disk: std::marker::PhantomData<fn() -> D>,
 }
@@ -154,6 +157,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             wall: Arc::new(SystemWallClock),
             metrics,
             budget: Arc::new(DirtyBudget::unlimited()),
+            bucket_settings: None,
             buckets: Mutex::default(),
             _disk: std::marker::PhantomData,
         }
@@ -170,6 +174,14 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     #[must_use]
     pub fn with_budget(mut self, budget: Arc<DirtyBudget>) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Takes each bucket's `import_parallel_streams` from `buckets`;
+    /// otherwise every import has `settings.import_streams` streams.
+    #[must_use]
+    pub fn with_buckets(mut self, buckets: BucketsConfig) -> Self {
+        self.bucket_settings = Some(buckets);
         self
     }
 
@@ -249,15 +261,23 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
         let (ready, target) = watch::channel(None);
         let probe_task = tokio::spawn(run_probe(parts, Arc::clone(&probe), ready));
-        let import_task = tokio::spawn(import::run(
-            Arc::clone(&store),
-            prefix.clone(),
-            bucket.clone(),
-            set.clone(),
-            self.settings.clone(),
-            Arc::clone(&self.wall),
-            Arc::clone(&import),
-        ));
+        let streams =
+            self.bucket_settings
+                .as_ref()
+                .map_or(self.settings.import_streams, |buckets| {
+                    usize::try_from(buckets.get(&bucket.name).import_parallel_streams)
+                        .unwrap_or(usize::MAX)
+                });
+        let import_task = tokio::spawn(import::run(ImportJob {
+            store: Arc::clone(&store),
+            prefix: prefix.clone(),
+            bucket: bucket.clone(),
+            set: set.clone(),
+            settings: self.settings.clone(),
+            streams,
+            wall: Arc::clone(&self.wall),
+            state: Arc::clone(&import),
+        }));
         BucketFlusher {
             name,
             probe,
@@ -334,11 +354,16 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         }
     }
 
-    /// Stops every flusher. Flushes in flight are abandoned; their keys stay
-    /// dirty and are flushed after the next start.
+    /// Stops every flusher and import. Flushes in flight are abandoned;
+    /// their keys stay dirty and are flushed after the next start. An
+    /// import resumes from its stored checkpoints.
     pub async fn shutdown(&self) {
         let flushers = std::mem::take(&mut *self.lock());
         for (_, mut flusher) in flushers {
+            // Once the import task is gone, so are its streams: none
+            // stores a checkpoint after this returns.
+            flusher.import_task.abort();
+            let _ = (&mut flusher.import_task).await;
             for (_, shard) in std::mem::take(&mut flusher.shards) {
                 shard.stop().await;
             }
