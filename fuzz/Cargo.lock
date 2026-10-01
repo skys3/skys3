@@ -2192,6 +2192,7 @@ dependencies = [
  "skys3-log",
  "skys3-net",
  "skys3-obs",
+ "skys3-peer",
  "skys3-shard",
  "skys3-sts",
  "skys3-types",
@@ -2299,6 +2300,18 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "skys3-peer"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "prost",
+ "skys3-log",
+ "skys3-types",
+ "thiserror",
 ]
 
 [[package]]

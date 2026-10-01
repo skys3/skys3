@@ -2572,6 +2572,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "skys3-peer"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "proptest",
+ "prost",
+ "skys3-log",
+ "skys3-types",
+ "thiserror",
+]
+
+[[package]]
 name = "skys3-remote"
 version = "0.1.0"
 dependencies = [

@@ -434,6 +434,13 @@ fn peering_rules() {
         "[peering]\npeer_frame_bytes = 0",
         &["peering.peer_frame_bytes"],
     );
+    // A DATA frame is staged as one log record.
+    assert_violations(
+        "[peering]\npeer_frame_bytes = 16777217\npeer_max_inflight_bytes = 33554432",
+        &["peering.peer_frame_bytes"],
+    );
+    let config = load("[peering]\npeer_frame_bytes = 16777216").unwrap();
+    assert_eq!(config.peering().peer_frame_bytes, 16_777_216);
 }
 
 #[test]
