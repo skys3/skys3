@@ -1772,6 +1772,73 @@ of this file. A task with nothing unexpected keeps "None."
   warnings` failed on the budget's `fetch_update`. The fix was
   `try_update`, which MSRV 1.98.1 already has.
 
+### M1-18 Namespace import
+
+- **Writes made before the import reached their key ended in conflict.**
+  M1-16's flusher HEADed a write of unknown remote state only while the
+  import had not passed its key, deciding at flush time. A PUT committed
+  before the import reached the key but flushed after the import passed it
+  had no `remote_etag`, so it went out with `If-None-Match: *`, found the
+  object the remote already held, and was held in conflict forever. The
+  design had `IMPORT` dropped for every existing entry, so nothing ever
+  told the entry what the remote held. An `IMPORT` now records the listed
+  ETag on a dirty entry that has no `remote_etag` (design §4.2), and the
+  flusher asks whether the import passed a key before it reads the entry.
+  The new simulation scenario fails on its first seed with either change
+  undone.
+- **The import checkpoint lives in the index, not the log.** Plan M2-17
+  says a new primary resumes import checkpoints "from the log", but §10.1
+  has no record kind for them, and adding one changes the log format. A
+  restarted import turned out to be safe from any position: every
+  `IMPORT` is conditional, and the remote no longer holds what a flushed
+  delete removed. So M1 keeps one checkpoint per bucket in a new `imports`
+  table, synced after each page (index format 3), and M2-17 decides
+  whether it moves into the log.
+- **Lazily loaded metadata needed a marker, not a record kind.** An
+  `ADOPT` naming the stub's `seq` already has the right semantics (dropped
+  if a local write came first, adopts an out-of-band change). What it
+  lacked was a way to tell a loaded entry from an unloaded one without a
+  new entry field: every local write stores a checksum (the gateway
+  computes CRC64NVME since M1-08), so "no checksums and no
+  `Content-Type`" marks an unloaded stub, provided every `ADOPT` stores a
+  `Content-Type`. The lazy load stores S3's default where the remote has
+  none; M1-20's HEAD-based `ADOPT` must do the same once both are in the
+  stack, or such objects reload on every read.
+- **Tombstones waited up to 30 s after the import passed them.** The
+  flusher retried a tombstone waiting for the import after the maximum
+  backoff. It now backs off from the minimum, doubling, like any retry.
+- **A retried capability probe misjudged the target.** The flush service
+  built its probe, and so its scratch-key nonce, once and reused it for
+  every retry. A run that failed under faults could leave its scratch
+  keys behind, and the next run's `If-None-Match: *` that must hold then
+  got `412`, so `PutObject` and `CompleteMultipartUpload` were reported
+  unprotected and every flush went out unconditionally. The import
+  scenario, whose remote is faulty from the start, found it on seed 0.
+  Each run now takes a fresh nonce, and the scenario checks that the probe
+  found every precondition honored.
+- **The rate limit let single pages through at once.** Review found
+  that the import waited only after a truncated page, so the first page
+  committed at once and the last never waited: an import of one page
+  ignored `import_max_keys_per_second`, and a rate of 1 still committed
+  1,000 keys in a burst. A token bucket that starts empty and holds one
+  second's keys now admits every page before it commits, and a page asks
+  for at most a second's keys, so no stretch of `t` seconds commits more
+  than `rate * (t + 1)` keys, even after slow requests.
+- **A listing lost a common prefix the import was inside.** Review found
+  that the remote side of a delimited listing sent the import's position
+  as `StartAfter`, and S3 (and `SimS3`, since M0-05) leaves out a common
+  prefix at or before it: with the import past `a/x`, a remote-only `a/y`
+  did not list as `a/` unless a live local entry produced it. The merge
+  now adds that prefix to the remote's items and checks it like any
+  remote-only prefix. The gateway's test remote had modeled the opposite
+  S3 behavior, which hid the bug; it now matches `SimS3`.
+- **Index bytes per imported entry: 157** (§19 item 6). Measured by
+  `index_bytes_per_imported_entry` in `skys3-flush`: 20,000 stubs with
+  40-byte keys and a storage class, applied to a fresh index and made
+  durable, grow the redb file by 157 bytes each, about 16 GB per member
+  for 100 million objects. The log's `IMPORT` records come on top until
+  their segments are released.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named
@@ -2481,9 +2548,10 @@ of this file. A task with nothing unexpected keeps "None."
   share one read.
 - **No new index format for the shard map.** The map is a new `shard_map`
   table, keyed like `shards`, holding each configuration's register JSON.
-  It is a cache that is safe when stale, so the index format stays 2: an
-  older build ignores the table, and opening an index that lacks it adds
-  it. It is kept apart from the control-state copy, which each sync
+  It is a cache that is safe when stale, so it takes no index format of
+  its own (the format is 3, from M1-18's `imports` table): an older build
+  ignores the table, and opening an index that lacks it, of any supported
+  format, adds it. It is kept apart from the control-state copy, which each sync
   replaces whole.
 - **A pooled connection the peer dropped fails one write.** The gateway
   keeps idle connections per node (at most 8, for at most 60 s; the server
@@ -2501,6 +2569,13 @@ of this file. A task with nothing unexpected keeps "None."
   primary for up to `LAZY_MAX_DELAY` (1 s), which M2-07 named as a risk. A
   routing scenario with a 1 s forwarding timeout failed writes that way;
   the scenarios now give forwarded requests 4 s, and the default is 30 s.
+- **Leases and acknowledgement timeouts cross the wire as refusals.** A
+  primary that lacks a lease from some member (M2-09), or a stopped one,
+  refuses a forwarded read as unavailable, and the gateway answers `503`
+  at once rather than asking other members, which would only redirect it
+  back. A write that was not acknowledged in time (M2-10) travels as its
+  own outcome, with the position it took, so the gateway answers it as
+  the local path does.
 - **Seals across nodes.** The design left them to this task. The gateway
   forwards seal and unseal to the primary, which holds a seal until it is
   lifted or it restarts. Lifting the seals of a crashed gateway, and seals
@@ -2551,3 +2626,115 @@ of this file. A task with nothing unexpected keeps "None."
   - **Size.** About 2,000 lines of non-test library code, most of it
     the forwarding messages and their checks, plus about 350 in the
     simulation harness.
+
+### M2-09 Leases and strong reads
+
+- **No takeover yet, so no read can really be stale.** Placements are
+  static until M2-12, so the old primary is always the only one and the
+  history checker cannot see a stale read. The simulation checks the
+  property a takeover relies on instead: the lease audit of
+  `ReplicatedServices` flags every read a primary serves once some
+  member's `primary_grace` has passed, since that member could then have
+  proposed itself and acknowledged writes the read misses. Within `ρ` no
+  read is flagged, also with node 1 as slow and node 2 as fast as `ρ`
+  allows; with node 1 40% slow and node 2 40% fast, reads during a
+  partition between them are (about 1.33 s of lease against 1 s of grace),
+  while the commit audit, linearizability, and the every-member
+  durability check still pass. M2-12 can turn the drift-beyond-`ρ`
+  scenario into an actual stale read in the history.
+- **Clock readings cannot cross hosts, not even in the checker.** Each
+  `turmoil` host runs its own paused Tokio runtime, whose `Instant`s have
+  their own base, and outside any host `tokio::time::Instant::now` falls
+  back to real time, so the driver cannot read a node's `MonotonicClock`.
+  The audit converts each member's grace deadline to simulated time inside
+  the member's host, as it changes (`Grace::subscribe`), and checks reads
+  in the primary's host with `turmoil::sim_elapsed`. For the same reason,
+  `ReplicatedServices::ready` asks only that every member granted each
+  primary a lease, not that it is still valid.
+- **Stalled writes hid the anomaly.** A partition stalls the writes of
+  every shard it cuts a member from (there is no `replica_ack_timeout`
+  before M2-10), and with the default 2 s client timeout every client was
+  soon waiting on one, so no read landed in the 330 ms window. The lease
+  scenarios give clients a 300 ms timeout.
+- **Fixed drifts.** The harness drew every life's drift within the bound,
+  so a scenario could not put two chosen clocks beyond `ρ`.
+  `ClusterConfig::node_drifts` fixes the drift of the first nodes; the
+  drift is still drawn, so fixing it changes no other draw of a seed.
+- **Stamps rather than beacon numbers.** The primary stamps each append
+  and beacon with its clock reading, and members echo the latest one, so
+  the primary keeps no table of beacons in flight. A member grants a lease
+  with every acknowledgement after its first stamp, also when it repeats
+  an old stamp; that only restarts its grace later. Design §5.4 records
+  the details, and that unconditional writes need no lease.
+- **The renewal interval equalled the link timeout.** Both default to 1 s.
+  On a busy link whose member's log stalls, the answers to renewal
+  beacons were all the primary heard, one per timeout, so the link
+  dropped and reconnected over and over, and a reconnect waits for the
+  member's slow sync, so leases could lapse. Review caught it.
+  `ReplicationConfig::beacon_every` now caps every beacon interval at a
+  quarter of `link_timeout`; a test with a member that answers beacons
+  and acknowledges no record keeps one session and its lease through
+  three timeouts.
+- **Left for later.** R1 needs a member to stop granting leases before it
+  proposes (M2-12): `Grace` has no such switch yet, and the member's link
+  echoes stamps as long as it follows the primary. The lease timings sit
+  in `ReplicationConfig` with the design's defaults; the configuration
+  keys exist (M0-03) but are wired in only with replication itself.
+
+### M2-10 Acknowledgement timeout modes
+
+- **The history checker assumed a failed write lands before its answer.**
+  `Outcome::Failed` let a write take effect only between its call and its
+  `503`, which held while failures came from crashes. With the timeout, a
+  record commits after its writer was told it failed, so a read sent
+  after the failure can miss it and a later read see it: allowed by §5.2,
+  but flagged by the checker. A failed write's answer now holds back only
+  writes that may have written: it is ordered after its call and before
+  every such write sent after its answer, which is exactly "never
+  resurfaces over a later PUT or DELETE". Writes refused for their
+  condition count as reads, because the gateway refuses them on a plain
+  read before it writes anything. Checker tests cover both sides.
+- **Fail fast needed a rule.** §5.2 says requests fail "as soon as a member
+  is late" without saying how a primary knows. Once a request times out,
+  a fail-fast shard refuses new writes at once, unsequenced, until every
+  record sequenced before the timeout is applied; wait-through shards take
+  every write and let each wait its own timeout. Design §5.2 records it,
+  together with what the timeout covers (conditional writes waiting for
+  an earlier write of their key, and seals).
+- **Closing a shard (decided, design §5.2).** `Shard::close` waits for its
+  barrier at most `replica_ack_timeout`, then abandons the records still
+  waiting: the pipeline stops, drops them unapplied and fails their
+  waiters. They stay in the log, and the next opening rolls them forward
+  in the primary's epoch (or M2-12's reconciliation discards them). A
+  member closes the same way when its primary is gone; a shard alone keeps
+  waiting for its disk. Every writer's own timeout starts before the
+  close does, so in practice the writers have timed out already and the
+  abandon only answers barriers.
+- **Seeing that failed writes really apply.** A history alone rarely shows
+  it: the next operation on the key is usually another write. So the
+  `NotAcknowledged` error carries the position its record took, and
+  `ReplicatedServices::late_writes` counts the failed writes a primary
+  committed later. Over 10 seeds of the new `acks` scenarios (partitions
+  between every pair of nodes), wait-through with 600 ms had 207 writes
+  fail after getting a position and 205 commit later, and fail-fast with
+  300 ms had 93 and 74; the rest were still waiting for a member when the
+  run ended. The linearizability and durability checks pass on all of
+  them. A seeded bug that resends each failed write a second later (as a
+  gateway retrying on its own would) is caught in 10 of 10 seeds.
+- **The lease scenarios use the default 2 s client timeout again.** They
+  use fail-fast with 300 ms, so writes stalled by a partition fail at
+  once and clients keep reading. Drift beyond `ρ` is still caught (230
+  flagged reads over 10 seeds), and the within-`ρ` scenario still sees
+  served and refused reads and no stale one.
+- **The simulated wait-through timeout is below the design's minimum.**
+  Configuration loading requires `replica_ack_timeout > member_suspect_after
+  + 1 s` in wait-through mode, so that the removal (M2-11) fits inside it.
+  Nothing removes members yet, so the scenarios use 600 ms to get answers
+  before the clients' 2 s timeout.
+- **Left for later.** `ReplicationConfig::ack_timeout` defaults to the
+  design's 5 s wait-through; the `replica_ack_timeout_ms` and
+  `replica_ack_timeout_mode` keys are mapped onto it when replication is
+  wired into the binary. Until M2-11 removes a dead member, wait-through
+  writes on its shards each wait the full timeout and their records pile
+  up in the primary's memory and log until the member returns; fail-fast
+  bounds that to the records sequenced before the first timeout.

@@ -33,6 +33,8 @@ pub(crate) const PARTS: TableDefinition<Bytes, Bytes> = TableDefinition::new("pa
 pub(crate) const COVERAGE: TableDefinition<Bytes, Bytes> = TableDefinition::new("coverage");
 /// The node's local copy of control state, keyed by register key.
 pub(crate) const CONTROL: TableDefinition<&str, Bytes> = TableDefinition::new("control");
+/// Each bucket's namespace import checkpoint, keyed by bucket ID.
+pub(crate) const IMPORTS: TableDefinition<&str, Bytes> = TableDefinition::new("imports");
 /// The gateway's shard map (§6.2): the newest configuration the node knows
 /// of each shard, keyed by shard. It is a cache that is safe when stale,
 /// so a build that does not know the table loses nothing by ignoring it,

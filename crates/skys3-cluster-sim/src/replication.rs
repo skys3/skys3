@@ -1,9 +1,12 @@
 //! Node services that replicate every shard to the members of its static
-//! placement (plan M2-07), with the audit the replication scenarios check.
+//! placement (plan M2-07), with the audits the replication scenarios check:
+//! commits (M2-07) and reads under leases (M2-09). Writes wait for the
+//! members at most the configured acknowledgement timeout (M2-10).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_gateway::{
@@ -11,12 +14,12 @@ use skys3_gateway::{
     UploadParts,
 };
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
-use skys3_io::SimMount;
+use skys3_io::{Clock, MonoTime, MonotonicClock, SimMount};
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_log::{LogStats, RecordBody, SegmentLog};
 use skys3_net::{Listener, TurmoilNetwork};
 use skys3_shard::replication::{Replication, ReplicationConfig};
-use skys3_shard::{Role, Shard};
+use skys3_shard::{Grace, Role, Shard};
 use skys3_types::{BucketDocument, EpochSeq, NodeId, Seq, ShardConfig};
 
 use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
@@ -30,15 +33,31 @@ use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
 /// can compare what primaries committed with what members made durable
 /// ([`ReplicatedServices::check_commits`]) and count the I/O the writes
 /// cost ([`ReplicatedServices::io`]).
+///
+/// They also audit reads against leases (§5.4). Each member's grace for
+/// each shard is followed in simulated time, converted from the member's
+/// own drifting clock, and every read a primary serves is checked against
+/// it: a read served once some member's `primary_grace` had passed could be
+/// stale, since that member could have taken over and acknowledged writes
+/// the read misses ([`ReplicatedServices::check_reads`]). Within the drift
+/// bound `ρ` no such read exists; beyond it, some do
+/// ([`ReplicatedServices::leases`]).
 #[derive(Clone, Default)]
 pub struct ReplicatedServices {
     config: ReplicationConfig,
     /// A seeded bug: primaries commit alone.
     alone: bool,
+    /// A seeded bug: writes that were not acknowledged are sent again.
+    resubmit: bool,
     /// A seeded bug: members answer reads from their own index.
     members_read: bool,
     audit: Arc<Mutex<Audit>>,
 }
+
+/// How long the seeded bug of
+/// [`ReplicatedServices::resubmitting_failed_writes`] waits before it
+/// sends a failed write again.
+const RESUBMIT_DELAY: Duration = Duration::from_secs(1);
 
 impl fmt::Debug for ReplicatedServices {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,6 +76,41 @@ struct Audit {
     early: Vec<String>,
     /// The I/O before the workload started.
     baseline: Option<IoCounts>,
+    /// When the grace of each member of each shard passes, in simulated
+    /// time since the run began, as of its latest grant (§5.4).
+    graces: BTreeMap<(NodeId, ShardRef), Duration>,
+    /// Reads under leases.
+    leases: LeaseCounts,
+    /// Reads served after a member's grace had passed.
+    stale: Vec<String>,
+    /// Writes that were not acknowledged in time after they got a
+    /// position, by shard.
+    late: Vec<(ShardRef, EpochSeq)>,
+}
+
+/// Writes that were not acknowledged in time over a run (§5.2), as the
+/// acknowledgement audit counted them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LateWrites {
+    /// Writes answered `503 SlowDown` after their record got a position.
+    pub sequenced: usize,
+    /// Those whose record a primary of their shard committed later: not
+    /// acknowledged, but applied.
+    pub committed: usize,
+}
+
+/// Reads at primaries of replicated shards over a run, as the lease audit
+/// counted them (§5.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LeaseCounts {
+    /// Reads (`GET`, `HEAD`, and listings) a primary served.
+    pub served: u64,
+    /// Reads a serving primary refused because the lease from some member
+    /// had lapsed.
+    pub refused: u64,
+    /// Reads a primary served after some member's `primary_grace` had
+    /// passed: reads that would be stale had that member taken over.
+    pub stale: u64,
 }
 
 /// The I/O of every replica's log over a run.
@@ -97,6 +151,19 @@ impl ReplicatedServices {
         Self {
             alone: true,
             ..Self::default()
+        }
+    }
+
+    /// Services whose links use `config`, with a seeded bug for the checks
+    /// to catch: a write the members did not acknowledge in time is sent
+    /// again a second after its failure was answered, as a gateway that
+    /// retried it on its own would. It then takes a new position, and can
+    /// take effect over a write sent after the failure (§5.2).
+    #[must_use]
+    pub fn resubmitting_failed_writes(config: ReplicationConfig) -> Self {
+        Self {
+            resubmit: true,
+            ..Self::new(config)
         }
     }
 
@@ -147,9 +214,68 @@ impl ReplicatedServices {
         }
     }
 
-    fn audit(&self) -> MutexGuard<'_, Audit> {
-        self.audit.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Checks every read a primary served against its members' grace: none
+    /// was served once some member's `primary_grace` had passed since it
+    /// last granted the primary a lease. Such a member could have taken
+    /// over, and the read could then miss a write the new primary
+    /// acknowledged (§5.4, §6.8).
+    ///
+    /// # Errors
+    ///
+    /// The first read that could be stale.
+    pub fn check_reads(&self) -> Result<(), String> {
+        match self.audit().stale.first() {
+            Some(stale) => Err(stale.clone()),
+            None => Ok(()),
+        }
     }
+
+    /// What the lease audit counted so far.
+    #[must_use]
+    pub fn leases(&self) -> LeaseCounts {
+        self.audit().leases
+    }
+
+    /// The writes that were not acknowledged in time after they got a
+    /// position, and how many of them a primary has committed since.
+    #[must_use]
+    pub fn late_writes(&self) -> LateWrites {
+        let audit = self.audit();
+        let committed = audit
+            .late
+            .iter()
+            .filter(|(shard, position)| {
+                audit.replicas.iter().any(|(_, config, replica)| {
+                    config.bucket_id == shard.bucket
+                        && config.shard == shard.shard
+                        && replica
+                            .leader()
+                            .is_some_and(|leader| leader.commit() >= position.seq)
+                })
+            })
+            .count();
+        LateWrites {
+            sequenced: audit.late.len(),
+            committed,
+        }
+    }
+
+    fn audit(&self) -> MutexGuard<'_, Audit> {
+        lock(&self.audit)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The simulated time since the run began at which `clock`, a node's clock
+/// in this life, reads `local`. Call it in the node's host.
+fn simulated(clock: &MonotonicClock, local: MonoTime) -> Duration {
+    let now = turmoil::sim_elapsed().unwrap_or_default();
+    now + clock
+        .runtime_deadline(local)
+        .saturating_duration_since(tokio::time::Instant::now())
 }
 
 impl Audit {
@@ -179,14 +305,19 @@ impl Audit {
 impl NodeServices for ReplicatedServices {
     type Shards = ReplicatedShards;
 
-    /// Ready once every primary opened so far serves. The I/O counts start
-    /// then.
+    /// Ready once every primary opened so far serves, and every member
+    /// granted it a lease. The I/O counts start then.
     fn ready(&self) -> bool {
         let mut audit = self.audit();
-        let ready = audit
-            .replicas
-            .iter()
-            .all(|(_, _, replica)| replica.is_serving() || replica.leader().is_none());
+        let ready = audit.replicas.iter().all(|(_, _, replica)| {
+            replica.leader().is_none_or(|leader| {
+                replica.is_serving()
+                    && leader
+                        .members()
+                        .iter()
+                        .all(|member| leader.lease(member).is_some())
+            })
+        });
         if ready && audit.baseline.is_none() {
             audit.baseline = Some(audit.io());
         }
@@ -217,6 +348,7 @@ impl ReplicatedServices {
             set,
             env.transport.clone(),
             env.peers.clone(),
+            Arc::clone(&env.clock) as Arc<dyn Clock>,
             self.config,
         );
         let listener = env
@@ -228,9 +360,12 @@ impl ReplicatedServices {
             replication,
             placement: Arc::clone(&env.placement),
             node: env.node.clone(),
+            clock: Arc::clone(&env.clock),
             alone: self.alone,
+            resubmit: self.resubmit,
             members_read: self.members_read,
             audit: Arc::clone(&self.audit),
+            followed: Arc::default(),
         };
         Ok((shards, listener))
     }
@@ -245,9 +380,14 @@ pub struct ReplicatedShards {
     pub(crate) replication: Replication<TurmoilNetwork, SimMount>,
     placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
     node: NodeId,
+    /// The node's clock in this life.
+    clock: Arc<MonotonicClock>,
     alone: bool,
+    resubmit: bool,
     members_read: bool,
     audit: Arc<Mutex<Audit>>,
+    /// The shards whose grace this life follows.
+    followed: Arc<Mutex<BTreeSet<ShardRef>>>,
 }
 
 impl fmt::Debug for ReplicatedShards {
@@ -265,7 +405,7 @@ impl ReplicatedShards {
         let Some(config) = self.placement.get(shard) else {
             return;
         };
-        let mut audit = self.audit.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut audit = lock(&self.audit);
         for member in &config.members {
             let durable = audit.durable(member, config);
             if durable < position.seq {
@@ -275,6 +415,62 @@ impl ReplicatedShards {
                     self.node
                 );
                 audit.early.push(early);
+            }
+        }
+    }
+
+    /// Follows the grace of this node's replica of `shard` into the audit:
+    /// in simulated time, when it passes as of each grant. Each life
+    /// follows a shard once.
+    fn follow_grace(&self, shard: &ShardRef, grace: Arc<Grace>) {
+        if !lock(&self.followed).insert(shard.clone()) {
+            return;
+        }
+        let (clock, audit) = (Arc::clone(&self.clock), Arc::clone(&self.audit));
+        let key = (self.node.clone(), shard.clone());
+        let mut granted = grace.subscribe();
+        tokio::spawn(async move {
+            loop {
+                granted.borrow_and_update();
+                let passes = simulated(&clock, grace.passes_at());
+                lock(&audit).graces.insert(key.clone(), passes);
+                if granted.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Counts a read of `shard` that ended with `result`, and checks a
+    /// served one against the grace of the shard's other members.
+    async fn audit_read<T>(&self, shard: &ShardRef, result: &Result<T, ShardError>) {
+        let Some(replica) = self.replication.set().get(&shard.into()).await else {
+            return;
+        };
+        let Some(leader) = replica.leader() else {
+            return;
+        };
+        let now = turmoil::sim_elapsed().unwrap_or_default();
+        let mut audit = lock(&self.audit);
+        if result.is_err() {
+            if replica.is_serving() && !leader.holds_leases() {
+                audit.leases.refused += 1;
+            }
+            return;
+        }
+        audit.leases.served += 1;
+        for member in leader.members() {
+            let Some(&passed) = audit.graces.get(&(member.clone(), shard.clone())) else {
+                continue;
+            };
+            if passed <= now {
+                audit.leases.stale += 1;
+                let stale = format!(
+                    "{} served a read of shard {shard} at {now:?}, but the primary_grace of \
+                     {member} had passed at {passed:?}",
+                    self.node
+                );
+                audit.stale.push(stale);
             }
         }
     }
@@ -301,7 +497,10 @@ impl Shards for ReplicatedShards {
                     shard: shard.clone(),
                     reason: error.to_string(),
                 })?;
-        let mut audit = self.audit.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(grace) = self.replication.grace(replica.shard()) {
+            self.follow_grace(shard, grace);
+        }
+        let mut audit = lock(&self.audit);
         if !audit
             .replicas
             .iter()
@@ -342,11 +541,15 @@ impl Shards for ReplicatedShards {
                 reason: error.to_string(),
             });
         }
-        self.local.entry(shard, key).await
+        let entry = self.local.entry(shard, key).await;
+        self.audit_read(shard, &entry).await;
+        entry
     }
 
     async fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, ShardError> {
-        self.local.list(shard, query).await
+        let page = self.local.list(shard, query).await;
+        self.audit_read(shard, &page).await;
+        page
     }
 
     async fn upload(
@@ -400,7 +603,25 @@ impl Shards for ReplicatedShards {
         body: RecordBody,
         condition: Precondition,
     ) -> Result<Result<EpochSeq, ConditionFailed>, ShardError> {
-        let written = self.local.write(shard, body, condition).await?;
+        let again = self.resubmit.then(|| (body.clone(), condition.clone()));
+        let written = self.local.write(shard, body, condition).await;
+        if let (Err(ShardError::NotAcknowledged { .. }), Some((body, condition))) =
+            (&written, again)
+        {
+            let (local, shard) = (self.local.clone(), shard.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(RESUBMIT_DELAY).await;
+                let _ = local.write(&shard, body, condition).await;
+            });
+        }
+        if let Err(ShardError::NotAcknowledged {
+            position: Some(position),
+            ..
+        }) = &written
+        {
+            lock(&self.audit).late.push((shard.clone(), *position));
+        }
+        let written = written?;
         if let Ok(position) = written {
             self.audit_acknowledged(shard, position);
         }

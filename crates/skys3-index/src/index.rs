@@ -15,9 +15,10 @@ use skys3_log::record::ShardRef;
 use skys3_log::{
     LogRecord, RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentLog, SegmentSummary,
 };
-use skys3_types::{EpochSeq, Label, ShardConfig};
+use skys3_types::{BucketId, EpochSeq, Label, ShardConfig};
 
 use crate::codec;
+use crate::entry::ImportCheckpoint;
 use crate::error::IndexError;
 use crate::tables::{
     self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META,
@@ -27,8 +28,9 @@ use crate::tables::{
 /// covers the tables and every encoding in [`codec`]. Version 2 adds the
 /// uploads and parts tables; opening a version 1 index creates them and
 /// marks it version 2, so a build that does not know them refuses it
-/// rather than miss the uploads in it.
-pub const FORMAT_VERSION: u64 = 2;
+/// rather than miss the uploads in it. Version 3 adds the imports table
+/// (§9.1) in the same way.
+pub const FORMAT_VERSION: u64 = 3;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -234,6 +236,7 @@ impl Index {
                 txn.open_table(table)?;
             }
             txn.open_table(tables::CONTROL)?;
+            txn.open_table(tables::IMPORTS)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -357,6 +360,61 @@ impl Index {
         let result = update(&mut ControlWriter::open(&txn)?)?;
         txn.commit()?;
         Ok(result)
+    }
+
+    /// The import checkpoint of `bucket` (§9.1), or `None` if its import
+    /// never started on this node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn import_checkpoint(
+        &self,
+        bucket: &BucketId,
+    ) -> Result<Option<ImportCheckpoint>, IndexError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(tables::IMPORTS)?;
+        let Some(value) = table.get(bucket.as_str())? else {
+            return Ok(None);
+        };
+        codec::decode_import(value.value())
+            .map(Some)
+            .map_err(IndexError::codec("imports"))
+    }
+
+    /// Stores the import checkpoint of `bucket`, or removes it, in one
+    /// durable commit.
+    ///
+    /// A checkpoint does not come from the log, so replay cannot restore
+    /// it; it is made durable at once instead, once a page of `IMPORT`
+    /// records it covers is applied. Each page costs one sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the checkpoint cannot be encoded or the
+    /// commit fails; nothing changes then.
+    pub fn set_import_checkpoint(
+        &self,
+        bucket: &BucketId,
+        checkpoint: Option<&ImportCheckpoint>,
+    ) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut table = txn.open_table(tables::IMPORTS)?;
+            match checkpoint {
+                Some(checkpoint) => {
+                    let value =
+                        codec::encode_import(checkpoint).map_err(IndexError::codec("imports"))?;
+                    table.insert(bucket.as_str(), value.as_slice())?;
+                }
+                None => {
+                    table.remove(bucket.as_str())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Keeps `config` as the gateway's configuration of its shard, in one

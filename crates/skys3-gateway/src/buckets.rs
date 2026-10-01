@@ -50,6 +50,7 @@ use crate::admission::{Admission, AdmitAll};
 use crate::authz::Permissions;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
+use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
 /// The CreateBucket header that sets the bucket's mode: `write_back`,
@@ -98,6 +99,10 @@ pub struct GatewayConfig {
     /// (§7.6, §13). [`GatewayConfig::new`] admits everything; the node
     /// checks the dirty-data budgets and free disk space.
     pub admission: Arc<dyn Admission>,
+    /// The remote targets of `write_back` buckets, which reads of keys the
+    /// namespace import has not reached and lazily loaded metadata use
+    /// (§9.1). [`GatewayConfig::new`] has none: every read is local.
+    pub remote: Option<Arc<dyn RemoteReads>>,
 }
 
 impl GatewayConfig {
@@ -118,6 +123,7 @@ impl GatewayConfig {
             hashing_pool: None,
             list_token_keys: ListTokenKeys::generate(),
             admission: Arc::new(AdmitAll),
+            remote: None,
         }
     }
 }
@@ -639,6 +645,13 @@ pub(crate) fn shard_error(error: ShardError) -> S3Error {
             tracing::error!(%error, "a shard refused a record");
             s3_error!(InternalError)
         }
+        ShardError::NotAcknowledged { .. } => {
+            tracing::warn!(%error, "a shard did not acknowledge a write in time");
+            s3_error!(
+                SlowDown,
+                "The write was not acknowledged in time and may still take effect; retry later"
+            )
+        }
         other => {
             tracing::warn!(error = %other, "a shard request failed");
             s3_error!(
@@ -752,6 +765,13 @@ mod tests {
         };
         let sealed = shard_error(ShardError::Sealed(shard.clone()));
         assert_eq!(*sealed.code(), S3ErrorCode::OperationAborted);
+        let late = shard_error(ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position: None,
+            reason: "a member is late".into(),
+        });
+        assert_eq!(*late.code(), S3ErrorCode::SlowDown);
+        assert_eq!(late.code().status_code().map(|s| s.as_u16()), Some(503));
         let missing = shard_error(ShardError::NotFound(shard));
         assert_eq!(*missing.code(), S3ErrorCode::ServiceUnavailable);
     }

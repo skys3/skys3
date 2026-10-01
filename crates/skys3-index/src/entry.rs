@@ -166,6 +166,32 @@ pub struct Part {
     pub payload: Payload,
 }
 
+/// How far a bucket's namespace import has got (§9.1): what the import
+/// resumes from after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportCheckpoint {
+    /// The import is running. Every remote object whose key is at most
+    /// `after` has its `IMPORT` record committed; `None` before the first.
+    Running {
+        /// The last key imported, without the target's prefix.
+        after: Option<String>,
+    },
+    /// Every object the remote prefix held when it was listed is imported.
+    Done,
+}
+
+impl ImportCheckpoint {
+    /// Whether the import has passed `key`: the remote object at `key`,
+    /// if the listing found one, has its `IMPORT` record committed.
+    #[must_use]
+    pub fn passed(&self, key: &str) -> bool {
+        match self {
+            Self::Running { after } => after.as_deref().is_some_and(|after| key <= after),
+            Self::Done => true,
+        }
+    }
+}
+
 /// A node's local copy of one control-store register (§6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlEntry {

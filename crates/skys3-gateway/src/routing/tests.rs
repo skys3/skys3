@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use proptest::prelude::*;
+use prost::Message as _;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType,
@@ -16,7 +17,7 @@ use skys3_control::{
     Expected, MemoryControlStore, ProposalOutcome, RetryPolicy, TypedKey, propose_document,
 };
 use skys3_index::{Index, IndexConfig, ListItem, ListQuery};
-use skys3_io::{BlockingPool, SimDisk, SimMount};
+use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::RecordBody;
 use skys3_log::record::{Delete, Extent, MpuCreate, MpuPart, PutData};
 use skys3_net::{
@@ -207,6 +208,7 @@ impl Cluster {
                 set,
                 transport,
                 peers.clone(),
+                Arc::new(MonotonicClock::new()),
                 ReplicationConfig::default(),
             );
             tokio::spawn(serve_peers(listener, replication, routed.server().clone()));
@@ -531,6 +533,16 @@ fn refusals_and_hints_round_trip() {
             shard: shard.clone(),
             reason: "é".repeat(600),
         }),
+        Reply::Refused(ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position: Some(EpochSeq::new(Epoch::new(4), Seq::new(7))),
+            reason: "late".into(),
+        }),
+        Reply::Refused(ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position: None,
+            reason: "late".into(),
+        }),
         Reply::Served {
             response: Response::Unsealed,
             epoch: Epoch::new(4),
@@ -557,6 +569,19 @@ fn refusals_and_hints_round_trip() {
     // A refusal that carries a payload is refused.
     let mut frame = wire::reply_frame(&Reply::Behind(Epoch::new(1)), 1);
     frame.payload = Bytes::from_static(b"x");
+    assert!(wire::decode_reply(&frame, &shard).is_err());
+    // Only a write that was not acknowledged carries a position.
+    let reply = wire::ForwardReply {
+        outcome: wire::OUTCOME_UNAVAILABLE,
+        epoch: 0,
+        config: Vec::new(),
+        reason: String::new(),
+        position: Some(wire::Position { epoch: 1, seq: 1 }),
+    };
+    let frame = Frame::new(
+        Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+        Bytes::new(),
+    );
     assert!(wire::decode_reply(&frame, &shard).is_err());
     // NotPrimary never reaches the wire as such: it becomes a redirect.
     let not_primary = ShardError::NotPrimary {

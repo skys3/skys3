@@ -190,6 +190,9 @@ pub struct ForwardReply {
     /// Why the replica refused, if it did.
     #[prost(string, tag = "4")]
     pub reason: String,
+    /// The position a write that was not acknowledged took, if it got one.
+    #[prost(message, optional, tag = "5")]
+    pub position: Option<Position>,
 }
 
 /// The replica served the request; the payload holds the [`Answer`].
@@ -206,6 +209,9 @@ pub const OUTCOME_SEALED: u32 = 4;
 pub const OUTCOME_INVALID: u32 = 5;
 /// The shard could not serve the request.
 pub const OUTCOME_UNAVAILABLE: u32 = 6;
+/// The write was not acknowledged in time, and may still commit at
+/// `position`, if it has one.
+pub const OUTCOME_NOT_ACKNOWLEDGED: u32 = 7;
 
 /// The answer to a served request, in the reply's payload.
 #[derive(Clone, PartialEq, Message)]
@@ -548,6 +554,7 @@ pub fn reply_frame(reply: &Reply, request_id: u64) -> Frame {
         epoch: epoch.get(),
         config: Vec::new(),
         reason: truncate(reason),
+        position: None,
     };
     let (header, payload) = match reply {
         Reply::Served {
@@ -561,6 +568,7 @@ pub fn reply_frame(reply: &Reply, request_id: u64) -> Frame {
                     epoch: epoch.get(),
                     config: hint.as_ref().map(config).unwrap_or_default(),
                     reason: String::new(),
+                    position: None,
                 },
                 Bytes::from(answer.encode_to_vec()),
             ),
@@ -575,6 +583,7 @@ pub fn reply_frame(reply: &Reply, request_id: u64) -> Frame {
                 epoch: hint.epoch.get(),
                 config: config(hint),
                 reason: String::new(),
+                position: None,
             },
             Bytes::new(),
         ),
@@ -584,15 +593,23 @@ pub fn reply_frame(reply: &Reply, request_id: u64) -> Frame {
                 ShardError::NotFound(_) => OUTCOME_NOT_FOUND,
                 ShardError::Sealed(_) => OUTCOME_SEALED,
                 ShardError::Invalid { .. } => OUTCOME_INVALID,
+                ShardError::NotAcknowledged { .. } => OUTCOME_NOT_ACKNOWLEDGED,
                 _ => OUTCOME_UNAVAILABLE,
             };
             let reason = match error {
-                ShardError::Invalid { reason, .. } | ShardError::Unavailable { reason, .. } => {
-                    reason.clone()
-                }
+                ShardError::Invalid { reason, .. }
+                | ShardError::Unavailable { reason, .. }
+                | ShardError::NotAcknowledged { reason, .. } => reason.clone(),
                 other => other.to_string(),
             };
-            (refused(outcome, Epoch::ZERO, &reason), Bytes::new())
+            let mut refusal = refused(outcome, Epoch::ZERO, &reason);
+            if let ShardError::NotAcknowledged {
+                position: Some(at), ..
+            } = error
+            {
+                refusal.position = Some(position(*at));
+            }
+            (refusal, Bytes::new())
         }
     };
     Frame::new(
@@ -731,6 +748,9 @@ pub fn decode_reply(frame: &Frame, shard: &ShardRef) -> Decoded<Reply> {
     if reply.outcome != OUTCOME_SERVED && !frame.payload.is_empty() {
         return Err("a refusal carries a payload".to_owned());
     }
+    if reply.outcome != OUTCOME_NOT_ACKNOWLEDGED && reply.position.is_some() {
+        return Err("only a write that was not acknowledged has a position".to_owned());
+    }
     let shard = shard.clone();
     Ok(match reply.outcome {
         OUTCOME_SERVED => Reply::Served {
@@ -748,6 +768,11 @@ pub fn decode_reply(frame: &Frame, shard: &ShardRef) -> Decoded<Reply> {
         OUTCOME_SEALED => Reply::Refused(ShardError::Sealed(shard)),
         OUTCOME_INVALID => Reply::Refused(ShardError::Invalid { shard, reason }),
         OUTCOME_UNAVAILABLE => Reply::Refused(ShardError::Unavailable { shard, reason }),
+        OUTCOME_NOT_ACKNOWLEDGED => Reply::Refused(ShardError::NotAcknowledged {
+            shard,
+            position: reply.position.map(|at| epoch_seq(Some(at))).transpose()?,
+            reason,
+        }),
         other => return Err(format!("outcome {other}")),
     })
 }

@@ -7,7 +7,8 @@ use proptest::option;
 use proptest::prelude::*;
 use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 use skys3_index::{
-    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
+    ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
+    Upload,
 };
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, ShardRef,
@@ -186,6 +187,7 @@ proptest! {
         version in text(20),
         value in vec(any::<u8>(), 0..64),
         segment in any::<u64>(),
+        after in proptest::option::of(text(40)),
     ) {
         let bytes = codec::encode_summary(&summary).unwrap();
         prop_assert_eq!(codec::decode_summary(&bytes).unwrap(), summary);
@@ -201,6 +203,11 @@ proptest! {
         let control = ControlEntry { generation: Generation::new(generation), version, value };
         let bytes = codec::encode_control(&control).unwrap();
         prop_assert_eq!(codec::decode_control(&bytes).unwrap(), control);
+
+        for import in [ImportCheckpoint::Running { after }, ImportCheckpoint::Done] {
+            let bytes = codec::encode_import(&import).unwrap();
+            prop_assert_eq!(codec::decode_import(&bytes).unwrap(), import);
+        }
 
         let disk = Label::new("disk-1").unwrap();
         let key = codec::coverage_key(&disk, SegmentId::new(segment));
@@ -226,6 +233,9 @@ proptest! {
         }
         if let Ok(location) = codec::decode_location(&bytes) {
             prop_assert_eq!(codec::encode_location(&location), bytes.clone());
+        }
+        if let Ok(import) = codec::decode_import(&bytes) {
+            prop_assert_eq!(codec::encode_import(&import).unwrap(), bytes.clone());
         }
         if let Ok((shard, key)) = codec::decode_entry_key(&bytes) {
             prop_assert_eq!(codec::entry_key(&shard, &key), bytes.clone());
@@ -701,4 +711,28 @@ fn multipart_values_are_validated() {
     assert!(codec::decode_upload_key(&with(&key, key.len() - 17, 1)).is_err());
     let no_key = [&key[..3], &key[key.len() - 17..]].concat();
     assert!(codec::decode_upload_key(&no_key).is_err());
+}
+
+#[test]
+fn import_checkpoints_reject_unknown_states() {
+    let mut bytes = codec::encode_import(&ImportCheckpoint::Done).unwrap();
+    bytes[1] = 2;
+    assert_eq!(
+        codec::decode_import(&bytes).unwrap_err().field(),
+        "import.state"
+    );
+    let long = ImportCheckpoint::Running {
+        after: Some("k".repeat(1025)),
+    };
+    assert_eq!(
+        codec::encode_import(&long).unwrap_err().field(),
+        "import.after"
+    );
+
+    assert!(ImportCheckpoint::Done.passed("z"));
+    let running = ImportCheckpoint::Running {
+        after: Some("m".to_owned()),
+    };
+    assert!(running.passed("a") && running.passed("m") && !running.passed("n"));
+    assert!(!ImportCheckpoint::Running { after: None }.passed(""));
 }

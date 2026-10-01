@@ -638,6 +638,9 @@ pub struct ObjectInfo {
     pub metadata: UserMetadata,
     /// Content type.
     pub content_type: Option<String>,
+    /// `Last-Modified`, in milliseconds since the Unix epoch, if the store
+    /// returned it.
+    pub last_modified_ms: Option<u64>,
 }
 
 /// The result of a write that creates an object: `PutObject`, `CopyObject`,
@@ -681,6 +684,11 @@ pub struct ListedObject {
     pub etag: ETag,
     /// The size in bytes.
     pub size: u64,
+    /// `LastModified`, in milliseconds since the Unix epoch, if the store
+    /// returned it.
+    pub last_modified_ms: Option<u64>,
+    /// The storage class, if the store returned one.
+    pub storage_class: Option<String>,
 }
 
 /// A `ListObjectsV2` page.

@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use skys3_index::{Entry, EntryState, Index, IndexError, ListPage, ListQuery, Part, Upload};
@@ -16,6 +16,7 @@ use skys3_types::{Epoch, EpochSeq, NodeId, Seq, ShardConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
+use crate::ack::{AckMode, AckTimeout};
 use crate::error::ShardError;
 use crate::leader::Leader;
 use crate::machine::{Effect, Outcome, Recorder, StateMachine};
@@ -67,7 +68,8 @@ pub enum Role {
     /// durable here.
     Alone,
     /// The primary of a configuration with other members: a record commits
-    /// once every member has it durably.
+    /// once every member has it durably, and reads are served only while
+    /// every member grants a lease (§5.4).
     Primary,
     /// A member that stores and acknowledges what its primary sends, and
     /// applies it once the primary's commit watermark covers it. It serves
@@ -76,6 +78,7 @@ pub enum Role {
 }
 
 type WriteReply = oneshot::Sender<Result<Committed, ShardError>>;
+type WriteReceiver = oneshot::Receiver<Result<Committed, ShardError>>;
 type BarrierReply = oneshot::Sender<Result<(), ShardError>>;
 
 /// What the shard's appender task receives, in position order.
@@ -107,6 +110,9 @@ pub(crate) enum Message {
     Barrier(BarrierReply),
     /// Every record up to this `seq` is committed.
     Commit(Seq),
+    /// Stop the shard, fail every record and barrier still queued, then
+    /// reply.
+    Abandon(BarrierReply),
 }
 
 /// The sequencing state, changed only under its lock.
@@ -141,6 +147,11 @@ pub(crate) struct Sequencer {
     readers: BTreeMap<EpochSeq, usize>,
     /// Where applied client writes are reported, if anyone subscribed.
     subscriber: Option<mpsc::UnboundedSender<Change>>,
+    /// How long requests wait for the members, on a replicated shard.
+    ack: Option<AckTimeout>,
+    /// In fail-fast mode, the last position sequenced when a request
+    /// last timed out: new writes are refused until it is applied.
+    late: Option<EpochSeq>,
 }
 
 struct Inner<D: Disk> {
@@ -317,6 +328,8 @@ impl<D: Disk> Shard<D> {
             writes: BTreeMap::new(),
             readers: BTreeMap::new(),
             subscriber: None,
+            ack: None,
+            late: None,
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
         let (durable_tx, durable) = watch::channel(last.seq);
@@ -418,6 +431,25 @@ impl<D: Disk> Shard<D> {
         self.inner.leader.as_ref()
     }
 
+    /// Bounds how long the requests of a replicated shard wait for its
+    /// members (§5.2): writes, seals, conditional checks that wait for an
+    /// earlier write of their key, and [`Shard::close`]. A request that
+    /// waits longer fails with [`ShardError::NotAcknowledged`]; its record,
+    /// if it got one, keeps its position and may still commit. A shard
+    /// alone waits only for its disk, so this changes nothing on it.
+    pub fn set_ack_timeout(&self, ack: AckTimeout) {
+        let mut sequencer = self.sequencer();
+        if sequencer.role != Role::Alone {
+            sequencer.ack = Some(ack);
+        }
+    }
+
+    /// The shard's [`AckTimeout`], if it has one.
+    #[must_use]
+    pub fn ack_timeout(&self) -> Option<AckTimeout> {
+        self.sequencer().ack
+    }
+
     /// The last `seq` of the longest run of the shard's records that is
     /// durable on this replica, committed or not, as it changes.
     #[must_use]
@@ -428,9 +460,7 @@ impl<D: Disk> Shard<D> {
     /// The `seq` of the last record sequenced, durable or not.
     #[must_use]
     pub fn last_sequenced(&self) -> Seq {
-        // `next.seq` is at least 1: opening starts it after the CONFIG
-        // record at `seq` 0 or later.
-        Seq::new(self.sequencer().next.seq.get() - 1)
+        self.sequencer().last_sequenced().seq
     }
 
     /// Commits `body` as the shard's next record, and returns its position
@@ -442,19 +472,23 @@ impl<D: Disk> Shard<D> {
     /// accepted only once each of them is applied: append them with
     /// [`Shard::append_extent`] first (§10.1).
     ///
-    /// The record is appended even if the returned future is dropped.
+    /// The record is appended even if the returned future is dropped, or
+    /// the write times out.
     ///
     /// # Errors
     ///
     /// [`ShardError::Sealed`]; [`ShardError::InvalidRecord`] if the record
     /// cannot be encoded, references an extent that is not applied, or is a
-    /// `CONFIG` or `TRUNCATE`, which a replica appends for itself; and
-    /// [`ShardError::Unavailable`] if the shard stopped.
+    /// `CONFIG` or `TRUNCATE`, which a replica appends for itself;
+    /// [`ShardError::NotAcknowledged`] if the members did not acknowledge
+    /// it within the shard's [`AckTimeout`], or a late write makes a
+    /// fail-fast shard refuse it; and [`ShardError::Unavailable`] if the
+    /// shard stopped.
     pub async fn commit(&self, body: RecordBody) -> Result<Committed, ShardError> {
-        let reply = self.submit_locked(&mut self.sequencer(), body, false)?;
-        reply
+        let (position, reply) = self.submit_locked(&mut self.sequencer(), body, false)?;
+        self.within_ack(self.answer(reply))
             .await
-            .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
+            .map_err(|error| error.sequenced_at(position))
     }
 
     /// Commits `body` like [`Shard::commit`], but lets its record ride the
@@ -470,10 +504,48 @@ impl<D: Disk> Shard<D> {
     ///
     /// As [`Shard::commit`].
     pub async fn commit_lazy(&self, body: RecordBody) -> Result<Committed, ShardError> {
-        let reply = self.submit_locked(&mut self.sequencer(), body, true)?;
+        let (position, reply) = self.submit_locked(&mut self.sequencer(), body, true)?;
+        self.within_ack(self.answer(reply))
+            .await
+            .map_err(|error| error.sequenced_at(position))
+    }
+
+    /// The answer to a record's writer.
+    async fn answer(&self, reply: WriteReceiver) -> Result<Committed, ShardError> {
         reply
             .await
             .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
+    }
+
+    /// Waits for `request` for at most the shard's [`AckTimeout`], if it
+    /// has one. A request that waits longer fails as not acknowledged, and
+    /// in fail-fast mode makes the shard refuse new writes until every
+    /// record sequenced so far is applied.
+    async fn within_ack<T>(
+        &self,
+        request: impl Future<Output = Result<T, ShardError>>,
+    ) -> Result<T, ShardError> {
+        let ack = self.sequencer().ack;
+        let Some(ack) = ack else {
+            return request.await;
+        };
+        match tokio::time::timeout(ack.timeout, request).await {
+            Ok(result) => result,
+            Err(_) => {
+                let mut sequencer = self.sequencer();
+                if ack.mode == AckMode::FailFast {
+                    let last = sequencer.last_sequenced();
+                    sequencer.late = sequencer.late.max(Some(last));
+                }
+                Err(ShardError::not_acknowledged(
+                    self.shard(),
+                    format!(
+                        "its members did not acknowledge it within {:?}",
+                        ack.timeout
+                    ),
+                ))
+            }
+        }
     }
 
     /// Commits one extent of a large body (§5.1), and returns the reference
@@ -494,15 +566,16 @@ impl<D: Disk> Shard<D> {
 
     /// Sequences `body` and starts its append, lazily if `lazy`, under the
     /// sequencer's lock, which the caller holds, so records reach the
-    /// pipeline in position order.
+    /// pipeline in position order. Returns the record's position.
     fn submit_locked(
         &self,
         sequencer: &mut Sequencer,
         body: RecordBody,
         lazy: bool,
-    ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
+    ) -> Result<(EpochSeq, WriteReceiver), ShardError> {
         let shard = self.shard();
         sequencer.check_serving(shard)?;
+        sequencer.check_late(shard)?;
         let client_write = match &body {
             RecordBody::Put(_) | RecordBody::Delete(_) | RecordBody::Tags(_) => true,
             RecordBody::Extent(_) => true,
@@ -550,7 +623,7 @@ impl<D: Disk> Shard<D> {
         if let Some(key) = key {
             sequencer.writes.insert(key, position);
         }
-        Ok(receiver)
+        Ok((position, receiver))
     }
 
     /// Takes `record`, which the primary of `epoch` sequenced and encoded
@@ -573,8 +646,8 @@ impl<D: Disk> Shard<D> {
     /// R2 refuses older ones; a newer one needs the configuration first),
     /// or the session is not the current one; [`ShardError::InvalidRecord`]
     /// if the record is of another shard, is a `CONFIG` or `TRUNCATE`, which
-    /// a replica appends for itself, cannot be appended, or does not follow
-    /// the last record held; [`ShardError::Unavailable`] if the shard
+    /// a replica appends for itself, is of another epoch than the shard's,
+    /// cannot be appended, or does not follow the last record held; [`ShardError::Unavailable`] if the shard
     /// stopped.
     pub fn receive(
         &self,
@@ -613,6 +686,16 @@ impl<D: Disk> Shard<D> {
             ));
         }
         let position = record.position;
+        // The record's own epoch, not only the message's: a record of
+        // another epoch would move the sequencer away from the
+        // configuration. Configurations are static, so every record a
+        // replica takes is of its epoch (§5.1).
+        if position.epoch != ours {
+            return Err(ShardError::invalid(
+                shard,
+                format!("the record at {position} is not of the replica's epoch {ours}"),
+            ));
+        }
         let next = sequencer.next.seq;
         match position.seq.cmp(&next) {
             Ordering::Less => return Ok(false),
@@ -724,11 +807,30 @@ impl<D: Disk> Shard<D> {
     ///
     /// The outer error as [`Shard::commit`], or
     /// [`ShardError::InvalidRecord`] for a record that names no key or is an
-    /// `EXTENT`; the inner one is `check`'s.
+    /// `EXTENT`; the inner one is `check`'s. The shard's [`AckTimeout`]
+    /// bounds the whole request, waits for earlier writes of the key
+    /// included.
     pub async fn commit_if<E>(
         &self,
         body: RecordBody,
+        check: impl FnMut(Option<&Entry>) -> Result<(), E>,
+    ) -> Result<Result<Committed, E>, ShardError> {
+        let sequenced = OnceLock::new();
+        self.within_ack(self.check_and_commit(body, check, &sequenced))
+            .await
+            .map_err(|error| match sequenced.get() {
+                Some(&position) => error.sequenced_at(position),
+                None => error,
+            })
+    }
+
+    /// [`Shard::commit_if`] without the timeout. It sets `sequenced` to the
+    /// record's position once it has one.
+    async fn check_and_commit<E>(
+        &self,
+        body: RecordBody,
         mut check: impl FnMut(Option<&Entry>) -> Result<(), E>,
+        sequenced: &OnceLock<EpochSeq>,
     ) -> Result<Result<Committed, E>, ShardError> {
         let key = entry_key(&body)
             .ok_or_else(|| ShardError::invalid(self.shard(), "the record names no entry"))?
@@ -773,12 +875,11 @@ impl<D: Disk> Shard<D> {
                 let Some(body) = body.take() else {
                     unreachable!("the record is sequenced at most once");
                 };
-                self.submit_locked(&mut sequencer, body, false)?
+                let (position, reply) = self.submit_locked(&mut sequencer, body, false)?;
+                let _ = sequenced.set(position);
+                reply
             };
-            return reply
-                .await
-                .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
-                .map(Ok);
+            return self.answer(reply).await.map(Ok);
         }
     }
 
@@ -1027,7 +1128,7 @@ impl<D: Disk> Shard<D> {
         body: RecordBody,
         encoded: Option<Bytes>,
         lazy: bool,
-    ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
+    ) -> Result<WriteReceiver, ShardError> {
         let shard = self.shard();
         let record = LogRecord {
             shard: shard.clone(),
@@ -1106,7 +1207,9 @@ impl<D: Disk> Shard<D> {
     ///
     /// # Errors
     ///
-    /// [`ShardError::Unavailable`] if the shard stopped or its index fails.
+    /// [`ShardError::Unavailable`] if the shard stopped or its index fails;
+    /// [`ShardError::NotAcknowledged`] if the writes before the seal did not
+    /// commit within the shard's [`AckTimeout`].
     pub async fn seal(&self) -> Result<ShardSummary, ShardError> {
         let barrier = {
             let mut sequencer = self.sequencer();
@@ -1115,7 +1218,7 @@ impl<D: Disk> Shard<D> {
             self.barrier()
         };
         let mut guard = SealGuard(Some(self));
-        barrier.await?;
+        self.within_ack(barrier).await?;
         let summary = self.summary().await?;
         guard.0 = None;
         Ok(summary)
@@ -1130,18 +1233,42 @@ impl<D: Disk> Shard<D> {
     /// Stops the shard once every record sequenced so far is applied or
     /// failed: later requests fail with [`ShardError::Unavailable`].
     ///
+    /// A replicated shard waits for that at most its [`AckTimeout`], since
+    /// a member that does not acknowledge would hold it forever (§5.2).
+    /// Then it stops all the same, and abandons the records still waiting
+    /// for the members: their writers, who have timed out by then, were not
+    /// acknowledged, nothing applies the records here any more, and they
+    /// stay in the log for the shard's next opening to commit or discard.
+    ///
     /// # Errors
     ///
     /// [`ShardError::Unavailable`] if the shard had stopped already.
     pub async fn close(&self) -> Result<(), ShardError> {
-        let barrier = {
+        let (barrier, ack) = {
             let mut sequencer = self.sequencer();
             sequencer.check_running(self.shard())?;
             sequencer.stopped = Some("the shard was closed".to_owned());
             sequencer.subscriber = None;
-            self.barrier()
+            (self.barrier(), sequencer.ack)
         };
-        barrier.await
+        let Some(ack) = ack else {
+            return barrier.await;
+        };
+        if let Ok(closed) = tokio::time::timeout(ack.timeout, barrier).await {
+            return closed;
+        }
+        tracing::warn!(
+            shard = %self.shard(),
+            timeout = ?ack.timeout,
+            "closing the shard abandons the records its members did not acknowledge",
+        );
+        let (reply, abandoned) = oneshot::channel();
+        if self.inner.pipeline.send(Message::Abandon(reply)).is_ok() {
+            // The pipeline answers every waiter before it replies, and
+            // ends only with the shard.
+            let _ = abandoned.await;
+        }
+        Ok(())
     }
 
     /// Queues a barrier; the caller holds the sequencer's lock.
@@ -1186,15 +1313,24 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
-    /// Checks that the replica serves reads: it is not a member, and not a
-    /// primary still reconciling its members.
+    /// Checks that the replica serves reads: it has not stopped, since its
+    /// index may then miss records it acknowledged, it is not a member, nor
+    /// a primary still reconciling its members, and as a primary it holds a
+    /// valid lease from every member (§5.4).
     ///
     /// # Errors
     ///
-    /// [`ShardError::NotPrimary`] on a member, and
-    /// [`ShardError::Unavailable`] on a primary that does not serve yet.
+    /// [`ShardError::Unavailable`] if the shard stopped, or is a primary
+    /// that does not serve yet or holds no lease from some member, and
+    /// [`ShardError::NotPrimary`] on a member.
     pub fn check_readable(&self) -> Result<(), ShardError> {
-        self.sequencer().check_role(self.shard())
+        self.sequencer().check_serving(self.shard())?;
+        match &self.inner.leader {
+            Some(leader) if !leader.holds_leases() => {
+                Err(self.unavailable("the primary does not hold a lease from every member"))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn sequencer(&self) -> MutexGuard<'_, Sequencer> {
@@ -1247,6 +1383,29 @@ impl Sequencer {
     fn check_serving(&self, shard: &ShardRef) -> Result<(), ShardError> {
         self.check_running(shard)?;
         self.check_role(shard)
+    }
+
+    /// Checks that no write is late on a fail-fast shard: one timed out,
+    /// and a record sequenced before it is not applied yet.
+    fn check_late(&mut self, shard: &ShardRef) -> Result<(), ShardError> {
+        match self.late {
+            Some(late) if late > self.applied => Err(ShardError::not_acknowledged(
+                shard,
+                format!("the record at {late} still waits for its members"),
+            )),
+            Some(_) => {
+                self.late = None;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The position of the last record sequenced.
+    fn last_sequenced(&self) -> EpochSeq {
+        // `next.seq` is at least 1: opening starts it after the CONFIG
+        // record at `seq` 0 or later.
+        EpochSeq::new(self.next.epoch, Seq::new(self.next.seq.get() - 1))
     }
 
     /// Registers a conditional read, which needs every record of its key
@@ -1433,6 +1592,17 @@ impl PipelineTask {
             Message::Appended { position, result } => self.pipeline.resolved(position, result),
             Message::Barrier(reply) => self.pipeline.barrier(reply),
             Message::Commit(seq) => self.pipeline.commit_through(seq),
+            Message::Abandon(reply) => {
+                let error = self.stop("the shard was closed".to_owned());
+                let (writes, barriers) = self.pipeline.abandon();
+                for write in writes {
+                    let _ = write.send(Err(error.clone()));
+                }
+                for barrier in barriers {
+                    let _ = barrier.send(Err(error.clone()));
+                }
+                let _ = reply.send(Ok(()));
+            }
         }
     }
 

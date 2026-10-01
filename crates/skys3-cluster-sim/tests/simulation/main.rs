@@ -10,11 +10,17 @@
 //!   catching seeded bugs, invariants, and node services.
 //! - [`replication`]: shards with three members, under crashes, power
 //!   loss, partitions, and message loss.
+//! - [`leases`]: reads under leases, with partitions and clock drift within
+//!   and beyond the bound `ρ`.
+//! - [`acks`]: writes that time out while a member is cut off, in both
+//!   acknowledgement timeout modes.
 //! - [`routing`]: gateways on every node with stale shard maps, routing
 //!   each request to its primary under crashes and partitions.
 
+mod acks;
 mod crash;
 mod harness;
+mod leases;
 mod replication;
 mod routing;
 mod workload;

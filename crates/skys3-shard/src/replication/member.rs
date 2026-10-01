@@ -1,32 +1,36 @@
 //! A member's end of a link from its shard's primary.
 
+use std::sync::{Mutex, PoisonError};
+
 use bytes::Bytes;
 use skys3_io::Disk;
 use skys3_log::{LogRecord, ShardRef};
-use skys3_net::{Frame, MessageKind, PeerIdentity, Receiver, Sender};
+use skys3_net::{Frame, MessageKind, Network, PeerIdentity, Receiver, Sender};
 use skys3_types::{Epoch, Seq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
 use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
-use super::{LinkError, ReplicationConfig, recv};
+use super::{Inner, LinkError, ReplicationConfig, recv};
+use crate::lease::Grace;
 use crate::set::ShardSet;
 use crate::shard::{Role, Shard};
 
 /// Serves one link from a primary, whose first frame is `frame`: a session
 /// for one shard, until the link fails or a later session replaces it.
-pub(super) async fn serve<S, D>(
+pub(super) async fn serve<S, N, D>(
     (mut receiver, mut sender): (Receiver<S>, Sender<S>),
     frame: Frame,
-    set: &ShardSet<D>,
-    config: ReplicationConfig,
+    inner: &Inner<N, D>,
 ) -> Result<(), LinkError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    N: Network,
     D: Disk,
 {
+    let config = inner.config;
     let request: Sync = wire::body(&frame, MessageKind::Sync).map_err(LinkError::Protocol)?;
-    let (shard, epoch) = match accept(&request, receiver.peer(), set).await {
+    let (shard, epoch) = match accept(&request, receiver.peer(), &inner.set).await {
         Ok(accepted) => accepted,
         Err((epoch, refused)) => {
             let answer = SyncAck {
@@ -64,12 +68,17 @@ where
         ))
         .await?;
     let beacons = Notify::new();
+    // A replica opened outside `Replication::open` starts its grace with
+    // its first session.
+    let grace = inner.grace_of(shard.shard());
     let follow = Follower {
         shard: &shard,
         session,
         epoch,
         config,
         beacons: &beacons,
+        grace: &grace,
+        stamp: Mutex::new(None),
     };
     let refused = tokio::select! {
         biased;
@@ -80,6 +89,7 @@ where
         let ack = AppendAck {
             durable: shard.durable().borrow().get(),
             rejected: epoch.get(),
+            lease: None,
         };
         sender
             .send(&wire::frame(MessageKind::AppendAck, &ack, Bytes::new()))
@@ -149,6 +159,11 @@ struct Follower<'a, D: Disk> {
     epoch: Epoch,
     config: ReplicationConfig,
     beacons: &'a Notify,
+    /// The shard's grace, which every acknowledgement that grants a lease
+    /// restarts.
+    grace: &'a Grace,
+    /// The latest lease stamp received in this session.
+    stamp: Mutex<Option<u64>>,
 }
 
 impl<D: Disk> Follower<'_, D> {
@@ -164,6 +179,7 @@ impl<D: Disk> Follower<'_, D> {
                     let append: Append =
                         wire::body(&frame, MessageKind::Append).map_err(LinkError::Protocol)?;
                     self.check_epoch(append.epoch)?;
+                    self.stamped(append.lease);
                     let (record, _) = LogRecord::decode(&frame.payload)
                         .map_err(|error| LinkError::Protocol(error.to_string()))?;
                     let taken = self.shard.receive(
@@ -182,11 +198,19 @@ impl<D: Disk> Follower<'_, D> {
                     let beacon: Beacon =
                         wire::body(&frame, MessageKind::Beacon).map_err(LinkError::Protocol)?;
                     self.check_epoch(beacon.epoch)?;
+                    self.stamped(beacon.lease);
                     self.beacons.notify_one();
                     beacon.commit
                 }
             };
             self.shard.commit_through(Seq::new(commit));
+        }
+    }
+
+    /// Keeps the lease stamp of a frame from the primary, if it has one.
+    fn stamped(&self, lease: Option<u64>) {
+        if lease.is_some() {
+            *self.stamp.lock().unwrap_or_else(PoisonError::into_inner) = lease;
         }
     }
 
@@ -203,7 +227,9 @@ impl<D: Disk> Follower<'_, D> {
     }
 
     /// Acknowledges the run of records held durably as it grows, and
-    /// answers every beacon.
+    /// answers every beacon. Each acknowledgement echoes the latest lease
+    /// stamp, which grants the primary a lease, so it restarts the grace
+    /// before it leaves (§5.4).
     async fn acknowledge<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         sender: &mut Sender<S>,
@@ -219,9 +245,14 @@ impl<D: Disk> Follower<'_, D> {
                 }
                 () = self.beacons.notified() => {}
             }
+            let lease = *self.stamp.lock().unwrap_or_else(PoisonError::into_inner);
+            if lease.is_some() {
+                self.grace.grant();
+            }
             let ack = AppendAck {
                 durable: durable.borrow_and_update().get(),
                 rejected: 0,
+                lease,
             };
             sender
                 .send(&wire::frame(MessageKind::AppendAck, &ack, Bytes::new()))

@@ -63,6 +63,10 @@ pub struct ClusterConfig {
     /// The bound `ρ` on each node's clock drift; each life of a node
     /// draws its drift within it.
     pub drift: Drift,
+    /// Fixed drifts of the first nodes, by position, in every life, in
+    /// place of one drawn within `drift`: for scenarios that set chosen
+    /// nodes' clocks fast or slow, beyond `ρ` too. Empty by default.
+    pub node_drifts: Vec<Drift>,
     /// Faults every disk injects throughout, such as torn writes.
     pub disk_faults: SimDiskFaults,
     /// Faults of every node's control-store requests throughout.
@@ -85,6 +89,7 @@ impl Default for ClusterConfig {
             placement_epoch: 1,
             every_member_durable: false,
             drift: Drift::from_ppm(1_000).expect("the drift is valid"),
+            node_drifts: Vec::new(),
             disk_faults: SimDiskFaults {
                 torn_write_probability: 0.5,
                 ..SimDiskFaults::default()
@@ -630,6 +635,7 @@ impl<S: NodeServices> World<S> {
                 disks,
                 handle,
                 credentials,
+                config.node_drifts.get(index).copied(),
                 seed,
             )));
         }
