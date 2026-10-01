@@ -1131,6 +1131,12 @@ of this file. A task with nothing unexpected keeps "None."
   `CommonPrefixes` precede the top-level `Prefix`, and it omits an empty
   `Prefix`. It does not escape quotes in ETags. `encoding-type` on
   ListMultipartUploads is ignored and not echoed.
+- **Listings after M1-11.** Open uploads live outside the namespace
+  table, so ListObjects never sees them, and a completed object lists
+  with its multipart ETag and size like any other entry; a gateway test
+  checks both. ListMultipartUploads keeps its own merge rather than M1-11's
+  `listing::merge`, which is typed to `ListQuery` and `ListItem` and pages
+  by item rather than by (key, upload).
 - **Test helper limit.** The shared `answer` helper read at most 1 MiB of
   body; multipart objects are at least 5 MiB, so it now reads up to
   64 MiB.

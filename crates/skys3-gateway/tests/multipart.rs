@@ -299,6 +299,23 @@ async fn an_upload_completes_with_the_etag_and_checksum_s3_gives() {
         .complete("movie.mp4", &id, &[], &[(1, &etags[0])])
         .await
         .assert(404, Some("NoSuchUpload"));
+
+    // ListObjectsV2 lists the completed object with its multipart ETag and
+    // size, and not an upload still open.
+    setup.create_upload("pending", &[]).await;
+    let listed = setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await;
+    listed.assert(200, None);
+    assert_eq!(elements(&listed.body, "Key"), ["movie.mp4"]);
+    assert_eq!(
+        element(&listed.body, "ETag"),
+        Some(&*format!("\"{s3_etag}\""))
+    );
+    assert_eq!(
+        element(&listed.body, "Size"),
+        Some(&*(3 * PART).to_string())
+    );
 }
 
 /// Without a checksum algorithm, parts get CRC64NVME checksums and the
