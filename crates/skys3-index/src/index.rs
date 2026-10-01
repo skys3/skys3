@@ -8,18 +8,18 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, StorageBackend};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableHandle};
 use skys3_config::StorageConfig;
 use skys3_io::{Disk, SimBlockFile, SimMount};
 use skys3_log::record::ShardRef;
 use skys3_log::{
     LogRecord, RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentLog, SegmentSummary,
 };
-use skys3_types::{BucketId, EpochSeq, Label};
+use skys3_types::{BucketId, EpochSeq, Label, ShardConfig};
 
 use crate::codec;
-use crate::entry::ImportCheckpoint;
 use crate::error::IndexError;
+use crate::import::ImportRanges;
 use crate::tables::{
     self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META,
 };
@@ -219,6 +219,12 @@ impl Index {
         let mut txn = db.begin_write()?;
         let mut coverage = Coverage::new();
         let created = {
+            // An index of this format may predate the shard map, which
+            // needs no new format (see `tables::SHARD_MAP`).
+            let had_map = txn
+                .list_tables()?
+                .any(|table| table.name() == tables::SHARD_MAP.name());
+            txn.open_table(tables::SHARD_MAP)?;
             let mut meta = txn.open_table(META)?;
             for table in [
                 tables::NAMESPACE,
@@ -254,7 +260,7 @@ impl Index {
                     codec::decode_summary(value.value()).map_err(IndexError::codec("coverage"))?;
                 coverage.entry(disk).or_default().insert(segment, summary);
             }
-            format != Some(FORMAT_VERSION)
+            format != Some(FORMAT_VERSION) || !had_map
         };
         if created {
             txn.set_durability(Durability::Immediate)?;
@@ -356,16 +362,13 @@ impl Index {
         Ok(result)
     }
 
-    /// The import checkpoint of `bucket` (§9.1), or `None` if its import
-    /// never started on this node.
+    /// The import ranges of `bucket` and their checkpoints (§9.1), or
+    /// `None` if its import never started on this node.
     ///
     /// # Errors
     ///
     /// Returns an [`IndexError`] if reading or decoding fails.
-    pub fn import_checkpoint(
-        &self,
-        bucket: &BucketId,
-    ) -> Result<Option<ImportCheckpoint>, IndexError> {
+    pub fn import_ranges(&self, bucket: &BucketId) -> Result<Option<ImportRanges>, IndexError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(tables::IMPORTS)?;
         let Some(value) = table.get(bucket.as_str())? else {
@@ -376,30 +379,30 @@ impl Index {
             .map_err(IndexError::codec("imports"))
     }
 
-    /// Stores the import checkpoint of `bucket`, or removes it, in one
-    /// durable commit.
+    /// Stores the import ranges of `bucket` and their checkpoints, or
+    /// removes them, in one durable commit.
     ///
     /// A checkpoint does not come from the log, so replay cannot restore
     /// it; it is made durable at once instead, once a page of `IMPORT`
-    /// records it covers is applied. Each page costs one sync.
+    /// records it covers is applied. Each store costs one sync.
     ///
     /// # Errors
     ///
-    /// Returns an [`IndexError`] if the checkpoint cannot be encoded or the
+    /// Returns an [`IndexError`] if the ranges cannot be encoded or the
     /// commit fails; nothing changes then.
-    pub fn set_import_checkpoint(
+    pub fn set_import_ranges(
         &self,
         bucket: &BucketId,
-        checkpoint: Option<&ImportCheckpoint>,
+        import: Option<&ImportRanges>,
     ) -> Result<(), IndexError> {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::Immediate)?;
         {
             let mut table = txn.open_table(tables::IMPORTS)?;
-            match checkpoint {
-                Some(checkpoint) => {
+            match import {
+                Some(import) => {
                     let value =
-                        codec::encode_import(checkpoint).map_err(IndexError::codec("imports"))?;
+                        codec::encode_import(import).map_err(IndexError::codec("imports"))?;
                     table.insert(bucket.as_str(), value.as_slice())?;
                 }
                 None => {
@@ -407,6 +410,41 @@ impl Index {
                 }
             }
         }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Keeps `config` as the gateway's configuration of its shard, in one
+    /// durable commit (§6.2). The shard map is not in the log, so replay
+    /// cannot restore it, but it is a cache: a stale or lost configuration
+    /// costs a redirect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the configuration does not encode or
+    /// redb fails; nothing changes then.
+    pub fn store_route(&self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("shard_map"))?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::SHARD_MAP)?
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes the gateway's configuration of `shard`, in one durable
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn forget_route(&self, shard: &ShardRef) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::SHARD_MAP)?
+            .remove(codec::shard_key(shard).as_slice())?;
         txn.commit()?;
         Ok(())
     }

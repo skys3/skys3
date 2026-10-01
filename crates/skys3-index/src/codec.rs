@@ -22,7 +22,8 @@
 //! | control | register key (UTF-8) | [`ControlEntry`] |
 //! | uploads | shard, the object key's bytes, a zero byte, then the upload's epoch and seq | [`Upload`] |
 //! | parts | shard, the upload's epoch and seq, part number (`u16`) | [`Part`] |
-//! | imports | bucket ID (UTF-8) | [`ImportCheckpoint`]: a tag (0 running, 1 done), and for a running import the last key imported, as an option |
+//! | shard_map | shard | the gateway's [`ShardConfig`], as its register's JSON |
+//! | imports | bucket ID (UTF-8) | [`ImportRanges`]: one range as its [`ImportCheckpoint`] alone, a tag (0 running, 1 done) and for a running import the last key imported, as an option; or several as tag 2, a `u16` count of at least two, and each range's end, as an option present on all but the last, followed by its checkpoint |
 //!
 //! An upload key ends with a fixed 17 bytes, so it decodes whatever bytes
 //! the object key holds, and a shard's uploads sort by key, then by age.
@@ -50,13 +51,15 @@ use skys3_log::record::{
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::limits::MAX_PARTS;
 use skys3_types::{
-    BucketId, ETag, Epoch, EpochSeq, Generation, Label, Seq, ShardId, VersionIdentity,
+    BucketId, ETag, Epoch, EpochSeq, Generation, Label, RegisterDocument, Seq, ShardConfig,
+    ShardId, VersionIdentity,
 };
 
 use crate::entry::{
     ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
     Upload,
 };
+use crate::import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 
 /// The format byte every value this build writes starts with, and the
 /// newest format it reads.
@@ -563,6 +566,36 @@ pub fn encode_control(entry: &ControlEntry) -> Result<Vec<u8>> {
     Ok(w.0)
 }
 
+/// Encodes a configuration of the gateway's shard map (§6.2).
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if its JSON is longer than
+/// [`MAX_CONTROL_VALUE_LEN`].
+pub fn encode_route(config: &ShardConfig) -> Result<Vec<u8>> {
+    let json = config
+        .to_json()
+        .map_err(|error| CodecError::new("shard_map.config", error))?;
+    let mut w = Writer::value();
+    w.len32("shard_map.config", json.len(), MAX_CONTROL_VALUE_LEN)?;
+    w.0.extend_from_slice(&json);
+    Ok(w.0)
+}
+
+/// Decodes a configuration of the gateway's shard map, checked as a shard
+/// register is.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded configuration.
+pub fn decode_route(bytes: &[u8]) -> Result<ShardConfig> {
+    let mut r = Reader::value(bytes, "shard_map")?;
+    let len = r.len32("shard_map.config", MAX_CONTROL_VALUE_LEN)?;
+    let json = r.take("shard_map.config", len)?;
+    r.finish("shard_map")?;
+    ShardConfig::from_json(json).map_err(|error| CodecError::new("shard_map.config", error))
+}
+
 /// Decodes a control-state copy.
 ///
 /// # Errors
@@ -582,14 +615,30 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlEntry> {
     })
 }
 
-/// Encodes a bucket's import checkpoint.
+/// Encodes a bucket's import ranges. One range is encoded as its
+/// checkpoint alone, as a single-stream import always was; several are
+/// tagged 2.
 ///
 /// # Errors
 ///
-/// Returns a [`CodecError`] if the last key imported is longer than an
-/// object key may be.
-pub fn encode_import(checkpoint: &ImportCheckpoint) -> Result<Vec<u8>> {
+/// Returns a [`CodecError`] if a key is longer than an object key may be.
+pub fn encode_import(import: &ImportRanges) -> Result<Vec<u8>> {
     let mut w = Writer::value();
+    match import.ranges() {
+        [only] => encode_checkpoint(&mut w, &only.checkpoint)?,
+        ranges => {
+            w.u8(2);
+            w.len16("import.ranges", ranges.len(), MAX_IMPORT_RANGES)?;
+            for range in ranges {
+                w.option_str("import.end", range.end.as_deref(), MAX_KEY_LEN)?;
+                encode_checkpoint(&mut w, &range.checkpoint)?;
+            }
+        }
+    }
+    Ok(w.0)
+}
+
+fn encode_checkpoint(w: &mut Writer, checkpoint: &ImportCheckpoint) -> Result<()> {
     match checkpoint {
         ImportCheckpoint::Running { after } => {
             w.u8(0);
@@ -597,30 +646,53 @@ pub fn encode_import(checkpoint: &ImportCheckpoint) -> Result<Vec<u8>> {
         }
         ImportCheckpoint::Done => w.u8(1),
     }
-    Ok(w.0)
+    Ok(())
 }
 
-/// Decodes a bucket's import checkpoint.
+/// Decodes a bucket's import ranges.
 ///
 /// # Errors
 ///
-/// Returns a [`CodecError`] if `bytes` is not an encoded checkpoint.
-pub fn decode_import(bytes: &[u8]) -> Result<ImportCheckpoint> {
+/// Returns a [`CodecError`] if `bytes` is not encoded import ranges: among
+/// others, if a tag 2 has fewer than two ranges, or ranges that break the
+/// invariants of [`ImportRanges::from_ranges`].
+pub fn decode_import(bytes: &[u8]) -> Result<ImportRanges> {
     let mut r = Reader::value(bytes, "import")?;
-    let checkpoint = match r.u8("import.state")? {
-        0 => ImportCheckpoint::Running {
-            after: r.option_str("import.after", MAX_KEY_LEN)?,
-        },
-        1 => ImportCheckpoint::Done,
-        tag => {
-            return Err(CodecError::new(
-                "import.state",
-                format_args!("invalid tag {tag}"),
-            ));
+    let import = match r.u8("import.state")? {
+        2 => {
+            let count = r.len16("import.ranges", MAX_IMPORT_RANGES)?;
+            if count < 2 {
+                return Err(CodecError::new("import.ranges", "fewer than two ranges"));
+            }
+            // Each range takes at least two bytes.
+            r.check_count("import.ranges", count, 2)?;
+            let mut ranges = Vec::with_capacity(count);
+            for _ in 0..count {
+                let end = r.option_str("import.end", MAX_KEY_LEN)?;
+                let tag = r.u8("import.state")?;
+                let checkpoint = decode_checkpoint(&mut r, tag)?;
+                ranges.push(ImportRange { end, checkpoint });
+            }
+            ImportRanges::from_ranges(ranges)
+                .ok_or_else(|| CodecError::new("import.ranges", "ranges out of order"))?
         }
+        tag => decode_checkpoint(&mut r, tag)?.into(),
     };
     r.finish("import")?;
-    Ok(checkpoint)
+    Ok(import)
+}
+
+fn decode_checkpoint(r: &mut Reader<'_>, tag: u8) -> Result<ImportCheckpoint> {
+    match tag {
+        0 => Ok(ImportCheckpoint::Running {
+            after: r.option_str("import.after", MAX_KEY_LEN)?,
+        }),
+        1 => Ok(ImportCheckpoint::Done),
+        tag => Err(CodecError::new(
+            "import.state",
+            format_args!("invalid tag {tag}"),
+        )),
+    }
 }
 
 /// Encodes a namespace entry.

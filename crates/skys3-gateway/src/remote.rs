@@ -68,9 +68,19 @@ pub struct RemotePage {
 /// boxed futures so that the gateway can hold any implementation behind one
 /// `Arc<dyn RemoteReads>`.
 pub trait RemoteReads: fmt::Debug + Send + Sync + 'static {
-    /// How far the namespace import of `bucket` has got, or `None` if this
-    /// node does not read the bucket's target.
+    /// How far the namespace import of `bucket` has got without a gap, or
+    /// `None` if this node does not read the bucket's target.
     fn import(&self, bucket: &BucketId) -> Option<ImportCheckpoint>;
+
+    /// Whether the namespace import of `bucket` has passed `key`, or this
+    /// node does not read the bucket's target. An import that lists key
+    /// ranges in parallel (§9.1) may pass a key before [`import`] says so;
+    /// by default, only [`import`] is asked.
+    ///
+    /// [`import`]: RemoteReads::import
+    fn passed(&self, bucket: &BucketId, key: &str) -> bool {
+        self.import(bucket).is_none_or(|import| import.passed(key))
+    }
 
     /// HEADs `key`: `None` if the remote has no object there.
     ///

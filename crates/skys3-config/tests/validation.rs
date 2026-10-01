@@ -837,6 +837,10 @@ fn bucket_overrides_are_checked_against_inherited_values() {
             "buckets.small.import_parallel_streams",
         ],
     );
+    assert_violations(
+        "[buckets.small]\nimport_parallel_streams = 257",
+        &["buckets.small.import_parallel_streams"],
+    );
 }
 
 #[test]
