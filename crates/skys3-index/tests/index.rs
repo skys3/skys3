@@ -126,7 +126,7 @@ fn rejects_an_index_of_another_format() {
         {
             let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
             let mut table = txn.open_table(meta).unwrap();
-            table.insert("format_version", 2).unwrap();
+            table.insert("format_version", 3).unwrap();
         }
         txn.commit().unwrap();
     }
@@ -135,8 +135,8 @@ fn rejects_an_index_of_another_format() {
         matches!(
             error,
             IndexError::UnsupportedFormat {
-                found: 2,
-                supported: 1
+                found: 3,
+                supported: 2
             }
         ),
         "{error}"

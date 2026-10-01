@@ -110,6 +110,12 @@ pub struct ControlStoreConfig {
 }
 
 impl ControlStoreConfig {
+    /// The longest `prefix`, in bytes: S3's 1,024-byte limit on object
+    /// keys, less the longest register key (512 bytes), so that every
+    /// register fits under the prefix (§6.1). `skys3-control` checks that
+    /// its S3 backend uses the same bound.
+    pub const MAX_PREFIX_LEN: usize = 512;
+
     /// Checks a data target against an S3 control store (§6.1), as
     /// configuration loading does for backup and snapshot targets and
     /// attaching a bucket does for its target.
@@ -229,13 +235,15 @@ impl RawControlStore {
         let prefix = match &self.prefix {
             Some(prefix) => {
                 let valid = prefix.len() > 1
+                    && prefix.len() <= ControlStoreConfig::MAX_PREFIX_LEN
                     && prefix.ends_with('/')
                     && !prefix.starts_with('/')
                     && prefix.bytes().all(|b| b.is_ascii_graphic());
                 checker.require(valid, "control_store.prefix", || {
                     format!(
-                        "{prefix:?} must be visible ASCII that ends with '/' and does not start \
-                         with it"
+                        "{prefix:?} must be at most {} bytes of visible ASCII that ends with '/' \
+                         and does not start with it",
+                        ControlStoreConfig::MAX_PREFIX_LEN
                     )
                 });
                 prefix.clone()

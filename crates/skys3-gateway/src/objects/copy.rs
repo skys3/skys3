@@ -9,10 +9,15 @@
 //! a remote server-side copy (plan M4-07). Until then a copy flushes as a
 //! regular upload. The copy's write identity names its own `PUT` (§7.2).
 //!
-//! The copy keeps the source's ETag and checksums, since its bytes are the
-//! same. With `x-amz-checksum-algorithm`, its checksum is that algorithm's
-//! instead, computed while the bytes are copied unless the source already
-//! has it. `Last-Modified` is the time of the copy.
+//! A copy is always a single-part object. Of a source stored by a single
+//! PUT, it keeps the ETag and checksums, since its bytes are the same. Of a
+//! multipart source, whose ETag and checksums are derived from parts the
+//! copy does not keep, it takes the MD5 of its bytes as its ETag and
+//! full-object checksums of the source's algorithms (or CRC64NVME), computed
+//! while the bytes are copied, so the flush reproduces them with a regular
+//! upload. With `x-amz-checksum-algorithm`, its checksum is that
+//! algorithm's instead, computed unless the source has a full-object one.
+//! `Last-Modified` is the time of the copy.
 //!
 //! - **Metadata** (`x-amz-metadata-directive`): `COPY`, the default, keeps
 //!   the source's stored headers and user metadata and ignores the
@@ -37,15 +42,15 @@ use s3s::dto::{CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource a
 use s3s::{S3ErrorCode, S3Request, S3Result, s3_error};
 use skys3_index::{EntryState, ObjectVersion, Payload};
 use skys3_log::RecordBody;
-use skys3_log::record::{CopySource, Metadata, Put};
+use skys3_log::record::{CopySource, ExtentRef, Metadata, Put, PutData};
 use skys3_types::checksum::{Checksum, ChecksumAlgorithm, Checksums};
-use skys3_types::{BucketDocument, VersionIdentity, WriteIdentity};
+use skys3_types::{BucketDocument, ETag, EpochSeq, VersionIdentity, WriteIdentity};
 
 use super::tagging::parse_tagging_header;
 use super::upload::Upload;
-use super::{MAX_OBJECT_BYTES, Objects, USER_METADATA_PREFIX, download, now_ms, stored_metadata};
+use super::{MAX_OBJECT_BYTES, Objects, USER_METADATA_PREFIX, download, metadata_of, now_ms};
 use crate::buckets::shard_error;
-use crate::checksum::{PooledHasher, parse_algorithm};
+use crate::checksum::{DEFAULT_ALGORITHM, Digests, PooledHasher, parse_algorithm};
 use crate::conditions::{
     Precondition, ReadConditions, last_modified, no_such_key, precondition_failed, s3_etag,
 };
@@ -131,7 +136,7 @@ impl<H: Shards> Objects<H> {
         }
         let replaced_metadata = match metadata_directive {
             Directive::Copy => None,
-            Directive::Replace => Some(stored_metadata(
+            Directive::Replace => Some(metadata_of(
                 standard_headers!(input),
                 input.metadata.as_ref(),
             )?),
@@ -197,30 +202,75 @@ impl<H: Shards> Objects<H> {
             condition.check(entry.as_ref())?;
         }
 
-        let rehash = algorithm.filter(|&algorithm| {
+        // A multipart source's ETag and checksums describe parts that the
+        // copy, a single-part object, does not keep: they are computed again
+        // over its bytes, so a flush by PutObject reproduces them (§11).
+        let multipart = matches!(object.payload, Payload::Parts { .. });
+        let wanted: Vec<ChecksumAlgorithm> = match algorithm {
+            Some(algorithm) => vec![algorithm],
+            None if multipart => {
+                let kept: Vec<_> = object
+                    .checksums
+                    .keys()
+                    .copied()
+                    .filter(|&algorithm| algorithm != ChecksumAlgorithm::Md5)
+                    .collect();
+                if kept.is_empty() {
+                    vec![DEFAULT_ALGORITHM]
+                } else {
+                    kept
+                }
+            }
+            None => Vec::new(),
+        };
+        // A full-object checksum of a single-part source is still right.
+        let reusable = |algorithm: &ChecksumAlgorithm| {
             object
                 .checksums
-                .get(&algorithm)
-                .is_none_or(|checksum| checksum.parts().is_some())
-        });
-        let (data, computed) = self
-            .copy_bytes(&source_shard, &object, &shard, &input.key, rehash)
+                .get(algorithm)
+                .filter(|checksum| !multipart && checksum.parts().is_none())
+                .cloned()
+        };
+        let mut hashed: Vec<_> = wanted
+            .iter()
+            .copied()
+            .filter(|algorithm| reusable(algorithm).is_none())
+            .collect();
+        if multipart {
+            hashed.push(ChecksumAlgorithm::Md5);
+        }
+        let (data, digests) = self
+            .copy_bytes(&source_shard, &object, &shard, &input.key, &hashed)
             .await?;
-        // A requested algorithm's checksum replaces every other; it is
-        // computed, or the source's if it had it.
-        let checksums = match algorithm {
-            None => object.checksums.clone(),
-            Some(algorithm) => computed
-                .or_else(|| object.checksums.get(&algorithm).cloned())
-                .map(|checksum| Checksums::from([(algorithm, checksum)]))
-                .unwrap_or_default(),
+        let checksums = if wanted.is_empty() {
+            object.checksums.clone()
+        } else {
+            wanted
+                .iter()
+                .map(|&algorithm| {
+                    let checksum = match digests.get(&algorithm) {
+                        Some(digest) => Checksum::full_object(algorithm, digest).ok(),
+                        None => reusable(&algorithm),
+                    };
+                    checksum
+                        .map(|checksum| (algorithm, checksum))
+                        .ok_or_else(unavailable)
+                })
+                .collect::<S3Result<Checksums>>()?
+        };
+        let etag = match digests.get(&ChecksumAlgorithm::Md5) {
+            Some(md5) => {
+                let md5 = <[u8; 16]>::try_from(md5.as_slice()).map_err(|_| unavailable())?;
+                ETag::from_md5(&md5)
+            }
+            None => object.local_etag.clone(),
         };
         let clean = matches!(state, EntryState::Clean | EntryState::Evicted);
         let put = Put {
             key: input.key,
             size: object.size,
             last_modified_ms: now_ms(),
-            etag: object.local_etag.clone(),
+            etag: etag.clone(),
             inherited_identity: None,
             metadata: replaced_metadata.unwrap_or_else(|| without_identity(&object.metadata)),
             tags: replaced_tags.unwrap_or_else(|| object.tags.clone()),
@@ -235,6 +285,7 @@ impl<H: Shards> Objects<H> {
         };
         let copied = ObjectVersion {
             last_modified_ms: put.last_modified_ms,
+            local_etag: etag,
             checksums: put.checksums.clone(),
             ..object
         };
@@ -255,22 +306,25 @@ impl<H: Shards> Objects<H> {
     }
 
     /// Writes the bytes of `object`, in `source`, into `shard` as the body
-    /// of a `PUT` of `key`, and returns where they are and, if `rehash`
-    /// names an algorithm, their checksum in it.
+    /// of a `PUT` of `key`, and returns where they are and their digests in
+    /// the `hashed` algorithms.
     async fn copy_bytes(
         &self,
         source: &ShardRef,
         object: &ObjectVersion,
         shard: &ShardRef,
         key: &str,
-        rehash: Option<ChecksumAlgorithm>,
-    ) -> S3Result<(skys3_log::record::PutData, Option<Checksum>)> {
+        hashed: &[ChecksumAlgorithm],
+    ) -> S3Result<(PutData, Digests)> {
         let positions: Vec<_> = match &object.payload {
             Payload::Inline(position) => vec![(*position, object.size)],
-            Payload::Extents(extents) => extents
-                .iter()
-                .map(|extent| (extent.position, u64::from(extent.len)))
-                .collect(),
+            Payload::Extents(extents) => extent_positions(extents),
+            Payload::Parts { upload, parts } => {
+                let whole = 0..object.size;
+                let (extents, _) =
+                    download::part_extents(&self.shards, source, *upload, parts, whole).await?;
+                extent_positions(&extents)
+            }
             Payload::None => return Err(download::not_cached()),
         };
         let mut upload = Upload::new(
@@ -280,7 +334,8 @@ impl<H: Shards> Objects<H> {
             self.inline_max_bytes,
             self.extent_bytes,
         );
-        let mut hasher = rehash.map(|algorithm| PooledHasher::new([algorithm], self.pool.clone()));
+        let mut hasher = (!hashed.is_empty())
+            .then(|| PooledHasher::new(hashed.iter().copied(), self.pool.clone()));
         let mut copied = 0u64;
         for (position, len) in positions {
             let data: Bytes = self
@@ -289,10 +344,7 @@ impl<H: Shards> Objects<H> {
                 .await
                 .map_err(shard_error)?;
             if data.len() as u64 != len {
-                return Err(s3_error!(
-                    InternalError,
-                    "the stored object's bytes do not match its size"
-                ));
+                return Err(size_mismatch());
             }
             copied += len;
             upload.push(&data).await?;
@@ -301,22 +353,30 @@ impl<H: Shards> Objects<H> {
             }
         }
         if copied != object.size {
-            return Err(s3_error!(
-                InternalError,
-                "the stored object's bytes do not match its size"
-            ));
+            return Err(size_mismatch());
         }
         let data = upload.finish().await?;
-        let checksum = match (hasher, rehash) {
-            (Some(hasher), Some(algorithm)) => {
-                let digests = hasher.finish().await.map_err(|_| unavailable())?;
-                let digest = digests.get(&algorithm).ok_or_else(unavailable)?;
-                Some(Checksum::full_object(algorithm, digest).map_err(|_| unavailable())?)
-            }
-            _ => None,
+        let digests = match hasher {
+            Some(hasher) => hasher.finish().await.map_err(|_| unavailable())?,
+            None => Digests::new(),
         };
-        Ok((data, checksum))
+        Ok((data, digests))
     }
+}
+
+/// Each extent's position and length.
+fn extent_positions(extents: &[ExtentRef]) -> Vec<(EpochSeq, u64)> {
+    extents
+        .iter()
+        .map(|extent| (extent.position, u64::from(extent.len)))
+        .collect()
+}
+
+fn size_mismatch() -> s3s::S3Error {
+    s3_error!(
+        InternalError,
+        "the stored object's bytes do not match its size"
+    )
 }
 
 /// `metadata` without a write identity, which an object adopted or imported

@@ -74,7 +74,7 @@ pub(super) struct Bucket {
     /// What each written key's current object was before its latest
     /// write, with its version ID, or `None` if it had none: what a stale
     /// read answers with.
-    previous: HashMap<String, Option<Snapshot>>,
+    previous: BTreeMap<String, Option<Snapshot>>,
 }
 
 impl Bucket {
@@ -85,7 +85,7 @@ impl Bucket {
             uploads: BTreeMap::new(),
             list_tokens: HashMap::new(),
             next_id: 1,
-            previous: HashMap::new(),
+            previous: BTreeMap::new(),
         }
     }
 
@@ -374,9 +374,12 @@ impl Bucket {
     /// `max_keys == 0` returns an empty page that is not truncated, as S3
     /// does. It tells the caller nothing about the keys, so callers never
     /// send it.
+    ///
+    /// A `stale` listing lists every key as it was before its latest write.
     pub(super) fn list_objects_v2(
         &mut self,
         request: &ListObjectsV2,
+        stale: bool,
     ) -> S3Result<ListObjectsV2Output> {
         let position = match &request.continuation_token {
             Some(token) => Some(self.list_tokens.get(token).cloned().ok_or_else(|| {
@@ -403,11 +406,25 @@ impl Bucket {
         // returned sorts after it.
         let mut floor = position;
         let mut emitted = 0;
-        for (key, versions) in self.keys.range::<String, _>((start, Bound::Unbounded)) {
+        let range = (start, Bound::Unbounded);
+        let current = self
+            .keys
+            .range::<String, _>(range.clone())
+            .map(|(key, versions)| (key, versions.last().and_then(|v| v.object.as_ref())));
+        let entries: Box<dyn Iterator<Item = (&String, Option<&Arc<Stored>>)>> = if stale {
+            let mut entries: BTreeMap<_, _> = current.collect();
+            for (key, before) in self.previous.range::<String, _>(range) {
+                entries.insert(key, before.as_ref().map(|(_, object)| object));
+            }
+            Box::new(entries.into_iter())
+        } else {
+            Box::new(current)
+        };
+        for (key, object) in entries {
             if !key.starts_with(prefix) {
                 break;
             }
-            let Some(object) = versions.last().and_then(|v| v.object.as_ref()) else {
+            let Some(object) = object else {
                 continue;
             };
             let common_prefix = delimiter.and_then(|delimiter| {

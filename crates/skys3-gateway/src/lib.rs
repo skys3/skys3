@@ -31,6 +31,12 @@
 //!   the source's bytes into the destination's shard and commits a `PUT`
 //!   that records its source. Object tags, at most [`MAX_OBJECT_TAGS`], are
 //!   stored with the `PUT` or replaced by a `TAGS` record.
+//! - Multipart uploads: CreateMultipartUpload, UploadPart,
+//!   CompleteMultipartUpload, AbortMultipartUpload, ListParts, and
+//!   ListMultipartUploads, as `MPU_*` records in the key's shard. An
+//!   upload's ID ([`upload_id`]) is the position of its `MPU_CREATE`, the
+//!   write identity of the object it completes, which keeps its parts'
+//!   boundaries for GetObject's `partNumber` and the multipart ETag.
 //! - Listings: ListObjectsV2 and ListObjects (V1), with prefixes,
 //!   delimiters, `start-after` and markers, and `encoding-type=url`. Each
 //!   shard returns a sorted page from its index, the gateway merges them,
@@ -56,7 +62,7 @@
 //! - [`checksum`]: checksum validation of request bodies, on a blocking
 //!   pool, for CRC32, CRC32C, CRC64NVME, SHA1, SHA256, and `Content-MD5`
 //!   (trailing checksums included), MD5 ETags, and multipart ETags and
-//!   checksums. PutObject uses it.
+//!   checksums. PutObject and the multipart operations use it.
 //!
 //! The gateway serves path-style requests, over HTTP or, with
 //! [`GatewayListener::with_tls`], HTTPS. The `skys3` node binary serves it.
@@ -131,13 +137,14 @@ pub use listener::GatewayListener;
 pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};
 pub use local::LocalShards;
 pub use objects::{
-    MAX_DELETE_KEYS, MAX_OBJECT_BYTES, MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS,
-    MAX_USER_METADATA_BYTES,
+    MAX_DELETE_KEYS, MAX_MULTIPART_OBJECT_BYTES, MAX_OBJECT_BYTES, MAX_OBJECT_TAGS,
+    MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
+    parse_upload_id, upload_id,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};
-pub use shard::{ShardError, ShardRef, ShardSummary, Shards};
+pub use shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
 pub use sigv4::{
     Authenticated, BodyError, CredentialLookup, LookupError, SecretAccessKey, SigV4Authenticator,
     SigningCredential, Trailers,

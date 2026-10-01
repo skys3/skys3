@@ -263,6 +263,9 @@ pub struct ChecksumValidator {
     trailers: Option<Trailers>,
     hasher: PooledHasher,
     length: u64,
+    /// A checksum computed and stored whatever the request supplies: the
+    /// one every part of a multipart upload carries.
+    required: Option<ChecksumAlgorithm>,
 }
 
 impl ChecksumValidator {
@@ -288,15 +291,29 @@ impl ChecksumValidator {
         trailers: Option<Trailers>,
         pool: Option<BlockingPool>,
     ) -> Result<Self, IntegrityError> {
+        Self::requiring(expected, trailers, pool, None)
+    }
+
+    /// [`ChecksumValidator::on`], also computing and storing a checksum of
+    /// `required`, if given, whatever the request supplies.
+    pub(crate) fn requiring(
+        expected: ExpectedChecksums,
+        trailers: Option<Trailers>,
+        pool: Option<BlockingPool>,
+        required: Option<ChecksumAlgorithm>,
+    ) -> Result<Self, IntegrityError> {
         if matches!(expected.checksum, Some(ExpectedChecksum::Trailer(_))) && trailers.is_none() {
             return Err(IntegrityError::NoTrailers);
         }
-        let algorithms = [ChecksumAlgorithm::Md5, expected.stored_algorithm()];
+        let algorithms = [ChecksumAlgorithm::Md5, expected.stored_algorithm()]
+            .into_iter()
+            .chain(required);
         Ok(Self {
             hasher: PooledHasher::new(algorithms, pool),
             expected,
             trailers,
             length: 0,
+            required,
         })
     }
 
@@ -380,6 +397,11 @@ impl ChecksumValidator {
             return Err(IntegrityError::BadDigest(algorithm));
         }
         checksums.insert(algorithm, full_object(algorithm, &computed));
+        if let Some(required) = self.required
+            && let Some(digest) = digests.remove(&required)
+        {
+            checksums.insert(required, full_object(required, &digest));
+        }
         Ok(VerifiedBody {
             length: self.length,
             md5,

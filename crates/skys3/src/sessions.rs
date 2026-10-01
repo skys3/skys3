@@ -208,6 +208,11 @@ impl<D: Disk> SessionStore for SystemSessions<D> {
                 extents.iter().map(|extent| extent.position).collect()
             }
             skys3_index::Payload::None => return Err(failed("a session record has no bytes")),
+            // Records are written by PUT only; nothing completes an upload
+            // in the system bucket.
+            skys3_index::Payload::Parts { .. } => {
+                return Err(failed("a session record is a multipart object"));
+            }
         };
         let mut json = Vec::new();
         for position in positions {

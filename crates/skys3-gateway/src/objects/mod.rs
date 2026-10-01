@@ -32,11 +32,14 @@
 //! `x-amz-checksum-mode: ENABLED` for a whole object, and the stored storage
 //! class unless it is `STANDARD`. The `response-*` query parameters replace
 //! the stored headers they name; S3 refuses them in an anonymous request,
-//! and so does SkyS3. An object with tags reports their number in
+//! and so does SkyS3. `partNumber=N` serves the `N`th part of a multipart
+//! object, with `206` and `x-amz-mp-parts-count`, and `partNumber=1` the
+//! whole of any other. An object with tags reports their number in
 //! `x-amz-tagging-count`.
 //!
-//! DeleteObject and DeleteObjects are in `delete`, CopyObject in `copy`, and
-//! GetObjectTagging, PutObjectTagging, and DeleteObjectTagging in `tagging`.
+//! DeleteObject and DeleteObjects are in `delete`, CopyObject in `copy`,
+//! GetObjectTagging, PutObjectTagging, and DeleteObjectTagging in `tagging`,
+//! and multipart uploads in `multipart`.
 
 mod download;
 mod upload;
@@ -50,15 +53,15 @@ use s3s::dto::{
     PutObjectOutput, Range, StreamingBlob,
 };
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
-use skys3_index::ObjectVersion;
+use skys3_index::{ObjectVersion, Payload};
 use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
-use skys3_log::record::{MAX_METADATA_LEN, Metadata, Put};
-use skys3_types::checksum::{ChecksumAlgorithm, Checksums};
+use skys3_log::record::{MAX_METADATA_LEN, Metadata, Put, PutData};
+use skys3_types::checksum::ChecksumAlgorithm;
 use skys3_types::{BucketDocument, WriteIdentity};
 
 use crate::buckets::{GatewayConfig, shard_error};
-use crate::checksum::{ChecksumValidator, ExpectedChecksums};
+use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, no_such_key, s3_etag};
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
@@ -87,12 +90,13 @@ const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 /// The `Content-Type` of an object stored without one, as S3 answers.
 const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 
-/// Sets the checksum fields of a PutObject, GetObject, or HeadObject output
-/// from stored checksums. `Content-MD5` is stored as a checksum too, but S3
-/// returns it as the ETag only.
-macro_rules! set_checksums {
+/// Sets the checksum value fields of an S3 output or part from stored
+/// checksums, and returns the type of the last one set. `Content-MD5` is
+/// stored as a checksum too, but S3 returns it as the ETag only.
+macro_rules! set_checksum_values {
     ($output:expr, $checksums:expr) => {{
-        let checksums: &Checksums = $checksums;
+        let checksums: &skys3_types::checksum::Checksums = $checksums;
+        let mut checksum_type = None;
         for (algorithm, checksum) in checksums {
             let value = Some(checksum.to_string());
             match algorithm {
@@ -103,24 +107,34 @@ macro_rules! set_checksums {
                 ChecksumAlgorithm::Sha256 => $output.checksum_sha256 = value,
                 ChecksumAlgorithm::Md5 => continue,
             }
-            $output.checksum_type = Some(s3s::dto::ChecksumType::from_static(
-                checksum.checksum_type().as_str(),
-            ));
+            checksum_type = Some(checksum.checksum_type());
+        }
+        checksum_type
+    }};
+}
+
+/// Sets the checksum fields of an output that has a checksum type, such as
+/// PutObject's, GetObject's, or a CopyObject result, from stored checksums.
+macro_rules! set_checksums {
+    ($output:expr, $checksums:expr) => {{
+        if let Some(checksum_type) = set_checksum_values!($output, $checksums) {
+            $output.checksum_type =
+                Some(s3s::dto::ChecksumType::from_static(checksum_type.as_str()));
         }
     }};
 }
 
-/// The standard headers of a PutObject or CopyObject input that the object
-/// stores, by stored name, for [`stored_metadata`].
+/// The standard headers S3 stores with an object, from the input of a
+/// PutObject, a CopyObject, or a CreateMultipartUpload.
 macro_rules! standard_headers {
     ($input:expr) => {
         [
-            ("cache-control", $input.cache_control.as_ref()),
-            ("content-disposition", $input.content_disposition.as_ref()),
-            ("content-encoding", $input.content_encoding.as_ref()),
-            ("content-language", $input.content_language.as_ref()),
-            ("content-type", $input.content_type.as_ref()),
-            ("expires", $input.expires.as_ref()),
+            ("cache-control", &$input.cache_control),
+            ("content-disposition", &$input.content_disposition),
+            ("content-encoding", &$input.content_encoding),
+            ("content-language", &$input.content_language),
+            ("content-type", &$input.content_type),
+            ("expires", &$input.expires),
         ]
     };
 }
@@ -156,6 +170,7 @@ macro_rules! describe {
         $output.expires = header("expires");
         $output.content_length = i64::try_from(found.bytes.end - found.bytes.start).ok();
         $output.content_range = found.content_range.clone();
+        $output.parts_count = found.parts_count;
         $output.e_tag = Some(s3_etag(object));
         $output.last_modified = Some(last_modified(object));
         $output.storage_class = storage_class(object);
@@ -188,9 +203,13 @@ macro_rules! describe {
     }};
 }
 
+// After the macros, which they use.
 mod copy;
 mod delete;
+mod multipart;
 mod tagging;
+
+pub use multipart::{MAX_MULTIPART_OBJECT_BYTES, MIN_PART_BYTES, parse_upload_id, upload_id};
 
 /// The object operations, over the shards.
 pub(crate) struct Objects<H> {
@@ -233,7 +252,7 @@ impl<H: Shards> Objects<H> {
         {
             return Err(entity_too_large());
         }
-        let metadata = stored_metadata(standard_headers!(input), input.metadata.as_ref())?;
+        let metadata = stored_metadata(&input)?;
         let tags = input
             .tagging
             .as_deref()
@@ -254,29 +273,10 @@ impl<H: Shards> Objects<H> {
 
         let expected = ExpectedChecksums::from_headers(&headers)?;
         let trailers = extensions.get::<Trailers>().cloned();
-        let mut validator = ChecksumValidator::on(expected, trailers, self.pool.clone())?;
-        let mut upload = Upload::new(
-            self.shards.clone(),
-            shard.clone(),
-            input.key.clone(),
-            self.inline_max_bytes,
-            self.extent_bytes,
-        );
-        let mut body = s3s::Body::from(input.body.take().unwrap_or_else(empty_blob));
-        let mut length = 0u64;
-        while let Some(frame) = body.frame().await {
-            let Ok(data) = frame.map_err(|error| body_error(&*error))?.into_data() else {
-                continue;
-            };
-            length += data.len() as u64;
-            if length > MAX_OBJECT_BYTES {
-                return Err(entity_too_large());
-            }
-            upload.push(&data).await?;
-            validator.update(data).await?;
-        }
-        let verified = validator.finish().await?;
-        let data = upload.finish().await?;
+        let validator = ChecksumValidator::on(expected, trailers, self.pool.clone())?;
+        let (verified, data) = self
+            .receive(&shard, &input.key, input.body.take(), validator)
+            .await?;
 
         let put = Put {
             key: input.key,
@@ -301,6 +301,47 @@ impl<H: Shards> Objects<H> {
         };
         set_checksums!(output, &checksums);
         Ok(output)
+    }
+
+    /// Streams a request body of `key` into `shard` through `validator`:
+    /// inline, or as `EXTENT` records while it arrives ([`Upload`]). It
+    /// returns once the body has been read to its end and passed its
+    /// checks, and its extents are applied.
+    ///
+    /// # Errors
+    ///
+    /// `400 EntityTooLarge` past [`MAX_OBJECT_BYTES`], which is also the
+    /// largest part; the body's and the validator's errors.
+    async fn receive(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        body: Option<StreamingBlob>,
+        mut validator: ChecksumValidator,
+    ) -> S3Result<(VerifiedBody, PutData)> {
+        let mut upload = Upload::new(
+            self.shards.clone(),
+            shard.clone(),
+            key.to_owned(),
+            self.inline_max_bytes,
+            self.extent_bytes,
+        );
+        let mut body = s3s::Body::from(body.unwrap_or_else(empty_blob));
+        let mut length = 0u64;
+        while let Some(frame) = body.frame().await {
+            let Ok(data) = frame.map_err(|error| body_error(&*error))?.into_data() else {
+                continue;
+            };
+            length += data.len() as u64;
+            if length > MAX_OBJECT_BYTES {
+                return Err(entity_too_large());
+            }
+            upload.push(&data).await?;
+            validator.update(data).await?;
+        }
+        let verified = validator.finish().await?;
+        let data = upload.finish().await?;
+        Ok((verified, data))
     }
 
     pub(crate) async fn get(
@@ -397,27 +438,36 @@ impl<H: Shards> Objects<H> {
                 let bytes = range.check(object.size).map_err(|_| {
                     s3_error!(InvalidRange, "The requested range is not satisfiable")
                 })?;
-                return Ok(Found {
-                    shard,
-                    content_range: Some(format!(
-                        "bytes {}-{}/{}",
-                        bytes.start,
-                        bytes.end - 1,
-                        object.size
-                    )),
-                    object,
-                    bytes,
-                });
+                return Ok(Found::range(shard, object, bytes, None));
             }
-            // An object stored by a single PUT has one part.
-            (None, Some(1) | None) => 0..object.size,
-            (None, Some(_)) => return Err(invalid_part_number()),
+            (None, Some(number)) => {
+                if let Payload::Parts { parts, .. } = &object.payload {
+                    // A multipart object's parts are numbered in order from
+                    // 1, whatever numbers they were uploaded as.
+                    let index = usize::try_from(number)
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .filter(|&i| i < parts.len())
+                        .ok_or_else(invalid_part_number)?;
+                    let start: u64 = parts[..index].iter().map(|part| part.size).sum();
+                    let bytes = start..start + parts[index].size;
+                    let count = i32::try_from(parts.len()).ok();
+                    return Ok(Found::range(shard, object, bytes, count));
+                }
+                // An object stored by a single PUT has one part.
+                if number != 1 {
+                    return Err(invalid_part_number());
+                }
+                0..object.size
+            }
+            (None, None) => 0..object.size,
         };
         Ok(Found {
             shard,
             object,
             bytes,
             content_range: None,
+            parts_count: None,
         })
     }
 }
@@ -428,8 +478,32 @@ struct Found {
     object: ObjectVersion,
     /// The bytes to serve.
     bytes: std::ops::Range<u64>,
-    /// `Content-Range`, for a range request.
+    /// `Content-Range`, for a range or part of the object.
     content_range: Option<String>,
+    /// The number of parts of a multipart object, for a read of one of
+    /// them (`x-amz-mp-parts-count`).
+    parts_count: Option<i32>,
+}
+
+impl Found {
+    /// A read of the `bytes` of `object`, with their `Content-Range` unless
+    /// they are empty.
+    fn range(
+        shard: ShardRef,
+        object: ObjectVersion,
+        bytes: std::ops::Range<u64>,
+        parts_count: Option<i32>,
+    ) -> Self {
+        let content_range = (!bytes.is_empty())
+            .then(|| format!("bytes {}-{}/{}", bytes.start, bytes.end - 1, object.size));
+        Self {
+            shard,
+            object,
+            bytes,
+            content_range,
+            parts_count,
+        }
+    }
 }
 
 /// The response headers a GetObject or HeadObject request overrides with
@@ -528,13 +602,20 @@ fn storage_class(object: &ObjectVersion) -> Option<s3s::dto::StorageClass> {
 /// `400 InvalidArgument` for the write identity's reserved name, and
 /// `400 MetadataTooLarge` for user metadata over
 /// [`MAX_USER_METADATA_BYTES`] or metadata over what a record holds.
-fn stored_metadata(
-    standard: [(&str, Option<&String>); 6],
+fn stored_metadata(input: &PutObjectInput) -> S3Result<Metadata> {
+    metadata_of(standard_headers!(input), input.metadata.as_ref())
+}
+
+/// [`stored_metadata`] from the standard headers, as [`standard_headers!`]
+/// lists them, and the user metadata of a PutObject, a CopyObject, or a
+/// CreateMultipartUpload.
+fn metadata_of(
+    standard: [(&str, &Option<String>); 6],
     user: Option<&s3s::dto::Metadata>,
 ) -> S3Result<Metadata> {
     let mut metadata: Metadata = standard
         .into_iter()
-        .filter_map(|(name, value)| Some((name.to_owned(), value?.clone())))
+        .filter_map(|(name, value)| Some((name.to_owned(), value.clone()?)))
         .collect();
     let mut user_bytes = 0;
     for (name, value) in user.into_iter().flatten() {

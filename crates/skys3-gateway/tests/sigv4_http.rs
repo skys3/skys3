@@ -13,7 +13,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::ChecksumMode;
+use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
 use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 use bytes::Bytes;
 use common::signing::{KEY, NOW, SECRET, Signing, credentials, sdk_chunked, sdk_signed};
@@ -382,6 +382,191 @@ async fn the_aws_sdk_reads_and_writes_objects() {
         error.as_service_error().unwrap().is_not_found(),
         "{error:?}"
     );
+    client
+        .delete_bucket()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_aws_sdk_uploads_in_parts() {
+    let server = Server::start(Arc::new(SystemWallClock)).await;
+    let client = server.client(SECRET);
+    client
+        .create_bucket()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+
+    let created = client
+        .create_multipart_upload()
+        .bucket("photos")
+        .key("movie")
+        .checksum_algorithm(ChecksumAlgorithm::Crc32)
+        .metadata("owner", "test")
+        .send()
+        .await
+        .unwrap();
+    let id = created.upload_id().unwrap().to_owned();
+    assert_eq!(
+        created.checksum_algorithm(),
+        Some(&ChecksumAlgorithm::Crc32)
+    );
+
+    // A first part at the 5 MiB minimum, and a short last one. The SDK
+    // sends both as aws-chunked bodies with a trailing CRC32.
+    let first: Bytes = (0..5 * 1024 * 1024)
+        .map(|i: usize| (i % 249) as u8)
+        .collect();
+    let last = Bytes::from_static(b"the end");
+    let mut completed = Vec::new();
+    for (number, data) in [(1, &first), (2, &last)] {
+        let part = client
+            .upload_part()
+            .bucket("photos")
+            .key("movie")
+            .upload_id(&id)
+            .part_number(number)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+            .unwrap();
+        completed.push(
+            CompletedPart::builder()
+                .part_number(number)
+                .e_tag(part.e_tag().unwrap())
+                .checksum_crc32(part.checksum_crc32().unwrap())
+                .build(),
+        );
+    }
+    let listed = client
+        .list_parts()
+        .bucket("photos")
+        .key("movie")
+        .upload_id(&id)
+        .send()
+        .await
+        .unwrap();
+    let sizes: Vec<_> = listed.parts().iter().filter_map(|p| p.size()).collect();
+    assert_eq!(sizes, [5 * 1024 * 1024, 7]);
+    let uploads = client
+        .list_multipart_uploads()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+    let ids: Vec<_> = uploads
+        .uploads()
+        .iter()
+        .filter_map(|u| u.upload_id())
+        .collect();
+    assert_eq!(ids, [id.as_str()]);
+
+    let done = client
+        .complete_multipart_upload()
+        .bucket("photos")
+        .key("movie")
+        .upload_id(&id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let etag = done.e_tag().unwrap();
+    assert!(etag.ends_with("-2\""), "{etag}");
+    assert!(done.checksum_crc32().unwrap().ends_with("-2"), "{done:?}");
+
+    let got = client
+        .get_object()
+        .bucket("photos")
+        .key("movie")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.e_tag(), Some(etag));
+    assert_eq!(got.metadata().unwrap()["owner"], "test");
+    let body = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.len(), first.len() + last.len());
+    assert_eq!(body[first.len()..], last[..]);
+    let second = client
+        .get_object()
+        .bucket("photos")
+        .key("movie")
+        .part_number(2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.parts_count(), Some(2));
+    assert_eq!(second.body.collect().await.unwrap().into_bytes(), last);
+    let head = client
+        .head_object()
+        .bucket("photos")
+        .key("movie")
+        .part_number(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_length(), Some(5 * 1024 * 1024));
+
+    // An aborted upload is gone.
+    let aborted = client
+        .create_multipart_upload()
+        .bucket("photos")
+        .key("draft")
+        .send()
+        .await
+        .unwrap();
+    let aborted = aborted.upload_id().unwrap();
+    client
+        .upload_part()
+        .bucket("photos")
+        .key("draft")
+        .upload_id(aborted)
+        .part_number(1)
+        .body(ByteStream::from_static(b"draft"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .abort_multipart_upload()
+        .bucket("photos")
+        .key("draft")
+        .upload_id(aborted)
+        .send()
+        .await
+        .unwrap();
+    let error = client
+        .list_parts()
+        .bucket("photos")
+        .key("draft")
+        .upload_id(aborted)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some("NoSuchUpload"), "{error:?}");
+    let uploads = client
+        .list_multipart_uploads()
+        .bucket("photos")
+        .send()
+        .await
+        .unwrap();
+    assert!(uploads.uploads().is_empty(), "{uploads:?}");
+
+    client
+        .delete_object()
+        .bucket("photos")
+        .key("movie")
+        .send()
+        .await
+        .unwrap();
     client
         .delete_bucket()
         .bucket("photos")

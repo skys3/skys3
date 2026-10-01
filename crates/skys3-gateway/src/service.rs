@@ -19,7 +19,7 @@ use crate::authz::{self, Access, NoSignatures, Permissions};
 use crate::buckets::{Buckets, GatewayConfig, IdSource};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums};
 use crate::features;
-use crate::limits::{BodyKind, RequestLimits, Target};
+use crate::limits::{BodyKind, RequestLimits, RequestShape, Target};
 use crate::listing::Listings;
 use crate::objects::{self, Objects};
 use crate::shard::Shards;
@@ -256,7 +256,7 @@ impl<A: Authenticator> Gateway<A> {
                 .await
                 .map_err(|error| body_error(&inner.limits, &*error))?;
             inner.limits.check_xml(&bytes)?;
-            check_integrity(&parts, bytes, inner.hashing_pool.clone()).await?;
+            check_integrity(&parts, &shape, bytes, inner.hashing_pool.clone()).await?;
         }
         let head = parts.method == http::Method::HEAD;
         let mut response = inner
@@ -289,17 +289,31 @@ fn strip_trusted_extensions(extensions: &mut http::Extensions) {
 
 /// Checks an XML body against the `Content-MD5` or `x-amz-checksum-*` value
 /// its request supplies, as S3 does for every request that has one.
-/// DeleteObjects requires one (`crate::objects`).
+/// DeleteObjects requires one (`crate::objects`). The `x-amz-checksum-*`
+/// headers of CompleteMultipartUpload describe the completed object, not
+/// the body, so only its `Content-MD5` is checked here.
 ///
 /// # Errors
 ///
 /// The [`ChecksumValidator`]'s, such as `400 BadDigest`.
 async fn check_integrity(
     parts: &http::request::Parts,
+    shape: &RequestShape,
     body: bytes::Bytes,
     pool: Option<BlockingPool>,
 ) -> Result<(), S3Error> {
-    let expected = ExpectedChecksums::from_headers(&parts.headers)?;
+    let completes_upload = parts.method == Method::POST
+        && shape.target == Target::Object
+        && shape.query().any(|(name, _)| name == "uploadId");
+    let expected = if completes_upload {
+        let mut headers = http::HeaderMap::new();
+        for value in parts.headers.get_all("content-md5") {
+            headers.append("content-md5", value.clone());
+        }
+        ExpectedChecksums::from_headers(&headers)?
+    } else {
+        ExpectedChecksums::from_headers(&parts.headers)?
+    };
     if expected.content_md5().is_none() && expected.checksum().is_none() {
         return Ok(());
     }

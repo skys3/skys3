@@ -9,8 +9,9 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use s3s::dto::StreamingBlob;
 use s3s::{S3Result, s3_error};
-use skys3_index::Payload;
+use skys3_index::{ObjectPart, Payload};
 use skys3_log::record::ExtentRef;
+use skys3_types::EpochSeq;
 use tokio::sync::mpsc;
 
 use crate::buckets::shard_error;
@@ -44,20 +45,10 @@ pub(crate) async fn read<H: Shards>(
                 })?;
             Ok(StreamingBlob::from_bytes(data.slice(slice.0..slice.1)))
         }
-        Payload::Extents(extents) => {
-            let (sender, receiver) = mpsc::channel(1);
-            tokio::spawn(send_extents(
-                shards.clone(),
-                shard.clone(),
-                extents.clone(),
-                range.clone(),
-                sender,
-            ));
-            let body = ExtentBody {
-                receiver,
-                remaining: range.end - range.start,
-            };
-            Ok(StreamingBlob::from(s3s::Body::http_body(body)))
+        Payload::Extents(extents) => Ok(stream(shards, shard, extents.clone(), range)),
+        Payload::Parts { upload, parts } => {
+            let (extents, range) = part_extents(shards, shard, *upload, parts, range).await?;
+            Ok(stream(shards, shard, extents, range))
         }
         Payload::None => Err(not_cached()),
     }
@@ -70,6 +61,89 @@ pub(super) fn not_cached() -> s3s::S3Error {
         ServiceUnavailable,
         "The object's bytes are not cached on this cluster"
     )
+}
+
+/// Streams the bytes `range` of the body made of `extents`.
+fn stream<H: Shards>(
+    shards: &H,
+    shard: &ShardRef,
+    extents: Vec<ExtentRef>,
+    range: Range<u64>,
+) -> StreamingBlob {
+    let (sender, receiver) = mpsc::channel(1);
+    let remaining = range.end - range.start;
+    tokio::spawn(send_extents(
+        shards.clone(),
+        shard.clone(),
+        extents,
+        range,
+        sender,
+    ));
+    StreamingBlob::from(s3s::Body::http_body(ExtentBody {
+        receiver,
+        remaining,
+    }))
+}
+
+/// The bytes of the parts of a multipart object that `range` overlaps, as
+/// one list of extents, and `range` within them.
+///
+/// The parts are read from the index in one transaction before the
+/// response starts: a later write of the key drops them, and a read that
+/// resolved the object first still finds what it needs (§10.3). An inline
+/// part is one extent, its `MPU_PART` record.
+pub(super) async fn part_extents<H: Shards>(
+    shards: &H,
+    shard: &ShardRef,
+    upload: EpochSeq,
+    parts: &[ObjectPart],
+    range: Range<u64>,
+) -> S3Result<(Vec<ExtentRef>, Range<u64>)> {
+    // The parts `range` overlaps, and where the first of them starts.
+    let mut offset = 0;
+    let mut start = None;
+    let mut needed = Vec::new();
+    for part in parts {
+        let end = offset + part.size;
+        if end > range.start && offset < range.end {
+            start.get_or_insert(offset);
+            needed.push(*part);
+        }
+        offset = end;
+    }
+    let (Some(start), Some(first)) = (start, needed.first()) else {
+        return Ok((Vec::new(), 0..0));
+    };
+    let rows = shards
+        .parts(shard, upload, first.number - 1, needed.len())
+        .await
+        .map_err(shard_error)?;
+    let found: Vec<_> = rows.iter().map(|(n, part)| (*n, part.size)).collect();
+    let expected: Vec<_> = needed.iter().map(|part| (part.number, part.size)).collect();
+    if found != expected {
+        // The key was written again since the read resolved it.
+        return Err(s3_error!(
+            ServiceUnavailable,
+            "The object changed while it was read; please retry"
+        ));
+    }
+    let mut extents = Vec::new();
+    for (_, part) in rows {
+        match part.payload {
+            Payload::Inline(position) => {
+                if let Ok(len) = u32::try_from(part.size)
+                    && len > 0
+                {
+                    extents.push(ExtentRef { position, len });
+                }
+            }
+            Payload::Extents(part_extents) => extents.extend(part_extents),
+            _ => {
+                return Err(s3_error!(InternalError, "a part has no bytes"));
+            }
+        }
+    }
+    Ok((extents, range.start - start..range.end - start))
 }
 
 /// Reads the parts of `extents` that overlap `range`, in order, into
