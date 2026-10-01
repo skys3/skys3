@@ -446,3 +446,26 @@ async fn listings_merge_the_remote_while_the_import_runs() {
         .await;
     failing.assert(503, Some("ServiceUnavailable"));
 }
+
+#[tokio::test]
+async fn a_stopped_shard_never_falls_through_to_the_remote() {
+    let remote = Arc::new(Remote::default());
+    let (setup, bucket) = setup(&remote).await;
+    remote.running(None);
+    remote.put("a.txt", "hello");
+    // The key's shard stops: it refuses reads, so a miss cannot be told
+    // from an entry it would have held.
+    let shard = ShardRef::for_key(&bucket, "a.txt");
+    let local = setup.shards.local().set().get(&(&shard).into()).await;
+    local.unwrap().close().await.unwrap();
+
+    let head = setup.call(Method::HEAD, "/photos/a.txt", &[], "").await;
+    assert_eq!(head.status, 503);
+    let get = setup.call(Method::GET, "/photos/a.txt", &[], "").await;
+    get.assert(503, Some("ServiceUnavailable"));
+    let list = setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await;
+    list.assert(503, Some("ServiceUnavailable"));
+    assert_eq!(remote.lock().heads, 0, "nothing was read from the remote");
+}
