@@ -932,6 +932,21 @@ A `CONFIG` record holds a full shard configuration: epoch, primary, members, lea
 
 Parsing checks lengths before allocating, uses checked arithmetic, and rejects unknown versions. On recovery, a torn tail is cut back to the last record whose CRC verifies.
 
+**Segments.** The `skys3-log` crate's `SegmentLog` owns a disk's segments:
+
+- A segment file is named `<class>-<id>.seg`, with the class `hot` or `bulk` and the id as 16 lowercase hex digits. One counter per disk numbers segments of both classes, so ids follow creation order. Records hold no segment header: each record carries its own magic, version, and CRC.
+- `EXTENT` records go to bulk segments and every other kind to hot segments. A record in a hot segment carries at most `inline_max_bytes` of payload. Records of one class are written in the order they were queued. Records of different classes become durable independently, even in one group commit, so a `PUT` is appended only after its extents are acknowledged.
+- A record's location is `(segment id, offset, length)`. The log returns it on acknowledgement, and the location map (section 10.2) stores it for extents.
+- A class starts a new segment only between group commits: before a commit writes to a non-empty segment past `segment_bytes`. So every segment except the last of each class was fully synced before its successor existed, and only the last of each class can have a torn tail. A segment exceeds `segment_bytes` only if one group commit's records for the class do.
+
+**Recovery** scans the last segment of each class and stops at the first bytes that are not a record whose CRC verifies. It acts on the decoding error's class:
+
+- Incomplete: a torn tail, cut.
+- Corrupt (bad magic, impossible lengths, or a CRC mismatch): a crash leaves at most one group commit unsynced, less than `group_commit_max_bytes` plus one maximum-size record. If a verifiable record starts beyond that window, synced records were damaged, and recovery refuses to start. Otherwise the tail is cut, including whole records inside the window: they followed a lost record in an unacknowledged group commit.
+- Unsupported (a newer version or a kind this build does not define) or invalid (a verified CRC but a broken header): a whole record this build cannot use. Recovery refuses to start rather than cut it.
+
+Recovery then syncs those segments and the directory, so every record it leaves in place is durable even after a process crash that kept the page cache. Earlier segments are read by replay (section 10.2), where any error is damage.
+
 ### 10.2 Index and checkpoints
 
 A per-node `redb` database[^redb] holds:
@@ -954,6 +969,8 @@ Segments are reclaimed on each node, with no cross-node coordination, because pa
 ### 10.4 Durability discipline
 
 A member acknowledges a record only after `fdatasync` covers it. New segment files also get a directory `fsync`. Disk I/O runs on dedicated blocking workers, never on the Tokio reactor. Each disk has its own fixed pool of workers, so a stalled disk delays only its own I/O. A sync error takes the disk out of service, and the node reports it. It never acknowledges after a failed sync: as on Linux, the bytes a failed sync covered may be lost even if a later sync of the same file succeeds.
+
+Group commit runs as one task per disk. A group starts with the first queued record. It takes every record already queued, waits for more until `group_commit_max_delay_us` after the first record's arrival, and stops once it holds `group_commit_max_bytes`. The delay bounds only the wait: records that queued behind a slow sync of the previous group join the next group even if they arrived after its first record's deadline. Closing a group at the deadline would commit only one delay window of records per sync, so once syncs take longer than the delay, the queue would grow without bound. Tokio timers have millisecond resolution, so a delay below 1 ms rounds up to the next timer tick. The task writes each class's records with one append, syncs every file it wrote and, if it created a file, the directory, and only then acknowledges the group. The first I/O error of any kind (a write, a sync, or creating a file) takes the disk out of service: the group and every queued record fail, and the task never retries. After a sync error, the page cache can still show bytes the disk lost, and recovery cannot tell them from durable records, so a disk taken out of service is used again only after the host restarts.
 
 ## 11. S3 surface and workload identity
 

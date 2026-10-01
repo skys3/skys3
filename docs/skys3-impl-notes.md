@@ -350,6 +350,68 @@ of this file. A task with nothing unexpected keeps "None."
   A locally built cargo-fuzz never shows this, because its own triple is
   already the gnu host.
 
+### M1-02 Segments, group commit, and recovery
+
+- **A torn tail and damage look alike.** A disk may persist an unsynced
+  range out of order, so whole records can follow a missing one after a
+  crash, just as they follow a damaged record in the middle of a log. Two
+  rules separate the cases. First, a class starts a new segment only
+  between group commits, so only the last segment of each class can have
+  a torn tail. Second, a crash leaves at most one group commit unsynced,
+  so a record that verifies more than `group_commit_max_bytes` plus one
+  maximum-size record past a bad record means damage. Recovery then
+  refuses to start. Inside that window it cuts the tail. Lowering
+  `group_commit_max_bytes` while a node is down narrows the window, which
+  can make a torn tail look like damage, but never the reverse. Records
+  of an unknown version or kind, or with a verified CRC but a broken
+  header, also make recovery refuse to start. Design §10.1 records the
+  rules.
+- **A process restart after a failed sync can lose acknowledged records.**
+  The turmoil scenario found this on its first 256 seeds. After a failed
+  `fdatasync`, the page cache still showed the lost bytes. The restarted
+  process recovered them as valid records, appended after them, and
+  acknowledged. The next power loss zeroed the failed range, and recovery
+  cut the segment at the hole, losing the later acknowledged records.
+  Recovery cannot tell those bytes from durable ones. Design §10.4 now says
+  a disk taken out of service is used again only after the host restarts,
+  and the scenario models that. Nothing enforces it yet: startup (M1-13)
+  should keep a disk out of service until the host restarts, for example
+  by recording the boot ID with the failure.
+- **Recovery syncs what it keeps.** A process crash keeps the page cache
+  and directory entries that were never synced, so recovery sees records
+  and segment files that are not durable. Recovery syncs the last segment
+  of each class and the directory before the log appends anything. The
+  process-crash crash-point test fails without this.
+- **Tokio timers have millisecond resolution.** The default
+  `group_commit_max_delay_us = 500` rounds up to the next 1 ms tick. A
+  shorter wait would need a dedicated timer thread or spinning. The
+  configuration reference and §10.4 say so. The performance suite
+  (§16.3) should decide whether that matters.
+- **Simulated disk operations never yield.** `SimMount` finishes each
+  operation without yielding, so no record could queue behind a group
+  commit in progress. A deliberate mutation that kept committing after a
+  failed sync passed every test. The tests' audited disk now yields once per
+  operation, and a unit test queues records behind a failing commit. Six
+  deliberate mutations, including skipped data or directory syncs,
+  skipped recovery syncs, and a missing damage check, each fail at least one test.
+- **Any write-path I/O error takes the disk out of service**, not just a
+  failed sync. A short write on a full disk leaves a partial record in the
+  middle of a segment if appends continue, and truncating it is another
+  write that can fail. Admission control (M1-17) is meant to keep disks
+  from filling.
+- **Recovery verifies headers, not bodies.** Recovery checks each
+  record's fixed header and CRC, which is all a torn tail can break. A
+  body that breaks the format under a valid CRC comes from a faulty writer.
+  Replay (M1-03) decodes bodies and treats such a record as damage.
+- **The benchmark.** `cargo run --release -p skys3-log --example
+  group_commit_bench` runs concurrent appenders against a real disk and
+  prints records per group commit, throughput, and latency. It is an
+  example, not a criterion bench, to avoid a new dependency. On the
+  development container's disk, 64 writers of 4 KiB inline records with
+  the default 500 µs delay got about 60 records per group commit (214
+  commits for 12,800 records, about 15,000 records per second). A single
+  writer gets one record per commit.
+
 ### M1-05 Control store interface and local backends
 
 - **Which ID keys a bucket register.** The layout said `buckets/<bucket>.json`

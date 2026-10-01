@@ -1623,8 +1623,11 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32c",
+ "skys3-config",
+ "skys3-io",
  "skys3-types",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
