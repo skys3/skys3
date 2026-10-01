@@ -9,19 +9,30 @@
 //! configuration while the store is unreachable. Writes, which only bucket
 //! creation and deletion make, fail as unavailable until then. Each sync
 //! after that replaces the copy.
+//!
+//! The file control store is opened through [`open_file_store`], which
+//! records the node and data directory that own it and refuses a store
+//! that is not this node's, or that looks reset under a node that has
+//! synced from it before.
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use skys3_control::{
-    ControlError, ControlStore, DeleteOutcome, Expected, KeyPrefix, PutOutcome, RegisterKey,
-    RetryPolicy, Version, Versioned, read_cluster,
+    ControlError, ControlStore, DeleteOutcome, Expected, FileControlStore, FileStoreConfig,
+    KeyPrefix, PutOutcome, RegisterKey, RetryPolicy, Version, Versioned, read_cluster,
 };
 use skys3_index::{ControlEntry, Index, IndexError};
-use skys3_types::{ClusterId, Generation};
+use skys3_io::BlockingPool;
+use skys3_types::{ClusterId, Generation, NodeId};
+
+use crate::datadir::{self, DataDirError, HasFormat};
 
 /// The prefixes of the registers the node copies.
 fn copied() -> [KeyPrefix; 2] {
@@ -148,37 +159,242 @@ where
     }
 }
 
+/// The file control store's record of its owner, `.owner.json` in its
+/// directory, beside the store's own lock file.
+pub const OWNER_FILE: &str = ".owner.json";
+
+/// The node and data directory a file control store belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreOwner {
+    format: u32,
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    instance_id: String,
+}
+
+impl StoreOwner {
+    /// The owner record of `node` in `cluster`, whose data directory has
+    /// `instance_id`.
+    #[must_use]
+    pub fn new(cluster_id: ClusterId, node_id: NodeId, instance_id: String) -> Self {
+        Self {
+            format: datadir::FORMAT,
+            cluster_id,
+            node_id,
+            instance_id,
+        }
+    }
+}
+
+impl HasFormat for StoreOwner {
+    fn format(&self) -> u32 {
+        self.format
+    }
+}
+
+/// Why [`open_file_store`] did not give the node a store.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenStoreError {
+    /// The store could not be opened or read; it may answer later.
+    #[error(transparent)]
+    Unavailable(#[from] ControlError),
+    /// The store is not the one this node synced from: its directory is
+    /// missing or names no owner, or it has no `cluster.json`. A volume
+    /// that is not mounted looks like this. The node never replaces such a
+    /// store by itself (§6.2): rebuilding one is an operator's decision.
+    #[error("{0}")]
+    Reset(String),
+    /// The store belongs to another node or data directory.
+    #[error("{0}")]
+    Foreign(String),
+}
+
+impl From<DataDirError> for OpenStoreError {
+    fn from(error: DataDirError) -> Self {
+        match error {
+            DataDirError::Io { path, source } => Self::Unavailable(ControlError::Io(
+                io::Error::new(source.kind(), format!("{}: {source}", path.display())),
+            )),
+            other => Self::Foreign(other.to_string()),
+        }
+    }
+}
+
+/// A file control store [`open_file_store`] opened.
+#[derive(Debug)]
+pub struct OpenedStore {
+    /// The store.
+    pub store: FileControlStore,
+    /// Whether this open claimed an empty store for the node. Its
+    /// registers are then new, so they say nothing about which buckets
+    /// exist.
+    pub claimed: bool,
+}
+
+/// Opens the file control store in `root` for `owner`, running its I/O on
+/// `pool`.
+///
+/// A store that names `owner` is opened. One that names another node or
+/// data directory is refused. A node that has synced from a store before
+/// (`initialized`) requires its directory, its owner record, and
+/// `cluster.json` to exist; otherwise the store is reported as reset and
+/// left alone. Only a node that never synced claims a store, and only an
+/// empty one.
+///
+/// # Errors
+///
+/// [`OpenStoreError`].
+pub async fn open_file_store(
+    root: &Path,
+    owner: &StoreOwner,
+    initialized: bool,
+    pool: &BlockingPool,
+) -> Result<OpenedStore, OpenStoreError> {
+    let exists = {
+        let root = root.to_owned();
+        on(pool, move || match std::fs::symlink_metadata(&root) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(ControlError::Io(error).into()),
+        })
+        .await?
+    };
+    if initialized && !exists {
+        return Err(OpenStoreError::Reset(format!(
+            "the control store directory {} is missing; this node has synced from it before, \
+             so it is not created again (is its volume mounted?)",
+            root.display()
+        )));
+    }
+    let config = FileStoreConfig {
+        root: root.to_owned(),
+        node: owner.node_id.clone(),
+    };
+    let store =
+        FileControlStore::open(config, pool.clone())
+            .await
+            .map_err(|error| match error {
+                ControlError::SecondNode { .. } => OpenStoreError::Foreign(error.to_string()),
+                other => OpenStoreError::Unavailable(other),
+            })?;
+    let recorded = {
+        let path = root.join(OWNER_FILE);
+        on(pool, move || Ok(datadir::read_json::<StoreOwner>(&path)?)).await?
+    };
+    let claimed = match recorded {
+        Some(recorded) if recorded == *owner => false,
+        Some(recorded) => {
+            return Err(OpenStoreError::Foreign(format!(
+                "the control store in {} belongs to node {} (data directory instance {}) in \
+                 cluster {}, not to node {} (instance {}); the file backend serves one node",
+                root.display(),
+                recorded.node_id,
+                recorded.instance_id,
+                recorded.cluster_id,
+                owner.node_id,
+                owner.instance_id
+            )));
+        }
+        None if initialized => {
+            return Err(OpenStoreError::Reset(format!(
+                "the control store in {} names no owner, but this node has synced from its \
+                 store before; it is not claimed again",
+                root.display()
+            )));
+        }
+        None => {
+            if !store.list(&KeyPrefix::root()).await?.is_empty() {
+                return Err(OpenStoreError::Foreign(format!(
+                    "the control store in {} holds registers but names no owner; a node \
+                     claims only an empty store",
+                    root.display()
+                )));
+            }
+            let (root, owner) = (root.to_owned(), owner.clone());
+            on(pool, move || {
+                Ok(datadir::write_json(&root, OWNER_FILE, &owner)?)
+            })
+            .await?;
+            true
+        }
+    };
+    if initialized && store.get(&RegisterKey::cluster()).await?.is_none() {
+        return Err(OpenStoreError::Reset(format!(
+            "the control store in {} has no cluster.json, but this node has synced from it \
+             before; it is not bootstrapped again",
+            root.display()
+        )));
+    }
+    Ok(OpenedStore { store, claimed })
+}
+
+/// Runs `job` on `pool`.
+async fn on<T: Send + 'static>(
+    pool: &BlockingPool,
+    job: impl FnOnce() -> Result<T, OpenStoreError> + Send + 'static,
+) -> Result<T, OpenStoreError> {
+    pool.run(job)
+        .await
+        .map_err(|error| OpenStoreError::Unavailable(ControlError::Io(io::Error::from(error))))?
+}
+
 /// The control store the gateway and STS use: the node's store, or its
-/// local copy until the store has answered once.
+/// local copy until the store has answered once. A node that could not
+/// open its store at startup has none until [`NodeStore::attach`].
 ///
 /// Clones share the state.
 #[derive(Debug, Clone)]
 pub struct NodeStore<C> {
-    store: C,
-    /// The copy reads are served from while the store has not answered.
-    kept: Arc<RwLock<Option<Arc<ControlCopy>>>>,
+    state: Arc<RwLock<State<C>>>,
 }
 
-impl<C: ControlStore> NodeStore<C> {
+#[derive(Debug)]
+struct State<C> {
+    store: Option<C>,
+    /// The copy reads are served from while the store has not answered.
+    kept: Option<Arc<ControlCopy>>,
+}
+
+/// Where a request goes.
+enum Route<C> {
+    Store(C),
+    Copy(Arc<ControlCopy>),
+}
+
+impl<C: ControlStore + Clone> NodeStore<C> {
     /// `store`, used directly.
     pub fn live(store: C) -> Self {
+        Self::with(Some(store), None)
+    }
+
+    /// `store`, if the node has one, read through `copy` until
+    /// [`NodeStore::go_live`].
+    pub fn from_copy(store: Option<C>, copy: ControlCopy) -> Self {
+        Self::with(store, Some(Arc::new(copy)))
+    }
+
+    fn with(store: Option<C>, kept: Option<Arc<ControlCopy>>) -> Self {
         Self {
-            store,
-            kept: Arc::default(),
+            state: Arc::new(RwLock::new(State { store, kept })),
         }
     }
 
-    /// `store`, read through `copy` until [`NodeStore::go_live`].
-    pub fn from_copy(store: C, copy: ControlCopy) -> Self {
-        Self {
-            store,
-            kept: Arc::new(RwLock::new(Some(Arc::new(copy)))),
-        }
+    /// Gives a node that runs from its copy the store it opened since.
+    pub fn attach(&self, store: C) {
+        self.state
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .store = Some(store);
     }
 
-    /// Uses the store directly from now on.
+    /// Uses the store directly from now on. A node without a store keeps
+    /// its copy.
     pub fn go_live(&self) {
-        *self.kept.write().unwrap_or_else(PoisonError::into_inner) = None;
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        if state.store.is_some() {
+            state.kept = None;
+        }
     }
 
     /// Whether requests go to the store rather than the local copy.
@@ -186,16 +402,30 @@ impl<C: ControlStore> NodeStore<C> {
         self.kept().is_none()
     }
 
-    /// The store itself.
-    pub fn store(&self) -> &C {
-        &self.store
+    /// The store itself, if the node has one.
+    pub fn store(&self) -> Option<C> {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .store
+            .clone()
     }
 
     fn kept(&self) -> Option<Arc<ControlCopy>> {
-        self.kept
+        self.state
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .kept
             .clone()
+    }
+
+    fn route(&self) -> Route<C> {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        match (&state.kept, &state.store) {
+            (Some(copy), _) => Route::Copy(Arc::clone(copy)),
+            (None, Some(store)) => Route::Store(store.clone()),
+            (None, None) => unreachable!("a node goes live only with a store"),
+        }
     }
 
     fn unavailable() -> ControlError {
@@ -207,12 +437,13 @@ impl<C: ControlStore> NodeStore<C> {
     }
 }
 
-impl<C: ControlStore> ControlStore for NodeStore<C> {
+impl<C: ControlStore + Clone> ControlStore for NodeStore<C> {
     type Changes = C::Changes;
 
     async fn get(&self, key: &RegisterKey) -> Result<Option<Versioned>, ControlError> {
-        let Some(copy) = self.kept() else {
-            return self.store.get(key).await;
+        let copy = match self.route() {
+            Route::Store(store) => return store.get(key).await,
+            Route::Copy(copy) => copy,
         };
         if !copied().iter().any(|prefix| key.starts_with(prefix)) {
             return Err(Self::unavailable());
@@ -226,10 +457,10 @@ impl<C: ControlStore> ControlStore for NodeStore<C> {
         expected: Expected,
         value: Bytes,
     ) -> Result<PutOutcome, ControlError> {
-        if self.kept().is_some() {
-            return Err(Self::unavailable());
+        match self.route() {
+            Route::Store(store) => store.put_if(key, expected, value).await,
+            Route::Copy(_) => Err(Self::unavailable()),
         }
-        self.store.put_if(key, expected, value).await
     }
 
     async fn delete_if(
@@ -237,15 +468,16 @@ impl<C: ControlStore> ControlStore for NodeStore<C> {
         key: &RegisterKey,
         expected: &Version,
     ) -> Result<DeleteOutcome, ControlError> {
-        if self.kept().is_some() {
-            return Err(Self::unavailable());
+        match self.route() {
+            Route::Store(store) => store.delete_if(key, expected).await,
+            Route::Copy(_) => Err(Self::unavailable()),
         }
-        self.store.delete_if(key, expected).await
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<(RegisterKey, Version)>, ControlError> {
-        let Some(copy) = self.kept() else {
-            return self.store.list(prefix).await;
+        let copy = match self.route() {
+            Route::Store(store) => return store.list(prefix).await,
+            Route::Copy(copy) => copy,
         };
         if !copied()
             .iter()
@@ -262,7 +494,10 @@ impl<C: ControlStore> ControlStore for NodeStore<C> {
     }
 
     async fn changes(&self, after: Generation) -> Result<Self::Changes, ControlError> {
-        self.store.changes(after).await
+        match self.store() {
+            Some(store) => store.changes(after).await,
+            None => Err(Self::unavailable()),
+        }
     }
 }
 
@@ -330,7 +565,7 @@ mod tests {
             .put_if(&late, Expected::Absent, Bytes::from_static(b"{}"))
             .await
             .unwrap();
-        let node = NodeStore::from_copy(store.clone(), copy);
+        let node = NodeStore::from_copy(Some(store.clone()), copy);
         assert!(!node.is_live());
         assert!(node.get(&late).await.unwrap().is_none());
         assert!(node.get(&key("buckets/a.json")).await.unwrap().is_some());
@@ -363,9 +598,35 @@ mod tests {
         );
         assert!(node.changes(Generation::ZERO).await.is_ok());
         assert_eq!(
-            node.store().list(&KeyPrefix::root()).await.unwrap().len(),
+            node.store()
+                .unwrap()
+                .list(&KeyPrefix::root())
+                .await
+                .unwrap()
+                .len(),
             5
         );
+    }
+
+    #[tokio::test]
+    async fn a_node_without_a_store_keeps_its_copy_until_one_is_attached() {
+        let (store, cluster) = store_with_registers().await;
+        let copy = ControlCopy::fetch(&store, &cluster, &RetryPolicy::default(), Duration::ZERO)
+            .await
+            .unwrap();
+        let node = NodeStore::from_copy(None, copy);
+        node.go_live();
+        assert!(!node.is_live());
+        assert!(node.store().is_none());
+        assert!(node.get(&key("buckets/a.json")).await.unwrap().is_some());
+        assert!(matches!(
+            node.changes(Generation::ZERO).await,
+            Err(ControlError::Unavailable(_))
+        ));
+        node.attach(store);
+        node.go_live();
+        assert!(node.is_live());
+        assert!(node.get(&key("nodes/n.json")).await.unwrap().is_some());
     }
 
     #[tokio::test]

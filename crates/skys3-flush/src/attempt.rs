@@ -65,6 +65,10 @@ pub(crate) enum Outcome {
     Settled,
     /// The remote changed out of band.
     Conflict(Conflict),
+    /// The version is a completed multipart upload, which only a remote
+    /// multipart upload with the same part boundaries reproduces (§7.4,
+    /// plan M1-16b). It waits, dirty, for a newer version or that flush.
+    AwaitsMultipart,
     /// A retryable failure: back off and try again.
     Retry(String),
 }
@@ -133,6 +137,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         object: &ObjectVersion,
         known: Option<ETag>,
     ) -> Result<Outcome, Failure> {
+        if matches!(object.payload, Payload::Parts { .. }) {
+            return Ok(Outcome::AwaitsMultipart);
+        }
         let version = entry.version;
         let identity = self
             .target
@@ -314,6 +321,11 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             // An imported or evicted stub changed by `TAGS`: its bytes must
             // be filled from the remote first (plan M1-20).
             Payload::None => return Err(Failure::Local("the version has no local bytes".into())),
+            Payload::Parts { .. } => {
+                return Err(Failure::Local(
+                    "a multipart object is not sent whole".into(),
+                ));
+            }
         };
         if body.len() as u64 != object.size {
             return Err(Failure::Local(format!(

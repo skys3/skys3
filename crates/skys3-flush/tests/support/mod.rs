@@ -12,7 +12,9 @@ use bytes::Bytes;
 use skys3_flush::{FlushSettings, ShardFlusher, Target};
 use skys3_index::{Entry, EntryState, Index, IndexConfig};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
-use skys3_log::record::{Delete, Put, PutData, Tags};
+use skys3_log::record::{
+    CompletedPart, Delete, MpuComplete, MpuCreate, MpuPart, Put, PutData, Tags,
+};
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
 use skys3_remote::probe::{ConditionalWrites, OperationSupport, PreconditionSupport};
 use skys3_shard::{Shard, ShardSet};
@@ -124,6 +126,46 @@ impl Node {
         committed.position.seq.get()
     }
 
+    /// Uploads `parts` of `key` as a multipart upload and completes it;
+    /// returns the `seq` of the `MPU_COMPLETE`.
+    pub async fn multipart(&self, key: &str, parts: &[&str]) -> u64 {
+        let create = RecordBody::MpuCreate(MpuCreate {
+            key: key.to_owned(),
+            initiated_ms: 1_700_000_000_000,
+            metadata: BTreeMap::from([("content-type".to_owned(), "video/mp4".to_owned())]),
+            tags: BTreeMap::new(),
+            checksum: None,
+        });
+        let upload = self.shard.commit(create).await.unwrap().position;
+        let mut completed = Vec::new();
+        for (number, body) in (1..).zip(parts) {
+            let part = RecordBody::MpuPart(MpuPart {
+                key: key.to_owned(),
+                upload,
+                part_number: number,
+                size: body.len() as u64,
+                last_modified_ms: 1_700_000_000_001,
+                etag: md5_etag(body.as_bytes()),
+                checksums: BTreeMap::new(),
+                data: PutData::Inline(Bytes::copy_from_slice(body.as_bytes())),
+            });
+            let position = self.shard.commit(part).await.unwrap().position;
+            completed.push(CompletedPart { number, position });
+        }
+        let complete = RecordBody::MpuComplete(MpuComplete {
+            key: key.to_owned(),
+            upload,
+            last_modified_ms: 1_700_000_000_002,
+            size: parts.iter().map(|body| body.len() as u64).sum(),
+            etag: ETag::new(format!("{:032x}-{}", upload.seq.get(), parts.len())).unwrap(),
+            checksums: BTreeMap::new(),
+            parts: completed,
+        });
+        let committed = self.shard.commit(complete).await.unwrap();
+        assert!(committed.outcome.is_applied(), "{:?}", committed.outcome);
+        committed.position.seq.get()
+    }
+
     /// Commits a DELETE of `key`.
     pub async fn delete(&self, key: &str) -> u64 {
         let body = RecordBody::Delete(Delete {
@@ -158,22 +200,41 @@ impl Node {
             .collect()
     }
 
-    /// Waits until the flusher has nothing left to do but hold conflicts,
-    /// and the index shows only the conflicted keys unclean.
+    /// Waits until the flusher has nothing left to do but hold conflicts
+    /// and multipart objects, and the index shows only those unclean.
     pub async fn settle(&self, flusher: &ShardFlusher) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+        let patience = Patience::new();
         loop {
             let status = flusher.status();
             let unclean = self.unclean().await;
-            if status.dirty == 0 && unclean.len() == status.conflicts.len() {
+            let held = status.conflicts.len() + status.awaiting_multipart.len();
+            if status.dirty == 0 && unclean.len() == held {
                 return;
             }
             assert!(
-                tokio::time::Instant::now() < deadline,
+                !patience.is_exhausted(),
                 "the flush did not settle: {status:?}, unclean: {unclean:?}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+
+/// How long a test waits for a condition, in real time. The runtime's
+/// paused clock jumps ahead whenever the runtime idles, also while the
+/// index work runs on real blocking threads, so a bound in virtual time
+/// could expire before that work is done.
+pub struct Patience(std::time::Instant);
+
+impl Patience {
+    /// A minute from now.
+    pub fn new() -> Patience {
+        Patience(std::time::Instant::now() + Duration::from_secs(60))
+    }
+
+    /// Whether the wait should give up.
+    pub fn is_exhausted(&self) -> bool {
+        std::time::Instant::now() >= self.0
     }
 }
 

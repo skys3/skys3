@@ -55,6 +55,14 @@ pub enum ConditionFailed {
     /// The key's object does not satisfy the precondition.
     #[error("the precondition does not hold")]
     PreconditionFailed,
+    /// A multipart record names an upload that is not open (`404
+    /// NoSuchUpload`).
+    #[error("the upload is not open")]
+    NoSuchUpload,
+    /// A completion names a part that is missing, or was replaced while the
+    /// completion was prepared (`400 InvalidPart`).
+    #[error("a part is not the one the completion names")]
+    InvalidPart,
 }
 
 impl Precondition {
@@ -110,8 +118,28 @@ impl From<ConditionFailed> for S3Error {
         match failed {
             ConditionFailed::NoSuchKey => no_such_key(),
             ConditionFailed::PreconditionFailed => precondition_failed(),
+            ConditionFailed::NoSuchUpload => no_such_upload(),
+            ConditionFailed::InvalidPart => invalid_part(),
         }
     }
+}
+
+/// `404 NoSuchUpload`.
+pub(crate) fn no_such_upload() -> S3Error {
+    s3_error!(
+        NoSuchUpload,
+        "The specified upload does not exist. The upload ID may be invalid, or the upload may \
+         have been aborted or completed."
+    )
+}
+
+/// `400 InvalidPart`.
+pub(crate) fn invalid_part() -> S3Error {
+    s3_error!(
+        InvalidPart,
+        "One or more of the specified parts could not be found. The part may not have been \
+         uploaded, or the specified entity tag may not match the part's entity tag."
+    )
 }
 
 /// The conditional headers of a read.

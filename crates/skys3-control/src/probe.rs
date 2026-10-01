@@ -39,9 +39,16 @@ use crate::store::{ControlError, ControlStore, Expected, Version, Versioned};
 /// register write takes, so `409` conflicts are retried and lost responses
 /// are resolved as in production. A round passes when:
 ///
-/// - exactly one writer's proposal is accepted, and
+/// - exactly one writer's proposal is accepted,
 /// - every other writer, reading the register right after it lost, reads
-///   the winner's value at the winner's version.
+///   the winner's value at the winner's version, and
+/// - a listing of the scratch registers right after the round shows every
+///   register written so far at its latest version, and nothing else.
+///
+/// The listing check is there because change streams list the registers
+/// once per generation they observe (design §6.2): a listing that lags the
+/// writes a generation announces would lose those writes until the next
+/// increment.
 ///
 /// # Deletes
 ///
@@ -50,9 +57,9 @@ use crate::store::{ControlError, ControlStore, Expected, Version, Versioned};
 /// honor. After the rounds, the probe deletes each scratch register once
 /// at a version it no longer has, which must be refused, then at its
 /// current version, which must succeed, and then reads it, which must find
-/// nothing. A store that ignores or rejects the precondition is refused
-/// like one that fails a round (design §6.1 says why there is no
-/// fallback).
+/// nothing, and a listing must no longer show it. A store that ignores or
+/// rejects the precondition is refused like one that fails a round
+/// (design §6.1 says why there is no fallback).
 ///
 /// # Cleanup
 ///
@@ -205,6 +212,13 @@ pub enum ProbeFailure {
     /// A delete at the register's current version was refused.
     #[error("a conditional delete at the current version was refused")]
     DeleteRefused,
+    /// A listing missed a register written before it, showed an old
+    /// version, or showed a deleted register.
+    #[error("a listing showed {found}")]
+    StaleListing {
+        /// What the listing got wrong.
+        found: String,
+    },
     /// A register was read after it was deleted.
     #[error("a deleted register was still read")]
     DeletedStillRead,
@@ -284,17 +298,72 @@ impl<S: ControlStore> Run<'_, S> {
     async fn probe(&mut self) -> Result<(), StepError> {
         for round in 0..self.probe.rounds {
             let key = self.probe.key(round % self.probe.keys);
-            self.round(round, &key)
+            let lister = &self.writers[round as usize % self.writers.len()];
+            let checked = async {
+                self.round(round, &key).await?;
+                self.check_listing(lister).await
+            };
+            checked
                 .await
                 .map_err(|failure| (format!("round {round} on {key}"), failure))?;
         }
-        let registers = std::mem::take(&mut self.registers);
-        for (key, (current, previous)) in registers {
-            self.delete(&key, current, previous)
+        let keys: Vec<RegisterKey> = self.registers.keys().cloned().collect();
+        for key in keys {
+            let checked = async {
+                let (current, previous) = self.registers[&key].clone();
+                self.delete(&key, current, previous).await?;
+                self.registers.remove(&key);
+                self.check_listing(&self.writers[1]).await
+            };
+            checked
                 .await
                 .map_err(|failure| (format!("the deletion of {key}"), failure))?;
         }
         Ok(())
+    }
+
+    /// Lists the scratch registers through `lister`, which must show
+    /// exactly the registers written so far, each at its latest version.
+    async fn check_listing(&self, lister: &S) -> Result<(), ProbeFailure> {
+        let prefix = self.probe.scratch_prefix();
+        let policy = &self.probe.policy;
+        let mut attempts = 0;
+        let listed = loop {
+            attempts += 1;
+            match lister.list(&prefix).await {
+                Ok(listed) => break listed,
+                Err(error) if error.is_retryable() && attempts < policy.max_attempts => {
+                    tokio::time::sleep(policy.initial_backoff).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let listed: BTreeMap<RegisterKey, Version> = listed.into_iter().collect();
+        let written = self
+            .registers
+            .iter()
+            .map(|(key, (version, _))| (key, version));
+        for (key, version) in written {
+            match listed.get(key) {
+                Some(found) if found == version => {}
+                Some(found) => {
+                    return Err(ProbeFailure::StaleListing {
+                        found: format!("{key} at version {found}, not {version}"),
+                    });
+                }
+                None => {
+                    return Err(ProbeFailure::StaleListing {
+                        found: format!("no {key}"),
+                    });
+                }
+            }
+        }
+        match listed.keys().find(|key| !self.registers.contains_key(*key)) {
+            Some(key) => Err(ProbeFailure::StaleListing {
+                found: format!("{key}, which is deleted or was never written"),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// One round: every writer proposes, exactly one wins, and the losers
@@ -339,6 +408,10 @@ impl<S: ControlStore> Run<'_, S> {
         let [(value, version)] = winners[..] else {
             return Err(ProbeFailure::Winners(winners.len()));
         };
+        // Recorded before the checks, so the cleanup knows the version.
+        let previous = self.registers.get(key).map(|(current, _)| current.clone());
+        self.registers
+            .insert(key.clone(), (version.clone(), previous));
         for read in attempts.iter().filter_map(|(_, _, read)| read.as_ref()) {
             match read {
                 Some(read) if read.value == value && read.version == *version => {}
@@ -354,9 +427,6 @@ impl<S: ControlStore> Run<'_, S> {
                 }
             }
         }
-        let previous = self.registers.get(key).map(|(current, _)| current.clone());
-        self.registers
-            .insert(key.clone(), (version.clone(), previous));
         Ok(())
     }
 
@@ -394,9 +464,16 @@ impl<S: ControlStore> Run<'_, S> {
         let mut leftovers = Vec::new();
         for n in 0..self.probe.keys.min(self.probe.rounds) {
             let key = self.probe.key(n);
-            // A store with stale reads may show a deleted value again, so
-            // the deletes are bounded.
+            let known = self.registers.get(&key).map(|(version, _)| version);
+            // A store with stale reads may show a deleted value again, or
+            // a present one as absent, so the version the probe knows is
+            // deleted first, and the deletes are bounded.
             let removed = async {
+                if let Some(version) = known {
+                    propose_delete(store, &key, version, policy)
+                        .await
+                        .map(drop)?;
+                }
                 for _ in 0..policy.max_attempts {
                     match get_with_retries(store, &key, policy).await? {
                         Some(current) => propose_delete(store, &key, &current.version, policy)

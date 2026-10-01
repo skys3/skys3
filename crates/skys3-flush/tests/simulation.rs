@@ -42,6 +42,7 @@ const FAULTS: SimS3Faults = SimS3Faults {
     lost_request_probability: 0.04,
     lost_response_probability: 0.08,
     stale_read_probability: 0.0,
+    stale_list_probability: 0.0,
 };
 
 const KEYS: u32 = 6;

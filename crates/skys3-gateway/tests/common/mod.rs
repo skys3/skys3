@@ -195,7 +195,7 @@ pub fn request(method: Method, uri: &str, headers: &[(&str, &str)], body: &str) 
 
 pub async fn answer(response: Response<Body>) -> Answer {
     let (parts, mut body) = response.into_parts();
-    let bytes = body.store_all_limited(1 << 20).await.unwrap();
+    let bytes = body.store_all_limited(1 << 26).await.unwrap();
     Answer {
         status: parts.status,
         headers: parts.headers,

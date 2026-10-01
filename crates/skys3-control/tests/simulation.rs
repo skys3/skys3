@@ -68,6 +68,7 @@ const S3_FAULTS: SimS3Faults = SimS3Faults {
     lost_request_probability: 0.02,
     lost_response_probability: 0.03,
     stale_read_probability: 0.0,
+    stale_list_probability: 0.0,
 };
 
 /// The control prefix in the simulated bucket.

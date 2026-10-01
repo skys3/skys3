@@ -36,6 +36,8 @@ pub struct Gauges {
     pub flush_lag: f64,
     /// Keys held in conflict.
     pub conflicted_keys: u64,
+    /// Keys whose latest version waits for multipart flush.
+    pub awaiting_multipart_keys: u64,
 }
 
 /// The flush metrics of a node.
@@ -45,6 +47,7 @@ pub struct FlushMetrics {
     oldest_dirty_age: Family<Labels, Gauge<f64, AtomicU64>>,
     flush_lag: Family<Labels, Gauge<f64, AtomicU64>>,
     conflicted_keys: Family<Labels, Gauge>,
+    awaiting_multipart_keys: Family<Labels, Gauge>,
     flushes: Family<Labels, Counter>,
     retries: Family<Labels, Counter>,
     conflicts: Family<Labels, Counter>,
@@ -79,6 +82,12 @@ impl FlushMetrics {
             "conflicted_keys",
             "Keys whose flush found an out-of-band remote write, held under the hold policy.",
             metrics.conflicted_keys.clone(),
+        );
+        registry.register(
+            "awaiting_multipart_flush_keys",
+            "Dirty keys whose latest version is a multipart object, which waits for multipart \
+             flush.",
+            metrics.awaiting_multipart_keys.clone(),
         );
         registry.register(
             "flushes",
@@ -123,6 +132,9 @@ impl FlushMetrics {
         self.conflicted_keys
             .get_or_create(&labels)
             .set(saturate(gauges.conflicted_keys));
+        self.awaiting_multipart_keys
+            .get_or_create(&labels)
+            .set(saturate(gauges.awaiting_multipart_keys));
     }
 
     /// Forgets `bucket`'s series, once it is no longer flushed here.
@@ -132,6 +144,7 @@ impl FlushMetrics {
         self.oldest_dirty_age.remove(&labels);
         self.flush_lag.remove(&labels);
         self.conflicted_keys.remove(&labels);
+        self.awaiting_multipart_keys.remove(&labels);
     }
 }
 

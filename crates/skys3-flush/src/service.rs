@@ -60,7 +60,8 @@ impl BucketStatus {
             dirty_bytes: statuses.clone().map(|s| s.dirty_bytes).sum(),
             oldest_dirty_age: age(statuses.clone().filter_map(|s| s.oldest_dirty).min()),
             flush_lag: age(statuses.clone().filter_map(|s| s.oldest_pending).min()),
-            conflicted_keys: statuses.map(|s| s.conflicts.len() as u64).sum(),
+            conflicted_keys: statuses.clone().map(|s| s.conflicts.len() as u64).sum(),
+            awaiting_multipart_keys: statuses.map(|s| s.awaiting_multipart.len() as u64).sum(),
         }
     }
 }

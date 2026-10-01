@@ -14,11 +14,12 @@ use skys3_log::RecordBody;
 use skys3_remote::{ObjectStore, PutObject, UserMetadata};
 use skys3_sim::SimS3;
 use skys3_sim::s3::{Fault, Operation};
-use support::{Node, identity, md5_etag, remote, runtime, target, target_with, writes};
+use support::{Node, Patience, identity, md5_etag, remote, runtime, target, target_with, writes};
 
 /// Waits until `key`'s phase satisfies `check`.
 async fn wait_for(flusher: &ShardFlusher, key: &str, check: impl Fn(Option<&Phase>) -> bool) {
-    for _ in 0..10_000 {
+    let patience = Patience::new();
+    while !patience.is_exhausted() {
         if check(flusher.phase(key).as_ref()) {
             return;
         }
@@ -340,7 +341,8 @@ fn a_flusher_stops_with_its_shard() {
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(!flusher.is_stopped());
         node.shard.close().await.unwrap();
-        for _ in 0..1000 {
+        let patience = Patience::new();
+        while !patience.is_exhausted() {
             if flusher.is_stopped() {
                 break;
             }
@@ -380,5 +382,72 @@ fn a_version_that_cannot_be_sent_is_retried_and_reported() {
             remote_object(&store, "k"),
             Some(("fixed".to_owned(), Some(identity(seq))))
         );
+    });
+}
+
+#[test]
+fn multipart_objects_wait_without_holding_up_other_keys() {
+    runtime().block_on(async {
+        let node = Node::open(13).await;
+        let store = remote(13, false);
+        let first = node.put("over", "v1").await;
+        node.put("gone", "v1").await;
+        let flusher = node.flusher(&target(&store));
+        node.settle(&flusher).await;
+
+        // Completed multipart objects over flushed keys and a new one.
+        node.multipart("over", &["aaaa", "bb"]).await;
+        node.multipart("gone", &["c"]).await;
+        node.multipart("fresh", &["ddd"]).await;
+        let plain = node.put("plain", "p").await;
+        node.settle(&flusher).await;
+
+        // They wait, dirty, apart from the line and from conflicts; the
+        // remote keeps what it had, and other keys flush.
+        let status = flusher.status();
+        assert_eq!(status.awaiting_multipart, ["fresh", "gone", "over"]);
+        assert!(status.conflicts.is_empty() && status.last_error.is_none());
+        assert_eq!((status.dirty, status.dirty_bytes), (0, 10));
+        assert!(status.oldest_dirty.is_some());
+        assert_eq!(status.oldest_pending, None);
+        for key in ["over", "gone", "fresh"] {
+            assert_eq!(flusher.phase(key), Some(Phase::AwaitsMultipart));
+            assert_eq!(node.entry(key).await.unwrap().state, EntryState::Dirty);
+        }
+        assert_eq!(
+            remote_object(&store, "over"),
+            Some(("v1".to_owned(), Some(identity(first))))
+        );
+        assert_eq!(remote_object(&store, "fresh"), None);
+        assert_eq!(
+            remote_object(&store, "plain"),
+            Some(("p".to_owned(), Some(identity(plain))))
+        );
+
+        // A tag change keeps the parts, so the key still waits; so it does
+        // for a restarted flusher.
+        node.tag("over", &[("kind", "video")]).await;
+        flusher.stop().await;
+        let flusher = node.flusher(&target(&store));
+        node.settle(&flusher).await;
+        assert_eq!(flusher.status().awaiting_multipart.len(), 3);
+        assert_eq!(remote_object(&store, "over").unwrap().0, "v1");
+
+        // An overwrite and tombstones flush as usual.
+        let over = node.put("over", "v2").await;
+        node.delete("gone").await;
+        node.delete("fresh").await;
+        node.settle(&flusher).await;
+        assert_eq!(
+            remote_object(&store, "over"),
+            Some(("v2".to_owned(), Some(identity(over))))
+        );
+        assert_eq!(remote_object(&store, "gone"), None);
+        assert_eq!(remote_object(&store, "fresh"), None);
+        assert_eq!(node.entry("over").await.unwrap().state, EntryState::Clean);
+        assert!(node.entry("gone").await.is_none() && node.entry("fresh").await.is_none());
+        let status = flusher.status();
+        assert!(status.awaiting_multipart.is_empty() && status.conflicts.is_empty());
+        assert_eq!((status.dirty, status.dirty_bytes), (0, 0));
     });
 }

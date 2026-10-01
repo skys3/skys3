@@ -60,8 +60,9 @@
 //! # Kind-specific headers
 //!
 //! Each defined kind's fields are encoded in the declaration order of its
-//! body type ([`Put`], [`Delete`], [`Extent`], [`Tags`], [`Flushed`],
-//! [`Import`], [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
+//! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
+//! [`MpuComplete`], [`MpuAbort`], [`Tags`], [`Flushed`], [`Import`],
+//! [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
 //! without the bucket, shard, and epoch the fixed header holds, and
 //! `TRUNCATE`, which has no fields):
 //!
@@ -75,9 +76,13 @@
 //!   order, so every map has exactly one encoding,
 //! - checksums as a map from the algorithm's code (`u8`) to its digest,
 //!   followed by the `u16` part count of a `COMPOSITE` checksum, or zero,
-//! - a `PUT`'s data as a tag byte: 0 for inline data, which is the payload;
-//!   or 1 for extents, followed by a `u32` count and, per extent, its
-//!   position and a `u32` length.
+//! - a `PUT`'s or `MPU_PART`'s data as a tag byte: 0 for inline data, which
+//!   is the payload; or 1 for extents, followed by a `u32` count and, per
+//!   extent, its position and a `u32` length,
+//! - an `MPU_CREATE`'s checksum as an option of the algorithm's code (`u8`)
+//!   and the type (`u8`: 0 for `FULL_OBJECT`, 1 for `COMPOSITE`), and an
+//!   `MPU_COMPLETE`'s parts as a `u16` count followed by each part's
+//!   number (`u16`) and position, in increasing part number.
 //!
 //! # Decoding
 //!
@@ -95,6 +100,7 @@
 mod body;
 mod error;
 mod header;
+mod multipart;
 mod wire;
 
 use bytes::Bytes;
@@ -107,6 +113,7 @@ pub use body::{
 };
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
+pub use multipart::{CompletedPart, MpuAbort, MpuComplete, MpuCreate, MpuPart, UploadChecksum};
 pub use skys3_types::checksum::{Checksum, ChecksumAlgorithm, ChecksumType, Checksums};
 
 use wire::Writer;

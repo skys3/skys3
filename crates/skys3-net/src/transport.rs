@@ -264,6 +264,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Incoming<S> {
 }
 
 /// An authenticated connection to a peer.
+///
+/// [`Connection::send`] returns only once the frame is written to the
+/// socket, and a frame larger than the socket buffers is written only as
+/// the peer reads it. So a task that sends large frames must not be the
+/// one that reads the peer's frames, or two peers that send at once wait
+/// for each other forever: split the connection with
+/// [`Connection::into_split`] and receive on a task of its own. Calling
+/// `send` and `recv` from one task suits request and reply exchanges
+/// where only one side writes at a time.
 pub struct Connection<S> {
     receiver: Receiver<S>,
     sender: Sender<S>,

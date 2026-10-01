@@ -13,7 +13,7 @@ use skys3_remote::probe::ConditionalOperation;
 use skys3_sim::SimS3;
 use skys3_sim::s3::{Conditionals, SimS3Config, SimS3Faults};
 use skys3_types::{BucketDocument, BucketMode, BucketName, ProposalId, RemoteTarget, ShardCount};
-use support::{Node, cluster, identity, runtime, settings, shard_ref};
+use support::{Node, Patience, cluster, identity, runtime, settings, shard_ref};
 
 fn bucket(mode: BucketMode) -> BucketDocument {
     BucketDocument {
@@ -53,7 +53,8 @@ async fn reconcile_until_probed(
     node: &Node,
     bucket: &BucketDocument,
 ) -> ProbeStatus {
-    for _ in 0..1000 {
+    let patience = Patience::new();
+    while !patience.is_exhausted() {
         service
             .reconcile(std::slice::from_ref(bucket), &node.set)
             .await;
@@ -84,7 +85,8 @@ fn flushes_write_back_buckets_under_their_prefix() {
                 unprotected: Vec::new()
             }
         );
-        for _ in 0..1000 {
+        let patience = Patience::new();
+        while !patience.is_exhausted() {
             if store.object("team/cat.jpg").is_some() {
                 break;
             }
@@ -98,7 +100,8 @@ fn flushes_write_back_buckets_under_their_prefix() {
         // The probe cleaned up after itself.
         assert_eq!(store.keys(), ["team/cat.jpg"]);
 
-        // A conflict shows in the status and the metrics.
+        // A conflict and a multipart object show in the status and the
+        // metrics.
         let mut metadata = skys3_remote::UserMetadata::new();
         metadata.insert("writer", "other").unwrap();
         skys3_remote::ObjectStore::put_object(
@@ -108,9 +111,11 @@ fn flushes_write_back_buckets_under_their_prefix() {
         .await
         .unwrap();
         node.put("dog.jpg", "bark").await;
+        node.multipart("clip.mp4", &["ab", "cd"]).await;
         let status = loop {
             let status = service.status(&bucket.bucket_id).unwrap();
-            if status.shards[0].1.conflicts.len() == 1 {
+            let shard = &status.shards[0].1;
+            if shard.conflicts.len() == 1 && shard.awaiting_multipart.len() == 1 {
                 break status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -120,14 +125,16 @@ fn flushes_write_back_buckets_under_their_prefix() {
         wall.advance(Duration::from_secs(100));
         let gauges = status.gauges(wall.now());
         assert_eq!(gauges.conflicted_keys, 1);
-        assert_eq!(gauges.dirty_bytes, 4);
+        assert_eq!(gauges.awaiting_multipart_keys, 1);
+        assert_eq!(gauges.dirty_bytes, 8);
         assert_eq!(gauges.flush_lag, 0.0);
         assert_eq!(gauges.oldest_dirty_age, 100.0);
         service.refresh_metrics();
         let text = registry.encode().unwrap();
         for line in [
-            "skys3_dirty_bytes{bucket=\"photos\"} 4",
+            "skys3_dirty_bytes{bucket=\"photos\"} 8",
             "skys3_conflicted_keys{bucket=\"photos\"} 1",
+            "skys3_awaiting_multipart_flush_keys{bucket=\"photos\"} 1",
             "skys3_flush_conflicts_total{bucket=\"photos\"} 1",
             "skys3_flushes_total{bucket=\"photos\"} 1",
             "skys3_oldest_dirty_age_seconds{bucket=\"photos\"} 100.0",

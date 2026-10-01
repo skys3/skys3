@@ -25,9 +25,10 @@
 //! - **Versioning**, when enabled, keeps every version, adds delete markers,
 //!   and serves reads and deletes of specific versions.
 //! - **Read-after-write consistency**, as on AWS S3, unless
-//!   [`Fault::StaleRead`] faults make a `GetObject` or `HeadObject` answer
-//!   with what the key held before its latest write, to model a store the
-//!   control-store probe must refuse (design §6.1).
+//!   [`Fault::StaleRead`] faults make a `GetObject` or `HeadObject`
+//!   answer, or a `ListObjectsV2` list, what keys held before their latest
+//!   write, to model stores the control-store probe must refuse (design
+//!   §6.1).
 //!
 //! Faults come from a generator seeded at creation, and the store never
 //! reads the wall clock, so a simulation seed replays them exactly. Delays
@@ -533,8 +534,8 @@ impl ObjectStore for SimS3 {
     }
 
     async fn list_objects_v2(&self, request: ListObjectsV2) -> S3Result<ListObjectsV2Output> {
-        self.request(Operation::ListObjectsV2, Tracking::NONE, |bucket, _| {
-            bucket.list_objects_v2(&request)
+        self.request(Operation::ListObjectsV2, Tracking::NONE, |bucket, stale| {
+            bucket.list_objects_v2(&request, stale)
         })
         .await
     }

@@ -1067,6 +1067,96 @@ of this file. A task with nothing unexpected keeps "None."
   remote's listing (§9.1); the import task adds that. The configuration
   key for shared token keys comes with multi-node gateways.
 
+### M1-12 Multipart upload, local
+
+- **The upload ID is the `MPU_CREATE` position.** Formatted as 32 hex
+  digits, it is unique within the shard, needs no generator, and is the
+  write identity the completed object carries (`write_identity =
+  Some(upload)`), so M1-16b can hand it to the remote
+  `CreateMultipartUpload` unchanged. An ID that does not parse answers
+  `404 NoSuchUpload`, never `400`. AbortMultipartUpload looks the upload up
+  before committing, so an ID that never named an upload stays out of the
+  log.
+- **Versions moved in three places, not four.** Defining reserved record
+  kinds needs no new log version (design §10.1), so the log stays at
+  format 2. The index value format went to 3 (a `Parts` entry payload,
+  and the upload and part values, which exist only in format 3); readers
+  still take formats 1 and 2. The redb database got a format version bump
+  of its own, 1 to 2, for the `uploads` and `parts` tables; opening a
+  format 1 index creates them and rewrites the version, which
+  `tests/uploads.rs` exercises.
+- **Parts live beside the entry, not in it.** A completed object's entry
+  holds only part numbers and sizes (`Payload::Parts`); each part's
+  payload stays in the `parts` table under the upload. A GET reads the
+  part rows it needs in one call before streaming, flattens them into the
+  extent list M1-09's streaming already serves (an inline part becomes one
+  "extent" covering its record), and answers `503` if the rows no longer
+  match the entry. For a 10,000-part object the rows are read in one go;
+  paging them is left for when it matters.
+- **Releasing is removing location-map rows.** An aborted upload's parts,
+  a replaced part, the parts a completion leaves out, and a part refused
+  because its upload is gone all leave the location map when the
+  orphaning record applies. Shard tests check that their positions no
+  longer locate. Replaced object versions are not released, since a read
+  of the old version may still be streaming; M1-22 must drop released
+  records without a reference check and find the rest by reference
+  (design §10.3).
+- **The shard guards completion, not just the gateway.** The gateway
+  checks the listed parts, then commits an `MPU_COMPLETE` that names each
+  part's `MPU_PART` position. The state machine rejects it
+  (`PartChanged`, `NoSuchUpload`) if a part was uploaded again or the
+  upload ended meanwhile, and `LocalShards` maps those to `400
+  InvalidPart` and `404 NoSuchUpload`. `MPU_CREATE`, `MPU_PART`, and
+  `MPU_ABORT` do not take the key's conditional-write slot, so they never
+  wait behind a conditional PUT; `MPU_COMPLETE` does.
+- **`partNumber` counts kept parts.** On a multipart object `partNumber=N`
+  serves the Nth part of the completed object, numbering from 1 in order,
+  even if the parts were uploaded as 1, 3, and 7. This is what the stored
+  form (numbers and sizes in order) gives directly; if S3 turns out to
+  use the uploaded numbers, the entry already keeps them.
+- **Checksums follow the upload.** Each part computes the upload's
+  algorithm, or CRC64NVME, through `ChecksumValidator::requiring`, so
+  completion can always fold a `MultipartChecksum`. A part that supplies a
+  different algorithm than the upload's is refused with S3's "Checksum
+  Type mismatch" `400 InvalidRequest`; with no upload algorithm any
+  supplied value is checked and kept beside the CRC64NVME. Completion
+  checks a part's checksum only when the request lists one, which the
+  SDKs do for uploads created with an algorithm.
+- **Known vectors.** The s3-tests three-part upload (5 MiB of `A`, `B`,
+  and `C`) completes with S3's ETag `b2add96cc9702bbf4efb0ccdfc6b7747-3`
+  and composite SHA256 `uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=-3`
+  through the HTTP pipeline; the Rust SDK drives every operation over a
+  real socket in `sigv4_http.rs`.
+- **s3s details.** It serializes XML fields alphabetically, so
+  `CommonPrefixes` precede the top-level `Prefix`, and it omits an empty
+  `Prefix`. It does not escape quotes in ETags. `encoding-type` on
+  ListMultipartUploads is ignored and not echoed.
+- **Listings after M1-11.** Open uploads live outside the namespace
+  table, so ListObjects never sees them, and a completed object lists
+  with its multipart ETag and size like any other entry; a gateway test
+  checks both. ListMultipartUploads keeps its own merge rather than M1-11's
+  `listing::merge`, which is typed to `ListQuery` and `ListItem` and pages
+  by item rather than by (key, upload).
+- **Review fixes.** ListParts first checked that the upload was open
+  and then read its parts in a second index read, so an abort between the
+  two answered `200` with no parts, which no serialization point
+  produces. `Shards::upload` now returns the upload with a page of its
+  parts from one read transaction, and CompleteMultipartUpload uses the
+  same read. Completion compared only the digest of a supplied
+  whole-object checksum, so a composite value with the wrong `-N`, or
+  none, passed; it now compares the parsed value, part count included,
+  and so does the per-part check. `max-parts=0` and `max-uploads=0`
+  answered a truncated page with no marker, which cannot be continued;
+  they now answer an empty final page, as the simulator models S3, and
+  ListParts names `NextPartNumberMarker` only on truncated pages.
+- **Test helper limit.** The shared `answer` helper read at most 1 MiB of
+  body; multipart objects are at least 5 MiB, so it now reads up to
+  64 MiB.
+- **Left open.** UploadPartCopy is M4-05, and cleanup of abandoned
+  uploads M5-10. Eviction (M1-21) must drop part rows along with the
+  entry it turns into a stub. `x-amz-if-match-initiated-time` on abort
+  answers `501`.
+
 ### M1-13 Node binary and startup recovery
 
 - **The configuration had nowhere to put a node.** Design §14 named no
@@ -1120,6 +1210,26 @@ of this file. A task with nothing unexpected keeps "None."
   from the local copy could drop a bucket created after the copy was
   taken, so a node that starts from its copy reclaims nothing (design
   §4.1).
+- **The file store did not know whose it was.** Review found three gaps.
+  `FileControlStore::open` creates a missing directory, so a node whose
+  control volume was not mounted bootstrapped an empty store, synced no
+  buckets, and reclaimed every shard. The store refuses a second node only
+  through `nodes/` registrations, which nothing writes yet, so a second
+  node pointed at the directory loaded the first node's catalog over
+  empty shards. And an error opening the store stopped startup before the
+  kept copy was consulted. `control::open_file_store` now checks the
+  directory before opening it and keeps an owner record, `.owner.json`
+  (cluster, node ID, and a random `instance_id` that `node.json` gained),
+  beside the store's lock file; the store's loader skips dot files. A node
+  that has a copy treats a missing directory, a missing owner record, or
+  a missing `cluster.json` as a reset store: it never bootstraps it, runs
+  from the copy, and retries; a node without a copy claims only an empty
+  store. Another owner stops startup (`StartError::ControlStore`). An
+  open that fails otherwise runs from the copy too: `NodeStore` may hold
+  no store, and the follow task reopens it every `config_poll_interval`.
+  Orphans are reclaimed only when the start read a store it did not
+  claim. The owner record lives in this crate rather than in
+  `skys3-control`, because whether to claim depends on the node's copy.
 - **The index outlived the node in one process.** Restarting a node
   in-process failed with redb's `DatabaseAlreadyOpen`: each shard's
   pipeline task holds the index until it notices, on another task, that
@@ -1314,6 +1424,24 @@ of this file. A task with nothing unexpected keeps "None."
   and not superseding the shard's own earlier writes. No fuzz target was
   added: the flusher parses nothing new (write identities go through the
   existing `WriteIdentity` parser).
+- **Multipart objects wait for M1-16b.** The flusher's branch merges M1-12.
+  A completed multipart object (`Payload::Parts`) cannot be flushed as one
+  `PutObject`: that would give it an MD5 ETag rather than the multipart
+  ETag, and lose its part boundaries. Its attempt ends at once, without
+  touching the remote, in a new `Phase::AwaitsMultipart`.
+  - The key leaves the line and the flush lag. It stays in `dirty_bytes`
+    and the oldest dirty age, because it is loss exposure.
+  - It is not a conflict and is not retried. A newer version puts it back
+    in line: an overwrite PUT or a DELETE flushes normally, conditioned on
+    what the remote last had. A `TAGS` keeps the parts, so the key waits
+    again.
+  - The admin flush status lists such keys as `awaiting_multipart`, and
+    the gauge `skys3_awaiting_multipart_flush_keys` counts them.
+  - The shard now also reports `MPU_COMPLETE` to its subscriber. Without
+    this, a running flusher would not see a multipart object written over a
+    clean key until its next restart.
+  - M1-16b replaces the early return in `Attempt::put` with a multipart
+    flush.
 - **Left open.** Multipart objects (M1-16b) and copies flushed as
   `CopyObject` (§7.2's copy row; a copy is flushed as a `PutObject` of its
   bytes, which is correct but transfers them) are not done. A version
@@ -1557,6 +1685,21 @@ of this file. A task with nothing unexpected keeps "None."
   equals the handshake timeout, so the scenario raises it, and only every
   sixteenth seed waits out a handshake timeout, which costs about 10,000
   simulated ticks.
+- **A test hung CI on smaller socket buffers.** A real-TCP test sent a
+  3 MiB frame and only then read it, on a single-threaded runtime. Locally
+  the loopback socket buffers held the whole frame, so it passed; on CI's
+  runners they did not, and the send waited forever for a reader, which
+  stalled every job running all tests. Capping `tcp_rmem` and `tcp_wmem`
+  at 1 MiB reproduces it. The test now sends and receives together, over
+  a test `Network` that sets 16 KiB `SO_SNDBUF` and `SO_RCVBUF`
+  (`SmallBuffers`), so it exercises small buffers on every host; a new
+  test has both peers send multi-MiB frames at once over split
+  connections. Every network wait in the transport tests is bounded at
+  30 s (`Bounded::bounded` in `tests/common`), so a regression fails with
+  the waiting line instead of hanging; the simulation's waits are bounded
+  by turmoil's simulated duration. The library itself does not deadlock
+  when both peers send, as long as each connection's receiver runs on its
+  own task; `Connection` documents that.
 - **rcgen without its defaults.** rcgen's default features pull `ring`, a
   second crypto provider; the workspace entry enables only `aws_lc_rs`, and
   tests write PEM with the workspace's `base64` instead of rcgen's `pem`
@@ -1627,3 +1770,24 @@ of this file. A task with nothing unexpected keeps "None."
 - **No fuzz target.** The backend parses nothing new: listed keys go
   through the existing `RegisterKey` grammar, and values through the
   existing document parsing.
+- **Listings need the same consistency as reads (review).** The first
+  probe checked only reads, so a store with consistent `GetObject` but
+  lagging `ListObjectsV2` passed, and its change streams would miss writes
+  a generation announced: the feed lists once per generation, and a
+  generation does not name the registers it announces, so the feed cannot
+  tell a lagging listing from a complete one. The probe now lists the
+  scratch registers after every round and every deletion, and refuses a
+  store whose listing misses a register, shows an old version, or shows a
+  deleted one; design §6.1 records why the feed does not relist instead.
+  `SimS3` gained `stale_list_probability`, and a scripted
+  `Fault::StaleRead` now also makes a listing stale. Stale reads are now
+  drawn only for `GetObject` and `HeadObject`, which changed the draws of
+  profiles with stale reads; they were new in this PR. That change exposed
+  that the probe's cleanup stopped at a stale read showing a register as
+  absent, so the cleanup now first deletes at the version the probe knows.
+- **The prefix bound was the backend's alone (review).** The backend
+  refuses prefixes over 512 bytes (S3's 1,024-byte key limit less the
+  longest register key), which configuration accepted. Configuration now
+  applies `ControlStoreConfig::MAX_PREFIX_LEN`, and a test in
+  `skys3-control` checks that it equals the backend's bound, derived from
+  `skys3-remote`, which `skys3-config` does not depend on.

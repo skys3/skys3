@@ -3,8 +3,9 @@
 //! (design §10.1, §10.4).
 //!
 //! The data directory holds `node.json`, written once when the node is
-//! created: its cluster, its ID, and its disks, each with a label and the
-//! path it was configured at. Each disk directory holds `disk.json`, which
+//! created: its cluster, its ID, a random instance ID that names this data
+//! directory (the file control store records it as its owner), and its
+//! disks, each with a label and the path it was configured at. Each disk directory holds `disk.json`, which
 //! names the cluster, the node, and the disk's label, so a disk mounted at
 //! the wrong path, or another node's disk, is never used. A node keeps the
 //! disks it was created with: shard replicas are placed on disks by label
@@ -39,8 +40,9 @@ pub const FENCE_FILE: &str = "out-of-service.json";
 const LOCK_FILE: &str = ".lock";
 /// Where Linux reports the current boot's ID.
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
-/// The format of `node.json`, `disk.json`, and the fence.
-const FORMAT: u32 = 1;
+/// The format of `node.json`, `disk.json`, the fence, and the file control
+/// store's owner file.
+pub(crate) const FORMAT: u32 = 1;
 
 /// Why the data directory cannot be used.
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +109,9 @@ struct NodeFile {
     format: u32,
     cluster_id: ClusterId,
     node_id: NodeId,
+    /// Random, set when the node is created: two data directories never
+    /// share it, even when configured with the same node ID.
+    instance_id: String,
     disks: Vec<RecordedDisk>,
 }
 
@@ -146,6 +151,7 @@ pub struct DiskDir {
 pub struct DataDir {
     path: PathBuf,
     node_id: NodeId,
+    instance_id: String,
     disks: Vec<DiskDir>,
     _lock: File,
 }
@@ -183,6 +189,7 @@ impl DataDir {
         Ok(Self {
             path,
             node_id: node.node_id,
+            instance_id: node.instance_id,
             disks,
             _lock: lock,
         })
@@ -198,6 +205,13 @@ impl DataDir {
     #[must_use]
     pub fn node_id(&self) -> &NodeId {
         &self.node_id
+    }
+
+    /// The data directory's instance ID: random, set when the node was
+    /// created.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// The node's disks, in the order they were configured when the node
@@ -284,6 +298,7 @@ fn create_node(
         format: FORMAT,
         cluster_id: cluster.clone(),
         node_id,
+        instance_id: random_base32(26),
         disks,
     };
     write_json(dir, NODE_FILE, &node)?;
@@ -294,12 +309,16 @@ fn create_node(
 /// A node ID for a node whose configuration sets none: `n-` and 16 random
 /// base-32 characters.
 fn generate_node_id() -> NodeId {
+    NodeId::new(format!("n-{}", random_base32(16))).expect("the alphabet makes a valid node ID")
+}
+
+/// `len` random lowercase base-32 characters.
+fn random_base32(len: usize) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut rng = rand::rng();
-    let suffix: String = (0..16)
+    (0..len)
         .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
-        .collect();
-    NodeId::new(format!("n-{suffix}")).expect("the alphabet makes a valid node ID")
+        .collect()
 }
 
 /// Whether `dir` holds log segments.
@@ -391,7 +410,7 @@ pub fn boot_id() -> Option<String> {
 }
 
 /// Reads a JSON file, or `None` if it does not exist.
-fn read_json<T: for<'de> Deserialize<'de> + HasFormat>(
+pub(crate) fn read_json<T: for<'de> Deserialize<'de> + HasFormat>(
     path: &Path,
 ) -> Result<Option<T>, DataDirError> {
     let bytes = match fs::read(path) {
@@ -417,7 +436,11 @@ fn read_json<T: for<'de> Deserialize<'de> + HasFormat>(
 
 /// Writes `value` as `dir/name` durably: a synced temporary file, renamed
 /// over the name, then a sync of the directory.
-fn write_json(dir: &Path, name: &str, value: &impl Serialize) -> Result<(), DataDirError> {
+pub(crate) fn write_json(
+    dir: &Path,
+    name: &str,
+    value: &impl Serialize,
+) -> Result<(), DataDirError> {
     let bytes = serde_json::to_vec_pretty(value).expect("the file serializes");
     let temporary = dir.join(format!(".{name}.tmp"));
     let mut file = File::create(&temporary).map_err(io_error(&temporary))?;
@@ -436,7 +459,7 @@ fn sync_dir(dir: &Path) -> Result<(), DataDirError> {
 }
 
 /// The files with a format number.
-trait HasFormat {
+pub(crate) trait HasFormat {
     fn format(&self) -> u32;
 }
 

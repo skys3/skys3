@@ -14,8 +14,8 @@ use skys3_shard::{
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
-    at, config, delete, extent, flushed, import, index_config, open_log, pool, put, put_extents,
-    runtime, shard, tags,
+    at, config, delete, extent, flushed, import, index_config, mpu_complete, mpu_create, mpu_part,
+    open_log, pool, put, put_extents, runtime, shard, tags,
 };
 
 /// A node's disk, log, index, and pool.
@@ -686,6 +686,13 @@ fn subscribers_see_applied_client_writes() {
         let first = shard.commit(put("a", 3, 1)).await.unwrap();
         let tagged = shard.commit(tags("a", "x")).await.unwrap();
         let deleted = shard.commit(delete("b")).await.unwrap();
+        // An upload and its parts change no version; its completion does.
+        let upload = shard.commit(mpu_create("m")).await.unwrap().position;
+        let part = shard.commit(mpu_part("m", upload, 1, 4, vec![])).await;
+        let parts = [(1, part.unwrap().position)];
+        let completed = shard.commit(mpu_complete("m", upload, &parts, 4)).await;
+        let completed = completed.unwrap();
+        assert!(completed.outcome.is_applied());
         // A rejected TAGS and a FLUSHED change no version and are not
         // reported. The lazy FLUSHED rides the next commit's group.
         shard.commit(tags("missing", "x")).await.unwrap();
@@ -697,6 +704,7 @@ fn subscribers_see_applied_client_writes() {
             ("a", first.position, Some(3)),
             ("a", tagged.position, None),
             ("b", deleted.position, Some(0)),
+            ("m", completed.position, Some(4)),
             ("c", next.position, Some(1)),
         ];
         for (key, position, size) in expected {
@@ -708,7 +716,7 @@ fn subscribers_see_applied_client_writes() {
         }
         let entries = shard.entries(None, 10).await.unwrap();
         let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
-        assert_eq!(keys, ["a", "b", "c"]);
+        assert_eq!(keys, ["a", "b", "c", "m"]);
         assert_eq!(shard.entries(Some("a".into()), 1).await.unwrap()[0].0, "b");
 
         // A new subscription ends the old one, and closing ends both.

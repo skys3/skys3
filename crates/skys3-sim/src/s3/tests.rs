@@ -866,6 +866,58 @@ async fn random_stale_reads_follow_their_probability() {
     assert!((60..140).contains(&stale), "{stale}");
 }
 
+#[tokio::test]
+async fn stale_listings_list_keys_from_before_their_latest_write() {
+    let store = store();
+    let listed = async || {
+        let page = store.list_objects_v2(ListObjectsV2::new("")).await.unwrap();
+        page.objects
+            .into_iter()
+            .map(|o| (o.key, o.etag.as_str().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    let old = put(&store, "a", "one").await.etag;
+    put(&store, "b", "gone").await;
+    put(&store, "c", "never written before").await;
+    // "a" is overwritten, "b" deleted, and "c" created: a stale listing
+    // shows none of the latest writes.
+    let new = put(&store, "a", "two").await.etag;
+    store.delete_object(DeleteObject::new("b")).await.unwrap();
+    store.inject(Operation::ListObjectsV2, Fault::StaleRead);
+    let gone = md5_hex(b"gone");
+    assert_eq!(
+        listed().await,
+        [
+            ("a".to_owned(), old.as_str().to_owned()),
+            ("b".to_owned(), gone)
+        ]
+    );
+    // Without the fault, listings are current.
+    assert_eq!(
+        listed().await,
+        [
+            ("a".to_owned(), new.as_str().to_owned()),
+            ("c".to_owned(), md5_hex(b"never written before")),
+        ]
+    );
+    // Reads draw stale_read_probability, listings stale_list_probability.
+    store.set_faults(SimS3Faults {
+        stale_list_probability: 1.0,
+        ..SimS3Faults::NONE
+    });
+    assert_eq!(
+        store
+            .get_object(GetObject::new("a"))
+            .await
+            .unwrap()
+            .info
+            .etag,
+        new
+    );
+    assert_eq!(listed().await.len(), 2);
+    assert_eq!(listed().await[0].1, old.as_str());
+}
+
 #[tokio::test(start_paused = true)]
 async fn delays_hold_both_legs_of_a_request() {
     let store = store();

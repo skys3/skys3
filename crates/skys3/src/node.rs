@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -12,8 +12,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{
-    ControlError, FileControlStore, FileStoreConfig, ProposalIds, RetryPolicy, bootstrap,
-    read_cluster,
+    ControlError, FileControlStore, ProposalIds, RetryPolicy, bootstrap, read_cluster,
 };
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
@@ -37,7 +36,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
-use crate::control::{ControlCopy, NodeStore};
+use crate::control::{ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 
@@ -96,6 +95,10 @@ pub enum StartError {
     /// from.
     #[error("the control store: {0}")]
     Control(#[from] ControlError),
+    /// The control store belongs to another node or data directory, or
+    /// looks reset to a node with no copy to run from.
+    #[error("the control store: {0}")]
+    ControlStore(String),
     /// A static credential's secret could not be loaded.
     #[error(transparent)]
     Credentials(#[from] CredentialError),
@@ -180,6 +183,9 @@ struct Shared {
     index: Arc<Index>,
     pools: Pools,
     store: Store,
+    /// The file control store's directory and owner, for reopening it.
+    control_dir: PathBuf,
+    owner: StoreOwner,
     shards: NodeShards,
     gateway: NodeGateway,
     identity: Arc<IdentityCopy>,
@@ -226,7 +232,8 @@ impl Shared {
     async fn refresh_copy(&self) -> Result<ControlCopy, StartError> {
         let started = self.wall.now();
         let cluster = &self.config.cluster().cluster_id;
-        let copy = ControlCopy::fetch(self.store.store(), cluster, &self.retry, started).await?;
+        let store = self.store.store().ok_or_else(no_store)?;
+        let copy = ControlCopy::fetch(&store, cluster, &self.retry, started).await?;
         let (index, kept) = (Arc::clone(&self.index), copy.clone());
         on_pool(&self.pools.index, move || kept.save(&index)).await?;
         Ok(copy)
@@ -271,7 +278,7 @@ impl Shared {
             let known = self.generation();
             if self.store.is_live() {
                 let after = known.unwrap_or(Generation::ZERO);
-                match self.store.store().changes(after).await {
+                match self.store.changes(after).await {
                     Ok(mut changes) => {
                         if let Ok(Err(error)) = timeout(interval, changes.next()).await {
                             tracing::warn!(%error, "the control store's change stream failed");
@@ -286,7 +293,14 @@ impl Shared {
             } else {
                 tokio::time::sleep(interval).await;
             }
-            let moved = match read_cluster(self.store.store(), &cluster, &self.retry).await {
+            let store = match self.store.store() {
+                Some(store) => store,
+                None => match self.reopen().await {
+                    Some(store) => store,
+                    None => continue,
+                },
+            };
+            let moved = match read_cluster(&store, &cluster, &self.retry).await {
                 Ok(current) => Some(current.value.generation) != known,
                 Err(error) => {
                     tracing::warn!(%error, "cannot read the control store's generation");
@@ -323,6 +337,26 @@ impl Shared {
             self.flush.reconcile(&buckets, self.shards.set()).await;
             self.flush.refresh_metrics();
             tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+        }
+    }
+
+    /// Opens the control store for a node that runs from its copy without
+    /// one, and gives it to the node store.
+    async fn reopen(&self) -> Option<FileControlStore> {
+        match open_file_store(&self.control_dir, &self.owner, true, &self.pools.control).await {
+            Ok(opened) => {
+                tracing::info!("opened the control store");
+                self.store.attach(opened.store.clone());
+                Some(opened.store)
+            }
+            Err(OpenStoreError::Unavailable(error)) => {
+                tracing::warn!(%error, "cannot open the control store; serving the local copy");
+                None
+            }
+            Err(error) => {
+                tracing::error!(%error, "refusing the control store; serving the local copy");
+                None
+            }
         }
     }
 
@@ -477,39 +511,85 @@ async fn open_storage(
     })
 }
 
-/// Opens the control store, bootstraps `cluster.json`, and reads a fresh
-/// copy of the control state, which it keeps in the index. If that fails,
-/// the node runs from the copy the index kept, if it has one (§6.2).
+/// What [`open_control`] gives the node.
+struct OpenedControl {
+    store: Store,
+    copy: ControlCopy,
+    /// Whether the buckets the copy names were read from the store at this
+    /// start, from a store this start did not create, so a shard no
+    /// register names is an orphan (§4.1).
+    reclaim: bool,
+}
+
+/// Opens the file control store, bootstraps `cluster.json` if this node
+/// never synced, and syncs the copy kept in the index. If the store cannot
+/// be opened or does not answer, or looks reset, a node with a copy runs
+/// from it (§6.2); a store that belongs to another node is refused.
 async fn open_control(
     config: &Config,
-    node_id: &NodeId,
-    directory: PathBuf,
+    owner: &StoreOwner,
+    directory: &Path,
     index: &Arc<Index>,
     pools: &Pools,
     started: Duration,
-) -> Result<(Store, ControlCopy), StartError> {
+) -> Result<OpenedControl, StartError> {
     let cluster = &config.cluster().cluster_id;
     let retry = RetryPolicy::default();
-    let file_config = FileStoreConfig {
-        root: directory,
-        node: node_id.clone(),
-    };
-    let store = FileControlStore::open(file_config, pools.control.clone()).await?;
-    let fetched = async {
-        let proposal = ProposalIds::from_os_rng().next_id();
-        bootstrap(&store, cluster, proposal, &retry).await?;
-        ControlCopy::fetch(&store, cluster, &retry, started).await
-    }
-    .await;
     let kept = {
         let index = Arc::clone(index);
         on_pool(&pools.index, move || ControlCopy::load(&index)).await?
     };
+    let initialized = kept.is_some();
+    let opened = match open_file_store(directory, owner, initialized, &pools.control).await {
+        Ok(opened) => opened,
+        Err(OpenStoreError::Foreign(reason)) => return Err(StartError::ControlStore(reason)),
+        Err(error) => {
+            let Some(kept) = kept else {
+                return Err(match error {
+                    OpenStoreError::Unavailable(error) => StartError::Control(error),
+                    other => StartError::ControlStore(other.to_string()),
+                });
+            };
+            if matches!(error, OpenStoreError::Reset(_)) {
+                tracing::error!(
+                    %error,
+                    generation = %kept.generation,
+                    "the control store looks reset; running from the local copy"
+                );
+            } else {
+                tracing::warn!(
+                    %error,
+                    generation = %kept.generation,
+                    "cannot open the control store; running from the local copy"
+                );
+            }
+            return Ok(OpenedControl {
+                store: NodeStore::from_copy(None, kept.clone()),
+                copy: kept,
+                reclaim: false,
+            });
+        }
+    };
+    let store = opened.store;
+    let fetched = async {
+        // A node that synced before never bootstraps: its store must
+        // already hold cluster.json (open_file_store checked).
+        if !initialized {
+            let proposal = ProposalIds::from_os_rng().next_id();
+            bootstrap(&store, cluster, proposal, &retry).await?;
+        }
+        ControlCopy::fetch(&store, cluster, &retry, started).await
+    }
+    .await;
     match (fetched, kept) {
         (Ok(copy), _) => {
             let (index, saved) = (Arc::clone(index), copy.clone());
             on_pool(&pools.index, move || saved.save(&index)).await?;
-            Ok((NodeStore::live(store), copy))
+            Ok(OpenedControl {
+                store: NodeStore::live(store),
+                copy,
+                reclaim: !opened.claimed,
+            })
         }
         (Err(error), Some(kept)) => {
             tracing::warn!(
@@ -517,10 +597,19 @@ async fn open_control(
                 generation = %kept.generation,
                 "the control store does not answer; running from the local copy"
             );
-            Ok((NodeStore::from_copy(store, kept.clone()), kept))
+            Ok(OpenedControl {
+                store: NodeStore::from_copy(Some(store), kept.clone()),
+                copy: kept,
+                reclaim: false,
+            })
         }
         (Err(error), None) => Err(error.into()),
     }
+}
+
+/// The error a node without a control store gives for what needs one.
+fn no_store() -> ControlError {
+    ControlError::Unavailable("the control store has not been opened".to_owned())
 }
 
 /// The STS endpoint, if `sts_web_identity` is on. It validates tokens
@@ -705,10 +794,19 @@ impl Node {
         storage_ready.set_ready(true);
 
         let wall: Arc<dyn WallClock> = Arc::new(SystemWallClock);
-        let (store, copy) = open_control(
+        let owner = StoreOwner::new(
+            cluster.clone(),
+            node_id.clone(),
+            data_dir.instance_id().to_owned(),
+        );
+        let OpenedControl {
+            store,
+            copy,
+            reclaim,
+        } = open_control(
             &config,
-            &node_id,
-            control_dir,
+            &owner,
+            &control_dir,
             &storage.index,
             &pools,
             wall.now(),
@@ -790,6 +888,8 @@ impl Node {
             index: Arc::clone(&storage.index),
             pools: pools.clone(),
             store,
+            control_dir,
+            owner,
             shards: storage.shards.clone(),
             gateway,
             identity,
@@ -800,7 +900,7 @@ impl Node {
         });
         shared.sync_identity(copy.synced_at).await?;
         shared.open_bucket_shards().await?;
-        if shared.store.is_live() {
+        if reclaim {
             reclaim_orphans(&shared).await?;
         }
 

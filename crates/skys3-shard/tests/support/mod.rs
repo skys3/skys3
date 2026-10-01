@@ -13,7 +13,10 @@ use skys3_index::{
     Applier, Entry, EntryState, Index, IndexConfig, IndexDump, IndexError, IndexWriter,
 };
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
-use skys3_log::record::{Adopt, Delete, Extent, ExtentRef, Flushed, Import, Put, PutData, Tags};
+use skys3_log::record::{
+    Adopt, CompletedPart, Delete, Extent, ExtentRef, Flushed, Import, MpuAbort, MpuComplete,
+    MpuCreate, MpuPart, Put, PutData, Tags,
+};
 use skys3_log::{
     LogConfig, LogRecord, RecordBody, RecordLocation, SegmentId, SegmentLog, ShardRef,
 };
@@ -122,6 +125,77 @@ pub fn adopt(key: &str, expected_seq: u64, tag: u64) -> RecordBody {
         remote_version_id: Some("remote".to_owned()),
         metadata: BTreeMap::from([("content-type".to_owned(), "image/png".to_owned())]),
         checksums: BTreeMap::new(),
+    })
+}
+
+/// An `MPU_CREATE` of `key`.
+pub fn mpu_create(key: &str) -> RecordBody {
+    RecordBody::MpuCreate(MpuCreate {
+        key: key.to_owned(),
+        initiated_ms: 1_700_000_000_000,
+        metadata: BTreeMap::from([("content-type".to_owned(), "video/mp4".to_owned())]),
+        tags: BTreeMap::new(),
+        checksum: None,
+    })
+}
+
+/// An `MPU_PART` of `key`'s upload at `upload`: part `number`, with `len`
+/// inline bytes, or in `extents` if there are any.
+pub fn mpu_part(
+    key: &str,
+    upload: EpochSeq,
+    number: u16,
+    len: usize,
+    extents: Vec<ExtentRef>,
+) -> RecordBody {
+    let data = if extents.is_empty() {
+        PutData::Inline(fill(len))
+    } else {
+        PutData::Extents(extents)
+    };
+    let size = match &data {
+        PutData::Inline(bytes) => bytes.len() as u64,
+        PutData::Extents(extents) => extents.iter().map(|e| u64::from(e.len)).sum(),
+    };
+    RecordBody::MpuPart(MpuPart {
+        key: key.to_owned(),
+        upload,
+        part_number: number,
+        size,
+        last_modified_ms: 1_700_000_000_001,
+        etag: etag(u64::from(number)),
+        checksums: BTreeMap::new(),
+        data,
+    })
+}
+
+/// An `MPU_COMPLETE` of `key`'s upload at `upload` with `parts`, numbers
+/// and positions, of `size` bytes in all.
+pub fn mpu_complete(
+    key: &str,
+    upload: EpochSeq,
+    parts: &[(u16, EpochSeq)],
+    size: u64,
+) -> RecordBody {
+    RecordBody::MpuComplete(MpuComplete {
+        key: key.to_owned(),
+        upload,
+        last_modified_ms: 1_700_000_000_002,
+        size,
+        etag: ETag::new(format!("{:032x}-{}", upload.seq.get(), parts.len())).unwrap(),
+        checksums: BTreeMap::new(),
+        parts: parts
+            .iter()
+            .map(|&(number, position)| CompletedPart { number, position })
+            .collect(),
+    })
+}
+
+/// An `MPU_ABORT` of `key`'s upload at `upload`.
+pub fn mpu_abort(key: &str, upload: EpochSeq) -> RecordBody {
+    RecordBody::MpuAbort(MpuAbort {
+        key: key.to_owned(),
+        upload,
     })
 }
 

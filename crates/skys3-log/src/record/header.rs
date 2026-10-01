@@ -54,13 +54,13 @@ pub enum RecordKind {
     /// One extent of a large body, streamed before the record that
     /// references it (defined).
     Extent,
-    /// Opens a multipart upload (reserved for M1-12).
+    /// Opens a multipart upload (defined).
     MpuCreate,
-    /// One part of a multipart upload (reserved for M1-12).
+    /// One part of a multipart upload (defined).
     MpuPart,
-    /// Completes a multipart upload (reserved for M1-12).
+    /// Completes a multipart upload (defined).
     MpuComplete,
-    /// Aborts a multipart upload (reserved for M1-12).
+    /// Aborts a multipart upload (defined).
     MpuAbort,
     /// Starts a streamed single PUT and fixes its write identity (reserved
     /// for M4).
@@ -177,6 +177,10 @@ impl RecordKind {
             Self::Put
                 | Self::Delete
                 | Self::Extent
+                | Self::MpuCreate
+                | Self::MpuPart
+                | Self::MpuComplete
+                | Self::MpuAbort
                 | Self::Flushed
                 | Self::Tags
                 | Self::Import
