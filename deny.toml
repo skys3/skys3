@@ -49,6 +49,13 @@ skip = [
     # prometheus-client's derive are on syn 3. Both are build-time only.
     # Remove once tracing-attributes and zerocopy-derive move to syn 3.
     { crate = "syn@2", reason = "proc-macro dependencies are split between syn 2 and syn 3; build-time only" },
+    # aws-lc-sys (the crypto behind rustls and skys3-sts) builds with cc,
+    # whose jobserver uses getrandom 0.4 on Windows only; getrandom 0.4 uses
+    # r-efi 6 on UEFI only. rand 0.9 uses getrandom 0.3 and r-efi 5. Neither
+    # duplicate is compiled on the platforms SkyS3 targets. Remove once rand
+    # moves to getrandom 0.4.
+    { crate = "getrandom@0.4", reason = "Windows-only build dependency of aws-lc-sys (cc, jobserver); rand 0.9 uses 0.3" },
+    { crate = "r-efi@6", reason = "UEFI-only dependency of getrandom 0.4; getrandom 0.3 uses r-efi 5" },
 ]
 
 [sources]

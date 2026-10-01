@@ -20,11 +20,26 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 skys3-obs = { path = "../crates/skys3-obs" }
+skys3-sts = { path = "../crates/skys3-sts" }
 skys3-types = { path = "../crates/skys3-types" }
 
 [[bin]]
 name = "obs_bearer"
 path = "fuzz_targets/obs_bearer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sts_jwks"
+path = "fuzz_targets/sts_jwks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sts_jwt"
+path = "fuzz_targets/sts_jwt.rs"
 test = false
 doc = false
 bench = false
