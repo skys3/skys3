@@ -1,0 +1,30 @@
+[package]
+name = "skys3-index"
+description = "SkyS3 node index: redb tables, checkpoints, and replay of the log."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+redb.workspace = true
+skys3-config.workspace = true
+skys3-io.workspace = true
+skys3-log.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+bytes.workspace = true
+crc32c.workspace = true
+proptest.workspace = true
+rand.workspace = true
+skys3-sim.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

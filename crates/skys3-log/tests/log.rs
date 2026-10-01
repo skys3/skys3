@@ -3,6 +3,7 @@
 
 mod harness;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use skys3_log::record::{DecodeError, ErrorClass};
 use skys3_log::segment::file_name;
 use skys3_log::{
     LogConfig, LogError, LogRecord, RecordLocation, RecoveryError, SegmentClass, SegmentId,
-    SegmentInfo, SegmentLog,
+    SegmentInfo, SegmentLog, SegmentSummary,
 };
 use tokio::time::Instant;
 
@@ -800,5 +801,114 @@ fn a_real_disk_keeps_records_across_reopening() {
         harness::check_recovered(&log, &outcome).await;
         let location = log.append(&delete(0, 1)).await.unwrap();
         assert_eq!(log.read(location).await.unwrap(), delete(0, 1));
+    });
+}
+
+#[test]
+fn summaries_cover_acknowledged_records_since_the_log_opened() {
+    run(async {
+        let disk = SimDisk::new(11);
+        let (log, _) = open(disk.mount(), small_config()).await.unwrap();
+        assert!(log.summaries().is_empty());
+        let records = [delete(1, 5), extent(2, 3, 100), delete(1, 4), delete(2, 9)];
+        let locations = append_all(&log, &records).await;
+        let summaries = log.summaries();
+        let hot = &summaries[&locations[0].segment];
+        assert_eq!(hot.start, 0);
+        assert_eq!(hot.end, locations[3].end());
+        assert_eq!(
+            hot.positions,
+            BTreeMap::from([
+                (harness::shard(1), records[0].position),
+                (harness::shard(2), records[3].position),
+            ])
+        );
+        let bulk = &summaries[&locations[1].segment];
+        assert_eq!(bulk.end, locations[1].end());
+        assert!(bulk.is_behind(|_| Some(records[1].position)));
+        assert!(!bulk.is_behind(|_| None));
+        drop(log);
+        disk.crash();
+
+        // After a restart, a recovered segment's summary starts at its
+        // recovered length.
+        let (log, _) = open(disk.mount(), small_config()).await.unwrap();
+        let summaries = log.summaries();
+        let hot = &summaries[&locations[0].segment];
+        assert_eq!(
+            (hot.start, hot.end),
+            (locations[3].end(), locations[3].end())
+        );
+        assert!(hot.positions.is_empty());
+        let next = log.append(&delete(3, 1)).await.unwrap();
+        let hot = &log.summaries()[&next.segment];
+        assert_eq!(hot.end, next.end());
+
+        // Released segments leave the summaries; unknown ids are ignored.
+        log.release([locations[1].segment, SegmentId::new(999)]);
+        assert_eq!(log.released(), BTreeSet::from([locations[1].segment]));
+        assert!(!log.summaries().contains_key(&locations[1].segment));
+    });
+}
+
+#[test]
+fn summaries_merge_runs_that_meet_or_overlap() {
+    let shard = harness::shard(1);
+    let position = |seq| delete(1, seq).position;
+    let mut first = SegmentSummary::starting_at(0);
+    first.add(&shard, position(4), 100);
+    first.add(&shard, position(2), 150);
+    assert_eq!(first.positions[&shard], position(4));
+    let mut gap = SegmentSummary::starting_at(200);
+    gap.add(&shard, position(9), 300);
+    assert!(!first.clone().merge(&gap));
+    let mut next = SegmentSummary::starting_at(150);
+    next.add(&shard, position(7), 220);
+    assert!(first.merge(&next));
+    assert_eq!((first.start, first.end), (0, 220));
+    assert_eq!(first.positions[&shard], position(7));
+    // An empty run that ends further still extends the summary.
+    assert!(first.merge(&SegmentSummary::starting_at(220)));
+    assert!(first.merge(&SegmentSummary {
+        start: 100,
+        end: 400,
+        positions: BTreeMap::new(),
+    }));
+    assert_eq!(first.end, 400);
+    assert!(!first.merge(&SegmentSummary::starting_at(500)));
+}
+
+#[test]
+fn scan_range_reads_part_of_a_segment() {
+    run(async {
+        let disk = SimDisk::new(12);
+        let (log, _) = open(disk.mount(), small_config()).await.unwrap();
+        let records = [delete(1, 1), delete(1, 2), delete(1, 3)];
+        let locations = append_all(&log, &records).await;
+        let segment = locations[0].segment;
+        let scan = |from, to| {
+            let log = log.clone();
+            async move {
+                let mut scanner = log.scan_range(segment, from, to).unwrap();
+                let mut found = Vec::new();
+                while let Some(record) = scanner.next().await.unwrap() {
+                    found.push(record.location);
+                }
+                (found, scanner.end())
+            }
+        };
+        let (found, end) = scan(locations[1].offset, u64::MAX).await;
+        assert_eq!(
+            (found.as_slice(), end),
+            (&locations[1..], locations[2].end())
+        );
+        let (found, _) = scan(0, locations[1].end()).await;
+        assert_eq!(found, &locations[..2]);
+        let (found, end) = scan(u64::MAX, u64::MAX).await;
+        assert_eq!((found.len(), end), (0, locations[2].end()));
+        assert!(matches!(
+            log.scan_range(SegmentId::new(77), 0, 1),
+            Err(LogError::UnknownSegment(_))
+        ));
     });
 }
