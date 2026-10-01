@@ -19,13 +19,15 @@ env:
 jobs:
   # Decides whether this change needs the build and test jobs. When every
   # changed file is documentation (scripts/ci/docs-only.sh), they are
-  # skipped and the `docs` job runs instead. Manual dispatches, and pushes
+  # skipped and the `docs` job runs instead. The protocol model check runs
+  # only when something under spec/ changed. Manual dispatches, and pushes
   # whose previous tip cannot be fetched, run everything.
   changes:
     name: Classify changes
     runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      spec: ${{ steps.classify.outputs.spec }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -49,6 +51,12 @@ jobs:
             echo code=false >> "$GITHUB_OUTPUT"
           else
             echo code=true >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$base" ] || git diff --name-only "$base" HEAD | grep -q '^spec/'; then
+            echo spec=true >> "$GITHUB_OUTPUT"
+          else
+            echo "spec/ is unchanged; skipping the protocol model check."
+            echo spec=false >> "$GITHUB_OUTPUT"
           fi
 
   rust:
@@ -333,6 +341,26 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
+  # Model-checks the shard protocol (spec/ShardProtocol.tla) with TLC at the
+  # PR bounds, and checks that every seeded bug is still caught, so the
+  # model cannot silently lose its teeth. spec/check.sh downloads the pinned
+  # tla2tools.jar and verifies its checksum. The nightly workflow runs the
+  # same checks at larger bounds.
+  model:
+    name: Protocol model check
+    needs: changes
+    if: needs.changes.outputs.spec == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show the Java runtime
+        run: java -version
+
+      - name: Check the model and the seeded bugs
+        run: spec/check.sh all pr
+
   # The one check to require in branch protection. A job skipped for a
   # docs-only change satisfies a required check, except a matrix job: it
   # reports under its unexpanded name, so a required `Format, lint, test,
@@ -341,7 +369,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny, simulation, fuzz]
+    needs: [changes, rust, docs, coverage, msrv, deny, simulation, fuzz, model]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results

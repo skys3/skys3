@@ -849,3 +849,61 @@ of this file. A task with nothing unexpected keeps "None."
   client features, which the AWS SDK's HTTP client enables (M1-15), pull in
   `base64` 0.23. Stacking M1-15 on this PR failed the duplicate-version ban,
   so the workspace uses `base64` 0.23; its API is unchanged for our use.
+
+## M2 Replicated shards
+
+### M2-01 Protocol model
+
+- **TLA+ rather than a Rust model checker.** The model is
+  `spec/ShardProtocol.tla`, checked by TLC. The design names TLA+ first,
+  reviewers can read it beside the design, and it models the design rather
+  than an implementation that does not exist yet; the simulation harness
+  (M2-03) is where the real code gets checked. It stays outside the Cargo
+  workspace and adds no crates. `spec/README.md` gives the full rationale.
+- **The model found four gaps in the design**, each now fixed in
+  `docs/skys3-design.md` and kept honest by a seeded bug that reintroduces
+  it: a restarted node must count the restart as a lease grant before it
+  may take over (section 5.4); a node must record a proposal durably and act
+  as if its CAS succeeded until it learns the outcome, which keeps a
+  restarted candidate from granting leases and a promoting primary from
+  dropping the learner (section 6.3); a primary with a promotion
+  outstanding needs the learner's lease, or the promoted learner can take
+  over while the primary still serves reads on the old members' leases
+  (sections 5.4 and 6.7); and reconciliation must compare records by
+  `(epoch, seq)`, not truncate past the new primary's last `seq`
+  (section 6.6). The step-down of a planned handoff must also be durable
+  and count only for the epoch it names (section 5.4).
+- **The first model was far too large.** With every feature in one
+  specification, three nodes, three epochs, and one write, TLC was still
+  growing past millions of states. Merging the R1 stop with the takeover
+  proposal (a gap between them only removes acknowledgements), dropping
+  members' commit watermarks (only primaries serve), learning
+  configurations from the register or another node instead of from a
+  history of every configuration, bounding restarts, and node symmetry
+  brought it to about a million states. A profile is now a list of small
+  models instead of one large one: two-node models reach four epochs and a
+  restart in seconds, and three-node models cover a third member and a
+  spare.
+- **A seeded bug was first "caught" by a modeling error.**
+  `truncate_by_seq_only` produced a violation that had nothing to do with
+  truncation: the model let a primary drop the learner it was promoting
+  and re-add it through the live-stream path, which credits the learner
+  with records it never received. The design says the primary keeps
+  waiting for that learner, so the model now forbids the drop, and the
+  bug's real counterexample needs a re-admitted node. To keep that from
+  recurring, each seeded bug is checked against only the invariant it is
+  meant to break, and the traces of the subtler ones were read.
+- **Integer ticks resolve the lease inequality coarsely.** Timers expire
+  only at tick boundaries, so a grace slightly short of
+  `Lease × hi / lo` can still pass: `Rates = {1, 3}` with `Lease = 2` and
+  `Grace = 4` breaks the inequality and checks clean. The checks therefore
+  use a grace with no drift allowance (`Grace = Lease`) and drift well past
+  the bound (`Rates = {1, 4}`), both of which TLC must catch. The model shows
+  the inequality is sufficient; it cannot measure a small shortfall.
+- **TLA+ tooling.** The `v1.8.0` release of `tla2tools.jar` is a rolling
+  prerelease whose jar is rebuilt nightly, so it cannot be pinned by
+  checksum; `spec/check.sh` pins 1.7.4, the last stable release, by SHA-256.
+  TLC 1.7.4 has no `-noGenerateSpecTE` (trace specs are opt-in there) and did
+  not find a `-config` file outside the specification's directory, so the
+  script copies the specification and its generated configuration into a
+  temporary directory. TLC keeps its search queue on disk there.
