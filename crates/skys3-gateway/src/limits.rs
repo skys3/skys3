@@ -97,12 +97,25 @@ pub(crate) enum BodyKind {
 pub(crate) struct RequestShape {
     pub(crate) target: Target,
     pub(crate) body: BodyKind,
+    /// The query parameters, decoded as `s3s` decodes them, so every check
+    /// sees the names and values `s3s` routes on.
+    pub(crate) query: Vec<(String, String)>,
 }
 
 impl RequestShape {
-    /// Whether the request is CreateBucket: `PUT /bucket` with no query.
+    /// Whether the request is CreateBucket: `PUT /bucket` with no query
+    /// parameter but the SDKs' `x-id`.
     pub(crate) fn is_create_bucket(&self, parts: &Parts) -> bool {
-        self.target == Target::Bucket && parts.method == Method::PUT && parts.uri.query().is_none()
+        self.target == Target::Bucket
+            && parts.method == Method::PUT
+            && self.query.iter().all(|(name, _)| name == "x-id")
+    }
+
+    /// The decoded query parameters.
+    pub(crate) fn query(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.query
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 }
 
@@ -115,7 +128,8 @@ impl RequestLimits {
     /// # Errors
     ///
     /// The S3 error for the first limit the request breaks:
-    /// `RequestHeaderSectionTooLarge`, `InvalidURI`, `KeyTooLongError`,
+    /// `RequestHeaderSectionTooLarge`, `InvalidURI` (also for a path or
+    /// query that does not decode), `KeyTooLongError`,
     /// `InvalidArgument` (part number or range), or
     /// `MaxMessageLengthExceeded` for an XML body that declares a length
     /// above the limit.
@@ -129,11 +143,16 @@ impl RequestLimits {
                 self.max_uri_bytes
             ));
         }
-        let target = match parts.uri.path().trim_start_matches('/').split_once('/') {
-            None if parts.uri.path().trim_start_matches('/').is_empty() => Target::Service,
+        // Decoded as s3s decodes it before splitting off the bucket, so an
+        // escaped `/` separates the key as it does for routing.
+        let path = String::from_utf8(percent_decode(parts.uri.path()))
+            .map_err(|_| s3_error!(InvalidURI, "The request path is not UTF-8 once decoded."))?;
+        let path = path.trim_start_matches('/');
+        let target = match path.split_once('/') {
+            None if path.is_empty() => Target::Service,
             None | Some((_, "")) => Target::Bucket,
             Some((_, key)) => {
-                let len = percent_decoded_len(key);
+                let len = key.len();
                 if len > MAX_KEY_BYTES {
                     return Err(s3_error!(
                         KeyTooLongError,
@@ -143,8 +162,14 @@ impl RequestLimits {
                 Target::Object
             }
         };
-        let query = parts.uri.query().unwrap_or("");
-        for (name, value) in query_pairs(query) {
+        // s3s parses queries with serde_urlencoded too; its parser is not
+        // public.
+        let query = match parts.uri.query() {
+            Some(query) => serde_urlencoded::from_str::<Vec<(String, String)>>(query)
+                .map_err(|_| s3_error!(InvalidURI, "The query string does not decode."))?,
+            None => Vec::new(),
+        };
+        for (name, value) in &query {
             if name == "partNumber" && !valid_part_number(value) {
                 return Err(s3_error!(
                     InvalidArgument,
@@ -162,9 +187,9 @@ impl RequestLimits {
             ));
         }
         let streams = match (&parts.method, &target) {
-            (&Method::PUT, Target::Object) => {
-                !query_pairs(query).any(|(name, _)| XML_OBJECT_SUBRESOURCES.contains(&name))
-            }
+            (&Method::PUT, Target::Object) => !query
+                .iter()
+                .any(|(name, _)| XML_OBJECT_SUBRESOURCES.contains(&name.as_str())),
             (&Method::POST, Target::Bucket) => is_form(&parts.headers),
             _ => false,
         };
@@ -180,7 +205,11 @@ impl RequestLimits {
             }
             BodyKind::Xml
         };
-        Ok(RequestShape { target, body })
+        Ok(RequestShape {
+            target,
+            body,
+            query,
+        })
     }
 
     fn check_headers(&self, headers: &HeaderMap) -> Result<(), S3Error> {
@@ -280,15 +309,6 @@ fn is_form(headers: &HeaderMap) -> bool {
         })
 }
 
-/// The `name=value` pairs of a query string, undecoded. A pair without `=`
-/// has an empty value.
-pub(crate) fn query_pairs(query: &str) -> impl Iterator<Item = (&str, &str)> {
-    query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
-}
-
 fn valid_part_number(value: &str) -> bool {
     value.len() <= 5
         && value.bytes().all(|b| b.is_ascii_digit())
@@ -297,20 +317,26 @@ fn valid_part_number(value: &str) -> bool {
             .is_ok_and(|n| (1..=MAX_PART_NUMBER).contains(&n))
 }
 
-/// The length of `text` once its `%XX` escapes are decoded. A `%` not
-/// followed by two hex digits counts as itself.
-pub(crate) fn percent_decoded_len(text: &str) -> usize {
+/// `text` with its `%XX` escapes decoded, as `s3s` decodes request paths.
+/// A `%` not followed by two hex digits stays as it is.
+pub(crate) fn percent_decode(text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
-    let mut len = 0;
+    let hex = |b: Option<&u8>| b.and_then(|b| char::from(*b).to_digit(16));
+    let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let escaped = bytes[i] == b'%'
-            && bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
-            && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit);
-        i += if escaped { 3 } else { 1 };
-        len += 1;
+        match (bytes[i], hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+            (b'%', Some(high), Some(low)) => {
+                decoded.push(u8::try_from(high * 16 + low).expect("two hex digits fit a byte"));
+                i += 3;
+            }
+            (byte, _, _) => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
     }
-    len
+    decoded
 }
 
 #[cfg(test)]
@@ -385,6 +411,52 @@ mod tests {
                 .unwrap()
                 .is_create_bucket(&acl)
         );
+    }
+
+    #[test]
+    fn queries_and_paths_are_decoded_as_s3s_decodes_them() {
+        // An escaped name is still the part number.
+        let uri = "/b/k?part%4Eumber=10001&uploadId=x";
+        assert_eq!(
+            code(shape(Method::PUT, uri, &[])),
+            S3ErrorCode::InvalidArgument
+        );
+        let uri = "/b/k?partNumber=%31%30%30%30%31&uploadId=x";
+        assert_eq!(
+            code(shape(Method::PUT, uri, &[])),
+            S3ErrorCode::InvalidArgument
+        );
+        // An escaped subresource still makes the body XML.
+        assert_eq!(
+            shape(Method::PUT, "/b/k?a%63l", &[]).unwrap().body,
+            BodyKind::Xml
+        );
+        assert_eq!(
+            shape(Method::PUT, "/b/k?tag%67ing=", &[]).unwrap().body,
+            BodyKind::Xml
+        );
+        // An escaped slash separates the key, as it does for routing.
+        let shape_of = shape(Method::PUT, "/b%2Fk", &[]).unwrap();
+        assert_eq!(
+            (shape_of.target, shape_of.body),
+            (Target::Object, BodyKind::Stream)
+        );
+        let long = format!("/b%2F{}", "k".repeat(MAX_KEY_BYTES + 1));
+        assert_eq!(
+            code(shape(Method::GET, &long, &[])),
+            S3ErrorCode::KeyTooLongError
+        );
+        assert_eq!(
+            code(shape(Method::GET, "/b/%FF", &[])),
+            S3ErrorCode::InvalidURI
+        );
+        // Query bytes that are not UTF-8 decode lossily, as in s3s.
+        let lossy = shape(Method::GET, "/b/k?a=%FF", &[]).unwrap();
+        assert_eq!(lossy.query, [("a".to_owned(), "\u{fffd}".to_owned())]);
+        // SDKs add x-id to CreateBucket.
+        let create = parts(Method::PUT, "/b?x-id=CreateBucket", &[]);
+        let created = shape(Method::PUT, "/b?x-id=CreateBucket", &[]).unwrap();
+        assert!(created.is_create_bucket(&create));
     }
 
     #[test]
@@ -522,11 +594,30 @@ mod tests {
         }
 
         #[test]
-        fn decoded_lengths_match_a_decoder(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
+        fn percent_decoding_inverts_encoding(bytes in proptest::collection::vec(any::<u8>(), 0..64)) {
             let encoded: String = bytes.iter().map(|b| format!("%{b:02X}")).collect();
-            prop_assert_eq!(percent_decoded_len(&encoded), bytes.len());
+            prop_assert_eq!(percent_decode(&encoded), bytes.clone());
             let plain = String::from_utf8_lossy(&bytes).replace('%', "");
-            prop_assert_eq!(percent_decoded_len(&plain), plain.len());
+            prop_assert_eq!(percent_decode(&plain), plain.as_bytes());
+        }
+
+        /// Escaping any characters of a query changes nothing the checks
+        /// decide, as it changes nothing `s3s` routes on.
+        #[test]
+        fn escaped_queries_are_checked_as_written(
+            part in 0_u32..20_000,
+            subresource in prop::sample::select(vec!["acl", "tagging", "retention", "uploadId"]),
+            escape in proptest::collection::vec(any::<bool>(), 64),
+        ) {
+            let query = format!("partNumber={part}&{subresource}=v");
+            let escaped: String = query
+                .chars()
+                .zip(escape.iter().cycle())
+                .map(|(c, &e)| if e && c != '&' && c != '=' { format!("%{:02X}", c as u32) } else { c.to_string() })
+                .collect();
+            let plain = shape(Method::PUT, &format!("/b/k?{query}"), &[]);
+            let coded = shape(Method::PUT, &format!("/b/k?{escaped}"), &[]);
+            prop_assert_eq!(plain.map(|s| s.body).ok(), coded.map(|s| s.body).ok());
         }
     }
 }

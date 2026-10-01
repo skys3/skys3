@@ -335,6 +335,20 @@ async fn request_limits_hold() {
     );
     let answer = setup.call(Method::POST, "/photos?delete", &[], &deep).await;
     answer.assert(400, Some("MalformedXML"));
+    // Escaped query names are checked as s3s decodes them.
+    let answer = setup
+        .call(Method::PUT, "/photos/key?a%63l", &[], doctype_acl())
+        .await;
+    answer.assert(400, Some("MalformedXML"));
+    let answer = setup
+        .call(
+            Method::PUT,
+            "/photos/key?part%4Eumber=10001&uploadId=x",
+            &[],
+            "",
+        )
+        .await;
+    answer.assert(400, Some("InvalidArgument"));
     // Found by fuzzing: the parser's error quoted a NUL byte, which no XML
     // error response can carry.
     let nul = "<//+++++\0\0\0> '\"+";
@@ -359,4 +373,9 @@ async fn request_limits_hold() {
         )
         .await;
     answer.assert(400, Some("MaxMessageLengthExceeded"));
+}
+
+/// An ACL body with a document type declaration.
+fn doctype_acl() -> &'static str {
+    "<!DOCTYPE p [<!ENTITY a \"aaaa\">]><AccessControlPolicy>&a;</AccessControlPolicy>"
 }

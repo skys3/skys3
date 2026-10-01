@@ -22,8 +22,15 @@
 //! with `409 BucketNotEmpty` while a `write_back` bucket has entries not
 //! yet flushed, or a `local` bucket has any object. Otherwise it deletes
 //! the register at the version it read, and then drops the shards.
+//!
+//! **Lost answers.** A creation or deletion that lands while every answer
+//! is lost reports `503` and announces nothing. A retried CreateBucket that
+//! finds the register announces it. A deletion of unknown outcome keeps its
+//! seals and is remembered; a retried DeleteBucket that finds the register
+//! gone, or naming a new bucket, drops the old shards, announces the
+//! deletion, and answers `204` (design §4.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,8 +40,8 @@ use s3s::{S3Error, s3_error};
 use skys3_config::{BucketsConfig, Config, ControlStoreConfig, parse_target};
 use skys3_control::{
     ControlError, ControlStore, DeletionOutcome, Expected, KeyPrefix, ProposalIds, ProposalOutcome,
-    RegisterKind, RetryPolicy, TypedKey, bump_generation, propose_delete, propose_document, read,
-    read_with_retries,
+    RegisterKind, RetryPolicy, TypedKey, Version, Versioned, bump_generation, propose_delete,
+    propose_document, read, read_with_retries,
 };
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
@@ -135,6 +142,24 @@ impl IdSource {
     }
 }
 
+/// The most deletions of unknown outcome a gateway remembers. Beyond it the
+/// oldest is forgotten: its shards stay sealed until a restart, and startup
+/// recovery reclaims them if the register is gone.
+const MAX_PENDING_DELETIONS: usize = 256;
+
+/// A DeleteBucket whose register delete may or may not have applied. Its
+/// seals are still held, so no write is acknowledged into a bucket that may
+/// be gone.
+#[derive(Debug)]
+struct PendingDeletion {
+    bucket: BucketDocument,
+    /// The register version the delete was conditional on: while the
+    /// register is at it, a late delete may still apply.
+    version: Version,
+    /// Seals held on every shard of the bucket.
+    seals: u32,
+}
+
 /// The bucket records and the operations on them.
 #[derive(Debug)]
 pub(crate) struct Buckets<C, H> {
@@ -143,6 +168,8 @@ pub(crate) struct Buckets<C, H> {
     config: GatewayConfig,
     /// The local copy of every bucket register.
     catalog: RwLock<BTreeMap<BucketName, BucketDocument>>,
+    /// Deletions of unknown outcome, oldest first.
+    pending: Mutex<VecDeque<PendingDeletion>>,
     ids: Mutex<IdSource>,
 }
 
@@ -163,6 +190,7 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             shards,
             config,
             catalog: RwLock::default(),
+            pending: Mutex::default(),
             ids: Mutex::new(ids),
         };
         buckets.reload().await?;
@@ -295,7 +323,15 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             Ok(ProposalOutcome::Rejected) => {
                 self.remove_shards(&shards).await;
                 if let Ok(current) = read(&self.store, &key).await {
+                    let found = current.is_some();
                     self.remember(&name, current.map(|current| current.value));
+                    // The bucket may be one whose creation landed but whose
+                    // answers were lost, here or on another gateway, before
+                    // it was announced. Announcing again costs other nodes
+                    // only a re-read.
+                    if found {
+                        self.announce().await;
+                    }
                 }
                 Err(already_owned())
             }
@@ -318,38 +354,66 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
         let current = read_with_retries(&self.store, &key, retry)
             .await
             .map_err(|error| control_error(&error))?;
+        let pending = self.take_pending(name);
         let Some(current) = current else {
             self.remember(name, None);
+            if let Some(pending) = pending {
+                // An earlier DeleteBucket of this gateway applied, but its
+                // answers were lost: finish what it started.
+                self.finish_detach(&pending.bucket).await;
+                return Ok(());
+            }
             return Err(no_such_bucket());
         };
+        // Seals an earlier DeleteBucket of unknown outcome still holds on
+        // this bucket's shards.
+        let mut held = 0;
+        if let Some(pending) = pending {
+            if pending.bucket.bucket_id != current.value.bucket_id {
+                // The name now belongs to a new bucket: the earlier delete
+                // applied.
+                self.finish_detach(&pending.bucket).await;
+            } else if pending.version != current.version {
+                // The register moved on, so the earlier delete can no
+                // longer apply.
+                self.unseal_times(&pending.bucket, pending.seals).await;
+            } else {
+                held = pending.seals;
+            }
+        }
         let bucket = &current.value;
         let shards: Vec<_> = ShardRef::all(bucket).collect();
         let mut summary = ShardSummary::default();
         for (sealed, shard) in shards.iter().enumerate() {
             match self.shards.seal(shard).await {
-                Ok(held) => summary = summary.add(held),
+                Ok(holds) => summary = summary.add(holds),
                 Err(error) => {
                     self.unseal(&shards[..sealed]).await;
+                    self.keep_pending(&current, held);
                     return Err(shard_error(error));
                 }
             }
         }
         if let Some(refusal) = refuse_detach(bucket.mode, summary) {
+            // Held seals came from a check that passed, and no client write
+            // has committed since, so they cannot lead here; they are kept
+            // all the same while the earlier delete may apply.
             self.unseal(&shards).await;
+            self.keep_pending(&current, held);
             return Err(refusal);
         }
         match propose_delete(&self.store, key.key(), &current.version, retry).await {
             Ok(DeletionOutcome::Deleted) => {
                 self.remember(name, None);
-                self.remove_shards(&shards).await;
-                self.announce().await;
+                self.finish_detach(bucket).await;
                 Ok(())
             }
             Ok(DeletionOutcome::Rejected) => {
-                // The register changed since it was read. Lifting the seal
+                // The register changed since it was read, so no delete
+                // conditional on that version can apply. Lifting the seals
                 // is safe whatever it holds now: the same bucket keeps
                 // these shards, and another one has shards of its own.
-                self.unseal(&shards).await;
+                self.unseal_times(bucket, held + 1).await;
                 match read(&self.store, &key).await {
                     Ok(None) => {
                         self.remember(name, None);
@@ -368,13 +432,58 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             }
             Err(error) => {
                 // A delete that may still land keeps the shards sealed, so
-                // no write is acknowledged into a bucket about to vanish. A
-                // retried DeleteBucket resolves it; a restart lifts it.
-                if !error.may_have_applied() {
+                // no write is acknowledged into a bucket about to vanish,
+                // and is remembered: a retried DeleteBucket resolves it.
+                if error.may_have_applied() {
+                    held += 1;
+                } else {
                     self.unseal(&shards).await;
                 }
+                self.keep_pending(&current, held);
                 Err(control_error(&error))
             }
+        }
+    }
+
+    /// Drops a deleted bucket's shards and announces the deletion.
+    async fn finish_detach(&self, bucket: &BucketDocument) {
+        let shards: Vec<_> = ShardRef::all(bucket).collect();
+        self.remove_shards(&shards).await;
+        self.announce().await;
+    }
+
+    fn take_pending(&self, name: &BucketName) -> Option<PendingDeletion> {
+        let mut pending = lock(&self.pending);
+        let index = pending.iter().position(|p| p.bucket.name == *name)?;
+        pending.remove(index)
+    }
+
+    /// Remembers that `held` seals stay on `current`'s shards because a
+    /// delete conditional on its version may still apply.
+    fn keep_pending(&self, current: &Versioned<BucketDocument>, held: u32) {
+        if held == 0 {
+            return;
+        }
+        let mut pending = lock(&self.pending);
+        pending.push_back(PendingDeletion {
+            bucket: current.value.clone(),
+            version: current.version.clone(),
+            seals: held,
+        });
+        if pending.len() > MAX_PENDING_DELETIONS
+            && let Some(forgotten) = pending.pop_front()
+        {
+            tracing::warn!(
+                bucket = %forgotten.bucket.name,
+                "a deletion of unknown outcome was forgotten; its shards stay sealed until a restart"
+            );
+        }
+    }
+
+    async fn unseal_times(&self, bucket: &BucketDocument, times: u32) {
+        let shards: Vec<_> = ShardRef::all(bucket).collect();
+        for _ in 0..times {
+            self.unseal(&shards).await;
         }
     }
 
@@ -495,8 +604,50 @@ mod tests {
     use std::time::Duration;
 
     use s3s::S3ErrorCode;
+    use skys3_control::MemoryControlStore;
 
     use super::*;
+    use crate::stub::MemoryShards;
+
+    #[tokio::test]
+    async fn pending_deletions_are_bounded() {
+        let config: Config = "[cluster]\ncluster_id = \"c\"\n[control_store]\n\
+                              etcd_endpoints = [\"https://e:2379\"]"
+            .parse()
+            .unwrap();
+        let buckets = Buckets::load(
+            MemoryControlStore::new(),
+            MemoryShards::new(),
+            GatewayConfig::new(&config),
+            IdSource::seeded(1),
+        )
+        .await
+        .unwrap();
+        let bucket = |n: usize| Versioned {
+            value: BucketDocument {
+                bucket_id: format!("b-{n}").parse().unwrap(),
+                name: format!("bucket-{n}").parse().unwrap(),
+                mode: BucketMode::Local,
+                shards: skys3_types::ShardCount::new(1).unwrap(),
+                replicas: 1,
+                min_write_replicas: 1,
+                clean_copies: 0,
+                target: None,
+                created_unix_ms: 0,
+                proposal_id: "p".parse().unwrap(),
+            },
+            version: Version::new("1"),
+        };
+        buckets.keep_pending(&bucket(0), 0);
+        assert!(lock(&buckets.pending).is_empty());
+        for n in 0..=MAX_PENDING_DELETIONS {
+            buckets.keep_pending(&bucket(n), 1);
+        }
+        assert_eq!(lock(&buckets.pending).len(), MAX_PENDING_DELETIONS);
+        assert!(buckets.take_pending(&bucket(0).value.name).is_none());
+        let kept = buckets.take_pending(&bucket(1).value.name).unwrap();
+        assert_eq!(kept.seals, 1);
+    }
 
     #[test]
     fn bucket_ids_are_valid_distinct_and_seedable() {
