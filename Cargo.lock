@@ -2340,6 +2340,7 @@ dependencies = [
  "skys3-io",
  "skys3-log",
  "skys3-net",
+ "skys3-shard",
  "skys3-sim",
  "skys3-types",
  "tokio",
@@ -2565,14 +2566,18 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "proptest",
+ "prost",
  "rand",
+ "rcgen",
  "skys3-index",
  "skys3-io",
  "skys3-log",
+ "skys3-net",
  "skys3-sim",
  "skys3-types",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

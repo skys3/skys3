@@ -2156,6 +2156,7 @@ dependencies = [
  "skys3-log",
  "skys3-net",
  "skys3-obs",
+ "skys3-shard",
  "skys3-sts",
  "skys3-types",
  "tokio",
@@ -2278,12 +2279,15 @@ name = "skys3-shard"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "prost",
  "skys3-index",
  "skys3-io",
  "skys3-log",
+ "skys3-net",
  "skys3-types",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

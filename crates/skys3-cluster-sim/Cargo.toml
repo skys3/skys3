@@ -32,6 +32,7 @@ skys3-io.workspace = true
 skys3-log.workspace = true
 # `turmoil` for the transport over the simulated network.
 skys3-net = { workspace = true, features = ["turmoil"] }
+skys3-shard.workspace = true
 skys3-sim.workspace = true
 skys3-types.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
