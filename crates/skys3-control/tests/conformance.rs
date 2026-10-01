@@ -6,9 +6,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_control::conformance::{self, Backend};
 use skys3_control::{
-    ChangeFeed, ChangeStream, ControlError, ControlStore, Expected, FileControlStore,
-    FileStoreConfig, KeyPrefix, MemoryControlStore, ProposalIds, PutOutcome, RegisterKey,
-    RetryPolicy, Version, Versioned, bootstrap, bump_generation,
+    ChangeFeed, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected,
+    FileControlStore, FileStoreConfig, KeyPrefix, MemoryControlStore, ProposalIds, PutOutcome,
+    RegisterKey, RetryPolicy, Version, Versioned, bootstrap, bump_generation,
 };
 use skys3_io::BlockingPool;
 use skys3_types::Generation;
@@ -43,6 +43,14 @@ impl ControlStore for Polling {
         value: Bytes,
     ) -> Result<PutOutcome, ControlError> {
         self.0.put_if(key, expected, value).await
+    }
+
+    async fn delete_if(
+        &self,
+        key: &RegisterKey,
+        expected: &Version,
+    ) -> Result<DeleteOutcome, ControlError> {
+        self.0.delete_if(key, expected).await
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<(RegisterKey, Version)>, ControlError> {

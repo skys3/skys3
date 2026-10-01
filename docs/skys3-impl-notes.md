@@ -340,6 +340,77 @@ of this file. A task with nothing unexpected keeps "None."
   cargo-fuzz with `taiki-e/install-action` and caches `fuzz/target`
   with `Swatinem/rust-cache`. It uploads `fuzz/artifacts/` when a target
   fails.
+- **The prebuilt cargo-fuzz built for musl.** The first CI runs of the
+  fuzz job failed before compiling anything: "sanitizer is incompatible
+  with statically linked libc". `taiki-e/install-action` ships a
+  cargo-fuzz built for `x86_64-unknown-linux-musl`. cargo-fuzz defaults
+  `--target` to the triple it was built for, so it asked for a musl
+  AddressSanitizer build, which Rust does not support. The job now passes
+  `--target x86_64-unknown-linux-gnu` to `fuzz build` and `fuzz run`.
+  A locally built cargo-fuzz never shows this, because its own triple is
+  already the gnu host.
+
+### M1-02 Segments, group commit, and recovery
+
+- **A torn tail and damage look alike.** A disk may persist an unsynced
+  range out of order, so whole records can follow a missing one after a
+  crash, just as they follow a damaged record in the middle of a log. Two
+  rules separate the cases. First, a class starts a new segment only
+  between group commits, so only the last segment of each class can have
+  a torn tail. Second, a crash leaves at most one group commit unsynced,
+  so a record that verifies more than `group_commit_max_bytes` plus one
+  maximum-size record past a bad record means damage. Recovery then
+  refuses to start. Inside that window it cuts the tail. Lowering
+  `group_commit_max_bytes` while a node is down narrows the window, which
+  can make a torn tail look like damage, but never the reverse. Records
+  of an unknown version or kind, or with a verified CRC but a broken
+  header, also make recovery refuse to start. Design §10.1 records the
+  rules.
+- **A process restart after a failed sync can lose acknowledged records.**
+  The turmoil scenario found this on its first 256 seeds. After a failed
+  `fdatasync`, the page cache still showed the lost bytes. The restarted
+  process recovered them as valid records, appended after them, and
+  acknowledged. The next power loss zeroed the failed range, and recovery
+  cut the segment at the hole, losing the later acknowledged records.
+  Recovery cannot tell those bytes from durable ones. Design §10.4 now says
+  a disk taken out of service is used again only after the host restarts,
+  and the scenario models that. Nothing enforces it yet: startup (M1-13)
+  should keep a disk out of service until the host restarts, for example
+  by recording the boot ID with the failure.
+- **Recovery syncs what it keeps.** A process crash keeps the page cache
+  and directory entries that were never synced, so recovery sees records
+  and segment files that are not durable. Recovery syncs the last segment
+  of each class and the directory before the log appends anything. The
+  process-crash crash-point test fails without this.
+- **Tokio timers have millisecond resolution.** The default
+  `group_commit_max_delay_us = 500` rounds up to the next 1 ms tick. A
+  shorter wait would need a dedicated timer thread or spinning. The
+  configuration reference and §10.4 say so. The performance suite
+  (§16.3) should decide whether that matters.
+- **Simulated disk operations never yield.** `SimMount` finishes each
+  operation without yielding, so no record could queue behind a group
+  commit in progress. A deliberate mutation that kept committing after a
+  failed sync passed every test. The tests' audited disk now yields once per
+  operation, and a unit test queues records behind a failing commit. Six
+  deliberate mutations, including skipped data or directory syncs,
+  skipped recovery syncs, and a missing damage check, each fail at least one test.
+- **Any write-path I/O error takes the disk out of service**, not just a
+  failed sync. A short write on a full disk leaves a partial record in the
+  middle of a segment if appends continue, and truncating it is another
+  write that can fail. Admission control (M1-17) is meant to keep disks
+  from filling.
+- **Recovery verifies headers, not bodies.** Recovery checks each
+  record's fixed header and CRC, which is all a torn tail can break. A
+  body that breaks the format under a valid CRC comes from a faulty writer.
+  Replay (M1-03) decodes bodies and treats such a record as damage.
+- **The benchmark.** `cargo run --release -p skys3-log --example
+  group_commit_bench` runs concurrent appenders against a real disk and
+  prints records per group commit, throughput, and latency. It is an
+  example, not a criterion bench, to avoid a new dependency. On the
+  development container's disk, 64 writers of 4 KiB inline records with
+  the default 500 µs delay got about 60 records per group commit (214
+  commits for 12,800 records, about 15,000 records per second). A single
+  writer gets one record per commit.
 
 ### M1-05 Control store interface and local backends
 
@@ -405,6 +476,149 @@ of this file. A task with nothing unexpected keeps "None."
   wired into the binary (rule 1.1); the task that wires the control store
   into the node (M1-13) adds `backend = "file"` and its directory key.
 
+### M1-06 Gateway skeleton and bucket operations
+
+- **The s3s dependency tree.** `s3s` 0.17 is on hyper 1 and http 1, like the
+  workspace, but brings `crc-fast`, whose default features (which `s3s`
+  turns on) implement `digest` 0.10's traits while everything else is on
+  0.11, and `xxhash-rust`, licensed BSL-1.0. `deny.toml` skips
+  `digest@0.10` and `crypto-common@0.1` with that reason, and allows
+  BSL-1.0, a permissive license that asks nothing of binary distributions.
+  `crc-fast` also gives M1-08 a CRC64NVME implementation.
+- **s3s rejects signed requests without its own authenticator.** With no
+  `S3Auth` set, `s3s` accepts unsigned requests, skips its access hook
+  entirely, and answers any signed request with `501 NotImplemented`. The
+  gateway's `Authenticator` stage returns the request to route, so SigV4
+  (M1-07a), which SkyS3 verifies itself, must hand `s3s` a request it
+  takes as anonymous: signature headers or query parameters removed and an
+  `aws-chunked` body already decoded. Its access hook is unused; M1-07b
+  authorizes in the pipeline.
+- **Bounding XML before s3s parses it.** `s3s` reads a body only after
+  routing, so the gateway decides from the method, path, and query whether
+  a body is object data, which streams on, or XML, which it reads up to
+  4 MiB and scans for depth and document type declarations with
+  `quick-xml`, the version `s3s` already uses, so the tree gains nothing.
+  `s3s`'s own XML deserializer follows each operation's schema and skips
+  unknown elements without recursion, so depth was never a stack risk; the
+  scan is defense in depth, and the size bound is what bounds memory. The
+  classification assumes path-style requests. Virtual-hosted-style needs
+  the service's domain, which no configuration key names yet.
+- **How a request sets a bucket's mode and target.** S3 has no field for
+  either, and configuration has no `target` key for `write_back` buckets
+  (they are bound at attach time). CreateBucket takes them from
+  `x-skys3-bucket-mode` and `x-skys3-bucket-target`, with the mode
+  defaulting to the bucket's configured `mode`; design §11 records it. They
+  are not `x-amz-` headers, so M1-07a must require them to be signed.
+- **No delete in the control store.** `ControlStore` gained `delete_if`,
+  conditional on a version, in both backends, the fault wrapper, and the
+  conformance suite, with `propose_delete` for retries. A lost delete
+  response is resolved by re-reading: an absent register counts as
+  deleted. Tombstone values with a `proposal_id` were the alternative, but
+  every reader and lister would have to skip them. Design §6.1 records the
+  rule and that S3 backends delete with `DeleteObject` and `If-Match`; AWS
+  supports it, Cloudflare R2 lists conditional headers only on `PutObject`,
+  so the M2-04 probe must check conditional deletes too.
+- **Detaching needs a fence in the shard.** Checking for dirty entries and
+  then deleting the register races with writes in between, and two
+  concurrent DeleteBucket requests could lift each other's fence. The shard
+  interface has nesting `seal` and `unseal`, which the stub implements and
+  the shard state machine (M1-04) must order with the shard's writes. A
+  seal held across nodes, and lifted if its gateway fails, is left to the
+  shard map (M2-08). Shards left behind by a creation or deletion whose
+  outcome was unknown are for startup recovery (M1-13) to reclaim.
+- **Bucket registers had no creation time.** ListBuckets reports
+  `CreationDate`, which the AWS CLI's `s3 ls` reads unconditionally.
+  `BucketDocument` gained `created_unix_ms`, without a format version bump
+  since no register has been written by a release.
+- **Bucket operations do touch the control store.** Design §6.1 said no
+  client request reads or writes it. CreateBucket and DeleteBucket must;
+  §6.1 now says so, and HeadBucket, ListBuckets, and GetBucketLocation are
+  answered from the gateway's local copy, which `Gateway::reload_buckets`
+  refreshes for changes other nodes make.
+- **Configuration helpers.** Attaching a target must apply the control-store
+  independence check, which was private to configuration loading.
+  `skys3-config` now exports `parse_target` and
+  `ControlStoreConfig::check_target_independence`.
+- **ServerSideEncryptionConfigurationNotFoundError is a 400.** S3 (and
+  `s3s`) answer it with 400, not 404 like the Object Lock equivalent.
+- **Fuzzing found an unanswerable error.** The `gateway_request` target
+  drives arbitrary requests, and arbitrary XML bodies for 14 operations,
+  through the whole pipeline. Its first run found that the XML scan's
+  error message quoted the parser's error, which quoted a NUL byte from the
+  body; `s3s` cannot write that as XML, and the request got an empty
+  `500`. Messages no longer quote request bytes, and an error whose message
+  cannot be written is answered with its code alone. A later 60-second run
+  executed about 250,000 inputs without a failure. The target asserts that
+  no input gets a `500` and that responses stay under 64 KiB; memory is
+  bounded with libFuzzer's `-rss_limit_mb`.
+
+### M1-15 Remote target client and capability probe
+
+- **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
+  defaults enable both the legacy `rustls` client (hyper 0.14, rustls 0.21,
+  ring) and `default-https-client` (hyper 1, rustls 0.23, aws-lc-rs), plus
+  `sigv4a`. Every AWS crate is used with `default-features = false`, and the
+  HTTP client is built explicitly from `aws-smithy-http-client` with
+  `rustls-aws-lc`, on the workspace's hyper 1. The first version used the
+  `ring` provider to avoid aws-lc's C build, which needed `deny.toml` skips
+  for `getrandom` 0.2 and `windows-sys` 0.52; it switched to aws-lc-rs so
+  the binary has one crypto stack with the OIDC validation of M1-23, whose
+  `getrandom@0.4` and `r-efi@6` skips it shares. The SDK adds 144 crates to
+  the lock file; a clean debug build of `skys3-remote` takes about a minute.
+- **Turning off aws-config's defaults drops `credential_process`.** The
+  feature is `credentials-process`, and without it the default chain still
+  builds; a profile that uses `credential_process` fails only when
+  credentials are loaded, with an `InvalidConfiguration` error. The
+  feature is on (it adds only tokio's `process` feature), and a unit test
+  loads credentials from such a profile. `sso` and `credentials-login`
+  stay off: they pull in the SSO and sign-in SDK clients.
+- **`digest` 0.10 through the SDK's checksums.** `aws-smithy-checksums`
+  uses `crc-fast`, whose default `std` feature needs `digest` 0.10, while
+  everything else is on 0.11. It cannot be turned off from outside, so
+  `deny.toml` skips `digest@0.10` and `crypto-common@0.1`.
+- **SDK retries would break the store contract.** The SDK retries 5xx,
+  throttling, and timeouts three times by default, so a caller could not
+  see that a write may have been applied, nor control backoff. Retries are
+  disabled; callers retry by write identity (design §15 now says so).
+- **Flexible checksums break S3-compatible providers.** Recent SDKs send a
+  CRC32 trailer with aws-chunked encoding on every `PutObject` and
+  `UploadPart` by default, which several S3-compatible stores reject. The
+  client asks for checksums only where S3 requires them. Bodies stay
+  covered: SigV4 signs the payload's SHA-256, which a test checks.
+- **Error responses lose information.** The SDK synthesizes an error code
+  only for a `404` to `HEAD`; a `304` or `412` to `HEAD`, and a proxy's HTML
+  `502`, arrive without one, so the client classifies them by status. M0-05's
+  `S3Error` had only a kind, so a `403 AccessDenied` or `404 NoSuchBucket`
+  became `Other`, which counts as possibly applied. `S3Error` now keeps the
+  status and code, and `S3Error::is_transient` and `may_have_applied` use
+  them (an `Other` with a 4xx status was not applied). A request the SDK
+  could not build is the new kind `NotSent`. Connection failures, timeouts,
+  and credential failures (which the SDK reports as dispatch failures) are
+  `Timeout`, because the client cannot tell whether the request was sent.
+- **SDK quirks.** `x-amz-copy-source` is sent as given, so the client
+  percent-encodes the source key itself. Every request carries an
+  `x-id=<Operation>` query parameter. `DefaultCredentialsChain` without an
+  explicit region looks one up, from instance metadata if need be, and uses
+  it over the configured one, so the region is passed explicitly.
+- **The probe tests each header, not each operation.** AWS added
+  `If-None-Match` on writes months before `If-Match`, so a provider can
+  honor one and not the other. The probe tests both headers of `PutObject`
+  and `CompleteMultipartUpload`, each with a failing and a holding
+  precondition (a store that answers `412` to everything is "rejected", not
+  "honored"), and an operation is protected only if all its headers are.
+  Design §7.2 records the procedure and the scratch prefix.
+- **Mock server instead of the SDK's replay client.** Request construction
+  and error mapping are tested against a local hyper server rather than
+  `StaticReplayClient`, whose `test-util` feature adds several crates and
+  bypasses the real HTTP client, so timeouts and refused connections could
+  not be tested. No test reaches the network.
+- **Left for the attach path.** The constructor takes the region and an
+  addressing override, but §14 has no key for a target's region, and S3-
+  compatible providers need one (`auto` for R2). The PR that wires attach
+  into the binary adds the keys. Scratch keys that a failed cleanup leaves
+  behind are ordinary objects to a later import (M1-18), which may want to
+  skip `.skys3-probe/`.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named
@@ -454,65 +668,7 @@ of this file. A task with nothing unexpected keeps "None."
   `aws-lc-sys` with the sanitizer flags, which took about 3.5 minutes.
   `sts_jwt` ran about 4.3 million inputs in 30 s and `sts_jwks` about 1.9
   million, with no failures.
-
-### M1-02 Segments, group commit, and recovery
-
-- **A torn tail and damage look alike.** A disk may persist an unsynced
-  range out of order, so whole records can follow a missing one after a
-  crash, just as they follow a damaged record in the middle of a log. Two
-  rules separate the cases. First, a class starts a new segment only
-  between group commits, so only the last segment of each class can have
-  a torn tail. Second, a crash leaves at most one group commit unsynced,
-  so a record that verifies more than `group_commit_max_bytes` plus one
-  maximum-size record past a bad record means damage. Recovery then
-  refuses to start. Inside that window it cuts the tail. Lowering
-  `group_commit_max_bytes` while a node is down narrows the window, which
-  can make a torn tail look like damage, but never the reverse. Records
-  of an unknown version or kind, or with a verified CRC but a broken
-  header, also make recovery refuse to start. Design §10.1 records the
-  rules.
-- **A process restart after a failed sync can lose acknowledged records.**
-  The turmoil scenario found this on its first 256 seeds. After a failed
-  `fdatasync`, the page cache still showed the lost bytes. The restarted
-  process recovered them as valid records, appended after them, and
-  acknowledged. The next power loss zeroed the failed range, and recovery
-  cut the segment at the hole, losing the later acknowledged records.
-  Recovery cannot tell those bytes from durable ones. Design §10.4 now says
-  a disk taken out of service is used again only after the host restarts,
-  and the scenario models that. Nothing enforces it yet: startup (M1-13)
-  should keep a disk out of service until the host restarts, for example
-  by recording the boot ID with the failure.
-- **Recovery syncs what it keeps.** A process crash keeps the page cache
-  and directory entries that were never synced, so recovery sees records
-  and segment files that are not durable. Recovery syncs the last segment
-  of each class and the directory before the log appends anything. The
-  process-crash crash-point test fails without this.
-- **Tokio timers have millisecond resolution.** The default
-  `group_commit_max_delay_us = 500` rounds up to the next 1 ms tick. A
-  shorter wait would need a dedicated timer thread or spinning. The
-  configuration reference and §10.4 say so. The performance suite
-  (§16.3) should decide whether that matters.
-- **Simulated disk operations never yield.** `SimMount` finishes each
-  operation without yielding, so no record could queue behind a group
-  commit in progress. A deliberate mutation that kept committing after a
-  failed sync passed every test. The tests' audited disk now yields once per
-  operation, and a unit test queues records behind a failing commit. Six
-  deliberate mutations, including skipped data or directory syncs,
-  skipped recovery syncs, and a missing damage check, each fail at least one test.
-- **Any write-path I/O error takes the disk out of service**, not just a
-  failed sync. A short write on a full disk leaves a partial record in the
-  middle of a segment if appends continue, and truncating it is another
-  write that can fail. Admission control (M1-17) is meant to keep disks
-  from filling.
-- **Recovery verifies headers, not bodies.** Recovery checks each
-  record's fixed header and CRC, which is all a torn tail can break. A
-  body that breaks the format under a valid CRC comes from a faulty writer.
-  Replay (M1-03) decodes bodies and treats such a record as damage.
-- **The benchmark.** `cargo run --release -p skys3-log --example
-  group_commit_bench` runs concurrent appenders against a real disk and
-  prints records per group commit, throughput, and latency. It is an
-  example, not a criterion bench, to avoid a new dependency. On the
-  development container's disk, 64 writers of 4 KiB inline records with
-  the default 500 µs delay got about 60 records per group commit (214
-  commits for 12,800 records, about 15,000 records per second). A single
-  writer gets one record per commit.
+- **`base64` 0.22 would duplicate the AWS SDK's 0.23.** `hyper-util`'s
+  client features, which the AWS SDK's HTTP client enables (M1-15), pull in
+  `base64` 0.23. Stacking M1-15 on this PR failed the duplicate-version ban,
+  so the workspace uses `base64` 0.23; its API is unchanged for our use.

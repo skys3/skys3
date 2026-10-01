@@ -1432,6 +1432,13 @@ async fn versioned_deletes_add_and_remove_markers() {
         S3ErrorKind::MethodNotAllowed
     );
     assert!(store.keys().is_empty());
+    assert_eq!(
+        store.versions(),
+        [
+            ("k".to_owned(), written.version_id.clone(), false),
+            ("k".to_owned(), Some(marker.clone()), true),
+        ]
+    );
     let listed = store.list_objects_v2(ListObjectsV2::new("")).await.unwrap();
     assert!(listed.objects.is_empty());
     // A delete marker is no object for If-Match.

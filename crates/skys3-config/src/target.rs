@@ -106,9 +106,25 @@ pub(crate) fn parse_endpoint(url: &str) -> Result<String, String> {
     Ok(origin.to_endpoint())
 }
 
-/// Parses a path-style target URL into a canonical endpoint, a bucket, and
-/// an optional key prefix.
-pub(crate) fn parse_target(url: &str) -> Result<RemoteTarget, String> {
+/// Parses a path-style target URL, `https://host[:port]/bucket` or
+/// `https://host[:port]/bucket/prefix`, into a canonical endpoint, a
+/// bucket, and an optional key prefix, with the rules of `backup_target`.
+///
+/// Bucket creation reads a `write_back` bucket's target in the same form
+/// (design §11).
+///
+/// # Errors
+///
+/// A message that quotes the URL and names the rule it breaks.
+///
+/// ```
+/// let target = skys3_config::parse_target("https://S3.Example.com/data/team-a/")?;
+/// assert_eq!(target.endpoint, "https://s3.example.com");
+/// assert_eq!(target.bucket, "data");
+/// assert_eq!(target.prefix.as_deref(), Some("team-a/"));
+/// # Ok::<(), String>(())
+/// ```
+pub fn parse_target(url: &str) -> Result<RemoteTarget, String> {
     let (origin, path) = split_origin(url)?;
     let path = path.strip_prefix('/').unwrap_or(path);
     let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));

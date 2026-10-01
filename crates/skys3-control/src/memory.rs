@@ -9,7 +9,9 @@ use tokio::sync::watch;
 
 use crate::feed::ChangeFeed;
 use crate::key::{KeyPrefix, RegisterKey};
-use crate::store::{ControlError, ControlStore, Expected, PutOutcome, Version, Versioned};
+use crate::store::{
+    ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+};
 
 /// A control store held in memory: registers in a map, versioned by a
 /// counter of writes, so no two writes share a version.
@@ -108,6 +110,21 @@ impl ControlStore for MemoryControlStore {
         drop(state);
         self.shared.written.send_replace(());
         Ok(PutOutcome::Written(version))
+    }
+
+    async fn delete_if(
+        &self,
+        key: &RegisterKey,
+        expected: &Version,
+    ) -> Result<DeleteOutcome, ControlError> {
+        let mut state = self.state();
+        if state.registers.get(key).map(|current| &current.version) != Some(expected) {
+            return Ok(DeleteOutcome::PreconditionFailed);
+        }
+        state.registers.remove(key);
+        drop(state);
+        self.shared.written.send_replace(());
+        Ok(DeleteOutcome::Deleted)
     }
 
     async fn list(&self, prefix: &KeyPrefix) -> Result<Vec<(RegisterKey, Version)>, ControlError> {

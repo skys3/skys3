@@ -432,6 +432,9 @@ pub struct BucketDocument {
     /// buckets, absent for `local` ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<RemoteTarget>,
+    /// When the bucket was created, in milliseconds since the Unix epoch:
+    /// the `CreationDate` that ListBuckets reports.
+    pub created_unix_ms: u64,
     /// The proposal ID of the write that stored this document.
     pub proposal_id: ProposalId,
 }

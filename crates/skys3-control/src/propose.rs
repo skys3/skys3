@@ -20,6 +20,11 @@
 //! writer is reported as [`ProposalOutcome::Rejected`]: the proposal is no
 //! longer the register's value, and the caller acts on the value it reads
 //! next, as it would after losing the race.
+//!
+//! [`propose_delete`] deletes a register the same way. A deleted register
+//! holds no `proposal_id`, so after a missing answer and a failed
+//! precondition the rule is: an absent register was deleted, by this
+//! proposal or by another one, and either way the caller's goal holds.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
@@ -31,7 +36,9 @@ use serde::Deserialize;
 use skys3_types::{ProposalId, RegisterDocument};
 
 use crate::key::{RegisterKey, TypedKey};
-use crate::store::{ControlError, ControlStore, Expected, PutOutcome, Version, Versioned};
+use crate::store::{
+    ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+};
 
 /// How [`propose`] retries a write that got no usable answer.
 ///
@@ -109,6 +116,14 @@ pub async fn propose<S: ControlStore>(
     let mut uncertain = false;
     let mut check = false;
     let mut attempts = 0;
+    // The last error, kept for the report when the budget runs out.
+    let mut last: Option<ControlError> = None;
+    let exhausted = |attempts, uncertain, last| ControlError::RetriesExhausted {
+        key: key.clone(),
+        attempts,
+        may_have_applied: uncertain,
+        last: Box::new(last),
+    };
     loop {
         attempts += 1;
         let error = if check {
@@ -120,10 +135,87 @@ pub async fn propose<S: ControlStore>(
             match store.put_if(key, expected.clone(), value.clone()).await {
                 Ok(PutOutcome::Written(version)) => return Ok(ProposalOutcome::Accepted(version)),
                 Ok(PutOutcome::PreconditionFailed) if uncertain => {
+                    // The re-read of the lost-response rule counts toward
+                    // the budget like any other request.
+                    if attempts >= policy.max_attempts {
+                        let last = last.take().unwrap_or_else(|| {
+                            ControlError::Indeterminate("an earlier write got no answer".into())
+                        });
+                        return Err(exhausted(attempts, uncertain, last));
+                    }
                     check = true;
                     continue;
                 }
                 Ok(PutOutcome::PreconditionFailed) => return Ok(ProposalOutcome::Rejected),
+                Err(error) => {
+                    uncertain |= error.may_have_applied();
+                    error
+                }
+            }
+        };
+        if !error.is_retryable() {
+            return Err(error);
+        }
+        if attempts >= policy.max_attempts {
+            return Err(exhausted(attempts, uncertain, error));
+        }
+        last = Some(error);
+        tokio::time::sleep(policy.backoff(attempts, proposal)).await;
+    }
+}
+
+/// What a [`propose_delete`] achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum DeletionOutcome {
+    /// The register is gone. After a lost answer this includes a register
+    /// another writer deleted: the two cannot be told apart, and both mean
+    /// that the version the caller read no longer exists.
+    Deleted,
+    /// The register holds a value other than the expected version, so the
+    /// caller acts on that value instead.
+    Rejected,
+}
+
+/// Deletes the register if it is at `expected`, retrying under `policy`.
+///
+/// Retries send the same conditional delete, so at most one attempt can
+/// apply, and none applies to a value written after `expected`: every
+/// value a register ever holds has its own version (design §6.1). After an
+/// attempt with no answer, a failed precondition is resolved by re-reading
+/// the register: absent means [`DeletionOutcome::Deleted`], present means
+/// [`DeletionOutcome::Rejected`]. A delete that landed before the register
+/// was created again is reported as rejected, as a write that landed and
+/// was overwritten is.
+///
+/// # Errors
+///
+/// As [`propose`].
+pub async fn propose_delete<S: ControlStore>(
+    store: &S,
+    key: &RegisterKey,
+    expected: &Version,
+    policy: &RetryPolicy,
+) -> Result<DeletionOutcome, ControlError> {
+    let mut uncertain = false;
+    let mut check = false;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let error = if check {
+            match store.get(key).await {
+                Ok(None) => return Ok(DeletionOutcome::Deleted),
+                Ok(Some(_)) => return Ok(DeletionOutcome::Rejected),
+                Err(error) => error,
+            }
+        } else {
+            match store.delete_if(key, expected).await {
+                Ok(DeleteOutcome::Deleted) => return Ok(DeletionOutcome::Deleted),
+                Ok(DeleteOutcome::PreconditionFailed) if uncertain => {
+                    check = true;
+                    continue;
+                }
+                Ok(DeleteOutcome::PreconditionFailed) => return Ok(DeletionOutcome::Rejected),
                 Err(error) => {
                     uncertain |= error.may_have_applied();
                     error
@@ -141,7 +233,7 @@ pub async fn propose<S: ControlStore>(
                 last: Box::new(error),
             });
         }
-        tokio::time::sleep(policy.backoff(attempts, proposal)).await;
+        tokio::time::sleep(policy.backoff(attempts, key)).await;
     }
 }
 
@@ -479,6 +571,49 @@ mod tests {
         assert!(error.may_have_applied(), "{error}");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn the_lost_response_re_read_counts_toward_the_budget() {
+        let store = FaultyStore::new(MemoryControlStore::new());
+        let key = TypedKey::coordinator_lease();
+        let doc = lease("node-1", &ProposalId::new("p").unwrap());
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            ..RetryPolicy::default()
+        };
+        // The first write lands with its answer lost; the second fails its
+        // precondition on the last permitted request, so no re-read is sent.
+        store.script([Fault::LoseResponse]);
+        let error = propose_document(&store, &key, Expected::Absent, &doc, &policy)
+            .await
+            .unwrap_err();
+        assert_eq!(store.requests(), 2);
+        let ControlError::RetriesExhausted {
+            attempts,
+            may_have_applied,
+            last,
+            ..
+        } = error
+        else {
+            panic!("{error}");
+        };
+        assert_eq!(attempts, 2);
+        assert!(may_have_applied);
+        assert!(matches!(*last, ControlError::Indeterminate(_)), "{last}");
+        // With one more request allowed, the re-read resolves it.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            ..policy
+        };
+        let store = FaultyStore::new(MemoryControlStore::new());
+        store.script([Fault::LoseResponse]);
+        let outcome = propose_document(&store, &key, Expected::Absent, &doc, &policy).await;
+        assert!(
+            matches!(outcome, Ok(ProposalOutcome::Accepted(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(store.requests(), 3);
+    }
+
     #[tokio::test]
     async fn invalid_documents_are_neither_written_nor_read() {
         let store = MemoryControlStore::new();
@@ -514,6 +649,76 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    async fn create(store: &impl ControlStore, key: &RegisterKey) -> Version {
+        let value = lease("node-1", &ProposalId::new("p").unwrap());
+        let value = Bytes::from(value.to_json().unwrap());
+        match store.put_if(key, Expected::Absent, value).await.unwrap() {
+            PutOutcome::Written(version) => version,
+            PutOutcome::PreconditionFailed => panic!("the register exists"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_delete_response_is_resolved_by_reading() {
+        let store = FaultyStore::new(MemoryControlStore::new());
+        let key = RegisterKey::coordinator_lease();
+        let version = create(&store, &key).await;
+        store.script([Fault::LoseResponse]);
+        let outcome = propose_delete(&store, &key, &version, &quick()).await;
+        assert_eq!(outcome.unwrap(), DeletionOutcome::Deleted);
+        // Create, delete (lost), delete (412), and the re-read.
+        assert_eq!(store.requests(), 4);
+        assert!(store.inner().get(&key).await.unwrap().is_none());
+
+        // The register was created again before the re-read.
+        let version = create(&store, &key).await;
+        let other = store.inner().clone();
+        let (other_key, again) = (key.clone(), Bytes::from_static(br#"{"proposal_id":"q"}"#));
+        store.script([Fault::lose_response_after(move || {
+            let (other, key, again) = (other.clone(), other_key.clone(), again.clone());
+            async move {
+                let created = other.put_if(&key, Expected::Absent, again).await.unwrap();
+                assert!(matches!(created, PutOutcome::Written(_)));
+            }
+        })]);
+        let outcome = propose_delete(&store, &key, &version, &quick()).await;
+        assert_eq!(outcome.unwrap(), DeletionOutcome::Rejected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deletes_retry_and_reject_stale_versions() {
+        let store = FaultyStore::new(MemoryControlStore::new());
+        let key = RegisterKey::coordinator_lease();
+        let version = create(&store, &key).await;
+        let stale = propose_delete(&store, &key, &Version::new("0"), &quick()).await;
+        assert_eq!(stale.unwrap(), DeletionOutcome::Rejected);
+        store.script([Fault::Conflict, Fault::LoseRequest, Fault::Unavailable]);
+        let outcome = propose_delete(&store, &key, &version, &quick()).await;
+        assert_eq!(outcome.unwrap(), DeletionOutcome::Deleted);
+
+        let version = create(&store, &key).await;
+        store.script(vec![Fault::LoseRequest; 4]);
+        let error = propose_delete(&store, &key, &version, &quick())
+            .await
+            .unwrap_err();
+        assert!(error.may_have_applied(), "{error}");
+        store.script([
+            Fault::LoseResponse,
+            Fault::Unavailable,
+            Fault::Unavailable,
+            Fault::Unavailable,
+        ]);
+        let error = propose_delete(&store, &key, &version, &quick())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::RetriesExhausted { .. }));
+        store.script([Fault::Fail]);
+        let error = propose_delete(&store, &key, &version, &quick())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::Io(_)), "{error}");
     }
 
     #[tokio::test]
