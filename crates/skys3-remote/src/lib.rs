@@ -14,9 +14,12 @@
 //!   (§7.2).
 //! - [`S3Error`]: S3 error codes, and whether an error is transient or may
 //!   hide an applied write.
-//!
-//! The client over the AWS SDK and the capability probe (plan M1-15) are
-//! added to this crate later.
+//! - [`aws`]: the remote-target client, [`ObjectStore`] over the AWS SDK for
+//!   AWS S3 and S3-compatible providers, with credentials from `aws-config`
+//!   providers (§7, §11).
+//! - [`probe`]: the capability probe run when a target is attached, which
+//!   finds the write preconditions a store honors (§7.2). It is generic
+//!   over [`ObjectStore`], so simulations probe the simulated store.
 //!
 //! ```
 //! use skys3_remote::{PutObject, S3ErrorKind, WritePrecondition};
@@ -28,9 +31,11 @@
 //! assert_eq!(S3ErrorKind::PreconditionFailed.status(), Some(412));
 //! ```
 
+pub mod aws;
 mod error;
 mod metadata;
 pub mod model;
+pub mod probe;
 mod store;
 
 pub use error::{S3Error, S3ErrorKind};

@@ -108,11 +108,20 @@ impl<S: ControlStore> ChangeFeed<S> {
     }
 }
 
-/// Whether the feed reports `key`: every register but `cluster.json`,
-/// whose generation the report carries, and `coordinator.lease`, which is
-/// rewritten on every renewal.
+/// Whether the feed reports `key`: the registers under `nodes/`,
+/// `buckets/`, `shards/`, and `identity/`, which nodes keep local copies
+/// of. Not `cluster.json`, whose generation the report carries, nor
+/// `coordinator.lease`, which is rewritten on every renewal, nor keys
+/// outside the layout, such as a probe's scratch keys.
 fn reported(key: &RegisterKey) -> bool {
-    *key != RegisterKey::cluster() && *key != RegisterKey::coordinator_lease()
+    [
+        KeyPrefix::nodes(),
+        KeyPrefix::buckets(),
+        KeyPrefix::shards(),
+        KeyPrefix::identity(),
+    ]
+    .iter()
+    .any(|prefix| key.starts_with(prefix))
 }
 
 /// The registers whose version differs between two listings.
@@ -170,10 +179,13 @@ impl<S: ControlStore> ChangeStream for ChangeFeed<S> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
     use crate::cluster::{bootstrap, bump_generation};
     use crate::memory::MemoryControlStore;
     use crate::propose::{ProposalIds, RetryPolicy};
+    use crate::store::{Expected, PutOutcome};
 
     fn key(key: &str) -> RegisterKey {
         RegisterKey::new(key).unwrap()
@@ -201,6 +213,58 @@ mod tests {
             ]
         );
         assert!(diff(&current, &current).is_empty());
+    }
+
+    #[test]
+    fn only_registers_under_the_layout_prefixes_are_reported() {
+        for k in [
+            "nodes/node-1.json",
+            "buckets/b.json",
+            "shards/b-1/0.json",
+            "identity/roles/r.json",
+        ] {
+            assert!(reported(&key(k)), "{k}");
+        }
+        for k in [
+            "cluster.json",
+            "coordinator.lease",
+            "probe/0",
+            "nodes-old/x.json",
+            "scratch.json",
+        ] {
+            assert!(!reported(&key(k)), "{k}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keys_outside_the_layout_are_not_reported() {
+        let store = MemoryControlStore::new();
+        let (policy, mut ids) = (RetryPolicy::default(), ProposalIds::seeded(1));
+        let cluster = "c".parse().unwrap();
+        bootstrap(&store, &cluster, ids.next_id(), &policy)
+            .await
+            .unwrap();
+        let mut feed = store.changes(Generation::ZERO).await.unwrap();
+        let first = feed.next().await.unwrap();
+        assert!(first.snapshot && first.registers.is_empty(), "{first:?}");
+        for k in ["probe/0", "buckets/b.json"] {
+            let written = store
+                .put_if(&key(k), Expected::Absent, Bytes::from_static(b"{}"))
+                .await
+                .unwrap();
+            assert!(matches!(written, PutOutcome::Written(_)));
+        }
+        bump_generation(&store, &cluster, &mut ids, &policy)
+            .await
+            .unwrap();
+        let change = feed.next().await.unwrap();
+        let keys: Vec<_> = change.registers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["buckets/b.json"]);
+        // A stream opened later starts with a snapshot without it, too.
+        let mut late = store.changes(Generation::ZERO).await.unwrap();
+        let snapshot = late.next().await.unwrap();
+        let keys: Vec<_> = snapshot.registers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["buckets/b.json"]);
     }
 
     #[tokio::test(start_paused = true)]

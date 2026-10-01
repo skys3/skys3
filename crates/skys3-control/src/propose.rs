@@ -116,6 +116,14 @@ pub async fn propose<S: ControlStore>(
     let mut uncertain = false;
     let mut check = false;
     let mut attempts = 0;
+    // The last error, kept for the report when the budget runs out.
+    let mut last: Option<ControlError> = None;
+    let exhausted = |attempts, uncertain, last| ControlError::RetriesExhausted {
+        key: key.clone(),
+        attempts,
+        may_have_applied: uncertain,
+        last: Box::new(last),
+    };
     loop {
         attempts += 1;
         let error = if check {
@@ -127,6 +135,14 @@ pub async fn propose<S: ControlStore>(
             match store.put_if(key, expected.clone(), value.clone()).await {
                 Ok(PutOutcome::Written(version)) => return Ok(ProposalOutcome::Accepted(version)),
                 Ok(PutOutcome::PreconditionFailed) if uncertain => {
+                    // The re-read of the lost-response rule counts toward
+                    // the budget like any other request.
+                    if attempts >= policy.max_attempts {
+                        let last = last.take().unwrap_or_else(|| {
+                            ControlError::Indeterminate("an earlier write got no answer".into())
+                        });
+                        return Err(exhausted(attempts, uncertain, last));
+                    }
                     check = true;
                     continue;
                 }
@@ -141,13 +157,9 @@ pub async fn propose<S: ControlStore>(
             return Err(error);
         }
         if attempts >= policy.max_attempts {
-            return Err(ControlError::RetriesExhausted {
-                key: key.clone(),
-                attempts,
-                may_have_applied: uncertain,
-                last: Box::new(error),
-            });
+            return Err(exhausted(attempts, uncertain, error));
         }
+        last = Some(error);
         tokio::time::sleep(policy.backoff(attempts, proposal)).await;
     }
 }
@@ -557,6 +569,49 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.may_have_applied(), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_lost_response_re_read_counts_toward_the_budget() {
+        let store = FaultyStore::new(MemoryControlStore::new());
+        let key = TypedKey::coordinator_lease();
+        let doc = lease("node-1", &ProposalId::new("p").unwrap());
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            ..RetryPolicy::default()
+        };
+        // The first write lands with its answer lost; the second fails its
+        // precondition on the last permitted request, so no re-read is sent.
+        store.script([Fault::LoseResponse]);
+        let error = propose_document(&store, &key, Expected::Absent, &doc, &policy)
+            .await
+            .unwrap_err();
+        assert_eq!(store.requests(), 2);
+        let ControlError::RetriesExhausted {
+            attempts,
+            may_have_applied,
+            last,
+            ..
+        } = error
+        else {
+            panic!("{error}");
+        };
+        assert_eq!(attempts, 2);
+        assert!(may_have_applied);
+        assert!(matches!(*last, ControlError::Indeterminate(_)), "{last}");
+        // With one more request allowed, the re-read resolves it.
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            ..policy
+        };
+        let store = FaultyStore::new(MemoryControlStore::new());
+        store.script([Fault::LoseResponse]);
+        let outcome = propose_document(&store, &key, Expected::Absent, &doc, &policy).await;
+        assert!(
+            matches!(outcome, Ok(ProposalOutcome::Accepted(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(store.requests(), 3);
     }
 
     #[tokio::test]
