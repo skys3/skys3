@@ -1888,7 +1888,16 @@ of this file. A task with nothing unexpected keeps "None."
   its next import waits for the old task before reading the checkpoint.
   `shutdown_waits_for_a_checkpoint_write_in_flight` holds the pool with a
   blocking job while a write is queued; with the abort it fails, as
-  `shutdown` returns before the write lands.
+  `shutdown` returns before the write lands. Its first version expected
+  the hold to catch the second page and failed in CI on aarch64: under a
+  paused clock, the runtime advances time while it waits for the pool's
+  real thread, so a slow write lets the stream get pages further than
+  planned. The test now waits until the holding job runs, which means
+  every earlier write is done. It reads the checkpoint shown once the
+  stream is stuck behind the hold, and expects exactly the next page to
+  be stored when `shutdown` returns. It passed 200 runs alone and 200
+  more alongside eight parallel copies and the full test binary on four
+  cores.
 - **The discovery budget first counted every node as sampled.** Charging
   a level its worst case, a listing and 96 probes per node, before
   sending anything stopped discovery from listing twelve small folders.
