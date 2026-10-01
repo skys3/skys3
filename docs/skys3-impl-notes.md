@@ -1903,6 +1903,18 @@ of this file. A task with nothing unexpected keeps "None."
   sending anything stopped discovery from listing twelve small folders.
   A level is now charged its listings, then its probes, and abandoned
   only if what it actually needs exceeds the budget.
+- **A codec proptest failed on a location, not on an import.** CI on a
+  later PR shrank `arbitrary_bytes_decode_canonically` to `[1, 0 × 20]`,
+  re-encoded as `[3, 0 × 20]`, and the import codec looked like the cause.
+  It was not: `decode_import` rejects those bytes (trailing bytes after
+  `Running { after: None }`). They are a format 1 record location, which
+  `decode_location` accepts and re-encodes in format 3, as the codec
+  documents for every older value. The property dates from M1-03, when
+  format 1 was the only format; once formats 2 and 3 existed, any 21
+  random bytes starting with 1 or 2 failed it, about one run in two hundred.
+  It now checks what the `index_codec` fuzz target always did: a value of
+  the current format re-encodes byte for byte, and an older one re-encodes
+  in the current format to the same value. A unit test keeps the case.
 
 ### M1-23 OIDC token validation
 
