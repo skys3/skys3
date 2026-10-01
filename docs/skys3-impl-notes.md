@@ -2048,7 +2048,11 @@ of this file. A task with nothing unexpected keeps "None."
   so `FAILED_PRECONDITION`, like `PERMISSION_DENIED` and
   `UNAUTHENTICATED`, is `Rejected`. Only a request that never left (no
   connection to any endpoint) is `Unavailable` for a write. A call without
-  an answer drops the connection and moves to the next endpoint. HTTP/2
+  an answer drops the connection and moves to the next endpoint, and so
+  does a transient status (review): a member cut off from its quorum
+  still answers over TCP, with `UNAVAILABLE`, so moving only on missing
+  answers kept every retry, and the lost-response re-read, on that
+  member. HTTP/2
   pings every 10 seconds while a call is open (etcd refuses pings more
   often than every 5) detect a dead watch connection; idle connections
   are not pinged, since etcd counts pings without streams against the

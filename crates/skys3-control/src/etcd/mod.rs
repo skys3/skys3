@@ -322,25 +322,10 @@ fn range_end(prefix: &str) -> Bytes {
     Bytes::from(end)
 }
 
-/// Statuses after which a request may have been applied, or may still be.
-fn may_have_applied(code: Code) -> bool {
-    matches!(
-        code,
-        Code::CANCELLED
-            | Code::UNKNOWN
-            | Code::DEADLINE_EXCEEDED
-            | Code::ABORTED
-            | Code::INTERNAL
-            | Code::UNAVAILABLE
-    )
-}
-
 /// Maps a failed read.
 fn read_error(error: CallError) -> ControlError {
     match error {
-        CallError::Status(status)
-            if may_have_applied(status.code) || status.code == Code::RESOURCE_EXHAUSTED =>
-        {
+        CallError::Status(status) if status.code.is_transient() => {
             ControlError::Unavailable(CallError::Status(status).to_string())
         }
         CallError::Status(_) => ControlError::Rejected(error.to_string()),
@@ -354,7 +339,7 @@ fn read_error(error: CallError) -> ControlError {
 fn write_error(error: CallError) -> ControlError {
     match &error {
         CallError::NoAnswer(_) => ControlError::Indeterminate(error.to_string()),
-        CallError::Status(status) if may_have_applied(status.code) => {
+        CallError::Status(status) if status.code.may_have_applied() => {
             ControlError::Indeterminate(error.to_string())
         }
         CallError::NotSent(_) => ControlError::Unavailable(error.to_string()),

@@ -16,7 +16,7 @@ use super::fake::{Fake, Fault, WatchFault};
 use super::*;
 use crate::cluster::{bootstrap, bump_generation};
 use crate::conformance::{self, Backend};
-use crate::propose::{ProposalIds, RetryPolicy};
+use crate::propose::{ProposalIds, ProposalOutcome, RetryPolicy, get_with_retries, propose};
 use crate::store::ChangeStream;
 
 /// Bounds every test, so a hang fails it.
@@ -178,6 +178,49 @@ async fn an_unanswered_call_moves_to_the_next_endpoint() {
         assert_eq!((first.requests(), second.requests()), (2, 3));
     })
     .await;
+}
+
+/// A member cut off from its quorum still answers, with `UNAVAILABLE`
+/// ("no leader", "request timed out"); retries, including the re-read of
+/// the lost-response rule, go to a healthy member.
+#[tokio::test]
+async fn a_member_without_a_quorum_is_left_for_a_healthy_one() {
+    bounded(async {
+        let (cut_off, healthy) = (Fake::start(None).await, Fake::start(None).await);
+        let urls = [cut_off.url("http"), healthy.url("http")];
+        let store = EtcdControlStore::new(config(&urls)).unwrap();
+        let policy = RetryPolicy::default();
+        assert_eq!(store.get(&key()).await.unwrap(), None);
+        healthy.put("c/buckets/b.json", b"{}");
+        cut_off.fail([Fault::Status(14)]);
+        let read = get_with_retries(&store, &key(), &policy).await.unwrap();
+        assert_eq!(read.unwrap().value.as_ref(), b"{}");
+        assert_eq!((cut_off.requests(), healthy.requests()), (2, 1));
+
+        // A write: the cut-off member times the proposal out, and the
+        // proposer's retry and re-read reach the healthy member.
+        let store = EtcdControlStore::new(config(&urls)).unwrap();
+        let key = RegisterKey::new("nodes/n.json").unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), None);
+        cut_off.fail([Fault::Status(14)]);
+        let mut ids = ProposalIds::seeded(5);
+        let proposal = ids.next_id();
+        let value = Bytes::from(format!(r#"{{"proposal_id":"{proposal}"}}"#));
+        let outcome = propose(&store, &key, Expected::Absent, value, &proposal, &policy)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ProposalOutcome::Accepted(_)),
+            "{outcome:?}"
+        );
+        assert!(healthy_has(&healthy, &key).await);
+    })
+    .await;
+}
+
+/// Whether `fake` holds `key` under the test prefix.
+async fn healthy_has(fake: &Fake, key: &RegisterKey) -> bool {
+    store(fake).get(key).await.unwrap().is_some()
 }
 
 #[tokio::test]
