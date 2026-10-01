@@ -130,12 +130,14 @@ impl RemoteReads for Remote {
                 delimiter: listing.delimiter.clone(),
                 ..ListQuery::default()
             };
-            // A token is the last item of the page before; a start is a
-            // key, after which a common prefix lists again, as S3's does.
+            // A token is the last item of the page before, and a start is
+            // a key. As S3 does, an item, key or common prefix, lists only
+            // if it sorts after either: a common prefix at or before a
+            // start inside it is left out.
             let after = listing.token.or(listing.start_after);
             let mut items: Vec<ListItem> = Vec::new();
             for (key, (object, _)) in &state.objects {
-                if !key.starts_with(&query.prefix) || after.as_ref().is_some_and(|a| key <= a) {
+                if !key.starts_with(&query.prefix) {
                     continue;
                 }
                 let item = match query.common_prefix(key) {
@@ -145,6 +147,9 @@ impl RemoteReads for Remote {
                         object: Box::new(object.object.clone()),
                     },
                 };
+                if after.as_deref().is_some_and(|after| item.name() <= after) {
+                    continue;
+                }
                 if items.last().is_none_or(|last| last.name() != item.name()) {
                     items.push(item);
                 }
@@ -445,6 +450,46 @@ async fn listings_merge_the_remote_while_the_import_runs() {
         .call(Method::GET, "/photos?list-type=2", &[], "")
         .await;
     failing.assert(503, Some("ServiceUnavailable"));
+}
+
+#[tokio::test]
+async fn a_common_prefix_the_import_is_inside_still_lists() {
+    let remote = Arc::new(Remote::default());
+    let (setup, bucket) = setup(&remote).await;
+    // The import has passed `a/x`, which was then deleted; `a/y` is only
+    // on the remote. The remote's listing starts after `a/x`, so it leaves
+    // the common prefix `a/` out.
+    remote.running(Some("a/x"));
+    let etag = remote.put("a/x", "remote");
+    import(&setup, &bucket, "a/x", &etag).await;
+    remote.put("a/y", "remote");
+    remote.put("b/1", "remote");
+    setup
+        .call(Method::DELETE, "/photos/a/x", &[], "")
+        .await
+        .assert(204, None);
+
+    let rolled = setup
+        .call(Method::GET, "/photos?list-type=2&delimiter=/", &[], "")
+        .await;
+    rolled.assert(200, None);
+    assert_eq!(listed(&rolled.body), ["a/", "b/"]);
+    let all = setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await;
+    assert_eq!(listed(&all.body), ["a/y", "b/1"]);
+    // A listing that starts past the prefix, or inside it, leaves it out.
+    for start in ["a/", "a/z"] {
+        let uri = format!("/photos?list-type=2&delimiter=/&start-after={start}");
+        let page = setup.call(Method::GET, &uri, &[], "").await;
+        assert_eq!(listed(&page.body), ["b/"], "after {start}");
+    }
+    // A prefix with nothing left to import under it does not list.
+    remote.lock().objects.remove("a/y");
+    let rolled = setup
+        .call(Method::GET, "/photos?list-type=2&delimiter=/", &[], "")
+        .await;
+    assert_eq!(listed(&rolled.body), ["b/"]);
 }
 
 #[tokio::test]

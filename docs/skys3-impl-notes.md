@@ -1816,6 +1816,22 @@ of this file. A task with nothing unexpected keeps "None."
   scenario, whose remote is faulty from the start, found it on seed 0.
   Each run now takes a fresh nonce, and the scenario checks that the probe
   found every precondition honored.
+- **The rate limit let single pages through at once.** Review found
+  that the import waited only after a truncated page, so the first page
+  committed at once and the last never waited: an import of one page
+  ignored `import_max_keys_per_second`, and a rate of 1 still committed
+  1,000 keys in a burst. A token bucket that starts empty and holds one
+  second's keys now admits every page before it commits, and a page asks
+  for at most a second's keys, so no stretch of `t` seconds commits more
+  than `rate * (t + 1)` keys, even after slow requests.
+- **A listing lost a common prefix the import was inside.** Review found
+  that the remote side of a delimited listing sent the import's position
+  as `StartAfter`, and S3 (and `SimS3`, since M0-05) leaves out a common
+  prefix at or before it: with the import past `a/x`, a remote-only `a/y`
+  did not list as `a/` unless a live local entry produced it. The merge
+  now adds that prefix to the remote's items and checks it like any
+  remote-only prefix. The gateway's test remote had modeled the opposite
+  S3 behavior, which hid the bug; it now matches `SimS3`.
 - **Index bytes per imported entry: 157** (§19 item 6). Measured by
   `index_bytes_per_imported_entry` in `skys3-flush`: 20,000 stubs with
   40-byte keys and a storage class, applied to a fresh index and made

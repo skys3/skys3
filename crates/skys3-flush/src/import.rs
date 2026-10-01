@@ -120,9 +120,9 @@ impl ImportProgress for ImportState {
 /// index holds, at most `settings.import_keys_per_second` keys a second.
 ///
 /// One page of the listing at a time: the page's objects become `IMPORT`
-/// records, committed to their shards concurrently, and once every one is
-/// applied, the page's last key is stored as the checkpoint, durably, and
-/// only then shown in `state`. A failed request or commit is retried
+/// records, committed to their shards concurrently once the rate allows
+/// (`Throttle`), and once every one is applied, the page's last key is
+/// stored as the checkpoint, durably, and only then shown in `state`. A failed request or commit is retried
 /// after the flush backoff; the import never gives up. Keys under the
 /// capability probe's scratch prefix (§7.2) are never imported.
 pub(crate) async fn run<S: ObjectStore, D: Disk>(
@@ -157,11 +157,14 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(
         },
         0,
     );
-    let rate = settings.import_keys_per_second.max(1) as f64;
-    let started = Instant::now();
-    let mut listed = 0u64;
+    let mut throttle = Throttle::new(settings.import_keys_per_second);
+    // A page is never larger than a second's keys, so that the throttle can
+    // admit it whole.
+    let page_keys = settings
+        .import_page_keys
+        .clamp(1, IMPORT_PAGE_KEYS)
+        .min(u32::try_from(throttle.capacity).unwrap_or(u32::MAX));
     loop {
-        let page_keys = settings.import_page_keys.clamp(1, IMPORT_PAGE_KEYS);
         let mut request = ListObjectsV2::new(prefix.clone()).with_max_keys(page_keys);
         if let Some(after) = &after {
             request = request.with_start_after(format!("{prefix}{after}"));
@@ -187,6 +190,7 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(
             .filter_map(|object| import_of(object, &prefix, &*wall))
             .collect();
         let count = imports.len() as u64;
+        throttle.admit(listed_now).await;
         if let Err(error) = commit(&set, &bucket, imports).await {
             retry.wait(error).await;
             continue;
@@ -210,8 +214,52 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(
             return;
         };
         after = next;
-        listed += listed_now;
-        tokio::time::sleep_until(started + Duration::from_secs_f64(listed as f64 / rate)).await;
+    }
+}
+
+/// A token bucket over listed keys: it fills at the import's rate, up to a
+/// second's keys, and starts empty. Every page waits for its keys before
+/// it is committed, the first and the last included, so no stretch of `t`
+/// seconds commits more than `rate * (t + 1)` keys, however slow the
+/// requests before it were.
+#[derive(Debug)]
+struct Throttle {
+    /// Keys a second.
+    rate: f64,
+    /// The most keys the bucket holds: a second's, and at least one.
+    capacity: u64,
+    tokens: f64,
+    at: Instant,
+}
+
+impl Throttle {
+    fn new(keys_per_second: u64) -> Self {
+        let capacity = keys_per_second.max(1);
+        Self {
+            rate: capacity as f64,
+            capacity,
+            tokens: 0.0,
+            at: Instant::now(),
+        }
+    }
+
+    /// Waits until `keys` keys, at most the capacity, may be committed,
+    /// and takes them.
+    async fn admit(&mut self, keys: u64) {
+        let keys = keys.min(self.capacity) as f64;
+        self.refill();
+        if self.tokens < keys {
+            tokio::time::sleep(Duration::from_secs_f64((keys - self.tokens) / self.rate)).await;
+            self.refill();
+        }
+        self.tokens = (self.tokens - keys).max(0.0);
+    }
+
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let filled = self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate;
+        self.tokens = filled.min(self.capacity as f64);
+        self.at = now;
     }
 }
 

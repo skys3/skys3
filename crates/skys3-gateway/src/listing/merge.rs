@@ -15,7 +15,11 @@
 //! index holds every key up to it. A remote key lists only if the index
 //! has no entry for it, since a live entry lists from its shard and a
 //! delete tombstone hides it. A remote common prefix that no shard lists
-//! is checked: it lists only if a remote key under it lists.
+//! is checked: it lists only if a remote key under it lists. S3 leaves out
+//! a common prefix at or before the listing's start even if keys under it
+//! come after, so when the import's position is inside a common prefix the
+//! listing has not passed, the merge puts that prefix at the head of the
+//! remote's items itself, to be checked like any other.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -241,7 +245,8 @@ async fn refill<H: Shards>(
 /// Fetches the next page of the remote's listing into `cursor`, keeping
 /// the items after the listing's `start_after` and the keys the index has
 /// no entry for. The first page starts after the last key the import has
-/// passed, if that is later.
+/// passed, if that is later; it starts with the common prefix that
+/// position is inside, if any ([`straddled`]).
 async fn refill_remote<H: Shards>(
     shards: &H,
     bucket: &BucketDocument,
@@ -253,6 +258,12 @@ async fn refill_remote<H: Shards>(
     let Source::Remote { token } = &mut cursor.source else {
         return Ok(());
     };
+    let straddled = straddled(query, remote.passed.as_deref());
+    if token.is_none()
+        && let Some(prefix) = straddled
+    {
+        cursor.items.push_back(ListItem::Prefix(prefix.to_owned()));
+    }
     let listing = RemoteListing {
         prefix: query.prefix.clone(),
         delimiter: query.delimiter.clone().filter(|d| !d.is_empty()),
@@ -268,6 +279,7 @@ async fn refill_remote<H: Shards>(
         .items
         .into_iter()
         .filter(|item| after.is_none_or(|after| item.name() > after))
+        .filter(|item| straddled.is_none_or(|prefix| item.name() != prefix))
         .collect();
     let entries = local_entries(shards, bucket, object_keys(&items)).await?;
     cursor
@@ -277,6 +289,17 @@ async fn refill_remote<H: Shards>(
             ListItem::Prefix(_) => true,
         }));
     Ok(())
+}
+
+/// The common prefix of `query` that the import's position `passed` is
+/// inside, if the listing has not passed it: the remote's listing starts
+/// at `passed`, so S3 leaves that prefix out, though keys under it may
+/// come after `passed`.
+fn straddled<'a>(query: &ListQuery, passed: Option<&'a str>) -> Option<&'a str> {
+    let passed = passed.filter(|passed| passed.starts_with(&query.prefix))?;
+    let prefix = query.common_prefix(passed)?;
+    let after = query.start_after.as_deref();
+    after.is_none_or(|after| prefix > after).then_some(prefix)
 }
 
 /// Whether a remote key under `prefix` that the import has not passed has

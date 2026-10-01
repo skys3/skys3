@@ -147,12 +147,12 @@ fn an_import_resumes_from_its_checkpoint_at_its_rate() {
             .set_import_checkpoint(&bucket().bucket_id, Some(after))
             .await
             .unwrap();
-        // 30 keys in pages of 10, at 10 keys a second: two waits.
+        // 30 keys in pages of 10, at 10 keys a second: each page waits.
         let service = service(&store, 10, 10);
         let started = tokio::time::Instant::now();
         let status = import(&service, &node).await;
         assert!(
-            started.elapsed() >= Duration::from_secs(2),
+            started.elapsed() >= Duration::from_secs(3),
             "{:?}",
             started.elapsed()
         );
@@ -160,6 +160,41 @@ fn an_import_resumes_from_its_checkpoint_at_its_rate() {
         let entries = node.shard.entries(None, usize::MAX).await.unwrap();
         assert_eq!(entries.len(), 30);
         assert_eq!(entries[0].0, "k10");
+        service.shutdown().await;
+    });
+}
+
+#[test]
+fn an_import_of_one_page_keeps_to_its_rate() {
+    runtime().block_on(async {
+        let node = Node::open(87).await;
+        let store = SimS3::new(87, SimS3Config::default());
+        for n in 0..3 {
+            remote_put(&store, &format!("{PREFIX}k{n}"), "body").await;
+        }
+        // Three keys fit one page of 1,000, but at one key a second the
+        // first commits after a second and the last after three.
+        let service = service(&store, 1000, 1);
+        let started = tokio::time::Instant::now();
+        let patience = Patience::new();
+        loop {
+            service.reconcile(&[bucket()], &node.set).await;
+            let entries = node.shard.entries(None, usize::MAX).await.unwrap();
+            let elapsed = started.elapsed();
+            assert!(
+                entries.len() as u64 <= elapsed.as_secs(),
+                "{} keys after {elapsed:?}",
+                entries.len()
+            );
+            let status = service.status(&bucket().bucket_id).unwrap().import;
+            if status.checkpoint == ImportCheckpoint::Done {
+                assert_eq!(status.imported, 3);
+                break;
+            }
+            assert!(!patience.is_exhausted(), "the import never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.elapsed() >= Duration::from_secs(3));
         service.shutdown().await;
     });
 }
