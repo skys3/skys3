@@ -3148,9 +3148,15 @@ of this file. A task with nothing unexpected keeps "None."
 - **Shortfalls are judged by healthy domains.** A shard is reported short
   when its members not on departing nodes span fewer than `replicas`
   domains, so a lost rack shows up once its nodes depart, before
-  replacement (M3-05) removes them. Members that no registration
-  describes count as domains of their own: nothing is known to share one
-  with them.
+  replacement (M3-05) removes them. Only members whose separation can be
+  shown count: on a registered node, not departing, with the label the
+  level needs. The first version counted an unlabeled or unregistered
+  member as a domain of its own, so two unlabeled members in a `rack`
+  cluster could make a shard look whole, contradicting the rule that an
+  unlabeled node cannot be shown to be apart from any other (found in
+  review). An unregistered member is a node the coordinator forgot,
+  which it does only after marking it departing, or one that never
+  joined, so it counts for nothing either.
 - **The `departing` mark arrived mid-task.** M3-02's review fix forgets a
   node in two rounds and marks its registration `departing` first. A
   `Candidate` built from a marked registration is `Departing` whether it
