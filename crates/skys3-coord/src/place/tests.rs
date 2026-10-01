@@ -105,6 +105,7 @@ fn candidates_come_from_registrations_and_registry_entries() {
                 capacity_bytes: 5,
             },
         ],
+        departing: false,
         proposal_id: ProposalId::new("p1").unwrap(),
     };
     let candidate = Candidate::from_registration(&registration);
@@ -113,7 +114,7 @@ fn candidates_come_from_registrations_and_registry_entries() {
     assert_eq!(candidate.state, NodeState::Live);
     assert_eq!((candidate.shards, candidate.primaries), (0, 0));
 
-    let entry = NodeEntry {
+    let mut entry = NodeEntry {
         registration,
         version: skys3_control::Version::new("v1"),
         state: NodeState::Suspect,
@@ -122,6 +123,56 @@ fn candidates_come_from_registrations_and_registry_entries() {
     let candidate = Candidate::from_entry(&entry);
     assert_eq!(candidate.state, NodeState::Suspect);
     assert_eq!(candidate.zone, Some(label("z".into())));
+
+    // A registration marked departing is departing, from either source.
+    entry.registration.departing = true;
+    assert_eq!(
+        Candidate::from_registration(&entry.registration).state,
+        NodeState::Departing
+    );
+    assert_eq!(Candidate::from_entry(&entry).state, NodeState::Departing);
+}
+
+#[test]
+fn a_node_marked_departing_is_never_chosen() {
+    // Three nodes in three racks; the coordinator marked node-2 departing.
+    let registrations: Vec<NodeRegistration> = (0..3)
+        .map(|n| NodeRegistration {
+            node_id: node(n),
+            address: format!("10.0.0.{n}:7400").parse::<NodeAddress>().unwrap(),
+            zone: None,
+            rack: Some(label(format!("rack-{n}"))),
+            disks: vec![DiskInfo {
+                disk_id: label("nvme0".into()),
+                capacity_bytes: TB,
+            }],
+            departing: n == 2,
+            proposal_id: ProposalId::new(format!("p{n}")).unwrap(),
+        })
+        .collect();
+    let topology = Topology::new(
+        FailureDomain::Rack,
+        registrations.iter().map(Candidate::from_registration),
+    );
+    assert!(
+        !topology
+            .get(&node(2))
+            .unwrap()
+            .is_eligible(FailureDomain::Rack)
+    );
+    assert_eq!(topology.eligible_domains().len(), 2);
+    assert!(topology.unlabeled().is_empty());
+    // Three replicas no longer fit: the marked node does not count.
+    assert_eq!(topology.check(3).unwrap_err().domains, 2);
+    for shard in 0..32 {
+        let placed = topology.place(&ShardRequest::new(&bucket(), ShardId::new(shard), 3));
+        assert!(!placed.members.contains(&node(2)), "{placed:?}");
+        assert_eq!(placed.short, 1);
+    }
+    let placed = topology
+        .place_bucket(&bucket(), ShardCount::new(16).unwrap(), 2)
+        .unwrap();
+    assert!(placed.iter().all(|shard| !shard.members.contains(&node(2))));
 }
 
 #[test]

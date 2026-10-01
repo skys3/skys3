@@ -120,11 +120,19 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    /// A live node that holds no shard yet, as `registration` describes
-    /// it: for a node that judges placement without a registry, such as a
-    /// gateway checking a new bucket's policy.
+    /// A node that holds no shard yet, as `registration` describes it: for
+    /// a node that judges placement without a registry, such as a gateway
+    /// checking a new bucket's policy. It is live, unless the coordinator
+    /// has marked the registration `departing`: then it is
+    /// [`NodeState::Departing`], as the registry judges it too, and
+    /// receives nothing.
     #[must_use]
     pub fn from_registration(registration: &NodeRegistration) -> Self {
+        let state = if registration.departing {
+            NodeState::Departing
+        } else {
+            NodeState::Live
+        };
         Self {
             node: registration.node_id.clone(),
             zone: registration.zone.clone(),
@@ -133,18 +141,21 @@ impl Candidate {
                 .disks
                 .iter()
                 .fold(0, |sum: u64, disk| sum.saturating_add(disk.capacity_bytes)),
-            state: NodeState::Live,
+            state,
             shards: 0,
             primaries: 0,
         }
     }
 
-    /// A node the coordinator's registry lists, in the state it judges.
+    /// A node the coordinator's registry lists, in the state it judges. A
+    /// registration marked `departing` is departing whatever the entry
+    /// says (the registry judges it so as well).
     #[must_use]
     pub fn from_entry(entry: &NodeEntry) -> Self {
+        let candidate = Self::from_registration(&entry.registration);
         Self {
-            state: entry.state,
-            ..Self::from_registration(&entry.registration)
+            state: candidate.state.max(entry.state),
+            ..candidate
         }
     }
 

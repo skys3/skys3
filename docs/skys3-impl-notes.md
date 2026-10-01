@@ -3151,3 +3151,10 @@ of this file. A task with nothing unexpected keeps "None."
   replacement (M3-05) removes them. Members that no registration
   describes count as domains of their own: nothing is known to share one
   with them.
+- **The `departing` mark arrived mid-task.** M3-02's review fix forgets a
+  node in two rounds and marks its registration `departing` first. A
+  `Candidate` built from a marked registration is `Departing` whether it
+  comes from the registration alone (a gateway checking a new bucket) or
+  from a registry entry, so the marked node receives no member, does not
+  count towards satisfiability, and its members count as missing in the
+  health report.

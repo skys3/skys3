@@ -12,7 +12,7 @@ use skys3_types::{
 
 use super::*;
 use crate::join::{NodeProfile, register};
-use crate::place::Candidate;
+use crate::place::{Candidate, ShardRequest};
 use crate::registry::RegistryConfig;
 
 const TB: u64 = 1 << 40;
@@ -318,7 +318,9 @@ async fn the_watch_publishes_what_the_registers_say() {
     let applied = Applied {
         written: Vec::new(),
         rejected: None,
+        failed: None,
         generation: None,
+        pending: None,
     };
     watch.applied(&change, &applied);
 }
@@ -352,6 +354,68 @@ async fn a_failed_scan_keeps_the_previous_view() {
     assert_eq!(watch.health().latest(), Some(report));
 }
 
+#[tokio::test(start_paused = true)]
+async fn members_on_a_node_marked_departing_count_as_missing() {
+    let store = store().await;
+    let bucket = bucket(1, 1, 3);
+    put(
+        &store,
+        &TypedKey::bucket(&bucket.name),
+        Expected::Absent,
+        &bucket,
+    )
+    .await;
+    let key = TypedKey::shard(&bucket_id(1), ShardId::new(0));
+    put(&store, &key, Expected::Absent, &shard(1, 0, &[0, 1, 2])).await;
+    let registry = registry();
+    registry.begin_tenure();
+    let mut watch = PolicyWatch::new(registry.clone(), FailureDomain::Rack);
+    let mut proposals = ProposalIds::seeded(5);
+    registry.refresh(&store).await.unwrap();
+    watch.plan(&store, &mut proposals).await.unwrap();
+    assert!(watch.health().latest().unwrap().is_satisfied());
+
+    // The coordinator marks node-2 departing, as the lifecycle's first
+    // round of forgetting does; the node itself has not gone silent.
+    let node_key = TypedKey::node(&node(2));
+    let current = skys3_control::read(&store, &node_key)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut marked = current.value.clone();
+    marked.departing = true;
+    marked.proposal_id = proposals.next_id();
+    put(
+        &store,
+        &node_key,
+        Expected::Version(current.version),
+        &marked,
+    )
+    .await;
+    registry.refresh(&store).await.unwrap();
+    assert_eq!(registry.get(&node(2)).unwrap().state, NodeState::Departing);
+    watch.plan(&store, &mut proposals).await.unwrap();
+
+    let report = watch.health().latest().unwrap();
+    assert_eq!((report.eligible_nodes, report.domains), (2, 2));
+    let policy = &report.unsatisfied[0];
+    assert!(!policy.placeable, "the marked node does not count");
+    assert_eq!(
+        policy.short,
+        [ShortShard {
+            shard: ShardId::new(0),
+            members: vec![node(0), node(1), node(2)],
+            domains: 2,
+        }]
+    );
+    // And placement never gives it a member.
+    let topology = Topology::from_registry(FailureDomain::Rack, &registry);
+    let keep = [node(0)];
+    let placed = topology.place(&ShardRequest::new(&bucket_id(1), ShardId::new(0), 3).keep(&keep));
+    assert_eq!(placed.members, [node(0), node(1)]);
+    assert_eq!(placed.short, 1);
+}
+
 #[test]
 fn registrations_feed_a_topology_without_a_registry() {
     let registration = NodeRegistration {
@@ -360,6 +424,7 @@ fn registrations_feed_a_topology_without_a_registry() {
         zone: None,
         rack: None,
         disks: Vec::new(),
+        departing: false,
         proposal_id: ProposalId::new("p1").unwrap(),
     };
     let topology = Topology::new(
