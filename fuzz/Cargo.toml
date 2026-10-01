@@ -18,13 +18,67 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+crc32c = "0.6"
 libfuzzer-sys = "0.4"
+skys3-gateway = { path = "../crates/skys3-gateway", features = ["test-util"] }
+skys3-index = { path = "../crates/skys3-index" }
+skys3-log = { path = "../crates/skys3-log" }
 skys3-obs = { path = "../crates/skys3-obs" }
+skys3-sts = { path = "../crates/skys3-sts" }
 skys3-types = { path = "../crates/skys3-types" }
+
+[[bin]]
+name = "gateway_aws_chunked"
+path = "fuzz_targets/gateway_aws_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_request"
+path = "fuzz_targets/gateway_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_sigv4_canonical"
+path = "fuzz_targets/gateway_sigv4_canonical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_codec"
+path = "fuzz_targets/index_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_record"
+path = "fuzz_targets/log_record.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "obs_bearer"
 path = "fuzz_targets/obs_bearer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sts_jwks"
+path = "fuzz_targets/sts_jwks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sts_jwt"
+path = "fuzz_targets/sts_jwt.rs"
 test = false
 doc = false
 bench = false

@@ -118,10 +118,18 @@ fn bucket_document() -> impl Strategy<Value = BucketDocument> {
             any::<prop::sample::Index>(),
         ),
         target,
-        proposal_id(),
+        (any::<u64>(), proposal_id()),
     )
         .prop_map(
-            |(bucket_id, name, mode, shards, (replicas, min, clean), target, proposal_id)| {
+            |(
+                bucket_id,
+                name,
+                mode,
+                shards,
+                (replicas, min, clean),
+                target,
+                (created_unix_ms, proposal_id),
+            )| {
                 BucketDocument {
                     bucket_id,
                     name: BucketName::new(name).unwrap(),
@@ -131,6 +139,7 @@ fn bucket_document() -> impl Strategy<Value = BucketDocument> {
                     min_write_replicas: u8::try_from(min.index(usize::from(replicas)) + 1).unwrap(),
                     clean_copies: u8::try_from(clean.index(usize::from(replicas) + 1)).unwrap(),
                     target: mode.has_target().then_some(target),
+                    created_unix_ms,
                     proposal_id,
                 }
             },

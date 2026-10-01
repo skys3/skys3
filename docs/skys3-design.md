@@ -155,6 +155,8 @@ Each **bucket** has a mode, fixed at creation:
 
 Attaching a `write_back` bucket imports the remote namespace (section 9.1). Deleting a SkyS3 bucket detaches it and leaves any remote untouched.
 
+**Detaching.** DeleteBucket first seals every shard of the bucket. A sealed shard commits no client write, and reports what it holds, counting every write committed before the seal; flushing continues. A `write_back` bucket is refused with `409 BucketNotEmpty` while any entry is dirty, flushing, or in conflict, delete tombstones included: those changes exist nowhere else. Clean and evicted entries do not block, since their system of record is the remote. A `local` bucket is refused while it holds any object, as S3 refuses a non-empty bucket. A refusal lifts the seals, and the client retries once the flusher has drained the bucket. Detaching never waits for a drain itself, because a conflict held by the `hold` policy (section 7.2) may never drain without an operator. Otherwise the bucket register is deleted at the version read before sealing, and the shards are dropped. If the register changed in between, the seals are lifted and the request fails with `409 OperationAborted`. If the delete's outcome is unknown, the shards stay sealed, so no write is acknowledged into a bucket that may be gone, and the gateway remembers the pending deletion (at most 256, oldest forgotten first). A retried DeleteBucket resolves it by the lost-response rule for deletes (section 6.1). If the register is gone, or names a new bucket, the earlier delete applied: the retry drops the old shards, increments the generation that was never incremented, and answers `204`, the answer the first request would have had; AWS answers `404 NoSuchBucket` to a retry after a delete that succeeded, but there the client saw the success. If the register is still at the version the delete named, the delete may yet land, so the seals stay until a later attempt resolves it; once the register has moved to another version, no such delete can apply, and the seals are lifted. A restart lifts them too. Seals nest, so concurrent DeleteBucket requests cannot lift each other's. In M1 the gateway and every shard share a process, so a crash lifts the seals with everything else; a seal held across nodes is specified with the shard map (plan M2-08). Shards whose bucket ID no register names, left by a creation or deletion whose outcome was unknown, are reclaimed by startup recovery (plan M1-13).
+
 Replication is configured per bucket, because every shard belongs to exactly one bucket:
 
 - `replicas`: the number of shard members, and so of copies of every write until it reaches its durable home (default 3).
@@ -286,6 +288,8 @@ trait ControlStore {
     async fn get(&self, key: &str) -> Result<Option<(Bytes, Version)>>;
     /// Write only if the register is still at `expected`, or still absent.
     async fn put_if(&self, key: &str, expected: Expected, value: Bytes) -> Result<PutOutcome>;
+    /// Delete only if the register is still at `expected`.
+    async fn delete_if(&self, key: &str, expected: Version) -> Result<DeleteOutcome>;
     /// List registers under a prefix, for bootstrap and recovery.
     async fn list(&self, prefix: &str) -> Result<Vec<(String, Version)>>;
     /// Stream changes after a generation, from a native watch or by polling.
@@ -293,7 +297,7 @@ trait ControlStore {
 }
 ```
 
-`put_if` must be linearizable per key. Nothing else is required: SkyS3 needs no transactions across registers, and the coordinator lease (section 6.7) is built from `put_if` plus local timers.
+`put_if` and `delete_if` must be linearizable per key, and every value a register holds, across deletions and re-creations, has a version of its own. Nothing else is required: SkyS3 needs no transactions across registers, and the coordinator lease (section 6.7) is built from `put_if` plus local timers.
 
 | Backend | Compare-and-swap | Change notification | Status |
 |---|---|---|---|
@@ -302,6 +306,8 @@ trait ControlStore {
 | Other S3-compatible stores | The same headers | Poll `cluster.json` | Only if the probe passes |
 | etcd v3 | A transaction that compares the key's `mod_revision`[^etcd-api] | Native watch | First release |
 | Embedded Raft on SkyS3 nodes | Compare-and-swap applied from the Raft log | Push | Future, for air-gapped sites |
+| Local directory | Under an exclusive lock on the directory: write a temporary file, `fsync`, rename, `fsync` the directory | In-process | Single-node development; refuses to open once a second node is registered |
+| In memory | A map under a lock | In-process | Tests and simulation |
 
 etcd and embedded Raft are consensus systems themselves. They need no external service, but if a majority of their voters is lost permanently, recovering them needs an operator. An S3 or R2 backend has no voters to lose, but its provider must be reachable for membership to change (section 6.10).
 
@@ -312,14 +318,18 @@ Every backend uses the same register layout:
   cluster.json                  cluster id, format version, generation, global settings
   coordinator.lease             coordinator lease register
   nodes/<node-id>.json          node registration: address, failure domain, disks
-  buckets/<bucket>.json         bucket mode, target binding, shard count, replication settings
-  shards/<bucket>/<n>.json      shard configuration register
+  buckets/<bucket-name>.json    bucket mode, target binding, shard count, replication settings
+  shards/<bucket-id>/<n>.json   shard configuration register
   identity/                     OIDC providers, roles, trust and session policies
 ```
 
-**S3 backends.** Registers are objects in a control bucket. They are updated with `PutObject` and `If-Match: <etag>`, or created with `If-None-Match: *`. A precondition failure (412) means someone else won. A `409 ConditionalRequestConflict` means a concurrent conditional write was in progress, and the caller retries after re-reading[^s3-cond]. At startup, each node probes an S3 control store. It runs 100 rounds across several scratch keys, racing conditional writers on different nodes, and requires exactly one winner in every round. After each round, the losers read the register and must see the winner's value, because the lost-response rule below depends on read-after-write. A store that fails any round is refused. The conformance suite (section 16.1) runs the same probe against every backend, not only at startup.
+**S3 backends.** Registers are objects in a control bucket. They are updated with `PutObject` and `If-Match: <etag>`, created with `If-None-Match: *`, and deleted with `DeleteObject` and `If-Match: <etag>`. A precondition failure (412) means someone else won. A `409 ConditionalRequestConflict` means a concurrent conditional write was in progress, and the caller retries after re-reading[^s3-cond]. At startup, each node probes an S3 control store. It runs 100 rounds across several scratch keys, racing conditional writers on different nodes, and requires exactly one winner in every round. After each round, the losers read the register and must see the winner's value, because the lost-response rule below depends on read-after-write. A store that fails any round is refused. The conformance suite (section 16.1) runs the same probe against every backend, not only at startup.
 
-**Lost responses.** Each write includes a unique `proposal_id` in the value. If a response is lost and the retry fails its precondition, the proposer re-reads the register. If the register contains its own `proposal_id`, the write succeeded. This applies to every backend.
+A bucket register is keyed by the bucket's S3 name, which requests use to find it. Its shards are keyed by the bucket ID, which is never reused (section 4.1), so a bucket recreated under the same name never inherits an old shard register. Keys are `/`-separated segments of ASCII letters, digits, `-`, `_`, and `.`, none empty or starting with `.`, so every backend can store them as object keys, etcd keys, or file paths.
+
+**Lost responses.** Each write includes a unique `proposal_id` in the value. If a response is lost and the retry fails its precondition, the proposer re-reads the register. If the register contains its own `proposal_id`, the write succeeded. This applies to every backend. The retry sends the same value under the same precondition, so at most one attempt can apply, even one still in flight. A `409` or an outage applied nothing, and the request is sent again as it is. A write that landed and was overwritten before the re-read cannot be told from a lost race, and is treated as one: the proposer acts on the register's current value, as a loser would. For bootstrap, this means a node may not learn that it created `cluster.json`, which is harmless because bootstrap is idempotent.
+
+A deleted register holds no `proposal_id`, so a lost delete response is resolved by the register's absence. The retry sends the same conditional delete, which can apply only while the register is still at the version the proposer read. If it fails its precondition after an unanswered attempt, the proposer re-reads: an absent register counts as deleted, whether by this proposal or by another proposer, since either way the version it read is gone. A present register means the delete did not apply, or applied before the register was created again; both are treated as a lost race. Because the original request reported neither, the change was never announced: the proposer that later learns an unannounced create or delete applied increments the generation then. CreateBucket increments it whenever its create loses to an existing register it did not know, which covers a creation whose answers were all lost, and DeleteBucket does when it resolves a pending deletion (section 4.1). Tombstone values carrying a `proposal_id` were rejected: registers would never disappear, and every reader and lister would have to skip them.
 
 An example shard register:
 
@@ -341,11 +351,12 @@ Register values are JSON objects. Readers reject unknown fields and invalid valu
 
 #### Traffic and latency
 
-**No client request reads or writes the control store.** Routing, leases, commits, and reads all stay inside the cluster. The control store sees background traffic, plus bursts when membership changes:
+**No object request reads or writes the control store.** Routing, leases, commits, and reads all stay inside the cluster. Of the bucket operations, only CreateBucket and DeleteBucket do: they write the bucket register and increment the generation, and DeleteBucket reads the register first. HeadBucket, ListBuckets, and GetBucketLocation are answered from the node's local copy (section 6.2). The control store sees background traffic, plus bursts when membership changes:
 
 | Activity | Control-store requests | Effect of a 100 ms round trip |
 |---|---|---|
-| Any client request | 0 | None |
+| Any object request | 0 | None |
+| CreateBucket, DeleteBucket | 2 to 4 (read, CAS, generation increment) | Adds a few round trips to an operation that is rare |
 | Primary leases | 0 (granted by backups, section 5.4) | None |
 | Coordinator lease renewal | 1 conditional PUT every `coordinator_lease / 3` | None while renewal fits well inside the lease |
 | Configuration propagation (section 6.2) | S3 backends: 1 conditional GET per node every `config_poll_interval`, usually `304 Not Modified`. etcd: a watch. | None |
@@ -377,6 +388,14 @@ Every node also keeps a durable local copy of the control state it uses:
 | Bucket bindings, identity and trust configuration, node registry | Node-local index, tagged with a configuration generation | Coordinator pushes, plus polling of `cluster.json` |
 
 **Propagation.** Every control-store change the coordinator makes also increments the generation number in `cluster.json`, and the coordinator pushes the change to every node. As a backstop, each node polls `cluster.json` every `config_poll_interval` with `If-None-Match: <etag>`, and refetches changed objects only when the generation moves.
+
+`cluster.json` is created at generation 1 with `If-None-Match: *`. The generation is incremented after the writes it announces, never before, so a node that sees the new generation and then lists the registers finds them. An increment that loses its CAS to another increment needs no retry: the winner wrote after the loser's changes, so its generation announces them.
+
+`changes(after)` delivers reports with these semantics, for every backend:
+
+- It reports when it observes a generation other than the one it last reported, or than `after` before its first report. The first report is a snapshot: every register under `nodes/`, `buckets/`, `shards/`, and `identity/`, with its version. Later reports list the registers whose version changed since the previous report. `cluster.json` and `coordinator.lease` are not reported.
+- A write announced by generation `g` is reported, at its version or a later one, no later than the first report at or after `g`. A write never followed by an increment may be reported early, or never.
+- Reports are coalesced and at least once: a register written several times between reports appears once, at its latest version, and the reader acts on the value it reads, not on the reported version. A node with no local copy passes generation 0 and receives a snapshot at once.
 
 **Stale routing.** A shard replica that is not the current primary rejects a forwarded request with its current configuration (epoch, primary, members). The gateway updates its shard map from that hint and retries, without touching the control store. It reads the shard register directly only if no member of the configuration it knows answers.
 
@@ -579,6 +598,8 @@ On 412, the flusher HEADs the remote object. S3 answers an `If-Match` write to a
 - `discard_local`. Adopt the remote version and drop the local one. This loses acknowledged writes, so it must be opted into per bucket.
 
 Conditional-write support differs by provider and operation. When a target is attached, SkyS3 probes which of `PutObject`, `CompleteMultipartUpload`, and `DeleteObject` honor preconditions. Cloudflare R2, for example, lists conditional headers on `PutObject` but not on the other two[^r2-api]. A provider may ignore an unsupported header, applying the write unconditionally, or reject it with `501 NotImplemented`; the probe tells the two apart and treats both as unsupported. Operations without support are sent unconditionally, so an out-of-band write to that key can be overwritten silently. The bucket's status lists which operations are unprotected.
+
+**The probe.** It tests each header of each operation separately (`If-None-Match: *` and `If-Match` on `PutObject` and `CompleteMultipartUpload`, `If-Match` on `DeleteObject`), once with a precondition that fails and once with one that holds. A header is *honored* if the failing write gets `412` and the holding one succeeds, *ignored* if the failing write is applied, and *rejected* if a write carrying it fails even when it holds (`501`, a `400`, or a `412`). An operation is protected only if all its headers are honored. Any other error, such as `403` or a transient one, fails the probe, and attaching fails or is retried; the probe itself does not retry. It writes only under a scratch prefix inside the target's prefix, `<prefix>.skys3-probe/<nonce>/`, with a fresh 64-bit nonce per run so that probes from several nodes never share keys. Before it returns, success or not, it deletes everything it created: each version and delete marker by version ID on a versioned bucket, so no history is left behind, each key on an unversioned one, and any multipart upload it left open. A write whose response was lost may have been applied, and is the last request the probe sends to its key, so the probe finds the version it may have created with `HeadObject` and deletes it. Two things it cannot find without `ListObjectVersions` or `ListMultipartUploads`, which the object-store interface does not have: the delete marker a lost `DeleteObject` response may hide on a versioned bucket, and the upload a lost `CreateMultipartUpload` response may hide (the abort-incomplete-uploads lifecycle rule of §7.3 removes it). Both are reported as possibly left behind. What it cannot remove is reported with its error.
 
 A conditional write can also fail with `409 ConditionalRequestConflict` when another write to the key is applied while it is in progress. Nothing was written: the flusher re-reads the key (HEAD) and retries, as the control store does (section 6.1).
 
@@ -899,22 +920,54 @@ Each disk has append-only segment files shared by every shard replica on that di
 
 Record header: magic, format version, record kind, shard id, epoch, seq, key hash, header and payload lengths, and CRC32C. Record kinds are `PUT`, `DELETE`, `EXTENT`, `MPU_CREATE`, `MPU_PART`, `MPU_COMPLETE`, `MPU_ABORT`, `UPLOAD_BEGIN`, `FLUSHED`, `PART_FLUSHED`, `TAGS`, `IMPORT`, `ADOPT`, `EC_PUBLISH`, `EC_RELOCATE`, `EC_RELEASE`, `TRUNCATE`, and `CONFIG`.
 
+**Record format, version 1.** The `skys3-log` crate's `record` module specifies the layout byte for byte. It is fixed and little-endian, with no serialization framework:
+
+- An 80-byte fixed header, then a kind-specific header, then the payload. `header_len` counts both headers and is at most 2 MiB; `payload_len` counts the inline body or the one extent and is at most 16 MiB. Configuration loading keeps `inline_max_bytes` at most 16 MiB and `extent_bytes` from 64 KiB to 16 MiB, so a 5 GiB PUT references at most 81,920 extents. Every text field, map, and list in a body has its own bound.
+- Segments are shared by every shard on a disk, so the shard id is the bucket ID and the shard number. The key hash is the §4.1 hash of the record's key, and zero for `CONFIG` and `TRUNCATE`, which name no key.
+- The CRC32C covers every byte after the magic and the CRC field: the rest of the fixed header, the kind-specific header, and the payload. A reader checks the magic, the version, and both lengths, then the CRC, and only then interprets other fields.
+- The format version covers the fixed header and every defined body, and any change to them takes a new version. Readers reject versions they do not know. Kind codes follow the order of the list above, from `PUT` = 1 to `CONFIG` = 18. A reserved kind whose body a build does not define is rejected as unsupported and never parsed. Defining it later needs no new version.
+- Every record, `EXTENT` included, has its own `(epoch, seq)`. A `PUT` references its extents by position and length. `CONFIG` and `TRUNCATE` are appended by a replica for itself and take no sequence number of their own. A `TRUNCATE(shard, epoch, seq)` is exactly its header, with `seq` the last valid record. A `CONFIG`'s `seq` is the replica's last `seq` when it adopted the configuration.
+- A `PUT` carries the key, size, `Last-Modified` from the primary's clock (so every replica reports the same), the local ETag, the position of an inherited write identity (`UPLOAD_BEGIN`, section 7.2), stored metadata (standard headers and `x-amz-meta-*`), tags, client checksums (section 7.4), the optional copy source, and either inline data or extent references. `FLUSHED`, `IMPORT`, and `ADOPT` carry the fields of sections 7.1, 9.1, and 9.2. `ADOPT` also carries the `seq` the read plan named, the size, and `Last-Modified`.
+- Decoding errors are classified. An incomplete or corrupt record can be a torn tail. A record that is unsupported (an unknown version or kind) or invalid (a verified CRC but broken content) is a whole record this build cannot use, not a torn tail.
+
 A copy has no record kind of its own. It commits as a `PUT` that records its source: bucket, key, version identity, and the source's `remote_etag`. The flusher uses that source reference to choose a remote `CopyObject` with `x-amz-copy-source-if-match` (section 11).
 
 A `CONFIG` record holds a full shard configuration: epoch, primary, members, learners, and replica targets. A replica appends one, and group commit makes it durable, whenever it adopts a new epoch, before it acknowledges or serves anything in that epoch. Checkpoints keep each shard's latest `CONFIG` record reachable, so it survives log reclamation. It is the replica's local copy of its membership (section 6.2).
 
 Parsing checks lengths before allocating, uses checked arithmetic, and rejects unknown versions. On recovery, a torn tail is cut back to the last record whose CRC verifies.
 
+**Segments.** The `skys3-log` crate's `SegmentLog` owns a disk's segments:
+
+- A segment file is named `<class>-<id>.seg`, with the class `hot` or `bulk` and the id as 16 lowercase hex digits. One counter per disk numbers segments of both classes, so ids follow creation order. Records hold no segment header: each record carries its own magic, version, and CRC.
+- `EXTENT` records go to bulk segments and every other kind to hot segments. A record in a hot segment carries at most `inline_max_bytes` of payload. Records of one class are written in the order they were queued. Records of different classes become durable independently, even in one group commit, so a `PUT` is appended only after its extents are acknowledged.
+- A record's location is `(segment id, offset, length)`. The log returns it on acknowledgement, and the location map (section 10.2) stores it for extents and inline payload.
+- A class starts a new segment only between group commits: before a commit writes to a non-empty segment past `segment_bytes`. So every segment except the last of each class was fully synced before its successor existed, and only the last of each class can have a torn tail. A segment exceeds `segment_bytes` only if one group commit's records for the class do.
+
+**Recovery** scans the last segment of each class and stops at the first bytes that are not a record whose CRC verifies. It acts on the decoding error's class:
+
+- Incomplete: a torn tail, cut.
+- Corrupt (bad magic, impossible lengths, or a CRC mismatch): a crash leaves at most one group commit unsynced, less than `group_commit_max_bytes` plus one maximum-size record. If a verifiable record starts beyond that window, synced records were damaged, and recovery refuses to start. Otherwise the tail is cut, including whole records inside the window: they followed a lost record in an unacknowledged group commit.
+- Unsupported (a newer version or a kind this build does not define) or invalid (a verified CRC but a broken header): a whole record this build cannot use. Recovery refuses to start rather than cut it.
+
+Recovery then syncs those segments and the directory, so every record it leaves in place is durable even after a process crash that kept the page cache. Earlier segments are read by replay (section 10.2), where any error is damage.
+
 ### 10.2 Index and checkpoints
 
 A per-node `redb` database[^redb] holds:
 
 - each shard's namespace index, keyed by `(shard, key)`, with state, ETags, checksums, metadata, and payload location,
-- the node-local location map, from extent to `(segment, offset, length)`,
+- the node-local location map, from a record holding payload (an extent or inline data) to `(segment, offset, length)`,
 - each shard's applied `(epoch, seq)`,
 - the node's local copy of control state: the gateway shard map, bucket bindings, identity configuration, and node registry, each tagged with its configuration generation (section 6.2).
 
 Index updates are committed **without fsync** (`Durability::None`). A durable checkpoint runs every `index_checkpoint_interval`. After a crash, redb reverts to the last durable checkpoint, and records after the checkpointed `seq` are replayed from the log. The log is the source of truth, and only log appends are fsynced on the write path. Log segments are released only once they are behind the durable checkpoint.
+
+The `skys3-index` crate's `codec` module specifies the tables and encodings. The rules that the sentences above leave open:
+
+- **Payload by position.** An entry names its payload by log position: the record holding inline data, or the `EXTENT` records. Entries are therefore the same on every replica. The location map resolves a position to `(segment, offset, length)` on this node, for `EXTENT` records and for `PUT` records with inline data.
+- **One apply path.** Live writes and replay apply records through the same function, a shard's records in position order. A record at or before the shard's applied position is skipped, so replay is idempotent. An applied position therefore means that every earlier record of the shard was applied, `EXTENT` records included. Replay applies every durable record past its shard's checkpointed position. It sorts each shard's records by position, because a shard's extents and its other records are in segments of different classes. A record whose CRC verifies but whose body does not decode is damage (§10.1).
+- **Segment summaries.** The log keeps a summary of each segment: the highest position of each shard among the records it acknowledged there. Each checkpoint folds these into a summary of each segment from offset zero, and stores it in the same durable commit as the applied positions. A segment other than the last of its class is released once its summary covers its whole length and every position in it is at or before its shard's checkpointed position. Replay starts reading a segment where such a summary ends, and otherwise reads it whole. Summaries cover acknowledged records, not applied ones, so a record acknowledged but not yet applied holds its segment back. So does a shard that never applies again, so dropping a shard from a node must also account for its segments.
+- **Control state.** The local copy of control state does not come from the log, so replay cannot restore it. Each change to it commits durably at once.
 
 ### 10.3 Reclaiming space
 
@@ -927,6 +980,8 @@ Segments are reclaimed on each node, with no cross-node coordination, because pa
 ### 10.4 Durability discipline
 
 A member acknowledges a record only after `fdatasync` covers it. New segment files also get a directory `fsync`. Disk I/O runs on dedicated blocking workers, never on the Tokio reactor. Each disk has its own fixed pool of workers, so a stalled disk delays only its own I/O. A sync error takes the disk out of service, and the node reports it. It never acknowledges after a failed sync: as on Linux, the bytes a failed sync covered may be lost even if a later sync of the same file succeeds.
+
+Group commit runs as one task per disk. A group starts with the first queued record. It takes every record already queued, waits for more until `group_commit_max_delay_us` after the first record's arrival, and stops once it holds `group_commit_max_bytes`. The delay bounds only the wait: records that queued behind a slow sync of the previous group join the next group even if they arrived after its first record's deadline. Closing a group at the deadline would commit only one delay window of records per sync, so once syncs take longer than the delay, the queue would grow without bound. Tokio timers have millisecond resolution, so a delay below 1 ms rounds up to the next timer tick. The task writes each class's records with one append, syncs every file it wrote and, if it created a file, the directory, and only then acknowledges the group. The first I/O error of any kind (a write, a sync, or creating a file) takes the disk out of service: the group and every queued record fail, and the task never retries. After a sync error, the page cache can still show bytes the disk lost, and recovery cannot tell them from durable records, so a disk taken out of service is used again only after the host restarts.
 
 ## 11. S3 surface and workload identity
 
@@ -943,9 +998,42 @@ A member acknowledges a record only after `fdatasync` covers it. New segment fil
 
 S3 parsing and serialization use `s3s`[^s3s]. SkyS3 implements authentication, authorization, and resource limits itself.
 
+**Signing.** Requests are signed with `AWS4-HMAC-SHA256`, in the `Authorization` header or as a presigned URL; SigV2 and SigV4a are refused with `400 InvalidRequest`. The gateway verifies the signature itself and hands `s3s` the request without it, so `s3s` takes it as anonymous.
+
+- **Canonical request.** It is built from the bytes received. Path and query components are never decoded and re-encoded: a `%XX` escape is kept (its hexadecimal digits uppercased), an unreserved character and the path's `/` are kept, and any other byte is percent-encoded. Paths are not normalized. So `%2F` and `/` stay distinct, as the client signed them. Decisions on a query parameter's name (whether the request is presigned, which parameters carry the signature and are removed before `s3s` sees the request) use the name decoded as `s3s` decodes it, so an escaped `X-Amz-%53ignature` is the signature.
+- **Scope and time.** The credential scope may name any region, since SkyS3 has none, and must name the service `s3`. The signing time is `x-amz-date`; the `Date` header is not accepted in its place. A header signature must be within 15 minutes of the node's wall clock (`403 RequestTimeTooSkewed`). A presigned URL is valid from 15 minutes before its `X-Amz-Date` until `X-Amz-Expires`, at most seven days, after it (`403 AccessDenied`).
+- **Signed headers.** `host`, every `x-amz-*` header, and every `x-skys3-*` header the request has must be signed (`403 AccessDenied`), and an unsigned request may carry no `x-skys3-*` header.
+- **Credentials.** The access key and any session token (`x-amz-security-token`, or `X-Amz-Security-Token` in a presigned URL) are looked up together, and signatures are compared in constant time with `aws-lc-rs`.
+- **Payloads.** A header-signed request needs `x-amz-content-sha256`. A SHA-256 there is checked when the body ends (`400 XAmzContentSHA256Mismatch`). The gateway decodes `aws-chunked` bodies in all three forms, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`: it checks each chunk signature and the trailer signature, requires the trailers to be exactly those `x-amz-trailer` declares, and hands `s3s` the decoded body with `x-amz-decoded-content-length` as its length. A presigned URL signs `UNSIGNED-PAYLOAD` and cannot carry an `aws-chunked` body. A body is authenticated only once it has been read to its end without error, so no operation commits before then; a trailing checksum is available to the checksum checks (section 7.4) at that point too.
+
+**Creating a bucket.** S3 has no field for a mode or a target, so CreateBucket takes them from two SkyS3 headers. `x-skys3-bucket-mode` is `write_back`, `local`, or `read_only`; without it, the bucket's `[buckets.<name>]` table or `[buckets.defaults]` decides (section 14). `x-skys3-bucket-target` is a `write_back` bucket's target, a path-style URL in the form of `backup_target`: `https://host[:port]/bucket[/prefix]`. A `write_back` bucket without a target, and a `local` bucket with one, are refused with `400 InvalidArgument`, as is a target in the control store's failure scope (section 6.1). `read_only` answers `501 NotImplemented` until read-only buckets land. The shard count and replication settings come from the configuration. A new bucket gets a random ID, `b-` and 23 base-32 characters (115 bits), so IDs are never reused without a registry of every ID ever issued. Its shards are opened before its register is created with `If-None-Match: *`, so a bucket is never visible without them. A name that exists answers `409 BucketAlreadyOwnedByYou`. The headers are not `x-amz-` headers, so SigV4 covers them only when the client signs them; the authenticator requires that they be signed (plan M1-07a). Any `LocationConstraint` is accepted and ignored: SkyS3 has no regions, and GetBucketLocation answers as for `us-east-1`. Requests are path-style (`/bucket/key`).
+
+**Rejected features.** Headers that ask for a rejected feature are refused on every operation, so object operations need no checks of their own. Each answer is the one S3 gives where it has one:
+
+| Request | Answer |
+|---|---|
+| `x-amz-server-side-encryption*` headers (SSE-S3, SSE-KMS, SSE-C, and the copy-source SSE-C headers); PutBucketEncryption | `501 NotImplemented` |
+| GetBucketEncryption | `400 ServerSideEncryptionConfigurationNotFoundError` |
+| `x-amz-bucket-object-lock-enabled: true`; PutObjectLockConfiguration | `501 NotImplemented` |
+| `x-amz-object-lock-*` headers; Put and Get of object retention and legal hold | `400 InvalidRequest`, as for a bucket without Object Lock |
+| GetObjectLockConfiguration | `404 ObjectLockConfigurationNotFoundError` |
+| PutBucketVersioning; ListObjectVersions | `501 NotImplemented` |
+| `versionId` other than `null` | `400 InvalidArgument`, as for an unversioned bucket; GetBucketVersioning reports no status |
+| `x-amz-grant-*` headers, an `x-amz-acl` other than `private` or `bucket-owner-full-control`, or an ACL body | `400 InvalidBucketAclWithObjectOwnership` on CreateBucket, otherwise `400 AccessControlListNotSupported`, as for a bucket-owner-enforced bucket |
+| Object ownership other than `BucketOwnerEnforced`, on CreateBucket or PutBucketOwnershipControls | `501 NotImplemented` |
+
 CopyObject within the cluster copies the bytes into the destination shard and commits a `PUT` that records its source (section 10.1). If the source is clean and in the same target, the flush uses a remote server-side `CopyObject` to save WAN bandwidth. The remote copy must carry the copy's own write identity. With the default `COPY` metadata directive, it would keep the source's identity, and the 412 recovery rule (section 7.2) would report a successful flush as a conflict. So the flush sends `x-amz-metadata-directive: REPLACE` with the full metadata and the copy's write identity, `x-amz-tagging-directive: REPLACE` with the tags, `x-amz-copy-source-if-match: <source remote_etag>` so the source has not changed, and the destination precondition. A target that does not support all of these gets a regular upload instead.
 
 **Workload identity.** STS implements `AssumeRoleWithWebIdentity`[^sts-wif]. It validates the JWT signature against allowlisted issuers (discovery and JWKS fetched with bounded size and rate), and checks `iss`, `aud`, `sub`, `exp`, `nbf`, and `azp` where required, using an algorithm allowlist. It then issues `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`. Trust policies and roles live in the control store. Each node validates against its local copy, and stops issuing new sessions once that copy is older than `identity_max_staleness` (section 6.2). Session records live in an internal, local-only system bucket that is replicated like any shard and never flushed. Session tokens are stored hashed. Secrets needed for SigV4 are held in memory with `secrecy`/`zeroize`.
+
+**Token validation rules.**
+
+- **Issuer allowlist.** Each OIDC provider is a record under `identity/` with `issuer`, `audiences`, optional `authorized_parties`, and `algorithms` (default `["RS256"]`). A token's `iss` must equal an `issuer` exactly.
+- **Algorithms.** RS256, RS384, RS512, PS256, PS384, PS512, ES256, ES384, and EdDSA (Ed25519). `none` and the HMAC algorithms are never accepted, so a public key can never serve as an HMAC secret. A key verifies only the algorithms of its own type and curve, and only its JWK `alg` if it has one. RSA keys have 2048 to 8192 bits. Keys marked `use: enc`, symmetric keys, and malformed keys are skipped.
+- **Claims.** `exp` is required; `nbf` and `iat`, when present, must not be in the future. All three allow `[identity] oidc_clock_skew_seconds` (default 60, at most 300). `sub` must be present and not empty, and `aud` must contain an accepted audience.
+- **`azp`.** It is checked only when the provider lists `authorized_parties`: then it is required and must be one of them. It never stands in for `aud`. In workload tokens `azp` often names the calling workload (Google ID tokens put the service account there), so the OpenID Connect Core rule that it names the relying party does not hold. Trust policies can still set conditions on it.
+- **Keys.** Discovery is fetched from `<issuer>/.well-known/openid-configuration`, and its `issuer` must equal the provider's. Discovery documents and key sets are at most 64 KiB, key sets at most 100 keys, and fetches use HTTPS (plain HTTP only in tests, never through configuration) with a 10 s timeout and no redirects. Server certificates are checked against the system roots; the fetcher also accepts extra roots, for an issuer with a private CA. Keys are cached for an hour and discovery for a day. A token with an unknown `kid` triggers a refresh, since the issuer may have rotated its keys. At most one refresh is attempted per issuer every 30 s, so tokens with made-up key IDs cannot make SkyS3 flood an issuer. If a refresh fails, cached keys stay in use until they are a day old. These limits are constants, not configuration keys.
+- **Implementation.** Tokens and key sets are parsed by SkyS3 (`skys3-sts`), and signatures are verified with `aws-lc-rs`, the provider rustls already uses. `openidconnect` is built for relying parties that run login flows, not for validating bearer tokens on a server. `jsonwebtoken` selects its crypto backend through a process-wide provider chosen by Cargo features, which panics when feature unification enables both backends. The parsing a validator needs is small enough to own and fuzz.
 
 Clients point both `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL_STS` at SkyS3. The SDK matrix (section 16.2) verifies that each SDK's web-identity provider honors them.
 
@@ -954,6 +1042,7 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 ## 12. Security
 
 - Clients, headers, XML, chunk framing, and keys are untrusted. XML depth, header sizes, part counts, and ranges are bounded. Canonical request bytes are kept intact for SigV4.
+- The gateway checks each request's head before authentication: at most 100 header fields and 16 KiB of header names and values, a request target of at most 16 KiB, keys of at most 1,024 bytes, part numbers from 1 to 10,000, and a `Range` header of at most 64 bytes, which `s3s` parses as a single range with offsets below 2⁶³. A request whose body is not object data has an XML body, which is read up to 4 MiB and must nest at most 32 elements deep, with no document type declaration, before `s3s` parses it. In an `aws-chunked` body, a chunk header line is at most 128 bytes and the trailer section at most 4 KiB, with at most 8 declared trailers; chunk data streams through unbuffered, and all of it together must equal `x-amz-decoded-content-length`, at most 5 GiB. These are constants of `skys3-gateway`, not configuration keys.
 - Internal traffic uses mutual TLS with node identities issued by the operator's PKI. Replication, lease, and admin messages are authenticated per node and per role.
 - The admin HTTP listener (metrics, health, and the admin API) binds to loopback by default (`[admin] listen = "127.0.0.1:7490"`). On a non-loopback address, callers present a bearer token read from `[admin] token_file` (`Authorization: Bearer`); configuration validation rejects a non-loopback `listen` without one. A configured token also applies on loopback. `/healthz` and `/readyz` never require it, so load balancers and orchestrators can probe them; they disclose only which components are not ready. The token is at least 32 bytes and compared in constant time. A bearer token rather than client certificates, because scrapers and operator tools send one from a file with no PKI enrollment, and node certificates identify nodes, not people. Until the listener serves TLS, the token crosses the network in cleartext, so a non-loopback listener belongs on a management network or behind a TLS-terminating proxy. TLS for the admin listener (`tls_cert_file`, `tls_key_file`), and client certificates as an alternative to the token, are added with the node PKI (plan M2-02).
 - The control store is a trust anchor. Whoever can write it can reassign shards. It gets a dedicated bucket or prefix, least-privilege credentials, and remote-side versioning for audit.
@@ -1086,6 +1175,7 @@ sts_web_identity = true
 session_default_seconds = 3600
 session_maximum_seconds = 3600
 identity_max_staleness_hours = 24
+oidc_clock_skew_seconds = 60
 
 [admin]                       # metrics, health checks, admin API (section 12)
 listen = "127.0.0.1:7490"     # a non-loopback address requires token_file
@@ -1104,11 +1194,11 @@ format = "text"               # "text" or "json"
 | Async runtime | `tokio` | Dedicated blocking pools for disk and hashing |
 | Index | `redb` | Non-durable commits plus periodic durable checkpoints (section 10.2)[^redb] |
 | Peer transport between clusters | `quinn` with `rustls` | QUIC streams, pluggable congestion control (section 7.8)[^quinn] |
-| Remote targets and S3 control store | `aws-sdk-s3`, `aws-config` | Conditional writes, multipart, credential providers[^aws-sdk-rust] |
+| Remote targets and S3 control store | `aws-sdk-s3`, `aws-config` | Conditional writes, multipart, credential providers[^aws-sdk-rust]. The SDK's own retries are off, since callers retry by write identity. TLS is `rustls` with the `aws-lc-rs` provider, one TLS stack for the whole binary. AWS endpoints use virtual-hosted-style addressing, other providers path style. |
 | etcd control store | `etcd-client` | Transactions and watches |
 | Erasure coding | `reed-solomon-simd` behind a versioned `EcCodec` trait | The codec ID is stored with every stripe[^rs-simd] |
 | Intra-cluster transport | TCP with `rustls`/`tokio-rustls`, `prost` headers, raw payload frames | Simple on a LAN. Traffic between clusters uses QUIC. |
-| Identity | `openidconnect`, `jsonwebtoken` or equivalent, `secrecy`, `zeroize` | Workload-token profile with explicit `azp` handling |
+| Identity | `aws-lc-rs` for signatures and SigV4 HMACs, `hyper-rustls` for discovery and key sets, `secrecy`, `zeroize` | Workload-token profile with explicit `azp` handling. SkyS3 parses tokens and key sets itself (section 11). |
 | Integrity | `crc32c`, `md-5`, `sha1`, `sha2`, a CRC64NVME implementation | Checksums are validated at the protocol boundary |
 | Config and observability | `serde`, `toml`, `serde_json`, `tracing`, `tracing-subscriber`, `prometheus-client` | Per-node metrics registry, not a process-global one, so simulated nodes in one process keep separate metrics. The admin listener runs on `hyper`. |
 | Testing | `turmoil`, `proptest`, `cargo-fuzz` | Deterministic simulation of network, disk, and clocks[^turmoil] |
