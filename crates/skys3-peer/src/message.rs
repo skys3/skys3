@@ -257,8 +257,9 @@ pub enum ApplyError {
 }
 
 /// `BATCH`: small objects with their bytes inline, and deletes. Each item
-/// is a `COMMIT` with [`PutData::Inline`] or [`Write::Delete`], of distinct
-/// keys, and the destination answers each with an `APPLIED`.
+/// is a `COMMIT` with [`PutData::Inline`] or [`Write::Delete`]. Items have
+/// distinct keys and distinct write identities, and the destination answers
+/// each with an `APPLIED` that names it by its identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
     /// The items.
@@ -422,6 +423,7 @@ impl Batch {
             || format!("holds {count} items; it must hold 1 to {MAX_BATCH_ITEMS}"),
         )?;
         let mut keys = BTreeSet::new();
+        let mut identities = BTreeSet::new();
         let mut inline = 0u64;
         for item in &self.items {
             item.validate(true)?;
@@ -430,6 +432,11 @@ impl Batch {
                 "batch.items",
                 || format!("holds key {:?} twice", item.key),
             )?;
+            // Each item's APPLIED names it by its identity alone, and a
+            // destination treats a known identity as a replay.
+            ensure(identities.insert(&item.identity), "batch.items", || {
+                format!("holds write identity {} twice", item.identity)
+            })?;
             if let Write::Put(Put {
                 data: PutData::Inline(bytes),
                 ..

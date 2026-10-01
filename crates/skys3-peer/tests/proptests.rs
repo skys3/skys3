@@ -233,12 +233,14 @@ fn messages() -> impl Strategy<Value = Message> {
     let applied = (identities(), outcome)
         .prop_map(|(identity, outcome)| Message::Applied(Applied { identity, outcome }));
     let batch = prop::collection::vec(commits(true), 1..6).prop_map(|items| {
-        // Keys are distinct within a batch.
+        // Keys and write identities are distinct within a batch: the
+        // index makes each key and each identity's seq unique.
         let items = items
             .into_iter()
-            .enumerate()
-            .map(|(index, mut item)| {
+            .zip(0u64..)
+            .map(|(mut item, index)| {
                 item.key = format!("{index}/{}", item.key);
+                item.identity.position.seq = Seq::new(index);
                 item
             })
             .collect();
@@ -320,6 +322,25 @@ proptest! {
         let (decoded, len) = Message::decode(&bytes[first_len..]).unwrap().unwrap();
         prop_assert_eq!(decoded, second);
         prop_assert_eq!(first_len + len, bytes.len());
+    }
+
+    #[test]
+    fn batches_with_a_repeated_identity_are_refused(
+        message in messages(),
+        from in any::<prop::sample::Index>(),
+        to in any::<prop::sample::Index>(),
+    ) {
+        let Message::Batch(mut batch) = message else {
+            return Ok(());
+        };
+        let (from, to) = (from.index(batch.items.len()), to.index(batch.items.len()));
+        prop_assume!(from != to);
+        batch.items[to].identity = batch.items[from].identity.clone();
+        let refused = matches!(
+            Message::Batch(batch).encode(),
+            Err(skys3_peer::MessageError::Invalid { field: "batch.items", .. })
+        );
+        prop_assert!(refused);
     }
 
     #[test]
