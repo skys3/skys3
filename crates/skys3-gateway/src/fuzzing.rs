@@ -196,16 +196,21 @@ impl Harness {
         let mut signed = decode(data)?;
         sign(&mut signed);
         let query = signed.uri().query().unwrap_or("");
-        let must_pass = !crate::sigv4::params::query_params(query).any(|(_, name, _)| {
-            matches!(
-                name.as_str(),
-                "X-Amz-Algorithm"
-                    | "X-Amz-Credential"
-                    | "X-Amz-Signature"
-                    | "AWSAccessKeyId"
-                    | "Signature"
-            )
-        });
+        // A signed query may not repeat a parameter.
+        let mut names = std::collections::HashSet::new();
+        let repeats =
+            !crate::sigv4::params::query_params(query).all(|(_, name, _)| names.insert(name));
+        let must_pass = !repeats
+            && !crate::sigv4::params::query_params(query).any(|(_, name, _)| {
+                matches!(
+                    name.as_str(),
+                    "X-Amz-Algorithm"
+                        | "X-Amz-Credential"
+                        | "X-Amz-Signature"
+                        | "AWSAccessKeyId"
+                        | "Signature"
+                )
+            });
         let resigned = self.runtime.block_on(auth.authenticate(signed));
         if must_pass && let Err(error) = &resigned {
             panic!("a request the harness signed was refused: {error:?}");
@@ -445,6 +450,9 @@ mod tests {
             .unwrap();
         assert_eq!(unsupported.raw, Some(400));
         assert!(!unsupported.must_pass);
+        // A repeated parameter is refused even when signed.
+        let repeated = harness.sigv4(b"//?h&/&/").unwrap();
+        assert!(!repeated.must_pass && !repeated.resigned);
         let forged = harness
             .sigv4(
                 b"\x00/\nauthorization: AWS4-HMAC-SHA256 Credential=AKIDFUZZ/20261001/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000\nx-amz-date: 20261001T000000Z\nhost: h\nx-amz-content-sha256: UNSIGNED-PAYLOAD",
