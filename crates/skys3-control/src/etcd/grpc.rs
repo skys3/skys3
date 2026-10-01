@@ -59,6 +59,27 @@ impl Code {
     pub(crate) const INTERNAL: Self = Self(13);
     pub(crate) const UNAVAILABLE: Self = Self(14);
 
+    /// Whether a request answered with this code may have been applied,
+    /// or may still be: etcd answers `UNAVAILABLE` to a proposal that timed
+    /// out, which can still commit.
+    pub(crate) fn may_have_applied(self) -> bool {
+        matches!(
+            self,
+            Self::CANCELLED
+                | Self::UNKNOWN
+                | Self::DEADLINE_EXCEEDED
+                | Self::ABORTED
+                | Self::INTERNAL
+                | Self::UNAVAILABLE
+        )
+    }
+
+    /// Whether the same request may succeed if sent again, perhaps to
+    /// another member.
+    pub(crate) fn is_transient(self) -> bool {
+        self.may_have_applied() || self == Self::RESOURCE_EXHAUSTED
+    }
+
     /// The code's name in the gRPC specification.
     fn name(self) -> &'static str {
         const NAMES: [&str; 17] = [
@@ -157,6 +178,19 @@ pub(crate) enum CallError {
     NoAnswer(String),
     /// etcd answered with an error status.
     Status(Status),
+}
+
+impl CallError {
+    /// Whether the call should move to another endpoint: it got no answer,
+    /// or a transient status, which a member cut off from its quorum gives
+    /// to every linearizable request ("no leader", "request timed out").
+    fn leaves_endpoint(&self) -> bool {
+        match self {
+            Self::NoAnswer(_) => true,
+            Self::Status(status) => status.code.is_transient(),
+            Self::NotSent(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for CallError {
@@ -362,9 +396,10 @@ type Sender = http2::SendRequest<RequestBody>;
 /// Connections to an etcd cluster: one HTTP/2 connection at a time, to
 /// the first endpoint that accepts one, multiplexing every call.
 ///
-/// A call without an answer drops the connection, and the next call
-/// connects again, starting from the next endpoint, so a member that is
-/// cut off from its cluster or stops answering is left behind.
+/// A call without an answer, or with a transient status, drops the
+/// connection, and the next call connects again, starting from the next
+/// endpoint, so a member that stops answering, or is cut off from its
+/// quorum and answers `UNAVAILABLE`, is left behind.
 pub(crate) struct Channel {
     endpoints: Vec<Endpoint>,
     tls: Option<TlsConnector>,
@@ -476,7 +511,9 @@ impl Channel {
     }
 
     /// Drops the connection to endpoint `index` after a call through it
-    /// went unanswered, so the next call tries the next endpoint.
+    /// went unanswered or failed transiently, so the next call, such as
+    /// the retry or the re-read of the lost-response rule, tries the next
+    /// endpoint.
     async fn abandon(&self, index: usize) {
         let mut state = self.state.lock().await;
         if matches!(&state.connection, Some((current, _)) if *current == index) {
@@ -535,7 +572,7 @@ impl Channel {
                 self.timeout
             ))),
         };
-        if matches!(result, Err(CallError::NoAnswer(_))) {
+        if result.as_ref().is_err_and(CallError::leaves_endpoint) {
             self.abandon(index).await;
         }
         result
@@ -563,7 +600,7 @@ impl Channel {
                 self.timeout
             ))),
         };
-        if matches!(result, Err(CallError::NoAnswer(_))) {
+        if result.as_ref().is_err_and(CallError::leaves_endpoint) {
             self.abandon(index).await;
         }
         result
