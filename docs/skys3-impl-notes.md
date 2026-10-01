@@ -1472,6 +1472,16 @@ of this file. A task with nothing unexpected keeps "None."
   equals the handshake timeout, so the scenario raises it, and only every
   sixteenth seed waits out a handshake timeout, which costs about 10,000
   simulated ticks.
+- **A test hung CI on smaller socket buffers.** A real-TCP test sent a
+  3 MiB frame and only then read it, on a single-threaded runtime. Locally
+  the loopback socket buffers held the whole frame, so it passed; on CI's
+  runners they did not, and the send waited forever for a reader, which
+  stalled every job running all tests. Capping `tcp_rmem` and `tcp_wmem`
+  at 1 MiB reproduces it. The test now sends and receives together, and
+  every network wait in the transport tests is bounded at 30 s
+  (`Bounded::bounded` in `tests/common`), so a regression fails with the
+  waiting line instead of hanging. The simulation's waits are bounded by
+  turmoil's simulated duration.
 - **rcgen without its defaults.** rcgen's default features pull `ring`, a
   second crypto provider; the workspace entry enables only `aws_lc_rs`, and
   tests write PEM with the workspace's `base64` instead of rcgen's `pem`
