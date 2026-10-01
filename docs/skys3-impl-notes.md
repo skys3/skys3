@@ -1120,6 +1120,26 @@ of this file. A task with nothing unexpected keeps "None."
   from the local copy could drop a bucket created after the copy was
   taken, so a node that starts from its copy reclaims nothing (design
   §4.1).
+- **The file store did not know whose it was.** Review found three gaps.
+  `FileControlStore::open` creates a missing directory, so a node whose
+  control volume was not mounted bootstrapped an empty store, synced no
+  buckets, and reclaimed every shard. The store refuses a second node only
+  through `nodes/` registrations, which nothing writes yet, so a second
+  node pointed at the directory loaded the first node's catalog over
+  empty shards. And an error opening the store stopped startup before the
+  kept copy was consulted. `control::open_file_store` now checks the
+  directory before opening it and keeps an owner record, `.owner.json`
+  (cluster, node ID, and a random `instance_id` that `node.json` gained),
+  beside the store's lock file; the store's loader skips dot files. A node
+  that has a copy treats a missing directory, a missing owner record, or
+  a missing `cluster.json` as a reset store: it never bootstraps it, runs
+  from the copy, and retries; a node without a copy claims only an empty
+  store. Another owner stops startup (`StartError::ControlStore`). An
+  open that fails otherwise runs from the copy too: `NodeStore` may hold
+  no store, and the follow task reopens it every `config_poll_interval`.
+  Orphans are reclaimed only when the start read a store it did not
+  claim. The owner record lives in this crate rather than in
+  `skys3-control`, because whether to claim depends on the node's copy.
 - **The index outlived the node in one process.** Restarting a node
   in-process failed with redb's `DatabaseAlreadyOpen`: each shard's
   pipeline task holds the index until it notices, on another task, that
