@@ -17,6 +17,7 @@ use crate::authz::{self, Access, NoSignatures, Permissions};
 use crate::buckets::{Buckets, GatewayConfig, IdSource};
 use crate::features;
 use crate::limits::{BodyKind, RequestLimits};
+use crate::objects::{self, Objects};
 use crate::shard::Shards;
 use crate::sigv4::{Authenticated, BodyError, Trailers};
 
@@ -135,8 +136,9 @@ impl<A: Authenticator> Gateway<A> {
     ) -> Result<Self, ControlError> {
         let limits = config.limits;
         let anonymous = config.anonymous.clone();
+        let objects = Objects::new(shards.clone(), &config);
         let buckets = Arc::new(Buckets::load(store, shards, config, ids).await?);
-        let mut builder = S3ServiceBuilder::new(Api::new(Arc::clone(&buckets)));
+        let mut builder = S3ServiceBuilder::new(Api::new(Arc::clone(&buckets), objects));
         builder.set_config(limits.s3s_config());
         builder.set_auth(NoSignatures);
         builder.set_access(Access::new(anonymous.clone()));
@@ -184,11 +186,12 @@ impl<A: Authenticator> Gateway<A> {
             .auth
             .authenticate(Request::from_parts(parts, body))
             .await?;
-        let (parts, mut body) = request.into_parts();
+        let (mut parts, mut body) = request.into_parts();
         if inner.anonymous.is_none() && parts.extensions.get::<Authenticated>().is_none() {
             return Err(authz::access_denied());
         }
         features::reject_unsupported(&parts, &shape)?;
+        objects::ignore_unsupported_range(&mut parts);
         if shape.body == BodyKind::Xml {
             let max = inner.limits.max_xml_body_bytes;
             let bytes = body
@@ -197,14 +200,22 @@ impl<A: Authenticator> Gateway<A> {
                 .map_err(|error| body_error(&inner.limits, &*error))?;
             inner.limits.check_xml(&bytes)?;
         }
-        inner
+        let head = parts.method == http::Method::HEAD;
+        let mut response = inner
             .s3
             .call(Request::from_parts(parts, body))
             .await
             .map_err(|error| {
                 tracing::error!(%error, "s3s failed to answer a request");
                 s3_error!(InternalError)
-            })
+            })?;
+        // `s3s` answers HeadObject with 200 even for a range; the answer to
+        // HEAD has the status GET would have (RFC 9110 §9.3.2).
+        let ranged = response.headers().contains_key(http::header::CONTENT_RANGE);
+        if head && ranged && response.status() == StatusCode::OK {
+            *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        }
+        Ok(response)
     }
 }
 

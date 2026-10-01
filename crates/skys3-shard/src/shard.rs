@@ -6,9 +6,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use skys3_index::{EntryState, Index, IndexError};
+use bytes::Bytes;
+use skys3_index::{Entry, EntryState, Index, IndexError};
 use skys3_io::{BlockingPool, Disk};
-use skys3_log::record::{Extent, ExtentRef, PutData};
+use skys3_log::record::{Extent, ExtentRef, Put, PutData};
 use skys3_log::{LogRecord, RecordBody, SegmentLog, ShardRef};
 use skys3_types::{Epoch, EpochSeq, Seq, ShardConfig};
 use tokio::sync::{mpsc, oneshot};
@@ -73,6 +74,14 @@ struct Sequencer {
     config: ShardConfig,
     /// Why the shard stopped, once it has.
     stopped: Option<String>,
+    /// The position of the latest record sequenced for each key, other than
+    /// an `EXTENT`, while it is not applied, and while a conditional read
+    /// that began at or before it is in progress (see
+    /// [`Shard::commit_if`]).
+    writes: BTreeMap<String, EpochSeq>,
+    /// Conditional reads in progress, counted by the position the next
+    /// record had when each began.
+    readers: BTreeMap<EpochSeq, usize>,
 }
 
 struct Inner<D: Disk> {
@@ -192,6 +201,8 @@ impl<D: Disk> Shard<D> {
             seals: 0,
             config: config.clone(),
             stopped: None,
+            writes: BTreeMap::new(),
+            readers: BTreeMap::new(),
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
         let task = PipelineTask {
@@ -290,8 +301,16 @@ impl<D: Disk> Shard<D> {
         &self,
         body: RecordBody,
     ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
+        self.submit_locked(&mut self.sequencer(), body)
+    }
+
+    /// [`Shard::submit`], for a caller that holds the sequencer's lock.
+    fn submit_locked(
+        &self,
+        sequencer: &mut Sequencer,
+        body: RecordBody,
+    ) -> Result<oneshot::Receiver<Result<Committed, ShardError>>, ShardError> {
         let shard = self.shard();
-        let mut sequencer = self.sequencer();
         sequencer.check_running(shard)?;
         let client_write = match &body {
             RecordBody::Put(_) | RecordBody::Delete(_) | RecordBody::Tags(_) => true,
@@ -321,9 +340,139 @@ impl<D: Disk> Shard<D> {
             .seq
             .checked_next()
             .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
+        let key = entry_key(&body).map(str::to_owned);
         let receiver = self.sequence(position, body)?;
         sequencer.next = EpochSeq::new(position.epoch, next);
+        if let Some(key) = key {
+            sequencer.writes.insert(key, position);
+        }
         Ok(receiver)
+    }
+
+    /// Commits `body`, a record that names a key, if `check` accepts the
+    /// key's entry as it is when the record is sequenced: the outcome of
+    /// every record of the key sequenced before it, applied or not. If
+    /// `check` refuses, nothing is appended and its error is returned.
+    ///
+    /// The check and the record's position are therefore linearizable with
+    /// every other write of the key, as conditional requests need (§5.1).
+    /// While a record of the key is sequenced but not yet applied, the check
+    /// waits until it is. `check` may run more than once, and runs under the
+    /// sequencer's lock, so it must be quick.
+    ///
+    /// # Errors
+    ///
+    /// The outer error as [`Shard::commit`], or
+    /// [`ShardError::InvalidRecord`] for a record that names no key or is an
+    /// `EXTENT`; the inner one is `check`'s.
+    pub async fn commit_if<E>(
+        &self,
+        body: RecordBody,
+        mut check: impl FnMut(Option<&Entry>) -> Result<(), E>,
+    ) -> Result<Result<Committed, E>, ShardError> {
+        let key = entry_key(&body)
+            .ok_or_else(|| ShardError::invalid(self.shard(), "the record names no entry"))?
+            .to_owned();
+        let mut body = Some(body);
+        loop {
+            // Records of the key sequenced before the read must be applied,
+            // so that the index holds their outcome.
+            let begun = {
+                let mut sequencer = self.sequencer();
+                sequencer.check_running(self.shard())?;
+                match sequencer.writes.get(&key) {
+                    Some(&position) if position > sequencer.applied => Err(self.barrier()),
+                    _ => Ok(sequencer.begin_read()),
+                }
+            };
+            let since = match begun {
+                Ok(since) => since,
+                Err(barrier) => {
+                    barrier.await?;
+                    continue;
+                }
+            };
+            let read = ReadGuard {
+                shard: self,
+                since: Some(since),
+            };
+            let entry = self.entry(&key).await?;
+            let reply = {
+                let mut sequencer = self.sequencer();
+                // A record of the key sequenced since the read began is
+                // still listed while the read lasts, and the read may have
+                // missed it.
+                let raced = sequencer.writes.get(&key).is_some_and(|&p| p >= since);
+                read.end(&mut sequencer);
+                if raced {
+                    continue;
+                }
+                if let Err(error) = check(entry.as_ref()) {
+                    return Ok(Err(error));
+                }
+                let Some(body) = body.take() else {
+                    unreachable!("the record is sequenced at most once");
+                };
+                self.submit_locked(&mut sequencer, body)?
+            };
+            return reply
+                .await
+                .unwrap_or_else(|_| Err(self.unavailable("the shard's pipeline stopped")))
+                .map(Ok);
+        }
+    }
+
+    /// The entry of `key` as the index holds it: the outcome of every
+    /// applied record of the key, and of no record not yet applied.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn entry(&self, key: &str) -> Result<Option<Entry>, ShardError> {
+        let (index, shard, key) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.entry(&shard, &key)
+        })
+        .await
+    }
+
+    /// The payload of the record at `position`, as an entry names it: an
+    /// `EXTENT`'s data, or a `PUT`'s inline bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if this replica locates no payload at
+    /// `position`, or the index or the log fails.
+    pub async fn payload(&self, position: EpochSeq) -> Result<Bytes, ShardError> {
+        let shard = self.shard();
+        let location = {
+            let (index, key) = (Arc::clone(&self.inner.index), shard.clone());
+            run(&self.inner.pool, shard, move || {
+                index.read()?.location(&key, position)
+            })
+            .await?
+        };
+        let Some(location) = location else {
+            return Err(self.unavailable(&format!("no payload is located at {position}")));
+        };
+        let record = self
+            .inner
+            .log
+            .read(location)
+            .await
+            .map_err(|error| ShardError::unavailable(shard, error))?;
+        match record.body {
+            RecordBody::Extent(Extent { data, .. })
+            | RecordBody::Put(Put {
+                data: PutData::Inline(data),
+                ..
+            }) if record.shard == *shard && record.position == position => Ok(data),
+            _ => Err(self.unavailable(&format!("the record at {position} holds no payload"))),
+        }
     }
 
     /// Adopts `config`, a newer epoch of the shard, in order with its
@@ -538,6 +687,65 @@ impl Sequencer {
             None => Ok(()),
         }
     }
+
+    /// Registers a conditional read, which needs every record of its key
+    /// sequenced from now on to stay in `writes` until the read ends, and
+    /// returns the position it began at.
+    fn begin_read(&mut self) -> EpochSeq {
+        *self.readers.entry(self.next).or_default() += 1;
+        self.next
+    }
+
+    fn end_read(&mut self, since: EpochSeq) {
+        if let Some(count) = self.readers.get_mut(&since) {
+            *count -= 1;
+            if *count == 0 {
+                self.readers.remove(&since);
+            }
+        }
+        self.forget_applied();
+    }
+
+    /// Forgets the writes that are applied and that no conditional read in
+    /// progress may have missed.
+    fn forget_applied(&mut self) {
+        let applied = self.applied;
+        let oldest = self.readers.keys().next().copied();
+        self.writes
+            .retain(|_, position| *position > applied || oldest.is_some_and(|o| *position >= o));
+    }
+}
+
+/// The key of the entry `body` changes: every record that names a key
+/// except an `EXTENT`, which changes only the location map.
+fn entry_key(body: &RecordBody) -> Option<&str> {
+    match body {
+        RecordBody::Extent(_) => None,
+        other => other.key(),
+    }
+}
+
+/// Ends a conditional read, also when its future is dropped.
+struct ReadGuard<'a, D: Disk> {
+    shard: &'a Shard<D>,
+    since: Option<EpochSeq>,
+}
+
+impl<D: Disk> ReadGuard<'_, D> {
+    /// Ends the read; the caller holds the sequencer's lock.
+    fn end(mut self, sequencer: &mut Sequencer) {
+        if let Some(since) = self.since.take() {
+            sequencer.end_read(since);
+        }
+    }
+}
+
+impl<D: Disk> Drop for ReadGuard<'_, D> {
+    fn drop(&mut self) {
+        if let Some(since) = self.since.take() {
+            self.shard.sequencer().end_read(since);
+        }
+    }
 }
 
 /// Checks that this build can serve `config`: a single member without
@@ -637,7 +845,9 @@ impl PipelineTask {
                 match applied {
                     Ok(outcomes) => {
                         if let Some(&last) = positions.last() {
-                            lock(&self.sequencer).applied = last;
+                            let mut sequencer = lock(&self.sequencer);
+                            sequencer.applied = last;
+                            sequencer.forget_applied();
                         }
                         // Every record is past the applied position, so none
                         // was skipped and each has an outcome.
