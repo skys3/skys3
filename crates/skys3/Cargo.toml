@@ -40,7 +40,9 @@ tracing.workspace = true
 [dev-dependencies]
 aws-sdk-s3.workspace = true
 aws-smithy-http-client.workspace = true
+md-5.workspace = true
 # Enables `test-util` for the in-memory shards in unit tests.
 skys3-gateway = { workspace = true, features = ["test-util"] }
+skys3-sim.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }

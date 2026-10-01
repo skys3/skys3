@@ -11,7 +11,7 @@ use skys3_config::StorageConfig;
 use skys3_index::{
     Applier, ControlEntry, Entry, EntryState, Index, IndexConfig, IndexError, IndexWriter, LogState,
 };
-use skys3_io::SimDisk;
+use skys3_io::{SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_log::record::{Delete, RecordBody};
 use skys3_log::{LogRecord, RecordLocation, SegmentId};
 use skys3_types::{Epoch, EpochSeq, Generation, Seq};
@@ -489,4 +489,62 @@ fn replay_orders_a_shards_records_across_disks() {
         assert_eq!(after, before);
         assert_eq!(after.entries.len(), 2);
     });
+}
+
+/// redb's magic number, which a complete database file begins with.
+const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+
+#[test]
+fn a_creation_cut_short_by_a_power_loss_is_redone() {
+    // redb creates a database with two syncs: the header, then its magic
+    // number. The power fails just after the first, or just before the
+    // second, with or without a torn write of the magic number.
+    for (sync, cut) in [(0, SyncCut::After), (1, SyncCut::Before)] {
+        for seed in 0..8 {
+            let faults = SimDiskFaults {
+                torn_write_probability: 0.5,
+                ..SimDiskFaults::default()
+            };
+            let disk = SimDisk::with_faults(seed, faults);
+            let power = SimPower::new();
+            disk.set_power(&power);
+            power.cut_at_sync(sync, cut);
+            Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap_err();
+            assert!(power.is_cut());
+            let index = Index::open_sim(&disk.mount(), "index.redb", &index_config())
+                .unwrap_or_else(|error| panic!("{cut:?} sync {sync}, seed {seed}: {error}"));
+            index.apply(&TestApplier, &[delete(0, 1, "a")]).unwrap();
+            assert_eq!(
+                index.read().unwrap().entry(&shard(0), "a").unwrap(),
+                Some(tombstone(1))
+            );
+        }
+    }
+}
+
+#[test]
+fn a_real_file_without_its_magic_number_is_created_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.redb");
+    drop(Index::open(&path, &IndexConfig::default()).unwrap());
+    let written = std::fs::read(&path).unwrap();
+    assert_eq!(written[..REDB_MAGIC.len()], REDB_MAGIC);
+
+    // A header without the magic number, whole or torn.
+    for prefix in [0, 4, 8] {
+        let mut header = vec![0; 4096];
+        header[..prefix].copy_from_slice(&REDB_MAGIC[..prefix]);
+        std::fs::write(&path, &header).unwrap();
+        let index = Index::open(&path, &IndexConfig::default()).unwrap();
+        index.apply(&TestApplier, &[delete(0, 1, "a")]).unwrap();
+        drop(index);
+    }
+    std::fs::write(&path, &REDB_MAGIC[..3]).unwrap();
+    drop(Index::open(&path, &IndexConfig::default()).unwrap());
+
+    // Anything else is not taken for an unfinished index.
+    std::fs::write(&path, b"not an index at all").unwrap();
+    let error = Index::open(&path, &IndexConfig::default()).unwrap_err();
+    assert!(error.to_string().contains("magic number"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"not an index at all");
 }
