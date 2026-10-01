@@ -52,8 +52,13 @@ fn malformed(bytes: &[u8]) -> FieldError {
     }
 }
 
+/// Returns why `body` does not encode, checking that `check` refuses it
+/// for the same reason.
 fn encode_err(body: RecordBody) -> FieldError {
-    record(body).to_bytes().unwrap_err().0
+    let record = record(body);
+    let error = record.to_bytes().unwrap_err();
+    assert_eq!(record.check().unwrap_err(), error);
+    error.0
 }
 
 fn hex(bytes: &[u8]) -> String {

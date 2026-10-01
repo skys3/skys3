@@ -196,6 +196,15 @@ stateDiagram-v2
 
 Local buckets use the same replicated state for new writes, then move large objects to a coded state instead of flushing them (section 8.4).
 
+**Applying records.** Every replica applies a shard's records with one deterministic function of the record and its index, specified in the `skys3-shard` crate's `machine` module. A rejected record leaves every entry as it was; it still advances the applied position, and the writer learns why. The rules the diagram leaves open:
+
+- `PUT`, `DELETE`, and `TAGS` make a new version at the record's position, dirty, from any state and from no entry; a `DELETE` of a key with no entry leaves a tombstone (section 9.1). A key in conflict stays in conflict until the conflict policy resolves it. The new version keeps the entry's `remote_etag` and `remote_version_id`, which still describe the remote. `TAGS` keeps the bytes, size, ETag, and `Last-Modified`, and its version's write identity names the `TAGS` record; how it reaches the remote is decided with the flusher (plan M1-16). It is rejected for a key with no live object.
+- `FLUSHED` of the current `seq` moves a dirty, flushing, or conflicted entry to clean, or removes a tombstone; it is rejected for a clean or evicted entry, for a `seq` newer than the entry's, and when its `remote_etag` is absent for an object or present for a tombstone. `FLUSHED` of an older `seq` while a newer version is not yet clean records the remote ETag and version ID the flush produced, so that the newer version's flush conditions on them (section 7.1), and leaves the entry dirty. Once a newer version is clean, it is rejected. The flusher commits the `FLUSHED` of a tombstone only once the import has passed its key (section 9.1).
+- `IMPORT` creates an evicted stub, with `remote_etag` and `local_etag` the listed ETag, only for a key with no entry at all.
+- `ADOPT` applies only to a clean or evicted entry whose `seq` is the one named. The remote version replaces it as an evicted stub at the `ADOPT` record's position, so its version identity is new; its tags are unknown and left empty.
+- `EXTENT` and a `PUT` with inline data enter their record into the node-local location map. Applying never removes a location: which payload is still live is decided by compaction (section 10.3).
+- `CONFIG` and `TRUNCATE` change no entry.
+
 An entry records `local_etag` (what S3 clients see), `remote_etag` (what the remote returned), and `remote_version_id` when the remote is versioned. These usually match (section 7.4).
 
 ## 5. Shard replication: all members acknowledge
@@ -230,6 +239,8 @@ sequenceDiagram
 5. Members learn the commit watermark from later appends and heartbeats, and apply committed records to their own index.
 
 Large bodies are streamed as 1 MiB extent records, which are replicated the same way while the body arrives. The final PUT record references them. Payload and metadata never take separate durable rounds.
+
+**Sequencing on a replica.** The primary checks that a record encodes, and for a `PUT`, that every extent it references is applied, before it gives the record a position, so a refused record never leaves a gap in the log. Records become durable out of order, because extents and other records are in segments that sync independently (section 10.1), but they are applied strictly in position order: a record is applied, and its writer answered, only once every earlier record of the shard is durable and applied. So an applied position means every earlier record was applied, `EXTENT` records included (section 10.2), and a small `PUT` is never applied ahead of the extents of an upload sequenced before it. A record that cannot be made durable stops the shard: it and every later record fail, and nothing is acknowledged on the shard until the node reopens it after replaying its log. A replica that opens a shard in a newer epoch first appends a `CONFIG` record at `(epoch, last seq)` (section 10.1). A replica that has the shard open already adopts a newer epoch in order with its writes: the `CONFIG` record takes `(epoch, last seq)` after every record sequenced before it, later records are sequenced in the new epoch, and none of them is acknowledged before the `CONFIG` record is durable and applied. Opening the shard in the configuration it is in returns it unchanged; a configuration in an older epoch, or another configuration in the same epoch, is refused, because one epoch names one configuration. A shard being removed cannot open again until the removal finished, so a reopened shard never sequences from index state the removal then deletes. A seal is ordered with the shard's writes: it waits for every record sequenced before it, and refuses client writes (`PUT`, `DELETE`, `TAGS`, and `EXTENT`) sequenced after it, while `FLUSHED`, `IMPORT`, and `ADOPT` continue (section 4.1).
 
 ### 5.2 Failed writes
 
