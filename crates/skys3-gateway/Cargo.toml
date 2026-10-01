@@ -13,13 +13,16 @@ workspace = true
 
 [features]
 # Test support: the in-memory shard stub (`stub`), an authenticator that
-# lets every request through, and the fuzzing entry points.
+# lets every request through, an in-memory credential lookup, and the
+# fuzzing entry points.
 test-util = ["skys3-control/test-util"]
 
 [dependencies]
 async-trait.workspace = true
+aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
 bytes.workspace = true
 http.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["http1", "server", "server-graceful", "tokio"] }
@@ -28,14 +31,20 @@ rand.workspace = true
 s3s.workspace = true
 skys3-config.workspace = true
 skys3-control.workspace = true
+skys3-io.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+aws-credential-types.workspace = true
+aws-sdk-s3.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-http-client.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 proptest.workspace = true
+serde_json.workspace = true
 # Enables `test-util` for this crate's own tests.
 skys3-gateway = { path = ".", features = ["test-util"] }
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "test-util", "time"] }

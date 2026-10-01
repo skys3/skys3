@@ -27,8 +27,22 @@ skys3-sts = { path = "../crates/skys3-sts" }
 skys3-types = { path = "../crates/skys3-types" }
 
 [[bin]]
+name = "gateway_aws_chunked"
+path = "fuzz_targets/gateway_aws_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "gateway_request"
 path = "fuzz_targets/gateway_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_sigv4_canonical"
+path = "fuzz_targets/gateway_sigv4_canonical.rs"
 test = false
 doc = false
 bench = false

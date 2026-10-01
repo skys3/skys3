@@ -552,6 +552,64 @@ of this file. A task with nothing unexpected keeps "None."
   no input gets a `500` and that responses stay under 64 KiB; memory is
   bounded with libFuzzer's `-rss_limit_mb`.
 
+### M1-07a SigV4 signing and aws-chunked bodies
+
+- **The node clock cannot check request times.** The task asked for the
+  `skys3-io` `Clock`, but it is monotonic with a per-node origin, and
+  SigV4 times are Unix times. `skys3-sts` already had a `WallClock` for
+  token lifetimes; it moved to `skys3-io` (`WallClock`, `SystemWallClock`,
+  `ManualWallClock`), and `skys3-sts` re-exports it. Skew and presigned
+  expiry tests set a `ManualWallClock`.
+- **Canonical requests are built without decoding.** Decoding the path and
+  re-encoding it, as many servers do, turns `%2F` into `/` and `%2B` into
+  `+`, so a signature over one key would verify for another. The
+  canonicalizer keeps `%XX` escapes (uppercasing their digits), keeps
+  unreserved bytes, and encodes the rest; design §11 records the rule.
+  The AWS Common Runtime suite agrees on every S3-relevant vector, except
+  that its `post-sts-header-after` presigned form adds the session token
+  after signing, which S3 does not do, so that form is skipped.
+- **The published examples could not be fetched.** The sandbox's proxy
+  refuses `docs.aws.amazon.com`. The S3 documentation's signatures (GET
+  and PUT Object, lifecycle, listing, the presigned URL, and both chunked
+  uploads with their chunk and trailer signatures) are quoted by two
+  independent implementations in the registry (`s3s-sigv4` and
+  `aws-runtime` tests), which agree with each other and now with SkyS3.
+  The CRT suite is vendored from the `aws-sigv4` crate, 31 of its 40
+  vectors, with its Apache-2.0 license and a `NOTICE`.
+- **Chunk data streams before its chunk is verified.** `s3s` buffers each
+  chunk until its signature checks out, which costs a chunk of memory per
+  upload and bounds chunk sizes. The decoder instead passes data through,
+  checks a chunk's signature when its last byte arrives, and fails the read
+  that carries it. A body is therefore authenticated only once read to its
+  end without error; consumers must commit nothing before then, which they
+  must do anyway for `x-amz-content-sha256` and trailing checksums. Memory
+  is bounded by the 128-byte chunk line and 4 KiB trailer limits (design
+  §12), never by a declared length.
+- **Hashing runs on the reactor.** Payload SHA-256 and chunk hashing run in
+  the body's `poll_frame`, one frame at a time. Design §15 puts hashing on
+  blocking pools; when M1-08 moves checksum validation there, SigV4's
+  hashing can join it.
+- **s3s has no codes for two answers.** `XAmzContentSHA256Mismatch` and
+  `MalformedTrailerError` are custom codes with status 400. Body failures
+  are a `BodyError`, which the gateway maps for XML bodies (found through
+  the error's source chain) and object operations (M1-09) must map too.
+- **Anonymous requests pass through.** Rejecting them is authorization's
+  job (M1-07b, `anonymous_access`). They get no `Authenticated` extension,
+  may not carry `x-skys3-*` headers, and an unsigned-trailer `aws-chunked`
+  body is still decoded for them.
+- **Left out.** The `Date` header as the signing time (every SDK sends
+  `x-amz-date`), SigV4a, and signed POST policy forms, which `s3s` still
+  answers with `501` and which S3 operations in design §11 do not need.
+- **Test signers.** `aws-sigv4`, `aws-credential-types`, and `aws-sdk-s3`
+  were already in the lockfile through `skys3-remote`; as dev-dependencies
+  they sign test requests independently of SkyS3's code, and the AWS SDK
+  for Rust creates, lists, locates, presigns for, and deletes buckets over
+  the `GatewayListener`. `http-body` became a direct dependency for the
+  body wrappers; it was already in the tree through hyper.
+- **Fuzzing.** `gateway_aws_chunked` ran about 39,000 inputs in 30 s (each
+  signs and verifies many small chunks under the sanitizers) and
+  `gateway_sigv4_canonical` about 440,000, with no failures.
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
