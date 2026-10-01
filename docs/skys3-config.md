@@ -77,7 +77,7 @@ Where the cluster's registers live (§6.1).
 | `etcd_endpoints` | array of endpoint URLs | none | Required, and non-empty, for `backend = "etcd"`. Not allowed for the other backends. |
 | `endpoint` | endpoint URL | none | Required for `backend = "s3"`. Not allowed for the other backends. |
 | `bucket` | string | none | The control bucket. Required for `backend = "s3"`: visible ASCII without `/`. Not allowed for the other backends. |
-| `directory` | path | `"<data_dir>/control"` | Where `backend = "file"` keeps the registers. Not empty. Not allowed for the other backends. |
+| `directory` | path | `"<data_dir>/control"` | Where `backend = "file"` keeps the registers. Not empty. Not allowed for the other backends. The node claims an empty directory by writing `.owner.json`, and refuses one another node or data directory owns. Once a node has synced, it never creates or bootstraps this directory again: if it is missing (for example, an unmounted volume) or has lost its registers, the node runs from its local copy (design §6.2). |
 | `prefix` | string | `"<cluster_id>/"` | The prefix of every register key. At most 512 bytes of visible ASCII, ending with `/` and not starting with it: S3's 1,024-byte key limit less the longest register key. |
 | `allow_correlated_control_store` | boolean | `false` | Accept an S3 control store in the failure scope of a data target (see below). |
 | `coordinator_lease_seconds` | integer | `10` | Positive. The holder renews every third of it (§6.7). |
