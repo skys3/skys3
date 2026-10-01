@@ -349,3 +349,67 @@ of this file. A task with nothing unexpected keeps "None."
   `--target x86_64-unknown-linux-gnu` to `fuzz build` and `fuzz run`.
   A locally built cargo-fuzz never shows this, because its own triple is
   already the gnu host.
+
+### M1-05 Control store interface and local backends
+
+- **Which ID keys a bucket register.** The layout said `buckets/<bucket>.json`
+  and `shards/<bucket>/<n>.json`, which could mean the S3 name or the bucket
+  ID for either. Bucket registers are keyed by name, which requests use to
+  find them, and shard registers by bucket ID, which is never reused, so a
+  bucket recreated under the same name never inherits old shards. Design
+  §6.1 now says so, with the key grammar every backend can store.
+- **The lost-response rule cannot see a superseded write.** The simulation
+  found seeds where no node reported creating `cluster.json`: the creator's
+  answer was lost, and another node incremented the generation, replacing
+  the creator's `proposal_id`, before the creator re-read. The rule then
+  sees another writer's value and reports a lost race. That is safe, since
+  the proposer acts on the current value as a loser would, but "exactly one
+  node reports creating it" holds only without lost responses. Design §6.1
+  now states the limit; the simulation checks that at most one node reports
+  creating it and that all agree on the document, and the fault-free
+  conformance suite checks exactly one.
+- **Change semantics were open.** Design §6.2 now defines them:
+  generation-driven, a snapshot first, then coalesced differences, at
+  least once, and never `cluster.json` or `coordinator.lease`. They are the
+  weakest a polling S3 backend can give, so every backend shares one
+  implementation, `ChangeFeed`, built from `get` and `list` and woken by
+  in-process notifications or a timer. M2-04 can use the polling feed as it
+  is; the trait has no conditional `get`, so a feed that sends
+  `If-None-Match` would be backend-specific. The increment comes after the
+  writes it announces, and a lost increment race needs no retry, because
+  the winning increment came after the loser's writes.
+- **Reads need retries too.** The first simulation runs failed on a
+  transient error in bootstrap's read of an existing `cluster.json`, which
+  `propose` did not cover. `read_with_retries` retries reads under the same
+  policy, and bootstrap and the generation increment use it.
+- **No delete.** The plan's trait has none, but M1-06 (DeleteBucket) and
+  M3-02 (forgetting nodes) will need one. Change reports already carry
+  removals. Whoever adds `delete_if` must decide how a lost response is
+  resolved, since a deleted register carries no `proposal_id`.
+- **File I/O uses `std::fs`, not `skys3-io`'s `Disk`.** `Disk` models one
+  flat directory of append-only segments, with no rename and no
+  subdirectories, so it cannot do temp-file, `fsync`, rename, directory
+  `fsync`. The file store runs `std::fs` on a caller-supplied
+  `BlockingPool`, and a whole write, precondition check included, is one
+  pool job, so a dropped future cannot leave the in-memory copy behind the
+  files. One process owns the directory through `File::try_lock` (stable
+  since Rust 1.89). Versions are content hashes, as S3 ETags are. Crashes
+  cannot be simulated through `SimDisk`, so crash safety rests on the
+  write protocol; a test checks that leftover temporary files are removed
+  at open.
+- **Faults as a wrapper, not a hook in the memory store.** `FaultyStore`
+  wraps any backend, so the conformance suite can inject lost responses,
+  late requests (applied after the error was returned, like a timed-out
+  request in flight), conflicts, and outages into every backend, not only
+  the in-memory one. Test support sits behind a `test-util` feature, which
+  the crate's own tests enable through a dev-dependency on itself.
+- **Where the simulation scenario lives.** It is in `skys3-control`'s own
+  `simulation` test target, following the `skys3-sim` convention that
+  scenarios live in the crate whose code they exercise; CI's
+  `--workspace --test simulation` job runs it. Two deliberate mutations of
+  the rule (treating a lost answer as success, and skipping the re-read)
+  each fail the scenario on the first seeds.
+- **No configuration key for the file backend yet.** §14's
+  `[control_store] backend` offers `etcd` and `s3`. The file backend is not
+  wired into the binary (rule 1.1); the task that wires the control store
+  into the node (M1-13) adds `backend = "file"` and its directory key.
