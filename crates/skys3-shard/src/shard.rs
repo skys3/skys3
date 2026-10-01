@@ -7,7 +7,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
-use skys3_index::{Entry, EntryState, Index, IndexError};
+use skys3_index::{Entry, EntryState, Index, IndexError, ListPage, ListQuery};
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::{Extent, ExtentRef, Put, PutData};
 use skys3_log::{LogRecord, RecordBody, SegmentLog, ShardRef};
@@ -436,6 +436,20 @@ impl<D: Disk> Shard<D> {
         );
         run(&self.inner.pool, self.shard(), move || {
             index.read()?.entry(&shard, &key)
+        })
+        .await
+    }
+
+    /// One page of the shard's listing (§9.4), as the index holds it: the
+    /// outcome of every applied record, and so of every acknowledged write.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn list(&self, query: ListQuery) -> Result<ListPage, ShardError> {
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.list(&shard, &query)
         })
         .await
     }
