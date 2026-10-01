@@ -91,7 +91,7 @@ mod header;
 mod wire;
 
 use bytes::Bytes;
-use skys3_types::{EpochSeq, KeyHash};
+use skys3_types::{EpochSeq, KeyHash, limits};
 
 pub use body::{
     Adopt, ChecksumAlgorithm, Checksums, CopySource, Delete, Extent, ExtentRef, Flushed, Import,
@@ -115,14 +115,9 @@ pub const FORMAT_VERSION: u16 = 1;
 pub const MAX_HEADER_LEN: u32 = 2 * 1024 * 1024;
 
 /// The largest payload: an inline body or one extent. Configuration
-/// loading keeps `inline_max_bytes` and `extent_bytes` within it.
-pub const MAX_PAYLOAD_LEN: u32 = 16 * 1024 * 1024;
-
-/// The smallest `extent_bytes` configuration loading accepts, so that a
-/// 5 GiB object needs at most [`MAX_EXTENTS`] extents.
-pub const MIN_EXTENT_LEN: u32 = 64 * 1024;
-
-const _: () = assert!(MAX_EXTENTS as u64 * MIN_EXTENT_LEN as u64 >= 5 * 1024 * 1024 * 1024);
+/// loading keeps `inline_max_bytes` and `extent_bytes` within it; the value
+/// lives in [`skys3_types::limits`] so both crates share it.
+pub const MAX_PAYLOAD_LEN: u32 = limits::MAX_RECORD_PAYLOAD_LEN;
 
 /// One log record: the shard it belongs to, its log position, and its
 /// kind-specific body.

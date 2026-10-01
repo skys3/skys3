@@ -33,8 +33,9 @@ pub const MAX_TAG_KEY_LEN: usize = 512;
 pub const MAX_TAG_VALUE_LEN: usize = 1024;
 
 /// The most extents a `PUT` references: a 5 GiB object, S3's largest single
-/// PUT, in extents of 64 KiB, the smallest `extent_bytes` allows.
-pub const MAX_EXTENTS: usize = 81_920;
+/// PUT, in extents of 64 KiB, the smallest `extent_bytes` allows
+/// ([`skys3_types::limits::MAX_EXTENTS_PER_PUT`]).
+pub const MAX_EXTENTS: usize = skys3_types::limits::MAX_EXTENTS_PER_PUT;
 
 /// The longest remote version ID, in bytes.
 pub const MAX_VERSION_ID_LEN: usize = 1024;

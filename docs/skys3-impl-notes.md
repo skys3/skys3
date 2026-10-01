@@ -305,8 +305,12 @@ of this file. A task with nothing unexpected keeps "None."
   any number of extent references. The format bounds payloads at 16 MiB
   and extent references per `PUT` at 81,920. Configuration loading now
   checks `inline_max_bytes` against the same bound and `extent_bytes`
-  against 64 KiB to 16 MiB, using constants from `skys3-log`, so
-  `skys3-config` depends on it. One existing test used
+  against 64 KiB to 16 MiB. The shared constants live in
+  `skys3_types::limits`, which both `skys3-log` and `skys3-config` read.
+  An earlier draft had `skys3-config` depend on `skys3-log`, but
+  configuration is a lower layer: the segment and group-commit code
+  (M1-02) will want configuration types, which would make a cycle. One
+  existing test used
   `inline_max_bytes = 512 MiB` to break the segment-size rule, and now
   uses values within the new bounds.
 - **Records the design lists fields for needed more.** `PUT` also needs

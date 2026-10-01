@@ -13,7 +13,6 @@ workspace = true
 
 [dependencies]
 serde.workspace = true
-skys3-log.workspace = true
 skys3-types = { path = "../skys3-types" }
 thiserror.workspace = true
 toml.workspace = true

@@ -657,7 +657,6 @@ name = "skys3-config"
 version = "0.1.0"
 dependencies = [
  "serde",
- "skys3-log",
  "skys3-types",
  "thiserror",
  "toml",
