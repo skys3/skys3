@@ -3,9 +3,10 @@
 //! as compare-and-swaps announced by a new generation, and pushes that
 //! generation to every node.
 //!
-//! What to change is the placement's decision; plan tasks M3-02 to M3-06
-//! add the node registry, placement, replacement, and rebalancing as
-//! placements. This loop owns only the rules every change follows.
+//! What to change is the placement's decision: the node lifecycle
+//! ([`Lifecycle`](crate::Lifecycle)) wraps the placement, replacement, and
+//! rebalancing of plan tasks M3-03 to M3-06. This loop owns only the rules
+//! every change follows.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use skys3_io::{Clock, MonoTime};
 use skys3_types::ClusterId;
 use tokio::sync::{Notify, watch};
 
-use crate::change::{Applied, ChangeSet, apply};
+use crate::change::{Applied, ChangeSet, Pending, apply, settle};
 use crate::lease::Leadership;
 use crate::push::Announce;
 
@@ -41,10 +42,17 @@ pub trait Placement: Send + 'static {
         proposals: &mut ProposalIds,
     ) -> impl Future<Output = Result<Option<ChangeSet>, ControlError>> + Send;
 
-    /// Learns what [`apply`] did with a planned change.
+    /// Learns what [`apply`] did with a planned change, also when it
+    /// failed part of the way ([`Applied::is_complete`]).
     fn applied(&mut self, change: &ChangeSet, applied: &Applied) {
         let _ = (change, applied);
     }
+
+    /// Learns that this node has just become coordinator, before the
+    /// tenure's first plan. What it observed as coordinator before, such
+    /// as heartbeats, may be stale: other nodes reported to another
+    /// coordinator meanwhile.
+    fn begin_tenure(&mut self) {}
 }
 
 /// A placement with nothing to do: the coordinator holds the lease and
@@ -80,6 +88,12 @@ pub struct CoordinatorConfig {
 /// Leadership comes from the node's [`Elector`](crate::Elector), and the
 /// coordinator checks it on its own clock before every change: a change
 /// planned under a tenure that has since ended is dropped.
+///
+/// A change that failed part of the way still has what it wrote pushed. A
+/// write of it that got no answer, and so may land later, is announced
+/// only once [`settle`] has learned its outcome; until then the
+/// coordinator settles it before it plans anything else, also after its
+/// tenure ends.
 pub struct Coordinator<S, P, A> {
     store: S,
     clock: Arc<dyn Clock>,
@@ -89,6 +103,8 @@ pub struct Coordinator<S, P, A> {
     config: CoordinatorConfig,
     proposals: ProposalIds,
     wake: Arc<Notify>,
+    /// Changes whose announcement is still owed.
+    pending: Vec<Pending>,
 }
 
 impl<S, P, A> std::fmt::Debug for Coordinator<S, P, A> {
@@ -121,6 +137,7 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
             config,
             proposals,
             wake: Arc::new(Notify::new()),
+            pending: Vec::new(),
         }
     }
 
@@ -132,24 +149,51 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
     }
 
     /// Works whenever this node is coordinator, until the elector is
-    /// dropped.
+    /// dropped and nothing is left to settle.
     pub async fn run(mut self) {
-        while self.wait_for_tenure().await {
-            self.serve_tenure().await;
+        loop {
+            self.settle().await;
+            if self.tenure().is_some() {
+                // `serve_tenure` returns only once the tenure has ended,
+                // so each call serves a new tenure.
+                self.placement.begin_tenure();
+                self.serve_tenure().await;
+            } else if !self.pending.is_empty() {
+                self.clock.sleep(self.config.idle).await;
+            } else if self.leadership.changed().await.is_err() {
+                return;
+            }
         }
     }
 
-    /// Waits until this node is coordinator. Returns `false` once the
-    /// elector is gone.
-    async fn wait_for_tenure(&mut self) -> bool {
-        loop {
-            if self.tenure().is_some() {
-                return true;
-            }
-            if self.leadership.changed().await.is_err() {
-                return false;
+    /// Settles every change whose announcement is owed, and announces
+    /// what landed. Returns whether none is left.
+    async fn settle(&mut self) -> bool {
+        let mut left = Vec::new();
+        for pending in std::mem::take(&mut self.pending) {
+            let settled = settle(
+                &self.store,
+                &self.config.cluster,
+                &pending,
+                &mut self.proposals,
+                &self.config.retry,
+            )
+            .await;
+            match settled {
+                Ok(settled) => {
+                    if let Some(generation) = settled.generation {
+                        self.announce.announce(generation).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, register = ?pending.unsettled(),
+                        "cannot settle a coordinator change yet");
+                    left.push(pending);
+                }
             }
         }
+        self.pending = left;
+        self.pending.is_empty()
     }
 
     /// When the current tenure ends, if this node is coordinator now.
@@ -165,6 +209,12 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
     /// Plans and applies changes until the tenure ends.
     async fn serve_tenure(&mut self) {
         while let Some(until) = self.tenure() {
+            // A change planned while an earlier one may still land could
+            // be announced before it.
+            if !self.settle().await {
+                self.idle(until).await;
+                continue;
+            }
             let planned = self.placement.plan(&self.store, &mut self.proposals).await;
             match planned {
                 Ok(Some(change)) if !change.is_empty() => {
@@ -183,7 +233,8 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
         }
     }
 
-    /// Applies `change`, announces it, and reports it to the placement.
+    /// Applies `change`, announces what it wrote, keeps what is still to
+    /// be settled, and reports it to the placement.
     async fn make(&mut self, change: ChangeSet) {
         let applied = apply(
             &self.store,
@@ -193,18 +244,23 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
             &self.config.retry,
         )
         .await;
-        match applied {
-            Ok(applied) => {
-                if let Some(generation) = applied.generation {
-                    self.announce.announce(generation).await;
-                }
-                self.placement.applied(&change, &applied);
+        let (applied, failed) = match applied {
+            Ok(applied) => (applied, false),
+            Err(failed) => {
+                tracing::warn!(error = %failed.source, "a coordinator change failed");
+                (failed.applied, true)
             }
-            Err(error) => {
-                tracing::warn!(%error, "a coordinator change failed");
-                let until = self.tenure().unwrap_or_else(|| self.clock.now());
-                self.idle(until).await;
-            }
+        };
+        if let Some(generation) = applied.generation {
+            self.announce.announce(generation).await;
+        }
+        if let Some(pending) = applied.pending.clone() {
+            self.pending.push(pending);
+        }
+        self.placement.applied(&change, &applied);
+        if failed {
+            let until = self.tenure().unwrap_or_else(|| self.clock.now());
+            self.idle(until).await;
         }
     }
 

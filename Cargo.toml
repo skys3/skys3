@@ -63,6 +63,7 @@ skys3-io = { path = "crates/skys3-io" }
 skys3-log = { path = "crates/skys3-log" }
 skys3-net = { path = "crates/skys3-net" }
 skys3-obs = { path = "crates/skys3-obs" }
+skys3-peer = { path = "crates/skys3-peer" }
 skys3-remote = { path = "crates/skys3-remote" }
 skys3-shard = { path = "crates/skys3-shard" }
 skys3-sim = { path = "crates/skys3-sim" }

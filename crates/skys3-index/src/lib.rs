@@ -13,7 +13,7 @@
 //!   its segment, offset, and length; each shard's applied position; and
 //!   the node's copy of control-state registers, tagged with their
 //!   configuration generation (§6.2), and each bucket's namespace import
-//!   checkpoint ([`ImportCheckpoint`], §9.1). [`codec`] specifies every
+//!   ranges and their checkpoints ([`ImportRanges`], §9.1). [`codec`] specifies every
 //!   encoding.
 //! - **Listing** ([`IndexReader::list`]): one shard's page of a
 //!   listing, with prefix and delimiter handling (§9.4).
@@ -50,6 +50,7 @@ mod checkpointer;
 pub mod codec;
 mod entry;
 mod error;
+mod import;
 mod index;
 mod listing;
 mod tables;
@@ -60,6 +61,7 @@ pub use entry::{
     Upload,
 };
 pub use error::IndexError;
+pub use import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 pub use index::{
     Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
 };

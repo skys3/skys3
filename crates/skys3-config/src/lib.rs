@@ -78,7 +78,7 @@ mod target;
 mod transport;
 
 pub use admin::{AdminConfig, LogFormat, LoggingConfig};
-pub use buckets::{BucketSettings, BucketsConfig, TargetTransport};
+pub use buckets::{BucketSettings, BucketsConfig, MAX_IMPORT_PARALLEL_STREAMS, TargetTransport};
 pub use cluster::{ClusterConfig, ControlStoreBackend, ControlStoreConfig, FailureDomain};
 pub use ec::EcConfig;
 pub use error::{ConfigError, Violation, Violations};

@@ -17,6 +17,8 @@
 //! - [`coordinator`]: the coordinator lease, with a node that wrongly
 //!   believes it is coordinator and with a coordinator cut off from the
 //!   control store, and pushes of every change.
+//! - [`registry`]: nodes that join with nothing but their credentials, and
+//!   a coordinator that forgets a silent node only once no shard names it.
 //! - [`removal`]: primaries removing a member that stops responding, in
 //!   both modes, without the control store, and across a restart.
 //! - [`routing`]: gateways on every node with stale shard maps, routing
@@ -30,6 +32,7 @@ mod coordinator;
 mod crash;
 mod harness;
 mod leases;
+mod registry;
 mod removal;
 mod replication;
 mod routing;

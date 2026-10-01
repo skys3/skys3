@@ -18,8 +18,8 @@ use skys3_log::{
 use skys3_types::{BucketId, EpochSeq, Label, ShardConfig};
 
 use crate::codec;
-use crate::entry::ImportCheckpoint;
 use crate::error::IndexError;
+use crate::import::ImportRanges;
 use crate::tables::{
     self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META,
 };
@@ -362,16 +362,13 @@ impl Index {
         Ok(result)
     }
 
-    /// The import checkpoint of `bucket` (§9.1), or `None` if its import
-    /// never started on this node.
+    /// The import ranges of `bucket` and their checkpoints (§9.1), or
+    /// `None` if its import never started on this node.
     ///
     /// # Errors
     ///
     /// Returns an [`IndexError`] if reading or decoding fails.
-    pub fn import_checkpoint(
-        &self,
-        bucket: &BucketId,
-    ) -> Result<Option<ImportCheckpoint>, IndexError> {
+    pub fn import_ranges(&self, bucket: &BucketId) -> Result<Option<ImportRanges>, IndexError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(tables::IMPORTS)?;
         let Some(value) = table.get(bucket.as_str())? else {
@@ -382,30 +379,30 @@ impl Index {
             .map_err(IndexError::codec("imports"))
     }
 
-    /// Stores the import checkpoint of `bucket`, or removes it, in one
-    /// durable commit.
+    /// Stores the import ranges of `bucket` and their checkpoints, or
+    /// removes them, in one durable commit.
     ///
     /// A checkpoint does not come from the log, so replay cannot restore
     /// it; it is made durable at once instead, once a page of `IMPORT`
-    /// records it covers is applied. Each page costs one sync.
+    /// records it covers is applied. Each store costs one sync.
     ///
     /// # Errors
     ///
-    /// Returns an [`IndexError`] if the checkpoint cannot be encoded or the
+    /// Returns an [`IndexError`] if the ranges cannot be encoded or the
     /// commit fails; nothing changes then.
-    pub fn set_import_checkpoint(
+    pub fn set_import_ranges(
         &self,
         bucket: &BucketId,
-        checkpoint: Option<&ImportCheckpoint>,
+        import: Option<&ImportRanges>,
     ) -> Result<(), IndexError> {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::Immediate)?;
         {
             let mut table = txn.open_table(tables::IMPORTS)?;
-            match checkpoint {
-                Some(checkpoint) => {
+            match import {
+                Some(import) => {
                     let value =
-                        codec::encode_import(checkpoint).map_err(IndexError::codec("imports"))?;
+                        codec::encode_import(import).map_err(IndexError::codec("imports"))?;
                     table.insert(bucket.as_str(), value.as_slice())?;
                 }
                 None => {

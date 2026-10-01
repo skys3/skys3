@@ -72,6 +72,8 @@ pub struct NodeEnv {
     pub transport: Transport<TurmoilNetwork>,
     /// Every node's transport address, this one's included.
     pub peers: BTreeMap<NodeId, NodeAddress>,
+    /// The labels of the node's disks.
+    pub disks: Vec<Label>,
     /// The static shard placement: each shard's configuration.
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
     /// The remote S3 store that `write_back` buckets flush to.
@@ -280,6 +282,7 @@ pub(crate) async fn run<S: NodeServices>(
         control: store.clone(),
         transport: Transport::new(TurmoilNetwork, &slot.credentials),
         peers: shared.peers.clone(),
+        disks: slot.disks.iter().map(|(label, _)| label.clone()).collect(),
         placement: Arc::clone(&shared.placement),
         remote: shared.remote.clone(),
         seed: seed.rotate_left(17),

@@ -5,6 +5,13 @@
 //! moves a few shard registers of a bucket no gateway serves through their
 //! epochs, as membership changes would.
 //!
+//! Every node also registers itself and sends the coordinator heartbeats
+//! (plan M3-02, design §6.7). The coordinator's pushes start with no node
+//! to go to: they reach the nodes its registry lists, so a node that is
+//! pushed to has joined with nothing but its credentials. The coordinator
+//! forgets a node silent for `node_forget_after` once no shard register
+//! names it.
+//!
 //! The audits check what the scenarios need:
 //!
 //! - every accepted change wrote an epoch nobody else wrote, so two nodes
@@ -25,16 +32,18 @@ use std::time::Duration;
 
 use skys3_control::faults::FaultRates;
 use skys3_control::{
-    ControlError, ControlStore, ProposalIds, RetryPolicy, TypedKey, Version, read,
+    ControlError, ControlStore, ProposalIds, RegisterKind, RetryPolicy, TypedKey, Version, read,
 };
 use skys3_coord::{
-    Announce, Applied, ChangeSet, ControlHints, Coordinator, CoordinatorConfig, Elector,
-    Leadership, LeaseConfig, Placement, Pusher,
+    AdminEndpoint, Announce, Applied, ChangeSet, ControlHints, Coordinator, CoordinatorConfig,
+    Elector, HeartbeatConfig, HeartbeatStatus, Heartbeater, Leadership, LeaseConfig, Lifecycle,
+    NodeEntry, NodeProfile, NodeRegistry, PeerSink, Placement, Pusher, RegistryConfig,
 };
 use skys3_io::{Clock, MonoTime, MonotonicClock};
 use skys3_net::TurmoilNetwork;
 use skys3_types::{
-    BucketId, ClusterId, Epoch, Generation, NodeAddress, NodeId, ShardConfig, ShardId,
+    BucketId, ClusterId, DiskInfo, Epoch, Generation, Label, NodeAddress, NodeId, ShardConfig,
+    ShardId,
 };
 use tokio::sync::watch;
 
@@ -76,6 +85,10 @@ pub struct CoordinationConfig {
     pub isolate: Option<(Duration, Duration)>,
     /// The control-store fault rates the isolated node returns to.
     pub rates: FaultRates,
+    /// How the coordinator judges node health, and when it forgets nodes.
+    pub registry: RegistryConfig,
+    /// How nodes register and send heartbeats.
+    pub heartbeat: HeartbeatConfig,
 }
 
 impl Default for CoordinationConfig {
@@ -97,6 +110,18 @@ impl Default for CoordinationConfig {
             hasty: None,
             isolate: None,
             rates: FaultRates::default(),
+            // Nodes are suspected after 600 ms of silence, and forgotten
+            // after an hour: never, in most runs.
+            registry: RegistryConfig {
+                suspect_after: Duration::from_millis(600),
+                forget_after: Duration::from_secs(3600),
+            },
+            heartbeat: HeartbeatConfig {
+                interval: Duration::from_millis(150),
+                timeout: Duration::from_millis(500),
+                resolve_interval: Duration::from_millis(300),
+                retry: lease.retry,
+            },
         }
     }
 }
@@ -157,6 +182,13 @@ struct Audit {
     /// When each node, by position, was seen down: spans of simulated
     /// time, the last one growing while the node stays down.
     down: BTreeMap<usize, Vec<(Duration, Duration)>>,
+    /// What the registry of the latest coordinator to plan listed.
+    view: Option<RegistryView>,
+    /// The nodes coordinators forgot.
+    forgotten: Vec<Forgotten>,
+    /// When each node registered, in each of its lives and again whenever
+    /// a coordinator told it that it was not registered.
+    registered: BTreeMap<NodeId, Vec<Duration>>,
 }
 
 /// Node services that add the coordinator of plan M3-01 to `S`.
@@ -366,6 +398,41 @@ impl<S: NodeServices> CoordinatedServices<S> {
         Ok(delays)
     }
 
+    /// What the registry of the latest coordinator to plan listed, if one
+    /// planned.
+    #[must_use]
+    pub fn registry_view(&self) -> Option<RegistryView> {
+        self.audit().view.clone()
+    }
+
+    /// The spans of simulated time in which the node at `position` was
+    /// seen down, as [`CoordinatedServices::observe`] recorded them.
+    #[must_use]
+    pub fn downtime(&self, position: usize) -> Vec<(Duration, Duration)> {
+        self.audit()
+            .down
+            .get(&position)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The nodes coordinators forgot, in the order they forgot them.
+    #[must_use]
+    pub fn forgotten(&self) -> Vec<Forgotten> {
+        self.audit().forgotten.clone()
+    }
+
+    /// When `node` registered: in each life, and again whenever a
+    /// coordinator told it that it was not registered.
+    #[must_use]
+    pub fn registrations(&self, node: &NodeId) -> Vec<Duration> {
+        self.audit()
+            .registered
+            .get(node)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// How many generations were announced.
     #[must_use]
     pub fn announcements(&self) -> usize {
@@ -403,12 +470,22 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
         let (position, life, clock) = (env.position, env.life, Arc::clone(&env.clock));
         let store = env.control.store();
         let transport = env.transport.clone();
-        let port = NonZeroU16::new(PUSH_PORT).expect("a nonzero port");
-        let peers: BTreeMap<NodeId, NodeAddress> = env
-            .peers
-            .iter()
-            .map(|(id, address)| (id.clone(), NodeAddress::new(address.host().clone(), port)))
-            .collect();
+        // What the node registers: its transport address, a rack label,
+        // and its disks. Nothing else tells the coordinator about it.
+        let profile = NodeProfile {
+            node: node.clone(),
+            address: env.peers[&node].clone(),
+            zone: None,
+            rack: Some(rack(position)),
+            disks: env
+                .disks
+                .iter()
+                .map(|disk| DiskInfo {
+                    disk_id: disk.clone(),
+                    capacity_bytes: DISK_BYTES,
+                })
+                .collect(),
+        };
         let seed = env.seed;
         let shards = self.inner.start(env).await?;
 
@@ -417,12 +494,12 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
             .bind((std::net::Ipv4Addr::UNSPECIFIED, PUSH_PORT).into())
             .await?;
         self.audit().nodes.insert(position, node.clone());
-        let serving = hints.clone();
-        tokio::spawn(async move { serving.serve(listener).await });
         self.follow_pushes(node.clone(), &hints);
 
         let Some(store) = store else {
             tracing::warn!(%node, "no control store: this life runs no coordinator");
+            let endpoint = AdminEndpoint::new(hints);
+            tokio::spawn(async move { endpoint.serve(listener).await });
             return Ok(shards);
         };
         let stale = self.config.stale == Some(position);
@@ -475,31 +552,175 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
             planned: None,
             audit: Arc::clone(&self.audit),
         };
-        let pusher = Pusher::new(transport, peers, PUSH_TIMEOUT).with_local(hints);
+        let clock = clock as Arc<dyn Clock>;
+        let registry = NodeRegistry::new(Arc::clone(&clock), self.config.registry);
+        let endpoint = AdminEndpoint::new(hints.clone()).with_heartbeats(
+            registry.clone(),
+            leadership.clone(),
+            Arc::clone(&clock),
+        );
+        tokio::spawn(async move { endpoint.serve(listener).await });
+
+        // Pushes go only to the nodes the registry lists.
+        let pusher =
+            Pusher::new(transport.clone(), BTreeMap::new(), PUSH_TIMEOUT).with_local(hints);
+        let placement = Observed {
+            node: node.clone(),
+            stale,
+            lifecycle: Lifecycle::new(registry.clone(), placement)
+                .with_peers(PushPeers(pusher.clone())),
+            audit: Arc::clone(&self.audit),
+        };
         let announce = AuditedPush {
             node: node.clone(),
             pusher,
             audit: Arc::clone(&self.audit),
         };
+        let cluster = ClusterId::new("sim")?;
+        // The node serves once it is registered, as the binary would.
+        let mut heartbeater = Heartbeater::new(
+            store.clone(),
+            transport,
+            cluster.clone(),
+            profile,
+            Arc::clone(&clock),
+            self.config.heartbeat,
+            ProposalIds::seeded(seed.wrapping_add(3)),
+        )
+        .with_local(registry.clone(), leadership.clone())
+        .with_admin_port(NonZeroU16::new(PUSH_PORT).expect("a nonzero port"));
+        self.follow_registrations(node.clone(), heartbeater.subscribe());
+        heartbeater.register().await?;
+        tokio::spawn(heartbeater.run());
         let coordinator = Coordinator::new(
             store,
-            clock as Arc<dyn Clock>,
+            clock,
             leadership,
             placement,
             announce,
             CoordinatorConfig {
-                cluster: ClusterId::new("sim")?,
+                cluster,
                 retry: self.config.lease.retry,
                 idle: self.config.interval,
             },
             ProposalIds::seeded(seed.wrapping_add(2)),
         );
+        registry.set_waker(coordinator.waker());
         tokio::spawn(coordinator.run());
         Ok(shards)
     }
 }
 
+/// The rack label of the node at `position`: two racks, alternating.
+fn rack(position: usize) -> Label {
+    Label::new(format!("rack-{}", position % 2)).expect("a valid label")
+}
+
+/// The capacity each simulated disk registers.
+const DISK_BYTES: u64 = 1 << 30;
+
+/// Hands the registry's nodes to a [`Pusher`], at the port pushes arrive
+/// on in the harness.
+struct PushPeers(Pusher<TurmoilNetwork>);
+
+impl PeerSink for PushPeers {
+    fn set_peers(&self, peers: BTreeMap<NodeId, NodeAddress>) {
+        let port = NonZeroU16::new(PUSH_PORT).expect("a nonzero port");
+        self.0.set_peers(
+            peers
+                .into_iter()
+                .map(|(node, address)| (node, NodeAddress::new(address.host().clone(), port)))
+                .collect(),
+        );
+    }
+}
+
+/// A node the coordinator forgot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forgotten {
+    /// When, in simulated time.
+    pub at: Duration,
+    /// The coordinator that forgot it.
+    pub by: NodeId,
+    /// The node forgotten.
+    pub node: NodeId,
+}
+
+/// What a coordinator's registry listed when it last planned.
+#[derive(Clone, Debug)]
+pub struct RegistryView {
+    /// When, in simulated time.
+    pub at: Duration,
+    /// The coordinator.
+    pub by: NodeId,
+    /// Every registered node.
+    pub nodes: Vec<NodeEntry>,
+}
+
+/// The node lifecycle around the stand-in placement, recording what the
+/// registry lists and which nodes it forgets.
+struct Observed<P> {
+    node: NodeId,
+    stale: bool,
+    lifecycle: Lifecycle<P>,
+    audit: Arc<Mutex<Audit>>,
+}
+
+impl<P: Placement> Placement for Observed<P> {
+    fn begin_tenure(&mut self) {
+        self.lifecycle.begin_tenure();
+    }
+
+    async fn plan<C: ControlStore>(
+        &mut self,
+        store: &C,
+        proposals: &mut ProposalIds,
+    ) -> Result<Option<ChangeSet>, ControlError> {
+        let planned = self.lifecycle.plan(store, proposals).await;
+        if !self.stale {
+            lock(&self.audit).view = Some(RegistryView {
+                at: elapsed(),
+                by: self.node.clone(),
+                nodes: self.lifecycle.registry().entries(),
+            });
+        }
+        planned
+    }
+
+    fn applied(&mut self, change: &ChangeSet, applied: &Applied) {
+        for (key, version) in &applied.written {
+            if let (RegisterKind::Node(node), None) = (key.kind(), version) {
+                lock(&self.audit).forgotten.push(Forgotten {
+                    at: elapsed(),
+                    by: self.node.clone(),
+                    node,
+                });
+            }
+        }
+        self.lifecycle.applied(change, applied);
+    }
+}
+
 impl<S> CoordinatedServices<S> {
+    /// Records when `node` registers.
+    fn follow_registrations(&self, node: NodeId, mut status: watch::Receiver<HeartbeatStatus>) {
+        let audit = Arc::clone(&self.audit);
+        tokio::spawn(async move {
+            let mut seen = 0;
+            while status.changed().await.is_ok() {
+                let registrations = status.borrow_and_update().registrations;
+                if registrations > seen {
+                    seen = registrations;
+                    lock(&audit)
+                        .registered
+                        .entry(node.clone())
+                        .or_default()
+                        .push(elapsed());
+                }
+            }
+        });
+    }
+
     /// Records when `node` hears of each new generation pushed to it.
     fn follow_pushes(&self, node: NodeId, hints: &ControlHints) {
         let (hints, audit) = (hints.clone(), Arc::clone(&self.audit));
@@ -680,7 +901,9 @@ impl Placement for EpochPlacement {
                 register,
                 epoch,
             }),
-            _ => audit.rejected += 1,
+            _ if applied.rejected.is_some() => audit.rejected += 1,
+            // Failed without an answer that settles it: not a race.
+            _ => {}
         }
     }
 }
