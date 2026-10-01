@@ -21,7 +21,8 @@ use skys3_remote::{
 };
 use skys3_shard::ShardSet;
 use skys3_types::{BucketDocument, ETag, WriteIdentity, shard_for_key};
-use tokio::task::JoinSet;
+use tokio::sync::watch;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 use crate::target::{FlushSettings, ImportProgress};
@@ -142,6 +143,48 @@ pub(crate) struct ImportJob<S, D: Disk> {
     pub(crate) wall: Arc<dyn WallClock>,
     /// Where the import shows its progress.
     pub(crate) state: Arc<ImportState>,
+    /// When to stop.
+    pub(crate) stop: Stop,
+    /// Earlier import tasks of the bucket that were told to stop, which
+    /// this one waits for, so that none of their checkpoint writes lands
+    /// after this one's.
+    pub(crate) previous: Vec<JoinHandle<()>>,
+}
+
+/// Tells an import's tasks to stop: on [`FlushService::shutdown`], or once
+/// the service no longer follows the bucket.
+///
+/// They stop between steps, never while a checkpoint is being stored. That
+/// write is a job on the index's pool, which finishes it whether or not its
+/// caller still waits, so an import that dropped it midway could have a
+/// stale checkpoint land after a later import's, and move the bucket's
+/// stored progress back. A stopped import's task therefore ends only once
+/// none of its writes is pending.
+///
+/// [`FlushService::shutdown`]: crate::FlushService::shutdown
+#[derive(Debug, Clone)]
+pub(crate) struct Stop(watch::Receiver<bool>);
+
+impl Stop {
+    /// A signal and the sender that raises it, by sending `true` or by
+    /// being dropped.
+    pub(crate) fn new() -> (watch::Sender<bool>, Self) {
+        let (sender, receiver) = watch::channel(false);
+        (sender, Self(receiver))
+    }
+
+    fn is_raised(&self) -> bool {
+        *self.0.borrow() || self.0.has_changed().is_err()
+    }
+
+    /// Runs `work`, unless the signal is raised first; `None` then.
+    async fn unless<T>(&mut self, work: impl Future<Output = T>) -> Option<T> {
+        tokio::select! {
+            biased;
+            _ = self.0.wait_for(|stopped| *stopped) => None,
+            done = work => Some(done),
+        }
+    }
 }
 
 /// Imports the remote namespace of the job's bucket from its target,
@@ -163,13 +206,29 @@ pub(crate) struct ImportJob<S, D: Disk> {
 /// then shown in the state. A failed request or commit is retried after
 /// the flush backoff; the import never gives up. Keys under the capability
 /// probe's scratch prefix (§7.2) are never imported.
-pub(crate) async fn run<S: ObjectStore, D: Disk>(job: ImportJob<S, D>) {
+pub(crate) async fn run<S: ObjectStore, D: Disk>(mut job: ImportJob<S, D>) {
+    let mut stop = job.stop.clone();
+    for previous in std::mem::take(&mut job.previous) {
+        if stop.unless(previous).await.is_none() {
+            return;
+        }
+    }
     let streams = job.streams.clamp(1, MAX_IMPORT_RANGES);
-    let mut retry = Retry::new(&job.bucket, &job.state, &job.settings);
+    let mut retry = Retry::new(&job.bucket, &job.state, &job.settings, &job.stop);
     let stored = loop {
-        match job.set.import_ranges(&job.bucket.bucket_id).await {
+        let Some(read) = stop
+            .unless(job.set.import_ranges(&job.bucket.bucket_id))
+            .await
+        else {
+            return;
+        };
+        match read {
             Ok(stored) => break stored,
-            Err(error) => retry.wait(error.to_string()).await,
+            Err(error) => {
+                if !retry.wait(error.to_string()).await {
+                    return;
+                }
+            }
         }
     };
     let ranges = match stored {
@@ -189,14 +248,18 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(job: ImportJob<S, D>) {
                 0,
             );
             let splits = loop {
-                let found =
-                    split::split_points(&job.store, &job.prefix, after.as_deref(), streams).await;
+                let discovery =
+                    split::split_points(&job.store, &job.prefix, after.as_deref(), streams);
+                let Some(found) = stop.unless(discovery).await else {
+                    return;
+                };
                 match found {
                     Ok(splits) => break splits,
                     Err(error) => {
-                        retry
-                            .wait(format!("discovering split points failed: {error}"))
-                            .await;
+                        let error = format!("discovering split points failed: {error}");
+                        if !retry.wait(error).await {
+                            return;
+                        }
                     }
                 }
             };
@@ -207,9 +270,10 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(job: ImportJob<S, D>) {
                     .set_import_ranges(&job.bucket.bucket_id, Some(ranges.clone()))
                     .await
             {
-                retry
-                    .wait(format!("storing the import ranges failed: {error}"))
-                    .await;
+                let error = format!("storing the import ranges failed: {error}");
+                if !retry.wait(error).await {
+                    return;
+                }
             }
             ranges
         }
@@ -264,6 +328,8 @@ struct ImportRun<S, D: Disk> {
     /// How many updates the stored ranges hold. Held while they are
     /// stored, so that a store never replaces a later one.
     stored: tokio::sync::Mutex<u64>,
+    /// When to stop.
+    stop: Stop,
 }
 
 /// One range's stream.
@@ -300,19 +366,25 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
             page_keys,
             latest: Mutex::new((ranges, 0)),
             stored: tokio::sync::Mutex::new(0),
+            stop: job.stop,
         }
     }
 
-    /// Lists and imports one range, from its checkpoint to its end.
+    /// Lists and imports one range, from its checkpoint to its end, or
+    /// until the import is stopped.
     async fn list(self: Arc<Self>, mut stream: Stream) {
         let prefix = &self.prefix;
-        let mut retry = Retry::new(&self.bucket, &self.state, &self.settings);
-        loop {
+        let mut stop = self.stop.clone();
+        let mut retry = Retry::new(&self.bucket, &self.state, &self.settings, &self.stop);
+        while !stop.is_raised() {
             let mut request = ListObjectsV2::new(prefix.clone()).with_max_keys(self.page_keys);
             if let Some(from) = stream.after.as_ref().or(stream.start.as_ref()) {
                 request = request.with_start_after(format!("{prefix}{from}"));
             }
-            let page = match self.store.list_objects_v2(request).await {
+            let Some(listed) = stop.unless(self.store.list_objects_v2(request)).await else {
+                return;
+            };
+            let page = match listed {
                 Ok(page) => page,
                 Err(error) => {
                     retry
@@ -345,8 +417,16 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
                 .filter_map(|object| import_of(object, prefix, &*self.wall))
                 .collect();
             let count = imports.len() as u64;
-            self.throttle.admit(listed).await;
-            if let Err(error) = commit(&self.set, &self.bucket, imports).await {
+            if stop.unless(self.throttle.admit(listed)).await.is_none() {
+                return;
+            }
+            // A commit dropped midway may still apply: harmless, since an
+            // `IMPORT` is conditional and the next import repeats it.
+            let Some(committed) = stop.unless(commit(&self.set, &self.bucket, imports)).await
+            else {
+                return;
+            };
+            if let Err(error) = committed {
                 retry.wait(error).await;
                 continue;
             }
@@ -354,8 +434,13 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
                 Some(last) => ImportCheckpoint::Running { after: Some(last) },
                 None => ImportCheckpoint::Done,
             };
-            self.checkpoint(stream.index, next.clone(), count, &mut retry)
-                .await;
+            // Never dropped midway: see `Stop`.
+            if !self
+                .checkpoint(stream.index, next.clone(), count, &mut retry)
+                .await
+            {
+                return;
+            }
             retry.failures = 0;
             match next {
                 ImportCheckpoint::Running { after } => stream.after = after,
@@ -366,14 +451,15 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
 
     /// Records `checkpoint` as range `index`'s, stores every stream's
     /// latest checkpoint durably unless a store since has, and shows them.
-    /// Streams that finish pages together share one store.
+    /// Streams that finish pages together share one store. `false` if the
+    /// import was stopped while a failed store waited to be retried.
     async fn checkpoint(
         &self,
         index: usize,
         checkpoint: ImportCheckpoint,
         imported: u64,
         retry: &mut Retry<'_>,
-    ) {
+    ) -> bool {
         let update = {
             let mut latest = lock(&self.latest);
             latest.0.set(index, checkpoint);
@@ -383,7 +469,7 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
         let mut stored = self.stored.lock().await;
         if *stored >= update {
             self.state.advance(None, imported);
-            return;
+            return true;
         }
         let (ranges, updates) = lock(&self.latest).clone();
         while let Err(error) = self
@@ -391,12 +477,14 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
             .set_import_ranges(&self.bucket.bucket_id, Some(ranges.clone()))
             .await
         {
-            retry
-                .wait(format!("storing the checkpoint failed: {error}"))
-                .await;
+            let error = format!("storing the checkpoint failed: {error}");
+            if !retry.wait(error).await {
+                return false;
+            }
         }
         *stored = updates;
         self.state.advance(Some(ranges), imported);
+        true
     }
 }
 
@@ -453,6 +541,7 @@ struct Retry<'a> {
     bucket: &'a str,
     state: &'a ImportState,
     settings: &'a FlushSettings,
+    stop: Stop,
     /// Failures since the last success.
     failures: u32,
 }
@@ -462,20 +551,25 @@ impl<'a> Retry<'a> {
         bucket: &'a BucketDocument,
         state: &'a ImportState,
         settings: &'a FlushSettings,
+        stop: &Stop,
     ) -> Self {
         Self {
             bucket: bucket.name.as_str(),
             state,
             settings,
+            stop: stop.clone(),
             failures: 0,
         }
     }
 
-    async fn wait(&mut self, error: String) {
+    /// Records `error` and backs off; `false` if the import was stopped
+    /// meanwhile.
+    async fn wait(&mut self, error: String) -> bool {
         self.failures += 1;
         tracing::warn!(bucket = self.bucket, %error, "the namespace import will retry");
         self.state.failed(error);
-        tokio::time::sleep(self.settings.backoff(self.failures)).await;
+        let backoff = tokio::time::sleep(self.settings.backoff(self.failures));
+        self.stop.unless(backoff).await.is_some()
     }
 }
 

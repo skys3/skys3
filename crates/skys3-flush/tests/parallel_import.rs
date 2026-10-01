@@ -13,10 +13,13 @@ use skys3_flush::{FlushMetrics, FlushService, FlushSettings, ImportStatus};
 use skys3_index::{ImportCheckpoint, ImportRanges};
 use skys3_io::SimMount;
 use skys3_obs::MetricsRegistry;
+use skys3_remote::probe::ConditionalProbe;
 use skys3_remote::{ObjectStore, PutObject};
 use skys3_sim::SimS3;
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
-use skys3_types::{BucketDocument, BucketMode, BucketName, ProposalId, RemoteTarget, ShardCount};
+use skys3_types::{
+    BucketDocument, BucketId, BucketMode, BucketName, ProposalId, RemoteTarget, ShardCount,
+};
 use support::{Node, Patience, cluster, runtime, settings, shard_ref};
 use tokio::time::Instant;
 
@@ -260,4 +263,104 @@ fn the_import_rate_scales_with_the_stream_count_against_a_100_ms_target() {
     assert!(seconds[1] <= seconds[0] * 0.75, "{seconds:?}");
     assert!(seconds[2] <= seconds[0] * 0.45, "{seconds:?}");
     assert!(seconds[3] <= seconds[0] * 0.3, "{seconds:?}");
+}
+
+#[test]
+fn shutdown_waits_for_a_checkpoint_write_in_flight() {
+    runtime().block_on(async {
+        // A real pool thread, which finishes a queued job whether or not
+        // anyone still waits for it.
+        let node = Node::open(95).await;
+        // Keys under the probe's scratch prefix are listed but never
+        // imported, so a page uses the index only to store its
+        // checkpoint, and a bucket with no shard open here has no flusher
+        // that could use it.
+        let scratch = ConditionalProbe::SCRATCH_DIR;
+        let keys: Vec<String> = (0..40).map(|n| format!("{scratch}k{n:02}")).collect();
+        let store = remote(95, &keys).await;
+        let bucket = BucketDocument {
+            bucket_id: BucketId::new("b-elsewhere").unwrap(),
+            ..bucket()
+        };
+        let checkpoint = |service: &FlushService<SimS3, SimMount>| {
+            service.status(&bucket.bucket_id).unwrap().import.checkpoint
+        };
+        // One page of ten keys a second.
+        let service = service(&store, 10, 10, 1);
+        service
+            .reconcile(std::slice::from_ref(&bucket), &node.set)
+            .await;
+        let patience = Patience::new();
+        while checkpoint(&service) == (ImportCheckpoint::Running { after: None }) {
+            assert!(!patience.is_exhausted(), "{:?}", checkpoint(&service));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first = format!("{scratch}k09");
+        assert_eq!(
+            checkpoint(&service),
+            ImportCheckpoint::Running { after: Some(first) }
+        );
+
+        // Hold the index's pool, so the next page's checkpoint write waits
+        // in its queue, and let the next page come.
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        drop(node.pool.run(move || {
+            let _ = gate.recv();
+        }));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let shutdown = service.shutdown();
+        tokio::pin!(shutdown);
+        let early = tokio::time::timeout(Duration::from_secs(5), &mut shutdown).await;
+        assert!(
+            early.is_err(),
+            "shutdown returned with a checkpoint write still queued"
+        );
+        open.send(()).unwrap();
+        // The pool thread runs on the real clock, which the paused one
+        // does not wait for.
+        let patience = Patience::new();
+        while tokio::time::timeout(Duration::from_millis(10), &mut shutdown)
+            .await
+            .is_err()
+        {
+            assert!(!patience.is_exhausted(), "shutdown never finished");
+        }
+        // The write landed before shutdown returned.
+        let stored = node.set.import_ranges(&bucket.bucket_id).await.unwrap();
+        let second = format!("{scratch}k19");
+        assert_eq!(
+            stored.map(|ranges| ranges.position()),
+            Some(ImportCheckpoint::Running {
+                after: Some(second)
+            })
+        );
+    });
+}
+
+#[test]
+fn a_bucket_followed_again_resumes_its_ranges() {
+    runtime().block_on(async {
+        let node = Node::open_inline(96).await;
+        let keys = folders(4, 30);
+        let store = remote(96, &keys).await;
+        let service = service(&store, 10, 40, 4);
+        service.reconcile(&[bucket()], &node.set).await;
+        let patience = Patience::new();
+        while !every_range_running(&status(&service).ranges) {
+            assert!(!patience.is_exhausted(), "{:?}", status(&service));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The bucket is no longer followed, then followed again: the new
+        // import waits for the old one to stop, and resumes its ranges.
+        service.reconcile(&[], &node.set).await;
+        assert!(service.status(&bucket().bucket_id).is_none());
+        let stored = node.set.import_ranges(&bucket().bucket_id).await.unwrap();
+        let stored = stored.unwrap();
+        assert_eq!(stored.ranges().len(), 4);
+        let passed = keys.iter().filter(|key| stored.passed(key)).count();
+        let status = import(&service, &node).await;
+        assert!(status.imported as usize <= keys.len() - passed);
+        assert_eq!(indexed(&node).await, keys);
+        service.shutdown().await;
+    });
 }

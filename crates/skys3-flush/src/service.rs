@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::budget::DirtyBudget;
-use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader};
+use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{FlushSettings, Target};
@@ -108,6 +108,9 @@ pub struct FlushService<S, D> {
     /// Each bucket's settings, if the service has them.
     bucket_settings: Option<BucketsConfig>,
     buckets: Mutex<BTreeMap<BucketId, BucketFlusher<S>>>,
+    /// The import tasks of buckets no longer followed, told to stop and
+    /// not yet waited for: the bucket's next import waits for them first.
+    stopping: Mutex<BTreeMap<BucketId, Vec<JoinHandle<()>>>>,
     _disk: std::marker::PhantomData<fn() -> D>,
 }
 
@@ -128,7 +131,10 @@ struct BucketFlusher<S> {
     /// What client reads of the remote use.
     remote: RemoteReader<S>,
     import: Arc<ImportState>,
-    import_task: JoinHandle<()>,
+    /// Stops the import when raised or dropped.
+    stop_import: watch::Sender<bool>,
+    /// The import's task, until it is waited for or handed on.
+    import_task: Option<JoinHandle<()>>,
     /// The target, once the probe is done.
     target: Ready<S>,
     shards: BTreeMap<ShardId, ShardFlusher>,
@@ -137,7 +143,9 @@ struct BucketFlusher<S> {
 impl<S> Drop for BucketFlusher<S> {
     fn drop(&mut self) {
         self.probe_task.abort();
-        self.import_task.abort();
+        // Not aborted: the import stops between steps, and its task ends
+        // once no checkpoint write of it is pending (`import::Stop`).
+        self.stop_import.send_replace(true);
     }
 }
 
@@ -159,6 +167,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             budget: Arc::new(DirtyBudget::unlimited()),
             bucket_settings: None,
             buckets: Mutex::default(),
+            stopping: Mutex::default(),
             _disk: std::marker::PhantomData,
         }
     }
@@ -226,6 +235,13 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let keep = wanted.contains(id);
             if !keep {
                 self.metrics.remove(&flusher.name);
+                flusher.stop_import.send_replace(true);
+                if let Some(task) = flusher.import_task.take() {
+                    let mut stopping = lock(&self.stopping);
+                    let tasks = stopping.entry(id.clone()).or_default();
+                    tasks.retain(|task| !task.is_finished());
+                    tasks.push(task);
+                }
             }
             keep
         });
@@ -268,6 +284,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                     usize::try_from(buckets.get(&bucket.name).import_parallel_streams)
                         .unwrap_or(usize::MAX)
                 });
+        let previous = lock(&self.stopping)
+            .remove(&bucket.bucket_id)
+            .unwrap_or_default();
+        let (stop_import, stop) = Stop::new();
         let import_task = tokio::spawn(import::run(ImportJob {
             store: Arc::clone(&store),
             prefix: prefix.clone(),
@@ -277,6 +297,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             streams,
             wall: Arc::clone(&self.wall),
             state: Arc::clone(&import),
+            stop,
+            previous,
         }));
         BucketFlusher {
             name,
@@ -284,7 +306,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             probe_task,
             remote: RemoteReader::new(store, prefix, Arc::clone(&import), Arc::clone(&self.wall)),
             import,
-            import_task,
+            stop_import,
+            import_task: Some(import_task),
             target,
             shards: BTreeMap::new(),
         }
@@ -360,14 +383,20 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     pub async fn shutdown(&self) {
         let flushers = std::mem::take(&mut *self.lock());
         for (_, mut flusher) in flushers {
-            // Once the import task is gone, so are its streams: none
-            // stores a checkpoint after this returns.
-            flusher.import_task.abort();
-            let _ = (&mut flusher.import_task).await;
+            // The import stops between steps; once its task ends, none of
+            // its checkpoint writes is pending (`import::Stop`).
+            flusher.stop_import.send_replace(true);
+            if let Some(task) = flusher.import_task.take() {
+                let _ = task.await;
+            }
             for (_, shard) in std::mem::take(&mut flusher.shards) {
                 shard.stop().await;
             }
             self.metrics.remove(&flusher.name);
+        }
+        let stopping = std::mem::take(&mut *lock(&self.stopping));
+        for task in stopping.into_values().flatten() {
+            let _ = task.await;
         }
     }
 
