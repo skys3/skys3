@@ -90,7 +90,9 @@ mod s3;
 mod workload;
 
 pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View};
-pub use coordination::{Change, CoordinatedServices, CoordinationConfig, PUSH_PORT, PushDelays};
+pub use coordination::{
+    Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
+};
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards};

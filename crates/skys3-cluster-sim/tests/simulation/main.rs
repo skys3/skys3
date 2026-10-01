@@ -17,12 +17,15 @@
 //! - [`coordinator`]: the coordinator lease, with a node that wrongly
 //!   believes it is coordinator and with a coordinator cut off from the
 //!   control store, and pushes of every change.
+//! - [`registry`]: nodes that join with nothing but their credentials, and
+//!   a coordinator that forgets a silent node only once no shard names it.
 
 mod acks;
 mod coordinator;
 mod crash;
 mod harness;
 mod leases;
+mod registry;
 mod replication;
 mod workload;
 

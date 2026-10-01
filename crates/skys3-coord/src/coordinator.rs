@@ -3,9 +3,10 @@
 //! as compare-and-swaps announced by a new generation, and pushes that
 //! generation to every node.
 //!
-//! What to change is the placement's decision; plan tasks M3-02 to M3-06
-//! add the node registry, placement, replacement, and rebalancing as
-//! placements. This loop owns only the rules every change follows.
+//! What to change is the placement's decision: the node lifecycle
+//! ([`Lifecycle`](crate::Lifecycle)) wraps the placement, replacement, and
+//! rebalancing of plan tasks M3-03 to M3-06. This loop owns only the rules
+//! every change follows.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +46,12 @@ pub trait Placement: Send + 'static {
     fn applied(&mut self, change: &ChangeSet, applied: &Applied) {
         let _ = (change, applied);
     }
+
+    /// Learns that this node has just become coordinator, before the
+    /// tenure's first plan. What it observed as coordinator before, such
+    /// as heartbeats, may be stale: other nodes reported to another
+    /// coordinator meanwhile.
+    fn begin_tenure(&mut self) {}
 }
 
 /// A placement with nothing to do: the coordinator holds the lease and
@@ -135,6 +142,7 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
     /// dropped.
     pub async fn run(mut self) {
         while self.wait_for_tenure().await {
+            self.placement.begin_tenure();
             self.serve_tenure().await;
         }
     }
