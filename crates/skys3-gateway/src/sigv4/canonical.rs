@@ -2,14 +2,24 @@
 //!
 //! The canonical request is built from the bytes the client sent. Its URI
 //! and query components are never decoded and re-encoded, which would turn
-//! `%2F` into `/` or `%2B` into `+` and lose what the client signed:
+//! `%2F` into `/` and lose what the client signed:
 //!
 //! - a `%XX` escape is kept as it was received, with its hexadecimal
 //!   digits in uppercase, as every signer writes them;
 //! - an unreserved character (`A-Z a-z 0-9 - . _ ~`), and `/` in the path,
 //!   is kept;
-//! - any other byte, such as a literal space, `$`, or `+`, is
+//! - in the query, a `+` becomes `%20`: `s3s` decodes the query as a form,
+//!   where `+` is a space, and so does the AWS SDKs' signer;
+//! - any other byte, such as a literal space, `$`, or a `+` in the path, is
 //!   percent-encoded, as the client did when it signed.
+//!
+//! The rule that matters is that two requests `s3s` reads differently never
+//! share a canonical form: each canonical `%XX` stands for the byte `XX`
+//! whether it came from an escape (in either case), from the byte itself,
+//! or (for `%20` in the query) from a `+`, which is how `s3s` decodes them
+//! too, and an escape that is not one stays `%25`. Repeated query
+//! parameters are the exception, since signing sorts them by value; the
+//! authenticator refuses them.
 //!
 //! S3 does not normalize paths: `/a/./b` and `//` are signed as they are.
 
@@ -105,7 +115,7 @@ pub(crate) fn canonical_uri(path: &str, out: &mut Vec<u8>) {
     if path.is_empty() {
         out.push(b'/');
     } else {
-        push_canonical(path.as_bytes(), true, out);
+        push_canonical(path.as_bytes(), Component::Path, out);
     }
 }
 
@@ -120,9 +130,9 @@ pub(crate) fn canonical_query(query: &str, presigned: bool, out: &mut Vec<u8>) {
         .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
         .map(|(name, value)| {
             let mut canonical_name = Vec::with_capacity(name.len());
-            push_canonical(name.as_bytes(), false, &mut canonical_name);
+            push_canonical(name.as_bytes(), Component::Query, &mut canonical_name);
             let mut canonical_value = Vec::with_capacity(value.len());
-            push_canonical(value.as_bytes(), false, &mut canonical_value);
+            push_canonical(value.as_bytes(), Component::Query, &mut canonical_value);
             (canonical_name, canonical_value)
         })
         .collect();
@@ -137,8 +147,17 @@ pub(crate) fn canonical_query(query: &str, presigned: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// Which part of the request target a component is from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Component {
+    /// The path: `/` is kept, and `+` is a plus.
+    Path,
+    /// A query parameter's name or value: `+` is a space.
+    Query,
+}
+
 /// Appends `component` in canonical form (see the module documentation).
-fn push_canonical(component: &[u8], keep_slash: bool, out: &mut Vec<u8>) {
+fn push_canonical(component: &[u8], kind: Component, out: &mut Vec<u8>) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut i = 0;
     while i < component.len() {
@@ -154,9 +173,11 @@ fn push_canonical(component: &[u8], keep_slash: bool, out: &mut Vec<u8>) {
         }
         if byte.is_ascii_alphanumeric()
             || matches!(byte, b'-' | b'.' | b'_' | b'~')
-            || (keep_slash && byte == b'/')
+            || (kind == Component::Path && byte == b'/')
         {
             out.push(byte);
+        } else if kind == Component::Query && byte == b'+' {
+            out.extend_from_slice(b"%20");
         } else {
             out.extend_from_slice(&[
                 b'%',
@@ -238,6 +259,15 @@ pub(crate) fn sign(key: &hmac::Key, string_to_sign: &[u8]) -> [u8; 32] {
 /// Whether `signature` signs `string_to_sign`, compared in constant time.
 pub(crate) fn verify(key: &hmac::Key, string_to_sign: &[u8], signature: &[u8; 32]) -> bool {
     constant_time::verify_slices_are_equal(&sign(key, string_to_sign), signature).is_ok()
+}
+
+/// What a query means to `s3s`: its pairs decoded as a form, in order of
+/// name and value. A canonical query must mean what its query means.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn query_meaning(query: &str) -> Vec<(String, String)> {
+    let mut pairs = serde_urlencoded::from_str::<Vec<(String, String)>>(query).unwrap_or_default();
+    pairs.sort();
+    pairs
 }
 
 #[cfg(test)]
@@ -393,8 +423,9 @@ mod tests {
         assert_eq!(query("b=2&a=1&&a=0&c", false), "a=0&a=1&b=2&c=");
         assert_eq!(
             query("k=a+b&k2=a%2bb&k3=a/b", false),
-            "k=a%2Bb&k2=a%2Bb&k3=a%2Fb"
+            "k=a%20b&k2=a%2Bb&k3=a%2Fb"
         );
+        assert_eq!(query("a+b=%20+", false), "a%20b=%20%20");
         assert_eq!(query("a=1&X-Amz-Signature=s", true), "a=1");
         assert_eq!(query("a=1&X-Amz-%53ignature=s", true), "a=1");
         assert_eq!(
@@ -481,6 +512,42 @@ mod tests {
             prop_assert_eq!(&once, &twice);
         }
 
+        /// The canonical query means what the query means to `s3s`, so two
+        /// queries `s3s` reads differently never share a canonical form.
+        #[test]
+        fn canonical_queries_mean_what_the_query_means(
+            tokens in proptest::collection::vec(
+                proptest::sample::select(&[
+                    "a", "B", "+", "%2B", "%2b", "%20", " ", "%", "%zz", "%2", "=", "&", ";",
+                    "%3D", "%26", "%61", "%FF", "%C3%A9", "\u{e9}", "/", "%2F", "~",
+                ][..]),
+                0..24,
+            ),
+        ) {
+            let query = tokens.concat();
+            let mut canonical = Vec::new();
+            canonical_query(&query, false, &mut canonical);
+            prop_assert_eq!(query_meaning(std::str::from_utf8(&canonical).unwrap()), query_meaning(&query));
+        }
+
+        #[test]
+        fn canonical_paths_mean_what_the_path_means(
+            tokens in proptest::collection::vec(
+                proptest::sample::select(&[
+                    "a", "+", "%2B", "%20", " ", "%", "%zz", "/", "%2F", "%2f", "%FF", "\u{e9}",
+                ][..]),
+                0..24,
+            ),
+        ) {
+            let path = tokens.concat();
+            let mut canonical = Vec::new();
+            canonical_uri(&path, &mut canonical);
+            let decoded = crate::limits::percent_decode(&path);
+            let canonical = crate::limits::percent_decode(std::str::from_utf8(&canonical).unwrap());
+            // An empty path is `/`.
+            prop_assert_eq!(canonical, if decoded.is_empty() { b"/".to_vec() } else { decoded });
+        }
+
         #[test]
         fn canonical_queries_are_sorted_and_stable(query in "[a-zA-Z0-9%=&+ ~._/-]{0,64}") {
             let mut once = Vec::new();
@@ -506,7 +573,7 @@ mod tests {
             // Fully percent-encoded input is already canonical.
             let encoded: String = bytes.iter().map(|b| format!("%{b:02X}")).collect();
             let mut out = Vec::new();
-            push_canonical(encoded.as_bytes(), false, &mut out);
+            push_canonical(encoded.as_bytes(), Component::Query, &mut out);
             prop_assert_eq!(out, encoded.into_bytes());
         }
     }
