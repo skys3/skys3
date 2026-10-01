@@ -1,6 +1,6 @@
 [package]
 name = "skys3-remote"
-description = "SkyS3 remote targets: the object-store interface to S3-compatible stores, and later its client and capability probe."
+description = "SkyS3 remote targets: the object-store interface to S3-compatible stores, its AWS SDK client, and the conditional-write capability probe."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,9 +12,18 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+aws-smithy-http-client.workspace = true
 bytes.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 proptest.workspace = true
+skys3-sim.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

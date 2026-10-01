@@ -288,3 +288,65 @@ of this file. A task with nothing unexpected keeps "None."
   (`fuzz/Cargo.lock`, committed). Its dependencies never reach the shipped
   binary. `libfuzzer-sys` bundles libFuzzer under the NCSA license, which is
   not on the allowlist.
+
+## M1 Single node
+
+### M1-15 Remote target client and capability probe
+
+- **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s
+  defaults enable both the legacy `rustls` client (hyper 0.14, rustls 0.21,
+  ring) and `default-https-client` (hyper 1, rustls 0.23, aws-lc-rs), plus
+  `sigv4a`. Every AWS crate is used with `default-features = false`, and the
+  HTTP client is built explicitly from `aws-smithy-http-client` with
+  `rustls-aws-lc`, on the workspace's hyper 1. The first version used the
+  `ring` provider to avoid aws-lc's C build, which needed `deny.toml` skips
+  for `getrandom` 0.2 and `windows-sys` 0.52; it switched to aws-lc-rs so
+  the binary has one crypto stack with the OIDC validation of M1-23, whose
+  `getrandom@0.4` and `r-efi@6` skips it shares. The SDK adds 144 crates to
+  the lock file; a clean debug build of `skys3-remote` takes about a minute.
+- **`digest` 0.10 through the SDK's checksums.** `aws-smithy-checksums`
+  uses `crc-fast`, whose default `std` feature needs `digest` 0.10, while
+  everything else is on 0.11. It cannot be turned off from outside, so
+  `deny.toml` skips `digest@0.10` and `crypto-common@0.1`.
+- **SDK retries would break the store contract.** The SDK retries 5xx,
+  throttling, and timeouts three times by default, so a caller could not
+  see that a write may have been applied, nor control backoff. Retries are
+  disabled; callers retry by write identity (design §15 now says so).
+- **Flexible checksums break S3-compatible providers.** Recent SDKs send a
+  CRC32 trailer with aws-chunked encoding on every `PutObject` and
+  `UploadPart` by default, which several S3-compatible stores reject. The
+  client asks for checksums only where S3 requires them. Bodies stay
+  covered: SigV4 signs the payload's SHA-256, which a test checks.
+- **Error responses lose information.** The SDK synthesizes an error code
+  only for a `404` to `HEAD`; a `304` or `412` to `HEAD`, and a proxy's HTML
+  `502`, arrive without one, so the client classifies them by status. M0-05's
+  `S3Error` had only a kind, so a `403 AccessDenied` or `404 NoSuchBucket`
+  became `Other`, which counts as possibly applied. `S3Error` now keeps the
+  status and code, and `S3Error::is_transient` and `may_have_applied` use
+  them (an `Other` with a 4xx status was not applied). A request the SDK
+  could not build is the new kind `NotSent`. Connection failures, timeouts,
+  and credential failures (which the SDK reports as dispatch failures) are
+  `Timeout`, because the client cannot tell whether the request was sent.
+- **SDK quirks.** `x-amz-copy-source` is sent as given, so the client
+  percent-encodes the source key itself. Every request carries an
+  `x-id=<Operation>` query parameter. `DefaultCredentialsChain` without an
+  explicit region looks one up, from instance metadata if need be, and uses
+  it over the configured one, so the region is passed explicitly.
+- **The probe tests each header, not each operation.** AWS added
+  `If-None-Match` on writes months before `If-Match`, so a provider can
+  honor one and not the other. The probe tests both headers of `PutObject`
+  and `CompleteMultipartUpload`, each with a failing and a holding
+  precondition (a store that answers `412` to everything is "rejected", not
+  "honored"), and an operation is protected only if all its headers are.
+  Design §7.2 records the procedure and the scratch prefix.
+- **Mock server instead of the SDK's replay client.** Request construction
+  and error mapping are tested against a local hyper server rather than
+  `StaticReplayClient`, whose `test-util` feature adds several crates and
+  bypasses the real HTTP client, so timeouts and refused connections could
+  not be tested. No test reaches the network.
+- **Left for the attach path.** The constructor takes the region and an
+  addressing override, but §14 has no key for a target's region, and S3-
+  compatible providers need one (`auto` for R2). The PR that wires attach
+  into the binary adds the keys. Scratch keys that a failed cleanup leaves
+  behind are ordinary objects to a later import (M1-18), which may want to
+  skip `.skys3-probe/`.
