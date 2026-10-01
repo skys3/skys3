@@ -10,9 +10,12 @@
 //!   catching seeded bugs, invariants, and node services.
 //! - [`replication`]: shards with three members, under crashes, power
 //!   loss, partitions, and message loss.
+//! - [`leases`]: reads under leases, with partitions and clock drift within
+//!   and beyond the bound `ρ`.
 
 mod crash;
 mod harness;
+mod leases;
 mod replication;
 mod workload;
 

@@ -101,7 +101,7 @@ fn config() -> ShardConfig {
 
 /// Node 2, serving links on a loopback port, with the shard open as a
 /// member.
-async fn member(pki: &Pki) -> SocketAddr {
+async fn member(pki: &Pki) -> (SocketAddr, Replication<TokioNetwork, SimMount>) {
     let disk = SimDisk::new(9);
     let log_config = LogConfig {
         inline_max_bytes: 512,
@@ -110,7 +110,7 @@ async fn member(pki: &Pki) -> SocketAddr {
         group_commit_max_bytes: 16 * 1024,
     };
     let clock = Arc::new(MonotonicClock::new());
-    let (log, _) = SegmentLog::open(disk.mount(), log_config, clock)
+    let (log, _) = SegmentLog::open(disk.mount(), log_config, Arc::clone(&clock) as _)
         .await
         .unwrap();
     let index = Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
@@ -122,16 +122,19 @@ async fn member(pki: &Pki) -> SocketAddr {
         set,
         transport.clone(),
         BTreeMap::new(),
+        clock,
         ReplicationConfig::default(),
     );
+    assert!(replication.grace(&shard()).is_none());
     replication.open(&config()).await.unwrap();
     let listener = transport
         .bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { replication.serve(listener).await });
-    address
+    let serving = replication.clone();
+    tokio::spawn(async move { serving.serve(listener).await });
+    (address, replication)
 }
 
 type Link = Connection<TcpStream>;
@@ -191,6 +194,7 @@ async fn append(link: &mut Link, epoch: u64, seq: u64) {
         epoch,
         commit: 0,
         lazy: false,
+        lease: None,
     };
     // A peer that already closed the link refuses the frame; the next
     // receive tells.
@@ -225,8 +229,12 @@ fn a_member_follows_only_its_primary() {
 
 async fn scenario() {
     let pki = Pki::new();
-    let address = member(&pki).await;
+    let (address, replication) = member(&pki).await;
     let config = config();
+    // Opening the shard as a member started its grace.
+    let grace = replication.grace(&shard()).expect("the member's grace");
+    let mut grants = grace.subscribe();
+    grants.borrow_and_update();
 
     // Refusals: a node that is not the primary it names, a shard not
     // open here, an older epoch (R2), and another configuration.
@@ -261,15 +269,23 @@ async fn scenario() {
     assert_eq!((answers[0].0.last, answers[0].0.epoch), (0, 2));
     append(&mut first, 2, 1).await;
     durable_through(&mut first, 1).await;
+    // No stamp came yet, so no acknowledgement granted a lease.
+    assert!(!grants.has_changed().unwrap());
     let beacon = Beacon {
         epoch: 2,
         commit: 1,
+        lease: Some(7_000),
     };
     first
         .send(&wire::frame(MessageKind::Beacon, &beacon, Bytes::new()))
         .await
         .unwrap();
-    assert_eq!(ack(&mut first).await.unwrap().durable, 1);
+    // The answer echoes the stamp, which grants a lease and restarts the
+    // member's grace.
+    let answer = ack(&mut first).await.unwrap();
+    assert_eq!((answer.durable, answer.lease), (1, Some(7_000)));
+    assert!(grants.has_changed().unwrap());
+    assert!(!grace.has_passed());
 
     // A later session ends the earlier one, and gets back the record
     // its primary does not hold.

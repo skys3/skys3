@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use skys3_io::Disk;
+use skys3_io::{Disk, MonoTime};
 use skys3_log::LogRecord;
 use skys3_net::{MessageKind, Network, Receiver, Sender, Transport};
 use skys3_types::{NodeAddress, NodeId, RegisterDocument, Seq};
@@ -96,7 +96,10 @@ impl<N: Network, D: Disk> Link<N, D> {
     }
 
     /// Sends the member every record after `cursor` as the primary holds
-    /// it, and beacons with the commit watermark in between.
+    /// it, and beacons with the commit watermark in between: every
+    /// `beacon_interval` while there is nothing to send, and at least every
+    /// `lease_renew_interval` while there is, so the member renews the
+    /// primary's lease even while its log is slow to sync (§5.4).
     async fn send<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         sender: &mut Sender<S>,
@@ -107,7 +110,7 @@ impl<N: Network, D: Disk> Link<N, D> {
             .leader
             .subscribe(&self.member)
             .ok_or_else(|| LinkError::Protocol(format!("{} is not a member", self.member)))?;
-        let mut beacon_due = Instant::now();
+        let mut last_beacon: Option<Instant> = None;
         loop {
             changes.borrow_and_update();
             let records = match self.leader.records_after(cursor, BATCH) {
@@ -118,21 +121,31 @@ impl<N: Network, D: Disk> Link<N, D> {
                     continue;
                 }
             };
+            if records.is_empty() && self.shard.is_stopped() {
+                return Ok(());
+            }
+            let interval = if records.is_empty() {
+                self.config.beacon_interval
+            } else {
+                self.config.lease_renew_interval
+            };
+            if last_beacon.is_none_or(|at| Instant::now() >= at + interval) {
+                let beacon = Beacon {
+                    epoch,
+                    commit: self.leader.commit().get(),
+                    lease: self.stamp(),
+                };
+                sender
+                    .send(&wire::frame(MessageKind::Beacon, &beacon, Bytes::new()))
+                    .await?;
+                last_beacon = Some(Instant::now());
+            }
             if records.is_empty() {
-                if self.shard.is_stopped() {
-                    return Ok(());
-                }
-                if Instant::now() >= beacon_due {
-                    let commit = self.leader.commit().get();
-                    let beacon = Beacon { epoch, commit };
-                    sender
-                        .send(&wire::frame(MessageKind::Beacon, &beacon, Bytes::new()))
-                        .await?;
-                    beacon_due = Instant::now() + self.config.beacon_interval;
-                }
                 // Woken by a new record, or for the next beacon. The
                 // watermark waits for either.
-                let _ = tokio::time::timeout_at(beacon_due, changes.changed()).await;
+                let due =
+                    last_beacon.map_or_else(Instant::now, |at| at + self.config.beacon_interval);
+                let _ = tokio::time::timeout_at(due, changes.changed()).await;
                 continue;
             }
             for record in records {
@@ -140,6 +153,7 @@ impl<N: Network, D: Disk> Link<N, D> {
                     epoch,
                     commit: self.leader.commit().get(),
                     lazy: record.lazy,
+                    lease: self.stamp(),
                 };
                 sender
                     .send(&wire::frame(MessageKind::Append, &append, record.bytes))
@@ -149,7 +163,13 @@ impl<N: Network, D: Disk> Link<N, D> {
         }
     }
 
-    /// Takes the member's acknowledgements until the link fails.
+    /// The lease stamp for a frame sent now.
+    fn stamp(&self) -> Option<u64> {
+        self.leader.lease_stamp().map(MonoTime::as_nanos)
+    }
+
+    /// Takes the member's acknowledgements, and the leases they grant,
+    /// until the link fails.
     async fn hear<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         receiver: &mut Receiver<S>,
@@ -165,6 +185,10 @@ impl<N: Network, D: Disk> Link<N, D> {
                     "the member refused an append: it is in epoch {}",
                     ack.rejected
                 )));
+            }
+            if let Some(stamp) = ack.lease {
+                self.leader
+                    .granted(&self.member, MonoTime::from_nanos(stamp));
             }
             self.leader
                 .acknowledged(&self.member, Seq::new(ack.durable));

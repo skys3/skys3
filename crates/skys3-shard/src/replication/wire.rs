@@ -10,11 +10,16 @@
 //!   Sync(config, primary's last seq)      ->
 //!                                          <- SyncAck(last, record)*   records past the primary's last seq
 //!                                          <- SyncAck(last, done)
-//!   Append(epoch, commit, lazy) + record  ->
-//!   Beacon(epoch, commit)                 ->
-//!                                          <- AppendAck(durable)       as durability grows, and per beacon
+//!   Append(epoch, commit, lazy, lease) + record ->
+//!   Beacon(epoch, commit, lease)          ->
+//!                                          <- AppendAck(durable, lease) as durability grows, and per beacon
 //!                                          <- AppendAck(rejected)      an append from an older epoch (R2)
 //! ```
+//!
+//! `lease` is a lease stamp (§5.4): the primary's clock reading when it sent
+//! the frame. An acknowledgement echoes the latest stamp the member received
+//! in the session, which grants the primary a lease until the stamp plus
+//! `primary_lease`, on the primary's clock.
 
 use bytes::Bytes;
 use prost::Message;
@@ -75,10 +80,14 @@ pub struct Append {
     /// Whether the record may wait for another to start a group commit.
     #[prost(bool, tag = "3")]
     pub lazy: bool,
+    /// The lease stamp, in nanoseconds on the primary's clock.
+    #[prost(uint64, optional, tag = "4")]
+    pub lease: Option<u64>,
 }
 
-/// Primary to member: the commit watermark, while there is nothing to
-/// append. The member answers with an [`AppendAck`].
+/// Primary to member: the commit watermark and a lease stamp, while there
+/// is nothing to append and at least every `lease_renew_interval` while
+/// there is. The member answers with an [`AppendAck`].
 #[derive(Clone, PartialEq, Message)]
 pub struct Beacon {
     /// The primary's epoch.
@@ -87,6 +96,9 @@ pub struct Beacon {
     /// The commit watermark.
     #[prost(uint64, tag = "2")]
     pub commit: u64,
+    /// The lease stamp, in nanoseconds on the primary's clock.
+    #[prost(uint64, optional, tag = "3")]
+    pub lease: Option<u64>,
 }
 
 /// Member to primary: the last `seq` of the run of records it holds
@@ -99,6 +111,10 @@ pub struct AppendAck {
     /// The member's newer epoch, if it refused the append (rule R2), or 0.
     #[prost(uint64, tag = "2")]
     pub rejected: u64,
+    /// The latest lease stamp the member received in the session, if it
+    /// grants a lease with this acknowledgement.
+    #[prost(uint64, optional, tag = "3")]
+    pub lease: Option<u64>,
 }
 
 /// A frame of `kind` with `body` and `payload`.
@@ -133,7 +149,8 @@ mod tests {
         /// fields come back as they were sent.
         #[test]
         fn bodies_from_any_bytes(body in proptest::collection::vec(any::<u8>(), 0..256),
-                                 epoch: u64, commit: u64, lazy: bool) {
+                                 epoch: u64, commit: u64, lazy: bool,
+                                 lease: Option<u64>) {
             let frame = Frame::new(Header::new(MessageKind::Sync).with_body(body.clone()), "");
             if let Ok(sync) = super::body::<Sync>(&frame, MessageKind::Sync) {
                 let _ = sync.configuration();
@@ -146,9 +163,12 @@ mod tests {
                 let _ = super::body::<AppendAck>(&frame, kind);
                 let _ = super::body::<Beacon>(&frame, kind);
             }
-            let append = Append { epoch, commit, lazy };
+            let append = Append { epoch, commit, lazy, lease };
             let sent = super::frame(MessageKind::Append, &append, Bytes::new());
             prop_assert_eq!(super::body::<Append>(&sent, MessageKind::Append), Ok(append));
+            let beacon = Beacon { epoch, commit, lease };
+            let sent = super::frame(MessageKind::Beacon, &beacon, Bytes::new());
+            prop_assert_eq!(super::body::<Beacon>(&sent, MessageKind::Beacon), Ok(beacon));
         }
     }
 
@@ -167,6 +187,7 @@ mod tests {
         let ack = AppendAck {
             durable: 9,
             rejected: 0,
+            lease: Some(0),
         };
         let frame = frame(MessageKind::AppendAck, &ack, Bytes::from_static(b"x"));
         assert_eq!(body::<AppendAck>(&frame, MessageKind::AppendAck), Ok(ack));

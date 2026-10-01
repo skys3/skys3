@@ -67,7 +67,8 @@ pub enum Role {
     /// durable here.
     Alone,
     /// The primary of a configuration with other members: a record commits
-    /// once every member has it durably.
+    /// once every member has it durably, and reads are served only while
+    /// every member grants a lease (§5.4).
     Primary,
     /// A member that stores and acknowledges what its primary sends, and
     /// applies it once the primary's commit watermark covers it. It serves
@@ -1187,14 +1188,22 @@ impl<D: Disk> Shard<D> {
     }
 
     /// Checks that the replica serves reads: it is not a member, and not a
-    /// primary still reconciling its members.
+    /// primary still reconciling its members or without a valid lease from
+    /// every one of them (§5.4).
     ///
     /// # Errors
     ///
     /// [`ShardError::NotPrimary`] on a member, and
-    /// [`ShardError::Unavailable`] on a primary that does not serve yet.
+    /// [`ShardError::Unavailable`] on a primary that does not serve yet or
+    /// holds no lease from some member.
     pub fn check_readable(&self) -> Result<(), ShardError> {
-        self.sequencer().check_role(self.shard())
+        self.sequencer().check_role(self.shard())?;
+        match &self.inner.leader {
+            Some(leader) if !leader.holds_leases() => {
+                Err(self.unavailable("the primary does not hold a lease from every member"))
+            }
+            _ => Ok(()),
+        }
     }
 
     fn sequencer(&self) -> MutexGuard<'_, Sequencer> {

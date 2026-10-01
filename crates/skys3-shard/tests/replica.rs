@@ -4,11 +4,12 @@
 mod support;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::Index;
-use skys3_io::{BlockingPool, SimDisk, SimMount};
+use skys3_io::{BlockingPool, Clock, MonoTime, SimDisk, SimMount};
 use skys3_log::{LogRecord, RecordBody, SegmentLog};
 use skys3_shard::{Pending, Role, Shard, ShardError};
 use skys3_types::{Epoch, NodeId, Seq, ShardConfig};
@@ -56,6 +57,27 @@ impl Replica {
             self.pool.clone(),
         )
         .await
+    }
+}
+
+/// A clock that moves only when a test moves it.
+#[derive(Debug, Default)]
+struct ManualClock(AtomicU64);
+
+impl ManualClock {
+    fn advance(&self, by: Duration) {
+        let nanos = u64::try_from(by.as_nanos()).unwrap();
+        self.0.fetch_add(nanos, Ordering::SeqCst);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> MonoTime {
+        MonoTime::from_nanos(self.0.load(Ordering::SeqCst))
+    }
+
+    fn runtime_deadline(&self, _: MonoTime) -> tokio::time::Instant {
+        unreachable!("the shard sets no timer on the lease clock")
     }
 }
 
@@ -335,7 +357,109 @@ fn a_restarted_primary_rolls_forward_what_a_member_holds() {
         leader.acknowledged(&node(3), Seq::new(1));
         until(|| primary.is_serving()).await;
         assert_eq!(primary.applied(), at(1));
+        let clock = Arc::new(ManualClock::default());
+        leader.start_leases(clock, Duration::from_secs(4));
+        let stamp = leader.lease_stamp().unwrap();
+        leader.granted(&node(2), stamp);
+        leader.granted(&node(3), stamp);
         let entry = primary.entry("k").await.unwrap().unwrap();
         assert!(entry.object.is_some());
+    });
+}
+
+/// Why `result` is unavailable.
+fn unavailable<T: std::fmt::Debug>(result: Result<T, ShardError>) -> String {
+    match result {
+        Err(ShardError::Unavailable { reason, .. }) => reason,
+        other => panic!("expected the shard to be unavailable, got {other:?}"),
+    }
+}
+
+/// Reads, listings, and conditional checks need a valid lease from every
+/// member; unconditional writes do not (§5.4).
+#[test]
+fn a_primary_reads_only_under_every_members_lease() {
+    runtime().block_on(async {
+        let replica = Replica::new().await;
+        let primary = replica.open(&replicated(), &node(1)).await.unwrap();
+        let leader = Arc::clone(primary.leader().unwrap());
+        assert!(leader.claim_links());
+        leader.synced(&node(2), Seq::ZERO);
+        leader.synced(&node(3), Seq::ZERO);
+        until(|| primary.is_serving()).await;
+
+        // Serving, but without leases: no read, and no stamp to send.
+        assert!(!leader.holds_leases());
+        assert_eq!(leader.lease_stamp(), None);
+        let reason = unavailable(primary.entry("k").await);
+        assert!(reason.contains("lease"), "{reason}");
+        leader.granted(&node(2), MonoTime::ZERO);
+        assert_eq!(leader.lease(&node(2)), None);
+
+        let clock = Arc::new(ManualClock::default());
+        clock.advance(Duration::from_secs(10));
+        leader.start_leases(
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Duration::from_millis(400),
+        );
+        let stamp = leader.lease_stamp().unwrap();
+        clock.advance(Duration::from_millis(100));
+        leader.granted(&node(2), stamp);
+        // A node that is not a member grants nothing.
+        leader.granted(&node(9), stamp);
+        assert_eq!(leader.lease(&node(9)), None);
+        assert_eq!(
+            leader.lease(&node(2)),
+            Some(stamp + Duration::from_millis(400))
+        );
+        unavailable(primary.list(Default::default()).await);
+        leader.granted(&node(3), stamp);
+        assert!(leader.holds_leases());
+        assert_eq!(primary.entry("k").await.unwrap(), None);
+        primary.list(Default::default()).await.unwrap();
+        primary.uploads("", None, 10).await.unwrap();
+
+        // The leases count from the stamp: they lapse 400 ms after it.
+        clock.advance(Duration::from_millis(300));
+        assert!(!leader.holds_leases());
+        unavailable(primary.entry("k").await);
+        // A conditional write needs a read of its key, so it waits for a
+        // lease too; an unconditional one commits on the members'
+        // acknowledgements alone.
+        let conditional = primary
+            .commit_if(put("k", 10, 1), |_| Ok::<(), ()>(()))
+            .await;
+        unavailable(conditional.map(drop));
+        let writer = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.commit(delete("k")).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(1)).await;
+        leader.acknowledged(&node(2), Seq::new(1));
+        leader.acknowledged(&node(3), Seq::new(1));
+        assert_eq!(writer.await.unwrap().unwrap().position, at(1));
+
+        // Fresh acknowledgements renew the leases.
+        let stamp = leader.lease_stamp().unwrap();
+        leader.granted(&node(2), stamp);
+        leader.granted(&node(3), stamp);
+        let entry = primary.entry("k").await.unwrap().unwrap();
+        assert!(entry.object.is_none());
+        let conditional = {
+            let primary = primary.clone();
+            tokio::spawn(async move {
+                primary
+                    .commit_if(put("k", 10, 2), |entry| {
+                        let deleted = entry.is_some_and(|e| e.object.is_none());
+                        deleted.then_some(()).ok_or(())
+                    })
+                    .await
+            })
+        };
+        until(|| primary.last_sequenced() == Seq::new(2)).await;
+        leader.acknowledged(&node(2), Seq::new(2));
+        leader.acknowledged(&node(3), Seq::new(2));
+        let committed = conditional.await.unwrap().unwrap().unwrap();
+        assert_eq!(committed.position, at(2));
     });
 }

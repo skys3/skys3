@@ -141,6 +141,8 @@ pub(crate) struct NodeSlot {
     pub power: SimPower,
     pub control: ControlHandle,
     pub credentials: Credentials,
+    /// The node's clock drift in every life, if it is fixed.
+    drift: Option<Drift>,
     /// Draws for each life: its clock and seeds.
     rng: Mutex<SmallRng>,
     lives: Mutex<u64>,
@@ -155,6 +157,7 @@ impl NodeSlot {
         disks: Vec<(Label, SimDisk)>,
         control: ControlHandle,
         credentials: Credentials,
+        drift: Option<Drift>,
         seed: u64,
     ) -> Self {
         let power = SimPower::new();
@@ -169,6 +172,7 @@ impl NodeSlot {
             power,
             control,
             credentials,
+            drift,
             rng: Mutex::new(SmallRng::seed_from_u64(seed)),
             lives: Mutex::new(0),
             ready: AtomicBool::new(false),
@@ -225,8 +229,11 @@ pub(crate) async fn run<S: NodeServices>(
         let life = *lives;
         *lives += 1;
         let mut rng = slot.rng.lock().unwrap_or_else(PoisonError::into_inner);
+        // The drift is drawn even when it is fixed, so fixing it changes no
+        // other draw of the seed.
+        let drawn = Drift::random_within(&mut *rng, shared.settings.drift);
         let clock = NodeClock {
-            drift: Drift::random_within(&mut *rng, shared.settings.drift),
+            drift: slot.drift.unwrap_or(drawn),
             start: skys3_io::MonoTime::from_nanos(rng.random_range(0..1 << 50)),
         };
         (life, clock, rng.random::<u64>())
