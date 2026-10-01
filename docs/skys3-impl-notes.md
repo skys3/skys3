@@ -291,6 +291,56 @@ of this file. A task with nothing unexpected keeps "None."
 
 ## M1 Single node
 
+### M1-01 Log record format
+
+- **A shard number alone does not name a shard.** The plan and §10.1 put
+  a "shard id" in the record header. `ShardId` is a shard's number within
+  its bucket (0 to 255), and segments are shared by every shard on a
+  disk, across buckets. So the fixed header holds the bucket ID (up to 25
+  bytes, in a zero-padded 32-byte field) and the shard number. The header
+  is 80 bytes.
+- **Record payloads needed bounds that configuration did not enforce.**
+  `inline_max_bytes` and `extent_bytes` had no upper bound, and
+  `extent_bytes` had no lower bound. Without one, a 5 GiB PUT could need
+  any number of extent references. The format bounds payloads at 16 MiB
+  and extent references per `PUT` at 81,920. Configuration loading now
+  checks `inline_max_bytes` against the same bound and `extent_bytes`
+  against 64 KiB to 16 MiB. The shared constants live in
+  `skys3_types::limits`, which both `skys3-log` and `skys3-config` read.
+  An earlier draft had `skys3-config` depend on `skys3-log`, but
+  configuration is a lower layer: the segment and group-commit code
+  (M1-02) will want configuration types, which would make a cycle. One
+  existing test used
+  `inline_max_bytes = 512 MiB` to break the segment-size rule, and now
+  uses values within the new bounds.
+- **Records the design lists fields for needed more.** `PUT` also needs
+  `Last-Modified`, so every replica reports the same time; the
+  inherited write-identity position (§7.2); and client checksums (§7.4).
+  `ADOPT` needs the `seq` its read plan named (§9.2), the size, and
+  `Last-Modified`. `EXTENT` records take their own `(epoch, seq)`, so a
+  `PUT` references them by position. A `seq` can be reused in a new epoch
+  after truncation, so a reference uses the full position. `CONFIG` and
+  `TRUNCATE` take no sequence number. Their `seq` field holds the position
+  they refer to, and `TRUNCATE` needs no body. These are recorded in §10.1.
+- **A torn tail and a record from a newer build look alike.** Recovery
+  (M1-02) cuts a torn tail back to the last record whose CRC verifies. A
+  whole record with an unknown version or reserved kind is not damage,
+  and cutting it would lose data. `DecodeError::class` separates
+  incomplete or corrupt records from unsupported or invalid ones, so
+  M1-02 can refuse to start instead of truncating.
+- **Fuzzing past the CRC.** Random inputs almost never carry a valid
+  CRC, so the `log_record` target also decodes a copy of each input with
+  the CRC recomputed, which reaches the kind-specific parsers. It checks
+  that every accepted input re-encodes to the same bytes, since the
+  encoding is canonical. A 60-second run executed about 7.9 million
+  inputs without a failure. The proptests do the same with valid records
+  that are mutated and then resealed.
+- **The fuzz smoke job.** The CI job finds targets with
+  `cargo +nightly fuzz list` and runs each for 30 seconds. It installs
+  cargo-fuzz with `taiki-e/install-action` and caches `fuzz/target`
+  with `Swatinem/rust-cache`. It uploads `fuzz/artifacts/` when a target
+  fails.
+
 ### M1-05 Control store interface and local backends
 
 - **Which ID keys a bucket register.** The layout said `buckets/<bucket>.json`
