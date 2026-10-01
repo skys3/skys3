@@ -76,6 +76,28 @@ fn stale() -> WritePrecondition {
 // Objects: PUT, GET, HEAD, DELETE.
 
 #[tokio::test]
+async fn puts_keep_tags_and_check_content_md5() {
+    let store = store();
+    let tags = std::collections::BTreeMap::from([("team".to_owned(), "a".to_owned())]);
+    let request = PutObject::new("k", "hello")
+        .with_tags(tags.clone())
+        .with_content_md5("XUFAKrxLKna5cZ2REBfFkg==");
+    store.put_object(request).await.unwrap();
+    assert_eq!(store.tags("k"), Some(tags.clone()));
+    store
+        .copy_object(CopyObject::new("k", "copy"))
+        .await
+        .unwrap();
+    assert_eq!(store.tags("copy"), Some(tags));
+    assert_eq!(store.tags("missing"), None);
+
+    let wrong = PutObject::new("k", "other").with_content_md5("XUFAKrxLKna5cZ2REBfFkg==");
+    let error = store.put_object(wrong).await.unwrap_err();
+    assert_eq!((error.status(), error.code()), (Some(400), "BadDigest"));
+    assert_eq!(body(&store, "k").as_deref(), Some(&b"hello"[..]));
+}
+
+#[tokio::test]
 async fn put_get_and_head_round_trip() {
     let store = store();
     let mut metadata = UserMetadata::new();

@@ -1,10 +1,10 @@
 //! [`ObjectStore`] for [`AwsS3`]: requests built from the model, and
 //! responses converted back.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{self as sdk, CompletedMultipartUpload};
 use bytes::Bytes;
 use skys3_types::ETag;
@@ -18,6 +18,29 @@ use crate::model::{
     ObjectInfo, PutObject, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
 };
 use crate::{ObjectStore, S3Error, S3ErrorKind, S3Result, UserMetadata};
+
+/// The `x-amz-tagging` value of a tag set: a URL-encoded query string.
+pub(super) fn tagging(tags: &BTreeMap<String, String>) -> String {
+    fn encode(out: &mut String, text: &str) {
+        for byte in text.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                out.push(char::from(byte));
+            } else {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    let mut out = String::new();
+    for (i, (key, value)) in tags.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        encode(&mut out, key);
+        out.push('=');
+        encode(&mut out, value);
+    }
+    out
+}
 
 /// `If-None-Match` and `If-Match` header values for a write precondition.
 fn precondition_headers(precondition: &WritePrecondition) -> (Option<String>, Option<String>) {
@@ -114,6 +137,18 @@ impl ObjectStore for AwsS3 {
             .body(ByteStream::from(request.body))
             .set_metadata(metadata_map(&request.metadata))
             .set_content_type(request.content_type)
+            .set_cache_control(request.headers.get("cache-control").cloned())
+            .set_content_disposition(request.headers.get("content-disposition").cloned())
+            .set_content_encoding(request.headers.get("content-encoding").cloned())
+            .set_content_language(request.headers.get("content-language").cloned())
+            .set_expires(
+                request
+                    .headers
+                    .get("expires")
+                    .and_then(|value| DateTime::from_str(value, DateTimeFormat::HttpDate).ok()),
+            )
+            .set_tagging((!request.tags.is_empty()).then(|| tagging(&request.tags)))
+            .set_content_md5(request.content_md5)
             .set_if_none_match(if_none_match)
             .set_if_match(if_match)
             .send()

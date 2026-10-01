@@ -6,6 +6,7 @@ use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_io::{Clock, Disk, SegmentFile};
@@ -28,6 +29,12 @@ pub const MAX_RECORD_LEN: u32 = MAX_HEADER_LEN + MAX_PAYLOAD_LEN;
 /// How many records may wait for the committer before appenders wait to
 /// queue more.
 const QUEUE_LEN: usize = 1024;
+
+/// The longest a record appended with [`SegmentLog::append_lazy`] waits
+/// for another record to start a group commit before it is committed on its
+/// own. Lazy records therefore add at most one sync per this interval to an
+/// otherwise idle disk, and none to a busy one.
+pub const LAZY_MAX_DELAY: Duration = Duration::from_secs(1);
 
 /// Why the log could not append or read a record.
 #[derive(Debug, thiserror::Error)]
@@ -339,7 +346,28 @@ impl<D: Disk> SegmentLog<D> {
         let class = SegmentClass::of(record.kind());
         self.check_inline(class, record.body.payload().len() as u64)?;
         let bytes = record.to_bytes()?;
-        self.submit(class, bytes, record.shard.clone(), record.position)
+        self.submit(class, bytes, record.shard.clone(), record.position, false)
+            .await
+    }
+
+    /// Appends `record` without starting a group commit for it: it joins
+    /// the next group that another record starts, or commits on its own
+    /// after [`LAZY_MAX_DELAY`]. It returns the record's location once it
+    /// is durable, like [`SegmentLog::append`].
+    ///
+    /// Records that may be lost in a crash without harm use it, such as a
+    /// `FLUSHED`, which the flusher repeats idempotently (§7.1). Records of
+    /// one class are still written in the order they were queued, lazy or
+    /// not.
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentLog::append`].
+    pub async fn append_lazy(&self, record: &LogRecord) -> Result<RecordLocation, LogError> {
+        let class = SegmentClass::of(record.kind());
+        self.check_inline(class, record.body.payload().len() as u64)?;
+        let bytes = record.to_bytes()?;
+        self.submit(class, bytes, record.shard.clone(), record.position, true)
             .await
     }
 
@@ -365,7 +393,7 @@ impl<D: Disk> SegmentLog<D> {
         }
         let class = SegmentClass::of(header.kind);
         self.check_inline(class, header.payload_len.into())?;
-        self.submit(class, bytes, header.shard, header.position)
+        self.submit(class, bytes, header.shard, header.position, false)
             .await
     }
 
@@ -402,6 +430,7 @@ impl<D: Disk> SegmentLog<D> {
         bytes: Bytes,
         shard: ShardRef,
         position: EpochSeq,
+        lazy: bool,
     ) -> Result<RecordLocation, LogError> {
         self.check_in_service()?;
         let (reply, acknowledged) = oneshot::channel();
@@ -411,6 +440,7 @@ impl<D: Disk> SegmentLog<D> {
             shard,
             position,
             arrival: self.clock.now(),
+            lazy,
             reply,
         };
         if self.requests.send(request).await.is_err() {

@@ -57,4 +57,4 @@ mod shard;
 pub use error::ShardError;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
 pub use set::ShardSet;
-pub use shard::{Committed, Shard, ShardSummary};
+pub use shard::{Change, Committed, Shard, ShardSummary};

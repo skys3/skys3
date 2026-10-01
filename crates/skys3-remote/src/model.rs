@@ -6,6 +6,7 @@
 //! set with `with_*` methods. Names follow the S3 API, so the AWS SDK client
 //! maps each field to the parameter of the same name.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 
@@ -147,11 +148,29 @@ pub struct PutObject {
     pub metadata: UserMetadata,
     /// `Content-Type`.
     pub content_type: Option<String>,
+    /// The other standard headers S3 stores with an object, by lowercase
+    /// name: `cache-control`, `content-disposition`, `content-encoding`,
+    /// `content-language`, and `expires`. Other names are not sent.
+    pub headers: BTreeMap<String, String>,
+    /// The object's tags (`x-amz-tagging`), by tag key.
+    pub tags: BTreeMap<String, String>,
+    /// `Content-MD5`: the base64 MD5 digest of the body, which the store
+    /// verifies.
+    pub content_md5: Option<String>,
     /// `If-None-Match: *` or `If-Match`.
     pub precondition: WritePrecondition,
 }
 
 impl PutObject {
+    /// The standard headers [`PutObject::headers`] may hold.
+    pub const HEADERS: [&'static str; 5] = [
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "expires",
+    ];
+
     /// An unconditional PUT of `body` without metadata.
     pub fn new(key: impl Into<String>, body: impl Into<Bytes>) -> Self {
         PutObject {
@@ -159,8 +178,29 @@ impl PutObject {
             body: body.into(),
             metadata: UserMetadata::new(),
             content_type: None,
+            headers: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            content_md5: None,
             precondition: WritePrecondition::None,
         }
+    }
+
+    /// Sets the standard headers other than `Content-Type`.
+    pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Sets the tags.
+    pub fn with_tags(mut self, tags: BTreeMap<String, String>) -> Self {
+        self.tags = tags;
+        self
+    }
+
+    /// Sets `Content-MD5`.
+    pub fn with_content_md5(mut self, content_md5: impl Into<String>) -> Self {
+        self.content_md5 = Some(content_md5.into());
+        self
     }
 
     /// Sets the user metadata.

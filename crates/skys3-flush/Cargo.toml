@@ -1,0 +1,33 @@
+[package]
+name = "skys3-flush"
+description = "SkyS3 write-back flush: per-shard flushers that send committed writes to a bucket's remote target with conditional requests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+prometheus-client.workspace = true
+skys3-config.workspace = true
+skys3-index.workspace = true
+skys3-io.workspace = true
+skys3-log.workspace = true
+skys3-obs.workspace = true
+skys3-remote.workspace = true
+skys3-shard.workspace = true
+skys3-types.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+md-5.workspace = true
+rand.workspace = true
+skys3-sim.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }

@@ -291,6 +291,45 @@ async fn shards_of_a_bucket_without_a_register_are_reclaimed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_back_buckets_get_flushers() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), "").await;
+    let s3 = client(&endpoint(&node));
+    // A target nothing listens on: its capability probe keeps failing, so
+    // nothing is flushed and the write stays dirty.
+    s3.create_bucket()
+        .bucket("archive")
+        .customize()
+        .mutate_request(|request| {
+            let headers = request.headers_mut();
+            headers.insert("x-skys3-bucket-mode", "write_back");
+            headers.insert("x-skys3-bucket-target", "http://127.0.0.1:9/remote/team");
+        })
+        .send()
+        .await
+        .unwrap();
+    put(&s3, "archive", "k", b"v").await;
+    let admin = node.admin_addr().to_string();
+    eventually("the bucket has a flusher", || async {
+        let status = admin_json(&admin, "/v1/buckets/archive").await;
+        status["flush"]["probe"] == "running"
+    })
+    .await;
+    let status = admin_json(&admin, "/v1/buckets/archive").await;
+    assert_eq!(status["unflushed"], 1);
+    assert_eq!(status["flush"]["conflicts"], serde_json::json!([]));
+    assert_eq!(status["flush"]["awaiting_multipart"], serde_json::json!([]));
+    let (_, metrics) = http_get(&admin, "/metrics").await.unwrap();
+    assert!(
+        metrics.contains("skys3_dirty_bytes{bucket=\"archive\"}"),
+        "{metrics}"
+    );
+    // A bucket with unflushed writes cannot be detached.
+    assert!(s3.delete_bucket().bucket("archive").send().await.is_err());
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_gateway_serves_https_and_sts() {
     let dir = tempfile::tempdir().unwrap();
     let cert = support::tls_file("server.pem");
