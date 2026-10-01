@@ -27,7 +27,7 @@ use skys3_types::{BucketDocument, BucketId, ETag, EpochSeq, Label, NodeId};
 
 use crate::conditions::{ConditionFailed, Precondition};
 use crate::local::LocalShards;
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
+use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
 
 /// The state [`MemoryShards::put`] leaves an entry in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,9 +272,11 @@ impl Shards for MemoryShards {
         shard: &ShardRef,
         key: &str,
         upload: EpochSeq,
-    ) -> Result<Option<Upload>, ShardError> {
+        after: u16,
+        limit: usize,
+    ) -> Result<Option<UploadParts>, ShardError> {
         self.check(shard)?;
-        self.local.upload(shard, key, upload).await
+        self.local.upload(shard, key, upload, after, limit).await
     }
 
     async fn uploads(

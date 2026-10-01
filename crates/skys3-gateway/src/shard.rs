@@ -91,6 +91,10 @@ impl ShardSummary {
     }
 }
 
+/// An open upload and a page of its parts, by part number, as
+/// [`Shards::upload`] reads them.
+pub type UploadParts = (Upload, Vec<(u16, Part)>);
+
 /// The shard primaries, as the gateway sees them.
 ///
 /// Calls go to a shard's current primary, which orders them with the
@@ -168,9 +172,11 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         query: &ListQuery,
     ) -> impl Future<Output = Result<ListPage, ShardError>> + Send;
 
-    /// The open multipart upload of `key` opened at `upload`, or `None` if
-    /// it was never opened, or is completed or aborted. Every write
-    /// acknowledged before the call is in it.
+    /// The open multipart upload of `key` opened at `upload`, with up to
+    /// `limit` of its parts in part order after part `after` (0 for the
+    /// first), or `None` if it was never opened, or is completed or aborted.
+    /// The upload and its parts are read at one point in the shard's
+    /// history, and every write acknowledged before the call is in it.
     ///
     /// # Errors
     ///
@@ -180,7 +186,9 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         shard: &ShardRef,
         key: &str,
         upload: EpochSeq,
-    ) -> impl Future<Output = Result<Option<Upload>, ShardError>> + Send;
+        after: u16,
+        limit: usize,
+    ) -> impl Future<Output = Result<Option<UploadParts>, ShardError>> + Send;
 
     /// Up to `limit` open uploads of the shard whose keys start with
     /// `prefix`, by key and then age: with `after`, those after that key and

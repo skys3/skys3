@@ -207,6 +207,22 @@ async fn an_upload_completes_with_the_etag_and_checksum_s3_gives() {
     assert_eq!(element(&listed.body, "ChecksumAlgorithm"), Some("SHA256"));
     assert_eq!(element(&listed.body, "IsTruncated"), Some("false"));
 
+    // The right digest with the wrong part count, or none, is not the
+    // object's checksum.
+    for wrong in [
+        "uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=",
+        "uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=-2",
+    ] {
+        setup
+            .complete(
+                "movie.mp4",
+                &id,
+                &[("x-amz-checksum-sha256", wrong)],
+                &[(1, &etags[0]), (2, &etags[1]), (3, &etags[2])],
+            )
+            .await
+            .assert(400, Some("BadDigest"));
+    }
     let complete = setup
         .complete(
             "movie.mp4",
@@ -355,15 +371,33 @@ async fn an_upload_without_an_algorithm_gets_crc64nvme_and_keeps_listed_parts() 
     assert!(answer.header("x-amz-checksum-crc64nvme").is_some());
     let _ = e2;
 
-    let complete = setup.complete("k", &id, &[], &[(1, &e1), (5, &e5)]).await;
-    complete.assert(200, None);
     let body = [first, last].concat();
+    let crc = encode_digest(&digest(ChecksumAlgorithm::Crc64Nvme, &body));
+    // A full-object checksum has no part count.
+    let composite = format!("{crc}-2");
+    setup
+        .complete(
+            "k",
+            &id,
+            &[("x-amz-checksum-crc64nvme", &composite)],
+            &[(1, &e1), (5, &e5)],
+        )
+        .await
+        .assert(400, Some("InvalidRequest"));
+    let complete = setup
+        .complete(
+            "k",
+            &id,
+            &[("x-amz-checksum-crc64nvme", &crc)],
+            &[(1, &e1), (5, &e5)],
+        )
+        .await;
+    complete.assert(200, None);
     let mut md5s = Vec::new();
     for part in [&body[..PART + 17], &body[PART + 17..]] {
         md5s.extend(digest(ChecksumAlgorithm::Md5, part));
     }
     let etag = format!("\"{}-2\"", md5_hex(&md5s));
-    let crc = encode_digest(&digest(ChecksumAlgorithm::Crc64Nvme, &body));
     let got = setup
         .get("k", &[("x-amz-checksum-mode", "ENABLED")], "")
         .await;
@@ -596,6 +630,14 @@ async fn parts_are_listed_in_pages() {
         .await;
     assert_eq!(elements(&page.body, "PartNumber"), ["5", "9"]);
     assert_eq!(element(&page.body, "IsTruncated"), Some("false"));
+    // The last page names no next marker.
+    assert_eq!(element(&page.body, "NextPartNumberMarker"), None);
+    // An empty page is the last one, as in S3.
+    let empty = setup.list_parts("k", &id, "&max-parts=0").await;
+    empty.assert(200, None);
+    assert!(elements(&empty.body, "PartNumber").is_empty());
+    assert_eq!(element(&empty.body, "IsTruncated"), Some("false"));
+    assert_eq!(element(&empty.body, "NextPartNumberMarker"), None);
     setup
         .list_parts("k", &id, "&max-parts=-1")
         .await
@@ -616,6 +658,13 @@ async fn uploads_are_listed_across_shards() {
     let a1: Vec<_> = elements(&all.body, "UploadId")[..2].to_vec();
     assert_eq!(a1, [ids[0].1.as_str(), ids[5].1.as_str()]);
     assert_eq!(element(&all.body, "IsTruncated"), Some("false"));
+    assert_eq!(element(&all.body, "NextKeyMarker"), None);
+    assert_eq!(element(&all.body, "NextUploadIdMarker"), None);
+    // An empty page is the last one, as in S3.
+    let empty = setup.list_uploads("&max-uploads=0").await;
+    assert!(elements(&empty.body, "Key").is_empty());
+    assert_eq!(element(&empty.body, "IsTruncated"), Some("false"));
+    assert_eq!(element(&empty.body, "NextKeyMarker"), None);
 
     let page = setup.list_uploads("&max-uploads=2").await;
     assert_eq!(elements(&page.body, "Key"), ["a/1", "a/1"]);
@@ -732,5 +781,30 @@ async fn restart(setup: &Setup, bucket: &BucketDocument) -> Setup {
         store: setup.store.clone(),
         memory: setup.memory.clone(),
         shards,
+    }
+}
+
+/// ListParts reads the upload and its parts at one point in the shard's
+/// history: racing an abort, it lists the part or finds no upload, and never
+/// lists an open upload without the part it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listing_parts_races_an_abort_consistently() {
+    let (setup, _) = local().await;
+    let setup = std::sync::Arc::new(setup);
+    for round in 0..40 {
+        let key = format!("k{round}");
+        let id = setup.create_upload(&key, &[]).await;
+        setup.part(&key, &id, 1, filled(3, b'r')).await;
+        let abort = {
+            let (setup, key, id) = (std::sync::Arc::clone(&setup), key.clone(), id.clone());
+            tokio::spawn(async move { setup.abort(&key, &id).await })
+        };
+        let listed = setup.list_parts(&key, &id, "").await;
+        match listed.status.as_u16() {
+            200 => assert_eq!(elements(&listed.body, "PartNumber"), ["1"], "{listed:?}"),
+            404 => assert_eq!(listed.code(), Some("NoSuchUpload")),
+            _ => panic!("{listed:?}"),
+        }
+        abort.await.unwrap().assert(204, None);
     }
 }

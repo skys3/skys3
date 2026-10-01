@@ -464,19 +464,38 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
-    /// The open upload of `key` opened at `upload`, as the index holds it.
+    /// The open upload of `key` opened at `upload`, as the index holds it,
+    /// with up to `limit` of its parts after part `after` (0 for the first).
+    /// The upload and its parts are read at one point in the shard's
+    /// history, so an upload that is open never comes with the parts of a
+    /// later abort or completion.
     ///
     /// # Errors
     ///
     /// [`ShardError::Unavailable`] if the index fails.
-    pub async fn upload(&self, key: &str, upload: EpochSeq) -> Result<Option<Upload>, ShardError> {
+    pub async fn upload(
+        &self,
+        key: &str,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Option<(Upload, Vec<(u16, Part)>)>, ShardError> {
         let (index, shard, key) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
             key.to_owned(),
         );
         run(&self.inner.pool, self.shard(), move || {
-            index.read()?.upload(&shard, &key, upload)
+            let reader = index.read()?;
+            let Some(state) = reader.upload(&shard, &key, upload)? else {
+                return Ok(None);
+            };
+            let parts = if limit == 0 {
+                Vec::new()
+            } else {
+                reader.parts(&shard, upload, after, limit)?
+            };
+            Ok(Some((state, parts)))
         })
         .await
     }

@@ -1137,6 +1137,18 @@ of this file. A task with nothing unexpected keeps "None."
   checks both. ListMultipartUploads keeps its own merge rather than M1-11's
   `listing::merge`, which is typed to `ListQuery` and `ListItem` and pages
   by item rather than by (key, upload).
+- **Review fixes.** ListParts first checked that the upload was open
+  and then read its parts in a second index read, so an abort between the
+  two answered `200` with no parts, which no serialization point
+  produces. `Shards::upload` now returns the upload with a page of its
+  parts from one read transaction, and CompleteMultipartUpload uses the
+  same read. Completion compared only the digest of a supplied
+  whole-object checksum, so a composite value with the wrong `-N`, or
+  none, passed; it now compares the parsed value, part count included,
+  and so does the per-part check. `max-parts=0` and `max-uploads=0`
+  answered a truncated page with no marker, which cannot be continued;
+  they now answer an empty final page, as the simulator models S3, and
+  ListParts names `NextPartNumberMarker` only on truncated pages.
 - **Test helper limit.** The shared `answer` helper read at most 1 MiB of
   body; multipart objects are at least 5 MiB, so it now reads up to
   64 MiB.

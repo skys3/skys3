@@ -139,7 +139,7 @@ pub use objects::{
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};
-pub use shard::{ShardError, ShardRef, ShardSummary, Shards};
+pub use shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
 pub use sigv4::{
     Authenticated, BodyError, CredentialLookup, LookupError, SecretAccessKey, SigV4Authenticator,
     SigningCredential, Trailers,

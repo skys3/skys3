@@ -99,21 +99,26 @@ pub fn parse_upload_id(id: &str) -> Option<EpochSeq> {
     Some(EpochSeq::new(Epoch::new(hex(epoch)?), Seq::new(hex(seq)?)))
 }
 
-/// The upload of `key` that `id` names, which must be open.
+/// The upload of `key` that `id` names, which must be open, with up to
+/// `limit` of its parts after part `after`, all from one read of the shard.
 async fn open_upload<H: Shards>(
     shards: &H,
     shard: &ShardRef,
     key: &str,
     id: &str,
-) -> S3Result<(EpochSeq, Upload)> {
+    (after, limit): (u16, usize),
+) -> S3Result<(EpochSeq, Upload, Vec<(u16, Part)>)> {
     let position = parse_upload_id(id).ok_or_else(no_such_upload)?;
-    let upload = shards
-        .upload(shard, key, position)
+    let (upload, parts) = shards
+        .upload(shard, key, position, after, limit)
         .await
         .map_err(shard_error)?
         .ok_or_else(no_such_upload)?;
-    Ok((position, upload))
+    Ok((position, upload, parts))
 }
+
+/// No parts: [`open_upload`] only checks that the upload is open.
+const NO_PARTS: (u16, usize) = (0, 0);
 
 /// The checksum an upload asks for, from CreateMultipartUpload's
 /// `x-amz-checksum-algorithm` and `x-amz-checksum-type`.
@@ -259,8 +264,8 @@ impl<H: Shards> Objects<H> {
             return Err(entity_too_large());
         }
         let shard = ShardRef::for_key(bucket, &input.key);
-        let (upload, state) =
-            open_upload(&self.shards, &shard, &input.key, &input.upload_id).await?;
+        let (upload, state, _) =
+            open_upload(&self.shards, &shard, &input.key, &input.upload_id, NO_PARTS).await?;
         let required = effective_checksum(&state).algorithm;
         let expected = ExpectedChecksums::from_headers(&headers)?;
         if let (Some(declared), Some(supplied)) = (state.checksum, expected.checksum())
@@ -312,8 +317,15 @@ impl<H: Shards> Objects<H> {
         let condition =
             Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         let shard = ShardRef::for_key(bucket, &input.key);
-        let (upload, state) =
-            open_upload(&self.shards, &shard, &input.key, &input.upload_id).await?;
+        let every_part = (0, MAX_PARTS as usize);
+        let (upload, state, stored) = open_upload(
+            &self.shards,
+            &shard,
+            &input.key,
+            &input.upload_id,
+            every_part,
+        )
+        .await?;
         let checksum = effective_checksum(&state);
         if let Some(requested) = &input.checksum_type
             && requested.as_str() != checksum.checksum_type.as_str()
@@ -335,11 +347,6 @@ impl<H: Shards> Objects<H> {
                 "You must specify at least one part"
             ));
         }
-        let stored = self
-            .shards
-            .parts(&shard, upload, 0, MAX_PARTS as usize)
-            .await
-            .map_err(shard_error)?;
         let parts = match_parts(listed, &stored, checksum.algorithm)?;
 
         let mut etag = MultipartEtag::new();
@@ -378,7 +385,9 @@ impl<H: Shards> Objects<H> {
         if let Some(value) = checksum_value!(input, checksum.algorithm) {
             let supplied = Checksum::parse(checksum.algorithm, value)
                 .map_err(|_| s3_error!(InvalidRequest, "The checksum value is not valid"))?;
-            if supplied.digest() != object_checksum.digest() {
+            // The type and part count count too: `<digest>-<parts>` for a
+            // composite checksum, and no suffix for a full-object one.
+            if supplied != object_checksum {
                 return Err(s3_error!(
                     BadDigest,
                     "The {} you specified did not match the calculated checksum.",
@@ -433,7 +442,8 @@ impl<H: Shards> Objects<H> {
         let shard = ShardRef::for_key(bucket, &input.key);
         // The shard refuses the abort too if the upload has gone meanwhile;
         // looking first keeps an ID that was never an upload out of the log.
-        let (upload, _) = open_upload(&self.shards, &shard, &input.key, &input.upload_id).await?;
+        let (upload, _, _) =
+            open_upload(&self.shards, &shard, &input.key, &input.upload_id, NO_PARTS).await?;
         let abort = MpuAbort {
             key: input.key,
             upload,
@@ -457,13 +467,17 @@ impl<H: Shards> Objects<H> {
             Some(marker) => u16::try_from(marker.clamp(0, i32::from(u16::MAX))).unwrap_or(0),
         };
         let shard = ShardRef::for_key(bucket, &input.key);
-        let (upload, state) =
-            open_upload(&self.shards, &shard, &input.key, &input.upload_id).await?;
-        let mut page = self
-            .shards
-            .parts(&shard, upload, after, limit.saturating_add(1))
-            .await
-            .map_err(shard_error)?;
+        // One more part than the page holds tells whether it is the last.
+        // An empty page (`max-parts=0`) is the last, as in S3.
+        let look = if limit == 0 { 0 } else { limit + 1 };
+        let (_, state, mut page) = open_upload(
+            &self.shards,
+            &shard,
+            &input.key,
+            &input.upload_id,
+            (after, look),
+        )
+        .await?;
         let truncated = page.len() > limit;
         page.truncate(limit);
         let parts = page
@@ -486,7 +500,10 @@ impl<H: Shards> Objects<H> {
             upload_id: Some(input.upload_id),
             max_parts: i32::try_from(limit).ok(),
             part_number_marker: input.part_number_marker,
-            next_part_number_marker: page.last().map(|(number, _)| i32::from(*number)),
+            next_part_number_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|(number, _)| i32::from(*number)),
             is_truncated: Some(truncated),
             parts: Some(parts),
             checksum_algorithm: state
@@ -518,6 +535,8 @@ impl<H: Shards> Objects<H> {
             }
         };
         let mut merge = UploadMerge::new(&self.shards, bucket, &prefix, after.clone(), limit);
+        // An empty page (`max-uploads=0`) is the last, as in S3.
+        let mut truncated = false;
         // A key marker that is itself a common prefix resumes after it.
         let mut last_prefix = after
             .as_ref()
@@ -527,8 +546,9 @@ impl<H: Shards> Objects<H> {
         let mut uploads = Vec::new();
         let mut prefixes = Vec::new();
         let mut next_marker = None;
-        let mut truncated = false;
-        while let Some((key, upload, state)) = merge.next().await? {
+        while limit > 0
+            && let Some((key, upload, state)) = merge.next().await?
+        {
             let rolled = delimiter
                 .as_deref()
                 .and_then(|d| common_prefix(&key, &prefix, d));
@@ -620,7 +640,7 @@ fn match_parts<'a>(
             Checksum::parse(algorithm, value)
                 .ok()
                 .zip(part.checksums.get(&algorithm))
-                .is_some_and(|(supplied, stored)| supplied.digest() == stored.digest())
+                .is_some_and(|(supplied, stored)| supplied == *stored)
         });
         if !etag_matches || !checksum_matches {
             return Err(invalid_part());

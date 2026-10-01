@@ -14,7 +14,7 @@ use skys3_shard::{Outcome, Rejection, Shard, ShardSet};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
 
 use crate::conditions::{ConditionFailed, Precondition};
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
+use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
 
 /// The node's shard replicas, as the gateway calls them.
 ///
@@ -148,10 +148,12 @@ impl<D: Disk> Shards for LocalShards<D> {
         shard: &ShardRef,
         key: &str,
         upload: EpochSeq,
-    ) -> Result<Option<Upload>, ShardError> {
+        after: u16,
+        limit: usize,
+    ) -> Result<Option<UploadParts>, ShardError> {
         let local = self.find(shard).await?;
         local
-            .upload(key, upload)
+            .upload(key, upload, after, limit)
             .await
             .map_err(|error| convert(shard, error))
     }
