@@ -2301,11 +2301,14 @@ name = "skys3-shard"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "prometheus-client",
  "prost",
+ "skys3-control",
  "skys3-index",
  "skys3-io",
  "skys3-log",
  "skys3-net",
+ "skys3-obs",
  "skys3-types",
  "thiserror",
  "tokio",
