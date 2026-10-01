@@ -971,8 +971,15 @@ dependencies = [
  "bytes",
  "crc32c",
  "proptest",
+ "rand",
+ "skys3-config",
+ "skys3-io",
+ "skys3-sim",
  "skys3-types",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "turmoil",
 ]
 
 [[package]]
