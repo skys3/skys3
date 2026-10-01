@@ -61,8 +61,11 @@ pub struct ReplicationConfig {
     /// it has no record to send a member.
     pub beacon_interval: Duration,
     /// How long either end of a link waits for the next frame before it
-    /// drops the link. Members answer every beacon, so a live link hears
-    /// something at least every `beacon_interval`.
+    /// drops the link. Members answer every beacon, and a primary sends one
+    /// at least every quarter of this timeout whatever the other intervals
+    /// say ([`ReplicationConfig::beacon_every`]), so a live link hears
+    /// something well within it, even while a member's log is slow to
+    /// sync and acknowledges no record.
     pub link_timeout: Duration,
     /// How long a primary waits before it reconnects a link that dropped.
     pub reconnect_delay: Duration,
@@ -96,6 +99,25 @@ impl Default for ReplicationConfig {
             primary_grace: Duration::from_secs(6),
             ack_timeout: AckTimeout::DEFAULT,
         }
+    }
+}
+
+impl ReplicationConfig {
+    /// The longest a primary goes without sending a member a beacon:
+    /// `beacon_interval` while it has nothing to send, else
+    /// `lease_renew_interval`, and never more than a quarter of
+    /// `link_timeout`. A member answers every beacon at once, so its answer
+    /// reaches the primary well before either end gives up on a link that
+    /// is merely busy (§5.4). Beacons more frequent than
+    /// `lease_renew_interval` only renew leases sooner.
+    #[must_use]
+    pub fn beacon_every(&self, idle: bool) -> Duration {
+        let interval = if idle {
+            self.beacon_interval
+        } else {
+            self.lease_renew_interval
+        };
+        interval.min(self.link_timeout / 4)
     }
 }
 

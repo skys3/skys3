@@ -1,10 +1,12 @@
 //! A member's end of the protocol over real TCP, driven by a hand-written
-//! primary that also breaks the rules.
+//! primary that also breaks the rules, and a primary's link to a
+//! hand-written member whose log stalls.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -99,10 +101,9 @@ fn config() -> ShardConfig {
     }
 }
 
-/// Node 2, serving links on a loopback port, with the shard open as a
-/// member.
-async fn member(pki: &Pki) -> (SocketAddr, Replication<TokioNetwork, SimMount>) {
-    let disk = SimDisk::new(9);
+/// A node's shard set on a disk of its own, and its clock.
+async fn shard_set(seed: u64) -> (ShardSet<SimMount>, Arc<MonotonicClock>) {
+    let disk = SimDisk::new(seed);
     let log_config = LogConfig {
         inline_max_bytes: 512,
         segment_bytes: 8192,
@@ -115,7 +116,13 @@ async fn member(pki: &Pki) -> (SocketAddr, Replication<TokioNetwork, SimMount>) 
         .unwrap();
     let index = Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
     let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
-    let set = ShardSet::<SimMount>::new(Arc::new(index), log, pool);
+    (ShardSet::new(Arc::new(index), log, pool), clock)
+}
+
+/// Node 2, serving links on a loopback port, with the shard open as a
+/// member.
+async fn member(pki: &Pki) -> (SocketAddr, Replication<TokioNetwork, SimMount>) {
+    let (set, clock) = shard_set(9).await;
     let transport = pki.transport(&node(2));
     let replication = Replication::new(
         node(2),
@@ -315,4 +322,116 @@ async fn scenario() {
         sync(&mut fourth, &config, 1).await.last().unwrap().0.last,
         1
     );
+}
+
+#[test]
+fn beacons_come_well_within_the_link_timeout() {
+    let config = ReplicationConfig::default();
+    assert_eq!(config.beacon_every(true), config.beacon_interval);
+    // The renewal interval equals the link timeout by default: a busy link
+    // beacons four times as often.
+    assert_eq!(config.lease_renew_interval, config.link_timeout);
+    assert_eq!(config.beacon_every(false), config.link_timeout / 4);
+    let slow = ReplicationConfig {
+        beacon_interval: Duration::from_secs(5),
+        lease_renew_interval: Duration::from_millis(100),
+        ..config
+    };
+    assert_eq!(slow.beacon_every(true), slow.link_timeout / 4);
+    assert_eq!(slow.beacon_every(false), Duration::from_millis(100));
+}
+
+/// A member that takes a session, answers every beacon, and acknowledges
+/// no record: its log is stuck behind a slow sync. Counts its sessions.
+async fn stalled_member(pki: &Pki, sessions: Arc<AtomicUsize>) -> SocketAddr {
+    let listener = pki
+        .transport(&node(2))
+        .bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok(incoming) = listener.accept().await {
+            let Ok(mut link) = incoming.handshake().await else {
+                continue;
+            };
+            sessions.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let answer = SyncAck {
+                    last: 0,
+                    done: true,
+                    epoch: 2,
+                    refused: String::new(),
+                };
+                if next(&mut link).await.is_none() {
+                    return;
+                }
+                let frame = wire::frame(MessageKind::SyncAck, &answer, Bytes::new());
+                if link.send(&frame).await.is_err() {
+                    return;
+                }
+                while let Some(frame) = next(&mut link).await {
+                    let Ok(beacon) = wire::body::<Beacon>(&frame, MessageKind::Beacon) else {
+                        // An append: never durable while the log is stuck.
+                        continue;
+                    };
+                    let ack = AppendAck {
+                        durable: 0,
+                        rejected: 0,
+                        lease: beacon.lease,
+                    };
+                    let frame = wire::frame(MessageKind::AppendAck, &ack, Bytes::new());
+                    if link.send(&frame).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+/// A busy primary beacons on its renewal interval, which equals the link
+/// timeout by default. While its member's log acknowledges nothing, the
+/// answers to those beacons were all the link heard, one per timeout, so
+/// the link timed out and reconnected over and over. Beacons now come at
+/// least every quarter of the timeout: through a stall of three timeouts,
+/// the link stays up and the primary keeps its lease.
+#[test]
+fn a_busy_link_whose_member_stalls_stays_up_and_keeps_its_lease() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(WAIT, stalled_link())
+            .await
+            .expect("the test finished in time");
+    });
+}
+
+async fn stalled_link() {
+    let pki = Pki::new();
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let address = stalled_member(&pki, Arc::clone(&sessions)).await;
+    // Idle beacons on the renewal interval too, so the primary beacons as
+    // a busy one does whether or not records flow.
+    let timing = ReplicationConfig {
+        beacon_interval: ReplicationConfig::default().lease_renew_interval,
+        ..ReplicationConfig::default()
+    };
+    let (set, clock) = shard_set(11).await;
+    let peers = BTreeMap::from([(node(2), address.to_string().parse().unwrap())]);
+    let primary = Replication::new(node(1), set, pki.transport(&node(1)), peers, clock, timing);
+    let shard = primary.open(&config()).await.unwrap();
+    let leader = Arc::clone(shard.leader().unwrap());
+    while !leader.holds_leases() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let until = tokio::time::Instant::now() + timing.link_timeout * 3;
+    while tokio::time::Instant::now() < until {
+        assert!(leader.holds_leases(), "the primary lost its lease");
+        assert_eq!(sessions.load(Ordering::SeqCst), 1, "the link reconnected");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
