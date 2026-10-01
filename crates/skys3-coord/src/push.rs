@@ -32,6 +32,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
+use crate::admin::AdminEndpoint;
+use crate::heartbeat::HeartbeatError;
+
 /// The body of a [`MessageKind::ControlChanged`] frame. Its payload is
 /// empty.
 #[derive(Clone, PartialEq, Eq, Message)]
@@ -96,7 +99,7 @@ impl ControlChanged {
 }
 
 /// The reply to a [`ControlChanged`] frame that carries a request ID.
-fn reply(request_id: u64) -> Frame {
+pub(crate) fn reply(request_id: u64) -> Frame {
     Frame::new(
         Header::new(MessageKind::AdminReply).with_request_id(request_id),
         Bytes::new(),
@@ -121,16 +124,25 @@ impl Default for ControlHints {
     }
 }
 
-/// Why a push connection ended.
+/// Why a push or admin connection ended.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PushError {
     /// The transport failed.
     #[error(transparent)]
     Transport(#[from] TransportError),
-    /// The peer sent something other than a valid push.
+    /// The peer sent a malformed push.
     #[error(transparent)]
     Hint(#[from] HintError),
+    /// The peer sent a malformed heartbeat.
+    #[error(transparent)]
+    Heartbeat(#[from] HeartbeatError),
+    /// The peer sent a frame of a kind the endpoint does not serve.
+    #[error("unexpected {0:?} frame on an admin connection")]
+    Unexpected(MessageKind),
+    /// A peer that is not a node sent a heartbeat.
+    #[error("{0} is not a node, so it sends no heartbeats")]
+    NotANode(PeerIdentity),
     /// The peer sent nothing for [`PUSH_IDLE_TIMEOUT`].
     #[error("no frame within {PUSH_IDLE_TIMEOUT:?}")]
     Idle,
@@ -178,28 +190,10 @@ impl ControlHints {
     }
 
     /// Serves pushes arriving on `listener`, each connection on a task of
-    /// its own, until the task is dropped.
+    /// its own, until the task is dropped. An [`AdminEndpoint`] that also
+    /// answers heartbeats serves the same pushes.
     pub async fn serve<N: Network>(&self, listener: Listener<N>) {
-        loop {
-            let incoming = match listener.accept().await {
-                Ok(incoming) => incoming,
-                Err(error) => {
-                    tracing::warn!(%error, "accepting a push connection failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            };
-            let hints = self.clone();
-            tokio::spawn(async move {
-                let result = match incoming.handshake().await {
-                    Ok(connection) => hints.serve_connection(connection).await,
-                    Err(error) => Err(error.into()),
-                };
-                if let Err(error) = result {
-                    tracing::debug!(%error, "a push connection ended");
-                }
-            });
-        }
+        AdminEndpoint::new(self.clone()).serve(listener).await;
     }
 
     /// Serves pushes on one connection until the peer closes it.
@@ -208,26 +202,13 @@ impl ControlHints {
     ///
     /// [`PushError`] if the connection fails, stays idle, or carries
     /// anything but valid pushes.
-    pub async fn serve_connection<S>(&self, mut connection: Connection<S>) -> Result<(), PushError>
+    pub async fn serve_connection<S>(&self, connection: Connection<S>) -> Result<(), PushError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        loop {
-            let frame = match tokio::time::timeout(PUSH_IDLE_TIMEOUT, connection.recv()).await {
-                Err(_) => return Err(PushError::Idle),
-                Ok(frame) => frame?,
-            };
-            let Some(frame) = frame else {
-                return Ok(());
-            };
-            let generation = ControlChanged::from_frame(&frame)?;
-            if self.hint(generation) {
-                tracing::debug!(%generation, peer = %connection.peer(), "pushed a new generation");
-            }
-            if frame.header.request_id != 0 {
-                connection.send(&reply(frame.header.request_id)).await?;
-            }
-        }
+        AdminEndpoint::new(self.clone())
+            .serve_connection(connection)
+            .await
     }
 }
 

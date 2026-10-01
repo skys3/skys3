@@ -49,6 +49,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "coord_heartbeat"
+path = "fuzz_targets/coord_heartbeat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "gateway_aws_chunked"
 path = "fuzz_targets/gateway_aws_chunked.rs"
 test = false

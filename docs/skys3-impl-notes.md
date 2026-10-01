@@ -3007,6 +3007,117 @@ of this file. A task with nothing unexpected keeps "None."
   twice; the quarter-length-lease bug was caught in 20 of 32 seeds (in
   the rest the hasty node held the lease from the start).
 
+### M3-02 Node registry and lifecycle
+
+- **Nodes had no way to find the coordinator.** The lease names its
+  holder, but nothing gave a node the holder's address. A node now reads
+  `coordinator.lease` and the holder's registration, and only when it has
+  no coordinator that answers as one, at most every `resolve_interval`;
+  while the coordinator stays put, heartbeats cost the control store
+  nothing. The answer says whether the receiver coordinates and whether
+  its registry lists the sender, which registers again if not (a node
+  forgotten during a long partition, for example).
+- **A new coordinator has heard no heartbeats.** Heartbeats went to the
+  previous holder, so silence measured from the last heartbeat this node
+  happened to receive would make a node that regains the lease after a
+  day forget everyone. `Placement` gained a `begin_tenure` hook with a
+  default no-op (an additive change to the M3-01 trait), and silence is
+  counted from the latest of the last heartbeat, the first listing of the
+  node's current registration, and the start of the tenure. A node is not
+  told it is unregistered before the tenure's first listing.
+- **Forgetting needed a re-homing check before placement exists.** The
+  `Rehoming` hook decides when a departing node can be forgotten; its
+  default, `ShardScan`, lists `shards/` and keeps every node a shard
+  register names as primary, member, or learner, rereading only registers
+  whose version changed. A shard register that does not parse keeps every
+  departing node. Re-homing itself is M3-03 and M3-05, which read the
+  states from `NodeRegistry::entries`.
+- **Scanning and then deleting raced with an overlapping coordinator.**
+  Review found that the first version scanned the shards and deleted the
+  registration in one round. A second coordinator (M3-01 allows brief
+  overlaps, and a stale one keeps writing) could add the node to a shard
+  between the scan and the delete. The two writes go to different
+  registers, so both CASes succeeded, and a shard was left naming an
+  unregistered node. Forgetting now takes two rounds. The first marks the
+  registration `departing` by a CAS, and placement never assigns a marked
+  node. The second, whose listing read the mark, scans the shards and
+  deletes under `If-Match` on the marked version. So an assignment of the
+  node comes from a planner that read it before the mark, and lands before
+  the scan, which sees it. The exception is a planner that stalls across a
+  whole round. No CAS can close that window without transactions across
+  registers, which the design rules out. The result is then a shard member
+  on a lost node, which member removal (§6.4) and replacement handle. A
+  unit test, which fails when the two rounds are merged, runs a competing
+  placement right after the scan. The mark is a new optional
+  `NodeRegistration` field (`departing`, written only when set). It is
+  added under format version 1, as M1-06 added `created_unix_ms`, because
+  no release has shipped it. A marked registration no longer describes its
+  node, so a node that returns clears the mark by registering again, and
+  the heartbeat answer tells a marked node to do so. Silence is not reset
+  by the coordinator's own mark. Recorded in design §6.7.
+- **Registrations settle unanswered writes before announcing them.**
+  M3-01's change path now hands back a write that may still land as a
+  `Pending`, and announces it only once `settle` knows that it landed.
+  `register` settles it at once. If settling fails too, the `Pending`
+  goes back to the node's `Heartbeater` (`RegistrationError::Unsettled`),
+  which settles it before it registers again, so a registration that lands
+  late is still announced, and only once it has landed. A node that
+  restarts in between loses the `Pending`. That leaves at most an
+  unannounced registration, which the coordinator finds by listing and the
+  next increment announces. The coordinator settles its own pending marks
+  and deletes, as it settles every change.
+- **A restart that changes nothing writes nothing.** The design said a
+  restart updates the record under `If-Match`; rewriting an identical
+  record would cost a CAS and a generation increment per restart. A node
+  that crashed between its registration CAS and the increment leaves the
+  write unannounced, which is harmless: the coordinator lists `nodes/` on
+  every round rather than relying on change streams, and the next
+  increment of any change announces it to the other nodes. Recorded in
+  design §6.7, with heartbeat and registry traffic in the §6.1 table.
+- **Pushes and heartbeats share one endpoint.** `ControlHints::serve`
+  refused every frame but `ControlChanged`. `AdminEndpoint` now dispatches
+  by kind, answering `NodeHeartbeat` only from node certificates (an
+  `admin` tool certificate may send admin messages but has no node to
+  record), and `ControlHints::serve` delegates to it unchanged. In the
+  simulation both live on the push port, 7401, so the heartbeater and the
+  pusher's peer sink move registered addresses to that port.
+- **Zone and rack labels have no configuration keys yet.** The node binary
+  does not wire the transport or the coordinator yet (M3-01 notes), so
+  `NodeProfile` is built by the caller; `[node] zone` and `rack` keys
+  belong with that wiring and §14. The simulation registers alternating
+  rack labels and each node's disks, for which `NodeEnv` gained the disk
+  labels.
+- **The dirty-budget shares stand (§7.6).** Re-checked against the
+  registry: load-following shares would put heartbeat delay and
+  coordinator failover into admission control, and a partitioned node
+  would still need the fixed share. Shares follow the shard registers'
+  primaries, which already move with every takeover. No code changed.
+- **Plan §14 also assigns admin-listener TLS to M3-02.** TLS for the admin
+  HTTP listener and `admin` certificates as an alternative to its bearer
+  token are unrelated to the registry and would push this PR past size M,
+  so they are left open for a follow-up task.
+- **A local heartbeat must check the node's own tenure.** The first
+  simulation runs found a node judged suspect while it ran: it had looked
+  up the coordinator while it held the lease itself, recorded its
+  heartbeats in its own registry, and never looked again after another
+  node took over. The local path now answers "coordinator" only while the
+  node's own leadership says so, as the endpoint does for remote nodes.
+- **Pushes to nodes that are down slow placement.** The coordinator awaits
+  each change's push, and a push to a crashed node waits out its timeout
+  (1 s in the simulation), so with two nodes down every change takes over
+  a second, and re-homing the stand-in registers of a crashed coordinator
+  took several seconds. The forgetting scenario allows for it; pushing
+  in the background, or not waiting for suspect nodes, is left for when
+  placement makes many changes in a row (M3-05, M3-06).
+- **Numbers.** Over 64 seeds: four nodes joined with no peer list, every
+  announcement after the clients started reached every node by push
+  within 300 ms, and the last coordinator judged every node live; with
+  `node_forget_after` at 2 s, the node that held no shard was forgotten
+  after 2 s to 9 s of silence (longer when it had been coordinator and
+  its stand-in registers had to be re-homed first), the node that held
+  data shards never was, and the forgotten node registered again on its
+  return.
+
 ## M6 Native peer transport
 
 ### M6-01 Peer protocol messages
