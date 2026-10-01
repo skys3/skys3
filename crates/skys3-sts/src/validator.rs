@@ -33,11 +33,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::clock::WallClock;
 use crate::fetch::{DocumentFetcher, FetchError};
 use crate::jwk::{JwksError, KeySet};
 use crate::jwt::{Algorithm, Claims, TokenError, UnverifiedToken};
 use crate::provider::{OidcProvider, ProviderError};
+use skys3_io::WallClock;
 
 /// Limits and cache lifetimes of an [`OidcValidator`].
 #[derive(Clone, Debug, PartialEq, Eq)]

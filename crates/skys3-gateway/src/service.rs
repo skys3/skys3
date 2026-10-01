@@ -16,15 +16,16 @@ use crate::buckets::{Buckets, GatewayConfig, IdSource};
 use crate::features;
 use crate::limits::{BodyKind, RequestLimits};
 use crate::shard::Shards;
+use crate::sigv4::BodyError;
 
 /// Authenticates requests before they are routed.
 ///
 /// The gateway calls it with every request whose head is within the
 /// limits, before anything else looks at the request. It returns the
 /// request to route, with whatever it learned about the caller in its
-/// extensions, or the S3 error to answer with. SigV4 (plan M1-07a) is the
-/// production implementation; until it exists the gateway is not reachable
-/// from the node binary.
+/// extensions, or the S3 error to answer with.
+/// [`SigV4Authenticator`](crate::SigV4Authenticator) is the production
+/// implementation.
 pub trait Authenticator: Send + Sync + 'static {
     /// Authenticates `request`.
     ///
@@ -183,6 +184,9 @@ impl<A: Authenticator> Gateway<A> {
 
 /// The S3 error for a request body that could not be read.
 fn body_error(limits: &RequestLimits, error: &(dyn std::error::Error + 'static)) -> S3Error {
+    if let Some(error) = BodyError::find(error) {
+        return error.to_s3_error();
+    }
     let too_long = error.is::<BodySizeLimitExceeded>()
         || error.is::<http_body_util::LengthLimitError>()
         || error
