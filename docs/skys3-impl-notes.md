@@ -1875,8 +1875,20 @@ of this file. A task with nothing unexpected keeps "None."
 - **Shutdown left import streams running.** The flush service aborted the
   import task on drop without waiting, and with streams spawned in a
   `JoinSet` a stream could still store a checkpoint after `shutdown`
-  returned, which made the restart test racy. `shutdown` now awaits the
-  aborted task, whose `JoinSet` aborts every stream.
+  returned, which made the restart test racy. The first fix, awaiting the
+  aborted task, was not enough (review on the PR): a stream aborted while
+  it awaited `set_import_ranges` had already queued the write on the
+  index's `BlockingPool`, which runs a queued job whether or not anyone
+  still waits for it. On a pool of several threads, a late write could
+  then land after a restarted import's and move the stored progress back.
+  Imports now stop cooperatively: a stop signal is checked between steps
+  and interrupts listings, throttle waits, commits, and backoffs, but
+  never a checkpoint write, and `shutdown` raises it and awaits the task.
+  A bucket that stops being followed is told to stop the same way, and
+  its next import waits for the old task before reading the checkpoint.
+  `shutdown_waits_for_a_checkpoint_write_in_flight` holds the pool with a
+  blocking job while a write is queued; with the abort it fails, as
+  `shutdown` returns before the write lands.
 - **The discovery budget first counted every node as sampled.** Charging
   a level its worst case, a listing and 96 probes per node, before
   sending anything stopped discovery from listing twelve small folders.
