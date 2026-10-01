@@ -3031,19 +3031,49 @@ of this file. A task with nothing unexpected keeps "None."
   register names as primary, member, or learner, rereading only registers
   whose version changed. A shard register that does not parse keeps every
   departing node. Re-homing itself is M3-03 and M3-05, which read the
-  states from `NodeRegistry::entries`. The delete is `If-Match` on the
-  registration version the registry read, so a node that registered again
-  meanwhile is kept.
+  states from `NodeRegistry::entries`.
+- **Scanning and then deleting raced with an overlapping coordinator.**
+  Review found that the first version scanned the shards and deleted the
+  registration in one round. A second coordinator (M3-01 allows brief
+  overlaps, and a stale one keeps writing) could add the node to a shard
+  between the scan and the delete. The two writes go to different
+  registers, so both CASes succeeded, and a shard was left naming an
+  unregistered node. Forgetting now takes two rounds. The first marks the
+  registration `departing` by a CAS, and placement never assigns a marked
+  node. The second, whose listing read the mark, scans the shards and
+  deletes under `If-Match` on the marked version. So an assignment of the
+  node comes from a planner that read it before the mark, and lands before
+  the scan, which sees it. The exception is a planner that stalls across a
+  whole round. No CAS can close that window without transactions across
+  registers, which the design rules out. The result is then a shard member
+  on a lost node, which member removal (§6.4) and replacement handle. A
+  unit test, which fails when the two rounds are merged, runs a competing
+  placement right after the scan. The mark is a new optional
+  `NodeRegistration` field (`departing`, written only when set). It is
+  added under format version 1, as M1-06 added `created_unix_ms`, because
+  no release has shipped it. A marked registration no longer describes its
+  node, so a node that returns clears the mark by registering again, and
+  the heartbeat answer tells a marked node to do so. Silence is not reset
+  by the coordinator's own mark. Recorded in design §6.7.
+- **Registrations settle unanswered writes before announcing them.**
+  M3-01's change path now hands back a write that may still land as a
+  `Pending`, and announces it only once `settle` knows that it landed.
+  `register` settles it at once. If settling fails too, the `Pending`
+  goes back to the node's `Heartbeater` (`RegistrationError::Unsettled`),
+  which settles it before it registers again, so a registration that lands
+  late is still announced, and only once it has landed. A node that
+  restarts in between loses the `Pending`. That leaves at most an
+  unannounced registration, which the coordinator finds by listing and the
+  next increment announces. The coordinator settles its own pending marks
+  and deletes, as it settles every change.
 - **A restart that changes nothing writes nothing.** The design said a
   restart updates the record under `If-Match`; rewriting an identical
   record would cost a CAS and a generation increment per restart. A node
   that crashed between its registration CAS and the increment leaves the
   write unannounced, which is harmless: the coordinator lists `nodes/` on
   every round rather than relying on change streams, and the next
-  increment of any change announces it to the other nodes. Registration
-  reuses the coordinator's change path (`apply`), so a write that may have
-  landed is announced too. Recorded in design §6.7, with heartbeat and
-  registry traffic in the §6.1 table.
+  increment of any change announces it to the other nodes. Recorded in
+  design §6.7, with heartbeat and registry traffic in the §6.1 table.
 - **Pushes and heartbeats share one endpoint.** `ControlHints::serve`
   refused every frame but `ControlChanged`. `AdminEndpoint` now dispatches
   by kind, answering `NodeHeartbeat` only from node certificates (an
