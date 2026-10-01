@@ -451,3 +451,51 @@ fn multipart_objects_wait_without_holding_up_other_keys() {
         assert_eq!((status.dirty, status.dirty_bytes), (0, 0));
     });
 }
+
+#[test]
+fn an_error_is_reported_until_its_key_gets_past_it() {
+    runtime().block_on(async {
+        let node = Node::open(14).await;
+        let store = remote(14, false);
+        // "bad" cannot be sent until a later version fixes it; "good" fails
+        // once, and then flushes.
+        let RecordBody::Put(mut put) = support::put("bad", "body") else {
+            unreachable!()
+        };
+        put.metadata
+            .insert("x-amz-meta-note".to_owned(), "caf\u{e9}".to_owned());
+        node.shard.commit(RecordBody::Put(put)).await.unwrap();
+        node.put("good", "body").await;
+        store.inject(Operation::PutObject, Fault::InternalError);
+        let flusher = node.flusher(&target(&store));
+        wait_for(&flusher, "good", |phase| {
+            matches!(phase, Some(Phase::Backoff(_)))
+        })
+        .await;
+        wait_for(&flusher, "good", |phase| phase.is_none()).await;
+        assert_eq!(store.stats().internal_errors, 1);
+
+        // The error "good" got past is gone; the one of "bad" stays.
+        let error = flusher.status().last_error.unwrap();
+        assert!(
+            error.starts_with("bad: ") && error.contains("note"),
+            "{error}"
+        );
+
+        // A key that is still failing keeps its error after another key's
+        // error clears.
+        store.inject(Operation::PutObject, Fault::InternalError);
+        node.put("flaky", "body").await;
+        wait_for(&flusher, "flaky", |phase| {
+            matches!(phase, Some(Phase::Backoff(_)))
+        })
+        .await;
+        wait_for(&flusher, "flaky", |phase| phase.is_none()).await;
+        assert!(flusher.status().last_error.unwrap().starts_with("bad: "));
+
+        // Once its key is flushed, no error is left.
+        node.put("bad", "fixed").await;
+        node.settle(&flusher).await;
+        assert_eq!(flusher.status().last_error, None);
+    });
+}
