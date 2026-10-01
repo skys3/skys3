@@ -1277,3 +1277,88 @@ of this file. A task with nothing unexpected keeps "None."
   not find a `-config` file outside the specification's directory, so the
   script copies the specification and its generated configuration into a
   temporary directory. TLC keeps its search queue on disk there.
+
+### M2-04 S3 control-store backend
+
+- **The trait has no conditional read.** `ChangeFeed` polls through `get`,
+  so an `If-None-Match` poll could not go through it unchanged. The S3
+  backend's change stream is the shared polling feed over a private view of
+  the store that reads `cluster.json` with `If-None-Match` on the copy it
+  last read and answers a `304` from that copy; the delivery rules stay
+  shared with every backend.
+- **One probe for every backend.** The plan describes the startup probe as
+  part of the S3 backend. It is `ControlProbe`, generic over
+  `ControlStore`, so the conformance suite (M2-06) can run it against
+  etcd and the in-memory store too. Its writers go through `propose`, so
+  the probe also tests the `409` retries and the lost-response rule that
+  production writes use: mapping a lost S3 response to "nothing applied"
+  makes it fail in the first seed of the simulation.
+- **"Writers on different nodes".** A node probes alone at startup, so the
+  probe races one writer per store handle the caller passes, at least two,
+  as concurrent requests; per-run nonces keep probes of different nodes
+  on different registers. The simulation scenario runs five nodes' probes
+  concurrently against one faulty simulated bucket.
+- **Conditional deletes: refuse rather than fall back.** M1-06 asked what
+  `delete_if` does on a store without conditional `DeleteObject`. A
+  tombstone fallback (conditional PUT of a tombstone, then unconditional
+  DELETE) has an ABA race, since equal tombstones share an ETag, and
+  permanent tombstones are what M1-06 already rejected. Such stores are
+  refused; design §6.1 records why. R2 qualifies only if the probe finds
+  it honors `If-Match` on `DeleteObject`.
+- **Permanent errors had no `ControlError`.** `403 AccessDenied`, a
+  missing bucket, or `501 NotImplemented` would have been `Unavailable`
+  and retried for seconds. `ControlError::Rejected` is not retried; the
+  gateway answers it with `500`. A `409` to a read or listing, which
+  `skys3-remote` does not class as transient, is `Unavailable` there.
+- **`SimS3` could not read stale.** `Fault::StaleRead` and
+  `SimS3Faults::stale_read_probability` answer `GetObject` and
+  `HeadObject` with the key's state from before its latest write. The
+  probability is drawn only when it is non-zero, so seeds recorded for
+  existing profiles replay unchanged. Listings are never stale.
+- **Probe history on versioned control buckets.** The `ControlStore`
+  interface has no delete by version ID, so on a versioned control bucket,
+  which design §12 recommends for audit, each probe leaves its writes as
+  noncurrent versions and delete markers, as every overwritten register
+  does; a noncurrent-version lifecycle rule removes them.
+- **Conditional deletes of missing keys on AWS.** The simulator answers
+  `If-Match` on a key without a current object with `404`, which the
+  backend maps to a failed precondition. If AWS answers `204`, as the
+  older pages M0-05 found suggest, deleting an absent register reports
+  success: harmless for `propose_delete`, which counts an absent register
+  as deleted, but the conformance check that a second delete fails would
+  not hold. M1-26 and the M2-06 nightly runs must confirm it.
+- **The validator.** M0-03 already refused an S3 control store in a backup
+  target's failure scope. Snapshot targets are now checked too (once when
+  one defaults to the backup target), and a target in the control bucket
+  whose prefix overlaps the control prefix is refused even with
+  `allow_correlated_control_store`, the part of credential scoping SkyS3
+  can enforce. Scoping the credential itself is the operator's; design
+  §6.1 and the configuration reference give the policy.
+- **No credential key yet.** §14 names no credential source for the
+  control store, and nothing wires the S3 backend into the binary (rule
+  1.1). The PR that does adds that key with the region and addressing
+  keys M1-15 also left to the attach path.
+- **No fuzz target.** The backend parses nothing new: listed keys go
+  through the existing `RegisterKey` grammar, and values through the
+  existing document parsing.
+- **Listings need the same consistency as reads (review).** The first
+  probe checked only reads, so a store with consistent `GetObject` but
+  lagging `ListObjectsV2` passed, and its change streams would miss writes
+  a generation announced: the feed lists once per generation, and a
+  generation does not name the registers it announces, so the feed cannot
+  tell a lagging listing from a complete one. The probe now lists the
+  scratch registers after every round and every deletion, and refuses a
+  store whose listing misses a register, shows an old version, or shows a
+  deleted one; design §6.1 records why the feed does not relist instead.
+  `SimS3` gained `stale_list_probability`, and a scripted
+  `Fault::StaleRead` now also makes a listing stale. Stale reads are now
+  drawn only for `GetObject` and `HeadObject`, which changed the draws of
+  profiles with stale reads; they were new in this PR. That change exposed
+  that the probe's cleanup stopped at a stale read showing a register as
+  absent, so the cleanup now first deletes at the version the probe knows.
+- **The prefix bound was the backend's alone (review).** The backend
+  refuses prefixes over 512 bytes (S3's 1,024-byte key limit less the
+  longest register key), which configuration accepted. Configuration now
+  applies `ControlStoreConfig::MAX_PREFIX_LEN`, and a test in
+  `skys3-control` checks that it equals the backend's bound, derived from
+  `skys3-remote`, which `skys3-config` does not depend on.
