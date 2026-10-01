@@ -264,6 +264,159 @@ async fn writes_are_refused_while_a_detach_decides() {
 }
 
 #[tokio::test]
+async fn a_creation_whose_answers_were_lost_is_announced_on_retry() {
+    let setup = setup("").await;
+    let before = setup.generation().await;
+    // The create lands; its answer and the answers of both retries are lost.
+    setup.store.script(vec![Fault::LoseResponse; 3]);
+    let answer = setup.create("photos", "local", None).await;
+    answer.assert(503, Some("ServiceUnavailable"));
+    assert!(setup.register("photos").await.is_some());
+    assert_eq!(setup.generation().await, before, "announced too early");
+
+    let retry = setup.create("photos", "local", None).await;
+    retry.assert(409, Some("BucketAlreadyOwnedByYou"));
+    assert!(
+        setup.generation().await > before,
+        "the bucket was never announced"
+    );
+    setup
+        .call(Method::HEAD, "/photos", &[], "")
+        .await
+        .assert(200, None);
+}
+
+#[tokio::test]
+async fn a_deletion_whose_answers_were_lost_is_finished_on_retry() {
+    let setup = setup("").await;
+    let bucket = setup.create_local("photos").await;
+    let other = Gateway::new(
+        config(""),
+        setup.memory.clone(),
+        setup.shards.clone(),
+        IdSource::seeded(8),
+        Unauthenticated,
+    )
+    .await
+    .unwrap();
+    let head = || common::request(Method::HEAD, "/photos", &[], "");
+    assert_eq!(other.handle(head()).await.status(), 200);
+    let before = setup.generation().await;
+    // The read passes; the delete lands, and every answer is lost.
+    setup.store.script([
+        Fault::Pass,
+        Fault::LoseResponse,
+        Fault::LoseResponse,
+        Fault::LoseResponse,
+    ]);
+    let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
+    answer.assert(503, Some("ServiceUnavailable"));
+    assert!(setup.register("photos").await.is_none());
+    assert_eq!(setup.generation().await, before);
+    let shard = ShardRef::for_key(&bucket, "k");
+    assert_eq!(setup.shards.is_sealed(&shard), Some(true));
+
+    // The retry finds the register gone, and finishes the detach.
+    setup
+        .call(Method::DELETE, "/photos", &[], "")
+        .await
+        .assert(204, None);
+    assert!(setup.shards.open_shards(&bucket.bucket_id).is_empty());
+    assert!(
+        setup.generation().await > before,
+        "the deletion was never announced"
+    );
+    other.reload_buckets().await.unwrap();
+    assert_eq!(other.handle(head()).await.status(), 404);
+    let again = setup.call(Method::DELETE, "/photos", &[], "").await;
+    again.assert(404, Some("NoSuchBucket"));
+}
+
+#[tokio::test]
+async fn a_lost_deletion_superseded_by_a_new_bucket_is_finished() {
+    let setup = setup("").await;
+    let old = setup.create_local("photos").await;
+    setup.store.script([
+        Fault::Pass,
+        Fault::LoseResponse,
+        Fault::LoseResponse,
+        Fault::LoseResponse,
+    ]);
+    let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
+    answer.assert(503, Some("ServiceUnavailable"));
+    // Another gateway creates a new bucket under the name.
+    let mut new = old.clone();
+    new.bucket_id = "b-new".parse().unwrap();
+    new.proposal_id = "new".parse().unwrap();
+    for shard in ShardRef::all(&new) {
+        setup.shards.open(&shard, &new).await.unwrap();
+    }
+    let key = TypedKey::bucket(&new.name);
+    let value = Bytes::from(new.to_json().unwrap());
+    let written = setup.memory.put_if(key.key(), Expected::Absent, value);
+    assert!(matches!(written.await.unwrap(), PutOutcome::Written(_)));
+
+    setup
+        .call(Method::DELETE, "/photos", &[], "")
+        .await
+        .assert(204, None);
+    assert!(setup.shards.open_shards(&old.bucket_id).is_empty());
+    assert!(setup.shards.open_shards(&new.bucket_id).is_empty());
+}
+
+#[tokio::test]
+async fn seals_of_a_lost_deletion_are_lifted_once_it_cannot_apply() {
+    let setup = setup("").await;
+    let bucket = setup.create_local("photos").await;
+    let shard = ShardRef::for_key(&bucket, "k");
+    // The delete never lands, but nothing says so.
+    setup.store.script([
+        Fault::Pass,
+        Fault::LoseRequest,
+        Fault::LoseRequest,
+        Fault::LoseRequest,
+    ]);
+    let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
+    answer.assert(503, Some("ServiceUnavailable"));
+    assert_eq!(setup.shards.is_sealed(&shard), Some(true));
+
+    // A retry that applies nothing keeps the earlier seal: the earlier
+    // delete may still land.
+    setup.store.script([
+        Fault::Pass,
+        Fault::Unavailable,
+        Fault::Unavailable,
+        Fault::Unavailable,
+    ]);
+    let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
+    answer.assert(503, Some("ServiceUnavailable"));
+    assert_eq!(setup.shards.is_sealed(&shard), Some(true));
+
+    // Once the register moves on, no earlier delete can apply.
+    let key = TypedKey::bucket(&bucket.name);
+    let current = setup.memory.get(key.key()).await.unwrap().unwrap();
+    let mut rewritten = bucket.clone();
+    rewritten.proposal_id = "rewritten".parse().unwrap();
+    let value = Bytes::from(rewritten.to_json().unwrap());
+    let written = setup
+        .memory
+        .put_if(key.key(), Expected::Version(current.version), value);
+    assert!(matches!(written.await.unwrap(), PutOutcome::Written(_)));
+    setup.store.script([
+        Fault::Pass,
+        Fault::Unavailable,
+        Fault::Unavailable,
+        Fault::Unavailable,
+    ]);
+    let answer = setup.call(Method::DELETE, "/photos", &[], "").await;
+    answer.assert(503, Some("ServiceUnavailable"));
+    assert_eq!(setup.shards.is_sealed(&shard), Some(false));
+    setup.shards.put(&bucket, "k", EntryState::Dirty).unwrap();
+    let refused = setup.call(Method::DELETE, "/photos", &[], "").await;
+    refused.assert(409, Some("BucketNotEmpty"));
+}
+
+#[tokio::test]
 async fn a_lost_delete_answer_still_detaches() {
     let setup = setup("").await;
     let bucket = setup.create_local("photos").await;
