@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{
-    Checkpointer, Entry, EntryState as IndexState, Index, IndexConfig, ListPage, ListQuery,
+    Checkpointer, Entry, EntryState as IndexState, Index, IndexConfig, ListPage, ListQuery, Part,
+    Upload,
 };
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Delete, Extent, ExtentRef, Flushed, Put, PutData};
@@ -26,7 +27,7 @@ use skys3_types::{BucketDocument, BucketId, ETag, EpochSeq, Label, NodeId};
 
 use crate::conditions::{ConditionFailed, Precondition};
 use crate::local::LocalShards;
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
+use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
 
 /// The state [`MemoryShards::put`] leaves an entry in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +265,40 @@ impl Shards for MemoryShards {
     async fn entry(&self, shard: &ShardRef, key: &str) -> Result<Option<Entry>, ShardError> {
         self.check(shard)?;
         self.local.entry(shard, key).await
+    }
+
+    async fn upload(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Option<UploadParts>, ShardError> {
+        self.check(shard)?;
+        self.local.upload(shard, key, upload, after, limit).await
+    }
+
+    async fn uploads(
+        &self,
+        shard: &ShardRef,
+        prefix: &str,
+        after: Option<(String, Option<EpochSeq>)>,
+        limit: usize,
+    ) -> Result<Vec<(String, EpochSeq, Upload)>, ShardError> {
+        self.check(shard)?;
+        self.local.uploads(shard, prefix, after, limit).await
+    }
+
+    async fn parts(
+        &self,
+        shard: &ShardRef,
+        upload: EpochSeq,
+        after: u16,
+        limit: usize,
+    ) -> Result<Vec<(u16, Part)>, ShardError> {
+        self.check(shard)?;
+        self.local.parts(shard, upload, after, limit).await
     }
 
     async fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, ShardError> {

@@ -1067,6 +1067,96 @@ of this file. A task with nothing unexpected keeps "None."
   remote's listing (§9.1); the import task adds that. The configuration
   key for shared token keys comes with multi-node gateways.
 
+### M1-12 Multipart upload, local
+
+- **The upload ID is the `MPU_CREATE` position.** Formatted as 32 hex
+  digits, it is unique within the shard, needs no generator, and is the
+  write identity the completed object carries (`write_identity =
+  Some(upload)`), so M1-16b can hand it to the remote
+  `CreateMultipartUpload` unchanged. An ID that does not parse answers
+  `404 NoSuchUpload`, never `400`. AbortMultipartUpload looks the upload up
+  before committing, so an ID that never named an upload stays out of the
+  log.
+- **Versions moved in three places, not four.** Defining reserved record
+  kinds needs no new log version (design §10.1), so the log stays at
+  format 2. The index value format went to 3 (a `Parts` entry payload,
+  and the upload and part values, which exist only in format 3); readers
+  still take formats 1 and 2. The redb database got a format version bump
+  of its own, 1 to 2, for the `uploads` and `parts` tables; opening a
+  format 1 index creates them and rewrites the version, which
+  `tests/uploads.rs` exercises.
+- **Parts live beside the entry, not in it.** A completed object's entry
+  holds only part numbers and sizes (`Payload::Parts`); each part's
+  payload stays in the `parts` table under the upload. A GET reads the
+  part rows it needs in one call before streaming, flattens them into the
+  extent list M1-09's streaming already serves (an inline part becomes one
+  "extent" covering its record), and answers `503` if the rows no longer
+  match the entry. For a 10,000-part object the rows are read in one go;
+  paging them is left for when it matters.
+- **Releasing is removing location-map rows.** An aborted upload's parts,
+  a replaced part, the parts a completion leaves out, and a part refused
+  because its upload is gone all leave the location map when the
+  orphaning record applies. Shard tests check that their positions no
+  longer locate. Replaced object versions are not released, since a read
+  of the old version may still be streaming; M1-22 must drop released
+  records without a reference check and find the rest by reference
+  (design §10.3).
+- **The shard guards completion, not just the gateway.** The gateway
+  checks the listed parts, then commits an `MPU_COMPLETE` that names each
+  part's `MPU_PART` position. The state machine rejects it
+  (`PartChanged`, `NoSuchUpload`) if a part was uploaded again or the
+  upload ended meanwhile, and `LocalShards` maps those to `400
+  InvalidPart` and `404 NoSuchUpload`. `MPU_CREATE`, `MPU_PART`, and
+  `MPU_ABORT` do not take the key's conditional-write slot, so they never
+  wait behind a conditional PUT; `MPU_COMPLETE` does.
+- **`partNumber` counts kept parts.** On a multipart object `partNumber=N`
+  serves the Nth part of the completed object, numbering from 1 in order,
+  even if the parts were uploaded as 1, 3, and 7. This is what the stored
+  form (numbers and sizes in order) gives directly; if S3 turns out to
+  use the uploaded numbers, the entry already keeps them.
+- **Checksums follow the upload.** Each part computes the upload's
+  algorithm, or CRC64NVME, through `ChecksumValidator::requiring`, so
+  completion can always fold a `MultipartChecksum`. A part that supplies a
+  different algorithm than the upload's is refused with S3's "Checksum
+  Type mismatch" `400 InvalidRequest`; with no upload algorithm any
+  supplied value is checked and kept beside the CRC64NVME. Completion
+  checks a part's checksum only when the request lists one, which the
+  SDKs do for uploads created with an algorithm.
+- **Known vectors.** The s3-tests three-part upload (5 MiB of `A`, `B`,
+  and `C`) completes with S3's ETag `b2add96cc9702bbf4efb0ccdfc6b7747-3`
+  and composite SHA256 `uWBwpe1dxI4Vw8Gf0X9ynOdw/SS6VBzfWm9giiv1sf4=-3`
+  through the HTTP pipeline; the Rust SDK drives every operation over a
+  real socket in `sigv4_http.rs`.
+- **s3s details.** It serializes XML fields alphabetically, so
+  `CommonPrefixes` precede the top-level `Prefix`, and it omits an empty
+  `Prefix`. It does not escape quotes in ETags. `encoding-type` on
+  ListMultipartUploads is ignored and not echoed.
+- **Listings after M1-11.** Open uploads live outside the namespace
+  table, so ListObjects never sees them, and a completed object lists
+  with its multipart ETag and size like any other entry; a gateway test
+  checks both. ListMultipartUploads keeps its own merge rather than M1-11's
+  `listing::merge`, which is typed to `ListQuery` and `ListItem` and pages
+  by item rather than by (key, upload).
+- **Review fixes.** ListParts first checked that the upload was open
+  and then read its parts in a second index read, so an abort between the
+  two answered `200` with no parts, which no serialization point
+  produces. `Shards::upload` now returns the upload with a page of its
+  parts from one read transaction, and CompleteMultipartUpload uses the
+  same read. Completion compared only the digest of a supplied
+  whole-object checksum, so a composite value with the wrong `-N`, or
+  none, passed; it now compares the parsed value, part count included,
+  and so does the per-part check. `max-parts=0` and `max-uploads=0`
+  answered a truncated page with no marker, which cannot be continued;
+  they now answer an empty final page, as the simulator models S3, and
+  ListParts names `NextPartNumberMarker` only on truncated pages.
+- **Test helper limit.** The shared `answer` helper read at most 1 MiB of
+  body; multipart objects are at least 5 MiB, so it now reads up to
+  64 MiB.
+- **Left open.** UploadPartCopy is M4-05, and cleanup of abandoned
+  uploads M5-10. Eviction (M1-21) must drop part rows along with the
+  entry it turns into a stub. `x-amz-if-match-initiated-time` on abort
+  answers `501`.
+
 ### M1-13 Node binary and startup recovery
 
 - **The configuration had nowhere to put a node.** Design §14 named no
