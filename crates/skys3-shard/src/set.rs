@@ -162,18 +162,28 @@ impl<D: Disk> ShardSet<D> {
             // A replica opened as the shard's only member runs for one
             // member. Given learners (§6.7), it closes once its records are
             // applied, and opens again as their primary.
-            let alone = shard.config();
+            let held = shard.config();
             let gains_learners = node.is_some()
                 && shard.role() == Role::Alone
                 && !shard.is_stopped()
-                && config.epoch > alone.epoch
-                && config.members == alone.members
+                && config.epoch > held.epoch
+                && config.members == held.members
                 && !config.learners.is_empty();
-            if !gains_learners {
+            // A node removed from the shard and added back as a learner
+            // (§6.7) may still hold the replica of its old role, which no
+            // configuration change turns into a learner: that replica
+            // stops, and the node opens again as a learner from its log.
+            let readmitted = node.is_some_and(|node| {
+                config.epoch > held.epoch && config.is_learner(node) && !held.is_learner(node)
+            });
+            if readmitted {
+                shard.abandon("the node is re-admitted as a learner").await;
+            } else if gains_learners {
+                shard.close().await?;
+            } else {
                 shard.reconfigure(config).await?;
                 return Ok(shard.clone());
             }
-            shard.close().await?;
         }
         let log = self.logs[self.placement(&key)].1.clone();
         let (index, pool) = (Arc::clone(&self.index), self.pool.clone());
