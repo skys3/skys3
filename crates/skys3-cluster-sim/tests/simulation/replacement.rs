@@ -25,6 +25,12 @@ use skys3_types::NodeId;
 
 use crate::COST;
 
+/// What one seed of these scenarios costs, in typical seeds: a whole
+/// cluster under the coordinator, writing for about 19 s of simulated time
+/// with a node lost, costs about twenty typical seeds' run time, so CI's
+/// fixed seed set runs one seed of each, and larger seed sets more.
+const REPLACEMENT_COST: u64 = 8 * COST;
+
 /// Replicated, routed services under a coordinator that replaces lost
 /// members.
 pub(crate) type Services = CoordinatedServices<RoutedServices>;
@@ -54,11 +60,12 @@ pub(crate) fn workload(context: &SimContext) -> Workload {
 }
 
 /// [`workload`], for long enough that a lost primary is taken over from,
-/// about 7 s after the loss, and its shard replaced well before the
-/// clients stop.
+/// about 7 s after the loss, and its shard replaced, and the lost node
+/// forgotten, before the clients stop: they write for about 19 s, and the
+/// last shard is back to three members by about 12.5 s.
 fn long_workload(context: &SimContext) -> Workload {
     Workload {
-        operations: 700 * context.scale() as usize,
+        operations: 500 * context.scale() as usize,
         ..workload(context)
     }
 }
@@ -139,7 +146,7 @@ fn node(position: usize) -> NodeId {
 /// chose, with no driver and no operator.
 #[test]
 fn after_a_node_loss_every_affected_shard_returns_to_replicas_members() {
-    Runner::with_cost(3, COST).run(|context| {
+    Runner::with_cost(2, REPLACEMENT_COST).run(|context| {
         let crash = Fault::Crash {
             node: 0,
             power_loss: false,
@@ -173,7 +180,7 @@ fn after_a_node_loss_every_affected_shard_returns_to_replicas_members() {
 /// it once no shard names it, with no operator action.
 #[test]
 fn a_lost_node_is_replaced_then_forgotten() {
-    Runner::with_cost(3, COST).run(|context| {
+    Runner::with_cost(2, REPLACEMENT_COST).run(|context| {
         let crash = Fault::Crash {
             node: 1,
             power_loss: true,
