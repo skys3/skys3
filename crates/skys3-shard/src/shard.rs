@@ -92,6 +92,12 @@ enum Job {
         encoded: Option<Bytes>,
         lazy: bool,
     },
+    /// Append `record`, a `TRUNCATE` that no writer waits on, and reply
+    /// once it is durable or failed (§6.6).
+    Mark {
+        record: Box<LogRecord>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// Reply once every record queued before is durable or failed.
     Settle(oneshot::Sender<()>),
 }
@@ -112,9 +118,16 @@ pub(crate) enum Message {
     Barrier(BarrierReply),
     /// Every record up to this `seq` is committed.
     Commit(Seq),
-    /// Drop the records after this `seq` unapplied: a member truncated
-    /// them (§6.6).
-    Truncate(Seq),
+    /// Drop the records after `after` unapplied, which a member truncated
+    /// with a `TRUNCATE` record at `marker` (§6.6), and release nothing
+    /// queued later until that record is durable.
+    Truncate { after: Seq, marker: EpochSeq },
+    /// The append of the `TRUNCATE` record at `position` finished. If it
+    /// failed, the shard stops.
+    Marked {
+        position: EpochSeq,
+        result: Result<(), String>,
+    },
     /// Stop the shard, fail every record and barrier still queued, then
     /// reply.
     Abandon(BarrierReply),
@@ -961,10 +974,12 @@ impl<D: Disk> Shard<D> {
     ///
     /// [`ShardError::Configuration`] on a replica that is not a member, or
     /// if a record past `after` is applied already;
-    /// [`ShardError::Unavailable`] if the shard stopped.
+    /// [`ShardError::Unavailable`] if the shard stopped, or the `TRUNCATE`
+    /// record did not become durable, which stops it.
     pub async fn truncate(&self, after: Seq, epoch: Epoch) -> Result<(), ShardError> {
         let shard = self.shard();
         self.settle().await;
+        let (reply, durable) = oneshot::channel();
         {
             let mut sequencer = self.sequencer();
             sequencer.check_running(shard)?;
@@ -980,23 +995,24 @@ impl<D: Disk> Shard<D> {
             if after >= sequencer.last_sequenced().seq {
                 return Ok(());
             }
+            let marker = EpochSeq::new(epoch, after);
             let record = LogRecord {
                 shard: shard.clone(),
-                position: EpochSeq::new(epoch, after),
+                position: marker,
                 body: RecordBody::Truncate,
             };
             // The pipeline drops the records before any later one reaches
-            // it. The TRUNCATE takes no place in it and is never applied:
-            // its position is past records it leaves valid.
+            // it. The TRUNCATE is never applied, since its position is past
+            // records it leaves valid, but nothing queued after it is
+            // applied, or counts as durable, until it is durable.
             let stopped = || self.unavailable("the shard's pipeline stopped");
             self.inner
                 .pipeline
-                .send(Message::Truncate(after))
+                .send(Message::Truncate { after, marker })
                 .map_err(|_| stopped())?;
-            let job = Job::Append {
+            let job = Job::Mark {
                 record: Box::new(record),
-                encoded: None,
-                lazy: false,
+                reply,
             };
             self.inner.appender.send(job).map_err(|_| stopped())?;
             sequencer.lineage.truncate(after);
@@ -1006,8 +1022,17 @@ impl<D: Disk> Shard<D> {
             sequencer.adopt_after = None;
             sequencer.writes.retain(|_, position| position.seq <= after);
         }
-        self.settle().await;
-        self.sequencer().check_running(shard)
+        let failed = match durable.await {
+            Ok(Ok(())) => return self.sequencer().check_running(shard),
+            Ok(Err(error)) => format!("a TRUNCATE record did not become durable: {error}"),
+            Err(_) => "the shard's appender stopped".to_owned(),
+        };
+        // The pipeline stops the shard too; stop it now, so that no record
+        // takes a truncated one's place without the TRUNCATE.
+        self.sequencer()
+            .stopped
+            .get_or_insert_with(|| failed.clone());
+        Err(self.unavailable(&failed))
     }
 
     /// Steps down as the primary for a planned handoff to the member `to`
@@ -2195,10 +2220,17 @@ impl PipelineTask {
                 }
                 self.pipeline.resolved(position, result);
             }
+            Message::Marked { position, result } => {
+                if let Err(error) = &result {
+                    self.stop(format!("a TRUNCATE record did not become durable: {error}"));
+                }
+                self.pipeline.marker_resolved(position, result);
+            }
             Message::Barrier(reply) => self.pipeline.barrier(reply),
             Message::Commit(seq) => self.pipeline.commit_through(seq),
-            Message::Truncate(after) => {
+            Message::Truncate { after, marker } => {
                 self.pipeline.truncate(after);
+                self.pipeline.marked(marker);
                 self.durable.send_if_modified(|durable| {
                     let truncated = *durable > after;
                     *durable = (*durable).min(after);
@@ -2374,6 +2406,7 @@ impl<D: Disk> Appender<D> {
                     encoded,
                     lazy,
                 } => self.append(*record, encoded, lazy).await,
+                Job::Mark { record, reply } => self.mark(*record, reply).await,
             }
         }
         self.drain().await;
@@ -2418,5 +2451,35 @@ impl<D: Disk> Appender<D> {
 
     fn resolved(&self, position: EpochSeq, result: Result<Durable, String>) {
         let _ = self.pipeline.send(Message::Appended { position, result });
+    }
+
+    /// Appends a `TRUNCATE` record, which no writer waits on and nothing
+    /// applies, and tells the pipeline and `reply` whether it became
+    /// durable.
+    async fn mark(&mut self, record: LogRecord, reply: oneshot::Sender<Result<(), String>>) {
+        let (position, pipeline) = (record.position, self.pipeline.clone());
+        let done = move |result: Result<(), String>| {
+            let _ = pipeline.send(Message::Marked {
+                position,
+                result: result.clone(),
+            });
+            let _ = reply.send(result);
+        };
+        let encoded = match record.to_bytes() {
+            Ok(encoded) => encoded,
+            Err(error) => return done(Err(error.to_string())),
+        };
+        let class = SegmentClass::of(record.kind());
+        if self.ordered && class != self.class {
+            self.drain().await;
+        }
+        self.class = class;
+        let queued = match self.log.queue_encoded(encoded, false).await {
+            Ok(queued) => queued,
+            Err(error) => return done(Err(error.to_string())),
+        };
+        self.in_flight.spawn(async move {
+            done(queued.durable().await.map(drop).map_err(|e| e.to_string()));
+        });
     }
 }

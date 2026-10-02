@@ -788,3 +788,66 @@ async fn a_cluster_places_new_buckets_on_its_registered_nodes() {
         .await
         .assert(503, Some("ServiceUnavailable"));
 }
+
+/// Waits, for at most ten seconds, until the generation passes `before`.
+async fn announced_after(setup: &common::Setup, before: u64) -> bool {
+    let wait = async {
+        while setup.generation().await.get() <= before {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn a_creation_whose_announcement_failed_is_announced_later() {
+    let mut config = config("");
+    config.placement = ShardPlacement::Cluster(FailureDomain::Node);
+    let setup = setup_with(config).await;
+    for node in 1..=3 {
+        register_node(&setup, node, false).await;
+    }
+    // The listing, the three registrations, the bucket register, and its
+    // eight shard registers pass; the generation increment, and settling
+    // it, do not.
+    let before = setup.generation().await.get();
+    setup.store.script(
+        std::iter::repeat_n(Fault::Pass, 13).chain(std::iter::repeat_n(Fault::Unavailable, 6)),
+    );
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(503, Some("ServiceUnavailable"));
+    assert!(setup.register("photos").await.is_some());
+    // The gateway keeps settling in the background: nodes hear of the
+    // bucket without another change.
+    assert!(
+        announced_after(&setup, before).await,
+        "the creation was never announced"
+    );
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(409, Some("BucketAlreadyOwnedByYou"));
+}
+
+#[tokio::test]
+async fn a_deletion_whose_announcement_failed_is_announced_later() {
+    let setup = setup("").await;
+    setup.create_local("photos").await;
+    let before = setup.generation().await.get();
+    // The read of the register and its delete pass; the generation
+    // increment does not.
+    setup.store.script(
+        std::iter::repeat_n(Fault::Pass, 2).chain(std::iter::repeat_n(Fault::Unavailable, 3)),
+    );
+    let deleted = setup.call(Method::DELETE, "/photos", &[], "").await;
+    assert_eq!(deleted.status, 204, "{deleted:?}");
+    assert!(setup.register("photos").await.is_none());
+    assert!(
+        announced_after(&setup, before).await,
+        "the deletion was never announced"
+    );
+}

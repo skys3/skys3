@@ -1903,6 +1903,18 @@ of this file. A task with nothing unexpected keeps "None."
   sending anything stopped discovery from listing twelve small folders.
   A level is now charged its listings, then its probes, and abandoned
   only if what it actually needs exceeds the budget.
+- **A codec proptest failed on a location, not on an import.** CI on a
+  later PR shrank `arbitrary_bytes_decode_canonically` to `[1, 0 × 20]`,
+  re-encoded as `[3, 0 × 20]`, and the import codec looked like the cause.
+  It was not: `decode_import` rejects those bytes (trailing bytes after
+  `Running { after: None }`). They are a format 1 record location, which
+  `decode_location` accepts and re-encodes in format 3, as the codec
+  documents for every older value. The property dates from M1-03, when
+  format 1 was the only format; once formats 2 and 3 existed, any 21
+  random bytes starting with 1 or 2 failed it, about one run in two hundred.
+  It now checks what the `index_codec` fuzz target always did: a value of
+  the current format re-encodes byte for byte, and an older one re-encodes
+  in the current format to the same value. A unit test keeps the case.
 
 ### M1-23 OIDC token validation
 
@@ -3001,7 +3013,12 @@ of this file. A task with nothing unexpected keeps "None."
   records the primary sends next, at the same `seq`s, are not hidden. The
   index is not rolled back: a member applies only committed records, so
   nothing it truncates is applied, and one that has (after replaying a
-  tail past the commit watermark on restart) is diverged.
+  tail past the commit watermark on restart) is diverged. The `TRUNCATE`
+  holds a place in the commit pipeline that nothing applies: no record
+  queued after it is applied or reported durable until it is durable, and
+  if its write or sync fails the member stops and `Shard::truncate`
+  returns the error. Every other record, `CONFIG` included, has a writer
+  slot whose failure stops the shard already.
 - **A diverged member is removed.** A member that applied past the match,
   shares no epoch with the primary to compare by, or whose records past
   the match are not older than the primary's next, refuses the session.
@@ -3412,6 +3429,26 @@ of this file. A task with nothing unexpected keeps "None."
   `create_bucket` settles it, which sends it again and writes it. The
   writes after it are never sent, and the coordinator completes the
   bucket. The test now expects this.
+- **A creation reported done could leave its announcement owed
+  (review).** `create_bucket` settled a `Pending` once. If that failed
+  too, for example a generation increment that ran out of retries, it
+  only logged the error and still returned `Created`. The gateway then
+  answered `200` and dropped the only handle on the owed announcement.
+  Nodes refresh only when the generation moves, so they could miss the
+  bucket, or a late shard register, until some unrelated change. Such a
+  creation is now `CreationError::Unsettled`, carrying the `Pending`.
+  The gateway answers `503` and keeps settling it in a background task,
+  pausing from the retry policy's longest backoff up to 30 s, until the
+  generation is incremented. A retried CreateBucket finds the register
+  and announces it as well. The same gap was in every other gateway
+  announcement, DeleteBucket's included, and in the M1 path, whose
+  failed increments were left for "the next change". All of them now
+  retry in the background. What is owed lives in memory and ends with
+  the process, as after a crash between a write and its increment.
+  Making it durable would need a record of owed announcements. That is
+  left open, as is the coordinator's own pending list (M3-01). The
+  coordinator test fails without the fix, and so do the gateway tests,
+  one for a creation and one for a deletion. Recorded in §11.
 - **DeleteBucket is unchanged on the gateway; detaching drops shards in
   two places.** The gateway seals, refuses, and deletes the bucket
   register as before. The shard registers go when the coordinator deletes
