@@ -474,3 +474,23 @@ async fn a_change_that_loses_to_the_primary_is_planned_again_from_the_register()
     assert!(matches!(outcome, ProposalOutcome::Rejected));
     assert_eq!(shard_register(&store, 0).await, after);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_member_on_a_node_that_has_not_registered_is_left_to_its_primary() {
+    // node-7 has not registered (yet): nothing shows it lost.
+    let store = store(5).await;
+    write_shard(&store, 0, &[0, 1, 7], &[]).await;
+    write_shard(&store, 1, &[0, 1, 2, 7], &[]).await;
+    let mut coordinator = Coordinator::nodes();
+    assert!(coordinator.round(&store).await.is_none());
+    assert_eq!(shard_register(&store, 0).await.members, nodes(&[0, 1, 7]));
+    assert_eq!(
+        shard_register(&store, 1).await.members,
+        nodes(&[0, 1, 2, 7])
+    );
+
+    // Its primary removes it as unresponsive: the shard is short now.
+    write_shard(&store, 0, &[0, 1], &[]).await;
+    coordinator.step(&store).await;
+    assert_eq!(shard_register(&store, 0).await.learners.len(), 1);
+}

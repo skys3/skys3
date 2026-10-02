@@ -7,7 +7,10 @@
 //! the `failure_domain` level needs, and in a domain no other member or
 //! learner that counts is in (the primary first, then the other members,
 //! then the learners). This is the measure cluster health reports shards
-//! short by ([`report`](crate::report)).
+//! short by ([`report`](crate::report)), with one exception: a member on a
+//! node the registry does not list counts, in no domain. Such a node may
+//! not have registered yet, and nothing shows it lost; if it is, its
+//! primary removes it (design §6.4), and the shard is then short.
 //!
 //! Each round, [`Replacement`] reads the shard registers ([`ClusterScan`])
 //! and changes each shard by one compare-and-swap of its register, from
@@ -107,11 +110,19 @@ impl Census {
             .map(|node| (node, true))
             .chain(config.learners.iter().map(|node| (node, false)))
         {
-            let counts = topology
-                .get(node)
-                .filter(|candidate| candidate.state != NodeState::Departing)
-                .and_then(|candidate| candidate.domain(topology.level()))
-                .is_some_and(|domain| domains.insert(domain));
+            let counts = match topology.get(node) {
+                // A member on a node the registry does not list may not
+                // have registered yet, and cannot be shown lost: it counts,
+                // in no domain, and is left to its primary, which removes
+                // it if it does not respond (§6.4).
+                None => member,
+                Some(candidate) => {
+                    candidate.state != NodeState::Departing
+                        && candidate
+                            .domain(topology.level())
+                            .is_some_and(|domain| domains.insert(domain))
+                }
+            };
             match (counts, member) {
                 (true, true) => {
                     census.counted.push(node.clone());
@@ -147,8 +158,29 @@ enum Repair {
     Remove(NodeId),
 }
 
-/// The coordinator's replacement of lost members, as a [`Placement`]: see
-/// the [module documentation](self).
+/// The coordinator's replacement of lost members, as a [`Placement`]
+/// (design §6.4, §6.7).
+///
+/// Each round it reads the shard registers and counts each shard's members
+/// and learners as cluster health does ([`report`](crate::report)): on a
+/// registered node that is not departing, with the label the level needs,
+/// and in a domain no other counted node of the shard is in (a member on
+/// a node the registry does not list counts too, in no domain). It then
+/// changes each shard that needs it by one compare-and-swap of its
+/// register to the next epoch, keeping the primary and the members:
+///
+/// - a shard whose counted members and learners are fewer than `replicas`
+///   gets learners on the nodes [`Topology::place`] chooses, which its
+///   primary backfills and promotes (rule R3);
+/// - a learner that does not count is dropped, and one on a suspect node
+///   is swapped for a live node when placement has one;
+/// - a member other than the primary that does not count is removed once
+///   the counted members reach `replicas` without it, at most one removal
+///   per [`ReplacementConfig::removal_interval`] across the cluster.
+///
+/// Its compare-and-swaps and the primary's own removals and promotions
+/// are equals: the first to land wins, and the loser plans again from the
+/// register.
 ///
 /// It plans before the placement it wraps, which plans whenever no shard
 /// needs a change. It reads node health from the [`NodeRegistry`] that the
