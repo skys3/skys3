@@ -48,6 +48,12 @@
 //!   watermark, the primary promotes it by a compare-and-swap of the
 //!   shard's register, without pausing commits.
 //!
+//! - **Resuming** (§6.2): a node that starts opens each replica in its
+//!   shard's register, or, while the register cannot be read, in the
+//!   configuration of the latest `CONFIG` record it applied
+//!   ([`Replication::resume`]). Epochs fence a replica whose configuration
+//!   is stale, until it reads the register.
+//!
 //! A configuration change switches epochs at the same `seq` on every
 //! replica (§5.1): a primary's session carries its newest configuration
 //! and the epoch it sequences in, and a member in an earlier epoch takes
@@ -61,6 +67,7 @@ mod learners;
 mod member;
 mod primary;
 mod removal;
+mod resume;
 mod takeover;
 #[cfg(test)]
 mod tests;
@@ -329,6 +336,11 @@ impl<N: Network, D: Disk> Replication<N, D> {
     /// when the node opens the newer configuration, as the coordinator's
     /// change propagation will have it do (plan M3-05), or reads the
     /// register after a member refused it or a compare-and-swap failed.
+    ///
+    /// A node that starts opens its replicas with
+    /// [`Replication::resume`] instead, which finds the configuration in
+    /// the register or, while the register cannot be read, in the node's
+    /// local copy (§6.2).
     ///
     /// # Errors
     ///

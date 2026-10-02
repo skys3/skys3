@@ -105,7 +105,8 @@ pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use learners::{DurabilityWindows, LearnerCounts};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{
-    HandoffCounts, IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards,
+    HandoffCounts, IoCounts, LateWrites, LeaseCounts, ReplicaState, ReplicatedServices,
+    ReplicatedShards,
 };
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;

@@ -23,6 +23,8 @@
 //! | uploads | shard, the object key's bytes, a zero byte, then the upload's epoch and seq | [`Upload`] |
 //! | parts | shard, the upload's epoch and seq, part number (`u16`) | [`Part`] |
 //! | shard_map | shard | the gateway's [`ShardConfig`], as its register's JSON |
+//! | configs | shard | the [`ShardConfig`] of the shard's latest applied `CONFIG` record, as its register's JSON |
+//! | takeovers | shard | the [`ShardConfig`] a member proposed to take over in, as its register's JSON |
 //! | imports | bucket ID (UTF-8) | [`ImportRanges`]: one range as its [`ImportCheckpoint`] alone, a tag (0 running, 1 done) and for a running import the last key imported, as an option; or several as tag 2, a `u16` count of at least two, and each range's end, as an option present on all but the last, followed by its checkpoint |
 //!
 //! An upload key ends with a fixed 17 bytes, so it decodes whatever bytes

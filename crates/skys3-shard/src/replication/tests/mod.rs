@@ -32,6 +32,7 @@ mod backfill;
 mod handoff;
 mod learners;
 mod removal;
+mod resume;
 mod takeover;
 
 use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
