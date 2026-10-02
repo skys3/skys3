@@ -10,13 +10,14 @@ use std::time::Duration;
 use skys3_config::FailureDomain;
 use skys3_control::faults::{FaultRates, FaultyStore};
 use skys3_control::{
-    Expected, ProposalIds, ProposalOutcome, RetryPolicy, S3ControlStore, S3StoreConfig, TypedKey,
-    bootstrap, bump_generation, propose_document,
+    Applied, ControlExport, ControlStore, Expected, KeyPrefix, ProposalIds, ProposalOutcome,
+    RebuildOptions, RebuildPlan, RetryPolicy, S3ControlStore, S3StoreConfig, TypedKey, bootstrap,
+    bump_generation, propose_document,
 };
 use skys3_flush::FlushSettings;
 use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
 use skys3_index::{EntryState, Index};
-use skys3_io::{Drift, MonotonicClock, SimDiskFaults, SyncCut};
+use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SyncCut};
 use skys3_log::LogConfig;
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
 use skys3_sim::history::{History, Operation, Outcome};
@@ -187,6 +188,26 @@ pub struct Report {
     /// Every write a client sent and got an answer to, or gave up on, in
     /// the order they ended: how long each took, end to end.
     pub writes: Vec<WriteTiming>,
+    /// The rebuilds of the control store ([`Fault::RebuildControlStore`]),
+    /// in order.
+    pub rebuilds: Vec<Rebuild>,
+    /// What each shard's register holds at the end, after every fault
+    /// healed; a shard without one is left out.
+    pub registers: BTreeMap<ShardRef, ShardConfig>,
+}
+
+/// An operator's rebuild of the control store from the nodes' exports
+/// ([`Fault::RebuildControlStore`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rebuild {
+    /// When the nodes stopped for it, in simulated time since the run
+    /// began.
+    pub at: Duration,
+    /// The registers it wrote.
+    pub plan: RebuildPlan,
+    /// How many it wrote, and how many an attempt whose answer was lost
+    /// had written.
+    pub applied: Applied,
 }
 
 /// One client write, timed end to end in simulated time: a `PUT`, the
@@ -482,6 +503,8 @@ impl<S: NodeServices> Cluster<S> {
             in_force: InForce::default(),
             faults: 0,
             fences: 0,
+            rebuilds: Vec::new(),
+            failure: None,
         };
         // The clients start once every node serves, and the faults with
         // them.
@@ -496,6 +519,7 @@ impl<S: NodeServices> Cluster<S> {
                 return Err(RunError::Simulation("the nodes did not start".to_owned()));
             }
             driver.advance(&mut sim, false);
+            driver.check()?;
             sim.step().map_err(failed)?;
         }
         let routes = if self.config.create_buckets {
@@ -530,6 +554,11 @@ impl<S: NodeServices> Cluster<S> {
         sim.client("verifier", reader.read_all(FINAL_READ_ATTEMPTS));
         self.drive(&mut sim, &mut driver, &history, true)?;
 
+        let registers = routes
+            .placement
+            .keys()
+            .filter_map(|shard| Some((shard.clone(), register(&world.registers, shard)?)))
+            .collect();
         // Power loss everywhere: what survives is what the checkers see.
         let syncs = world.slots.iter().map(|slot| slot.power.syncs()).collect();
         for slot in &world.slots {
@@ -573,6 +602,8 @@ impl<S: NodeServices> Cluster<S> {
             fences: driver.fences,
             started: driver.origin.unwrap_or_default(),
             writes: writes.take(),
+            rebuilds: driver.rebuilds,
+            registers,
         })
     }
 
@@ -607,6 +638,7 @@ impl<S: NodeServices> Cluster<S> {
                 ));
             }
             driver.advance(sim, false);
+            driver.check()?;
             self.check_invariants(sim, driver, history)?;
             sim.step().map_err(failed)?;
         }
@@ -623,6 +655,7 @@ impl<S: NodeServices> Cluster<S> {
     ) -> Result<(), RunError> {
         loop {
             driver.advance(sim, heal_all);
+            driver.check()?;
             self.check_invariants(sim, driver, history)?;
             if sim.step().map_err(failed)? {
                 return Ok(());
@@ -876,6 +909,85 @@ impl<S: NodeServices> World<S> {
     }
 }
 
+/// The faults of the control store's requests while an operator rebuilds
+/// it: the answers an operator's tool sees from any store.
+const REBUILD_FAULTS: FaultRates = FaultRates {
+    lose_request: 0.1,
+    lose_response: 0.2,
+    late_request: 0.0,
+    conflict: 0.1,
+    unavailable: 0.1,
+    max_delay: Duration::ZERO,
+};
+
+/// How the rebuild retries: often, and without waiting long, since the
+/// harness runs it outside simulated time.
+const REBUILD_RETRY: RetryPolicy = RetryPolicy {
+    max_attempts: 30,
+    initial_backoff: Duration::from_millis(1),
+    max_backoff: Duration::from_millis(2),
+};
+
+impl<S: NodeServices> World<S> {
+    /// Deletes every register of the control store, as when its bucket is
+    /// lost ([`Fault::LoseControlStore`]).
+    fn lose_control_store(&self) -> Result<(), BoxError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        runtime.block_on(async {
+            for (key, version) in self.registers.list(&KeyPrefix::root()).await? {
+                let _ = self.registers.delete_if(&key, &version).await?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Rebuilds the control store from every node's export, which the
+    /// nodes, all down, give as `skys3 control export` does: their logs
+    /// recovered into their indexes first ([`Fault::RebuildControlStore`]).
+    /// The store's answers are lost now and then (`seed`).
+    fn rebuild_control_store(&self, seed: u64) -> Result<(RebuildPlan, Applied), BoxError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        let settings = &self.shared.settings;
+        let mut exports: Vec<ControlExport> = Vec::new();
+        for slot in &self.slots {
+            let mounts: Vec<_> = slot
+                .disks
+                .iter()
+                .map(|(label, disk)| (label.clone(), disk.mount()))
+                .collect();
+            let index = Index::open_sim(&mounts[0].1, INDEX_FILE, &node::index_config(settings))?;
+            let pool = BlockingPool::inline("export");
+            let storage = runtime.block_on(skys3::storage::recover(
+                mounts,
+                settings.log.clone(),
+                Arc::new(MonotonicClock::new()),
+                Arc::new(index),
+                pool.clone(),
+                slot.id.clone(),
+            ))?;
+            let export = runtime.block_on(skys3::rebuild::export(
+                &storage.index,
+                &pool,
+                &settings.cluster,
+                &slot.id,
+                slot.id.as_str(),
+            ))?;
+            drop(storage);
+            // The export's process ends.
+            slot.stop_disks(false);
+            exports.push(export);
+        }
+        let plan = RebuildPlan::new(&settings.cluster, &exports, &RebuildOptions::default())?;
+        let store = FaultyStore::seeded(self.registers.clone(), seed, REBUILD_FAULTS);
+        let applied = runtime.block_on(plan.apply(&store, &REBUILD_RETRY))?;
+        Ok((plan, applied))
+    }
+}
+
 /// The settings every simulated node runs with: small log segments and
 /// inline bodies, so a short workload exercises extents and several
 /// segments, and frequent checkpoints.
@@ -1046,9 +1158,22 @@ struct Driver<'a, S> {
     in_force: InForce,
     faults: usize,
     fences: usize,
+    /// The rebuilds of the control store so far.
+    rebuilds: Vec<Rebuild>,
+    /// Why the harness itself failed while applying a fault, which fails
+    /// the run.
+    failure: Option<String>,
 }
 
 impl<S: NodeServices> Driver<'_, S> {
+    /// Fails the run if the harness failed to apply a fault.
+    fn check(&mut self) -> Result<(), RunError> {
+        match self.failure.take() {
+            Some(failure) => Err(RunError::Simulation(failure)),
+            None => Ok(()),
+        }
+    }
+
     fn host(&self, endpoint: Endpoint) -> String {
         match endpoint {
             Endpoint::Node(index) => self.world.slots[index].host.clone(),
@@ -1168,6 +1293,30 @@ impl<S: NodeServices> Driver<'_, S> {
                 // It starts at the next advance, once.
                 if self.down[node] == Some(Duration::MAX) {
                     self.down[node] = Some(now);
+                }
+            }
+            Fault::LoseControlStore => {
+                if let Err(error) = self.world.lose_control_store() {
+                    self.failure = Some(format!("the control store could not be lost: {error}"));
+                }
+            }
+            Fault::RebuildControlStore {
+                power_loss,
+                downtime,
+            } => {
+                for node in 0..self.world.slots.len() {
+                    self.crash(sim, now, node, power_loss, downtime);
+                }
+                let seed = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
+                match self.world.rebuild_control_store(seed) {
+                    Ok((plan, applied)) => self.rebuilds.push(Rebuild {
+                        at: now,
+                        plan,
+                        applied,
+                    }),
+                    Err(error) => {
+                        self.failure = Some(format!("the control-store rebuild failed: {error}"));
+                    }
                 }
             }
             Fault::MessageLoss { .. }

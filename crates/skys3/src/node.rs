@@ -1097,6 +1097,92 @@ impl Node {
     }
 }
 
+/// A stopped node's data directory and its storage, recovered as a start
+/// recovers them but without serving, for an offline command such as
+/// `skys3 control export`. The data directory's lock keeps the node from
+/// starting meanwhile, and a running node keeps the command out.
+pub(crate) struct Offline {
+    /// The data directory, locked.
+    pub(crate) data_dir: DataDir,
+    /// The index, with every log replayed into it.
+    pub(crate) index: Arc<Index>,
+    /// The pool index work runs on.
+    pub(crate) pool: BlockingPool,
+    pools: Pools,
+}
+
+impl Offline {
+    /// Opens the data directory of `config`, which must hold a node, and
+    /// recovers its logs into its index.
+    ///
+    /// # Errors
+    ///
+    /// [`StartError::Unsupported`] if the data directory holds no node, and
+    /// otherwise what stops a start from recovering its storage, such as a
+    /// data directory in use by a running node.
+    pub(crate) async fn open(config: &Config) -> Result<Self, StartError> {
+        let node_file = config.node().data_dir.join(datadir::NODE_FILE);
+        if !node_file.exists() {
+            return Err(StartError::Unsupported(format!(
+                "{} holds no node",
+                config.node().data_dir.display()
+            )));
+        }
+        let mut pools = Pools {
+            index: pool("index", INDEX_THREADS)?,
+            hashing: pool("hashing", 1)?,
+            control: pool("control", 1)?,
+            disks: Vec::new(),
+        };
+        let mut opened = Opened::default();
+        let recovered = async {
+            let (node, cluster) = (config.node().clone(), config.cluster().cluster_id.clone());
+            let boot_id = datadir::boot_id();
+            let data_dir = on_pool(&pools.index, move || {
+                DataDir::open(&node, &cluster, boot_id.as_deref())
+            })
+            .await?;
+            let data_dir = opened.data_dir.insert(data_dir);
+            open_storage(config, data_dir, &mut pools, &mut opened.index).await
+        }
+        .await;
+        match recovered {
+            Ok(storage) => {
+                let index = Arc::clone(&storage.index);
+                drop(storage);
+                Ok(Self {
+                    data_dir: opened.data_dir.take().expect("the data directory is open"),
+                    index,
+                    pool: pools.index.clone(),
+                    pools,
+                })
+            }
+            Err(error) => {
+                if let Some(index) = opened.index.take() {
+                    close_index(index).await;
+                }
+                drop(opened);
+                pools.shutdown();
+                Err(error)
+            }
+        }
+    }
+
+    /// Closes the index, then the data directory.
+    pub(crate) async fn close(self) {
+        let Self {
+            data_dir,
+            index,
+            pool,
+            pools,
+        } = self;
+        drop(pool);
+        close_index(index).await;
+        pools.shutdown();
+        drop(data_dir);
+    }
+}
+
 /// Waits until `index` is its last handle and closes it. Each shard's
 /// pipeline task holds the index until it notices that its shard was
 /// dropped, which happens on another task shortly after.

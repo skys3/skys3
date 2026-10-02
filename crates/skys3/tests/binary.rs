@@ -100,3 +100,94 @@ fn a_node_that_cannot_start_exits_with_failure() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("backend"));
 }
+
+/// Runs `skys3 control <args>` with the configuration at `config`.
+fn control(config: &std::path::Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    Command::new(BINARY)
+        .arg("control")
+        .arg(args[0])
+        .arg("--config")
+        .arg(config)
+        .args(&args[1..])
+        .output()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_command_line_rebuilds_a_lost_control_store() {
+    use std::ffi::OsStr;
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("node.log");
+    let (config, gateway, admin) = configure(dir.path());
+    let node = Process::start(&config, &gateway, &admin, &log).await;
+    let s3 = node.s3();
+    s3.create_bucket().bucket("data").send().await.unwrap();
+    put(&s3, "data", "k", b"kept").await;
+    assert!(node.terminate().await.success());
+    std::fs::remove_dir_all(dir.path().join("data/control")).unwrap();
+
+    let export = dir.path().join("export.json");
+    let output = control(
+        &config,
+        &[
+            OsStr::new("export"),
+            OsStr::new("--output"),
+            export.as_os_str(),
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("a copy at generation"));
+    // Without --output, the export goes to standard output.
+    let output = control(&config, &[OsStr::new("export")]);
+    assert!(output.status.success(), "{output:?}");
+    let printed = skys3_control::ControlExport::from_json(&output.stdout).unwrap();
+    let written =
+        skys3_control::ControlExport::from_json(&std::fs::read(&export).unwrap()).unwrap();
+    assert_eq!(printed, written);
+
+    let from = [OsStr::new("--from"), export.as_os_str()];
+    let rebuild = |extra: &[&OsStr]| {
+        let args: Vec<&OsStr> = [OsStr::new("rebuild")]
+            .into_iter()
+            .chain(from)
+            .chain(extra.iter().copied())
+            .collect();
+        control(&config, &args)
+    };
+    let output = rebuild(&[OsStr::new("--dry-run")]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 bucket, 0 identity, and 0 shard registers"),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("dry run: nothing written\n"), "{stdout}");
+    // Mistakes on the command line.
+    let output = rebuild(&[OsStr::new("--lost"), OsStr::new("Not Valid")]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let output = control(
+        &config,
+        &[
+            OsStr::new("rebuild"),
+            OsStr::new("--from"),
+            OsStr::new("/missing.json"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    // A rebuild that is refused fails.
+    let output = rebuild(&[OsStr::new("--lost"), written.node_id.as_str().as_ref()]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("refused"));
+
+    let output = rebuild(&[]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("rebuilt: wrote 2 registers"), "{stdout}");
+
+    let node = Process::start(&config, &gateway, &admin, &log).await;
+    let s3 = node.s3();
+    assert_eq!(get(&s3, "data", "k").await, b"kept");
+    s3.create_bucket().bucket("more").send().await.unwrap();
+    assert!(node.terminate().await.success());
+}

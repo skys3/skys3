@@ -4098,6 +4098,109 @@ of this file. A task with nothing unexpected keeps "None."
   - **A new node that is briefly suspect** gets its rebalancing learners
     swapped by replacement. Nothing breaks, but the moves take longer.
 
+### M3-07 Control-store rebuild tool
+
+- **What the binary can do (found).** The node binary runs only the file
+  control store, every shard alone (M2-08b is not wired), so
+  `skys3 control export` and `skys3 control rebuild` rebuild that store:
+  from the one node's export, with the node stopped (the data directory's
+  lock), and claimed for it with its `.owner.json`. Another backend is
+  refused with a message. The plan and the write are backend-agnostic
+  (`skys3_control::RebuildPlan`), and the simulation rebuilds a shared S3
+  control store with them. A lone replica keeps a `CONFIG` record of its
+  own, which is no register's, so the binary's export leaves shard
+  configurations out; the simulation's exports carry them.
+- **Exports are taken from stopped nodes, after log recovery (decided).**
+  The index keeps the configuration of the latest `CONFIG` record a
+  replica *applied*; a primary's removal makes its record durable, and
+  acts on it, before the record commits. An export of a running node
+  could therefore miss a configuration the node acts on, and rebuilding
+  the older one would let a removed member take over over it: two
+  configurations of one epoch. Replay applies every durable record, so
+  an export after recovery holds the newest `CONFIG` record the node has.
+  Stopping every node also leaves no proposal in memory that the rebuilt
+  store could accept (an etcd store rebuilt from scratch reuses
+  revisions). Recorded in design §6.2.
+- **Registers are rebuilt byte for byte, not at fresh epochs (decided).**
+  Each shard's newest configuration among the exports is written
+  unchanged, `proposal_id` included. A replica compares its register with
+  its whole configuration and is deposed by "another configuration of its
+  epoch", so a rewritten `proposal_id` would have stopped every replica;
+  at a fresh epoch every replica would have to adopt a configuration no
+  one proposed. Fresh epochs buy nothing once every member of the newest
+  configuration exported: the primary of any later configuration was a
+  member of it (R1) and made the record durable first. So the plan
+  refuses a configuration whose members did not all export, unless they
+  are declared lost (`--lost`), and refuses two configurations of one
+  epoch. Recorded takeovers and promotions need no handling: they are
+  sent again over the rebuilt register and land or lose as usual.
+- **Identity cached on some nodes only: the newest copy wins (decided).**
+  Each node's copy is a whole listing at its generation, so the plan takes
+  the copy with the highest generation (then the latest sync start, then
+  the node ID), byte for byte. Merging copies was rejected: a role
+  deleted after an older copy was read would come back, with its trust
+  policy. A copy of the same generation that differs is reported.
+- **Shards of buckets the copy does not name (decided).** A bucket created
+  shortly before the loss may be missing from every copy, and its nodes
+  would drop its shards at their next start (§4.1). The export says which
+  shards hold objects; such a shard stops the rebuild unless
+  `--allow-unnamed`. An empty one is a deleted bucket's leftover and only
+  reported.
+- **A lost store stopped every replica that read its register (found).**
+  M2-16 deposes a replica whose register is gone, and resumes nothing for
+  one. With the whole store gone, a node restarted during the loss opened
+  no replica, and a primary whose removal found its register "gone" would
+  have stopped. `ControlRegisters` now answers `NotBootstrapped` for a
+  register absent from a store that holds no `cluster.json` either, so the
+  replica runs on in its kept configuration until the store is rebuilt.
+  The drill fails without it (seed 0: the restarted node opened nothing).
+  Recorded in design §6.2.
+- **Nodes no longer follow a store backwards (decided).** A node with a
+  copy synced from any store whose generation merely differed, so a store
+  recreated at generation 1, by a node that never synced bootstrapping a
+  lost shared store for instance, would have replaced its copy with
+  nothing. `ControlCopy::fetch_since` now refuses a store behind the copy
+  (`ControlError::GenerationBehind`), and the rebuilt `cluster.json` is
+  at the generation after the newest copy's, so every exported node syncs.
+- **Racing a store that is alive (decided).** The rebuild writes nothing
+  into a store holding `cluster.json` or a bucket, shard, or identity
+  register it does not write. Node registrations and a coordinator lease
+  that a running coordinator writes into a lost store (M3-01, M3-02 write
+  regardless of `cluster.json`) are left; nodes register again at start.
+  `cluster.json` goes last with a `proposal_id` derived from the plan, so
+  an interrupted rebuild, run again with the same exports, completes and
+  then reports itself complete.
+- **Simulation.** `Fault::LoseControlStore` deletes every register;
+  `Fault::RebuildControlStore` stops every node, exports each from its
+  disks through `skys3::rebuild::export` after `storage::recover`, and
+  applies the plan through injected lost requests, lost answers,
+  conflicts, and outages. `Report::rebuilds` and `Report::registers` (the
+  final shard registers) carry the outcome. The drill
+  (`rebuild::a_lost_control_store_is_rebuilt_and_membership_changes_resume`)
+  loses the store at 1 s, restarts one node during the loss, rebuilds at
+  4 s, and takes node 3 down at 13 s.
+- **Numbers.** 32 seeds (0 to 31) ran clean, about 27 s each, 861 s in
+  all. In each, writes were acknowledged on 6 or 7 of the 8 shards while
+  the store was lost, the restarted node resumed its replicas, the plan
+  held all 8 shard registers with no note, and `cluster.json` went from
+  generation 2 to 3. Lost answers made 1 to 5 of the 11 registers turn up
+  already written when sent again. After the restart every shard was
+  served in its rebuilt configuration, and the first membership change on
+  the rebuilt store landed 728 to 755 ms after node 3 went down
+  (`member_suspect_after` is 700 ms); every shard node 3 belonged to
+  ended without it. The scenario declares `4 * COST`, so CI's fixed set
+  (`SKYS3_SIM_SEEDS=256`) runs 2 seeds, about 55 s.
+- **Left open.**
+  - **Rebuilding an etcd or S3 store from the binary**, with the binary's
+    multi-node wiring (M2-08b).
+  - **A full stop for the export.** An export from running replicas'
+    in-memory configurations, with nodes frozen for membership, would
+    avoid it.
+  - **Writes into a lost store.** The coordinator and node registry still
+    write into a store without `cluster.json`; a node that never synced
+    would bootstrap one. The rebuild and the generation check make both
+    safe, but they should wait for `cluster.json`.
+
 ## M6 Native peer transport
 
 ### M6-01 Peer protocol messages
