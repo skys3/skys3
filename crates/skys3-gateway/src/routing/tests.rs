@@ -187,7 +187,7 @@ impl Cluster {
         let served = Arc::new(Mutex::new(Vec::new()));
         let mut nodes = Vec::new();
         for (n, (transport, listener)) in (1..).zip(listeners) {
-            let shards = MemoryShards::open(SimDisk::new(u64::from(n)))
+            let shards = MemoryShards::open_as(SimDisk::new(u64::from(n)), node(n))
                 .await
                 .unwrap();
             let set = shards.local().set().clone();
@@ -441,6 +441,95 @@ async fn every_call_is_forwarded_to_the_primary() {
     assert!(replicas.is_empty(), "{replicas:?}");
 }
 
+/// A GET's plan comes from the primary, and its bytes from whichever
+/// holder the gateway asks, over the wire or in process; a holder that
+/// lacks the version says so, and one that does not answer fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_are_planned_by_the_primary_and_served_by_any_holder() {
+    let cluster = Cluster::start(timing()).await;
+    let shard = shard(0);
+    let extent = Extent {
+        key: "big".into(),
+        offset: 0,
+        data: Bytes::from_static(b"extent bytes"),
+    };
+    let primary = cluster.gateway(1);
+    let extent = timed(primary.append_extent(&shard, extent)).await.unwrap();
+    let put = RecordBody::Put(skys3_log::record::Put {
+        key: "big".into(),
+        size: 12,
+        last_modified_ms: 0,
+        etag: etag(1),
+        inherited_identity: None,
+        metadata: BTreeMap::new(),
+        tags: BTreeMap::new(),
+        checksums: BTreeMap::new(),
+        copy_source: None,
+        data: PutData::Extents(vec![extent]),
+    });
+    let version = timed(primary.write(&shard, put, Precondition::None))
+        .await
+        .unwrap()
+        .unwrap();
+    let observed = cluster.served().len();
+
+    let gateway = cluster.gateway(2);
+    assert_eq!(gateway.node(), Some(node(2)));
+    let plan = timed(gateway.plan(&shard, "big")).await.unwrap();
+    assert_eq!(plan.entry.unwrap().version, version);
+    assert_eq!((plan.layout, plan.holders), (vec![extent], vec![node(1)]));
+    let none = timed(gateway.plan(&shard, "none")).await.unwrap();
+    assert_eq!((none.entry, none.holders), (None, Vec::new()));
+
+    // Node 1 holds the version: the read is registered, renewed, fetched,
+    // and released over the wire.
+    let registered = timed(gateway.register(&shard, &node(1), "big", version, vec![extent]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(registered.layout, [extent]);
+    assert_eq!(
+        timed(gateway.renew(&shard, &node(1), registered.id)).await,
+        Ok(true)
+    );
+    let fetched = timed(gateway.fetch(&shard, &node(1), registered.id, extent.position)).await;
+    assert_eq!(fetched, Ok(Bytes::from_static(b"extent bytes")));
+    timed(gateway.release(&shard, &node(1), registered.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        timed(gateway.renew(&shard, &node(1), registered.id)).await,
+        Ok(false)
+    );
+    let lapsed = timed(gateway.fetch(&shard, &node(1), registered.id, extent.position)).await;
+    assert!(
+        matches!(&lapsed, Err(ShardError::Unavailable { reason, .. }) if reason.contains("lapsed")),
+        "{lapsed:?}"
+    );
+
+    // Node 2's replica never got the records, so it says it lacks them,
+    // in process.
+    let missing = timed(gateway.register(&shard, &node(2), "big", version, vec![extent])).await;
+    assert_eq!(missing, Ok(None));
+    // Node 3 never answers.
+    let silent = timed(gateway.register(&shard, &node(3), "big", version, vec![extent])).await;
+    assert!(
+        matches!(silent, Err(ShardError::Unavailable { .. })),
+        "{silent:?}"
+    );
+    // Node 1 has no replica of shard 1.
+    let other = shard_number(1);
+    let absent = timed(gateway.register(&other, &node(1), "big", version, Vec::new())).await;
+    assert_eq!(absent, Err(ShardError::NotFound(other)));
+
+    // Only the plans were observed: holders are not audited as primaries.
+    assert_eq!(cluster.served().len(), observed + 2);
+}
+
+fn shard_number(n: u8) -> ShardRef {
+    shard(n)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_register_is_read_only_when_no_member_answers() {
     let cluster = Cluster::start(timing()).await;
@@ -626,6 +715,53 @@ fn refusals_and_hints_round_trip() {
             epoch: Epoch::new(4),
             hint: Some(config(0, 4, &[1])),
         },
+        Reply::Served {
+            response: Response::Plan(ReadPlan {
+                entry: Some(skys3_index::Entry {
+                    version: EpochSeq::new(Epoch::new(4), Seq::new(9)),
+                    state: skys3_index::EntryState::Dirty,
+                    object: None,
+                    remote_etag: None,
+                    remote_version_id: None,
+                }),
+                layout: vec![extent_ref(3, 5), extent_ref(4, 1)],
+                holders: vec![node(2), node(1)],
+            }),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Plan(ReadPlan {
+                entry: None,
+                layout: Vec::new(),
+                holders: Vec::new(),
+            }),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Registered(Some(Registered {
+                id: 7,
+                layout: vec![extent_ref(3, 5)],
+            })),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Registered(None),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Renewed(false),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Released,
+            epoch: Epoch::new(4),
+            hint: None,
+        },
     ];
     for reply in replies {
         let frame = wire::reply_frame(&reply, 9);
@@ -672,6 +808,76 @@ fn refusals_and_hints_round_trip() {
         wire::decode_reply(&frame, &shard),
         Ok(Reply::Refused(ShardError::Unavailable { .. }))
     ));
+
+    // Answers about reads that make no sense are refused.
+    let served = |answer: wire::Result| {
+        let reply = wire::ForwardReply {
+            outcome: wire::OUTCOME_SERVED,
+            epoch: 1,
+            config: Vec::new(),
+            reason: String::new(),
+            position: None,
+        };
+        let answer = wire::Answer {
+            result: Some(answer),
+        };
+        Frame::new(
+            Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+            Bytes::from(answer.encode_to_vec()),
+        )
+    };
+    let empty_extent = wire::Layout {
+        extents: vec![wire::ExtentAnswer {
+            position: Some(wire::Position { epoch: 1, seq: 1 }),
+            len: 0,
+        }],
+    };
+    let malformed = [
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: Vec::new(),
+            layout: None,
+            holders: vec!["node-1".into()],
+        }),
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: Vec::new(),
+            layout: Some(empty_extent),
+            holders: Vec::new(),
+        }),
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: vec![1, 2, 3],
+            layout: None,
+            holders: Vec::new(),
+        }),
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: Vec::new(),
+            layout: None,
+            holders: vec!["Not A Node".into()],
+        }),
+        wire::Result::Registered(wire::RegisteredAnswer {
+            read: None,
+            layout: Some(wire::Layout::default()),
+        }),
+        wire::Result::Registered(wire::RegisteredAnswer {
+            read: Some(1),
+            layout: Some(wire::Layout {
+                extents: vec![wire::ExtentAnswer {
+                    position: None,
+                    len: 1,
+                }],
+            }),
+        }),
+    ];
+    for answer in malformed {
+        let frame = served(answer.clone());
+        assert!(wire::decode_reply(&frame, &shard).is_err(), "{answer:?}");
+    }
+}
+
+fn extent_ref(seq: u64, len: u32) -> skys3_log::record::ExtentRef {
+    skys3_log::record::ExtentRef {
+        position: EpochSeq::new(Epoch::new(4), Seq::new(seq)),
+        len,
+    }
 }
 
 #[test]
@@ -733,6 +939,43 @@ fn malformed_requests_are_refused() {
     let mut frame = forward(wire::Op::Write(wire::Condition::default()), 1);
     frame.payload = record;
     assert!(wire::decode_request(&frame).is_err());
+
+    // A registration carries its layout, and only it, as its payload.
+    let register = |payload: &'static [u8]| {
+        let mut frame = forward(
+            wire::Op::Register(wire::RegisterQuery {
+                key: "k".into(),
+                version: Some(wire::Position { epoch: 1, seq: 2 }),
+            }),
+            0,
+        );
+        frame.payload = Bytes::from_static(payload);
+        frame
+    };
+    assert!(matches!(
+        wire::decode_request(&register(b"")),
+        Ok((_, _, Request::Register { layout, .. })) if layout.is_empty()
+    ));
+    assert!(wire::decode_request(&register(&[0xff, 0xff])).is_err());
+    let without_version = forward(
+        wire::Op::Register(wire::RegisterQuery {
+            key: "k".into(),
+            version: None,
+        }),
+        0,
+    );
+    assert!(wire::decode_request(&without_version).is_err());
+    let fetch = forward(
+        wire::Op::Fetch(wire::FetchQuery {
+            read: 1,
+            position: None,
+        }),
+        0,
+    );
+    assert!(wire::decode_request(&fetch).is_err());
+    let mut renew = forward(wire::Op::Renew(1), 0);
+    renew.payload = Bytes::from_static(b"stray");
+    assert!(wire::decode_request(&renew).is_err());
 }
 
 /// A peer cluster's conditions travel to the primary whole, and a
@@ -847,6 +1090,23 @@ proptest! {
             }),
             Request::Uploads { prefix: key.clone(), after: Some((key.clone(), None)), limit },
             Request::Payload(EpochSeq::new(Epoch::new(epoch), Seq::new(1))),
+            Request::Plan { key: key.clone() },
+            Request::Register {
+                key: key.clone(),
+                version: EpochSeq::new(Epoch::new(epoch), Seq::new(2)),
+                layout: (0..limit % 5)
+                    .map(|n| skys3_log::record::ExtentRef {
+                        position: EpochSeq::new(Epoch::new(epoch), Seq::new(n as u64)),
+                        len: u32::try_from(limit).unwrap() + 1,
+                    })
+                    .collect(),
+            },
+            Request::Renew(epoch),
+            Request::Release(epoch),
+            Request::Fetch {
+                read: epoch,
+                position: EpochSeq::new(Epoch::new(1), Seq::new(epoch)),
+            },
             Request::Write {
                 body: RecordBody::Delete(Delete { key: format!("k{key}") }),
                 condition: Precondition::Peer(PeerCondition {

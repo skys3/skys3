@@ -282,6 +282,12 @@ impl CleanCache {
         }
     }
 
+    /// The `clean_copies` of `bucket`, if the cache was told it.
+    #[must_use]
+    pub fn clean_copies(&self, bucket: &BucketId) -> Option<u8> {
+        self.ledger().clean_copies.get(bucket).copied()
+    }
+
     /// Records the space of `disk`, as last read: the room it has for
     /// clean payload is its available bytes, plus the clean payload it
     /// holds and the payload evicted from it, less `reserve_fraction` of

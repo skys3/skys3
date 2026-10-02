@@ -1237,6 +1237,44 @@ mod tests {
             async fn payload(&self, s: &ShardRef, p: EpochSeq) -> Result<Bytes, ShardError> {
                 self.0.payload(s, p).await
             }
+            async fn plan(&self, s: &ShardRef, k: &str) -> Result<skys3_shard::ReadPlan, ShardError> {
+                self.0.plan(s, k).await
+            }
+            async fn register(
+                &self,
+                s: &ShardRef,
+                h: &skys3_types::NodeId,
+                k: &str,
+                v: EpochSeq,
+                l: Vec<ExtentRef>,
+            ) -> Result<Option<skys3_shard::Registered>, ShardError> {
+                self.0.register(s, h, k, v, l).await
+            }
+            async fn renew(
+                &self,
+                s: &ShardRef,
+                h: &skys3_types::NodeId,
+                r: u64,
+            ) -> Result<bool, ShardError> {
+                self.0.renew(s, h, r).await
+            }
+            async fn release(
+                &self,
+                s: &ShardRef,
+                h: &skys3_types::NodeId,
+                r: u64,
+            ) -> Result<(), ShardError> {
+                self.0.release(s, h, r).await
+            }
+            async fn fetch(
+                &self,
+                s: &ShardRef,
+                h: &skys3_types::NodeId,
+                r: u64,
+                p: EpochSeq,
+            ) -> Result<Bytes, ShardError> {
+                self.0.fetch(s, h, r, p).await
+            }
             async fn append_extent(
                 &self,
                 s: &ShardRef,

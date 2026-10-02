@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 use crate::cache::CleanCache;
 use crate::error::ShardError;
+use crate::reads::Reads;
 use crate::shard::{Role, Shard, ShardSummary};
 
 /// A shard's place in the set.
@@ -44,6 +45,8 @@ pub struct ShardSet<D: Disk> {
     shards: Arc<Mutex<Slots<D>>>,
     /// The node's clean cache, once the set has one (§9.3).
     cache: Arc<OnceLock<CleanCache>>,
+    /// The read registrations of the node's replicas (§8.7).
+    reads: Reads,
 }
 
 impl<D: Disk> Clone for ShardSet<D> {
@@ -55,6 +58,7 @@ impl<D: Disk> Clone for ShardSet<D> {
             pool: self.pool.clone(),
             shards: Arc::clone(&self.shards),
             cache: Arc::clone(&self.cache),
+            reads: self.reads.clone(),
         }
     }
 }
@@ -96,6 +100,7 @@ impl<D: Disk> ShardSet<D> {
             pool,
             shards: Arc::default(),
             cache: Arc::default(),
+            reads: Reads::default(),
         }
     }
 
@@ -231,6 +236,15 @@ impl<D: Disk> ShardSet<D> {
     #[must_use]
     pub fn cache(&self) -> Option<&CleanCache> {
         self.cache.get()
+    }
+
+    /// The read registrations of the node's replicas as holders (§8.7),
+    /// which outlive any one replica: a replica that closes and opens
+    /// again keeps them. Compaction asks them what it must keep
+    /// ([`Reads::is_pinned`]).
+    #[must_use]
+    pub fn reads(&self) -> &Reads {
+        &self.reads
     }
 
     /// Makes `shard` report to the set's cache, if it has one.

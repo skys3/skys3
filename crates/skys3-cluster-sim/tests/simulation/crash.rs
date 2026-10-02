@@ -17,8 +17,8 @@ use skys3_cluster_sim::{
     Report, RunError, SyncCut, Workload,
 };
 use skys3_gateway::{
-    ConditionFailed, LocalShards, Precondition, ShardError, ShardRef, ShardSummary, Shards,
-    UploadParts,
+    ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError,
+    ShardRef, ShardSummary, Shards, UploadParts,
 };
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::SimMount;
@@ -27,7 +27,7 @@ use skys3_log::record::{Extent, ExtentRef};
 use skys3_sim::check::Violation;
 use skys3_sim::history::Outcome;
 use skys3_sim::{Runner, SimContext};
-use skys3_types::{BucketDocument, EpochSeq};
+use skys3_types::{BucketDocument, EpochSeq, NodeId};
 use tokio::sync::RwLock;
 
 /// What one seed of the sync-boundary scenario costs, in seeds of a typical
@@ -195,6 +195,57 @@ impl Shards for EagerShards {
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
         self.settle().await;
         self.inner.payload(shard, position).await
+    }
+
+    fn node(&self) -> Option<NodeId> {
+        self.inner.node()
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        self.settle().await;
+        self.inner.plan(shard, key).await
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        self.inner
+            .register(shard, holder, key, version, layout)
+            .await
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        self.inner.renew(shard, holder, read).await
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        self.inner.release(shard, holder, read).await
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        self.settle().await;
+        self.inner.fetch(shard, holder, read, position).await
     }
 
     async fn append_extent(

@@ -91,6 +91,7 @@ mod cluster;
 mod coordination;
 mod creation;
 mod faults;
+mod holders;
 mod learners;
 mod node;
 mod pki;
@@ -100,12 +101,14 @@ mod s3;
 mod workload;
 
 pub use cluster::{
-    Cluster, ClusterConfig, Invariant, Rebuild, Report, RunError, View, WriteTiming,
+    Cluster, ClusterConfig, Invariant, ReadRegistration, Rebuild, Report, RunError, View,
+    WriteTiming,
 };
 pub use coordination::{
     Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
 };
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
+pub use holders::{HolderCounts, HolderFaults};
 pub use learners::{DurabilityWindows, LearnerCounts};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{

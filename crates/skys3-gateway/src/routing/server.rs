@@ -108,6 +108,18 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
     /// Answers `request` to `shard` from a gateway that knows its
     /// configuration in `epoch`.
     pub async fn handle(&self, shard: &ShardRef, epoch: Epoch, request: Request) -> Reply {
+        if request.is_holder() {
+            // Any replica holds the payload it has, whatever its role and
+            // epoch, and the routing audit is of primaries only.
+            return match self.execute(shard, request).await {
+                Ok(response) => Reply::Served {
+                    response,
+                    epoch,
+                    hint: None,
+                },
+                Err(error) => Reply::Refused(error),
+            };
+        }
         let Some(replica) = self.inner.set.get(&shard.into()).await else {
             return Reply::Refused(ShardError::NotFound(shard.clone()));
         };
@@ -164,7 +176,7 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
     }
 
     async fn execute(&self, shard: &ShardRef, request: Request) -> Result<Response, ShardError> {
-        let shards = &self.inner.shards;
+        let (shards, node) = (&self.inner.shards, &self.inner.node);
         Ok(match request {
             Request::Entry { key } => Response::Entry(shards.entry(shard, &key).await?),
             Request::List(query) => Response::List(shards.list(shard, &query).await?),
@@ -185,6 +197,24 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
                 limit,
             } => Response::Parts(shards.parts(shard, upload, after, limit).await?),
             Request::Payload(position) => Response::Payload(shards.payload(shard, position).await?),
+            Request::Plan { key } => Response::Plan(shards.plan(shard, &key).await?),
+            Request::Register {
+                key,
+                version,
+                layout,
+            } => Response::Registered(
+                shards
+                    .register(shard, node, &key, version, layout)
+                    .await?,
+            ),
+            Request::Renew(read) => Response::Renewed(shards.renew(shard, node, read).await?),
+            Request::Release(read) => {
+                shards.release(shard, node, read).await?;
+                Response::Released
+            }
+            Request::Fetch { read, position } => {
+                Response::Payload(shards.fetch(shard, node, read, position).await?)
+            }
             Request::AppendExtent(extent) => {
                 Response::Extent(shards.append_extent(shard, extent).await?)
             }

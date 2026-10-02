@@ -20,8 +20,8 @@ use bytes::Bytes;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, TypedKey};
 use skys3_coord::{Handoff, HandoffFuture, HandoffSink};
 use skys3_gateway::{
-    ConditionFailed, LocalShards, Precondition, ShardError, ShardRef, ShardSummary, Shards,
-    UploadParts,
+    ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError,
+    ShardRef, ShardSummary, Shards, UploadParts,
 };
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::{Clock, MonoTime, MonotonicClock, SimMount};
@@ -33,6 +33,7 @@ use skys3_shard::{Grace, Role, Shard};
 use skys3_sim::SimS3;
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
 
+use crate::holders::{HolderAudit, HolderCounts, HolderFaults, Holders, own_plan};
 use crate::learners::{Audited, LearnerAudit, LearnerDriver, LearnerPlan};
 use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
 
@@ -84,7 +85,10 @@ pub struct ReplicatedServices {
     pub(crate) learners: Option<LearnerPlan>,
     /// Whether nodes open replicas from their local copies (plan M2-16).
     local_copies: bool,
+    /// How replicas behave as holders of read payload (plan M2-18).
+    holders: HolderFaults,
     pub(crate) audit: Arc<Mutex<Audit>>,
+    holder_audit: HolderAudit,
 }
 
 /// When primaries hand their shards off ([`ReplicatedServices::with_handoffs`]).
@@ -353,6 +357,32 @@ impl ReplicatedServices {
             local_copies: true,
             ..self
         }
+    }
+
+    /// The same services, whose replicas behave as `faults` says when they
+    /// hold the payload a gateway reads (plan M2-18).
+    #[must_use]
+    pub fn with_holders(self, faults: HolderFaults) -> Self {
+        Self {
+            holders: faults,
+            ..self
+        }
+    }
+
+    /// What the replicas did as holders of read payload, over every life.
+    #[must_use]
+    pub fn holder_counts(&self) -> HolderCounts {
+        self.holder_audit.counts()
+    }
+
+    /// Checks that no holder served a fetch under a registration that had
+    /// lapsed (§8.7).
+    ///
+    /// # Errors
+    ///
+    /// The first such fetch.
+    pub fn check_holders(&self) -> Result<(), String> {
+        self.holder_audit.check()
     }
 
     /// Each node's replica of each shard in the node's current life, with
@@ -839,6 +869,11 @@ impl ReplicatedServices {
             local_copies: self.local_copies,
             audit: Arc::clone(&self.audit),
             followed: Arc::default(),
+            holders: Holders::new(
+                self.holders,
+                env.seed ^ 0x484f_4c44,
+                self.holder_audit.clone(),
+            ),
         };
         if self.local_copies {
             // Every replica the node keeps a configuration of, with the
@@ -943,6 +978,8 @@ pub struct ReplicatedShards {
     pub(crate) audit: Arc<Mutex<Audit>>,
     /// The shards whose grace this life follows.
     followed: Arc<Mutex<BTreeSet<ShardRef>>>,
+    /// The node's replicas as holders of read payload.
+    holders: Holders,
 }
 
 impl fmt::Debug for ReplicatedShards {
@@ -1299,6 +1336,70 @@ impl Shards for ReplicatedShards {
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
         self.local.payload(shard, position).await
+    }
+
+    fn node(&self) -> Option<NodeId> {
+        Some(self.node.clone())
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        if let Some(replica) = self.local.set().get(&shard.into()).await
+            && ((self.members_read && replica.role() == Role::Member)
+                || (self.stepped_down_read && replica.stepped_down().is_some()))
+        {
+            // The seeded bugs of `entry`, for the plans of GETs.
+            let plan = own_plan(&replica, shard, key, &self.node);
+            if replica.stepped_down().is_some() {
+                self.audit_read(shard, &plan).await;
+            }
+            return plan;
+        }
+        let plan = self.local.plan(shard, key).await;
+        self.audit_read(shard, &plan).await;
+        plan
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        self.holders
+            .register(&self.local, shard, holder, key, version, layout)
+            .await
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        self.local.renew(shard, holder, read).await
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        self.local.release(shard, holder, read).await
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        self.holders
+            .fetch(&self.local, shard, holder, read, position)
+            .await
     }
 
     async fn append_extent(

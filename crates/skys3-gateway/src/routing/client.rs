@@ -13,7 +13,7 @@ use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_net::{Connection, Frame, Network, Transport};
-use skys3_shard::ShardSet;
+use skys3_shard::{ReadId, ReadPlan, Registered, ShardSet};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeAddress, NodeId, ShardConfig};
 use tokio::time::Instant;
 
@@ -371,6 +371,30 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
         }
     }
 
+    /// Sends `request`, a holder's (see [`Request::is_holder`]), to the
+    /// replica of `shard` on `holder`, and returns its answer. It is never
+    /// redirected: the holder serves what it holds, whatever its role.
+    async fn hold(
+        &self,
+        holder: &NodeId,
+        shard: &ShardRef,
+        request: Request,
+    ) -> Result<Response, ShardError> {
+        let epoch = self.inner.map.get(shard).map_or(Epoch::ZERO, |c| c.epoch);
+        let failed = |reason: String| ShardError::Unavailable {
+            shard: shard.clone(),
+            reason: format!("{holder} did not serve the read: {reason}"),
+        };
+        match self.ask(holder, shard, epoch, &request).await {
+            Attempt::Reply(Reply::Served { response, .. }) => Ok(response),
+            Attempt::Reply(Reply::Refused(error)) => Err(error),
+            Attempt::Reply(Reply::Redirect(_) | Reply::Behind(_)) => {
+                Err(failed("it answered as a primary would".to_owned()))
+            }
+            Attempt::Unreached(error) | Attempt::Lost(error) => Err(failed(error)),
+        }
+    }
+
     /// An idle connection to `node`, or a new one.
     async fn connection(
         &self,
@@ -570,6 +594,79 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
         match self.call(shard, Request::Payload(position)).await? {
+            Response::Payload(bytes) => Ok(bytes),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    fn node(&self) -> Option<NodeId> {
+        Some(self.inner.node.clone())
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        let request = Request::Plan {
+            key: key.to_owned(),
+        };
+        match self.call(shard, request).await? {
+            Response::Plan(plan) => Ok(plan),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        let request = Request::Register {
+            key: key.to_owned(),
+            version,
+            layout,
+        };
+        match self.hold(holder, shard, request).await? {
+            Response::Registered(registered) => Ok(registered),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        match self.hold(holder, shard, Request::Renew(read)).await? {
+            Response::Renewed(renewed) => Ok(renewed),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        match self.hold(holder, shard, Request::Release(read)).await? {
+            Response::Released => Ok(()),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        match self
+            .hold(holder, shard, Request::Fetch { read, position })
+            .await?
+        {
             Response::Payload(bytes) => Ok(bytes),
             _ => Err(mismatched(shard)),
         }

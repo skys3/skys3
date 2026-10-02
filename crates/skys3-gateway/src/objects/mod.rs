@@ -35,7 +35,11 @@
 //! and so does SkyS3. `partNumber=N` serves the `N`th part of a multipart
 //! object, with `206` and `x-amz-mp-parts-count`, and `partNumber=1` the
 //! whole of any other. An object with tags reports their number in
-//! `x-amz-tagging-count`. A GET of an evicted version of a `write_back`
+//! `x-amz-tagging-count`. A GET reads its bytes from a holder its shard's
+//! primary names in the read plan (§9.2), the gateway's own node first,
+//! under a registration that keeps them on the holder while they stream
+//! (`holders`); when no holder still has the version, the read resolves
+//! the key again. A GET of an evicted version of a `write_back`
 //! bucket reads it through a fill from the remote ([`Fills`]); when the fill
 //! finds the remote changed and adopts its version, the read resolves the
 //! key again, at most [`MAX_FILL_ROUNDS`] times.
@@ -45,6 +49,7 @@
 //! and multipart uploads in `multipart`.
 
 mod download;
+mod holders;
 mod upload;
 
 use std::sync::Arc;
@@ -60,14 +65,17 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
 use skys3_index::{ObjectVersion, Payload};
 use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
-use skys3_log::record::{IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put, PutData};
+use skys3_log::record::{
+    ExtentRef, IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put, PutData,
+};
 use skys3_types::checksum::ChecksumAlgorithm;
-use skys3_types::{BucketDocument, BucketMode, EpochSeq, WriteIdentity};
+use skys3_types::{BucketDocument, BucketMode, EpochSeq, NodeId, WriteIdentity};
 
 use crate::admission::Admission;
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
+use holders::HolderReads;
 use crate::fill::{FillError, Fills};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
@@ -81,7 +89,8 @@ use upload::Upload;
 
 /// How many times a GET resolves its key again after a read-through fill
 /// found the key changed, such as after the fill adopted the remote's
-/// version (§9.2), before it answers `503`.
+/// version, or after no holder still had the version its plan named
+/// (§9.2), before it answers `503`.
 const MAX_FILL_ROUNDS: usize = 3;
 
 /// The largest object a single PUT stores: 5 GiB, S3's limit.
@@ -233,6 +242,7 @@ pub(crate) struct Objects<H> {
     fills: Option<Arc<dyn Fills>>,
     admission: Arc<dyn Admission>,
     remote: Option<Arc<dyn RemoteReads>>,
+    holders: HolderReads,
 }
 
 impl<H: Shards> Objects<H> {
@@ -245,6 +255,7 @@ impl<H: Shards> Objects<H> {
             fills: config.fills.clone(),
             admission: Arc::clone(&config.admission),
             remote: config.remote.clone(),
+            holders: HolderReads::new(config.read_registration_renew_interval),
         }
     }
 
@@ -395,21 +406,34 @@ impl<H: Shards> Objects<H> {
                     conditions,
                     input.range,
                     input.part_number,
+                    true,
                 )
                 .await?;
             if found.remote {
                 let body = self.read_remote(bucket, &input.key, &found).await?;
                 break (found, body);
             }
-            if !found.evicted && !matches!(found.object.payload, Payload::None) {
-                let body = download::read(
-                    &self.shards,
-                    &found.shard,
-                    &found.object.payload,
-                    found.bytes.clone(),
-                )
-                .await?;
-                break (found, body);
+            if !found.evicted {
+                if found.holders.is_empty() {
+                    // A version whose bytes no replica holds, as a copy
+                    // of an evicted object.
+                    return Err(download::not_cached());
+                }
+                match self.read_held(&input.key, &found).await {
+                    Some(body) => break (found, body),
+                    // No holder still has the version: it was replaced or
+                    // evicted since the plan, so the key is resolved again.
+                    None if rounds + 1 < MAX_FILL_ROUNDS => {
+                        rounds += 1;
+                        continue;
+                    }
+                    None => {
+                        return Err(s3_error!(
+                            ServiceUnavailable,
+                            "The object changed while it was read; please retry"
+                        ));
+                    }
+                }
             }
             match self.fill(bucket, &input.key, &found).await? {
                 Ok(body) => break (found, body),
@@ -450,11 +474,46 @@ impl<H: Shards> Objects<H> {
                 conditions,
                 input.range,
                 input.part_number,
+                false,
             )
             .await?;
         let mut output = HeadObjectOutput::default();
         describe!(output, found, input.checksum_mode, overrides);
         Ok(output)
+    }
+
+    /// The bytes of `found`, a version of `key`, from the first of the
+    /// plan's holders that still holds it (§9.2), or `None` if none does.
+    async fn read_held(&self, key: &str, found: &Found) -> Option<StreamingBlob> {
+        if found.bytes.is_empty() {
+            return Some(empty_blob());
+        }
+        let local = self.shards.node();
+        for holder in self.holders.order(&found.holders, local.as_ref()) {
+            let opened = self
+                .holders
+                .open(
+                    &self.shards,
+                    (&found.shard, &holder),
+                    key,
+                    found.version,
+                    found.layout.clone(),
+                    found.bytes.clone(),
+                )
+                .await;
+            match opened {
+                Ok(Some(body)) => return Some(body),
+                Ok(None) => {
+                    tracing::debug!(shard = %found.shard, %holder, key,
+                        "a holder no longer has the version");
+                }
+                Err(error) => {
+                    tracing::debug!(shard = %found.shard, %holder, key, %error,
+                        "a holder did not serve the version");
+                }
+            }
+        }
+        None
     }
 
     /// Reads the bytes of `found`, an evicted version of `key`, through a
@@ -484,7 +543,7 @@ impl<H: Shards> Objects<H> {
     }
 
     /// Resolves a read: the key's object, the conditions checked, and the
-    /// bytes to serve.
+    /// bytes to serve, with where to read them if `planned`.
     async fn resolve(
         &self,
         bucket: &BucketDocument,
@@ -492,13 +551,16 @@ impl<H: Shards> Objects<H> {
         conditions: ReadConditions<'_>,
         range: Option<Range>,
         part_number: Option<i32>,
+        planned: bool,
     ) -> S3Result<Found> {
         let shard = ShardRef::for_key(bucket, key);
-        let found = self.lookup(bucket, &shard, key).await?;
+        let found = self.lookup(bucket, &shard, key, planned).await?;
         conditions.check(&found.object)?;
         let mut selected = select(shard, found.version, found.object, range, part_number)?;
         selected.remote = found.remote;
         selected.evicted = found.evicted;
+        selected.layout = found.layout;
+        selected.holders = found.holders;
         Ok(selected)
     }
 }
@@ -556,6 +618,8 @@ fn select(
         parts_count: None,
         remote: false,
         evicted: false,
+        layout: Vec::new(),
+        holders: Vec::new(),
     })
 }
 
@@ -577,6 +641,10 @@ struct Found {
     remote: bool,
     /// Whether the entry is evicted, so a fill serves its bytes (§9.2).
     evicted: bool,
+    /// The version's bytes as log positions, from the read plan.
+    layout: Vec<ExtentRef>,
+    /// The nodes the read plan names as holders of the bytes.
+    holders: Vec<NodeId>,
 }
 
 impl Found {
@@ -600,6 +668,8 @@ impl Found {
             parts_count,
             remote: false,
             evicted: false,
+            layout: Vec::new(),
+            holders: Vec::new(),
         }
     }
 }

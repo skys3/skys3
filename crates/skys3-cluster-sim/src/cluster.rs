@@ -19,7 +19,7 @@ use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
 use skys3_index::{Entry, EntryState, Index, IndexReader, Payload};
 use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SyncCut};
 use skys3_log::LogConfig;
-use skys3_shard::CacheSettings;
+use skys3_shard::{CacheSettings, ReadSettings};
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
 use skys3_sim::history::{History, Operation, Outcome};
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
@@ -99,6 +99,30 @@ pub struct ClusterConfig {
     /// hold counts as no copy when the checkers look for acknowledged
     /// writes: dirty payload must never be evicted.
     pub clean_cache: Option<CacheSettings>,
+    /// The `clean_copies` of every bucket the harness writes (§9.3).
+    pub clean_copies: u8,
+    /// How long a read registration lasts on its holder, and how often a
+    /// gateway renews the ones it streams under (§8.7).
+    pub read_registration: ReadRegistration,
+}
+
+/// The timers of read registrations (§8.7) on every node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadRegistration {
+    /// `read_registration_ttl_seconds`.
+    pub ttl: Duration,
+    /// `read_registration_renew_interval_seconds`.
+    pub renew_every: Duration,
+}
+
+impl Default for ReadRegistration {
+    /// The defaults of the node configuration.
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(30),
+            renew_every: Duration::from_secs(10),
+        }
+    }
 }
 
 impl Default for ClusterConfig {
@@ -130,6 +154,8 @@ impl Default for ClusterConfig {
             create_buckets: false,
             joining: 0,
             clean_cache: None,
+            clean_copies: 1,
+            read_registration: ReadRegistration::default(),
         }
     }
 }
@@ -205,6 +231,9 @@ pub struct Report {
     /// Copies of keys whose payload their member evicted, at the end, over
     /// every member of every key's shard.
     pub evicted: usize,
+    /// `GET`s of the workload's clients that were answered and whose body
+    /// then broke off, as when a read registration lapses (§8.7).
+    pub broken_reads: usize,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -613,6 +642,7 @@ impl<S: NodeServices> Cluster<S> {
             fences: driver.fences,
             started: driver.origin.unwrap_or_default(),
             writes: writes.take(),
+            broken_reads: writes.broken(),
             rebuilds: driver.rebuilds,
             registers,
             evicted,
@@ -1064,6 +1094,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     }
     gateway.inline_max_bytes = 512;
     gateway.extent_bytes = 512;
+    gateway.read_registration_renew_interval = shape.read_registration.renew_every;
     gateway.retry = RetryPolicy {
         max_attempts: 5,
         initial_backoff: Duration::from_millis(20),
@@ -1091,6 +1122,10 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         drift: Drift::NONE,
         poll_interval: Duration::from_millis(500),
         clean_cache: shape.clean_cache,
+        reads: ReadSettings {
+            ttl: shape.read_registration.ttl,
+            ..ReadSettings::default()
+        },
     })
 }
 
@@ -1126,7 +1161,7 @@ fn registers(
             shards,
             replicas: u8::try_from(replicas)?,
             min_write_replicas: 1,
-            clean_copies: 1,
+            clean_copies: config.clean_copies,
             target,
             created_unix_ms: 0,
             proposal_id: ids.next_id(),

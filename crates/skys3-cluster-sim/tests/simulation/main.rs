@@ -52,6 +52,9 @@
 //!   than the workload: copies dropped beyond `clean_copies`, LRU
 //!   eviction, fills of what was evicted, and no dirty byte lost under
 //!   crashes.
+//! - [`reads`]: `GET`s through any node read their bytes from the holders
+//!   their read plans name while overwrites and evictions race them, and
+//!   fail mid-stream when their registration lapses.
 
 mod acks;
 mod backfill;
@@ -63,6 +66,7 @@ mod handoff;
 mod harness;
 mod learners;
 mod leases;
+mod reads;
 mod rebalancing;
 mod rebuild;
 mod registry;

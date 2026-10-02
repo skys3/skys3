@@ -22,7 +22,7 @@ use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallCloc
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
 use skys3_remote::aws::{AwsS3, default_credentials};
-use skys3_shard::{CacheMetrics, CacheSettings, CleanCache};
+use skys3_shard::{CacheMetrics, CacheSettings, CleanCache, ReadSettings};
 use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
@@ -564,6 +564,11 @@ async fn open_storage(
         data_dir.node_id().clone(),
     )
     .await?;
+    // Read registrations of this node's replicas as holders (§8.7).
+    recovered.shards.set().reads().configure(ReadSettings {
+        ttl: config.storage().read_registration_ttl(),
+        release_delay: config.ec().fragment_release_delay(),
+    });
     let disks = dirs
         .into_iter()
         .map(|dir| {

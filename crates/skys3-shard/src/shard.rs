@@ -26,6 +26,7 @@ use crate::leader::Leader;
 use crate::lineage::{Lineage, Reconcile};
 use crate::machine::{Effect, Outcome, Recorder, StateMachine};
 use crate::pipeline::{Durable, Pipeline, Ready};
+use crate::reads::{self, ReadId, ReadPlan, Reads, Registered};
 
 mod backfill;
 
@@ -1788,6 +1789,146 @@ impl<D: Disk> Shard<D> {
             Some(data) if record.shard == *shard && record.position == position => Ok(data.clone()),
             _ => Err(self.unavailable(&format!("the record at {position} holds no payload"))),
         }
+    }
+
+    /// The read plan of `key` (§9.2): its entry as [`Shard::entry`] reads
+    /// it, the layout of its version, read with it, and the members that
+    /// should hold its bytes. See [`reads`](crate::reads).
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::entry`].
+    pub async fn plan(&self, key: &str) -> Result<ReadPlan, ShardError> {
+        let _read = self.admit_read()?;
+        let config = self.config();
+        let clean_copies = self
+            .inner
+            .cache
+            .get()
+            .and_then(|cache| cache.clean_copies(&self.shard().bucket));
+        let (index, shard, owned) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        let (entry, layout) = run(&self.inner.pool, self.shard(), move || {
+            let reader = index.read()?;
+            let entry = reader.entry(&shard, &owned)?;
+            let object = entry
+                .as_ref()
+                .filter(|entry| entry.state != EntryState::Evicted)
+                .and_then(|entry| entry.object.as_ref());
+            let layout = match object {
+                Some(object) => reads::layout(&reader, &shard, object)?,
+                None => None,
+            };
+            Ok((entry, layout))
+        })
+        .await?;
+        if let Some(cache) = self.inner.cache.get()
+            && entry.as_ref().is_some_and(|e| e.state == EntryState::Clean)
+        {
+            cache.touch(self.shard(), key);
+        }
+        let holders = match (&entry, &layout) {
+            (Some(entry), Some(_)) => reads::holders(&config, entry, clean_copies),
+            _ => Vec::new(),
+        };
+        Ok(ReadPlan {
+            entry,
+            layout: layout.unwrap_or_default(),
+            holders,
+        })
+    }
+
+    /// Registers a read of `version` of `key` in `reads`, the node's
+    /// registrations, as a holder (§8.7): from this replica's own copy if
+    /// its entry still names `version` with local bytes, and otherwise from
+    /// `plan`, the layout the primary's read plan gave, if this replica
+    /// still locates every position of it. `None` if it does neither: it
+    /// does not hold the version. Any replica that runs may hold one, a
+    /// member or a learner too, since it only serves payload it has.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the shard stopped or its index fails.
+    pub async fn register_read(
+        &self,
+        reads: &Reads,
+        key: &str,
+        version: EpochSeq,
+        plan: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        self.sequencer().check_running(self.shard())?;
+        let (index, shard, owned) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        let own = run(&self.inner.pool, self.shard(), move || {
+            let reader = index.read()?;
+            let held = reader
+                .entry(&shard, &owned)?
+                .filter(|entry| entry.version == version && entry.state != EntryState::Evicted);
+            let Some((state, object)) = held.and_then(|entry| Some((entry.state, entry.object?)))
+            else {
+                return Ok(None);
+            };
+            Ok(reads::layout(&reader, &shard, &object)?.map(|layout| (state, layout)))
+        })
+        .await?;
+        let clean = own.as_ref().is_some_and(|(state, _)| *state == EntryState::Clean);
+        let layout = own.map_or(plan, |(_, layout)| layout);
+        // Pinned before the check, so a compaction that drops a position
+        // after it finds the pin, and one that dropped it before leaves
+        // the check failing.
+        let id = reads.pin(self.shard(), &layout);
+        let (index, shard, positions) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            layout.iter().map(|extent| extent.position).collect::<Vec<_>>(),
+        );
+        let located = run(&self.inner.pool, self.shard(), move || {
+            let reader = index.read()?;
+            for position in positions {
+                if reader.location(&shard, position)?.is_none() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .await;
+        if !located.inspect_err(|_| reads.release(id))? {
+            reads.release(id);
+            reads.not_held();
+            return Ok(None);
+        }
+        // A read of a copy this replica keeps uses it (§9.3).
+        if clean && let Some(cache) = self.inner.cache.get() {
+            cache.touch(self.shard(), key);
+        }
+        Ok(Some(Registered { id, layout }))
+    }
+
+    /// The payload at `position` for the read `id` registered in `reads`
+    /// ([`Shard::register_read`]), as [`Shard::payload`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the registration lapsed, or does not
+    /// pin `position` of this shard, and as [`Shard::payload`].
+    pub async fn read_registered(
+        &self,
+        reads: &Reads,
+        id: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        if !reads.admits(id, self.shard(), position) {
+            return Err(self.unavailable(&format!(
+                "read {id} is not registered for {position}: its registration lapsed"
+            )));
+        }
+        self.payload(position).await
     }
 
     /// Evicted → Clean (§4.2): makes the evicted version `version` of `key`
