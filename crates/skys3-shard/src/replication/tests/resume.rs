@@ -164,6 +164,45 @@ fn a_replica_resumes_from_its_kept_configuration_while_its_register_cannot_be_re
 }
 
 #[test]
+fn a_replica_resumed_from_its_kept_configuration_stops_once_its_register_is_gone() {
+    run(async {
+        let pki = Pki::new();
+        let (set, _) = shard_set(66).await;
+        // The shard's only member, which serves without a lease.
+        let alone = ShardConfig {
+            replicas: 1,
+            ..configured(2, 1, &[1])
+        };
+        let register = Register::holding(Some(alone.clone()));
+        let replica = replication(1, &pki, set.clone(), &register)
+            .open(&alone)
+            .await
+            .unwrap();
+        register.set(None);
+        let set = restarted(&replica, &set).await;
+        let resumed = replication(1, &pki, set, &register);
+        let replica = resumed.resume(&shard()).await.unwrap().unwrap();
+        assert_eq!(replica.config(), alone);
+        replica.check_readable().unwrap();
+
+        // A stale read of the register, older than the kept configuration,
+        // settles nothing: the replica reads the register again.
+        register.set(Some(Some(configured(1, 1, &[1]))));
+        tokio::time::sleep(timing().link_timeout * 3).await;
+        assert!(!replica.is_stopped());
+        replica.check_readable().unwrap();
+
+        // The bucket was deleted while the node was down: once the register
+        // answers that it is gone, the replica stops serving.
+        register.set(Some(None));
+        until(|| replica.is_stopped()).await;
+        assert!(replica.is_deposed());
+        assert!(replica.check_readable().is_err());
+        assert!(replica.commit(super::removal::put("a", 1)).await.is_err());
+    });
+}
+
+#[test]
 fn a_replica_resumes_in_the_newer_of_its_register_and_its_kept_configuration() {
     run(async {
         let pki = Pki::new();

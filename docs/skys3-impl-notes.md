@@ -3375,7 +3375,15 @@ of this file. A task with nothing unexpected keeps "None."
   is opened through `Replication::open` (in place, or, after the M2-15
   review fix, as a learner again for a node re-admitted as one), and
   otherwise the replica is deposed with the register's configuration as
-  its redirect. Epochs fence a stale replica in between. `resume_kept`
+  its redirect. Epochs fence a stale replica in between.
+- **A register found gone stops the resumed replica (found in review).**
+  The first version took a register that answered "absent" for a
+  confirmation of the kept configuration and stopped reading it, so a
+  replica whose bucket was deleted while the node was down, a lone
+  primary among them, kept serving. The confirm loop now deposes the
+  replica when the register is gone, or holds another configuration of
+  its epoch, and reads again after a read older than its configuration,
+  which is stale, instead of ending. `resume_kept`
   resumes every kept shard concurrently, so a slow store costs one wait,
   not one per shard.
 - **A takeover proposal is recorded before its compare-and-swap (the
