@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use skys3_index::{ImportRanges, Index, IndexError};
 use skys3_io::{BlockingPool, Disk};
@@ -12,6 +12,7 @@ use skys3_types::{BucketId, KeyHash, Label, NodeId, ShardConfig};
 use tokio::sync::{Mutex, MutexGuard, watch};
 use tokio::task::JoinSet;
 
+use crate::cache::CleanCache;
 use crate::error::ShardError;
 use crate::shard::{Role, Shard, ShardSummary};
 
@@ -41,6 +42,8 @@ pub struct ShardSet<D: Disk> {
     logs: Vec<(Label, SegmentLog<D>)>,
     pool: BlockingPool,
     shards: Arc<Mutex<Slots<D>>>,
+    /// The node's clean cache, once the set has one (§9.3).
+    cache: Arc<OnceLock<CleanCache>>,
 }
 
 impl<D: Disk> Clone for ShardSet<D> {
@@ -51,6 +54,7 @@ impl<D: Disk> Clone for ShardSet<D> {
             logs: self.logs.clone(),
             pool: self.pool.clone(),
             shards: Arc::clone(&self.shards),
+            cache: Arc::clone(&self.cache),
         }
     }
 }
@@ -91,6 +95,7 @@ impl<D: Disk> ShardSet<D> {
             logs: logs.into_iter().collect(),
             pool,
             shards: Arc::default(),
+            cache: Arc::default(),
         }
     }
 
@@ -202,8 +207,37 @@ impl<D: Disk> ShardSet<D> {
             Some(node) => Shard::open_replica(config, node, log, index, pool).await?,
             None => Shard::open(config, log, index, pool).await?,
         };
+        self.attach(&shard);
         shards.insert(key, Slot::Open(shard.clone()));
         Ok(shard)
+    }
+
+    /// Makes every replica open in the set, and every one it opens from
+    /// now on, report to `cache`, the node's clean cache (§9.3). A set has
+    /// one cache; a second is ignored.
+    pub async fn use_cache(&self, cache: &CleanCache) {
+        let shards = self.shards.lock().await;
+        if self.cache.set(cache.clone()).is_err() {
+            return;
+        }
+        for slot in shards.values() {
+            if let Slot::Open(shard) = slot {
+                self.attach(shard);
+            }
+        }
+    }
+
+    /// The node's clean cache, if the set has one.
+    #[must_use]
+    pub fn cache(&self) -> Option<&CleanCache> {
+        self.cache.get()
+    }
+
+    /// Makes `shard` report to the set's cache, if it has one.
+    fn attach(&self, shard: &Shard<D>) {
+        if let Some(cache) = self.cache.get() {
+            shard.attach_cache(cache, self.disk_of(shard.shard()));
+        }
     }
 
     /// Stops `replica`, node `node`'s replica in the shard of `config`,
@@ -244,7 +278,10 @@ impl<D: Disk> ShardSet<D> {
         let mut shards = self.shards.lock().await;
         let opened = Shard::open_replica(config, node, log, index, pool).await;
         match &opened {
-            Ok(shard) => shards.insert(key, Slot::Open(shard.clone())),
+            Ok(shard) => {
+                self.attach(shard);
+                shards.insert(key, Slot::Open(shard.clone()))
+            }
             Err(_) => shards.remove(&key),
         };
         drop(shards);
@@ -411,6 +448,7 @@ impl<D: Disk> ShardSet<D> {
         };
         let shards = Arc::clone(&self.shards);
         let (index, pool, key) = (Arc::clone(&self.index), self.pool.clone(), shard.clone());
+        let cache = self.cache.get().cloned();
         let removal = tokio::spawn(async move {
             if let Some(removed) = removed {
                 // A shard that stopped already has nothing left to apply.
@@ -420,6 +458,9 @@ impl<D: Disk> ShardSet<D> {
                 let key = key.clone();
                 pool.run(move || index.remove_shard(&key)).await
             };
+            if let Some(cache) = cache {
+                cache.forget_shard(&key);
+            }
             shards.lock().await.remove(&key);
             // Nobody may be waiting.
             let _ = done.send(true);

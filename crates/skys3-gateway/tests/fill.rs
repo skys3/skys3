@@ -174,3 +174,68 @@ async fn a_failed_fill_answers_503() {
     answer.assert(503, Some("ServiceUnavailable"));
     assert!(answer.body.contains("not cached"), "{}", answer.body);
 }
+
+/// The text of the first `<tag>` element of an XML body.
+fn element<'a>(body: &'a str, tag: &str) -> &'a str {
+    let open = format!("<{tag}>");
+    let start = body.find(&open).unwrap() + open.len();
+    let end = body[start..].find(&format!("</{tag}>")).unwrap() + start;
+    &body[start..end]
+}
+
+#[tokio::test]
+async fn an_evicted_multipart_object_keeps_its_parts() {
+    // A first part of the smallest size S3 allows, and a short last one.
+    const PART: usize = 5 << 20;
+    let object: &'static [u8] = {
+        let mut bytes = vec![b'a'; PART];
+        bytes.extend_from_slice(b"tail");
+        Box::leak(bytes.into_boxed_slice())
+    };
+    let fills = ScriptedFills::new([Ok(object)]);
+    let mut config = config("");
+    config.fills = Some(Arc::clone(&fills) as Arc<dyn Fills>);
+    let setup = setup_with(config).await;
+    let bucket = setup.create_write_back("remote").await;
+    let created = setup.call(Method::POST, "/remote/k?uploads", &[], "").await;
+    created.assert(200, None);
+    let id = element(&created.body, "UploadId").to_owned();
+    let mut parts = String::new();
+    for (number, body) in [(1, &object[..PART]), (2, &object[PART..])] {
+        let uri = format!("/remote/k?partNumber={number}&uploadId={id}");
+        let body = std::str::from_utf8(body).unwrap();
+        let part = setup.call(Method::PUT, &uri, &[], body).await;
+        part.assert(200, None);
+        let etag = part.headers["etag"].to_str().unwrap();
+        parts += &format!("<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>");
+    }
+    let completion = format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>");
+    let uri = format!("/remote/k?uploadId={id}");
+    setup
+        .call(Method::POST, &uri, &[], &completion)
+        .await
+        .assert(200, None);
+    setup.shards.flush(&bucket.bucket_id).await;
+    let shard = ShardRef::for_key(&bucket, "k");
+    let entry = setup.shards.entry(&shard, "k").await.unwrap().unwrap();
+    let local = setup.shards.local().set().get(&(&shard).into()).await;
+    let local = local.unwrap();
+    local.evict("k", entry.version).await.unwrap().unwrap();
+
+    // A copy of it needs its bytes, which are not cached here.
+    let source = [("x-amz-copy-source", "/remote/k")];
+    setup
+        .call(Method::PUT, "/remote/copy", &source, "")
+        .await
+        .assert(503, Some("ServiceUnavailable"));
+    // A read of its second part is filled, within the part's bounds.
+    let second = setup
+        .call(Method::GET, "/remote/k?partNumber=2", &[], "")
+        .await;
+    second.assert(206, None);
+    assert_eq!(second.body, "tail");
+    assert_eq!(second.headers["x-amz-mp-parts-count"], "2");
+    let range = PART as u64..PART as u64 + 4;
+    let call = (shard, "k".to_owned(), entry.version, range);
+    assert_eq!(fills.calls(), [call]);
+}

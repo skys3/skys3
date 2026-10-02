@@ -22,6 +22,7 @@ use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallCloc
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
 use skys3_remote::aws::{AwsS3, default_credentials};
+use skys3_shard::{CacheMetrics, CacheSettings, CleanCache};
 use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
@@ -384,7 +385,8 @@ impl Shared {
     }
 
     /// Keeps a flusher on every `write_back` bucket shard open on the node
-    /// (§7.1), and refreshes the flush gauges.
+    /// (§7.1), refreshes the flush gauges, and gives the clean cache each
+    /// bucket's `clean_copies` (§9.3).
     async fn follow_flushes(self: Arc<Self>) {
         let mut warned = BTreeSet::new();
         loop {
@@ -401,6 +403,13 @@ impl Shared {
                 }
             }
             self.flush.reconcile(&buckets, self.shards.set()).await;
+            if let Some(cache) = self.shards.set().cache() {
+                cache.set_clean_copies(
+                    buckets
+                        .iter()
+                        .map(|bucket| (bucket.bucket_id.clone(), bucket.clean_copies)),
+                );
+            }
             self.flush.refresh_metrics();
             tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
         }
@@ -891,7 +900,20 @@ impl Node {
         let budget = Arc::new(
             DirtyBudget::new(config.flush().max_dirty_bytes).with_buckets(config.buckets().clone()),
         );
-        let space = Arc::new(DiskSpace::new(config.storage().disk_min_free_bytes));
+        // The clean cache (§9.3): every replica reports to it, and it
+        // evicts within `[cache]` and each disk's room, which the space
+        // watcher reads.
+        let cache = CleanCache::new(
+            CacheSettings {
+                max_bytes: config.cache().cache_max_bytes_per_node,
+                reserve_fraction: config.cache().reserve_fraction,
+            },
+            CacheMetrics::register(&metrics.registry),
+        );
+        storage.shards.set().use_cache(&cache).await;
+        let space = Arc::new(
+            DiskSpace::new(config.storage().disk_min_free_bytes).with_cache(cache.clone()),
+        );
         let watched: Vec<Watched> = storage
             .disks
             .iter()
@@ -1037,6 +1059,10 @@ impl Node {
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(watch_space(space, watched, DISK_WATCH_INTERVAL));
+        {
+            let set = storage.shards.set().clone();
+            background.spawn(async move { cache.run(set).await });
+        }
         background.spawn(watch_disks(
             storage.disks,
             pools.index.clone(),

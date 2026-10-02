@@ -137,8 +137,8 @@ The node storage engine (§10) and read registrations (§8.7).
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `hot_cache_bytes_per_node` | integer | `68719476736` (64 GiB) | The node-local hot cache (§9.2). May be 0. |
-| `cache_max_bytes_per_node` | integer | `1099511627776` (1 TiB) | The bound on clean cache per node (§9.3). May be 0. |
-| `reserve_fraction` | float | `0.10` | At least 0 and less than 1. The share of each disk held back from caching, for learner catch-up and filesystem overhead (§9.3). |
+| `cache_max_bytes_per_node` | integer | `1099511627776` (1 TiB) | The bound on clean cache per node (§9.3): above it, clean payload is evicted least recently used first. May be 0, which keeps no clean payload once it is flushed. |
+| `reserve_fraction` | float | `0.10` | At least 0 and less than 1. The share of each disk held back from caching, for learner catch-up and filesystem overhead (§9.3): clean payload on a disk is evicted while the disk has less free than this share of its size, counting the payload already evicted as free. |
 
 ## `[flush]`
 

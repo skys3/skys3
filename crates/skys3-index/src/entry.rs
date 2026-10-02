@@ -107,7 +107,8 @@ pub struct ObjectVersion {
 /// segment, offset, and length on this node's disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
-    /// No local bytes: an evicted entry or an imported stub.
+    /// No local bytes: an evicted entry that is not a multipart object, or
+    /// an imported stub.
     None,
     /// Inline in the record at this position, usually the version's own
     /// `PUT`.
@@ -116,6 +117,8 @@ pub enum Payload {
     Extents(Vec<ExtentRef>),
     /// In the parts of the completed multipart upload opened at `upload`,
     /// in object order. Each part's [`Part`] row says where its bytes are.
+    /// An evicted multipart object keeps this payload, for its part
+    /// boundaries, and its parts hold no bytes.
     Parts {
         /// The position of the upload's `MPU_CREATE`.
         upload: EpochSeq,
@@ -162,7 +165,10 @@ pub struct Part {
     /// The part's checksums.
     pub checksums: Checksums,
     /// Where the part's bytes are: [`Payload::Inline`] in its `MPU_PART`
-    /// record, or [`Payload::Extents`].
+    /// record, or [`Payload::Extents`], those a stored part or a fill
+    /// committed. A part of an evicted multipart object has none
+    /// ([`Payload::None`]): the object's entry keeps its parts, and the
+    /// parts keep their boundaries, ETags, and checksums (§9.3).
     pub payload: Payload,
 }
 

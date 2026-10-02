@@ -15,6 +15,7 @@ exports yet is listed as planned, with the PR that owns it.
   - [3.2 Flush and loss exposure](#32-flush-and-loss-exposure)
   - [3.3 Replication](#33-replication)
   - [3.4 Read-through fill](#34-read-through-fill)
+  - [3.5 Clean cache](#35-clean-cache)
 
 ## 1. Scraping
 
@@ -128,3 +129,14 @@ bucket's remote target into the clean cache.
 | `skys3_fill_conflicts_total` | counter | `bucket` | exported (M1-20) | Fills that found the remote changed out of band: their precondition failed, or the object or version was gone. Counted whether the remote's version was adopted, a local write came first and the `ADOPT` was dropped, or the remote object was deleted and nothing could be adopted. |
 
 The `bucket` label is the bucket's name, as for the flush metrics.
+
+### 3.5 Clean cache
+
+Design section 9.3. Each node keeps the clean payload of its shard replicas
+as cache, and evicts it least recently used first.
+
+| Name | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `skys3_clean_cache_bytes` | gauge | none | exported (M1-21) | Bytes of clean payload this node keeps as cache, over every shard replica on it. |
+| `skys3_clean_cache_limit_bytes` | gauge | none | exported (M1-21) | The most clean payload this node keeps: `cache_max_bytes_per_node`, or the room its disks have under `reserve_fraction` if that is less and every disk's space has been read. |
+| `skys3_clean_cache_evictions_total` | counter | none | exported (M1-21) | Clean payloads this node evicted: least recently used ones over a bound, and copies beyond the bucket's `clean_copies`. |

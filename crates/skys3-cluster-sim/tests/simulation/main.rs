@@ -48,10 +48,15 @@
 //! - [`buckets`]: buckets created through a gateway, with their shards
 //!   placed on the registered nodes, serving reads and writes through
 //!   every node.
+//! - [`cache`]: replicated `write_back` buckets under a clean cache smaller
+//!   than the workload: copies dropped beyond `clean_copies`, LRU
+//!   eviction, fills of what was evicted, and no dirty byte lost under
+//!   crashes.
 
 mod acks;
 mod backfill;
 mod buckets;
+mod cache;
 mod coordinator;
 mod crash;
 mod handoff;

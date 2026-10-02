@@ -2046,6 +2046,81 @@ of this file. A task with nothing unexpected keeps "None."
   S3 server in the tests honors preconditions, so the `Filler` runs against
   `SimS3`, and M1-26 runs it against real providers.
 
+### M1-21 Clean cache and eviction
+
+- **Fills on members stay on the primary (M1-20's open item).** A member
+  sees a fill only as `EXTENT` records of the key, which look exactly like
+  the extents of a PUT body still on its way, so it cannot tell that they
+  hold the version its entry names; linking them would need a record,
+  which the node-local Clean ↔ Evicted rule forbids, or a log format
+  change. Only the primary serves reads until read plans (M2-18), so a
+  member's filled copy would serve nothing but a later takeover, where
+  the new primary fills on demand anyway. A fill therefore keeps one copy,
+  the primary's, whatever `clean_copies` says, and design §9.2 now says
+  so. Copies on more members come from flushes: when a `FLUSHED` makes an
+  entry clean, each replica keeps the payload only if its rank (primary 0,
+  then the other members in configuration order; learners none) is below
+  the bucket's `clean_copies`, and evicts it at once otherwise.
+- **Multipart objects are evicted after all: index format 7.** M1-20
+  refused them because a stub had nowhere to keep part boundaries. The
+  entry's `Payload::Parts` already holds them, so an evicted multipart
+  object keeps that payload and its part rows, with ETags and checksums,
+  and only the rows' payloads become `Payload::None`. The codec refused a
+  part without bytes, so it now accepts one, and the index format went
+  from 6 to 7 because older builds would fail to decode such a part. A
+  fill cuts its chunks at the part boundaries and gives each part its own
+  extents back. The gateway used to decide "fill" from `Payload::None`; it
+  now asks whether the entry is evicted, and a part without bytes answers
+  `503` like any version whose bytes are not cached.
+- **Eviction frees no disk space until compaction (M1-22).** The §9.3
+  capacity model with `reserve_fraction` reads each disk's free space, but
+  a byte evicted stays in the log until compaction reclaims it, so a disk
+  over its reserve would have evicted its whole cache, one refresh after
+  another, without gaining a byte. A disk's room for clean payload now
+  counts what this node evicted from it since it started as free:
+  available + cached + evicted − `reserve_fraction` × size. Evicting
+  leaves the room unchanged, so the cache gives back exactly the
+  shortfall. After a restart the evicted payload counts as used again,
+  which is conservative; M1-22 should tell the cache what compaction
+  reclaims. The free-space watcher of M1-17 now also feeds the cache, so
+  it reads `statvfs` even when `disk_min_free_bytes` is 0;
+  `skys3_io::disk::space` returns the size with the free space.
+- **Reports to the cache had to be ordered.** The cache keeps in memory
+  which entries are clean, from reports the replicas send after each
+  change. A fill reported its Clean after its index commit, so a write
+  applied in between could report Gone first and leave the cache counting
+  a dirty entry as clean (and it then could not count it out). Every change
+  the cache follows (applied records, fills, evictions, and the scan a
+  replica gets when it opens) now runs under one lock per replica together
+  with its report, so the cache sees them in index order. The eviction
+  itself never trusts the cache: it names the version and refuses anything
+  not clean at it.
+- **The simulation needed deliberate races.** The seeded scenario first
+  passed with an eviction that checked neither the version nor the state,
+  because the evictor almost never interleaved with a write. It now also
+  evicts at whatever version an entry holds, in any state, and stages
+  "evict a version a write has just replaced"; it compares the index with
+  a replay of the log up to which clean payloads were kept. With those, a
+  check-free eviction and a state-blind one fail at seed 0. 256 seeds take
+  about a minute in a debug build, so the scenario is declared at cost 4.
+- **The cluster harness had no fills.** Evicted keys would have failed
+  the final reads, so `ClusterConfig::clean_cache` turns on the cache and
+  fills (`SimFills`, the node binary's without the free-space check). With
+  a cache, the durability checker counts a dirty copy whose bytes its node
+  does not locate as no copy, so `every_member_durable` checks that no
+  member evicted dirty payload, also across crashes and power loss.
+- **`TAGS` over an evicted member copy.** `TAGS` keeps the bytes of the
+  version it changes; on a member that dropped its copy beyond
+  `clean_copies`, the new dirty version has none. Nothing is lost (the
+  bytes are the remote's), but it widens M1-20's open item: such a version
+  cannot be flushed from that replica until the flusher fills before it
+  flushes. Design §9.3 records it.
+- **Left open.** A learner's snapshot still turns clean multipart entries
+  into stubs without parts, as before. A new `clean_copies`, or a new
+  primary, does not revisit copies already kept; LRU reclaims them. Only
+  reads on the primary count as uses, since members serve none yet; read
+  plans (M2-18) and the hot cache (M2-19) change that.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named

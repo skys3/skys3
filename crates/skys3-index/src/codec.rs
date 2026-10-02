@@ -909,15 +909,10 @@ pub fn decode_upload(bytes: &[u8]) -> Result<Upload> {
 ///
 /// # Errors
 ///
-/// Returns a [`CodecError`] if a field is out of bounds, or the payload is
-/// neither inline nor in extents.
+/// Returns a [`CodecError`] if a field is out of bounds, or the payload
+/// names parts.
 pub fn encode_part(part: &Part) -> Result<Vec<u8>> {
-    if !matches!(part.payload, Payload::Inline(_) | Payload::Extents(_)) {
-        return Err(CodecError::new(
-            "part.payload",
-            "a part's bytes are inline or in extents",
-        ));
-    }
+    check_part_payload(&part.payload)?;
     let mut w = Writer::value();
     w.position(part.position);
     w.u64(part.size);
@@ -945,14 +940,21 @@ pub fn decode_part(bytes: &[u8]) -> Result<Part> {
         checksums: read_checksums(&mut r)?,
         payload: read_payload(&mut r)?,
     };
-    if !matches!(part.payload, Payload::Inline(_) | Payload::Extents(_)) {
-        return Err(CodecError::new(
-            "part.payload",
-            "a part's bytes are inline or in extents",
-        ));
-    }
+    check_part_payload(&part.payload)?;
     r.finish("part")?;
     Ok(part)
+}
+
+/// Checks that a part's bytes are inline or in extents, or that the part
+/// has none: a part of an evicted multipart object (§9.3).
+fn check_part_payload(payload: &Payload) -> Result<()> {
+    if matches!(payload, Payload::Parts { .. }) {
+        return Err(CodecError::new(
+            "part.payload",
+            "a part's bytes are inline, in extents, or evicted",
+        ));
+    }
+    Ok(())
 }
 
 fn check_has_uploads(r: &Reader<'_>, field: &'static str) -> Result<()> {
