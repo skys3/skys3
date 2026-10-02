@@ -3638,3 +3638,12 @@ of this file. A task with nothing unexpected keeps "None."
   before the stream is opened. Tests cancel a connect mid-handshake and
   check that a waiting caller takes over, and check that an open waiting
   for stream credit already counts. Each fails without its fix.
+- **A pool test read the load of the test machine.** The test that grows
+  the pool's limit adapted it from real loopback measurements. On a
+  loaded machine, loopback's smoothed round trip reached 6 to 20 ms
+  against a minimum under 1 ms, which the limit rightly reads as rising
+  latency, so it held at one connection (49 of 200 runs under CPU load).
+  The pool now takes its measurements from a `Meter`, by default the
+  transport's statistics (`TransportMeter`). Tests that adapt the pool use
+  a steady path, so they check the pool's rules and not the machine's
+  scheduling. The rules themselves are unit-tested with samples.
