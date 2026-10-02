@@ -49,8 +49,14 @@ pub struct ClusterConfig {
     /// Shards per bucket.
     pub shards_per_bucket: u32,
     /// Members of each shard's configuration in the static placement. The
-    /// M1 node keeps one copy, on the primary, whatever this says.
+    /// M1 node keeps one copy, on the primary, whatever this says;
+    /// [`ReplicatedServices`](crate::ReplicatedServices) keep one on every
+    /// member.
     pub replicas: usize,
+    /// Whether every member of a shard, not only one, must hold each
+    /// acknowledged write after recovery, as the all-member commit rule
+    /// promises (§5.1).
+    pub every_member_durable: bool,
     /// The bound `ρ` on each node's clock drift; each life of a node
     /// draws its drift within it.
     pub drift: Drift,
@@ -73,6 +79,7 @@ impl Default for ClusterConfig {
             write_back_buckets: 0,
             shards_per_bucket: 4,
             replicas: 1,
+            every_member_durable: false,
             drift: Drift::from_ppm(1_000).expect("the drift is valid"),
             disk_faults: SimDiskFaults {
                 torn_write_probability: 0.5,
@@ -421,10 +428,11 @@ impl<S: NodeServices> Cluster<S> {
         };
         // The clients start once every node serves, and the faults with
         // them.
-        while !world
+        while !(world
             .slots
             .iter()
             .all(|slot| slot.ready.load(Ordering::SeqCst))
+            && self.services.ready())
         {
             if sim.elapsed() > STARTUP_LIMIT {
                 return Err(RunError::Simulation("the nodes did not start".to_owned()));
@@ -467,6 +475,23 @@ impl<S: NodeServices> Cluster<S> {
         let survivors = world.survivors(workload.keys)?;
         check_linearizable(&operations).map_err(RunError::Check)?;
         check_durable(&operations, &survivors).map_err(RunError::Check)?;
+        if self.config.every_member_durable {
+            let members = survivors.values().map(|s| s.copies.len()).max();
+            for member in 0..members.unwrap_or(0) {
+                let one: BTreeMap<String, Survivors> = survivors
+                    .iter()
+                    .map(|(key, survivor)| {
+                        let copies = survivor.copies.get(member).cloned().into_iter().collect();
+                        let one = Survivors {
+                            copies,
+                            ..survivor.clone()
+                        };
+                        (key.clone(), one)
+                    })
+                    .collect();
+                check_durable(&operations, &one).map_err(RunError::Check)?;
+            }
+        }
         Ok(Report {
             history: operations,
             faults: driver.faults,

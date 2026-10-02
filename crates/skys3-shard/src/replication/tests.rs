@@ -1,0 +1,302 @@
+//! A member's end of the protocol over real TCP, driven by a hand-written
+//! primary that also breaks the rules.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, SanType,
+};
+use skys3_index::{Index, IndexConfig};
+use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
+use skys3_log::record::Delete;
+use skys3_log::{LogConfig, LogRecord, RecordBody, SegmentLog, ShardRef};
+use skys3_net::{
+    CertificateDer, Connection, Credentials, Frame, MessageKind, PeerIdentity, PrivateKeyDer,
+    TokioNetwork, Transport,
+};
+use skys3_types::{
+    BucketId, ClusterId, Epoch, EpochSeq, NodeId, ProposalId, RegisterDocument, Seq, ShardConfig,
+    ShardId,
+};
+use tokio::net::TcpStream;
+
+use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
+use super::{Replication, ReplicationConfig};
+use crate::set::ShardSet;
+
+/// Every wait in these tests.
+const WAIT: Duration = Duration::from_secs(30);
+
+struct Pki {
+    cluster: ClusterId,
+    issuer: Issuer<'static, KeyPair>,
+    ca: CertificateDer<'static>,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let ca = params.self_signed(&key).unwrap().der().clone();
+        Self {
+            cluster: ClusterId::new("test").unwrap(),
+            issuer: Issuer::new(params, key),
+            ca,
+        }
+    }
+
+    fn transport(&self, node: &NodeId) -> Transport<TokioNetwork> {
+        let identity = PeerIdentity::Node(node.clone()).spiffe_id(&self.cluster);
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![SanType::URI(identity.as_str().try_into().unwrap())];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        let cert = params.signed_by(&key, &self.issuer).unwrap().der().clone();
+        let key = PrivateKeyDer::try_from(key.serialize_der()).unwrap();
+        let credentials = Credentials::new(
+            self.cluster.clone(),
+            vec![cert],
+            key,
+            std::slice::from_ref(&self.ca),
+        )
+        .unwrap();
+        Transport::new(TokioNetwork, &credentials)
+    }
+}
+
+fn node(n: u8) -> NodeId {
+    format!("node-{n}").parse().unwrap()
+}
+
+fn shard() -> ShardRef {
+    ShardRef::new(BucketId::new("b-1").unwrap(), ShardId::new(0))
+}
+
+/// Shard `b-1/0` in epoch 2, with node 1 its primary and node 2 a member.
+fn config() -> ShardConfig {
+    ShardConfig {
+        bucket_id: BucketId::new("b-1").unwrap(),
+        shard: ShardId::new(0),
+        epoch: Epoch::new(2),
+        primary: node(1),
+        members: vec![node(1), node(2)],
+        learners: Vec::new(),
+        min_write_replicas: 1,
+        replicas: 2,
+        proposal_id: ProposalId::new("p").unwrap(),
+    }
+}
+
+/// Node 2, serving links on a loopback port, with the shard open as a
+/// member.
+async fn member(pki: &Pki) -> SocketAddr {
+    let disk = SimDisk::new(9);
+    let log_config = LogConfig {
+        inline_max_bytes: 512,
+        segment_bytes: 8192,
+        group_commit_max_delay: Duration::ZERO,
+        group_commit_max_bytes: 16 * 1024,
+    };
+    let clock = Arc::new(MonotonicClock::new());
+    let (log, _) = SegmentLog::open(disk.mount(), log_config, clock)
+        .await
+        .unwrap();
+    let index = Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
+    let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+    let set = ShardSet::<SimMount>::new(Arc::new(index), log, pool);
+    let transport = pki.transport(&node(2));
+    let replication = Replication::new(
+        node(2),
+        set,
+        transport.clone(),
+        BTreeMap::new(),
+        ReplicationConfig::default(),
+    );
+    replication.open(&config()).await.unwrap();
+    let listener = transport
+        .bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { replication.serve(listener).await });
+    address
+}
+
+type Link = Connection<TcpStream>;
+
+async fn connect(pki: &Pki, from: u8, to: SocketAddr) -> Link {
+    let address = to.to_string().parse().unwrap();
+    pki.transport(&node(from))
+        .connect(&node(2), &address)
+        .await
+        .unwrap()
+}
+
+async fn next(link: &mut Link) -> Option<Frame> {
+    tokio::time::timeout(WAIT, link.recv())
+        .await
+        .expect("an answer in time")
+        .ok()
+        .flatten()
+}
+
+/// Sends a `Sync` of `config` and returns the answers up to the last.
+async fn sync(link: &mut Link, config: &ShardConfig, primary_last: u64) -> Vec<(SyncAck, Bytes)> {
+    let request = Sync {
+        config: config.to_json().unwrap(),
+        primary_last,
+    };
+    link.send(&wire::frame(MessageKind::Sync, &request, Bytes::new()))
+        .await
+        .unwrap();
+    let mut answers = Vec::new();
+    loop {
+        let frame = next(link).await.expect("a SyncAck");
+        let answer: SyncAck = wire::body(&frame, MessageKind::SyncAck).unwrap();
+        let done = answer.done || !answer.refused.is_empty();
+        answers.push((answer, frame.payload));
+        if done {
+            return answers;
+        }
+    }
+}
+
+fn refusal(answers: &[(SyncAck, Bytes)]) -> String {
+    answers.last().unwrap().0.refused.clone()
+}
+
+fn record(seq: u64, key: &str) -> Bytes {
+    let record = LogRecord {
+        shard: shard(),
+        position: EpochSeq::new(Epoch::new(2), Seq::new(seq)),
+        body: RecordBody::Delete(Delete { key: key.into() }),
+    };
+    record.to_bytes().unwrap()
+}
+
+async fn append(link: &mut Link, epoch: u64, seq: u64) {
+    let body = Append {
+        epoch,
+        commit: 0,
+        lazy: false,
+    };
+    // A peer that already closed the link refuses the frame; the next
+    // receive tells.
+    let _ = link
+        .send(&wire::frame(MessageKind::Append, &body, record(seq, "k")))
+        .await;
+}
+
+/// The next acknowledgement, if the link is still open.
+async fn ack(link: &mut Link) -> Option<AppendAck> {
+    let frame = next(link).await?;
+    Some(wire::body(&frame, MessageKind::AppendAck).unwrap())
+}
+
+/// Acknowledgements until one covers `seq`.
+async fn durable_through(link: &mut Link, seq: u64) {
+    while ack(link).await.expect("the link is open").durable < seq {}
+}
+
+#[test]
+fn a_member_follows_only_its_primary() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(WAIT * 4, scenario())
+            .await
+            .expect("the test finished in time");
+    });
+}
+
+async fn scenario() {
+    let pki = Pki::new();
+    let address = member(&pki).await;
+    let config = config();
+
+    // Refusals: a node that is not the primary it names, a shard not
+    // open here, an older epoch (R2), and another configuration.
+    let mut link = connect(&pki, 3, address).await;
+    assert!(refusal(&sync(&mut link, &config, 0).await).contains("not the primary"));
+    let mut link = connect(&pki, 1, address).await;
+    let other = ShardConfig {
+        shard: ShardId::new(1),
+        ..config.clone()
+    };
+    assert!(refusal(&sync(&mut link, &other, 0).await).contains("not open"));
+    let mut link = connect(&pki, 1, address).await;
+    let older = ShardConfig {
+        epoch: Epoch::new(1),
+        ..config.clone()
+    };
+    let answers = sync(&mut link, &older, 0).await;
+    assert!(refusal(&answers).contains("older"));
+    assert_eq!(answers[0].0.epoch, 2);
+    let mut link = connect(&pki, 1, address).await;
+    let changed = ShardConfig {
+        replicas: 3,
+        ..config.clone()
+    };
+    assert!(refusal(&sync(&mut link, &changed, 0).await).contains("differs"));
+
+    // A session: appends in order are acknowledged once durable, and
+    // so is every beacon.
+    let mut first = connect(&pki, 1, address).await;
+    let answers = sync(&mut first, &config, 0).await;
+    assert_eq!(answers.len(), 1);
+    assert_eq!((answers[0].0.last, answers[0].0.epoch), (0, 2));
+    append(&mut first, 2, 1).await;
+    durable_through(&mut first, 1).await;
+    let beacon = Beacon {
+        epoch: 2,
+        commit: 1,
+    };
+    first
+        .send(&wire::frame(MessageKind::Beacon, &beacon, Bytes::new()))
+        .await
+        .unwrap();
+    assert_eq!(ack(&mut first).await.unwrap().durable, 1);
+
+    // A later session ends the earlier one, and gets back the record
+    // its primary does not hold.
+    let mut second = connect(&pki, 1, address).await;
+    let answers = sync(&mut second, &config, 0).await;
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[0].1, record(1, "k"));
+    assert_eq!(answers[1].0.last, 1);
+    append(&mut first, 2, 2).await;
+    while ack(&mut first).await.is_some() {}
+    // An append of an older epoch is refused with the member's.
+    append(&mut second, 1, 2).await;
+    let mut rejected = 0;
+    while let Some(ack) = ack(&mut second).await {
+        rejected = ack.rejected;
+    }
+    assert_eq!(rejected, 2);
+
+    // A gap ends the session; the member still holds only seq 1.
+    let mut third = connect(&pki, 1, address).await;
+    let answers = sync(&mut third, &config, 1).await;
+    assert_eq!(answers.last().unwrap().0.last, 1);
+    append(&mut third, 2, 5).await;
+    while ack(&mut third).await.is_some() {}
+    let mut fourth = connect(&pki, 1, address).await;
+    assert_eq!(
+        sync(&mut fourth, &config, 1).await.last().unwrap().0.last,
+        1
+    );
+}

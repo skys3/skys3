@@ -8,7 +8,7 @@ use std::sync::Arc;
 use skys3_index::Index;
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::{SegmentLog, ShardRef};
-use skys3_types::{KeyHash, Label, ShardConfig};
+use skys3_types::{KeyHash, Label, NodeId, ShardConfig};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
 use crate::error::ShardError;
@@ -40,6 +40,18 @@ pub struct ShardSet<D: Disk> {
     logs: Vec<(Label, SegmentLog<D>)>,
     pool: BlockingPool,
     shards: Arc<Mutex<Slots<D>>>,
+}
+
+impl<D: Disk> Clone for ShardSet<D> {
+    /// Another handle to the same set.
+    fn clone(&self) -> Self {
+        Self {
+            index: Arc::clone(&self.index),
+            logs: self.logs.clone(),
+            pool: self.pool.clone(),
+            shards: Arc::clone(&self.shards),
+        }
+    }
 }
 
 impl<D: Disk> fmt::Debug for ShardSet<D> {
@@ -89,6 +101,11 @@ impl<D: Disk> ShardSet<D> {
         &self.logs[self.placement(shard)].0
     }
 
+    /// Each disk's log, in label order.
+    pub fn logs(&self) -> impl Iterator<Item = (&Label, &SegmentLog<D>)> {
+        self.logs.iter().map(|(label, log)| (label, log))
+    }
+
     fn placement(&self, shard: &ShardRef) -> usize {
         let hash = KeyHash::of(&shard.bucket, &[shard.shard.get()]).get();
         // The remainder is below the disk count, which is a `usize`.
@@ -109,6 +126,29 @@ impl<D: Disk> ShardSet<D> {
     /// As [`Shard::open`] and [`Shard::reconfigure`];
     /// [`ShardError::Unavailable`] if the shard's removal did not finish.
     pub async fn open(&self, config: &ShardConfig) -> Result<Shard<D>, ShardError> {
+        self.open_as(config, None).await
+    }
+
+    /// Opens node `node`'s replica in the shard of `config`, in the role the
+    /// configuration gives it, or returns it if it is open already; see
+    /// [`ShardSet::open`] and [`Shard::open_replica`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ShardSet::open`] and [`Shard::open_replica`].
+    pub async fn open_replica(
+        &self,
+        config: &ShardConfig,
+        node: &NodeId,
+    ) -> Result<Shard<D>, ShardError> {
+        self.open_as(config, Some(node)).await
+    }
+
+    async fn open_as(
+        &self,
+        config: &ShardConfig,
+        node: Option<&NodeId>,
+    ) -> Result<Shard<D>, ShardError> {
         let key = ShardRef::new(config.bucket_id.clone(), config.shard);
         // Held across the open and any epoch change, so a shard never gets
         // two sequencers, and two opens in a newer epoch append one CONFIG.
@@ -118,7 +158,11 @@ impl<D: Disk> ShardSet<D> {
             return Ok(shard.clone());
         }
         let log = self.logs[self.placement(&key)].1.clone();
-        let shard = Shard::open(config, log, Arc::clone(&self.index), self.pool.clone()).await?;
+        let (index, pool) = (Arc::clone(&self.index), self.pool.clone());
+        let shard = match node {
+            Some(node) => Shard::open_replica(config, node, log, index, pool).await?,
+            None => Shard::open(config, log, index, pool).await?,
+        };
         shards.insert(key, Slot::Open(shard.clone()));
         Ok(shard)
     }

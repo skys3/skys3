@@ -2340,3 +2340,112 @@ of this file. A task with nothing unexpected keeps "None."
   tests), and a few seconds on the simulated stores with the paused
   clock. The file store and the fake etcd run on real time at
   `Scale::SMALL`.
+
+### M2-07 Replication data path
+
+- **The model's members never fell behind their primary; real ones do.**
+  The M2-01 model makes an append durable as it is taken, so a primary
+  that restarts in its own epoch always holds every record its members
+  hold. With group commit, a member can sync a record before its primary
+  does, and a primary that loses power comes back behind it. Truncating
+  the member would lose nothing committed, but the primary cannot tell a
+  record it sequenced from one it never did without a second numbering.
+  Every record a member holds in the primary's epoch was sequenced by that
+  primary, so the primary rolls such records forward instead: members send
+  them in their `SyncAck` frames, the primary appends them, and it serves
+  nothing until every member has synced and its whole log is committed.
+  Design §5.1 ("Replicating") records the rule.
+- **Segment classes left holes in a replica's log.** Hot and bulk records
+  become durable independently (§10.1), so an `EXTENT` could be synced
+  while an earlier hot record was not. On one replica that only cost an
+  unacknowledged record (M1-04's note on holes); on a member, an
+  acknowledgement must name a run without gaps. Each shard now has one
+  appender task that queues records in position order (`SegmentLog::queue`
+  splits queueing from waiting), and on a replicated shard it waits for
+  every earlier record to be durable before it queues a record of the
+  other class. This also settles M1-04's out-of-order queueing on worker
+  threads. The cost: a lazy `FLUSHED` queued just before an extent holds
+  the extent until the lazy record commits, up to `LAZY_MAX_DELAY` on an
+  otherwise idle disk. M2-17's write path should check that this stays
+  rare. Design §10.1 has the rule.
+- **Appends of an earlier session.** After a link drops, frames of the
+  old session can still sit in the member's queue. `Shard::begin_session`
+  makes the member refuse appends of every earlier session, and
+  `Shard::settle` waits until the records it already queued are durable or
+  failed before it reports its last `seq`, so the primary resends from a
+  point the member really holds.
+- **Replay applies the uncommitted tail.** A replica replays its whole
+  log on open. In the primary's epoch that is right, since the tail always
+  commits by the roll-forward rule. After a primary change it is not:
+  reconciliation (M2-12) truncates uncommitted records and must also undo
+  what a member's replay applied. §5.1 says so.
+- **The primary reads its own log for slow members.** Records committed on
+  every member leave the primary's memory. A member that reconnects
+  further back gets them from `Shard::read_tail`, which scans the
+  segments on disk and fails unless the range is complete. Log compaction
+  (M1-22) must keep the records a member may still need, or the link
+  must fall back to a snapshot (M2-09).
+- **Watch channels wake in random order.** `tokio::sync::watch` spreads
+  its waiters over several `Notify`s chosen at random, so one channel
+  shared by all of a primary's links woke them in a different order on
+  each run, the links drew their network latencies in a different order,
+  and a seed did not replay. The leader keeps one channel per member.
+  Every `select!` on the replication path is `biased;` for the same
+  reason. `a_replicated_seed_replays_exactly` passes 1,024 seeds.
+- **How the simulation checks it.** `ReplicatedServices` runs the
+  replication transport on each simulated node and records every replica.
+  After every step, an audit checks that no primary has committed, or
+  answered a write, beyond what every member holds durably.
+  `ClusterConfig::every_member_durable` makes the recovery check read
+  every acknowledged write from every member, not only from the primary.
+  Two seeded bugs show the checks work: a primary that commits alone
+  trips the audit, and M1 nodes that keep writes on one member trip the
+  every-member check. Scenarios cover random crashes with message loss,
+  and a power loss on each primary in turn, with a partition and a failed
+  sync, while members hold its tail. All of them passed 1,024 seeds.
+  `NodeServices::ready` lets the driver wait until every primary has
+  reconciled before clients start, because a reconciling primary answers
+  `503`.
+- **Measured I/O per small PUT (§5.3).** `replicated_write_io` runs 24
+  clients writing bodies of up to 256 bytes on three replicas, and counts
+  group commits and records on every replica after startup. Over two
+  seeds, 503 acknowledged writes took 2.66 group commits over all three
+  replicas (0.89 per replica, each one sync of every file it wrote), and
+  a group commit held 1.81 records on average (4.83 records per write
+  over all replicas). With `SKYS3_SIM_SEEDS=256`, 1,943 writes took
+  2.45 group commits each, at 1.94 records per group commit. A write
+  costs at most three syncs, one per member,
+  all in parallel, and group commit brings it under that. The record counts
+  include the three records of each multipart completion, and writes that
+  failed a condition or went unanswered, so they overstate records per
+  acknowledged PUT. One serial durable round before success holds: the
+  primary sends each record to its members while it syncs its own copy.
+- **Left for later.**
+  - **Wiring.** No configuration keys and no binary wiring: the node
+    still serves shards alone, and `ReplicationConfig`'s defaults (100 ms
+    beacons, 1 s link timeout, 200 ms reconnect delay) are fixed until
+    M2-08 wires replication in.
+  - **Static configurations only.** `Shard::reconfigure` refuses a
+    replicated shard (M2-10, M2-11).
+  - **No timeout yet.** There is no `replica_ack_timeout`. While a member
+    is down, writes wait, and so does `Shard::close`, since its barrier
+    waits for every earlier record to commit (M2-10).
+  - **R2 refusals.** A member that refuses an append from an older epoch
+    answers with its epoch. The primary only logs it and drops the link;
+    deposing itself is M2-12's.
+  - **Simulation follow-ups.** M1-14's power cuts at every sync boundary
+    run on single-member shards only. Running them under
+    `ReplicatedServices`, where a cut can land between a member's sync
+    and its acknowledgement, would cover the commit rule at every
+    boundary. The harness also starts a flusher on every `write_back`
+    shard open on a node, members included, and a member refuses its
+    `FLUSHED` records. The replication scenarios use only `local`
+    buckets, so flushing replicated buckets from the primary alone
+    waits for M2-08.
+  - **One connection per shard and member.** This is simple, but a node
+    with many shards opens many connections. Multiplexing shards over one
+    connection per peer is a later optimisation.
+  - **Size.** About 1,800 lines of non-test library code, a good part of
+    it doc comments, plus about 350 in the simulation harness: over the
+    plan's 1,500. Splitting would have left the data path without its
+    checks, so it stays one task.

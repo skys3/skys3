@@ -8,9 +8,12 @@
 //!   while the control store is unreachable.
 //! - [`harness`]: the harness itself: replay of a seed, the checkers
 //!   catching seeded bugs, invariants, and node services.
+//! - [`replication`]: shards with three members, under crashes, power
+//!   loss, partitions, and message loss.
 
 mod crash;
 mod harness;
+mod replication;
 mod workload;
 
 /// What one seed of a cluster scenario costs, in seeds of a typical

@@ -96,6 +96,13 @@ pub trait NodeServices: Clone + 'static {
     /// Starts the services of one life of a node. Tasks it spawns end
     /// when the node crashes.
     fn start(&self, env: NodeEnv) -> impl Future<Output = Result<Self::Shards, BoxError>>;
+
+    /// Whether the services are ready for clients once every node serves
+    /// S3, such as replicated shards whose primaries have brought their
+    /// members up to date. The workload starts once they are.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 /// The single-node services of M1: every shard is local, and the node is

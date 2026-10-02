@@ -48,13 +48,16 @@
 //! ```
 
 mod error;
+mod leader;
 mod machine;
 mod multipart;
 mod pipeline;
+pub mod replication;
 mod set;
 mod shard;
 
 pub use error::ShardError;
+pub use leader::{Leader, Outgoing, Pending};
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
 pub use set::ShardSet;
-pub use shard::{Change, Committed, Shard, ShardSummary};
+pub use shard::{Change, Committed, Role, Shard, ShardSummary};
