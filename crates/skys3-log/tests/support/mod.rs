@@ -11,7 +11,7 @@ use proptest::sample::{Index, subsequence};
 use skys3_log::record::{
     Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
     Extent, ExtentRef, Flushed, Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
-    MpuComplete, MpuCreate, MpuPart, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
+    MpuComplete, MpuCreate, MpuPart, Put, PutData, RecordBody, ShardRef, TagSet, Tags, UploadBegin,
     UploadChecksum,
 };
 use skys3_types::{
@@ -309,6 +309,7 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
         mpu_complete(position).prop_map(RecordBody::MpuComplete),
         (key(), position_before(position))
             .prop_map(|(key, upload)| RecordBody::MpuAbort(MpuAbort { key, upload })),
+        key().prop_map(|key| RecordBody::UploadBegin(UploadBegin { key })),
         (key(), tags()).prop_map(|(key, tags)| RecordBody::Tags(Tags { key, tags })),
         (
             key(),

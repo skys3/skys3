@@ -2,7 +2,10 @@
 //! larger seed set.
 //!
 //! Each seed runs one node whose shard takes a random sequence of PUTs,
-//! completed multipart uploads, tag changes, and DELETEs on a few keys
+//! streamed PUTs (an `UPLOAD_BEGIN`, sometimes a write of the key while the
+//! body streams, then the `PUT` that inherits the identity, or nothing if
+//! the upload fails), completed multipart uploads, tag changes, and
+//! DELETEs on a few keys
 //! while its flusher sends them to a simulated remote that delays
 //! requests, loses requests and responses, and answers `500` and `503
 //! SlowDown`. On most seeds the remote behaves like AWS S3 (every
@@ -15,13 +18,16 @@
 //!
 //! - every key no other writer touched holds the latest acknowledged write
 //!   at the remote, with that write's identity (an `MPU_CREATE`'s for a
-//!   multipart object) and its local ETag (a multipart ETag for a
+//!   multipart object, an `UPLOAD_BEGIN`'s for a streamed PUT) and its
+//!   local ETag (a multipart ETag for a
 //!   multipart object), or is absent there after a delete, and is clean in
 //!   the index: lost responses never became conflicts, so they were
 //!   recognized by the write identity;
 //! - every key another writer touched is either flushed the same way or
 //!   held in conflict, and in its remote history no write of the flusher
 //!   follows another writer's: out-of-band writes are never overwritten;
+//! - no remote object, or version of one, carries the identity of a
+//!   streamed PUT that failed;
 //! - once the target has aborted the uploads flushes left to it, the only
 //!   remote multipart uploads still open are those whose
 //!   `CreateMultipartUpload` answer never reached the flusher: every other
@@ -103,20 +109,33 @@ fn scenario(context: &mut SimContext) -> Outcome {
         // delete.
         let mut latest: BTreeMap<String, Option<Version>> = BTreeMap::new();
         let mut touched = BTreeSet::new();
+        // The identities of the streamed PUTs that failed.
+        let mut failed = BTreeSet::new();
         for op in 0..rng.random_range(40..120) {
             let key = format!("key-{}", rng.random_range(0..KEYS));
             match rng.random_range(0..100) {
-                0..=44 => {
+                0..=36 => {
                     let body = format!("{key} v{op}");
                     let seq = node.put(&key, &body).await;
-                    let etag = md5_etag(body.as_bytes());
-                    let version = Version {
-                        body,
-                        seq,
-                        identity: seq,
-                        etag,
-                    };
-                    latest.insert(key, Some(version));
+                    latest.insert(key, Some(Version::put(body, seq, seq)));
+                }
+                // A streamed PUT. A write of the key that commits while its
+                // body streams has a newer identity but an older version,
+                // which a failed precondition's HEAD must tell apart (§7.2).
+                37..=44 => {
+                    let begun = node.begin(&key).await;
+                    if rng.random_ratio(1, 3) {
+                        let body = format!("{key} v{op} meanwhile");
+                        let seq = node.put(&key, &body).await;
+                        latest.insert(key.clone(), Some(Version::put(body, seq, seq)));
+                    }
+                    if rng.random_ratio(1, 4) {
+                        failed.insert(identity(begun));
+                    } else {
+                        let body = format!("{key} v{op} streamed");
+                        let seq = node.complete(&key, &body, begun).await;
+                        latest.insert(key, Some(Version::put(body, seq, begun)));
+                    }
                 }
                 45..=56 => {
                     let parts: Vec<String> = (0..rng.random_range(1..=3))
@@ -169,6 +188,7 @@ fn scenario(context: &mut SimContext) -> Outcome {
         store.set_faults(SimS3Faults::NONE);
         node.settle(&flusher).await;
         check(&node, &flusher, &store, &latest, &touched).await?;
+        check_unpublished(&store, &failed).await?;
         // Scripted faults may still fail a few aborts.
         for _ in 0..10 {
             target.abort_orphaned_uploads().await;
@@ -198,6 +218,19 @@ struct Version {
     identity: u64,
     /// Its local ETag.
     etag: ETag,
+}
+
+impl Version {
+    /// A single PUT of `body` at `seq`, whose identity names `identity`.
+    fn put(body: String, seq: u64, identity: u64) -> Self {
+        let etag = md5_etag(body.as_bytes());
+        Self {
+            body,
+            seq,
+            identity,
+            etag,
+        }
+    }
 }
 
 /// Writes `body` to `key` as another writer would, trying again while the
@@ -293,6 +326,29 @@ async fn check_history(store: &SimS3, key: &str) -> Outcome {
             return Err(format!("{key}: the flusher overwrote another writer's object").into());
         }
         foreign |= !ours;
+    }
+    Ok(())
+}
+
+/// Checks that no remote object, nor any version of one, carries one of
+/// the `failed` identities: a streamed PUT that fails publishes none.
+async fn check_unpublished(store: &SimS3, failed: &BTreeSet<String>) -> Outcome {
+    for (key, version, delete_marker) in store.versions() {
+        if delete_marker {
+            continue;
+        }
+        let mut request = GetObject::new(&key);
+        if let Some(version) = version {
+            request = request.with_version_id(version);
+        }
+        let object = store.get_object(request).await?;
+        if let Some(wid) = object.info.metadata.write_identity()
+            && failed.contains(wid)
+        {
+            return Err(
+                format!("{key}: a failed streamed PUT's identity {wid} was published").into(),
+            );
+        }
     }
     Ok(())
 }

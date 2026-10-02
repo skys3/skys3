@@ -346,6 +346,7 @@ impl<H: Shards> Objects<H> {
             key.to_owned(),
             self.inline_max_bytes,
             self.extent_bytes,
+            self.max_body_duration,
         );
         let mut hasher = (!hashed.is_empty())
             .then(|| PooledHasher::new(hashed.iter().copied(), self.pool.clone()));

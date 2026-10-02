@@ -20,7 +20,7 @@ use skys3_control::{
 use skys3_index::{Index, IndexConfig, ListItem, ListQuery};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::RecordBody;
-use skys3_log::record::{Delete, Extent, MpuCreate, MpuPart, PutData};
+use skys3_log::record::{Delete, Extent, MpuCreate, MpuPart, PutData, UploadBegin};
 use skys3_net::{
     CertificateDer, Credentials, Frame, Header, MessageKind, PeerIdentity, PrivateKeyDer,
     TokioNetwork, Transport,
@@ -413,6 +413,14 @@ async fn every_call_is_forwarded_to_the_primary() {
         .await
         .unwrap();
     assert_eq!(payload, Bytes::from_static(b"part"));
+
+    // The identity of a streamed PUT.
+    let begin = RecordBody::UploadBegin(UploadBegin { key: "big".into() });
+    let begun = timed(gateway.write(&shard, begin, Precondition::None))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(begun > upload, "{begun} follows {upload}");
 
     // Seals.
     let summary = timed(gateway.seal(&shard)).await.unwrap();
