@@ -68,7 +68,9 @@ pub struct ReplacementConfig {
     /// The most shard registers one change writes. Each change is
     /// announced by one generation increment.
     pub batch: usize,
-    /// The least time between two member removals, across the cluster.
+    /// The least time between two member removals, across the cluster:
+    /// from when a removal takes effect, and from the start of each tenure,
+    /// since the previous coordinator may have just removed one.
     pub removal_interval: Duration,
 }
 
@@ -437,6 +439,7 @@ impl<P: Placement> Placement for Replacement<P> {
         // The previous coordinator may have removed a member just before
         // its tenure ended: a new tenure waits a whole interval first, so
         // removals stay one per interval across coordinators.
+        self.removed_at = Some(self.clock.now());
         self.placement.begin_tenure();
     }
 

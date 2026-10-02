@@ -522,3 +522,19 @@ async fn a_removal_that_never_landed_does_not_hold_back_the_next() {
     coordinator.step(&store).await;
     assert_eq!(shard_register(&store, 1).await.members, nodes(&[0, 1, 2]));
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_new_tenure_waits_a_removal_interval_before_its_first_removal() {
+    let store = store(5).await;
+    write_shard(&store, 0, &[0, 1, 2, 3], &[]).await;
+    depart(&store, 3).await;
+    let mut coordinator = Coordinator::nodes();
+    // The previous coordinator may have just removed a member elsewhere.
+    coordinator.replacement.begin_tenure();
+    assert!(coordinator.round(&store).await.is_none());
+    tokio::time::advance(INTERVAL / 2).await;
+    assert!(coordinator.round(&store).await.is_none());
+    tokio::time::advance(INTERVAL / 2).await;
+    coordinator.step(&store).await;
+    assert_eq!(shard_register(&store, 0).await.members, nodes(&[0, 1, 2]));
+}
