@@ -5,8 +5,9 @@
 //! with the first that holds the version. The response streams from that
 //! holder alone: the first piece is fetched before the response starts,
 //! so a holder that fails at once is passed over, and the rest is fetched
-//! at most one piece ahead of the client. While it streams, the gateway
-//! renews the registration every `read_registration_renew_interval_seconds`;
+//! at most one piece ahead of the client. From registration until the
+//! stream ends, the first fetch included, the gateway renews the
+//! registration every `read_registration_renew_interval_seconds`;
 //! a holder that lets it lapse refuses the next fetch, and the response
 //! fails mid-stream. The registration is released once the stream ends.
 
@@ -81,13 +82,14 @@ impl HolderReads {
         else {
             return Ok(None);
         };
-        let read = HolderRead {
-            shards: shards.clone(),
-            shard: shard.clone(),
-            holder: holder.clone(),
-            id,
-            _load: Load::start(&self.load, holder),
-        };
+        // Renewals start now, so a first fetch slower than the TTL does not
+        // outlive the registration.
+        let read = HolderRead::start(
+            shards.clone(),
+            (shard.clone(), holder.clone(), id),
+            Load::start(&self.load, holder),
+            self.renew_every,
+        );
         let mut pieces = match pieces(&layout, &range) {
             Some(pieces) => pieces.into_iter(),
             None => {
@@ -109,9 +111,7 @@ impl HolderReads {
             None => None,
         };
         let (sender, receiver) = mpsc::channel(1);
-        let renew_every = self.renew_every;
         tokio::spawn(async move {
-            let renewal = tokio::spawn(read.clone_handle().renew_every(renew_every));
             if let Some(first) = first
                 && sender.send(Ok(first)).await.is_ok()
             {
@@ -123,7 +123,6 @@ impl HolderReads {
                     }
                 }
             }
-            renewal.abort();
             read.release().await;
         });
         Ok(Some(StreamingBlob::from(s3s::Body::http_body(
@@ -146,11 +145,37 @@ struct HolderRead<H> {
     shard: ShardRef,
     holder: NodeId,
     id: ReadId,
+    /// Renews the registration until the read is released or dropped.
+    renewing: Renewing,
     /// Counts the read against the holder while it lasts.
     _load: Load,
 }
 
 impl<H: Shards> HolderRead<H> {
+    /// The read registered as `id` with `holder` for `shard`, which renews
+    /// its registration every `renew_every` from now on.
+    fn start(
+        shards: H,
+        (shard, holder, id): (ShardRef, NodeId, ReadId),
+        load: Load,
+        renew_every: Duration,
+    ) -> Self {
+        let renewal = Renewal {
+            shards: shards.clone(),
+            shard: shard.clone(),
+            holder: holder.clone(),
+            id,
+        };
+        Self {
+            shards,
+            shard,
+            holder,
+            id,
+            renewing: Renewing(tokio::spawn(renewal.renew_every(renew_every))),
+            _load: load,
+        }
+    }
+
     /// The bytes of `piece`.
     async fn fetch(&self, piece: &Piece) -> Result<Bytes, ShardError> {
         let data = self
@@ -169,20 +194,10 @@ impl<H: Shards> HolderRead<H> {
         Ok(data.slice(piece.bytes.clone()))
     }
 
-    /// A handle that renews the registration, without counting the read
-    /// again.
-    fn clone_handle(&self) -> Renewal<H> {
-        Renewal {
-            shards: self.shards.clone(),
-            shard: self.shard.clone(),
-            holder: self.holder.clone(),
-            id: self.id,
-        }
-    }
-
-    /// Releases the registration, as a courtesy: one that is not released
-    /// lapses.
-    async fn release(&self) {
+    /// Stops renewing the registration and releases it, as a courtesy: one
+    /// that is not released lapses.
+    async fn release(self) {
+        drop(self.renewing);
         if let Err(error) = self
             .shards
             .release(&self.shard, &self.holder, self.id)
@@ -191,6 +206,16 @@ impl<H: Shards> HolderRead<H> {
             tracing::debug!(shard = %self.shard, holder = %self.holder, %error,
                 "a read registration was not released; it lapses");
         }
+    }
+}
+
+/// The task renewing one registration, stopped when this is dropped: on
+/// every path that releases the read, and when the read itself is dropped.
+struct Renewing(tokio::task::JoinHandle<()>);
+
+impl Drop for Renewing {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -466,6 +491,36 @@ mod tests {
             }
         }
         assert!(set.reads().counts().lapsed >= 1);
+    }
+
+    // Real time, as above. Without renewals from the registration on, the
+    // first fetch, which takes more than twice the TTL, finds it lapsed.
+    #[tokio::test]
+    async fn renewals_cover_fetches_slower_than_the_ttl_from_the_first() {
+        let (shards, shard, version, layout) = overwritten("k").await;
+        let set = shards.local().set().clone();
+        set.reads().configure(ReadSettings {
+            ttl: Duration::from_millis(500),
+            ..ReadSettings::default()
+        });
+        shards.set_fetch_delay(Duration::from_millis(1200));
+        let holder = shards.node().unwrap();
+        let reads = HolderReads::new(Duration::from_millis(100));
+        let body = reads
+            .open(&shards, (&shard, &holder), "k", version, layout, 0..8)
+            .await
+            .expect("the first fetch is served under a renewed registration")
+            .unwrap();
+        assert_eq!(collect(body).await.unwrap(), vec![b'a'; 8]);
+        assert_eq!(set.reads().counts().lapsed, 0);
+        // The stream released the read, and renewals stopped with it.
+        for _ in 0..100 {
+            if set.reads().live() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(set.reads().live(), 0);
     }
 
     fn extent(seq: u64, len: u32) -> ExtentRef {
