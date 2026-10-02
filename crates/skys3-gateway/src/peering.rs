@@ -560,6 +560,7 @@ mod tests {
     use skys3_config::Config;
     use skys3_log::record::Put as PutRecord;
     use skys3_peer::Precondition as Expected;
+    use skys3_peer::{BatchBuilder, DEFAULT_BATCH_RECORD_BYTES, Refusal};
     use skys3_types::{
         BucketId, BucketMode, ETag, EpochSeq, ProposalId, ShardCount, WriteIdentity,
     };
@@ -1123,6 +1124,55 @@ mod tests {
             total += local.last_sequenced().get();
         }
         total
+    }
+
+    /// The bytes the shards' log has written so far.
+    fn log_bytes(shards: &MemoryShards) -> u64 {
+        let (_, log) = shards.local().set().logs().next().unwrap();
+        log.stats().bytes
+    }
+
+    #[tokio::test]
+    async fn a_built_batch_writes_at_most_its_record_budget() {
+        let (shards, document) = opened().await;
+        let commits = PeerCommits::new(shards.clone(), lookup(&document), &settings(Some(SOURCE)));
+        // 1,024 objects of 8 KiB, every eighth with the most metadata: the
+        // builder splits them so that each batch's records fit one group
+        // commit of the default log.
+        let body = vec![5; 8 << 10];
+        let mut builder = BatchBuilder::new();
+        let mut batches = Vec::new();
+        for seq in 1..=1024 {
+            let mut item = item(seq % 250, &format!("k{seq}"), Expected::Absent, Some(&body));
+            item.identity = identity(seq);
+            if seq % 8 == 0
+                && let Write::Put(put) = &mut item.write
+            {
+                put.metadata = BTreeMap::from([(
+                    "x-amz-meta-big".to_owned(),
+                    "x".repeat(MAX_METADATA_LEN - 200),
+                )]);
+            }
+            if builder.push(&item) == Err(Refusal::Full) {
+                batches.extend(builder.take());
+                builder.push(&item).unwrap();
+            }
+        }
+        batches.extend(builder.take());
+        assert!(batches.len() > 2, "{} batches", batches.len());
+        let cap = skys3_log::LogConfig::default().group_commit_max_bytes;
+        assert_eq!(cap, DEFAULT_BATCH_RECORD_BYTES);
+        for batch in batches {
+            let before = log_bytes(&shards);
+            let outcomes = commits.apply_batch(&batch.items).await;
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|o| matches!(o, Outcome::Committed { .. }))
+            );
+            let written = log_bytes(&shards) - before;
+            assert!(written <= cap, "{written} bytes of records");
+        }
     }
 
     #[tokio::test]

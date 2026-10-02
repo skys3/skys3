@@ -170,6 +170,17 @@ struct Victim {
     disk: Label,
 }
 
+/// The share of a disk's clean payload, its most recently used, that
+/// compaction copies rather than evicts (§10.3).
+const HOT_SHARE: f64 = 0.5;
+
+/// Which clean entries of a disk compaction copies: those used at or
+/// after `from`, if any ([`CleanCache::hot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Hot {
+    from: Option<Tick>,
+}
+
 /// When an entry was last used, for LRU order: the time it was last
 /// modified, for an entry a scan found, or [`NOW`] for one used since;
 /// then the order the cache learned it in, which also makes ticks unique.
@@ -429,6 +440,61 @@ impl CleanCache {
         drop(ledger);
         if over {
             self.inner.wake.notify_one();
+        }
+    }
+
+    /// Which clean entries of `disk` compaction copies rather than evicts
+    /// (§10.3): the most recently used ones that together hold at most
+    /// [`HOT_SHARE`] of the clean payload the cache keeps on the disk, and
+    /// none while the cache is over its bounds.
+    pub(crate) fn hot(&self, disk: &Label) -> Hot {
+        let ledger = self.ledger();
+        if ledger.over() {
+            return Hot { from: None };
+        }
+        let cached = ledger.disks.get(disk).map_or(0, |bytes| bytes.cached);
+        // The share is a fraction of a byte count, which fits a u64.
+        let budget = (cached as f64 * HOT_SHARE) as u64;
+        let mut held = 0u64;
+        let mut from = None;
+        for (&tick, (shard, key)) in ledger.lru.get(disk).into_iter().flatten().rev() {
+            let size = ledger
+                .shards
+                .get(shard)
+                .and_then(|held| held.keys.get(key))
+                .map_or(0, |slot| slot.size);
+            held = held.saturating_add(size);
+            if held > budget {
+                break;
+            }
+            from = Some(tick);
+        }
+        Hot { from }
+    }
+
+    /// Whether the cache keeps the clean version `version` of `key` and
+    /// ranks it among the entries `hot` names.
+    pub(crate) fn is_hot(&self, hot: Hot, shard: &ShardRef, key: &str, version: EpochSeq) -> bool {
+        let Some(from) = hot.from else {
+            return false;
+        };
+        let ledger = self.ledger();
+        ledger
+            .shards
+            .get(shard)
+            .and_then(|held| held.keys.get(key))
+            .is_some_and(|slot| slot.version == version && slot.tick >= from)
+    }
+
+    /// Takes note that compaction removed `bytes` of payload that no entry
+    /// held from `disk`: the disk's room no longer counts them as free on
+    /// top of its available space (§9.3, §10.3). It counts every such
+    /// byte, evicted or replaced, so the room never exceeds what the disk
+    /// really has.
+    pub(crate) fn reclaimed(&self, disk: &Label, bytes: u64) {
+        let mut ledger = self.ledger();
+        if let Some(disk) = ledger.disks.get_mut(disk) {
+            disk.released = disk.released.saturating_sub(bytes);
         }
     }
 

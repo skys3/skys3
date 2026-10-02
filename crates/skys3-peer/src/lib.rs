@@ -126,7 +126,7 @@ mod tls;
 mod trust;
 mod wire;
 
-pub use batch::{BatchBuilder, Refusal, send_batch, skips_staging};
+pub use batch::{BatchBuilder, DEFAULT_BATCH_RECORD_BYTES, Refusal, send_batch, skips_staging};
 pub use destination::{
     CommitSink, ExtentSink, MAX_APPENDS_PER_STREAM, NoCommits, SinkError, StagingService,
 };

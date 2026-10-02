@@ -52,6 +52,10 @@
 //!   than the workload: copies dropped beyond `clean_copies`, LRU
 //!   eviction, fills of what was evicted, and no dirty byte lost under
 //!   crashes.
+//! - [`compaction`]: segment compaction on replicated shards under
+//!   crashes, message loss, and power losses at sync boundaries, with
+//!   every member's dirty bytes and every shard's latest `CONFIG` record
+//!   kept.
 //! - [`reads`]: `GET`s through any node read their bytes from the holders
 //!   their read plans name while overwrites and evictions race them, and
 //!   fail mid-stream when their registration lapses.
@@ -60,6 +64,7 @@ mod acks;
 mod backfill;
 mod buckets;
 mod cache;
+mod compaction;
 mod coordinator;
 mod crash;
 mod handoff;

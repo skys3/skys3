@@ -209,11 +209,21 @@ fn payloads_are_read_by_position() {
 
 /// A shard whose log takes a whole batch in one group commit, and its log.
 async fn open_batched() -> (SimDisk, Shard<SimMount>, SegmentLog<SimMount>) {
+    open_grouped(1 << 20, Duration::ZERO).await
+}
+
+/// A shard whose group commits hold `max_bytes` and wait `delay` for more
+/// records, and its log.
+async fn open_grouped(
+    max_bytes: u64,
+    delay: Duration,
+) -> (SimDisk, Shard<SimMount>, SegmentLog<SimMount>) {
     let disk = SimDisk::new(9);
     let clock = Arc::new(skys3_io::MonotonicClock::new());
     let log_config = LogConfig {
         segment_bytes: 1 << 20,
-        group_commit_max_bytes: 1 << 20,
+        group_commit_max_bytes: max_bytes,
+        group_commit_max_delay: delay,
         ..log_config()
     };
     let (log, _) = SegmentLog::open(disk.mount(), log_config, clock)
@@ -367,6 +377,44 @@ fn a_batch_on_a_sealed_or_closed_shard_is_refused() {
         assert!(
             matches!(results[..], [Err(ShardError::Unavailable { .. })]),
             "{results:?}"
+        );
+    });
+}
+
+/// A batch shares one group commit only as far as `group_commit_max_bytes`
+/// allows: the log keeps its cap, which bounds what a crash can leave
+/// unsynced (§10.4), so a larger batch takes one group commit per cap.
+#[test]
+fn a_batch_takes_one_group_commit_per_group_commit_max_bytes() {
+    runtime().block_on(async {
+        // Each group waits for more records, so only the cap closes one.
+        let cap = 16 << 10;
+        let (_disk, shard, log) = open_grouped(cap, Duration::from_millis(20)).await;
+
+        // Just under the cap: 25 records, one group commit.
+        let before = log.stats();
+        let bodies = (0..25).map(|n| put(&format!("a{n}"), 400, n)).collect();
+        let results = shard.commit_all_if(bodies, absent_at).await;
+        assert!(results.iter().all(|r| matches!(r, Ok(Ok(_)))));
+        let after = log.stats();
+        assert_eq!(after.records - before.records, 25);
+        let bytes = after.bytes - before.bytes;
+        assert!(bytes < cap, "{bytes} bytes");
+        assert_eq!(after.group_commits - before.group_commits, 1);
+
+        // Four times that: about one group commit per cap, never one per
+        // record.
+        let before = log.stats();
+        let bodies = (0..100).map(|n| put(&format!("b{n}"), 400, n)).collect();
+        let results = shard.commit_all_if(bodies, absent_at).await;
+        assert!(results.iter().all(|r| matches!(r, Ok(Ok(_)))));
+        let after = log.stats();
+        let bytes = after.bytes - before.bytes;
+        let groups = after.group_commits - before.group_commits;
+        assert!(bytes > 3 * cap, "{bytes} bytes");
+        assert!(
+            (2..=bytes.div_ceil(cap)).contains(&groups),
+            "{groups} group commits for {bytes} bytes"
         );
     });
 }

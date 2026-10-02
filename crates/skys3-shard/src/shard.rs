@@ -5,6 +5,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
@@ -240,6 +241,9 @@ struct Inner<D: Disk> {
     reads: watch::Sender<usize>,
     /// The node's clean cache, once the replica reports to it (§9.3).
     cache: Arc<Link>,
+    /// The highest commit watermark the replica has learned in this life:
+    /// every member holds the shard's records through it (§5.1).
+    watermark: Arc<AtomicU64>,
 }
 
 /// One shard replica on this node: the shard's only member, its primary,
@@ -512,6 +516,7 @@ impl<D: Disk> Shard<D> {
             pipeline.require_commit(last.seq);
         }
         let cache = Arc::new(Link::default());
+        let watermark = Arc::new(AtomicU64::new(0));
         let task = PipelineTask {
             shard: shard.clone(),
             index: Arc::clone(&index),
@@ -521,6 +526,7 @@ impl<D: Disk> Shard<D> {
             durable: durable_tx,
             leader: Arc::clone(&leader),
             cache: Arc::clone(&cache),
+            watermark: Arc::clone(&watermark),
             stopped: None,
         };
         tokio::spawn(task.run(receiver));
@@ -547,6 +553,7 @@ impl<D: Disk> Shard<D> {
                 leader,
                 reads: watch::Sender::new(0),
                 cache,
+                watermark,
             }),
         })
     }
@@ -646,6 +653,22 @@ impl<D: Disk> Shard<D> {
     #[must_use]
     pub fn last_sequenced(&self) -> Seq {
         self.sequencer().last_sequenced().seq
+    }
+
+    /// The `seq` through which every member of the shard is known to hold
+    /// its records durably, or `None` on a replica alone, whose log no
+    /// other replica reads. A member that is behind is sent records after
+    /// it, from this replica's log if it leads the shard or comes to, so
+    /// compaction keeps every record after it (§10.3).
+    ///
+    /// It is the commit watermark this replica learned in this life (§5.1):
+    /// a primary's own, a member's or a learner's from its primary. It
+    /// starts at zero when the replica opens, which keeps everything until
+    /// the replica learns one.
+    #[must_use]
+    pub fn replicated_through(&self) -> Option<Seq> {
+        (self.role() != Role::Alone)
+            .then(|| Seq::new(self.inner.watermark.load(AtomicOrdering::Acquire)))
     }
 
     /// Commits `body` as the shard's next record, and returns its position
@@ -1363,11 +1386,22 @@ impl<D: Disk> Shard<D> {
             }
         }
         // Records a reconciliation truncated are not the shard's (§6.6).
-        let found: BTreeMap<_, _> = candidates
-            .into_iter()
-            .filter(|(position, _)| !truncates.iter().any(|t| truncated_by(*t, *position)))
-            .map(|(position, bytes)| (position.seq, (position, bytes)))
-            .collect();
+        // Compaction may have dropped a `TRUNCATE` whose records are still
+        // in an older segment: a `seq` this replica holds again was then
+        // taken by a later epoch, and the record of the newest epoch is the
+        // shard's. A record compaction copied is found twice, alike.
+        let mut found: BTreeMap<Seq, (EpochSeq, Bytes)> = BTreeMap::new();
+        for (position, bytes) in candidates {
+            if truncates.iter().any(|t| truncated_by(*t, position)) {
+                continue;
+            }
+            match found.get(&position.seq) {
+                Some((held, _)) if *held >= position => {}
+                _ => {
+                    found.insert(position.seq, (position, bytes));
+                }
+            }
+        }
         let expected = through.get().saturating_sub(after.get());
         if found.len() as u64 != expected {
             return Err(failed(&format!(
@@ -2829,6 +2863,8 @@ struct PipelineTask {
     /// The node's clean cache, told of every entry that becomes clean or
     /// stops being so.
     cache: Arc<Link>,
+    /// The highest commit watermark learned, published for compaction.
+    watermark: Arc<AtomicU64>,
     /// Why the shard stopped, once a record failed or applying did.
     stopped: Option<ShardError>,
 }
@@ -2873,7 +2909,10 @@ impl PipelineTask {
                 self.pipeline.marker_resolved(position, result);
             }
             Message::Barrier(reply) => self.pipeline.barrier(reply),
-            Message::Commit(seq) => self.pipeline.commit_through(seq),
+            Message::Commit(seq) => {
+                self.watermark.fetch_max(seq.get(), AtomicOrdering::Release);
+                self.pipeline.commit_through(seq);
+            }
             Message::Truncate { after, marker } => {
                 self.pipeline.truncate(after);
                 self.pipeline.marked(marker);

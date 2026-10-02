@@ -10,8 +10,9 @@
 //!
 //! A whole batch therefore costs one round trip, where staging costs one
 //! per object at least: `BEGIN` and its `RESUME`, or a `COMMIT` and its
-//! `APPLIED`. [`BatchBuilder`] packs items within the protocol's limits,
-//! and [`send_batch`] sends one and collects its answers.
+//! `APPLIED`. [`BatchBuilder`] packs items within the protocol's limits
+//! and within one group commit of the destination's log, and
+//! [`send_batch`] sends one and collects its answers.
 
 use std::collections::BTreeSet;
 
@@ -28,6 +29,19 @@ use crate::wire::batch_item_len;
 /// The bytes a `BATCH` header holds besides its items: the envelope's
 /// field key and length, and the CRC32C of the payload.
 const BATCH_HEADER_OVERHEAD: usize = 16;
+
+/// The log record bytes a batch holds by default: the default
+/// `group_commit_max_bytes` (4 MiB). A destination's log takes queued
+/// records into one group commit until they reach that size, so a batch
+/// within it shares one group commit on a destination with the default
+/// settings, and a larger one takes one group commit per 4 MiB (§7.8).
+pub const DEFAULT_BATCH_RECORD_BYTES: u64 = 4 << 20;
+
+/// What the destination's log record of an item holds beyond the item's
+/// bytes in the `BATCH`: the record's fixed header and framing, and the
+/// write identity the destination adds to its metadata, with room to
+/// spare.
+const RECORD_OVERHEAD: u64 = 256;
 
 /// Whether an object of `size` bytes skips staging and travels in a
 /// `BATCH`: it fits in one frame of `frame_bytes` (`peer_frame_bytes`).
@@ -50,7 +64,8 @@ pub const fn skips_staging(size: u64, frame_bytes: u64) -> bool {
 #[non_exhaustive]
 pub enum Refusal {
     /// The batch has no room for it: send the batch, and put the item in
-    /// the next one.
+    /// the next one. A builder never refuses the first item of a batch as
+    /// full.
     #[error("the batch is full")]
     Full,
     /// The batch already holds the item's key or write identity. A key's
@@ -68,6 +83,13 @@ pub enum Refusal {
 /// distinct write identities, whose inline bytes fit one payload
 /// ([`MAX_PAYLOAD_LEN`]) and whose attributes fit one header
 /// ([`MAX_HEADER_LEN`]).
+///
+/// The batch also stays within a budget of log record bytes at the
+/// destination, [`DEFAULT_BATCH_RECORD_BYTES`] unless
+/// [`BatchBuilder::with_record_bytes`] sets another, so that its records
+/// share one group commit there. Each item counts its bytes in the batch
+/// plus a fixed overhead, which bounds the record the destination writes
+/// for it. An item over the budget by itself travels alone.
 ///
 /// ```
 /// use std::collections::BTreeMap;
@@ -101,7 +123,7 @@ pub enum Refusal {
 /// assert!(builder.is_empty());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BatchBuilder {
     items: Vec<Commit>,
     keys: BTreeSet<(BucketName, String)>,
@@ -110,13 +132,39 @@ pub struct BatchBuilder {
     payload: u64,
     /// The bytes the items take in the header.
     header: usize,
+    /// The record bytes the items are counted for at the destination.
+    records: u64,
+    /// The most record bytes a batch holds.
+    max_records: u64,
+}
+
+impl Default for BatchBuilder {
+    fn default() -> Self {
+        Self::with_record_bytes(DEFAULT_BATCH_RECORD_BYTES)
+    }
 }
 
 impl BatchBuilder {
-    /// An empty batch.
+    /// An empty batch, within [`DEFAULT_BATCH_RECORD_BYTES`].
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty batch whose items' records hold at most `max_records`
+    /// bytes at the destination, such as its `group_commit_max_bytes`
+    /// when the source knows it.
+    #[must_use]
+    pub fn with_record_bytes(max_records: u64) -> Self {
+        Self {
+            items: Vec::new(),
+            keys: BTreeSet::new(),
+            identities: BTreeSet::new(),
+            payload: 0,
+            header: 0,
+            records: 0,
+            max_records,
+        }
     }
 
     /// The number of items.
@@ -135,6 +183,13 @@ impl BatchBuilder {
     #[must_use]
     pub fn payload_len(&self) -> u64 {
         self.payload
+    }
+
+    /// The record bytes the items are counted for at the destination: at
+    /// most the builder's budget, unless one item alone exceeds it.
+    #[must_use]
+    pub fn record_len(&self) -> u64 {
+        self.records
     }
 
     /// Adds `commit`, a delete or a version with its bytes inline.
@@ -156,9 +211,11 @@ impl BatchBuilder {
         if self.keys.contains(&key) || self.identities.contains(&commit.identity) {
             return Err(Refusal::Repeated);
         }
+        let records = header as u64 + payload + RECORD_OVERHEAD;
         if self.items.len() == MAX_BATCH_ITEMS
             || self.payload + payload > u64::from(MAX_PAYLOAD_LEN)
             || self.header + header > MAX_HEADER_LEN as usize - BATCH_HEADER_OVERHEAD
+            || (!self.items.is_empty() && self.records + records > self.max_records)
         {
             return Err(Refusal::Full);
         }
@@ -166,13 +223,15 @@ impl BatchBuilder {
         self.identities.insert(commit.identity.clone());
         self.payload += payload;
         self.header += header;
+        self.records += records;
         self.items.push(commit.clone());
         Ok(())
     }
 
-    /// The batch, if it holds any item, leaving the builder empty.
+    /// The batch, if it holds any item, leaving the builder empty with the
+    /// same budget.
     pub fn take(&mut self) -> Option<Batch> {
-        let builder = std::mem::take(self);
+        let builder = std::mem::replace(self, Self::with_record_bytes(self.max_records));
         (!builder.items.is_empty()).then_some(Batch {
             items: builder.items,
         })
@@ -290,8 +349,9 @@ mod tests {
         assert!(Message::Batch(batch).encode().is_ok());
         builder.push(&next).unwrap();
 
-        // Two 6 MiB objects fit; a third would pass the payload limit.
-        let mut builder = BatchBuilder::new();
+        // Two 6 MiB objects fit a 16 MiB budget; a third would pass the
+        // payload limit.
+        let mut builder = BatchBuilder::with_record_bytes(16 << 20);
         let body = Bytes::from(vec![7; 6 << 20]);
         for seq in 0..2 {
             builder
@@ -313,7 +373,7 @@ mod tests {
     fn items_are_packed_within_the_header_limit() {
         // Items with the most metadata: the header, not the count or the
         // payload, fills first, and every batch still encodes.
-        let mut builder = BatchBuilder::new();
+        let mut builder = BatchBuilder::with_record_bytes(u64::MAX);
         let mut batches = Vec::new();
         for seq in 0..400u64 {
             let mut item = put(seq, &format!("k{seq}"), Bytes::from_static(b"x"));
@@ -336,6 +396,36 @@ mod tests {
             assert!(batch.items.len() < MAX_BATCH_ITEMS);
             assert!(header_len(batch) <= MAX_HEADER_LEN as usize);
         }
+    }
+
+    #[test]
+    fn batches_stay_within_one_group_commit_of_records() {
+        // 1,024 objects of 8 KiB: 8 MiB of records, more than one group
+        // commit of the default log holds, so they take three batches.
+        let body = Bytes::from(vec![3; 8 << 10]);
+        let mut builder = BatchBuilder::new();
+        let mut batches = Vec::new();
+        for seq in 0..1024 {
+            let item = put(seq, &format!("k{seq}"), body.clone());
+            if builder.push(&item) == Err(Refusal::Full) {
+                assert!(builder.record_len() <= DEFAULT_BATCH_RECORD_BYTES);
+                batches.extend(builder.take());
+                builder.push(&item).unwrap();
+            }
+        }
+        batches.extend(builder.take());
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches.iter().map(|b| b.items.len()).sum::<usize>(), 1024);
+
+        // An item over the budget by itself travels alone.
+        let mut builder = BatchBuilder::with_record_bytes(1000);
+        builder.push(&put(1, "big", body.clone())).unwrap();
+        assert!(builder.record_len() > 1000);
+        assert_eq!(builder.push(&delete(2, "small")), Err(Refusal::Full));
+        assert_eq!(builder.take().unwrap().items.len(), 1);
+        // The next batch keeps the budget.
+        builder.push(&delete(2, "small")).unwrap();
+        assert_eq!(builder.push(&put(3, "big", body)), Err(Refusal::Full));
     }
 
     #[test]

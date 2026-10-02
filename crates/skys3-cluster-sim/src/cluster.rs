@@ -1,12 +1,13 @@
 //! Building a simulated cluster, driving it through a workload and a
 //! fault plan, and checking the outcome.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use skys3::storage::Storage;
 use skys3_config::FailureDomain;
 use skys3_control::faults::{FaultRates, FaultyStore};
 use skys3_control::{
@@ -17,9 +18,9 @@ use skys3_control::{
 use skys3_flush::FlushSettings;
 use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
 use skys3_index::{Entry, EntryState, Index, IndexReader, Payload};
-use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SyncCut};
-use skys3_log::LogConfig;
-use skys3_shard::{CacheSettings, ReadSettings};
+use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SimMount, SyncCut};
+use skys3_log::{LogConfig, RecordBody, RecordKind, SegmentId};
+use skys3_shard::{CacheSettings, CompactionSettings, ReadSettings};
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
 use skys3_sim::history::{History, Operation, Outcome};
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
@@ -99,6 +100,12 @@ pub struct ClusterConfig {
     /// hold counts as no copy when the checkers look for acknowledged
     /// writes: dirty payload must never be evicted.
     pub clean_cache: Option<CacheSettings>,
+    /// Segment compaction every node runs after each checkpoint interval
+    /// (§10.3); `None` for none. With compaction, a dirty copy counts as
+    /// held only if each record its payload names is in a segment its
+    /// node still has, and every node must keep each shard's latest
+    /// `CONFIG` record in its log.
+    pub compaction: Option<CompactionSettings>,
     /// The `clean_copies` of every bucket the harness writes (§9.3).
     pub clean_copies: u8,
     /// How long a read registration lasts on its holder, and how often a
@@ -156,6 +163,7 @@ impl Default for ClusterConfig {
             clean_cache: None,
             clean_copies: 1,
             read_registration: ReadRegistration::default(),
+            compaction: None,
         }
     }
 }
@@ -234,6 +242,8 @@ pub struct Report {
     /// `GET`s of the workload's clients that were answered and whose body
     /// then broke off, as when a read registration lapses (§8.7).
     pub broken_reads: usize,
+    /// Log segments compaction reclaimed, over every node and life.
+    pub compacted: u64,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -646,6 +656,7 @@ impl<S: NodeServices> Cluster<S> {
             rebuilds: driver.rebuilds,
             registers,
             evicted,
+            compacted: world.shared.compacted.load(Ordering::Relaxed),
         })
     }
 
@@ -842,6 +853,7 @@ impl<S: NodeServices> World<S> {
                 peers,
                 placement: Arc::clone(&placement),
                 remote: remote.clone(),
+                compacted: Arc::new(AtomicU64::new(0)),
             }),
             routes: Routes {
                 buckets,
@@ -913,7 +925,13 @@ impl<S: NodeServices> World<S> {
                 skys3_io::BlockingPool::inline("recovery"),
                 slot.id.clone(),
             ))?;
-            indexes.insert(slot.id.clone(), storage.index);
+            let segments = if settings.compaction.is_some() {
+                runtime.block_on(check_configs(&storage))?;
+                Some(segments_of(&storage))
+            } else {
+                None
+            };
+            indexes.insert(slot.id.clone(), (storage.index, storage.shards, segments));
         }
         let mut survivors = BTreeMap::new();
         let mut evicted = 0;
@@ -927,7 +945,13 @@ impl<S: NodeServices> World<S> {
             let write_back = bucket.mode == BucketMode::WriteBack;
             let mut survivor = Survivors::default();
             for member in &members {
-                let read = indexes[member].read()?;
+                let (index, shards, segments) = &indexes[member];
+                let read = index.read()?;
+                // With compaction, the bytes must be in a segment the node
+                // still has.
+                let segments = segments
+                    .as_ref()
+                    .map(|segments| &segments[shards.set().disk_of(&(&shard).into())]);
                 let entry = read.entry(&(&shard).into(), &key)?;
                 evicted += usize::from(
                     entry
@@ -941,10 +965,10 @@ impl<S: NodeServices> World<S> {
                 });
                 // With a cache, a dirty copy must still hold its bytes.
                 let held = clean
-                    || self.shared.settings.clean_cache.is_none()
+                    || (settings.clean_cache.is_none() && settings.compaction.is_none())
                     || entry
                         .as_ref()
-                        .is_some_and(|entry| holds_bytes(&read, &shard, entry));
+                        .is_some_and(|entry| holds_bytes(&read, &shard, entry, segments));
                 survivor.copies.push(
                     entry
                         .filter(|_| held)
@@ -966,11 +990,61 @@ impl<S: NodeServices> World<S> {
     }
 }
 
+/// The segments each disk of a recovered node holds.
+fn segments_of(storage: &Storage<SimMount>) -> BTreeMap<Label, BTreeSet<SegmentId>> {
+    storage
+        .logs
+        .iter()
+        .map(|(disk, log)| {
+            let ids = log.segments().iter().map(|segment| segment.id).collect();
+            (disk.clone(), ids)
+        })
+        .collect()
+}
+
+/// Checks that each shard's latest `CONFIG` record, whose configuration
+/// the index of a recovered node keeps, is in the log of the shard's disk:
+/// compaction keeps it (§10.3).
+async fn check_configs(storage: &Storage<SimMount>) -> Result<(), BoxError> {
+    let configs = storage.index.read()?.configs()?;
+    let set = storage.shards.set();
+    let mut found = Vec::new();
+    for (_, log) in set.logs() {
+        for segment in log.segments() {
+            let mut scanner = log.scan(segment.id)?;
+            while let Some(scanned) = scanner.next().await? {
+                if scanned.header.kind == RecordKind::Config
+                    && let RecordBody::Config(config) = scanned.decode()?.body
+                {
+                    found.push(config);
+                }
+            }
+        }
+    }
+    match configs.values().find(|config| !found.contains(*config)) {
+        Some(lost) => Err(format!(
+            "the latest CONFIG record of {}/{} is gone from the log",
+            lost.bucket_id, lost.shard
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
 /// Whether the node that `read` is of holds the bytes of `entry`, a dirty
-/// entry of `shard`: every record its payload names is located there.
-fn holds_bytes(read: &IndexReader, shard: &ShardRef, entry: &Entry) -> bool {
+/// entry of `shard`: every record its payload names is located there, in
+/// one of `segments` if they are given.
+fn holds_bytes(
+    read: &IndexReader,
+    shard: &ShardRef,
+    entry: &Entry,
+    segments: Option<&BTreeSet<SegmentId>>,
+) -> bool {
     let shard = &shard.into();
-    let located = |position| matches!(read.location(shard, position), Ok(Some(_)));
+    let located = |position| match read.location(shard, position) {
+        Ok(Some(location)) => segments.is_none_or(|ids| ids.contains(&location.segment)),
+        _ => false,
+    };
     let Some(object) = &entry.object else {
         return true;
     };
@@ -1126,6 +1200,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
             ttl: shape.read_registration.ttl,
             ..ReadSettings::default()
         },
+        compaction: shape.compaction,
     })
 }
 

@@ -54,6 +54,7 @@ mod checkpointer;
 pub mod codec;
 mod entry;
 mod error;
+mod holders;
 mod import;
 mod index;
 mod listing;
@@ -65,6 +66,7 @@ pub use entry::{
     Upload,
 };
 pub use error::IndexError;
+pub use holders::{Holder, Holders};
 pub use import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 pub use index::{
     Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
