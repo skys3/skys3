@@ -89,6 +89,38 @@ async fn handoff() {
 }
 
 #[test]
+fn a_handoff_waits_for_the_reads_it_admitted() {
+    run(admitted_read());
+}
+
+async fn admitted_read() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    let nodes = serving(&pki, &store).await;
+    let old = &nodes[0].shard;
+
+    // A read admitted before the step-down holds it up: the candidate
+    // must not take over while the old primary may still read its index.
+    let read = old.admit_read().unwrap();
+    let replication = nodes[0].replication.clone();
+    let handoff = tokio::spawn(async move { replication.hand_off(&shard(), &node(2)).await });
+    until(|| old.stepped_down().is_some()).await;
+    // No read is admitted from then on.
+    assert!(matches!(
+        old.admit_read(),
+        Err(ShardError::Unavailable { .. })
+    ));
+    tokio::time::sleep(timing().link_timeout).await;
+    assert!(!handoff.is_finished());
+    let candidate = nodes[1].replication.grace(&shard()).unwrap();
+    assert_eq!(candidate.stepped_down(), None);
+    assert_eq!(register(&store).await, initial());
+    drop(read);
+    assert!(handoff.await.unwrap().unwrap().sent);
+    assert_eq!(new_primary(&nodes).await, 1);
+}
+
+#[test]
 fn a_lost_step_down_falls_back_to_the_grace() {
     run(lost_step_down());
 }

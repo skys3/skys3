@@ -1854,11 +1854,18 @@ impl<D: Disk> Shard<D> {
     /// Admits a read of the index, as [`Shard::check_readable`] allows,
     /// and counts it until the returned permit drops, so that a primary
     /// stepping down knows when the reads it admitted are over (§5.4).
-    fn admit_read(&self) -> Result<ReadPermit<'_>, ShardError> {
+    ///
+    /// The final check and the count happen under one hold of the
+    /// sequencer's lock, which [`Shard::step_down`] takes to stop admitting
+    /// reads: a read is either refused or counted before the step-down
+    /// looks at the count, never admitted in between.
+    pub(crate) fn admit_read(&self) -> Result<ReadPermit<'_>, ShardError> {
         self.check_readable()?;
+        let sequencer = self.sequencer();
         // A step-down may have come since.
-        self.sequencer().check_serving(self.shard())?;
+        sequencer.check_serving(self.shard())?;
         self.inner.reads.send_modify(|reads| *reads += 1);
+        drop(sequencer);
         Ok(ReadPermit(&self.inner.reads))
     }
 
@@ -1875,7 +1882,7 @@ impl<D: Disk> Shard<D> {
 const STEPPED_DOWN: &str = "the primary stepped down for a planned handoff";
 
 /// A read of the index in progress ([`Shard::admit_read`]).
-struct ReadPermit<'a>(&'a watch::Sender<usize>);
+pub(crate) struct ReadPermit<'a>(&'a watch::Sender<usize>);
 
 impl Drop for ReadPermit<'_> {
     fn drop(&mut self) {
