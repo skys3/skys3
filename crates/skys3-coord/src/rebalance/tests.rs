@@ -524,6 +524,64 @@ async fn a_departing_primary_is_handed_off_once_replaced() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_primary_is_not_handed_off_to_a_target_that_fell_silent() {
+    let store = store(4).await;
+    four_nodes_loaded(&store).await;
+    join(&store, 4, PLAIN).await;
+    let mut coordinator = Coordinator::nodes();
+    coordinator.hear(5);
+    assert!(coordinator.round(&store).await);
+    primaries(&store, 8, &[]).await;
+    let promoted = shards(&store, 8).await;
+    assert!(promoted.iter().any(|c| c.is_member(&node(4))));
+
+    // Node 4, the target of every move, falls silent once its learners
+    // are promoted. Handoffs go to a live member instead.
+    tokio::time::advance(SUSPECT + Duration::from_secs(1)).await;
+    let mut asked = Vec::new();
+    for _ in 0..4 {
+        coordinator.hear(4);
+        coordinator.round(&store).await;
+        asked.extend(coordinator.asked.take());
+        tokio::time::advance(Duration::from_secs(3)).await;
+    }
+    assert!(!asked.is_empty(), "a surplus primary is handed off");
+    for (primary, handoff) in &asked {
+        assert_ne!(handoff.to, node(4), "{asked:?}");
+        assert_ne!(handoff.to, *primary);
+        let config = promoted.iter().find(|c| c.shard == handoff.shard).unwrap();
+        assert!(config.is_member(&handoff.to), "{config:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_departing_primary_waits_for_a_live_successor() {
+    let store = store(4).await;
+    write_shard(&store, 0, &[0, 1, 2], &[]).await;
+    depart(&store, 0).await;
+    let mut coordinator = Coordinator::nodes();
+    coordinator.hear(4);
+    assert!(coordinator.round(&store).await);
+    primaries(&store, 1, &[]).await;
+    assert_eq!(shard_register(&store, 0).await.members.len(), 4);
+
+    // Every member that could lead falls silent: the primary keeps
+    // serving rather than handing off to a node that may not answer.
+    tokio::time::advance(SUSPECT + Duration::from_secs(1)).await;
+    coordinator.hear(1);
+    assert!(!coordinator.round(&store).await);
+    assert!(coordinator.asked.take().is_empty());
+
+    // One is heard from again: the handoff goes to it.
+    coordinator.registry.heard(&node(2));
+    assert!(!coordinator.round(&store).await);
+    let asked = coordinator.asked.take();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(asked[0].0, node(0));
+    assert_eq!(asked[0].1.to, node(2));
+}
+
+#[tokio::test(start_paused = true)]
 async fn nothing_moves_while_a_node_is_suspect_or_a_shard_is_moving() {
     let store = store(4).await;
     four_nodes_loaded(&store).await;

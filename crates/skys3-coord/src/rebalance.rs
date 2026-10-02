@@ -691,19 +691,29 @@ fn primary_move<'a, 's>(
 }
 
 /// The member of `shard` to hand it off to: `preferred` if it is a member
-/// that counts, otherwise the one that counts on a live node leading the
-/// fewest shards.
+/// that counts on a live node, otherwise the one that counts on a live
+/// node leading the fewest shards. `None` if no member that counts is
+/// live: a handoff to a silent node would stop a serving primary and
+/// leave the shard to wait out another member's takeover grace, so the
+/// primary keeps serving until a successor is heard from again.
 fn successor(topology: &Topology, shard: &Shard<'_>, preferred: Option<&NodeId>) -> Option<NodeId> {
-    if let Some(preferred) = preferred.filter(|node| shard.successors().any(|s| s == *node)) {
+    let live = |node: &NodeId| {
+        topology
+            .get(node)
+            .filter(|entry| entry.state == NodeState::Live)
+    };
+    if let Some(preferred) = preferred
+        .filter(|node| shard.successors().any(|s| s == *node))
+        .filter(|node| live(node).is_some())
+    {
         return Some(preferred.clone());
     }
     shard
         .successors()
-        .filter_map(|node| topology.get(node))
+        .filter_map(live)
         .min_by(|a, b| {
-            a.state
-                .cmp(&b.state)
-                .then(a.primaries.cmp(&b.primaries))
+            a.primaries
+                .cmp(&b.primaries)
                 .then_with(|| a.node.cmp(&b.node))
         })
         .map(|candidate| candidate.node.clone())
