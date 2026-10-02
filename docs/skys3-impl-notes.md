@@ -3426,8 +3426,10 @@ of this file. A task with nothing unexpected keeps "None."
 - **Left open.** The binary does not run replication yet (M2-08b), so
   it neither resumes replicas nor reads `with_takeover` or a
   `takeover_delay` from its configuration; the binary wiring here is the
-  control copy's delta sync and the staleness sync. About 900 lines of
-  non-test code.
+  control copy's delta sync and the staleness sync. An index upgraded
+  from format 5 keeps no configuration for a replica until it applies or
+  replays a `CONFIG` record, so such a replica resumes only once its
+  register can be read. About 900 lines of non-test code.
 
 ## M3 Coordinator
 

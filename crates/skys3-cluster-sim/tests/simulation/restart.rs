@@ -207,7 +207,7 @@ fn plan(context: &SimContext) -> FaultPlan {
         Duration::from_millis(500),
         Fault::Crash {
             node: AWAY,
-            power_loss: seed % 2 == 0,
+            power_loss: seed & 1 == 0,
             downtime: Duration::from_millis(5000),
         },
     );
@@ -223,7 +223,7 @@ fn plan(context: &SimContext) -> FaultPlan {
             Duration::from_millis(4000 + 200 * step),
             Fault::Crash {
                 node,
-                power_loss: (seed >> (step + 1)) % 2 == 0,
+                power_loss: (seed >> (step + 1)) & 1 == 0,
                 downtime: Duration::from_millis(1200 + 100 * ((seed >> 4) % 4) + 100 * step),
             },
         );
