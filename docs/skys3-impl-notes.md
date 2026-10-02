@@ -3820,9 +3820,9 @@ of this file. A task with nothing unexpected keeps "None."
   mid-stream (`Report::broken_reads`). The cluster-sim compaction
   scenario uses a 2 s release delay (`ReadRegistration::release_delay`).
   Every scenario declares `COST`. At `SKYS3_SIM_SEEDS=256` (8 seeds
-  each, debug build) they take 34 s, 42 s, and 40 s, and the two
-  seeded-bug scenarios take 6 s and 5 s. The compaction scenarios take
-  34 s and 36 s.
+  each, debug build) they take 25 s, 31 s, and 36 s, and the two
+  seeded-bug scenarios take 6 s and 4 s. The compaction scenarios take
+  28 s and 30 s.
 - **Seeded bugs are caught at seed 0.** A holder that registers its
   current copy, whatever version the plan names (`ignore_version`), is
   caught by "a GET whose body does not match". That scenario uses
