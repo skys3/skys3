@@ -21,6 +21,7 @@ use skys3_cluster_sim::{
 use skys3_coord::{RebalanceConfig, ReplacementConfig};
 use skys3_gateway::ShardRef;
 use skys3_gateway::routing::RoutingConfig;
+use skys3_log::LAZY_MAX_DELAY;
 use skys3_shard::replication::ReplicationConfig;
 use skys3_sim::history::Outcome;
 use skys3_sim::{Runner, SimContext};
@@ -38,12 +39,33 @@ const JOIN_EVERY: Duration = Duration::from_secs(8);
 /// How long the moves may go on after the last join.
 const MOVES: Duration = Duration::from_secs(15);
 
-/// How long a write may take when no handoff of its shard is under way. A
-/// stall would be a write waiting for a membership change, such as for
-/// `member_suspect_after` (3 s) or `primary_grace` (6 s). Without any
-/// move, writes here take up to about 1.5 s, when control-store faults
-/// delay a gateway's register read.
-const SLOW: Duration = Duration::from_secs(2);
+/// How long a write may take when no handoff of its shard is under way,
+/// for reasons that have nothing to do with membership.
+///
+/// A move must never make a write wait for a membership timer: a write
+/// held up by a member that stopped answering, or by a primary that
+/// stopped serving, waits at least `member_suspect_after` (3 s) or
+/// `primary_grace` (6 s). What else a write waits on is bounded, and
+/// moves change none of it:
+///
+/// - Each of a `PUT`'s two commits, its extent and then its index record,
+///   can wait up to `LAZY_MAX_DELAY` behind the lazy `FLUSHED` records
+///   the write-back bucket's flusher commits: a replicated shard drains
+///   its in-flight records before it switches segment class, and a lazy
+///   record in flight is durable only once another record starts a group
+///   commit or `LAZY_MAX_DELAY` passes (impl notes, M3-06). A write on a
+///   shard no move touched took 2.011 s this way (CI, seed 3).
+/// - Routing: a gateway's register read and a retry, within
+///   `ROUTING_SLACK`.
+///
+/// So the bound is their sum, and [`joins`] checks that it stays below
+/// `member_suspect_after`, so that a write that waited for a membership
+/// timer still fails it. Comparing with the slowest write outside the
+/// moves would not do: two waits of `LAZY_MAX_DELAY` in one write are rare
+/// enough that a run's baseline often has none.
+const SLOW: Duration = LAZY_MAX_DELAY
+    .saturating_mul(2)
+    .saturating_add(ROUTING_SLACK);
 
 /// How long after a handoff's new primary serves a gateway may still be
 /// learning of it: its register poll, a redirect, and a retry.
@@ -210,6 +232,8 @@ fn joins(context: &mut SimContext, joining: usize) -> Result<(), Box<dyn std::er
         summary(&outside),
     );
     assert!(!away.is_empty());
+    // The bound tells a membership stall from the waits it allows.
+    assert!(SLOW < ReplicationConfig::default().member_suspect_after);
     for write in &away {
         assert!(
             write.took < SLOW,
