@@ -127,8 +127,9 @@ impl<N: Network, D: Disk> Replication<N, D> {
 
     /// Reads the register of `replica`'s shard, which opened in its kept
     /// configuration, every `link_timeout` until it can, then follows it
-    /// ([`Replication::follow_register`]). It stops early once the node
-    /// no longer has that replica open.
+    /// ([`Replication::follow_register`]); a read older than the replica's
+    /// configuration is stale, and the register is read again. It stops
+    /// early once the node no longer has that replica open.
     fn confirm(&self, replica: &Shard<D>) {
         let Some(removal) = self.inner.removal.get().cloned() else {
             return;
@@ -145,8 +146,9 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 }
                 match removal.registers.read(&shard).await {
                     Ok(held) => {
-                        replication.follow_register(&replica, held.as_ref()).await;
-                        return;
+                        if replication.follow_register(&replica, held.as_ref()).await {
+                            return;
+                        }
                     }
                     Err(error) => {
                         tracing::debug!(%shard, %error, "the shard's register still cannot be read");
@@ -156,28 +158,52 @@ impl<N: Network, D: Disk> Replication<N, D> {
         });
     }
 
-    /// Brings `replica` to `held`, what its shard's register holds, if that
-    /// is newer than its configuration. A configuration that names the
-    /// node is adopted in order with the replica's writes where the
-    /// replica can change in place ([`ShardSet::open_replica`](crate::ShardSet::open_replica)),
-    /// and one that re-admits the node as a learner stops the replica and
-    /// opens the shard again as a learner from its log; one that makes this
-    /// node the primary is left to the takeover the member proposed, which
-    /// it settles itself. A replica that cannot
-    /// adopt `held`, because the register no longer names the node or
-    /// gives it another role, stops: it serves and grants nothing, answers
-    /// with `held` as a redirect, and opens in the register's
-    /// configuration at the node's next start.
-    async fn follow_register(&self, replica: &Shard<D>, held: Option<&ShardConfig>) {
+    /// Brings `replica` to `held`, what its shard's register holds, and
+    /// returns whether that settled the replica, or `false` if `held` is a
+    /// stale read, older than the replica's configuration.
+    ///
+    /// The replica's own configuration is confirmed. A newer configuration
+    /// that names the node is adopted in order with the replica's writes
+    /// where the replica can change in place
+    /// ([`ShardSet::open_replica`](crate::ShardSet::open_replica)), and one
+    /// that re-admits the node as a learner stops the replica and opens the
+    /// shard again as a learner from its log; one that makes this node the
+    /// primary is left to the takeover the member proposed, which it
+    /// settles itself. A replica that cannot adopt `held`, because the
+    /// register no longer names the node or gives it another role, stops:
+    /// it serves and grants nothing, answers with `held` as a redirect, and
+    /// opens in the register's configuration at the node's next start. So
+    /// does a replica whose register is gone, as the shard's bucket was
+    /// deleted, which opens nothing at the next start, and one whose
+    /// register holds another configuration of its epoch.
+    async fn follow_register(&self, replica: &Shard<D>, held: Option<&ShardConfig>) -> bool {
         let shard = replica.shard();
-        let Some(held) = held.filter(|held| held.epoch > replica.config().epoch) else {
-            tracing::debug!(%shard, "the shard's register confirms the local copy");
-            return;
+        let config = replica.config();
+        let Some(held) = held else {
+            tracing::info!(%shard, "the shard's register is gone; the replica stops");
+            replica.depose("the shard's register is gone", None);
+            return true;
         };
+        if held.epoch < config.epoch {
+            tracing::debug!(%shard, epoch = %held.epoch, "a stale read of the shard's register");
+            return false;
+        }
+        if held.epoch == config.epoch {
+            if *held == config {
+                tracing::debug!(%shard, "the shard's register confirms the local copy");
+            } else {
+                tracing::warn!(%shard, ?held, "the shard's register holds another configuration");
+                replica.depose(
+                    "the shard's register holds another configuration of the replica's epoch",
+                    None,
+                );
+            }
+            return true;
+        }
         let node = &self.inner.node;
         let named = held.is_member(node) || held.is_learner(node);
         if named && held.primary == *node && replica.outstanding_takeover().is_some() {
-            return;
+            return true;
         }
         let adopted = if named {
             self.open(held).await.map(drop)
@@ -195,5 +221,6 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 Some(held),
             );
         }
+        true
     }
 }
