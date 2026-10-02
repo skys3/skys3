@@ -3138,3 +3138,50 @@ of this file. A task with nothing unexpected keeps "None."
   its stand-in registers had to be re-homed first), the node that held
   data shards never was, and the forgotten node registered again on its
   return.
+
+## M6 Native peer transport
+
+### M6-01 Peer protocol messages
+
+- **`DATA` "at an offset" cannot address multipart uploads.** Design §7.8
+  gives `DATA` an offset only. A multipart upload's parts arrive
+  concurrently and in any order, and the final part boundaries are not
+  known until `CompleteMultipartUpload`. A re-uploaded part must also
+  replace the old one. Staged bytes are therefore addressed by *piece* and
+  offset. A piece is the body of a single PUT, or one part, and the source
+  gives it an ID that it never reuses. `COMMIT` lists the pieces of a
+  multipart object with their part numbers, sizes, and MD5s. The decision
+  is recorded in design §7.8.
+- **The precondition needs a third case.** The design gives a `COMMIT`
+  precondition as "the destination's expected current write identity, or
+  absent". `flush_conflict_policy = "overwrite"` needs a write with no
+  condition at all, so the precondition is one of `Absent`, `Matches`, and
+  `Unconditional`.
+- **`RESUME` had no trigger.** The table says that after a reconnect the
+  destination returns its durable ranges, but no message asks for them.
+  The destination now answers every `BEGIN` with a `RESUME`. For new
+  staging the `RESUME` is empty, and a source can stream `DATA` without
+  waiting for it.
+- **`peer_frame_bytes` had no upper bound.** A destination stages each
+  frame as one log record, so the configuration now limits it to the
+  largest record payload (16 MiB), as `extent_bytes` is limited.
+- **The intra-cluster frame was not reusable.** `skys3-net`'s `Frame`
+  keys its header on `MessageKind`, a closed enum whose kinds the
+  transport authorizes per node role. The peer protocol keeps the same
+  layout, two length prefixes, a `prost` header, and a raw payload, but
+  has its own envelope: a protobuf `oneof` of the nine messages, whose
+  field numbers are never reused.
+- **Size.** The plan sizes this task S (under 500 lines). The crate has
+  about 1,300 lines of non-test code, not counting comments. Most of it
+  is the `prost` wire structs and the checked conversions to typed
+  messages.
+- **Batch items could share a write identity (review).** `BATCH`
+  validation refused two items of the same key, but not two items of
+  different keys with the same write identity. Each item's `APPLIED`
+  names it only by its identity, and a destination treats a known
+  identity as a `COMMIT` replay. The second item could therefore get the
+  first one's stored result and never be applied. Validation now
+  refuses repeated identities too, on encode and decode. The proptest
+  batch generator gives each item a distinct identity. A proptest that
+  copies one item's identity onto another, and a rules test, both fail
+  without the check.
