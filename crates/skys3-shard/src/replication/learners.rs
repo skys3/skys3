@@ -16,12 +16,14 @@
 //!   `member_suspect_after`, as a member would be removed for, leaves the
 //!   set; the configuration does not change, since the commit rule does
 //!   not count learners. It must catch up again before it rejoins.
-//! - **Backfill.** The primary starts a learner's [`Backfill`] once the
-//!   learner has reported its log. Without one, the live stream is the
-//!   backfill: it brings the learner the primary's log from the record
-//!   after the learner's last, from the first record for a new learner,
-//!   and this build reclaims no log segment (plan M1-22), so a learner
-//!   holds every record up to what it acknowledges.
+//! - **Backfill.** A learner that keeps its log takes the primary's from
+//!   the record after its last; one that cannot gets a snapshot of the
+//!   shard's index first (see the `backfill` module). The primary starts
+//!   the backfill of a learner's payload once the learner has reported its
+//!   log in a session, and it is complete once the learner holds the
+//!   payload of every entry it has, as of a position at or after the
+//!   snapshot the primary last sent it. A [`Backfill`] hook replaces the
+//!   built-in backfill.
 //! - **Promoting.** The primary proposes the next configuration, with the
 //!   learner a member, once the learner is in the set, its backfill is
 //!   complete, and it is durable up to everything the primary may commit.
@@ -47,13 +49,14 @@ use tokio::time::Instant;
 use super::lock;
 use super::removal::{BoxFuture, Replaced, Seen, Watchdog};
 
-/// Brings a learner the history of a shard that the live stream does not:
-/// the extension point for backfill (§6.7, plan M2-15).
+/// Brings a learner the history of a shard that the live stream does not,
+/// in place of the built-in backfill of its payload (§6.7): a seam that
+/// tests hold promotions back with.
 ///
 /// The primary calls [`Backfill::backfill`] once a learner of the shard has
-/// reported its log in the primary's life, while the live stream runs, and
-/// promotes the learner only after it returns `Ok`. A failure is retried on
-/// a later check.
+/// reported its log in a session, while the live stream runs, and
+/// promotes the learner only after it returns `Ok`. A failure is retried a
+/// reconnect delay later.
 pub trait Backfill: Send + Sync + 'static {
     /// Brings `learner` the history of `shard` it lacks, and returns once
     /// it holds it durably, or why it could not.
@@ -102,27 +105,29 @@ impl<D: Disk> Watchdog<D> {
     }
 
     /// Starts the backfill of `learner`, unless it is complete or running.
+    /// One that fails is tried again a reconnect delay later.
     fn start_backfill(&self, learner: &NodeId, backfilling: &Backfilling) {
-        if self.leader.is_backfilled(learner) {
-            return;
-        }
-        let Some(backfill) = self.backfill.clone() else {
-            self.leader.backfilled(learner);
-            return;
-        };
-        if !lock(backfilling).insert(learner.clone()) {
+        if self.leader.is_backfilled(learner) || !lock(backfilling).insert(learner.clone()) {
             return;
         }
         let (shard, leader) = (self.shard.shard().clone(), Arc::clone(&self.leader));
         let (learner, backfilling) = (learner.clone(), Arc::clone(backfilling));
+        let (hook, fill) = (self.backfill.clone(), Arc::clone(&self.fill));
+        let delay = self.config.reconnect_delay;
         tokio::spawn(async move {
-            match backfill.backfill(&shard, &learner).await {
-                Ok(()) => {
-                    tracing::info!(%shard, %learner, "a learner's backfill is complete");
-                    leader.backfilled(&learner);
-                }
+            let filled = match hook {
+                Some(hook) => hook
+                    .backfill(&shard, &learner)
+                    .await
+                    .map(|()| leader.backfilled(&learner)),
+                // The built-in backfill records its completion itself.
+                None => fill(learner.clone()).await,
+            };
+            match filled {
+                Ok(()) => tracing::info!(%shard, %learner, "a learner's backfill is complete"),
                 Err(error) => {
-                    tracing::warn!(%shard, %learner, %error, "backfilling a learner failed; trying again");
+                    tracing::debug!(%shard, %learner, %error, "backfilling a learner failed; trying again");
+                    tokio::time::sleep(delay).await;
                 }
             }
             lock(&backfilling).remove(&learner);

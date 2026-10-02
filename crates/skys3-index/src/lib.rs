@@ -25,6 +25,10 @@
 //!   reverts to its last checkpoint, and [`Checkpointer::replay`] applies
 //!   the log records after each shard's checkpointed position, through
 //!   the same [`Applier`], which reproduces the index exactly.
+//! - **Snapshots** ([`IndexReader::shard_rows`], [`Index::begin_install`]):
+//!   a primary sends a learner a shard's rows, and the learner installs
+//!   them in place of what it held, at the position they were taken at
+//!   (§6.7).
 //! - **Releasing segments**: each checkpoint also stores what each log
 //!   segment holds: the highest position of each shard's records in it,
 //!   from the log's [`SegmentSummary`](skys3_log::SegmentSummary). A
@@ -66,4 +70,4 @@ pub use index::{
     Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
 };
 pub use listing::{ListItem, ListPage, ListQuery};
-pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter};
+pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter, ShardRow, ShardTable};

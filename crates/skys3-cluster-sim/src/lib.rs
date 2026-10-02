@@ -102,7 +102,7 @@ pub use coordination::{
     Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
 };
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
-pub use learners::LearnerCounts;
+pub use learners::{DurabilityWindows, LearnerCounts};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{
     HandoffCounts, IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards,

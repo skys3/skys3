@@ -729,6 +729,30 @@ impl ReplicatedShards {
         Ok(())
     }
 
+    /// Audits `replica`, this node's replica of its shard, unless it is
+    /// audited already: a learner that installed a snapshot opened it
+    /// again (§6.7). A learner's earlier replicas of the shard leave the
+    /// audit then, since the snapshot discarded what they held.
+    pub(crate) fn track(&self, replica: &Shard<SimMount>) {
+        let mut audit = lock(&self.audit);
+        let durable = replica.durable();
+        if audit
+            .replicas
+            .iter()
+            .any(|(_, _, open)| open.durable().same_channel(&durable))
+        {
+            return;
+        }
+        if replica.role() == Role::Learner {
+            audit
+                .replicas
+                .retain(|(node, _, old)| *node != self.node || old.shard() != replica.shard());
+        }
+        audit
+            .replicas
+            .push((self.node.clone(), replica.config(), replica.clone()));
+    }
+
     /// Records an acknowledgement of `position` that some member of the
     /// shard did not hold durably. The members are those of the register
     /// now: a removal takes effect only once its compare-and-swap landed,

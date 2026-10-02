@@ -15,7 +15,7 @@ use skys3_control::{
 use skys3_io::SimMount;
 use skys3_log::ShardRef;
 use skys3_net::TokioNetwork;
-use skys3_types::{Epoch, NodeId, ProposalId, Seq, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, NodeId, ProposalId, Seq, ShardConfig};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
@@ -30,7 +30,7 @@ use crate::shard::{Role, Shard};
 
 /// Shard `b-1/0` in epoch 1 on nodes 1 and 2, node 1 its primary, which
 /// aims for three members.
-fn two_members() -> ShardConfig {
+pub(super) fn two_members() -> ShardConfig {
     ShardConfig {
         members: vec![node(1), node(2)],
         ..initial()
@@ -39,7 +39,7 @@ fn two_members() -> ShardConfig {
 
 /// `config`'s next configuration, with `learner` added as a learner: the
 /// test driver's compare-and-swap.
-fn with_learner(config: &ShardConfig, learner: u8) -> ShardConfig {
+pub(super) fn with_learner(config: &ShardConfig, learner: u8) -> ShardConfig {
     ShardConfig {
         epoch: Epoch::new(config.epoch.get() + 1),
         learners: vec![node(learner)],
@@ -56,15 +56,15 @@ fn promotes(current: &ShardConfig, next: &ShardConfig) -> bool {
 /// The shard registers of a store, with the promotions held up for a
 /// while, as by a slow control store, and answered first by `scripted`
 /// answers, if any.
-struct Promotions {
-    registers: ControlRegisters<MemoryControlStore>,
-    delay: Duration,
-    scripted: Mutex<VecDeque<Result<Replaced, ControlError>>>,
+pub(super) struct Promotions {
+    pub(super) registers: ControlRegisters<MemoryControlStore>,
+    pub(super) delay: Duration,
+    pub(super) scripted: Mutex<VecDeque<Result<Replaced, ControlError>>>,
     /// How many promotions were proposed.
-    proposed: Arc<Mutex<usize>>,
+    pub(super) proposed: Arc<Mutex<usize>>,
     /// The epochs of each promotion's compare-and-swap: the one it
     /// expects, and the one it writes.
-    epochs: Arc<Mutex<Vec<(Epoch, Epoch)>>>,
+    pub(super) epochs: Arc<Mutex<Vec<(Epoch, Epoch)>>>,
 }
 
 impl ShardRegisters for Promotions {
@@ -116,19 +116,19 @@ impl Backfill for Gate {
 /// Nodes 1 to 3, none with the shard open, each reaching the others
 /// through proxies of its own, with the register in `store` holding
 /// `config`. Node 1's promotions go through `promotions`, and its
-/// backfills through `gate`.
-struct Nodes {
-    replications: Vec<Replication<TokioNetwork, SimMount>>,
+/// backfills through `gate`, if there is one.
+pub(super) struct Nodes {
+    pub(super) replications: Vec<Replication<TokioNetwork, SimMount>>,
     /// The proxies of node 1's links, by the node they reach.
     proxies: BTreeMap<NodeId, Proxy>,
 }
 
-async fn nodes(
+pub(super) async fn nodes(
     pki: &Pki,
     store: &MemoryControlStore,
     config: &ShardConfig,
     promotions: Promotions,
-    gate: watch::Receiver<bool>,
+    gate: Option<watch::Receiver<bool>>,
 ) -> Nodes {
     let policy = RetryPolicy::default();
     let key = TypedKey::shard(&config.bucket_id, config.shard);
@@ -169,11 +169,14 @@ async fn nodes(
             timing(),
         );
         let ids = ProposalIds::seeded(u64::from(n));
-        let replication = match promotions.take() {
-            Some(promotions) => replication
+        let replication = match (promotions.take(), &gate) {
+            (Some(promotions), Some(gate)) => replication
                 .with_removal(promotions, ids)
                 .with_backfill(Gate(gate.clone())),
-            None => replication.with_removal(ControlRegisters::new(store.clone(), policy), ids),
+            (Some(promotions), None) => replication.with_removal(promotions, ids),
+            (None, _) => {
+                replication.with_removal(ControlRegisters::new(store.clone(), policy), ids)
+            }
         };
         let serving = replication.clone();
         tokio::spawn(async move { serving.serve(listener).await });
@@ -186,15 +189,28 @@ async fn nodes(
 }
 
 /// Commits a `PUT` of `key` and returns how long it took.
-async fn timed_put(primary: &Shard<SimMount>, key: &str) -> Duration {
+pub(super) async fn timed_put(primary: &Shard<SimMount>, key: &str) -> Duration {
     let started = Instant::now();
     primary.commit(put(key, 10)).await.unwrap();
     started.elapsed()
 }
 
+/// The replica of the shard `replication` has open now: a learner opens
+/// its replica again once it installed a snapshot.
+pub(super) async fn current(replication: &Replication<TokioNetwork, SimMount>) -> Shard<SimMount> {
+    let deadline = Instant::now() + super::WAIT;
+    loop {
+        if let Some(replica) = replication.set().get(&shard()).await {
+            return replica;
+        }
+        assert!(Instant::now() < deadline, "the shard did not open again");
+        tokio::time::sleep(ms(5)).await;
+    }
+}
+
 /// The test driver adds node 3 to `current` as a learner, and tells the
 /// learner and the primary, as the coordinator's change propagation will.
-async fn add_learner(
+pub(super) async fn add_learner(
     store: &MemoryControlStore,
     nodes: &Nodes,
     current: &ShardConfig,
@@ -228,7 +244,7 @@ async fn promotion() {
         proposed: Arc::clone(&proposed),
         epochs: Arc::default(),
     };
-    let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
+    let nodes = nodes(&pki, &store, &two_members(), promotions, Some(gate)).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
     let primary = nodes.replications[0].open(&two_members()).await.unwrap();
     let leader = Arc::clone(primary.leader().unwrap());
@@ -239,7 +255,7 @@ async fn promotion() {
 
     // The new learner takes the log from its first record, and joins the
     // acknowledgement set once it has caught up.
-    let (added, learner) = add_learner(&store, &nodes, &two_members()).await;
+    let (added, _) = add_learner(&store, &nodes, &two_members()).await;
     until(|| leader.acking() == [node(3)]).await;
     assert_eq!(leader.learners(), [node(3)]);
     // Only the primary reports the shard's exposure, not its learner.
@@ -247,8 +263,13 @@ async fn promotion() {
     assert_eq!(nodes.replications[2].exposure().await, Exposure::default());
     timed_put(&primary, "d").await;
     let committed = leader.commit();
+    let learner = current(&nodes.replications[2]).await;
     assert!(*learner.durable().borrow() >= committed);
-    assert_eq!(learner.lineage().epoch_at(Seq::new(1)), Some(Epoch::new(1)));
+    // It installed a snapshot of the primary's index, taken once the
+    // primary had applied its CONFIG record of epoch 2, and holds none of
+    // the records before it.
+    assert!(learner.applied() >= EpochSeq::new(Epoch::new(2), Seq::new(3)));
+    assert_eq!(learner.lineage().epoch_at(Seq::new(1)), None);
     assert!(learner.check_readable().is_err());
 
     // Its backfill is not complete: no promotion yet.
@@ -307,13 +328,13 @@ async fn silence() {
         proposed: Arc::default(),
         epochs: Arc::default(),
     };
-    let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
+    let nodes = nodes(&pki, &store, &two_members(), promotions, Some(gate)).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
     let primary = nodes.replications[0].open(&two_members()).await.unwrap();
     let leader = Arc::clone(primary.leader().unwrap());
     until(|| primary.is_serving()).await;
     timed_put(&primary, "a").await;
-    let (added, learner) = add_learner(&store, &nodes, &two_members()).await;
+    let (added, _) = add_learner(&store, &nodes, &two_members()).await;
     until(|| leader.acking() == [node(3)]).await;
 
     // Cut off, the learner holds up a write for member_suspect_after, then
@@ -328,6 +349,7 @@ async fn silence() {
     // Back, it catches up before it rejoins.
     nodes.proxies[&node(3)].heal();
     until(|| leader.acking() == [node(3)]).await;
+    let learner = current(&nodes.replications[2]).await;
     assert!(*learner.durable().borrow() >= leader.commit());
     assert_eq!(learner.role(), Role::Learner);
 }
@@ -361,7 +383,7 @@ async fn lost() {
         proposed: Arc::clone(&proposed),
         epochs: Arc::default(),
     };
-    let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
+    let nodes = nodes(&pki, &store, &two_members(), promotions, Some(gate)).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
     let primary = nodes.replications[0].open(&two_members()).await.unwrap();
     let leader = Arc::clone(primary.leader().unwrap());
@@ -397,7 +419,7 @@ async fn handoff() {
         proposed: Arc::default(),
         epochs: Arc::default(),
     };
-    let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
+    let nodes = nodes(&pki, &store, &two_members(), promotions, Some(gate)).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
     let primary = nodes.replications[0].open(&two_members()).await.unwrap();
     let leader = Arc::clone(primary.leader().unwrap());
@@ -430,7 +452,7 @@ async fn overtaken() {
         proposed: Arc::default(),
         epochs: Arc::clone(&epochs),
     };
-    let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
+    let nodes = nodes(&pki, &store, &two_members(), promotions, Some(gate)).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
     let primary = nodes.replications[0].open(&two_members()).await.unwrap();
     let leader = Arc::clone(primary.leader().unwrap());

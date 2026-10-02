@@ -178,6 +178,68 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     end
 }
 
+/// A row of a [`ShardTable`], its key and value as stored.
+pub type ShardRow = (Vec<u8>, Vec<u8>);
+
+/// A table of a shard's state that a snapshot carries (§6.7): what a learner
+/// needs besides its applied position, which the snapshot names, and the
+/// location map, which is node-local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShardTable {
+    /// The namespace index.
+    Namespace,
+    /// The open multipart uploads.
+    Uploads,
+    /// The parts of uploads and multipart objects.
+    Parts,
+}
+
+impl ShardTable {
+    /// Every table, in the order a snapshot sends them.
+    pub const ALL: [Self; 3] = [Self::Namespace, Self::Uploads, Self::Parts];
+
+    /// The table's code in a snapshot.
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Namespace => 1,
+            Self::Uploads => 2,
+            Self::Parts => 3,
+        }
+    }
+
+    /// The table with `code`, if any.
+    #[must_use]
+    pub fn from_code(code: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|table| table.code() == code)
+    }
+
+    /// Checks that a row of the table, as a peer sent it, belongs to
+    /// `shard` and decodes.
+    pub(crate) fn check(self, shard: &ShardRef, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let theirs = match self {
+            Self::Namespace => {
+                codec::decode_entry(value).map_err(|e| e.to_string())?;
+                codec::decode_entry_key(key).map(|(shard, _)| shard)
+            }
+            Self::Uploads => {
+                codec::decode_upload(value).map_err(|e| e.to_string())?;
+                codec::decode_upload_key(key).map(|(shard, ..)| shard)
+            }
+            Self::Parts => {
+                codec::decode_part(value).map_err(|e| e.to_string())?;
+                codec::decode_part_key(key).map(|(shard, ..)| shard)
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        if theirs == *shard {
+            Ok(())
+        } else {
+            Err(format!("a row of shard {theirs} in a snapshot of {shard}"))
+        }
+    }
+}
+
 /// Write access to the tables that applying records changes, inside one
 /// write transaction (see [`Applier`](crate::Applier)).
 ///
@@ -880,6 +942,45 @@ impl IndexReader {
             .meta
             .get(CONTROL_SYNCED_AT_KEY)?
             .map(|value| Duration::from_millis(value.value())))
+    }
+
+    /// Returns rows of `shard` in `table`, in key order after the key
+    /// `after` (from the first if `None`), as stored: at least one row if
+    /// any is left, and then rows while their keys and values add up to no
+    /// more than `max_bytes`. A primary sends them to a learner as a
+    /// snapshot of the shard (§6.7, [`Index::install_rows`](crate::Index::install_rows)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading fails.
+    pub fn shard_rows(
+        &self,
+        table: ShardTable,
+        shard: &ShardRef,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<Vec<ShardRow>, IndexError> {
+        let prefix = codec::shard_key(shard);
+        let end = prefix_end(&prefix);
+        let table = match table {
+            ShardTable::Namespace => &self.namespace,
+            ShardTable::Uploads => &self.uploads,
+            ShardTable::Parts => &self.parts,
+        };
+        let (mut rows, mut bytes) = (Vec::new(), 0);
+        for row in table.range(prefix.as_slice()..end.as_slice())? {
+            let (key, value) = row?;
+            let (key, value) = (key.value(), value.value());
+            if after.is_some_and(|after| key <= after) {
+                continue;
+            }
+            bytes += key.len() + value.len();
+            if !rows.is_empty() && bytes > max_bytes {
+                break;
+            }
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(rows)
     }
 
     /// Returns everything the index holds except its bookkeeping.

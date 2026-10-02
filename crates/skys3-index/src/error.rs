@@ -50,6 +50,10 @@ pub enum IndexError {
         /// What is wrong with it.
         source: LogError,
     },
+    /// A snapshot a primary sent holds a row that is of another shard or
+    /// does not decode (§6.7).
+    #[error("snapshot: {0}")]
+    Snapshot(String),
     /// The blocking pool that runs index I/O has shut down.
     #[error(transparent)]
     Pool(#[from] PoolClosed),

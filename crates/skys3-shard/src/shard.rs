@@ -24,6 +24,10 @@ use crate::lineage::{Lineage, Reconcile};
 use crate::machine::{Effect, Outcome, Recorder, StateMachine};
 use crate::pipeline::{Durable, Pipeline, Ready};
 
+mod backfill;
+
+pub(crate) use self::backfill::FillCursor;
+
 /// How many entries a summary reads per index transaction.
 const SUMMARY_PAGE: usize = 1024;
 
@@ -370,6 +374,22 @@ impl<D: Disk> Shard<D> {
                 ))
             })
             .await?
+        };
+        let applied = match applied {
+            // A snapshot install was cut short (§6.7): what it stored goes,
+            // and the learner holds nothing until its next snapshot.
+            Some(marker) if marker.seq == Seq::MAX => {
+                if role != Role::Learner {
+                    return Err(ShardError::configuration(
+                        &shard,
+                        "a snapshot install did not finish, and the replica is not a learner",
+                    ));
+                }
+                let (index, key) = (Arc::clone(&index), shard.clone());
+                run(&pool, &shard, move || index.begin_install(&key, marker)).await?;
+                None
+            }
+            applied => applied,
         };
         let epoch = config.epoch;
         // A primary that stepped down in this epoch never serves in it
@@ -1516,16 +1536,8 @@ impl<D: Disk> Shard<D> {
             .read(location)
             .await
             .map_err(|error| ShardError::unavailable(shard, error))?;
-        match record.body {
-            RecordBody::Extent(Extent { data, .. })
-            | RecordBody::Put(Put {
-                data: PutData::Inline(data),
-                ..
-            })
-            | RecordBody::MpuPart(MpuPart {
-                data: PutData::Inline(data),
-                ..
-            }) if record.shard == *shard && record.position == position => Ok(data),
+        match backfill::payload_of(&record) {
+            Some(data) if record.shard == *shard && record.position == position => Ok(data.clone()),
             _ => Err(self.unavailable(&format!("the record at {position} holds no payload"))),
         }
     }

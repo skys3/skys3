@@ -188,10 +188,17 @@ pub(super) struct Watchdog<D: Disk> {
     pub config: ReplicationConfig,
     /// Called with each configuration the primary adopts.
     pub adopted: Box<dyn Fn(&ShardConfig) + Send + Sync>,
-    /// What backfills the learners, if anything beyond the live stream
-    /// does.
+    /// What backfills the learners in place of the built-in backfill, if
+    /// anything does.
     pub backfill: Option<Arc<dyn Backfill>>,
+    /// The built-in backfill of a learner's payload (§6.7).
+    pub fill: Fill,
 }
+
+/// A primary's built-in backfill of the payload of one of its learners: it
+/// returns once the learner's backfill is complete, which it records in
+/// the leader itself.
+pub(super) type Fill = Arc<dyn Fn(NodeId) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
 
 impl<D: Disk> Watchdog<D> {
     /// How often the watchdog checks the members.

@@ -3293,6 +3293,86 @@ of this file. A task with nothing unexpected keeps "None."
   to add them is M3-05's; the binary does not run replication yet
   (M2-16).
 
+### M2-15 Backfill and re-admission
+
+- **A learner keeps its log or gets a snapshot (decided, design §6.7).**
+  After its `SyncAck`, each session of a primary with a learner sends a
+  verdict first: `Backfill { keep }`, after which the live stream goes on
+  from the learner's last record, or a snapshot. The learner keeps its log
+  if lineage reconciliation kept it, or, when reconciliation called it
+  diverged (a re-admitted node whose lineage, or the primary's, is known
+  only from where it last opened), if the primary durably holds a record
+  of the same epoch at the learner's last `seq` (`SyncAck.unverified`
+  carries that epoch): one primary per epoch assigns each `seq` once, so
+  the logs agree up to there. A learner that holds nothing
+  (`SyncAck.fresh`), is not verified, or ends before what the primary's
+  log still holds (a failed `read_tail`) gets a snapshot, and its old
+  records are discarded.
+- **A snapshot needs no format bump (decided, design §10.2).** The
+  primary reads the shard's rows of `namespace`, `uploads`, and `parts` in
+  one read transaction (`IndexReader::shard_rows`), at an applied
+  position that must be in the session's epoch, so that everything the
+  stream sends next is of that epoch or later; clean entries go as
+  evicted, with no payload. The learner stops its replica
+  (`ShardSet::reopen_after`), appends `TRUNCATE` at `(epoch, 0)`, which
+  invalidates every older record by the marker rule of M2-12, marks its
+  applied position `(epoch, Seq::MAX)` with the shard's rows removed,
+  installs the rows, sets the snapshot's position, and opens again. The
+  marker and the final position are durable; the rows ride on the second.
+  Replay skips everything at or before the marker, and a learner that
+  opens with it drops the rows and holds nothing, so a cut install is
+  redone. A build that predates the marker sees an exhausted `seq` and
+  refuses to open, so the index format stays at 5.
+- **Payload is filled by the learner's requests (decided, design §6.4).**
+  The primary's watchdog opens a connection of its own to the learner,
+  whose first frame is `Backfill { config }`. The learner checks it
+  follows that primary in that configuration, scans its index in pages
+  for entries that are not clean and open uploads whose payload it does
+  not locate, and asks for those records in runs of at most 64
+  (`BackfillAck { needs }`); the primary answers each with the encoded
+  record from its log, which the learner queues at its position,
+  unapplied, and locates durably (`Index::store_locations`). Once a
+  scan finds nothing missing, it reports its applied position
+  (`BackfillAck { complete }`), and `Leader::fill_complete` counts it as
+  backfilled only if that is at or after the last snapshot the primary
+  sent it. The new frames are decoded by the `shard_replication` fuzz
+  target and the wire proptests.
+- **A re-admitted node reopens its replica (found in review).** A member
+  removed while it was up, or cut off, is not told, and keeps its replica
+  open in its old role. When a later configuration adds it back as a
+  learner, `ShardSet` stops that replica and opens the shard again as a
+  learner from its log, since a configuration change never turns a member
+  or primary into a learner; before, every open failed and the shard
+  stayed under-replicated until the node restarted.
+- **The `Backfill` hook stays as a test seam.** With a hook,
+  `Replication::with_backfill` replaces the built-in fill, as M2-14's
+  tests use it to hold a promotion back; without one, the watchdog runs
+  the fill above.
+- **Simulation.** `ReplicatedServices::replacing_lost_members` makes the
+  learners driver add a learner to each shard left with fewer than
+  `replicas` members: a node outside the shard if there is one, and the
+  lost node itself, once it is back, otherwise. `sample_durability` opens
+  a window when a shard has fewer than `replicas` members and records
+  when new writes have `replicas` copies again (a learner in the
+  acknowledgement set) and when all data does (backfill complete).
+  `ReplicatedShards::track` follows the replica a learner opens again
+  after a snapshot, so that the R3 audit keeps checking it. With four
+  nodes and node 0 lost for good at 2 s, new writes regained three copies
+  within 425 ms of each removal and all data within 437 ms (6 shards, 3
+  seeds); with three nodes and node 2 down 6 s, so that only its
+  re-admission can restore the copies, within 3.30 and 3.31 s, mostly the
+  rest of its downtime. Four seeds of random crashes, partitions, message
+  loss, and control-store faults with lost members replaced ran clean,
+  with the R3 audit after every step.
+- **The protocol model is unchanged.** `spec/ShardProtocol.tla` already
+  models a learner's `Sync` against the common prefix, holes filled by
+  `Backfill`, and the seeded bug `truncate_by_seq_only`; snapshot install
+  and payload fill are implementation detail below it.
+- **Left for later.** Coded objects (M8) will be skipped by the fill,
+  since their fragments live outside the shard; segment reclaim (M1-22)
+  will make the snapshot path common for any learner far behind; the
+  coordinator chooses learners (M3-05).
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation

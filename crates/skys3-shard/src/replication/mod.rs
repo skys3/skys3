@@ -55,6 +55,7 @@
 //! primary's is. A link whose primary changes configuration opens a new
 //! session; one to a member the configuration leaves out ends.
 
+mod backfill;
 mod exposure;
 mod learners;
 mod member;
@@ -274,11 +275,10 @@ impl<N: Network, D: Disk> Replication<N, D> {
     }
 
     /// Backfills the learners of this node's primaries through `backfill`
-    /// (§6.7), which reports when a learner holds the shard's history; a
-    /// primary promotes a learner only then. Without it, a learner's
-    /// backfill counts as complete once it has reported its log: the live
-    /// stream brings it the primary's log from its first record, which this
-    /// build keeps whole. A second call changes nothing.
+    /// (§6.7) instead of the built-in backfill of their payload: the hook
+    /// reports when a learner holds the shard's history, and a primary
+    /// promotes a learner only then. Tests hold promotions back with it. A
+    /// second call changes nothing.
     #[must_use]
     pub fn with_backfill(self, backfill: impl Backfill) -> Self {
         let _ = self.inner.backfill.set(Arc::new(backfill));
@@ -374,6 +374,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 config: inner.config,
                 adopted: self.on_adopted(),
                 backfill: inner.backfill.get().cloned(),
+                fill: self.fill(shard, leader),
             };
             tokio::spawn(watchdog.run());
         }
@@ -398,6 +399,21 @@ impl<N: Network, D: Disk> Replication<N, D> {
         if is_under_replicated(&shard.config()) {
             self.on_adopted()(&shard.config());
         }
+    }
+
+    /// The built-in backfill of the payload of the learners of `shard`,
+    /// which `leader` leads (§6.7).
+    fn fill(&self, shard: &Shard<D>, leader: &Arc<Leader>) -> removal::Fill {
+        let (replication, shard, leader) = (self.clone(), shard.clone(), Arc::clone(leader));
+        Arc::new(move |learner| {
+            let (replication, shard, leader) =
+                (replication.clone(), shard.clone(), Arc::clone(&leader));
+            Box::pin(async move {
+                backfill::fill(&replication, &shard, &leader, &learner)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
     }
 
     /// Starts a link to each member and learner of `leader` that has none
@@ -654,7 +670,12 @@ impl<N: Network, D: Disk> Replication<N, D> {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        if let Err(error) = member::serve(link, first, self).await {
+        let served = if first.header.kind == skys3_net::MessageKind::Backfill {
+            backfill::serve(link, &first, self).await
+        } else {
+            member::serve(link, first, self).await
+        };
+        if let Err(error) = served {
             tracing::debug!(%error, "a replication link to a primary ended");
         }
     }

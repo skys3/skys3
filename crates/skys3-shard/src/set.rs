@@ -162,18 +162,28 @@ impl<D: Disk> ShardSet<D> {
             // A replica opened as the shard's only member runs for one
             // member. Given learners (§6.7), it closes once its records are
             // applied, and opens again as their primary.
-            let alone = shard.config();
+            let held = shard.config();
             let gains_learners = node.is_some()
                 && shard.role() == Role::Alone
                 && !shard.is_stopped()
-                && config.epoch > alone.epoch
-                && config.members == alone.members
+                && config.epoch > held.epoch
+                && config.members == held.members
                 && !config.learners.is_empty();
-            if !gains_learners {
+            // A node removed from the shard and added back as a learner
+            // (§6.7) may still hold the replica of its old role, which no
+            // configuration change turns into a learner: that replica
+            // stops, and the node opens again as a learner from its log.
+            let readmitted = node.is_some_and(|node| {
+                config.epoch > held.epoch && config.is_learner(node) && !held.is_learner(node)
+            });
+            if readmitted {
+                shard.abandon("the node is re-admitted as a learner").await;
+            } else if gains_learners {
+                shard.close().await?;
+            } else {
                 shard.reconfigure(config).await?;
                 return Ok(shard.clone());
             }
-            shard.close().await?;
         }
         let log = self.logs[self.placement(&key)].1.clone();
         let (index, pool) = (Arc::clone(&self.index), self.pool.clone());
@@ -183,6 +193,53 @@ impl<D: Disk> ShardSet<D> {
         };
         shards.insert(key, Slot::Open(shard.clone()));
         Ok(shard)
+    }
+
+    /// Stops `replica`, node `node`'s replica in the shard of `config`,
+    /// keeps the shard closed while `work` runs, and then opens the
+    /// replica again in `config`, from what the index holds then, whatever
+    /// `work` returned. A learner installs a snapshot this way (§6.7).
+    /// Meanwhile the shard is not open: [`ShardSet::get`] does not find it,
+    /// and opening it waits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::open_replica`], if the replica does not open again; it
+    /// is then not open, and opening it later tries again.
+    pub(crate) async fn reopen_after<T>(
+        &self,
+        replica: &Shard<D>,
+        config: &ShardConfig,
+        node: &NodeId,
+        work: impl Future<Output = T>,
+    ) -> Result<(Shard<D>, T), ShardError> {
+        let key = replica.shard().clone();
+        let (done, closed) = watch::channel(false);
+        {
+            let mut shards = self.settled(&key).await?;
+            let open = match shards.get(&key) {
+                Some(Slot::Open(open)) => open.durable().same_channel(&replica.durable()),
+                _ => false,
+            };
+            if !open {
+                return Err(ShardError::unavailable(&key, "the replica is not open"));
+            }
+            shards.insert(key.clone(), Slot::Removing(closed));
+        }
+        replica.abandon("the learner installs a snapshot").await;
+        let output = work.await;
+        let log = self.logs[self.placement(&key)].1.clone();
+        let (index, pool) = (Arc::clone(&self.index), self.pool.clone());
+        let mut shards = self.shards.lock().await;
+        let opened = Shard::open_replica(config, node, log, index, pool).await;
+        match &opened {
+            Ok(shard) => shards.insert(key, Slot::Open(shard.clone())),
+            Err(_) => shards.remove(&key),
+        };
+        drop(shards);
+        // Nobody may be waiting.
+        let _ = done.send(true);
+        opened.map(|shard| (shard, output))
     }
 
     /// Returns the open shard `shard`.
