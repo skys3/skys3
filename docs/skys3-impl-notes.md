@@ -4004,25 +4004,47 @@ of this file. A task with nothing unexpected keeps "None."
   happens after every coordinator change (replacement's too), and
   retrying an "is still in epoch" answer in the routing client, or pushes
   to replicas, would remove it.
+- **Handoffs went to silent nodes (found in review).** `successor` took
+  the move's target whenever it was still a member that counts, even
+  once its node turned suspect, and its fallback only sorted live nodes
+  first, so with none live it still chose a suspect one. A handoff to a
+  node that does not answer stops a healthy primary and leaves the shard
+  to another member's `primary_grace`. A handoff now goes only to a
+  member on a live node, and none is asked for while no successor is
+  live: the primary keeps serving (§6.7).
+- **The latency check left out writes that never connected, which hid a
+  harness flaw (found in review).** A `PUT`, multipart completion, or
+  `DELETE` whose connection failed or timed out returned before it was
+  timed. Timed now, as unanswered, the two-join scenario failed: a write
+  waited 2.4 s, and others up to the client's whole 8 s timeout, outside
+  the moves as well. Every one was sent to a node that had not joined
+  yet: `Routes::nodes` listed every node, so any-gateway clients drew
+  nodes still down, the connection hanging until the client gave up or
+  the node started (and failed then). Nothing in rebalancing stalled.
+  Clients and the bucket creator now address only the nodes present
+  from the start, as `ClusterConfig::joining` already said; no write
+  then failed to connect, and the bound held unchanged.
 - **Numbers.** Three seeds of one node joining four, and two of two nodes
   joining one after the other, with two buckets of four shards and three
-  members each, four clients writing through any gateway, and the commit,
-  R3, lease, and routing audits after every step. Each new node ended
-  with its share: 4 or 5 of 24 members and 1 or 2 of 8 primaries (4
-  members and 1 or 2 primaries each with six nodes). A join took 4 moves
-  (8 to 14 promotions for two joins, the second seed with replacement
-  swapping learners as above); promotions' compare-and-swaps took at most
-  41 ms. One or two handoffs per run moved primaries, each serving again
-  after 25 to 58 ms (about 35 ms on average). No shard had fewer than
-  `replicas` members, except once for 204 to 316 ms in one two-join
-  seed. Writes in flight while shards moved and meeting no handoff took
-  at most 1.02 s in four of the five seeds and 1.76 s in the fifth,
-  against up to 1.98 s before and after the moves (control-store faults
-  on gateway register reads); up to two of them were fast 503s (above).
-  Writes meeting a handoff took at most 27 ms, one of them a fast 503.
-  So the only stall is the handoff, tens of milliseconds. (Measured
-  before and after merging M6-04 and the M3-05 removal-timer fixes;
-  ranges cover both runs.)
+  members each, four clients writing through any of the initial nodes'
+  gateways, and the commit, R3, lease, and routing audits after every
+  step. Each new node ended with its share: 4 or 5 of 24 members and 1
+  or 2 of 8 primaries (4 members and 1 or 2 primaries each with six
+  nodes). A join took 4 moves (8 to 14 promotions for two joins, a seed
+  with replacement swapping learners as above); promotions'
+  compare-and-swaps took at most 41 ms. One or two handoffs per run
+  moved primaries, each serving again after 22 to 58 ms (about 30 to 35
+  ms on average). No shard had fewer than `replicas` members after the
+  review fixes; before them, once for 204 to 316 ms in one two-join
+  seed. With every write timed, including any that never connected,
+  writes in flight while shards moved and meeting no handoff took at
+  most 1.01 s in four of the five seeds and 1.75 s in the fifth, against
+  up to 2.0 s before and after the moves (control-store faults on
+  gateway register reads); up to two per run were unanswered, fast 503s
+  (above). Writes meeting a handoff took at most 27 ms, at most 9 ms
+  after the review fixes, most of them fast 503s. So the only stall is the handoff, tens of milliseconds.
+  (Measured before and after merging M6-04 and the M3-05 removal-timer
+  fixes, and again after the review fixes; ranges cover all runs.)
 - **Left for later.**
   - **Configuration keys** for the pace, with the coordinator's wiring.
   - **Rebalancing scans the shard registers itself**, a fourth listing per

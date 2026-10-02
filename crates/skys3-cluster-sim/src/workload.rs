@@ -74,11 +74,14 @@ impl Default for Workload {
 }
 
 /// Where the workload sends each key: the bucket documents, each shard's
-/// configuration, whose primary serves it, and every node.
+/// configuration, whose primary serves it, and the nodes clients know.
 #[derive(Clone, Debug)]
 pub(crate) struct Routes {
     pub buckets: Vec<BucketDocument>,
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
+    /// The nodes in the cluster from the start, which any-gateway clients
+    /// draw from: not those that join later
+    /// ([`ClusterConfig::joining`](crate::ClusterConfig::joining)).
     pub nodes: Vec<NodeId>,
 }
 

@@ -771,7 +771,10 @@ impl<S: NodeServices> World<S> {
             routes: Routes {
                 buckets,
                 placement,
-                nodes: node_ids,
+                // Clients and the bucket creator address only the nodes in
+                // the cluster from the start: one that joins later is down
+                // until then, and no client knows of it.
+                nodes: node_ids[..config.nodes.saturating_sub(config.joining).max(1)].to_vec(),
             },
             base_control: control.faults(),
             control,
