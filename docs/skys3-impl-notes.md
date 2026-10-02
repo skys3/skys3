@@ -4009,6 +4009,15 @@ of this file. A task with nothing unexpected keeps "None."
   M2-15's backfill scenarios now run on it unchanged, and
   `DurabilityWindows` gained `restored`, the time until the register had
   `replicas` members again.
+- **The replacement scenarios' cost (found).** One seed of either costs
+  140 to 160 s of run time, against about 13 s for a typical seed, and at
+  `with_cost(3, COST)` CI's fixed set of 256 ran eight of each: 2010 s and
+  1773 s, the two slowest scenarios, which made the simulation job take
+  half as long again. They now declare `8 * COST`, as `crash.rs` does for
+  its heavy scenario, so the fixed set runs one seed of each (162 s and
+  141 s) and larger seed sets more, and the clients write 500 operations,
+  not 700, which still ends after the lost node is forgotten. No seed
+  hung: all 59 scenarios finished at 256 seeds.
 - **Numbers.** Over 10 seeds of each scenario (from seed 100), with the
   commit and R3 audits after every step: with five nodes and two buckets,
   losing the first node (often the coordinator) left four shards short
@@ -4122,25 +4131,80 @@ of this file. A task with nothing unexpected keeps "None."
   happens after every coordinator change (replacement's too), and
   retrying an "is still in epoch" answer in the routing client, or pushes
   to replicas, would remove it.
-- **Numbers.** Three seeds of one node joining four, and two of two nodes
-  joining one after the other, with two buckets of four shards and three
-  members each, four clients writing through any gateway, and the commit,
-  R3, lease, and routing audits after every step. Each new node ended
-  with its share: 4 or 5 of 24 members and 1 or 2 of 8 primaries (4
-  members and 1 or 2 primaries each with six nodes). A join took 4 moves
-  (8 to 14 promotions for two joins, the second seed with replacement
-  swapping learners as above); promotions' compare-and-swaps took at most
-  41 ms. One or two handoffs per run moved primaries, each serving again
-  after 25 to 58 ms (about 35 ms on average). No shard had fewer than
-  `replicas` members, except once for 204 to 316 ms in one two-join
-  seed. Writes in flight while shards moved and meeting no handoff took
-  at most 1.02 s in four of the five seeds and 1.76 s in the fifth,
-  against up to 1.98 s before and after the moves (control-store faults
-  on gateway register reads); up to two of them were fast 503s (above).
-  Writes meeting a handoff took at most 27 ms, one of them a fast 503.
-  So the only stall is the handoff, tens of milliseconds. (Measured
-  before and after merging M6-04 and the M3-05 removal-timer fixes;
-  ranges cover both runs.)
+- **Handoffs went to silent nodes (found in review).** `successor` took
+  the move's target whenever it was still a member that counts, even
+  once its node turned suspect, and its fallback only sorted live nodes
+  first, so with none live it still chose a suspect one. A handoff to a
+  node that does not answer stops a healthy primary and leaves the shard
+  to another member's `primary_grace`. A handoff now goes only to a
+  member on a live node, and none is asked for while no successor is
+  live: the primary keeps serving (§6.7).
+- **The latency check left out writes that never connected, which hid a
+  harness flaw (found in review).** A `PUT`, multipart completion, or
+  `DELETE` whose connection failed or timed out returned before it was
+  timed. Timed now, as unanswered, the two-join scenario failed: a write
+  waited 2.4 s, and others up to the client's whole 8 s timeout, outside
+  the moves as well. Every one was sent to a node that had not joined
+  yet: `Routes::nodes` listed every node, so any-gateway clients drew
+  nodes still down, the connection hanging until the client gave up or
+  the node started (and failed then). Nothing in rebalancing stalled.
+  Clients and the bucket creator now address only the nodes present
+  from the start, as `ClusterConfig::joining` already said; no write
+  then failed to connect, and the bound held unchanged.
+- **Writes on a write-back bucket wait up to 1 s per commit behind lazy
+  `FLUSHED` records (found in CI, left open).** CI's seed set (8 seeds of
+  each scenario) failed seed 3: a `PUT` on a shard no move touched (it
+  stayed at epoch 1 all run) took 2.011 s. Traced with timing prints:
+  its extent commit took 1.0 s, then its index record 1.0 s, with no
+  register read over 200 ms and no slow round trip. A replicated shard's
+  pipeline is ordered (M2-07): before it queues a record of the other
+  segment class it drains every record in flight. The flusher commits
+  `FLUSHED` (hot class) lazily (M1-16), and a lazy record becomes durable
+  only once another record starts a group commit or `LAZY_MAX_DELAY`
+  (1 s) passes. An extent (bulk class) queued after one therefore waits
+  out the full delay: the drain holds back the very record that would
+  have committed it. An index record queued behind such extents waits
+  again. Setting `LAZY_MAX_DELAY` to 300 ms made the same seed's slowest
+  write 388 ms, against 2.011 s, and the slowest write outside the moves
+  317 ms, against 1.017 s. So the ~1 s write latency seen throughout
+  these scenarios was this delay, not control-store faults on register
+  reads, as the notes said before. It contradicts the log's promise
+  that a lazy record delays others only while nothing else is written,
+  and it costs every replicated write-back bucket up to 2 s per `PUT`.
+  The fix belongs to the log and the shard pipeline, not to
+  rebalancing: for instance, a way to commit the waiting lazy records
+  now, called by the pipeline before a class-switch drain. Until then
+  the scenarios' bound for a write that meets no handoff is derived from
+  it: two `LAZY_MAX_DELAY` waits plus `ROUTING_SLACK` (2.8 s), checked to
+  stay below `member_suspect_after` (3 s), the shortest wait a write
+  held up by a membership change would see. Comparing with the run's
+  own writes outside the moves was considered and rejected: two waits in
+  one write are rare enough that a run's baseline often has none, as in
+  seed 3 (1.017 s).
+- **Numbers.** CI's seed set: 8 seeds of one node joining four, and 8
+  of two nodes joining one after the other (`SKYS3_SIM_SEEDS=256` over a
+  cost of 32), with two buckets of four shards and three members each,
+  one of them `write_back`, four clients writing through any of the
+  initial nodes' gateways, and the commit, R3, lease, and routing audits
+  after every step. Each new node ended with its share: 4 or 5 of 24
+  members and 1 or 2 of 8 primaries (4 members and 1 or 2 primaries
+  each with six nodes). A join took 4 moves (8 to 14 promotions for two
+  joins, a seed with replacement swapping learners as above);
+  promotions' compare-and-swaps took at most 60 ms. One or two handoffs
+  per run moved primaries, each serving again after 22 to 58 ms (about
+  30 ms on average). No shard had fewer than `replicas` members after
+  the review fixes; before them, once for 204 to 316 ms in one two-join
+  seed. With every write timed, including any that never connected,
+  writes in flight while shards moved and meeting no handoff took at
+  most 2.011 s (seed 3, two lazy-record waits on a shard no move
+  touched, above), otherwise at most 1.75 s, against up to 2.0 s before
+  and after the moves: the same lazy-record waits, not moves. Up to
+  three per run were unanswered, fast 503s (above). Writes meeting a
+  handoff took at most 27 ms, at most 10 ms after the review fixes, most
+  of them fast 503s. So the only stall moves cause is the handoff, tens
+  of milliseconds. (Measured before and after merging M6-04 and the
+  M3-05 removal-timer fixes, after the review fixes, and on CI's seed
+  set; ranges cover all runs.)
 - **Left for later.**
   - **Configuration keys** for the pace, with the coordinator's wiring.
   - **Rebalancing scans the shard registers itself**, a fourth listing per

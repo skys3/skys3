@@ -197,7 +197,9 @@ pub struct WriteTiming {
     pub shard: ShardRef,
     /// When the client sent it, in simulated time since the run began.
     pub sent: Duration,
-    /// How long until its answer arrived, or until the client gave up.
+    /// How long until its answer arrived, or until the client gave up,
+    /// connecting included: a write that never connected is recorded
+    /// with the time the client spent trying.
     pub took: Duration,
     /// Whether it was acknowledged, or refused for its condition: whether
     /// the shard answered it definitely.
@@ -769,7 +771,10 @@ impl<S: NodeServices> World<S> {
             routes: Routes {
                 buckets,
                 placement,
-                nodes: node_ids,
+                // Clients and the bucket creator address only the nodes in
+                // the cluster from the start: one that joins later is down
+                // until then, and no client knows of it.
+                nodes: node_ids[..config.nodes.saturating_sub(config.joining).max(1)].to_vec(),
             },
             base_control: control.faults(),
             control,
