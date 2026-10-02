@@ -217,6 +217,15 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 | `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least `peer_frame_bytes`. |
 | `peer_staging_ttl_seconds` | integer | `86400` | Positive. |
 
+### `[peering.peers.<cluster-id>]`
+
+A peer cluster this node trusts, keyed by its cluster ID (§12). Peer connections present the node's own certificate, so a configured peer requires the `[transport]` certificate files. The table's cluster ID must not be this cluster's.
+
+| Key | Type | Default | Rules |
+|---|---|---|---|
+| `ca_file` | path | required | Not empty. The peer's CA bundle in PEM; the peer's node certificates must lead to it and name the peer's cluster in their SPIFFE ID. |
+| `buckets` | array of `{ source, destination }` tables | `[]` | The bucket pairs the peer may write as a source: `source` is the peer's bucket ID, which its write identities carry, and `destination` is this cluster's bucket name. No pair appears twice. Empty for a peer this node only sends to. |
+
 ## `[identity]`
 
 Anonymous access, static credentials, STS sessions, and OIDC token validation (§11). Policies are JSON documents in a TOML string, in the policy language subset of design §11; a policy outside the subset is a parsing error.
