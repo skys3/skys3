@@ -7,6 +7,14 @@
 //! simulation, whichever host they happened on. An operation that never
 //! gets an answer stays [`Outcome::Unknown`].
 //!
+//! An operation sent to a named server ([`History::call_to`]) can also be
+//! closed by that server's crash ([`History::crashed`]): a request that
+//! reached a process can take effect only while the process lives, so an
+//! operation still unanswered when it dies ends then, as
+//! [`Outcome::Failed`] unless an answer it sent before dying arrives
+//! later. This is what keeps an unacknowledged write from resurfacing over
+//! a later acknowledged one unnoticed (design §5.2).
+//!
 //! Values are opaque strings that identify the write that stored them, such
 //! as the ETag of a body no other write uses.
 
@@ -136,6 +144,8 @@ pub struct History {
 struct State {
     clock: u64,
     operations: Vec<Operation>,
+    /// The server each operation was sent to, if the caller named one.
+    servers: Vec<Option<String>>,
 }
 
 /// An operation that was called and has not been answered yet.
@@ -159,6 +169,19 @@ impl History {
     /// Records that `process` called `call` on `key`, now. Until
     /// [`History::answer`] records its outcome, it is unknown.
     pub fn call(&self, process: &str, key: &str, call: Call) -> Pending {
+        self.record(process, None, key, call)
+    }
+
+    /// Records that `process` called `call` on `key`, now, in a request
+    /// that only the current life of `server` can receive: one on a
+    /// connection that life accepted, for example, or one whose sender
+    /// gives up before the server restarts. [`History::crashed`] ends the
+    /// operation if `server` dies first.
+    pub fn call_to(&self, process: &str, server: &str, key: &str, call: Call) -> Pending {
+        self.record(process, Some(server), key, call)
+    }
+
+    fn record(&self, process: &str, server: Option<&str>, key: &str, call: Call) -> Pending {
         let mut state = self.state();
         state.clock += 1;
         let called = state.clock;
@@ -170,18 +193,52 @@ impl History {
             answered: None,
             outcome: Outcome::Unknown,
         });
+        state.servers.push(server.map(str::to_owned));
         Pending {
             index: state.operations.len() - 1,
         }
     }
 
+    /// Records that the process serving as `server` died, now: every
+    /// operation sent to it with [`History::call_to`] and not yet answered
+    /// ends now, as [`Outcome::Failed`]. A write among them took effect
+    /// before this moment or never.
+    pub fn crashed(&self, server: &str) {
+        let mut state = self.state();
+        state.clock += 1;
+        let now = state.clock;
+        let State {
+            operations,
+            servers,
+            ..
+        } = &mut *state;
+        for (operation, sent_to) in operations.iter_mut().zip(servers.iter()) {
+            if operation.answered.is_none() && sent_to.as_deref() == Some(server) {
+                operation.answered = Some(now);
+                operation.outcome = Outcome::Failed;
+            }
+        }
+    }
+
     /// Records the outcome of `pending`, now. [`Outcome::Unknown`] leaves
     /// the operation without an answer.
+    ///
+    /// If its server's crash ended the operation already, the operation
+    /// keeps that end: an answer that arrives after the crash was sent
+    /// before it. A definite outcome (an acknowledgement, a refused
+    /// condition, or a read) replaces [`Outcome::Failed`]; a failure or no
+    /// answer leaves it.
     pub fn answer(&self, pending: Pending, outcome: Outcome) {
         let mut state = self.state();
         state.clock += 1;
         let answered = state.clock;
         let operation = &mut state.operations[pending.index];
+        if operation.answered.is_some() {
+            if !matches!(outcome, Outcome::Failed | Outcome::Unknown) {
+                operation.outcome = outcome;
+            }
+            return;
+        }
         operation.answered = (outcome != Outcome::Unknown).then_some(answered);
         operation.outcome = outcome;
     }

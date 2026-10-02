@@ -13,13 +13,15 @@
 //!   binary does, through the same functions: log recovery and index
 //!   replay ([`skys3::storage::recover`]), the control store or the local
 //!   copy of control state ([`skys3::control::open`]), the gateway, and
-//!   every bucket's shards. It serves S3 over the simulated network and
-//!   takes checkpoints. Its disks are `skys3-io` simulated disks with torn
-//!   writes, its clock drifts within `ρ`, and each node has intra-cluster
-//!   credentials from a throwaway PKI. See [`NodeEnv`].
+//!   every bucket's shards. It serves S3 over the simulated network, takes
+//!   checkpoints, and flushes `write_back` buckets to the remote store
+//!   with the flusher (`skys3-flush`). Its disks are `skys3-io` simulated
+//!   disks with torn writes, its clock drifts within `ρ`, and each node
+//!   has intra-cluster credentials from a throwaway PKI. See [`NodeEnv`].
 //! - **Stores.** One simulated S3 bucket holds the control store (the S3
 //!   backend), which every node reaches through its own fault injection;
-//!   another is the remote store for `write_back` buckets.
+//!   another, with its own faults, is the remote store for `write_back`
+//!   buckets ([`ClusterConfig::write_back_buckets`]).
 //! - **Clients.** The [`Workload`] of M1: concurrent `PUT`s, inline and as
 //!   extents, conditional `PUT`s, one-part multipart uploads, `GET`, `HEAD`,
 //!   and `DELETE`, each sent to the primary of its key's shard under the
@@ -29,7 +31,10 @@
 //!   partitions, held links (delay and reordering), random message loss,
 //!   failed syncs, control-store outages, control-store round trips of
 //!   100 ms and more, and lost control-store answers, plus a new clock
-//!   drift for every life of a node.
+//!   drift for every life of a node. Separately,
+//!   [`Cluster::power_loss_at_sync`] cuts a node's power at one numbered
+//!   sync of its disks, so a scenario can visit every sync boundary of a
+//!   seed, one per run.
 //!
 //! # What is checked
 //!
@@ -38,7 +43,12 @@
 //! and is recovered outside the simulation. The history must be
 //! linearizable per key ([`skys3_sim::check::check_linearizable`]), and
 //! every acknowledged write must be flushed, present on a surviving member
-//! of its shard, or reported lost ([`skys3_sim::check::check_durable`]).
+//! of its shard (in a `write_back` bucket, one whose entry is still
+//! dirty), or reported lost ([`skys3_sim::check::check_durable`]).
+//! Clients record an operation once a node accepted its connection, and
+//! a node's crash ends the operations it had not answered
+//! ([`skys3_sim::history::History::crashed`]), so a write cut off by a
+//! crash cannot resurface over a later acknowledged one unnoticed.
 //! [`Invariant`]s run after every step.
 //!
 //! # Extending it
@@ -81,5 +91,6 @@ pub use workload::Workload;
 
 /// The control-store fault rates of [`ClusterConfig::control_rates`].
 pub use skys3_control::faults::FaultRates;
-/// The drift bound and disk faults of [`ClusterConfig`].
-pub use skys3_io::{Drift, SimDiskFaults};
+/// The drift bound and disk faults of [`ClusterConfig`], and where a power
+/// loss falls at a sync ([`Cluster::power_loss_at_sync`]).
+pub use skys3_io::{Drift, SimDiskFaults, SyncCut};

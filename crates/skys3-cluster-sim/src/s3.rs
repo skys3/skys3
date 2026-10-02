@@ -67,28 +67,50 @@ impl std::fmt::Display for NoAnswer {
     }
 }
 
-/// Sends `request` to `host` and waits up to `timeout` for the whole
-/// answer.
-pub(crate) async fn send(
-    host: &str,
-    request: Request<Full<Bytes>>,
-    timeout: Duration,
-) -> Result<Response<Bytes>, NoAnswer> {
-    let exchange = async {
-        let io = |error: &dyn std::fmt::Display| NoAnswer::Io(error.to_string());
+/// A connection a node's S3 listener accepted, ready for one request.
+pub(crate) struct Connection {
+    sender: hyper::client::conn::http1::SendRequest<Full<Bytes>>,
+}
+
+/// Connects to `host` within `timeout`. Once this returns, the life of the
+/// node that accepted the connection is the only one that can receive a
+/// request sent on it: a later life has no such connection.
+pub(crate) async fn connect(host: &str, timeout: Duration) -> Result<Connection, NoAnswer> {
+    let connecting = async {
         let stream = turmoil::net::TcpStream::connect((host, S3_PORT))
             .await
-            .map_err(|e| io(&e))?;
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .map_err(|e| NoAnswer::Io(e.to_string()))?;
+        let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
-            .map_err(|e| io(&e))?;
+            .map_err(|e| NoAnswer::Io(e.to_string()))?;
         tokio::spawn(connection);
-        let response = sender.send_request(request).await.map_err(|e| io(&e))?;
-        let (parts, body) = response.into_parts();
-        let body = body.collect().await.map_err(|e| io(&e))?.to_bytes();
-        Ok(Response::from_parts(parts, body))
+        Ok(Connection { sender })
     };
-    tokio::time::timeout(timeout, exchange)
+    tokio::time::timeout(timeout, connecting)
         .await
         .unwrap_or(Err(NoAnswer::Timeout))
+}
+
+impl Connection {
+    /// Sends `request` and waits up to `timeout` for the whole answer.
+    pub(crate) async fn send(
+        mut self,
+        request: Request<Full<Bytes>>,
+        timeout: Duration,
+    ) -> Result<Response<Bytes>, NoAnswer> {
+        let exchange = async {
+            let io = |error: &dyn std::fmt::Display| NoAnswer::Io(error.to_string());
+            let response = self
+                .sender
+                .send_request(request)
+                .await
+                .map_err(|e| io(&e))?;
+            let (parts, body) = response.into_parts();
+            let body = body.collect().await.map_err(|e| io(&e))?.to_bytes();
+            Ok(Response::from_parts(parts, body))
+        };
+        tokio::time::timeout(timeout, exchange)
+            .await
+            .unwrap_or(Err(NoAnswer::Timeout))
+    }
 }
