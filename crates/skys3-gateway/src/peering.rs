@@ -1287,7 +1287,11 @@ mod tests {
             async fn payload(&self, s: &ShardRef, p: EpochSeq) -> Result<Bytes, ShardError> {
                 self.0.payload(s, p).await
             }
-            async fn plan(&self, s: &ShardRef, k: &str) -> Result<skys3_shard::ReadPlan, ShardError> {
+            async fn plan(
+                &self,
+                s: &ShardRef,
+                k: &str,
+            ) -> Result<skys3_shard::ReadPlan, ShardError> {
                 self.0.plan(s, k).await
             }
             async fn register(

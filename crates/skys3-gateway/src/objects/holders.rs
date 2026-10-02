@@ -76,9 +76,8 @@ impl HolderReads {
         range: Range<u64>,
     ) -> Result<Option<StreamingBlob>, ShardError> {
         let (shard, holder) = target;
-        let Some(Registered { id, layout }) = shards
-            .register(shard, holder, key, version, layout)
-            .await?
+        let Some(Registered { id, layout }) =
+            shards.register(shard, holder, key, version, layout).await?
         else {
             return Ok(None);
         };
@@ -127,10 +126,12 @@ impl HolderReads {
             renewal.abort();
             read.release().await;
         });
-        Ok(Some(StreamingBlob::from(s3s::Body::http_body(ExtentBody {
-            receiver,
-            remaining: range.end - range.start,
-        }))))
+        Ok(Some(StreamingBlob::from(s3s::Body::http_body(
+            ExtentBody {
+                receiver,
+                remaining: range.end - range.start,
+            },
+        ))))
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<NodeId, usize>> {
@@ -359,7 +360,14 @@ mod tests {
         let reads = HolderReads::new(Duration::from_secs(10));
         let holder = shards.node().unwrap();
         let body = reads
-            .open(&shards, (&shard, &holder), "k", version, layout.clone(), 2..11)
+            .open(
+                &shards,
+                (&shard, &holder),
+                "k",
+                version,
+                layout.clone(),
+                2..11,
+            )
             .await
             .unwrap()
             .expect("the holder still locates the first version");
@@ -393,7 +401,10 @@ mod tests {
         let refused = reads
             .open(&shards, (&shard, &other), "k", version, layout, 0..12)
             .await;
-        assert!(matches!(refused, Err(ShardError::NotFound(_))), "{refused:?}");
+        assert!(
+            matches!(refused, Err(ShardError::NotFound(_))),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -405,10 +416,20 @@ mod tests {
             ..ReadSettings::default()
         });
         let holder = shards.node().unwrap();
-        for (renew_every, lapses) in [(Duration::from_secs(5), true), (Duration::from_millis(300), false)] {
+        for (renew_every, lapses) in [
+            (Duration::from_secs(5), true),
+            (Duration::from_millis(300), false),
+        ] {
             let reads = HolderReads::new(renew_every);
             let body = reads
-                .open(&shards, (&shard, &holder), "k", version, layout.clone(), 0..20)
+                .open(
+                    &shards,
+                    (&shard, &holder),
+                    "k",
+                    version,
+                    layout.clone(),
+                    0..20,
+                )
                 .await
                 .unwrap()
                 .unwrap();
@@ -432,7 +453,10 @@ mod tests {
                 let failed = failed.expect("the stream fails mid-way");
                 assert!(failed.contains("lapsed"), "{failed}");
                 // Only what was fetched ahead of the client arrived.
-                assert!(rest.len() < 16 && rest.iter().all(|b| *b == b'a'), "{rest:?}");
+                assert!(
+                    rest.len() < 16 && rest.iter().all(|b| *b == b'a'),
+                    "{rest:?}"
+                );
             } else {
                 assert_eq!(failed, None);
                 assert_eq!(rest, vec![b'a'; 16]);

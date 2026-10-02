@@ -202,11 +202,7 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
                 key,
                 version,
                 layout,
-            } => Response::Registered(
-                shards
-                    .register(shard, node, &key, version, layout)
-                    .await?,
-            ),
+            } => Response::Registered(shards.register(shard, node, &key, version, layout).await?),
             Request::Renew(read) => Response::Renewed(shards.renew(shard, node, read).await?),
             Request::Release(read) => {
                 shards.release(shard, node, read).await?;

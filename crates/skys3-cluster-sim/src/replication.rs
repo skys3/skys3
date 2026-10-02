@@ -20,8 +20,8 @@ use bytes::Bytes;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, TypedKey};
 use skys3_coord::{Handoff, HandoffFuture, HandoffSink};
 use skys3_gateway::{
-    ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError,
-    ShardRef, ShardSummary, Shards, UploadParts,
+    ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError, ShardRef,
+    ShardSummary, Shards, UploadParts,
 };
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::{Clock, MonoTime, MonotonicClock, SimMount};

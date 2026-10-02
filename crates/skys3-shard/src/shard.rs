@@ -1911,37 +1911,49 @@ impl<D: Disk> Shard<D> {
             Ok(reads::layout(&reader, &shard, &object)?.map(|layout| (state, layout)))
         })
         .await?;
-        let clean = own.as_ref().is_some_and(|(state, _)| *state == EntryState::Clean);
+        let clean = own
+            .as_ref()
+            .is_some_and(|(state, _)| *state == EntryState::Clean);
         let layout = own.map_or(plan, |(_, layout)| layout);
-        // Pinned before the check, so a compaction that drops a position
-        // after it finds the pin, and one that dropped it before leaves
-        // the check failing.
-        let id = reads.pin(self.shard(), &layout);
-        let (index, shard, positions) = (
+        // Pinned and checked in one decision against compaction's, so a
+        // compaction that drops a position either does so first, and the
+        // check fails, or finds the pin and keeps it (see `reads`).
+        let (index, shard, gate, layout) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
-            layout.iter().map(|extent| extent.position).collect::<Vec<_>>(),
+            reads.clone(),
+            layout,
         );
-        let located = run(&self.inner.pool, self.shard(), move || {
-            let reader = index.read()?;
-            for position in positions {
-                if reader.location(&shard, position)?.is_none() {
-                    return Ok(false);
+        let registered = run(&self.inner.pool, self.shard(), move || {
+            gate.exclusive(|| {
+                let id = gate.pin(&shard, &layout);
+                let reader = index.read().inspect_err(|_| gate.release(id))?;
+                for extent in &layout {
+                    match reader.location(&shard, extent.position) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            gate.release(id);
+                            gate.not_held();
+                            return Ok(None);
+                        }
+                        Err(error) => {
+                            gate.release(id);
+                            return Err(error);
+                        }
+                    }
                 }
-            }
-            Ok(true)
+                Ok(Some(Registered { id, layout }))
+            })
         })
-        .await;
-        if !located.inspect_err(|_| reads.release(id))? {
-            reads.release(id);
-            reads.not_held();
+        .await?;
+        let Some(registered) = registered else {
             return Ok(None);
-        }
+        };
         // A read of a copy this replica keeps uses it (§9.3).
         if clean && let Some(cache) = self.inner.cache.get() {
             cache.touch(self.shard(), key);
         }
-        Ok(Some(Registered { id, layout }))
+        Ok(Some(registered))
     }
 
     /// The payload at `position` for the read `id` registered in `reads`

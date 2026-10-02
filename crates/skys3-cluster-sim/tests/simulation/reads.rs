@@ -85,11 +85,8 @@ fn reads_racing_overwrites_and_evictions_return_the_planned_version() {
     let mut counts = Vec::new();
     Runner::with_cost(2, COST).run(|context| {
         let services = services(racing());
-        let report = cluster(config(), &services).run(
-            context,
-            &workload(context),
-            &FaultPlan::none(),
-        )?;
+        let report =
+            cluster(config(), &services).run(context, &workload(context), &FaultPlan::none())?;
         assert!(report.flushed > 0, "{report:?}");
         counts.push(services.replicated().holder_counts());
         Ok(())
@@ -133,6 +130,7 @@ fn lapsing() -> (ClusterConfig, HolderFaults) {
         read_registration: ReadRegistration {
             ttl: Duration::from_millis(100),
             renew_every: Duration::from_secs(1),
+            ..ReadRegistration::default()
         },
         ..config()
     };
@@ -148,7 +146,8 @@ fn a_lapsed_registration_fails_the_get_mid_stream() {
     Runner::with_cost(2, COST).run(|context| {
         let (config, holders) = lapsing();
         let services = services(holders);
-        let report = cluster(config, &services).run(context, &workload(context), &FaultPlan::none())?;
+        let report =
+            cluster(config, &services).run(context, &workload(context), &FaultPlan::none())?;
         let counts = services.replicated().holder_counts();
         assert!(counts.lapsed > 0, "{counts:?}");
         assert!(report.broken_reads > 0, "{counts:?}");
@@ -158,22 +157,35 @@ fn a_lapsed_registration_fails_the_get_mid_stream() {
 
 /// The seeded bug: a holder registers the copy it holds now, whatever
 /// version the plan named, so a read racing an overwrite gets the new
-/// bytes under the old version's headers.
+/// bytes under the old version's headers. Bodies are no longer than their
+/// prefix, so a later write is seldom shorter than the version it replaces
+/// and the gateway streams the planned size of its bytes rather than
+/// finding them short; and holders register up to half a second after the
+/// plan.
 #[test]
 fn a_holder_that_ignores_the_version_is_caught() {
     Runner::with_cost(1, COST).run(|context| {
         let holders = HolderFaults {
             ignore_version: true,
-            ..racing()
+            register_delay: Duration::from_millis(500),
+            ..HolderFaults::default()
+        };
+        let workload = Workload {
+            max_body: 0,
+            ..workload(context)
         };
         let outcome =
-            cluster(config(), &services(holders)).run(context, &workload(context), &FaultPlan::none());
+            cluster(config(), &services(holders)).run(context, &workload, &FaultPlan::none());
         match outcome {
             Err(RunError::Simulation(error)) => {
                 assert!(error.contains("does not match"), "{error}");
+                eprintln!("seed {}: caught: {error}", context.seed());
                 Ok(())
             }
-            Err(RunError::Check(_)) => Ok(()),
+            Err(RunError::Check(error)) => {
+                eprintln!("seed {}: caught by the check: {error:?}", context.seed());
+                Ok(())
+            }
             other => Err(format!("a holder ignoring the version went unnoticed: {other:?}").into()),
         }
     });
@@ -189,11 +201,15 @@ fn a_holder_that_serves_lapsed_registrations_is_caught() {
             ignore_lapse: true,
             ..faults
         };
-        let outcome =
-            cluster(config, &services(holders)).run(context, &workload(context), &FaultPlan::none());
+        let outcome = cluster(config, &services(holders)).run(
+            context,
+            &workload(context),
+            &FaultPlan::none(),
+        );
         match outcome {
             Err(RunError::Simulation(error)) => {
                 assert!(error.contains("had lapsed"), "{error}");
+                eprintln!("seed {}: caught: {error}", context.seed());
                 Ok(())
             }
             other => Err(format!("a holder serving lapsed reads went unnoticed: {other:?}").into()),

@@ -1061,7 +1061,10 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
             let holders = plan
                 .holders
                 .iter()
-                .map(|node| node.parse().map_err(|error| format!("holder {node}: {error}")))
+                .map(|node| {
+                    node.parse()
+                        .map_err(|error| format!("holder {node}: {error}"))
+                })
                 .collect::<Decoded<Vec<NodeId>>>()?;
             if entry.is_none() && !holders.is_empty() {
                 return Err("holders of a key with no entry".to_owned());

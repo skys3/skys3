@@ -75,13 +75,13 @@ use crate::admission::Admission;
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
-use holders::HolderReads;
 use crate::fill::{FillError, Fills};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
 pub(crate) use copy::copy_source;
 pub use delete::MAX_DELETE_KEYS;
+use holders::HolderReads;
 pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};

@@ -206,7 +206,9 @@ pub(crate) fn own_plan(
         .and_then(|r| r.entry(&shard.into(), key))
         .map_err(unavailable)?;
     let copy = current_copy(replica, shard, key).filter(|(version, _)| {
-        entry.as_ref().is_some_and(|entry| entry.version == *version)
+        entry
+            .as_ref()
+            .is_some_and(|entry| entry.version == *version)
     });
     let (layout, holders) = match copy {
         Some((_, layout)) => (layout, vec![node.clone()]),

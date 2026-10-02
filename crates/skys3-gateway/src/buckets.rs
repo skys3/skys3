@@ -161,9 +161,7 @@ impl GatewayConfig {
             admission: Arc::new(AdmitAll),
             remote: None,
             placement: ShardPlacement::Local,
-            read_registration_renew_interval: config
-                .storage()
-                .read_registration_renew_interval(),
+            read_registration_renew_interval: config.storage().read_registration_renew_interval(),
         }
     }
 }

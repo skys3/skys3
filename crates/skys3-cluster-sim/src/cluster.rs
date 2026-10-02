@@ -120,6 +120,9 @@ pub struct ReadRegistration {
     pub ttl: Duration,
     /// `read_registration_renew_interval_seconds`.
     pub renew_every: Duration,
+    /// `fragment_release_delay_seconds`: how long compaction keeps payload
+    /// nothing names before it drops it, for plans issued just before.
+    pub release_delay: Duration,
 }
 
 impl Default for ReadRegistration {
@@ -128,6 +131,7 @@ impl Default for ReadRegistration {
         Self {
             ttl: Duration::from_secs(30),
             renew_every: Duration::from_secs(10),
+            release_delay: Duration::from_secs(60),
         }
     }
 }
@@ -1198,7 +1202,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         clean_cache: shape.clean_cache,
         reads: ReadSettings {
             ttl: shape.read_registration.ttl,
-            ..ReadSettings::default()
+            release_delay: shape.read_registration.release_delay,
         },
         compaction: shape.compaction,
     })

@@ -29,19 +29,18 @@
 //! made or last renewed; a fetch under a registration that lapsed is
 //! refused, so the GET fails mid-stream, and the client retries.
 //!
-//! **What compaction must keep** (§10.3). Registrations are node-local and
-//! in memory, in [`Reads`], one per node. Compaction may drop a record
-//! that no entry references only if [`Reads::is_pinned`] says no live
-//! registration pins its position, asked while it holds the decision, and
-//! only once the record has been unreferenced for at least
-//! [`ReadSettings::release_delay`] (`fragment_release_delay_seconds`): a
-//! position it finds unreferenced is a candidate, dropped no earlier than
-//! that delay later if no entry references it and no registration pins it
-//! then. The delay covers a plan issued just before the write or eviction
-//! that left its payload unreferenced, whose gateway has not registered it
-//! yet. A registration checks that it still
-//! locates its positions only after it pinned them, so a compaction that
-//! dropped one first makes it refuse, never serve a reclaimed position.
+//! **What compaction keeps** (§10.3). Registrations are node-local and
+//! in memory, in [`Reads`], one per node, which the
+//! [`Compactor`](crate::Compactor) asks. It copies, rather than drops or
+//! evicts, every record whose position a live registration pins
+//! ([`Reads::is_pinned`]), and checks the pins again when it removes the
+//! locations of what it drops, in the same [`Reads::exclusive`] decision
+//! as a registration's pin and check, so neither misses the other. It
+//! drops payload that nothing references only once it has found it
+//! unreferenced for [`ReadSettings::release_delay`]
+//! (`fragment_release_delay_seconds`): the delay covers a plan issued
+//! just before the write or eviction that left the payload unreferenced,
+//! whose gateway has not registered it yet.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -119,6 +118,9 @@ pub struct ReadCounts {
 #[derive(Debug, Clone, Default)]
 pub struct Reads {
     state: Arc<Mutex<State>>,
+    /// Serializes a registration's pin and check against compaction's
+    /// decision to drop payload ([`Reads::exclusive`]).
+    decisions: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +155,20 @@ impl Reads {
     /// Uses `settings` for registrations made or renewed from now on.
     pub fn configure(&self, settings: ReadSettings) {
         self.lock().settings = settings;
+    }
+
+    /// Runs `decide` while no other caller of this method runs, on this
+    /// node: a registration pins its positions and checks that the index
+    /// still locates them in one such call, and compaction checks the
+    /// pins and removes the locations of what it drops in another, so
+    /// neither misses the other. `decide` must not call it again.
+    pub fn exclusive<T>(&self, decide: impl FnOnce() -> T) -> T {
+        // The lock guards no data.
+        let _decision = self
+            .decisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        decide()
     }
 
     /// The settings in use.
@@ -367,7 +383,11 @@ fn inline(position: EpochSeq, size: u64) -> Vec<ExtentRef> {
 
 /// The holders of `entry` in `config`, given the bucket's `clean_copies`
 /// if known, when the primary holds its bytes: see [`ReadPlan::holders`].
-pub(crate) fn holders(config: &ShardConfig, entry: &Entry, clean_copies: Option<u8>) -> Vec<NodeId> {
+pub(crate) fn holders(
+    config: &ShardConfig,
+    entry: &Entry,
+    clean_copies: Option<u8>,
+) -> Vec<NodeId> {
     let others = config.members.iter().filter(|m| **m != config.primary);
     let ranked = std::iter::once(&config.primary).chain(others).cloned();
     match entry.state {
@@ -520,7 +540,13 @@ mod tests {
 
     #[test]
     fn inline_bodies_are_one_extent_unless_empty() {
-        assert_eq!(inline(at(4), 7), [ExtentRef { position: at(4), len: 7 }]);
+        assert_eq!(
+            inline(at(4), 7),
+            [ExtentRef {
+                position: at(4),
+                len: 7
+            }]
+        );
         assert!(inline(at(4), 0).is_empty());
     }
 }

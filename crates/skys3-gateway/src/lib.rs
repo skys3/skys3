@@ -168,8 +168,8 @@ pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemoteP
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};
 pub use shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome};
-pub use skys3_shard::{ReadId, ReadPlan, Registered};
 pub use sigv4::{
     Authenticated, BodyError, CredentialLookup, LookupError, SecretAccessKey, SigV4Authenticator,
     SigningCredential, Trailers,
 };
+pub use skys3_shard::{ReadId, ReadPlan, Registered};
