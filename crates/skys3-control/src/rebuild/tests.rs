@@ -137,7 +137,7 @@ fn the_plan_takes_each_shards_newest_configuration_and_the_newest_copy() {
     let rebuilt = plan(&cluster_exports()).unwrap();
     assert_eq!(rebuilt.cluster_id(), &cluster());
     assert_eq!(rebuilt.generation(), Generation::new(6));
-    // Equal generations: the sync that started last wins.
+    // Equal copies of the newest generation: the lowest node ID names them.
     assert_eq!(rebuilt.copy_from(), &node(2));
     let keys: Vec<&str> = rebuilt
         .registers()
@@ -336,22 +336,110 @@ fn a_single_node_keeps_no_shard_configurations() {
 }
 
 #[test]
-fn copies_that_differ_at_one_generation_are_noted() {
+fn copies_that_differ_at_the_newest_generation_need_a_choice() {
     let mut exports = cluster_exports();
-    exports[2].copy = Some(copy(5, 80, &[bucket(1, 2)], &["admin", "late"]));
-    let plan = plan(&exports).unwrap();
-    assert!(
-        plan.notes()
-            .contains(&RebuildNote::CopyDiffers { node: node(3) })
+    // Node 3 listed a role created after node 2's listing, before any
+    // increment announced it. Its sync started later by its own clock, but
+    // a clock decides nothing.
+    exports[2].copy = Some(copy(5, 500, &[bucket(1, 2)], &["admin", "late"]));
+    let error = plan(&exports).unwrap_err();
+    let RebuildError::DivergentCopies {
+        generation,
+        copies,
+        registers,
+    } = &error
+    else {
+        panic!("{error}");
+    };
+    assert_eq!(*generation, Generation::new(5));
+    assert_eq!(*copies, [vec![node(2)], vec![node(3)]]);
+    assert_eq!(*registers, ["identity/roles/late.json"]);
+    assert_eq!(
+        error.to_string(),
+        "the copies of the bucket and identity registers at generation 5 differ, between \
+         [node-2] and [node-3], in identity/roles/late.json: nothing shows which is newer, so \
+         choose the copy to rebuild from"
     );
+    // A register two copies hold with other values differs too, and equal
+    // copies are grouped.
+    let mut more = exports.clone();
+    let mut fourth = export(4, Some(copy(5, 1, &[bucket(1, 2)], &["admin"])), vec![]);
+    fourth
+        .copy
+        .as_mut()
+        .unwrap()
+        .registers
+        .insert("identity/roles/admin.json".to_owned(), "{}".to_owned());
+    more.push(fourth);
+    more.push(export(5, exports[1].copy.clone(), vec![]));
+    let error = plan(&more).unwrap_err();
     assert!(
-        !plan
-            .registers()
-            .contains_key(&key("identity/roles/late.json"))
+        matches!(&error, RebuildError::DivergentCopies { copies, registers, .. }
+            if *copies == [vec![node(2), node(5)], vec![node(3)], vec![node(4)]]
+                && *registers == ["identity/roles/admin.json", "identity/roles/late.json"]),
+        "{error}"
     );
+
+    // The operator chooses either copy of the newest generation.
+    for (chosen, other, late) in [(3, 2, true), (2, 3, false)] {
+        let options = RebuildOptions {
+            prefer: Some(node(chosen)),
+            ..RebuildOptions::default()
+        };
+        let plan = RebuildPlan::new(&cluster(), &exports, &options).unwrap();
+        assert_eq!(plan.copy_from(), &node(chosen));
+        assert_eq!(
+            plan.registers()
+                .contains_key(&key("identity/roles/late.json")),
+            late
+        );
+        assert!(
+            plan.notes()
+                .contains(&RebuildNote::CopyDiffers { node: node(other) })
+        );
+        assert_eq!(plan.generation(), Generation::new(6));
+    }
     assert_eq!(
         RebuildNote::CopyDiffers { node: node(3) }.to_string(),
-        "the copy of node-3 has the rebuilt generation but other registers"
+        "the copy of node-3 has the rebuilt generation but other registers; the chosen copy is \
+         rebuilt"
+    );
+
+    // A higher generation always wins: a copy of an older one, or none,
+    // cannot be chosen.
+    for (chosen, expected) in [
+        (
+            1,
+            "the chosen copy, of node node-1, is at generation 4; the newest copies are at \
+             generation 5",
+        ),
+        (9, "the chosen copy, of node node-9, does not exist"),
+    ] {
+        let options = RebuildOptions {
+            prefer: Some(node(chosen)),
+            ..RebuildOptions::default()
+        };
+        let error = RebuildPlan::new(&cluster(), &exports, &options).unwrap_err();
+        assert!(
+            matches!(&error, RebuildError::PreferredNotNewest { node: n, newest, .. }
+                if *n == node(chosen) && *newest == Generation::new(5)),
+            "{error}"
+        );
+        assert!(error.to_string().starts_with(expected), "{error}");
+    }
+
+    // Equal copies need no choice; a choice takes the copy, without notes.
+    let options = RebuildOptions {
+        prefer: Some(node(3)),
+        ..RebuildOptions::default()
+    };
+    let plan = RebuildPlan::new(&cluster(), &cluster_exports(), &options).unwrap();
+    assert_eq!(plan.copy_from(), &node(3));
+    assert!(
+        !plan
+            .notes()
+            .iter()
+            .any(|note| matches!(note, RebuildNote::CopyDiffers { .. }))
     );
 }
 
@@ -383,6 +471,8 @@ fn exports_holding_what_no_node_writes_are_refused() {
     let invalid = |change: &dyn Fn(&mut ControlExport), expected: &str| {
         let mut exports = cluster_exports();
         change(&mut exports[1]);
+        // Node 3's copy, of the same generation, is equal to node 2's.
+        exports[2].copy = exports[1].copy.clone();
         let error = plan(&exports).unwrap_err();
         assert!(
             matches!(&error, RebuildError::InvalidExport { node: n, .. } if *n == node(2)),
@@ -684,7 +774,8 @@ proptest! {
     /// Whatever epochs each node holds of each shard, and whatever copies,
     /// the plan writes each shard's newest configuration, the newest
     /// copy's registers, and a generation past every copy's, whatever the
-    /// order of the exports.
+    /// order of the exports. Copies of the newest generation that differ
+    /// are refused, whatever their sync times, until one is chosen.
     #[test]
     fn plans_take_the_newest_of_everything_in_any_order(
         held in prop::collection::vec(
@@ -692,27 +783,54 @@ proptest! {
             4,
         ),
         generations in prop::collection::vec(prop::option::of(1_u64..9), 4),
+        late in prop::collection::vec(any::<bool>(), 4),
+        synced in prop::collection::vec(0_u64..1000, 4),
     ) {
         let mut exports = Vec::new();
         for (n, (epochs, generation)) in held.iter().zip(&generations).enumerate() {
+            let roles: &[&str] = if late[n] { &["late"] } else { &[] };
+            let copy = generation.map(|g| copy(g, synced[n], &[bucket(1, 4)], roles));
             let n = u8::try_from(n).unwrap() + 1;
             let configs = epochs
                 .iter()
                 .enumerate()
                 .filter_map(|(shard, epoch)| Some(landed(u8::try_from(shard).ok()?, (*epoch)?)))
                 .collect();
-            let copy = generation.map(|g| copy(g, 0, &[bucket(1, 4)], &[]));
             exports.push(export(n, copy, configs));
         }
         let Some(newest) = generations.iter().flatten().max() else {
             prop_assert!(matches!(plan(&exports), Err(RebuildError::NoCopy)));
             return Ok(());
         };
-        let forward = plan(&exports).unwrap();
+        let newest_late: Vec<(u8, bool)> = generations
+            .iter()
+            .zip(&late)
+            .enumerate()
+            .filter(|(_, (generation, _))| **generation == Some(*newest))
+            .map(|(n, (_, late))| (u8::try_from(n).unwrap() + 1, *late))
+            .collect();
+        let (chosen, chosen_late) = newest_late[newest_late.len() - 1];
+        let options = if newest_late.iter().all(|(_, late)| *late == chosen_late) {
+            RebuildOptions::default()
+        } else {
+            prop_assert!(
+                matches!(plan(&exports), Err(RebuildError::DivergentCopies { .. })),
+                "{:?}", newest_late
+            );
+            RebuildOptions {
+                prefer: Some(node(chosen)),
+                ..RebuildOptions::default()
+            }
+        };
+        let forward = RebuildPlan::new(&cluster(), &exports, &options).unwrap();
         exports.reverse();
-        let backward = plan(&exports).unwrap();
+        let backward = RebuildPlan::new(&cluster(), &exports, &options).unwrap();
         prop_assert_eq!(forward.registers(), backward.registers());
         prop_assert_eq!(forward.cluster_json(), backward.cluster_json());
+        prop_assert_eq!(
+            forward.registers().contains_key(&key("identity/roles/late.json")),
+            chosen_late
+        );
         prop_assert_eq!(forward.generation(), Generation::new(newest + 1));
         let configs: Vec<ShardConfig> = forward.shard_configs().collect();
         let expected: Vec<ShardConfig> = (0..4_u8)

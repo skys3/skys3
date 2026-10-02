@@ -42,7 +42,13 @@
 //!   whole listing at its generation, so the copy with the highest
 //!   generation is the newest whole state, deletions included; merging
 //!   copies would bring back deleted roles and buckets. Its registers are
-//!   written byte for byte. Shards that hold objects but belong to no
+//!   written byte for byte. Copies of the newest generation that differ
+//!   saw a write no increment had announced yet, and nothing in them
+//!   shows which saw the later state: a sync's start time is read from
+//!   the node's own clock, and a sync that started later can still have
+//!   listed a register earlier. So the plan refuses them, naming the
+//!   copies and the registers they differ in, until the operator chooses
+//!   one ([`RebuildOptions::prefer`]). Shards that hold objects but belong to no
 //!   bucket of that copy would be dropped by their nodes (§4.1), so the
 //!   plan refuses them unless [`RebuildOptions::allow_unnamed`] says so.
 //! - **Generations move forward.** `cluster.json` is written at the
@@ -131,7 +137,10 @@ pub struct ExportedCopy {
     /// The generation `cluster.json` held when the copy was read.
     pub generation: Generation,
     /// When the sync that read the copy started, in milliseconds since the
-    /// Unix epoch.
+    /// Unix epoch, by the node's clock. It is shown to an operator and
+    /// never orders copies: the clocks of different nodes are not
+    /// comparable, and a sync that started later can still have listed a
+    /// register earlier.
     pub synced_at_ms: u64,
     /// Each register's value, by key, as the store held it.
     pub registers: BTreeMap<String, String>,
@@ -161,6 +170,11 @@ pub struct RebuildOptions {
     /// Rebuild even though shards that hold objects belong to no bucket of
     /// the newest copy. Their nodes drop them at their next start (§4.1).
     pub allow_unnamed: bool,
+    /// The node whose copy of the bucket and identity registers is rebuilt
+    /// when the copies of the newest generation differ, which the plan
+    /// otherwise refuses. Its copy must be of the newest generation: a
+    /// copy of an older one misses changes a newer one announced.
+    pub prefer: Option<NodeId>,
 }
 
 /// Why a rebuild was refused.
@@ -199,6 +213,35 @@ pub enum RebuildError {
     /// No export holds a copy of the bucket and identity registers.
     #[error("no export holds a copy of the bucket and identity registers")]
     NoCopy,
+    /// The copies of the newest generation differ, and no copy was
+    /// chosen.
+    #[error(
+        "the copies of the bucket and identity registers at generation {generation} differ, \
+         between {}, in {}: nothing shows which is newer, so choose the copy to rebuild from",
+        groups(.copies), .registers.join(", ")
+    )]
+    DivergentCopies {
+        /// The newest generation.
+        generation: Generation,
+        /// The nodes holding a copy of it, grouped by equal copies.
+        copies: Vec<Vec<NodeId>>,
+        /// The registers whose values, or presence, differ between them.
+        registers: Vec<String>,
+    },
+    /// The chosen copy is not of the newest generation.
+    #[error(
+        "the chosen copy, of node {node}, {}; the newest copies are at generation {newest}, and \
+         only one of those can be chosen",
+        .found.map_or_else(|| "does not exist".to_owned(), |found| format!("is at generation {found}"))
+    )]
+    PreferredNotNewest {
+        /// The chosen node.
+        node: NodeId,
+        /// The generation of its copy, if it exported one.
+        found: Option<Generation>,
+        /// The newest generation.
+        newest: Generation,
+    },
     /// An export holds something no node writes.
     #[error("the export of node {node} is invalid: {reason}")]
     InvalidExport {
@@ -253,6 +296,17 @@ fn keys(keys: &[RegisterKey]) -> String {
     names.join(", ")
 }
 
+fn groups(copies: &[Vec<NodeId>]) -> String {
+    let groups: Vec<String> = copies
+        .iter()
+        .map(|nodes| {
+            let nodes: Vec<&str> = nodes.iter().map(NodeId::as_str).collect();
+            format!("[{}]", nodes.join(", "))
+        })
+        .collect();
+    groups.join(" and ")
+}
+
 fn list(missing: &BTreeMap<NodeId, Vec<RegisterKey>>) -> String {
     let nodes: Vec<String> = missing
         .iter()
@@ -303,7 +357,8 @@ pub enum RebuildNote {
     },
     /// Another copy of the same generation as the one rebuilt from holds
     /// other registers: a write between the two listings that no
-    /// increment announced. The copy whose sync started later wins.
+    /// increment announced. The operator chose the copy rebuilt from
+    /// ([`RebuildOptions::prefer`]).
     CopyDiffers {
         /// The node of the other copy.
         node: NodeId,
@@ -334,7 +389,8 @@ impl fmt::Display for RebuildNote {
             ),
             Self::CopyDiffers { node } => write!(
                 f,
-                "the copy of {node} has the rebuilt generation but other registers"
+                "the copy of {node} has the rebuilt generation but other registers; the chosen \
+                 copy is rebuilt"
             ),
         }
     }
@@ -372,19 +428,11 @@ impl RebuildPlan {
         options: &RebuildOptions,
     ) -> Result<Self, RebuildError> {
         let exported = check_exports(cluster, exports, options)?;
-        let (copy_from, copy) = newest_copy(exports)?;
-        let mut notes = Vec::new();
-        for export in exports {
-            if let Some(other) = &export.copy
-                && export.node_id != copy_from.node_id
-                && other.generation == copy.generation
-                && other.registers != copy.registers
-            {
-                notes.push(RebuildNote::CopyDiffers {
-                    node: export.node_id.clone(),
-                });
-            }
-        }
+        let (copy_from, copy, differing) = newest_copy(exports, options.prefer.as_ref())?;
+        let mut notes: Vec<RebuildNote> = differing
+            .into_iter()
+            .map(|node| RebuildNote::CopyDiffers { node })
+            .collect();
         let (mut registers, buckets) = copied_registers(&copy_from.node_id, copy)?;
         let newest = newest_configs(exports, &mut notes)?;
         let shards = shard_registers(&newest, &buckets, &exported, options, &mut notes)?;
@@ -584,21 +632,91 @@ fn check_exports(
     Ok(exported)
 }
 
-/// The newest copy of the bucket and identity registers: the highest
-/// generation, then the sync that started last, then the highest node ID,
-/// so that every run picks the same.
-fn newest_copy(exports: &[ControlExport]) -> Result<(&ControlExport, &ExportedCopy), RebuildError> {
-    exports
+/// The newest copy of the bucket and identity registers, and the nodes
+/// whose copies of its generation differ from it.
+///
+/// A copy of a higher generation always wins: its listing started after
+/// every change announced up to its generation. Copies of the newest
+/// generation must be equal, or one of them `prefer`red: nothing orders
+/// them (see [`ExportedCopy::synced_at_ms`]).
+fn newest_copy<'a>(
+    exports: &'a [ControlExport],
+    prefer: Option<&NodeId>,
+) -> Result<(&'a ControlExport, &'a ExportedCopy, Vec<NodeId>), RebuildError> {
+    let copies: Vec<(&ControlExport, &ExportedCopy)> = exports
         .iter()
         .filter_map(|export| export.copy.as_ref().map(|copy| (export, copy)))
-        .max_by(|(a, a_copy), (b, b_copy)| {
-            (a_copy.generation, a_copy.synced_at_ms, &a.node_id).cmp(&(
-                b_copy.generation,
-                b_copy.synced_at_ms,
-                &b.node_id,
-            ))
+        .collect();
+    let generation = copies
+        .iter()
+        .map(|(_, copy)| copy.generation)
+        .max()
+        .ok_or(RebuildError::NoCopy)?;
+    let mut newest: Vec<(&ControlExport, &ExportedCopy)> = copies
+        .iter()
+        .copied()
+        .filter(|(_, copy)| copy.generation == generation)
+        .collect();
+    newest.sort_by(|(a, _), (b, _)| a.node_id.cmp(&b.node_id));
+    let chosen = match prefer {
+        Some(node) => *newest
+            .iter()
+            .find(|(export, _)| export.node_id == *node)
+            .ok_or_else(|| RebuildError::PreferredNotNewest {
+                node: node.clone(),
+                found: copies
+                    .iter()
+                    .find(|(export, _)| export.node_id == *node)
+                    .map(|(_, copy)| copy.generation),
+                newest: generation,
+            })?,
+        // Every copy is of `generation`'s; the lowest node ID, so that every
+        // run of equal copies names the same node.
+        None => newest[0],
+    };
+    let differing: Vec<NodeId> = newest
+        .iter()
+        .filter(|(_, copy)| copy.registers != chosen.1.registers)
+        .map(|(export, _)| export.node_id.clone())
+        .collect();
+    if prefer.is_none() && !differing.is_empty() {
+        return Err(divergent(generation, &newest));
+    }
+    Ok((chosen.0, chosen.1, differing))
+}
+
+/// The refusal of `copies`, all of `generation`, which differ.
+fn divergent(generation: Generation, copies: &[(&ControlExport, &ExportedCopy)]) -> RebuildError {
+    let mut groups: Vec<(&BTreeMap<String, String>, Vec<NodeId>)> = Vec::new();
+    for (export, copy) in copies {
+        let node = export.node_id.clone();
+        match groups
+            .iter_mut()
+            .find(|(registers, _)| **registers == copy.registers)
+        {
+            Some((_, nodes)) => nodes.push(node),
+            None => groups.push((&copy.registers, vec![node])),
+        }
+    }
+    let keys: BTreeSet<&String> = groups
+        .iter()
+        .flat_map(|(registers, _)| registers.keys())
+        .collect();
+    let registers = keys
+        .into_iter()
+        .filter(|key| {
+            let first = groups[0].0.get(*key);
+            groups
+                .iter()
+                .any(|(registers, _)| registers.get(*key) != first)
         })
-        .ok_or(RebuildError::NoCopy)
+        .cloned()
+        .collect();
+    RebuildError::DivergentCopies {
+        generation,
+        copies: groups.into_iter().map(|(_, nodes)| nodes).collect(),
+        registers,
+    }
 }
 
 /// Each shard's newest configuration among the exports, noting the nodes

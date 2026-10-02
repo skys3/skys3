@@ -4358,10 +4358,29 @@ of this file. A task with nothing unexpected keeps "None."
   sent again over the rebuilt register and land or lose as usual.
 - **Identity cached on some nodes only: the newest copy wins (decided).**
   Each node's copy is a whole listing at its generation, so the plan takes
-  the copy with the highest generation (then the latest sync start, then
-  the node ID), byte for byte. Merging copies was rejected: a role
-  deleted after an older copy was read would come back, with its trust
-  policy. A copy of the same generation that differs is reported.
+  the copy with the highest generation, byte for byte. Merging copies was
+  rejected: a role deleted after an older copy was read would come back,
+  with its trust policy.
+- **Copies of the newest generation that differ need the operator's
+  choice (decided, review).** The first version broke ties by the sync's
+  start time. Review found that unsafe: a register is written before the
+  increment that announces it, nodes also sync on a timer, and a failed
+  increment leaves a write unannounced, so two copies of one generation
+  can differ. `synced_at_ms` comes from each node's own clock, and a sync
+  that started later can still have listed a register earlier, so the
+  tie-break could rebuild a deleted bucket or role, or drop a new one.
+  No register carries a version that would order the copies. So the plan
+  refuses differing copies of the newest generation
+  (`RebuildError::DivergentCopies`), naming the nodes, grouped by equal
+  copies, and the registers that differ. The operator then chooses one
+  with `skys3 control rebuild --prefer <node>` (`RebuildOptions::prefer`),
+  and each other copy is noted (`RebuildNote::CopyDiffers`). Only a copy
+  of the newest generation can be chosen
+  (`RebuildError::PreferredNotNewest`): a higher generation always wins.
+  Equal copies need no choice, and the lowest node ID names them. The
+  export keeps `synced_at_ms` for the operator; nothing orders by it.
+  Recorded in design §6.2 and §6.9, with the limit: a write that only
+  copies of older generations hold is lost with the store.
 - **Shards of buckets the copy does not name (decided).** A bucket created
   shortly before the loss may be missing from every copy, and its nodes
   would drop its shards at their next start (§4.1). The export says which

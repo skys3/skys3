@@ -166,6 +166,8 @@ async fn the_command_line_rebuilds_a_lost_control_store() {
     // Mistakes on the command line.
     let output = rebuild(&[OsStr::new("--lost"), OsStr::new("Not Valid")]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let output = rebuild(&[OsStr::new("--prefer"), OsStr::new("Not Valid")]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
     let output = control(
         &config,
         &[
@@ -179,8 +181,15 @@ async fn the_command_line_rebuilds_a_lost_control_store() {
     let output = rebuild(&[OsStr::new("--lost"), written.node_id.as_str().as_ref()]);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stderr).contains("refused"));
+    // The chosen copy must be one of the newest generation.
+    let output = rebuild(&[OsStr::new("--prefer"), OsStr::new("node-9")]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("of node node-9, does not exist"),
+        "{output:?}"
+    );
 
-    let output = rebuild(&[]);
+    let output = rebuild(&[OsStr::new("--prefer"), written.node_id.as_str().as_ref()]);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("rebuilt: wrote 2 registers"), "{stdout}");
