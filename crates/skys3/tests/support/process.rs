@@ -39,6 +39,19 @@ impl Process {
     /// Starts the binary with the configuration at `config`, appending its
     /// log to `log`, and waits until it is ready.
     pub async fn start(config: &Path, gateway: &str, admin: &str, log: &Path) -> Self {
+        Self::start_with_env(config, gateway, admin, log, &[]).await
+    }
+
+    /// Like [`Process::start`], with `env` added to the binary's
+    /// environment.
+    pub async fn start_with_env(
+        config: &Path,
+        gateway: &str,
+        admin: &str,
+        log: &Path,
+        env: &[(&str, &Path)],
+    ) -> Self {
+        let log_path = log.to_owned();
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -47,6 +60,7 @@ impl Process {
         let child = Command::new(BINARY)
             .arg("--config")
             .arg(config)
+            .envs(env.iter().copied())
             .stdout(Stdio::null())
             .stderr(log)
             .spawn()
@@ -60,8 +74,12 @@ impl Process {
         eventually("the node is ready", || {
             let admin = admin.clone();
             let exited = process.child.try_wait().unwrap();
+            let log_path = log_path.clone();
             async move {
-                assert!(exited.is_none(), "the node exited: {exited:?}");
+                if exited.is_some() {
+                    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    panic!("the node exited: {exited:?}; its log:\n{log}");
+                }
                 matches!(http_get(&admin, "/readyz").await, Ok((200, _)))
             }
         })

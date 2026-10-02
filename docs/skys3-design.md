@@ -1550,7 +1550,7 @@ format = "text"               # "text" or "json"
 ### 16.2 Compatibility
 
 - A selected subset of `ceph/s3-tests`[^s3-tests], plus explicit tests for every rejected feature.
-- AWS SDK matrix (Python, Go v2, JavaScript v3, Java v2, Rust, CLI): default checksums, aws-chunked uploads, multipart, presigned URLs, and web-identity credential refresh under load.
+- AWS SDK matrix (Python, Go v2, JavaScript v3, Java v2, Rust, CLI): default checksums, aws-chunked uploads, multipart, presigned URLs, and web-identity credential refresh under load. The matrix runs against the binary serving HTTPS, because SDKs such as botocore send `aws-chunked` bodies with trailing checksums only over TLS, with STS on the same listener and an OIDC issuer the node trusts. Each SDK reaches both through `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL_STS` alone, with its default credential chain. Sessions last 900 seconds, the STS minimum, so each client sets its SDK's refresh window to refresh within seconds while requests run.
 - Remote targets: AWS S3 and each supported S3-compatible provider. Pass the conditional-write probe, streaming flush, and conflict detection.
 
 ### 16.3 Performance
