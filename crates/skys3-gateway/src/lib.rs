@@ -132,10 +132,10 @@ mod conditions;
 mod credentials;
 mod features;
 mod fill;
-mod hot_cache;
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod hot_cache;
 mod limits;
 mod listener;
 mod listing;

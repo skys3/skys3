@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use skys3::storage::Storage;

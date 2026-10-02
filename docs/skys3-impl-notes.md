@@ -3798,9 +3798,12 @@ of this file. A task with nothing unexpected keeps "None."
 - **The gateway streams from one holder.** `HolderReads::open` orders
   the holders with its own node first, then by its own count of reads in
   progress from each. It registers, fetches the first piece before the
-  response starts, and streams the rest through a channel of one piece
-  while a task renews every `read_registration_renew_interval_seconds`.
-  It releases the registration at the end. A failed fetch ends the
+  response starts, and streams the rest through a channel of one piece.
+  From registration on, a task renews every
+  `read_registration_renew_interval_seconds`. Starting it only after the
+  first fetch let a holder slower than the TTL lapse the read (found in
+  review). It releases the registration at the end, and the renewal
+  stops on every path that ends the read. A failed fetch ends the
   stream, so the client sees the body break off. If no holder holds the
   version, the GET resolves the key again, up to three rounds, then
   answers 503. HEAD reads the entry alone.

@@ -14,8 +14,8 @@ use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig, GatewayListener,
-    HotCache, HotCacheMetrics, IdSource, LocalShards, ShardRef, Shards, SigV4Authenticator,
+    CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig, GatewayListener, HotCache,
+    HotCacheMetrics, IdSource, LocalShards, ShardRef, Shards, SigV4Authenticator,
     StaticCredentials, StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};

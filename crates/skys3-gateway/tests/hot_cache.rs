@@ -36,7 +36,13 @@ async fn gateway(capacity: u64, remote: bool) -> (Setup, HotCache) {
 /// `len` bytes of `letter`, but for a marker every 100 bytes.
 fn body(len: usize, letter: u8) -> Bytes {
     (0..len)
-        .map(|i| if i % 100 == 0 { b'0' + (i / 100 % 10) as u8 } else { letter })
+        .map(|i| {
+            if i % 100 == 0 {
+                b'0' + (i / 100 % 10) as u8
+            } else {
+                letter
+            }
+        })
         .collect()
 }
 

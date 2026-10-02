@@ -244,7 +244,9 @@ fn a_hot_cache_that_ignores_the_version_is_caught() {
                 eprintln!("seed {}: caught by the check: {error:?}", context.seed());
                 Ok(())
             }
-            other => Err(format!("a hot cache ignoring the version went unnoticed: {other:?}").into()),
+            other => {
+                Err(format!("a hot cache ignoring the version went unnoticed: {other:?}").into())
+            }
         }
     });
 }

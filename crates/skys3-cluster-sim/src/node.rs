@@ -246,7 +246,10 @@ impl<S> Shared<S> {
     /// The `GET`s each node served from its hot caches, over every life.
     pub(crate) fn hot_cache_hits(&self) -> BTreeMap<NodeId, u64> {
         let mut hits = BTreeMap::new();
-        let caches = self.hot_caches.lock().unwrap_or_else(PoisonError::into_inner);
+        let caches = self
+            .hot_caches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         for (node, cache) in caches.iter() {
             let served = cache.usage().hits;
             if served > 0 {
