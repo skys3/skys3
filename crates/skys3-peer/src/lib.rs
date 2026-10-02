@@ -127,8 +127,8 @@ pub use negotiation::{
     Side, VersionRange, negotiate,
 };
 pub use pool::{
-    AdaptiveLimit, ConnectionPool, GROWTH_THRESHOLD, LATENCY_SLACK, LATENCY_TOLERANCE, PoolError,
-    PoolStats, Sample, ShardLease,
+    AdaptiveLimit, ConnectionPool, GROWTH_THRESHOLD, LATENCY_SLACK, LATENCY_TOLERANCE, Measurement,
+    Meter, PoolError, PoolStats, Sample, ShardLease, TransportMeter,
 };
 pub use ranges::ByteRanges;
 pub use stream::{

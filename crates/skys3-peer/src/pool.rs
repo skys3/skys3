@@ -11,6 +11,7 @@
 //! allows, else to the connection with the fewest open streams.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -148,6 +149,40 @@ pub struct PoolStats {
     pub streams: Vec<usize>,
 }
 
+/// What a pool reads from one of its connections to adapt its limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measurement {
+    /// The bytes sent on the connection so far.
+    pub sent: u64,
+    /// The smoothed round trip.
+    pub rtt: Duration,
+    /// The lowest round trip seen.
+    pub min_rtt: Duration,
+}
+
+/// Where a pool's measurements come from: the QUIC transport's own
+/// statistics ([`TransportMeter`]), or a simulation's or test's.
+pub trait Meter: fmt::Debug + Send + Sync {
+    /// Measures `connection` now.
+    fn measure(&self, connection: &PeerConnection) -> Measurement;
+}
+
+/// Measures connections with the QUIC transport's statistics: UDP bytes
+/// sent, and the path's smoothed and lowest round trips.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TransportMeter;
+
+impl Meter for TransportMeter {
+    fn measure(&self, connection: &PeerConnection) -> Measurement {
+        let stats = connection.stats();
+        Measurement {
+            sent: stats.udp_tx.bytes,
+            rtt: stats.path.rtt,
+            min_rtt: stats.path.min_rtt,
+        }
+    }
+}
+
 /// The peer connections of every shard a node hosts, pooled per
 /// destination. Cloning it gives another handle to the same pool.
 #[derive(Debug, Clone)]
@@ -159,6 +194,7 @@ pub struct ConnectionPool {
 struct PoolInner {
     endpoint: PeerEndpoint,
     per_shard: u32,
+    meter: Arc<dyn Meter>,
     destinations: Mutex<HashMap<Destination, Arc<DestinationPool>>>,
 }
 
@@ -181,7 +217,7 @@ struct PoolState {
 #[derive(Debug)]
 struct Pooled {
     connection: PeerConnection,
-    /// UDP bytes sent at the previous sample.
+    /// The bytes sent at the previous sample.
     sent: u64,
 }
 
@@ -260,12 +296,25 @@ impl ConnectionPool {
     /// A pool that connects through `endpoint`, with at most
     /// `connections_per_shard` (`peer_connections_per_shard`) connections
     /// to a destination for each shard attached to it.
+    /// The pool measures its connections with [`TransportMeter`].
     #[must_use]
     pub fn new(endpoint: PeerEndpoint, connections_per_shard: u32) -> Self {
+        Self::with_meter(endpoint, connections_per_shard, Arc::new(TransportMeter))
+    }
+
+    /// A pool as [`ConnectionPool::new`], that measures its connections
+    /// with `meter`.
+    #[must_use]
+    pub fn with_meter(
+        endpoint: PeerEndpoint,
+        connections_per_shard: u32,
+        meter: Arc<dyn Meter>,
+    ) -> Self {
         Self {
             inner: Arc::new(PoolInner {
                 endpoint,
                 per_shard: connections_per_shard.max(1),
+                meter,
                 destinations: Mutex::new(HashMap::new()),
             }),
         }
@@ -341,11 +390,11 @@ impl ConnectionPool {
             let mut rtt = Duration::ZERO;
             let mut base_rtt = Duration::MAX;
             for pooled in &mut state.connections {
-                let stats = pooled.connection.stats();
-                sent += stats.udp_tx.bytes.saturating_sub(pooled.sent);
-                pooled.sent = stats.udp_tx.bytes;
-                rtt += stats.path.rtt;
-                base_rtt = base_rtt.min(stats.path.min_rtt);
+                let measured = self.inner.meter.measure(&pooled.connection);
+                sent += measured.sent.saturating_sub(pooled.sent);
+                pooled.sent = measured.sent;
+                rtt += measured.rtt;
+                base_rtt = base_rtt.min(measured.min_rtt);
             }
             if std::mem::take(&mut state.overloaded) {
                 state.limit.on_overload();
@@ -451,7 +500,7 @@ impl ShardLease {
         let connection = self.pool.inner.endpoint.connect(&self.destination).await?;
         let reservation = connection.reserve_stream();
         lock(&self.destination_pool.state).connections.push(Pooled {
-            sent: connection.stats().udp_tx.bytes,
+            sent: self.pool.inner.meter.measure(&connection).sent,
             connection: connection.clone(),
         });
         drop(slot);

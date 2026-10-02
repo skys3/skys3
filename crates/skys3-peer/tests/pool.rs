@@ -5,18 +5,44 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
 use common::*;
 use skys3_peer::{
-    Begin, ConnectError, ConnectionPool, Destination, EndpointSettings, Message, PeerEndpoint,
-    PeerTrust, PoolError, PoolStats, StagedRanges,
+    Begin, ConnectError, ConnectionPool, Destination, EndpointSettings, Measurement, Message,
+    Meter, PeerConnection, PeerEndpoint, PeerTrust, PoolError, PoolStats, StagedRanges,
 };
 use skys3_types::{BucketName, WriteIdentity};
 
 const US: &str = "prod-us";
 const EU: &str = "prod-eu";
+
+/// A path that never congests: its round trip stays at its 10 ms base,
+/// and each measurement finds another MiB sent. Tests that adapt the pool
+/// measure with it, so the limit follows the pool's rules and not the
+/// round trips of a loaded test machine, where loopback's smoothed round
+/// trip can be many times its minimum.
+#[derive(Debug, Default)]
+struct SteadyPath {
+    sent: AtomicU64,
+}
+
+impl Meter for SteadyPath {
+    fn measure(&self, _: &PeerConnection) -> Measurement {
+        Measurement {
+            sent: self.sent.fetch_add(1 << 20, Ordering::Relaxed),
+            rtt: Duration::from_millis(10),
+            min_rtt: Duration::from_millis(10),
+        }
+    }
+}
+
+fn steady() -> Arc<SteadyPath> {
+    Arc::new(SteadyPath::default())
+}
 
 fn begin(seq: u64) -> Message {
     let identity: WriteIdentity = format!("{US}/b-src/5/42.{seq}").parse().unwrap();
@@ -80,7 +106,7 @@ async fn pools_connections_per_destination_within_the_limit() {
     let to = destination(EU, &destination_endpoint);
     let server = serve(destination_endpoint);
 
-    let pool = ConnectionPool::new(us.endpoint("us-1", source_trust), 2);
+    let pool = ConnectionPool::with_meter(us.endpoint("us-1", source_trust), 2, steady());
     assert_eq!(pool.stats(&to), None);
     let lease = pool.attach(to.clone());
     assert_eq!(lease.destination(), &to);
@@ -151,7 +177,7 @@ async fn a_burst_of_streams_spreads_across_connections() {
     let destination_endpoint = eu.endpoint("eu-1", destination_trust);
     let to = destination(EU, &destination_endpoint);
     let server = serve(destination_endpoint);
-    let pool = ConnectionPool::new(us.endpoint("us-1", source_trust), 4);
+    let pool = ConnectionPool::with_meter(us.endpoint("us-1", source_trust), 4, steady());
     let lease = pool.attach(to.clone());
 
     // Two connections, both idle.
