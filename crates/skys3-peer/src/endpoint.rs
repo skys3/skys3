@@ -488,13 +488,28 @@ impl PeerConnection {
     ///
     /// [`StreamError::Connection`] if the connection is lost.
     pub async fn open_stream(&self) -> Result<MessageStream, StreamError> {
+        self.open_reserved(self.reserve_stream()).await
+    }
+
+    /// Counts a stream as open before it is, so that callers choosing a
+    /// connection while the stream is being opened see it. Dropping the
+    /// reservation, as a failed or cancelled open does, releases it.
+    pub(crate) fn reserve_stream(&self) -> StreamCount {
+        StreamCount::new(&self.shared.streams)
+    }
+
+    /// Opens a stream for a reservation of this connection.
+    pub(crate) async fn open_reserved(
+        &self,
+        reservation: StreamCount,
+    ) -> Result<MessageStream, StreamError> {
         let shared = &self.shared;
         let streams = shared.connection.open_bi().await?;
         Ok(MessageStream::new(
             streams,
             shared.session.clone(),
             shared.side,
-            StreamCount::new(&shared.streams),
+            reservation,
         ))
     }
 

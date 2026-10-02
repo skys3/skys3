@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, MutexGuard, watch};
 use tokio::task::JoinSet;
 
 use crate::error::ShardError;
-use crate::shard::{Shard, ShardSummary};
+use crate::shard::{Role, Shard, ShardSummary};
 
 /// A shard's place in the set.
 enum Slot<D: Disk> {
@@ -132,7 +132,11 @@ impl<D: Disk> ShardSet<D> {
 
     /// Opens node `node`'s replica in the shard of `config`, in the role the
     /// configuration gives it, or returns it if it is open already; see
-    /// [`ShardSet::open`] and [`Shard::open_replica`].
+    /// [`ShardSet::open`] and [`Shard::open_replica`]. A replica open as
+    /// the shard's only member that `config` gives learners (§6.7) is
+    /// closed once its records are applied, and a new one opens as their
+    /// primary: requests that still hold the closed one fail as
+    /// unavailable.
     ///
     /// # Errors
     ///
@@ -155,8 +159,21 @@ impl<D: Disk> ShardSet<D> {
         // two sequencers, and two opens in a newer epoch append one CONFIG.
         let mut shards = self.settled(&key).await?;
         if let Some(Slot::Open(shard)) = shards.get(&key) {
-            shard.reconfigure(config).await?;
-            return Ok(shard.clone());
+            // A replica opened as the shard's only member runs for one
+            // member. Given learners (§6.7), it closes once its records are
+            // applied, and opens again as their primary.
+            let alone = shard.config();
+            let gains_learners = node.is_some()
+                && shard.role() == Role::Alone
+                && !shard.is_stopped()
+                && config.epoch > alone.epoch
+                && config.members == alone.members
+                && !config.learners.is_empty();
+            if !gains_learners {
+                shard.reconfigure(config).await?;
+                return Ok(shard.clone());
+            }
+            shard.close().await?;
         }
         let log = self.logs[self.placement(&key)].1.clone();
         let (index, pool) = (Arc::clone(&self.index), self.pool.clone());

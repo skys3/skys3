@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
 use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
-use super::{Inner, LinkError, ReplicationConfig, recv};
+use super::{LinkError, Replication, ReplicationConfig, recv};
 use crate::lease::Grace;
 use crate::lineage::Reconcile;
 use crate::shard::{Role, Shard};
@@ -21,16 +21,17 @@ use crate::shard::{Role, Shard};
 pub(super) async fn serve<S, N, D>(
     (mut receiver, mut sender): (Receiver<S>, Sender<S>),
     frame: Frame,
-    inner: &Inner<N, D>,
+    replication: &Replication<N, D>,
 ) -> Result<(), LinkError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     N: Network,
     D: Disk,
 {
+    let inner = &*replication.inner;
     let config = inner.config;
     let request: Sync = wire::body(&frame, MessageKind::Sync).map_err(LinkError::Protocol)?;
-    let (shard, epoch) = match accept(&request, receiver.peer(), inner).await {
+    let (shard, epoch) = match accept(&request, receiver.peer(), replication).await {
         Ok(accepted) => accepted,
         Err((epoch, refused)) => return refuse(&mut sender, epoch, refused).await,
     };
@@ -133,18 +134,21 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Finds the shard a `Sync` names, which must be open on this node as a
-/// member, and checks that the peer is its primary in its epoch. A newer
-/// configuration that keeps this member is adopted
-/// ([`Shard::reconfigure`]): its primary removed other members (§6.4), or
-/// took over (§6.5). A member that proposed itself as primary follows only
-/// a newer configuration than the one it proposed over, which tells it
-/// that its proposal lost (R1, §6.3). A refusal carries the member's
+/// member or a learner, and checks that the peer is its primary in its
+/// epoch. A newer configuration that keeps this replica is adopted
+/// ([`Shard::reconfigure`]): its primary removed other members (§6.4),
+/// took over (§6.5), added or removed learners, or promoted one (§6.7). A
+/// learner promoted to member starts to watch its primary, to take over
+/// should it go silent. A member that proposed itself as primary follows
+/// only a newer configuration than the one it proposed over, which tells
+/// it that its proposal lost (R1, §6.3). A refusal carries the member's
 /// epoch, if it knows the shard, and why.
 async fn accept<N: Network, D: Disk>(
     request: &Sync,
     peer: &PeerIdentity,
-    inner: &Inner<N, D>,
+    replication: &Replication<N, D>,
 ) -> Result<(Shard<D>, Epoch), (Epoch, String)> {
+    let inner = &*replication.inner;
     let refuse = |epoch, reason: &str| Err((epoch, reason.to_owned()));
     let theirs = request.configuration().map_err(|e| (Epoch::ZERO, e))?;
     let shard = ShardRef::new(theirs.bucket_id.clone(), theirs.shard);
@@ -152,10 +156,11 @@ async fn accept<N: Network, D: Disk>(
         return refuse(Epoch::ZERO, "the shard is not open on this node");
     };
     let ours = replica.config();
-    if replica.role() != Role::Member {
+    let role = replica.role();
+    if !role.follows() {
         return refuse(
             ours.epoch,
-            "this node is not a member that follows a primary",
+            "this node is not a member or a learner that follows a primary",
         );
     }
     if !matches!(peer, PeerIdentity::Node(node) if *node == theirs.primary) {
@@ -175,6 +180,10 @@ async fn accept<N: Network, D: Disk>(
     }
     if let Err(error) = replica.reconfigure(&theirs).await {
         return refuse(ours.epoch, &error.to_string());
+    }
+    if role == Role::Learner && replica.role() == Role::Member {
+        tracing::info!(%shard, epoch = %theirs.epoch, "promoted from learner to member");
+        replication.watch_primary(&replica, inner.grace_of(&shard));
     }
     Ok((replica, theirs.epoch))
 }

@@ -31,7 +31,7 @@ use crate::tables::{
 /// rather than miss the uploads in it. Version 3 adds the imports table
 /// (§9.1) in the same way, and version 4 the step-downs of planned
 /// handoffs (§5.4).
-pub const FORMAT_VERSION: u64 = 4;
+pub const FORMAT_VERSION: u64 = 5;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -239,6 +239,7 @@ impl Index {
             txn.open_table(tables::CONTROL)?;
             txn.open_table(tables::IMPORTS)?;
             txn.open_table(tables::STEP_DOWNS)?;
+            txn.open_table(tables::PROMOTIONS)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -325,7 +326,9 @@ impl Index {
 
     /// Removes everything the index holds for `shard`, in one non-durable
     /// commit: its entries, its record locations, its applied position,
-    /// and its step-down (see [`Index::store_step_down`]). A node drops a shard this way once its bucket is deleted.
+    /// its step-down (see [`Index::store_step_down`]), and its promotion
+    /// (see [`Index::store_promotion`]). A node drops a shard this way once
+    /// its bucket is deleted.
     ///
     /// The shard's records stay in the log until their segments are
     /// reclaimed, so replay after a crash can bring the shard back; startup
@@ -340,6 +343,8 @@ impl Index {
         txn.set_durability(Durability::None)?;
         IndexWriter::open(&txn)?.remove_shard(shard)?;
         txn.open_table(tables::STEP_DOWNS)?
+            .remove(codec::shard_key(shard).as_slice())?;
+        txn.open_table(tables::PROMOTIONS)?
             .remove(codec::shard_key(shard).as_slice())?;
         txn.commit()?;
         Ok(())
@@ -452,6 +457,29 @@ impl Index {
         txn.set_durability(Durability::Immediate)?;
         txn.open_table(tables::STEP_DOWNS)?
             .insert(codec::shard_key(shard).as_slice(), epoch.get())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records, in one durable commit, that this node's replica of a shard,
+    /// as its primary, proposes `config` to promote a learner (§6.3,
+    /// §6.7), before it issues the compare-and-swap: until it learns the
+    /// outcome, across restarts too, it keeps waiting for the learner,
+    /// since a proposal that landed unseen made the learner a member. A
+    /// later proposal replaces the record; one whose epoch the replica has
+    /// reached since is settled, so it is ignored rather than removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if encoding or redb fails; nothing changes
+    /// then.
+    pub fn store_promotion(&self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("promotions"))?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::PROMOTIONS)?
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
         txn.commit()?;
         Ok(())
     }

@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::endpoint::{ConnectError, Destination, PeerConnection, PeerEndpoint};
-use crate::stream::{MessageStream, StreamError};
+use crate::stream::{MessageStream, StreamCount, StreamError};
 
 /// A round trip this many times its base, plus [`LATENCY_SLACK`], counts
 /// as rising latency.
@@ -134,7 +134,7 @@ pub enum PoolError {
 
 /// A destination's place in a pool, as [`ConnectionPool::stats`] reports
 /// it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolStats {
     /// The shards attached to the destination.
     pub shards: u32,
@@ -144,6 +144,8 @@ pub struct PoolStats {
     pub max: u32,
     /// The connections open.
     pub connections: usize,
+    /// The streams open, or being opened, on each connection.
+    pub streams: Vec<usize>,
 }
 
 /// The peer connections of every shard a node hosts, pooled per
@@ -221,11 +223,37 @@ impl PoolState {
     }
 }
 
-/// What a caller of [`ShardLease::open_stream`] does next.
+/// What a caller of [`ShardLease::open_stream`] does next. Each choice
+/// holds the reservation it made under the state lock, so concurrent
+/// callers see it, and dropping it, as a failed or cancelled call does,
+/// releases it.
 enum Choice {
-    Use(PeerConnection),
-    Connect,
+    /// Open a stream on this connection, whose slot is reserved.
+    Use(PeerConnection, StreamCount),
+    /// Open a new connection in the reserved slot.
+    Connect(ConnectSlot),
+    /// Wait for a connection being opened by another caller.
     Wait,
+}
+
+/// A reserved slot for a connection being opened. Dropping it frees the
+/// slot and wakes the callers waiting for a connection, whether the
+/// connect succeeded, failed, or was cancelled.
+struct ConnectSlot(Arc<DestinationPool>);
+
+impl ConnectSlot {
+    /// Reserves a slot; the caller holds the state lock as `state`.
+    fn reserve(pool: &Arc<DestinationPool>, state: &mut PoolState) -> Self {
+        state.connecting += 1;
+        Self(pool.clone())
+    }
+}
+
+impl Drop for ConnectSlot {
+    fn drop(&mut self) {
+        lock(&self.0.state).connecting -= 1;
+        self.0.connected.notify_waiters();
+    }
 }
 
 impl ConnectionPool {
@@ -290,6 +318,11 @@ impl ConnectionPool {
             limit: state.limit.current(),
             max: state.limit.max(),
             connections: state.connections.len(),
+            streams: state
+                .connections
+                .iter()
+                .map(|pooled| pooled.connection.open_streams())
+                .collect(),
         })
     }
 
@@ -375,21 +408,26 @@ impl ShardLease {
                     .iter()
                     .min_by_key(|pooled| pooled.connection.open_streams());
                 if let Some(idle) = idle {
-                    Choice::Use(idle.connection.clone())
+                    let connection = idle.connection.clone();
+                    let reservation = connection.reserve_stream();
+                    Choice::Use(connection, reservation)
                 } else if state.live() + state.connecting < state.limit.current() {
-                    state.connecting += 1;
-                    Choice::Connect
+                    Choice::Connect(ConnectSlot::reserve(pool, &mut state))
                 } else if let Some(least_busy) = least_busy {
-                    Choice::Use(least_busy.connection.clone())
+                    let connection = least_busy.connection.clone();
+                    let reservation = connection.reserve_stream();
+                    Choice::Use(connection, reservation)
                 } else {
                     Choice::Wait
                 }
             };
             match choice {
-                Choice::Use(connection) => return Ok(connection.open_stream().await?),
-                Choice::Connect => {
-                    let connection = self.connect().await?;
-                    return Ok(connection.open_stream().await?);
+                Choice::Use(connection, reservation) => {
+                    return Ok(connection.open_reserved(reservation).await?);
+                }
+                Choice::Connect(slot) => {
+                    let (connection, reservation) = self.connect(slot).await?;
+                    return Ok(connection.open_reserved(reservation).await?);
                 }
                 Choice::Wait => connected.await,
             }
@@ -403,22 +441,21 @@ impl ShardLease {
         lock(&self.destination_pool.state).overloaded = true;
     }
 
-    /// Opens a connection for a slot already reserved.
-    async fn connect(&self) -> Result<PeerConnection, ConnectError> {
-        let result = self.pool.inner.endpoint.connect(&self.destination).await;
-        let pool = &self.destination_pool;
-        {
-            let mut state = lock(&pool.state);
-            state.connecting -= 1;
-            if let Ok(connection) = &result {
-                state.connections.push(Pooled {
-                    sent: connection.stats().udp_tx.bytes,
-                    connection: connection.clone(),
-                });
-            }
-        }
-        pool.connected.notify_waiters();
-        result
+    /// Opens a connection in a reserved slot, and adds it to the pool with
+    /// a stream reserved for the caller, so that the callers `slot` wakes
+    /// do not take it for an idle connection.
+    async fn connect(
+        &self,
+        slot: ConnectSlot,
+    ) -> Result<(PeerConnection, StreamCount), ConnectError> {
+        let connection = self.pool.inner.endpoint.connect(&self.destination).await?;
+        let reservation = connection.reserve_stream();
+        lock(&self.destination_pool.state).connections.push(Pooled {
+            sent: connection.stats().udp_tx.bytes,
+            connection: connection.clone(),
+        });
+        drop(slot);
+        Ok((connection, reservation))
     }
 }
 

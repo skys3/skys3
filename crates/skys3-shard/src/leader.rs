@@ -1,7 +1,7 @@
 //! A primary's replication state: what each member holds, the records it
 //! still has to send, and the commit rule (§5.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -57,12 +57,32 @@ struct Progress {
     heard: u64,
 }
 
+/// A promotion the primary proposed and does not know the outcome of
+/// (§6.7).
+#[derive(Debug, Clone)]
+struct Promotion {
+    /// The learner it makes a member.
+    learner: NodeId,
+    /// The configuration proposed.
+    config: ShardConfig,
+}
+
 #[derive(Debug)]
 struct State {
     /// The members other than the primary that commits and leases need, in
     /// configuration order.
     members: Vec<NodeId>,
-    /// What the primary knows of each of them.
+    /// The learners the primary sends its log to, in configuration order.
+    learners: Vec<NodeId>,
+    /// The learners in the acknowledgement set: every commit waits for
+    /// them too (§6.4).
+    acking: BTreeSet<NodeId>,
+    /// The learners whose backfill is complete (§6.7).
+    backfilled: BTreeSet<NodeId>,
+    /// The promotion outstanding, if any: commits wait for its learner,
+    /// and reads need its lease, until the primary knows the outcome.
+    promoting: Option<Promotion>,
+    /// What the primary knows of each member and learner.
     progress: BTreeMap<NodeId, Progress>,
     /// Every record after `base` the primary has sequenced or rolled
     /// forward: those not yet committed, which a member may still need,
@@ -111,20 +131,31 @@ struct State {
 ///   leases need those members any more ([`Leader::members`]): the records
 ///   they held back commit, and their acknowledgements and grants count for
 ///   nothing from then on.
+/// - **Learners** (§6.4, §6.7). The primary sends its log to the learners
+///   of its configuration too ([`Leader::peers`]), but only the records it
+///   holds durably, so a learner never holds a record that a restart of
+///   the primary could give its `seq` to again. A learner the primary
+///   takes into the acknowledgement set ([`Leader::join`]) holds up every
+///   commit as a member does, until the primary drops it again
+///   ([`Leader::drop_learner`]). Once its backfill is complete
+///   ([`Leader::backfilled`]) and it is durable up to the commit
+///   watermark, the primary proposes its promotion
+///   ([`Leader::begin_promotion`]); until it knows the outcome, commits
+///   wait for the learner and reads need its lease (§6.3).
 pub struct Leader {
     shard: ShardRef,
-    /// The members other than the primary when the leader started: the
-    /// owners of the channels in `changes`.
-    started: Vec<NodeId>,
     sequencer: Arc<Mutex<Sequencer>>,
     pipeline: mpsc::WeakUnboundedSender<Message>,
     durable: watch::Receiver<Seq>,
     state: Mutex<State>,
     /// Bumped when records are added, the watermark moves, or the members
-    /// change: one channel per member, in the order of `started`, so that
-    /// the links wake in the same order on every run (a channel with
-    /// several receivers wakes them in an order chosen at random).
-    changes: Vec<watch::Sender<u64>>,
+    /// change: one channel per member and learner, in the order the leader
+    /// learned of them, so that the links wake in the same order on every
+    /// run (a channel with several receivers wakes them in an order chosen
+    /// at random). A leaf lock.
+    changes: Mutex<Vec<(NodeId, watch::Sender<u64>)>>,
+    /// The members and learners the primary sends its log to.
+    peers: watch::Sender<Vec<NodeId>>,
     links: AtomicBool,
     /// The leases from the members. A leaf lock: nothing else is locked
     /// while it is held.
@@ -162,9 +193,14 @@ impl fmt::Debug for Leader {
 }
 
 impl Leader {
+    /// The leader of the primary of `config`. `promotion` is a promotion
+    /// the primary recorded in an earlier life: unless `config` has reached
+    /// its epoch, the outcome is unknown, so commits wait for its learner
+    /// and reads need the learner's lease (§6.3).
     pub(crate) fn new(
         shard: ShardRef,
         config: &ShardConfig,
+        promotion: Option<&ShardConfig>,
         sequencer: Arc<Mutex<Sequencer>>,
         pipeline: mpsc::UnboundedSender<Message>,
         durable: watch::Receiver<Seq>,
@@ -175,12 +211,30 @@ impl Leader {
             .filter(|member| **member != config.primary)
             .cloned()
             .collect();
+        let mut learners = config.learners.clone();
+        let promoting = promotion
+            .filter(|proposed| proposed.epoch > config.epoch)
+            .and_then(|proposed| {
+                let learner = proposed.members.iter().find(|m| !config.is_member(m))?;
+                if !learners.contains(learner) {
+                    learners.push(learner.clone());
+                }
+                Some(Promotion {
+                    learner: learner.clone(),
+                    config: proposed.clone(),
+                })
+            });
+        let peers: Vec<NodeId> = members.iter().chain(&learners).cloned().collect();
         let base = *durable.borrow();
         let state = State {
-            members: members.clone(),
-            progress: members
+            members,
+            learners,
+            acking: BTreeSet::new(),
+            backfilled: BTreeSet::new(),
+            promoting,
+            progress: peers
                 .iter()
-                .map(|member| (member.clone(), Progress::default()))
+                .map(|peer| (peer.clone(), Progress::default()))
                 .collect(),
             buffer: BTreeMap::new(),
             base,
@@ -188,10 +242,14 @@ impl Leader {
             commit: Seq::ZERO,
             target: None,
         };
+        let changes = peers
+            .iter()
+            .map(|peer| (peer.clone(), watch::Sender::new(0)))
+            .collect();
         Self {
             shard,
-            changes: members.iter().map(|_| watch::Sender::new(0)).collect(),
-            started: members,
+            changes: Mutex::new(changes),
+            peers: watch::Sender::new(peers),
             sequencer,
             pipeline: pipeline.downgrade(),
             durable,
@@ -221,6 +279,147 @@ impl Leader {
     #[must_use]
     pub fn is_member(&self, member: &NodeId) -> bool {
         self.state().members.contains(member)
+    }
+
+    /// The learners the primary sends its log to, in configuration order.
+    #[must_use]
+    pub fn learners(&self) -> Vec<NodeId> {
+        self.state().learners.clone()
+    }
+
+    /// Whether `node` is one of [`Leader::learners`].
+    #[must_use]
+    pub fn is_learner(&self, node: &NodeId) -> bool {
+        self.state().learners.contains(node)
+    }
+
+    /// The members and learners the primary sends its log to.
+    #[must_use]
+    pub fn peers(&self) -> watch::Receiver<Vec<NodeId>> {
+        self.peers.subscribe()
+    }
+
+    /// Whether the primary sends its log to `node`.
+    #[must_use]
+    pub fn links_to(&self, node: &NodeId) -> bool {
+        self.peers.borrow().contains(node)
+    }
+
+    /// The learners in the acknowledgement set, which every commit waits
+    /// for (§6.4).
+    #[must_use]
+    pub fn acking(&self) -> Vec<NodeId> {
+        self.state().acking.iter().cloned().collect()
+    }
+
+    /// Takes `learner` into the acknowledgement set: from now on every
+    /// commit waits for it, and it counts as an acknowledging copy for
+    /// `min_write_replicas` (§6.4). Call it once the learner holds the
+    /// records the primary had sequenced a moment ago, so that it stores
+    /// new records as they come. Returns whether it joined now.
+    pub fn join(&self, learner: &NodeId) -> bool {
+        let joined = {
+            let mut state = self.state();
+            let joined = state.learners.contains(learner) && state.acking.insert(learner.clone());
+            lock(&self.sequencer).acking = state.acking.len();
+            joined
+        };
+        self.progress();
+        joined
+    }
+
+    /// Drops `learner` from the acknowledgement set, as when it missed
+    /// `member_suspect_after` (§6.4): commits no longer wait for it, and it
+    /// must catch up again before it rejoins. No configuration changes.
+    /// The learner of an outstanding promotion stays: the primary keeps
+    /// waiting for it until it knows the outcome. Returns whether it was
+    /// dropped.
+    pub fn drop_learner(&self, learner: &NodeId) -> bool {
+        let dropped = {
+            let mut state = self.state();
+            if state
+                .promoting
+                .as_ref()
+                .is_some_and(|p| p.learner == *learner)
+            {
+                return false;
+            }
+            let dropped = state.acking.remove(learner);
+            lock(&self.sequencer).acking = state.acking.len();
+            dropped
+        };
+        self.progress();
+        dropped
+    }
+
+    /// Records that `learner`'s backfill is complete (§6.7): it holds the
+    /// shard's history that the live stream did not bring it.
+    pub fn backfilled(&self, learner: &NodeId) {
+        let mut state = self.state();
+        if state.learners.contains(learner) {
+            state.backfilled.insert(learner.clone());
+        }
+    }
+
+    /// Whether `learner`'s backfill is complete.
+    #[must_use]
+    pub fn is_backfilled(&self, learner: &NodeId) -> bool {
+        self.state().backfilled.contains(learner)
+    }
+
+    /// The configuration of the promotion the primary proposed and does
+    /// not know the outcome of, if any.
+    #[must_use]
+    pub fn promoting(&self) -> Option<ShardConfig> {
+        self.state().promoting.as_ref().map(|p| p.config.clone())
+    }
+
+    /// Records that the primary proposes `config` to promote `learner`
+    /// (§6.7), if R3 allows it now: the learner is in the acknowledgement
+    /// set, its backfill is complete, it is durable up to every record the
+    /// pipeline may commit, and no other promotion is outstanding. From
+    /// then on, until the primary adopts a configuration at `config`'s
+    /// epoch or later, commits wait for the learner and reads need its
+    /// lease, since the proposal may land unseen. Commits do not pause:
+    /// they only keep waiting for the learner, as they did.
+    ///
+    /// # Errors
+    ///
+    /// Why the learner cannot be promoted now.
+    pub fn begin_promotion(&self, learner: &NodeId, config: &ShardConfig) -> Result<(), String> {
+        let mut state = self.state();
+        let acked = state.progress.get(learner).map_or(Seq::ZERO, |p| p.acked);
+        let refusal = if state.promoting.is_some() {
+            "another promotion is outstanding".to_owned()
+        } else if !state.acking.contains(learner) {
+            format!("{learner} is not in the acknowledgement set")
+        } else if !state.backfilled.contains(learner) {
+            format!("the backfill of {learner} is not complete")
+        } else if acked < state.limit.max(state.commit) {
+            format!("{learner} is durable only up to seq {acked}")
+        } else if !config.is_member(learner) || config.is_learner(learner) {
+            format!("the configuration does not make {learner} a member")
+        } else {
+            state.promoting = Some(Promotion {
+                learner: learner.clone(),
+                config: config.clone(),
+            });
+            return Ok(());
+        };
+        Err(refusal)
+    }
+
+    /// Forgets the outstanding promotion of `config`, which the primary
+    /// did not propose after all: it could not record it.
+    pub(crate) fn abandon_promotion(&self, config: &ShardConfig) {
+        let mut state = self.state();
+        if state
+            .promoting
+            .as_ref()
+            .is_some_and(|p| p.config == *config)
+        {
+            state.promoting = None;
+        }
     }
 
     /// Records that a member refused an append because it knows `epoch`,
@@ -325,11 +524,11 @@ impl Leader {
     }
 
     /// Records that `member` acknowledged the beacon or append stamped
-    /// `stamp`, which grants a lease until `stamp + primary_lease`. A node
-    /// that is not one of [`Leader::members`] grants nothing, a member
-    /// removed from the shard included.
+    /// `stamp`, which grants a lease until `stamp + primary_lease`. Learners
+    /// grant leases as members do (§5.4). A node the primary does not link
+    /// to grants nothing, a member removed from the shard included.
     pub fn granted(&self, member: &NodeId, stamp: MonoTime) {
-        if self.is_member(member) {
+        if self.state().progress.contains_key(member) {
             self.leases().granted(member, stamp);
         }
     }
@@ -341,12 +540,18 @@ impl Leader {
         self.leases().until(member)
     }
 
-    /// Whether the primary holds a valid lease from every member now, as
-    /// serving a read requires.
+    /// Whether the primary holds a valid lease from every member now, and
+    /// from the learner of an outstanding promotion, which may be a member
+    /// already (§5.4, §6.7), as serving a read requires.
     #[must_use]
     pub fn holds_leases(&self) -> bool {
-        let members = self.members();
-        self.leases().held(&members)
+        let needed = {
+            let state = self.state();
+            let mut needed = state.members.clone();
+            needed.extend(state.promoting.iter().map(|p| p.learner.clone()));
+            needed
+        };
+        self.leases().held(&needed)
     }
 
     /// The commit watermark: every record up to it is durable on every
@@ -386,17 +591,18 @@ impl Leader {
 
     /// A receiver for the link to `member` that sees a change whenever
     /// records are added, the commit watermark moves, or the members
-    /// change, or `None` if `member` was never one of
-    /// [`Leader::members`].
+    /// change, or `None` if the primary never linked to `member`.
     #[must_use]
     pub fn subscribe(&self, member: &NodeId) -> Option<watch::Receiver<u64>> {
-        let index = self.started.iter().position(|m| m == member)?;
-        Some(self.changes[index].subscribe())
+        let changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+        let (_, changes) = changes.iter().find(|(node, _)| node == member)?;
+        Some(changes.subscribe())
     }
 
-    /// Wakes every link, in the order of the members.
+    /// Wakes every link, in the order the leader learned of their peers.
     fn changed(&self) {
-        for changes in &self.changes {
+        let changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+        for (_, changes) in changes.iter() {
             changes.send_modify(|n| *n = n.wrapping_add(1));
         }
     }
@@ -470,7 +676,8 @@ impl Leader {
     /// Sets the last `seq` the primary commits before it serves, its whole
     /// log, once every member has reported.
     fn target_if_synced(&self, state: &mut State) {
-        if state.target.is_none() && state.progress.values().all(|p| p.synced) {
+        let synced = |member: &NodeId| state.progress.get(member).is_some_and(|p| p.synced);
+        if state.target.is_none() && state.members.iter().all(synced) {
             let next = lock(&self.sequencer).next.seq;
             state.target = Some(Seq::new(next.get().saturating_sub(1)));
         }
@@ -491,15 +698,64 @@ impl Leader {
     /// Adopts `config`, whose `CONFIG` record is now durable on the
     /// primary: commits and leases no longer need the members it leaves out
     /// (§6.4), so the records only they held back commit, and the links to
-    /// them see the change and end. A configuration adds no member here.
+    /// them see the change and end. A learner it adds gets a link; a
+    /// learner it promotes is a member from now on (§6.7); and a promotion
+    /// outstanding is settled once `config` has reached its epoch, whether
+    /// `config` is that promotion or a configuration it lost to.
     pub(crate) fn adopt(&self, config: &ShardConfig) {
         {
             let mut state = self.state();
+            if state
+                .promoting
+                .as_ref()
+                .is_some_and(|p| p.config.epoch <= config.epoch)
+            {
+                state.promoting = None;
+            }
+            state.members = config
+                .members
+                .iter()
+                .filter(|member| **member != config.primary)
+                .cloned()
+                .collect();
+            state.learners.clone_from(&config.learners);
             let State {
-                members, progress, ..
+                members,
+                learners,
+                acking,
+                backfilled,
+                promoting,
+                progress,
+                ..
             } = &mut *state;
-            members.retain(|member| config.is_member(member) && *member != config.primary);
-            progress.retain(|member, _| members.contains(member));
+            // An outstanding promotion keeps its learner linked.
+            if let Some(p) = promoting
+                .as_ref()
+                .filter(|p| !learners.contains(&p.learner))
+            {
+                learners.push(p.learner.clone());
+            }
+            let peers: Vec<NodeId> = members.iter().chain(learners.iter()).cloned().collect();
+            progress.retain(|node, _| peers.contains(node));
+            for peer in &peers {
+                progress.entry(peer.clone()).or_default();
+            }
+            acking.retain(|node| learners.contains(node));
+            backfilled.retain(|node| learners.contains(node));
+            lock(&self.sequencer).acking = acking.len();
+            {
+                let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+                for peer in &peers {
+                    if !changes.iter().any(|(node, _)| node == peer) {
+                        changes.push((peer.clone(), watch::Sender::new(0)));
+                    }
+                }
+            }
+            self.peers.send_if_modified(|linked| {
+                let changed = *linked != peers;
+                *linked = peers;
+                changed
+            });
             self.target_if_synced(&mut state);
         }
         self.changed();
@@ -507,14 +763,19 @@ impl Leader {
     }
 
     /// Applies the commit rule: raises the pipeline's commit limit to what
-    /// every member acknowledged, moves the watermark, drops committed
-    /// records, and starts serving once reconciling is done.
+    /// every member, every learner in the acknowledgement set, and the
+    /// learner of an outstanding promotion acknowledged, moves the
+    /// watermark, drops committed records, and starts serving once
+    /// reconciling is done.
     pub(crate) fn progress(&self) {
         let mut state = self.state();
-        let acked = state
-            .progress
-            .values()
-            .map(|p| p.acked)
+        let needed = state
+            .members
+            .iter()
+            .chain(&state.acking)
+            .chain(state.promoting.iter().map(|p| &p.learner));
+        let acked = needed
+            .map(|node| state.progress.get(node).map_or(Seq::ZERO, |p| p.acked))
             .min()
             .unwrap_or(Seq::MAX);
         if acked > state.limit {

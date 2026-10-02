@@ -77,6 +77,19 @@ pub enum Role {
     /// applies it once the primary's commit watermark covers it. It serves
     /// no client request.
     Member,
+    /// A learner (§6.4, §6.7): it follows its primary as a member does,
+    /// but the commit rule counts it only while its primary keeps it in
+    /// the acknowledgement set, and it never takes over. A promotion makes
+    /// it a member.
+    Learner,
+}
+
+impl Role {
+    /// Whether the replica follows a primary: a member or a learner.
+    #[must_use]
+    pub fn follows(self) -> bool {
+        matches!(self, Role::Member | Role::Learner)
+    }
 }
 
 type WriteReply = oneshot::Sender<Result<Committed, ShardError>>;
@@ -187,6 +200,9 @@ pub(crate) struct Sequencer {
     /// In fail-fast mode, the last position sequenced when a request
     /// last timed out: new writes are refused until it is applied.
     late: Option<EpochSeq>,
+    /// How many learners a primary's acknowledgement set holds: they count
+    /// as acknowledging copies for `min_write_replicas` (§6.4).
+    pub(crate) acking: usize,
 }
 
 struct Inner<D: Disk> {
@@ -308,14 +324,22 @@ impl<D: Disk> Shard<D> {
     /// show it ([`Shard::follow`]), a primary once every member has reported
     /// its log ([`Shard::align`]).
     ///
+    /// A learner whose log holds nothing of the shard yet opens in no epoch,
+    /// and takes its primary's log from the first record on, each record in
+    /// the epoch it was sequenced in, switching to `config`'s as a member
+    /// does (§6.7).
+    ///
     /// A primary that stepped down in `config`'s epoch for a planned
     /// handoff, in an earlier life too, opens stopped: it never serves in
-    /// that epoch again (§5.4, [`Shard::stepped_down`]).
+    /// that epoch again (§5.4, [`Shard::stepped_down`]). A primary that
+    /// recorded a promotion it proposed in an earlier life, and whose
+    /// epoch `config` has not reached, keeps waiting for that learner until
+    /// it learns the outcome (§6.3, [`Leader::promoting`]).
     ///
     /// # Errors
     ///
     /// As [`Shard::open`], and [`ShardError::Configuration`] if `node` is
-    /// not a member of `config` or `config` has learners (plan M2-14).
+    /// neither a member nor a learner of `config`.
     pub async fn open_replica(
         config: &ShardConfig,
         node: &NodeId,
@@ -335,11 +359,15 @@ impl<D: Disk> Shard<D> {
     ) -> Result<Self, ShardError> {
         let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
         let role = check_config(&shard, config, node)?;
-        let (applied, stepped_down) = {
+        let (applied, stepped_down, promotion) = {
             let (index, key) = (Arc::clone(&index), shard.clone());
             run(&pool, &shard, move || {
                 let read = index.read()?;
-                Ok((read.applied(&key)?, read.step_down(&key)?))
+                Ok((
+                    read.applied(&key)?,
+                    read.step_down(&key)?,
+                    read.promotion(&key)?,
+                ))
             })
             .await?
         };
@@ -354,7 +382,12 @@ impl<D: Disk> Shard<D> {
         // its primary's session, and a primary appends its `CONFIG` record
         // once every member has reported its log (§5.1). Both open in the
         // epoch of their last record, and align later.
-        let aligning = role != Role::Alone && applied.is_some_and(|a| a.epoch < epoch);
+        // A primary with no other member has no one to align with. A
+        // learner that holds nothing yet takes the primary's log from its
+        // first record, in the epochs it was sequenced in.
+        let aligns = role.follows() || (role == Role::Primary && config.members.len() > 1);
+        let aligning = (aligns && applied.is_some_and(|a| a.epoch < epoch))
+            || (role == Role::Learner && applied.is_none());
         let mut last = match applied {
             Some(applied) if applied.epoch > epoch => {
                 return Err(ShardError::configuration(
@@ -405,14 +438,18 @@ impl<D: Disk> Shard<D> {
             subscriber: None,
             ack: None,
             late: None,
+            acking: 0,
         }));
         let (sender, receiver) = mpsc::unbounded_channel();
         let (durable_tx, durable) = watch::channel(last.seq);
         let leader = Arc::new(OnceLock::new());
         if role == Role::Primary {
+            // A promotion this primary proposed in an earlier life, whose
+            // outcome it may not know: it keeps waiting for the learner.
             let _ = leader.set(Arc::new(Leader::new(
                 shard.clone(),
                 config,
+                promotion.as_ref(),
                 Arc::clone(&sequencer),
                 sender.clone(),
                 durable.clone(),
@@ -852,7 +889,7 @@ impl<D: Disk> Shard<D> {
     pub fn follow(&self, sequencing: Epoch, primary_last: Seq) -> Result<(), ShardError> {
         let mut sequencer = self.sequencer();
         sequencer.check_running(self.shard())?;
-        if sequencer.role != Role::Member || sequencer.is_aligned() {
+        if !sequencer.role.follows() || sequencer.is_aligned() {
             return Ok(());
         }
         sequencer.adopt_after = (sequencing == sequencer.config.epoch).then_some(primary_last);
@@ -865,7 +902,7 @@ impl<D: Disk> Shard<D> {
     /// and never adopts: it refuses the new epoch's records, and its
     /// primary removes it (§6.4).
     fn adopt_if_due(&self, sequencer: &mut Sequencer) -> Result<(), ShardError> {
-        let due = sequencer.role == Role::Member
+        let due = sequencer.role.follows()
             && !sequencer.is_aligned()
             && sequencer.adopt_after == Some(sequencer.last_sequenced().seq);
         if due {
@@ -983,8 +1020,11 @@ impl<D: Disk> Shard<D> {
         {
             let mut sequencer = self.sequencer();
             sequencer.check_running(shard)?;
-            if sequencer.role != Role::Member {
-                return Err(ShardError::configuration(shard, "only a member truncates"));
+            if !sequencer.role.follows() {
+                return Err(ShardError::configuration(
+                    shard,
+                    "only a member or a learner truncates",
+                ));
             }
             if after < sequencer.applied.seq {
                 return Err(ShardError::configuration(
@@ -1109,6 +1149,17 @@ impl<D: Disk> Shard<D> {
         self.sequencer().stepped_down
     }
 
+    /// Records durably that this primary proposes `config` to promote a
+    /// learner (§6.3): a primary that opens again before `config`'s epoch
+    /// keeps waiting for that learner ([`Shard::open_replica`]).
+    pub(crate) async fn record_promotion(&self, config: &ShardConfig) -> Result<(), ShardError> {
+        let (index, config) = (Arc::clone(&self.inner.index), config.clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.store_promotion(&config)
+        })
+        .await
+    }
+
     /// Makes this member the primary of `config`, which it proposed over
     /// its current configuration `over` and the shard's register accepted
     /// (§6.5). It appends `config`'s `CONFIG` record after every record it
@@ -1146,6 +1197,7 @@ impl<D: Disk> Shard<D> {
             let leader = Leader::new(
                 shard.clone(),
                 config,
+                None,
                 Arc::clone(&self.inner.sequencer),
                 self.inner.pipeline.clone(),
                 self.inner.durable.clone(),
@@ -1489,10 +1541,11 @@ impl<D: Disk> Shard<D> {
     /// configuration the shard is in already changes nothing, even on a
     /// stopped shard.
     ///
-    /// On a replicated shard the configuration adds no member: it removes
-    /// members (§6.4), or names one of them as the new primary after a
-    /// takeover (§6.5), which a member follows. The epoch must switch at
-    /// the same `seq` on every replica (§5.1), so:
+    /// On a replicated shard the configuration removes members (§6.4),
+    /// names one of them as the new primary after a takeover (§6.5), which
+    /// a member follows, adds or removes learners, or promotes a learner to
+    /// member (§6.7), which it then is. The epoch must switch at the same
+    /// `seq` on every replica (§5.1), so:
     ///
     /// - **A primary** appends the record once every member of `config`
     ///   has reported its log in this life, at once if they have, and
@@ -1501,9 +1554,10 @@ impl<D: Disk> Shard<D> {
     ///   members `config` leaves out stop counting for commits and leases
     ///   once the record is durable here ([`Leader`]), so the records they
     ///   held back commit under the new epoch.
-    /// - **A member** returns at once, and appends the record where its
-    ///   primary's session shows the primary's is ([`Shard::follow`]).
-    ///   Meanwhile it refuses appends of the older epoch (rule R2).
+    /// - **A member or a learner** returns at once, and appends the record
+    ///   where its primary's session shows the primary's is
+    ///   ([`Shard::follow`]). Meanwhile it refuses appends of the older
+    ///   epoch (rule R2).
     ///
     /// # Errors
     ///
@@ -1511,8 +1565,9 @@ impl<D: Disk> Shard<D> {
     /// older than the shard's configuration, differs from it in the same
     /// epoch, cannot open (see [`Shard::open`]), or makes a change a
     /// replicated shard does not support: a new primary on the primary or
-    /// on the member it names, a new member or a learner (M2-14), or this
-    /// replica's removal;
+    /// on the member it names, a member that was not a learner, a member
+    /// made a learner, or this replica's removal; on a shard opened alone,
+    /// any other member or learner;
     /// [`ShardError::Unavailable`] if the shard stopped, and otherwise as
     /// [`Shard::commit`].
     pub async fn reconfigure(&self, config: &ShardConfig) -> Result<(), ShardError> {
@@ -1566,13 +1621,20 @@ impl<D: Disk> Shard<D> {
                 if check_config(shard, config, sequencer.node.as_ref())? != Role::Alone {
                     return Err(ShardError::configuration(
                         shard,
-                        "a shard alone gains members only through learners (plan M2-14)",
+                        "a shard opened alone takes members and learners only once it \
+                         reopens as a primary",
                     ));
                 }
                 sequencer.config = config.clone();
                 Some(self.adopt_locked(&mut sequencer)?)
             } else {
                 sequencer.check_change(shard, config)?;
+                // A promotion (§6.7): the learner is a member from now on.
+                if sequencer.role == Role::Learner
+                    && sequencer.node.as_ref().is_some_and(|n| config.is_member(n))
+                {
+                    sequencer.role = Role::Member;
+                }
                 sequencer.config = config.clone();
                 sequencer.adopt_after = None;
                 None
@@ -1914,7 +1976,7 @@ impl Sequencer {
     /// [`Shard::check_readable`]).
     fn check_role(&self, shard: &ShardRef) -> Result<(), ShardError> {
         match self.role {
-            Role::Member => Err(ShardError::NotPrimary {
+            Role::Member | Role::Learner => Err(ShardError::NotPrimary {
                 shard: shard.clone(),
                 primary: self.config.primary.clone(),
                 epoch: self.config.epoch,
@@ -1950,26 +2012,26 @@ impl Sequencer {
         self.next.epoch == self.config.epoch
     }
 
-    /// The error a client write gets while the configuration has fewer
-    /// members, and so acknowledging copies, than its `min_write_replicas`
-    /// (§6.4), or `None`.
+    /// The error a client write gets while the configuration's members and
+    /// the learners in the acknowledgement set, the acknowledging copies,
+    /// are fewer than its `min_write_replicas` (§6.4), or `None`.
     fn under_replicated(&self, shard: &ShardRef) -> Option<ShardError> {
         let config = &self.config;
-        (config.members.len() < usize::from(config.min_write_replicas)).then(|| {
-            ShardError::UnderReplicated {
-                shard: shard.clone(),
-                copies: config.members.len(),
-                min_write_replicas: config.min_write_replicas,
-            }
+        let copies = config.members.len() + self.acking;
+        (copies < usize::from(config.min_write_replicas)).then(|| ShardError::UnderReplicated {
+            shard: shard.clone(),
+            copies,
+            min_write_replicas: config.min_write_replicas,
         })
     }
 
     /// Checks that a replicated shard supports changing to `config`, a
-    /// newer configuration: no new member nor learner, and this replica
-    /// still a member (§6.4). A new primary is one of the members, and only
-    /// a member that does not propose it follows it (§6.5): a primary
-    /// learns of its successor by being deposed, and a candidate takes over
-    /// itself ([`Shard::take_over`]).
+    /// newer configuration: members leave (§6.4), learners come and go,
+    /// learners become members (§6.7), and this replica stays a member or
+    /// a learner, never moving from member to learner. A new primary is one
+    /// of the members, and only a member that does not propose it follows
+    /// it (§6.5): a primary learns of its successor by being deposed, and a
+    /// candidate takes over itself ([`Shard::take_over`]).
     fn check_change(&self, shard: &ShardRef, config: &ShardConfig) -> Result<(), ShardError> {
         let refuse = |reason: &str| Err(ShardError::configuration(shard, reason));
         if config.primary != self.config.primary
@@ -1977,23 +2039,22 @@ impl Sequencer {
         {
             return refuse("a new primary takes over by proposing itself");
         }
-        if !config.learners.is_empty() {
-            return refuse("learners are not supported yet");
-        }
         if !config.is_member(&config.primary) {
             return refuse("the primary is not a member");
         }
-        if config.members.iter().any(|m| !self.config.is_member(m)) {
-            return refuse("a member joins only as a learner (plan M2-14)");
+        let known = |m: &NodeId| self.config.is_member(m) || self.config.is_learner(m);
+        if config.members.iter().any(|m| !known(m)) {
+            return refuse("a member joins only as a learner");
         }
-        if self
-            .node
-            .as_ref()
-            .is_some_and(|node| !config.is_member(node))
-        {
-            return refuse("this node is not a member");
+        match &self.node {
+            Some(node) if !config.is_member(node) && !config.is_learner(node) => {
+                refuse("this node is not a member or a learner")
+            }
+            Some(node) if self.config.is_member(node) && config.is_learner(node) => {
+                refuse("a member does not become a learner")
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// Checks that no write is late on a fail-fast shard: one timed out,
@@ -2136,24 +2197,23 @@ impl<D: Disk> Drop for ReadGuard<'_, D> {
 
 /// Checks that this build can serve `config`, and returns the role it
 /// gives `node`. Without a node, the configuration must have a single
-/// member. Learners arrive with plan M2-14.
+/// member and no learner.
 fn check_config(
     shard: &ShardRef,
     config: &ShardConfig,
     node: Option<&NodeId>,
 ) -> Result<Role, ShardError> {
     let refuse = |reason: &str| Err(ShardError::configuration(shard, reason));
-    if !config.learners.is_empty() {
-        return refuse("learners are not supported yet");
-    }
     if !config.is_member(&config.primary) {
         return refuse("the primary is not a member");
     }
+    let alone = config.members.len() == 1 && config.learners.is_empty();
     match node {
-        None if config.members.len() == 1 => Ok(Role::Alone),
+        None if alone => Ok(Role::Alone),
         None => refuse("a replicated shard opens on a named node"),
-        Some(node) if !config.is_member(node) => refuse("this node is not a member"),
-        Some(_) if config.members.len() == 1 => Ok(Role::Alone),
+        Some(node) if config.is_learner(node) => Ok(Role::Learner),
+        Some(node) if !config.is_member(node) => refuse("this node is not a member or a learner"),
+        Some(_) if alone => Ok(Role::Alone),
         Some(node) if *node == config.primary => Ok(Role::Primary),
         Some(_) => Ok(Role::Member),
     }
