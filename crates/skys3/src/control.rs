@@ -81,9 +81,14 @@ impl ControlCopy {
     /// of a register at a version it had is the one `previous` holds
     /// (§6.1). Registers that are gone are left out.
     ///
+    /// A store whose generation is older than `previous`'s was reset, or
+    /// rebuilt from older copies, and is refused: following it would undo
+    /// changes the copy holds (§6.2).
+    ///
     /// # Errors
     ///
-    /// As [`ControlCopy::fetch`].
+    /// As [`ControlCopy::fetch`], and [`ControlError::GenerationBehind`]
+    /// for a store behind `previous`.
     pub async fn fetch_since<C: ControlStore>(
         store: &C,
         cluster: &ClusterId,
@@ -92,6 +97,14 @@ impl ControlCopy {
         previous: Option<&Self>,
     ) -> Result<Self, ControlError> {
         let generation = read_cluster(store, cluster, retry).await?.value.generation;
+        if let Some(previous) = previous
+            && generation < previous.generation
+        {
+            return Err(ControlError::GenerationBehind {
+                kept: previous.generation,
+                found: generation,
+            });
+        }
         let mut registers = BTreeMap::new();
         for prefix in copied() {
             for (key, version) in retrying(retry, || store.list(&prefix)).await? {
@@ -880,6 +893,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(gets(), 3 + 3 + 1);
+    }
+
+    #[tokio::test]
+    async fn a_store_behind_the_copy_is_not_followed() {
+        let (store, cluster) = store_with_registers().await;
+        let retry = RetryPolicy::default();
+        let mut copy = ControlCopy::fetch(&store, &cluster, &retry, Duration::ZERO)
+            .await
+            .unwrap();
+        // The copy was read at a later generation than the store holds
+        // now: the store was reset or rebuilt from older state.
+        copy.generation = Generation::new(5);
+        let error = ControlCopy::fetch_since(&store, &cluster, &retry, Duration::ZERO, Some(&copy))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ControlError::GenerationBehind { kept, found }
+                if kept == Generation::new(5) && found == Generation::new(1)),
+            "{error}"
+        );
+        // A node with that copy keeps running from it.
+        let disk = SimDisk::new(4);
+        let index = Arc::new(
+            Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap(),
+        );
+        let pool = BlockingPool::inline("index");
+        let ids = ProposalIds::seeded(2).next_id();
+        let (node, kept) = open(
+            store,
+            Some(copy.clone()),
+            &cluster,
+            ids,
+            &retry,
+            &index,
+            &pool,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(!node.is_live());
+        assert_eq!(kept, copy);
     }
 
     #[test]

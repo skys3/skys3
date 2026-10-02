@@ -93,6 +93,23 @@ pub enum Fault {
         /// How long the losses go on.
         duration: Duration,
     },
+    /// Every register of the control store is deleted, `cluster.json`
+    /// included, as when its bucket is lost (§6.9). Nodes run on from
+    /// their local copies (§6.2) until a [`Fault::RebuildControlStore`].
+    LoseControlStore,
+    /// Not a fault: an operator rebuilds the control store (plan M3-07,
+    /// §6.9). Every node stops, losing power with `power_loss`, as the
+    /// procedure asks; each node's export is taken from its disks
+    /// ([`skys3::rebuild::export`]); the store is rebuilt from the exports
+    /// ([`skys3_control::RebuildPlan`]), through lost answers and
+    /// conflicts; and the nodes start again after `downtime`. The rebuild
+    /// is in [`Report::rebuilds`](crate::Report::rebuilds).
+    RebuildControlStore {
+        /// Whether the nodes lose power as they stop.
+        power_loss: bool,
+        /// How long the nodes stay down.
+        downtime: Duration,
+    },
     /// Not a fault: a node held back from the start
     /// ([`ClusterConfig::joining`](crate::ClusterConfig::joining)) starts
     /// for the first time, as a newly provisioned node with valid
@@ -115,7 +132,8 @@ impl Fault {
             | Fault::ControlOutage { duration }
             | Fault::ControlLatency { duration, .. }
             | Fault::LostCasResponses { duration, .. } => Some(*duration),
-            Fault::FailSync { .. } | Fault::Join { .. } => None,
+            Fault::RebuildControlStore { downtime, .. } => Some(*downtime),
+            Fault::FailSync { .. } | Fault::Join { .. } | Fault::LoseControlStore => None,
         }
     }
 }
@@ -307,6 +325,12 @@ mod tests {
         assert_eq!(crash(0).duration(), Some(Duration::from_secs(1)));
         assert_eq!(Fault::FailSync { node: 0, disk: 0 }.duration(), None);
         assert_eq!(Fault::Join { node: 3 }.duration(), None);
+        assert_eq!(Fault::LoseControlStore.duration(), None);
+        let rebuild = Fault::RebuildControlStore {
+            power_loss: true,
+            downtime: Duration::from_secs(1),
+        };
+        assert_eq!(rebuild.duration(), Some(Duration::from_secs(1)));
         assert_eq!(FaultPlan::none().faults(), []);
     }
 
@@ -350,7 +374,11 @@ mod tests {
                         assert!((0.2..0.8).contains(probability));
                         6
                     }
-                    Fault::Join { .. } => panic!("a random plan joins no node"),
+                    Fault::Join { .. }
+                    | Fault::LoseControlStore
+                    | Fault::RebuildControlStore { .. } => {
+                        panic!("a random plan joins no node and loses no store")
+                    }
                 };
                 kinds[kind] += 1;
             }

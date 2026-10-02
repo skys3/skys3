@@ -33,7 +33,9 @@
 //! - **Faults.** A [`FaultPlan`]: crashes with or without power loss,
 //!   partitions, held links (delay and reordering), random message loss,
 //!   failed syncs, control-store outages, control-store round trips of
-//!   100 ms and more, and lost control-store answers, plus a new clock
+//!   100 ms and more, lost control-store answers, and a lost control
+//!   store, which an operator rebuilds from the nodes' exports (plan
+//!   M3-07), plus a new clock
 //!   drift for every life of a node, or a fixed one, even beyond `ρ`
 //!   ([`ClusterConfig::node_drifts`]). Separately,
 //!   [`Cluster::power_loss_at_sync`] cuts a node's power at one numbered
@@ -97,7 +99,9 @@ mod routing;
 mod s3;
 mod workload;
 
-pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View, WriteTiming};
+pub use cluster::{
+    Cluster, ClusterConfig, Invariant, Rebuild, Report, RunError, View, WriteTiming,
+};
 pub use coordination::{
     Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
 };
