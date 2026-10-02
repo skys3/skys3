@@ -3090,6 +3090,94 @@ of this file. A task with nothing unexpected keeps "None."
   places them) are a counter on the primary's replica only, so a new
   primary from a takeover starts unsealed (M3-04).
 
+### M2-13 Planned handoff
+
+- **A handoff is a takeover from the compare-and-swap on (decided, design
+  §5.4, §6.5).** `Replication::hand_off` makes the primary step down; the
+  candidate's `Grace` then stops without waiting for `primary_grace`
+  (`Grace::step_down`, `Grace::stop_if_passed`), and the M2-12 candidate
+  proposes and takes over as after silence. It proposes what a takeover
+  proposes, so the old primary leaves the configuration and rejoins only
+  as a learner. Keeping it as a member would turn a primary into a member
+  in place, which needs the re-admission of M2-15. Until learners exist, a
+  shard of `n` members can be handed off `n − 1` times; rebalancing
+  (M3-06) adds the old primary back if it should stay.
+- **The step-down is in the index (decided, design §5.4, §10.2).** The
+  plan does not say where. A `step_downs` table, keyed by shard, holds the
+  epoch with one durable commit, written before the message is sent.
+  `Shard::open` opens a primary that stepped down in the configuration's
+  epoch stopped, so after a restart it never serves in that epoch. The
+  table is not a cache, so it bumps the index format to 4, and older
+  builds refuse the index rather than ignore it.
+- **The old primary drains first.** It stops admitting reads and writes,
+  then waits for the reads it already admitted (a counter of reads in
+  progress, `Shard::admit_read`), and for the writes it sequenced to commit
+  within `replica_ack_timeout`. Without the read counter, a read that
+  passed its lease check just before the step-down could read the index
+  after the new primary acknowledged a write: the gap the 500 ms margin
+  of `primary_grace` covers after silence, which a handoff does not wait
+  for. Clients of the writes in flight get their answers. Review found
+  that the first version released the sequencer's lock between a read's
+  last serving check and its count, so a step-down on another thread
+  could see no read in progress and let the candidate take over while
+  that read was still to come. Both now happen under one hold of the
+  lock. The cluster simulation could not have found it: each simulated
+  node runs a current-thread runtime, and nothing awaits between the
+  check and the count, so no step-down can run in between there; the
+  lease audit would flag such a read if one were served.
+- **The message rides the candidate's link (decided).** `StepDown(epoch,
+  last)`, the `MessageKind::StepDown` frame of M2-02, goes after the last
+  record on the replication link, so it arrives after every append. The
+  other links end at once, so the members' grace runs out on its own if
+  the message is lost; the old primary waits for the send at most
+  `link_timeout`. The candidate proposes at once only once it holds every
+  record up to `last` durably; otherwise it ignores the message and waits
+  for its grace.
+- **A step-down counts once.** A candidate whose proposal loses resumes
+  granting and forgets the step-down; otherwise it would propose over the
+  same epoch again in a tight loop.
+- **No removal moves the register past a step-down.** The first
+  message-loss seeds left a shard unavailable for good: the primary
+  removed the candidate and every other member (a compare-and-swap in
+  flight when the handoff began) and was left the only member of a
+  configuration it had stepped down from in memory, so no one could take
+  over. A handoff now takes a lock that member removals also take
+  (`Leader::changing`), checks that the register holds the primary's
+  configuration, and only then steps down; the watchdog removes no member
+  after that. A removal whose answer was lost shows up in that check and
+  refuses the handoff.
+- **The old primary polls the register.** It is no longer a member of the
+  new configuration, so no member's refusal tells it about the takeover,
+  as it does after one from silence. It reads the shard's register every
+  `lease_renew_interval` until it holds a newer configuration, then
+  redirects to it; until then it answers `503`.
+- **The lease audit checks step-downs.** The M2-09 audit flags a read
+  served after some member's grace passed, which a handoff never waits
+  for. It now also flags a read served after a member of the shard
+  received the step-down of the primary of the read's epoch. A seeded bug
+  (a stepped-down primary that still reads its index,
+  `ReplicatedServices::stepped_down_serving_reads`) is caught by it.
+- **A primary that hands off before the cluster is ready.** The first
+  random-fault seeds failed with "the nodes did not start": a handoff
+  before every primary served left a replica that never serves, and the
+  harness waited for it. `ReplicatedServices::ready` now skips replicas
+  that stepped down.
+- **Measured.** In the loopback test the candidate serves before its
+  600 ms grace could have passed, and the write in flight when the
+  primary stepped down is acknowledged. The cluster scenarios hand off up
+  to 31 shards per seed through gateways with stale maps. With the fixes
+  above, 64 seeds of the stale-gateway scenario, 64 with message loss,
+  and 128 with random crashes, partitions, message loss, and drift within
+  `ρ` ran clean, and the seeded bug was caught in each of its 64 seeds.
+- **The protocol model needed no change.** `StepDown` and
+  `ProposeTakeover` already model the durable step-down and the
+  candidate's proposal over the epoch it names. The implementation only
+  removes behaviors: the drain, the `last` check, and ending the step-down
+  when a candidate resumes.
+- **Left for later.** The coordinator's `Handoff` admin message and when
+  to hand off are M3-06's; the binary does not run replication yet
+  (M2-16).
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation

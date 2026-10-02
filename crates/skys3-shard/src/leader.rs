@@ -132,6 +132,24 @@ pub struct Leader {
     /// The newest epoch a member refused an append for: another
     /// configuration may have replaced this one (§6.5).
     rejected: watch::Sender<Epoch>,
+    /// Where a planned handoff stands (§5.4).
+    handoff: watch::Sender<Handoff>,
+    /// Held while the primary changes the shard's register, or hands the
+    /// shard off: a handoff starts from the configuration the register
+    /// holds, and no removal moves it on meanwhile.
+    changing: tokio::sync::Mutex<()>,
+}
+
+/// Where a primary's planned handoff stands (§5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Handoff {
+    /// None was asked for.
+    None,
+    /// The primary stepped down, durably, and owes the candidate `to` a
+    /// step-down message after its records up to `last`.
+    Owed { to: NodeId, epoch: Epoch, last: Seq },
+    /// The message was sent, or the primary gave up sending it.
+    Over { sent: bool },
 }
 
 impl fmt::Debug for Leader {
@@ -181,6 +199,8 @@ impl Leader {
             links: AtomicBool::new(false),
             leases: Mutex::default(),
             rejected: watch::Sender::new(Epoch::ZERO),
+            handoff: watch::Sender::new(Handoff::None),
+            changing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -215,6 +235,73 @@ impl Leader {
     /// ([`Leader::rejected`]), with the newest such epoch.
     pub(crate) fn rejections(&self) -> watch::Receiver<Epoch> {
         self.rejected.subscribe()
+    }
+
+    /// The lock held while the primary changes the shard's register, by a
+    /// removal (§6.4), or hands the shard off (§5.4).
+    pub(crate) fn changing(&self) -> &tokio::sync::Mutex<()> {
+        &self.changing
+    }
+
+    /// Stops renewing leases for good, as the first step of a planned
+    /// handoff (§5.4): the primary holds none from then on.
+    pub(crate) fn stop_leases(&self) {
+        self.leases().stop();
+    }
+
+    /// Owes `to` the step-down message of a planned handoff in `epoch`,
+    /// after the records up to `last` (§5.4). The links wake: the one to
+    /// `to` sends it, and every other one ends.
+    pub(crate) fn owe_step_down(&self, to: NodeId, epoch: Epoch, last: Seq) {
+        self.handoff.send_replace(Handoff::Owed { to, epoch, last });
+        self.changed();
+    }
+
+    /// The step-down owed to `member`, if one is: its epoch and last `seq`.
+    pub(crate) fn step_down_owed(&self, member: &NodeId) -> Option<(Epoch, Seq)> {
+        match &*self.handoff.borrow() {
+            Handoff::Owed { to, epoch, last } if to == member => Some((*epoch, *last)),
+            _ => None,
+        }
+    }
+
+    /// Whether the link to `member` has nothing more to do because of a
+    /// handoff: one is under way and owes `member` nothing.
+    pub(crate) fn handed_off(&self, member: &NodeId) -> bool {
+        match &*self.handoff.borrow() {
+            Handoff::None => false,
+            Handoff::Owed { to, .. } => to != member,
+            Handoff::Over { .. } => true,
+        }
+    }
+
+    /// Records that the owed step-down message was sent.
+    pub(crate) fn step_down_sent(&self) {
+        self.handoff.send_if_modified(|handoff| {
+            let owed = matches!(handoff, Handoff::Owed { .. });
+            if owed {
+                *handoff = Handoff::Over { sent: true };
+            }
+            owed
+        });
+    }
+
+    /// Waits up to `timeout` for the owed step-down message to be sent,
+    /// then gives up on it: the candidate then waits out its grace
+    /// instead. Returns whether it was sent.
+    pub(crate) async fn await_step_down(&self, timeout: Duration) -> bool {
+        let mut handoff = self.handoff.subscribe();
+        let over = |h: &Handoff| matches!(h, Handoff::Over { .. });
+        let _ = tokio::time::timeout(timeout, handoff.wait_for(over)).await;
+        self.handoff.send_if_modified(|handoff| {
+            let owed = matches!(handoff, Handoff::Owed { .. });
+            if owed {
+                *handoff = Handoff::Over { sent: false };
+            }
+            owed
+        });
+        self.changed();
+        *self.handoff.borrow() == Handoff::Over { sent: true }
     }
 
     /// Returns `true` the first time it is called: whoever gets `true`
@@ -448,6 +535,7 @@ impl Leader {
         if let Some(target) = state.target {
             let mut sequencer = lock(&self.sequencer);
             if !sequencer.serving
+                && sequencer.stepped_down.is_none()
                 && sequencer.is_aligned()
                 && commit >= target
                 && sequencer.applied.seq >= target

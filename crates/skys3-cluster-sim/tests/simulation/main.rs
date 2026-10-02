@@ -24,6 +24,9 @@
 //! - [`takeover`]: members taking over from a primary that crashed, with
 //!   competing candidates, partitions, crashes during reconciliation, and
 //!   a single survivor.
+//! - [`handoff`]: primaries handing their shards off to members while
+//!   gateways with stale shard maps read through them, with lost
+//!   step-downs, crashes, and drift.
 //! - [`registry`]: nodes that join with nothing but their credentials, and
 //!   a coordinator that forgets a silent node only once no shard names it.
 //! - [`buckets`]: buckets created through a gateway, with their shards
@@ -34,6 +37,7 @@ mod acks;
 mod buckets;
 mod coordinator;
 mod crash;
+mod handoff;
 mod harness;
 mod leases;
 mod registry;
