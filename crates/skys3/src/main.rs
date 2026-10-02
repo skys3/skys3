@@ -5,7 +5,7 @@
 //! skys3 [--config <path>] [--check-config]
 //! skys3 control export [--config <path>] [--output <path>]
 //! skys3 control rebuild [--config <path>] --from <export>... [--lost <node-id>]...
-//!                       [--allow-unnamed] [--dry-run]
+//!                       [--allow-unnamed] [--prefer <node-id>] [--dry-run]
 //! ```
 //!
 //! It loads and validates the configuration (default
@@ -20,7 +20,8 @@
 //! writes them into the empty store. `--dry-run` shows the plan and
 //! writes nothing; `--lost` names a node whose disks are lost for good;
 //! `--allow-unnamed` rebuilds although shards holding objects belong to
-//! no bucket of the newest copy.
+//! no bucket of the newest copy; `--prefer` names the node whose copy is
+//! rebuilt when the copies of the newest generation differ.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -29,7 +30,7 @@ use std::process::ExitCode;
 
 use skys3::{Node, log_config};
 use skys3_config::Config;
-use skys3_control::{ControlExport, RebuildOptions};
+use skys3_control::{ControlExport, RebuildError, RebuildOptions};
 use skys3_types::NodeId;
 
 /// The configuration file read without `--config`.
@@ -38,7 +39,7 @@ const DEFAULT_CONFIG: &str = "/etc/skys3/skys3.toml";
 const USAGE: &str = "usage: skys3 [--config <path>] [--check-config]
        skys3 control export [--config <path>] [--output <path>]
        skys3 control rebuild [--config <path>] --from <export>... [--lost <node-id>]...
-                             [--allow-unnamed] [--dry-run]";
+                             [--allow-unnamed] [--prefer <node-id>] [--dry-run]";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -59,6 +60,7 @@ enum Command {
         from: Vec<PathBuf>,
         lost: Vec<String>,
         allow_unnamed: bool,
+        prefer: Option<String>,
         dry_run: bool,
     },
 }
@@ -83,6 +85,7 @@ fn command(
             from: Vec::new(),
             lost: Vec::new(),
             allow_unnamed: false,
+            prefer: None,
             dry_run: false,
         }),
         Some(other) => Err(usage(format!("unknown control command {other:?}"))),
@@ -110,6 +113,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, (String, ExitC
             ("--from", Command::Rebuild { from, .. }) => from.push(PathBuf::from(value("--from")?)),
             ("--lost", Command::Rebuild { lost, .. }) => lost.push(value("--lost")?),
             ("--allow-unnamed", Command::Rebuild { allow_unnamed, .. }) => *allow_unnamed = true,
+            ("--prefer", Command::Rebuild { prefer, .. }) => *prefer = Some(value("--prefer")?),
             ("--dry-run", Command::Rebuild { dry_run, .. }) => *dry_run = true,
             ("--help" | "-h", _) => return Err((USAGE.to_owned(), ExitCode::SUCCESS)),
             ("--version" | "-V", _) => {
@@ -191,8 +195,16 @@ fn main() -> ExitCode {
             from,
             lost,
             allow_unnamed,
+            prefer,
             dry_run,
-        } => runtime.block_on(rebuild(&config, &from, &lost, allow_unnamed, dry_run)),
+        } => runtime.block_on(rebuild(
+            &config,
+            &from,
+            &lost,
+            allow_unnamed,
+            prefer.as_deref(),
+            dry_run,
+        )),
     }
 }
 
@@ -258,6 +270,7 @@ async fn rebuild(
     from: &[PathBuf],
     lost: &[String],
     allow_unnamed: bool,
+    prefer: Option<&str>,
     dry_run: bool,
 ) -> ExitCode {
     let mut exports = Vec::with_capacity(from.len());
@@ -276,6 +289,7 @@ async fn rebuild(
     let mut options = RebuildOptions {
         lost: BTreeSet::new(),
         allow_unnamed,
+        prefer: None,
     };
     for node in lost {
         match NodeId::new(node.as_str()) {
@@ -284,6 +298,15 @@ async fn rebuild(
             }
             Err(error) => {
                 eprintln!("--lost {node}: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Some(node) = prefer {
+        match NodeId::new(node) {
+            Ok(node) => options.prefer = Some(node),
+            Err(error) => {
+                eprintln!("--prefer {node}: {error}");
                 return ExitCode::from(2);
             }
         }
@@ -304,6 +327,11 @@ async fn rebuild(
         }
         Err(error) => {
             eprintln!("the rebuild was refused: {error}");
+            if let skys3::rebuild::CommandError::Rebuild(RebuildError::DivergentCopies { .. }) =
+                error
+            {
+                eprintln!("compare the exports' copies and choose one with --prefer <node-id>");
+            }
             ExitCode::FAILURE
         }
     }
@@ -373,6 +401,8 @@ mod tests {
             "--lost",
             "node-3",
             "--allow-unnamed",
+            "--prefer",
+            "node-2",
             "--dry-run",
         ])
         .ok()
@@ -383,8 +413,10 @@ mod tests {
                 from: vec![PathBuf::from("a.json"), PathBuf::from("b.json")],
                 lost: vec!["node-3".to_owned()],
                 allow_unnamed: true,
+                prefer: Some("node-2".to_owned()),
                 dry_run: true,
             }
         );
+        assert!(parse(&["control", "rebuild", "--from", "a.json", "--prefer"]).is_err());
     }
 }
