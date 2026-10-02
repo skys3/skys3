@@ -3142,6 +3142,8 @@ impl<D: Disk> Appender<D> {
         while let Some(joined) = self.in_flight.join_next().await {
             self.joined(joined);
         }
+        // Nothing is in flight now, whatever the tasks that ended did.
+        self.lazy = 0;
     }
 
     /// Counts an append that is no longer in flight.
