@@ -4776,8 +4776,9 @@ of this file. A task with nothing unexpected keeps "None."
   the log within `group_commit_max_delay`. `Shard::commit_all_if` now
   reads the keys of a batch in one transaction and sequences every record
   whose check passes in one pass of the sequencer, so the records take
-  consecutive positions and share one group commit. A test commits 30
-  records and counts exactly one group commit in the log's statistics.
+  consecutive positions and are queued for the log back to back. A test
+  commits 30 records within `group_commit_max_bytes` and counts exactly
+  one group commit in the log's statistics.
   `Shards::write_all` exposes it. By default it sends each write on its
   own, all at once, and `LocalShards` overrides it.
 - **The forwarding protocol has no batch request.** A forwarded request
@@ -4833,3 +4834,22 @@ of this file. A task with nothing unexpected keeps "None."
   no input, so this PR adds no fuzz target. A proptest packs random items
   (some with repeated keys or identities) and checks that every batch
   encodes, decodes, and that no item is lost.
+- **A batch could outgrow one group commit (review).** A `BATCH` may hold
+  16 MiB of inline bytes, but the log closes a group once it holds
+  `group_commit_max_bytes` (4 MiB by default), so a large batch's records
+  of one shard took several syncs. A test confirms it: 100 records of
+  about 57 KiB with a 16 KiB cap take between 2 and 4 group commits.
+  Letting one submission form a single larger group was rejected,
+  because recovery's tear window (`LogConfig::tear_window`, §10.1) relies
+  on no group passing the cap plus one record. The fix is on the source:
+  by default `BatchBuilder` also closes a batch at 4 MiB of estimated
+  records (`DEFAULT_BATCH_RECORD_BYTES`), and `with_record_bytes` sets
+  another budget. Each item counts its bytes in the batch plus 256 bytes,
+  which covers its record header and the destination's identity entry. A
+  gateway test packs 1,024 objects of 8 KiB, some with the most metadata.
+  The builder makes several batches, and each one writes at most 4 MiB of
+  records at the destination. §7.8 now states the guarantee exactly. A shard's records of a
+  batch share one group commit when they fit `group_commit_max_bytes` and
+  reach the queue within `group_commit_max_delay`, and otherwise take one
+  group commit per cap. A destination configured with a smaller cap
+  splits default-size batches.
