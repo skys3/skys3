@@ -209,6 +209,14 @@ impl NodeRegistry {
         registered
     }
 
+    /// Whether the registry's nodes come from a listing made in this
+    /// node's current tenure as coordinator. Before that, a node it does not
+    /// list may still be registered.
+    #[must_use]
+    pub fn is_listed(&self) -> bool {
+        self.state().listed
+    }
+
     /// Every registered node, with its state, by node ID.
     #[must_use]
     pub fn entries(&self) -> Vec<NodeEntry> {
