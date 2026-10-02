@@ -24,7 +24,7 @@ use super::takeover::run;
 use super::{Pki, node, shard, shard_set};
 use crate::error::ShardError;
 use crate::replication::{
-    Backfill, BoxFuture, ControlRegisters, Replaced, Replication, ShardRegisters,
+    Backfill, BoxFuture, ControlRegisters, Exposure, Replaced, Replication, ShardRegisters,
 };
 use crate::shard::{Role, Shard};
 
@@ -242,6 +242,9 @@ async fn promotion() {
     let (added, learner) = add_learner(&store, &nodes, &two_members()).await;
     until(|| leader.acking() == [node(3)]).await;
     assert_eq!(leader.learners(), [node(3)]);
+    // Only the primary reports the shard's exposure, not its learner.
+    assert_eq!(nodes.replications[0].exposure().await.shards, 1);
+    assert_eq!(nodes.replications[2].exposure().await, Exposure::default());
     timed_put(&primary, "d").await;
     let committed = leader.commit();
     assert!(*learner.durable().borrow() >= committed);
