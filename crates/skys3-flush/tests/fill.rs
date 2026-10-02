@@ -5,7 +5,9 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -13,8 +15,14 @@ use skys3_flush::{Counters, FILL_CHUNK_BYTES, FillBody, FillError, Filler, Flush
 use skys3_index::{Entry, EntryState, Payload};
 use skys3_io::ManualWallClock;
 use skys3_log::RecordBody;
+use skys3_log::record::ExtentRef;
 use skys3_log::record::Import;
-use skys3_remote::{DeleteObject, ObjectStore, PutObject, UserMetadata};
+use skys3_remote::{
+    AbortMultipartUpload, CompleteMultipartUpload, CopyObject, CreateMultipartUpload, DeleteObject,
+    DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
+    ListPartsOutput, ObjectInfo, ObjectStore, PutObject, S3Result, UploadId, UploadPart,
+    UserMetadata, WriteOutput,
+};
 use skys3_sim::SimS3;
 use skys3_sim::s3::{Fault, Operation};
 use skys3_types::{ETag, EpochSeq};
@@ -471,5 +479,168 @@ fn a_remote_object_of_another_size_fails_the_fill() {
             matches!(&failed, Err(FillError::Failed(reason)) if reason.contains("12-byte")),
             "{failed:?}"
         );
+    });
+}
+
+/// A remote that records the bytes each GET asks for, and the most that
+/// GETs ask for at once. Each GET takes 10 ms, so concurrent fills overlap.
+#[derive(Debug)]
+struct Metered {
+    inner: SimS3,
+    gets: Mutex<Vec<u64>>,
+    in_flight: AtomicU64,
+    most_in_flight: AtomicU64,
+}
+
+impl Metered {
+    fn new(inner: SimS3) -> Self {
+        Self {
+            inner,
+            gets: Mutex::default(),
+            in_flight: AtomicU64::new(0),
+            most_in_flight: AtomicU64::new(0),
+        }
+    }
+
+    fn largest_get(&self) -> u64 {
+        self.gets.lock().unwrap().iter().copied().max().unwrap_or(0)
+    }
+
+    fn most_in_flight(&self) -> u64 {
+        self.most_in_flight.load(SeqCst)
+    }
+}
+
+impl ObjectStore for Metered {
+    async fn put_object(&self, request: PutObject) -> S3Result<WriteOutput> {
+        self.inner.put_object(request).await
+    }
+
+    async fn get_object(&self, request: GetObject) -> S3Result<GetOutput> {
+        let asked = request
+            .range
+            .and_then(|range| range.resolve(u64::MAX))
+            .map_or(u64::MAX, |range| range.end - range.start);
+        self.gets.lock().unwrap().push(asked);
+        let now = self.in_flight.fetch_add(asked, SeqCst) + asked;
+        self.most_in_flight.fetch_max(now, SeqCst);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let output = self.inner.get_object(request).await;
+        self.in_flight.fetch_sub(asked, SeqCst);
+        output
+    }
+
+    async fn head_object(&self, request: HeadObject) -> S3Result<ObjectInfo> {
+        self.inner.head_object(request).await
+    }
+
+    async fn delete_object(&self, request: DeleteObject) -> S3Result<DeleteOutput> {
+        self.inner.delete_object(request).await
+    }
+
+    async fn list_objects_v2(&self, request: ListObjectsV2) -> S3Result<ListObjectsV2Output> {
+        self.inner.list_objects_v2(request).await
+    }
+
+    async fn copy_object(&self, request: CopyObject) -> S3Result<WriteOutput> {
+        self.inner.copy_object(request).await
+    }
+
+    async fn create_multipart_upload(&self, request: CreateMultipartUpload) -> S3Result<UploadId> {
+        self.inner.create_multipart_upload(request).await
+    }
+
+    async fn upload_part(&self, request: UploadPart) -> S3Result<ETag> {
+        self.inner.upload_part(request).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        request: CompleteMultipartUpload,
+    ) -> S3Result<WriteOutput> {
+        self.inner.complete_multipart_upload(request).await
+    }
+
+    async fn abort_multipart_upload(&self, request: AbortMultipartUpload) -> S3Result<()> {
+        self.inner.abort_multipart_upload(request).await
+    }
+
+    async fn list_parts(&self, request: ListParts) -> S3Result<ListPartsOutput> {
+        self.inner.list_parts(request).await
+    }
+}
+
+/// Fills two objects of `size` bytes at once, through a filler with
+/// `extent_bytes` and an in-flight budget of `budget` bytes, checks the
+/// bytes both reads return, and returns the remote and the extents of the
+/// first object.
+async fn fill_two(
+    seed: u64,
+    size: usize,
+    extent_bytes: u64,
+    budget: u64,
+) -> (Arc<Metered>, Vec<ExtentRef>) {
+    let node = Node::open(seed).await;
+    let store = Arc::new(Metered::new(remote(seed, false)));
+    let filler = Filler::new(
+        Arc::clone(&store),
+        "",
+        FlushSettings {
+            extent_bytes,
+            max_inflight_bytes: budget,
+            ..settings()
+        },
+        Counters::default(),
+        Arc::new(ManualWallClock::new(Duration::from_secs(1_750_000_000))),
+    );
+    let body = pattern(size);
+    let mut stubs = Vec::new();
+    for key in ["a", "b"] {
+        let etag = write_remote(&store.inner, key, body.clone()).await;
+        stubs.push(import(&node, key, size as u64, etag).await);
+    }
+    let whole = 0..size as u64;
+    let body_of = |key, stub| {
+        let filler = filler.clone();
+        let (node, whole) = (&node, whole.clone());
+        async move {
+            let body = filler.read(&node.shard, key, stub, whole).await.unwrap();
+            collect(body).await.unwrap()
+        }
+    };
+    let (a, b) = tokio::join!(body_of("a", stubs[0]), body_of("b", stubs[1]));
+    assert!(a == body && b == body, "both fills read the body");
+    let entry = wait_for(&node, "a", |e| e.state == EntryState::Clean).await;
+    let Payload::Extents(extents) = entry.object.unwrap().payload else {
+        panic!("a fill commits extents");
+    };
+    (store, extents)
+}
+
+#[test]
+fn extents_larger_than_a_fill_chunk_are_read_a_chunk_at_a_time() {
+    runtime().block_on(async {
+        // `storage.extent_bytes` may be up to 16 MiB, twice a fill chunk.
+        let size = 2 * FILL_CHUNK_BYTES as usize + 5000;
+        let (store, extents) = fill_two(14, size, 16 << 20, FILL_CHUNK_BYTES).await;
+        assert_eq!(store.largest_get(), FILL_CHUNK_BYTES);
+        let most = store.most_in_flight();
+        assert!(most <= FILL_CHUNK_BYTES, "{most} bytes in flight");
+        let lens: Vec<u64> = extents.iter().map(|e| u64::from(e.len)).collect();
+        assert_eq!(lens, [FILL_CHUNK_BYTES, FILL_CHUNK_BYTES, 5000]);
+    });
+}
+
+#[test]
+fn a_fill_reads_no_more_than_the_in_flight_budget() {
+    runtime().block_on(async {
+        // A budget of two and a half extents: reads of two whole extents,
+        // one at a time.
+        let budget = 2560 << 10;
+        let (store, extents) = fill_two(15, 5 << 20, 1 << 20, budget).await;
+        assert_eq!(store.largest_get(), 2 << 20);
+        let most = store.most_in_flight();
+        assert!(most <= budget, "{most} bytes in flight");
+        assert_eq!(extents.len(), 5);
     });
 }

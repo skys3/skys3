@@ -1948,6 +1948,18 @@ of this file. A task with nothing unexpected keeps "None."
   `last_modified_ms` for the `ADOPT` record; the AWS client fills it, and
   `SimS3`, which keeps no times, leaves it out, so the primary's clock
   stands in.
+- **Review: extents larger than a chunk.** A read was a whole number of
+  extents, at least one, so `extent_bytes` above 8 MiB (the configuration
+  allows 16 MiB) made each GET one 16 MiB extent, past the chunk limit,
+  and a GET larger than the in-flight budget took the whole budget and
+  still held more. A fill's extents are now at most 8 MiB, and a read is
+  the most whole extents that fit both the chunk and the budget. Extents
+  are not cut below that to fit a smaller budget: the index holds at most
+  81,920 extents per object, which 64 KiB extents of a 5 GiB object
+  reach, so a budget smaller than one extent still admits one extent at a
+  time. Regression tests fill two objects at once with 16 MiB extents,
+  and with a budget of two and a half extents, and check every GET and
+  the bytes all GETs ask for at once.
 - **`versionId` pins the version.** The plan's "Done when" reads as if a
   fill always notices an out-of-band write, but with `versionId` a GET of
   the named version succeeds after one. A versioned remote therefore keeps

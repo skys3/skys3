@@ -7,9 +7,11 @@
 //!   remote is versioned. A large object is read in chunks of
 //!   [`FILL_CHUNK_BYTES`], each with the same conditions, so no fill holds
 //!   more than one chunk in memory, and the fills of a target share an
-//!   in-flight budget of their own.
+//!   in-flight budget of their own, which also bounds a chunk.
 //! - **Committing.** Each chunk is committed as `EXTENT` records of the
-//!   shard, `extent_bytes` each, like the body of a PUT (§5.1). Once every
+//!   shard, `extent_bytes` each, like the body of a PUT (§5.1), but no
+//!   larger than a chunk: one remote read never spans more than a chunk,
+//!   even where `extent_bytes` is larger. Once every
 //!   extent is committed, [`Shard::fill`] makes the entry clean with those
 //!   extents as its payload (§4.2, Evicted → Clean), unless a write
 //!   replaced the version meanwhile. The fill's bytes still serve the reads
@@ -127,8 +129,13 @@ struct Inner<S> {
     settings: FlushSettings,
     counters: Counters,
     wall: Arc<dyn WallClock>,
-    /// The size of the `EXTENT` records a fill commits.
+    /// The size of the `EXTENT` records a fill commits: `extent_bytes`,
+    /// but at most [`FILL_CHUNK_BYTES`].
     extent_bytes: u32,
+    /// The most bytes one remote read asks for: whole extents, at most
+    /// [`FILL_CHUNK_BYTES`] and the in-flight budget, and at least one
+    /// extent.
+    chunk: u64,
     /// The in-flight budget, in KiB, as a flush target keeps one.
     inflight: Semaphore,
     inflight_kib: u32,
@@ -138,10 +145,12 @@ struct Inner<S> {
 impl<S: ObjectStore> Filler<S> {
     /// The fills from `store`, under the key prefix `prefix` (empty for a
     /// whole bucket). Fills commit `EXTENT` records of
-    /// `settings.extent_bytes`, hold at most `settings.max_inflight_bytes`
-    /// in memory at once, and retry transient errors after `settings`'
-    /// backoff. They are counted in `counters`, and `wall` stands in for a
-    /// `Last-Modified` the remote does not return.
+    /// `settings.extent_bytes`, but at most [`FILL_CHUNK_BYTES`], read
+    /// whole extents at a time, hold at most `settings.max_inflight_bytes`
+    /// in memory at once (one extent if the budget is smaller than that),
+    /// and retry transient errors after `settings`' backoff. They are
+    /// counted in `counters`, and `wall` stands in for a `Last-Modified`
+    /// the remote does not return.
     pub fn new(
         store: Arc<S>,
         prefix: impl Into<String>,
@@ -149,8 +158,11 @@ impl<S: ObjectStore> Filler<S> {
         counters: Counters,
         wall: Arc<dyn WallClock>,
     ) -> Self {
-        let extent_bytes =
-            u32::try_from(settings.extent_bytes.clamp(1, u64::from(u32::MAX))).unwrap_or(u32::MAX);
+        let extent = settings.extent_bytes.clamp(1, FILL_CHUNK_BYTES);
+        // A read of whole extents, within the chunk and the budget.
+        let chunk = (FILL_CHUNK_BYTES.min(settings.max_inflight_bytes) / extent).max(1) * extent;
+        // At most `FILL_CHUNK_BYTES`, which fits.
+        let extent_bytes = u32::try_from(extent).unwrap_or(u32::MAX);
         let inflight_kib = u32::try_from(settings.max_inflight_bytes.div_ceil(1024))
             .unwrap_or(u32::MAX)
             .clamp(1, u32::try_from(Semaphore::MAX_PERMITS).unwrap_or(u32::MAX));
@@ -162,6 +174,7 @@ impl<S: ObjectStore> Filler<S> {
                 counters,
                 wall,
                 extent_bytes,
+                chunk,
                 inflight: Semaphore::new(inflight_kib as usize),
                 inflight_kib,
                 fills: Mutex::default(),
@@ -253,8 +266,7 @@ impl<S: ObjectStore> Filler<S> {
             ));
         };
         let size = object.size;
-        let chunk = (FILL_CHUNK_BYTES / u64::from(self.inner.extent_bytes)).max(1)
-            * u64::from(self.inner.extent_bytes);
+        let chunk = self.inner.chunk;
         let mut extents = Vec::new();
         let mut offset = 0;
         loop {
@@ -386,7 +398,9 @@ impl<S: ObjectStore> Filler<S> {
         format!("{}{}", self.inner.prefix, key)
     }
 
-    /// Waits until `size` bytes fit the in-flight budget.
+    /// Waits until `size` bytes fit the in-flight budget. A read is at most
+    /// the budget unless the budget is smaller than one extent; it then
+    /// waits for the whole budget.
     async fn reserve(&self, size: u64) -> Option<tokio::sync::SemaphorePermit<'_>> {
         let kib = u32::try_from(size.div_ceil(1024))
             .unwrap_or(u32::MAX)
