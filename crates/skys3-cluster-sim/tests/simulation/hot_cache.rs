@@ -87,7 +87,8 @@ fn hot_reads(context: &SimContext) -> Workload {
 
 #[test]
 fn gets_of_a_hot_object_spread_across_gateways() {
-    Runner::with_cost(2, COST).run(|context| {
+    // Two clusters of 100 operations per client each seed: twice the cost.
+    Runner::with_cost(2, 2 * COST).run(|context| {
         let workload = hot_reads(context);
         let mut shares = Vec::new();
         // The same seed twice: without hot caches, then with them.
@@ -151,15 +152,16 @@ fn racing_config() -> ClusterConfig {
     }
 }
 
-/// Clients that send each request to any node, on few keys, half of the
-/// operations `GET`s.
+/// Clients that send each request to any node, on few keys, about half
+/// of the operations `GET`s.
 fn racing_workload(context: &SimContext) -> Workload {
     Workload {
         keys: 3,
-        operations: 40 * context.scale() as usize,
+        operations: 60 * context.scale() as usize,
         any_gateway: true,
         get_percent: 30,
         timeout: Duration::from_secs(6),
+        think_time: Duration::from_millis(100),
         ..Workload::default()
     }
 }
@@ -218,7 +220,9 @@ fn hot_caches_under_crashes_and_message_loss_serve_the_planned_version() {
 
 /// The seeded bug: a hot cache that serves whatever version of a key it
 /// holds, so a `GET` after an overwrite gets the old bytes under the new
-/// version's headers.
+/// version's headers. Bodies are no longer than their prefix, so a new
+/// version is seldom longer than the cached one, which then holds the
+/// range the plan names; and half the operations are `GET`s.
 #[test]
 fn a_hot_cache_that_ignores_the_version_is_caught() {
     Runner::with_cost(1, COST).run(|context| {
@@ -229,9 +233,14 @@ fn a_hot_cache_that_ignores_the_version_is_caught() {
             },
             ..racing_config()
         };
+        let workload = Workload {
+            max_body: 0,
+            get_percent: 50,
+            ..racing_workload(context)
+        };
         let outcome = cluster(config, &services(HolderFaults::default())).run(
             context,
-            &racing_workload(context),
+            &workload,
             &FaultPlan::none(),
         );
         match outcome {
