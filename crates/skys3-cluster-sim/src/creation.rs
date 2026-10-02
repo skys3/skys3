@@ -108,7 +108,7 @@ async fn until(
                     String::from_utf8_lossy(response.body())
                 ));
             }
-            Err(NoAnswer::Io(error)) => last = error,
+            Err(NoAnswer::Io(error) | NoAnswer::Broken(error)) => last = error,
             Err(NoAnswer::Timeout) => last = "no answer in time".to_owned(),
         }
         tokio::time::sleep(RETRY_DELAY).await;

@@ -8,8 +8,9 @@ use s3s::dto::StreamingBlob;
 use s3s::{S3Error, S3Result, s3_error};
 use skys3_index::{Entry, EntryState, ObjectVersion};
 use skys3_log::RecordBody;
-use skys3_log::record::Adopt;
-use skys3_types::{BucketDocument, BucketMode, EpochSeq};
+use skys3_log::record::{Adopt, ExtentRef};
+use skys3_shard::ReadPlan;
+use skys3_types::{BucketDocument, BucketMode, EpochSeq, NodeId};
 
 use super::{Found, Objects};
 use crate::buckets::shard_error;
@@ -31,6 +32,11 @@ pub(super) struct Lookup {
     /// (§9.2). An evicted multipart object keeps its parts, which then
     /// hold no bytes.
     pub(super) evicted: bool,
+    /// For a planned read, the version's bytes as log positions (§9.2).
+    pub(super) layout: Vec<ExtentRef>,
+    /// For a planned read, the nodes that should hold the bytes; none if
+    /// no replica does.
+    pub(super) holders: Vec<NodeId>,
 }
 
 impl<H: Shards> Objects<H> {
@@ -42,7 +48,9 @@ impl<H: Shards> Objects<H> {
             .filter(|_| bucket.mode == BucketMode::WriteBack)
     }
 
-    /// The object a read of `key` in `shard` serves (§9.1).
+    /// The object a read of `key` in `shard` serves (§9.1), with its read
+    /// plan if `planned` (§9.2): a GET reads the bytes from the plan's
+    /// holders, a HEAD needs no plan.
     ///
     /// A key with no entry falls through to a remote HEAD while the
     /// bucket's import has not passed it; once it has, or for a delete
@@ -58,17 +66,23 @@ impl<H: Shards> Objects<H> {
         bucket: &BucketDocument,
         shard: &ShardRef,
         key: &str,
+        planned: bool,
     ) -> S3Result<Lookup> {
-        let entry = self.shards.entry(shard, key).await.map_err(shard_error)?;
+        let plan = self.read_plan(shard, key, planned).await?;
         let Some(remote) = self.remote_of(bucket) else {
-            return local(entry);
+            return local(plan);
         };
-        match entry {
+        match plan.entry {
             Some(entry) if unloaded(&entry) => {
-                let entry = self.load(&**remote, bucket, shard, key, entry).await?;
-                local(entry)
+                let loaded = self.load(&**remote, bucket, shard, key, entry).await?;
+                if planned {
+                    // The plan of what the key holds after the load.
+                    local(self.read_plan(shard, key, true).await?)
+                } else {
+                    local(unplanned(loaded))
+                }
             }
-            Some(entry) => local(Some(entry)),
+            Some(_) => local(plan),
             None => {
                 if remote.passed(&bucket.bucket_id, key) {
                     return Err(no_such_key());
@@ -83,8 +97,20 @@ impl<H: Shards> Objects<H> {
                     object: found.object,
                     remote: true,
                     evicted: false,
+                    layout: Vec::new(),
+                    holders: Vec::new(),
                 })
             }
+        }
+    }
+
+    /// The read plan of `key`, or, unless `planned`, its entry alone.
+    async fn read_plan(&self, shard: &ShardRef, key: &str, planned: bool) -> S3Result<ReadPlan> {
+        if planned {
+            self.shards.plan(shard, key).await.map_err(shard_error)
+        } else {
+            let entry = self.shards.entry(shard, key).await.map_err(shard_error)?;
+            Ok(unplanned(entry))
         }
     }
 
@@ -186,9 +212,19 @@ fn unloaded(entry: &Entry) -> bool {
         })
 }
 
+/// A plan of `entry` alone, with no bytes to read.
+fn unplanned(entry: Option<Entry>) -> ReadPlan {
+    ReadPlan {
+        entry,
+        layout: Vec::new(),
+        holders: Vec::new(),
+    }
+}
+
 /// What a read of a local entry serves.
-fn local(entry: Option<Entry>) -> S3Result<Lookup> {
-    let (version, state, object) = entry
+fn local(plan: ReadPlan) -> S3Result<Lookup> {
+    let (version, state, object) = plan
+        .entry
         .and_then(|entry| Some((entry.version, entry.state, entry.object?)))
         .ok_or_else(no_such_key)?;
     Ok(Lookup {
@@ -196,6 +232,8 @@ fn local(entry: Option<Entry>) -> S3Result<Lookup> {
         object,
         remote: false,
         evicted: state == EntryState::Evicted,
+        layout: plan.layout,
+        holders: plan.holders,
     })
 }
 

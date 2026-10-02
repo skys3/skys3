@@ -56,6 +56,9 @@
 //!   crashes, message loss, and power losses at sync boundaries, with
 //!   every member's dirty bytes and every shard's latest `CONFIG` record
 //!   kept.
+//! - [`reads`]: `GET`s through any node read their bytes from the holders
+//!   their read plans name while overwrites and evictions race them, and
+//!   fail mid-stream when their registration lapses.
 
 mod acks;
 mod backfill;
@@ -68,6 +71,7 @@ mod handoff;
 mod harness;
 mod learners;
 mod leases;
+mod reads;
 mod rebalancing;
 mod rebuild;
 mod registry;

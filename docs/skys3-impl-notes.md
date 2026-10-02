@@ -3754,6 +3754,92 @@ of this file. A task with nothing unexpected keeps "None."
   replays a `CONFIG` record, so such a replica resumes only once its
   register can be read. About 900 lines of non-test code.
 
+### M2-18 Read plans and holder fetch
+
+- **A plan carries the version's layout (decided, design §9.2).**
+  `Shard::plan` reads the entry and its layout in one index transaction.
+  The layout is the version's bytes as log positions in body order, with
+  a multipart object's parts flattened (`reads::layout`). Positions name
+  the same immutable payload on every replica, so a holder can serve a
+  version its own entry no longer names, as long as it still locates
+  every position. The holders are every member, primary first, while the
+  version is not clean. Once it is clean, they are the first
+  `clean_copies` members (`CleanCache::clean_copies`), or every member
+  while the cache has not been told the count. An evicted version has no
+  holders.
+- **Registration pins, then checks, in one exclusive section (decided,
+  design §8.7, §10.3).** `Shard::register_read` serves the holder's own
+  copy if its entry is at the planned version with bytes. Otherwise it
+  serves the plan's layout if every position is still located, and
+  otherwise it answers `None`, counted as `not_held`. The pin and the
+  location check run inside `Reads::exclusive`, and so does compaction's
+  relocating index commit. Either the registration pins a position
+  first and compaction keeps it, or compaction removes the location first
+  and the registration refuses.
+- **`Reads` is node-wide and in memory.** One `Reads` per `ShardSet`
+  holds registrations with their expiry, pin counts by shard and
+  position, and counts of `registered`, `not_held`, and `lapsed`.
+  `Shard::read_registered` refuses a fetch whose registration lapsed, as
+  `Unavailable`. A restarted holder has no registrations, so a stream
+  from it fails the same way. The binary configures it from
+  `read_registration_ttl_seconds` and `fragment_release_delay_seconds`.
+- **Compaction keeps what reads need (the coordinator's M1-22 hook;
+  decided, design §10.3).** A pinned record is classified `Copy`, ahead
+  of every other rule, so it is never evicted or dropped. `relocate`
+  checks the pins again under `Reads::exclusive`. Payload that no entry
+  names waits until compaction has found it unreferenced for the release
+  delay. The `Compactor` remembers, per shard and position, when a pass
+  first found it so, and a pass that does not find it so again forgets
+  it. Compaction's own eviction of cold clean payload is not delayed: a
+  plan from just before it finds the positions unlocated and asks the
+  next holder or plans again. Shard tests and the shard simulation set a
+  zero delay; `registered_reads_and_recently_unreferenced_payload_are_kept`
+  covers the delay and a pin.
+- **The gateway streams from one holder.** `HolderReads::open` orders
+  the holders with its own node first, then by its own count of reads in
+  progress from each. It registers, fetches the first piece before the
+  response starts, and streams the rest through a channel of one piece.
+  From registration on, a task renews every
+  `read_registration_renew_interval_seconds`. Starting it only after the
+  first fetch let a holder slower than the TTL lapse the read (found in
+  review). It releases the registration at the end, and the renewal
+  stops on every path that ends the read. A failed fetch ends the
+  stream, so the client sees the body break off. If no holder holds the
+  version, the GET resolves the key again, up to three rounds, then
+  answers 503. HEAD reads the entry alone.
+- **Five routed operations.** Plan, Register, Renew, Release, and Fetch
+  are wire ops 14 to 18, and Register carries its layout as the frame
+  payload. Holder operations (`Request::is_holder`) bypass the epoch and
+  role checks: any replica with the payload may serve, and the version
+  check is the holder's own.
+- **Simulation.** `HolderFaults` delays registrations and fetches by a
+  seeded random amount, and `HolderAudit` counts what holders did and
+  flags fetches served under lapsed registrations. The scenarios are in
+  `tests/simulation/reads.rs`: four nodes, three replicas,
+  `clean_copies` 2, and a 4 KiB cache. Overwrites and evictions racing
+  reads never return the wrong version, with and without crashes and
+  message loss. Members serve reads, and some reads are of superseded
+  versions. Registrations with a 100 ms TTL and a 1 s renewal fail GETs
+  mid-stream (`Report::broken_reads`). The cluster-sim compaction
+  scenario uses a 2 s release delay (`ReadRegistration::release_delay`).
+  Every scenario declares `COST`. At `SKYS3_SIM_SEEDS=256` (8 seeds
+  each, debug build) they take 25 s, 31 s, and 36 s, and the two
+  seeded-bug scenarios take 6 s and 4 s. The compaction scenarios take
+  28 s and 30 s.
+- **Seeded bugs are caught at seed 0.** A holder that registers its
+  current copy, whatever version the plan names (`ignore_version`), is
+  caught by "a GET whose body does not match". That scenario uses
+  prefix-only bodies, since a shorter new version only makes the gateway
+  pass the holder over, and 500 ms registration delays. A holder that
+  serves lapsed registrations (`ignore_lapse`) is caught by the holder
+  audit. Both were caught on each of seeds 0 to 31 (`SKYS3_SIM_SEEDS=1024`).
+- **Left open.** Fills still run only on the primary and are not
+  forwarded, so a GET of an evicted version through another node
+  answers 503. CopyObject still reads its source through the primary's
+  `payload`. Load is what each gateway sees; no node reports its own.
+  About 1,700 lines of non-test code, 400 of them in the simulation
+  crate.
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation
