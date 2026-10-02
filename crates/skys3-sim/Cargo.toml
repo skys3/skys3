@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
 md-5.workspace = true
 rand.workspace = true

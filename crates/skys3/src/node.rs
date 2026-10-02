@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
-use skys3_config::{Config, ControlStoreBackend, LogFormat};
+use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{
     ControlError, FileControlStore, ProposalIds, RetryPolicy, bootstrap, read_cluster,
 };
+use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     CredentialError, Gateway, GatewayConfig, GatewayListener, IdSource, LocalShards, ShardRef,
     Shards, SigV4Authenticator, StaticCredentials, StsService,
@@ -22,6 +23,7 @@ use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
+use skys3_remote::aws::{AwsS3, default_credentials};
 use skys3_shard::{ShardSet, StateMachine};
 use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
@@ -46,6 +48,12 @@ const INDEX_THREADS: usize = 4;
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// How often the node checks whether a disk went out of service.
 const DISK_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the flushers follow the node's buckets and shards, and their
+/// gauges are refreshed.
+const FLUSH_FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
+/// The longest one request to a remote target may take, a whole PUT body
+/// included, before the flusher gives up on it and retries.
+const FLUSH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The shards of a running node.
 type NodeShards = LocalShards<RealDisk>;
@@ -59,6 +67,8 @@ type Sts = StsEndpoint<HttpsFetcher, Sessions>;
 type NodeAuth = SigV4Authenticator<NodeCredentials<Sessions>>;
 /// The gateway.
 type NodeGateway = Gateway<NodeAuth>;
+/// The flushers of `write_back` buckets.
+pub(crate) type NodeFlush = FlushService<AwsS3, RealDisk>;
 
 /// Why a node could not start.
 #[derive(Debug, thiserror::Error)]
@@ -182,6 +192,7 @@ struct Shared {
     sts: Option<Arc<Sts>>,
     control: Arc<Mutex<ControlState>>,
     control_live: Gauge,
+    flush: Arc<NodeFlush>,
 }
 
 impl Shared {
@@ -303,6 +314,29 @@ impl Shared {
                 // The stream would report the same generation at once.
                 tokio::time::sleep(interval).await;
             }
+        }
+    }
+
+    /// Keeps a flusher on every `write_back` bucket shard open on the node
+    /// (§7.1), and refreshes the flush gauges.
+    async fn follow_flushes(self: Arc<Self>) {
+        let mut warned = BTreeSet::new();
+        loop {
+            let buckets = self.gateway.buckets();
+            for bucket in &buckets {
+                let policy = self
+                    .config
+                    .buckets()
+                    .get(&bucket.name)
+                    .flush_conflict_policy;
+                if policy != ConflictPolicy::Hold && warned.insert(bucket.bucket_id.clone()) {
+                    tracing::warn!(bucket = %bucket.name, ?policy,
+                        "only the hold conflict policy is implemented; conflicts are held");
+                }
+            }
+            self.flush.reconcile(&buckets, self.shards.set()).await;
+            self.flush.refresh_metrics();
+            tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
         }
     }
 
@@ -660,11 +694,14 @@ struct Opened {
 ///    (§4.1). This needs a copy read from the store itself.
 /// 6. Serve the gateway (HTTPS when `[gateway]` names a certificate) and
 ///    the admin listener, and start the background work: checkpoints,
-///    control-store polling, session expiry, and disk fencing.
+///    control-store polling, session expiry, disk fencing, and the
+///    flushers of `write_back` buckets, which probe each target first
+///    (`skys3_flush`).
 ///
 /// [`Node::shutdown`] stops accepting requests, drains those in flight,
-/// stops every shard once its sequenced records are applied, and takes a
-/// final checkpoint, so the next start replays little.
+/// stops the flushers, stops every shard once its sequenced records are
+/// applied, and takes a final checkpoint, so the next start replays
+/// little.
 pub struct Node {
     node_id: NodeId,
     gateway_addr: SocketAddr,
@@ -829,6 +866,21 @@ impl Node {
         if let Some(sts) = &sts {
             gateway = gateway.with_sts(Arc::clone(sts) as Arc<dyn StsService>);
         }
+        let flush = {
+            let region = config.flush().target_region.clone();
+            let credentials = default_credentials(&region).await;
+            let connect = move |target: &skys3_types::RemoteTarget| {
+                AwsS3::builder(target, region.clone(), credentials.clone())
+                    .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
+                    .build()
+            };
+            Arc::new(FlushService::new(
+                cluster.clone(),
+                FlushSettings::from_config(config.flush()),
+                Box::new(connect),
+                FlushMetrics::register(&metrics.registry),
+            ))
+        };
         let shared = Arc::new(Shared {
             config,
             retry,
@@ -844,6 +896,7 @@ impl Node {
             sts,
             control: Arc::clone(&control),
             control_live: metrics.control_store_live.clone(),
+            flush: Arc::clone(&flush),
         });
         shared.sync_identity(copy.synced_at).await?;
         shared.open_bucket_shards().await?;
@@ -875,6 +928,7 @@ impl Node {
             disks: storage.disks.clone(),
             control,
             health: health.clone(),
+            flush: Arc::new(move |bucket| flush.status(bucket)),
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?
@@ -900,6 +954,7 @@ impl Node {
         let mut background = JoinSet::new();
         background.spawn(Arc::clone(&shared).follow_control_store());
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
+        background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(watch_disks(
             storage.disks,
             pools.index.clone(),
@@ -996,6 +1051,7 @@ impl Node {
         background.shutdown().await;
         checkpoints.abort();
         let _ = checkpoints.await;
+        shared.flush.shutdown().await;
         if let Err(error) = shared.shards.set().close_all().await {
             tracing::warn!(%error, "a shard stopped with an error");
         }
