@@ -3178,6 +3178,121 @@ of this file. A task with nothing unexpected keeps "None."
   to hand off are M3-06's; the binary does not run replication yet
   (M2-16).
 
+### M2-14 Learners: live stream and promotion
+
+- **Learners are a role (decided, design §6.4, §6.7).** A node in a
+  configuration's `learners` opens its replica as `Role::Learner`: it
+  follows the primary's link as a member does, grants leases, and never
+  serves or takes over. `Shard::reconfigure` accepts a configuration that
+  adds learners, promotes a learner to member (`Learner` becomes `Member`,
+  which then starts watching the primary's grace), or removes one; it
+  refuses one that adds a member that was not a learner, or demotes a
+  member. Adding a learner is the coordinator's compare-and-swap (M3-05);
+  until then a test driver issues it.
+- **The primary's peers are dynamic.** `Leader` now keeps the learners,
+  the acknowledgement set, the backfilled learners, and an outstanding
+  promotion, and publishes its peers on a watch channel; the primary
+  starts a link for each new peer and stops it once the peer leaves the
+  configuration. The commit rule waits for the members, the
+  acknowledgement set, and the learner of an outstanding promotion;
+  `min_write_replicas` counts the acknowledgement set's copies too.
+- **What counts as "backfilled".** Backfill is the `Backfill` trait
+  (`Replication::with_backfill`), the extension point for M2-15: the
+  primary starts it once a learner has reported its log in the primary's
+  life, and treats the learner as backfilled when it returns `Ok`. Without
+  a hook, a learner counts as backfilled as soon as it has reported its
+  log: the live stream sends it the primary's log from the record after
+  its last (from `seq` 1 for an empty log), and no log segment is
+  reclaimed before M1-22, so a learner that acknowledges `seq` `n` holds
+  every record up to `n`. Promotion then needs it in the acknowledgement
+  set, backfilled, and durable up to the larger of the commit watermark
+  and the commit limit, the lowest `seq` every member acknowledged, all
+  of which the primary may commit (`Leader::begin_promotion`). The check
+  and the start of the wait happen under the leader's lock, so nothing
+  commits in between. M2-15 replaces this with snapshot and
+  payload copy, once segments can be reclaimed.
+- **Joining and dropping (design §6.4).** The watchdog of M2-11 also tends
+  learners: one that has reported its log, responds, and acknowledged
+  every record sequenced a check ago joins the acknowledgement set; one
+  in the set silent for `member_suspect_after` leaves it, without a
+  compare-and-swap, and must meet the join rule again. The learner of an
+  outstanding promotion is never dropped.
+- **Learners receive only records the primary holds durably (found, design
+  §6.4).** A restarted primary re-aligns its members before it reuses a
+  `seq`, but not its learners. Had it streamed a record before its own
+  sync and then lost it in a crash, a learner could hold a different
+  record at the same `(epoch, seq)` as the one the primary writes next,
+  and lineage reconciliation could not tell. The cost is one extra serial
+  sync per write while a learner is in the acknowledgement set: the
+  primary's, then the learner's. The protocol model treats the primary's
+  log as durable at once, so it could not show this.
+- **Promotion is durable and never on the write path (decided, design
+  §6.3, §6.7).** The primary records the proposal in a new `promotions`
+  index table (format 5) before the compare-and-swap, and from then on,
+  across restarts too, waits for the learner and needs its lease. Commits
+  never wait for the compare-and-swap. A request that fails is sent again,
+  unchanged, on a later check; a proposal that loses follows the register,
+  adopting the configuration there if it keeps the primary (which settles
+  the promotion if its epoch is at or past the proposal's) and stopping
+  otherwise. The primary stops waiting only on adopting a configuration
+  at or past the proposal's epoch. A handoff is refused while a promotion
+  is outstanding. `ShardRegisters::replace` and `Leader::changing` from
+  M2-11 serve both removals and promotions; removal comes first when both
+  are due.
+- **A lone replica given learners opens again as primary.** A shard
+  opened as its only member (`Role::Alone`) has no links. `ShardSet`
+  closes it once its records are applied and opens it again as a primary
+  when a newer configuration adds learners to the same members. A primary
+  with no other member does not wait to align on open.
+- **Lineage reconciliation keeps an empty log.** A learner with no records
+  holds a prefix of any log, so `lineage::reconcile` keeps it instead of
+  calling it diverged. A re-admitted learner with an old log still goes
+  through reconciliation; one that is diverged refuses the session and
+  stays out of the acknowledgement set. Discarding its records is M2-15's.
+- **Simulation.** `ReplicatedServices::with_learners` runs a driver on
+  each node that adds a spare node to each shard it leads by a
+  compare-and-swap through the node's faulty control store, and has every
+  node follow the registers that name it. `Audited` registers time each
+  promotion's compare-and-swap, and `check_members_hold_commits` checks R3
+  after every step: every member the register names holds every record any
+  primary of the shard committed. Under a control store whose round trips
+  take 0.5 to 2 s each way, promotions took 4.0 to 7.2 s over 32 seeds,
+  while no acknowledged write in flight meanwhile took more than 220 ms:
+  promotion adds no write stall. 64 seeds of random crashes, partitions,
+  message loss, control-store faults, and lost compare-and-swap answers
+  ran clean, and the seeded bug `promoting_early` (the driver promotes
+  each learner as it adds it) was caught in each of its 32 seeds.
+- **The protocol model now splits promotion (spec/ShardProtocol.tla).**
+  `Promote` records the proposal; `SendPromotion` sends its
+  compare-and-swap, again after a failure or a restart, and is disabled
+  once the register moved past the primary's epoch, after which only
+  `Adopt` ends the wait. The seeded bug `abandon_unsettled_promotion`
+  (stop waiting without reading the register) violates
+  `CommittedRecordsSurvive`. The `pr` profile passes with every seeded bug
+  caught; the nightly profile's state counts in `spec/README.md` predate
+  the split.
+- **Review fixes.** Three findings, each with a test that fails without
+  its fix:
+  - **Commit limit when alone.** A primary with no other member and no
+    learner to wait for set its commit limit to `Seq::MAX`. The
+    pipeline's limit never comes down, so once a learner joined (the
+    single survivor's repair), writes were still acknowledged on one
+    copy, and the learner could never be promoted. The limit is now the
+    last sequenced `seq`. The cluster scenario with single-member shards
+    caught it as promotions that never came.
+  - **Promotion precondition.** The promotion's compare-and-swap was sent
+    over the configuration the replica held after recording it, so one
+    adopted in between could be replaced by the stale proposal at its own
+    epoch. It is now sent only while the replica holds the configuration
+    the proposal extends. The model's `SendPromotion` already had this
+    guard.
+  - **Exposure on learners.** `Replication::exposure` skipped only
+    members, so learners reported the shards they learn as exposure.
+- **Left for later.** Snapshot and payload backfill and the re-admission
+  of a node with a diverged log are M2-15's; choosing learners and when
+  to add them is M3-05's; the binary does not run replication yet
+  (M2-16).
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation

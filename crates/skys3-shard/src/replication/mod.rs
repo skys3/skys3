@@ -13,7 +13,7 @@
 //!   beacons carry lease stamps, and a beacon goes out at least every
 //!   [`ReplicationConfig::lease_renew_interval`] even while records flow.
 //!   The member's acknowledgements feed the commit rule and the primary's
-//!   leases ([`Leader`](crate::Leader)). A link that fails,
+//!   leases ([`Leader`]). A link that fails,
 //!   or hears nothing for [`ReplicationConfig::link_timeout`], reconnects,
 //!   and resumes from what the member then holds.
 //! - **As a member**, it accepts links from the shard's primary only. A
@@ -39,6 +39,14 @@
 //!   members than its `min_write_replicas` stays readable and refuses
 //!   writes. [`Replication::exposure`] reports what then has fewer copies
 //!   than `replicas`.
+//! - **Learners** (§6.4, §6.7): a primary links to the learners of its
+//!   configuration as to its members, and takes a learner into the
+//!   acknowledgement set once it holds what the primary had sequenced a
+//!   moment ago; it drops a learner that misses `member_suspect_after`
+//!   from that set without changing the configuration. Once a learner's
+//!   [`Backfill`] is complete and it is durable up to the commit
+//!   watermark, the primary promotes it by a compare-and-swap of the
+//!   shard's register, without pausing commits.
 //!
 //! A configuration change switches epochs at the same `seq` on every
 //! replica (§5.1): a primary's session carries its newest configuration
@@ -48,6 +56,7 @@
 //! session; one to a member the configuration leaves out ends.
 
 mod exposure;
+mod learners;
 mod member;
 mod primary;
 mod removal;
@@ -69,9 +78,11 @@ use skys3_net::{Frame, Listener, Network, Receiver, Sender, Transport, Transport
 use skys3_types::{Epoch, NodeAddress, NodeId, Seq, ShardConfig};
 
 pub use self::exposure::{Exposure, ReplicationMetrics};
+pub use self::learners::Backfill;
 pub use self::removal::{BoxFuture, ControlRegisters, Replaced, ShardRegisters};
 use crate::ack::AckTimeout;
 use crate::error::ShardError;
+use crate::leader::Leader;
 use crate::lease::Grace;
 use crate::set::ShardSet;
 use crate::shard::{Role, Shard};
@@ -173,6 +184,9 @@ struct Inner<N: Network, D: Disk> {
     /// What primaries remove members through, and members take over
     /// through, if they do.
     removal: OnceLock<Arc<removal::Removal>>,
+    /// What backfills the learners of this node's primaries, if anything
+    /// beyond the live stream does.
+    backfill: OnceLock<Arc<dyn Backfill>>,
     /// Whether members take over from a silent primary.
     takeover: AtomicBool,
     /// The shards whose members watch their primary in this life.
@@ -235,6 +249,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 config,
                 graces: Mutex::default(),
                 removal: OnceLock::new(),
+                backfill: OnceLock::new(),
                 takeover: AtomicBool::new(false),
                 candidates: Mutex::default(),
                 under: Arc::default(),
@@ -255,6 +270,18 @@ impl<N: Network, D: Disk> Replication<N, D> {
             ids: Mutex::new(ids),
         };
         let _ = self.inner.removal.set(Arc::new(removal));
+        self
+    }
+
+    /// Backfills the learners of this node's primaries through `backfill`
+    /// (§6.7), which reports when a learner holds the shard's history; a
+    /// primary promotes a learner only then. Without it, a learner's
+    /// backfill counts as complete once it has reported its log: the live
+    /// stream brings it the primary's log from its first record, which this
+    /// build keeps whole. A second call changes nothing.
+    #[must_use]
+    pub fn with_backfill(self, backfill: impl Backfill) -> Self {
+        let _ = self.inner.backfill.set(Arc::new(backfill));
         self
     }
 
@@ -289,13 +316,19 @@ impl<N: Network, D: Disk> Replication<N, D> {
     /// Opens this node's replica in the shard of `config`, or returns it if
     /// it is open, adopting `config` if it is newer
     /// ([`ShardSet::open_replica`]). As the primary of a replicated shard,
-    /// it starts its links to the members on the current Tokio runtime,
-    /// which run until the shard stops, its leases, and, if the node removes
-    /// members, the watch over them. As a member, it starts the shard's
-    /// grace, unless it is running: opening counts as granting a lease,
-    /// since this life does not know when the node last granted one. Either
-    /// way its requests wait for the members at most
-    /// [`ReplicationConfig::ack_timeout`].
+    /// it starts its links to the members and learners on the current
+    /// Tokio runtime, which run until the shard stops, its leases, and, if
+    /// the node removes members, the watch over them, which also tends its
+    /// learners. As a member, it starts the shard's grace, unless it is
+    /// running: opening counts as granting a lease, since this life does
+    /// not know when the node last granted one. A learner waits for its
+    /// primary's sessions. Either way its requests wait for the members at
+    /// most [`ReplicationConfig::ack_timeout`].
+    ///
+    /// The primary of a shard learns of a learner added to its register
+    /// when the node opens the newer configuration, as the coordinator's
+    /// change propagation will have it do (plan M3-05), or reads the
+    /// register after a member refused it or a compare-and-swap failed.
     ///
     /// # Errors
     ///
@@ -340,27 +373,61 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 removal: Arc::clone(removal),
                 config: inner.config,
                 adopted: self.on_adopted(),
+                backfill: inner.backfill.get().cloned(),
             };
             tokio::spawn(watchdog.run());
         }
-        for member in leader.members() {
-            let Some(address) = inner.peers.get(&member) else {
-                tracing::warn!(shard = %leader.shard(), %member, "no address for a member");
+        let mut links = BTreeMap::new();
+        self.link_peers(shard, leader, &mut links);
+        let linking = (self.clone(), shard.clone(), Arc::clone(leader));
+        tokio::spawn(async move {
+            // Links to the learners a later configuration adds (§6.7), and
+            // again to a peer whose link ended, as a learner's does when it
+            // is removed and added back.
+            let (replication, shard, leader) = linking;
+            let mut peers = leader.peers();
+            let interval = replication.inner.config.link_timeout;
+            while !shard.is_stopped() {
+                match tokio::time::timeout(interval, peers.changed()).await {
+                    Ok(Ok(())) => replication.link_peers(&shard, &leader, &mut links),
+                    Ok(Err(_)) => return,
+                    Err(_) => {}
+                }
+            }
+        });
+        if is_under_replicated(&shard.config()) {
+            self.on_adopted()(&shard.config());
+        }
+    }
+
+    /// Starts a link to each member and learner of `leader` that has none
+    /// running in `links`, in the order the leader lists them.
+    fn link_peers(
+        &self,
+        shard: &Shard<D>,
+        leader: &Arc<Leader>,
+        links: &mut BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
+    ) {
+        let inner = &self.inner;
+        let peers = leader.peers().borrow().clone();
+        for peer in peers {
+            if links.get(&peer).is_some_and(|link| !link.is_finished()) {
+                continue;
+            }
+            let Some(address) = inner.peers.get(&peer) else {
+                tracing::warn!(shard = %leader.shard(), %peer, "no address for a member or learner");
                 continue;
             };
             let link = primary::Link {
                 shard: shard.clone(),
                 leader: Arc::clone(leader),
-                member,
+                member: peer.clone(),
                 address: address.clone(),
                 transport: inner.transport.clone(),
                 config: inner.config,
-                watched: removal.is_some(),
+                watched: inner.removal.get().is_some(),
             };
-            tokio::spawn(link.run());
-        }
-        if is_under_replicated(&shard.config()) {
-            self.on_adopted()(&shard.config());
+            links.insert(peer, tokio::spawn(link.run()));
         }
     }
 
@@ -404,6 +471,11 @@ impl<N: Network, D: Disk> Replication<N, D> {
         // unseen, or is in flight, would leave this primary leading a
         // configuration it did not step down in.
         let _changing = leader.changing().lock().await;
+        // A promotion that may have landed unseen made the learner a member
+        // the candidate must hold every record for.
+        if leader.promoting().is_some() {
+            return Err(ShardError::unavailable(shard, "a promotion is outstanding"));
+        }
         if let Some(removal) = self.inner.removal.get() {
             let held = removal
                 .registers
@@ -510,10 +582,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 continue;
             };
             let config = replica.config();
-            if replica.role() == Role::Member
-                || replica.is_stopped()
-                || !is_under_replicated(&config)
-            {
+            if replica.role().follows() || replica.is_stopped() || !is_under_replicated(&config) {
                 continue;
             }
             match replica.stored_bytes().await {
@@ -585,7 +654,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        if let Err(error) = member::serve(link, first, &self.inner).await {
+        if let Err(error) = member::serve(link, first, self).await {
             tracing::debug!(%error, "a replication link to a primary ended");
         }
     }
