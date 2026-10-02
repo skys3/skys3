@@ -11,7 +11,11 @@
 //! the request is answered only once the record is durable and applied.
 //! `If-None-Match: *` and `If-Match` are checked by the shard when it
 //! sequences the `PUT` ([`Precondition`]), and once before the body is read,
-//! so a write bound to fail does not upload its body first.
+//! so a write bound to fail does not upload its body first. A body of a
+//! `write_back` bucket that reaches `streaming_flush_min_bytes` commits an
+//! `UPLOAD_BEGIN` while it streams, and its `PUT` inherits that record's
+//! write identity (§7.2); a body that fails leaves the record naming no
+//! write.
 //!
 //! **Metadata.** The record keeps the standard headers S3 stores
 //! (`Cache-Control`, `Content-Disposition`, `Content-Encoding`,
@@ -55,7 +59,7 @@ mod holders;
 mod upload;
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::request::Parts;
 use http_body_util::BodyExt;
@@ -241,6 +245,8 @@ pub(crate) struct Objects<H> {
     shards: H,
     inline_max_bytes: usize,
     extent_bytes: usize,
+    streaming_flush_min_bytes: Option<u64>,
+    max_body_duration: Duration,
     pool: Option<BlockingPool>,
     fills: Option<Arc<dyn Fills>>,
     admission: Arc<dyn Admission>,
@@ -255,6 +261,8 @@ impl<H: Shards> Objects<H> {
             shards,
             inline_max_bytes: usize::try_from(config.inline_max_bytes).unwrap_or(usize::MAX),
             extent_bytes: usize::try_from(config.extent_bytes).unwrap_or(usize::MAX),
+            streaming_flush_min_bytes: config.streaming_flush_min_bytes,
+            max_body_duration: config.max_body_duration,
             pool: config.hashing_pool.clone(),
             fills: config.fills.clone(),
             admission: Arc::clone(&config.admission),
@@ -319,8 +327,18 @@ impl<H: Shards> Objects<H> {
         let expected = ExpectedChecksums::from_headers(&headers)?;
         let trailers = extensions.get::<Trailers>().cloned();
         let validator = ChecksumValidator::on(expected, trailers, self.pool.clone())?;
-        let (verified, data) = self
-            .receive(&shard, &input.key, input.body.take(), validator)
+        // Only a bucket with a remote target streams a PUT to it (§7.3).
+        let stream_from = self
+            .streaming_flush_min_bytes
+            .filter(|_| bucket.mode == BucketMode::WriteBack);
+        let (verified, data, inherited_identity) = self
+            .receive(
+                &shard,
+                &input.key,
+                input.body.take(),
+                validator,
+                stream_from,
+            )
             .await?;
 
         let put = Put {
@@ -328,7 +346,7 @@ impl<H: Shards> Objects<H> {
             size: verified.length,
             last_modified_ms: now_ms(),
             etag: verified.etag.clone(),
-            inherited_identity: None,
+            inherited_identity,
             metadata,
             tags,
             checksums: verified.checksums,
@@ -351,7 +369,9 @@ impl<H: Shards> Objects<H> {
     /// Streams a request body of `key` into `shard` through `validator`:
     /// inline, or as `EXTENT` records while it arrives ([`Upload`]). It
     /// returns once the body has been read to its end and passed its
-    /// checks, and its extents are applied.
+    /// checks, and its extents are applied, with the position of the
+    /// `UPLOAD_BEGIN` it committed once it reached `stream_from` bytes,
+    /// whose write identity its `PUT` inherits (§7.2).
     ///
     /// # Errors
     ///
@@ -363,14 +383,17 @@ impl<H: Shards> Objects<H> {
         key: &str,
         body: Option<StreamingBlob>,
         mut validator: ChecksumValidator,
-    ) -> S3Result<(VerifiedBody, PutData)> {
+        stream_from: Option<u64>,
+    ) -> S3Result<(VerifiedBody, PutData, Option<EpochSeq>)> {
         let mut upload = Upload::new(
             self.shards.clone(),
             shard.clone(),
             key.to_owned(),
             self.inline_max_bytes,
             self.extent_bytes,
-        );
+            self.max_body_duration,
+        )
+        .streamed(stream_from);
         let mut body = s3s::Body::from(body.unwrap_or_else(empty_blob));
         let mut length = 0u64;
         while let Some(frame) = body.frame().await {
@@ -385,8 +408,9 @@ impl<H: Shards> Objects<H> {
             validator.update(data).await?;
         }
         let verified = validator.finish().await?;
+        let identity = upload.identity();
         let data = upload.finish().await?;
-        Ok((verified, data))
+        Ok((verified, data, identity))
     }
 
     pub(crate) async fn get(

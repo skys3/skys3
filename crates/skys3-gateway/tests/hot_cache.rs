@@ -6,6 +6,8 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -145,4 +147,60 @@ async fn large_objects_and_local_holders_do_not_fill_the_cache() {
     }
     let usage = cache.usage();
     assert_eq!((usage.entries, usage.hits, usage.misses), (0, 0, 2));
+}
+
+#[tokio::test]
+async fn a_burst_of_misses_stays_within_the_bound() {
+    // Room for eight objects of 2,000 bytes, held or filling.
+    let (setup, cache) = gateway(8 * 2000, true).await;
+    let objects: Vec<Bytes> = (0..12).map(|n| body(2000, b'a' + n)).collect();
+    for (n, data) in objects.iter().enumerate() {
+        put(&setup, &format!("k{n}"), data).await;
+    }
+    // Slow holders keep every fill in progress at once: three GETs of each
+    // of twelve uncached objects.
+    setup.shards.set_fetch_delay(Duration::from_millis(100));
+    let done = Arc::new(AtomicBool::new(false));
+    let (watching, finished) = (cache.clone(), Arc::clone(&done));
+    let peak = tokio::spawn(async move {
+        let mut peak = 0;
+        loop {
+            let usage = watching.usage();
+            peak = peak.max(usage.bytes + usage.reserved);
+            if finished.load(Ordering::SeqCst) && usage.reserved == 0 {
+                return peak;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    });
+    let mut gets = Vec::new();
+    for _ in 0..3 {
+        for n in 0..objects.len() {
+            let gateway = setup.gateway.clone();
+            let uri = format!("/photos/k{n}");
+            gets.push(tokio::spawn(async move {
+                let request = common::request(Method::GET, &uri, &[], "");
+                (n, common::answer(gateway.handle(request).await).await)
+            }));
+        }
+    }
+    for get in gets {
+        let (n, got) = get.await.unwrap();
+        got.assert(200, None);
+        assert_eq!(got.body.as_bytes(), objects[n], "k{n}");
+    }
+    done.store(true, Ordering::SeqCst);
+    let peak = tokio::time::timeout(Duration::from_secs(10), peak)
+        .await
+        .expect("every fill releases its room")
+        .unwrap();
+    let usage = cache.usage();
+    // Fills held all the room at once, and never more.
+    assert_eq!(peak, 16_000, "{usage:?}");
+    // Room ran out, and duplicate fills were refused: those GETs streamed
+    // and kept nothing.
+    assert!(usage.refused > 0, "{usage:?}");
+    assert!(usage.entries <= 8, "{usage:?}");
+    assert_eq!(usage.bytes, 2000 * usage.entries);
+    assert_eq!(usage.reserved, 0);
 }
