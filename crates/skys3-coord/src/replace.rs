@@ -200,7 +200,9 @@ pub struct Replacement<P = NoPlacement> {
     clock: Arc<dyn Clock>,
     config: ReplacementConfig,
     scan: ClusterScan,
-    /// When this coordinator last planned a member removal.
+    /// When the last member removal this coordinator made took effect, or
+    /// may have, or when its tenure began: no removal is planned within
+    /// [`ReplacementConfig::removal_interval`] of it.
     removed_at: Option<MonoTime>,
     /// The repairs of the change being made, by register, if the change is
     /// this placement's.
@@ -320,10 +322,8 @@ impl<P> Replacement<P> {
                 Repair::Learners { added, dropped } => {
                     learners = (learners + added.len()).saturating_sub(dropped.len());
                 }
-                Repair::Remove(_) => {
-                    may_remove = false;
-                    self.removed_at = Some(now);
-                }
+                // The timer starts once the removal lands ([`Placement::applied`]).
+                Repair::Remove(_) => may_remove = false,
             }
             tracing::info!(
                 register = %key.key(),
@@ -434,6 +434,9 @@ fn next_config(config: &ShardConfig, repair: &Repair, proposal: ProposalId) -> O
 
 impl<P: Placement> Placement for Replacement<P> {
     fn begin_tenure(&mut self) {
+        // The previous coordinator may have removed a member just before
+        // its tenure ended: a new tenure waits a whole interval first, so
+        // removals stay one per interval across coordinators.
         self.placement.begin_tenure();
     }
 
@@ -461,6 +464,14 @@ impl<P: Placement> Placement for Replacement<P> {
         };
         if let Some(rejected) = &applied.rejected {
             tracing::info!(register = %rejected, "a shard changed under its replacement; planning again");
+        }
+        let removal = |key: &RegisterKey| matches!(repairs.get(key), Some(Repair::Remove(_)));
+        // A removal counts toward the interval once it took effect, or
+        // may have: one that failed without an answer is settled later.
+        if applied.written.iter().any(|(key, _)| removal(key))
+            || applied.failed.as_ref().is_some_and(removal)
+        {
+            self.removed_at = Some(self.clock.now());
         }
         let done = applied
             .written
