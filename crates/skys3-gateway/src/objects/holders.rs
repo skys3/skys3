@@ -407,7 +407,10 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    // Real time: the shards' index work runs on a blocking pool, and a
+    // paused clock would jump to the next renewal while it waits, lapsing
+    // registrations before their first fetch.
+    #[tokio::test]
     async fn a_lapsed_registration_fails_the_stream_and_a_renewed_one_does_not() {
         let (shards, shard, version, layout) = overwritten("k").await;
         let set = shards.local().set().clone();
@@ -417,8 +420,8 @@ mod tests {
         });
         let holder = shards.node().unwrap();
         for (renew_every, lapses) in [
-            (Duration::from_secs(5), true),
-            (Duration::from_millis(300), false),
+            (Duration::from_secs(60), true),
+            (Duration::from_millis(200), false),
         ] {
             let reads = HolderReads::new(renew_every);
             let body = reads
@@ -437,7 +440,7 @@ mod tests {
             let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
             assert_eq!(first, Bytes::from(vec![b'a'; 4]));
             // The client stalls for longer than the TTL.
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             let mut rest = Vec::new();
             let mut failed = None;
             while let Some(frame) = body.frame().await {
