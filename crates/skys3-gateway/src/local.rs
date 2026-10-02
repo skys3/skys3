@@ -10,11 +10,11 @@ use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{Outcome, Rejection, Shard, ShardSet};
+use skys3_shard::{Committed, Outcome, Rejection, Shard, ShardSet};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
 
 use crate::conditions::{ConditionFailed, Precondition};
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
+use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome};
 
 /// The node's shard replicas, as the gateway calls them.
 ///
@@ -257,13 +257,41 @@ impl<D: Disk> Shards for LocalShards<D> {
             local.commit_if(body, |entry| condition.check(entry)).await
         };
         let committed = committed.map_err(|error| convert(shard, error))?;
-        Ok(committed.and_then(|committed| match committed.outcome {
-            Outcome::Rejected(Rejection::NoSuchUpload) => Err(ConditionFailed::NoSuchUpload),
-            Outcome::Rejected(Rejection::PartChanged { .. }) => Err(ConditionFailed::InvalidPart),
-            // Other rejections are of records only the node writes, such as
-            // a `FLUSHED` that lost a race, which their writer expects.
-            _ => Ok(committed.position),
-        }))
+        Ok(committed.and_then(written))
+    }
+
+    /// Sequences the writes together, in one pass of the shard's sequencer
+    /// ([`Shard::commit_all_if`]), so that they share a group commit.
+    async fn write_all(
+        &self,
+        shard: &ShardRef,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> Vec<WriteOutcome> {
+        let local = match self.find(shard).await {
+            Ok(local) => local,
+            Err(error) => return writes.iter().map(|_| Err(error.clone())).collect(),
+        };
+        let (bodies, conditions): (Vec<_>, Vec<_>) = writes.into_iter().unzip();
+        local
+            .commit_all_if(bodies, |at, entry| conditions[at].check(entry))
+            .await
+            .into_iter()
+            .map(|committed| match committed {
+                Ok(committed) => Ok(committed.and_then(written)),
+                Err(error) => Err(convert(shard, error)),
+            })
+            .collect()
+    }
+}
+
+/// What a committed write did, as [`Shards::write`] reports it.
+fn written(committed: Committed) -> Result<EpochSeq, ConditionFailed> {
+    match committed.outcome {
+        Outcome::Rejected(Rejection::NoSuchUpload) => Err(ConditionFailed::NoSuchUpload),
+        Outcome::Rejected(Rejection::PartChanged { .. }) => Err(ConditionFailed::InvalidPart),
+        // Other rejections are of records only the node writes, such as a
+        // `FLUSHED` that lost a race, which their writer expects.
+        _ => Ok(committed.position),
     }
 }
 

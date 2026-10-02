@@ -1471,6 +1471,163 @@ impl<D: Disk> Shard<D> {
         }
     }
 
+    /// Commits `bodies`, records that each name a different key, as
+    /// [`Shard::commit_if`] commits each one, but sequenced together: the
+    /// records whose `check` passes take consecutive positions in one pass
+    /// of the sequencer, so their appends reach the log together and share
+    /// its group commit (§10.4). A peer cluster's `BATCH` is applied this
+    /// way (§7.8).
+    ///
+    /// `check` gets each record's index in `bodies` and its key's entry as
+    /// it is when the record is sequenced, as in [`Shard::commit_if`]. The
+    /// keys are read in one index transaction. A record of a key with a
+    /// write not yet applied waits for it, and one whose read raced a write
+    /// of its key is checked again, in a later pass.
+    ///
+    /// Returns one result per record, in the order of `bodies`; the outer
+    /// error and the inner one are as in [`Shard::commit_if`]. A record that
+    /// names no key, is an `EXTENT`, or repeats an earlier record's key is
+    /// refused with [`ShardError::InvalidRecord`]. The shard's
+    /// [`AckTimeout`] bounds the whole call: a record not answered by then
+    /// fails as not acknowledged, and may still commit.
+    pub async fn commit_all_if<E>(
+        &self,
+        bodies: Vec<RecordBody>,
+        mut check: impl FnMut(usize, Option<&Entry>) -> Result<(), E>,
+    ) -> Vec<Result<Result<Committed, E>, ShardError>> {
+        let mut results: Vec<Option<Result<Result<Committed, E>, ShardError>>> =
+            bodies.iter().map(|_| None).collect();
+        let mut pending = Vec::with_capacity(bodies.len());
+        let mut keys = std::collections::BTreeSet::new();
+        for (at, body) in bodies.into_iter().enumerate() {
+            match entry_key(&body).map(str::to_owned) {
+                Some(key) if keys.insert(key.clone()) => pending.push((at, key, body)),
+                Some(_) => {
+                    let reason = "the record repeats the key of an earlier one";
+                    results[at] = Some(Err(ShardError::invalid(self.shard(), reason)));
+                }
+                None => {
+                    let reason = "the record names no entry";
+                    results[at] = Some(Err(ShardError::invalid(self.shard(), reason)));
+                }
+            }
+        }
+        let sequenced: Vec<OnceLock<EpochSeq>> = results.iter().map(|_| OnceLock::new()).collect();
+        let committed = self
+            .within_ack(async {
+                let replies = self
+                    .sequence_all(pending, &mut check, &sequenced, &mut results)
+                    .await?;
+                for (at, reply) in replies {
+                    let answer = self.answer(reply).await;
+                    results[at] = Some(answer.map(Ok));
+                }
+                Ok(())
+            })
+            .await;
+        results
+            .into_iter()
+            .zip(sequenced)
+            .map(|(result, position)| {
+                result.unwrap_or_else(|| {
+                    let error = committed.clone().err().unwrap_or_else(|| {
+                        self.unavailable("the record was neither sequenced nor refused")
+                    });
+                    Err(match position.get() {
+                        Some(&position) => error.sequenced_at(position),
+                        None => error,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// The passes of [`Shard::commit_all_if`]: checks and sequences each of
+    /// `pending`, an index into the call's records with its key and record,
+    /// and returns the replies of those it sequenced. A record `check`
+    /// refuses, or that cannot be sequenced, gets its result in `results`.
+    async fn sequence_all<E>(
+        &self,
+        mut pending: Vec<(usize, String, RecordBody)>,
+        check: &mut impl FnMut(usize, Option<&Entry>) -> Result<(), E>,
+        sequenced: &[OnceLock<EpochSeq>],
+        results: &mut [Option<Result<Result<Committed, E>, ShardError>>],
+    ) -> Result<Vec<(usize, WriteReceiver)>, ShardError> {
+        let mut replies = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            // Records of the keys sequenced before the read must be
+            // applied, so that the index holds their outcome.
+            let begun = {
+                let mut sequencer = self.sequencer();
+                sequencer.check_serving(self.shard())?;
+                let applied = sequencer.applied;
+                let unapplied = pending.iter().any(|(_, key, _)| {
+                    sequencer
+                        .writes
+                        .get(key)
+                        .is_some_and(|&position| position > applied)
+                });
+                if unapplied {
+                    Err(self.barrier())
+                } else {
+                    Ok(sequencer.begin_read())
+                }
+            };
+            let since = match begun {
+                Ok(since) => since,
+                Err(barrier) => {
+                    barrier.await?;
+                    continue;
+                }
+            };
+            let read = ReadGuard {
+                shard: self,
+                since: Some(since),
+            };
+            let keys = pending.iter().map(|(_, key, _)| key.clone()).collect();
+            let entries = self.entries_of(keys).await?;
+            let mut sequencer = self.sequencer();
+            // A record of a key sequenced since the read began is still
+            // listed while the read lasts, and the read may have missed it.
+            let missed: Vec<bool> = pending
+                .iter()
+                .map(|(_, key, _)| sequencer.writes.get(key).is_some_and(|&p| p >= since))
+                .collect();
+            read.end(&mut sequencer);
+            let mut raced = Vec::new();
+            for (((at, key, body), entry), missed) in pending.into_iter().zip(entries).zip(missed) {
+                if missed {
+                    raced.push((at, key, body));
+                    continue;
+                }
+                if let Err(error) = check(at, entry.as_ref()) {
+                    results[at] = Some(Ok(Err(error)));
+                    continue;
+                }
+                match self.submit_locked(&mut sequencer, body, false) {
+                    Ok((position, reply)) => {
+                        let _ = sequenced[at].set(position);
+                        replies.push((at, reply));
+                    }
+                    Err(error) => results[at] = Some(Err(error)),
+                }
+            }
+            pending = raced;
+        }
+        Ok(replies)
+    }
+
+    /// The entries of `keys`, in order, read in one index transaction.
+    async fn entries_of(&self, keys: Vec<String>) -> Result<Vec<Option<Entry>>, ShardError> {
+        let _read = self.admit_read()?;
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            let read = index.read()?;
+            keys.iter().map(|key| read.entry(&shard, key)).collect()
+        })
+        .await
+    }
+
     /// The entry of `key` as the index holds it: the outcome of every
     /// applied record of the key, and of no record not yet applied.
     ///

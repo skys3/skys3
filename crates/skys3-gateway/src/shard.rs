@@ -272,6 +272,49 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         body: RecordBody,
         condition: Precondition,
     ) -> impl Future<Output = Result<Result<EpochSeq, ConditionFailed>, ShardError>> + Send;
+
+    /// Commits `writes`, records that each name a different key, each if
+    /// its condition holds, as [`Shards::write`] commits each one, and
+    /// returns one result per write, in order. The shard's primary
+    /// sequences them together where it can, so that they share its group
+    /// commit (§7.8, `BATCH`). By default they are sent all at once, each
+    /// as its own [`Shards::write`].
+    fn write_all(
+        &self,
+        shard: &ShardRef,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> impl Future<Output = Vec<WriteOutcome>> + Send {
+        write_each(self.clone(), shard.clone(), writes)
+    }
+}
+
+/// The result of one write of [`Shards::write_all`], as [`Shards::write`]
+/// returns it.
+pub type WriteOutcome = Result<Result<EpochSeq, ConditionFailed>, ShardError>;
+
+/// Commits each of `writes` with its own [`Shards::write`], all at once.
+pub(crate) async fn write_each<S: Shards>(
+    shards: S,
+    shard: ShardRef,
+    writes: Vec<(RecordBody, Precondition)>,
+) -> Vec<WriteOutcome> {
+    let tasks: Vec<_> = writes
+        .into_iter()
+        .map(|(body, condition)| {
+            let (shards, shard) = (shards.clone(), shard.clone());
+            tokio::spawn(async move { shards.write(&shard, body, condition).await })
+        })
+        .collect();
+    let mut written = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        written.push(task.await.unwrap_or_else(|error| {
+            Err(ShardError::Unavailable {
+                shard: shard.clone(),
+                reason: format!("the write stopped: {error}"),
+            })
+        }));
+    }
+    written
 }
 
 /// A shard request that failed.

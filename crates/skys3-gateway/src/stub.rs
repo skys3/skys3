@@ -27,7 +27,7 @@ use skys3_types::{BucketDocument, BucketId, ETag, EpochSeq, Label, NodeId};
 
 use crate::conditions::{ConditionFailed, Precondition};
 use crate::local::LocalShards;
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
+use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome};
 
 /// The state [`MemoryShards::put`] leaves an entry in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,5 +341,16 @@ impl Shards for MemoryShards {
     ) -> Result<Result<EpochSeq, ConditionFailed>, ShardError> {
         self.check(shard)?;
         self.local.write(shard, body, condition).await
+    }
+
+    async fn write_all(
+        &self,
+        shard: &ShardRef,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> Vec<WriteOutcome> {
+        match self.check(shard) {
+            Ok(()) => self.local.write_all(shard, writes).await,
+            Err(error) => writes.iter().map(|_| Err(error.clone())).collect(),
+        }
     }
 }

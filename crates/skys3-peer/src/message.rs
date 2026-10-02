@@ -373,7 +373,7 @@ impl StagedRanges {
 
 impl Commit {
     /// Checks a `COMMIT`, or a `BATCH` item when `in_batch`.
-    fn validate(&self, in_batch: bool) -> Result<(), MessageError> {
+    pub(crate) fn validate(&self, in_batch: bool) -> Result<(), MessageError> {
         check_key("commit.key", &self.key)?;
         let Write::Put(put) = &self.write else {
             return Ok(());
