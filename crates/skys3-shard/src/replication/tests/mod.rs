@@ -28,6 +28,7 @@ use skys3_types::{
 };
 use tokio::net::TcpStream;
 
+mod backfill;
 mod handoff;
 mod learners;
 mod removal;
@@ -417,6 +418,7 @@ async fn stalled_member(pki: &Pki, sessions: Arc<AtomicUsize>) -> SocketAddr {
                     done: true,
                     epoch: 2,
                     refused: String::new(),
+                    ..SyncAck::default()
                 };
                 if next(&mut link).await.is_none() {
                     return;

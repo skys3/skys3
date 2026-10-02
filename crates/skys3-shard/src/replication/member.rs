@@ -6,12 +6,12 @@ use bytes::Bytes;
 use skys3_io::Disk;
 use skys3_log::{LogRecord, ShardRef};
 use skys3_net::{Frame, MessageKind, Network, PeerIdentity, Receiver, Sender};
-use skys3_types::{Epoch, Seq};
+use skys3_types::{Epoch, EpochSeq, Seq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
-use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
-use super::{LinkError, Replication, ReplicationConfig, recv};
+use super::wire::{self, Append, AppendAck, Backfill, Beacon, StepDown, Sync, SyncAck};
+use super::{LinkError, Replication, ReplicationConfig, backfill, recv};
 use crate::lease::Grace;
 use crate::lineage::Reconcile;
 use crate::shard::{Role, Shard};
@@ -45,9 +45,19 @@ where
         Ok(lineage) => shard.reconcile(&lineage, epoch),
         Err(error) => Reconcile::Diverged(format!("the primary's lineage is invalid: {error}")),
     };
+    let learner = shard.role() == Role::Learner;
+    let mut unverified = None;
     let rolled = match reconcile {
         Reconcile::Keep => false,
         Reconcile::RollForward => true,
+        // A re-admitted learner keeps its records only if the primary
+        // holds its last one too, and otherwise gets a snapshot (§6.7).
+        Reconcile::Diverged(why) if learner => {
+            tracing::info!(shard = %shard.shard(), %why, "asking the primary to verify the learner's log");
+            let last = *shard.durable().borrow();
+            unverified = Some(shard.record_epoch(last).await);
+            false
+        }
         Reconcile::Truncate { after, epoch: at } => {
             tracing::info!(shard = %shard.shard(), %after, epoch = %at, "truncating to reconcile");
             shard.truncate(after, at).await?;
@@ -60,11 +70,16 @@ where
         }
     };
     let last = *shard.durable().borrow();
+    // A learner that holds nothing of the shard, or cannot name its last
+    // record's epoch, keeps nothing.
+    let fresh = learner && (shard.applied() == EpochSeq::default() || unverified == Some(None));
     let answer = |done| SyncAck {
         last: last.get(),
         done,
         epoch: epoch.get(),
         refused: String::new(),
+        unverified: unverified.flatten().map_or(0, Epoch::get),
+        fresh,
     };
     if rolled && last > primary_last {
         for (_, record) in shard.read_tail(primary_last, last).await? {
@@ -73,7 +88,10 @@ where
         }
     }
     // A newer configuration's CONFIG record goes where the primary's is.
-    shard.follow(Epoch::new(request.sequencing), primary_last)?;
+    // A learner learns first whether it keeps its log.
+    if !learner {
+        shard.follow(Epoch::new(request.sequencing), primary_last)?;
+    }
     sender
         .send(&wire::frame(
             MessageKind::SyncAck,
@@ -81,6 +99,16 @@ where
             Bytes::new(),
         ))
         .await?;
+    if learner {
+        let frame = recv(&mut receiver, config.link_timeout).await?;
+        let verdict: Backfill =
+            wire::body(&frame, MessageKind::Backfill).map_err(LinkError::Protocol)?;
+        if !verdict.keep {
+            let link = (&mut receiver, &mut sender);
+            return backfill::install(replication, &shard, frame, link).await;
+        }
+        shard.follow(Epoch::new(request.sequencing), primary_last)?;
+    }
     let beacons = Notify::new();
     // A replica opened outside `Replication::open` starts its grace with
     // its first session.

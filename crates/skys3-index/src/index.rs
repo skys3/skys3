@@ -350,6 +350,104 @@ impl Index {
         Ok(())
     }
 
+    /// Starts installing a snapshot of `shard` (§6.7), in one durable
+    /// commit: removes what the index holds of the shard, as
+    /// [`Index::remove_shard`] does, except its step-down and promotion,
+    /// and sets its applied position to `marker`. A learner gives the
+    /// marker the `seq` [`Seq::MAX`](skys3_types::Seq::MAX), after any
+    /// record its log can hold: replay then applies none of the records
+    /// the snapshot replaces, even if the install is cut short, and the
+    /// marker tells the replica so when it opens again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn begin_install(&self, shard: &ShardRef, marker: EpochSeq) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut writer = IndexWriter::open(&txn)?;
+            writer.remove_shard(shard)?;
+            writer.set_applied(shard, marker)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Stores rows of `shard` in `table` as a primary's snapshot carried
+    /// them ([`IndexReader::shard_rows`]), in one non-durable commit,
+    /// between [`Index::begin_install`] and [`Index::finish_install`].
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Snapshot`] if a row is of another shard or does not
+    /// decode; an [`IndexError`] if redb fails. Nothing is stored then.
+    pub fn install_rows(
+        &self,
+        shard: &ShardRef,
+        table: tables::ShardTable,
+        rows: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), IndexError> {
+        for (key, value) in rows {
+            table.check(shard, key, value).map_err(IndexError::Snapshot)?;
+        }
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None)?;
+        {
+            let definition = match table {
+                tables::ShardTable::Namespace => tables::NAMESPACE,
+                tables::ShardTable::Uploads => tables::UPLOADS,
+                tables::ShardTable::Parts => tables::PARTS,
+            };
+            let mut table = txn.open_table(definition)?;
+            for (key, value) in rows {
+                table.insert(key.as_slice(), value.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Finishes installing a snapshot of `shard` whose rows are stored, in
+    /// one durable commit: its applied position becomes `applied`, the
+    /// position the snapshot was taken at.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn finish_install(&self, shard: &ShardRef, applied: EpochSeq) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        IndexWriter::open(&txn)?.set_applied(shard, applied)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records where records of `shard` that a learner copied from its
+    /// primary are on this node, in one durable commit (§6.7). The records
+    /// are at or before the shard's applied position, so replay never
+    /// restores their locations: the commit must be durable at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn store_locations(
+        &self,
+        shard: &ShardRef,
+        locations: &[(EpochSeq, RecordLocation)],
+    ) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut writer = IndexWriter::open(&txn)?;
+            for (position, location) in locations {
+                writer.put_location(shard, *position, location)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Changes the node's local copy of control state (§6.2) in one
     /// durable commit, and returns what `update` returns.
     ///
