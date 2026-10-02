@@ -116,6 +116,14 @@ fn convert(shard: &ShardRef, error: skys3_shard::ShardError) -> ShardError {
             position,
             reason,
         },
+        // Too few members left to take writes (§6.4): not acknowledged,
+        // `503 SlowDown`, here and across the forward wire. A pending write
+        // refused so was applied, as a write not acknowledged may be (§5.2).
+        error @ skys3_shard::ShardError::UnderReplicated { .. } => ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position: None,
+            reason: error.to_string(),
+        },
         other => ShardError::Unavailable {
             shard: shard.clone(),
             reason: other.to_string(),
@@ -256,5 +264,34 @@ impl<D: Disk> Shards for LocalShards<D> {
             // a `FLUSHED` that lost a race, which their writer expects.
             _ => Ok(committed.position),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_types::{BucketId, ShardId};
+
+    use super::*;
+
+    #[test]
+    fn too_few_members_is_not_acknowledged() {
+        let shard = ShardRef {
+            bucket: BucketId::new("b-1").unwrap(),
+            shard: ShardId::new(0),
+        };
+        let error = skys3_shard::ShardError::UnderReplicated {
+            shard: (&shard).into(),
+            copies: 1,
+            min_write_replicas: 2,
+        };
+        let converted = convert(&shard, error);
+        assert!(
+            matches!(
+                &converted,
+                ShardError::NotAcknowledged { position: None, reason, .. }
+                    if reason.contains("min_write_replicas")
+            ),
+            "{converted:?}"
+        );
     }
 }
