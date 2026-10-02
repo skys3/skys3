@@ -448,10 +448,13 @@ async fn completions_check_their_parts() {
             .await
             .assert(status, Some(code));
     }
-    // A whole-object checksum that does not match.
+    // A whole-object checksum that does not match, and a body that does
+    // not match its Content-MD5: the checksum headers describe the object,
+    // not the XML body, which only Content-MD5 covers.
     let parts = [(2, big.as_str()), (3, last.as_str())];
     for (header, value, code) in [
         ("x-amz-checksum-crc64nvme", "AAAAAAAAAAA=", "BadDigest"),
+        ("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg==", "BadDigest"),
         ("x-amz-checksum-type", "COMPOSITE", "InvalidRequest"),
         ("x-amz-mp-object-size", "7", "InvalidRequest"),
     ] {
@@ -478,7 +481,18 @@ async fn completions_check_their_parts() {
         .complete("k", &id, &[("if-none-match", "*")], &parts)
         .await
         .assert(412, Some("PreconditionFailed"));
-    let complete = setup.complete("k", &id, &[("if-match", "*")], &parts).await;
+    let md5 = encode_digest(&digest(
+        ChecksumAlgorithm::Md5,
+        completion(&parts).as_bytes(),
+    ));
+    let complete = setup
+        .complete(
+            "k",
+            &id,
+            &[("if-match", "*"), ("content-md5", &md5)],
+            &parts,
+        )
+        .await;
     complete.assert(200, None);
     let got = setup.get("k", &[], "").await;
     assert_eq!(got.body.len(), PART + 11);
@@ -540,7 +554,7 @@ async fn requests_for_unknown_or_invalid_uploads_are_refused() {
         .assert(400, Some("BadDigest"));
     // Creation options SkyS3 refuses.
     for (headers, status, code) in [
-        (vec![("x-amz-tagging", "a=b")], 501, "NotImplemented"),
+        (vec![("x-amz-tagging", "a=1&a=2")], 400, "InvalidArgument"),
         (
             vec![("x-amz-checksum-type", "COMPOSITE")],
             400,
@@ -807,4 +821,182 @@ async fn listing_parts_races_an_abort_consistently() {
         }
         abort.await.unwrap().assert(204, None);
     }
+}
+
+impl Setup {
+    /// Completes a two-part upload of `key`, created with `headers`: 5 MiB
+    /// of `a` and 1 MiB of `b`. Returns the object's bytes.
+    async fn two_parts(&self, key: &str, headers: &[(&str, &str)]) -> Bytes {
+        let id = self.create_upload(key, headers).await;
+        let parts = [filled(PART, b'a'), filled(MIB, b'b')];
+        let first = self.part(key, &id, 1, parts[0].clone()).await;
+        let second = self.part(key, &id, 2, parts[1].clone()).await;
+        self.complete(key, &id, &[], &[(1, &first), (2, &second)])
+            .await
+            .assert(200, None);
+        parts.concat().into()
+    }
+}
+
+/// Tags given to CreateMultipartUpload are the completed object's; tagging
+/// a multipart object keeps its parts, and DeleteObjects deletes it.
+#[tokio::test]
+async fn multipart_objects_take_tags_and_batch_deletes() {
+    let (setup, bucket) = local().await;
+    let data = setup
+        .two_parts("tagged", &[("x-amz-tagging", "kind=movie&cut=final")])
+        .await;
+    let tagging = setup.get("tagged", &[], "?tagging").await;
+    tagging.assert(200, None);
+    assert_eq!(elements(&tagging.body, "Key"), ["cut", "kind"]);
+    let head = setup.call(Method::HEAD, "/photos/tagged", &[], "").await;
+    assert_eq!(head.header("x-amz-tagging-count"), Some("2"));
+
+    let body = "<Tagging><TagSet><Tag><Key>new</Key><Value>tag</Value></Tag></TagSet></Tagging>";
+    setup
+        .call(Method::PUT, "/photos/tagged?tagging", &[], body)
+        .await
+        .assert(200, None);
+    let shard = ShardRef::for_key(&bucket, "tagged");
+    let object = setup.shards.entry(&shard, "tagged").await.unwrap();
+    let object = object.unwrap().object.unwrap();
+    assert!(matches!(object.payload, Payload::Parts { .. }));
+    assert_eq!(object.tags.len(), 1);
+    let part = setup.get("tagged", &[], "?partNumber=2").await;
+    part.assert(206, None);
+    assert_eq!(part.header("x-amz-mp-parts-count"), Some("2"));
+    assert_eq!(part.header("x-amz-tagging-count"), Some("1"));
+    assert_eq!(part.body.as_bytes(), &data[PART..]);
+    setup
+        .call(Method::DELETE, "/photos/tagged?tagging", &[], "")
+        .await
+        .assert(204, None);
+
+    let before = setup.located(&bucket, "tagged").await;
+    assert!(!before.is_empty());
+    let delete = "<Delete><Object><Key>tagged</Key></Object></Delete>";
+    let md5 = encode_digest(&digest(ChecksumAlgorithm::Md5, delete.as_bytes()));
+    let answer = setup
+        .call(
+            Method::POST,
+            "/photos?delete",
+            &[("content-md5", &md5)],
+            delete,
+        )
+        .await;
+    answer.assert(200, None);
+    assert_eq!(elements(&answer.body, "Key"), ["tagged"]);
+    setup
+        .get("tagged", &[], "")
+        .await
+        .assert(404, Some("NoSuchKey"));
+    let shard = ShardRef::for_key(&bucket, "tagged");
+    assert!(
+        setup
+            .shards
+            .parts(&shard, parse_upload_id_of(&object), 0, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the deleted object's parts are dropped"
+    );
+
+    // Tags on create keep S3's limits.
+    setup
+        .call(
+            Method::POST,
+            "/photos/k?uploads",
+            &[("x-amz-tagging", "aws:reserved=1")],
+            "",
+        )
+        .await
+        .assert(400, Some("InvalidTag"));
+}
+
+/// The upload a multipart object came from.
+fn parse_upload_id_of(object: &skys3_index::ObjectVersion) -> EpochSeq {
+    match &object.payload {
+        Payload::Parts { upload, .. } => *upload,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A copy of a multipart object is a single-part object: its ETag is the
+/// MD5 of its bytes and its checksums are full-object ones, which a regular
+/// upload reproduces.
+#[tokio::test]
+async fn copies_of_multipart_objects_have_one_part() {
+    let (setup, bucket) = local().await;
+    let data = setup
+        .two_parts("movie", &[("x-amz-checksum-algorithm", "SHA256")])
+        .await;
+    let source = setup
+        .get("movie", &[("x-amz-checksum-mode", "ENABLED")], "")
+        .await;
+    assert!(source.header("etag").unwrap().ends_with("-2\""));
+    assert_eq!(source.header("x-amz-checksum-type"), Some("COMPOSITE"));
+
+    let copied = setup
+        .call(
+            Method::PUT,
+            "/photos/copy",
+            &[("x-amz-copy-source", "photos/movie")],
+            "",
+        )
+        .await;
+    copied.assert(200, None);
+    let etag = format!("\"{}\"", md5_hex(&data));
+    let sha256 = encode_digest(&digest(ChecksumAlgorithm::Sha256, &data));
+    assert_eq!(element(&copied.body, "ETag"), Some(etag.as_str()));
+    assert_eq!(
+        element(&copied.body, "ChecksumSHA256"),
+        Some(sha256.as_str())
+    );
+    assert_eq!(element(&copied.body, "ChecksumType"), Some("FULL_OBJECT"));
+
+    let got = setup
+        .get("copy", &[("x-amz-checksum-mode", "ENABLED")], "")
+        .await;
+    got.assert(200, None);
+    assert_eq!(got.header("etag"), Some(etag.as_str()));
+    assert_eq!(got.header("x-amz-checksum-sha256"), Some(sha256.as_str()));
+    assert_eq!(got.body.as_bytes(), &data[..]);
+    let whole = setup.get("copy", &[], "?partNumber=1").await;
+    assert!(whole.header("x-amz-mp-parts-count").is_none(), "{whole:?}");
+    assert_eq!(whole.body.len(), data.len());
+    setup
+        .get("copy", &[], "?partNumber=2")
+        .await
+        .assert(416, Some("InvalidPartNumber"));
+
+    let shard = ShardRef::for_key(&bucket, "copy");
+    let object = setup.shards.entry(&shard, "copy").await.unwrap();
+    let object = object.unwrap().object.unwrap();
+    assert!(
+        matches!(object.payload, Payload::Extents(_)),
+        "{:?}",
+        object.payload
+    );
+    let source_etag = source.header("etag").unwrap().trim_matches('"');
+    let recorded = object.copy_source.unwrap();
+    assert_eq!(recorded.version.etag.as_str(), source_etag);
+
+    // A source without a checksum algorithm of its own gets CRC64NVME.
+    let data = setup.two_parts("plain", &[]).await;
+    let copied = setup
+        .call(
+            Method::PUT,
+            "/photos/plain-copy",
+            &[("x-amz-copy-source", "photos/plain")],
+            "",
+        )
+        .await;
+    copied.assert(200, None);
+    let crc = encode_digest(&digest(ChecksumAlgorithm::Crc64Nvme, &data));
+    assert_eq!(
+        element(&copied.body, "ChecksumCRC64NVME"),
+        Some(crc.as_str())
+    );
+    let md5 = format!("\"{}\"", md5_hex(&data));
+    assert_eq!(element(&copied.body, "ETag"), Some(md5.as_str()));
 }

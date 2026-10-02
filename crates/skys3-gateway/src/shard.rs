@@ -248,13 +248,14 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<ExtentRef, ShardError>> + Send;
 
     /// Commits `body`, a record that names a key (a `PUT`, a `DELETE`, a
-    /// `FLUSHED`, or a multipart record), if `condition` holds of the key's
-    /// entry when the record is sequenced, and returns the record's
-    /// position once it is durable and applied. The condition sees every
-    /// write of the key sequenced before the record, acknowledged or not, so
-    /// conditional writes are linearizable. Only a `PUT`, a `DELETE`, and an
-    /// `MPU_COMPLETE` take a condition. A `PUT` or `MPU_PART` that
-    /// references extents is accepted only once every one is applied.
+    /// `TAGS`, a `FLUSHED`, or a multipart record), if `condition` holds of
+    /// the key's entry when the record is sequenced, and returns the
+    /// record's position once it is durable and applied. The condition sees
+    /// every write of the key sequenced before the record, acknowledged or
+    /// not, so conditional writes are linearizable. Only a `PUT`, a
+    /// `DELETE`, a `TAGS`, and an `MPU_COMPLETE` take a condition. A `PUT` or
+    /// `MPU_PART` that references extents is accepted only once every one is
+    /// applied.
     ///
     /// # Errors
     ///

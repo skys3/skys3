@@ -50,11 +50,17 @@ pub(crate) async fn read<H: Shards>(
             let (extents, range) = part_extents(shards, shard, *upload, parts, range).await?;
             Ok(stream(shards, shard, extents, range))
         }
-        Payload::None => Err(s3_error!(
-            ServiceUnavailable,
-            "The object's bytes are not cached on this cluster"
-        )),
+        Payload::None => Err(not_cached()),
     }
+}
+
+/// The answer to a read of an object whose bytes this cluster does not
+/// hold, until read-through fill (plan M1-20) fetches them.
+pub(super) fn not_cached() -> s3s::S3Error {
+    s3_error!(
+        ServiceUnavailable,
+        "The object's bytes are not cached on this cluster"
+    )
 }
 
 /// Streams the bytes `range` of the body made of `extents`.
@@ -86,7 +92,7 @@ fn stream<H: Shards>(
 /// response starts: a later write of the key drops them, and a read that
 /// resolved the object first still finds what it needs (§10.3). An inline
 /// part is one extent, its `MPU_PART` record.
-async fn part_extents<H: Shards>(
+pub(super) async fn part_extents<H: Shards>(
     shards: &H,
     shard: &ShardRef,
     upload: EpochSeq,

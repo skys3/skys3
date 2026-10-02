@@ -26,7 +26,11 @@
 //!   up to `inline_max_bytes` is stored inline in its `PUT` record, a
 //!   larger one as `EXTENT` records while it arrives, and a PUT is answered
 //!   only once its record is durable and applied. User metadata is limited
-//!   to [`MAX_USER_METADATA_BYTES`].
+//!   to [`MAX_USER_METADATA_BYTES`]. DeleteObjects deletes up to
+//!   [`MAX_DELETE_KEYS`] keys, each authorized on its own. CopyObject copies
+//!   the source's bytes into the destination's shard and commits a `PUT`
+//!   that records its source. Object tags, at most [`MAX_OBJECT_TAGS`], are
+//!   stored with the `PUT` or replaced by a `TAGS` record.
 //! - Multipart uploads: CreateMultipartUpload, UploadPart,
 //!   CompleteMultipartUpload, AbortMultipartUpload, ListParts, and
 //!   ListMultipartUploads, as `MPU_*` records in the key's shard. An
@@ -133,7 +137,8 @@ pub use listener::GatewayListener;
 pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};
 pub use local::LocalShards;
 pub use objects::{
-    MAX_MULTIPART_OBJECT_BYTES, MAX_OBJECT_BYTES, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
+    MAX_DELETE_KEYS, MAX_MULTIPART_OBJECT_BYTES, MAX_OBJECT_BYTES, MAX_OBJECT_TAGS,
+    MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
     parse_upload_id, upload_id,
 };
 #[cfg(any(test, feature = "test-util"))]

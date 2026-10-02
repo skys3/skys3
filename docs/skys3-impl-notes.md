@@ -1017,6 +1017,111 @@ of this file. A task with nothing unexpected keeps "None."
   are not header values, with `400 InvalidRequest` before reading the
   object.
 
+### M1-10 DeleteObjects, tagging, and CopyObject
+
+- **No format change was needed.** M1-01 had already defined `TAGS`, a
+  `PUT` with tags, and a `PUT`'s copy source (bucket ID, key, `seq` and
+  ETag of the version, optional `remote_etag`), and M1-04 applies `TAGS`.
+  The log stays at version 2 and index values at format 2. The open choice
+  was where tags given at upload go: they are part of the `PUT` record, so
+  an object and its tags commit as one record under one write identity,
+  rather than a `PUT` followed by a `TAGS` that a crash could separate.
+  Design §10.1 records it. A `TAGS` is committed with an "object exists"
+  precondition, so a tagging request racing a delete answers `404` instead
+  of committing a record the state machine silently rejects.
+- **The authorizer checked one resource per request.** DeleteObjects names
+  a bucket in its path but needs `s3:DeleteObject` on each key of its body,
+  and S3 answers a key the caller may not delete with an `AccessDenied`
+  entry while deleting the others. `s3s` calls a per-operation access hook
+  after parsing the input, so the request-level check lets DeleteObjects
+  through (`authz::is_per_key`), and its hook stores a decision per key
+  in a `KeyDecisions` request extension. The operation fails closed
+  without one, and the gateway strips one that arrives with a request.
+  CopyObject's `copy_object` hook checks `s3:GetObject` on the source
+  (`authz::source_actions`). The authorization table gained a source
+  column, a caller denied only the source, and, for key-by-key operations,
+  a denied answer of `200` with an `AccessDenied` entry.
+- **XML bodies were never checked against their digest.** `s3s` does not
+  verify `Content-MD5`, and the gateway buffered XML bodies without
+  checking them. It now checks every XML body that carries `Content-MD5`
+  or an `x-amz-checksum-*` value before `s3s` parses it, with the same
+  validator as object bodies, and DeleteObjects requires one, as S3 does
+  (the AWS SDK for Rust sends `x-amz-checksum-crc32`). The answer to a
+  DeleteObjects without one is `400 InvalidRequest` with S3's message;
+  the S3 documentation was unreachable from the sandbox (as in M1-08), so
+  the SDK matrix (M1-25) should confirm the code against S3.
+- **A copy keeps its source's ETag rather than hashing its bytes again,
+  unless the source is a multipart object.** Keeping the ETag is S3's
+  result for an object stored by a single PUT. A copy of a multipart
+  object (M1-12, merged into this branch) would otherwise carry a
+  multipart ETag and composite checksums without part boundaries, which a
+  flush by PutObject (M1-16) cannot reproduce, and keeping the source's
+  parts would tie the copy to another key's upload. So a copy is always a
+  single-part object: of a multipart source, its ETag is the MD5 of its
+  bytes and its checksums are full-object checksums of the source's
+  algorithms (CRC64NVME if it had none), all computed on the hashing pool
+  while the bytes are copied. `partNumber=1` serves the whole copy, with no
+  `x-amz-mp-parts-count`, and other part numbers answer `416`. S3 may keep
+  a multipart source's ETag for some copies; the SDK matrix (M1-25) should
+  compare. With `x-amz-checksum-algorithm`, the copy stores that
+  algorithm's checksum, reused from the source only when it is a
+  full-object one. Design §11 records it.
+- **Writes could store and copy tags without the tagging actions.**
+  Review found that PutObject and CreateMultipartUpload with
+  `x-amz-tagging`, and CopyObject, needed only `s3:PutObject`, so a caller
+  denied `s3:PutObjectTagging` could still set tags, and one denied
+  `s3:GetObjectTagging` could copy a source's tags. As in S3, a write that
+  gives tags now also needs `s3:PutObjectTagging`, checked in the
+  operation's access hook, and a copy of a tagged source with the `COPY`
+  tagging directive also needs `s3:GetObjectTagging` on the source and
+  `s3:PutObjectTagging` on the copy. Whether the source has tags is known
+  only once the operation reads it, so the hook leaves its decision in a
+  `CopiedTags` extension, stripped from incoming requests like
+  `KeyDecisions`; the copy fails closed without it. An empty
+  `x-amz-tagging` still needs the action, and copies of untagged sources
+  need neither. The S3 documentation was unreachable from the sandbox; the
+  rule follows the AWS guidance that copying tagged objects needs both
+  tagging actions, and the SDK matrix (M1-25) should confirm it. The
+  authorization table gained rows for tagged writes and copies, and a test
+  checks that callers denied the tagging actions still write untagged
+  objects.
+- **A self-copy that only set a storage class or website redirect was
+  accepted and lost.** S3 counts either as a change, but SkyS3 stores
+  neither (PutObject accepts and ignores them, M1-09), so such a copy
+  answered success and changed nothing. It is now refused like any copy
+  onto itself that does not replace the metadata.
+- **Imported and adopted objects can carry a write identity.** Their
+  metadata comes from the remote, so a `COPY` directive would have copied
+  `x-amz-meta-skys3-wid` into the copy, naming another write. Copies drop
+  it.
+- **The fuzz harness could not reach DeleteObjects.** Its structured mode
+  sends a fixed set of XML operations, which now include a working
+  DeleteObjects; without a digest every input was refused before parsing.
+  The harness adds the body's `Content-MD5` to every structured request.
+- **CompleteMultipartUpload's checksum headers are not body digests.**
+  Merging M1-12 showed that the XML digest check read its
+  `x-amz-checksum-*` headers, which give the completed object's checksum,
+  as digests of the XML body, and refused every completion that sent one.
+  For CompleteMultipartUpload only `Content-MD5` is checked against the
+  body.
+- **Tags on CreateMultipartUpload.** M1-12 answered `501` to
+  `x-amz-tagging` on create because tags did not exist yet. `MPU_CREATE`
+  already carried tags, so create now parses them with PutObject's limits
+  and the completed object takes them; no format change. Tagging a
+  multipart object keeps its parts (GET with `partNumber` still serves
+  them), and DeleteObjects of one releases its parts, as DeleteObject
+  does; tests cover both.
+  A new target, `gateway_tagging`, parses `x-amz-tagging` headers and
+  checks that accepted sets keep S3's limits and round-trip through the
+  header and PutObjectTagging forms. A 30-second run executed about
+  670,000 inputs, and a 60-second run of `gateway_request` about 3,000,
+  with no failure.
+- **Left open.** How a `TAGS` flushes is M1-16's (plan section 14). A
+  copy reads its source's payload by position after reading the entry, as
+  a GET does; compaction (M1-22) must not reclaim payload a read in
+  progress still uses after an overwrite. UploadPartCopy, with copy-source
+  ranges, is M4-05's.
+
 ### M1-11 Listing
 
 - **A page resumes after an item, not a key.** V1's `NextMarker` can be
