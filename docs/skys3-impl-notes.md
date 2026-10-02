@@ -4013,13 +4013,16 @@ of this file. A task with nothing unexpected keeps "None."
   (8 to 14 promotions for two joins, the second seed with replacement
   swapping learners as above); promotions' compare-and-swaps took at most
   41 ms. One or two handoffs per run moved primaries, each serving again
-  after 25 to 58 ms (36 ms on average). No shard had fewer than
-  `replicas` members, except once for 316 ms in one two-join seed. Writes
-  in flight while shards moved and meeting no handoff took at most
-  1.02 s, against up to 1.57 s before and after the moves (control-store
-  faults on gateway register reads); writes meeting a handoff took at
-  most 27 ms, one of them a fast 503. So the only stall is the handoff,
-  tens of milliseconds.
+  after 25 to 58 ms (about 35 ms on average). No shard had fewer than
+  `replicas` members, except once for 204 to 316 ms in one two-join
+  seed. Writes in flight while shards moved and meeting no handoff took
+  at most 1.02 s in four of the five seeds and 1.76 s in the fifth,
+  against up to 1.98 s before and after the moves (control-store faults
+  on gateway register reads); up to two of them were fast 503s (above).
+  Writes meeting a handoff took at most 27 ms, one of them a fast 503.
+  So the only stall is the handoff, tens of milliseconds. (Measured
+  before and after merging M6-04 and the M3-05 removal-timer fixes;
+  ranges cover both runs.)
 - **Left for later.**
   - **Configuration keys** for the pace, with the coordinator's wiring.
   - **Rebalancing scans the shard registers itself**, a fourth listing per
