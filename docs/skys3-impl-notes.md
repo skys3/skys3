@@ -3139,6 +3139,53 @@ of this file. A task with nothing unexpected keeps "None."
   data shards never was, and the forgotten node registered again on its
   return.
 
+### M3-03 Placement engine
+
+- **Unlabeled nodes and reused rack names were undefined.** §6.7 names the
+  levels but not what a node without a `rack` (or `zone`) label is at
+  that level, nor whether rack names are scoped by zone. Treating an
+  unlabeled node as a domain of its own could put two members in one
+  physical rack, so at the `rack` and `zone` levels such a node never
+  receives members and cluster health lists it under `unlabeled`. Rack
+  labels are cluster-wide names: equal names in different zones count as
+  one rack, which can only make placement more cautious. Recorded in
+  §6.7.
+- **Placing a bucket's shards one by one against the same loads would
+  stack them.** With equal nodes, every shard of a new bucket would pick
+  the same least-loaded nodes. `Topology::place_bucket` counts each
+  placed shard into a private copy of the loads before placing the next,
+  and ties between equal nodes break by a hash of the shard and the node
+  (rendezvous), so 255 shards of 3 replicas over 9 equal nodes give every
+  node exactly 85 members and 28 or 29 primaries. The hash is FNV-1a with
+  a SplitMix64 finish, not `DefaultHasher`, so the result is the same on
+  every build and coordinator.
+- **The admin API cannot show placement health yet.** The node binary
+  does not run the coordinator, and only the coordinator judges policy.
+  `PolicyWatch` publishes a `PolicyReport` to a `PlacementHealth` handle
+  before each placement round, and §12 now fixes the `placement` object
+  of `GET /v1/health` that serves it; the binary wires it with the
+  coordinator. Shard members in bucket status wait for the multi-node
+  binary too (M3-04).
+- **Shortfalls are judged by healthy domains.** A shard is reported short
+  when its members not on departing nodes span fewer than `replicas`
+  domains, so a lost rack shows up once its nodes depart, before
+  replacement (M3-05) removes them. Only members whose separation can be
+  shown count: on a registered node, not departing, with the label the
+  level needs. The first version counted an unlabeled or unregistered
+  member as a domain of its own, so two unlabeled members in a `rack`
+  cluster could make a shard look whole, contradicting the rule that an
+  unlabeled node cannot be shown to be apart from any other (found in
+  review). An unregistered member is a node the coordinator forgot,
+  which it does only after marking it departing, or one that never
+  joined, so it counts for nothing either.
+- **The `departing` mark arrived mid-task.** M3-02's review fix forgets a
+  node in two rounds and marks its registration `departing` first. A
+  `Candidate` built from a marked registration is `Departing` whether it
+  comes from the registration alone (a gateway checking a new bucket) or
+  from a registry entry, so the marked node receives no member, does not
+  count towards satisfiability, and its members count as missing in the
+  health report.
+
 ## M6 Native peer transport
 
 ### M6-01 Peer protocol messages

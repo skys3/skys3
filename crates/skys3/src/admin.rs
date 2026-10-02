@@ -37,7 +37,9 @@
 //!   those done, `imported`, the `IMPORT` records committed since the node
 //!   started, and `error`, its last error until it gets past it.
 //!
-//! Placement (M3-03) adds shard members, and M4-06 its own fields.
+//! Once the node runs the coordinator, `health` gains a `placement` object
+//! from `skys3_coord::PlacementHealth` (design §12), and bucket status the
+//! shards' members (M3-04); M4-06 adds its own fields.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
