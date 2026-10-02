@@ -365,7 +365,9 @@ impl<N: Network, D: Disk> Replication<N, D> {
     }
 
     /// Hands the shard off to its member `to` (§5.4): this node's replica,
-    /// its primary, stops serving reads and writes and renewing its leases,
+    /// its primary, checks that the shard's register holds its
+    /// configuration, if the node has the registers, and removes no member
+    /// from then on; it stops serving reads and writes and renewing its leases,
     /// lets the reads and writes in progress finish, records the step-down
     /// durably ([`Shard::stepped_down`]), and sends `to` a step-down message
     /// with the last `seq` it sequenced. `to` then proposes itself as
@@ -382,10 +384,12 @@ impl<N: Network, D: Disk> Replication<N, D> {
     ///
     /// # Errors
     ///
-    /// [`ShardError::NotFound`] if the shard is not open on this node, and
-    /// as [`Shard::step_down`]: the replica is not a primary that leads
-    /// the shard, `to` is not another member, or the step-down could not
-    /// be recorded.
+    /// [`ShardError::NotFound`] if the shard is not open on this node;
+    /// [`ShardError::Unavailable`] if the register cannot be read or holds
+    /// another configuration, as after a removal whose answer was lost;
+    /// and as [`Shard::step_down`]: the replica is not a primary that leads
+    /// the shard, `to` is not another member, or the step-down could not be
+    /// recorded.
     pub async fn hand_off(&self, shard: &ShardRef, to: &NodeId) -> Result<HandedOff, ShardError> {
         let replica = self
             .inner
@@ -393,11 +397,28 @@ impl<N: Network, D: Disk> Replication<N, D> {
             .get(shard)
             .await
             .ok_or_else(|| ShardError::NotFound(shard.clone()))?;
+        let leader = replica.leader().ok_or_else(|| {
+            ShardError::configuration(shard, "the replica does not lead the shard")
+        })?;
+        // No removal moves the register on from here; one that landed
+        // unseen, or is in flight, would leave this primary leading a
+        // configuration it did not step down in.
+        let _changing = leader.changing().lock().await;
+        if let Some(removal) = self.inner.removal.get() {
+            let held = removal
+                .registers
+                .read(shard)
+                .await
+                .map_err(|error| ShardError::unavailable(shard, error))?;
+            if held.as_ref() != Some(&replica.config()) {
+                return Err(ShardError::unavailable(
+                    shard,
+                    "the shard's register holds another configuration",
+                ));
+            }
+        }
         tracing::info!(%shard, %to, "handing the shard off");
         let (epoch, last) = replica.step_down(to).await?;
-        let Some(leader) = replica.leader() else {
-            unreachable!("a primary that stepped down has a leader");
-        };
         let sent = leader.await_step_down(self.inner.config.link_timeout).await;
         replica.depose("the primary stepped down for a planned handoff", None);
         self.await_successor(&replica, epoch);

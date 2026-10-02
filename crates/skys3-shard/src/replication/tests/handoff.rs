@@ -5,7 +5,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use skys3_control::MemoryControlStore;
+use skys3_control::{MemoryControlStore, RetryPolicy};
 use skys3_io::BlockingPool;
 use skys3_log::ShardRef;
 use skys3_types::{Epoch, ShardConfig, ShardId};
@@ -15,6 +15,7 @@ use super::removal::{initial, put, register, timing, until};
 use super::takeover::{Node, cluster, new_primary, patient, run};
 use super::{Pki, node, shard};
 use crate::error::ShardError;
+use crate::replication::{ControlRegisters, Replaced, ShardRegisters};
 use crate::shard::{Role, Shard};
 
 /// Three nodes in the initial configuration, node 1 serving as primary
@@ -98,21 +99,22 @@ async fn lost_step_down() {
     let nodes = serving(&pki, &store).await;
     let old = &nodes[0].shard;
 
-    // The candidate cannot be reached: the message is never sent, and the
+    // The candidate cannot be reached: the message never arrives, whether
+    // or not the primary wrote it before it saw the link drop, and the
     // members take over once their grace passes.
     nodes[0].cut(2);
     let started = Instant::now();
-    let handed = nodes[0]
+    nodes[0]
         .replication
         .hand_off(&shard(), &node(2))
         .await
         .unwrap();
-    assert!(!handed.sent);
-    assert!(started.elapsed() >= timing().link_timeout);
     assert!(old.check_readable().is_err());
     new_primary(&nodes).await;
     let took = started.elapsed();
     assert!(took >= timing().primary_grace, "took over after {took:?}");
+    let candidate = nodes[1].replication.grace(&shard()).unwrap();
+    assert_eq!(candidate.stepped_down(), None);
     let register = register(&store).await;
     assert!(!register.is_member(&node(1)));
     until(|| old.config() == register).await;
@@ -156,6 +158,22 @@ async fn restart_after_step_down() {
         matches!(refused, Err(ShardError::NotFound(_))),
         "{refused:?}"
     );
+    // Nor while the register holds another configuration than the
+    // primary's, as after a removal whose answer was lost.
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    let moved = ShardConfig {
+        epoch: Epoch::new(2),
+        ..initial()
+    };
+    let replaced = registers.replace(&initial(), &moved).await.unwrap();
+    assert_eq!(replaced, Replaced::Accepted);
+    let refused = replication.hand_off(&shard(), &node(2)).await;
+    assert!(
+        matches!(refused, Err(ShardError::Unavailable { .. })),
+        "{refused:?}"
+    );
+    let replaced = registers.replace(&moved, &initial()).await.unwrap();
+    assert_eq!(replaced, Replaced::Accepted);
     assert!(old.is_serving());
 
     replication.hand_off(&shard(), &node(3)).await.unwrap();

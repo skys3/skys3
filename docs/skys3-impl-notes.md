@@ -3110,9 +3110,17 @@ of this file. A task with nothing unexpected keeps "None."
   for its grace.
 - **A step-down counts once.** A candidate whose proposal loses resumes
   granting and forgets the step-down; otherwise it would propose over the
-  same epoch again in a tight loop. The old primary's watchdog removes no
-  member after the step-down: a removal landing then would move the
-  register past the epoch the candidate proposes over.
+  same epoch again in a tight loop.
+- **No removal moves the register past a step-down.** The first
+  message-loss seeds left a shard unavailable for good: the primary
+  removed the candidate and every other member (a compare-and-swap in
+  flight when the handoff began) and was left the only member of a
+  configuration it had stepped down from in memory, so no one could take
+  over. A handoff now takes a lock that member removals also take
+  (`Leader::changing`), checks that the register holds the primary's
+  configuration, and only then steps down; the watchdog removes no member
+  after that. A removal whose answer was lost shows up in that check and
+  refuses the handoff.
 - **The old primary polls the register.** It is no longer a member of the
   new configuration, so no member's refusal tells it about the takeover,
   as it does after one from silence. It reads the shard's register every
@@ -3129,11 +3137,13 @@ of this file. A task with nothing unexpected keeps "None."
   before every primary served left a replica that never serves, and the
   harness waited for it. `ReplicatedServices::ready` now skips replicas
   that stepped down.
-- **Measured.** In the loopback test a handoff took tens of
-  milliseconds against a 600 ms grace, with the write in flight
-  acknowledged. The cluster scenarios hand off 15 to 24 shards per seed
-  through gateways with stale maps, and ran SEEDS seeds clean, including
-  ones with message loss, partitions, crashes, and drift within `ρ`.
+- **Measured.** In the loopback test the candidate serves before its
+  600 ms grace could have passed, and the write in flight when the
+  primary stepped down is acknowledged. The cluster scenarios hand off up
+  to 31 shards per seed through gateways with stale maps. With the fixes
+  above, 64 seeds of the stale-gateway scenario, 64 with message loss,
+  and 128 with random crashes, partitions, message loss, and drift within
+  `ρ` ran clean, and the seeded bug was caught in each of its 64 seeds.
 - **The protocol model needed no change.** `StepDown` and
   `ProposeTakeover` already model the durable step-down and the
   candidate's proposal over the epoch it names. The implementation only

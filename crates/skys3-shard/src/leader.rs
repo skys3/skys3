@@ -134,6 +134,10 @@ pub struct Leader {
     rejected: watch::Sender<Epoch>,
     /// Where a planned handoff stands (§5.4).
     handoff: watch::Sender<Handoff>,
+    /// Held while the primary changes the shard's register, or hands the
+    /// shard off: a handoff starts from the configuration the register
+    /// holds, and no removal moves it on meanwhile.
+    changing: tokio::sync::Mutex<()>,
 }
 
 /// Where a primary's planned handoff stands (§5.4).
@@ -196,6 +200,7 @@ impl Leader {
             leases: Mutex::default(),
             rejected: watch::Sender::new(Epoch::ZERO),
             handoff: watch::Sender::new(Handoff::None),
+            changing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -230,6 +235,12 @@ impl Leader {
     /// ([`Leader::rejected`]), with the newest such epoch.
     pub(crate) fn rejections(&self) -> watch::Receiver<Epoch> {
         self.rejected.subscribe()
+    }
+
+    /// The lock held while the primary changes the shard's register, by a
+    /// removal (§6.4), or hands the shard off (§5.4).
+    pub(crate) fn changing(&self) -> &tokio::sync::Mutex<()> {
+        &self.changing
     }
 
     /// Stops renewing leases for good, as the first step of a planned
