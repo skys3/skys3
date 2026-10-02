@@ -1,6 +1,6 @@
 //! Starting, running, and stopping a node (design §3, §6.2, §10).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -11,9 +11,7 @@ use std::time::Duration;
 use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
-use skys3_control::{
-    ControlError, FileControlStore, ProposalIds, RetryPolicy, bootstrap, read_cluster,
-};
+use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     CredentialError, Gateway, GatewayConfig, GatewayListener, IdSource, LocalShards, ShardRef,
@@ -24,7 +22,6 @@ use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallCloc
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
 use skys3_remote::aws::{AwsS3, default_credentials};
-use skys3_shard::{ShardSet, StateMachine};
 use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
@@ -36,9 +33,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
-use crate::control::{ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
+use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
+use crate::storage::{self, on_pool};
 
 /// Worker threads per disk for log I/O (§10.4).
 const DISK_THREADS: usize = 4;
@@ -230,13 +228,10 @@ impl Shared {
 
     /// Reads a fresh copy from the store and keeps it in the index.
     async fn refresh_copy(&self) -> Result<ControlCopy, StartError> {
-        let started = self.wall.now();
         let cluster = &self.config.cluster().cluster_id;
         let store = self.store.store().ok_or_else(no_store)?;
-        let copy = ControlCopy::fetch(&store, cluster, &self.retry, started).await?;
-        let (index, kept) = (Arc::clone(&self.index), copy.clone());
-        on_pool(&self.pools.index, move || kept.save(&index)).await?;
-        Ok(copy)
+        let (pool, started) = (&self.pools.index, self.wall.now());
+        control::refresh(&store, cluster, &self.retry, &self.index, pool, started).await
     }
 
     /// The generation of the node's copy.
@@ -408,22 +403,6 @@ async fn watch_disks(
     }
 }
 
-/// Runs blocking `job` on `pool`.
-async fn on_pool<T, E>(
-    pool: &BlockingPool,
-    job: impl FnOnce() -> Result<T, E> + Send + 'static,
-) -> Result<T, StartError>
-where
-    T: Send + 'static,
-    E: Send + 'static,
-    StartError: From<E>,
-{
-    match pool.run(job).await {
-        Ok(result) => result.map_err(StartError::from),
-        Err(closed) => Err(io_error(format!("the {} pool", pool.name()))(closed.into())),
-    }
-}
-
 /// The node's metrics beyond the admin listener's own.
 struct NodeMetrics {
     registry: MetricsRegistry,
@@ -464,15 +443,16 @@ struct Storage {
 }
 
 /// Recovers each disk's log, opens the index, and replays the logs into
-/// it (§10.1, §10.2). The index is kept in `opened` as soon as it is open.
+/// Opens each disk and the index, recovers each disk's log, and replays the
+/// logs into the index (§10.1, §10.2). The index is kept in `opened` as
+/// soon as it is open.
 async fn open_storage(
     config: &Config,
     data_dir: &DataDir,
     pools: &mut Pools,
     opened: &mut Option<Arc<Index>>,
 ) -> Result<Storage, StartError> {
-    let clock = Arc::new(MonotonicClock::new());
-    let mut logs = BTreeMap::new();
+    let mut dirs = Vec::new();
     let mut disks = Vec::new();
     for disk in data_dir.disks() {
         let disk_pool = pool(&format!("disk-{}", disk.label), DISK_THREADS)?;
@@ -480,34 +460,34 @@ async fn open_storage(
         let real = RealDisk::open(&disk.path, disk_pool)
             .await
             .map_err(io_error(format!("opening {}", disk.path.display())))?;
-        let log_config = LogConfig::from_storage(config.storage());
-        let (log, report) = SegmentLog::open(real, log_config, clock.clone())
-            .await
-            .map_err(|source| StartError::Recovery {
-                disk: disk.label.clone(),
-                source,
-            })?;
-        tracing::info!(disk = %disk.label, ?report, "recovered the log");
-        logs.insert(disk.label.clone(), log.clone());
-        disks.push((disk.clone(), log));
+        dirs.push(disk.clone());
+        disks.push((disk.label.clone(), real));
     }
     let path = data_dir.path().join("index.redb");
     let index_config = IndexConfig::from_storage(config.storage());
     let index = on_pool(&pools.index, move || Index::open(&path, &index_config)).await?;
     let index = Arc::clone(opened.insert(Arc::new(index)));
-    let checkpointer = Arc::new(Checkpointer::new(
-        Arc::clone(&index),
-        logs.clone(),
+    let recovered = storage::recover(
+        disks,
+        LogConfig::from_storage(config.storage()),
+        Arc::new(MonotonicClock::new()),
+        index,
         pools.index.clone(),
-    ));
-    let replayed = checkpointer.replay(Arc::new(StateMachine)).await?;
-    tracing::info!(records = replayed.applied, "replayed the logs");
-    let set = ShardSet::with_disks(Arc::clone(&index), logs, pools.index.clone());
+        data_dir.node_id().clone(),
+    )
+    .await?;
+    let disks = dirs
+        .into_iter()
+        .map(|dir| {
+            let log = recovered.logs[&dir.label].clone();
+            (dir, log)
+        })
+        .collect();
     Ok(Storage {
         disks,
-        index,
-        checkpointer,
-        shards: LocalShards::new(set, data_dir.node_id().clone()),
+        index: recovered.index,
+        checkpointer: recovered.checkpointer,
+        shards: recovered.shards,
     })
 }
 
@@ -535,10 +515,7 @@ async fn open_control(
 ) -> Result<OpenedControl, StartError> {
     let cluster = &config.cluster().cluster_id;
     let retry = RetryPolicy::default();
-    let kept = {
-        let index = Arc::clone(index);
-        on_pool(&pools.index, move || ControlCopy::load(&index)).await?
-    };
+    let kept = control::kept_copy(index, &pools.index).await?;
     let initialized = kept.is_some();
     let opened = match open_file_store(directory, owner, initialized, &pools.control).await {
         Ok(opened) => opened,
@@ -570,41 +547,23 @@ async fn open_control(
             });
         }
     };
-    let store = opened.store;
-    let fetched = async {
-        // A node that synced before never bootstraps: its store must
-        // already hold cluster.json (open_file_store checked).
-        if !initialized {
-            let proposal = ProposalIds::from_os_rng().next_id();
-            bootstrap(&store, cluster, proposal, &retry).await?;
-        }
-        ControlCopy::fetch(&store, cluster, &retry, started).await
-    }
-    .await;
-    match (fetched, kept) {
-        (Ok(copy), _) => {
-            let (index, saved) = (Arc::clone(index), copy.clone());
-            on_pool(&pools.index, move || saved.save(&index)).await?;
-            Ok(OpenedControl {
-                store: NodeStore::live(store),
-                copy,
-                reclaim: !opened.claimed,
-            })
-        }
-        (Err(error), Some(kept)) => {
-            tracing::warn!(
-                %error,
-                generation = %kept.generation,
-                "the control store does not answer; running from the local copy"
-            );
-            Ok(OpenedControl {
-                store: NodeStore::from_copy(Some(store), kept.clone()),
-                copy: kept,
-                reclaim: false,
-            })
-        }
-        (Err(error), None) => Err(error.into()),
-    }
+    let proposal = ProposalIds::from_os_rng().next_id();
+    let (store, copy) = control::open(
+        opened.store,
+        kept,
+        cluster,
+        proposal,
+        &retry,
+        index,
+        &pools.index,
+        started,
+    )
+    .await?;
+    Ok(OpenedControl {
+        reclaim: store.is_live() && !opened.claimed,
+        store,
+        copy,
+    })
 }
 
 /// The error a node without a control store gives for what needs one.

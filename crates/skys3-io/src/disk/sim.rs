@@ -66,7 +66,8 @@ pub struct SimFileInfo {
 /// The node reaches the disk through a [`SimMount`] from [`SimDisk::mount`].
 /// [`SimDisk::crash`] simulates power loss: it keeps only durable state and
 /// makes every existing mount and file handle fail, and the restarted node
-/// mounts the disk again. Clones share the same device.
+/// mounts the disk again. [`SimDisk::kill`] simulates the death of the
+/// process alone, which keeps the page cache. Clones share the same device.
 #[derive(Clone)]
 pub struct SimDisk {
     state: Arc<Mutex<DiskState>>,
@@ -75,8 +76,8 @@ pub struct SimDisk {
 type FileId = u64;
 
 struct DiskState {
-    /// Incremented by each crash. Mounts and handles from an earlier
-    /// incarnation are stale.
+    /// Incremented by each crash and kill. Mounts and handles from an
+    /// earlier incarnation are stale.
     incarnation: u64,
     next_id: FileId,
     entries: BTreeMap<String, FileId>,
@@ -211,6 +212,23 @@ impl SimDisk {
         block::crash(&mut state.blocks, &mut state.rng, torn_probability);
         state.incarnation += 1;
         state.crashes += 1;
+    }
+
+    /// Simulates the death of the process using the disk, without a power
+    /// loss: the page cache survives, so every byte and directory entry
+    /// written stays visible and a later sync makes it durable, but every
+    /// existing mount and file handle becomes stale, as a dead process's
+    /// would. Files that only open handles kept alive go away.
+    pub fn kill(&self) {
+        let mut state = self.lock();
+        state.incarnation += 1;
+        for file in state.files.values_mut() {
+            file.handles = 0;
+        }
+        let ids: Vec<FileId> = state.files.keys().copied().collect();
+        for id in ids {
+            state.collect(id);
+        }
     }
 
     /// Returns the number of crashes so far.

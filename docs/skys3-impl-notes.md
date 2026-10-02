@@ -1727,6 +1727,104 @@ of this file. A task with nothing unexpected keeps "None."
   and `untrusted` 0.7, which are never built; `cargo deny` checks the built
   graph and passes without new skips.
 
+### M2-03 Cluster simulation harness
+
+- **The harness is its own crate.** Plan section 4 put the cluster harness
+  in `skys3-sim`, but the harness needs the node's crates (gateway, shards,
+  index, control store, transport), and those use `skys3-sim` in their own
+  tests, `skys3-control` even in unit tests, which a cycle would give two
+  copies of every type. `skys3-sim` keeps the runner, the simulated S3
+  store, and now the history recorder and checkers (`history`, `check`),
+  which need nothing from the node; the harness is the new
+  `skys3-cluster-sim`. Plan section 4 is updated.
+- **The node could not run in a simulation.** `Node::start` is hard-wired to
+  real disks, a file control store, OS sockets, and thread pools. Rather
+  than a second, look-alike startup, the parts that matter moved into
+  generic functions the node now calls too: `skys3::storage::recover` (log
+  recovery, index replay, shards) and `skys3::control::open` and
+  `refresh` (bootstrap, the copy of control state, falling back to the kept
+  copy). `control::open` takes the copy the index keeps
+  (`control::kept_copy`) and bootstraps only a node that never synced, as
+  M1-13's review requires; opening the file store, its owner check, and a
+  reset store stay in the node. The harness adds what differs: simulated disks, a drifting clock
+  per life, a fault-injecting S3 control store, the gateway over `turmoil`
+  TCP, and an authenticator that trusts every request. Sessions, STS, the
+  admin listener, and disk fencing are not run.
+- **Thread pools break replay.** Index work runs on `BlockingPool` threads,
+  and a `turmoil` host whose task waits for a thread lets simulated time
+  jump by however long the thread happens to take, so a seed did not
+  replay. `BlockingPool::inline` runs each job on the caller when it is
+  queued; the harness uses it, and a test runs one seed twice and compares
+  the histories.
+- **`SimDisk` had no process kill.** A crash without power loss must keep
+  the page cache but invalidate the dead process's handles, or a
+  destructor of the old life could still write. `SimDisk::kill` does
+  that; the driver kills or crashes the disks before it crashes the host.
+  A node with a failed sync is always restarted with a power loss, as
+  M1-02 requires.
+- **Heals must end their own fault.** Review found that the driver's
+  heals were not scoped: the fallback power-loss restart of a failed sync
+  (the fence) also hit the process that replaced the failed one after a
+  crash or a supervisor restart, overlapping control-store windows that
+  ended out of start order removed the oldest one's effect instead of
+  their own, and the end of any message-loss window stopped all loss. The
+  driver now counts each node's processes and a fence applies only to
+  the process whose sync failed (moving to the next one if the node was
+  down when the sync failed), and each loss or control-store window has
+  an identity and ends on its own; what is in force is recomputed from
+  the windows still open. Overlapping loss windows give the highest rate,
+  as overlapping lost-response windows give the highest probability.
+  `Report::fences` counts the fences a run forced.
+- **A transient control-store error fails a node's start.**
+  `Buckets::reload`, which `Gateway::new` calls, lists `buckets/` without
+  retries, so one lost answer stops a starting node. The node binary has
+  the same behavior. The harness treats a node that stops by itself as a
+  supervisor would, restarting it after a power loss; the gateway should
+  retry the listing like its reads (left open).
+- **Where M1 keys live.** In M1 every node opens every bucket's shards as
+  their only member. The harness writes a static placement to the
+  `shards/` registers, as plan section 8 allows, and sends each key to its
+  shard's primary, which is the only copy the durability check reads.
+  Routing (M2-08) and replication (M2-07) replace that through the
+  `NodeServices` hook, which returns the shards the gateway calls.
+- **What an answer proves.** The checkers needed a rule for writes whose
+  outcome is unknown. A write answered with a 5xx may take effect only
+  before its answer (design §5.2), so its window closes then; a write
+  without an answer stays open forever, since a held link can deliver it
+  after the client gave up. Design §16.1 records the rule. Message loss in
+  `turmoil` stalls a TCP stream instead of retransmitting, so lossy links
+  surface as client timeouts, which the open window covers.
+- **Unanswered writes made the search explode.** A Wing–Gong search tries
+  every unanswered write at every point, so forty of them on one key, as
+  a long partition produces, did not finish. Two reductions keep it
+  exact and small: values no read returns and no `If-Match` names are
+  merged into one, and of unanswered writes with the same effect only the
+  earliest-called unplaced one is tried, since it can stand in for any
+  later one. The search still gives up, with a violation, past
+  `MAX_SEARCH_STATES`.
+- **Seeds cost more.** A cluster seed takes about a second in a debug
+  build, so 256 seeds per scenario would add tens of minutes to CI.
+  `Runner::with_cost` divides `SKYS3_SIM_SEEDS` by a scenario's cost; the
+  cluster scenarios run 8 or 16 seeds of CI's 256. The nightly job sets
+  `SKYS3_SIM_FIRST_SEED` at random, `SKYS3_SIM_SEEDS=1024`, and
+  `SKYS3_SIM_SCALE=4`, which lengthens the cluster workload and the fault
+  window; the replay command repeats the scale.
+- **Multipart uploads have one part.** S3 wants every part but the last
+  to hold at least 5 MiB (`MIN_PART_BYTES`), more than a simulated cluster
+  should move, so the workload's multipart uploads (6% of operations, half
+  of them completed with `If-None-Match: *`) send a single part. The
+  history records only the completion, as a `PUT` of the multipart ETag;
+  an upload whose creation or part gets no answer is left open, which no
+  read sees. A `GET` checks a multipart body against its ETag, the
+  no-fault scenario checks that uploads complete and are read (over its
+  seeds: a seed may overwrite each upload before a read), and the
+  seeded-bug shards also drop unconditional completions. Uploads with
+  several parts, aborts, and listing uploads are left to the gateway's
+  own tests.
+- **Not in the stack yet.** The flusher (M1-16) is not on this branch, so
+  every bucket is `local`. M1-16 fills the checker's `flushed` state from
+  the remote store the harness already provides.
+
 ### M2-04 S3 control-store backend
 
 - **The trait has no conditional read.** `ChangeFeed` polls through `get`,
