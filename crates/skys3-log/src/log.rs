@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_io::{Clock, Disk, SegmentFile};
+use skys3_io::{Clock, Disk, MonoTime, SegmentFile};
 use skys3_types::EpochSeq;
 use tokio::sync::{mpsc, oneshot};
 
@@ -21,7 +21,9 @@ use crate::record::{
 };
 use crate::recovery::{RecoveryError, RecoveryReport, recover};
 use crate::scan::SegmentScanner;
-use crate::segment::{RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentSummary};
+use crate::segment::{
+    RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentSummary, file_name,
+};
 
 /// The longest record: the largest header plus the largest payload.
 pub const MAX_RECORD_LEN: u32 = MAX_HEADER_LEN + MAX_PAYLOAD_LEN;
@@ -35,6 +37,11 @@ const QUEUE_LEN: usize = 1024;
 /// own. Lazy records therefore add at most one sync per this interval to an
 /// otherwise idle disk, and none to a busy one.
 pub const LAZY_MAX_DELAY: Duration = Duration::from_secs(1);
+
+/// How long a segment [`SegmentLog::retire`] removed stays readable by
+/// location: a read that found a record's location before compaction moved
+/// or dropped the record still finishes (§10.3).
+pub const RETIRE_GRACE: Duration = Duration::from_secs(60);
 
 /// Why the log could not append or read a record.
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +99,10 @@ pub enum LogError {
         /// The length of the record found there.
         record_len: usize,
     },
+    /// [`SegmentLog::retire`] refused a segment: the last of its class, or
+    /// one the index has not released.
+    #[error("segment {0} is the last of its class or not released")]
+    NotRetirable(SegmentId),
 }
 
 /// Counts of the log's group commits since it was opened.
@@ -142,17 +153,27 @@ impl Counters {
     }
 }
 
-/// What the log tracks for replay: each segment's summary, and the
-/// segments the index has released.
+/// What the log tracks for replay and compaction: each segment's summary,
+/// the segments the index has released, and since when each segment but
+/// the last of its class has taken no records.
 #[derive(Debug, Default)]
 struct Tracking {
     summaries: BTreeMap<SegmentId, SegmentSummary>,
     released: BTreeSet<SegmentId>,
+    sealed: BTreeMap<SegmentId, MonoTime>,
+}
+
+/// A segment [`SegmentLog::retire`] removed, still readable by location
+/// until [`RETIRE_GRACE`] after `at`.
+struct Retired<F> {
+    file: Arc<F>,
+    at: MonoTime,
 }
 
 /// State shared by the log's handles and its committer.
 pub(crate) struct Shared<F> {
     segments: Mutex<BTreeMap<SegmentId, (SegmentClass, Arc<F>)>>,
+    retired: Mutex<BTreeMap<SegmentId, Retired<F>>>,
     tracking: Mutex<Tracking>,
     failure: OnceLock<Arc<io::Error>>,
     pub(crate) stats: Counters,
@@ -183,6 +204,12 @@ impl<F: SegmentFile> Shared<F> {
             .insert(id, SegmentSummary::starting_at(len));
     }
 
+    /// Records that segment `id` takes no records from `at` on, as a newer
+    /// segment of its class does.
+    pub(crate) fn seal(&self, id: SegmentId, at: MonoTime) {
+        self.tracking().sealed.entry(id).or_insert(at);
+    }
+
     /// Adds acknowledged records to their segments' summaries.
     pub(crate) fn summarize<'a>(
         &self,
@@ -206,6 +233,17 @@ impl<F: SegmentFile> Shared<F> {
 
     fn file(&self, id: SegmentId) -> Option<Arc<F>> {
         self.lock().get(&id).map(|(_, file)| Arc::clone(file))
+    }
+
+    fn retired(&self) -> std::sync::MutexGuard<'_, BTreeMap<SegmentId, Retired<F>>> {
+        // Plain inserts and removals, as for `lock`.
+        self.retired.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The file of segment `id`, also if it was retired within the grace.
+    fn readable(&self, id: SegmentId) -> Option<Arc<F>> {
+        self.file(id)
+            .or_else(|| self.retired().get(&id).map(|r| Arc::clone(&r.file)))
     }
 
     /// Takes the disk out of service, and returns the error that did.
@@ -256,6 +294,7 @@ impl<F> fmt::Debug for Shared<F> {
 /// every handle is dropped.
 pub struct SegmentLog<D: Disk> {
     shared: Arc<Shared<D::File>>,
+    disk: Arc<D>,
     requests: mpsc::Sender<Request>,
     clock: Arc<dyn Clock>,
     inline_max_bytes: u64,
@@ -265,6 +304,7 @@ impl<D: Disk> Clone for SegmentLog<D> {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
+            disk: Arc::clone(&self.disk),
             requests: self.requests.clone(),
             clock: Arc::clone(&self.clock),
             inline_max_bytes: self.inline_max_bytes,
@@ -333,17 +373,28 @@ impl<D: Disk> SegmentLog<D> {
         let recovered = recover(&disk, &config).await?;
         let shared = Arc::new(Shared {
             segments: Mutex::default(),
+            retired: Mutex::default(),
             tracking: Mutex::default(),
             failure: OnceLock::new(),
             stats: Counters::default(),
         });
+        let opened = clock.now();
         for (id, segment) in recovered.segments {
             shared.add_segment(id, segment.class, segment.file);
+            // How long a recovered segment has taken no records is unknown,
+            // so it counts from now.
+            shared.seal(id, opened);
         }
+        for class in SegmentClass::ALL {
+            if let Some((last, _)) = shared.last_segment(class) {
+                shared.tracking().sealed.remove(&last);
+            }
+        }
+        let disk = Arc::new(disk);
         let (requests, receiver) = mpsc::channel(QUEUE_LEN);
         let inline_max_bytes = config.inline_max_bytes;
         let committer = Committer::new(
-            disk,
+            Arc::clone(&disk),
             Arc::clone(&shared),
             receiver,
             Arc::clone(&clock),
@@ -353,6 +404,7 @@ impl<D: Disk> SegmentLog<D> {
         tokio::spawn(committer.run());
         let log = Self {
             shared,
+            disk,
             requests,
             clock,
             inline_max_bytes,
@@ -515,15 +567,7 @@ impl<D: Disk> SegmentLog<D> {
     /// it does not hold exactly one valid record, and
     /// [`LogError::OutOfService`] once the disk is out of service.
     pub async fn read(&self, location: RecordLocation) -> Result<LogRecord, LogError> {
-        self.check_in_service()?;
-        let file = self
-            .shared
-            .file(location.segment)
-            .ok_or(LogError::UnknownSegment(location.segment))?;
-        let bytes = file
-            .read_at(location.offset, location.len as usize)
-            .await
-            .map_err(|source| LogError::Read { location, source })?;
+        let bytes = self.read_bytes(location).await?;
         let (record, record_len) =
             LogRecord::decode(&bytes).map_err(|source| LogError::Damaged { location, source })?;
         if record_len != bytes.len() {
@@ -533,6 +577,40 @@ impl<D: Disk> SegmentLog<D> {
             });
         }
         Ok(record)
+    }
+
+    /// Reads the record at `location` as it is encoded, once its fixed
+    /// header and CRC verify: what compaction copies, byte for byte
+    /// (§10.3).
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentLog::read`], except that a body that breaks the format
+    /// under a valid CRC is not detected.
+    pub async fn read_encoded(&self, location: RecordLocation) -> Result<Bytes, LogError> {
+        let bytes = self.read_bytes(location).await?;
+        let header = RecordHeader::decode(&bytes)
+            .map_err(|source| LogError::Damaged { location, source })?;
+        if header.record_len() != bytes.len() {
+            return Err(LogError::WrongLength {
+                location,
+                record_len: header.record_len(),
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Reads the bytes at `location`, of a segment the log holds or one
+    /// retired within [`RETIRE_GRACE`].
+    async fn read_bytes(&self, location: RecordLocation) -> Result<Bytes, LogError> {
+        self.check_in_service()?;
+        let file = self
+            .shared
+            .readable(location.segment)
+            .ok_or(LogError::UnknownSegment(location.segment))?;
+        file.read_at(location.offset, location.len as usize)
+            .await
+            .map_err(|source| LogError::Read { location, source })
     }
 
     /// Returns a scanner over the records of segment `id`, from its start
@@ -587,8 +665,8 @@ impl<D: Disk> SegmentLog<D> {
     /// segments again from its checkpoint. Ids the log does not hold are
     /// ignored.
     ///
-    /// Only released segments may be reclaimed (§10.3, M1-22), and
-    /// reclaiming must still keep the payload the index references.
+    /// Only released segments may be retired ([`SegmentLog::retire`]), and
+    /// compaction must first copy the payload the index references (§10.3).
     pub fn release(&self, ids: impl IntoIterator<Item = SegmentId>) {
         let held = self.shared.lock();
         let mut tracking = self.shared.tracking();
@@ -604,6 +682,87 @@ impl<D: Disk> SegmentLog<D> {
     #[must_use]
     pub fn released(&self) -> BTreeSet<SegmentId> {
         self.shared.tracking().released.clone()
+    }
+
+    /// Returns how long segment `id` has taken no records: since the
+    /// committer started a newer segment of its class or, for a segment
+    /// the log recovered when it opened, since then. `None` for the last
+    /// segment of each class, which still takes records, and for a segment
+    /// the log does not hold.
+    #[must_use]
+    pub fn sealed_for(&self, id: SegmentId) -> Option<Duration> {
+        let sealed = self.shared.tracking().sealed.get(&id).copied()?;
+        Some(self.clock.now().saturating_duration_since(sealed))
+    }
+
+    /// Removes segment `id`, once compaction has copied whatever in it is
+    /// still needed and the index no longer locates anything in it
+    /// (§10.3), and returns its length. The log stops listing, scanning,
+    /// and summarizing it, removes its file, and syncs the directory, so
+    /// the removal is durable when this returns. Reads by location still
+    /// find its records for [`RETIRE_GRACE`]: a read that found a location
+    /// before compaction moved or dropped the record finishes.
+    ///
+    /// Only a segment the index has released ([`SegmentLog::release`])
+    /// that is not the last of its class may be retired. Segment ids are
+    /// therefore never reused: the last segment of each class, which holds
+    /// the highest id, stays.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::UnknownSegment`] or [`LogError::NotRetirable`] for any
+    /// other segment; [`LogError::OutOfService`] if removing the file or
+    /// syncing the directory fails, which takes the disk out of service,
+    /// as any I/O error on the write path does (§10.4). The segment is
+    /// unlisted then, but its file may survive a crash; nothing locates
+    /// anything in it by then, so a later compaction removes it again.
+    pub async fn retire(&self, id: SegmentId) -> Result<u64, LogError> {
+        self.check_in_service()?;
+        let (class, file) = {
+            let mut segments = self.shared.lock();
+            let mut tracking = self.shared.tracking();
+            let class = segments
+                .get(&id)
+                .map(|(class, _)| *class)
+                .ok_or(LogError::UnknownSegment(id))?;
+            let last = segments
+                .iter()
+                .rev()
+                .find(|(_, (c, _))| *c == class)
+                .map(|(&last, _)| last);
+            if last == Some(id) || !tracking.released.contains(&id) {
+                return Err(LogError::NotRetirable(id));
+            }
+            tracking.released.remove(&id);
+            tracking.summaries.remove(&id);
+            tracking.sealed.remove(&id);
+            segments.remove(&id).ok_or(LogError::UnknownSegment(id))?
+        };
+        let len = file.len();
+        self.drop_retired();
+        let at = self.clock.now();
+        self.shared.retired().insert(id, Retired { file, at });
+        let removed = match self.disk.remove(&file_name(class, id)).await {
+            Ok(()) => self.disk.sync_dir().await,
+            Err(error) => Err(error),
+        };
+        match removed {
+            Ok(()) => Ok(len),
+            Err(error) => Err(LogError::OutOfService(
+                self.shared.take_out_of_service(error),
+            )),
+        }
+    }
+
+    /// Stops serving reads of the segments retired more than
+    /// [`RETIRE_GRACE`] ago, so that the space they take is freed, and
+    /// returns how many it dropped. Compaction calls it on every pass.
+    pub fn drop_retired(&self) -> usize {
+        let now = self.clock.now();
+        let mut retired = self.shared.retired();
+        let before = retired.len();
+        retired.retain(|_, retired| now.saturating_duration_since(retired.at) < RETIRE_GRACE);
+        before - retired.len()
     }
 
     /// Returns the log's segments in id order, which is creation order.

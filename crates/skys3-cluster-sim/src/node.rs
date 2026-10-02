@@ -17,7 +17,7 @@ use std::error::Error;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -40,7 +40,9 @@ use skys3_io::{
 use skys3_log::LogConfig;
 use skys3_net::{Credentials, Transport, TurmoilNetwork};
 use skys3_obs::MetricsRegistry;
-use skys3_shard::{CacheMetrics, CacheSettings, CleanCache};
+use skys3_shard::{
+    CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
+};
 use skys3_sim::{NodeClock, SimS3};
 use skys3_types::{
     BucketDocument, ClusterId, EpochSeq, Generation, Label, NodeAddress, NodeId, ShardConfig,
@@ -150,6 +152,9 @@ pub(crate) struct NodeSettings {
     pub flush: FlushSettings,
     /// The clean cache each node keeps, if any (§9.3).
     pub clean_cache: Option<CacheSettings>,
+    /// Segment compaction, if nodes run it (§10.3): a pass after each
+    /// checkpoint interval.
+    pub compaction: Option<CompactionSettings>,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -225,6 +230,8 @@ pub(crate) struct Shared<S> {
     pub peers: BTreeMap<NodeId, NodeAddress>,
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
     pub remote: SimS3,
+    /// Segments compaction reclaimed, over every node and life.
+    pub compacted: Arc<AtomicU64>,
 }
 
 /// The index settings of a simulated node: a small page cache, so redb
@@ -338,6 +345,15 @@ pub(crate) async fn run<S: NodeServices>(
     let checkpointer = Arc::clone(&recovered.checkpointer);
     let interval = settings.checkpoint_interval;
     let checkpoints = tokio::spawn(async move { checkpointer.run(interval).await });
+    if let Some(compaction) = settings.compaction {
+        let compactor = Compactor::new(
+            recovered.shards.set().clone(),
+            compaction,
+            CompactionMetrics::default(),
+        );
+        let compacted = Arc::clone(&shared.compacted);
+        tokio::spawn(async move { compact(&compactor, interval, &compacted).await });
+    }
     {
         let (settings, index, gateway, shards) = (
             shared.settings.clone(),
@@ -361,6 +377,20 @@ pub(crate) async fn run<S: NodeServices>(
         }
     }
     Ok(())
+}
+
+/// Compacts the node's logs every `interval`, as the node binary does, and
+/// counts the segments reclaimed in `compacted`.
+async fn compact(compactor: &Compactor<SimMount>, interval: Duration, compacted: &AtomicU64) {
+    loop {
+        tokio::time::sleep(interval).await;
+        match compactor.compact().await {
+            Ok(report) => {
+                compacted.fetch_add(report.segments, Ordering::Relaxed);
+            }
+            Err(error) => tracing::debug!(%error, "compaction failed"),
+        }
+    }
 }
 
 /// Opens the shards of every bucket in `buckets`.
