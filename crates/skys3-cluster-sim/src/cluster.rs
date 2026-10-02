@@ -980,8 +980,7 @@ async fn check_configs(storage: &Storage<SimMount>) -> Result<(), BoxError> {
     let set = storage.shards.set();
     let mut found = Vec::new();
     for (_, log) in set.logs() {
-        for segment in log.segments() {
-            let mut scanner = log.scan(segment.id)?;
+        for mut scanner in log.scan_all()? {
             while let Some(scanned) = scanner.next().await? {
                 if scanned.header.kind == RecordKind::Config
                     && let RecordBody::Config(config) = scanned.decode()?.body

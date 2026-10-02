@@ -231,18 +231,21 @@ impl<F: SegmentFile> Shared<F> {
             .map(|(&id, (_, file))| (id, Arc::clone(file)))
     }
 
-    fn file(&self, id: SegmentId) -> Option<Arc<F>> {
-        self.lock().get(&id).map(|(_, file)| Arc::clone(file))
-    }
-
     fn retired(&self) -> std::sync::MutexGuard<'_, BTreeMap<SegmentId, Retired<F>>> {
         // Plain inserts and removals, as for `lock`.
         self.retired.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The file of segment `id`, also if it was retired within the grace.
+    ///
+    /// It looks in the retired segments with the segments lock held, the
+    /// order [`SegmentLog::retire`] takes them in, so a segment that
+    /// retirement moves from one to the other is always in one of them.
     fn readable(&self, id: SegmentId) -> Option<Arc<F>> {
-        self.file(id)
+        let segments = self.lock();
+        segments
+            .get(&id)
+            .map(|(_, file)| Arc::clone(file))
             .or_else(|| self.retired().get(&id).map(|r| Arc::clone(&r.file)))
     }
 
@@ -616,15 +619,44 @@ impl<D: Disk> SegmentLog<D> {
     /// Returns a scanner over the records of segment `id`, from its start
     /// to its current length, for replay.
     ///
+    /// A segment [`SegmentLog::segments`] listed can still be scanned for
+    /// [`RETIRE_GRACE`] after compaction retires it, and a scanner keeps
+    /// its segment's file for as long as it lives. A caller that lists the
+    /// segments and then scans them one after another therefore needs to
+    /// start every scan within [`RETIRE_GRACE`] of the listing; one that
+    /// may take longer takes all its scanners at once with
+    /// [`SegmentLog::scan_all`].
+    ///
     /// # Errors
     ///
     /// [`LogError::UnknownSegment`] if the log has no such segment, and
     /// [`LogError::OutOfService`] once the disk is out of service.
     pub fn scan(&self, id: SegmentId) -> Result<SegmentScanner<D::File>, LogError> {
         self.check_in_service()?;
-        let file = self.shared.file(id).ok_or(LogError::UnknownSegment(id))?;
+        let file = self
+            .shared
+            .readable(id)
+            .ok_or(LogError::UnknownSegment(id))?;
         let end = file.len();
         Ok(SegmentScanner::new(file, id, 0, end))
+    }
+
+    /// Returns a scanner over each segment the log holds, in id order, as
+    /// [`SegmentLog::scan`] would, all taken at one instant: compaction
+    /// cannot retire a segment between them, and each keeps its file for
+    /// as long as it lives, so scanning them takes as long as it needs.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::OutOfService`] once the disk is out of service.
+    pub fn scan_all(&self) -> Result<Vec<SegmentScanner<D::File>>, LogError> {
+        self.check_in_service()?;
+        Ok(self
+            .shared
+            .lock()
+            .iter()
+            .map(|(&id, (_, file))| SegmentScanner::new(Arc::clone(file), id, 0, file.len()))
+            .collect())
     }
 
     /// Returns a scanner over the records of segment `id` from offset
@@ -641,7 +673,10 @@ impl<D: Disk> SegmentLog<D> {
         to: u64,
     ) -> Result<SegmentScanner<D::File>, LogError> {
         self.check_in_service()?;
-        let file = self.shared.file(id).ok_or(LogError::UnknownSegment(id))?;
+        let file = self
+            .shared
+            .readable(id)
+            .ok_or(LogError::UnknownSegment(id))?;
         let end = file.len().min(to);
         Ok(SegmentScanner::new(file, id, from.min(end), end))
     }
@@ -697,11 +732,12 @@ impl<D: Disk> SegmentLog<D> {
 
     /// Removes segment `id`, once compaction has copied whatever in it is
     /// still needed and the index no longer locates anything in it
-    /// (§10.3), and returns its length. The log stops listing, scanning,
-    /// and summarizing it, removes its file, and syncs the directory, so
-    /// the removal is durable when this returns. Reads by location still
-    /// find its records for [`RETIRE_GRACE`]: a read that found a location
-    /// before compaction moved or dropped the record finishes.
+    /// (§10.3), and returns its length. The log stops listing and
+    /// summarizing it, removes its file, and syncs the directory, so the
+    /// removal is durable when this returns. Reads by location and scans
+    /// still find it for [`RETIRE_GRACE`]: a read that found a location
+    /// before compaction moved or dropped the record finishes, and so does
+    /// a scan of segments listed before (see [`SegmentLog::scan`]).
     ///
     /// Only a segment the index has released ([`SegmentLog::release`])
     /// that is not the last of its class may be retired. Segment ids are
@@ -718,7 +754,11 @@ impl<D: Disk> SegmentLog<D> {
     /// anything in it by then, so a later compaction removes it again.
     pub async fn retire(&self, id: SegmentId) -> Result<u64, LogError> {
         self.check_in_service()?;
-        let (class, file) = {
+        self.drop_retired();
+        let at = self.clock.now();
+        let (class, len) = {
+            // Segments, then tracking, then retired: the order every
+            // method that takes more than one of the locks keeps.
             let mut segments = self.shared.lock();
             let mut tracking = self.shared.tracking();
             let class = segments
@@ -736,12 +776,13 @@ impl<D: Disk> SegmentLog<D> {
             tracking.released.remove(&id);
             tracking.summaries.remove(&id);
             tracking.sealed.remove(&id);
-            segments.remove(&id).ok_or(LogError::UnknownSegment(id))?
+            let (class, file) = segments.remove(&id).ok_or(LogError::UnknownSegment(id))?;
+            let len = file.len();
+            // Moved to the retired segments under the segments lock, so a
+            // read or a scan finds it in one or the other throughout.
+            self.shared.retired().insert(id, Retired { file, at });
+            (class, len)
         };
-        let len = file.len();
-        self.drop_retired();
-        let at = self.clock.now();
-        self.shared.retired().insert(id, Retired { file, at });
         let removed = match self.disk.remove(&file_name(class, id)).await {
             Ok(()) => self.disk.sync_dir().await,
             Err(error) => Err(error),

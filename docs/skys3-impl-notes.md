@@ -2181,7 +2181,18 @@ of this file. A task with nothing unexpected keeps "None."
 - **Retired segments stay readable for a minute.** A read that located a
   record just before compaction retired its segment keeps the file handle
   for `RETIRE_GRACE` (60 s), so streaming a GET is not cut off; the files
-  are already unlinked and synced out of the directory.
+  are already unlinked and synced out of the directory. Review found two
+  gaps: the segment left the listing before it joined the retired ones,
+  so a read in between failed, and scans did not look at retired
+  segments, so `read_tail`, which lists the segments and scans them one
+  by one, could hit one compaction had just retired and abort a
+  reconciliation; skipping it would lose records copied into a segment
+  created after the listing. The move is now one step under the segments
+  lock, scans see retired segments within the grace, and `read_tail`
+  takes every scanner at once (`SegmentLog::scan_all`), each holding its
+  file, so no time bound applies to it. One test catches the first gap
+  with a clock that scans the segment each time `retire` reads the
+  clock; another scans a listed segment after retiring it.
 - **Teeth.** The shard simulation runs 2 to 4 process lives of writers
   over overwritten keys, multipart uploads, and `TAGS`, cuts the power at
   a random sync inside a compaction pass in 70% of seeds, and races a

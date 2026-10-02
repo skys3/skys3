@@ -220,6 +220,10 @@ pub enum CompactionError {
 /// Reclaims the log segments of a node's disks (see the [module](self)
 /// docs). Each pass compacts every disk of the [`ShardSet`] in turn, its
 /// oldest candidates first.
+///
+/// A node runs one compactor, and its passes do not overlap: a pass lists
+/// a disk's segments and scans them one by one, however long that takes,
+/// so nothing else may retire them meanwhile.
 pub struct Compactor<D: Disk> {
     set: ShardSet<D>,
     settings: CompactionSettings,
