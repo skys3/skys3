@@ -3001,7 +3001,12 @@ of this file. A task with nothing unexpected keeps "None."
   records the primary sends next, at the same `seq`s, are not hidden. The
   index is not rolled back: a member applies only committed records, so
   nothing it truncates is applied, and one that has (after replaying a
-  tail past the commit watermark on restart) is diverged.
+  tail past the commit watermark on restart) is diverged. The `TRUNCATE`
+  holds a place in the commit pipeline that nothing applies: no record
+  queued after it is applied or reported durable until it is durable, and
+  if its write or sync fails the member stops and `Shard::truncate`
+  returns the error. Every other record, `CONFIG` included, has a writer
+  slot whose failure stops the shard already.
 - **A diverged member is removed.** A member that applied past the match,
   shares no epoch with the primary to compare by, or whose records past
   the match are not older than the primary's next, refuses the session.
