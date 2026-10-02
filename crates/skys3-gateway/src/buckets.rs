@@ -59,6 +59,7 @@ use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, P
 use crate::admission::{Admission, AdmitAll};
 use crate::authz::Permissions;
 use crate::fill::Fills;
+use crate::hot_cache::HotCache;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
 use crate::remote::RemoteReads;
@@ -123,6 +124,11 @@ pub struct GatewayConfig {
     /// `read_registration_renew_interval_seconds`: how often a GET renews
     /// the registration of the read it streams with its holder (§8.7).
     pub read_registration_renew_interval: Duration,
+    /// The node's hot cache of recently read objects (§9.2):
+    /// [`GatewayConfig::new`] makes one of `hot_cache_bytes_per_node`
+    /// without metrics. Clones of a configuration share it, so gateways
+    /// built from clones on several nodes need one each.
+    pub hot_cache: HotCache,
 }
 
 /// Where CreateBucket puts a new bucket's shards (design §4.1, §6.7).
@@ -162,6 +168,7 @@ impl GatewayConfig {
             remote: None,
             placement: ShardPlacement::Local,
             read_registration_renew_interval: config.storage().read_registration_renew_interval(),
+            hot_cache: HotCache::new(config.cache().hot_cache_bytes_per_node),
         }
     }
 }

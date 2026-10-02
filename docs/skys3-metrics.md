@@ -17,6 +17,7 @@ exports yet is listed as planned, with the PR that owns it.
   - [3.4 Read-through fill](#34-read-through-fill)
   - [3.5 Clean cache](#35-clean-cache)
   - [3.6 Segment compaction](#36-segment-compaction)
+  - [3.7 Hot cache](#37-hot-cache)
 
 ## 1. Scraping
 
@@ -154,3 +155,18 @@ ratio is below `compaction_live_threshold`, after every checkpoint interval.
 | `skys3_compaction_copied_bytes_total` | counter | none | exported (M1-22) | Bytes of records compaction copied out of the segments it reclaimed into the active segments: dirty payload, metadata records, each shard's latest `CONFIG`, and clean payload it kept as cache. |
 | `skys3_compaction_evictions_total` | counter | none | exported (M1-22) | Clean payloads compaction evicted instead of copying them. They are not counted in `skys3_clean_cache_evictions_total`. |
 | `skys3_compaction_write_amplification` | gauge | none | exported (M1-22) | Compaction's write amplification since the node started: the bytes its logs wrote, over those written for anything but compaction's copies. 1 while compaction has copied nothing. |
+
+### 3.7 Hot cache
+
+Design section 9.2. Each node's gateway keeps whole objects it read from
+another node's holder in memory, and serves later GETs of the same version
+from them. `hot_cache_bytes_per_node` bounds the objects held and the fills
+in progress together.
+
+| Name | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `skys3_hot_cache_bytes` | gauge | none | exported (M2-19) | Bytes of objects this node's hot cache holds. |
+| `skys3_hot_cache_filling_bytes` | gauge | none | exported (M2-19) | Bytes this node's hot cache reserves for fills in progress: the sizes of the objects GETs are streaming from other nodes to keep. With `skys3_hot_cache_bytes`, at most `hot_cache_bytes_per_node`. |
+| `skys3_hot_cache_hits_total` | counter | none | exported (M2-19) | GETs this node's gateway served from its hot cache. |
+| `skys3_hot_cache_misses_total` | counter | none | exported (M2-19) | GETs this node's gateway looked up in its hot cache without finding the version their read plan names. |
+| `skys3_hot_cache_evictions_total` | counter | none | exported (M2-19) | Objects the hot cache dropped as least recently used. Versions a later one replaced are not counted. |

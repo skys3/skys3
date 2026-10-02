@@ -3840,6 +3840,84 @@ of this file. A task with nothing unexpected keeps "None."
   About 1,700 lines of non-test code, 400 of them in the simulation
   crate.
 
+### M2-19 Hot cache
+
+- **The cache is in memory, so the default dropped to 1 GiB (decided,
+  design §9.2, §14).** The design gave `hot_cache_bytes_per_node` a
+  64 GiB default without saying where the bytes live. A disk-backed cache
+  would need the `Disk` trait in the gateway, which is generic over
+  `Shards` and holds its collaborators as trait objects, and it would
+  duplicate on the gateway's disk what the clean cache already keeps on
+  the holders. The hot cache holds whole objects in memory instead, and
+  64 GiB of memory is no default, so it is now 1 GiB; the configuration
+  reference and the §14 example say so.
+- **Keyed by bucket and key, one version per entry (decided).** The entry
+  names its version by record position and ETag; a lookup of any other
+  version misses and drops it. A fill of an earlier version that finishes
+  after a later one was cached keeps the later one. Objects above an
+  eighth of the cache are not kept, nor ranges, nor reads from the
+  gateway's own replicas, nor reads that broke off: `HolderReads::open`
+  collects the pieces it streams (`Keep`) and fills the cache only once
+  the whole object streamed. A cached version is also served after the
+  primary evicted it, without a fill.
+- **Fills in progress count against the bound (decided, review of
+  #70).** The first version gave each eligible miss a buffer of the
+  object's full size, outside the cache's accounting, so a burst of
+  misses could hold many times `hot_cache_bytes_per_node` at the 1 GiB
+  default (up to 128 MiB per GET). Now a fill reserves the object's size
+  when its stream starts (`HotCache::reserve`), evicting the least
+  recently used objects to make room, so held bytes plus reservations
+  never exceed the bound; one bound rather than a separate one for fills,
+  so the setting stays the node's whole hot-cache memory. A reservation
+  that does not fit beside the other fills, or a second fill of a version
+  already filling (the coalescing: the first fill wins, later GETs just
+  stream), is refused, and that GET keeps nothing. A fill keeps the
+  response's own `Bytes` pieces, so the buffers grow as the bytes arrive
+  and nothing is copied; entries are held as those pieces, and a range
+  across pieces is copied on lookup. The reservation is a guard
+  (`Fill`): finishing turns it into the entry, and dropping it, on a
+  lapsed registration, a failed fetch, a dropped response body, or a
+  short read, releases it. A burst of 36 GETs of 12 uncached objects
+  against room for 8 peaks at exactly the bound and refuses 28 fills
+  (`tests/hot_cache.rs`). New: `skys3_hot_cache_filling_bytes`, and
+  `reserved`/`refused` in `HotCacheUsage`.
+- **`GatewayConfig::hot_cache` is a shared handle.** Clones of a gateway
+  configuration share one cache, which the cluster harness's nodes would
+  have done, since every node's configuration is a clone of one. The
+  harness now gives each node's every life a new cache, and the binary
+  makes its own with metrics (`skys3_hot_cache_*`).
+- **Counting who served each GET needed two sources.** A GET is served
+  either by a holder, which the holder audit now counts per node
+  (`ReplicatedServices::holder_reads`), or by a gateway's hot cache, which
+  `Report::hot_cache_hits` counts per node over every life. The workload
+  gained `get_percent`, `GET`s drawn ahead of the usual mix, since the
+  mix's deletes made a hot key absent most of the time; with 0 it draws
+  nothing extra, so other scenarios' seeds are unchanged.
+- **Spread across gateways.** Five nodes, one replica of one key, 95% of
+  operations `GET`s through any node: without hot caches the holder
+  serves every `GET`; with them every node serves some, and the holder
+  25% to 41% of them on seeds 0 to 7. The test runs both on each seed.
+- **The seeded bug needed prefix-only bodies.** A cache lookup that
+  ignores the version (`HotCaches::ignore_version`) first went unnoticed
+  on seed 5: with bodies of random length, a new version is often longer
+  than the cached one, and the cache then cannot hold the planned range,
+  so it misses. With bodies no longer than their prefix and half the
+  operations `GET`s, "a GET whose body does not match" catches it at
+  seed 0, and on each of seeds 0 to 31 (`SKYS3_SIM_SEEDS=1024`).
+- **Compaction had to be made to happen.** With 40 operations per client,
+  the racing scenario compacted nothing on seeds 0 and 1, the two a run
+  without `SKYS3_SIM_SEEDS` uses; 60 operations with shorter pauses
+  compact on every seed but one of 0 to 7, and the test asserts that
+  some seed compacted and some `GET` hit a hot cache.
+- **Simulation cost.** At `SKYS3_SIM_SEEDS=256` (debug build) the
+  racing scenario (overwrites, clean-cache evictions, compaction) takes
+  30 s, the one with crashes and message loss 36 s, and the seeded bug
+  5 s, at 8 seeds each. The spread scenario runs two clusters per seed,
+  so it is declared at twice the cost: 4 seeds, about 22 s.
+- **Merged the M2-18 fix** that starts renewing a registration at
+  registration: the stream task no longer starts its own renewal, and
+  the hot-cache collection sits in the same loop.
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation

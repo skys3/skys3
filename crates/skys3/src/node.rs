@@ -14,8 +14,9 @@ use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig, GatewayListener, IdSource,
-    LocalShards, ShardRef, Shards, SigV4Authenticator, StaticCredentials, StsService,
+    CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig, GatewayListener, HotCache,
+    HotCacheMetrics, IdSource, LocalShards, ShardRef, Shards, SigV4Authenticator,
+    StaticCredentials, StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
@@ -998,6 +999,10 @@ impl Node {
             space: Arc::clone(&space),
         }));
         gateway_config.remote = Some(Arc::new(NodeRemote(Arc::clone(&flush))));
+        gateway_config.hot_cache = HotCache::with_metrics(
+            config.cache().hot_cache_bytes_per_node,
+            HotCacheMetrics::register(&metrics.registry),
+        );
         let ids = IdSource::from_os_rng();
         let mut gateway = Gateway::new(
             gateway_config,

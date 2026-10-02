@@ -10,6 +10,10 @@
 //! registration every `read_registration_renew_interval_seconds`;
 //! a holder that lets it lapse refuses the next fetch, and the response
 //! fails mid-stream. The registration is released once the stream ends.
+//! A read the gateway may keep in its hot cache ([`Keep`]) reserves room
+//! for the object when its stream starts, collects the pieces it streams,
+//! and fills the cache only once it streamed them all; a read that cannot
+//! reserve room streams without keeping anything.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -24,6 +28,7 @@ use skys3_types::{EpochSeq, NodeId};
 use tokio::sync::mpsc;
 
 use super::download::ExtentBody;
+use crate::hot_cache::{HotCache, ObjectName, VersionName};
 use crate::shard::{ShardError, ShardRef, Shards};
 
 /// The gateway's reads from holders: how many it has in progress from
@@ -61,12 +66,14 @@ impl HolderReads {
 
     /// Opens the bytes `range` of `version` of `key`, whose plan gave
     /// `layout`, from `holder`: `Ok(None)` if the holder does not hold the
-    /// version.
+    /// version. With `keep`, the bytes fill the hot cache once every one
+    /// of them has streamed.
     ///
     /// # Errors
     ///
     /// Why the holder could not register the read or serve its first
     /// piece; the read is then released.
+    #[allow(clippy::too_many_arguments, reason = "the parts of a planned read")]
     pub(crate) async fn open<H: Shards>(
         &self,
         shards: &H,
@@ -75,6 +82,7 @@ impl HolderReads {
         version: EpochSeq,
         layout: Vec<ExtentRef>,
         range: Range<u64>,
+        keep: Option<Keep>,
     ) -> Result<Option<StreamingBlob>, ShardError> {
         let (shard, holder) = target;
         let Some(Registered { id, layout }) =
@@ -111,19 +119,35 @@ impl HolderReads {
             None => None,
         };
         let (sender, receiver) = mpsc::channel(1);
+        // Room in the cache is reserved only once the stream starts; a read
+        // that cannot reserve it streams all the same and keeps nothing.
+        let mut fill =
+            keep.and_then(|keep| keep.cache.reserve(keep.object, keep.version, keep.size));
         tokio::spawn(async move {
-            if let Some(first) = first
-                && sender.send(Ok(first)).await.is_ok()
-            {
+            let mut streamed = false;
+            if let Some(first) = first {
+                if let Some(fill) = &mut fill {
+                    fill.push(&first);
+                }
+                streamed = sender.send(Ok(first)).await.is_ok();
                 for piece in pieces {
-                    let fetched = read.fetch(&piece).await;
-                    let failed = fetched.is_err();
-                    if sender.send(fetched).await.is_err() || failed {
+                    if !streamed {
                         break;
                     }
+                    let fetched = read.fetch(&piece).await;
+                    if let (Some(fill), Ok(data)) = (&mut fill, &fetched) {
+                        fill.push(data);
+                    }
+                    let failed = fetched.is_err();
+                    streamed = sender.send(fetched).await.is_ok() && !failed;
                 }
             }
             read.release().await;
+            // A read that broke off, or whose body was dropped, releases its
+            // room as the fill drops.
+            if let Some(fill) = fill.filter(|_| streamed) {
+                fill.finish();
+            }
         });
         Ok(Some(StreamingBlob::from(s3s::Body::http_body(
             ExtentBody {
@@ -137,6 +161,19 @@ impl HolderReads {
         // Every update leaves the counts consistent.
         self.load.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Where a read's bytes go once it has streamed them all: the hot cache,
+/// under the version the read plan named, if it reserves room for them
+/// when the stream starts.
+#[derive(Debug)]
+pub(crate) struct Keep {
+    pub cache: HotCache,
+    pub object: ObjectName,
+    pub version: VersionName,
+    /// The object's size: the room reserved, and the bytes the read must
+    /// stream for the cache to keep them.
+    pub size: u64,
 }
 
 /// One read registered with a holder.
@@ -372,6 +409,43 @@ mod tests {
         (shards, shard, version, layout)
     }
 
+    fn name(key: &str) -> ObjectName {
+        ObjectName {
+            bucket: bucket("b-1", 1).bucket_id,
+            key: key.to_owned(),
+        }
+    }
+
+    fn named(version: EpochSeq) -> VersionName {
+        VersionName {
+            position: version,
+            etag: ETag::new("0123456789abcdef0123456789abcdef").unwrap(),
+        }
+    }
+
+    /// Keeps the bytes of `version` of `k`, `size` bytes long, in `cache`.
+    fn keep(cache: &HotCache, version: EpochSeq, size: u64) -> Keep {
+        Keep {
+            cache: cache.clone(),
+            object: name("k"),
+            version: named(version),
+            size,
+        }
+    }
+
+    /// Waits until `cache` reserves nothing for fills: the stream tasks
+    /// release their room once they end, just after the client has the
+    /// last byte.
+    async fn released(cache: &HotCache) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cache.usage().reserved > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the fill releases its room");
+    }
+
     async fn collect(body: StreamingBlob) -> Result<Vec<u8>, String> {
         let collected = s3s::Body::from(body).collect().await;
         collected
@@ -392,6 +466,7 @@ mod tests {
                 version,
                 layout.clone(),
                 2..11,
+                None,
             )
             .await
             .unwrap()
@@ -409,13 +484,101 @@ mod tests {
         .unwrap();
         assert!(reads.lock().is_empty());
 
+        // A whole read that may keep its bytes fills the cache with them,
+        // under the planned version, once it streamed them all.
+        let cache = HotCache::new(1024);
+        let body = reads
+            .open(
+                &shards,
+                (&shard, &holder),
+                "k",
+                version,
+                layout.clone(),
+                0..20,
+                Some(keep(&cache, version, 20)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(collect(body).await.unwrap(), vec![b'a'; 20]);
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(data) = cache.get(&name("k"), &named(version), 0..20) {
+                    return data;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(cached, vec![b'a'; 20]);
+        // A read that streams fewer bytes than the object keeps none.
+        let cache = HotCache::new(1024);
+        let body = reads
+            .open(
+                &shards,
+                (&shard, &holder),
+                "k",
+                version,
+                layout.clone(),
+                0..8,
+                Some(keep(&cache, version, 20)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(collect(body).await.unwrap(), vec![b'a'; 8]);
+        released(&cache).await;
+        assert_eq!(cache.usage().entries, 0);
+        // A body the client drops mid-stream releases its room too.
+        let body = reads
+            .open(
+                &shards,
+                (&shard, &holder),
+                "k",
+                version,
+                layout.clone(),
+                0..20,
+                Some(keep(&cache, version, 20)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut body = s3s::Body::from(body);
+        body.frame().await.unwrap().unwrap();
+        assert_eq!(cache.usage().reserved, 20);
+        drop(body);
+        released(&cache).await;
+        assert_eq!(cache.usage().entries, 0);
+        // A read that cannot reserve room, as the same version already
+        // fills, streams all the same.
+        let filling = cache.reserve(name("k"), named(version), 20).unwrap();
+        let body = reads
+            .open(
+                &shards,
+                (&shard, &holder),
+                "k",
+                version,
+                layout.clone(),
+                0..20,
+                Some(keep(&cache, version, 20)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(collect(body).await.unwrap(), vec![b'a'; 20]);
+        assert_eq!(cache.usage().refused, 1);
+        drop(filling);
+        released(&cache).await;
+        assert_eq!(cache.usage().entries, 0);
+
         // A layout the holder does not locate: it does not hold the version.
         let gone = vec![ExtentRef {
             position: EpochSeq::new(Epoch::new(9), Seq::new(9)),
             len: 12,
         }];
         let missing = reads
-            .open(&shards, (&shard, &holder), "k", version, gone, 0..12)
+            .open(&shards, (&shard, &holder), "k", version, gone, 0..12, None)
             .await
             .unwrap();
         assert!(missing.is_none());
@@ -424,7 +587,7 @@ mod tests {
         // Another node has no replica here.
         let other: NodeId = "node-9".parse().unwrap();
         let refused = reads
-            .open(&shards, (&shard, &other), "k", version, layout, 0..12)
+            .open(&shards, (&shard, &other), "k", version, layout, 0..12, None)
             .await;
         assert!(
             matches!(refused, Err(ShardError::NotFound(_))),
@@ -449,6 +612,7 @@ mod tests {
             (Duration::from_millis(200), false),
         ] {
             let reads = HolderReads::new(renew_every);
+            let cache = HotCache::new(1024);
             let body = reads
                 .open(
                     &shards,
@@ -457,6 +621,7 @@ mod tests {
                     version,
                     layout.clone(),
                     0..20,
+                    Some(keep(&cache, version, 20)),
                 )
                 .await
                 .unwrap()
@@ -485,9 +650,15 @@ mod tests {
                     rest.len() < 16 && rest.iter().all(|b| *b == b'a'),
                     "{rest:?}"
                 );
+                // A read that broke off keeps nothing, and releases its
+                // room.
+                released(&cache).await;
+                assert_eq!(cache.usage().entries, 0);
             } else {
                 assert_eq!(failed, None);
                 assert_eq!(rest, vec![b'a'; 16]);
+                released(&cache).await;
+                assert_eq!(cache.usage().bytes, 20);
             }
         }
         assert!(set.reads().counts().lapsed >= 1);
@@ -507,7 +678,7 @@ mod tests {
         let holder = shards.node().unwrap();
         let reads = HolderReads::new(Duration::from_millis(100));
         let body = reads
-            .open(&shards, (&shard, &holder), "k", version, layout, 0..8)
+            .open(&shards, (&shard, &holder), "k", version, layout, 0..8, None)
             .await
             .expect("the first fetch is served under a renewed registration")
             .unwrap();
