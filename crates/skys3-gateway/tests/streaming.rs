@@ -114,6 +114,26 @@ impl http_body::Body for Paced {
     }
 }
 
+/// A body that sends one frame and then nothing more, without ending.
+struct Stalled {
+    first: Option<Bytes>,
+}
+
+impl http_body::Body for Stalled {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, std::io::Error>>> {
+        match self.first.take() {
+            Some(first) => Poll::Ready(Some(Ok(http_body::Frame::data(first)))),
+            None => Poll::Pending,
+        }
+    }
+}
+
 #[tokio::test]
 async fn streamed_puts_inherit_the_identity_of_their_upload_begin() {
     let setup = setup_with(streaming()).await;
@@ -221,4 +241,25 @@ async fn a_body_that_streams_past_its_deadline_is_refused() {
     setup.send(request).await.assert(200, None);
     let got = setup.call(Method::GET, "/remote/slow", &[], "").await;
     assert_eq!(got.body.len(), 6000);
+}
+
+#[tokio::test]
+async fn a_body_that_stalls_after_its_first_extent_is_refused_at_its_deadline() {
+    let mut config = streaming();
+    config.max_body_duration = Duration::from_millis(50);
+    let setup = setup_with(config).await;
+    let bucket = setup.create_write_back("remote").await;
+    let shard = ShardRef::for_key(&bucket, "stalled");
+    // 1,500 bytes send one extent, which starts the clock, and the client
+    // then sends nothing: the deadline ends the wait for its next bytes.
+    let request = Request::put("/remote/stalled")
+        .body(Body::http_body(Stalled {
+            first: Some(fill(1500)),
+        }))
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), setup.send(request))
+        .await
+        .expect("a stalled body is answered once its deadline passes");
+    answer.assert(400, Some("RequestTimeout"));
+    assert_eq!(setup.shards.entry(&shard, "stalled").await.unwrap(), None);
 }

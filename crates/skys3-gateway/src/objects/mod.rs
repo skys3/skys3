@@ -376,7 +376,9 @@ impl<H: Shards> Objects<H> {
     /// # Errors
     ///
     /// `400 EntityTooLarge` past [`MAX_OBJECT_BYTES`], which is also the
-    /// largest part; the body's and the validator's errors.
+    /// largest part; `400 RequestTimeout` once a body streamed as extents
+    /// has taken longer than `max_body_duration`, waiting for the client's
+    /// next bytes included; the body's and the validator's errors.
     async fn receive(
         &self,
         shard: &ShardRef,
@@ -396,7 +398,7 @@ impl<H: Shards> Objects<H> {
         .streamed(stream_from);
         let mut body = s3s::Body::from(body.unwrap_or_else(empty_blob));
         let mut length = 0u64;
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = upload.before_deadline(body.frame()).await? {
             let Ok(data) = frame.map_err(|error| body_error(&*error))?.into_data() else {
                 continue;
             };
