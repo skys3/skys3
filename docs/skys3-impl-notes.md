@@ -3099,7 +3099,15 @@ of this file. A task with nothing unexpected keeps "None."
   passed its lease check just before the step-down could read the index
   after the new primary acknowledged a write: the gap the 500 ms margin
   of `primary_grace` covers after silence, which a handoff does not wait
-  for. Clients of the writes in flight get their answers.
+  for. Clients of the writes in flight get their answers. Review found
+  that the first version released the sequencer's lock between a read's
+  last serving check and its count, so a step-down on another thread
+  could see no read in progress and let the candidate take over while
+  that read was still to come. Both now happen under one hold of the
+  lock. The cluster simulation could not have found it: each simulated
+  node runs a current-thread runtime, and nothing awaits between the
+  check and the count, so no step-down can run in between there; the
+  lease audit would flag such a read if one were served.
 - **The message rides the candidate's link (decided).** `StepDown(epoch,
   last)`, the `MessageKind::StepDown` frame of M2-02, goes after the last
   record on the replication link, so it arrives after every append. The
