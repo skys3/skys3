@@ -27,6 +27,9 @@
 //!   echoes the latest lease stamp, which grants the primary a lease, and
 //!   restarts the member's [`Grace`] for the shard
 //!   ([`Replication::grace`], §5.4).
+//! - **Planned handoff** (§5.4): [`Replication::hand_off`] makes a primary
+//!   step down to one of its members, which then takes over without
+//!   waiting for its grace ([`Replication::with_takeover`]).
 //! - **Removing members** (§6.4), once [`Replication::with_removal`] gives
 //!   the node the shard registers: a primary removes a member that stays
 //!   unresponsive for [`ReplicationConfig::member_suspect_after`], by a
@@ -63,7 +66,7 @@ use skys3_control::ProposalIds;
 use skys3_io::{Clock, Disk, MonoTime};
 use skys3_log::ShardRef;
 use skys3_net::{Frame, Listener, Network, Receiver, Sender, Transport, TransportError};
-use skys3_types::{NodeAddress, NodeId, ShardConfig};
+use skys3_types::{Epoch, NodeAddress, NodeId, Seq, ShardConfig};
 
 pub use self::exposure::{Exposure, ReplicationMetrics};
 pub use self::removal::{BoxFuture, ControlRegisters, Replaced, ShardRegisters};
@@ -314,8 +317,16 @@ impl<N: Network, D: Disk> Replication<N, D> {
 
     /// Starts a primary's links to its members, its leases, and, if the
     /// node removes members, the watch over them, unless they run already.
+    /// A primary that stepped down in an earlier life starts none of them:
+    /// it watches the register for its successor instead (§5.4).
     fn start_primary(&self, shard: &Shard<D>) {
         let inner = &self.inner;
+        if let Some(epoch) = shard.stepped_down() {
+            if shard.leader().is_some_and(|leader| leader.claim_links()) {
+                self.await_successor(shard, epoch);
+            }
+            return;
+        }
         let Some(leader) = shard.leader().filter(|leader| leader.claim_links()) else {
             return;
         };
@@ -351,6 +362,73 @@ impl<N: Network, D: Disk> Replication<N, D> {
         if is_under_replicated(&shard.config()) {
             self.on_adopted()(&shard.config());
         }
+    }
+
+    /// Hands the shard off to its member `to` (§5.4): this node's replica,
+    /// its primary, stops serving reads and writes and renewing its leases,
+    /// lets the reads and writes in progress finish, records the step-down
+    /// durably ([`Shard::stepped_down`]), and sends `to` a step-down message
+    /// with the last `seq` it sequenced. `to` then proposes itself as
+    /// primary at once, as in a takeover (§6.5); the old primary is left
+    /// out of the next configuration and rejoins only as a learner.
+    ///
+    /// It waits for the message to be sent at most
+    /// [`ReplicationConfig::link_timeout`]. If it is not, or is lost on the
+    /// way, `to` and the other members take over once their grace passes.
+    /// Either way the replica serves nothing more: it answers requests as
+    /// unavailable, and with a redirect to the new primary once it reads
+    /// the new configuration in the shard's register, if the node has the
+    /// registers ([`Replication::with_removal`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] if the shard is not open on this node, and
+    /// as [`Shard::step_down`]: the replica is not a primary that leads
+    /// the shard, `to` is not another member, or the step-down could not
+    /// be recorded.
+    pub async fn hand_off(&self, shard: &ShardRef, to: &NodeId) -> Result<HandedOff, ShardError> {
+        let replica = self
+            .inner
+            .set
+            .get(shard)
+            .await
+            .ok_or_else(|| ShardError::NotFound(shard.clone()))?;
+        tracing::info!(%shard, %to, "handing the shard off");
+        let (epoch, last) = replica.step_down(to).await?;
+        let Some(leader) = replica.leader() else {
+            unreachable!("a primary that stepped down has a leader");
+        };
+        let sent = leader.await_step_down(self.inner.config.link_timeout).await;
+        replica.depose("the primary stepped down for a planned handoff", None);
+        self.await_successor(&replica, epoch);
+        Ok(HandedOff { epoch, last, sent })
+    }
+
+    /// Reads the register of `shard`, whose primary stepped down in
+    /// `epoch`, every `lease_renew_interval` until it names a newer
+    /// configuration, or none: the replica then redirects to it (§6.5).
+    fn await_successor(&self, shard: &Shard<D>, epoch: Epoch) {
+        let Some(removal) = self.inner.removal.get().cloned() else {
+            return;
+        };
+        let (shard, interval) = (shard.clone(), self.inner.config.lease_renew_interval);
+        tokio::spawn(async move {
+            // Until the register names a newer configuration, or another
+            // path deposed the replica with one.
+            while shard.config().epoch <= epoch {
+                tokio::time::sleep(interval).await;
+                match removal.registers.read(shard.shard()).await {
+                    Ok(held) if held.as_ref().is_none_or(|held| held.epoch > epoch) => {
+                        shard.depose("another primary took the shard over", held.as_ref());
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(shard = %shard.shard(), %error, "reading the shard's register failed");
+                    }
+                }
+            }
+        });
     }
 
     /// Starts a member's watch over its primary, to take over once the
@@ -500,6 +578,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Whether `config` has fewer members than its `replicas` (§6.4).
 fn is_under_replicated(config: &ShardConfig) -> bool {
     config.members.len() < usize::from(config.replicas)
+}
+
+/// What a primary that handed its shard off told the candidate (§5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandedOff {
+    /// The epoch the primary stepped down in.
+    pub epoch: Epoch,
+    /// The last `seq` it sequenced, which the candidate holds before it
+    /// proposes itself.
+    pub last: Seq,
+    /// Whether the step-down message was sent. It may still be lost on
+    /// the way; if it is, the members take over once their grace passes.
+    pub sent: bool,
 }
 
 /// Why a link ended.

@@ -227,7 +227,9 @@ impl<D: Disk> Watchdog<D> {
                 }
             }
             sequenced = self.shard.last_sequenced();
-            if !suspects.is_empty() {
+            // A primary that steps down removes no one: the candidate
+            // proposes over the configuration it stepped down in (§5.4).
+            if !suspects.is_empty() && self.shard.stepped_down().is_none() {
                 self.remove(&suspects).await;
             }
         }

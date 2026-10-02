@@ -15,7 +15,7 @@ use skys3_log::record::ShardRef;
 use skys3_log::{
     LogRecord, RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentLog, SegmentSummary,
 };
-use skys3_types::{BucketId, EpochSeq, Label, ShardConfig};
+use skys3_types::{BucketId, Epoch, EpochSeq, Label, ShardConfig};
 
 use crate::codec;
 use crate::error::IndexError;
@@ -29,8 +29,9 @@ use crate::tables::{
 /// uploads and parts tables; opening a version 1 index creates them and
 /// marks it version 2, so a build that does not know them refuses it
 /// rather than miss the uploads in it. Version 3 adds the imports table
-/// (§9.1) in the same way.
-pub const FORMAT_VERSION: u64 = 3;
+/// (§9.1) in the same way, and version 4 the step-downs of planned
+/// handoffs (§5.4).
+pub const FORMAT_VERSION: u64 = 4;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -237,6 +238,7 @@ impl Index {
             }
             txn.open_table(tables::CONTROL)?;
             txn.open_table(tables::IMPORTS)?;
+            txn.open_table(tables::STEP_DOWNS)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -322,8 +324,8 @@ impl Index {
     }
 
     /// Removes everything the index holds for `shard`, in one non-durable
-    /// commit: its entries, its record locations, and its applied
-    /// position. A node drops a shard this way once its bucket is deleted.
+    /// commit: its entries, its record locations, its applied position,
+    /// and its step-down (see [`Index::store_step_down`]). A node drops a shard this way once its bucket is deleted.
     ///
     /// The shard's records stay in the log until their segments are
     /// reclaimed, so replay after a crash can bring the shard back; startup
@@ -337,6 +339,8 @@ impl Index {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::None)?;
         IndexWriter::open(&txn)?.remove_shard(shard)?;
+        txn.open_table(tables::STEP_DOWNS)?
+            .remove(codec::shard_key(shard).as_slice())?;
         txn.commit()?;
         Ok(())
     }
@@ -430,6 +434,24 @@ impl Index {
         txn.set_durability(Durability::Immediate)?;
         txn.open_table(tables::SHARD_MAP)?
             .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records, in one durable commit, that this node's replica of `shard`
+    /// stepped down as primary in `epoch` for a planned handoff (§5.4): it
+    /// must never serve in that epoch again, even after a restart, since
+    /// a step-down message still in flight lets the candidate take over
+    /// at once. A later epoch replaces the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn store_step_down(&self, shard: &ShardRef, epoch: Epoch) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::STEP_DOWNS)?
+            .insert(codec::shard_key(shard).as_slice(), epoch.get())?;
         txn.commit()?;
         Ok(())
     }

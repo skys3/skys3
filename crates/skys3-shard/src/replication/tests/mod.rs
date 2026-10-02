@@ -28,10 +28,11 @@ use skys3_types::{
 };
 use tokio::net::TcpStream;
 
+mod handoff;
 mod removal;
 mod takeover;
 
-use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
+use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
 use super::{Replication, ReplicationConfig};
 use crate::lineage::Lineage;
 use crate::set::ShardSet;
@@ -331,6 +332,50 @@ async fn scenario() {
         sync(&mut fourth, &config, 1).await.last().unwrap().0.last,
         1
     );
+}
+
+#[test]
+fn a_step_down_counts_once_the_member_holds_its_records() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(WAIT, step_down())
+            .await
+            .expect("the test finished in time");
+    });
+}
+
+async fn step_down() {
+    let pki = Pki::new();
+    let (address, replication) = member(&pki).await;
+    let grace = replication.grace(&shard()).unwrap();
+    let send = |epoch, last| {
+        let body = StepDown { epoch, last };
+        wire::frame(MessageKind::StepDown, &body, Bytes::new())
+    };
+    let mut link = connect(&pki, 1, address).await;
+    sync(&mut link, &config(), 0).await;
+    append(&mut link, 2, 1).await;
+    durable_through(&mut link, 1).await;
+    // A step-down past what the member holds does not count: the member
+    // waits for its grace instead. It waits a link timeout for the
+    // records, and the next frame must come within another.
+    link.send(&send(2, 5)).await.unwrap();
+    tokio::time::sleep(ReplicationConfig::default().link_timeout * 5 / 4).await;
+    assert_eq!(grace.stepped_down(), None);
+    // One it holds every record of counts for its epoch.
+    link.send(&send(2, 1)).await.unwrap();
+    grace.stepped_down_since(Epoch::new(2)).await;
+    assert_eq!(grace.stepped_down(), Some(Epoch::new(2)));
+    // One of an older epoch is refused with the member's (rule R2).
+    link.send(&send(1, 1)).await.unwrap();
+    let mut rejected = 0;
+    while let Some(ack) = ack(&mut link).await {
+        rejected = ack.rejected;
+    }
+    assert_eq!(rejected, 2);
 }
 
 #[test]

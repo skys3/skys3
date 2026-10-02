@@ -10,7 +10,7 @@ use skys3_types::{Epoch, Seq};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
 
-use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
+use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
 use super::{Inner, LinkError, ReplicationConfig, recv};
 use crate::lease::Grace;
 use crate::lineage::Reconcile;
@@ -235,6 +235,13 @@ impl<D: Disk> Follower<'_, D> {
                     }
                     append.commit
                 }
+                MessageKind::StepDown => {
+                    let step_down: StepDown =
+                        wire::body(&frame, MessageKind::StepDown).map_err(LinkError::Protocol)?;
+                    self.check_epoch(step_down.epoch)?;
+                    self.stepped_down(Seq::new(step_down.last)).await;
+                    continue;
+                }
                 _ => {
                     let beacon: Beacon =
                         wire::body(&frame, MessageKind::Beacon).map_err(LinkError::Protocol)?;
@@ -245,6 +252,27 @@ impl<D: Disk> Follower<'_, D> {
                 }
             };
             self.shard.commit_through(Seq::new(commit));
+        }
+    }
+
+    /// Acts on the primary's step-down for a planned handoff (§5.4): once
+    /// this member holds every record up to `last` durably, it may propose
+    /// itself over the session's epoch without waiting for its grace. One
+    /// that cannot catch up within the link timeout waits for its grace
+    /// instead, as if the message had been lost.
+    async fn stepped_down(&self, last: Seq) {
+        let mut durable = self.shard.durable();
+        let held = tokio::time::timeout(
+            self.config.link_timeout,
+            durable.wait_for(|durable| *durable >= last),
+        )
+        .await;
+        let shard = self.shard.shard();
+        if matches!(held, Ok(Ok(_))) {
+            tracing::info!(%shard, epoch = %self.epoch, "the primary stepped down to this member");
+            self.grace.step_down(self.epoch);
+        } else {
+            tracing::warn!(%shard, %last, "a step-down came before the records it covers");
         }
     }
 
