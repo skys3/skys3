@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use skys3_config::FailureDomain;
 use skys3_control::faults::{FaultRates, FaultyStore};
 use skys3_control::{
     Expected, ProposalIds, ProposalOutcome, RetryPolicy, S3ControlStore, S3StoreConfig, TypedKey,
     bootstrap, bump_generation, propose_document,
 };
 use skys3_flush::FlushSettings;
-use skys3_gateway::{GatewayConfig, ShardRef};
+use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
 use skys3_index::{EntryState, Index};
 use skys3_io::{Drift, MonotonicClock, SimDiskFaults, SyncCut};
 use skys3_log::LogConfig;
@@ -23,15 +24,17 @@ use skys3_sim::s3::{SimS3Config, SimS3Faults};
 use skys3_sim::{SimContext, SimS3};
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, BucketName, ClusterId, Epoch, Label, NodeAddress, NodeId,
-    RemoteTarget, ShardConfig, ShardCount,
+    RegisterDocument, RemoteTarget, ShardConfig, ShardCount,
 };
 
+use crate::creation;
 use crate::faults::{Endpoint, Fault, FaultPlan};
 use crate::node::{
     self, BoxError, ControlHandle, INDEX_FILE, LocalServices, NodeServices, NodeSettings, NodeSlot,
     Shared, TRANSPORT_PORT,
 };
 use crate::pki::Pki;
+use crate::replication::register;
 use crate::workload::{Client, Routes, Workload};
 
 /// The shape of a simulated cluster.
@@ -49,11 +52,24 @@ pub struct ClusterConfig {
     /// Shards per bucket.
     pub shards_per_bucket: u32,
     /// Members of each shard's configuration in the static placement. The
-    /// M1 node keeps one copy, on the primary, whatever this says.
+    /// M1 node keeps one copy, on the primary, whatever this says;
+    /// [`ReplicatedServices`](crate::ReplicatedServices) keep one on every
+    /// member.
     pub replicas: usize,
+    /// The epoch of every shard's configuration in the static placement.
+    /// Above 1, gateways can be given maps of older epochs.
+    pub placement_epoch: u64,
+    /// Whether every member of a shard, not only one, must hold each
+    /// acknowledged write after recovery, as the all-member commit rule
+    /// promises (§5.1).
+    pub every_member_durable: bool,
     /// The bound `ρ` on each node's clock drift; each life of a node
     /// draws its drift within it.
     pub drift: Drift,
+    /// Fixed drifts of the first nodes, by position, in every life, in
+    /// place of one drawn within `drift`: for scenarios that set chosen
+    /// nodes' clocks fast or slow, beyond `ρ` too. Empty by default.
+    pub node_drifts: Vec<Drift>,
     /// Faults every disk injects throughout, such as torn writes.
     pub disk_faults: SimDiskFaults,
     /// Faults of every node's control-store requests throughout.
@@ -62,6 +78,13 @@ pub struct ClusterConfig {
     pub latency: (Duration, Duration),
     /// Faults of the remote store that `write_back` buckets flush to.
     pub remote_faults: SimS3Faults,
+    /// Whether the buckets are created through the S3 API, each by a
+    /// different node's gateway, before the workload starts, with their
+    /// shards placed on the registered nodes, kept apart at the `node`
+    /// level (plan M3-04), instead of written by the harness with a static
+    /// placement. The nodes must register themselves
+    /// ([`CoordinatedServices`](crate::CoordinatedServices)).
+    pub create_buckets: bool,
 }
 
 impl Default for ClusterConfig {
@@ -73,7 +96,10 @@ impl Default for ClusterConfig {
             write_back_buckets: 0,
             shards_per_bucket: 4,
             replicas: 1,
+            placement_epoch: 1,
+            every_member_durable: false,
             drift: Drift::from_ppm(1_000).expect("the drift is valid"),
+            node_drifts: Vec::new(),
             disk_faults: SimDiskFaults {
                 torn_write_probability: 0.5,
                 ..SimDiskFaults::default()
@@ -87,6 +113,7 @@ impl Default for ClusterConfig {
             },
             latency: (Duration::from_millis(1), Duration::from_millis(5)),
             remote_faults: SimS3Faults::default(),
+            create_buckets: false,
         }
     }
 }
@@ -421,10 +448,11 @@ impl<S: NodeServices> Cluster<S> {
         };
         // The clients start once every node serves, and the faults with
         // them.
-        while !world
+        while !(world
             .slots
             .iter()
             .all(|slot| slot.ready.load(Ordering::SeqCst))
+            && self.services.ready())
         {
             if sim.elapsed() > STARTUP_LIMIT {
                 return Err(RunError::Simulation("the nodes did not start".to_owned()));
@@ -432,11 +460,16 @@ impl<S: NodeServices> Cluster<S> {
             driver.advance(&mut sim, false);
             sim.step().map_err(failed)?;
         }
+        let routes = if self.config.create_buckets {
+            self.create_buckets(&mut sim, &mut driver, &history, workload.timeout)?
+        } else {
+            world.routes.clone()
+        };
         driver.origin = Some(sim.elapsed());
         for index in 0..workload.clients {
             let client = Client::new(
                 client_host(index),
-                world.routes.clone(),
+                routes.clone(),
                 history.clone(),
                 workload.clone(),
                 context.fork_seed(),
@@ -449,7 +482,7 @@ impl<S: NodeServices> Cluster<S> {
         driver.advance(&mut sim, true);
         let reader = Client::new(
             "verifier".to_owned(),
-            world.routes.clone(),
+            routes.clone(),
             history.clone(),
             workload.clone(),
             context.fork_seed(),
@@ -464,9 +497,29 @@ impl<S: NodeServices> Cluster<S> {
             sim.crash(slot.host.as_str());
         }
         let operations = history.operations();
-        let survivors = world.survivors(workload.keys)?;
+        let survivors = world.survivors(&routes, workload.keys)?;
         check_linearizable(&operations).map_err(RunError::Check)?;
         check_durable(&operations, &survivors).map_err(RunError::Check)?;
+        if self.config.every_member_durable {
+            let members = survivors.values().map(|s| s.copies.len()).max();
+            for member in 0..members.unwrap_or(0) {
+                let one: BTreeMap<String, Survivors> = survivors
+                    .iter()
+                    .map(|(key, survivor)| {
+                        // A shard that lost members (§6.4) has fewer:
+                        // its last one stands in for the missing ones.
+                        let copy = survivor.copies.get(member).or(survivor.copies.last());
+                        let copies = copy.cloned().into_iter().collect();
+                        let one = Survivors {
+                            copies,
+                            ..survivor.clone()
+                        };
+                        (key.clone(), one)
+                    })
+                    .collect();
+                check_durable(&operations, &one).map_err(RunError::Check)?;
+            }
+        }
         Ok(Report {
             history: operations,
             faults: driver.faults,
@@ -479,6 +532,42 @@ impl<S: NodeServices> Cluster<S> {
                 .count(),
             fences: driver.fences,
         })
+    }
+
+    /// Creates the buckets through the gateways (plan M3-04): a client
+    /// sends CreateBucket for each planned bucket to a different node, and
+    /// waits until every node's gateway knows every bucket. Then the
+    /// driver waits until every shard register exists and the services are
+    /// ready. Returns the routes to the created buckets, read from their
+    /// registers.
+    fn create_buckets(
+        &mut self,
+        sim: &mut turmoil::Sim<'_>,
+        driver: &mut Driver<'_, S>,
+        history: &History,
+        timeout: Duration,
+    ) -> Result<Routes, RunError> {
+        let world = driver.world;
+        let planned = world.routes.buckets.clone();
+        let nodes = world.routes.nodes.clone();
+        sim.client("creator", creation::create(planned.clone(), nodes, timeout));
+        self.drive(sim, driver, history, false)?;
+        let started = sim.elapsed();
+        loop {
+            if let Some(routes) = world.created(&planned)
+                && self.services.ready()
+            {
+                return Ok(routes);
+            }
+            if sim.elapsed() > started + STARTUP_LIMIT {
+                return Err(RunError::Simulation(
+                    "the created buckets did not become ready".to_owned(),
+                ));
+            }
+            driver.advance(sim, false);
+            self.check_invariants(sim, driver, history)?;
+            sim.step().map_err(failed)?;
+        }
     }
 
     /// Steps the simulation, with faults and heals, until every client is
@@ -544,6 +633,9 @@ struct World<S> {
     shared: Arc<Shared<S>>,
     routes: Routes,
     control: SimS3,
+    /// The control store over `control`, without faults, for reading the
+    /// registers at the end.
+    registers: S3ControlStore<SimS3>,
     base_control: SimS3Faults,
     rates: FaultRates,
     remote: SimS3,
@@ -562,7 +654,7 @@ impl<S: NodeServices> World<S> {
         let control = context.s3(SimS3Config::default());
         let remote = context.s3(SimS3Config::default());
         remote.set_faults(config.remote_faults.clone());
-        let settings = settings(&cluster)?;
+        let settings = settings(&cluster, config)?;
         let store = S3ControlStore::new(
             control.clone(),
             S3StoreConfig {
@@ -574,12 +666,21 @@ impl<S: NodeServices> World<S> {
             .map(|n| NodeId::new(format!("node-{n}")))
             .collect::<Result<_, _>>()?;
         let mut ids = ProposalIds::seeded(context.fork_seed());
-        let (buckets, placement) = registers(config, &node_ids, &mut ids)?;
+        let (buckets, mut placement) = registers(config, &node_ids, &mut ids)?;
+        if config.create_buckets {
+            // The gateways create the buckets, and their placement.
+            placement.clear();
+        }
+        let written = if config.create_buckets {
+            &[][..]
+        } else {
+            &buckets[..]
+        };
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?
             .block_on(write_registers(
-                &store, &cluster, &buckets, &placement, &mut ids,
+                &store, &cluster, written, &placement, &mut ids,
             ))?;
 
         let pki = Pki::new()?;
@@ -601,6 +702,7 @@ impl<S: NodeServices> World<S> {
                 disks,
                 handle,
                 credentials,
+                config.node_drifts.get(index).copied(),
                 seed,
             )));
         }
@@ -622,11 +724,40 @@ impl<S: NodeServices> World<S> {
                 placement: Arc::clone(&placement),
                 remote: remote.clone(),
             }),
-            routes: Routes { buckets, placement },
+            routes: Routes {
+                buckets,
+                placement,
+                nodes: node_ids,
+            },
             base_control: control.faults(),
             control,
+            registers: store,
             rates: config.control_rates,
             remote,
+        })
+    }
+
+    /// The routes to the `planned` buckets as the gateways created them,
+    /// once every bucket register and every shard register exists.
+    fn created(&self, planned: &[BucketDocument]) -> Option<Routes> {
+        let mut buckets = Vec::new();
+        let mut placement = BTreeMap::new();
+        for bucket in planned {
+            let key = self
+                .registers
+                .object_key(TypedKey::bucket(&bucket.name).key());
+            let object = self.control.object(&key)?;
+            let bucket = BucketDocument::from_json(&object.body).ok()?;
+            for shard in ShardRef::all(&bucket) {
+                let config = register(&self.registers, &shard)?;
+                placement.insert(shard, config);
+            }
+            buckets.push(bucket);
+        }
+        Some(Routes {
+            buckets,
+            placement: Arc::new(placement),
+            nodes: self.routes.nodes.clone(),
         })
     }
 
@@ -634,7 +765,11 @@ impl<S: NodeServices> World<S> {
     /// reads each key's value on every member of its shard and, for a
     /// `write_back` bucket, whether the member's entry is clean, and the
     /// key's value in the remote store.
-    fn survivors(&self, keys: usize) -> Result<BTreeMap<String, Survivors>, BoxError> {
+    fn survivors(
+        &self,
+        routes: &Routes,
+        keys: usize,
+    ) -> Result<BTreeMap<String, Survivors>, BoxError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
@@ -658,12 +793,16 @@ impl<S: NodeServices> World<S> {
             indexes.insert(slot.id.clone(), storage.index);
         }
         let mut survivors = BTreeMap::new();
-        for (name, bucket, key) in self.routes.keys(keys) {
+        for (name, bucket, key) in routes.keys(keys) {
             let shard = ShardRef::for_key(&bucket, &key);
-            let members = &self.routes.placement[&shard].members;
+            // The members now: a member removed (§6.4) misses the writes
+            // committed after its removal.
+            let members = register(&self.registers, &shard)
+                .map_or_else(|| routes.placement[&shard].members.clone(), |c| c.members);
+
             let write_back = bucket.mode == BucketMode::WriteBack;
             let mut survivor = Survivors::default();
-            for member in members {
+            for member in &members {
                 let entry = indexes[member].read()?.entry(&(&shard).into(), &key)?;
                 // No entry claims what a clean one does: the remote store
                 // matches, here by holding nothing.
@@ -693,13 +832,22 @@ impl<S: NodeServices> World<S> {
 /// The settings every simulated node runs with: small log segments and
 /// inline bodies, so a short workload exercises extents and several
 /// segments, and frequent checkpoints.
-fn settings(cluster: &ClusterId) -> Result<NodeSettings, BoxError> {
+fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, BoxError> {
+    // Buckets the gateways create get the shape's shards and replicas.
+    let defaults = format!(
+        "[buckets.defaults]\nshards_per_bucket = {}\nreplicas = {}\nmin_write_replicas = 1\n",
+        shape.shards_per_bucket,
+        shape.replicas.clamp(1, shape.nodes.max(1)),
+    );
     let config: skys3_config::Config = format!(
         "[cluster]\ncluster_id = \"{cluster}\"\n\
-         [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n"
+         [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n{defaults}"
     )
     .parse()?;
     let mut gateway = GatewayConfig::new(&config);
+    if shape.create_buckets {
+        gateway.placement = ShardPlacement::Cluster(FailureDomain::Node);
+    }
     gateway.inline_max_bytes = 512;
     gateway.extent_bytes = 512;
     gateway.retry = RetryPolicy {
@@ -775,7 +923,7 @@ fn registers(
             let shard_config = ShardConfig {
                 bucket_id: bucket.bucket_id.clone(),
                 shard: shard.shard,
-                epoch: Epoch::new(1),
+                epoch: Epoch::new(config.placement_epoch),
                 primary: members[0].clone(),
                 members,
                 learners: Vec::new(),

@@ -4,8 +4,9 @@
 //! The gateway routes each key to its shard with the frozen hash of
 //! [`shard_for_key`] and sends the request to that shard's primary.
 //! [`Shards`] is the gateway's view of the shard primaries: on a single
-//! node every shard is local, and from M2 on an implementation forwards to
-//! the primaries the shard map names. [`LocalShards`](crate::LocalShards)
+//! node every shard is local, and with replication
+//! [`RoutedShards`](crate::routing::RoutedShards) forwards to the
+//! primaries the shard map names. [`LocalShards`](crate::LocalShards)
 //! is the single-node implementation.
 
 use std::fmt;
@@ -15,7 +16,7 @@ use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_types::{BucketDocument, BucketId, EpochSeq, ShardId, shard_for_key};
+use skys3_types::{BucketDocument, BucketId, Epoch, EpochSeq, NodeId, ShardId, shard_for_key};
 
 use crate::conditions::{ConditionFailed, Precondition};
 
@@ -284,6 +285,18 @@ pub enum ShardError {
     /// client writes.
     #[error("shard {0} is sealed while its bucket is deleted")]
     Sealed(ShardRef),
+    /// The shard's members did not acknowledge the write in time (design
+    /// §5.2): clients get `503 SlowDown`. The write may still take effect.
+    #[error("shard {shard} did not acknowledge the write: {reason}")]
+    NotAcknowledged {
+        /// The shard.
+        shard: ShardRef,
+        /// The position the write took, if it got one: it may still commit
+        /// there.
+        position: Option<EpochSeq>,
+        /// Why.
+        reason: String,
+    },
     /// The shard's primary could not serve the request.
     #[error("shard {shard} is unavailable: {reason}")]
     Unavailable {
@@ -300,6 +313,18 @@ pub enum ShardError {
         shard: ShardRef,
         /// Why.
         reason: String,
+    },
+    /// The replica asked is a member, not the shard's primary, so it served
+    /// nothing (§5.1, step 1). The routing layer follows its configuration
+    /// as a redirect hint ([`RoutedShards`](crate::routing::RoutedShards)).
+    #[error("shard {shard} is served by its primary {primary} in epoch {epoch}")]
+    NotPrimary {
+        /// The shard.
+        shard: ShardRef,
+        /// The primary the replica knows.
+        primary: NodeId,
+        /// The epoch of the configuration that names it.
+        epoch: Epoch,
     },
 }
 

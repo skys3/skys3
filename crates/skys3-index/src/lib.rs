@@ -12,7 +12,9 @@
 //!   object key; the node-local location map from a record's position to
 //!   its segment, offset, and length; each shard's applied position; and
 //!   the node's copy of control-state registers, tagged with their
-//!   configuration generation (§6.2). [`codec`] specifies every encoding.
+//!   configuration generation (§6.2), and each bucket's namespace import
+//!   ranges and their checkpoints ([`ImportRanges`], §9.1). [`codec`] specifies every
+//!   encoding.
 //! - **Listing** ([`IndexReader::list`]): one shard's page of a
 //!   listing, with prefix and delimiter handling (§9.4).
 //! - **Applying** ([`Index::apply`], [`Applier`]): records are applied
@@ -23,6 +25,10 @@
 //!   reverts to its last checkpoint, and [`Checkpointer::replay`] applies
 //!   the log records after each shard's checkpointed position, through
 //!   the same [`Applier`], which reproduces the index exactly.
+//! - **Snapshots** ([`IndexReader::shard_rows`], [`Index::begin_install`]):
+//!   a primary sends a learner a shard's rows, and the learner installs
+//!   them in place of what it held, at the position they were taken at
+//!   (§6.7).
 //! - **Releasing segments**: each checkpoint also stores what each log
 //!   segment holds: the highest position of each shard's records in it,
 //!   from the log's [`SegmentSummary`](skys3_log::SegmentSummary). A
@@ -48,17 +54,20 @@ mod checkpointer;
 pub mod codec;
 mod entry;
 mod error;
+mod import;
 mod index;
 mod listing;
 mod tables;
 
 pub use checkpointer::{Checkpointer, ReplayReport};
 pub use entry::{
-    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
+    ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
+    Upload,
 };
 pub use error::IndexError;
+pub use import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 pub use index::{
     Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
 };
 pub use listing::{ListItem, ListPage, ListQuery};
-pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter};
+pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter, ShardRow, ShardTable};

@@ -72,6 +72,8 @@ pub struct NodeEnv {
     pub transport: Transport<TurmoilNetwork>,
     /// Every node's transport address, this one's included.
     pub peers: BTreeMap<NodeId, NodeAddress>,
+    /// The labels of the node's disks.
+    pub disks: Vec<Label>,
     /// The static shard placement: each shard's configuration.
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
     /// The remote S3 store that `write_back` buckets flush to.
@@ -96,6 +98,13 @@ pub trait NodeServices: Clone + 'static {
     /// Starts the services of one life of a node. Tasks it spawns end
     /// when the node crashes.
     fn start(&self, env: NodeEnv) -> impl Future<Output = Result<Self::Shards, BoxError>>;
+
+    /// Whether the services are ready for clients once every node serves
+    /// S3, such as replicated shards whose primaries have brought their
+    /// members up to date. The workload starts once they are.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 /// The single-node services of M1: every shard is local, and the node is
@@ -134,6 +143,8 @@ pub(crate) struct NodeSlot {
     pub power: SimPower,
     pub control: ControlHandle,
     pub credentials: Credentials,
+    /// The node's clock drift in every life, if it is fixed.
+    drift: Option<Drift>,
     /// Draws for each life: its clock and seeds.
     rng: Mutex<SmallRng>,
     lives: Mutex<u64>,
@@ -148,6 +159,7 @@ impl NodeSlot {
         disks: Vec<(Label, SimDisk)>,
         control: ControlHandle,
         credentials: Credentials,
+        drift: Option<Drift>,
         seed: u64,
     ) -> Self {
         let power = SimPower::new();
@@ -162,6 +174,7 @@ impl NodeSlot {
             power,
             control,
             credentials,
+            drift,
             rng: Mutex::new(SmallRng::seed_from_u64(seed)),
             lives: Mutex::new(0),
             ready: AtomicBool::new(false),
@@ -218,8 +231,11 @@ pub(crate) async fn run<S: NodeServices>(
         let life = *lives;
         *lives += 1;
         let mut rng = slot.rng.lock().unwrap_or_else(PoisonError::into_inner);
+        // The drift is drawn even when it is fixed, so fixing it changes no
+        // other draw of the seed.
+        let drawn = Drift::random_within(&mut *rng, shared.settings.drift);
         let clock = NodeClock {
-            drift: Drift::random_within(&mut *rng, shared.settings.drift),
+            drift: slot.drift.unwrap_or(drawn),
             start: skys3_io::MonoTime::from_nanos(rng.random_range(0..1 << 50)),
         };
         (life, clock, rng.random::<u64>())
@@ -266,6 +282,7 @@ pub(crate) async fn run<S: NodeServices>(
         control: store.clone(),
         transport: Transport::new(TurmoilNetwork, &slot.credentials),
         peers: shared.peers.clone(),
+        disks: slot.disks.iter().map(|(label, _)| label.clone()).collect(),
         placement: Arc::clone(&shared.placement),
         remote: shared.remote.clone(),
         seed: seed.rotate_left(17),

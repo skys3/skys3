@@ -37,8 +37,14 @@
 //!   concurrent reads of one version, and commits `ADOPT` when the remote
 //!   changed out of band.
 //! - [`FlushService`]: every flusher of a node, following its buckets and
-//!   open shards, with each target's capability probe, and each bucket's
-//!   [`Filler`].
+//!   open shards, with each target's capability probe, each bucket's
+//!   namespace import, and each bucket's [`Filler`].
+//! - **Namespace import** (§9.1, [`ImportState`]): a `write_back` bucket
+//!   lists its remote prefix into `IMPORT` records, a page at a time, rate
+//!   limited, with a durable checkpoint after each page that a restart
+//!   resumes from. Until the import passes a key, its flushers keep its
+//!   tombstone and HEAD before writing it, and [`RemoteReader`] serves
+//!   client reads that miss locally from the remote.
 //! - [`FlushMetrics`]: `dirty_bytes`, `oldest_dirty_age`,
 //!   `flush_lag_seconds`, conflict counts, and fill counts, by bucket.
 //! - [`DirtyBudget`] (§7.6): the flushers' dirty bytes counted against each
@@ -61,6 +67,7 @@
 mod attempt;
 mod budget;
 mod fill;
+mod import;
 mod metrics;
 mod multipart;
 mod service;
@@ -70,6 +77,10 @@ mod target;
 pub use attempt::Conflict;
 pub use budget::{DirtyBudget, Exhausted, Usage, share};
 pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
+pub use import::{
+    DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject, RemoteReader,
+    loaded_metadata,
+};
 pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};

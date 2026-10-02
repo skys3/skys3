@@ -107,9 +107,10 @@ use bytes::Bytes;
 use skys3_types::{EpochSeq, KeyHash, limits};
 
 pub use body::{
-    Adopt, CopySource, Delete, Extent, ExtentRef, Flushed, Import, MAX_EXTENTS, MAX_KEY_LEN,
-    MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS,
-    MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet, Tags,
+    Adopt, CopySource, Delete, Extent, ExtentRef, Flushed, IDENTITY_METADATA,
+    IDENTITY_METADATA_RESERVED, Import, MAX_EXTENTS, MAX_KEY_LEN, MAX_METADATA_LEN,
+    MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN,
+    Metadata, Put, PutData, RecordBody, TagSet, Tags,
 };
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
@@ -117,6 +118,21 @@ pub use multipart::{CompletedPart, MpuAbort, MpuComplete, MpuCreate, MpuPart, Up
 pub use skys3_types::checksum::{Checksum, ChecksumAlgorithm, ChecksumType, Checksums};
 
 use wire::Writer;
+
+/// Whether a `TRUNCATE` at `truncate` invalidates the record of its shard
+/// at `position`: a record at a later `seq` from an earlier epoch (§6.6).
+///
+/// A replica that reconciles with a new primary truncates the records past
+/// the longest prefix it shares with the primary's log, and takes the
+/// primary's records from there on. It gives its `TRUNCATE` the epoch of
+/// the first record it takes next, which is newer than every record it
+/// truncates and no newer than any record it takes later, so the rule
+/// tells the two apart without knowing the order in which the log holds
+/// them. Replay and every read of a replica's log skip what it invalidates.
+#[must_use]
+pub fn truncated_by(truncate: EpochSeq, position: EpochSeq) -> bool {
+    position.seq > truncate.seq && position.epoch < truncate.epoch
+}
 
 /// The bytes every record starts with.
 pub const MAGIC: [u8; 4] = *b"SKYL";

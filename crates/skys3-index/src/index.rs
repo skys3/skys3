@@ -8,27 +8,32 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, StorageBackend};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableHandle};
 use skys3_config::StorageConfig;
 use skys3_io::{Disk, SimBlockFile, SimMount};
 use skys3_log::record::ShardRef;
 use skys3_log::{
     LogRecord, RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentLog, SegmentSummary,
 };
-use skys3_types::{EpochSeq, Label};
+use skys3_types::{BucketId, Epoch, EpochSeq, Label, ShardConfig};
 
 use crate::codec;
 use crate::error::IndexError;
+use crate::import::ImportRanges;
 use crate::tables::{
-    self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META,
+    self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META, ShardRow,
 };
 
 /// The index format version this build writes, and the newest it opens. It
 /// covers the tables and every encoding in [`codec`]. Version 2 adds the
 /// uploads and parts tables; opening a version 1 index creates them and
 /// marks it version 2, so a build that does not know them refuses it
-/// rather than miss the uploads in it.
-pub const FORMAT_VERSION: u64 = 2;
+/// rather than miss the uploads in it. Version 3 adds the imports table
+/// (§9.1) in the same way, version 4 the step-downs of planned handoffs
+/// (§5.4), version 5 the promotions a primary proposed (§6.7), and
+/// version 6 the configuration of each shard's latest `CONFIG` record and
+/// the takeovers a member proposed (§6.2, §6.3).
+pub const FORMAT_VERSION: u64 = 6;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -217,6 +222,12 @@ impl Index {
         let mut txn = db.begin_write()?;
         let mut coverage = Coverage::new();
         let created = {
+            // An index of this format may predate the shard map, which
+            // needs no new format (see `tables::SHARD_MAP`).
+            let had_map = txn
+                .list_tables()?
+                .any(|table| table.name() == tables::SHARD_MAP.name());
+            txn.open_table(tables::SHARD_MAP)?;
             let mut meta = txn.open_table(META)?;
             for table in [
                 tables::NAMESPACE,
@@ -228,6 +239,11 @@ impl Index {
                 txn.open_table(table)?;
             }
             txn.open_table(tables::CONTROL)?;
+            txn.open_table(tables::IMPORTS)?;
+            txn.open_table(tables::STEP_DOWNS)?;
+            txn.open_table(tables::PROMOTIONS)?;
+            txn.open_table(tables::CONFIGS)?;
+            txn.open_table(tables::TAKEOVERS)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -251,7 +267,7 @@ impl Index {
                     codec::decode_summary(value.value()).map_err(IndexError::codec("coverage"))?;
                 coverage.entry(disk).or_default().insert(segment, summary);
             }
-            format != Some(FORMAT_VERSION)
+            format != Some(FORMAT_VERSION) || !had_map
         };
         if created {
             txn.set_durability(Durability::Immediate)?;
@@ -339,8 +355,12 @@ impl Index {
     }
 
     /// Removes everything the index holds for `shard`, in one non-durable
-    /// commit: its entries, its record locations, and its applied
-    /// position. A node drops a shard this way once its bucket is deleted.
+    /// commit: its entries, its record locations, its applied position,
+    /// its kept configuration, its step-down (see
+    /// [`Index::store_step_down`]), its promotion (see
+    /// [`Index::store_promotion`]), and its takeover (see
+    /// [`Index::store_takeover`]). A node drops a shard this way once
+    /// its bucket is deleted.
     ///
     /// The shard's records stay in the log until their segments are
     /// reclaimed, so replay after a crash can bring the shard back; startup
@@ -354,6 +374,125 @@ impl Index {
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::None)?;
         IndexWriter::open(&txn)?.remove_shard(shard)?;
+        txn.open_table(tables::STEP_DOWNS)?
+            .remove(codec::shard_key(shard).as_slice())?;
+        txn.open_table(tables::PROMOTIONS)?
+            .remove(codec::shard_key(shard).as_slice())?;
+        txn.open_table(tables::TAKEOVERS)?
+            .remove(codec::shard_key(shard).as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Starts installing a snapshot of `shard` (§6.7), in one durable
+    /// commit: removes what the index holds of the shard, as
+    /// [`Index::remove_shard`] does, except its step-down, promotion, and
+    /// takeover, and sets its applied position to `marker`. The shard has
+    /// no kept configuration then until the install finishes. A learner gives the
+    /// marker the `seq` [`Seq::MAX`](skys3_types::Seq::MAX), after any
+    /// record its log can hold: replay then applies none of the records
+    /// the snapshot replaces, even if the install is cut short, and the
+    /// marker tells the replica so when it opens again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn begin_install(&self, shard: &ShardRef, marker: EpochSeq) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut writer = IndexWriter::open(&txn)?;
+            writer.remove_shard(shard)?;
+            writer.set_applied(shard, marker)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Stores rows of `shard` in `table` as a primary's snapshot carried
+    /// them ([`IndexReader::shard_rows`]), in one non-durable commit,
+    /// between [`Index::begin_install`] and [`Index::finish_install`].
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Snapshot`] if a row is of another shard or does not
+    /// decode; an [`IndexError`] if redb fails. Nothing is stored then.
+    pub fn install_rows(
+        &self,
+        shard: &ShardRef,
+        table: tables::ShardTable,
+        rows: &[ShardRow],
+    ) -> Result<(), IndexError> {
+        for (key, value) in rows {
+            table
+                .check(shard, key, value)
+                .map_err(IndexError::Snapshot)?;
+        }
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None)?;
+        {
+            let definition = match table {
+                tables::ShardTable::Namespace => tables::NAMESPACE,
+                tables::ShardTable::Uploads => tables::UPLOADS,
+                tables::ShardTable::Parts => tables::PARTS,
+            };
+            let mut table = txn.open_table(definition)?;
+            for (key, value) in rows {
+                table.insert(key.as_slice(), value.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Finishes installing a snapshot of the shard of `config` whose rows
+    /// are stored, in one durable commit: its applied position becomes
+    /// `applied`, the position the snapshot was taken at, and `config`, the
+    /// configuration the learner installs it in, becomes the shard's kept
+    /// configuration (§6.2), since the snapshot carries no `CONFIG` record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the configuration does not encode or
+    /// redb fails; nothing changes then.
+    pub fn finish_install(
+        &self,
+        config: &ShardConfig,
+        applied: EpochSeq,
+    ) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut writer = IndexWriter::open(&txn)?;
+            writer.set_applied(&shard, applied)?;
+            writer.put_config(config)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records where records of `shard` that a learner copied from its
+    /// primary are on this node, in one durable commit (§6.7). The records
+    /// are at or before the shard's applied position, so replay never
+    /// restores their locations: the commit must be durable at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn store_locations(
+        &self,
+        shard: &ShardRef,
+        locations: &[(EpochSeq, RecordLocation)],
+    ) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut writer = IndexWriter::open(&txn)?;
+            for (position, location) in locations {
+                writer.put_location(shard, *position, location)?;
+            }
+        }
         txn.commit()?;
         Ok(())
     }
@@ -377,6 +516,173 @@ impl Index {
         let result = update(&mut ControlWriter::open(&txn)?)?;
         txn.commit()?;
         Ok(result)
+    }
+
+    /// The import ranges of `bucket` and their checkpoints (§9.1), or
+    /// `None` if its import never started on this node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn import_ranges(&self, bucket: &BucketId) -> Result<Option<ImportRanges>, IndexError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(tables::IMPORTS)?;
+        let Some(value) = table.get(bucket.as_str())? else {
+            return Ok(None);
+        };
+        codec::decode_import(value.value())
+            .map(Some)
+            .map_err(IndexError::codec("imports"))
+    }
+
+    /// Stores the import ranges of `bucket` and their checkpoints, or
+    /// removes them, in one durable commit.
+    ///
+    /// A checkpoint does not come from the log, so replay cannot restore
+    /// it; it is made durable at once instead, once a page of `IMPORT`
+    /// records it covers is applied. Each store costs one sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the ranges cannot be encoded or the
+    /// commit fails; nothing changes then.
+    pub fn set_import_ranges(
+        &self,
+        bucket: &BucketId,
+        import: Option<&ImportRanges>,
+    ) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        {
+            let mut table = txn.open_table(tables::IMPORTS)?;
+            match import {
+                Some(import) => {
+                    let value =
+                        codec::encode_import(import).map_err(IndexError::codec("imports"))?;
+                    table.insert(bucket.as_str(), value.as_slice())?;
+                }
+                None => {
+                    table.remove(bucket.as_str())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Keeps `config` as the gateway's configuration of its shard, in one
+    /// durable commit (§6.2). The shard map is not in the log, so replay
+    /// cannot restore it, but it is a cache: a stale or lost configuration
+    /// costs a redirect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the configuration does not encode or
+    /// redb fails; nothing changes then.
+    pub fn store_route(&self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("shard_map"))?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::SHARD_MAP)?
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records, in one durable commit, that this node's replica of `shard`
+    /// stepped down as primary in `epoch` for a planned handoff (§5.4): it
+    /// must never serve in that epoch again, even after a restart, since
+    /// a step-down message still in flight lets the candidate take over
+    /// at once. A later epoch replaces the record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn store_step_down(&self, shard: &ShardRef, epoch: Epoch) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::STEP_DOWNS)?
+            .insert(codec::shard_key(shard).as_slice(), epoch.get())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records, in one durable commit, that this node's replica of a shard,
+    /// as its primary, proposes `config` to promote a learner (§6.3,
+    /// §6.7), before it issues the compare-and-swap: until it learns the
+    /// outcome, across restarts too, it keeps waiting for the learner,
+    /// since a proposal that landed unseen made the learner a member. A
+    /// later proposal replaces the record; one whose epoch the replica has
+    /// reached since is settled, so it is ignored rather than removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if encoding or redb fails; nothing changes
+    /// then.
+    pub fn store_promotion(&self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("promotions"))?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::PROMOTIONS)?
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records, in one durable commit, that this node's replica of a shard,
+    /// as a member, proposes `config` to take the shard over (§6.3, §6.5),
+    /// before it issues the compare-and-swap: until it learns the outcome,
+    /// across restarts too, it grants no lease and acknowledges no append
+    /// in the epoch it proposes over, since a proposal that landed unseen
+    /// made it the primary. A later proposal replaces the record; one
+    /// whose epoch the replica has reached since is settled, so it is
+    /// ignored rather than removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if encoding or redb fails; nothing changes
+    /// then.
+    pub fn store_takeover(&self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("takeovers"))?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::TAKEOVERS)?
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes the takeover this node's replica of `shard` recorded, in one
+    /// durable commit, once it learned that the proposal lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn forget_takeover(&self, shard: &ShardRef) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::TAKEOVERS)?
+            .remove(codec::shard_key(shard).as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes the gateway's configuration of `shard`, in one durable
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn forget_route(&self, shard: &ShardRef) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::SHARD_MAP)?
+            .remove(codec::shard_key(shard).as_slice())?;
+        txn.commit()?;
+        Ok(())
     }
 
     /// Makes everything applied so far durable, and returns which segments

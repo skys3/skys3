@@ -27,9 +27,11 @@
 //!   `CreateMultipartUpload` answer never reached the flusher: every other
 //!   upload was completed or aborted.
 //!
-//! The read-through fill and `ADOPT` scenario is in `fill_simulation`.
+//! The read-through fill and `ADOPT` scenario is in `fill_simulation`, and
+//! the namespace import racing client writes in `import_simulation`.
 
 mod fill_simulation;
+mod import_simulation;
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +71,11 @@ fn flushes_reach_the_remote_through_faults() {
 #[test]
 fn fills_adopt_out_of_band_writes_but_never_over_a_local_one() {
     Runner::new().run(fill_simulation::scenario);
+}
+
+#[test]
+fn imports_never_resurrect_a_delete_or_overwrite_a_local_write() {
+    Runner::new().run(import_simulation::scenario);
 }
 
 fn scenario(context: &mut SimContext) -> Outcome {

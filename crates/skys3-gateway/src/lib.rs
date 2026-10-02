@@ -49,10 +49,17 @@
 //!   shard returns a sorted page from its index, the gateway merges them,
 //!   and a V2 page ends with a continuation token authenticated with the
 //!   gateway's [`ListTokenKeys`].
+//! - The namespace import of a `write_back` bucket (§9.1), through
+//!   [`RemoteReads`]: while it runs, a read of a key it has not reached
+//!   and that has no entry falls through to the remote, and a listing
+//!   merges the remote's listing of such keys with the index. The first
+//!   read of an imported stub loads its metadata as an `ADOPT`.
 //! - [`Shards`] and [`ShardRef`]: the shard interface the gateway calls,
 //!   and routing of each key to its shard with the frozen hash. On a single
 //!   node every shard is local: [`LocalShards`] serves the interface from
-//!   the node's `skys3_shard::ShardSet`.
+//!   the node's `skys3_shard::ShardSet`. With replication, [`routing`]
+//!   sends each call to its shard's primary, on this node or another, by
+//!   the gateway's shard map, and serves the calls other gateways send.
 //!
 //! - [`sigv4`]: SigV4 authentication with the `Authorization` header or a
 //!   presigned URL, session tokens, and `aws-chunked` bodies with signed
@@ -131,6 +138,9 @@ mod listener;
 mod listing;
 mod local;
 mod objects;
+mod peering;
+mod remote;
+pub mod routing;
 mod service;
 mod shard;
 pub mod sigv4;
@@ -139,8 +149,8 @@ pub mod stub;
 
 pub use admission::{Admission, AdmitAll, Refusal};
 pub use authz::{Permissions, Principal};
-pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER};
-pub use conditions::{ConditionFailed, Precondition};
+pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, ShardPlacement, TARGET_HEADER};
+pub use conditions::{ConditionFailed, PeerCondition, Precondition, current_identity};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
 pub use fill::{FillBody, FillError, Fills};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
@@ -152,6 +162,8 @@ pub use objects::{
     MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
     parse_upload_id, upload_id,
 };
+pub use peering::{BucketLookup, PeerCommits, PeerExtents};
+pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};

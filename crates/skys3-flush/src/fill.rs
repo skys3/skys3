@@ -39,16 +39,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 use skys3_index::{Entry, EntryState, Payload};
 use skys3_io::{Disk, WallClock};
-use skys3_log::record::{Adopt, Extent, ExtentRef, Metadata};
+use skys3_log::record::{Adopt, Extent, ExtentRef};
 use skys3_log::{RecordBody, ShardRef};
 use skys3_remote::{
-    ByteRange, GetObject, GetOutput, HeadObject, ObjectInfo, ObjectStore, S3Error, S3ErrorKind,
-    VersionId,
+    ByteRange, GetObject, GetOutput, HeadObject, ObjectStore, S3Error, S3ErrorKind, VersionId,
 };
 use skys3_shard::{Outcome, Shard};
-use skys3_types::{EpochSeq, WriteIdentity};
+use skys3_types::EpochSeq;
 use tokio::sync::{Semaphore, mpsc, watch};
 
+use crate::import::loaded_metadata;
 use crate::metrics::Counters;
 use crate::target::FlushSettings;
 
@@ -335,7 +335,9 @@ impl<S: ObjectStore> Filler<S> {
             last_modified_ms,
             remote_etag: info.etag.clone(),
             remote_version_id: info.version_id.clone().map(|id| id.0),
-            metadata: stored_metadata(&info),
+            // As lazily loaded metadata (§9.1): an adopted version must not
+            // look like an imported stub whose metadata is not loaded yet.
+            metadata: loaded_metadata(&info),
             checksums: Default::default(),
         };
         match shard.commit(RecordBody::Adopt(adopt)).await {
@@ -492,22 +494,6 @@ fn gone(error: &S3Error) -> bool {
     )
 }
 
-/// The metadata an adopted version stores: the remote's user metadata
-/// under its `x-amz-meta-` name, without a write identity, and its
-/// `Content-Type`.
-fn stored_metadata(info: &ObjectInfo) -> Metadata {
-    let mut metadata: Metadata = info
-        .metadata
-        .iter()
-        .filter(|(name, _)| *name != WriteIdentity::METADATA_KEY)
-        .map(|(name, value)| (format!("x-amz-meta-{name}"), value.to_owned()))
-        .collect();
-    if let Some(content_type) = &info.content_type {
-        metadata.insert("content-type".to_owned(), content_type.clone());
-    }
-    metadata
-}
-
 /// The error of a read whose fill stopped without saying how it ended.
 fn stopped() -> FillError {
     FillError::Failed("the fill stopped".to_owned())
@@ -543,30 +529,5 @@ mod tests {
         assert_eq!(clip(&data, 10, &(12..15)).unwrap(), "234");
         assert_eq!(clip(&data, 10, &(0..100)).unwrap(), "0123456789");
         assert_eq!(clip(&data, 10, &(15..100)).unwrap(), "56789");
-    }
-
-    #[test]
-    fn adopted_metadata_drops_the_write_identity() {
-        let mut metadata = skys3_remote::UserMetadata::new();
-        metadata.insert("owner", "team-b").unwrap();
-        metadata
-            .insert(WriteIdentity::METADATA_KEY, "c/b/0/1.2")
-            .unwrap();
-        let info = ObjectInfo {
-            etag: skys3_types::ETag::new("abc").unwrap(),
-            size: 1,
-            version_id: None,
-            metadata,
-            content_type: Some("text/plain".to_owned()),
-            last_modified_ms: None,
-        };
-        let stored = stored_metadata(&info);
-        assert_eq!(
-            stored.into_iter().collect::<Vec<_>>(),
-            [
-                ("content-type".to_owned(), "text/plain".to_owned()),
-                ("x-amz-meta-owner".to_owned(), "team-b".to_owned()),
-            ]
-        );
     }
 }

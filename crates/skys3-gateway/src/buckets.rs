@@ -13,9 +13,13 @@
 //! `[buckets.<name>]` table or `[buckets.defaults]`, and a `write_back`
 //! bucket's target with [`TARGET_HEADER`], a path-style URL. The shard count
 //! and replication settings come from the configuration. The bucket gets a
-//! fresh random ID, and its shards are opened before its register is
-//! created with `If-None-Match: *`, so a bucket is never visible without
-//! its shards.
+//! fresh random ID. Where its shards live is the [`ShardPlacement`]: on a
+//! single node, its shards are opened before its register is created with
+//! `If-None-Match: *`, so a bucket is never visible without its shards; on
+//! a cluster, the shards are placed on the registered nodes and their
+//! registers follow the bucket register in the same change
+//! ([`skys3_coord::create_bucket`]), and every node opens its replicas
+//! when it learns of the bucket.
 //!
 //! **Deletion detaches.** The remote is never touched. DeleteBucket seals
 //! every shard, so no client write commits while it decides, and refuses
@@ -28,21 +32,27 @@
 //! finds the register announces it. A deletion of unknown outcome keeps its
 //! seals and is remembered; a retried DeleteBucket that finds the register
 //! gone, or naming a new bucket, drops the old shards, announces the
-//! deletion, and answers `204` (design §4.1).
+//! deletion, and answers `204` (design §4.1). A generation increment that
+//! fails is retried in the background until it succeeds, and so is the
+//! settling of a cluster creation whose write or increment got no answer
+//! (design §6.7): nodes refresh only when the generation moves.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use s3s::{S3Error, s3_error};
-use skys3_config::{BucketsConfig, Config, ControlStoreConfig, IdentityConfig, parse_target};
+use skys3_config::{
+    BucketsConfig, Config, ControlStoreConfig, FailureDomain, IdentityConfig, parse_target,
+};
 use skys3_control::{
     ControlError, ControlStore, DeletionOutcome, Expected, KeyPrefix, ProposalIds, ProposalOutcome,
     RegisterKind, RetryPolicy, TypedKey, Version, Versioned, bump_generation, propose_delete,
     propose_document, read, read_with_retries,
 };
+use skys3_coord::{Creation, CreationError, Pending, create_bucket, settle};
 use skys3_io::BlockingPool;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
@@ -51,6 +61,7 @@ use crate::authz::Permissions;
 use crate::fill::Fills;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
+use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
 /// The CreateBucket header that sets the bucket's mode: `write_back`,
@@ -102,6 +113,28 @@ pub struct GatewayConfig {
     /// (§7.6, §13). [`GatewayConfig::new`] admits everything; the node
     /// checks the dirty-data budgets and free disk space.
     pub admission: Arc<dyn Admission>,
+    /// The remote targets of `write_back` buckets, which reads of keys the
+    /// namespace import has not reached and lazily loaded metadata use
+    /// (§9.1). [`GatewayConfig::new`] has none: every read is local.
+    pub remote: Option<Arc<dyn RemoteReads>>,
+    /// Where new buckets' shards live. [`GatewayConfig::new`] keeps them
+    /// on this node, as a single-node cluster does.
+    pub placement: ShardPlacement,
+}
+
+/// Where CreateBucket puts a new bucket's shards (design §4.1, §6.7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShardPlacement {
+    /// On this node, the only one: it opens every shard before it creates
+    /// the bucket register, and writes no shard registers.
+    #[default]
+    Local,
+    /// On the nodes registered under `nodes/`, never two members of a
+    /// shard in one domain at this `failure_domain` level: the bucket
+    /// register and its shard registers are created in one change, and a
+    /// node opens its replicas when it learns of the bucket.
+    Cluster(FailureDomain),
 }
 
 impl GatewayConfig {
@@ -123,6 +156,8 @@ impl GatewayConfig {
             fills: None,
             list_token_keys: ListTokenKeys::generate(),
             admission: Arc::new(AdmitAll),
+            remote: None,
+            placement: ShardPlacement::Local,
         }
     }
 }
@@ -197,6 +232,9 @@ impl IdSource {
 /// oldest is forgotten: its shards stay sealed until a restart, and startup
 /// recovery reclaims them if the register is gone.
 const MAX_PENDING_DELETIONS: usize = 256;
+
+/// The longest pause between two attempts at an announcement still owed.
+const OWED_MAX_PAUSE: Duration = Duration::from_secs(30);
 
 /// A DeleteBucket whose register delete may or may not have applied. Its
 /// seals are still held, so no write is acknowledged into a bucket that may
@@ -274,6 +312,24 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     /// The bucket named `name`, or `NoSuchBucket`.
     pub(crate) fn require(&self, name: &BucketName) -> Result<BucketDocument, S3Error> {
         self.get(name).ok_or_else(no_such_bucket)
+    }
+
+    /// The bucket a client's object write names, which must exist and take
+    /// writes from this cluster's clients: a bucket that receives native
+    /// replication from a peer cluster (`peer_source`) is read-only to them,
+    /// so each key has a single writer, unless `peer_local_writes` is set
+    /// (design §7.8).
+    pub(crate) fn require_writable(&self, name: &BucketName) -> Result<BucketDocument, S3Error> {
+        let bucket = self.require(name)?;
+        let settings = self.config.buckets.get(name);
+        match &settings.peer_source {
+            Some(source) if !settings.peer_local_writes => Err(s3_error!(
+                AccessDenied,
+                "Bucket {name} receives native replication from cluster {source} and is \
+                 read-only to this cluster's clients"
+            )),
+            _ => Ok(bucket),
+        }
     }
 
     /// Every bucket, in name order, from the local copy.
@@ -355,6 +411,9 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             created_unix_ms: unix_ms(SystemTime::now()),
             proposal_id,
         };
+        if let ShardPlacement::Cluster(level) = self.config.placement {
+            return self.create_placed(bucket, level).await;
+        }
 
         let shards: Vec<_> = ShardRef::all(&bucket).collect();
         for (opened, shard) in shards.iter().enumerate() {
@@ -373,18 +432,7 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             }
             Ok(ProposalOutcome::Rejected) => {
                 self.remove_shards(&shards).await;
-                if let Ok(current) = read(&self.store, &key).await {
-                    let found = current.is_some();
-                    self.remember(&name, current.map(|current| current.value));
-                    // The bucket may be one whose creation landed but whose
-                    // answers were lost, here or on another gateway, before
-                    // it was announced. Announcing again costs other nodes
-                    // only a re-read.
-                    if found {
-                        self.announce().await;
-                    }
-                }
-                Err(already_owned())
+                Err(self.taken(&name).await)
             }
             Err(error) => {
                 // A write that may still land keeps its shards, so the
@@ -396,6 +444,60 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 Err(control_error(&error))
             }
         }
+    }
+
+    /// Creates `bucket` with its shards placed on the cluster's registered
+    /// nodes at `level`.
+    async fn create_placed(
+        &self,
+        bucket: BucketDocument,
+        level: FailureDomain,
+    ) -> Result<BucketDocument, S3Error> {
+        let mut ids = lock(&self.ids).proposal_ids();
+        let (cluster, retry) = (&self.config.cluster_id, &self.config.retry);
+        match create_bucket(&self.store, cluster, &bucket, level, &mut ids, retry).await {
+            Ok(Creation::Created { complete }) => {
+                if !complete {
+                    tracing::warn!(bucket = %bucket.name, "created a bucket whose shard registers the coordinator completes");
+                }
+                self.remember(&bucket.name, Some(bucket.clone()));
+                Ok(bucket)
+            }
+            Ok(Creation::Taken) => Err(self.taken(&bucket.name).await),
+            Err(CreationError::Unsatisfiable(unsatisfiable)) => Err(s3_error!(
+                InvalidRequest,
+                "The cluster cannot place the bucket's shards: {unsatisfiable}"
+            )),
+            Err(CreationError::Control(error)) => Err(control_error(&error)),
+            Err(CreationError::Unsettled { pending, source }) => {
+                // The bucket may exist, but nodes may not hear of it until
+                // its writes are settled and announced: keep at it, and
+                // answer as for a write of unknown outcome. A retried
+                // CreateBucket finds the register and announces it.
+                self.settle_later(Some(*pending));
+                Err(control_error(&source))
+            }
+            Err(error) => {
+                tracing::error!(%error, "a new bucket's registers are invalid");
+                Err(s3_error!(InternalError))
+            }
+        }
+    }
+
+    /// The answer to a CreateBucket whose name is taken, after reading the
+    /// register that holds it into the local copy.
+    async fn taken(&self, name: &BucketName) -> S3Error {
+        if let Ok(current) = read(&self.store, &TypedKey::bucket(name)).await {
+            let found = current.is_some();
+            self.remember(name, current.map(|current| current.value));
+            // The bucket may be one whose creation landed but whose answers
+            // were lost, here or on another gateway, before it was
+            // announced. Announcing again costs other nodes only a re-read.
+            if found {
+                self.announce().await;
+            }
+        }
+        already_owned()
     }
 
     /// Deletes (detaches) a bucket.
@@ -539,16 +641,53 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     }
 
     /// Increments the generation, which announces a bucket change to every
-    /// node. A failure is only logged: the next increment announces every
-    /// change before it (design §6.2).
+    /// node. An increment that fails is retried in the background until it
+    /// succeeds: nodes refresh their copies only when the generation moves
+    /// (design §6.2).
     async fn announce(&self) {
         let mut ids = lock(&self.ids).proposal_ids();
         let cluster = &self.config.cluster_id;
         if let Err(error) =
             bump_generation(&self.store, cluster, &mut ids, &self.config.retry).await
         {
-            tracing::warn!(%error, "a bucket change was not announced; the next change announces it");
+            tracing::warn!(%error, "a bucket change is not announced yet; retrying in the background");
+            self.settle_later(None);
         }
+    }
+
+    /// Settles `pending` in the background, or with `None` only increments
+    /// the generation, until it succeeds, pausing longer after each
+    /// failure (design §6.7). It ends with the process: a gateway that
+    /// restarts owes nothing it remembers, as after a crash between a
+    /// write and its announcement.
+    fn settle_later(&self, pending: Option<Pending>) {
+        let (store, cluster) = (self.store.clone(), self.config.cluster_id.clone());
+        let retry = self.config.retry;
+        let mut ids = lock(&self.ids).proposal_ids();
+        tokio::spawn(async move {
+            let mut pause = retry.max_backoff.max(Duration::from_millis(100));
+            loop {
+                tokio::time::sleep(pause).await;
+                let done = match &pending {
+                    Some(pending) => settle(&store, &cluster, pending, &mut ids, &retry)
+                        .await
+                        .map(drop),
+                    None => bump_generation(&store, &cluster, &mut ids, &retry)
+                        .await
+                        .map(drop),
+                };
+                match done {
+                    Ok(()) => {
+                        tracing::info!("announced a bucket change that was owed");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "a bucket change is still not announced");
+                    }
+                }
+                pause = (pause * 2).min(OWED_MAX_PAUSE);
+            }
+        });
     }
 
     async fn unseal(&self, shards: &[ShardRef]) {
@@ -643,6 +782,13 @@ pub(crate) fn shard_error(error: ShardError) -> S3Error {
         ShardError::Invalid { .. } => {
             tracing::error!(%error, "a shard refused a record");
             s3_error!(InternalError)
+        }
+        ShardError::NotAcknowledged { .. } => {
+            tracing::warn!(%error, "a shard did not acknowledge a write in time");
+            s3_error!(
+                SlowDown,
+                "The write was not acknowledged in time and may still take effect; retry later"
+            )
         }
         other => {
             tracing::warn!(error = %other, "a shard request failed");
@@ -757,6 +903,13 @@ mod tests {
         };
         let sealed = shard_error(ShardError::Sealed(shard.clone()));
         assert_eq!(*sealed.code(), S3ErrorCode::OperationAborted);
+        let late = shard_error(ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position: None,
+            reason: "a member is late".into(),
+        });
+        assert_eq!(*late.code(), S3ErrorCode::SlowDown);
+        assert_eq!(late.code().status_code().map(|s| s.as_u16()), Some(503));
         let missing = shard_error(ShardError::NotFound(shard));
         assert_eq!(*missing.code(), S3ErrorCode::ServiceUnavailable);
     }

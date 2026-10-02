@@ -22,11 +22,14 @@ crc32c = "0.6"
 libfuzzer-sys = "0.4"
 serde_json = "1"
 skys3-control = { path = "../crates/skys3-control" }
+skys3-coord = { path = "../crates/skys3-coord" }
 skys3-gateway = { path = "../crates/skys3-gateway", features = ["test-util"] }
 skys3-index = { path = "../crates/skys3-index" }
 skys3-log = { path = "../crates/skys3-log" }
 skys3-net = { path = "../crates/skys3-net" }
 skys3-obs = { path = "../crates/skys3-obs" }
+skys3-peer = { path = "../crates/skys3-peer" }
+skys3-shard = { path = "../crates/skys3-shard" }
 skys3-sts = { path = "../crates/skys3-sts" }
 skys3-types = { path = "../crates/skys3-types" }
 tokio = { version = "1", features = ["rt"] }
@@ -34,6 +37,20 @@ tokio = { version = "1", features = ["rt"] }
 [[bin]]
 name = "control_etcd_frame"
 path = "fuzz_targets/control_etcd_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coord_control_changed"
+path = "fuzz_targets/coord_control_changed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coord_heartbeat"
+path = "fuzz_targets/coord_heartbeat.rs"
 test = false
 doc = false
 bench = false
@@ -48,6 +65,13 @@ bench = false
 [[bin]]
 name = "gateway_checksums"
 path = "fuzz_targets/gateway_checksums.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_forward"
+path = "fuzz_targets/gateway_forward.rs"
 test = false
 doc = false
 bench = false
@@ -111,6 +135,20 @@ bench = false
 [[bin]]
 name = "obs_bearer"
 path = "fuzz_targets/obs_bearer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_messages"
+path = "fuzz_targets/peer_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shard_replication"
+path = "fuzz_targets/shard_replication.rs"
 test = false
 doc = false
 bench = false

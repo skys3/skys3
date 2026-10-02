@@ -1,7 +1,7 @@
 //! Each load-time rule, broken by a configuration.
 
 use skys3_config::{Config, ConfigError, ControlStoreBackend, ReplicationConfig, Violations};
-use skys3_types::BucketName;
+use skys3_types::{BucketName, ClusterId};
 
 const BASE: &str = r#"
 [cluster]
@@ -315,6 +315,7 @@ fn durations_and_sizes_must_be_positive() {
         ("flush", "flush_max_inflight_bytes_per_target"),
         ("flush", "streaming_flush_min_bytes"),
         ("flush", "max_dirty_bytes"),
+        ("flush", "import_max_keys_per_second"),
         ("ec", "max_data_fragments"),
         ("ec", "fragment_orphan_after_seconds"),
         ("ec", "repair_bytes_per_second_per_node"),
@@ -429,10 +430,98 @@ fn peering_rules() {
         "[peering]\npeer_staging_quota_bytes = 1000",
         &["peering.peer_staging_quota_bytes"],
     );
+    // One staging and one frame, each charged at least 64 KiB.
+    assert_violations(
+        "[peering]\npeer_staging_quota_bytes = 327679",
+        &["peering.peer_staging_quota_bytes"],
+    );
+    load("[peering]\npeer_staging_quota_bytes = 327680").unwrap();
+    assert_violations(
+        "[peering]\npeer_frame_bytes = 1024\npeer_staging_quota_bytes = 131071",
+        &["peering.peer_staging_quota_bytes"],
+    );
+    load("[peering]\npeer_frame_bytes = 1024\npeer_staging_quota_bytes = 131072").unwrap();
     assert_violations(
         "[peering]\npeer_frame_bytes = 0",
         &["peering.peer_frame_bytes"],
     );
+    // A DATA frame is staged as one log record.
+    assert_violations(
+        "[peering]\npeer_frame_bytes = 16777217\npeer_max_inflight_bytes = 33554432",
+        &["peering.peer_frame_bytes"],
+    );
+    let config = load("[peering]\npeer_frame_bytes = 16777216").unwrap();
+    assert_eq!(config.peering().peer_frame_bytes, 16_777_216);
+}
+
+#[test]
+fn peer_rules() {
+    const TLS: &str = r#"
+[transport]
+tls_cert_file = "/etc/skys3/node.crt"
+tls_key_file = "/etc/skys3/node.key"
+tls_ca_file = "/etc/skys3/ca.crt"
+"#;
+    let peer = r#"
+[peering.peers.skys3-prod-eu]
+ca_file = "/etc/skys3/peers/eu.crt"
+buckets = [
+    { source = "b-91c2", destination = "archive-from-eu" },
+    { source = "b-91c3", destination = "archive-from-eu" },
+]
+"#;
+    let config = load(&format!("{TLS}{peer}")).unwrap();
+    let peers = &config.peering().peers;
+    let eu = &peers[&ClusterId::new("skys3-prod-eu").unwrap()];
+    assert_eq!(eu.ca_file.to_str(), Some("/etc/skys3/peers/eu.crt"));
+    assert_eq!(eu.buckets.len(), 2);
+    assert_eq!(eu.buckets[0].source.as_str(), "b-91c2");
+    assert_eq!(eu.buckets[0].destination.as_str(), "archive-from-eu");
+
+    // A peer this node only sends to lists no pairs.
+    let config = load(&format!(
+        "{TLS}[peering.peers.skys3-prod-eu]\nca_file = \"/eu.crt\""
+    ))
+    .unwrap();
+    assert!(
+        config
+            .peering()
+            .peers
+            .values()
+            .all(|p| p.buckets.is_empty())
+    );
+
+    // Peer connections present the node's certificate.
+    assert_violations(peer, &["peering.peers.skys3-prod-eu"]);
+    assert_violations(
+        &format!("{TLS}[peering.peers.skys3-prod-a]\nca_file = \"/a.crt\""),
+        &["peering.peers.skys3-prod-a"],
+    );
+    assert_violations(
+        &format!("{TLS}[peering.peers.skys3-prod-eu]\nca_file = \"\""),
+        &["peering.peers.skys3-prod-eu.ca_file"],
+    );
+    assert_violations(
+        &format!(
+            "{TLS}[peering.peers.skys3-prod-eu]\nca_file = \"/eu.crt\"\nbuckets = [\
+             {{ source = \"b-1\", destination = \"dst\" }}, {{ source = \"b-1\", destination = \"dst\" }}]"
+        ),
+        &["peering.peers.skys3-prod-eu.buckets"],
+    );
+
+    // Identifiers are checked as they are parsed.
+    for bad in [
+        "[peering.peers.Prod]\nca_file = \"/x\"",
+        "[peering.peers.eu]\nca_file = \"/x\"\nbuckets = [{ source = \"B\", destination = \"dst\" }]",
+        "[peering.peers.eu]\nca_file = \"/x\"\nbuckets = [{ source = \"b\", destination = \"D\" }]",
+        "[peering.peers.eu]\nbuckets = []",
+        "[peering.peers.eu]\nca_file = \"/x\"\ntrust = \"/y\"",
+    ] {
+        assert!(
+            matches!(load(&format!("{TLS}{bad}")), Err(ConfigError::Parse(_))),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -836,6 +925,10 @@ fn bucket_overrides_are_checked_against_inherited_values() {
             "buckets.small.import_parallel_streams",
         ],
     );
+    assert_violations(
+        "[buckets.small]\nimport_parallel_streams = 257",
+        &["buckets.small.import_parallel_streams"],
+    );
 }
 
 #[test]
@@ -889,6 +982,47 @@ fn peer_source_must_be_another_cluster() {
     assert_violations(
         "[buckets.alpha]\nmode = \"local\"\npeer_source = \"Other_Cluster\"",
         &["buckets.alpha.peer_source"],
+    );
+}
+
+/// The peer tables a receiving bucket's settings need.
+const PEER_EU: &str = "[transport]\ntls_cert_file = \"/n.crt\"\ntls_key_file = \"/n.key\"\n\
+                       tls_ca_file = \"/ca.crt\"\n[peering.peers.skys3-prod-eu]\n\
+                       ca_file = \"/eu.crt\"\n";
+
+#[test]
+fn a_receiving_bucket_names_a_configured_peer() {
+    // No [peering.peers] table for the source: nothing could connect.
+    assert_violations(
+        "[buckets.alpha]\nmode = \"local\"\npeer_source = \"skys3-prod-eu\"",
+        &["buckets.alpha.peer_source"],
+    );
+    // A read_only bucket mirrors its target and cannot receive.
+    assert_violations(
+        &format!("{PEER_EU}[buckets.alpha]\nmode = \"read_only\"\npeer_source = \"skys3-prod-eu\""),
+        &["buckets.alpha.peer_source"],
+    );
+    let config = load(&format!(
+        "{PEER_EU}[buckets.alpha]\nmode = \"write_back\"\npeer_source = \"skys3-prod-eu\"\n\
+         [buckets.beta]\nmode = \"local\"\npeer_source = \"skys3-prod-eu\"\n\
+         peer_local_writes = true"
+    ))
+    .unwrap();
+    let settings = |name: &str| config.buckets().get(&name.parse().unwrap()).clone();
+    assert!(!settings("alpha").peer_local_writes);
+    assert!(settings("beta").peer_local_writes);
+    assert!(!config.buckets().defaults.peer_local_writes);
+}
+
+#[test]
+fn peer_local_writes_needs_a_peer_source() {
+    assert_violations(
+        "[buckets.alpha]\nmode = \"local\"\npeer_local_writes = true",
+        &["buckets.alpha.peer_local_writes"],
+    );
+    assert_violations(
+        "[buckets.defaults]\npeer_local_writes = false",
+        &["buckets.defaults.peer_local_writes"],
     );
 }
 

@@ -36,6 +36,7 @@ use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
+use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
 
@@ -298,6 +299,19 @@ impl Shared {
             .generation
     }
 
+    /// Whether the copy should be synced although no generation moved, so
+    /// that the identity copy, whose age STS measures from its last sync,
+    /// never goes stale while the store answers (§6.2).
+    fn sync_due(&self) -> bool {
+        let synced_at = self
+            .control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .synced_at;
+        let max_staleness = self.config.identity().identity_max_staleness();
+        control::sync_due(synced_at, self.wall.now(), max_staleness)
+    }
+
     /// Reads a fresh copy from the store, keeps it, and serves from the
     /// store from now on: buckets, identity, and the shards of new
     /// buckets.
@@ -320,8 +334,9 @@ impl Shared {
     /// Keeps the node's copy current (§6.2): it waits for the store's
     /// change stream to report a new generation, or at most
     /// `config_poll_interval`, then syncs if the generation in
-    /// `cluster.json` moved. While the node runs from its copy, it tries a
-    /// sync every interval.
+    /// `cluster.json` moved, reading only the registers that changed, or
+    /// if half of `identity_max_staleness` passed since the last sync.
+    /// While the node runs from its copy, it tries a sync every interval.
     async fn follow_control_store(self: Arc<Self>) {
         let interval = self.config.control_store().config_poll_interval();
         let cluster = self.config.cluster().cluster_id.clone();
@@ -358,7 +373,7 @@ impl Shared {
                     continue;
                 }
             };
-            if (moved || !self.store.is_live())
+            if (moved || !self.store.is_live() || self.sync_due())
                 && let Err(error) = self.sync().await
             {
                 tracing::warn!(%error, "cannot sync the control-state copy");
@@ -921,7 +936,8 @@ impl Node {
                     Box::new(connect),
                     FlushMetrics::register(&metrics.registry),
                 )
-                .with_budget(budget),
+                .with_budget(budget)
+                .with_buckets(config.buckets().clone()),
             )
         };
         let mut gateway_config = GatewayConfig::new(&config);
@@ -933,6 +949,7 @@ impl Node {
             flush: Arc::clone(&flush),
             space: Arc::clone(&space),
         }));
+        gateway_config.remote = Some(Arc::new(NodeRemote(Arc::clone(&flush))));
         let ids = IdSource::from_os_rng();
         let mut gateway = Gateway::new(
             gateway_config,

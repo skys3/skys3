@@ -65,8 +65,10 @@ is registered.
 
 ## 3. Metrics
 
-Status is **exported** once a merged PR registers the metric, and **planned**
-while the design names it and the owning PR has not merged. The owning PR of a
+Status is **exported** once a merged PR registers the metric, **defined** while
+the metric exists but the node binary does not run the component that
+registers it yet, and **planned** while the design names it and the owning PR
+has not merged. The owning PR of a
 planned metric decides its labels and records them here.
 
 ### 3.1 Process, node, and admin listener
@@ -103,12 +105,17 @@ bucket's gauges disappear when it is deleted.
 
 ### 3.3 Replication
 
-Design section 6.4. These report data with fewer than `replicas` copies.
+Design section 6.4. These report data with fewer than `replicas` copies,
+after a member was removed from a shard. A shard counts on the node that
+leads it, so summing the series of every node counts each shard once; the
+cluster's oldest age is the maximum over the nodes. The metrics are defined
+by M2-11 (`skys3_shard::replication::ReplicationMetrics`) and exported once
+replication runs in the node binary.
 
 | Name | Type | Labels | Status | Description |
 |---|---|---|---|---|
-| `skys3_under_replicated_bytes` | gauge | decided in M2-11 | planned (M2-11) | Bytes held by fewer than `replicas` copies (`under_replicated_bytes`). |
-| `skys3_oldest_under_replicated_age_seconds` | gauge | decided in M2-11 | planned (M2-11) | Age of the oldest under-replicated data (`oldest_under_replicated_age`). |
+| `skys3_under_replicated_bytes` | gauge | none | defined (M2-11) | Bytes of the object versions held by the shards this node leads whose configuration has fewer members than `replicas` (`under_replicated_bytes`): old data and new writes alike have fewer copies then. 0 when no shard is short of members. |
+| `skys3_oldest_under_replicated_age_seconds` | gauge | none | defined (M2-11) | How long the longest of those shards has had fewer members than `replicas` (`oldest_under_replicated_age`), counted from when this node removed the member or opened the shard short of members: after a restart it starts over. 0 when no shard is short of members. |
 
 ### 3.4 Read-through fill
 

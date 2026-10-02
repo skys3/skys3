@@ -438,6 +438,26 @@ fn a_version_that_is_not_evicted_is_not_filled() {
 }
 
 #[test]
+fn a_shard_that_does_not_serve_is_not_filled() {
+    runtime().block_on(async {
+        let node = Node::open(13).await;
+        let store = remote(13, false);
+        let filler = filler(&store, 4, &Counters::default());
+        let etag = write_remote(&store, "k", "hello").await;
+        let stub = import(&node, "k", 5, etag).await;
+        // A stopped replica, like a member or a primary that stepped down,
+        // refuses the fill's read of the entry, before any remote request.
+        node.shard.close().await.unwrap();
+        let requests = store.stats().requests;
+        assert!(matches!(
+            read(&filler, &node, "k", stub, 0..5).await,
+            Err(FillError::Failed(_))
+        ));
+        assert_eq!(store.stats().requests, requests, "nothing was read");
+    });
+}
+
+#[test]
 fn a_remote_object_of_another_size_fails_the_fill() {
     runtime().block_on(async {
         let node = Node::open(12).await;

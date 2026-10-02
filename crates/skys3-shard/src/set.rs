@@ -5,14 +5,15 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use skys3_index::Index;
+use skys3_index::{ImportRanges, Index, IndexError};
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::{SegmentLog, ShardRef};
-use skys3_types::{KeyHash, Label, ShardConfig};
+use skys3_types::{BucketId, KeyHash, Label, NodeId, ShardConfig};
 use tokio::sync::{Mutex, MutexGuard, watch};
+use tokio::task::JoinSet;
 
 use crate::error::ShardError;
-use crate::shard::{Shard, ShardSummary};
+use crate::shard::{Role, Shard, ShardSummary};
 
 /// A shard's place in the set.
 enum Slot<D: Disk> {
@@ -40,6 +41,18 @@ pub struct ShardSet<D: Disk> {
     logs: Vec<(Label, SegmentLog<D>)>,
     pool: BlockingPool,
     shards: Arc<Mutex<Slots<D>>>,
+}
+
+impl<D: Disk> Clone for ShardSet<D> {
+    /// Another handle to the same set.
+    fn clone(&self) -> Self {
+        Self {
+            index: Arc::clone(&self.index),
+            logs: self.logs.clone(),
+            pool: self.pool.clone(),
+            shards: Arc::clone(&self.shards),
+        }
+    }
 }
 
 impl<D: Disk> fmt::Debug for ShardSet<D> {
@@ -89,6 +102,11 @@ impl<D: Disk> ShardSet<D> {
         &self.logs[self.placement(shard)].0
     }
 
+    /// Each disk's log, in label order.
+    pub fn logs(&self) -> impl Iterator<Item = (&Label, &SegmentLog<D>)> {
+        self.logs.iter().map(|(label, log)| (label, log))
+    }
+
     fn placement(&self, shard: &ShardRef) -> usize {
         let hash = KeyHash::of(&shard.bucket, &[shard.shard.get()]).get();
         // The remainder is below the disk count, which is a `usize`.
@@ -109,18 +127,147 @@ impl<D: Disk> ShardSet<D> {
     /// As [`Shard::open`] and [`Shard::reconfigure`];
     /// [`ShardError::Unavailable`] if the shard's removal did not finish.
     pub async fn open(&self, config: &ShardConfig) -> Result<Shard<D>, ShardError> {
+        self.open_as(config, None).await
+    }
+
+    /// Opens node `node`'s replica in the shard of `config`, in the role the
+    /// configuration gives it, or returns it if it is open already; see
+    /// [`ShardSet::open`] and [`Shard::open_replica`]. A replica open as
+    /// the shard's only member that `config` gives learners (§6.7) is
+    /// closed once its records are applied, and a new one opens as their
+    /// primary: requests that still hold the closed one fail as
+    /// unavailable.
+    ///
+    /// # Errors
+    ///
+    /// As [`ShardSet::open`] and [`Shard::open_replica`].
+    pub async fn open_replica(
+        &self,
+        config: &ShardConfig,
+        node: &NodeId,
+    ) -> Result<Shard<D>, ShardError> {
+        self.open_as(config, Some(node)).await
+    }
+
+    async fn open_as(
+        &self,
+        config: &ShardConfig,
+        node: Option<&NodeId>,
+    ) -> Result<Shard<D>, ShardError> {
         let key = ShardRef::new(config.bucket_id.clone(), config.shard);
         // Held across the open and any epoch change, so a shard never gets
         // two sequencers, and two opens in a newer epoch append one CONFIG.
         let mut shards = self.settled(&key).await?;
         if let Some(Slot::Open(shard)) = shards.get(&key) {
-            shard.reconfigure(config).await?;
-            return Ok(shard.clone());
+            // A replica opened as the shard's only member runs for one
+            // member. Given learners (§6.7), it closes once its records are
+            // applied, and opens again as their primary.
+            let held = shard.config();
+            let gains_learners = node.is_some()
+                && shard.role() == Role::Alone
+                && !shard.is_stopped()
+                && config.epoch > held.epoch
+                && config.members == held.members
+                && !config.learners.is_empty();
+            // A node removed from the shard and added back as a learner
+            // (§6.7) may still hold the replica of its old role, which no
+            // configuration change turns into a learner: that replica
+            // stops, and the node opens again as a learner from its log. So
+            // does a learner that a takeover left out and the coordinator
+            // added again under the new primary, which a learner's replica
+            // cannot follow either.
+            let readmitted = node.is_some_and(|node| {
+                config.epoch > held.epoch
+                    && config.is_learner(node)
+                    && (!held.is_learner(node) || held.primary != config.primary)
+            });
+            if readmitted {
+                shard.abandon("the node is re-admitted as a learner").await;
+            } else if gains_learners {
+                shard.close().await?;
+            } else {
+                shard.reconfigure(config).await?;
+                return Ok(shard.clone());
+            }
         }
         let log = self.logs[self.placement(&key)].1.clone();
-        let shard = Shard::open(config, log, Arc::clone(&self.index), self.pool.clone()).await?;
+        let (index, pool) = (Arc::clone(&self.index), self.pool.clone());
+        let shard = match node {
+            Some(node) => Shard::open_replica(config, node, log, index, pool).await?,
+            None => Shard::open(config, log, index, pool).await?,
+        };
         shards.insert(key, Slot::Open(shard.clone()));
         Ok(shard)
+    }
+
+    /// Stops `replica`, node `node`'s replica in the shard of `config`,
+    /// keeps the shard closed while `work` runs, and then opens the
+    /// replica again in `config`, from what the index holds then, whatever
+    /// `work` returned. A learner installs a snapshot this way (§6.7).
+    /// Meanwhile the shard is not open: [`ShardSet::get`] does not find it,
+    /// and opening it waits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::open_replica`], if the replica does not open again; it
+    /// is then not open, and opening it later tries again.
+    pub(crate) async fn reopen_after<T>(
+        &self,
+        replica: &Shard<D>,
+        config: &ShardConfig,
+        node: &NodeId,
+        work: impl Future<Output = T>,
+    ) -> Result<(Shard<D>, T), ShardError> {
+        let key = replica.shard().clone();
+        let (done, closed) = watch::channel(false);
+        {
+            let mut shards = self.settled(&key).await?;
+            let open = match shards.get(&key) {
+                Some(Slot::Open(open)) => open.durable().same_channel(&replica.durable()),
+                _ => false,
+            };
+            if !open {
+                return Err(ShardError::unavailable(&key, "the replica is not open"));
+            }
+            shards.insert(key.clone(), Slot::Removing(closed));
+        }
+        replica.abandon("the learner installs a snapshot").await;
+        let output = work.await;
+        let log = self.logs[self.placement(&key)].1.clone();
+        let (index, pool) = (Arc::clone(&self.index), self.pool.clone());
+        let mut shards = self.shards.lock().await;
+        let opened = Shard::open_replica(config, node, log, index, pool).await;
+        match &opened {
+            Ok(shard) => shards.insert(key, Slot::Open(shard.clone())),
+            Err(_) => shards.remove(&key),
+        };
+        drop(shards);
+        // Nobody may be waiting.
+        let _ = done.send(true);
+        opened.map(|shard| (shard, output))
+    }
+
+    /// The configuration of the latest `CONFIG` record of `shard` this
+    /// node applied, or the one a snapshot install opened its replica in:
+    /// the node's local copy of the shard's configuration (§6.2).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn kept_config(&self, shard: &ShardRef) -> Result<Option<ShardConfig>, ShardError> {
+        let (index, key) = (Arc::clone(&self.index), shard.clone());
+        crate::shard::run(&self.pool, shard, move || index.read()?.config(&key)).await
+    }
+
+    /// The configuration this node keeps of every shard, as
+    /// [`ShardSet::kept_config`] gives it for one.
+    ///
+    /// # Errors
+    ///
+    /// An [`IndexError`] if the index fails.
+    pub async fn kept_configs(&self) -> Result<BTreeMap<ShardRef, ShardConfig>, IndexError> {
+        let index = Arc::clone(&self.index);
+        self.pool.run(move || index.read()?.configs()).await?
     }
 
     /// Returns the open shard `shard`.
@@ -129,6 +276,37 @@ impl<D: Disk> ShardSet<D> {
             Some(Slot::Open(open)) => Some(open.clone()),
             Some(Slot::Removing(_)) | None => None,
         }
+    }
+
+    /// The namespace import ranges of `bucket` on this node and their
+    /// checkpoints (§9.1), read on the index's pool.
+    ///
+    /// # Errors
+    ///
+    /// An [`IndexError`] if the index fails.
+    pub async fn import_ranges(
+        &self,
+        bucket: &BucketId,
+    ) -> Result<Option<ImportRanges>, IndexError> {
+        let (index, bucket) = (Arc::clone(&self.index), bucket.clone());
+        self.pool.run(move || index.import_ranges(&bucket)).await?
+    }
+
+    /// Stores the namespace import ranges of `bucket` durably, or removes
+    /// them, on the index's pool ([`Index::set_import_ranges`]).
+    ///
+    /// # Errors
+    ///
+    /// An [`IndexError`] if the index fails; nothing changes then.
+    pub async fn set_import_ranges(
+        &self,
+        bucket: &BucketId,
+        import: Option<ImportRanges>,
+    ) -> Result<(), IndexError> {
+        let (index, bucket) = (Arc::clone(&self.index), bucket.clone());
+        self.pool
+            .run(move || index.set_import_ranges(&bucket, import.as_ref()))
+            .await?
     }
 
     /// The open shards, in order.
@@ -144,11 +322,16 @@ impl<D: Disk> ShardSet<D> {
 
     /// Closes every open shard ([`Shard::close`]): each stops once the
     /// records it sequenced are applied, so nothing is in flight when the
-    /// node checkpoints and exits. The shards stay in the set, closed.
+    /// node checkpoints and exits, or, on a replicated shard, once its
+    /// [`AckTimeout`](crate::AckTimeout) gave up on its members. The shards
+    /// stay in the set, closed. The shards close concurrently, so the whole
+    /// call waits about one acknowledgement timeout, not one per shard
+    /// whose members are gone, and returns once every shard is closed.
     ///
     /// # Errors
     ///
-    /// The first shard's error; every shard is closed regardless.
+    /// The error of the first shard, in shard order, that failed to close;
+    /// every shard is closed regardless.
     pub async fn close_all(&self) -> Result<(), ShardError> {
         let open: Vec<_> = self
             .shards
@@ -160,15 +343,23 @@ impl<D: Disk> ShardSet<D> {
                 Slot::Removing(_) => None,
             })
             .collect();
-        let mut result = Ok(());
-        for shard in open {
-            if let Err(error) = shard.close().await
-                && result.is_ok()
-            {
-                result = Err(error);
+        let mut closing = JoinSet::new();
+        for (n, shard) in open.into_iter().enumerate() {
+            closing.spawn(async move { (n, shard.close().await) });
+        }
+        let mut errors = BTreeMap::new();
+        while let Some(closed) = closing.join_next().await {
+            match closed {
+                Ok((n, Err(error))) => {
+                    errors.insert(n, error);
+                }
+                Ok((_, Ok(()))) => {}
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                // Only the runtime shutting down cancels a close.
+                Err(_) => {}
             }
         }
-        result
+        errors.into_values().next().map_or(Ok(()), Err)
     }
 
     /// Seals `shard`; see [`Shard::seal`].

@@ -39,6 +39,7 @@ prometheus-client = "0.25.1"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
 quick-xml = { version = "0.42.0", default-features = false }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "0.9.5"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
@@ -55,6 +56,7 @@ sha2 = { version = "0.11.0", default-features = false }
 skys3 = { path = "crates/skys3" }
 skys3-config = { path = "crates/skys3-config" }
 skys3-control = { path = "crates/skys3-control" }
+skys3-coord = { path = "crates/skys3-coord" }
 skys3-flush = { path = "crates/skys3-flush" }
 skys3-gateway = { path = "crates/skys3-gateway" }
 skys3-index = { path = "crates/skys3-index" }
@@ -62,6 +64,7 @@ skys3-io = { path = "crates/skys3-io" }
 skys3-log = { path = "crates/skys3-log" }
 skys3-net = { path = "crates/skys3-net" }
 skys3-obs = { path = "crates/skys3-obs" }
+skys3-peer = { path = "crates/skys3-peer" }
 skys3-remote = { path = "crates/skys3-remote" }
 skys3-shard = { path = "crates/skys3-shard" }
 skys3-sim = { path = "crates/skys3-sim" }

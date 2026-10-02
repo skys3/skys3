@@ -8,9 +8,58 @@
 //!   while the control store is unreachable.
 //! - [`harness`]: the harness itself: replay of a seed, the checkers
 //!   catching seeded bugs, invariants, and node services.
+//! - [`replication`]: shards with three members, under crashes, power
+//!   loss, partitions, and message loss.
+//! - [`leases`]: reads under leases, with partitions and clock drift within
+//!   and beyond the bound `ρ`.
+//! - [`acks`]: writes that time out while a member is cut off, in both
+//!   acknowledgement timeout modes.
+//! - [`coordinator`]: the coordinator lease, with a node that wrongly
+//!   believes it is coordinator and with a coordinator cut off from the
+//!   control store, and pushes of every change.
+//! - [`removal`]: primaries removing a member that stops responding, in
+//!   both modes, without the control store, and across a restart.
+//! - [`routing`]: gateways on every node with stale shard maps, routing
+//!   each request to its primary under crashes and partitions.
+//! - [`takeover`]: members taking over from a primary that crashed, with
+//!   competing candidates, partitions, crashes during reconciliation, and
+//!   a single survivor.
+//! - [`handoff`]: primaries handing their shards off to members while
+//!   gateways with stale shard maps read through them, with lost
+//!   step-downs, crashes, and drift.
+//! - [`learners`]: learners added to every shard and promoted to member
+//!   while writes go on, under slow and faulty control stores, crashes,
+//!   and partitions, with rule R3 checked after every step.
+//! - [`backfill`]: learners that get a snapshot or keep a verified log,
+//!   backfill their payload, and are promoted, with the durability windows
+//!   of a member loss measured.
+//! - [`replacement`]: the coordinator replacing every member a lost node
+//!   held, and forgetting the node once no shard names it.
+//! - [`registry`]: nodes that join with nothing but their credentials, and
+//!   a coordinator that forgets a silent node only once no shard names it.
+//! - [`restart`]: a whole-cluster restart while the control store is
+//!   unreachable, with shards whose membership changed while a node was
+//!   down: unchanged shards serve again, stale configurations stay fenced.
+//! - [`buckets`]: buckets created through a gateway, with their shards
+//!   placed on the registered nodes, serving reads and writes through
+//!   every node.
 
+mod acks;
+mod backfill;
+mod buckets;
+mod coordinator;
 mod crash;
+mod handoff;
 mod harness;
+mod learners;
+mod leases;
+mod registry;
+mod removal;
+mod replacement;
+mod replication;
+mod restart;
+mod routing;
+mod takeover;
 mod workload;
 
 /// What one seed of a cluster scenario costs, in seeds of a typical

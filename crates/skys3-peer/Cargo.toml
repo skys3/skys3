@@ -1,0 +1,34 @@
+[package]
+name = "skys3-peer"
+description = "SkyS3 native peer protocol between clusters: messages, framing, negotiation, and the QUIC endpoint and connection pool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32c.workspace = true
+prost.workspace = true
+quinn.workspace = true
+rustls = { workspace = true, features = ["aws_lc_rs", "std"] }
+rustls-webpki.workspace = true
+skys3-config.workspace = true
+skys3-log.workspace = true
+skys3-net.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+proptest.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

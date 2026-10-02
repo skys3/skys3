@@ -282,6 +282,10 @@ impl ObjectStore for AwsS3 {
                         .to_owned(),
                     etag: parse_etag(OP, object.e_tag())?,
                     size: size(OP, object.size())?,
+                    last_modified_ms: last_modified(object.last_modified()),
+                    storage_class: object
+                        .storage_class()
+                        .map(|class| class.as_str().to_owned()),
                 })
             })
             .collect::<S3Result<_>>()?;

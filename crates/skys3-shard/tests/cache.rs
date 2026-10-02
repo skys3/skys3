@@ -225,6 +225,44 @@ fn a_shard_fills_and_evicts_its_entries() {
 }
 
 #[test]
+fn only_the_serving_primary_fills() {
+    runtime().block_on(async {
+        let node = |n: u8| format!("node-{n}").parse::<skys3_types::NodeId>().unwrap();
+        let replicated = skys3_types::ShardConfig {
+            members: vec![node(1), node(2), node(3)],
+            replicas: 3,
+            ..support::config(&shard(0), 1)
+        };
+        let filled = Payload::Extents(vec![ExtentRef {
+            position: at(2),
+            len: 5,
+        }]);
+        for (n, primary) in [(2, false), (1, true)] {
+            let disk = SimDisk::new(3);
+            let log = open_log(disk.mount()).await;
+            let index =
+                Arc::new(Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap());
+            let replica = Shard::open_replica(&replicated, &node(n), log, index, pool())
+                .await
+                .unwrap();
+            // A member never sequenced the extents; a primary that has not
+            // reconciled its members does not serve yet.
+            let refused = replica.fill("k", at(1), filled.clone()).await;
+            if primary {
+                assert!(matches!(refused, Err(ShardError::Unavailable { .. })));
+            } else {
+                assert!(matches!(refused, Err(ShardError::NotPrimary { .. })));
+            }
+            // Any running replica may drop a payload of its own.
+            assert_eq!(
+                replica.evict("k", at(1)).await.unwrap(),
+                Err(CacheRefusal::NoEntry)
+            );
+        }
+    });
+}
+
+#[test]
 fn refusals_describe_themselves() {
     assert_eq!(
         CacheRefusal::VersionChanged {

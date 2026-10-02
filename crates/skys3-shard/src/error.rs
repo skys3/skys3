@@ -1,6 +1,7 @@
 //! The shard runtime's error type.
 
 use skys3_log::ShardRef;
+use skys3_types::{Epoch, EpochSeq, NodeId};
 
 /// Why a shard request failed.
 ///
@@ -36,6 +37,49 @@ pub enum ShardError {
         /// Why.
         reason: String,
     },
+    /// This replica is a member, not the shard's primary, so it serves no
+    /// client request (§5.1, step 1). The primary and epoch it knows are a
+    /// redirect hint.
+    #[error("shard {shard} is served by its primary {primary} in epoch {epoch}")]
+    NotPrimary {
+        /// The shard.
+        shard: ShardRef,
+        /// The primary this replica knows.
+        primary: NodeId,
+        /// The epoch of the configuration that names it.
+        epoch: Epoch,
+    },
+    /// A replicated shard did not acknowledge the write within its
+    /// [`AckTimeout`](crate::AckTimeout), or refused it at once because an
+    /// earlier write is late in fail-fast mode (§5.2). Clients get `503
+    /// SlowDown`. A write that timed out keeps its position and may still
+    /// be applied, but never over a write sequenced after it.
+    #[error("shard {shard} did not acknowledge the write: {reason}")]
+    NotAcknowledged {
+        /// The shard.
+        shard: ShardRef,
+        /// The position the write's record took, if it got one: the record
+        /// may still commit there.
+        position: Option<EpochSeq>,
+        /// Why.
+        reason: String,
+    },
+    /// The shard has fewer members, and so fewer acknowledging copies, than
+    /// its `min_write_replicas`, after members were removed (§6.4). It
+    /// stays readable and refuses client writes until learners bring the
+    /// copies back. Clients get `503 SlowDown`.
+    #[error(
+        "shard {shard} has {copies} acknowledging copies, fewer than its min_write_replicas \
+         ({min_write_replicas})"
+    )]
+    UnderReplicated {
+        /// The shard.
+        shard: ShardRef,
+        /// The members that acknowledge every write, the primary included.
+        copies: usize,
+        /// The fewest copies a write must reach.
+        min_write_replicas: u8,
+    },
     /// The shard stopped: its disk is out of service, its index failed, or
     /// it was removed. Nothing is acknowledged on it until the node reopens
     /// it, after replaying its log.
@@ -53,6 +97,31 @@ impl ShardError {
         Self::Unavailable {
             shard: shard.clone(),
             reason: reason.to_string(),
+        }
+    }
+
+    pub(crate) fn not_acknowledged(shard: &ShardRef, reason: impl ToString) -> Self {
+        Self::NotAcknowledged {
+            shard: shard.clone(),
+            position: None,
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Names `at` as the position of the write that was not acknowledged,
+    /// unless the error names one already or is another error.
+    pub(crate) fn sequenced_at(self, at: EpochSeq) -> Self {
+        match self {
+            Self::NotAcknowledged {
+                shard,
+                position: None,
+                reason,
+            } => Self::NotAcknowledged {
+                shard,
+                position: Some(at),
+                reason,
+            },
+            other => other,
         }
     }
 

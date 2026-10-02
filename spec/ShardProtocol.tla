@@ -87,6 +87,9 @@ BugNames == {
     \* The primary stops waiting for a learner whose promotion CAS it has
     \* issued but whose outcome it does not know.
     "drop_promoting_learner",
+    \* The primary takes a failed or unanswered promotion CAS as lost and
+    \* stops waiting for the learner without reading the register.
+    "abandon_unsettled_promotion",
     \* The primary serves reads during a promotion without a lease from the
     \* learner being promoted.
     "promotion_without_learner_lease",
@@ -529,10 +532,16 @@ DropLearner(p, l) ==
     /\ UNCHANGED <<regVars, nodeVars, ackd, promoting, timeVars, envVars,
                    historyVars>>
 
-(* R3: the primary promotes a learner by CAS once the learner is in the  *)
+(* The configuration that promotes l over p's.                           *)
+Promotion(p, l) ==
+    [conf[p] EXCEPT !.epoch = @ + 1, !.members = @ \cup {l},
+                    !.learners = @ \ {l}]
+
+(* R3: the primary promotes a learner once the learner is in the         *)
 (* acknowledgement set, has finished backfill, and is durable up to the  *)
-(* commit watermark. It records the proposal durably first, and keeps    *)
-(* waiting for the learner and requiring its lease until it adopts a     *)
+(* commit watermark. It records the proposal durably first (here), then  *)
+(* sends the CAS (SendPromotion). From the record on, it keeps waiting   *)
+(* for the learner and requiring its lease until it adopts a              *)
 (* configuration at or past the proposed epoch. Commits do not pause.    *)
 Promote(p, l) ==
     /\ pstate[p] = "serving" /\ conf[p].primary = p
@@ -540,12 +549,31 @@ Promote(p, l) ==
     /\ l \in conf[p].learners \cap ackSet[p]
     /\ \/ Bug = "promote_before_watermark"
        \/ NoHoles(log[l]) /\ Len(log[l]) >= commit[p]
-    /\ LET old == conf[p]
-           new == [old EXCEPT !.epoch = @ + 1, !.members = @ \cup {l},
-                              !.learners = @ \ {l}]
-       IN /\ CAS(old.epoch, new)
-          /\ promoting' = [promoting EXCEPT ![p] = [node |-> l, epoch |-> new.epoch]]
-    /\ UNCHANGED <<nodeVars, synced, ackd, ackSet, timeVars, envVars,
+    /\ conf[p].epoch < MaxEpoch
+    /\ promoting' = [promoting EXCEPT ![p] =
+                        [node |-> l, epoch |-> conf[p].epoch + 1]]
+    /\ UNCHANGED <<regVars, nodeVars, synced, ackd, ackSet, timeVars, envVars,
+                   historyVars>>
+
+(* The CAS of the promotion p recorded, sent again after a failed request *)
+(* or a restart. It fails, and is not enabled, once the register has      *)
+(* moved past p's epoch: the primary then re-reads the register (Adopt)  *)
+(* and stops waiting only on adopting a configuration at or past the     *)
+(* proposed epoch. One whose answer is lost is a SendPromotion followed  *)
+(* later by that Adopt.                                                    *)
+SendPromotion(p) ==
+    /\ IsPrimary(p) /\ pstate[p] # "steppedDown"
+    /\ promoting[p].epoch = conf[p].epoch + 1
+    /\ CAS(conf[p].epoch, Promotion(p, promoting[p].node))
+    /\ UNCHANGED <<nodeVars, primaryVars, timeVars, envVars, historyVars>>
+
+(* Seeded bug: the primary takes a failed or unanswered promotion CAS as  *)
+(* lost and stops waiting for the learner without reading the register.  *)
+AbandonPromotion(p) ==
+    /\ Bug = "abandon_unsettled_promotion"
+    /\ promoting[p].epoch > 0
+    /\ promoting' = [promoting EXCEPT ![p] = NoPromotion]
+    /\ UNCHANGED <<regVars, nodeVars, synced, ackd, ackSet, timeVars, envVars,
                    historyVars>>
 
 -----------------------------------------------------------------------------
@@ -589,6 +617,8 @@ Next ==
         \/ Restart(n)
         \/ RemoveMember(n)
         \/ AddLearner(n)
+        \/ SendPromotion(n)
+        \/ AbandonPromotion(n)
     \/ \E p, m \in Nodes :
         \/ Replicate(p, m)
         \/ Sync(p, m)

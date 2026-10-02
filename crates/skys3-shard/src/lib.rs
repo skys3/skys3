@@ -24,7 +24,11 @@
 //!   ([`Shard::evict`]).
 //!
 //! Replication (M2) runs the same state machine on every member; only the
-//! commit rule changes.
+//! commit rule changes, and a primary serves reads only while every member
+//! grants it a lease ([`Grace`] is a member's side of that, §5.4). An
+//! [`AckTimeout`] bounds how long a replicated shard waits for its members
+//! (§5.2), and a primary removes a member that stops responding by a
+//! compare-and-swap of the shard's register ([`replication`], §6.4).
 //!
 //! ```
 //! use skys3_index::{Index, IndexConfig};
@@ -50,16 +54,24 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod ack;
 pub mod cache;
 mod error;
+mod leader;
+mod lease;
+pub mod lineage;
 mod machine;
 mod multipart;
 mod pipeline;
+pub mod replication;
 mod set;
 mod shard;
 
+pub use ack::{AckMode, AckTimeout};
 pub use cache::CacheRefusal;
 pub use error::ShardError;
+pub use leader::{Leader, Outgoing, Pending};
+pub use lease::Grace;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
 pub use set::ShardSet;
-pub use shard::{Change, Committed, Shard, ShardSummary};
+pub use shard::{Change, Committed, Role, Shard, ShardSummary};

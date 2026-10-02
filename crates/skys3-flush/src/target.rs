@@ -28,8 +28,8 @@ type Orphans = VecDeque<(String, UploadId)>;
 /// A key the import has passed is in the index exactly as the remote held
 /// it, so a key without a remote ETag is absent there. Before the import
 /// passes a key, its remote state is unknown, and a tombstone must stay in
-/// the index (§4.2). The import (plan M1-18) implements this; until a
-/// bucket has one, [`ImportDone`] says every key is passed.
+/// the index (§4.2). A bucket's import ([`ImportState`](crate::ImportState))
+/// implements it; [`ImportDone`] says every key is passed.
 pub trait ImportProgress: Send + Sync + 'static {
     /// Whether the import has passed `key`.
     fn passed(&self, key: &str) -> bool;
@@ -57,6 +57,17 @@ pub struct FlushSettings {
     /// target hold in memory for requests at once. A larger object takes
     /// the whole budget.
     pub max_inflight_bytes: u64,
+    /// `import_max_keys_per_second`: the most remote keys a bucket's
+    /// namespace import lists a second (§9.1).
+    pub import_keys_per_second: u64,
+    /// The most keys one listing request of the import asks for, at most
+    /// S3's 1,000 ([`IMPORT_PAGE_KEYS`](crate::IMPORT_PAGE_KEYS)): each
+    /// page ends with a checkpoint.
+    pub import_page_keys: u32,
+    /// The listing streams of a bucket's import, unless the service has
+    /// the bucket's `import_parallel_streams`
+    /// ([`FlushService::with_buckets`](crate::FlushService::with_buckets)).
+    pub import_streams: usize,
     /// The first delay before a key is retried after a failure.
     pub min_backoff: Duration,
     /// The longest delay between retries of a key; delays double up to it.
@@ -75,6 +86,7 @@ impl FlushSettings {
                 .unwrap_or(usize::MAX)
                 .max(1),
             max_inflight_bytes: config.flush_max_inflight_bytes_per_target,
+            import_keys_per_second: config.import_max_keys_per_second,
             ..Self::default()
         }
     }
@@ -94,6 +106,9 @@ impl Default for FlushSettings {
         Self {
             concurrency: 4,
             max_inflight_bytes: 1 << 30,
+            import_keys_per_second: FlushConfig::default().import_max_keys_per_second,
+            import_page_keys: crate::IMPORT_PAGE_KEYS,
+            import_streams: 1,
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
             extent_bytes: 1 << 20,

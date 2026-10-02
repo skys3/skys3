@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::fmt;
 
 use skys3_index::{Applier, Entry, EntryState, IndexError, IndexWriter, ObjectVersion, Payload};
-use skys3_log::record::{Adopt, Delete, Flushed, Import, Put, PutData, Tags};
+use skys3_log::record::{Adopt, Delete, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags};
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
 use skys3_types::{EpochSeq, Seq};
 
@@ -68,8 +68,9 @@ pub enum Effect {
     Cleaned,
     /// A `FLUSHED` of the current version, a tombstone, removed the entry.
     Removed,
-    /// A `FLUSHED` of an older version recorded what the remote now holds,
-    /// leaving the newer version dirty.
+    /// A `FLUSHED` of an older version, or an `IMPORT` of a key written
+    /// before the import reached it, recorded what the remote holds,
+    /// leaving the entry dirty.
     RemoteRecorded,
     /// An `IMPORT` created a stub.
     Imported,
@@ -101,8 +102,9 @@ pub enum Rejection {
     /// The key's entry is a tombstone.
     #[error("the key is deleted")]
     Deleted,
-    /// An `IMPORT` found an entry: a local change, a tombstone, or an
-    /// earlier import.
+    /// An `IMPORT` found an entry other than a local change whose remote
+    /// state is unknown: an earlier import, or an entry whose remote ETag
+    /// is known.
     #[error("the key already has an entry")]
     HasEntry,
     /// An `ADOPT` found the entry no longer clean: a local write committed
@@ -203,9 +205,14 @@ impl StateMachine {
             RecordBody::Flushed(flushed) => flush(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
-            // A replica's own bookkeeping: the configuration it adopted, or
-            // where reconciliation cut its log (§6.6, M2-12).
-            RecordBody::Config(_) | RecordBody::Truncate => Ok(Effect::Unchanged),
+            // A replica's own bookkeeping: the configuration it adopted,
+            // which the index keeps as the replica's local copy of it
+            // (§6.2), or where reconciliation cut its log (§6.6).
+            RecordBody::Config(config) => {
+                index.put_config(config)?;
+                Ok(Effect::Unchanged)
+            }
+            RecordBody::Truncate => Ok(Effect::Unchanged),
             other => Err(Rejection::Unsupported(other.kind())),
         };
         Ok(match rule {
@@ -341,7 +348,8 @@ pub(crate) fn store(
 /// `TAGS`: replaces a live object's tags as a new version, which the
 /// flusher must send to the remote. The new version keeps the object's
 /// bytes and `Last-Modified`, and its write identity names the `TAGS`
-/// record.
+/// record: an identity the object carried from another cluster (§7.8) is
+/// dropped with its metadata entry.
 fn set_tags(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -357,6 +365,7 @@ fn set_tags(
     };
     object.tags.clone_from(&tags.tags);
     object.write_identity = None;
+    object.metadata.remove(IDENTITY_METADATA);
     entry.version = position;
     entry.state = state;
     index.put_entry(shard, &tags.key, &entry)?;
@@ -417,14 +426,27 @@ fn flush(
 
 /// `IMPORT`: a stub for a remote object, only if the key has no entry at
 /// all (§9.1). Its user metadata and content type are loaded later.
+///
+/// A key written locally before the import reached it has an entry whose
+/// remote state is unknown: dirty, with no remote ETag. The `IMPORT` then
+/// records what the remote held instead, as its remote ETag, so the
+/// flush replaces that object with `If-Match` (§7.2) rather than finding
+/// it foreign. Every other entry rejects it.
 fn import_stub(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
     position: EpochSeq,
     import: &Import,
 ) -> Result<Rule, IndexError> {
-    if index.entry(shard, &import.key)?.is_some() {
-        return Ok(Err(Rejection::HasEntry));
+    if let Some(mut entry) = index.entry(shard, &import.key)? {
+        let unknown = matches!(entry.state, EntryState::Dirty | EntryState::Conflict)
+            && entry.remote_etag.is_none();
+        if !unknown {
+            return Ok(Err(Rejection::HasEntry));
+        }
+        entry.remote_etag = Some(import.etag.clone());
+        index.put_entry(shard, &import.key, &entry)?;
+        return Ok(Ok(Effect::RemoteRecorded));
     }
     let entry = Entry {
         version: position,

@@ -9,12 +9,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_config::StorageConfig;
 use skys3_index::{
-    Applier, ControlEntry, Entry, EntryState, Index, IndexConfig, IndexError, IndexWriter, LogState,
+    Applier, ControlEntry, Entry, EntryState, FORMAT_VERSION, ImportCheckpoint, ImportRanges,
+    Index, IndexConfig, IndexError, IndexWriter, LogState, ShardTable, codec,
 };
 use skys3_io::{SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_log::record::{Delete, RecordBody};
 use skys3_log::{LogRecord, RecordLocation, SegmentId};
-use skys3_types::{Epoch, EpochSeq, Generation, Seq};
+use skys3_types::{
+    BucketId, Epoch, EpochSeq, Generation, NodeId, ProposalId, RegisterDocument, Seq, ShardConfig,
+    ShardId,
+};
 use support::{
     TestApplier, Workload, apply, disk_label, disk_label_of, index_config, log_of, open_node,
     open_node_on, pool, runtime, shard,
@@ -126,7 +130,7 @@ fn rejects_an_index_of_another_format() {
         {
             let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
             let mut table = txn.open_table(meta).unwrap();
-            table.insert("format_version", 3).unwrap();
+            table.insert("format_version", FORMAT_VERSION + 1).unwrap();
         }
         txn.commit().unwrap();
     }
@@ -135,9 +139,9 @@ fn rejects_an_index_of_another_format() {
         matches!(
             error,
             IndexError::UnsupportedFormat {
-                found: 3,
-                supported: 2
-            }
+                found,
+                supported: FORMAT_VERSION
+            } if found == FORMAT_VERSION + 1
         ),
         "{error}"
     );
@@ -147,6 +151,44 @@ fn rejects_an_index_of_another_format() {
     )
     .unwrap_err();
     assert!(matches!(error, IndexError::Io(_)), "{error}");
+}
+
+#[test]
+fn import_checkpoints_are_durable_and_an_older_index_gets_their_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.redb");
+    // A version 2 index, from before the imports table.
+    {
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
+            txn.open_table(meta)
+                .unwrap()
+                .insert("format_version", 2)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let bucket = BucketId::new("b-import").unwrap();
+    let running = ImportRanges::from(ImportCheckpoint::Running {
+        after: Some("photos/cat.jpg".to_owned()),
+    });
+    {
+        let index = Index::open(&path, &IndexConfig::default()).unwrap();
+        assert_eq!(index.import_ranges(&bucket).unwrap(), None);
+        index.set_import_ranges(&bucket, Some(&running)).unwrap();
+    }
+    let index = Index::open(&path, &IndexConfig::default()).unwrap();
+    assert_eq!(index.import_ranges(&bucket).unwrap(), Some(running));
+    let split = ImportRanges::split(None, ["m".to_owned(), "t".to_owned()]);
+    index.set_import_ranges(&bucket, Some(&split)).unwrap();
+    assert_eq!(index.import_ranges(&bucket).unwrap(), Some(split));
+    let done = ImportRanges::from(ImportCheckpoint::Done);
+    index.set_import_ranges(&bucket, Some(&done)).unwrap();
+    assert_eq!(index.import_ranges(&bucket).unwrap(), Some(done));
+    index.set_import_ranges(&bucket, None).unwrap();
+    assert_eq!(index.import_ranges(&bucket).unwrap(), None);
 }
 
 #[test]
@@ -305,6 +347,195 @@ fn control_state_is_durable_at_once() {
         read.control_synced_at().unwrap(),
         Some(std::time::Duration::from_millis(1_234_567))
     );
+}
+
+fn route(shard_no: u8, epoch: u64) -> ShardConfig {
+    let node: NodeId = "node-1".parse().unwrap();
+    ShardConfig {
+        bucket_id: shard(shard_no).bucket,
+        shard: ShardId::new(shard_no),
+        epoch: Epoch::new(epoch),
+        primary: node.clone(),
+        members: vec![node],
+        learners: Vec::new(),
+        min_write_replicas: 1,
+        replicas: 1,
+        proposal_id: ProposalId::new("p").unwrap(),
+    }
+}
+
+#[test]
+fn the_shard_map_is_durable_at_once() {
+    let disk = SimDisk::new(1);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    index.store_route(&route(0, 1)).unwrap();
+    index.store_route(&route(0, 2)).unwrap();
+    index.store_route(&route(1, 1)).unwrap();
+    index.forget_route(&shard(1)).unwrap();
+    index.forget_route(&shard(2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let map = index.read().unwrap().shard_map().unwrap();
+    assert_eq!(map, BTreeMap::from([(shard(0), route(0, 2))]));
+
+    let encoded = codec::encode_route(&route(3, 9)).unwrap();
+    assert_eq!(codec::decode_route(&encoded).unwrap(), route(3, 9));
+    let mut damaged = encoded;
+    damaged.pop();
+    assert!(codec::decode_route(&damaged).is_err());
+    let mut wrong = codec::encode_route(&route(3, 9)).unwrap();
+    let json_start = wrong.len() - route(3, 9).to_json().unwrap().len();
+    wrong[json_start] = b'[';
+    let error = codec::decode_route(&wrong).unwrap_err();
+    assert_eq!(error.field(), "shard_map.config");
+}
+
+#[test]
+fn step_downs_are_durable_at_once_and_go_with_their_shard() {
+    let disk = SimDisk::new(2);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    assert_eq!(index.read().unwrap().step_down(&shard(0)).unwrap(), None);
+    index.store_step_down(&shard(0), Epoch::new(3)).unwrap();
+    index.store_step_down(&shard(0), Epoch::new(4)).unwrap();
+    index.store_step_down(&shard(1), Epoch::new(2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.step_down(&shard(0)).unwrap(), Some(Epoch::new(4)));
+    assert_eq!(read.step_down(&shard(1)).unwrap(), Some(Epoch::new(2)));
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().step_down(&shard(1)).unwrap(), None);
+}
+
+#[test]
+fn promotions_are_durable_at_once_and_go_with_their_shard() {
+    let disk = SimDisk::new(3);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    assert_eq!(index.read().unwrap().promotion(&shard(0)).unwrap(), None);
+    index.store_promotion(&route(0, 3)).unwrap();
+    index.store_promotion(&route(0, 4)).unwrap();
+    index.store_promotion(&route(1, 2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.promotion(&shard(0)).unwrap(), Some(route(0, 4)));
+    assert_eq!(read.promotion(&shard(1)).unwrap(), Some(route(1, 2)));
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().promotion(&shard(1)).unwrap(), None);
+}
+
+#[test]
+fn takeovers_are_durable_at_once_and_go_with_their_shard() {
+    let disk = SimDisk::new(4);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    assert_eq!(index.read().unwrap().takeover(&shard(0)).unwrap(), None);
+    index.store_takeover(&route(0, 3)).unwrap();
+    index.store_takeover(&route(0, 4)).unwrap();
+    index.store_takeover(&route(1, 2)).unwrap();
+    index.store_takeover(&route(2, 2)).unwrap();
+    index.forget_takeover(&shard(2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.takeover(&shard(0)).unwrap(), Some(route(0, 4)));
+    assert_eq!(read.takeover(&shard(1)).unwrap(), Some(route(1, 2)));
+    assert_eq!(read.takeover(&shard(2)).unwrap(), None);
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().takeover(&shard(1)).unwrap(), None);
+}
+
+/// An applier that keeps the configuration of every `CONFIG` record, as
+/// the shard state machine does.
+struct ConfigApplier;
+
+impl Applier for ConfigApplier {
+    fn apply(
+        &self,
+        index: &mut IndexWriter<'_>,
+        record: &LogRecord,
+        _: RecordLocation,
+    ) -> Result<(), IndexError> {
+        match &record.body {
+            RecordBody::Config(config) => index.put_config(config),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[test]
+fn kept_configurations_follow_the_applied_records_and_go_with_their_shard() {
+    let disk = SimDisk::new(5);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let config = |shard_no: u8, epoch: u64, seq: u64| {
+        let record = LogRecord {
+            shard: shard(shard_no),
+            position: EpochSeq::new(Epoch::new(epoch), Seq::new(seq)),
+            body: RecordBody::Config(route(shard_no, epoch)),
+        };
+        (record, delete(shard_no, seq, "k").1)
+    };
+    assert!(index.read().unwrap().configs().unwrap().is_empty());
+    index
+        .apply(&ConfigApplier, &[config(0, 1, 1), config(1, 1, 1)])
+        .unwrap();
+    index.apply(&ConfigApplier, &[config(0, 2, 5)]).unwrap();
+    // A record applied already changes nothing.
+    index.apply(&ConfigApplier, &[config(0, 1, 1)]).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.config(&shard(0)).unwrap(), Some(route(0, 2)));
+    let kept = read.configs().unwrap();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[&shard(1)], route(1, 1));
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().config(&shard(1)).unwrap(), None);
+    // A snapshot install drops it until it finishes.
+    let marker = EpochSeq::new(Epoch::new(3), Seq::MAX);
+    index.begin_install(&shard(0), marker).unwrap();
+    assert_eq!(index.read().unwrap().config(&shard(0)).unwrap(), None);
+    let position = EpochSeq::new(Epoch::new(3), Seq::new(9));
+    index.finish_install(&route(0, 3), position).unwrap();
+    assert_eq!(
+        index.read().unwrap().config(&shard(0)).unwrap(),
+        Some(route(0, 3))
+    );
+}
+
+#[test]
+fn an_index_from_before_the_shard_map_gains_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.redb");
+    {
+        // An index of the current format, written before the shard map.
+        let index = Index::open(&path, &IndexConfig::default()).unwrap();
+        index.apply(&TestApplier, &[delete(0, 1, "a")]).unwrap();
+        index.checkpoint(&BTreeMap::new()).unwrap();
+        drop(index);
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        let map: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("shard_map");
+        assert!(txn.delete_table(map).unwrap());
+        txn.commit().unwrap();
+    }
+    let index = Index::open(&path, &IndexConfig::default()).unwrap();
+    assert!(index.read().unwrap().shard_map().unwrap().is_empty());
+    assert_eq!(
+        index.read().unwrap().entry(&shard(0), "a").unwrap(),
+        Some(tombstone(1))
+    );
+    index.store_route(&route(0, 1)).unwrap();
+    assert_eq!(index.read().unwrap().shard_map().unwrap().len(), 1);
 }
 
 #[test]
@@ -491,6 +722,61 @@ fn replay_orders_a_shards_records_across_disks() {
     });
 }
 
+/// A member reconciled with a new primary (§6.6): it truncated two
+/// records of epoch 2 past seq 1, then took the primary's records from
+/// seq 2 on, of epoch 3 and later. Replay applies the valid ones in
+/// position order, and neither the truncated records nor the `TRUNCATE`,
+/// whose position is past records it keeps valid.
+#[test]
+fn replay_skips_what_a_truncate_invalidates() {
+    runtime().block_on(async {
+        let disk = SimDisk::new(8);
+        let pool = pool();
+        let node = open_node(&disk.mount(), &pool).await;
+        let at = |epoch: u64, seq: u64| EpochSeq::new(Epoch::new(epoch), Seq::new(seq));
+        let record = |position: EpochSeq, body: RecordBody| LogRecord {
+            shard: shard(0),
+            position,
+            body,
+        };
+        let delete =
+            |position, key: &str| record(position, RecordBody::Delete(Delete { key: key.into() }));
+        let log = log_of(&node);
+        for written in [
+            delete(at(1, 1), "kept"),
+            delete(at(2, 2), "truncated-2"),
+            delete(at(2, 3), "truncated-3"),
+            record(at(3, 1), RecordBody::Truncate),
+            delete(at(3, 2), "taken-2"),
+            delete(at(4, 3), "taken-3"),
+            // Another shard's records are not its business.
+            LogRecord {
+                shard: shard(1),
+                ..delete(at(2, 2), "other")
+            },
+        ] {
+            log.append(&written).await.unwrap();
+        }
+        disk.crash();
+        drop(node);
+
+        let node = open_node(&disk.mount(), &pool).await;
+        let report = node.replay(Arc::new(TestApplier)).await.unwrap();
+        // Three records of shard 0, the TRUNCATE, and the other shard's.
+        assert_eq!(report.applied, 5);
+        let reader = node.index().read().unwrap();
+        let keys: Vec<String> = reader
+            .entries(&shard(0), None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, ["kept", "taken-2", "taken-3"]);
+        assert_eq!(reader.applied(&shard(0)).unwrap(), Some(at(4, 3)));
+        assert!(reader.entry(&shard(1), "other").unwrap().is_some());
+    });
+}
+
 /// redb's magic number, which a complete database file begins with.
 const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
 
@@ -547,4 +833,94 @@ fn a_real_file_without_its_magic_number_is_created_again() {
     let error = Index::open(&path, &IndexConfig::default()).unwrap_err();
     assert!(error.to_string().contains("magic number"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), b"not an index at all");
+}
+
+#[test]
+fn a_snapshot_of_a_shard_installs_in_place_of_another_replicas_state() {
+    let disk = SimDisk::new(17);
+    let primary = Index::open_sim(&disk.mount(), "primary.redb", &index_config()).unwrap();
+    let records: Vec<_> = (1..=6)
+        .map(|seq| delete(0, seq, &format!("k{seq}")))
+        .chain([delete(1, 1, "other")])
+        .collect();
+    primary.apply(&TestApplier, &records).unwrap();
+    let read = primary.read().unwrap();
+    // Pages hold at least one row, then rows up to the byte limit.
+    let first = read
+        .shard_rows(ShardTable::Namespace, &shard(0), None, 1)
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let rest = read
+        .shard_rows(ShardTable::Namespace, &shard(0), Some(&first[0].0), 1 << 20)
+        .unwrap();
+    assert_eq!(rest.len(), 5);
+    let uploads = read.shard_rows(ShardTable::Uploads, &shard(0), None, 1 << 20);
+    assert!(uploads.unwrap().is_empty());
+
+    // A replica that held the shard and another one.
+    let learner = Index::open_sim(&disk.mount(), "learner.redb", &index_config()).unwrap();
+    learner
+        .apply(&TestApplier, &[delete(0, 1, "old"), delete(1, 1, "kept")])
+        .unwrap();
+    let marker = EpochSeq::new(Epoch::new(2), Seq::MAX);
+    learner.begin_install(&shard(0), marker).unwrap();
+    let applied = learner.read().unwrap().applied(&shard(0)).unwrap();
+    assert_eq!(applied, Some(marker));
+    // Rows of another shard, or that do not decode, are refused whole.
+    let foreign = read
+        .shard_rows(ShardTable::Namespace, &shard(1), None, 1 << 20)
+        .unwrap();
+    let refused = learner.install_rows(&shard(0), ShardTable::Namespace, &foreign);
+    assert!(
+        matches!(refused, Err(IndexError::Snapshot(_))),
+        "{refused:?}"
+    );
+    for table in [ShardTable::Uploads, ShardTable::Parts] {
+        let refused = learner.install_rows(&shard(0), table, &first);
+        assert!(
+            matches!(refused, Err(IndexError::Snapshot(_))),
+            "{refused:?}"
+        );
+    }
+    for rows in [&first, &rest] {
+        learner
+            .install_rows(&shard(0), ShardTable::Namespace, rows)
+            .unwrap();
+    }
+    let config = route(0, 2);
+    assert_eq!(learner.read().unwrap().config(&shard(0)).unwrap(), None);
+    learner.finish_install(&config, position(6)).unwrap();
+    assert_eq!(
+        learner.read().unwrap().config(&shard(0)).unwrap(),
+        Some(config)
+    );
+    let location = RecordLocation {
+        segment: SegmentId::new(4),
+        offset: 0,
+        len: 10,
+    };
+    learner
+        .store_locations(&shard(0), &[(position(3), location)])
+        .unwrap();
+
+    let dump = learner.read().unwrap().dump().unwrap();
+    let primary = primary.read().unwrap().dump().unwrap();
+    let of = |dump: &skys3_index::IndexDump, n: u8| -> Vec<Entry> {
+        dump.entries
+            .iter()
+            .filter(|((s, _), _)| *s == shard(n))
+            .map(|(_, entry)| entry.clone())
+            .collect()
+    };
+    assert_eq!(of(&dump, 0), of(&primary, 0));
+    assert_eq!(dump.applied.get(&shard(0)), Some(&position(6)));
+    assert_eq!(
+        dump.locations.get(&(shard(0), position(3))),
+        Some(&location)
+    );
+    // The other shard is untouched.
+    assert_eq!(of(&dump, 1), vec![tombstone(1)]);
+    let parts = ShardTable::Parts;
+    assert_eq!(ShardTable::from_code(parts.code()), Some(parts));
+    assert_eq!(ShardTable::from_code(0), None);
 }

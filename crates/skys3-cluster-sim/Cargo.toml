@@ -25,6 +25,7 @@ skys3.workspace = true
 skys3-config.workspace = true
 # `test-util` for the fault-injecting control store.
 skys3-control = { workspace = true, features = ["test-util"] }
+skys3-coord.workspace = true
 skys3-flush.workspace = true
 # `test-util` for the authenticator that trusts every request.
 skys3-gateway = { workspace = true, features = ["test-util"] }
@@ -34,6 +35,7 @@ skys3-log.workspace = true
 # `turmoil` for the transport over the simulated network.
 skys3-net = { workspace = true, features = ["turmoil"] }
 skys3-obs.workspace = true
+skys3-shard.workspace = true
 skys3-sim.workspace = true
 skys3-types.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }

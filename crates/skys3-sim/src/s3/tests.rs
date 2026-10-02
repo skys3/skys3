@@ -1446,6 +1446,8 @@ async fn listing_rolls_keys_up_by_delimiter() {
             key: "a".into(),
             etag: etag(&md5_hex(b"a")),
             size: 1,
+            last_modified_ms: None,
+            storage_class: None,
         }
     );
 

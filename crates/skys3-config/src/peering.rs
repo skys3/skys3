@@ -1,12 +1,17 @@
 //! `[peering]`: the native QUIC transport between SkyS3 clusters (§7.8).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
+use skys3_types::limits::{MAX_RECORD_PAYLOAD_LEN, MIN_STAGING_CHARGE};
+use skys3_types::{BucketId, BucketName, ClusterId};
 
-use crate::error::Checker;
+use crate::error::{Checker, key_path};
 use crate::storage::{KIB, MIB, TIB};
+use crate::transport::TransportConfig;
 
 /// The congestion controller of peer connections (§7.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
@@ -45,6 +50,41 @@ pub struct PeeringConfig {
     pub peer_staging_quota_bytes: u64,
     /// `peer_staging_ttl_seconds`: when uncommitted staging is discarded.
     pub peer_staging_ttl_seconds: u64,
+    /// `[peering.peers.<cluster-id>]`: the peer clusters this node trusts,
+    /// by cluster ID (§12).
+    pub peers: BTreeMap<ClusterId, PeerConfig>,
+}
+
+/// `[peering.peers.<cluster-id>]`: a peer cluster, its trust bundle, and
+/// the bucket pairs it may write (§12).
+///
+/// Peer connections present the node's own certificate (`[transport]`).
+/// The peer's chain must lead to the peer's own `ca_file`, so a CA that
+/// one peer shares with another cannot vouch for the other's nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    /// `ca_file`: the CA certificates the peer's node certificates lead
+    /// to, in PEM.
+    pub ca_file: PathBuf,
+    /// `buckets`: the pairs the peer may write as a source, from one of its
+    /// buckets into one of this cluster's. Empty for a peer this node only
+    /// sends to.
+    #[serde(default)]
+    pub buckets: Vec<BucketPair>,
+}
+
+/// A source bucket of a peer cluster, and the bucket of this cluster it
+/// replicates into.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketPair {
+    /// `source`: the peer's bucket, by the bucket ID its write identities
+    /// carry (§7.2). A recreated source bucket has a new ID, so its
+    /// predecessor's pair does not authorize it.
+    pub source: BucketId,
+    /// `destination`: this cluster's bucket, by name.
+    pub destination: BucketName,
 }
 
 impl Default for PeeringConfig {
@@ -58,6 +98,7 @@ impl Default for PeeringConfig {
             peer_max_inflight_bytes: 256 * MIB,
             peer_staging_quota_bytes: TIB,
             peer_staging_ttl_seconds: 86_400,
+            peers: BTreeMap::new(),
         }
     }
 }
@@ -72,8 +113,53 @@ crate::durations! {
 }
 
 impl PeeringConfig {
-    pub(crate) fn check(&self, checker: &mut Checker) {
-        checker.nonzero("peering.peer_frame_bytes", self.peer_frame_bytes);
+    pub(crate) fn check(
+        &self,
+        cluster_id: Option<&ClusterId>,
+        transport: &TransportConfig,
+        checker: &mut Checker,
+    ) {
+        self.check_limits(checker);
+        for (cluster, peer) in &self.peers {
+            let table = key_path("peering.peers", cluster.as_str());
+            checker.require(Some(cluster) != cluster_id, &table, || {
+                format!("is this cluster's own ID ({cluster}); a peer is another cluster")
+            });
+            checker.require(transport.tls_files().is_some(), &table, || {
+                "needs the [transport] tls_*_file keys: peer connections present the node's \
+                 certificate"
+                    .to_owned()
+            });
+            checker.require(
+                !peer.ca_file.as_os_str().is_empty(),
+                &format!("{table}.ca_file"),
+                || "must not be empty".to_owned(),
+            );
+            let mut seen = BTreeSet::new();
+            for pair in &peer.buckets {
+                checker.require(seen.insert(pair), &format!("{table}.buckets"), || {
+                    format!(
+                        "lists the pair {} -> {} twice",
+                        pair.source, pair.destination
+                    )
+                });
+            }
+        }
+    }
+
+    fn check_limits(&self, checker: &mut Checker) {
+        // A destination stages each `DATA` frame as one log record (§7.8).
+        let max_frame = u64::from(MAX_RECORD_PAYLOAD_LEN);
+        checker.require(
+            (1..=max_frame).contains(&self.peer_frame_bytes),
+            "peering.peer_frame_bytes",
+            || {
+                format!(
+                    "is {}; it must be from 1 to {max_frame}, the largest log record payload",
+                    self.peer_frame_bytes
+                )
+            },
+        );
         checker.nonzero(
             "peering.peer_connect_timeout_ms",
             self.peer_connect_timeout_ms,
@@ -93,12 +179,15 @@ impl PeeringConfig {
                 )
             },
         );
+        // One staging and one frame, each charged at least the minimum.
+        let least = MIN_STAGING_CHARGE + self.peer_frame_bytes.max(MIN_STAGING_CHARGE);
         checker.require(
-            self.peer_staging_quota_bytes >= self.peer_frame_bytes,
+            self.peer_staging_quota_bytes >= least,
             "peering.peer_staging_quota_bytes",
             || {
                 format!(
-                    "is {}; it must be at least peer_frame_bytes ({})",
+                    "is {}; it must be at least {least}, what one staging and one frame of \
+                     peer_frame_bytes ({}) are charged",
                     self.peer_staging_quota_bytes, self.peer_frame_bytes
                 )
             },

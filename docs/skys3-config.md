@@ -154,6 +154,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. |
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
 | `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
+| `import_max_keys_per_second` | integer | `100000` | Positive. The most remote keys the namespace import of one bucket lists a second (§9.1), so an attach does not crowd out client writes on the shards' logs or exceed the target's request rate. |
 | `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain. |
 
 ## `[ec]`
@@ -180,7 +181,7 @@ Erasure coding of `local` buckets (§8).
 | `replicas` | integer | `3` | From 1 to 255. |
 | `min_write_replicas` | integer | `2` | From 1 to `replicas` (§6.4). |
 | `clean_copies` | integer | `1` | From 0 to `replicas` (§9.3). |
-| `import_parallel_streams` | integer | `32` | Positive (§9.1). |
+| `import_parallel_streams` | integer | `32` | From 1 to 256. Key ranges a new namespace import lists in parallel, each with its own checkpoint; one rate limit, `import_max_keys_per_second`, covers them all (§9.1). |
 | `ec_min_object_bytes` | integer | `4194304` (4 MiB) | Positive (§8.2). |
 | `ec_stripe_data_bytes` | integer | `67108864` (64 MiB) | Positive. |
 | `ec_after_seconds` | integer | `600` | May be 0. |
@@ -197,7 +198,8 @@ Keys allowed only in a `[buckets.<name>]` table:
 | `flush_conflict_policy` | `"hold"`, `"overwrite"`, or `"discard_local"` | `flush.flush_conflict_policy` | §7.2. |
 | `backup_target` | target URL | none | Only for `mode = "local"` (§8.9). |
 | `snapshot_target` | target URL | `backup_target` | Where index snapshots go (§8.9). |
-| `peer_source` | cluster ID | none | The cluster this bucket receives native replication from (§7.8). A valid cluster ID other than this cluster's. |
+| `peer_source` | cluster ID | none | The cluster this bucket receives native replication from (§7.8). A valid cluster ID other than this cluster's, with a `[peering.peers.<cluster-id>]` table. Not for a `read_only` bucket. A `COMMIT` applies only to a bucket whose `peer_source` is its source cluster, and the bucket is read-only to this cluster's own clients: their object writes get `403 AccessDenied`. |
+| `peer_local_writes` | boolean | `false` | Only with `peer_source`. `true` lets this cluster's own clients write the bucket too. Their versions carry this cluster's write identity, so a source `COMMIT` that expects its own fails its precondition (§7.8). |
 
 Rules are reported at the table that sets the offending key, so a bad value in `[buckets.defaults]` is reported once, not again for every bucket that inherits it.
 
@@ -209,12 +211,21 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 |---|---|---|---|
 | `quic_listen` | socket address | `"0.0.0.0:7443"` | |
 | `congestion_control` | `"cubic"`, `"new_reno"`, or `"bbr"` | `"cubic"` | BBR is experimental in Quinn. |
-| `peer_frame_bytes` | integer | `262144` (256 KiB) | Positive. |
+| `peer_frame_bytes` | integer | `262144` (256 KiB) | From 1 to 16777216 (16 MiB). The size of a `DATA` frame and the largest object in a `BATCH`; a destination stages each frame as one log record. |
 | `peer_connect_timeout_ms` | integer | `3000` | Positive. |
 | `peer_connections_per_shard` | integer | `64` | Positive. |
 | `peer_max_inflight_bytes` | integer | `268435456` (256 MiB) | At least `peer_frame_bytes`. |
-| `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least `peer_frame_bytes`. |
+| `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least 64 KiB plus the larger of `peer_frame_bytes` and 64 KiB: one staging and one frame, each charged at least 64 KiB (design §7.8). |
 | `peer_staging_ttl_seconds` | integer | `86400` | Positive. |
+
+### `[peering.peers.<cluster-id>]`
+
+A peer cluster this node trusts, keyed by its cluster ID (§12). Peer connections present the node's own certificate, so a configured peer requires the `[transport]` certificate files. The table's cluster ID must not be this cluster's.
+
+| Key | Type | Default | Rules |
+|---|---|---|---|
+| `ca_file` | path | required | Not empty. The peer's CA bundle in PEM; the peer's node certificates must lead to it and name the peer's cluster in their SPIFFE ID. |
+| `buckets` | array of `{ source, destination }` tables | `[]` | The bucket pairs the peer may write as a source: `source` is the peer's bucket ID, which its write identities carry, and `destination` is this cluster's bucket name. No pair appears twice. Empty for a peer this node only sends to. |
 
 ## `[identity]`
 

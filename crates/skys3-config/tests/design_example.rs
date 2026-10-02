@@ -29,7 +29,7 @@ fn design_example() -> &'static str {
 }
 
 /// The dotted path of every key in `text`, with bucket tables collapsed to
-/// `buckets.<name>`.
+/// `buckets.<name>` and peer tables to `peering.peers.<cluster-id>`.
 fn keys(text: &str) -> BTreeSet<String> {
     fn walk(prefix: &str, table: &toml::Table, out: &mut BTreeSet<String>) {
         for (key, value) in table {
@@ -37,6 +37,8 @@ fn keys(text: &str) -> BTreeSet<String> {
                 key.clone()
             } else if prefix == "buckets" && key != "defaults" {
                 "buckets.<name>".to_owned()
+            } else if prefix == "peering.peers" {
+                "peering.peers.<cluster-id>".to_owned()
             } else {
                 format!("{prefix}.{key}")
             };
@@ -94,6 +96,10 @@ fn the_design_example_loads_unchanged() {
         "skys3-prod-eu"
     );
     assert_eq!(receiver.snapshot_target, None);
+
+    let peer = &config.peering().peers[receiver.peer_source.as_ref().unwrap()];
+    assert_eq!(peer.buckets.len(), 1);
+    assert_eq!(peer.buckets[0].destination.as_str(), "archive-from-eu");
 }
 
 /// The example's values are the defaults, so a configuration with only the
@@ -121,7 +127,11 @@ fn the_defaults_are_the_design_example_values() {
     assert_eq!(minimal.ec(), example.ec());
     assert_eq!(minimal.buckets().defaults, example.buckets().defaults);
     assert!(minimal.buckets().named.is_empty());
-    assert_eq!(minimal.peering(), example.peering());
+    let mut peering = example.peering().clone();
+    // The example's peer cluster has no default.
+    assert_eq!(peering.peers.len(), 1);
+    peering.peers.clear();
+    assert_eq!(minimal.peering(), &peering);
     let mut identity = example.identity().clone();
     // The example's static credential has no default.
     assert!(identity.static_credentials.remove("bootstrap").is_some());
@@ -214,6 +224,7 @@ streaming_flush_min_bytes = 33554432
 flush_part_bytes = 16777216
 flush_conflict_policy = "overwrite"
 max_dirty_bytes = 1099511627776
+import_max_keys_per_second = 5000
 target_region = "auto"
 
 [ec]
@@ -260,6 +271,7 @@ snapshot_target = "https://snapshots.example/snaps/logs/"
 [buckets.mirror]
 backup_target = "https://peer.example/mirror"
 peer_source = "c2"
+peer_local_writes = true
 
 [peering]
 quic_listen = "[::]:8443"
@@ -270,6 +282,10 @@ peer_connections_per_shard = 16
 peer_max_inflight_bytes = 134217728
 peer_staging_quota_bytes = 10737418240
 peer_staging_ttl_seconds = 3600
+
+[peering.peers.c2]
+ca_file = "/etc/skys3/peers/c2.crt"
+buckets = [{ source = "b-91c2", destination = "mirror" }]
 
 [identity]
 anonymous_access = true
@@ -352,6 +368,7 @@ fn every_key_parses_and_is_resolved() {
         "defaults to the backup target"
     );
     assert_eq!(mirror.peer_source.as_ref().unwrap().as_str(), "c2");
+    assert!(mirror.peer_local_writes);
 
     let unnamed = config.buckets().get(&BucketName::new("other").unwrap());
     assert_eq!(unnamed, defaults);

@@ -9,7 +9,7 @@ use std::time::Duration;
 use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
 use skys3_log::RecordLocation;
 use skys3_log::record::ShardRef;
-use skys3_types::{EpochSeq, Generation};
+use skys3_types::{Epoch, EpochSeq, Generation, ShardConfig};
 
 use crate::codec;
 use crate::entry::{ControlEntry, Entry, Part, Upload};
@@ -33,6 +33,36 @@ pub(crate) const PARTS: TableDefinition<Bytes, Bytes> = TableDefinition::new("pa
 pub(crate) const COVERAGE: TableDefinition<Bytes, Bytes> = TableDefinition::new("coverage");
 /// The node's local copy of control state, keyed by register key.
 pub(crate) const CONTROL: TableDefinition<&str, Bytes> = TableDefinition::new("control");
+/// Each bucket's namespace import checkpoint, keyed by bucket ID.
+pub(crate) const IMPORTS: TableDefinition<&str, Bytes> = TableDefinition::new("imports");
+/// The gateway's shard map (§6.2): the newest configuration the node knows
+/// of each shard, keyed by shard. It is a cache that is safe when stale,
+/// so a build that does not know the table loses nothing by ignoring it,
+/// and the table needs no new format version.
+pub(crate) const SHARD_MAP: TableDefinition<Bytes, Bytes> = TableDefinition::new("shard_map");
+/// The epoch in which this node's replica of each shard stepped down as
+/// primary for a planned handoff (§5.4), keyed by shard. Unlike the shard
+/// map it is not a cache: a build that ignored it could serve again in
+/// that epoch, so it came with a new format version.
+pub(crate) const STEP_DOWNS: TableDefinition<Bytes, u64> = TableDefinition::new("step_downs");
+/// The promotion of a learner that this node's replica of each shard
+/// proposed as primary and has not seen the outcome of (§6.3, §6.7): the
+/// configuration it proposed, keyed by shard. A build that ignored it
+/// could stop waiting for a learner the register has made a member, so it
+/// came with a new format version.
+pub(crate) const PROMOTIONS: TableDefinition<Bytes, Bytes> = TableDefinition::new("promotions");
+/// The configuration of the latest `CONFIG` record this node's replica of
+/// each shard applied, keyed by shard: the local copy a replica resumes
+/// from while its register cannot be read (§6.2). The state machine keeps
+/// it as it applies the record, so replay restores it, and a snapshot
+/// install sets it.
+pub(crate) const CONFIGS: TableDefinition<Bytes, Bytes> = TableDefinition::new("configs");
+/// The takeover that this node's replica of each shard proposed as a
+/// member and has not seen the outcome of (§6.3): the configuration it
+/// proposed, keyed by shard. A build that ignored it could grant leases
+/// again in the epoch it proposed over, so it came with a new format
+/// version.
+pub(crate) const TAKEOVERS: TableDefinition<Bytes, Bytes> = TableDefinition::new("takeovers");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -146,6 +176,21 @@ where
     Ok(rows)
 }
 
+/// The configuration `table`, named `name`, keeps for `shard`, as a
+/// register's JSON.
+fn decode_config<T: ReadableTable<Bytes, Bytes>>(
+    table: &T,
+    shard: &ShardRef,
+    name: &'static str,
+) -> Result<Option<ShardConfig>, IndexError> {
+    let Some(value) = table.get(codec::shard_key(shard).as_slice())? else {
+        return Ok(None);
+    };
+    codec::decode_route(value.value())
+        .map(Some)
+        .map_err(IndexError::codec(name))
+}
+
 /// Returns the smallest key greater than every key that starts with
 /// `prefix`. A shard key ends with its shard number and starts with a
 /// bucket ID length below 255, so it never consists of `0xff` bytes alone.
@@ -160,6 +205,68 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     end
 }
 
+/// A row of a [`ShardTable`], its key and value as stored.
+pub type ShardRow = (Vec<u8>, Vec<u8>);
+
+/// A table of a shard's state that a snapshot carries (§6.7): what a learner
+/// needs besides its applied position, which the snapshot names, and the
+/// location map, which is node-local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShardTable {
+    /// The namespace index.
+    Namespace,
+    /// The open multipart uploads.
+    Uploads,
+    /// The parts of uploads and multipart objects.
+    Parts,
+}
+
+impl ShardTable {
+    /// Every table, in the order a snapshot sends them.
+    pub const ALL: [Self; 3] = [Self::Namespace, Self::Uploads, Self::Parts];
+
+    /// The table's code in a snapshot.
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Namespace => 1,
+            Self::Uploads => 2,
+            Self::Parts => 3,
+        }
+    }
+
+    /// The table with `code`, if any.
+    #[must_use]
+    pub fn from_code(code: u32) -> Option<Self> {
+        Self::ALL.into_iter().find(|table| table.code() == code)
+    }
+
+    /// Checks that a row of the table, as a peer sent it, belongs to
+    /// `shard` and decodes.
+    pub(crate) fn check(self, shard: &ShardRef, key: &[u8], value: &[u8]) -> Result<(), String> {
+        let theirs = match self {
+            Self::Namespace => {
+                codec::decode_entry(value).map_err(|e| e.to_string())?;
+                codec::decode_entry_key(key).map(|(shard, _)| shard)
+            }
+            Self::Uploads => {
+                codec::decode_upload(value).map_err(|e| e.to_string())?;
+                codec::decode_upload_key(key).map(|(shard, ..)| shard)
+            }
+            Self::Parts => {
+                codec::decode_part(value).map_err(|e| e.to_string())?;
+                codec::decode_part_key(key).map(|(shard, ..)| shard)
+            }
+        }
+        .map_err(|e| e.to_string())?;
+        if theirs == *shard {
+            Ok(())
+        } else {
+            Err(format!("a row of shard {theirs} in a snapshot of {shard}"))
+        }
+    }
+}
+
 /// Write access to the tables that applying records changes, inside one
 /// write transaction (see [`Applier`](crate::Applier)).
 ///
@@ -171,6 +278,7 @@ pub struct IndexWriter<'txn> {
     shards: Table<'txn, Bytes, Bytes>,
     uploads: Table<'txn, Bytes, Bytes>,
     parts: Table<'txn, Bytes, Bytes>,
+    configs: Table<'txn, Bytes, Bytes>,
 }
 
 impl<'txn> IndexWriter<'txn> {
@@ -181,7 +289,23 @@ impl<'txn> IndexWriter<'txn> {
             shards: txn.open_table(SHARDS)?,
             uploads: txn.open_table(UPLOADS)?,
             parts: txn.open_table(PARTS)?,
+            configs: txn.open_table(CONFIGS)?,
         })
+    }
+
+    /// Keeps `config` as the configuration of the latest `CONFIG` record
+    /// of its shard applied on this node (§6.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the configuration does not encode or
+    /// the write fails.
+    pub fn put_config(&mut self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("configs"))?;
+        self.configs
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        Ok(())
     }
 
     /// Returns the open upload of `key` in `shard` opened at `upload`.
@@ -405,7 +529,8 @@ impl<'txn> IndexWriter<'txn> {
     }
 
     /// Removes everything the index holds for `shard`: its entries, its
-    /// record locations, its uploads and parts, and its applied position.
+    /// record locations, its uploads and parts, its applied position, and
+    /// its kept configuration.
     ///
     /// # Errors
     ///
@@ -423,6 +548,7 @@ impl<'txn> IndexWriter<'txn> {
             table.retain_in(range, |key, _| !key.starts_with(&prefix))?;
         }
         self.shards.remove(prefix.as_slice())?;
+        self.configs.remove(prefix.as_slice())?;
         Ok(())
     }
 
@@ -567,6 +693,11 @@ pub struct IndexReader {
     uploads: ReadOnlyTable<Bytes, Bytes>,
     parts: ReadOnlyTable<Bytes, Bytes>,
     control: ReadOnlyTable<&'static str, Bytes>,
+    shard_map: ReadOnlyTable<Bytes, Bytes>,
+    step_downs: ReadOnlyTable<Bytes, u64>,
+    promotions: ReadOnlyTable<Bytes, Bytes>,
+    configs: ReadOnlyTable<Bytes, Bytes>,
+    takeovers: ReadOnlyTable<Bytes, Bytes>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
 
@@ -579,8 +710,87 @@ impl IndexReader {
             uploads: txn.open_table(UPLOADS)?,
             parts: txn.open_table(PARTS)?,
             control: txn.open_table(CONTROL)?,
+            shard_map: txn.open_table(SHARD_MAP)?,
+            step_downs: txn.open_table(STEP_DOWNS)?,
+            promotions: txn.open_table(PROMOTIONS)?,
+            configs: txn.open_table(CONFIGS)?,
+            takeovers: txn.open_table(TAKEOVERS)?,
             meta: txn.open_table(META)?,
         })
+    }
+
+    /// Returns the epoch in which this node's replica of `shard` stepped
+    /// down as primary for a planned handoff (§5.4), if it ever did.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading fails.
+    pub fn step_down(&self, shard: &ShardRef) -> Result<Option<Epoch>, IndexError> {
+        let value = self.step_downs.get(codec::shard_key(shard).as_slice())?;
+        Ok(value.map(|epoch| Epoch::new(epoch.value())))
+    }
+
+    /// Returns the configuration this node's replica of `shard` last
+    /// proposed to promote a learner in, as primary, if it recorded one
+    /// (see [`Index::store_promotion`](crate::Index::store_promotion)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn promotion(&self, shard: &ShardRef) -> Result<Option<ShardConfig>, IndexError> {
+        decode_config(&self.promotions, shard, "promotions")
+    }
+
+    /// Returns the configuration of the latest `CONFIG` record of `shard`
+    /// applied on this node, or the one a snapshot install opened it in
+    /// (§6.2, §6.7), if it has one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn config(&self, shard: &ShardRef) -> Result<Option<ShardConfig>, IndexError> {
+        decode_config(&self.configs, shard, "configs")
+    }
+
+    /// Returns the configuration this node kept for each shard, as
+    /// [`IndexReader::config`] does for one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn configs(&self) -> Result<BTreeMap<ShardRef, ShardConfig>, IndexError> {
+        read_all(
+            &self.configs,
+            "configs",
+            codec::decode_shard_key,
+            codec::decode_route,
+        )
+    }
+
+    /// Returns the configuration this node's replica of `shard` last
+    /// proposed to take the shard over in, as a member, if it recorded one
+    /// (see [`Index::store_takeover`](crate::Index::store_takeover)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn takeover(&self, shard: &ShardRef) -> Result<Option<ShardConfig>, IndexError> {
+        decode_config(&self.takeovers, shard, "takeovers")
+    }
+
+    /// Returns the gateway's shard map: the configuration kept for each
+    /// shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn shard_map(&self) -> Result<BTreeMap<ShardRef, ShardConfig>, IndexError> {
+        read_all(
+            &self.shard_map,
+            "shard_map",
+            codec::decode_shard_key,
+            codec::decode_route,
+        )
     }
 
     /// Returns the open upload of `key` in `shard` opened at `upload`.
@@ -814,6 +1024,45 @@ impl IndexReader {
             .meta
             .get(CONTROL_SYNCED_AT_KEY)?
             .map(|value| Duration::from_millis(value.value())))
+    }
+
+    /// Returns rows of `shard` in `table`, in key order after the key
+    /// `after` (from the first if `None`), as stored: at least one row if
+    /// any is left, and then rows while their keys and values add up to no
+    /// more than `max_bytes`. A primary sends them to a learner as a
+    /// snapshot of the shard (§6.7, [`Index::install_rows`](crate::Index::install_rows)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading fails.
+    pub fn shard_rows(
+        &self,
+        table: ShardTable,
+        shard: &ShardRef,
+        after: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<Vec<ShardRow>, IndexError> {
+        let prefix = codec::shard_key(shard);
+        let end = prefix_end(&prefix);
+        let table = match table {
+            ShardTable::Namespace => &self.namespace,
+            ShardTable::Uploads => &self.uploads,
+            ShardTable::Parts => &self.parts,
+        };
+        let (mut rows, mut bytes) = (Vec::new(), 0);
+        for row in table.range(prefix.as_slice()..end.as_slice())? {
+            let (key, value) = row?;
+            let (key, value) = (key.value(), value.value());
+            if after.is_some_and(|after| key <= after) {
+                continue;
+            }
+            bytes += key.len() + value.len();
+            if !rows.is_empty() && bytes > max_bytes {
+                break;
+            }
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(rows)
     }
 
     /// Returns everything the index holds except its bookkeeping.
