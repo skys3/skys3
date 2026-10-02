@@ -19,7 +19,9 @@
 //!
 //! Writes take the [`Precondition`]s S3 supports for PutObject and
 //! DeleteObject, which the shard checks when it sequences the write
-//! ([`Shards::write`](crate::Shards::write)).
+//! ([`Shards::write`](crate::Shards::write)). A peer cluster's `COMMIT`
+//! takes a [`PeerCondition`] instead, on the write identity of the key's
+//! current version (design §7.8).
 
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -27,6 +29,14 @@ use http::HeaderMap;
 use s3s::dto::{ETag as S3ETag, ETagCondition, Timestamp, TimestampFormat};
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use skys3_index::{Entry, ObjectVersion};
+use skys3_types::{ClusterId, WriteIdentity};
+
+use crate::shard::ShardRef;
+
+/// The stored metadata that carries a version's write identity, as on any
+/// remote SkyS3 writes to (design §7.2): a version a peer cluster published
+/// carries the source's.
+pub(crate) const IDENTITY_METADATA: &str = "x-amz-meta-skys3-wid";
 
 /// What a conditional write requires of its key's current object.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -42,6 +52,77 @@ pub enum Precondition {
     Exists,
     /// The key's object has this ETag, without quotes (`If-Match`).
     Matches(String),
+    /// A peer cluster's write: the key's current write identity is the
+    /// one its `COMMIT` expects (design §7.8).
+    Peer(PeerCondition),
+}
+
+/// What a peer cluster's `COMMIT` requires of its key (design §7.8),
+/// checked against the write identity of the key's current version
+/// ([`current_identity`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCondition {
+    /// The identity the write publishes. If the current version carries it
+    /// already, an earlier `COMMIT` applied the write, and the condition
+    /// fails, so the write never applies twice.
+    pub identity: WriteIdentity,
+    /// What the current version's identity must be.
+    pub expected: skys3_peer::Precondition,
+    /// This cluster, which names the versions its own clients wrote.
+    pub cluster: ClusterId,
+    /// The key's shard.
+    pub shard: ShardRef,
+}
+
+impl PeerCondition {
+    /// Whether the condition holds of `entry`, the key's entry.
+    ///
+    /// # Errors
+    ///
+    /// [`ConditionFailed::PreconditionFailed`] if it does not, or if the
+    /// current version carries the write's own identity.
+    pub fn check(&self, entry: Option<&Entry>) -> Result<(), ConditionFailed> {
+        let current = current_identity(entry, &self.cluster, &self.shard);
+        let holds = current.as_ref() != Some(&self.identity)
+            && match &self.expected {
+                skys3_peer::Precondition::Absent => current.is_none(),
+                skys3_peer::Precondition::Matches(expected) => current.as_ref() == Some(expected),
+                skys3_peer::Precondition::Unconditional => true,
+            };
+        if holds {
+            Ok(())
+        } else {
+            Err(ConditionFailed::PreconditionFailed)
+        }
+    }
+}
+
+/// The write identity of the key's current version in `entry`, in `shard`
+/// of a bucket of `cluster` (design §7.2, §7.8): the identity the version
+/// carries in its stored metadata, as one a peer cluster published does,
+/// or else the identity of the local write that made it. `None` if the key
+/// has no current version: no entry, or a tombstone.
+#[must_use]
+pub fn current_identity(
+    entry: Option<&Entry>,
+    cluster: &ClusterId,
+    shard: &ShardRef,
+) -> Option<WriteIdentity> {
+    let entry = entry?;
+    let object = entry.object.as_ref()?;
+    let carried = object.metadata.get(IDENTITY_METADATA);
+    Some(
+        carried
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| {
+                WriteIdentity::new(
+                    cluster.clone(),
+                    shard.bucket.clone(),
+                    shard.shard,
+                    object.write_identity.unwrap_or(entry.version),
+                )
+            }),
+    )
 }
 
 /// Why a [`Precondition`] did not hold.
@@ -104,6 +185,7 @@ impl Precondition {
     pub fn check(&self, entry: Option<&Entry>) -> Result<(), ConditionFailed> {
         let object = entry.and_then(|entry| entry.object.as_ref());
         match (self, object) {
+            (Self::Peer(peer), _) => peer.check(entry),
             (Self::None, _) | (Self::Absent, None) | (Self::Exists, Some(_)) => Ok(()),
             (Self::Absent, Some(_)) => Err(ConditionFailed::PreconditionFailed),
             (Self::Exists | Self::Matches(_), None) => Err(ConditionFailed::NoSuchKey),

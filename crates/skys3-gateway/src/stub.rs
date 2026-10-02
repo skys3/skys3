@@ -71,6 +71,20 @@ impl MemoryShards {
     ///
     /// If recovery, the index, or replay fails.
     pub async fn open(disk: SimDisk) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Self::open_as(disk, NodeId::new("node-1")?).await
+    }
+
+    /// Shards on `disk`, as [`MemoryShards::open`] finds them, on the node
+    /// `node`: a node that holds another's log, as a new primary holds
+    /// every record its predecessor committed.
+    ///
+    /// # Errors
+    ///
+    /// As [`MemoryShards::open`].
+    pub async fn open_as(
+        disk: SimDisk,
+        node: NodeId,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mount = disk.mount();
         let clock = Arc::new(MonotonicClock::new());
         let (log, _) = SegmentLog::open(mount.clone(), Self::log_config(), clock).await?;
@@ -84,7 +98,6 @@ impl MemoryShards {
         Checkpointer::new(Arc::clone(&index), logs, pool.clone())
             .replay(Arc::new(StateMachine))
             .await?;
-        let node = NodeId::new("node-1")?;
         Ok(Self {
             disk,
             local: LocalShards::new(ShardSet::new(index, log, pool), node),

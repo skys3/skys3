@@ -828,7 +828,7 @@ sequenceDiagram
     S->>S: Commit locally on all members
     S-->>C: 200 OK
     S->>G: COMMIT with write identity and precondition
-    G->>D: Check ranges, checksums, and precondition
+    G->>D: Check ranges and precondition
     D->>D: Commit a PUT that references the staged extents
     D-->>S: APPLIED
     S->>S: Append FLUSHED
@@ -840,7 +840,7 @@ sequenceDiagram
 - **Small objects in batches.** Objects of up to one frame skip staging. Many of them travel in one `BATCH`, and the destination commits them in one group commit. That keeps destination-side durable operations per small object close to the source's (section 5.3).
 - **Flow control.** Stream and connection windows are sized from the bandwidth-delay product and capped by `peer_max_inflight_bytes`. The destination limits staged bytes per source (`peer_staging_quota_bytes`) and discards uncommitted staging after `peer_staging_ttl_seconds`.
 - **Topology.** Each shard primary's flusher may use up to `peer_connections_per_shard` QUIC connections to destination gateways, adapting the count the way REST flush concurrency adapts (section 7.7). A node pools the connections of all the shards it hosts per destination and spreads streams across them. It opens one stream per object or batch. Destination gateways relay to their shard primaries over the LAN.
-- **Receiving buckets.** A bucket that receives native replication names its source cluster (`peer_source`). By default it is read-only to the destination's own clients, so each key has a single writer.
+- **Receiving buckets.** A bucket that receives native replication names its source cluster (`peer_source`). By default it is read-only to the destination's own clients, so each key has a single writer. `peer_source` is node configuration in the bucket's `[buckets.<name>]` table, like the peer's bucket pairs (section 12), not part of the bucket register, and it must name a configured peer. The clients' object writes get `403 AccessDenied`, and `peer_local_writes = true` lets them write. A `COMMIT` to a bucket whose `peer_source` is not its source cluster is refused.
 - **Acknowledgement policies.** `write_through` buckets and `backup_ack = "write_through"` wait for `APPLIED`. The default policies acknowledge after the local commit, as before.
 
 **Messages on the wire.** These rules fix the details the table leaves open:
@@ -869,6 +869,14 @@ sequenceDiagram
 - **Cumulative acknowledgement.** A stream has up to 16 frames in flight to the primaries, and stops reading while all are. As appends finish, the destination sends one `DURABLE` per identity for every piece that grew since the last was sent, so appends that finish together cost one `DURABLE`. Frames in flight when a stream fails still settle into the staging, so the next `RESUME` reports them. Each staging has a generation, and an append settles only into the generation that admitted it, so an append that outlives its staging, discarded or expired, never changes staging of the same identity opened since.
 - **Quota.** `peer_staging_quota_bytes` bounds what each source cluster stages on each destination node. Each staging is charged 64 KiB when its first `BEGIN` opens it, and each part of a frame in flight or durable is charged its length, but at least 64 KiB; bytes a frame repeats are not charged again. The staging index's memory is therefore bounded by the quota however many `BEGIN`s without `DATA`, or however small the frames, a source sends: it holds no more entries than staging in 64 KiB extents would. A `BEGIN` that would pass the quota opens nothing, and a frame that would discards its identity's staging; both are answered with `ABORT` (`quota exceeded`). The quota is therefore at least 64 KiB plus the larger of `peer_frame_bytes` and 64 KiB.
 - **Expiry.** Staging that has seen no `BEGIN` or `DATA` for `peer_staging_ttl_seconds` is discarded, so a slow multipart upload keeps its staging while its parts arrive. Expired staging is looked for as staging is used, at most once a minute. `DATA` whose staging is gone, because it expired or was discarded, is answered with `ABORT` (`expired`). A refused append, such as one into a bucket being deleted, discards the staging and is answered with `ABORT` (`refused`). After an `ABORT` from either end, the stream's `DATA` is dropped until its next `BEGIN`.
+
+**Commits.** These rules fix how a destination applies a `COMMIT`:
+
+- **One record.** The node that accepted the stream first waits for the stream's frames in flight. The key's shard primary then commits one `PUT` that references the staged extents in offset order, through the gateway's routing, or one `DELETE`. The `PUT` keeps the source's ETag, last-modified time, metadata, tags, and checksums, and stores the commit's write identity as its `x-amz-meta-skys3-wid` metadata, as any remote does (section 7.2). Clients never see it. The destination does not hash the staged bytes again: each frame's CRC32C was checked on arrival, and each extent's record checksum guards it on disk. A `COMMIT` that commits consumes its staging. One that is refused, or answered `checksum mismatch`, discards it. Any other result keeps it until it expires, so the source can commit it again.
+- **Current write identity.** A key's current write identity is the one its current version carries in its metadata. A version the destination's own clients wrote (`peer_local_writes`) has the identity of that local write. A key with no current version, or a tombstone, has none.
+- **Precondition.** The shard primary checks it as it sequences the record, against every earlier write of the key, as it checks conditional client writes (section 5.1). The node also checks it before, so a precondition that fails already is answered without the staged bytes. `APPLIED` names the current write identity.
+- **Stored result.** The result of a committed `COMMIT` is its version: the record in the shard's log, and the index entry every member builds from it. A `COMMIT` whose identity the current version carries was applied already. It is answered `committed` with the version's ETag, and nothing is written, whichever destination node it reaches and whichever member is primary. The primary's check refuses such a write too, so copies of a `COMMIT` that race each other apply once. The result lives as long as its version is current. A later write of the key comes from the source only after it has the `APPLIED`, since it flushes one write of a key at a time (section 7.1). So a replay after that is a stale copy, from a connection already dropped. It fails its precondition, or finds no staging and is answered `incomplete`, and applies nothing. The exception is an unconditional delete, which needs no staging: a stale copy deletes whatever version is current, which `flush_conflict_policy = "overwrite"` permits.
+- **Deletes.** A delete of a key that has no current version writes nothing and is answered `committed`. A replayed delete therefore gets the answer of the first, as the 412 rule of section 7.2 treats deletes.
 
 **Discovery and fallback.** A target's `target_transport` is `auto` (the default), `native`, or `s3`. With `auto`, the flusher asks the target's S3 endpoint for a signed SkyS3 peer descriptor: cluster identity, QUIC addresses, and protocol versions. It uses QUIC if the handshake succeeds within `peer_connect_timeout`. Otherwise it falls back to S3 REST and probes again periodically, so a network that blocks UDP degrades to REST instead of failing. Peer connections use mutual TLS with the peer cluster's identity from a configured trust bundle (section 12).
 
@@ -1382,6 +1390,7 @@ snapshot_target = "https://s3.us-west-2.amazonaws.com/example-skys3-snapshots/ar
 [buckets.archive-from-eu]     # receives native replication from the peer cluster
 mode = "local"
 peer_source = "skys3-prod-eu"
+peer_local_writes = false     # true: this cluster's clients may write it too
 
 [peering]
 quic_listen = "0.0.0.0:7443"

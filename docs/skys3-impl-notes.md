@@ -3995,3 +3995,90 @@ of this file. A task with nothing unexpected keeps "None."
   its extent to the new staging. Each staging now has a generation that
   `admit` returns and `settle` checks. A test that settles an old
   append into a replacement fails without the check.
+
+### M6-04 COMMIT, APPLIED, and ABORT
+
+- **The stored result is the version itself.** The plan asks where a
+  `COMMIT`'s result is kept so a replay returns it, across primary
+  changes. A separate table of results would need a new record kind, an
+  index table, and a rule for when to drop entries. Instead the `PUT`
+  stores the commit's write identity as `x-amz-meta-skys3-wid`, which is
+  where §7.2 puts it on any remote, and which the gateway already strips
+  from responses and from copies. A `COMMIT` whose identity the current
+  version carries is answered `committed` with that version's ETag, and
+  nothing is written. The log and the index entry every member rebuilds
+  from it hold the answer, so no new state is needed. The result lives as
+  long as the version is current. A replay after a later write can only
+  be a stale copy, because the source flushes one write of a key at a
+  time. Such a copy fails its precondition, or finds its staging consumed
+  and gets `incomplete`. Recorded in §7.8 ("Commits").
+- **A precondition check alone does not stop duplicates.** An
+  `Unconditional` `COMMIT` (the `overwrite` policy) holds whatever is
+  current, so a second copy would apply again. The shard's condition
+  therefore also fails when the current version already carries the
+  commit's identity, and the gateway then reads the entry and answers
+  `committed`. A test races two copies of an unconditional `COMMIT`. It
+  fails without that clause: two records are written. The one remaining
+  hole is a late copy of an unconditional delete, which needs no staging.
+  §7.8 accepts it under `overwrite`.
+- **"Current write identity" was undefined for local writes.** With
+  `peer_local_writes`, a version can come from the destination's own
+  clients and carry no `skys3-wid`. Reporting none would tell the source
+  the key is absent. Such a version reports the identity of its local
+  write instead: this cluster, the bucket, the shard, and the record's
+  position. The forwarded condition therefore carries the destination's
+  cluster ID. The intra-cluster `Condition` message got three fields and
+  three kinds for peer conditions.
+- **Deletes keep no identity.** A tombstone has no metadata, so a
+  replayed delete cannot be recognized by identity. A delete of a key
+  that has no current version writes nothing and is answered
+  `committed`. This matches §7.2's 412 rule for deletes, and makes
+  replayed deletes idempotent.
+- **The destination does not hash staged bytes again.** The sequence
+  diagram had the gateway "check checksums". Re-hashing a 5 GiB object
+  at `COMMIT` would read every extent back. Each frame's CRC32C is checked
+  on arrival and each extent's record checksum on disk, so the final
+  checksums are stored as the source sent them. The diagram now reads
+  "Check ranges and precondition". Nothing in this PR answers
+  `checksum mismatch`. It stays for writes whose bytes the destination
+  has whole, such as `BATCH` items.
+- **The precondition is checked before the staged bytes are needed.** A
+  `COMMIT` whose precondition already fails is answered with the current
+  identity even with no staging, so the source learns of a conflict
+  without restaging the object. The primary checks again when it
+  sequences the record.
+- **Staging is consumed only when the result is final.** `committed`
+  discards the staging. So do `refused` and `checksum mismatch`, which
+  make the source stage again. A precondition failure, `incomplete`, or
+  `unavailable` keeps the staging until its TTL, so the source can commit
+  it again, for example under the precondition the destination named.
+  Before it applies a `COMMIT`, the stream waits for its own frames in
+  flight. A source can therefore send `COMMIT` right after its last
+  `DATA`.
+- **`peer_source` stays in configuration.** It already existed as a
+  `[buckets.<name>]` key (M0-03). The bucket pairs that authorize a peer
+  are configuration too (M6-02). Moving the source into the bucket
+  register would split one setting across two places. The new checks:
+  `peer_source` must name a `[peering.peers]` table, and must not be set
+  on a `read_only` bucket. The new key `peer_local_writes` (default
+  `false`) is allowed only next to a `peer_source`. It is added to §14
+  and the configuration reference.
+- **Multipart `COMMIT`s are answered `unavailable`.** §7.8 says the
+  destination keeps a multipart object's part boundaries. A `PUT` record
+  has no parts. The multipart records cannot be reused either:
+  `MPU_ABORT` and replaced parts release their extents' locations, which
+  the staging still references. Publishing a multipart object in one
+  record needs a `PUT` whose data lists each part's extents. That is a
+  log and index format change, so it is left to a follow-up. A `COMMIT`
+  that carries inline bytes is refused, since only `BATCH` items carry
+  them. `BATCH` is still answered `unavailable` (M6-05).
+- **A primary change is tested without the network.** Quinn under
+  turmoil waits for M6-08. The replay test therefore crashes the
+  destination's disk and recovers its log on another node
+  (`MemoryShards::open_as`). That node opens the shard as primary in
+  epoch 2, as a new primary holds every committed record. A fresh
+  `PeerCommits` with no staging then answers the replay from the log.
+  The loopback QUIC test streams an object and commits it without
+  waiting for `DURABLE`. It replays the `COMMIT` on a new connection,
+  checks a failing precondition, and checks that `ABORT` leaves nothing
+  to publish. Every network wait is bounded at 30 s.

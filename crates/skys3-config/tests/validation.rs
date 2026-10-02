@@ -985,6 +985,47 @@ fn peer_source_must_be_another_cluster() {
     );
 }
 
+/// The peer tables a receiving bucket's settings need.
+const PEER_EU: &str = "[transport]\ntls_cert_file = \"/n.crt\"\ntls_key_file = \"/n.key\"\n\
+                       tls_ca_file = \"/ca.crt\"\n[peering.peers.skys3-prod-eu]\n\
+                       ca_file = \"/eu.crt\"\n";
+
+#[test]
+fn a_receiving_bucket_names_a_configured_peer() {
+    // No [peering.peers] table for the source: nothing could connect.
+    assert_violations(
+        "[buckets.alpha]\nmode = \"local\"\npeer_source = \"skys3-prod-eu\"",
+        &["buckets.alpha.peer_source"],
+    );
+    // A read_only bucket mirrors its target and cannot receive.
+    assert_violations(
+        &format!("{PEER_EU}[buckets.alpha]\nmode = \"read_only\"\npeer_source = \"skys3-prod-eu\""),
+        &["buckets.alpha.peer_source"],
+    );
+    let config = load(&format!(
+        "{PEER_EU}[buckets.alpha]\nmode = \"write_back\"\npeer_source = \"skys3-prod-eu\"\n\
+         [buckets.beta]\nmode = \"local\"\npeer_source = \"skys3-prod-eu\"\n\
+         peer_local_writes = true"
+    ))
+    .unwrap();
+    let settings = |name: &str| config.buckets().get(&name.parse().unwrap()).clone();
+    assert!(!settings("alpha").peer_local_writes);
+    assert!(settings("beta").peer_local_writes);
+    assert!(!config.buckets().defaults.peer_local_writes);
+}
+
+#[test]
+fn peer_local_writes_needs_a_peer_source() {
+    assert_violations(
+        "[buckets.alpha]\nmode = \"local\"\npeer_local_writes = true",
+        &["buckets.alpha.peer_local_writes"],
+    );
+    assert_violations(
+        "[buckets.defaults]\npeer_local_writes = false",
+        &["buckets.defaults.peer_local_writes"],
+    );
+}
+
 // Rules keep running after an early failure.
 
 #[test]

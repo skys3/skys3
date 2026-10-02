@@ -309,6 +309,24 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
         self.get(name).ok_or_else(no_such_bucket)
     }
 
+    /// The bucket a client's object write names, which must exist and take
+    /// writes from this cluster's clients: a bucket that receives native
+    /// replication from a peer cluster (`peer_source`) is read-only to them,
+    /// so each key has a single writer, unless `peer_local_writes` is set
+    /// (design §7.8).
+    pub(crate) fn require_writable(&self, name: &BucketName) -> Result<BucketDocument, S3Error> {
+        let bucket = self.require(name)?;
+        let settings = self.config.buckets.get(name);
+        match &settings.peer_source {
+            Some(source) if !settings.peer_local_writes => Err(s3_error!(
+                AccessDenied,
+                "Bucket {name} receives native replication from cluster {source} and is \
+                 read-only to this cluster's clients"
+            )),
+            _ => Ok(bucket),
+        }
+    }
+
     /// Every bucket, in name order, from the local copy.
     pub(crate) fn list(&self) -> Vec<BucketDocument> {
         self.catalog().values().cloned().collect()
