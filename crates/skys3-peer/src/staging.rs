@@ -13,9 +13,15 @@
 //! - **Trimming.** A frame is staged only where the staging neither holds
 //!   its bytes nor has them in flight, so a piece's extents never overlap
 //!   and a `COMMIT` can list them in offset order ([`StagedObject`]).
-//! - **Quota.** The bytes staged or in flight for each source cluster stay
-//!   within `peer_staging_quota_bytes`. A frame that would pass it discards
-//!   its identity's staging.
+//! - **Quota.** What each source cluster stages stays within
+//!   `peer_staging_quota_bytes`. Each staging, and each part of a frame in
+//!   flight or durable, is charged its bytes but at least
+//!   [`MIN_STAGING_CHARGE`], so the index's memory is bounded by the quota
+//!   however small the frames. A `BEGIN` or frame that would pass it is
+//!   refused, and a frame discards its identity's staging.
+//! - **Generations.** Each staging has a generation, which an append
+//!   carries from [`Staging::admit`] to [`Staging::settle`], so an append
+//!   that outlives its staging never changes one that replaced it.
 //! - **Expiry.** Staging that sees no `BEGIN` or `DATA` for
 //!   `peer_staging_ttl_seconds` is discarded.
 
@@ -26,6 +32,7 @@ use std::time::Duration;
 
 use skys3_config::PeeringConfig;
 use skys3_log::record::{ExtentRef, MAX_EXTENTS};
+use skys3_types::limits::MIN_STAGING_CHARGE;
 use skys3_types::{BucketName, ClusterId, WriteIdentity};
 use tokio::time::Instant;
 
@@ -42,8 +49,9 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// The bounds on what a destination stages, from `[peering]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagingLimits {
-    /// `peer_staging_quota_bytes`: the most bytes staged or in flight for
-    /// one source cluster on this node.
+    /// `peer_staging_quota_bytes`: the most one source cluster may stage
+    /// on this node, each staging and each staged part charged at least
+    /// [`MIN_STAGING_CHARGE`].
     pub quota_bytes: u64,
     /// `peer_staging_ttl_seconds`: how long staging may go without a
     /// `BEGIN` or `DATA` before it is discarded.
@@ -73,8 +81,10 @@ pub struct Staging {
 #[derive(Debug, Default)]
 struct Table {
     stagings: HashMap<WriteIdentity, Entry>,
-    /// The bytes staged or in flight per source cluster.
+    /// What each source cluster's staging is charged.
     used: HashMap<ClusterId, u64>,
+    /// The generation the next staging gets.
+    next_generation: u64,
     /// When expired staging is next looked for.
     next_sweep: Option<Instant>,
 }
@@ -85,8 +95,10 @@ struct Entry {
     bucket: BucketName,
     key: String,
     pieces: BTreeMap<u64, Piece>,
-    /// The bytes staged or in flight, counted against the quota.
+    /// What the staging is charged against the quota.
     bytes: u64,
+    /// Tells this staging apart from an earlier one of its identity.
+    generation: u64,
     /// The last `BEGIN` or `DATA`.
     touched: Instant,
 }
@@ -132,6 +144,22 @@ impl Piece {
             })
             .collect()
     }
+}
+
+/// The charge for staging `len` bytes in one extent.
+fn charge(len: u64) -> u64 {
+    len.max(MIN_STAGING_CHARGE)
+}
+
+/// Parts of a frame that [`Staging::admit`] put in flight, for the
+/// generation of staging they belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admitted {
+    /// The generation of the staging, which [`Staging::settle`] takes.
+    pub generation: u64,
+    /// The parts, in order: the frame's range less what the staging holds
+    /// or has in flight. Empty if it holds every byte already.
+    pub ranges: Vec<Range<u64>>,
 }
 
 /// What a source staged for one write identity, as a `COMMIT` publishes
@@ -191,23 +219,43 @@ impl Staging {
     /// `RESUME`: every durable range of the staging, empty for new
     /// staging.
     ///
+    /// New staging is charged [`MIN_STAGING_CHARGE`].
+    ///
     /// # Errors
     ///
     /// [`AbortReason::Refused`] if the identity is already staged for
-    /// another bucket or key. That staging stays.
+    /// another bucket or key, and that staging stays; and
+    /// [`AbortReason::QuotaExceeded`] if new staging would take its source
+    /// past `peer_staging_quota_bytes`.
     pub fn begin(&self, begin: &Begin, now: Instant) -> Result<StagedRanges, AbortReason> {
         let mut table = self.table();
         self.sweep(&mut table, now);
-        let entry = table
-            .stagings
-            .entry(begin.identity.clone())
-            .or_insert_with(|| Entry {
+        let Table {
+            stagings,
+            used,
+            next_generation,
+            ..
+        } = &mut *table;
+        if !stagings.contains_key(&begin.identity) {
+            let source = used.entry(begin.identity.cluster.clone()).or_default();
+            if source.saturating_add(MIN_STAGING_CHARGE) > self.limits.quota_bytes {
+                return Err(AbortReason::QuotaExceeded);
+            }
+            *source += MIN_STAGING_CHARGE;
+            *next_generation += 1;
+            let entry = Entry {
                 bucket: begin.bucket.clone(),
                 key: begin.key.clone(),
                 pieces: BTreeMap::new(),
-                bytes: 0,
+                bytes: MIN_STAGING_CHARGE,
+                generation: *next_generation,
                 touched: now,
-            });
+            };
+            stagings.insert(begin.identity.clone(), entry);
+        }
+        let entry = stagings
+            .get_mut(&begin.identity)
+            .expect("the staging was just found or added");
         if entry.bucket != begin.bucket || entry.key != begin.key {
             return Err(AbortReason::Refused);
         }
@@ -215,11 +263,10 @@ impl Staging {
         Ok(report(&begin.identity, entry, entry.pieces.keys().copied()))
     }
 
-    /// Admits `data` to the staging of `identity`: returns the parts of its
-    /// range that the staging neither holds nor has in flight, now in
-    /// flight, which the caller stages and then reports with
-    /// [`Staging::settle`]. They are empty if the staging holds every byte
-    /// already.
+    /// Admits `data` to the staging of `identity`: puts the parts of its
+    /// range that the staging neither holds nor has in flight in flight,
+    /// and returns them with the staging's generation. The caller stages
+    /// each and then reports it with [`Staging::settle`].
     ///
     /// # Errors
     ///
@@ -234,7 +281,7 @@ impl Staging {
         identity: &WriteIdentity,
         data: &Data,
         now: Instant,
-    ) -> Result<Vec<Range<u64>>, AbortReason> {
+    ) -> Result<Admitted, AbortReason> {
         let mut table = self.table();
         self.sweep(&mut table, now);
         let Table { stagings, used, .. } = &mut *table;
@@ -244,7 +291,10 @@ impl Staging {
         let piece = entry.pieces.entry(data.piece).or_default();
         let ranges = piece.uncovered(data.offset..end);
         let extents = piece.extents.len() + piece.pending.len() + ranges.len();
-        let bytes: u64 = ranges.iter().map(|range| range.end - range.start).sum();
+        let bytes: u64 = ranges
+            .iter()
+            .map(|range| charge(range.end - range.start))
+            .sum();
         let source = used.entry(identity.cluster.clone()).or_default();
         let refusal = if extents > MAX_EXTENTS {
             Some(AbortReason::Refused)
@@ -262,24 +312,32 @@ impl Staging {
         for range in &ranges {
             piece.pending.insert(range.start, range.end);
         }
-        Ok(ranges)
+        Ok(Admitted {
+            generation: entry.generation,
+            ranges,
+        })
     }
 
-    /// Settles `range` of `piece`, which [`Staging::admit`] returned: it is
-    /// durable in `extent`, or, with `None`, it failed and is no longer in
-    /// flight. Returns whether the piece's durable ranges grew, so that a
-    /// `DURABLE` should report them. Staging discarded in the meantime is
-    /// not revived.
+    /// Settles `range` of `piece`, which [`Staging::admit`] returned for
+    /// staging of `generation`: it is durable in `extent`, or, with `None`,
+    /// it failed and is no longer in flight. Returns whether the piece's
+    /// durable ranges grew, so that a `DURABLE` should report them.
+    /// Staging discarded in the meantime is not revived, and staging that
+    /// replaced it, of another generation, is left alone.
     pub fn settle(
         &self,
         identity: &WriteIdentity,
+        generation: u64,
         piece: u64,
         range: Range<u64>,
         extent: Option<ExtentRef>,
     ) -> bool {
         let mut table = self.table();
         let Table { stagings, used, .. } = &mut *table;
-        let Some(entry) = stagings.get_mut(identity) else {
+        let Some(entry) = stagings
+            .get_mut(identity)
+            .filter(|entry| entry.generation == generation)
+        else {
             return false;
         };
         let Some(staged) = entry.pieces.get_mut(&piece) else {
@@ -293,7 +351,7 @@ impl Staging {
             staged.extents.insert(range.start, extent);
             return true;
         }
-        let len = range.end - range.start;
+        let len = charge(range.end - range.start);
         entry.bytes -= len;
         release(used, &identity.cluster, len);
         false
@@ -341,7 +399,7 @@ impl Staging {
         })
     }
 
-    /// The bytes staged or in flight for `source` on this node.
+    /// What the staging of `source` on this node is charged.
     #[must_use]
     pub fn used(&self, source: &ClusterId) -> u64 {
         self.table().used.get(source).copied().unwrap_or(0)
@@ -441,8 +499,11 @@ mod tests {
 
     use super::*;
 
+    /// The least charge, which the tests count in.
+    const C: u64 = MIN_STAGING_CHARGE;
+
     const LIMITS: StagingLimits = StagingLimits {
-        quota_bytes: 1000,
+        quota_bytes: 16 * C,
         ttl: Duration::from_secs(600),
     };
 
@@ -473,11 +534,23 @@ mod tests {
         }
     }
 
+    /// The parts of `range` of `piece` that `admit` puts in flight.
+    fn admit(
+        staging: &Staging,
+        id: &WriteIdentity,
+        piece: u64,
+        range: Range<u64>,
+        now: Instant,
+    ) -> Result<Vec<Range<u64>>, AbortReason> {
+        Ok(staging.admit(id, &data(piece, range), now)?.ranges)
+    }
+
     /// Admits `range` of `piece` and settles every part of it as durable.
     fn stage(staging: &Staging, id: &WriteIdentity, piece: u64, range: Range<u64>, now: Instant) {
-        for (seq, part) in (1..).zip(staging.admit(id, &data(piece, range), now).unwrap()) {
+        let admitted = staging.admit(id, &data(piece, range), now).unwrap();
+        for (seq, part) in (1..).zip(admitted.ranges) {
             let extent = extent(seq, &part);
-            assert!(staging.settle(id, piece, part, Some(extent)));
+            assert!(staging.settle(id, admitted.generation, piece, part, Some(extent)));
         }
     }
 
@@ -507,14 +580,15 @@ mod tests {
         elsewhere.bucket = BucketName::new("elsewhere").unwrap();
         assert_eq!(staging.begin(&elsewhere, now), Err(AbortReason::Refused));
         assert_eq!(staging.len(), 1);
-        assert_eq!(staging.used(&id.cluster), 100);
+        // The staging and its one extent, each charged the least charge.
+        assert_eq!(staging.used(&id.cluster), 2 * C);
         // DATA without staging is refused as expired.
         let unknown = identity("us", 2);
         assert_eq!(
-            staging.admit(&unknown, &data(1, 0..10), now),
+            admit(&staging, &unknown, 1, 0..10, now),
             Err(AbortReason::Expired)
         );
-        assert!(!staging.settle(&unknown, 1, 0..10, None));
+        assert!(!staging.settle(&unknown, 1, 1, 0..10, None));
         assert_eq!(staging.report(&unknown, [1]), None);
         assert_eq!(staging.staged(&unknown), None);
     }
@@ -527,28 +601,30 @@ mod tests {
         staging.begin(&begin(&id, "k"), now).unwrap();
         stage(&staging, &id, 1, 100..200, now);
         let in_flight = staging.admit(&id, &data(1, 300..400), now).unwrap();
-        assert_eq!(in_flight, [300..400]);
+        assert_eq!(in_flight.ranges, [300..400]);
+        let generation = in_flight.generation;
         // A frame across both stages only the gaps around them.
-        let parts = staging.admit(&id, &data(1, 50..450), now).unwrap();
+        let parts = admit(&staging, &id, 1, 50..450, now).unwrap();
         assert_eq!(parts, [50..100, 200..300, 400..450]);
-        assert_eq!(staging.admit(&id, &data(1, 120..180), now).unwrap(), []);
-        assert_eq!(staging.admit(&id, &data(1, 310..320), now).unwrap(), []);
+        assert_eq!(admit(&staging, &id, 1, 120..180, now).unwrap(), []);
+        assert_eq!(admit(&staging, &id, 1, 310..320, now).unwrap(), []);
         // Another piece is staged on its own.
-        assert_eq!(staging.admit(&id, &data(2, 0..10), now).unwrap(), [0..10]);
-        assert_eq!(staging.used(&id.cluster), 100 + 100 + 200 + 10);
+        assert_eq!(admit(&staging, &id, 2, 0..10, now).unwrap(), [0..10]);
+        // The staging, and six parts in flight or durable.
+        assert_eq!(staging.used(&id.cluster), 7 * C);
 
-        // A failed part is in flight no more, and its bytes are returned.
-        assert!(!staging.settle(&id, 1, 300..400, None));
-        assert_eq!(staging.used(&id.cluster), 310);
-        assert_eq!(
-            staging.admit(&id, &data(1, 300..350), now).unwrap(),
-            [300..350]
-        );
+        // A failed part is in flight no more, and its charge is returned.
+        assert!(!staging.settle(&id, generation, 1, 300..400, None));
+        assert_eq!(staging.used(&id.cluster), 6 * C);
+        assert_eq!(admit(&staging, &id, 1, 300..350, now).unwrap(), [300..350]);
         // Settling what is not in flight changes nothing.
-        assert!(!staging.settle(&id, 1, 300..400, Some(extent(9, &(300..400)))));
-        assert!(!staging.settle(&id, 9, 0..1, None));
-        assert!(staging.settle(&id, 1, 50..100, Some(extent(2, &(50..100)))));
-        assert!(staging.settle(&id, 1, 200..300, Some(extent(3, &(200..300)))));
+        let stray = Some(extent(9, &(300..400)));
+        assert!(!staging.settle(&id, generation, 1, 300..400, stray));
+        assert!(!staging.settle(&id, generation, 9, 0..1, None));
+        let first = Some(extent(2, &(50..100)));
+        assert!(staging.settle(&id, generation, 1, 50..100, first));
+        let second = Some(extent(3, &(200..300)));
+        assert!(staging.settle(&id, generation, 1, 200..300, second));
         let report = staging.report(&id, [1, 2, 3]).unwrap();
         // Piece 2 has nothing durable, and piece 3 does not exist.
         assert_eq!(report.pieces.len(), 1);
@@ -591,37 +667,111 @@ mod tests {
 
     #[test]
     fn the_quota_bounds_each_source_and_discards_the_staging_that_passes_it() {
-        let staging = Staging::new(LIMITS);
+        let staging = Staging::new(StagingLimits {
+            quota_bytes: 8 * C,
+            ..LIMITS
+        });
         let (first, second) = (identity("us", 1), identity("us", 2));
         let other = identity("ap", 1);
         let now = Instant::now();
         for id in [&first, &second, &other] {
             staging.begin(&begin(id, "k"), now).unwrap();
         }
-        stage(&staging, &first, 1, 0..600, now);
-        stage(&staging, &other, 1, 0..1000, now);
+        stage(&staging, &first, 1, 0..3 * C, now);
+        stage(&staging, &other, 1, 0..7 * C, now);
         // In flight counts too.
         assert_eq!(
-            staging.admit(&second, &data(1, 0..300), now).unwrap(),
-            [0..300]
+            admit(&staging, &second, 1, 0..2 * C, now).unwrap(),
+            [0..2 * C]
         );
+        let generation = staging
+            .admit(&second, &data(1, 0..1), now)
+            .unwrap()
+            .generation;
         assert_eq!(
-            staging.admit(&second, &data(1, 300..500), now),
+            admit(&staging, &second, 1, 2 * C..4 * C, now),
             Err(AbortReason::QuotaExceeded)
         );
         // Only the staging that passed it is discarded.
         assert_eq!(staging.staged(&second), None);
-        assert_eq!(staging.used(&first.cluster), 600);
-        assert_eq!(staging.used(&other.cluster), 1000);
+        assert_eq!(staging.used(&first.cluster), 4 * C);
+        assert_eq!(staging.used(&other.cluster), 8 * C);
         // Its frame in flight settles into nothing.
-        assert!(!staging.settle(&second, 1, 0..300, Some(extent(1, &(0..300)))));
-        assert_eq!(staging.used(&first.cluster), 600);
+        let late = Some(extent(1, &(0..2 * C)));
+        assert!(!staging.settle(&second, generation, 1, 0..2 * C, late));
+        assert_eq!(staging.used(&first.cluster), 4 * C);
         // Bytes the staging already holds cost nothing again.
-        assert_eq!(staging.admit(&first, &data(1, 0..600), now).unwrap(), []);
+        assert_eq!(admit(&staging, &first, 1, 0..3 * C, now).unwrap(), []);
         assert_eq!(
-            staging.admit(&first, &data(1, 600..1000), now).unwrap(),
-            [600..1000]
+            admit(&staging, &first, 1, 3 * C..7 * C, now).unwrap(),
+            [3 * C..7 * C]
         );
+        // A source at its quota opens no new staging.
+        assert_eq!(
+            staging.begin(&begin(&identity("ap", 2), "k"), now),
+            Err(AbortReason::QuotaExceeded)
+        );
+        assert_eq!(staging.len(), 2);
+    }
+
+    #[test]
+    fn staging_without_data_is_charged_against_the_quota() {
+        let staging = Staging::new(StagingLimits {
+            quota_bytes: 4 * C,
+            ..LIMITS
+        });
+        let now = Instant::now();
+        // A source that only sends BEGINs runs out of quota, not memory.
+        for seq in 1..=4 {
+            staging
+                .begin(&begin(&identity("us", seq), "k"), now)
+                .unwrap();
+        }
+        assert_eq!(
+            staging.begin(&begin(&identity("us", 5), "k"), now),
+            Err(AbortReason::QuotaExceeded)
+        );
+        assert_eq!(staging.len(), 4);
+        // Tiny frames are charged the least charge each.
+        assert_eq!(
+            admit(&staging, &identity("us", 1), 1, 0..1, now),
+            Err(AbortReason::QuotaExceeded)
+        );
+        // Another source has its own quota, and resuming costs nothing.
+        staging.begin(&begin(&identity("ap", 1), "k"), now).unwrap();
+        staging.begin(&begin(&identity("us", 2), "k"), now).unwrap();
+        // Discarding staging returns its charge.
+        assert!(staging.discard(&identity("us", 2)));
+        staging.begin(&begin(&identity("us", 5), "k"), now).unwrap();
+    }
+
+    #[test]
+    fn an_append_that_outlives_its_staging_leaves_the_replacement_alone() {
+        let staging = Staging::new(LIMITS);
+        let id = identity("us", 1);
+        let now = Instant::now();
+        staging.begin(&begin(&id, "k"), now).unwrap();
+        let old = staging.admit(&id, &data(1, 0..10), now).unwrap();
+        // The source aborts and starts over while the append runs.
+        assert!(staging.discard(&id));
+        staging.begin(&begin(&id, "k"), now).unwrap();
+        let new = staging.admit(&id, &data(1, 0..10), now).unwrap();
+        assert_eq!(new.ranges, [0..10]);
+        assert_ne!(new.generation, old.generation);
+        let used = staging.used(&id.cluster);
+        // The old append fails: the new one stays in flight.
+        assert!(!staging.settle(&id, old.generation, 1, 0..10, None));
+        assert_eq!(admit(&staging, &id, 1, 0..10, now).unwrap(), []);
+        assert_eq!(staging.used(&id.cluster), used);
+        // The old append succeeds: its extent is not the new staging's.
+        let stale = Some(extent(1, &(0..10)));
+        assert!(!staging.settle(&id, old.generation, 1, 0..10, stale));
+        assert_eq!(staging.report(&id, [1]).unwrap().pieces.len(), 0);
+        // The new append lands.
+        let fresh = Some(extent(2, &(0..10)));
+        assert!(staging.settle(&id, new.generation, 1, 0..10, fresh));
+        let extents = staging.staged(&id).unwrap().extents(1, 10).unwrap();
+        assert_eq!(extents, [extent(2, &(0..10))]);
     }
 
     #[test]
@@ -643,12 +793,12 @@ mod tests {
             staging.expire(start + LIMITS.ttl),
             std::slice::from_ref(&idle)
         );
-        assert_eq!(staging.used(&idle.cluster), 10);
+        assert_eq!(staging.used(&idle.cluster), 2 * C);
         // Sweeps run as staging is used, and DATA that finds its staging
         // gone is told it expired.
         let swept = later + LIMITS.ttl + SWEEP_INTERVAL;
         assert_eq!(
-            staging.admit(&busy, &data(1, 10..20), swept),
+            admit(&staging, &busy, 1, 10..20, swept),
             Err(AbortReason::Expired)
         );
         assert!(staging.is_empty());
@@ -695,12 +845,12 @@ mod tests {
         // A piece never needs more extents than a PUT references.
         let piece = u64::MAX;
         for at in 0..MAX_EXTENTS as u64 {
-            let parts = staging.admit(&id, &data(piece, 2 * at..2 * at + 1), now);
+            let parts = admit(&staging, &id, piece, 2 * at..2 * at + 1, now);
             assert_eq!(parts.unwrap().len(), 1);
         }
         let past = 2 * MAX_EXTENTS as u64;
         assert_eq!(
-            staging.admit(&id, &data(piece, past..past + 1), now),
+            admit(&staging, &id, piece, past..past + 1, now),
             Err(AbortReason::Refused)
         );
         assert!(staging.is_empty());
@@ -724,17 +874,25 @@ mod tests {
     }
 
     /// The sink of the simulated source: what it stored, by the position it
-    /// gave each extent, and how often it stored each byte.
+    /// gave each extent, how often it stored each byte, and what the
+    /// stored parts are charged.
     struct Sink {
         body: Vec<u8>,
         stored: BTreeMap<EpochSeq, Vec<u8>>,
         copies: Vec<u8>,
         durable: ByteRanges,
+        charged: u64,
     }
 
     impl Sink {
         /// Stores `range` and settles it as durable.
-        fn land(&mut self, staging: &Staging, id: &WriteIdentity, range: Range<u64>) -> bool {
+        fn land(
+            &mut self,
+            staging: &Staging,
+            id: &WriteIdentity,
+            generation: u64,
+            range: Range<u64>,
+        ) -> bool {
             let extent = extent(self.stored.len() as u64 + 1, &range);
             let (start, end) = (range.start as usize, range.end as usize);
             self.stored
@@ -743,7 +901,8 @@ mod tests {
                 *copies += 1;
             }
             self.durable.insert(range.clone());
-            staging.settle(id, 0, range, Some(extent))
+            self.charged += charge(range.end - range.start);
+            staging.settle(id, generation, 0, range, Some(extent))
         }
     }
 
@@ -755,7 +914,7 @@ mod tests {
         /// connection finishes cleanly the piece is complete.
         #[test]
         fn a_reconnect_resends_only_what_is_not_durable(rounds in rounds(), len in 1u64..400) {
-            let staging = Staging::new(StagingLimits { quota_bytes: len, ttl: LIMITS.ttl });
+            let staging = Staging::new(StagingLimits { quota_bytes: u64::MAX, ttl: LIMITS.ttl });
             let id = identity("us", 1);
             let now = Instant::now();
             let body: Vec<u8> = (0..len).map(|at| (at % 251) as u8).collect();
@@ -764,8 +923,9 @@ mod tests {
                 stored: BTreeMap::new(),
                 copies: vec![0; body.len()],
                 durable: ByteRanges::new(),
+                charged: MIN_STAGING_CHARGE,
             };
-            let mut in_flight: Vec<Range<u64>> = Vec::new();
+            let mut in_flight: Vec<(u64, Range<u64>)> = Vec::new();
             let clean = Round { frame: 64, outcomes: vec![(false, false)] };
             for round in rounds.iter().chain([&clean]) {
                 // Frames in flight when the connection dropped land only
@@ -784,26 +944,28 @@ mod tests {
                             offset: at,
                             bytes: Bytes::copy_from_slice(&body[at as usize..end as usize]),
                         };
-                        for part in staging.admit(&id, &frame, now).unwrap() {
+                        let admitted = staging.admit(&id, &frame, now).unwrap();
+                        let generation = admitted.generation;
+                        for part in admitted.ranges {
                             let &(fails, stays) = outcomes.next().unwrap();
                             if stays {
-                                in_flight.push(part);
+                                in_flight.push((generation, part));
                             } else if fails {
-                                staging.settle(&id, 0, part, None);
+                                staging.settle(&id, generation, 0, part, None);
                             } else {
-                                proptest::prop_assert!(sink.land(&staging, &id, part));
+                                proptest::prop_assert!(sink.land(&staging, &id, generation, part));
                                 let report = staging.report(&id, [0]).unwrap();
                                 proptest::prop_assert_eq!(&report.pieces[&0], &sink.durable);
                             }
                         }
                     }
                 }
-                for range in landing {
-                    sink.land(&staging, &id, range);
+                for (generation, range) in landing {
+                    sink.land(&staging, &id, generation, range);
                 }
             }
             proptest::prop_assert!(sink.copies.iter().all(|&copies| copies == 1));
-            proptest::prop_assert_eq!(staging.used(&id.cluster), len);
+            proptest::prop_assert_eq!(staging.used(&id.cluster), sink.charged);
             let extents = staging.staged(&id).unwrap().extents(0, len).unwrap();
             let assembled: Vec<u8> = extents
                 .iter()

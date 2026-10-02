@@ -3797,3 +3797,20 @@ of this file. A task with nothing unexpected keeps "None."
   `Staging::staged` and `StagedObject::extents` are the extension point:
   the extents a `PUT` references for a piece, or `None` if the piece is
   incomplete. Nothing is wired into the binary yet.
+- **Staging without `DATA` cost no quota (review).** Every `BEGIN` of a
+  new identity allocated an index entry charged nothing, so a source
+  could grow the index without bound before the TTL swept it; tiny
+  frames had the same effect per byte. Each staging is now charged
+  64 KiB (`MIN_STAGING_CHARGE`, the smallest `extent_bytes`) and each
+  staged part at least that much, instead of a separate count limit,
+  so the one quota bounds both bytes and index memory. A `BEGIN` past
+  it is answered `ABORT` (`quota exceeded`), and configuration now
+  requires a quota of at least one staging and one frame. A test that
+  sends only `BEGIN`s fails without the charge.
+- **A late append could change replacement staging (review).** An
+  append matched its staging by identity, piece, and range only. If the
+  staging was discarded or expired and the identity begun again, an old
+  failure removed the new in-flight range, and an old success attached
+  its extent to the new staging. Each staging now has a generation that
+  `admit` returns and `settle` checks. A test that settles an old
+  append into a replacement fails without the check.

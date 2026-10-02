@@ -19,7 +19,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
-use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -30,7 +29,7 @@ use tokio::time::Instant;
 
 use crate::endpoint::PeerConnection;
 use crate::message::{Abort, AbortReason, Applied, ApplyError, Begin, Data, Message, Outcome};
-use crate::staging::Staging;
+use crate::staging::{Admitted, Staging};
 use crate::stream::{InboundSender, InboundStream, StreamError};
 
 /// The most frames of one stream being staged at once. A stream whose
@@ -198,8 +197,8 @@ impl<S: ExtentSink> StagingService<S> {
                             Some(begin)
                         }
                         Err(reason) => {
-                            let detail = "the identity is staged for another bucket or key";
-                            stream.send(&abort(&begin.identity, reason, detail)).await?;
+                            let message = abort(&begin.identity, reason, discarded(reason));
+                            stream.send(&message).await?;
                             None
                         }
                     };
@@ -220,8 +219,8 @@ impl<S: ExtentSink> StagingService<S> {
                         .await
                         .expect("the semaphore is never closed");
                     match self.staging.admit(&begin.identity, &data, Instant::now()) {
-                        Ok(ranges) => {
-                            let append = self.append(begin, &data, ranges, reports.clone());
+                        Ok(admitted) => {
+                            let append = self.append(begin, &data, admitted, reports.clone());
                             tokio::spawn(async move {
                                 append.await;
                                 drop(permit);
@@ -264,13 +263,13 @@ impl<S: ExtentSink> StagingService<S> {
         stream.finish().await
     }
 
-    /// Stages `ranges` of `data`, which the staging of `begin` admitted,
+    /// Stages the parts of `data` that the staging of `begin` admitted,
     /// one after the other, and tells the reporter what changed.
     fn append(
         &self,
         begin: &Begin,
         data: &Data,
-        ranges: Vec<Range<u64>>,
+        admitted: Admitted,
         reports: Reports,
     ) -> impl Future<Output = ()> + Send + 'static {
         let (staging, sink) = (Arc::clone(&self.staging), self.sink.clone());
@@ -281,14 +280,14 @@ impl<S: ExtentSink> StagingService<S> {
         } = begin.clone();
         let data = data.clone();
         async move {
-            let piece = data.piece;
-            for range in ranges {
+            let (piece, generation) = (data.piece, admitted.generation);
+            for range in admitted.ranges {
                 let start = usize::try_from(range.start - data.offset).expect("within a frame");
                 let end = usize::try_from(range.end - data.offset).expect("within a frame");
                 let bytes = data.bytes.slice(start..end);
                 let result = sink.append(&bucket, &key, range.start, bytes).await;
                 let extent = result.as_ref().ok().copied();
-                let grew = staging.settle(&identity, piece, range, extent);
+                let grew = staging.settle(&identity, generation, piece, range, extent);
                 // The reporter is gone only once the stream is.
                 match result {
                     Ok(_) if grew => {
@@ -372,7 +371,10 @@ fn abort(identity: &WriteIdentity, reason: AbortReason, detail: &str) -> Message
 fn discarded(reason: AbortReason) -> &'static str {
     match reason {
         AbortReason::QuotaExceeded => "the source's staged bytes would exceed the quota",
-        AbortReason::Refused => "the piece would need more extents than an object references",
+        AbortReason::Refused => {
+            "the identity is staged for another bucket or key, or the piece would need more \
+             extents than an object references"
+        }
         AbortReason::Expired | AbortReason::Cancelled => "the staging expired or was discarded",
     }
 }

@@ -142,7 +142,7 @@ pub use pool::{
     PoolStats, Sample, ShardLease,
 };
 pub use ranges::ByteRanges;
-pub use staging::{SWEEP_INTERVAL, StagedObject, Staging, StagingLimits};
+pub use staging::{Admitted, SWEEP_INTERVAL, StagedObject, Staging, StagingLimits};
 pub use stream::{
     InboundSender, InboundStream, MessageReceiver, MessageSender, MessageStream, STREAM_REFUSED,
     StreamError,
