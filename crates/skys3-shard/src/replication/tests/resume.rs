@@ -202,6 +202,42 @@ fn a_replica_resumes_in_the_newer_of_its_register_and_its_kept_configuration() {
 }
 
 #[test]
+fn a_resumed_member_that_was_re_admitted_as_a_learner_reopens_as_one() {
+    run(async {
+        let pki = Pki::new();
+        let (set, _) = shard_set(65).await;
+        let register = Register::holding(Some(config()));
+        let member = replication(2, &pki, set.clone(), &register)
+            .open(&config())
+            .await
+            .unwrap();
+        register.set(None);
+        let set = restarted(&member, &set).await;
+        let resumed = replication(2, &pki, set.clone(), &register);
+        let replica = resumed.resume(&shard()).await.unwrap().unwrap();
+        assert_eq!(replica.role(), Role::Member);
+
+        // While the node was down, the primary removed it and added it back
+        // as a learner (§6.7): the stale member stops, and the shard opens
+        // again as a learner.
+        let readmitted = ShardConfig {
+            learners: vec![node(2)],
+            ..configured(4, 1, &[1])
+        };
+        register.set(Some(Some(readmitted.clone())));
+        until(|| replica.is_stopped()).await;
+        let learner = loop {
+            match set.get(&shard()).await {
+                Some(open) if open.role() == Role::Learner => break open,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        };
+        assert_eq!(learner.config(), readmitted);
+        assert!(!learner.durable().same_channel(&replica.durable()));
+    });
+}
+
+#[test]
 fn a_recorded_takeover_survives_a_restart_and_is_sent_again() {
     run(async {
         let pki = Pki::new();
