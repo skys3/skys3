@@ -115,12 +115,24 @@ fn roles_follow_the_configuration() {
         let shared = replicated();
         let outsider = configuration_error(replica.open(&shared, &node(4)).await.map(drop));
         assert!(outsider.contains("not a member"), "{outsider}");
+        // A learner follows its primary as a member does, from no epoch
+        // while it holds nothing of the shard (§6.7).
         let learners = ShardConfig {
             learners: vec![node(4)],
-            ..shared.clone()
+            members: shared.members.clone(),
+            replicas: 3,
+            ..config(&shard(2), 1)
         };
-        let reason = configuration_error(replica.open(&learners, &node(1)).await.map(drop));
-        assert!(reason.contains("learners"), "{reason}");
+        let learner = replica.open(&learners, &node(4)).await.unwrap();
+        assert_eq!(learner.role(), Role::Learner);
+        assert!(learner.role().follows() && !Role::Primary.follows());
+        assert!(!learner.is_serving() && learner.leader().is_none());
+        assert_eq!(learner.sequencing(), Epoch::ZERO);
+        assert!(matches!(
+            learner.commit(delete("k")).await,
+            Err(ShardError::NotPrimary { .. })
+        ));
+        learner.close().await.unwrap();
         let headless = ShardConfig {
             primary: node(9),
             ..shared.clone()

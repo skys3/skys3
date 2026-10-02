@@ -40,11 +40,11 @@ struct Session {
 
 impl<N: Network, D: Disk> Link<N, D> {
     /// Keeps the link up until the shard stops, its configuration leaves
-    /// the member out (§6.4), or the primary steps down for a planned
-    /// handoff and owes the member nothing (§5.4).
+    /// the member or learner out (§6.4), or the primary steps down for a
+    /// planned handoff and owes the member nothing (§5.4).
     pub(super) async fn run(self) {
         while !self.shard.is_stopped()
-            && self.shard.config().is_member(&self.member)
+            && self.names_member()
             && !self.leader.handed_off(&self.member)
         {
             match self.connect().await {
@@ -77,6 +77,14 @@ impl<N: Network, D: Disk> Link<N, D> {
             sent = self.send(&mut sender, last, &session) => sent,
             heard = self.hear(&mut receiver) => heard,
         }
+    }
+
+    /// Whether the primary's configuration names the member, as a member
+    /// or a learner, and the primary still sends it its log.
+    fn names_member(&self) -> bool {
+        let config = self.shard.config();
+        (config.is_member(&self.member) || config.is_learner(&self.member))
+            && self.leader.links_to(&self.member)
     }
 
     /// The session the primary opens now.
@@ -153,12 +161,13 @@ impl<N: Network, D: Disk> Link<N, D> {
             .subscribe(&self.member)
             .ok_or_else(|| LinkError::Protocol(format!("{} is not a member", self.member)))?;
         let mut last_beacon: Option<Instant> = None;
+        let mut durable = self.shard.durable();
         loop {
             changes.borrow_and_update();
             if self.session() != *session {
                 return Err(LinkError::Reconfigured);
             }
-            let records = match self.leader.records_after(cursor, BATCH) {
+            let mut records = match self.leader.records_after(cursor, BATCH) {
                 Pending::Ready(records) => records,
                 Pending::InLog(through) => {
                     let records = self.shard.read_tail(cursor, through).await?;
@@ -166,6 +175,14 @@ impl<N: Network, D: Disk> Link<N, D> {
                     continue;
                 }
             };
+            // A learner gets only what the primary holds durably: a primary
+            // that restarts waits for its members' logs, not its learners',
+            // before it gives a `seq` it lost a second record (§5.1, §6.4).
+            let learner = self.leader.is_learner(&self.member);
+            if learner {
+                let held = *durable.borrow_and_update();
+                records.retain(|record| record.seq <= held);
+            }
             if records.is_empty() && self.shard.is_stopped() {
                 return Ok(());
             }
@@ -207,11 +224,18 @@ impl<N: Network, D: Disk> Link<N, D> {
                 last_beacon = Some(Instant::now());
             }
             if records.is_empty() {
-                // Woken by a new record, or for the next beacon. The
-                // watermark waits for either.
+                // Woken by a new record, a learner by one becoming durable
+                // here, or for the next beacon. The watermark waits for
+                // either.
                 let every = self.config.beacon_every(true);
                 let due = last_beacon.map_or_else(Instant::now, |at| at + every);
-                let _ = tokio::time::timeout_at(due, changes.changed()).await;
+                let woken = async {
+                    tokio::select! {
+                        _ = changes.changed() => {}
+                        _ = durable.changed(), if learner => {}
+                    }
+                };
+                let _ = tokio::time::timeout_at(due, woken).await;
                 continue;
             }
             for record in records {
