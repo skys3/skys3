@@ -385,6 +385,14 @@ impl ReplicatedServices {
         self.holder_audit.check()
     }
 
+    /// The reads each node's replicas served as their holder, over every
+    /// life: the registrations they accepted. Nodes that served none are
+    /// left out.
+    #[must_use]
+    pub fn holder_reads(&self) -> BTreeMap<NodeId, u64> {
+        self.holder_audit.by_holder()
+    }
+
     /// Each node's replica of each shard in the node's current life, with
     /// the register's configuration, in node and shard order. A node that
     /// is down, or has not opened the shard in this life, has none.

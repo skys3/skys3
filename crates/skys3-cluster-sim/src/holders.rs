@@ -3,6 +3,7 @@
 //! with delays that widen the gap between a read plan and its
 //! registration, seeded bugs, and an audit of what the holders served.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -57,6 +58,8 @@ pub struct HolderCounts {
 #[derive(Debug, Default)]
 struct Audit {
     counts: HolderCounts,
+    /// Reads registered with each node as their holder.
+    by_holder: BTreeMap<NodeId, u64>,
     /// Fetches served under a registration that had lapsed.
     violations: Vec<String>,
 }
@@ -68,6 +71,12 @@ pub(crate) struct HolderAudit(Arc<Mutex<Audit>>);
 impl HolderAudit {
     pub(crate) fn counts(&self) -> HolderCounts {
         self.lock().counts
+    }
+
+    /// Reads registered with each node as their holder; nodes that served
+    /// none are left out.
+    pub(crate) fn by_holder(&self) -> BTreeMap<NodeId, u64> {
+        self.lock().by_holder.clone()
     }
 
     pub(crate) fn check(&self) -> Result<(), String> {
@@ -119,8 +128,11 @@ impl Holders {
         let superseded = current.is_none_or(|(current, _)| current != version);
         let registered = local.register(shard, holder, key, version, layout).await;
         let mut audit = self.audit.lock();
-        if superseded && matches!(registered, Ok(Some(_))) {
-            audit.counts.superseded += 1;
+        if matches!(registered, Ok(Some(_))) {
+            *audit.by_holder.entry(holder.clone()).or_default() += 1;
+            if superseded {
+                audit.counts.superseded += 1;
+            }
         }
         match &registered {
             Ok(Some(_)) if replica.as_ref().is_some_and(|r| r.role() == Role::Member) => {

@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use skys3::storage::Storage;
@@ -111,6 +111,18 @@ pub struct ClusterConfig {
     /// How long a read registration lasts on its holder, and how often a
     /// gateway renews the ones it streams under (§8.7).
     pub read_registration: ReadRegistration,
+    /// The hot cache every node's gateway keeps (§9.2): none by default.
+    pub hot_cache: HotCaches,
+}
+
+/// The hot cache of every node (§9.2), new in each life.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotCaches {
+    /// `hot_cache_bytes_per_node`; 0 keeps nothing.
+    pub bytes: u64,
+    /// A seeded bug: a lookup returns whatever version of the key the
+    /// cache holds, not only the one the read plan names.
+    pub ignore_version: bool,
 }
 
 /// The timers of read registrations (§8.7) on every node.
@@ -168,6 +180,7 @@ impl Default for ClusterConfig {
             clean_copies: 1,
             read_registration: ReadRegistration::default(),
             compaction: None,
+            hot_cache: HotCaches::default(),
         }
     }
 }
@@ -248,6 +261,9 @@ pub struct Report {
     pub broken_reads: usize,
     /// Log segments compaction reclaimed, over every node and life.
     pub compacted: u64,
+    /// `GET`s each node's gateway served from its hot cache, over every
+    /// life; nodes that served none are left out.
+    pub hot_cache_hits: BTreeMap<NodeId, u64>,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -661,6 +677,7 @@ impl<S: NodeServices> Cluster<S> {
             registers,
             evicted,
             compacted: world.shared.compacted.load(Ordering::Relaxed),
+            hot_cache_hits: world.shared.hot_cache_hits(),
         })
     }
 
@@ -858,6 +875,7 @@ impl<S: NodeServices> World<S> {
                 placement: Arc::clone(&placement),
                 remote: remote.clone(),
                 compacted: Arc::new(AtomicU64::new(0)),
+                hot_caches: Mutex::default(),
             }),
             routes: Routes {
                 buckets,
@@ -1212,6 +1230,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
             release_delay: shape.read_registration.release_delay,
         },
         compaction: shape.compaction,
+        hot_cache: shape.hot_cache,
     })
 }
 
