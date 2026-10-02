@@ -85,7 +85,7 @@ pub use error::{ConfigError, Violation, Violations};
 pub use flush::{AckPolicy, ConflictPolicy, FlushConfig};
 pub use identity::{IdentityConfig, StaticCredentialConfig};
 pub use node::{GatewayListenConfig, NodeConfig};
-pub use peering::{CongestionControl, PeeringConfig};
+pub use peering::{BucketPair, CongestionControl, PeerConfig, PeeringConfig};
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};
 pub use target::parse_target;
@@ -205,7 +205,7 @@ impl Config {
         raw.ec.check(&mut checker);
         let (bucket_defaults, named_buckets) =
             buckets::resolve(&raw.buckets, &raw.flush, cluster_id, &mut checker);
-        raw.peering.check(&mut checker);
+        raw.peering.check(cluster_id, &raw.transport, &mut checker);
         raw.identity.check(&mut checker);
         raw.admin.check(&mut checker);
         check_control_store_independence(&control_store, &named_buckets, &mut checker);
