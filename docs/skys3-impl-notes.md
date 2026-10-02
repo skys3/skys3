@@ -4206,3 +4206,24 @@ of this file. A task with nothing unexpected keeps "None."
   waiting for `DURABLE`. It replays the `COMMIT` on a new connection,
   checks a failing precondition, and checks that `ABORT` leaves nothing
   to publish. Every network wait is bounded at 30 s.
+- **A local tag change kept the peer's identity (review).** A `TAGS`
+  record makes a new version and clears its local write identity, but it
+  kept the stored metadata. A version a peer had published therefore
+  still carried the peer's `skys3-wid` after a local client
+  (`peer_local_writes`) changed its tags. The source's next `COMMIT`,
+  conditioned on that identity, then overwrote the tag change. The
+  flusher treats `TAGS` as a write with its own identity (M1-16b), so
+  `TAGS` now also drops the carried `x-amz-meta-skys3-wid` entry, and the
+  version reports the `TAGS` record's local identity. The entry's name
+  moved to `skys3-log` (`IDENTITY_METADATA`), next to the record limits.
+  A test tags a published object and checks that the next `COMMIT` fails
+  its precondition. Without the fix, it applies.
+- **The identity did not always fit in the record (review).** A `PUT`
+  record holds at most 8 KiB of metadata, and a `COMMIT` could carry all
+  8 KiB. Adding the 116-byte identity entry then refused a valid object
+  for good. §7.2 already reserves the identity's 105 bytes in the 2 KiB
+  user-metadata limit, for remotes. The same is now done for the record
+  limit (`IDENTITY_METADATA_RESERVED`). A client's stored metadata, and a
+  `COMMIT`'s without an identity entry, stay 116 bytes below 8 KiB. A
+  gateway test and a message-rules test each check the new bound, and
+  both fail without it.

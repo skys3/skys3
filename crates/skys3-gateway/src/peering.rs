@@ -9,7 +9,7 @@ use bytes::Bytes;
 use skys3_config::BucketsConfig;
 use skys3_index::Entry;
 use skys3_log::RecordBody;
-use skys3_log::record::{self, Delete, Extent, ExtentRef, MAX_METADATA_LEN};
+use skys3_log::record::{self, Delete, Extent, ExtentRef, IDENTITY_METADATA, MAX_METADATA_LEN};
 use skys3_peer::{
     ApplyError, Commit, CommitSink, ExtentSink, Outcome, Put, PutData, SinkError, StagedObject,
     Write,
@@ -17,7 +17,7 @@ use skys3_peer::{
 use skys3_types::{BucketDocument, BucketName, ClusterId};
 
 use crate::buckets::GatewayConfig;
-use crate::conditions::{IDENTITY_METADATA, PeerCondition, Precondition, current_identity};
+use crate::conditions::{PeerCondition, Precondition, current_identity};
 use crate::shard::{ShardError, ShardRef, Shards};
 
 /// Looks up a bucket by name, as the gateway's local copy of the bucket
@@ -597,6 +597,54 @@ mod tests {
             commits.apply(&missing, Some(&staged)).await,
             Outcome::PreconditionFailed { current: None }
         );
+    }
+
+    #[tokio::test]
+    async fn a_local_tag_change_replaces_the_carried_identity() {
+        let (shards, document) = opened().await;
+        let commits = PeerCommits::new(shards.clone(), lookup(&document), &settings(Some(SOURCE)));
+        let key = "k";
+        let staged = stage(&shards, &document, key, b"0123").await;
+        let first = put_commit(1, key, Expected::Absent, 4);
+        assert!(matches!(
+            commits.apply(&first, Some(&staged)).await,
+            Outcome::Committed { .. }
+        ));
+
+        // A client of this cluster (`peer_local_writes`) changes the tags:
+        // a new version, whose identity is the `TAGS` record's, as the
+        // flusher sends it (§7.2).
+        let shard = ShardRef::for_key(&document, key);
+        let tags = RecordBody::Tags(record::Tags {
+            key: key.to_owned(),
+            tags: BTreeMap::from([("local".to_owned(), "yes".to_owned())]),
+        });
+        let position = shards
+            .write(&shard, tags, Precondition::None)
+            .await
+            .unwrap()
+            .unwrap();
+        let entry = shards.entry(&shard, key).await.unwrap().unwrap();
+        let object = entry.object.as_ref().unwrap();
+        assert!(!object.metadata.contains_key(IDENTITY_METADATA));
+        assert_eq!(object.metadata["content-type"], "image/jpeg");
+        let local = WriteIdentity::new(
+            ClusterId::new("prod-eu").unwrap(),
+            shard.bucket.clone(),
+            shard.shard,
+            position,
+        );
+
+        // The source's next version, which expects its own, does not
+        // overwrite the tag change, and its replay of the first finds it
+        // gone.
+        let second = put_commit(2, key, Expected::Matches(identity(1)), 4);
+        let changed = Outcome::PreconditionFailed {
+            current: Some(local),
+        };
+        assert_eq!(commits.apply(&second, Some(&staged)).await, changed);
+        assert_eq!(commits.apply(&first, Some(&staged)).await, changed);
+        assert_eq!(shards.entry(&shard, key).await.unwrap(), Some(entry));
     }
 
     #[track_caller]

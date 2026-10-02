@@ -31,12 +31,9 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use skys3_index::{Entry, ObjectVersion};
 use skys3_types::{ClusterId, WriteIdentity};
 
-use crate::shard::ShardRef;
+use skys3_log::record::IDENTITY_METADATA;
 
-/// The stored metadata that carries a version's write identity, as on any
-/// remote SkyS3 writes to (design §7.2): a version a peer cluster published
-/// carries the source's.
-pub(crate) const IDENTITY_METADATA: &str = "x-amz-meta-skys3-wid";
+use crate::shard::ShardRef;
 
 /// What a conditional write requires of its key's current object.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

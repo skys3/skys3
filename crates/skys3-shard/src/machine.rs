@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::fmt;
 
 use skys3_index::{Applier, Entry, EntryState, IndexError, IndexWriter, ObjectVersion, Payload};
-use skys3_log::record::{Adopt, Delete, Flushed, Import, Put, PutData, Tags};
+use skys3_log::record::{Adopt, Delete, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags};
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
 use skys3_types::{EpochSeq, Seq};
 
@@ -348,7 +348,8 @@ pub(crate) fn store(
 /// `TAGS`: replaces a live object's tags as a new version, which the
 /// flusher must send to the remote. The new version keeps the object's
 /// bytes and `Last-Modified`, and its write identity names the `TAGS`
-/// record.
+/// record: an identity the object carried from another cluster (§7.8) is
+/// dropped with its metadata entry.
 fn set_tags(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -364,6 +365,7 @@ fn set_tags(
     };
     object.tags.clone_from(&tags.tags);
     object.write_identity = None;
+    object.metadata.remove(IDENTITY_METADATA);
     entry.version = position;
     entry.state = state;
     index.put_entry(shard, &tags.key, &entry)?;
