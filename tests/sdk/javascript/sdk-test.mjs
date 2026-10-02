@@ -185,7 +185,8 @@ async function features() {
  * chain's web-identity provider under a cache that refreshes a session
  * SKYS3_REFRESH_SECONDS after its issue, under load. The default chain's
  * own cache refreshes five minutes before expiry and cannot be told
- * otherwise.
+ * otherwise. Every refresh must reread the token file, whose tokens expire
+ * within seconds.
  */
 async function webIdentity() {
   const wiBucket = `${bucket}-web-identity`;
@@ -204,7 +205,8 @@ async function webIdentity() {
     (identity) => identity.expiration !== undefined,
   );
   const s3 = new S3Client({ forcePathStyle: true, credentials });
-  const keys = new Set([first.accessKeyId]);
+  // The keys this provider gives: a refresh is a second one from it.
+  const keys = new Set([(await credentials()).accessKeyId]);
   let count = 0;
   const deadline = Date.now() + Number(process.env.SKYS3_LOAD_SECONDS) * 1000;
   const worker = async (n) => {

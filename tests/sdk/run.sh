@@ -36,7 +36,9 @@
 #   AWS_EC2_METADATA_DISABLED, NODE_EXTRA_CA_CERTS
 #                           what a workload's default credential chain
 #                           reads; the test rewrites the token file with a
-#                           fresh token every few seconds
+#                           fresh token every two seconds, and a token
+#                           expires within seven, so every refresh must
+#                           reread the file
 #
 # A client runs in its image, skys3-sdk-<client>, with the host's network
 # and the matrix directory mounted at its own path. With SKYS3_SDK_LOCAL=1

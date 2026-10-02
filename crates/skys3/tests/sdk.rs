@@ -9,9 +9,10 @@
 //! `AWS_ROLE_ARN`, and `AWS_WEB_IDENTITY_TOKEN_FILE`, refreshed while
 //! requests run. Sessions last 900 seconds, the shortest STS allows, and
 //! each client sets its SDK's refresh window so that it refreshes within
-//! seconds (`SKYS3_REFRESH_SECONDS`); the token file is rewritten with a
-//! new token every few seconds, so a refresh that reused an old token
-//! would fail once it expired.
+//! seconds (`SKYS3_REFRESH_SECONDS`). The token file gets a new token
+//! every two seconds, and a token stops being accepted seven seconds after
+//! its issue at most, so a client that kept a token instead of rereading
+//! the file would fail its next refresh within the load phase.
 //!
 //! The AWS SDK for Rust always runs, in this test. The other clients run
 //! when `SKYS3_SDK_CLIENTS` names them (such as `python go javascript java
@@ -67,11 +68,16 @@ const ALT_SECRET_KEY: &str = "skys3-sdk-alt-secret-0123456789abcdefgh";
 const SESSION_SECONDS: u64 = 900;
 /// How soon after its issue a client should refresh a session.
 const REFRESH_SECONDS: u64 = 5;
-/// How long a token is valid. The node allows 60 seconds of clock skew
-/// past it.
-const TOKEN_LIFETIME: Duration = Duration::from_secs(60);
-/// How often the token file gets a new token.
-const TOKEN_ROTATION: Duration = Duration::from_secs(5);
+/// How long a token is valid. Its `iat` and `exp` are whole seconds, so
+/// it lasts between 5 and 6 seconds from its issue.
+const TOKEN_LIFETIME: Duration = Duration::from_secs(6);
+/// How far past a token's `exp` the node accepts it,
+/// `oidc_clock_skew_seconds`: the issuer and the node share a clock.
+const CLOCK_SKEW_SECONDS: u64 = 1;
+/// How often the token file gets a new token. A token read from the file
+/// is at most this old, so it has at least 4 seconds left; one kept from
+/// an earlier read fails within `TOKEN_LIFETIME` and the skew.
+const TOKEN_ROTATION: Duration = Duration::from_secs(2);
 /// How long a part of a multipart upload is, except the last: the S3
 /// minimum.
 const PART: usize = 5 << 20;
@@ -212,7 +218,10 @@ policy = '{{"Version": "2012-10-17", "Statement": {{"Effect": "Allow", "Action":
         )
         .replace(
             "sts_web_identity = false",
-            &format!("sts_web_identity = true\nsession_default_seconds = {SESSION_SECONDS}"),
+            &format!(
+                "sts_web_identity = true\nsession_default_seconds = {SESSION_SECONDS}\n\
+                 oidc_clock_skew_seconds = {CLOCK_SKEW_SECONDS}"
+            ),
         )
 }
 
@@ -929,6 +938,10 @@ async fn rust_web_identity(matrix: &Matrix) {
         "session keys: {first:?}"
     );
 
+    // A token every client has seen, which is superseded during the load.
+    let superseded = std::fs::read_to_string(&matrix.token_file).unwrap();
+    let read_at = Instant::now();
+
     let deadline = Instant::now() + Duration::from_secs(load_seconds());
     let operations = Arc::new(AtomicUsize::new(0));
     let workers: Vec<_> = (0..8)
@@ -969,4 +982,33 @@ async fn rust_web_identity(matrix: &Matrix) {
         operations.load(Ordering::Relaxed)
     );
     assert!(sessions >= 2, "the SDK never refreshed its session");
+
+    // The load outlasted the superseded token: every client that kept
+    // working through it reread the token file to refresh.
+    let expired = read_at + TOKEN_LIFETIME + Duration::from_secs(CLOCK_SKEW_SECONDS + 1);
+    tokio::time::sleep_until(expired.into()).await;
+    let (status, answer) = assume_role(matrix, &superseded).await;
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer.contains("ExpiredTokenException"), "{answer}");
+    let current = std::fs::read_to_string(&matrix.token_file).unwrap();
+    let (status, answer) = assume_role(matrix, &current).await;
+    assert_eq!(status, 200, "{answer}");
+}
+
+/// Calls `AssumeRoleWithWebIdentity` with `token`, without the SDK.
+async fn assume_role(matrix: &Matrix, token: &str) -> (u16, String) {
+    let form = format!(
+        "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn={ROLE_ARN}\
+         &RoleSessionName=rust-check&WebIdentityToken={}",
+        token.trim()
+    );
+    let (status, body) = https_request(
+        &matrix.ca(),
+        "POST",
+        &format!("{}/", matrix.endpoint),
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form.as_bytes(),
+    )
+    .await;
+    (status, String::from_utf8_lossy(&body).into_owned())
 }
