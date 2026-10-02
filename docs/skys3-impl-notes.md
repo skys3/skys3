@@ -2115,9 +2115,19 @@ of this file. A task with nothing unexpected keeps "None."
   bytes are the remote's), but it widens M1-20's open item: such a version
   cannot be flushed from that replica until the flusher fills before it
   flushes. Design §9.3 records it.
+- **No copy is evicted before its bucket's policy is known.** Review found
+  that a restarted node opened its replicas, and the cache scanned them,
+  before the node first read the buckets' `clean_copies`: under the
+  default of one copy, every member copy beyond rank 0 went, for good,
+  since a higher setting brings none back. A bucket made at runtime had
+  the same gap until the next round of the flush follower. The cache now
+  keeps every copy of a bucket it was not told about, and evicts the extra
+  ones when it is told, or when the setting drops; the node and the
+  cluster harness also install the policies before the cache runs and
+  before each round's reconcile awaits.
 - **Left open.** A learner's snapshot still turns clean multipart entries
-  into stubs without parts, as before. A new `clean_copies`, or a new
-  primary, does not revisit copies already kept; LRU reclaims them. Only
+  into stubs without parts, as before. A new primary does not revisit
+  copies already kept; LRU reclaims them. Only
   reads on the primary count as uses, since members serve none yet; read
   plans (M2-18) and the hot cache (M2-19) change that.
 

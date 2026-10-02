@@ -16,10 +16,6 @@ use tokio::sync::Notify;
 
 use crate::set::ShardSet;
 
-/// The `clean_copies` of a bucket the cache was not told about: the
-/// default of §4.1.
-const DEFAULT_CLEAN_COPIES: u8 = 1;
-
 /// The cache's bounds: `[cache]` in the configuration (§14).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CacheSettings {
@@ -105,9 +101,12 @@ impl CacheMetrics {
 /// - **Copies.** A replica keeps a clean payload only if its rank is below
 ///   its bucket's `clean_copies` ([`CleanCache::set_clean_copies`]): the
 ///   primary, or a replica alone, is rank 0, and the other members follow
-///   in the order of the configuration. Learners keep none. A clean entry
-///   whose bytes are not on the node is evicted too, so that its state
-///   says so.
+///   in the order of the configuration. Learners keep none. Until the
+///   cache is told a bucket's `clean_copies`, its members keep every copy:
+///   a node opens its replicas, and receives `FLUSHED` records of a new
+///   bucket, before it reads the bucket's policy, and a copy evicted then
+///   would be lost for good. A clean entry whose bytes are not on the node
+///   is evicted too, so that its state says so.
 /// - **Bounds.** The payloads kept are evicted least recently used first
 ///   while they hold more than `cache_max_bytes_per_node`, or while one
 ///   disk's hold more than its room. A disk's room is what clean payload
@@ -190,6 +189,9 @@ struct Slot {
 #[derive(Debug)]
 struct Held {
     disk: Label,
+    /// The replica's rank among the holders of clean copies, as it last
+    /// reported it: `None` for a learner, or before any report.
+    rank: Option<u8>,
     keys: HashMap<String, Slot>,
 }
 
@@ -252,12 +254,32 @@ impl CleanCache {
         cache
     }
 
-    /// Sets each bucket's `clean_copies`, replacing what was set before. A
-    /// bucket left out keeps one copy, the default. The setting applies to
-    /// entries as they become clean, and to a replica's entries when it
-    /// opens.
+    /// Sets each bucket's `clean_copies`, replacing what was set before.
+    ///
+    /// The setting applies to entries as they become clean, to a replica's
+    /// entries when it opens, and, for a bucket whose setting is new or
+    /// changed, to the copies kept already: those of replicas ranked at or
+    /// beyond it are evicted. A copy evicted is not brought back when the
+    /// setting grows. Until a bucket is set, or after it is left out, its
+    /// replicas keep every copy they rank for; learners still keep none.
     pub fn set_clean_copies(&self, copies: impl IntoIterator<Item = (BucketId, u8)>) {
-        self.ledger().clean_copies = copies.into_iter().collect();
+        let mut ledger = self.ledger();
+        let copies: HashMap<BucketId, u8> = copies.into_iter().collect();
+        let changed: Vec<(BucketId, u8)> = copies
+            .iter()
+            .filter(|&(bucket, copies)| ledger.clean_copies.get(bucket) != Some(copies))
+            .map(|(bucket, copies)| (bucket.clone(), *copies))
+            .collect();
+        ledger.clean_copies = copies;
+        for (bucket, copies) in changed {
+            ledger.doom_beyond(&bucket, copies);
+        }
+        let over = ledger.over();
+        self.publish(&ledger);
+        drop(ledger);
+        if over {
+            self.inner.wake.notify_one();
+        }
     }
 
     /// Records the space of `disk`, as last read: the room it has for
@@ -332,6 +354,7 @@ impl CleanCache {
             shard.clone(),
             Held {
                 disk: disk.clone(),
+                rank: None,
                 keys: HashMap::new(),
             },
         );
@@ -355,15 +378,18 @@ impl CleanCache {
             return;
         }
         let mut ledger = self.ledger();
-        let Some(disk) = ledger.shards.get(shard).map(|held| held.disk.clone()) else {
+        let Some(held) = ledger.shards.get_mut(shard) else {
             return;
         };
-        let copies = ledger
-            .clean_copies
-            .get(&shard.bucket)
-            .copied()
-            .unwrap_or(DEFAULT_CLEAN_COPIES);
-        let keeps = rank.is_some_and(|rank| rank < copies);
+        held.rank = rank;
+        let disk = held.disk.clone();
+        // A bucket whose `clean_copies` is not known yet keeps every copy,
+        // until `set_clean_copies` evicts the extra ones.
+        let keeps = match (rank, ledger.clean_copies.get(&shard.bucket)) {
+            (None, _) => false,
+            (Some(rank), Some(&copies)) => rank < copies,
+            (Some(_), None) => true,
+        };
         for note in notes {
             match note {
                 Note::Clean {
@@ -535,6 +561,38 @@ impl Ledger {
         self.bytes = self.bytes.saturating_sub(slot.size);
         self.entries = self.entries.saturating_sub(1);
         Some(slot)
+    }
+
+    /// Evicts the copies kept by the replicas of `bucket` ranked at or
+    /// beyond `copies`.
+    fn doom_beyond(&mut self, bucket: &BucketId, copies: u8) {
+        let beyond: Vec<(ShardRef, Label, Vec<String>)> = self
+            .shards
+            .iter()
+            .filter(|(shard, held)| {
+                &shard.bucket == bucket
+                    && !held.keys.is_empty()
+                    && held.rank.is_none_or(|rank| rank >= copies)
+            })
+            .map(|(shard, held)| {
+                let mut keys: Vec<String> = held.keys.keys().cloned().collect();
+                keys.sort_unstable();
+                (shard.clone(), held.disk.clone(), keys)
+            })
+            .collect();
+        for (shard, disk, keys) in beyond {
+            for key in keys {
+                if let Some(slot) = self.remove(&shard, &key) {
+                    self.doomed.push_back(Victim {
+                        shard: shard.clone(),
+                        key,
+                        version: slot.version,
+                        size: slot.size,
+                        disk: disk.clone(),
+                    });
+                }
+            }
+        }
     }
 
     fn forget_shard(&mut self, shard: &ShardRef) {
