@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use s3s::{S3Result, s3_error};
+use s3s::{S3Error, S3Result, s3_error};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef, PutData, UploadBegin};
 use skys3_types::EpochSeq;
@@ -35,7 +35,10 @@ pub(crate) const MAX_EXTENTS_IN_FLIGHT: usize = 4;
 /// still arriving cannot tell from garbage. A body therefore has
 /// `max_duration`, half that TTL, from its first extent to finish: past it,
 /// the upload fails with `400 RequestTimeout`, so every extent a committed
-/// record names was written less than half the TTL before (§10.3).
+/// record names was written less than half the TTL before (§10.3). The
+/// caller waits for each of the body's frames through
+/// [`Upload::before_deadline`], so a client that stops sending is answered
+/// then too, rather than holding the request open.
 ///
 /// **Streamed PUTs.** An upload made [`Upload::streamed`] commits an
 /// `UPLOAD_BEGIN` once its body reaches the threshold, and
@@ -102,6 +105,25 @@ impl<H: Shards> Upload<H> {
     /// identity its `PUT` inherits, or `None` if it committed none.
     pub(crate) fn identity(&self) -> Option<EpochSeq> {
         self.begun
+    }
+
+    /// Waits for `next`, the body's next frame, for no longer than the body
+    /// has left once its first extent is sent (see the type's docs).
+    ///
+    /// # Errors
+    ///
+    /// `400 RequestTimeout` if the deadline passes first; `next` is then
+    /// dropped.
+    pub(crate) async fn before_deadline<F: Future>(&self, next: F) -> S3Result<F::Output> {
+        let deadline = self
+            .started
+            .and_then(|started| started.checked_add(self.max_duration));
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, next)
+                .await
+                .map_err(|_| self.timed_out()),
+            None => Ok(next.await),
+        }
     }
 
     /// Takes the body's next bytes, committing every extent they fill, and
@@ -187,13 +209,17 @@ impl<H: Shards> Upload<H> {
     /// type's docs).
     fn check_deadline(&self) -> S3Result<()> {
         match self.started {
-            Some(started) if started.elapsed() > self.max_duration => Err(s3_error!(
-                RequestTimeout,
-                "The body took longer than {:?} to arrive",
-                self.max_duration
-            )),
+            Some(started) if started.elapsed() > self.max_duration => Err(self.timed_out()),
             _ => Ok(()),
         }
+    }
+
+    fn timed_out(&self) -> S3Error {
+        s3_error!(
+            RequestTimeout,
+            "The body took longer than {:?} to arrive",
+            self.max_duration
+        )
     }
 }
 
