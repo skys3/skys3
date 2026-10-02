@@ -204,6 +204,14 @@ impl Credentials {
         &self.verifier.cluster
     }
 
+    /// The certificate chain and signing key, for a TLS configuration of
+    /// another transport with its own trust rules, such as the peer
+    /// transport between clusters.
+    #[must_use]
+    pub fn certified_key(&self) -> Arc<CertifiedKey> {
+        self.certified.clone()
+    }
+
     /// The TLS configuration for accepting connections. Only nodes serve.
     pub(crate) fn server_config(&self) -> Option<Arc<ServerConfig>> {
         if self.identity.role() != Role::Node {
@@ -371,8 +379,8 @@ fn identity_error(error: IdentityError) -> rustls::Error {
 }
 
 /// Maps a path-building error to the TLS error, and so the alert, rustls
-/// would use for it.
-fn pki_error(error: webpki::Error) -> rustls::Error {
+/// would use for it. rustls keeps its own mapping private.
+pub fn pki_error(error: webpki::Error) -> rustls::Error {
     use webpki::Error as E;
     let error = match error {
         E::BadDer | E::BadDerTime | E::TrailingData(_) => CertificateError::BadEncoding,

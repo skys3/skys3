@@ -3564,3 +3564,66 @@ of this file. A task with nothing unexpected keeps "None."
   batch generator gives each item a distinct identity. A proptest that
   copies one item's identity onto another, and a rules test, both fail
   without the check.
+
+### M6-02 QUIC endpoint and connection pool
+
+- **No trust-bundle keys existed.** §7.8 and §12 speak of "a configured
+  trust bundle", but `[peering]` had no certificate keys. The PR adds
+  `[peering.peers.<cluster-id>]`, with `ca_file` and `buckets`, to §14 and
+  the configuration reference. Each peer has its own CA bundle, not one
+  shared file: with a single bundle, a CA that one peer controls could
+  issue a certificate in another peer's SPIFFE trust domain. A node
+  presents its `[transport]` certificate to peers, so a configured peer
+  requires the `[transport]` certificate files.
+- **"Bucket pairs" had no shape.** No peer message names the source
+  bucket. The write identity in `BEGIN`, `COMMIT`, `BATCH` items, and
+  `ABORT` carries the source cluster and bucket ID, so a pair is the
+  source bucket ID and the destination bucket name. The identity's cluster
+  must also be the authenticated peer, or a peer could write in another
+  cluster's name. How a refusal is answered (`ABORT` or `APPLIED`
+  `refused`, with refused batch items dropped from the batch) is recorded
+  in §7.8.
+- **REST flush concurrency does not adapt yet.** The task said to mirror
+  skys3-flush's adaptation, but skys3-flush still uses a fixed
+  `flush_min_concurrency_per_shard`; adaptive concurrency is M4-10. The
+  pool's `AdaptiveLimit` implements the §7.7 rule directly, and M4-10 can
+  reuse it. A pure ratio test of round trip against base read loopback
+  jitter (a base of tens of microseconds) as congestion and never grew,
+  so rising latency also needs 5 ms of absolute growth.
+- **quinn brings second versions of rand and ring's dependencies.**
+  quinn-proto 0.11.19 is on rand 0.10, while proptest, turmoil, and the
+  workspace are on 0.9, so `rand@0.10` and `rand_core@0.10` are skipped in
+  deny.toml. quinn-proto also lists `ring`, but only for
+  `wasm32-unknown-unknown`, so `getrandom@0.2` and `windows-sys@0.52`
+  appear in the lockfile but are never compiled; they are skipped with
+  that reason. With default features off and `rustls-aws-lc-rs`, quinn
+  uses the workspace's `aws-lc-rs` provider, and `cargo tree -i ring`
+  finds nothing for the host.
+- **skys3-net kept the pieces private.** The peer verifier needs the
+  node's certified key, the mapping from `webpki` errors to TLS alerts,
+  and the SPIFFE parsing of certificate URIs. `Credentials::certified_key`,
+  `pki_error`, and `PeerIdentity::from_uri_names` are now public, instead
+  of a second copy in skys3-peer.
+- **0-RTT cannot be attempted against the endpoint directly.** The
+  endpoint issues no session tickets, so a client never has the key to
+  send early data with. The test first gets a ticket under the
+  destination's name from a server that issues them and accepts early
+  data. It then sends a `HELLO` in 0-RTT to the real endpoint. The
+  endpoint refuses the early data, and the connection is never
+  established, because the early `HELLO` never arrives. A last check
+  confirms that a full handshake with the endpoint leaves no ticket. With
+  early data and tickets enabled in the server configuration, the test
+  fails.
+- **quinn sizes stream windows only at setup.** Connection send and
+  receive windows can change at run time, but the per-stream receive
+  window cannot. Stream windows are therefore the cap
+  (`peer_max_inflight_bytes`), and the connection window, sized from the
+  bandwidth-delay product every second, bounds the total. The sizing task
+  holds only a weak handle to the connection. A strong handle would keep
+  a connection that every user had dropped open forever, because
+  keep-alives stop the idle timeout.
+- **No simulation scenario yet.** Plan rule 1.1 runs peer-path code under
+  the simulation harness, but quinn over turmoil needs an
+  `AsyncUdpSocket` adapter for turmoil's UDP. That belongs to M6-08 (peer
+  protocol simulation). This PR tests over loopback, with every network
+  wait bounded at 30 s.

@@ -149,7 +149,13 @@ impl PeerIdentity {
     /// Finds the identity in a certificate's URI subject alternative names:
     /// exactly one must be a SPIFFE ID, and it must be one of `cluster`.
     /// URIs of other schemes are ignored.
-    pub(crate) fn from_uri_names<'a>(
+    ///
+    /// # Errors
+    ///
+    /// [`IdentityError::Missing`] or [`IdentityError::Ambiguous`] unless
+    /// exactly one URI is a SPIFFE ID, and the errors of
+    /// [`PeerIdentity::from_spiffe_id`].
+    pub fn from_uri_names<'a>(
         uris: impl IntoIterator<Item = &'a str>,
         cluster: &ClusterId,
     ) -> Result<Self, IdentityError> {
