@@ -93,6 +93,14 @@ pub enum Fault {
         /// How long the losses go on.
         duration: Duration,
     },
+    /// Not a fault: a node held back from the start
+    /// ([`ClusterConfig::joining`](crate::ClusterConfig::joining)) starts
+    /// for the first time, as a newly provisioned node with valid
+    /// credentials and empty disks does.
+    Join {
+        /// The node.
+        node: usize,
+    },
 }
 
 impl Fault {
@@ -107,7 +115,7 @@ impl Fault {
             | Fault::ControlOutage { duration }
             | Fault::ControlLatency { duration, .. }
             | Fault::LostCasResponses { duration, .. } => Some(*duration),
-            Fault::FailSync { .. } => None,
+            Fault::FailSync { .. } | Fault::Join { .. } => None,
         }
     }
 }
@@ -298,6 +306,7 @@ mod tests {
         assert_eq!(order, [crash(1), crash(0), crash(2)]);
         assert_eq!(crash(0).duration(), Some(Duration::from_secs(1)));
         assert_eq!(Fault::FailSync { node: 0, disk: 0 }.duration(), None);
+        assert_eq!(Fault::Join { node: 3 }.duration(), None);
         assert_eq!(FaultPlan::none().faults(), []);
     }
 
@@ -341,6 +350,7 @@ mod tests {
                         assert!((0.2..0.8).contains(probability));
                         6
                     }
+                    Fault::Join { .. } => panic!("a random plan joins no node"),
                 };
                 kinds[kind] += 1;
             }

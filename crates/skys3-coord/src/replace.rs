@@ -5,8 +5,11 @@
 //! A shard's members and learners **count** when placement can show them
 //! apart: each on a registered node that is not departing, with the label
 //! the `failure_domain` level needs, and in a domain no other member or
-//! learner that counts is in (the primary first, then the other members,
-//! then the learners). This is the measure cluster health reports shards
+//! learner that counts is in. The primary counts first; of two other
+//! nodes in one domain, the one listed later counts (a learner after the
+//! members), so that a rebalancing move within a domain
+//! ([`Rebalancing`](crate::Rebalancing)) keeps its learner and removes the
+//! member it replaces. This is the number cluster health reports shards
 //! short by ([`report`](crate::report)), with one exception: a member on a
 //! node the registry does not list counts, in no domain. Such a node may
 //! not have registered yet, and nothing shows it lost; if it is, its
@@ -43,7 +46,7 @@
 //! proposes again over it. A coordinator change that loses is dropped, and
 //! the next round plans from what the register holds then.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +57,7 @@ use skys3_types::{NodeId, ProposalId, ShardConfig};
 
 use crate::change::{Applied, ChangeSet};
 use crate::coordinator::{NoPlacement, Placement};
-use crate::place::{ShardRequest, Topology};
+use crate::place::{Domain, ShardRequest, Topology};
 use crate::policy::ClusterScan;
 use crate::registry::{NodeRegistry, NodeState};
 
@@ -86,44 +89,71 @@ impl Default for ReplacementConfig {
 
 /// A shard's members and learners, as placement counts them.
 #[derive(Debug, Default)]
-struct Census {
+pub(crate) struct Census {
     /// The members and learners that count, at most one per domain (a
-    /// member on an unregistered node in none): the primary first, then the
-    /// other members, then the learners.
-    counted: Vec<NodeId>,
+    /// member on an unregistered node in none), in the order the
+    /// configuration lists them: the primary first, then the other
+    /// members, then the learners.
+    pub(crate) counted: Vec<NodeId>,
     /// How many of `counted` are members.
-    members: usize,
+    pub(crate) members: usize,
     /// The members other than the primary that do not count.
-    stray_members: Vec<NodeId>,
+    pub(crate) stray_members: Vec<NodeId>,
     /// The learners that do not count.
-    stray_learners: Vec<NodeId>,
+    pub(crate) stray_learners: Vec<NodeId>,
     /// The learners that count, on nodes the registry suspects.
-    suspect_learners: Vec<NodeId>,
+    pub(crate) suspect_learners: Vec<NodeId>,
 }
 
 impl Census {
-    fn of(topology: &Topology, config: &ShardConfig) -> Self {
-        let mut census = Self::default();
-        let mut domains = BTreeSet::new();
+    /// Counts the members and learners of `config` in `topology`.
+    ///
+    /// The primary counts first, if it can. Of two other nodes in one
+    /// domain, the one listed later counts in place of the earlier: the
+    /// later member, or a learner over a member. A rebalancing move within
+    /// a domain (plan M3-06) adds its learner after the member it replaces,
+    /// so the learner counts, is kept, and once promoted the member it
+    /// replaces is the one removed.
+    pub(crate) fn of(topology: &Topology, config: &ShardConfig) -> Self {
+        // Each node, whether it is a member, and whether it counts.
+        let mut nodes: Vec<(&NodeId, bool, bool)> = Vec::new();
+        // The node that counts in each domain, by position in `nodes`.
+        let mut holders: BTreeMap<Domain, usize> = BTreeMap::new();
         let members = std::iter::once(&config.primary)
             .chain(config.members.iter().filter(|m| **m != config.primary));
         for (node, member) in members
             .map(|node| (node, true))
             .chain(config.learners.iter().map(|node| (node, false)))
         {
+            let position = nodes.len();
             let counts = match topology.get(node) {
                 // A member on a node the registry does not list may not
                 // have registered yet, and cannot be shown lost: it counts,
                 // in no domain, and is left to its primary, which removes
                 // it if it does not respond (§6.4).
                 None => member,
-                Some(candidate) => {
-                    candidate.state != NodeState::Departing
-                        && candidate
-                            .domain(topology.level())
-                            .is_some_and(|domain| domains.insert(domain))
-                }
+                Some(candidate) if candidate.state == NodeState::Departing => false,
+                Some(candidate) => match candidate.domain(topology.level()) {
+                    None => false,
+                    Some(domain) => match holders.get(&domain).copied() {
+                        None => {
+                            holders.insert(domain, position);
+                            true
+                        }
+                        // The primary keeps its domain.
+                        Some(0) => false,
+                        Some(earlier) => {
+                            nodes[earlier].2 = false;
+                            holders.insert(domain, position);
+                            true
+                        }
+                    },
+                },
             };
+            nodes.push((node, member, counts));
+        }
+        let mut census = Self::default();
+        for (node, member, counts) in nodes {
             match (counts, member) {
                 (true, true) => {
                     census.counted.push(node.clone());
