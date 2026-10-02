@@ -3373,6 +3373,89 @@ of this file. A task with nothing unexpected keeps "None."
   will make the snapshot path common for any learner far behind; the
   coordinator chooses learners (M3-05).
 
+### M2-16 Local control-state copies and propagation
+
+- **The kept configuration lives in the index (decided, design §6.2,
+  §10.2).** Index format 6 adds a `configs` table, keyed by shard, that
+  the state machine writes when it applies a `CONFIG` record and that
+  `Index::finish_install` sets to the configuration a snapshot installs
+  in, so replay restores it like any applied state and it is never ahead
+  of the log. Older builds refuse format 6. `ShardSet::kept_config` and
+  `kept_configs` read it; removing a shard removes its row.
+- **Resuming reads both and opens the newer (decided, design §6.2).**
+  `Replication::resume` reads the register through the removal registers
+  and the kept configuration, and opens the newer, so a stale read cannot
+  move a replica back; a register that is gone or no longer names the
+  node opens nothing. If the register cannot be read, the replica opens
+  in the kept configuration, and a task reads the register every
+  `link_timeout` until it can: a newer configuration that names the node
+  is opened through `Replication::open` (in place, or, after the M2-15
+  review fix, as a learner again for a node re-admitted as one), and
+  otherwise the replica is deposed with the register's configuration as
+  its redirect. Epochs fence a stale replica in between.
+- **A register found gone stops the resumed replica (found in review).**
+  The first version took a register that answered "absent" for a
+  confirmation of the kept configuration and stopped reading it, so a
+  replica whose bucket was deleted while the node was down, a lone
+  primary among them, kept serving. The confirm loop now deposes the
+  replica when the register is gone, or holds another configuration of
+  its epoch, and reads again after a read older than its configuration,
+  which is stale, instead of ending. `resume_kept`
+  resumes every kept shard concurrently, so a slow store costs one wait,
+  not one per shard.
+- **A takeover proposal is recorded before its compare-and-swap (the
+  M2-12 constraint; decided, design §6.3).** A candidate whose CAS landed
+  unseen, and that restarted from its kept configuration, would otherwise
+  follow the old primary again in the epoch it proposed over. It now
+  stores the proposal durably (`Index::store_takeover`, a `takeovers`
+  table) before sending it. On open, an outstanding proposal (newer than
+  the configuration, made by this member) makes the member refuse
+  sessions of older epochs and stop its grace (`Grace::stop_over`), and
+  the takeover task sends the recorded proposal again, unchanged, until
+  it learns the outcome. The record is forgotten when the register holds
+  something else; adopting a newer configuration settles it. Step-downs
+  (M2-13) and promotions (M2-14) were already in the index.
+- **A sync refetches only what changed (decided, design §6.2).**
+  `ControlCopy::fetch_since` lists the copied prefixes and reuses every
+  kept value whose listed version is unchanged, so a sync after one
+  change reads `cluster.json` and that register. `refresh` loads the kept
+  copy first, so a restarted node does not read everything again.
+- **STS staleness counts from the identity copy's last refresh
+  (decided, design §6.2).** The copy's `synced_at` is the start of the
+  last sync that listed every `identity/` register; a node now also syncs
+  when half of `identity_max_staleness` has passed (`control::sync_due`),
+  not only when the generation moves, so a quiet store does not make
+  session issuance fail closed.
+- **Simulation.** `ReplicatedServices::with_local_copies` opens replicas
+  as a restarted node does, through `resume_kept` and `resume` over the
+  faulty store; `replicas_now` gives each open replica's configuration,
+  role, and serving state beside the register's. The scenario
+  `restart::a_whole_cluster_restart_while_the_control_store_is_unreachable`
+  takes node 3 of four down for 5 s, makes the store unreachable from
+  3.5 s for 14 s, and crashes nodes 0 to 2 in turn from 4 s. In a 5 s
+  window that opens 5 s after every node is back, still inside the
+  outage, every shard is served by a primary in its register's
+  configuration, no replica in another configuration serves, node 3
+  holds stale configurations that stay fenced, and writes are
+  acknowledged; the commit, lease, and routing audits run after every
+  step. About twenty seeds ran clean. Simulated node IDs count from 1
+  (`node-1`), while fault plans count positions from 0.
+- **Clients of a stale gateway wait (found in testing).** Throughput
+  through the outage is low: requests sent to node 3, whose shard map is
+  stale, wait for its gateway's register reads, which retry under the
+  outage while holding the node's register-read lock, and the clients
+  wait with them. The same happens without local copies, so the scenario
+  checks serving on the replicas rather than an acknowledgement on every
+  shard. A gateway that redirects without the register is left for the
+  routing work.
+- **Left open.** The binary does not run replication yet (M2-08b), so
+  it neither resumes replicas nor reads `with_takeover` or a
+  `takeover_delay` from its configuration; the binary wiring here is the
+  control copy's delta sync and the staleness sync. An index upgraded
+  from format 5 keeps no configuration for a replica until it applies or
+  replays a `CONFIG` record, so such a replica resumes only once its
+  register can be read. About 900 lines of non-test code.
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation
