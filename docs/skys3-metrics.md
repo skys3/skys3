@@ -159,12 +159,14 @@ ratio is below `compaction_live_threshold`, after every checkpoint interval.
 ### 3.7 Hot cache
 
 Design section 9.2. Each node's gateway keeps whole objects it read from
-another node's holder in memory, bounded by `hot_cache_bytes_per_node`, and
-serves later GETs of the same version from them.
+another node's holder in memory, and serves later GETs of the same version
+from them. `hot_cache_bytes_per_node` bounds the objects held and the fills
+in progress together.
 
 | Name | Type | Labels | Status | Description |
 |---|---|---|---|---|
 | `skys3_hot_cache_bytes` | gauge | none | exported (M2-19) | Bytes of objects this node's hot cache holds. |
+| `skys3_hot_cache_filling_bytes` | gauge | none | exported (M2-19) | Bytes this node's hot cache reserves for fills in progress: the sizes of the objects GETs are streaming from other nodes to keep. With `skys3_hot_cache_bytes`, at most `hot_cache_bytes_per_node`. |
 | `skys3_hot_cache_hits_total` | counter | none | exported (M2-19) | GETs this node's gateway served from its hot cache. |
 | `skys3_hot_cache_misses_total` | counter | none | exported (M2-19) | GETs this node's gateway looked up in its hot cache without finding the version their read plan names. |
 | `skys3_hot_cache_evictions_total` | counter | none | exported (M2-19) | Objects the hot cache dropped as least recently used. Versions a later one replaced are not counted. |

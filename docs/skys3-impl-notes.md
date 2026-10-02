@@ -3860,6 +3860,27 @@ of this file. A task with nothing unexpected keeps "None."
   collects the pieces it streams (`Keep`) and fills the cache only once
   the whole object streamed. A cached version is also served after the
   primary evicted it, without a fill.
+- **Fills in progress count against the bound (decided, review of
+  #70).** The first version gave each eligible miss a buffer of the
+  object's full size, outside the cache's accounting, so a burst of
+  misses could hold many times `hot_cache_bytes_per_node` at the 1 GiB
+  default (up to 128 MiB per GET). Now a fill reserves the object's size
+  when its stream starts (`HotCache::reserve`), evicting the least
+  recently used objects to make room, so held bytes plus reservations
+  never exceed the bound; one bound rather than a separate one for fills,
+  so the setting stays the node's whole hot-cache memory. A reservation
+  that does not fit beside the other fills, or a second fill of a version
+  already filling (the coalescing: the first fill wins, later GETs just
+  stream), is refused, and that GET keeps nothing. A fill keeps the
+  response's own `Bytes` pieces, so the buffers grow as the bytes arrive
+  and nothing is copied; entries are held as those pieces, and a range
+  across pieces is copied on lookup. The reservation is a guard
+  (`Fill`): finishing turns it into the entry, and dropping it, on a
+  lapsed registration, a failed fetch, a dropped response body, or a
+  short read, releases it. A burst of 36 GETs of 12 uncached objects
+  against room for 8 peaks at exactly the bound and refuses 28 fills
+  (`tests/hot_cache.rs`). New: `skys3_hot_cache_filling_bytes`, and
+  `reserved`/`refused` in `HotCacheUsage`.
 - **`GatewayConfig::hot_cache` is a shared handle.** Clones of a gateway
   configuration share one cache, which the cluster harness's nodes would
   have done, since every node's configuration is a clone of one. The
