@@ -24,8 +24,8 @@
 //! - Backends: [`MemoryControlStore`] for tests and simulation,
 //!   [`FileControlStore`] for single-node development, and
 //!   [`S3ControlStore`] over any `skys3-remote` object store, AWS S3 and
-//!   S3-compatible providers. The etcd backend implements the same trait
-//!   (plan M2-05).
+//!   S3-compatible providers, and [`EtcdControlStore`] over an etcd v3
+//!   cluster, the production default.
 //! - [`ControlProbe`]: the startup probe that refuses a store whose
 //!   conditional writes, conditional deletes, or reads after writes cannot
 //!   be trusted.
@@ -55,10 +55,13 @@
 mod cluster;
 #[cfg(feature = "test-util")]
 pub mod conformance;
+mod etcd;
 #[cfg(any(test, feature = "test-util"))]
 pub mod faults;
 mod feed;
 mod file;
+#[doc(hidden)]
+pub mod fuzzing;
 mod key;
 mod memory;
 mod probe;
@@ -67,6 +70,7 @@ mod s3;
 mod store;
 
 pub use cluster::{Bootstrap, FIRST_GENERATION, bootstrap, bump_generation, read_cluster};
+pub use etcd::{EtcdConfigError, EtcdControlStore, EtcdStoreConfig};
 pub use feed::ChangeFeed;
 pub use file::{FileControlStore, FileStoreConfig};
 pub use key::{KeyError, KeyPrefix, RegisterKey, RegisterKind, TypedKey};

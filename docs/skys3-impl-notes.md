@@ -2014,3 +2014,80 @@ of this file. A task with nothing unexpected keeps "None."
   applies `ControlStoreConfig::MAX_PREFIX_LEN`, and a test in
   `skys3-control` checks that it equals the backend's bound, derived from
   `skys3-remote`, which `skys3-config` does not depend on.
+
+### M2-05 etcd control-store backend
+
+- **No `etcd-client`.** The plan's client crate, `etcd-client` 0.20 (tonic
+  0.14, prost 0.14), compiles etcd's `.proto` files in its build script
+  with `tonic-prost-build`, so every machine and CI job that builds the
+  workspace would need `protoc`. It also adds about 25 crates (tonic's
+  `axum` router, `prost-build`, `petgraph`, `pulldown-cmark`), and
+  `cargo deny` fails on three new duplicates: `base64` 0.22 beside the
+  workspace's 0.23, and `hashbrown` 0.15 and `foldhash` 0.1. The backend
+  instead carries its own client for the three calls it uses
+  (`KV.Range`, `KV.Txn`, `Watch.Watch`): hand-written `prost` messages, a
+  field-for-field subset of etcd 3.6's `rpc.proto` and `kv.proto`, over
+  `hyper`'s HTTP/2 client, with `rustls` and `aws-lc-rs` for `https://`
+  endpoints. No new crate entered the tree. Tests decode responses
+  captured from etcd 3.6.10 with `etcdctl -w protobuf`, so a wrong field
+  number fails a test. Design §6.1 and §15 record the choice.
+- **gRPC framing is untrusted input.** The 5-byte message prefix is
+  checked against a 4 MiB limit before anything is buffered for the
+  message, and a compressed message (never asked for) is refused. A
+  proptest splits framed streams at random points, and the fuzz target
+  `control_etcd_frame` feeds the decoder, the Protobuf responses, and the
+  status trailers.
+- **Which etcd errors may hide a write.** etcd answers "request timed
+  out", "leader changed", and "no leader" with `UNAVAILABLE`, but a
+  proposal that timed out can still commit, so a write answered with
+  `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `CANCELLED`, `ABORTED`, `INTERNAL`,
+  or `UNKNOWN`, or not answered, is `Indeterminate` and goes to the
+  lost-response rule; for reads these are `Unavailable`.
+  `RESOURCE_EXHAUSTED` ("too many requests", the space quota) applied
+  nothing. A failed comparison is not a gRPC error (`succeeded = false`),
+  so `FAILED_PRECONDITION`, like `PERMISSION_DENIED` and
+  `UNAUTHENTICATED`, is `Rejected`. Only a request that never left (no
+  connection to any endpoint) is `Unavailable` for a write. A call without
+  an answer drops the connection and moves to the next endpoint, and so
+  does a transient status (review): a member cut off from its quorum
+  still answers over TCP, with `UNAVAILABLE`, so moving only on missing
+  answers kept every retry, and the lost-response re-read, on that
+  member. HTTP/2
+  pings every 10 seconds while a call is open (etcd refuses pings more
+  often than every 5) detect a dead watch connection; idle connections
+  are not pinged, since etcd counts pings without streams against the
+  client.
+- **The watch only wakes the shared feed.** `changes()` opens a watch on
+  `cluster.json`, returns once etcd confirms it, and hands the shared
+  `ChangeFeed` a wake-up channel, so the delivery rules stay the ones
+  every backend shares. Watches start at the current revision, so none
+  is compacted at creation. When etcd ends, cancels, or compacts a
+  watch, or the connection breaks, the task opens it again after a second
+  and wakes the feed once; the feed reads the generation, which covers
+  writes made while no watch was open. The task ends when the feed is
+  dropped. Tests against an in-process fake etcd check each case with
+  the feed already waiting, which only the watch can wake.
+- **Listings are paged at one revision.** A listing reads 1,000 keys a
+  page, every page after the first at the first one's revision, and
+  starts over (three times at most) if that revision is compacted away
+  between pages.
+- **Tests with and without etcd.** `tests/etcd.rs` runs the conformance
+  suite, the startup probe with writers on separate connections, a
+  listing of 2,005 registers, endpoint failover, and watch delivery
+  against the etcd in `SKYS3_ETCD_ENDPOINTS`, and returns at once, saying
+  so, when it is unset. The new `etcd` CI job runs it against the pinned
+  `gcr.io/etcd-development/etcd:v3.6.10` service container; the image has
+  no shell, so the job polls `/health` in a bounded loop instead of a
+  container health check. Error paths, TLS, and watch restarts run in
+  every job against `etcd::fake`, an in-process stand-in on `hyper`'s
+  HTTP/2 server, which also passes the conformance suite. Locally, all of
+  it passed against an etcd 3.6.10 binary.
+- **Not wired into the node.** M1-13 left the binary refusing etcd until
+  this backend landed. It keeps refusing it: until replication (M2-07,
+  M2-08) each M1 node serves every shard alone, and the file backend's
+  owner record is what stops a second node from loading the same catalog
+  over its own empty shards. A shared etcd store has no such guard, so
+  two nodes would serve one bucket apart. The refusal now says so. The PR
+  that wires it adds the TLS keys (CA, client certificate and key) to
+  `[control_store]` and §14. etcd's user-and-password tokens are not
+  supported; client certificates are.
