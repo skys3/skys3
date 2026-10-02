@@ -327,7 +327,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
     ///
     /// The primary of a shard learns of a learner added to its register
     /// when the node opens the newer configuration, as the coordinator's
-    /// change propagation will have it do (plan M3-05), or reads the
+    /// change propagation will have it do (plan M2-16), or reads the
     /// register after a member refused it or a compare-and-swap failed.
     ///
     /// # Errors

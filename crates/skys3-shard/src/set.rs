@@ -162,18 +162,35 @@ impl<D: Disk> ShardSet<D> {
             // A replica opened as the shard's only member runs for one
             // member. Given learners (§6.7), it closes once its records are
             // applied, and opens again as their primary.
-            let alone = shard.config();
+            let current = shard.config();
             let gains_learners = node.is_some()
                 && shard.role() == Role::Alone
                 && !shard.is_stopped()
-                && config.epoch > alone.epoch
-                && config.members == alone.members
+                && config.epoch > current.epoch
+                && config.members == current.members
                 && !config.learners.is_empty();
-            if !gains_learners {
+            // A node removed from the shard rejoins only as a learner
+            // (§6.7): a replica that is not a learner of the same primary,
+            // such as a member removed while it was cut off, or a learner
+            // that a takeover left out and the coordinator added again,
+            // cannot follow the new configuration. It stops, and opens
+            // again as a learner, as a restart would open it; its records
+            // seed catch-up only once the primary verifies them.
+            let rejoins = node.is_some_and(|node| {
+                config.epoch > current.epoch
+                    && config.is_learner(node)
+                    && (shard.role() != Role::Learner || config.primary != current.primary)
+            });
+            if rejoins {
+                shard
+                    .abandon("the node rejoins the shard as a learner")
+                    .await;
+            } else if gains_learners {
+                shard.close().await?;
+            } else {
                 shard.reconfigure(config).await?;
                 return Ok(shard.clone());
             }
-            shard.close().await?;
         }
         let log = self.logs[self.placement(&key)].1.clone();
         let (index, pool) = (Arc::clone(&self.index), self.pool.clone());

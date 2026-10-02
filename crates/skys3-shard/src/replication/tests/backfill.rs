@@ -411,3 +411,61 @@ async fn refusals() {
     assert!(answer.complete && answer.refused.is_empty(), "{answer:?}");
     assert_eq!(answer.applied(), EpochSeq::new(Epoch::new(1), Seq::new(3)));
 }
+
+#[test]
+fn a_replica_that_cannot_follow_a_newer_configuration_rejoins_as_a_learner() {
+    run(rejoining());
+}
+
+/// A node whose replica cannot adopt a newer configuration that names it
+/// as a learner, without restarting: a member removed while it was cut
+/// off, then a learner that a takeover left out and the coordinator
+/// added again under the new primary.
+async fn rejoining() {
+    let disk = SimDisk::new(43);
+    let clock = Arc::new(MonotonicClock::new());
+    let (log, _) = SegmentLog::open(disk.mount(), LogConfig::default(), clock as _)
+        .await
+        .unwrap();
+    let index =
+        Arc::new(Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap());
+    let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+    let set = ShardSet::new(index, log, pool);
+    let member = set.open_replica(&initial(), &node(2)).await.unwrap();
+    assert_eq!(member.role(), Role::Member);
+
+    // Removed, then added back as a learner of the same primary.
+    let learner = ShardConfig {
+        epoch: Epoch::new(3),
+        members: vec![node(1), node(3)],
+        learners: vec![node(2)],
+        ..initial()
+    };
+    let rejoined = set.open_replica(&learner, &node(2)).await.unwrap();
+    assert!(member.is_stopped());
+    assert_eq!(rejoined.role(), Role::Learner);
+    assert_eq!(rejoined.config(), learner);
+
+    // Node 3 takes over without it, and it is added again.
+    let taken_over = ShardConfig {
+        epoch: Epoch::new(5),
+        primary: node(3),
+        members: vec![node(3)],
+        learners: vec![node(2)],
+        ..initial()
+    };
+    let again = set.open_replica(&taken_over, &node(2)).await.unwrap();
+    assert!(rejoined.is_stopped());
+    assert_eq!(again.role(), Role::Learner);
+    assert_eq!(again.config().primary, node(3));
+
+    // A newer configuration of the same primary is adopted in place.
+    let another = ShardConfig {
+        epoch: Epoch::new(6),
+        learners: vec![node(2), node(4)],
+        ..taken_over
+    };
+    let same = set.open_replica(&another, &node(2)).await.unwrap();
+    assert!(!again.is_stopped());
+    assert!(same.durable().same_channel(&again.durable()));
+}

@@ -1,10 +1,11 @@
-//! Learners in the replicated services (plans M2-14, M2-15): a test driver
-//! adds a spare node to each shard as a learner by a compare-and-swap of
-//! the shard's register, as the coordinator will (plan M3-05), or, to
-//! replace a lost member, a node outside the shard, a removed one
-//! included; every node follows the registers that name it, and the
-//! audits check rule R3, time the promotions, and measure how long shards
-//! that lost a member had fewer than `replicas` copies (§16.3).
+//! Learners in the replicated services (plans M2-14, M2-15, M3-05): a test
+//! driver adds a spare node to each shard as a learner by a
+//! compare-and-swap of the shard's register, or the coordinator's
+//! replacement adds learners to the shards that lost members
+//! ([`CoordinatedServices`](crate::CoordinatedServices)); every node
+//! follows the registers that name it, and the audits check rule R3, time
+//! the promotions, and measure how long shards that lost a member had
+//! fewer than `replicas` copies (§16.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -30,9 +31,10 @@ pub(crate) struct LearnerPlan {
     /// A seeded bug: the driver promotes each learner itself as soon as
     /// it adds it, before the learner holds anything.
     pub(crate) early: bool,
-    /// Whether the driver replaces lost members only
-    /// ([`ReplicatedServices::replacing_lost_members`]).
-    pub(crate) replace: bool,
+    /// Whether the driver adds learners at all. Without it, nodes only
+    /// follow the registers, and the coordinator adds learners
+    /// ([`ReplicatedServices::following_registers`]).
+    pub(crate) adds: bool,
 }
 
 /// How often a node reads the registers that name it.
@@ -58,7 +60,8 @@ pub struct LearnerCounts {
 /// (§6.4, §16.3), as the audit sampled them after every step: from the
 /// compare-and-swap that removed the member, until new writes had
 /// `replicas` copies again, as a learner joined the acknowledgement set,
-/// and until all data had them, as its backfill completed.
+/// until all data had them, as its backfill completed, and until the
+/// shard had `replicas` members again, as the learner was promoted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DurabilityWindows {
     /// How many times a shard's register came to have fewer members than
@@ -70,6 +73,9 @@ pub struct DurabilityWindows {
     /// For each window that closed with a promotion: how long until all
     /// data had them again.
     pub all_data: Vec<Duration>,
+    /// For each window that closed: how long until the shard's register
+    /// had `replicas` members again.
+    pub restored: Vec<Duration>,
 }
 
 impl DurabilityWindows {
@@ -176,7 +182,7 @@ impl ShardRegisters for Audited {
 impl ReplicatedServices {
     /// The same services, whose nodes follow the shard registers that name
     /// them, as the coordinator's change propagation will have them do
-    /// (plan M3-05), and whose primaries add a spare node to each shard
+    /// (plan M2-16), and whose primaries add a spare node to each shard
     /// they serve as a learner from `at` on, by a compare-and-swap of its
     /// register through the node's faulty control store: the test driver
     /// of §6.7's add-learner step. A spare is a node outside the shard's
@@ -188,25 +194,24 @@ impl ReplicatedServices {
         self.learners = Some(LearnerPlan {
             at,
             early: false,
-            replace: false,
+            adds: true,
         });
         self
     }
 
     /// The same services, whose nodes follow the shard registers that name
-    /// them, and whose primaries, from `at` on, add a learner to each shard
-    /// they serve that has fewer members than `replicas` and no learner:
-    /// a node outside the shard's placement if one is left, and otherwise
-    /// a node removed from the shard, which rejoins as a learner with
-    /// whatever its log still holds (§6.7). The primaries backfill and
-    /// promote their learners; [`ReplicatedServices::durability_windows`]
-    /// says how long that took.
+    /// them, as the coordinator's change propagation will have them do
+    /// (plan M2-16), and add no learner themselves: the coordinator's
+    /// replacement does (plan M3-05,
+    /// [`CoordinationConfig::replacement`](crate::CoordinationConfig::replacement)).
+    /// The primaries backfill and promote the learners;
+    /// [`ReplicatedServices::durability_windows`] says how long that took.
     #[must_use]
-    pub fn replacing_lost_members(mut self, at: Duration) -> Self {
+    pub fn following_registers(mut self) -> Self {
         self.learners = Some(LearnerPlan {
-            at,
+            at: Duration::MAX,
             early: false,
-            replace: true,
+            adds: false,
         });
         self
     }
@@ -220,7 +225,7 @@ impl ReplicatedServices {
         self.learners = Some(LearnerPlan {
             at,
             early: true,
-            replace: false,
+            adds: true,
         });
         self
     }
@@ -293,6 +298,7 @@ impl ReplicatedServices {
                 windows
                     .all_data
                     .push(window.all_data.unwrap_or(now) - window.since);
+                windows.restored.push(now - window.since);
                 continue;
             }
             // The primary of the register's configuration, as it serves now.
@@ -422,6 +428,9 @@ impl LearnerDriver {
                 follow(&shards, &registers).await;
             }
         });
+        if !self.plan.adds {
+            return;
+        }
         let mut added = BTreeSet::new();
         loop {
             tokio::time::sleep(FOLLOW_INTERVAL).await;
@@ -432,14 +441,12 @@ impl LearnerDriver {
     }
 
     /// Adds a learner to each shard this node serves as primary that has
-    /// none yet, once per shard and life, or, if the driver replaces lost
-    /// members, whenever the shard has fewer members than `replicas`.
+    /// none yet, once per shard and life.
     async fn add(&mut self, added: &mut BTreeSet<ShardRef>) {
         let node = self.shards.node.clone();
         let placement = Arc::clone(&self.shards.placement);
-        let replace = self.plan.replace;
         for (shard, placed) in placement.iter() {
-            if added.contains(shard) && !replace {
+            if added.contains(shard) {
                 continue;
             }
             let Some(replica) = self.shards.replication.set().get(&shard.into()).await else {
@@ -448,9 +455,6 @@ impl LearnerDriver {
             let current = replica.config();
             let serving = current.primary == node && replica.is_serving();
             if !serving || !current.learners.is_empty() {
-                continue;
-            }
-            if replace && current.members.len() >= usize::from(current.replicas) {
                 continue;
             }
             if register(&self.registers, shard).as_ref() != Some(&current) {
@@ -463,8 +467,7 @@ impl LearnerDriver {
                 .nodes
                 .iter()
                 .filter(outside)
-                .find(|candidate| !placed.is_member(candidate))
-                .or_else(|| self.nodes.iter().find(|c| replace && outside(c)));
+                .find(|candidate| !placed.is_member(candidate));
             let Some(spare) = spare.cloned() else {
                 continue;
             };
