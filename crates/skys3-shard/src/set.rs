@@ -162,29 +162,27 @@ impl<D: Disk> ShardSet<D> {
             // A replica opened as the shard's only member runs for one
             // member. Given learners (§6.7), it closes once its records are
             // applied, and opens again as their primary.
-            let current = shard.config();
+            let held = shard.config();
             let gains_learners = node.is_some()
                 && shard.role() == Role::Alone
                 && !shard.is_stopped()
-                && config.epoch > current.epoch
-                && config.members == current.members
+                && config.epoch > held.epoch
+                && config.members == held.members
                 && !config.learners.is_empty();
-            // A node removed from the shard rejoins only as a learner
-            // (§6.7): a replica that is not a learner of the same primary,
-            // such as a member removed while it was cut off, or a learner
-            // that a takeover left out and the coordinator added again,
-            // cannot follow the new configuration. It stops, and opens
-            // again as a learner, as a restart would open it; its records
-            // seed catch-up only once the primary verifies them.
-            let rejoins = node.is_some_and(|node| {
-                config.epoch > current.epoch
+            // A node removed from the shard and added back as a learner
+            // (§6.7) may still hold the replica of its old role, which no
+            // configuration change turns into a learner: that replica
+            // stops, and the node opens again as a learner from its log. So
+            // does a learner that a takeover left out and the coordinator
+            // added again under the new primary, which a learner's replica
+            // cannot follow either.
+            let readmitted = node.is_some_and(|node| {
+                config.epoch > held.epoch
                     && config.is_learner(node)
-                    && (shard.role() != Role::Learner || config.primary != current.primary)
+                    && (!held.is_learner(node) || held.primary != config.primary)
             });
-            if rejoins {
-                shard
-                    .abandon("the node rejoins the shard as a learner")
-                    .await;
+            if readmitted {
+                shard.abandon("the node is re-admitted as a learner").await;
             } else if gains_learners {
                 shard.close().await?;
             } else {

@@ -3320,6 +3320,13 @@ of this file. A task with nothing unexpected keeps "None."
   backfilled only if that is at or after the last snapshot the primary
   sent it. The new frames are decoded by the `shard_replication` fuzz
   target and the wire proptests.
+- **A re-admitted node reopens its replica (found in review).** A member
+  removed while it was up, or cut off, is not told, and keeps its replica
+  open in its old role. When a later configuration adds it back as a
+  learner, `ShardSet` stops that replica and opens the shard again as a
+  learner from its log, since a configuration change never turns a member
+  or primary into a learner; before, every open failed and the shard
+  stayed under-replicated until the node restarted.
 - **The `Backfill` hook stays as a test seam.** With a hook,
   `Replication::with_backfill` replaces the built-in fill, as M2-14's
   tests use it to hold a promotion back; without one, the watchdog runs

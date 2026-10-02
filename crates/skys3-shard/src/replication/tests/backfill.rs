@@ -28,7 +28,9 @@ use crate::lineage::Lineage;
 use crate::replication::wire::{
     self, Append, Backfill, BackfillAck, Row, SnapshotRows, Sync, SyncAck,
 };
-use crate::replication::{ControlRegisters, Replication, ReplicationConfig};
+use crate::replication::{
+    ControlRegisters, Replaced, Replication, ReplicationConfig, ShardRegisters as _,
+};
 use crate::set::ShardSet;
 use crate::shard::{Role, Shard};
 
@@ -413,14 +415,82 @@ async fn refusals() {
 }
 
 #[test]
-fn a_replica_that_cannot_follow_a_newer_configuration_rejoins_as_a_learner() {
+fn a_removed_member_that_stayed_up_is_readmitted_as_a_learner() {
+    run(removed_and_readmitted());
+}
+
+/// Node 2 is removed while it is up, and is not told: its replica stays
+/// open as a member of epoch 1. The driver then adds it back as a
+/// learner, without a restart. A member never becomes a learner by a
+/// configuration change, so the node closes that replica and opens again
+/// as a learner, which joins and is promoted.
+async fn removed_and_readmitted() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    let promotions = Promotions {
+        registers: ControlRegisters::new(store.clone(), RetryPolicy::default()),
+        delay: Duration::ZERO,
+        scripted: Mutex::default(),
+        proposed: Arc::default(),
+        epochs: Arc::default(),
+    };
+    let nodes = nodes(&pki, &store, &two_members(), promotions, None).await;
+    let stale = nodes.replications[1].open(&two_members()).await.unwrap();
+    let primary = nodes.replications[0].open(&two_members()).await.unwrap();
+    let leader = Arc::clone(primary.leader().unwrap());
+    until(|| primary.is_serving()).await;
+    primary.commit(put("a", 10)).await.unwrap();
+
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    let removed = ShardConfig {
+        epoch: Epoch::new(2),
+        members: vec![node(1)],
+        min_write_replicas: 1,
+        proposal_id: ProposalId::new("remove-2").unwrap(),
+        ..two_members()
+    };
+    assert_eq!(
+        registers.replace(&two_members(), &removed).await.unwrap(),
+        Replaced::Accepted
+    );
+    nodes.replications[0].open(&removed).await.unwrap();
+    primary.commit(put("b", 10)).await.unwrap();
+    assert_eq!(stale.role(), Role::Member);
+
+    let readmitted = ShardConfig {
+        epoch: Epoch::new(3),
+        learners: vec![node(2)],
+        proposal_id: ProposalId::new("readmit-2").unwrap(),
+        ..removed.clone()
+    };
+    assert_eq!(
+        registers.replace(&removed, &readmitted).await.unwrap(),
+        Replaced::Accepted
+    );
+    let learner = nodes.replications[1].open(&readmitted).await.unwrap();
+    assert_eq!(learner.role(), Role::Learner);
+    assert!(stale.is_stopped());
+    nodes.replications[0].open(&readmitted).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !register(&store).await.is_member(&node(2)) {
+        assert!(tokio::time::Instant::now() < deadline, "no promotion");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    primary.commit(put("c", 10)).await.unwrap();
+    let member = current(&nodes.replications[1]).await;
+    assert!(*member.durable().borrow() >= leader.commit());
+}
+
+#[test]
+fn a_learner_a_takeover_left_out_rejoins_under_the_new_primary() {
     run(rejoining());
 }
 
-/// A node whose replica cannot adopt a newer configuration that names it
-/// as a learner, without restarting: a member removed while it was cut
-/// off, then a learner that a takeover left out and the coordinator
-/// added again under the new primary.
+/// A learner of node 1 that node 3's takeover left out, and that the
+/// coordinator then added again under node 3, without a restart: a
+/// learner's replica follows only its own primary, so it stops and opens
+/// again as a learner of node 3. A newer configuration of the same
+/// primary is adopted in place.
 async fn rejoining() {
     let disk = SimDisk::new(43);
     let clock = Arc::new(MonotonicClock::new());
@@ -431,22 +501,15 @@ async fn rejoining() {
         Arc::new(Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap());
     let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
     let set = ShardSet::new(index, log, pool);
-    let member = set.open_replica(&initial(), &node(2)).await.unwrap();
-    assert_eq!(member.role(), Role::Member);
-
-    // Removed, then added back as a learner of the same primary.
     let learner = ShardConfig {
         epoch: Epoch::new(3),
         members: vec![node(1), node(3)],
         learners: vec![node(2)],
         ..initial()
     };
-    let rejoined = set.open_replica(&learner, &node(2)).await.unwrap();
-    assert!(member.is_stopped());
-    assert_eq!(rejoined.role(), Role::Learner);
-    assert_eq!(rejoined.config(), learner);
+    let first = set.open_replica(&learner, &node(2)).await.unwrap();
+    assert_eq!(first.role(), Role::Learner);
 
-    // Node 3 takes over without it, and it is added again.
     let taken_over = ShardConfig {
         epoch: Epoch::new(5),
         primary: node(3),
@@ -455,11 +518,10 @@ async fn rejoining() {
         ..initial()
     };
     let again = set.open_replica(&taken_over, &node(2)).await.unwrap();
-    assert!(rejoined.is_stopped());
+    assert!(first.is_stopped());
     assert_eq!(again.role(), Role::Learner);
-    assert_eq!(again.config().primary, node(3));
+    assert_eq!(again.config(), taken_over);
 
-    // A newer configuration of the same primary is adopted in place.
     let another = ShardConfig {
         epoch: Epoch::new(6),
         learners: vec![node(2), node(4)],
