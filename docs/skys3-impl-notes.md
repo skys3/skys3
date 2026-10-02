@@ -3627,3 +3627,14 @@ of this file. A task with nothing unexpected keeps "None."
   `AsyncUdpSocket` adapter for turmoil's UDP. That belongs to M6-08 (peer
   protocol simulation). This PR tests over loopback, with every network
   wait bounded at 30 s.
+- **The pool's counters outlived cancelled calls (review).** A caller
+  counted a connection being opened before awaiting the connect, and
+  uncounted it only after the await. A cancelled caller left the slot
+  taken forever, and with a limit of one the destination wedged. A stream
+  also counted only once `open_bi` returned, so concurrent callers could
+  all pick the same idle connection. Both reservations are now made under
+  the pool's lock and held by guards that release them on drop: a
+  connect slot that also wakes waiting callers, and a stream count taken
+  before the stream is opened. Tests cancel a connect mid-handshake and
+  check that a waiting caller takes over, and check that an open waiting
+  for stream credit already counts. Each fails without its fix.
