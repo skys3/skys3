@@ -13,7 +13,7 @@
 //!   beacons carry lease stamps, and a beacon goes out at least every
 //!   [`ReplicationConfig::lease_renew_interval`] even while records flow.
 //!   The member's acknowledgements feed the commit rule and the primary's
-//!   leases ([`Leader`](crate::Leader)). A link that fails,
+//!   leases ([`Leader`]). A link that fails,
 //!   or hears nothing for [`ReplicationConfig::link_timeout`], reconnects,
 //!   and resumes from what the member then holds.
 //! - **As a member**, it accepts links from the shard's primary only. A
