@@ -124,7 +124,9 @@ impl RoutedServices {
     /// primary of its shard's current configuration, in that
     /// configuration's epoch or, while a removal's compare-and-swap has
     /// landed unseen, an earlier one since the placement's (removals keep
-    /// the primary), whether or not its answer arrived.
+    /// the primary), whether or not its answer arrived. A primary that a
+    /// takeover deposed may complete, in its older epoch, a request it
+    /// began before: the commit and lease audits judge it.
     ///
     /// # Errors
     ///
@@ -236,7 +238,12 @@ impl NodeServices for RoutedServices {
                 return;
             };
             let first = placed.map_or(Epoch::new(1), |placed| placed.epoch);
-            if served.node != current.primary
+            // A primary deposed by a takeover may still complete a request
+            // it began in its own, older epoch: a write whose members
+            // acknowledged it before the takeover. The commit and lease
+            // audits judge those; a member never serves.
+            let deposed = served.epoch < current.epoch && registers.has_led(&served.shard);
+            if (served.node != current.primary && !deposed)
                 || served.epoch > current.epoch
                 || served.epoch < first
             {

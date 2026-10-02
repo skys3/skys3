@@ -235,9 +235,11 @@ pub enum RecordBody {
     /// `CONFIG`: the replica's full shard configuration (§6.2). Its bucket,
     /// shard, and epoch are the record's.
     Config(ShardConfig),
-    /// `TRUNCATE(shard, epoch, seq)` (§6.6): the record's epoch is the one
-    /// whose reconciliation truncates, and its sequence number is the last
-    /// that stays valid. It has no kind-specific fields.
+    /// `TRUNCATE(shard, epoch, seq)` (§6.6): its sequence number is the
+    /// last that stays valid, and every record of the shard at a later
+    /// sequence number from an earlier epoch is invalid
+    /// ([`truncated_by`](super::truncated_by)). It has no kind-specific
+    /// fields.
     Truncate,
 }
 

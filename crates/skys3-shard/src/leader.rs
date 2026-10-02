@@ -129,6 +129,9 @@ pub struct Leader {
     /// The leases from the members. A leaf lock: nothing else is locked
     /// while it is held.
     leases: Mutex<Leases>,
+    /// The newest epoch a member refused an append for: another
+    /// configuration may have replaced this one (§6.5).
+    rejected: watch::Sender<Epoch>,
 }
 
 impl fmt::Debug for Leader {
@@ -177,6 +180,7 @@ impl Leader {
             state: Mutex::new(state),
             links: AtomicBool::new(false),
             leases: Mutex::default(),
+            rejected: watch::Sender::new(Epoch::ZERO),
         }
     }
 
@@ -197,6 +201,20 @@ impl Leader {
     #[must_use]
     pub fn is_member(&self, member: &NodeId) -> bool {
         self.state().members.contains(member)
+    }
+
+    /// Records that a member refused an append because it knows `epoch`,
+    /// newer than the primary's (rule R2): the shard's register may name
+    /// another configuration, which the primary must check (§6.5).
+    pub(crate) fn rejected(&self, epoch: Epoch) {
+        self.rejected
+            .send_modify(|newest| *newest = (*newest).max(epoch));
+    }
+
+    /// A receiver that sees each refusal of an append for a newer epoch
+    /// ([`Leader::rejected`]), with the newest such epoch.
+    pub(crate) fn rejections(&self) -> watch::Receiver<Epoch> {
+        self.rejected.subscribe()
     }
 
     /// Returns `true` the first time it is called: whoever gets `true`

@@ -31,13 +31,13 @@ use crate::replication::{
 };
 use crate::shard::Shard;
 
-fn ms(ms: u64) -> Duration {
+pub(super) fn ms(ms: u64) -> Duration {
     Duration::from_millis(ms)
 }
 
 /// Fast links, and members suspected after 300 ms. Requests wait through
 /// a removal.
-fn timing() -> ReplicationConfig {
+pub(super) fn timing() -> ReplicationConfig {
     ReplicationConfig {
         beacon_interval: ms(20),
         link_timeout: ms(200),
@@ -47,12 +47,13 @@ fn timing() -> ReplicationConfig {
         primary_grace: ms(600),
         ack_timeout: AckTimeout::wait_through(ms(3000)),
         member_suspect_after: ms(300),
+        takeover_delay: ms(40),
     }
 }
 
 /// Shard `b-1/0` on nodes 1 to 3, node 1 its primary; writes need two
 /// copies.
-fn initial() -> ShardConfig {
+pub(super) fn initial() -> ShardConfig {
     ShardConfig {
         bucket_id: BucketId::new("b-1").unwrap(),
         shard: ShardId::new(0),
@@ -66,7 +67,7 @@ fn initial() -> ShardConfig {
     }
 }
 
-fn put(key: &str, len: usize) -> RecordBody {
+pub(super) fn put(key: &str, len: usize) -> RecordBody {
     RecordBody::Put(Put {
         key: key.to_owned(),
         size: len as u64,
@@ -83,14 +84,14 @@ fn put(key: &str, len: usize) -> RecordBody {
 
 /// A TCP proxy to one member, which the test can cut: it then drops every
 /// connection, and every new one at once.
-struct Proxy {
-    address: SocketAddr,
+pub(super) struct Proxy {
+    pub(super) address: SocketAddr,
     cut: Arc<AtomicBool>,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl Proxy {
-    async fn to(target: SocketAddr) -> Self {
+    pub(super) async fn to(target: SocketAddr) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let cut = Arc::new(AtomicBool::new(false));
@@ -119,7 +120,7 @@ impl Proxy {
         }
     }
 
-    fn cut(&self) {
+    pub(super) fn cut(&self) {
         self.cut.store(true, Ordering::SeqCst);
         let connections = self.connections.lock();
         for task in connections
@@ -128,6 +129,11 @@ impl Proxy {
         {
             task.abort();
         }
+    }
+
+    /// Lets connections through again.
+    pub(super) fn heal(&self) {
+        self.cut.store(false, Ordering::SeqCst);
     }
 }
 
@@ -156,14 +162,14 @@ async fn member(pki: &Pki, n: u8) -> (SocketAddr, Replication<TokioNetwork, SimM
 }
 
 /// Waits until `done` holds.
-async fn until(mut done: impl FnMut() -> bool) {
+pub(super) async fn until(mut done: impl FnMut() -> bool) {
     while !done() {
         tokio::time::sleep(ms(5)).await;
     }
 }
 
 /// The shard's register.
-async fn register(store: &MemoryControlStore) -> ShardConfig {
+pub(super) async fn register(store: &MemoryControlStore) -> ShardConfig {
     let key = TypedKey::shard(&BucketId::new("b-1").unwrap(), ShardId::new(0));
     read(store, &key).await.unwrap().unwrap().value
 }
@@ -304,6 +310,14 @@ impl ShardRegisters for Taken {
         let held = self.0.clone();
         Box::pin(async move { Ok(Replaced::Holds(Some(held))) })
     }
+
+    fn read<'a>(
+        &'a self,
+        _: &'a skys3_log::ShardRef,
+    ) -> BoxFuture<'a, Result<Option<ShardConfig>, skys3_control::ControlError>> {
+        let held = self.0.clone();
+        Box::pin(async move { Ok(Some(held)) })
+    }
 }
 
 #[test]
@@ -359,7 +373,7 @@ async fn yields() {
     until(|| primary.config() == coordinated).await;
     assert!(!primary.is_stopped());
 
-    // Another node took over: the primary stops.
+    // Another node took over: the primary stops, and redirects to it.
     let taken = ShardConfig {
         epoch: Epoch::new(2),
         primary: node(2),
@@ -367,8 +381,10 @@ async fn yields() {
     };
     let (_, primary) = lonely_primary(&pki, Taken(taken)).await;
     until(|| primary.is_stopped()).await;
+    assert!(primary.is_deposed());
     assert!(matches!(
         primary.commit(put("a", 1)).await,
-        Err(ShardError::Unavailable { .. })
+        Err(ShardError::NotPrimary { primary, epoch, .. })
+            if primary == node(2) && epoch == Epoch::new(2)
     ));
 }

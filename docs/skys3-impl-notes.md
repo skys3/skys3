@@ -2946,6 +2946,150 @@ of this file. A task with nothing unexpected keeps "None."
   `skys3-shard` now depends on `skys3-control`, `skys3-obs`, and
   `prometheus-client`.
 
+### M2-12 Primary takeover and reconciliation
+
+- **R1 lives in the grace.** `Grace` gained a stopped state: once
+  `primary_grace` has passed and the takeover delay with it, the candidate
+  stops it (`Grace::stop_if_passed`), and from then on the member grants
+  no lease and acknowledges no append of its epoch. A grant that comes in
+  during the delay means the primary is back, and the member stands down.
+  A lost proposal resumes it, and so does a session of an epoch newer
+  than the one the candidate proposes over, which the grace holds under
+  the same lock (`Grace::resume_for`, `Grace::propose_over`): the
+  register has then moved past it. A resumed candidate proposes nothing
+  until its grace passes again. The random-fault simulation found the
+  first version, a plain flag, wrong: a candidate resumed by the old
+  primary's session after that primary removed another member, then
+  proposed over the removal while granting that primary leases. Takeover is
+  opt-in (`Replication::with_takeover`, which needs `with_removal`), so the
+  scenarios of earlier tasks run as before.
+- **What the candidate proposes (decided, design §6.5).** Epoch `e+1`, itself
+  as primary, the other members, no learners, and not the old primary,
+  which comes back only as a learner (M2-15). The model allows keeping
+  it; leaving it out means a dead primary does not stall the first writes
+  until its removal. The delay is `takeover_delay` (400 ms) scaled down by
+  the records the member holds past what it applied, plus a quarter of it
+  as jitter hashed from the node, the shard, and the epoch.
+- **The member becomes the primary in place.** `Shard::take_over` builds
+  the `Leader` the replica lacked, behind a `OnceLock` so that the
+  pipeline, links, and appender pick it up, switches the role, and
+  appends the new epoch's `CONFIG` record at once, after its whole log.
+  Unlike a removal (M2-11) it need not wait for the members' reports:
+  its log is the one they reconcile to, so none keeps an older record
+  past it. The primary serves once that record commits, that is once
+  every member holds its whole log, tail included. The replica's watch
+  then runs `start_primary`: leases, the removal watchdog, and links.
+- **Losers adopt the winner's configuration.** A member that loses the
+  compare-and-swap adopts what the register holds, even before the
+  winner's session, so it refuses the old primary (R2) and, if the winner
+  dies before reaching it, proposes over the winner's configuration a
+  grace later. Without that, the simulation found a member proposing over
+  epoch `e` forever after the winner crashed. A loser the register no
+  longer names stays stopped.
+- **A new primary's session restarts the grace.** A loser can learn of the
+  winner from the winner's session rather than from its own refused
+  compare-and-swap: the session arrives while it still waits out its
+  takeover delay, before it stopped granting. It adopted the winner's
+  configuration but granted nothing yet, so once the delay ended its
+  grace, still counted from the old primary's last grant, had passed,
+  and it proposed over the winner at once: a second takeover, epoch
+  `e+2`, milliseconds after the first. Leases kept that safe (it had
+  granted the winner nothing), but it deposed a live primary, against
+  §6.5's "if the winner stays silent for `primary_grace` too". The
+  loopback takeover test caught it under CPU load (about 4% of runs).
+  `Grace::resume_for` now counts a session from a primary the member
+  did not follow before as a grant, as a lost proposal already did
+  (`Grace::resume`), under the same lock, and still refuses a session no
+  newer than the epoch a stopped candidate proposes over. A session of
+  the same primary in a newer epoch (its removal of other members) does
+  not restart it, so a candidate still proposes over that at once.
+- **The proposal is not recorded (decided, design §6.3).** §6.3 asks a
+  candidate to record its proposal before the compare-and-swap. A lost
+  answer is retried while the candidate stays stopped, and after a restart
+  a node reopens each replica in the register's configuration, which
+  tells the outcome. That holds for the simulation and the tests; M2-16
+  must keep it, or record the proposal, if it opens replicas from the
+  local copy while the register is unreachable.
+- **Lineages, not last positions (decided, design §6.6).** The plan says to
+  collect each member's last `(epoch, seq)` and truncate past the new
+  primary's `seq`. That misses a member holding a different record at a
+  `seq` the primary also holds. A `Sync` now carries the primary's
+  lineage, the last `seq` it holds in each epoch since the position it
+  opened at (`Lineage`, fields 4 and 5 of `Sync`), and the member keeps
+  the prefix up to the largest `min(last)` over the epochs both logs
+  share (`Lineage::reconcile`). The lineage lives in memory: a replica
+  knows its epochs only from where it opened, which is enough as long as
+  the match lies after both open points.
+- **`TRUNCATE` semantics (decided, design §6.6, §10.1).** A `TRUNCATE` at
+  `(E, s)` invalidates every record at `(e', s')` with `s' > s` and
+  `e' < E` (`skys3_log::record::truncated_by`). `E` is the primary's
+  epoch at `s + 1`, or the new configuration's if the primary's log ends
+  at `s`, and every truncated record must be older. Replay
+  (`Checkpointer`) and `Shard::read_tail` skip what a `TRUNCATE`
+  invalidates, so records keep their place in the shared log and the
+  records the primary sends next, at the same `seq`s, are not hidden. The
+  index is not rolled back: a member applies only committed records, so
+  nothing it truncates is applied, and one that has (after replaying a
+  tail past the commit watermark on restart) is diverged. The `TRUNCATE`
+  holds a place in the commit pipeline that nothing applies: no record
+  queued after it is applied or reported durable until it is durable, and
+  if its write or sync fails the member stops and `Shard::truncate`
+  returns the error. Every other record, `CONFIG` included, has a writer
+  slot whose failure stops the shard already.
+- **A diverged member is removed.** A member that applied past the match,
+  shares no epoch with the primary to compare by, or whose records past
+  the match are not older than the primary's next, refuses the session.
+  The new primary's watchdog removes it after `member_suspect_after`, and
+  it rejoins as a learner (M2-15). That costs a member in rare cases
+  (a member restarted with an unapplied tail, then a takeover by a
+  member that lacked it) but never rewrites applied state.
+- **Members accept records of the epochs in between.** The new primary's
+  uncommitted tail can hold records of epochs newer than a member's but
+  older than the new configuration's (rolled forward by earlier
+  primaries). `Shard::receive` accepts them in order, and the member
+  sequences in their epoch, so its `CONFIG` record still lands at the
+  primary's.
+- **What a deposed primary answers (decided, design §6.5).** A member's
+  refusal now names its epoch; a primary refused for a newer epoch asks
+  its watchdog to read the register (`Leader::rejected`). Once it knows
+  the configuration that deposed it, it stops and answers
+  `ShardError::NotPrimary` naming the new primary, which the gateway
+  follows as a redirect, instead of `503`. A primary without a watchdog,
+  or without the register, stops and answers `503`.
+- **The simulation audits one committer per epoch.** `check_commits` now
+  also fails when two nodes acknowledge writes in the same epoch of a
+  shard. The commit audit compares each primary's watermark with the
+  longest durable run of every member's lives, which a truncation only
+  shortens for records that never committed. The routing audit lets a
+  primary that a takeover deposed complete, in its own older epoch, a
+  request it began before: a write whose members acknowledged it before
+  they stopped commits after the compare-and-swap. The record is on the
+  new primary too, and the model allows the same (`Commit` after
+  `ProposeTakeover`); the commit and lease audits judge such requests.
+- **Measured.** With the defaults (6 s grace, 400 ms delay), the shards of
+  a crashed primary were served by new primaries 6.35 to 6.52 s after the
+  crash over 24 seeds, under the 10 s of §13. The loopback test sees a
+  takeover between `primary_grace` and `primary_grace` plus 1.5 s. The
+  random-fault scenario (crashes, partitions, held links, control store
+  outages, message loss, drift within `ρ`) ran 200 seeds clean after the
+  fixes above, as did 24 to 48 seeds of each other scenario.
+- **The protocol model needed no change.** `ProposeTakeover` already lets
+  a candidate drop the old primary, holds it in `proposed` until it adopts
+  the outcome, and `Sync` truncates to the `(epoch, value)` common prefix.
+  The implementation refines them: it reconciles by lineage, which finds
+  the same prefix, refuses to truncate applied records, and resumes
+  granting only when a CAS was refused outright. Those only remove
+  behaviors.
+- **Left for later.** Wiring: `takeover_delay` has no configuration key
+  yet, and the binary does not run replication (M2-16). Planned handoff
+  (M2-13) reuses `take_over`. A node partitioned from its members but not
+  from the control store, with a `primary_grace` shorter than
+  `member_suspect_after` (not the defaults), can take over shards it
+  cannot serve; the other members take them back a grace later. A
+  pre-vote would avoid that. Seals (`Shard::seal`, as DeleteBucket
+  places them) are a counter on the primary's replica only, so a new
+  primary from a takeover starts unsealed (M3-04).
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation
