@@ -244,7 +244,9 @@ impl Client {
     }
 
     /// Records a write to `key` in `bucket` sent at `sent` that ended with
-    /// `outcome` now.
+    /// `outcome` now. A write that never connected is recorded too, as
+    /// unanswered: the history leaves it out, since it reached no node, but
+    /// the client waited for it all the same.
     fn time(&self, bucket: &BucketDocument, key: &str, sent: Duration, outcome: &Outcome) {
         if let Some(timings) = &self.timings {
             timings.push(WriteTiming {
@@ -399,6 +401,7 @@ impl Client {
         let host = self.host(bucket, key);
         let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
@@ -480,6 +483,7 @@ impl Client {
         };
         let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
@@ -554,6 +558,7 @@ impl Client {
             .send_recorded(&host, &name, Call::Delete, request)
             .await
         else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
@@ -585,6 +590,75 @@ impl Client {
             if !answered {
                 return Err(format!("the primary of {}/{key} never answered", bucket.name).into());
             }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_control::ProposalIds;
+    use skys3_types::{BucketId, BucketMode, BucketName, ShardCount};
+
+    use super::*;
+
+    /// A write whose connection never opens still counts against the
+    /// client's latency: it is timed, as unanswered, for the whole time
+    /// the client spent trying.
+    #[test]
+    fn writes_that_never_connect_are_timed_as_unanswered() -> turmoil::Result {
+        const TIMEOUT: Duration = Duration::from_secs(2);
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(Duration::from_secs(60))
+            .build();
+        // A node whose messages from the client are held, never delivered.
+        sim.host("node-0", || async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let timings = Timings::default();
+        let recorded = timings.clone();
+        sim.client("client", async move {
+            let bucket = BucketDocument {
+                bucket_id: BucketId::new("b-test")?,
+                name: BucketName::new("bucket-test")?,
+                mode: BucketMode::Local,
+                shards: ShardCount::new(1)?,
+                replicas: 1,
+                min_write_replicas: 1,
+                clean_copies: 1,
+                target: None,
+                created_unix_ms: 0,
+                proposal_id: ProposalIds::seeded(1).next_id(),
+            };
+            let routes = Routes {
+                buckets: vec![bucket.clone()],
+                placement: Arc::new(BTreeMap::new()),
+                nodes: vec![NodeId::new("node-0")?],
+            };
+            let workload = Workload {
+                timeout: TIMEOUT,
+                any_gateway: true,
+                ..Workload::default()
+            };
+            let mut client = Client::new("client".to_owned(), routes, History::new(), workload, 1)
+                .with_timings(timings);
+            turmoil::hold("client", "node-0");
+            client.put(&bucket, "key-0", 0, Condition::None).await?;
+            client
+                .multipart(&bucket, "key-0", 1, Condition::None)
+                .await?;
+            client.delete(&bucket, "key-0").await?;
+            Ok(())
+        });
+        sim.run()?;
+        let writes = recorded.take();
+        // The multipart upload never got as far as its completion, the
+        // only part of it that is a write.
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        for write in &writes {
+            assert!(!write.answered, "{write:?}");
+            assert!(write.took >= TIMEOUT, "{write:?}");
         }
         Ok(())
     }

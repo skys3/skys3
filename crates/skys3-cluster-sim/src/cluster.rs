@@ -197,7 +197,9 @@ pub struct WriteTiming {
     pub shard: ShardRef,
     /// When the client sent it, in simulated time since the run began.
     pub sent: Duration,
-    /// How long until its answer arrived, or until the client gave up.
+    /// How long until its answer arrived, or until the client gave up,
+    /// connecting included: a write that never connected is recorded
+    /// with the time the client spent trying.
     pub took: Duration,
     /// Whether it was acknowledged, or refused for its condition: whether
     /// the shard answered it definitely.
