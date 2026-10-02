@@ -14,12 +14,15 @@
 //!   and beyond the bound `ρ`.
 //! - [`acks`]: writes that time out while a member is cut off, in both
 //!   acknowledgement timeout modes.
+//! - [`routing`]: gateways on every node with stale shard maps, routing
+//!   each request to its primary under crashes and partitions.
 
 mod acks;
 mod crash;
 mod harness;
 mod leases;
 mod replication;
+mod routing;
 mod workload;
 
 /// What one seed of a cluster scenario costs, in seeds of a typical
