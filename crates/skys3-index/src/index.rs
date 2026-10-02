@@ -21,7 +21,7 @@ use crate::codec;
 use crate::error::IndexError;
 use crate::import::ImportRanges;
 use crate::tables::{
-    self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META,
+    self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META, ShardRow,
 };
 
 /// The index format version this build writes, and the newest it opens. It
@@ -386,10 +386,12 @@ impl Index {
         &self,
         shard: &ShardRef,
         table: tables::ShardTable,
-        rows: &[(Vec<u8>, Vec<u8>)],
+        rows: &[ShardRow],
     ) -> Result<(), IndexError> {
         for (key, value) in rows {
-            table.check(shard, key, value).map_err(IndexError::Snapshot)?;
+            table
+                .check(shard, key, value)
+                .map_err(IndexError::Snapshot)?;
         }
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::None)?;

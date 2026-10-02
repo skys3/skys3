@@ -791,10 +791,16 @@ fn a_snapshot_of_a_shard_installs_in_place_of_another_replicas_state() {
         .shard_rows(ShardTable::Namespace, &shard(1), None, 1 << 20)
         .unwrap();
     let refused = learner.install_rows(&shard(0), ShardTable::Namespace, &foreign);
-    assert!(matches!(refused, Err(IndexError::Snapshot(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(IndexError::Snapshot(_))),
+        "{refused:?}"
+    );
     for table in [ShardTable::Uploads, ShardTable::Parts] {
         let refused = learner.install_rows(&shard(0), table, &first);
-        assert!(matches!(refused, Err(IndexError::Snapshot(_))), "{refused:?}");
+        assert!(
+            matches!(refused, Err(IndexError::Snapshot(_))),
+            "{refused:?}"
+        );
     }
     for rows in [&first, &rest] {
         learner
@@ -822,7 +828,10 @@ fn a_snapshot_of_a_shard_installs_in_place_of_another_replicas_state() {
     };
     assert_eq!(of(&dump, 0), of(&primary, 0));
     assert_eq!(dump.applied.get(&shard(0)), Some(&position(6)));
-    assert_eq!(dump.locations.get(&(shard(0), position(3))), Some(&location));
+    assert_eq!(
+        dump.locations.get(&(shard(0), position(3))),
+        Some(&location)
+    );
     // The other shard is untouched.
     assert_eq!(of(&dump, 1), vec![tombstone(1)]);
     let parts = ShardTable::Parts;

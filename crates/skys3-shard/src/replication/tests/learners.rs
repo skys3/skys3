@@ -452,7 +452,7 @@ async fn overtaken() {
         proposed: Arc::default(),
         epochs: Arc::clone(&epochs),
     };
-    let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
+    let nodes = nodes(&pki, &store, &two_members(), promotions, Some(gate)).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
     let primary = nodes.replications[0].open(&two_members()).await.unwrap();
     let leader = Arc::clone(primary.leader().unwrap());

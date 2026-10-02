@@ -103,7 +103,10 @@ async fn new_learner() {
     let learner = current(&nodes.replications[2]).await;
     assert!(learner.read_tail(Seq::ZERO, Seq::new(1)).await.is_err());
     assert_eq!(learner.payload(small).await.unwrap(), vec![7; 10]);
-    assert_eq!(learner.payload(extent.position).await.unwrap(), vec![9; 600]);
+    assert_eq!(
+        learner.payload(extent.position).await.unwrap(),
+        vec![9; 600]
+    );
     assert_eq!(&learner.payload(part.position).await.unwrap()[..], b"parts");
     // The clean entry's payload stays with the remote.
     let entry = |key: &str| {
@@ -162,7 +165,8 @@ async fn readmitted(pki: &Pki) -> (SocketAddr, Replication<TokioNetwork, SimMoun
     let (log, _) = SegmentLog::open(disk.mount(), log_config, Arc::clone(&clock) as _)
         .await
         .unwrap();
-    let index = Arc::new(Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap());
+    let index =
+        Arc::new(Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap());
     let pool = || BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
     let alone = ShardConfig {
         primary: node(2),
@@ -190,7 +194,10 @@ async fn readmitted(pki: &Pki) -> (SocketAddr, Replication<TokioNetwork, SimMoun
     );
     let learner = replication.open(&learner_config()).await.unwrap();
     assert_eq!(learner.role(), Role::Learner);
-    let listener = transport.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let listener = transport
+        .bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let address = listener.local_addr().unwrap();
     let serving = replication.clone();
     tokio::spawn(async move { serving.serve(listener).await });
@@ -289,7 +296,10 @@ async fn readmission() {
     let primary = Lineage::new(EpochSeq::new(Epoch::new(3), Seq::new(3)));
     let mut link = connect(&pki, 1, address).await;
     let answer = session(&mut link, 3, &primary).await;
-    assert_eq!((answer.last, answer.unverified, answer.fresh), (3, 1, false));
+    assert_eq!(
+        (answer.last, answer.unverified, answer.fresh),
+        (3, 1, false)
+    );
     // The primary holds that record: the learner keeps its log, and takes
     // the primary's next record.
     let keep = Backfill {
@@ -307,7 +317,10 @@ async fn readmission() {
     let mut link = connect(&pki, 1, address).await;
     let primary = Lineage::new(EpochSeq::new(Epoch::new(3), Seq::new(9)));
     let answer = session(&mut link, 9, &primary).await;
-    assert_eq!((answer.last, answer.unverified, answer.fresh), (4, 0, false));
+    assert_eq!(
+        (answer.last, answer.unverified, answer.fresh),
+        (4, 0, false)
+    );
     assert!(!snapshot(&mut link, 2, 9).await.refused.is_empty());
 
     // A snapshot replaces the learner's log and index.

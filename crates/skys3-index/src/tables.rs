@@ -178,6 +178,9 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     end
 }
 
+/// A row of a [`ShardTable`], its key and value as stored.
+pub type ShardRow = (Vec<u8>, Vec<u8>);
+
 /// A table of a shard's state that a snapshot carries (§6.7): what a learner
 /// needs besides its applied position, which the snapshot names, and the
 /// location map, which is node-local.
@@ -956,7 +959,7 @@ impl IndexReader {
         shard: &ShardRef,
         after: Option<&[u8]>,
         max_bytes: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, IndexError> {
+    ) -> Result<Vec<ShardRow>, IndexError> {
         let prefix = codec::shard_key(shard);
         let end = prefix_end(&prefix);
         let table = match table {

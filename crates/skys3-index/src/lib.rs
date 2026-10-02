@@ -70,4 +70,4 @@ pub use index::{
     Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
 };
 pub use listing::{ListItem, ListPage, ListQuery};
-pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter, ShardTable};
+pub use tables::{ControlWriter, IndexDump, IndexReader, IndexWriter, ShardRow, ShardTable};

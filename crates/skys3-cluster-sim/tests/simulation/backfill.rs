@@ -16,8 +16,8 @@
 use std::time::Duration;
 
 use skys3_cluster_sim::{
-    Cluster, ClusterConfig, DurabilityWindows, Fault, FaultPlan, FaultProfile,
-    ReplicatedServices, RoutedServices, View, Workload,
+    Cluster, ClusterConfig, DurabilityWindows, Fault, FaultPlan, FaultProfile, ReplicatedServices,
+    RoutedServices, View, Workload,
 };
 use skys3_gateway::routing::RoutingConfig;
 use skys3_shard::replication::ReplicationConfig;
@@ -172,7 +172,11 @@ fn lost_members_are_replaced_under_random_faults() {
         );
         let services = services();
         let report = cluster(4, &services).run(context, &workload, &plan)?;
-        eprintln!("{:?} {:?}", services.replicated().learners(), services.replicated().durability_windows());
+        eprintln!(
+            "{:?} {:?}",
+            services.replicated().learners(),
+            services.replicated().durability_windows()
+        );
         assert!(report.count(|o| *o == Outcome::Done) > 0);
         Ok(())
     });

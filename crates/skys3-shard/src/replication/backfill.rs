@@ -187,7 +187,11 @@ where
             replica.finish_install(at).await?;
             Ok::<_, LinkError>(())
         };
-        match inner.set.reopen_after(replica, &config, &inner.node, work).await {
+        match inner
+            .set
+            .reopen_after(replica, &config, &inner.node, work)
+            .await
+        {
             Ok((reopened, installed)) => {
                 reopened.set_ack_timeout(inner.config.ack_timeout);
                 installed.map_err(|error| error.to_string())
@@ -207,7 +211,9 @@ where
             tracing::info!(%shard, %at, "installed a snapshot");
             Ok(())
         }
-        Err(error) => Err(protocol(format_args!("installing a snapshot failed: {error}"))),
+        Err(error) => Err(protocol(format_args!(
+            "installing a snapshot failed: {error}"
+        ))),
     }
 }
 
@@ -255,13 +261,18 @@ pub(super) async fn fill<N: Network, D: Disk>(
         let frame = recv(&mut receiver, timeout).await?;
         let ack: BackfillAck = wire::body(&frame, MessageKind::BackfillAck).map_err(protocol)?;
         if !ack.refused.is_empty() {
-            return Err(protocol(format_args!("the learner refused: {}", ack.refused)));
+            return Err(protocol(format_args!(
+                "the learner refused: {}",
+                ack.refused
+            )));
         }
         if ack.complete {
             return if leader.fill_complete(learner, ack.applied()) {
                 Ok(())
             } else {
-                Err(protocol("the learner reported a backfill older than its snapshot"))
+                Err(protocol(
+                    "the learner reported a backfill older than its snapshot",
+                ))
             };
         }
         if ack.needs.len() > NEEDS || shard.is_stopped() || !leader.is_learner(learner) {

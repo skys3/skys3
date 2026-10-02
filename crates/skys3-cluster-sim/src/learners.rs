@@ -290,7 +290,9 @@ impl ReplicatedServices {
                 let windows = &mut learners.windows;
                 let new_writes = window.new_writes.unwrap_or(now);
                 windows.new_writes.push(new_writes - window.since);
-                windows.all_data.push(window.all_data.unwrap_or(now) - window.since);
+                windows
+                    .all_data
+                    .push(window.all_data.unwrap_or(now) - window.since);
                 continue;
             }
             // The primary of the register's configuration, as it serves now.

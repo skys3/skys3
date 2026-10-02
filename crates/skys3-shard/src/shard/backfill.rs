@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use skys3_index::{EntryState, IndexError, IndexReader, Payload, ShardTable, codec};
+use skys3_index::{EntryState, IndexError, IndexReader, Payload, ShardRow, ShardTable, codec};
 use skys3_io::Disk;
 use skys3_log::record::{Extent, MpuPart, Put, PutData};
 use skys3_log::{LogRecord, RecordBody};
@@ -140,7 +140,7 @@ impl<D: Disk> Shard<D> {
         reader: &Arc<IndexReader>,
         table: ShardTable,
         after: Option<Vec<u8>>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ShardError> {
+    ) -> Result<Vec<ShardRow>, ShardError> {
         let (reader, shard) = (Arc::clone(reader), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
             let mut rows = reader.shard_rows(table, &shard, after.as_deref(), CHUNK_BYTES)?;
@@ -195,7 +195,7 @@ impl<D: Disk> Shard<D> {
     pub(crate) async fn install_rows(
         &self,
         table: ShardTable,
-        rows: Vec<(Vec<u8>, Vec<u8>)>,
+        rows: Vec<ShardRow>,
     ) -> Result<(), ShardError> {
         let (index, key) = (Arc::clone(&self.inner.index), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
@@ -289,9 +289,13 @@ impl<D: Disk> Shard<D> {
             return Ok(None);
         };
         let failed = |error: &dyn std::fmt::Display| ShardError::unavailable(shard, error);
-        let record = self.inner.log.read(location).await.map_err(|e| failed(&e))?;
-        if record.shard != *shard || record.position != position || payload_of(&record).is_none()
-        {
+        let record = self
+            .inner
+            .log
+            .read(location)
+            .await
+            .map_err(|e| failed(&e))?;
+        if record.shard != *shard || record.position != position || payload_of(&record).is_none() {
             return Ok(None);
         }
         record.to_bytes().map(Some).map_err(|e| failed(&e))
@@ -317,7 +321,12 @@ impl<D: Disk> Shard<D> {
         for (position, bytes) in records {
             let record = match LogRecord::decode(&bytes) {
                 Ok((record, len)) if len == bytes.len() => record,
-                Ok(_) => return Err(ShardError::invalid(shard, "a copied record has trailing bytes")),
+                Ok(_) => {
+                    return Err(ShardError::invalid(
+                        shard,
+                        "a copied record has trailing bytes",
+                    ));
+                }
                 Err(error) => return Err(ShardError::invalid(shard, error.to_string())),
             };
             if record.shard != *shard
@@ -331,7 +340,10 @@ impl<D: Disk> Shard<D> {
                 ));
             }
             let pending = self.inner.log.queue_encoded(bytes, false).await;
-            queued.push((position, pending.map_err(|e| ShardError::unavailable(shard, e))?));
+            queued.push((
+                position,
+                pending.map_err(|e| ShardError::unavailable(shard, e))?,
+            ));
         }
         let mut locations = Vec::with_capacity(queued.len());
         for (position, pending) in queued {
