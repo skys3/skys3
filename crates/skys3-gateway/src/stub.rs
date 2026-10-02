@@ -5,13 +5,14 @@
 //! [`MemoryShards::open`] it again, which recovers the log and replays it as
 //! a restarted node does. Helpers commit entries in a given state
 //! ([`MemoryShards::put`]), flush a bucket ([`MemoryShards::flush`]), and
-//! make every request fail ([`MemoryShards::set_unavailable`]).
+//! make every request fail ([`MemoryShards::set_unavailable`]), and slow
+//! holder fetches down ([`MemoryShards::set_fetch_delay`]).
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -50,6 +51,9 @@ pub struct MemoryShards {
     local: LocalShards<SimMount>,
     /// When set, every request fails with [`ShardError::Unavailable`].
     unavailable: Arc<AtomicBool>,
+    /// How long each holder fetch waits before the holder serves it, in
+    /// milliseconds.
+    fetch_delay_ms: Arc<AtomicU64>,
 }
 
 impl MemoryShards {
@@ -102,6 +106,7 @@ impl MemoryShards {
             disk,
             local: LocalShards::new(ShardSet::new(index, log, pool), node),
             unavailable: Arc::default(),
+            fetch_delay_ms: Arc::default(),
         })
     }
 
@@ -224,6 +229,14 @@ impl MemoryShards {
     /// succeed again.
     pub fn set_unavailable(&self, unavailable: bool) {
         self.unavailable.store(unavailable, Ordering::SeqCst);
+    }
+
+    /// Makes each later holder fetch ([`Shards::fetch`]) wait `delay`
+    /// before the holder checks its registration and serves it, as a slow
+    /// holder does. Whole milliseconds count.
+    pub fn set_fetch_delay(&self, delay: Duration) {
+        let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.fetch_delay_ms.store(millis, Ordering::SeqCst);
     }
 
     fn check(&self, shard: &ShardRef) -> Result<(), ShardError> {
@@ -375,6 +388,10 @@ impl Shards for MemoryShards {
         position: EpochSeq,
     ) -> Result<Bytes, ShardError> {
         self.check(shard)?;
+        let delay = self.fetch_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         self.local.fetch(shard, holder, read, position).await
     }
 
