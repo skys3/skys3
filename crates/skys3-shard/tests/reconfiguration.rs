@@ -494,6 +494,57 @@ fn a_learner_holds_up_commits_only_in_the_acknowledgement_set() {
     });
 }
 
+/// The single survivor's repair (§6.5): the primary is the only member,
+/// and a learner brings the shard back to two copies. Commits the primary
+/// made alone authorize nothing past them.
+#[test]
+fn a_single_survivor_waits_for_its_learner_once_it_joins() {
+    runtime().block_on(async {
+        let replica = Replica::new(10).await;
+        let survivor = ShardConfig {
+            learners: vec![node(3)],
+            ..configuration(1, &[1])
+        };
+        let primary = replica.open(&survivor, &node(1)).await;
+        let leader = Arc::clone(primary.leader().unwrap());
+        leader.synced(&node(3), Seq::ZERO);
+        until(|| primary.is_serving()).await;
+        let refused = primary.commit(put("a", 10, 1)).await;
+        assert!(
+            matches!(refused, Err(ShardError::UnderReplicated { copies: 1, .. })),
+            "{refused:?}"
+        );
+        // Alone, the primary commits what it holds.
+        primary.commit(flushed("a", 1, true)).await.unwrap();
+        assert_eq!(leader.commit(), Seq::new(1));
+
+        leader.acknowledged(&node(3), Seq::new(1));
+        assert!(leader.join(&node(3)));
+        let writer = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.commit(put("b", 10, 1)).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(2)).await;
+        primary.settle().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !writer.is_finished(),
+            "the write did not wait for the learner"
+        );
+        assert_eq!(leader.commit(), Seq::new(1));
+        leader.acknowledged(&node(3), Seq::new(2));
+        assert_eq!(writer.await.unwrap().unwrap().position, position(1, 2));
+
+        // R3 can be met.
+        leader.backfilled(&node(3));
+        let promotion = ShardConfig {
+            learners: Vec::new(),
+            ..configuration(2, &[1, 3])
+        };
+        leader.begin_promotion(&node(3), &promotion).unwrap();
+    });
+}
+
 #[test]
 fn a_primary_that_recorded_a_promotion_waits_for_its_learner_after_a_restart() {
     runtime().block_on(async {

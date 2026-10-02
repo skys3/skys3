@@ -774,10 +774,16 @@ impl Leader {
             .iter()
             .chain(&state.acking)
             .chain(state.promoting.iter().map(|p| &p.learner));
+        // With no one to wait for, the primary may commit what it has
+        // sequenced so far, and no more: a learner that joins later holds
+        // up the records after it (§6.4).
         let acked = needed
             .map(|node| state.progress.get(node).map_or(Seq::ZERO, |p| p.acked))
             .min()
-            .unwrap_or(Seq::MAX);
+            .unwrap_or_else(|| {
+                let next = lock(&self.sequencer).next.seq;
+                Seq::new(next.get().saturating_sub(1))
+            });
         if acked > state.limit {
             state.limit = acked;
             if let Some(pipeline) = self.pipeline.upgrade() {

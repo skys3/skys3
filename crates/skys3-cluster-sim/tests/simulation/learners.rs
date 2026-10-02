@@ -53,7 +53,12 @@ fn services(config: ReplicationConfig) -> ReplicatedServices {
 
 /// A cluster checked against R3 after every step.
 fn cluster(services: &ReplicatedServices) -> Cluster<ReplicatedServices> {
-    Cluster::with_services(config(), services.clone()).invariant(
+    cluster_of(config(), services)
+}
+
+/// A cluster of `config` checked against R3 after every step.
+fn cluster_of(config: ClusterConfig, services: &ReplicatedServices) -> Cluster<ReplicatedServices> {
+    Cluster::with_services(config, services.clone()).invariant(
         |view: &View<'_, ReplicatedServices>| {
             view.services.check_commits()?;
             view.services.check_members_hold_commits()
@@ -92,6 +97,32 @@ fn learners_are_promoted_without_stalling_writes() {
             learners.slowest_write_during < Duration::from_millis(500),
             "a write stalled during a promotion: {learners:?}"
         );
+        assert!(report.count(|o| *o == Outcome::Done) > 0);
+        Ok(())
+    });
+}
+
+/// The single survivor's repair (§6.5): every shard has one member, which
+/// commits alone until the learner it is given joins its acknowledgement
+/// set, and then waits for it, so the learner catches up and is promoted.
+#[test]
+fn a_lone_member_waits_for_its_learner_and_promotes_it() {
+    Runner::with_cost(2, COST).run(|context| {
+        let config = ClusterConfig {
+            nodes: 3,
+            replicas: 1,
+            ..config()
+        };
+        let services = services(ReplicationConfig::default());
+        let report = cluster_of(config, &services).run(
+            context,
+            &workload(context, 60),
+            &FaultPlan::none(),
+        )?;
+        let learners = services.learners();
+        eprintln!("{learners:?}");
+        assert!(learners.added > 0, "{learners:?}");
+        assert_eq!(learners.promoted, learners.added, "{learners:?}");
         assert!(report.count(|o| *o == Outcome::Done) > 0);
         Ok(())
     });
