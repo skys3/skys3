@@ -67,7 +67,8 @@
 //!   keeps the index of what is staged, bounded by
 //!   `peer_staging_quota_bytes` and `peer_staging_ttl_seconds`, answers
 //!   each `BEGIN` with a `RESUME`, and reports durable ranges with
-//!   cumulative `DURABLE`s.
+//!   cumulative `DURABLE`s. A [`CommitSink`] applies each `COMMIT` in the
+//!   shard of its key, which publishes what is staged in one record.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -119,7 +120,9 @@ mod tls;
 mod trust;
 mod wire;
 
-pub use destination::{ExtentSink, MAX_APPENDS_PER_STREAM, SinkError, StagingService};
+pub use destination::{
+    CommitSink, ExtentSink, MAX_APPENDS_PER_STREAM, NoCommits, SinkError, StagingService,
+};
 pub use endpoint::{
     ConnectError, Destination, EndpointSettings, IDLE_TIMEOUT, INITIAL_WINDOW, Incoming,
     KEEP_ALIVE_INTERVAL, MAX_STREAMS_PER_CONNECTION, PeerConnection, PeerEndpoint, WINDOW_INTERVAL,

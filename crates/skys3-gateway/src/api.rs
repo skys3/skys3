@@ -79,6 +79,12 @@ impl<C: ControlStore, H: Shards> Api<C, H> {
     fn bucket(&self, name: &str) -> S3Result<BucketDocument> {
         self.buckets.require(&bucket_name(name)?)
     }
+
+    /// The bucket an object write names, which must exist and take writes
+    /// from this cluster's clients.
+    fn writable(&self, name: &str) -> S3Result<BucketDocument> {
+        self.buckets.require_writable(&bucket_name(name)?)
+    }
 }
 
 fn bucket_name(name: &str) -> S3Result<BucketName> {
@@ -189,7 +195,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.put(&bucket, req).await?)
     }
 
@@ -213,7 +219,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.delete(&bucket, req).await?)
     }
 
@@ -221,7 +227,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.delete_objects(&bucket, req).await?)
     }
 
@@ -229,7 +235,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         let (source, _) = copy_source(&req.input)?;
         let source = self.bucket(source)?;
         ok(self.objects.copy(&bucket, &source, req).await?)
@@ -247,7 +253,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.put_tagging(&bucket, req.input).await?)
     }
 
@@ -255,7 +261,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.delete_tagging(&bucket, req.input).await?)
     }
 
@@ -263,7 +269,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.create_upload(&bucket, req).await?)
     }
 
@@ -271,7 +277,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.upload_part(&bucket, req).await?)
     }
 
@@ -279,7 +285,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.complete_upload(&bucket, req).await?)
     }
 
@@ -287,7 +293,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let bucket = self.bucket(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.abort_upload(&bucket, req).await?)
     }
 

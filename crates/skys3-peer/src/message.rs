@@ -9,7 +9,8 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 use skys3_log::record::{
-    MAX_KEY_LEN, MAX_METADATA_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, Metadata, TagSet,
+    IDENTITY_METADATA, IDENTITY_METADATA_RESERVED, MAX_KEY_LEN, MAX_METADATA_LEN, MAX_TAG_KEY_LEN,
+    MAX_TAG_VALUE_LEN, MAX_TAGS, Metadata, TagSet,
 };
 use skys3_types::checksum::Checksums;
 use skys3_types::limits::{MAX_PARTS, MAX_SINGLE_PUT_BYTES};
@@ -468,9 +469,12 @@ fn check_reason(field: &'static str, reason: &str) -> Result<(), MessageError> {
 }
 
 /// The rules of the log's `PUT` records, so that the destination can
-/// store whatever it accepts: lowercase header names, and at most
-/// [`MAX_METADATA_LEN`] bytes of names and values.
+/// store whatever it accepts with the write identity it adds: lowercase
+/// header names, and, without an [`IDENTITY_METADATA`] entry, at most
+/// [`MAX_METADATA_LEN`] less [`IDENTITY_METADATA_RESERVED`] bytes of names
+/// and values.
 fn check_metadata(metadata: &Metadata) -> Result<(), MessageError> {
+    const LIMIT: usize = MAX_METADATA_LEN - IDENTITY_METADATA_RESERVED;
     let mut total = 0usize;
     for (name, value) in metadata {
         let token = !name.is_empty()
@@ -480,10 +484,12 @@ fn check_metadata(metadata: &Metadata) -> Result<(), MessageError> {
         ensure(token, "put.metadata", || {
             format!("{name:?} is not a lowercase header name")
         })?;
-        total = total.saturating_add(name.len()).saturating_add(value.len());
+        if name != IDENTITY_METADATA {
+            total = total.saturating_add(name.len()).saturating_add(value.len());
+        }
     }
-    ensure(total <= MAX_METADATA_LEN, "put.metadata", || {
-        format!("{total} bytes exceed the limit of {MAX_METADATA_LEN}")
+    ensure(total <= LIMIT, "put.metadata", || {
+        format!("{total} bytes exceed the limit of {LIMIT}")
     })
 }
 

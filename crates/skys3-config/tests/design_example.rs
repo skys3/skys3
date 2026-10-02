@@ -271,6 +271,7 @@ snapshot_target = "https://snapshots.example/snaps/logs/"
 [buckets.mirror]
 backup_target = "https://peer.example/mirror"
 peer_source = "c2"
+peer_local_writes = true
 
 [peering]
 quic_listen = "[::]:8443"
@@ -367,6 +368,7 @@ fn every_key_parses_and_is_resolved() {
         "defaults to the backup target"
     );
     assert_eq!(mirror.peer_source.as_ref().unwrap().as_str(), "c2");
+    assert!(mirror.peer_local_writes);
 
     let unnamed = config.buckets().get(&BucketName::new("other").unwrap());
     assert_eq!(unnamed, defaults);

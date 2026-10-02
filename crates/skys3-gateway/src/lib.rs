@@ -147,7 +147,7 @@ pub mod stub;
 pub use admission::{Admission, AdmitAll, Refusal};
 pub use authz::{Permissions, Principal};
 pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, ShardPlacement, TARGET_HEADER};
-pub use conditions::{ConditionFailed, Precondition};
+pub use conditions::{ConditionFailed, PeerCondition, Precondition, current_identity};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
@@ -158,7 +158,7 @@ pub use objects::{
     MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
     parse_upload_id, upload_id,
 };
-pub use peering::{BucketLookup, PeerExtents};
+pub use peering::{BucketLookup, PeerCommits, PeerExtents};
 pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;

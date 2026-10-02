@@ -81,6 +81,10 @@ pub struct BucketSettings {
     /// `peer_source`: the cluster this bucket receives native replication
     /// from (§7.8).
     pub peer_source: Option<ClusterId>,
+    /// `peer_local_writes`: whether this cluster's own clients may write a
+    /// bucket that names a `peer_source`. Off by default, so each key has a
+    /// single writer, the source (§7.8).
+    pub peer_local_writes: bool,
     /// `max_dirty_bytes`: the bucket's dirty-data budget (§7.6); by default
     /// the cluster's, `flush.max_dirty_bytes`.
     pub max_dirty_bytes: u64,
@@ -139,6 +143,7 @@ pub(crate) struct BucketTable {
     backup_target: Option<String>,
     snapshot_target: Option<String>,
     peer_source: Option<String>,
+    peer_local_writes: Option<bool>,
 }
 
 /// The built-in defaults of every bucket-level key that has one.
@@ -232,6 +237,10 @@ pub(crate) fn resolve(
         ("backup_target", defaults_table.backup_target.is_some()),
         ("snapshot_target", defaults_table.snapshot_target.is_some()),
         ("peer_source", defaults_table.peer_source.is_some()),
+        (
+            "peer_local_writes",
+            defaults_table.peer_local_writes.is_some(),
+        ),
     ] {
         if set {
             checker.report(
@@ -421,6 +430,21 @@ fn settle<'a>(
                 None
             }
         });
+    if peer_source.is_some() && values.mode == BucketMode::ReadOnly {
+        checker.report(
+            key("peer_source"),
+            "a read_only bucket mirrors its remote target and cannot receive from a peer \
+             cluster (§7.8)",
+        );
+    }
+    // `[buckets.defaults]` cannot set it; `resolve` has reported it if it does.
+    let peer_local_writes = named && table.peer_local_writes == Some(true);
+    if named && table.peer_local_writes.is_some() && table.peer_source.is_none() {
+        checker.report(
+            key("peer_local_writes"),
+            "only a bucket that names a peer_source is read-only to this cluster's clients",
+        );
+    }
 
     if !valid || checker.count() != before {
         return None;
@@ -441,6 +465,7 @@ fn settle<'a>(
         backup_target,
         snapshot_target,
         peer_source,
+        peer_local_writes,
         max_dirty_bytes: values.max_dirty_bytes,
     })
 }

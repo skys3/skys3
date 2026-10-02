@@ -510,3 +510,47 @@ async fn a_learner_in_a_members_domain_counts_in_its_place() {
     assert_eq!(shard_register(&store, 0).await.members, nodes(&[2, 3, 1]));
     assert!(coordinator.round(&store).await.is_none());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_removal_that_never_landed_does_not_hold_back_the_next() {
+    let store = store(6).await;
+    // Shard 0 is short and comes first; shard 1's departing member can go.
+    write_shard(&store, 0, &[0, 1], &[]).await;
+    write_shard(&store, 1, &[0, 1, 2, 3], &[]).await;
+    depart(&store, 3).await;
+    let mut coordinator = Coordinator::nodes();
+    let change = coordinator.plan(&store).await.unwrap();
+    assert_eq!(change.writes().len(), 2);
+    // The primary changes shard 0 first: the change stops there, and the
+    // removal is never sent.
+    write_shard(&store, 0, &[0, 1, 4], &[]).await;
+    let applied = apply(&store, &cluster(), &change, &mut coordinator.ids, &retry())
+        .await
+        .unwrap();
+    assert_eq!(applied.rejected.as_ref(), Some(key(0).key()));
+    coordinator.replacement.applied(&change, &applied);
+    assert_eq!(
+        shard_register(&store, 1).await.members,
+        nodes(&[0, 1, 2, 3])
+    );
+
+    // The next round removes it at once.
+    coordinator.step(&store).await;
+    assert_eq!(shard_register(&store, 1).await.members, nodes(&[0, 1, 2]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_tenure_waits_a_removal_interval_before_its_first_removal() {
+    let store = store(5).await;
+    write_shard(&store, 0, &[0, 1, 2, 3], &[]).await;
+    depart(&store, 3).await;
+    let mut coordinator = Coordinator::nodes();
+    // The previous coordinator may have just removed a member elsewhere.
+    coordinator.replacement.begin_tenure();
+    assert!(coordinator.round(&store).await.is_none());
+    tokio::time::advance(INTERVAL / 2).await;
+    assert!(coordinator.round(&store).await.is_none());
+    tokio::time::advance(INTERVAL / 2).await;
+    coordinator.step(&store).await;
+    assert_eq!(shard_register(&store, 0).await.members, nodes(&[0, 1, 2]));
+}
