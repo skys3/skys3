@@ -3871,6 +3871,17 @@ of this file. A task with nothing unexpected keeps "None."
   empty registry, as at the start of a tenure, makes every learner look
   unregistered and every node ineligible. `Replacement` plans nothing
   until `NodeRegistry::is_listed` says this tenure has listed `nodes/`.
+- **The removal interval in review (found).** The timer started when a
+  removal was planned, so a change whose earlier write lost its
+  compare-and-swap, and never sent the removal, still held back every
+  removal for the interval; it now starts once a removal took effect, or
+  may have. And each coordinator kept its own timer, so a new tenure could
+  remove a member right after its predecessor did; a tenure now waits a
+  whole interval before its first removal, which keeps removals an
+  interval apart across coordinators while tenures do not overlap.
+  Recording the time in the control store would need a new register
+  field and format version for a pacing bound. Recorded in §6.7; each
+  fix has a test that fails without it.
 - **The simulation's driver is gone.**
   `ReplicatedServices::replacing_lost_members` became
   `following_registers`: nodes follow the registers that name them (a
