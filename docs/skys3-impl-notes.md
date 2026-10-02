@@ -2131,6 +2131,89 @@ of this file. A task with nothing unexpected keeps "None."
   reads on the primary count as uses, since members serve none yet; read
   plans (M2-18) and the hot cache (M2-19) change that.
 
+### M1-22 Segment compaction
+
+- **Liveness needs the index, not just the location map.** Applying never
+  removes a location for a replaced version (a read may still stream it),
+  so the location map alone says nothing about what is live. A record is
+  live when the map locates it in the segment *and* an entry, a completed
+  object's parts, or a part of an open upload names its position;
+  `IndexReader::holders` answers that per key. The index format stays at
+  7: compaction adds no table, and its one durable commit per chunk only
+  moves and removes locations. `Index::update_durable` commits with
+  `Durability::Immediate`; a non-durable commit there lost data at seed 0
+  of both simulations, because the segment file is removed right after.
+- **Unnamed extents wait instead of being copied.** `EXTENT` records no
+  entry names are a body still arriving, a failed upload, or a peer's
+  staging (§7.8). Copying them would rewrite garbage forever, so their
+  segment waits until it has been sealed for `peer_staging_ttl_seconds`
+  and they are then dropped. The log tracks when it sealed each segment,
+  in memory; a segment recovered at startup counts from startup, which
+  only delays reclamation. A member's copy of a fill's extents, which
+  nothing on the member names (M1-21), is dropped the same way.
+- **Replicas hold what their members may lack.** Replay applies a
+  replicated shard's durable tail past the commit watermark, so a
+  segment's records can be applied and released while a member that is
+  behind still needs them sent from this log. `Shard::replicated_through`
+  is the highest commit watermark the replica learned since it opened
+  (`None` for a replica alone); records after it keep their segment, as
+  do records of a shard not open on the node. The unit test that opens a
+  replicated shard whose member never reports catches dropping this hold;
+  the cluster simulations do not, as the window is short there.
+- **Dropping a `TRUNCATE` broke reading the tail.** Once compaction drops
+  a `TRUNCATE`, the records it invalidated may still be in an older
+  segment, so `read_tail` found two records for one `seq` and failed.
+  It now keeps the newest epoch for each `seq` (a copied record, found
+  twice, is alike). Design §10.3 records the rule.
+- **The latest `CONFIG` is copied, though the index also keeps it.** The
+  plan asks for it to stay reachable in the log; the record matching the
+  index's `configs` row is copied and older ones are dropped. Both
+  simulations check every node's log for each shard's latest `CONFIG`.
+- **Hot clean payload is the most recently used half.** The cache ranks
+  entries by last use per disk; compaction copies a clean payload only if
+  it is among the most recently used entries holding half of the disk's
+  cached bytes, and only while the cache is within its bounds. A node
+  without a clean cache copies clean payload, since it never evicts.
+- **The cache now hears what compaction reclaims (M1-21's open item).**
+  `CleanCache::reclaimed` lowers the evicted bytes a disk's room counts as
+  free by every payload byte compaction drops from that disk, evicted or
+  replaced. That can count less free than there is, never more.
+- **Retired segments stay readable for a minute.** A read that located a
+  record just before compaction retired its segment keeps the file handle
+  for `RETIRE_GRACE` (60 s), so streaming a GET is not cut off; the files
+  are already unlinked and synced out of the directory. Review found two
+  gaps: the segment left the listing before it joined the retired ones,
+  so a read in between failed, and scans did not look at retired
+  segments, so `read_tail`, which lists the segments and scans them one
+  by one, could hit one compaction had just retired and abort a
+  reconciliation; skipping it would lose records copied into a segment
+  created after the listing. The move is now one step under the segments
+  lock, scans see retired segments within the grace, and `read_tail`
+  takes every scanner at once (`SegmentLog::scan_all`), each holding its
+  file, so no time bound applies to it. One test catches the first gap
+  with a clock that scans the segment each time `retire` reads the
+  clock; another scans a listed segment after retiring it.
+- **Teeth.** The shard simulation runs 2 to 4 process lives of writers
+  over overwritten keys, multipart uploads, and `TAGS`, cuts the power at
+  a random sync inside a compaction pass in 70% of seeds, and races a
+  `TAGS`/`FLUSHED` writer against compaction in half of them; it compares
+  the index with a replay of the model and checks every named payload's
+  bytes. Copies without new locations, a non-durable index commit, a
+  dropped `CONFIG`, and a relocation that ignored a racing write each
+  fail it; the last only with the racer. Classifying dirty payload as
+  droppable does not, because the relocation's re-check keeps the
+  segment: that check is the safety net, not the classification. With
+  `SKYS3_SIM_SEEDS=256` in a debug build: the shard scenario (cost 8, 32
+  seeds) takes 33 s; the cluster scenarios take 29 s (crashes, message
+  loss, and a partition; cost 32, 8 seeds) and 38 s (power loss at four
+  syncs of a base run; cost 128, 2 seeds of five runs each).
+- **Left open.** Every pass scans each released segment whole to measure
+  its live bytes; per-segment live counters would avoid that, at the cost
+  of keeping them across crashes. Segments of a shard dropped from the
+  node are still never released (§10.2), so compaction never sees them.
+  Compaction has no rate limit of its own beyond chunking (32 MiB or 4096
+  records per durable commit). Fragment segments (M7) are not handled.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named

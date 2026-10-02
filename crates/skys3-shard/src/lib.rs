@@ -24,6 +24,10 @@
 //!   ([`Shard::evict`]); and [`CleanCache`], which keeps clean payload on up
 //!   to `clean_copies` replicas and evicts it least recently used first
 //!   within the node's bounds (§9.3).
+//! - [`compaction`]: [`Compactor`] reclaims released log segments whose
+//!   live ratio is low, copying what the index and the shard's members
+//!   still need, and evicting cold clean payload instead of copying it
+//!   (§10.3).
 //!
 //! Replication (M2) runs the same state machine on every member; only the
 //! commit rule changes, and a primary serves reads only while every member
@@ -58,6 +62,7 @@
 
 mod ack;
 pub mod cache;
+pub mod compaction;
 mod error;
 mod leader;
 mod lease;
@@ -71,6 +76,9 @@ mod shard;
 
 pub use ack::{AckMode, AckTimeout};
 pub use cache::{CacheMetrics, CacheRefusal, CacheSettings, CacheUsage, CleanCache};
+pub use compaction::{
+    CompactionError, CompactionMetrics, CompactionReport, CompactionSettings, Compactor,
+};
 pub use error::ShardError;
 pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;
