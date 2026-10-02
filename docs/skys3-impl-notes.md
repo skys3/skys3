@@ -3254,6 +3254,23 @@ of this file. A task with nothing unexpected keeps "None."
   `CommittedRecordsSurvive`. The `pr` profile passes with every seeded bug
   caught; the nightly profile's state counts in `spec/README.md` predate
   the split.
+- **Review fixes.** Three findings, each with a test that fails without
+  its fix:
+  - **Commit limit when alone.** A primary with no other member and no
+    learner to wait for set its commit limit to `Seq::MAX`. The
+    pipeline's limit never comes down, so once a learner joined (the
+    single survivor's repair), writes were still acknowledged on one
+    copy, and the learner could never be promoted. The limit is now the
+    last sequenced `seq`. The cluster scenario with single-member shards
+    caught it as promotions that never came.
+  - **Promotion precondition.** The promotion's compare-and-swap was sent
+    over the configuration the replica held after recording it, so one
+    adopted in between could be replaced by the stale proposal at its own
+    epoch. It is now sent only while the replica holds the configuration
+    the proposal extends. The model's `SendPromotion` already had this
+    guard.
+  - **Exposure on learners.** `Replication::exposure` skipped only
+    members, so learners reported the shards they learn as exposure.
 - **Left for later.** Snapshot and payload backfill and the re-admission
   of a node with a diverged log are M2-15's; choosing learners and when
   to add them is M3-05's; the binary does not run replication yet
