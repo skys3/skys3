@@ -132,12 +132,39 @@ fn copies_beyond_clean_copies_and_entries_without_bytes_are_evicted_at_once() {
         victims(&cache),
         [named(0, "third"), named(0, "learner"), named(0, "stub"),]
     );
-    // A bucket the cache was not told about keeps one copy.
-    cache.set_clean_copies([]);
-    cache.note(&shard(0), Some(1), vec![clean("member", 2, 10)]);
-    assert_eq!(victims(&cache), [named(0, "member")]);
+    // Lowering the setting evicts the copies kept beyond it, by the rank
+    // each replica last reported: shard 1 is a member here.
+    cache.note(&shard(1), Some(1), vec![clean("other", 6, 10)]);
+    assert_eq!(cache.usage().bytes, 30);
+    cache.set_clean_copies([(shard(0).bucket.clone(), 1)]);
+    assert_eq!(victims(&cache), [named(1, "other")]);
     // A copy that was kept and is no longer is not counted twice.
+    assert_eq!(cache.usage().bytes, 20);
+    // Setting it again unchanged evicts nothing.
+    cache.set_clean_copies([(shard(0).bucket.clone(), 1)]);
+    assert!(victims(&cache).is_empty());
+}
+
+#[test]
+fn a_bucket_keeps_every_copy_until_its_clean_copies_is_known() {
+    // A node opens its replicas, and a bucket made at runtime gets
+    // `FLUSHED` records, before the node reads the bucket's policy.
+    let cache = cache(1000);
+    cache.note(&shard(0), Some(1), vec![clean("member", 1, 10)]);
+    cache.note(&shard(1), Some(2), vec![clean("third", 1, 10)]);
+    cache.note(&shard(1), None, vec![clean("learner", 2, 10)]);
+    assert_eq!(victims(&cache), [named(1, "learner")]);
+    assert_eq!(cache.usage().bytes, 20);
+    // Shards 0 and 1 are of the same bucket: rank 1 is within two
+    // copies, rank 2 is not.
+    cache.set_clean_copies([(shard(0).bucket.clone(), 2)]);
+    assert_eq!(victims(&cache), [named(1, "third")]);
     assert_eq!(cache.usage().bytes, 10);
+    // A bucket left out keeps every copy again, and no eviction follows.
+    cache.set_clean_copies([]);
+    cache.note(&shard(1), Some(2), vec![clean("third", 3, 10)]);
+    assert!(victims(&cache).is_empty());
+    assert_eq!(cache.usage().bytes, 20);
 }
 
 #[test]

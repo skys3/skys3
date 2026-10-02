@@ -316,13 +316,13 @@ pub(crate) async fn run<S: NodeServices>(
     let shards = shared.services.start(env).await?;
     let flush = Arc::new(flush_service(settings, &shared.remote));
     let mut gateway_config = settings.gateway.clone();
-    if let Some(cache) = settings.clean_cache {
+    let mut cache = None;
+    if let Some(bounds) = settings.clean_cache {
         // The clean cache, and fills of what it evicts, as the node
-        // binary keeps them.
-        let cache = CleanCache::new(cache, CacheMetrics::default());
-        let set = recovered.shards.set().clone();
-        set.use_cache(&cache).await;
-        tokio::spawn(async move { cache.run(set).await });
+        // binary keeps them; it runs once the bucket policies are in.
+        let clean = CleanCache::new(bounds, CacheMetrics::default());
+        recovered.shards.set().use_cache(&clean).await;
+        cache = Some(clean);
         gateway_config.fills = Some(Arc::new(SimFills {
             shards: recovered.shards.clone(),
             flush: Arc::clone(&flush),
@@ -337,6 +337,11 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
     open_shards(&shards, &gateway.buckets()).await?;
+    if let Some(cache) = cache {
+        install_clean_copies(&recovered.shards, &gateway.buckets());
+        let set = recovered.shards.set().clone();
+        tokio::spawn(async move { cache.run(set).await });
+    }
     {
         let (gateway, local) = (gateway.clone(), recovered.shards.clone());
         tokio::spawn(async move { follow_flushes(&flush, &gateway, &local).await });
@@ -427,14 +432,20 @@ async fn follow_flushes(
 ) {
     loop {
         let buckets = gateway.buckets();
+        install_clean_copies(shards, &buckets);
         flush.reconcile(&buckets, shards.set()).await;
-        if let Some(cache) = shards.set().cache() {
-            let copies = buckets
-                .iter()
-                .map(|b| (b.bucket_id.clone(), b.clean_copies));
-            cache.set_clean_copies(copies);
-        }
         tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+    }
+}
+
+/// Gives the clean cache each bucket's `clean_copies`, before it scans
+/// or a flush lands, as the node binary does (§9.3).
+fn install_clean_copies(shards: &LocalShards<SimMount>, buckets: &[BucketDocument]) {
+    if let Some(cache) = shards.set().cache() {
+        let copies = buckets
+            .iter()
+            .map(|b| (b.bucket_id.clone(), b.clean_copies));
+        cache.set_clean_copies(copies);
     }
 }
 

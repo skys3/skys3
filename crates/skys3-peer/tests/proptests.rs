@@ -6,9 +6,9 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use proptest::prelude::*;
 use skys3_peer::{
-    Abort, AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges, Capabilities, Commit, Data,
-    Hello, MAX_PIECE_BYTES, Message, Outcome, PREFIX_LEN, Precondition, Put, PutData, StagedPart,
-    StagedRanges, VersionRange, Write, negotiate,
+    Abort, AbortReason, Applied, ApplyError, Batch, BatchBuilder, Begin, ByteRanges, Capabilities,
+    Commit, Data, Hello, MAX_PIECE_BYTES, Message, Outcome, PREFIX_LEN, Precondition, Put, PutData,
+    Refusal, StagedPart, StagedRanges, VersionRange, Write, negotiate,
 };
 use skys3_types::checksum::{Checksum, ChecksumAlgorithm, Checksums};
 use skys3_types::{
@@ -341,6 +341,56 @@ proptest! {
             Err(skys3_peer::MessageError::Invalid { field: "batch.items", .. })
         );
         prop_assert!(refused);
+    }
+
+    #[test]
+    fn built_batches_hold_every_item_and_always_encode(
+        items in prop::collection::vec(commits(true), 1..24),
+    ) {
+        // Items in the order the source flushes them, some sharing a key
+        // or a write identity, packed as a source packs them: a repeat
+        // waits for the next batch.
+        let items: Vec<Commit> = items
+            .into_iter()
+            .zip(0u64..)
+            .map(|(mut item, n)| {
+                item.bucket = BucketName::new("archive").unwrap();
+                item.key = format!("k{}", n % 5);
+                item.identity = format!("c/b/0/1.{}", n % 7).parse().unwrap();
+                item
+            })
+            .collect();
+        let mut batches = Vec::new();
+        let mut builder = BatchBuilder::new();
+        let mut waiting: Vec<Commit> = Vec::new();
+        let mut queue: std::collections::VecDeque<Commit> = items.iter().cloned().collect();
+        while !queue.is_empty() || !waiting.is_empty() {
+            let Some(item) = queue.pop_front() else {
+                batches.extend(builder.take());
+                queue.extend(waiting.drain(..));
+                continue;
+            };
+            match builder.push(&item) {
+                Ok(()) => {}
+                Err(Refusal::Full) => {
+                    batches.extend(builder.take());
+                    builder.push(&item).unwrap();
+                }
+                Err(Refusal::Repeated) => waiting.push(item),
+                Err(other) => prop_assert!(false, "{other}"),
+            }
+        }
+        batches.extend(builder.take());
+        let mut sent = 0;
+        for batch in batches {
+            prop_assert!(!batch.items.is_empty());
+            let message = Message::Batch(batch);
+            let bytes = message.encode().unwrap();
+            prop_assert_eq!(Message::decode(&bytes).unwrap(), Some((message.clone(), bytes.len())));
+            let Message::Batch(batch) = message else { unreachable!() };
+            sent += batch.items.len();
+        }
+        prop_assert_eq!(sent, items.len());
     }
 
     #[test]

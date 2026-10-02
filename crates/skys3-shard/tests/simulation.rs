@@ -4,7 +4,8 @@
 //! Each seed runs one node over several restarts. In each life the node
 //! replays its log, opens a few shards (sometimes in a newer epoch), and
 //! runs concurrent writers against them: inline and extent-backed `PUT`s,
-//! `DELETE`, `TAGS`, `FLUSHED`, `IMPORT`, and `ADOPT`, with seals,
+//! `DELETE`, `TAGS`, `FLUSHED`, `IMPORT`, `ADOPT`, and batches of `PUT`s
+//! and `DELETE`s sequenced together, some conditional, with seals,
 //! checkpoints, and sometimes a failed sync. Then the node loses power or
 //! is killed. The checks:
 //!
@@ -35,7 +36,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -127,7 +128,7 @@ async fn writer(
         let seq = current
             .as_ref()
             .map_or(rng.random_range(0..9), |e| e.version.seq.get());
-        let body = match rng.random_range(0..20) {
+        let body = match rng.random_range(0..22) {
             0..=4 => put(&key, rng.random_range(0..400), seed),
             5..=7 => {
                 let mut extents = Vec::new();
@@ -162,6 +163,10 @@ async fn writer(
             }
             15 => import(&key, seed),
             16..=17 => adopt(&key, seq, seed),
+            18..=19 => {
+                batch(shard, &mut rng, seed, &acknowledged).await?;
+                continue;
+            }
             _ => {
                 shard.seal().await.map_err(|e| e.to_string())?;
                 let refused = shard.commit(put(&key, 1, seed)).await;
@@ -185,6 +190,58 @@ async fn writer(
                 record_ack(&acknowledged, record);
             }
             Err(ShardError::Sealed(_)) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Commits writes of a few keys together, as a peer's `BATCH` is applied
+/// (§7.8), some of them only if their key has no object.
+async fn batch(
+    shard: &Shard<SimMount>,
+    rng: &mut SmallRng,
+    seed: u64,
+    acknowledged: &Acknowledged,
+) -> Result<(), String> {
+    let keys: BTreeSet<String> = (0..rng.random_range(2..=4))
+        .map(|_| format!("key-{}", rng.random_range(0..5)))
+        .collect();
+    let bodies: Vec<RecordBody> = keys
+        .iter()
+        .map(|key| {
+            if rng.random_bool(0.8) {
+                put(key, rng.random_range(0..400), seed)
+            } else {
+                delete(key)
+            }
+        })
+        .collect();
+    let conditional: Vec<bool> = bodies.iter().map(|_| rng.random_bool(0.5)).collect();
+    let results = shard
+        .commit_all_if(bodies.clone(), |at, entry| {
+            let exists = entry.is_some_and(|entry| entry.object.is_some());
+            if conditional[at] && exists {
+                Err(())
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+    for (body, result) in bodies.into_iter().zip(results) {
+        match result {
+            Ok(Ok(committed)) => {
+                if shard.applied() < committed.position {
+                    return Err("a batch returned before its record was applied".into());
+                }
+                let record = LogRecord {
+                    shard: shard.shard().clone(),
+                    position: committed.position,
+                    body,
+                };
+                record_ack(acknowledged, record);
+            }
+            Ok(Err(())) | Err(ShardError::Sealed(_)) => {}
             Err(error) => return Err(error.to_string()),
         }
     }
