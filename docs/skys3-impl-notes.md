@@ -1839,6 +1839,83 @@ of this file. A task with nothing unexpected keeps "None."
   for 100 million objects. The log's `IMPORT` records come on top until
   their segments are released.
 
+### M1-19 Parallel import
+
+- **"Passed" stopped being a prefix of the key space.** M1-18's gateway
+  took the import's position as "the index holds every key up to here",
+  for both reads and listings. With ranges, a later range passes keys
+  long before the first range gets there. The position the gateway gets
+  is now the end of the gapless part (`ImportRanges::position`), which
+  keeps the merge sound, and `RemoteReads::passed` (default: the
+  position) answers per key. Both reads and listings ask it: had only
+  reads used it, a key added out of band in a passed range would list
+  but answer `404` to a HEAD.
+- **Checkpoints are one value per bucket, rewritten per page.** Splitting
+  the `imports` table's key per range would change its key layout; the
+  ranges instead share the bucket's value (tag 2 in the codec), and one
+  range still encodes exactly as M1-18 stored it, so existing checkpoints
+  resume, and a stored single-stream checkpoint is split after its
+  position. Since the whole value is rewritten after every page, streams
+  that finish pages together share one sync, and `import_parallel_streams`
+  gained an upper bound of 256 (it had none). A build from before this
+  one rejects a multi-range value, so it cannot resume such an import.
+- **The token bucket had to become a reservation.** M1-18's throttle was
+  owned by the one stream and slept with `&mut self`. Shared by streams,
+  each page now reserves its keys under a lock, the bucket going negative
+  while pages wait, and sleeps outside it; the `rate * (t + 1)` bound
+  holds over all streams.
+- **Simulated durations depended on real disk speed.** Under a paused
+  clock, Tokio advances time to the next timer whenever the runtime waits
+  on a blocking-pool thread, so each commit cost a few polling intervals
+  of simulated time, more on a slower machine. The scaling test runs the
+  index on `BlockingPool::inline`, and the import rate is then a pure
+  function of the remote's 100 ms round trip: 4.1 s with one stream for
+  4,000 keys in pages of 100, 2.6 s, 1.3 s, and 0.8 s with two, four, and
+  eight.
+- **Shutdown left import streams running.** The flush service aborted the
+  import task on drop without waiting, and with streams spawned in a
+  `JoinSet` a stream could still store a checkpoint after `shutdown`
+  returned, which made the restart test racy. The first fix, awaiting the
+  aborted task, was not enough (review on the PR): a stream aborted while
+  it awaited `set_import_ranges` had already queued the write on the
+  index's `BlockingPool`, which runs a queued job whether or not anyone
+  still waits for it. On a pool of several threads, a late write could
+  then land after a restarted import's and move the stored progress back.
+  Imports now stop cooperatively: a stop signal is checked between steps
+  and interrupts listings, throttle waits, commits, and backoffs, but
+  never a checkpoint write, and `shutdown` raises it and awaits the task.
+  A bucket that stops being followed is told to stop the same way, and
+  its next import waits for the old task before reading the checkpoint.
+  `shutdown_waits_for_a_checkpoint_write_in_flight` holds the pool with a
+  blocking job while a write is queued; with the abort it fails, as
+  `shutdown` returns before the write lands. Its first version expected
+  the hold to catch the second page and failed in CI on aarch64: under a
+  paused clock, the runtime advances time while it waits for the pool's
+  real thread, so a slow write lets the stream get pages further than
+  planned. The test now waits until the holding job runs, which means
+  every earlier write is done. It reads the checkpoint shown once the
+  stream is stuck behind the hold, and expects exactly the next page to
+  be stored when `shutdown` returns. It passed 200 runs alone and 200
+  more alongside eight parallel copies and the full test binary on four
+  cores.
+- **The discovery budget first counted every node as sampled.** Charging
+  a level its worst case, a listing and 96 probes per node, before
+  sending anything stopped discovery from listing twelve small folders.
+  A level is now charged its listings, then its probes, and abandoned
+  only if what it actually needs exceeds the budget.
+- **A codec proptest failed on a location, not on an import.** CI on a
+  later PR shrank `arbitrary_bytes_decode_canonically` to `[1, 0 × 20]`,
+  re-encoded as `[3, 0 × 20]`, and the import codec looked like the cause.
+  It was not: `decode_import` rejects those bytes (trailing bytes after
+  `Running { after: None }`). They are a format 1 record location, which
+  `decode_location` accepts and re-encodes in format 3, as the codec
+  documents for every older value. The property dates from M1-03, when
+  format 1 was the only format; once formats 2 and 3 existed, any 21
+  random bytes starting with 1 or 2 failed it, about one run in two hundred.
+  It now checks what the `index_codec` fuzz target always did: a value of
+  the current format re-encodes byte for byte, and an older one re-encodes
+  in the current format to the same value. A unit test keeps the case.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named

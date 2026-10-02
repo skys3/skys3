@@ -63,10 +63,7 @@ impl<H: Shards> Objects<H> {
             }
             Some(entry) => local(Some(entry)),
             None => {
-                let passed = remote
-                    .import(&bucket.bucket_id)
-                    .is_none_or(|import| import.passed(key));
-                if passed {
+                if remote.passed(&bucket.bucket_id, key) {
                     return Err(no_such_key());
                 }
                 let found = remote
