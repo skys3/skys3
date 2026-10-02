@@ -247,6 +247,29 @@ impl<D: Disk> ShardSet<D> {
         opened.map(|shard| (shard, output))
     }
 
+    /// The configuration of the latest `CONFIG` record of `shard` this
+    /// node applied, or the one a snapshot install opened its replica in:
+    /// the node's local copy of the shard's configuration (§6.2).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn kept_config(&self, shard: &ShardRef) -> Result<Option<ShardConfig>, ShardError> {
+        let (index, key) = (Arc::clone(&self.index), shard.clone());
+        crate::shard::run(&self.pool, shard, move || index.read()?.config(&key)).await
+    }
+
+    /// The configuration this node keeps of every shard, as
+    /// [`ShardSet::kept_config`] gives it for one.
+    ///
+    /// # Errors
+    ///
+    /// An [`IndexError`] if the index fails.
+    pub async fn kept_configs(&self) -> Result<BTreeMap<ShardRef, ShardConfig>, IndexError> {
+        let index = Arc::clone(&self.index);
+        self.pool.run(move || index.read()?.configs()).await?
+    }
+
     /// Returns the open shard `shard`.
     pub async fn get(&self, shard: &ShardRef) -> Option<Shard<D>> {
         match self.shards.lock().await.get(shard) {
