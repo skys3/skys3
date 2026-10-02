@@ -69,6 +69,11 @@
 //!   each `BEGIN` with a `RESUME`, and reports durable ranges with
 //!   cumulative `DURABLE`s. A [`CommitSink`] applies each `COMMIT` in the
 //!   shard of its key, which publishes what is staged in one record.
+//! - **Batches** ([`BatchBuilder`], [`send_batch`]): objects of up to one
+//!   frame ([`skips_staging`]) skip staging and travel many to a `BATCH`,
+//!   with their bytes inline. A batch costs one round trip, and the
+//!   destination's [`CommitSink`] applies its items together, in one group
+//!   commit per shard.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -106,6 +111,7 @@
 //! # }
 //! ```
 
+mod batch;
 mod destination;
 mod endpoint;
 mod error;
@@ -120,6 +126,7 @@ mod tls;
 mod trust;
 mod wire;
 
+pub use batch::{BatchBuilder, Refusal, send_batch, skips_staging};
 pub use destination::{
     CommitSink, ExtentSink, MAX_APPENDS_PER_STREAM, NoCommits, SinkError, StagingService,
 };

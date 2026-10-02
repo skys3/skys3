@@ -31,8 +31,11 @@ tracing.workspace = true
 http.workspace = true
 md-5.workspace = true
 rand.workspace = true
+rcgen.workspace = true
 s3s.workspace = true
 skys3-control.workspace = true
 skys3-gateway = { workspace = true, features = ["test-util"] }
+skys3-net.workspace = true
+skys3-peer.workspace = true
 skys3-sim.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }

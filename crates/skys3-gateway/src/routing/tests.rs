@@ -874,3 +874,58 @@ proptest! {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_writes_are_sequenced_on_a_local_primary_and_routed_otherwise() {
+    let cluster = Cluster::start(timing()).await;
+    let shard = shard(0);
+    let deletes = |keys: &[&str], condition: Precondition| -> Vec<_> {
+        keys.iter()
+            .map(|key| {
+                let body = RecordBody::Delete(Delete {
+                    key: (*key).to_owned(),
+                });
+                (body, condition.clone())
+            })
+            .collect()
+    };
+
+    // Node 1, the primary, sequences its gateway's batch in process: the
+    // writes take consecutive positions, and one request is observed.
+    let local = cluster.gateway(1);
+    timed(local.map().learn(config(0, 2, &[1]))).await;
+    let written =
+        timed(local.write_all(&shard, deletes(&["a", "b", "c"], Precondition::None))).await;
+    let positions: Vec<_> = written
+        .into_iter()
+        .map(|written| written.unwrap().unwrap().seq.get())
+        .collect();
+    assert_eq!(
+        positions,
+        [positions[0], positions[0] + 1, positions[0] + 2]
+    );
+    assert_eq!(local.stats().forwarded, 0);
+    assert_eq!(cluster.served().len(), 1);
+    // Conditions are checked as for single writes.
+    let written = timed(local.write_all(&shard, deletes(&["a", "x"], Precondition::Exists))).await;
+    assert_eq!(
+        written,
+        [
+            Ok(Err(ConditionFailed::NoSuchKey)),
+            Ok(Err(ConditionFailed::NoSuchKey))
+        ]
+    );
+
+    // Node 2's map names itself, but its replica is only a member: each
+    // write is routed on its own, and node 1 serves them.
+    let remote = cluster.gateway(2);
+    timed(remote.map().learn(config(0, 0, &[2]))).await;
+    let written = timed(remote.write_all(&shard, deletes(&["d", "e"], Precondition::None))).await;
+    assert!(
+        written.iter().all(|w| matches!(w, Ok(Ok(_)))),
+        "{written:?}"
+    );
+    assert_eq!(remote.stats().forwarded, 2);
+    let entry = timed(remote.entry(&shard, "e")).await.unwrap().unwrap();
+    assert!(entry.object.is_none());
+}

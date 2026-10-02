@@ -4757,3 +4757,69 @@ of this file. A task with nothing unexpected keeps "None."
   `COMMIT`'s without an identity entry, stay 116 bytes below 8 KiB. A
   gateway test and a message-rules test each check the new bound, and
   both fail without it.
+
+### M6-05 Small-object batches
+
+- **No shard call wrote several records at once.** `Shards::write` commits
+  one record, and each conditional write reads its key in its own index
+  transaction. Concurrent writes share a group commit only if they reach
+  the log within `group_commit_max_delay`. `Shard::commit_all_if` now
+  reads the keys of a batch in one transaction and sequences every record
+  whose check passes in one pass of the sequencer, so the records take
+  consecutive positions and share one group commit. A test commits 30
+  records and counts exactly one group commit in the log's statistics.
+  `Shards::write_all` exposes it. By default it sends each write on its
+  own, all at once, and `LocalShards` overrides it.
+- **The forwarding protocol has no batch request.** A forwarded request
+  carries its condition in a frame header, and `skys3-net` limits headers
+  to 64 KiB. The peer conditions of 1,024 items take about 300 KiB. A
+  batch request would need its conditions in the payload and a new answer
+  with one result per item, so it is left out. `RoutedShards::write_all`
+  sequences a batch in process when the map names this node as the
+  primary, through `ForwardServer::write_all`, which observes it like any
+  other request. Otherwise it forwards each write on its own, all at once.
+  Recorded in §7.8 ("Batches").
+- **A batch must look for races before it ends its read (found in
+  testing).** The first version of `commit_all_if` ended its read and only
+  then looked for records of its keys sequenced since the read began.
+  Ending a read forgets the applied writes that no reader still needs, so
+  a racing write could go unnoticed, and two writers each created the
+  same key under `Absent`. A test that races batches against single
+  conditional writes failed in 2 of 15 runs. The batch now looks for
+  races first, as `commit_if` does, and the test passed 40 runs out of 40.
+- **Batch items can be longer than `inline_max_bytes`.** By default
+  `peer_frame_bytes` is 256 KiB and `inline_max_bytes` is 128 KiB, and a
+  record in a hot segment carries at most `inline_max_bytes`. The
+  destination therefore commits a longer body first as `extent_bytes`
+  `EXTENT` records, as it does for a client upload. Such an item's `PUT`
+  follows one group commit later.
+- **Deletes read their key first.** A delete of a key with no current
+  version must write nothing (M6-04), and a condition cannot express "skip
+  without failing". Delete items therefore read their key before they are
+  written, as a `COMMIT` does. Puts skip that read. A replayed put fails
+  the condition's identity clause, and the entry read afterwards supplies
+  its stored result.
+- **Batch items are not hashed again either.** The `BATCH`'s CRC32C
+  covers the bytes in transit, as each `DATA` frame's CRC32C does, so the
+  final checksums are stored as the source sent them. Nothing answers
+  `checksum mismatch` yet.
+- **The round trips are counted, not timed.**
+  `skys3-flush/tests/round_trips.rs` flushes 1,500 small objects over
+  REST to the simulated store, which counts 1,500 requests (1.000 per
+  object, not counting TCP and TLS handshakes). The same objects then go
+  over loopback QUIC to a destination that applies them through
+  `PeerCommits`. Connecting takes 2 round trips (the QUIC handshake and
+  the `HELLO`s), and the two `BATCH`es take 1 each, for 4 in total (0.0027
+  per object). `send_batch` sends the whole batch and finishes its stream
+  before it reads anything, so one round trip per batch follows from its
+  structure. The test asserts exactly 2 plus one per batch. `skys3-flush`
+  gains `skys3-peer`, `skys3-net`, and `rcgen` as dev-dependencies.
+- **Simulation and fuzzing.** Quinn under turmoil still waits for M6-08.
+  Writers in the shard simulation now also commit batches of puts and
+  deletes, some conditional, and the scenario's crash, replay, and
+  in-order checks cover them. At 256 seeds its run time went from 47.8 s
+  to 51.7 s, so no new scenario or cost was added. `BATCH` decoding
+  already has M6-01's `peer_messages` fuzz target, and the builder parses
+  no input, so this PR adds no fuzz target. A proptest packs random items
+  (some with repeated keys or identities) and checks that every batch
+  encodes, decodes, and that no item is lost.
