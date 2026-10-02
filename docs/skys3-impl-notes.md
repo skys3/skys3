@@ -3891,6 +3891,15 @@ of this file. A task with nothing unexpected keeps "None."
   M2-15's backfill scenarios now run on it unchanged, and
   `DurabilityWindows` gained `restored`, the time until the register had
   `replicas` members again.
+- **The replacement scenarios' cost (found).** One seed of either costs
+  140 to 160 s of run time, against about 13 s for a typical seed, and at
+  `with_cost(3, COST)` CI's fixed set of 256 ran eight of each: 2010 s and
+  1773 s, the two slowest scenarios, which made the simulation job take
+  half as long again. They now declare `8 * COST`, as `crash.rs` does for
+  its heavy scenario, so the fixed set runs one seed of each (162 s and
+  141 s) and larger seed sets more, and the clients write 500 operations,
+  not 700, which still ends after the lost node is forgotten. No seed
+  hung: all 59 scenarios finished at 256 seeds.
 - **Numbers.** Over 10 seeds of each scenario (from seed 100), with the
   commit and R3 audits after every step: with five nodes and two buckets,
   losing the first node (often the coordinator) left four shards short
