@@ -131,6 +131,9 @@ pub struct GatewayConfig {
     /// Where new buckets' shards live. [`GatewayConfig::new`] keeps them
     /// on this node, as a single-node cluster does.
     pub placement: ShardPlacement,
+    /// `read_registration_renew_interval_seconds`: how often a GET renews
+    /// the registration of the read it streams with its holder (§8.7).
+    pub read_registration_renew_interval: Duration,
 }
 
 /// Where CreateBucket puts a new bucket's shards (design §4.1, §6.7).
@@ -171,6 +174,7 @@ impl GatewayConfig {
             admission: Arc::new(AdmitAll),
             remote: None,
             placement: ShardPlacement::Local,
+            read_registration_renew_interval: config.storage().read_registration_renew_interval(),
         }
     }
 }

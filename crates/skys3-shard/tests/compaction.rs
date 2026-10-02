@@ -15,7 +15,7 @@ use skys3_log::{LogRecord, RecordBody, SegmentLog};
 use skys3_obs::MetricsRegistry;
 use skys3_shard::{
     CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
-    Effect, Outcome, Shard, ShardSet, StateMachine,
+    Effect, Outcome, ReadSettings, Shard, ShardSet, StateMachine,
 };
 use skys3_types::{NodeId, Seq, ShardConfig};
 use support::{
@@ -47,6 +47,12 @@ impl Node {
         );
         checkpointer.replay(Arc::new(StateMachine)).await.unwrap();
         let set = ShardSet::new(Arc::clone(&index), log.clone(), pool());
+        // Payload goes as soon as nothing names it, unless a test sets a
+        // release delay.
+        set.reads().configure(ReadSettings {
+            release_delay: Duration::ZERO,
+            ..ReadSettings::default()
+        });
         Self {
             log,
             index,
@@ -178,6 +184,57 @@ fn overwritten_segments_are_reclaimed_and_survive_a_crash() {
         let node = Node::open(&disk).await;
         assert_eq!(node.index.read().unwrap().dump().unwrap(), dump);
         let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
+        for n in 0..4 {
+            assert_eq!(node.bytes(&shard, &key(n)).await, Some(pattern(400)));
+        }
+    });
+}
+
+#[test]
+fn registered_reads_and_recently_unreferenced_payload_are_kept() {
+    runtime().block_on(async {
+        let disk = SimDisk::new(7);
+        let node = Node::open(&disk).await;
+        let reads = node.set.reads();
+        reads.configure(ReadSettings {
+            release_delay: Duration::from_millis(300),
+            ..ReadSettings::default()
+        });
+        let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
+        // A gateway plans a read of the first version of k0, which is then
+        // overwritten many times before it registers: the plan's bytes are
+        // unreferenced but still located, so the holder serves them.
+        let first = shard.commit(put(&key(0), 400, 7)).await.unwrap();
+        let plan = shard.plan(&key(0)).await.unwrap();
+        overwrite(&shard, 4, 20).await;
+        let version = plan.entry.as_ref().unwrap().version;
+        assert_eq!(version, first.position);
+        let registered = shard
+            .register_read(reads, &key(0), version, plan.layout.clone())
+            .await
+            .unwrap()
+            .expect("the planned bytes are still located");
+        let position = registered.layout[0].position;
+        node.checkpointer.checkpoint().await.unwrap();
+
+        // Nothing is dropped before it has been unreferenced for the
+        // release delay.
+        let compactor = node.compactor(Duration::ZERO);
+        let report = compactor.compact().await.unwrap();
+        assert_eq!(report.segments, 0, "{report:?}");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let report = compactor.compact().await.unwrap();
+        assert!(report.segments > 0, "{report:?}");
+
+        // The registered version was copied, not dropped, and its read
+        // goes on; once released, the next passes may drop it.
+        let bytes = shard.read_registered(reads, registered.id, position).await;
+        assert_eq!(bytes.unwrap().to_vec(), pattern(400));
+        assert!(reads.is_pinned(shard.shard(), position));
+        reads.release(registered.id);
+        assert!(!reads.is_pinned(shard.shard(), position));
+        let refused = shard.read_registered(reads, registered.id, position).await;
+        assert!(refused.is_err());
         for n in 0..4 {
             assert_eq!(node.bytes(&shard, &key(n)).await, Some(pattern(400)));
         }

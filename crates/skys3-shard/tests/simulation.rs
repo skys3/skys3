@@ -48,7 +48,7 @@ use skys3_io::{SimDisk, SimDiskFaults, SimMount, SimPower, SyncCut};
 use skys3_log::{LogRecord, RecordBody, SegmentLog, ShardRef};
 use skys3_shard::{
     CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
-    Shard, ShardError, ShardSet, StateMachine,
+    ReadSettings, Shard, ShardError, ShardSet, StateMachine,
 };
 use skys3_sim::{Runner, SimContext};
 use skys3_types::{BucketId, EpochSeq, Label, ShardId};
@@ -1034,6 +1034,11 @@ fn compaction(context: &mut SimContext) -> Result<(), Box<dyn std::error::Error>
                 epoch += 1;
             }
             let set = ShardSet::new(Arc::clone(&index), log.clone(), pool.clone());
+            // No gateway reads here, so unreferenced payload goes at once.
+            set.reads().configure(ReadSettings {
+                release_delay: Duration::ZERO,
+                ..ReadSettings::default()
+            });
             let cache = rng.random_bool(0.7).then(|| {
                 let settings = CacheSettings {
                     max_bytes: rng.random_range(0..4000),

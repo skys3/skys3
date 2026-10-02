@@ -22,7 +22,7 @@ use skys3_index::{
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Delete, Extent, ExtentRef, Flushed, Put, PutData};
 use skys3_log::{LogConfig, RecordBody, SegmentLog};
-use skys3_shard::{ShardSet, StateMachine};
+use skys3_shard::{ReadId, ReadPlan, Registered, ShardSet, StateMachine};
 use skys3_types::{BucketDocument, BucketId, ETag, EpochSeq, Label, NodeId};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -322,6 +322,60 @@ impl Shards for MemoryShards {
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
         self.check(shard)?;
         self.local.payload(shard, position).await
+    }
+
+    fn node(&self) -> Option<NodeId> {
+        self.local.node()
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        self.check(shard)?;
+        self.local.plan(shard, key).await
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        self.check(shard)?;
+        self.local
+            .register(shard, holder, key, version, layout)
+            .await
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        self.check(shard)?;
+        self.local.renew(shard, holder, read).await
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        self.check(shard)?;
+        self.local.release(shard, holder, read).await
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        self.check(shard)?;
+        self.local.fetch(shard, holder, read, position).await
     }
 
     async fn append_extent(

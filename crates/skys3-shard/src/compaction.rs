@@ -29,6 +29,13 @@
 //!   which a member that is behind may be sent: the segment waits. So do
 //!   segments with records of a shard not open on the node.
 //!
+//! - payload a live read registration pins ([`Reads::is_pinned`]), which
+//!   a gateway is streaming from this node (§8.7): copied, never evicted.
+//! - payload nothing names, until compaction has found it so for the
+//!   release delay (`fragment_release_delay_seconds`, [`ReadSettings`]): a
+//!   read plan issued just before a write or an eviction left it
+//!   unreferenced may still register it here. The segment waits.
+//!
 //! Everything else, metadata records the index has applied and payload
 //! nothing names, is dropped.
 //!
@@ -38,7 +45,8 @@
 //! ([`Shard::evict`]), the records to keep are copied byte for byte into
 //! the log's newest segments and made durable, and one durable index
 //! commit points their locations at the copies and removes the locations
-//! of the records dropped, after checking again that nothing names them.
+//! of the records dropped, after checking again that nothing names them
+//! and no registration pins them, in one [`Reads::exclusive`] decision.
 //! Only once every chunk is through is the segment retired: unlisted, its
 //! file removed, and the directory synced ([`SegmentLog::retire`]). A
 //! crash at any point leaves either the old segment with every location
@@ -53,8 +61,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -69,9 +77,12 @@ use skys3_log::{
 };
 use skys3_obs::MetricsRegistry;
 use skys3_types::{EpochSeq, Label, ShardConfig};
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::cache::{CleanCache, Hot};
+#[cfg(doc)]
+use crate::reads::ReadSettings;
+use crate::reads::Reads;
 use crate::set::ShardSet;
 use crate::shard::Shard;
 
@@ -220,12 +231,51 @@ pub enum CompactionError {
 /// Reclaims the log segments of a node's disks (see the [module](self)
 /// docs). Each pass compacts every disk of the [`ShardSet`] in turn, its
 /// oldest candidates first.
+///
+/// A node runs one compactor, and its passes do not overlap: a pass lists
+/// a disk's segments and scans them one by one, however long that takes,
+/// so nothing else may retire them meanwhile.
 pub struct Compactor<D: Disk> {
     set: ShardSet<D>,
     settings: CompactionSettings,
     metrics: CompactionMetrics,
     /// Bytes copied since the compactor was made.
     copied: AtomicU64,
+    /// When compaction first found each payload record of a candidate
+    /// segment unreferenced, in the passes since.
+    unreferenced: Arc<Mutex<Unreferenced>>,
+}
+
+/// When compaction first found payload records unreferenced, by shard and
+/// position, with the pass that last found each so. A record a pass does
+/// not find unreferenced again is forgotten, and waits the whole delay if
+/// it is found so later.
+#[derive(Debug, Default)]
+struct Unreferenced {
+    pass: u64,
+    since: HashMap<(ShardRef, EpochSeq), (Instant, u64)>,
+}
+
+impl Unreferenced {
+    /// Whether the payload at `position` of `shard`, unreferenced now, has
+    /// been found so for at least `delay`.
+    fn for_at_least(&mut self, shard: &ShardRef, position: EpochSeq, delay: Duration) -> bool {
+        let pass = self.pass;
+        let now = Instant::now();
+        let seen = self
+            .since
+            .entry((shard.clone(), position))
+            .or_insert((now, pass));
+        seen.1 = pass;
+        now.duration_since(seen.0) >= delay
+    }
+
+    /// Starts a pass, forgetting the records the last one did not see.
+    fn next_pass(&mut self) {
+        let last = self.pass;
+        self.since.retain(|_, (_, pass)| *pass == last);
+        self.pass += 1;
+    }
 }
 
 impl<D: Disk> fmt::Debug for Compactor<D> {
@@ -280,6 +330,12 @@ struct Context {
     cache: Option<(CleanCache, Hot)>,
     /// Whether the segment has taken no records for the TTL.
     expired: bool,
+    /// The node's read registrations.
+    reads: Reads,
+    /// How long payload must have been unreferenced before it is dropped.
+    release_delay: Duration,
+    /// When payload was first found unreferenced.
+    unreferenced: Arc<Mutex<Unreferenced>>,
 }
 
 /// What a chunk's index commit did.
@@ -340,6 +396,7 @@ impl<D: Disk> Compactor<D> {
             settings,
             metrics,
             copied: AtomicU64::new(0),
+            unreferenced: Arc::default(),
         }
     }
 
@@ -372,6 +429,7 @@ impl<D: Disk> Compactor<D> {
     /// A [`CompactionError`] if a disk's log, a record, or the index
     /// fails; the pass stops there.
     pub async fn compact(&self) -> Result<CompactionReport, CompactionError> {
+        lock(&self.unreferenced).next_pass();
         let mut report = CompactionReport::default();
         let logs: Vec<(Label, SegmentLog<D>)> = self
             .set
@@ -437,6 +495,9 @@ impl<D: Disk> Compactor<D> {
             expired: log
                 .sealed_for(segment.id)
                 .is_some_and(|sealed| sealed >= self.settings.unreferenced_ttl),
+            reads: self.set.reads().clone(),
+            release_delay: self.set.reads().settings().release_delay,
+            unreferenced: Arc::clone(&self.unreferenced),
         }
     }
 
@@ -543,11 +604,15 @@ impl<D: Disk> Compactor<D> {
             }
             let relocated = {
                 let index = Arc::clone(self.set.index());
-                let expired = context.expired;
+                let (expired, reads) = (context.expired, context.reads.clone());
                 self.set
                     .pool()
                     .run(move || {
-                        index.update_durable(|writer| relocate(writer, &chunk, &copies, expired))
+                        reads.exclusive(|| {
+                            index.update_durable(|writer| {
+                                relocate(writer, &chunk, &copies, expired, &reads)
+                            })
+                        })
                     })
                     .await??
             };
@@ -724,10 +789,24 @@ fn classify(
                 Fate::Drop
             }
         } else if let Some(key) = &record.key {
-            if reader.location(shard, record.position)? == Some(record.location) {
+            if reader.location(shard, record.position)? != Some(record.location) {
+                // Another copy of the record is the one the index locates.
+                Fate::Drop
+            } else if context.reads.is_pinned(shard, record.position) {
+                // A gateway streams it from here (§8.7).
+                Fate::Copy
+            } else {
                 let holders = holders_of(&mut memo, shard, key, || reader.holders(shard, key))?;
                 match holders.get(&record.position) {
                     None if record.kind == RecordKind::Extent && !context.expired => Fate::Wait,
+                    None if !lock(&context.unreferenced).for_at_least(
+                        shard,
+                        record.position,
+                        context.release_delay,
+                    ) =>
+                    {
+                        Fate::Wait
+                    }
                     None => Fate::Drop,
                     Some(Holder::Entry {
                         state: EntryState::Clean,
@@ -740,9 +819,6 @@ fn classify(
                     },
                     Some(_) => Fate::Copy,
                 }
-            } else {
-                // Another copy of the record is the one the index locates.
-                Fate::Drop
             }
         } else {
             Fate::Drop
@@ -754,12 +830,14 @@ fn classify(
 
 /// Points the location of each record of `chunk` that was copied at its
 /// copy, and removes the locations of those dropped, unless something
-/// names one again: then the segment is kept.
+/// names one again or a read registration in `reads` pins it: then the
+/// segment is kept.
 fn relocate(
     writer: &mut IndexWriter<'_>,
     chunk: &[Scanned],
     copies: &[Option<RecordLocation>],
     expired: bool,
+    reads: &Reads,
 ) -> Result<Relocated, IndexError> {
     let mut memo = HashMap::new();
     let mut relocated = Relocated::default();
@@ -774,7 +852,9 @@ fn relocate(
             continue;
         }
         let holders = holders_of(&mut memo, shard, key, || writer.holders(shard, key))?;
-        if holders.contains_key(&record.position) || (record.kind == RecordKind::Extent && !expired)
+        if holders.contains_key(&record.position)
+            || (record.kind == RecordKind::Extent && !expired)
+            || reads.is_pinned(shard, record.position)
         {
             relocated.kept = true;
             continue;
@@ -785,9 +865,38 @@ fn relocate(
     Ok(relocated)
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // Every update leaves the value consistent.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
+    use skys3_types::{BucketId, Epoch, Seq, ShardId};
+
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unreferenced_payload_waits_out_the_delay_across_passes() {
+        let shard = ShardRef::new(BucketId::new("b-1").unwrap(), ShardId::new(0));
+        let at = |seq| EpochSeq::new(Epoch::new(1), Seq::new(seq));
+        let delay = Duration::from_secs(60);
+        let mut seen = Unreferenced::default();
+        seen.next_pass();
+        assert!(!seen.for_at_least(&shard, at(1), delay));
+        assert!(seen.for_at_least(&shard, at(1), Duration::ZERO));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        seen.next_pass();
+        assert!(!seen.for_at_least(&shard, at(1), delay));
+        assert!(!seen.for_at_least(&shard, at(2), delay));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        seen.next_pass();
+        assert!(seen.for_at_least(&shard, at(1), delay));
+        // Position 2 was not found in that pass, so it starts over.
+        seen.next_pass();
+        assert!(!seen.for_at_least(&shard, at(2), delay));
+        assert_eq!(seen.since.len(), 2);
+    }
 
     #[test]
     fn reports_add_up() {
