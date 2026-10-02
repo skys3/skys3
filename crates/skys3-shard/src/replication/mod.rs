@@ -385,11 +385,11 @@ impl<N: Network, D: Disk> Replication<N, D> {
     /// # Errors
     ///
     /// [`ShardError::NotFound`] if the shard is not open on this node;
-    /// [`ShardError::Unavailable`] if the register cannot be read or holds
-    /// another configuration, as after a removal whose answer was lost;
-    /// and as [`Shard::step_down`]: the replica is not a primary that leads
-    /// the shard, `to` is not another member, or the step-down could not be
-    /// recorded.
+    /// [`ShardError::Configuration`] if the replica is not a primary that
+    /// leads the shard, or `to` is not another member of it;
+    /// [`ShardError::Unavailable`] if the shard stopped, its register cannot
+    /// be read or holds another configuration (as after a removal whose
+    /// answer was lost), or the step-down could not be recorded.
     pub async fn hand_off(&self, shard: &ShardRef, to: &NodeId) -> Result<HandedOff, ShardError> {
         let replica = self
             .inner
