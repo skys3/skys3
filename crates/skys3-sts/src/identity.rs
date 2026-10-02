@@ -154,7 +154,23 @@ impl IdentityCopy {
         store: &C,
         retry: &RetryPolicy,
     ) -> Result<Arc<IdentitySnapshot>, ControlError> {
-        let started = self.clock.now();
+        self.sync_as_of(store, retry, self.clock.now()).await
+    }
+
+    /// As [`IdentityCopy::sync`], but the copy's age runs from `started`,
+    /// time since the Unix epoch, instead of now. A restarted node that
+    /// loads the copy it kept (§6.2) passes the start of the sync that
+    /// produced it, so the copy does not look fresher than it is.
+    ///
+    /// # Errors
+    ///
+    /// As [`IdentityCopy::sync`].
+    pub async fn sync_as_of<C: ControlStore>(
+        &self,
+        store: &C,
+        retry: &RetryPolicy,
+        started: Duration,
+    ) -> Result<Arc<IdentitySnapshot>, ControlError> {
         let mut providers: BTreeMap<String, Vec<OidcProvider>> = BTreeMap::new();
         let mut roles = BTreeMap::new();
         for (key, _) in store.list(&KeyPrefix::identity()).await? {

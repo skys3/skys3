@@ -1067,6 +1067,113 @@ of this file. A task with nothing unexpected keeps "None."
   remote's listing (§9.1); the import task adds that. The configuration
   key for shared token keys comes with multi-node gateways.
 
+### M1-13 Node binary and startup recovery
+
+- **The configuration had nowhere to put a node.** Design §14 named no
+  node ID, data directory, disks, S3 listen address, or TLS files. New
+  `[node]` (`node_id`, `data_dir`, `disks`) and `[gateway]` (`listen`,
+  `tls_cert_file`, `tls_key_file`) sections hold them, and
+  `[control_store]` gained `backend = "file"` with `directory`, as M1-05
+  asked. `node_id` is optional: a node generates one when it creates its
+  data directory and keeps it in `node.json`, so a single-node setup needs
+  no ID while a configured ID is still checked against the directory. The
+  binary runs only the file backend; the etcd and S3 backends are refused
+  until M2-04 and M2-05 land (plan rule 1.1).
+- **Shards on several disks.** `ShardSet` used one disk's log, and the
+  location map names no disk (M1-03 left the choice here). Adding the disk
+  to the location map would have changed the index format; instead each
+  shard replica keeps its records on the disk its hash picks among the
+  disks in label order (`ShardSet::with_disks`, `disk_of`). That is stable
+  only while the node keeps its disks, so `node.json` records each disk's
+  label and path, each disk's `disk.json` names its cluster, node, and
+  label, and a node refuses to start with a disk added, missing, swapped,
+  or another node's. Reordering `disks` in the file is harmless. Design
+  §10.2 records the rule.
+- **Disks fenced until the host restarts.** M1-02 asked startup to keep a
+  disk that failed a sync out of service until the host restarts. A task
+  checks each log's failure every second and writes
+  `out-of-service.json` with the boot ID; startup refuses the disk while
+  the boot ID is unchanged and lifts the fence after a reboot. A process
+  that dies within that second of the failure, before the fence is
+  written, can still reuse the disk in the same boot; hooking the fence
+  into the group committer would close that gap.
+- **The kept control copy must not look fresh.** The node keeps
+  `buckets/` and `identity/` in the index (design §6.2) and serves the
+  gateway and STS from it while the control store does not answer
+  (`NodeStore`). `IdentityCopy::sync` stamps the copy with the current
+  time, so restoring it after a restart would have restarted the
+  `identity_max_staleness` clock and let a stale copy issue sessions.
+  `IdentityCopy::sync_as_of` and `StsEndpoint::sync_identity_as_of` take
+  the kept sync time instead. The index gained `ControlWriter::clear` and
+  `set_synced_at`, and `IndexReader::control_entries` and
+  `control_synced_at`.
+- **Polling left the copy behind bucket creation.** The first version
+  refreshed the copy every `config_poll_interval`. A test that created a
+  bucket, restarted at once, and found the control store unreadable got
+  `NoSuchBucket`: the copy predated the bucket. The node now follows the
+  store's change stream, which the file store wakes on every write, with
+  the poll interval as a backstop, and refreshes the copy once more at a
+  graceful shutdown. A crash right after a creation can still leave the
+  copy behind; the next start syncs from the store if it answers.
+- **Orphaned shards are reclaimed only from a live read.** Startup drops
+  shards whose bucket ID no register names (M1-04, M1-06). Deciding that
+  from the local copy could drop a bucket created after the copy was
+  taken, so a node that starts from its copy reclaims nothing (design
+  §4.1).
+- **The file store did not know whose it was.** Review found three gaps.
+  `FileControlStore::open` creates a missing directory, so a node whose
+  control volume was not mounted bootstrapped an empty store, synced no
+  buckets, and reclaimed every shard. The store refuses a second node only
+  through `nodes/` registrations, which nothing writes yet, so a second
+  node pointed at the directory loaded the first node's catalog over
+  empty shards. And an error opening the store stopped startup before the
+  kept copy was consulted. `control::open_file_store` now checks the
+  directory before opening it and keeps an owner record, `.owner.json`
+  (cluster, node ID, and a random `instance_id` that `node.json` gained),
+  beside the store's lock file; the store's loader skips dot files. A node
+  that has a copy treats a missing directory, a missing owner record, or
+  a missing `cluster.json` as a reset store: it never bootstraps it, runs
+  from the copy, and retries; a node without a copy claims only an empty
+  store. Another owner stops startup (`StartError::ControlStore`). An
+  open that fails otherwise runs from the copy too: `NodeStore` may hold
+  no store, and the follow task reopens it every `config_poll_interval`.
+  Orphans are reclaimed only when the start read a store it did not
+  claim. The owner record lives in this crate rather than in
+  `skys3-control`, because whether to claim depends on the node's copy.
+- **The index outlived the node in one process.** Restarting a node
+  in-process failed with redb's `DatabaseAlreadyOpen`: each shard's
+  pipeline task holds the index until it notices, on another task, that
+  its shard was dropped. Shutdown, and a failed start, now wait for the
+  index's last handle before releasing the data directory's lock, so a
+  second process never sees the directory free while the index is open.
+- **Sessions moved to the system bucket.** M1-24 left sessions in memory.
+  `SystemSessions` stores each as a `PUT` in `sys-sessions`, a one-shard
+  `local` bucket with no register (generated IDs start with `b-`, so it
+  cannot collide), with the expiry in the record's metadata so a sweep
+  every five minutes finds expired sessions from the index alone. A record
+  larger than `inline_max_bytes` goes in one extent, since that may be 0.
+- **The admin listener had no hook for an API.** Its handlers were
+  synchronous. `skys3_obs::AdminApi` is an asynchronous trait the node
+  supplies (`AdminListener::with_api`); paths under `/v1/` go to it behind
+  the token and are counted as `endpoint="api"`. Design §12 records the
+  surface (plan section 14).
+- **TLS on the gateway listener.** `GatewayListener::with_tls` takes a
+  `rustls` server configuration built on `aws-lc-rs`; the handshake runs
+  on the connection's task under the request-head timeout. The tests reuse
+  the 100-year test CA and server certificate from `skys3-sts`, copied
+  into `crates/skys3/tests/data/`.
+- **Signals in tests without `unsafe`.** Sending `SIGTERM` needs
+  `libc::kill`, which `forbid(unsafe_code)` rules out, so the end-to-end
+  test runs `kill -TERM <pid>`; `Child::kill` sends `SIGKILL`.
+- **Left open.** Nodes do not register under `nodes/` yet:
+  `NodeRegistration` needs an intra-cluster address, which arrives with
+  the transport (M2-02) and the node registry (M3-02). Bucket status scans
+  each open shard's index entries per request, which is fine for M1 and
+  should move to counters once the flusher (M1-16) keeps them. Reclaimed
+  shards' segment summaries still hold their log segments until
+  compaction (M1-22), as M1-03 noted. The admin listener still serves
+  plain HTTP (M2-02).
+
 ### M1-15 Remote target client and capability probe
 
 - **The SDK's default features pull in two TLS stacks.** `aws-sdk-s3`'s

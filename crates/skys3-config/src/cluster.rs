@@ -1,5 +1,6 @@
 //! `[cluster]` and `[control_store]` (§6.1, §6.2, §6.7).
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -63,6 +64,7 @@ pub(crate) enum BackendKind {
     #[default]
     Etcd,
     S3,
+    File,
 }
 
 /// The control-store backend and where it is.
@@ -79,6 +81,13 @@ pub enum ControlStoreBackend {
         endpoint: String,
         /// `bucket`: the control bucket.
         bucket: String,
+    },
+    /// A directory on this node, for a single-node cluster. It refuses to
+    /// serve a second node.
+    File {
+        /// `directory`: where the registers are kept. Defaults to
+        /// `<data_dir>/control`.
+        directory: PathBuf,
     },
 }
 
@@ -176,6 +185,7 @@ pub(crate) struct RawControlStore {
     etcd_endpoints: Option<Vec<String>>,
     endpoint: Option<String>,
     bucket: Option<String>,
+    directory: Option<PathBuf>,
     prefix: Option<String>,
     allow_correlated_control_store: bool,
     coordinator_lease_seconds: u64,
@@ -189,6 +199,7 @@ impl Default for RawControlStore {
             etcd_endpoints: None,
             endpoint: None,
             bucket: None,
+            directory: None,
             prefix: None,
             allow_correlated_control_store: false,
             coordinator_lease_seconds: 10,
@@ -207,11 +218,19 @@ impl RawControlStore {
     pub(crate) fn resolve(
         &self,
         cluster_id: Option<&ClusterId>,
+        data_dir: &Path,
         checker: &mut Checker,
     ) -> ControlStoreConfig {
+        if self.backend != BackendKind::File && self.directory.is_some() {
+            checker.report(
+                "control_store.directory",
+                "applies only to backend = \"file\"",
+            );
+        }
         let backend = match self.backend {
             BackendKind::Etcd => self.etcd_backend(checker),
             BackendKind::S3 => self.s3_backend(checker),
+            BackendKind::File => self.file_backend(data_dir, checker),
         };
         let prefix = match &self.prefix {
             Some(prefix) => {
@@ -249,14 +268,7 @@ impl RawControlStore {
     }
 
     fn etcd_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
-        for (key, value) in [("endpoint", &self.endpoint), ("bucket", &self.bucket)] {
-            if value.is_some() {
-                checker.report(
-                    format!("control_store.{key}"),
-                    "applies only to backend = \"s3\"",
-                );
-            }
-        }
+        self.refuse_other_keys(&["etcd_endpoints"], "etcd", checker);
         let urls = self.etcd_endpoints.as_deref().unwrap_or_default();
         checker.require(!urls.is_empty(), "control_store.etcd_endpoints", || {
             "backend = \"etcd\" needs at least one endpoint".to_owned()
@@ -271,13 +283,38 @@ impl RawControlStore {
         ControlStoreBackend::Etcd { endpoints }
     }
 
-    fn s3_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
-        if self.etcd_endpoints.is_some() {
-            checker.report(
-                "control_store.etcd_endpoints",
-                "applies only to backend = \"etcd\"",
-            );
+    /// Reports `etcd_endpoints`, `endpoint`, and `bucket` unless `allowed`
+    /// names them.
+    fn refuse_other_keys(&self, allowed: &[&str], backend: &str, checker: &mut Checker) {
+        let keys = [
+            ("etcd_endpoints", self.etcd_endpoints.is_some()),
+            ("endpoint", self.endpoint.is_some()),
+            ("bucket", self.bucket.is_some()),
+        ];
+        for (key, set) in keys {
+            if set && !allowed.contains(&key) {
+                checker.report(
+                    format!("control_store.{key}"),
+                    format!("does not apply to backend = \"{backend}\""),
+                );
+            }
         }
+    }
+
+    fn file_backend(&self, data_dir: &Path, checker: &mut Checker) -> ControlStoreBackend {
+        self.refuse_other_keys(&[], "file", checker);
+        let directory = match &self.directory {
+            Some(directory) => {
+                crate::node::nonempty_path(checker, "control_store.directory", directory);
+                directory.clone()
+            }
+            None => data_dir.join("control"),
+        };
+        ControlStoreBackend::File { directory }
+    }
+
+    fn s3_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
+        self.refuse_other_keys(&["endpoint", "bucket"], "s3", checker);
         let endpoint = match self.endpoint.as_deref().map(target::parse_endpoint) {
             Some(Ok(endpoint)) => endpoint,
             Some(Err(error)) => {

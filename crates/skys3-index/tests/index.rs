@@ -282,7 +282,28 @@ fn control_state_is_durable_at_once() {
     let dump = read.dump().unwrap();
     assert_eq!(
         dump.control,
-        BTreeMap::from([("nodes/n-1.json".to_owned(), entry)])
+        BTreeMap::from([("nodes/n-1.json".to_owned(), entry.clone())])
+    );
+    assert_eq!(read.control_entries().unwrap(), dump.control);
+    assert_eq!(read.control_synced_at().unwrap(), None);
+    drop(read);
+
+    // A sync replaces the whole copy and records when it started.
+    index
+        .update_control(|control| {
+            control.clear()?;
+            control.put("buckets/b.json", &entry)?;
+            control.set_synced_at(std::time::Duration::from_millis(1_234_567))
+        })
+        .unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(
+        read.control_entries().unwrap(),
+        BTreeMap::from([("buckets/b.json".to_owned(), entry)])
+    );
+    assert_eq!(
+        read.control_synced_at().unwrap(),
+        Some(std::time::Duration::from_millis(1_234_567))
     );
 }
 
