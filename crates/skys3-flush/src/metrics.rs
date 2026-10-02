@@ -22,6 +22,10 @@ pub struct Counters {
     pub retries: Counter,
     /// Keys put in conflict.
     pub conflicts: Counter,
+    /// Evicted versions filled from the remote into the clean cache.
+    pub fills: Counter,
+    /// Fills that found the remote changed out of band (§9.2).
+    pub fill_conflicts: Counter,
 }
 
 /// A bucket's flush gauges at one moment.
@@ -54,6 +58,8 @@ pub struct FlushMetrics {
     flushes: Family<Labels, Counter>,
     retries: Family<Labels, Counter>,
     conflicts: Family<Labels, Counter>,
+    fills: Family<Labels, Counter>,
+    fill_conflicts: Family<Labels, Counter>,
 }
 
 impl FlushMetrics {
@@ -114,6 +120,17 @@ impl FlushMetrics {
             "Flushes that found an out-of-band remote write and put their key in conflict.",
             metrics.conflicts.clone(),
         );
+        registry.register(
+            "fills",
+            "Evicted versions filled from the remote target into the clean cache.",
+            metrics.fills.clone(),
+        );
+        registry.register(
+            "fill_conflicts",
+            "Read-through fills that found the remote changed out of band, whether the \
+             remote version was adopted or a local write came first.",
+            metrics.fill_conflicts.clone(),
+        );
         metrics
     }
 
@@ -125,6 +142,8 @@ impl FlushMetrics {
             flushes: self.flushes.get_or_create_owned(&labels),
             retries: self.retries.get_or_create_owned(&labels),
             conflicts: self.conflicts.get_or_create_owned(&labels),
+            fills: self.fills.get_or_create_owned(&labels),
+            fill_conflicts: self.fill_conflicts.get_or_create_owned(&labels),
         }
     }
 

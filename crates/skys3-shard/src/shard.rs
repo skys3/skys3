@@ -8,7 +8,9 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
-use skys3_index::{Entry, EntryState, Index, IndexError, ListPage, ListQuery, Part, Upload};
+use skys3_index::{
+    Entry, EntryState, Index, IndexError, IndexWriter, ListPage, ListQuery, Part, Payload, Upload,
+};
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::truncated_by;
 use skys3_log::record::{Extent, ExtentRef, MpuPart, Put, PutData};
@@ -18,6 +20,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::ack::{AckMode, AckTimeout};
+use crate::cache::{self, CacheRefusal};
 use crate::error::ShardError;
 use crate::leader::Leader;
 use crate::lineage::{Lineage, Reconcile};
@@ -1612,6 +1615,82 @@ impl<D: Disk> Shard<D> {
             Some(data) if record.shard == *shard && record.position == position => Ok(data.clone()),
             _ => Err(self.unavailable(&format!("the record at {position} holds no payload"))),
         }
+    }
+
+    /// Evicted → Clean (§4.2): makes the evicted version `version` of `key`
+    /// clean on this node with `payload`, the `EXTENT` records a
+    /// read-through fill committed its bytes in (§9.2), unless the entry no
+    /// longer is that evicted version. See [`cache::fill`].
+    ///
+    /// Only the serving primary fills, as only it commits the `EXTENT`
+    /// records a fill writes: the payload must be records this replica
+    /// sequenced as the primary it still is. The members have the extents
+    /// in their logs too, but their entries stay as they are.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is [`ShardError::Unavailable`] if the shard stopped,
+    /// stepped down, or does not serve yet, or its index fails, and
+    /// [`ShardError::NotPrimary`] on a member; the inner one says why the
+    /// transition was refused.
+    pub async fn fill(
+        &self,
+        key: &str,
+        version: EpochSeq,
+        payload: Payload,
+    ) -> Result<Result<(), CacheRefusal>, ShardError> {
+        self.sequencer().check_serving(self.shard())?;
+        self.update_cache(key, move |index, shard, key| {
+            cache::fill(index, shard, key, version, payload)
+        })
+        .await
+    }
+
+    /// Clean → Evicted (§4.2): drops this node's payload of the clean
+    /// version `version` of `key`. See [`cache::evict`]; what to evict and
+    /// when is plan M1-21's.
+    ///
+    /// Any replica that runs may evict, a member too: the transition only
+    /// drops a payload of its own, which no other replica reads.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is [`ShardError::Unavailable`] if the shard stopped
+    /// or its index fails; the inner one says why the transition was
+    /// refused.
+    pub async fn evict(
+        &self,
+        key: &str,
+        version: EpochSeq,
+    ) -> Result<Result<(), CacheRefusal>, ShardError> {
+        self.update_cache(key, move |index, shard, key| {
+            cache::evict(index, shard, key, version)
+        })
+        .await
+    }
+
+    /// Runs a cache transition of `key` on the index pool.
+    async fn update_cache(
+        &self,
+        key: &str,
+        transition: impl FnOnce(
+            &mut IndexWriter<'_>,
+            &ShardRef,
+            &str,
+        ) -> Result<Result<(), CacheRefusal>, IndexError>
+        + Send
+        + 'static,
+    ) -> Result<Result<(), CacheRefusal>, ShardError> {
+        self.sequencer().check_running(self.shard())?;
+        let (index, shard, key) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            index.update_local(|writer| transition(writer, &shard, &key))
+        })
+        .await
     }
 
     /// Adopts `config`, a newer epoch of the shard, in order with its

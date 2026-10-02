@@ -1,6 +1,6 @@
 [package]
 name = "skys3-flush"
-description = "SkyS3 write-back flush: per-shard flushers that send committed writes to a bucket's remote target with conditional requests."
+description = "SkyS3 write-back flush: per-shard flushers that send committed writes to a bucket's remote target with conditional requests, and read-through fill of evicted versions."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,6 +23,7 @@ skys3-obs.workspace = true
 skys3-remote.workspace = true
 skys3-shard.workspace = true
 skys3-types.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 

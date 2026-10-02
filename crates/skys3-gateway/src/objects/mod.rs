@@ -35,7 +35,10 @@
 //! and so does SkyS3. `partNumber=N` serves the `N`th part of a multipart
 //! object, with `206` and `x-amz-mp-parts-count`, and `partNumber=1` the
 //! whole of any other. An object with tags reports their number in
-//! `x-amz-tagging-count`.
+//! `x-amz-tagging-count`. A GET of an evicted version of a `write_back`
+//! bucket reads it through a fill from the remote ([`Fills`]); when the fill
+//! finds the remote changed and adopts its version, the read resolves the
+//! key again, at most [`MAX_FILL_ROUNDS`] times.
 //!
 //! DeleteObject and DeleteObjects are in `delete`, CopyObject in `copy`,
 //! GetObjectTagging, PutObjectTagging, and DeleteObjectTagging in `tagging`,
@@ -59,12 +62,13 @@ use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
 use skys3_log::record::{IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put, PutData};
 use skys3_types::checksum::ChecksumAlgorithm;
-use skys3_types::{BucketDocument, WriteIdentity};
+use skys3_types::{BucketDocument, BucketMode, EpochSeq, WriteIdentity};
 
 use crate::admission::Admission;
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
+use crate::fill::{FillError, Fills};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
@@ -74,6 +78,11 @@ pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};
 use upload::Upload;
+
+/// How many times a GET resolves its key again after a read-through fill
+/// found the key changed, such as after the fill adopted the remote's
+/// version (§9.2), before it answers `503`.
+const MAX_FILL_ROUNDS: usize = 3;
 
 /// The largest object a single PUT stores: 5 GiB, S3's limit.
 pub const MAX_OBJECT_BYTES: u64 = 5 << 30;
@@ -221,6 +230,7 @@ pub(crate) struct Objects<H> {
     inline_max_bytes: usize,
     extent_bytes: usize,
     pool: Option<BlockingPool>,
+    fills: Option<Arc<dyn Fills>>,
     admission: Arc<dyn Admission>,
     remote: Option<Arc<dyn RemoteReads>>,
 }
@@ -232,6 +242,7 @@ impl<H: Shards> Objects<H> {
             inline_max_bytes: usize::try_from(config.inline_max_bytes).unwrap_or(usize::MAX),
             extent_bytes: usize::try_from(config.extent_bytes).unwrap_or(usize::MAX),
             pool: config.hashing_pool.clone(),
+            fills: config.fills.clone(),
             admission: Arc::clone(&config.admission),
             remote: config.remote.clone(),
         }
@@ -375,25 +386,41 @@ impl<H: Shards> Objects<H> {
             if_modified_since: input.if_modified_since.as_ref(),
             if_unmodified_since: input.if_unmodified_since.as_ref(),
         };
-        let found = self
-            .resolve(
-                bucket,
-                &input.key,
-                conditions,
-                input.range,
-                input.part_number,
-            )
-            .await?;
-        let body = if found.remote {
-            self.read_remote(bucket, &input.key, &found).await?
-        } else {
-            download::read(
-                &self.shards,
-                &found.shard,
-                &found.object.payload,
-                found.bytes.clone(),
-            )
-            .await?
+        let mut rounds = 0;
+        let (found, body) = loop {
+            let found = self
+                .resolve(
+                    bucket,
+                    &input.key,
+                    conditions,
+                    input.range,
+                    input.part_number,
+                )
+                .await?;
+            if found.remote {
+                let body = self.read_remote(bucket, &input.key, &found).await?;
+                break (found, body);
+            }
+            if !matches!(found.object.payload, Payload::None) {
+                let body = download::read(
+                    &self.shards,
+                    &found.shard,
+                    &found.object.payload,
+                    found.bytes.clone(),
+                )
+                .await?;
+                break (found, body);
+            }
+            match self.fill(bucket, &input.key, &found).await? {
+                Ok(body) => break (found, body),
+                Err(FillError::Changed) if rounds + 1 < MAX_FILL_ROUNDS => rounds += 1,
+                Err(error) => {
+                    return Err(s3_error!(
+                        ServiceUnavailable,
+                        "The object's bytes could not be read from the bucket's target: {error}"
+                    ));
+                }
+            }
         };
         let mut output = GetObjectOutput {
             body: Some(body),
@@ -430,6 +457,32 @@ impl<H: Shards> Objects<H> {
         Ok(output)
     }
 
+    /// Reads the bytes of `found`, an evicted version of `key`, through a
+    /// read-through fill (§9.2).
+    ///
+    /// # Errors
+    ///
+    /// `503 ServiceUnavailable` for a bucket that is not `write_back` or a
+    /// gateway without [`Fills`]; the fill's errors.
+    async fn fill(
+        &self,
+        bucket: &BucketDocument,
+        key: &str,
+        found: &Found,
+    ) -> S3Result<Result<StreamingBlob, FillError>> {
+        let Some(fills) = self
+            .fills
+            .as_ref()
+            .filter(|_| bucket.mode == BucketMode::WriteBack)
+        else {
+            return Err(download::not_cached());
+        };
+        let read = fills
+            .read(&found.shard, key, found.version, found.bytes.clone())
+            .await;
+        Ok(read.map(|body| download::filled(body, found.bytes.end - found.bytes.start)))
+    }
+
     /// Resolves a read: the key's object, the conditions checked, and the
     /// bytes to serve.
     async fn resolve(
@@ -443,7 +496,7 @@ impl<H: Shards> Objects<H> {
         let shard = ShardRef::for_key(bucket, key);
         let found = self.lookup(bucket, &shard, key).await?;
         conditions.check(&found.object)?;
-        let mut selected = select(shard, found.object, range, part_number)?;
+        let mut selected = select(shard, found.version, found.object, range, part_number)?;
         selected.remote = found.remote;
         Ok(selected)
     }
@@ -453,6 +506,7 @@ impl<H: Shards> Objects<H> {
 /// whole object.
 fn select(
     shard: ShardRef,
+    version: EpochSeq,
     object: ObjectVersion,
     range: Option<Range>,
     part_number: Option<i32>,
@@ -468,7 +522,7 @@ fn select(
             let bytes = range
                 .check(object.size)
                 .map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
-            return Ok(Found::range(shard, object, bytes, None));
+            return Ok(Found::range(shard, version, object, bytes, None));
         }
         (None, Some(number)) => {
             if let Payload::Parts { parts, .. } = &object.payload {
@@ -482,7 +536,7 @@ fn select(
                 let start: u64 = parts[..index].iter().map(|part| part.size).sum();
                 let bytes = start..start + parts[index].size;
                 let count = i32::try_from(parts.len()).ok();
-                return Ok(Found::range(shard, object, bytes, count));
+                return Ok(Found::range(shard, version, object, bytes, count));
             }
             // An object stored by a single PUT has one part.
             if number != 1 {
@@ -494,6 +548,7 @@ fn select(
     };
     Ok(Found {
         shard,
+        version,
         object,
         bytes,
         content_range: None,
@@ -505,6 +560,8 @@ fn select(
 /// A resolved read.
 struct Found {
     shard: ShardRef,
+    /// The version's position, which names it (§9.2).
+    version: EpochSeq,
     object: ObjectVersion,
     /// The bytes to serve.
     bytes: std::ops::Range<u64>,
@@ -523,6 +580,7 @@ impl Found {
     /// they are empty.
     fn range(
         shard: ShardRef,
+        version: EpochSeq,
         object: ObjectVersion,
         bytes: std::ops::Range<u64>,
         parts_count: Option<i32>,
@@ -531,6 +589,7 @@ impl Found {
             .then(|| format!("bytes {}-{}/{}", bytes.start, bytes.end - 1, object.size));
         Self {
             shard,
+            version,
             object,
             bytes,
             content_range,
