@@ -4925,3 +4925,76 @@ of this file. A task with nothing unexpected keeps "None."
   reach the queue within `group_commit_max_delay`, and otherwise take one
   group commit per cap. A destination configured with a smaller cap
   splits default-size batches.
+
+## M4 Large objects
+
+### M4-01 Write identity for streamed single PUTs
+
+- **The flusher needed no change, but the 412 rule had a trap.** The
+  flusher already sends `write_identity.unwrap_or(version)`, written for
+  `MPU_CREATE` (M1-12, M1-16b), so a `PUT` that inherits an
+  `UPLOAD_BEGIN`'s position is created, replayed, and recognized after a
+  412 by that one identity, as `tests/streamed.rs` checks. The trap is the
+  "earlier write of this shard" clause: a write of the key that commits
+  while a streamed body arrives has a *later* identity than the streamed
+  PUT but is an *earlier* version. Comparing the remote identity with the
+  inherited one instead of the version's position makes it foreign, and
+  under `hold` the acknowledged streamed PUT is never flushed. The code
+  already compared with the version; a unit test and the flush simulation
+  (which now interleaves such writes) both fail under that mutation, the
+  simulation at seed 11. Design §7.2 now says which position is compared.
+- **When the record commits.** The gateway commits `UPLOAD_BEGIN` when the
+  bytes received reach `streaming_flush_min_bytes`, not from
+  `Content-Length`, and awaits it before taking another byte, so the
+  identity is durable before M4-03 could stream anything. Only `write_back`
+  buckets do it; copies and multipart parts never do. Its body is the key
+  alone. Defining a reserved kind needs no new log version, and applying it
+  changes no entry (`Effect::UploadBegun`), so the index format stays at 7.
+  It is a client write (a sealed shard refuses it) but takes no
+  conditional-write slot, and the forwarding wire accepts it as a write.
+  `GatewayConfig::streaming_flush_min_bytes` (`None` turns it off) comes
+  from `[flush]`; until M4-03 streams, a large PUT costs one more small
+  record and is still flushed as one `PutObject`.
+- **Compaction and a body still arriving (orchestrator's question).** The
+  `UPLOAD_BEGIN` itself may go once applied: nothing reads it back, and the
+  `PUT` holds its position. The body's extents are the problem, and not
+  only for streamed PUTs: nothing names them until the `PUT`, and M1-22
+  keeps unnamed extents only until their segment has been sealed for
+  `peer_staging_ttl_seconds`. Nothing bounded how long a body could take,
+  so a body slower than the TTL (it may be configured as low as a second)
+  would commit a `PUT` naming dropped extents, on any replica. The shard
+  checks only that the extents are *applied*. A hold per in-flight upload
+  was rejected: members must know it too, so it would have to come from
+  replicated state, and a failed PUT writes no record that could end it
+  (a new record or index table would be a format change). Instead the
+  gateway gives every body streamed as extents half of the TTL from its
+  first extent (`GatewayConfig::max_body_duration`), then answers
+  `400 RequestTimeout`. Design §10.3 and the configuration reference say
+  so. `a_streamed_put_keeps_its_extents_and_identity_while_it_streams`
+  compacts mid-stream, checks the `UPLOAD_BEGIN` is gone and the extents
+  are kept, completes the PUT, compacts again, and crashes; with a zero TTL
+  the extents go and the test fails.
+- **Remote requests are counted.** The flush tests count requests to show
+  that an inherited identity adds none: one
+  `PutObject` for a streamed PUT, as for any single PUT; three (the lost
+  `PutObject`, the refused retry, the HEAD) when the answer is lost; four
+  when it supersedes a write whose `FLUSHED` was lost.
+- **Simulation.** The flush scenario now also runs streamed PUTs: some
+  with a write of the key in between, a quarter of them failed, and a check
+  that no remote object or version carries a failed upload's identity. It
+  took 51 s for 256 seeds alone, about as before. The cluster simulation's
+  node settings set the streaming threshold to 1,024 bytes, below the
+  workload's 2,048-byte bodies, so `UPLOAD_BEGIN` crosses forwarding,
+  replication, crashes, takeovers, and compaction in every scenario
+  without a new one. With `SKYS3_SIM_SEEDS=256` in a debug build, all 66
+  cluster scenarios passed in 1,734 s (29 min). This machine has no
+  baseline time from the same build.
+- **Left open.** M4-03 opens the remote multipart upload where the
+  `UPLOAD_BEGIN` commits (`Upload::begin`). It must log the remote upload
+  ID itself, because compaction drops the `UPLOAD_BEGIN`, and nothing finds
+  an `UPLOAD_BEGIN` without a `PUT` after a crash. The same TTL hole
+  applies to a peer's staging (M6-03): its staging lives on while `DATA`
+  keeps arriving, but compaction counts the TTL from when each segment
+  was sealed. A transfer that stages for longer than
+  `peer_staging_ttl_seconds` can lose its first extents before its
+  `COMMIT`.

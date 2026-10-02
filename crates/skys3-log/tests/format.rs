@@ -13,7 +13,8 @@ use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, CompletedPart, DecodeError, Delete, EncodeError,
     ErrorClass, Extent, ExtentRef, FORMAT_VERSION, FieldError, LogRecord, MAGIC, MAX_HEADER_LEN,
     MAX_PAYLOAD_LEN, MAX_TAGS, MIN_FORMAT_VERSION, MpuAbort, MpuComplete, MpuCreate, MpuPart,
-    Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef, UploadChecksum,
+    Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef, UploadBegin,
+    UploadChecksum,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -27,6 +28,7 @@ const MPU_CREATE: u16 = 4;
 const MPU_PART: u16 = 5;
 const MPU_COMPLETE: u16 = 6;
 const MPU_ABORT: u16 = 7;
+const UPLOAD_BEGIN: u16 = 8;
 const CONFIG: u16 = 18;
 const TRUNCATE: u16 = 17;
 
@@ -305,6 +307,7 @@ fn record_kinds_have_fixed_codes_and_names() {
             "MPU_PART",
             "MPU_COMPLETE",
             "MPU_ABORT",
+            "UPLOAD_BEGIN",
             "FLUSHED",
             "TAGS",
             "IMPORT",
@@ -1023,9 +1026,9 @@ fn errors_are_classified_and_described() {
             "unknown log record kind 99",
         ),
         (
-            DecodeError::UnsupportedKind(RecordKind::UploadBegin),
+            DecodeError::UnsupportedKind(RecordKind::PartFlushed),
             ErrorClass::Unsupported,
-            "log record kind UPLOAD_BEGIN is reserved but not yet supported",
+            "log record kind PART_FLUSHED is reserved but not yet supported",
         ),
         (
             DecodeError::Malformed(FieldError {
@@ -1186,6 +1189,35 @@ fn multipart_records_follow_the_documented_layout() {
         record(RecordBody::MpuAbort(abort)).to_bytes().unwrap(),
         expected
     );
+}
+
+#[test]
+fn upload_begin_records_follow_the_documented_layout() {
+    // The key, and nothing else: the record's position is the identity.
+    let begin = RecordBody::UploadBegin(UploadBegin { key: "k".into() });
+    let body = Body::default().str16("k");
+    let expected = Frame::new(UPLOAD_BEGIN).keyed("k").build(&body.0, &[]);
+    let bytes = record(begin.clone()).to_bytes().unwrap();
+    assert_eq!(bytes, expected);
+    let (decoded, len) = LogRecord::decode(&bytes).unwrap();
+    assert_eq!(decoded.key_hash(), Some(KeyHash::of(&shard().bucket, b"k")));
+    assert_eq!((decoded.body, len), (begin, bytes.len()));
+
+    // An empty or overlong key, a payload, or trailing bytes are refused.
+    assert_eq!(
+        encode_err(RecordBody::UploadBegin(UploadBegin { key: String::new() })).field,
+        "upload_begin.key"
+    );
+    let long = "k".repeat(1025);
+    assert_eq!(
+        encode_err(RecordBody::UploadBegin(UploadBegin { key: long })).field,
+        "upload_begin.key"
+    );
+    let with_payload = Frame::new(UPLOAD_BEGIN).keyed("k").build(&body.0, b"x");
+    assert_eq!(malformed(&with_payload).field, "payload");
+    let trailing = Body::default().str16("k").u8(0);
+    let trailing = Frame::new(UPLOAD_BEGIN).keyed("k").build(&trailing.0, &[]);
+    assert_eq!(malformed(&trailing).field, "body");
 }
 
 #[test]

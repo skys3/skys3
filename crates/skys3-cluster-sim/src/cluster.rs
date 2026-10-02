@@ -1119,7 +1119,8 @@ impl<S: NodeServices> World<S> {
 
 /// The settings every simulated node runs with: small log segments and
 /// inline bodies, so a short workload exercises extents and several
-/// segments, and frequent checkpoints.
+/// segments; frequent checkpoints; and a low streaming threshold, so that
+/// longer PUTs to `write_back` buckets commit an `UPLOAD_BEGIN` (§7.2).
 fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, BoxError> {
     // Buckets the gateways create get the shape's shards and replicas.
     let defaults = format!(
@@ -1138,6 +1139,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     }
     gateway.inline_max_bytes = 512;
     gateway.extent_bytes = 512;
+    gateway.streaming_flush_min_bytes = Some(1024);
     gateway.retry = RetryPolicy {
         max_attempts: 5,
         initial_backoff: Duration::from_millis(20),

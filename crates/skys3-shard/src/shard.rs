@@ -673,8 +673,8 @@ impl<D: Disk> Shard<D> {
     /// Commits `body` as the shard's next record, and returns its position
     /// and what applying it did, once it is durable and applied.
     ///
-    /// Client writes (`PUT`, `DELETE`, `TAGS`, `EXTENT`, and the multipart
-    /// records) are refused while the shard is sealed; `FLUSHED`, `IMPORT`,
+    /// Client writes (`PUT`, `DELETE`, `TAGS`, `EXTENT`, `UPLOAD_BEGIN`, and
+    /// the multipart records) are refused while the shard is sealed; `FLUSHED`, `IMPORT`,
     /// and `ADOPT` are not. A `PUT` or `MPU_PART` that references extents is
     /// accepted only once each of them is applied: append them with
     /// [`Shard::append_extent`] first (§10.1).
@@ -2590,18 +2590,21 @@ fn is_client_write(body: &RecordBody) -> bool {
             | RecordBody::MpuPart(_)
             | RecordBody::MpuComplete(_)
             | RecordBody::MpuAbort(_)
+            | RecordBody::UploadBegin(_)
     )
 }
 
 /// The key of the entry `body` changes: every record that names a key
-/// except an `EXTENT`, which changes only the location map, and the
-/// multipart records other than `MPU_COMPLETE`, which change only uploads.
+/// except an `EXTENT`, which changes only the location map, the multipart
+/// records other than `MPU_COMPLETE`, which change only uploads, and an
+/// `UPLOAD_BEGIN`, which changes nothing.
 fn entry_key(body: &RecordBody) -> Option<&str> {
     match body {
         RecordBody::Extent(_)
         | RecordBody::MpuCreate(_)
         | RecordBody::MpuPart(_)
-        | RecordBody::MpuAbort(_) => None,
+        | RecordBody::MpuAbort(_)
+        | RecordBody::UploadBegin(_) => None,
         other => other.key(),
     }
 }

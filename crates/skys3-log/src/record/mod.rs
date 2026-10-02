@@ -61,8 +61,8 @@
 //!
 //! Each defined kind's fields are encoded in the declaration order of its
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
-//! [`MpuComplete`], [`MpuAbort`], [`Tags`], [`Flushed`], [`Import`],
-//! [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
+//! [`MpuComplete`], [`MpuAbort`], [`UploadBegin`], [`Tags`], [`Flushed`],
+//! [`Import`], [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
 //! without the bucket, shard, and epoch the fixed header holds, and
 //! `TRUNCATE`, which has no fields):
 //!
@@ -110,7 +110,7 @@ pub use body::{
     Adopt, CopySource, Delete, Extent, ExtentRef, Flushed, IDENTITY_METADATA,
     IDENTITY_METADATA_RESERVED, Import, MAX_EXTENTS, MAX_KEY_LEN, MAX_METADATA_LEN,
     MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN,
-    Metadata, Put, PutData, RecordBody, TagSet, Tags,
+    Metadata, Put, PutData, RecordBody, TagSet, Tags, UploadBegin,
 };
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};

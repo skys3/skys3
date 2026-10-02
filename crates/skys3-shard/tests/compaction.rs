@@ -15,12 +15,12 @@ use skys3_log::{LogRecord, RecordBody, SegmentLog};
 use skys3_obs::MetricsRegistry;
 use skys3_shard::{
     CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
-    Shard, ShardSet, StateMachine,
+    Effect, Outcome, Shard, ShardSet, StateMachine,
 };
 use skys3_types::{NodeId, Seq, ShardConfig};
 use support::{
     config, delete, extent, flushed, index_config, mpu_complete, mpu_create, mpu_part, open_log,
-    pool, put, put_extents, runtime, shard as shard_ref, tags,
+    pool, put, put_extents, runtime, shard as shard_ref, streamed, tags, upload_begin,
 };
 
 /// A node over one simulated disk: its log, index, and shards.
@@ -429,5 +429,82 @@ fn clean_bytes_a_tags_made_dirty_again_are_copied() {
         assert_eq!(node.bytes(&shard, "cold").await, Some(pattern(300)));
         let entry = node.index.read().unwrap().entry(shard.shard(), "cold");
         assert_eq!(entry.unwrap().unwrap().state, EntryState::Dirty);
+    });
+}
+
+#[test]
+fn a_streamed_put_keeps_its_extents_and_identity_while_it_streams() {
+    runtime().block_on(async {
+        let disk = SimDisk::new(7);
+        let node = Node::open(&disk).await;
+        let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
+        // A streamed PUT fixes its identity and sends part of its body...
+        let begin = shard.commit(upload_begin("streamed")).await.unwrap();
+        assert_eq!(begin.outcome, Outcome::Applied(Effect::UploadBegun));
+        let begin = begin.position;
+        let mut extents = Vec::new();
+        for n in 0..2 {
+            let appended = shard.append_extent(extent("streamed", n * 700, 700)).await;
+            extents.push(appended.unwrap());
+        }
+        // ...while other writes fill hot and bulk segments with garbage,
+        // and a checkpoint releases them all.
+        overwrite(&shard, 2, 40).await;
+        for round in 0..12 {
+            let mut garbage = Vec::new();
+            for n in 0..2 {
+                let appended = shard.append_extent(extent("garbage", n * 1000, 1000)).await;
+                garbage.push(appended.unwrap());
+            }
+            shard
+                .commit(put_extents("garbage", garbage, round))
+                .await
+                .unwrap();
+        }
+        node.checkpointer.checkpoint().await.unwrap();
+
+        // Compaction drops the applied UPLOAD_BEGIN, which nothing reads
+        // again, and keeps the body's extents: nothing names them yet, and
+        // their segment is younger than the TTL, which bounds how long a
+        // body may stream.
+        let report = node.compactor(Duration::from_secs(3600)).compact().await;
+        let report = report.unwrap();
+        assert!(report.segments > 0, "{report:?}");
+        let records = node.records().await;
+        assert!(
+            !records.iter().any(|record| record.position == begin),
+            "the applied UPLOAD_BEGIN outlived compaction"
+        );
+        for sent in &extents {
+            let kept = records
+                .iter()
+                .any(|record| record.position == sent.position);
+            assert!(kept, "an extent of the streaming body went: {report:?}");
+        }
+
+        // The rest of the body arrives, and the PUT inherits the identity.
+        let last = shard.append_extent(extent("streamed", 1400, 700)).await;
+        extents.push(last.unwrap());
+        let body = streamed(put_extents("streamed", extents, 1), begin);
+        let committed = shard.commit(body).await.unwrap();
+        assert!(committed.outcome.is_applied(), "{:?}", committed.outcome);
+        let whole: Vec<u8> = (0..3).flat_map(|_| pattern(700)).collect();
+        assert_eq!(node.bytes(&shard, "streamed").await, Some(whole.clone()));
+
+        // Named now, the extents are copied like any dirty payload, and the
+        // identity lives in the entry, through compaction and a crash.
+        node.checkpointer.checkpoint().await.unwrap();
+        overwrite(&shard, 2, 40).await;
+        node.checkpointer.checkpoint().await.unwrap();
+        let report = node.compactor(Duration::ZERO).compact().await.unwrap();
+        assert!(report.segments > 0, "{report:?}");
+        drop((shard, node));
+        disk.crash();
+        let node = Node::open(&disk).await;
+        let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
+        assert_eq!(node.bytes(&shard, "streamed").await, Some(whole));
+        let entry = shard.entry("streamed").await.unwrap().unwrap();
+        assert_eq!(entry.version, committed.position);
+        assert_eq!(entry.object.unwrap().write_identity, Some(begin));
     });
 }
