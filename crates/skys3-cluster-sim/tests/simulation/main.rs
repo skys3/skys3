@@ -35,6 +35,8 @@
 //!   of a member loss measured.
 //! - [`replacement`]: the coordinator replacing every member a lost node
 //!   held, and forgetting the node once no shard names it.
+//! - [`rebalancing`]: nodes that join a loaded cluster receive their share
+//!   of shards and primaries, with writes waiting only for handoffs.
 //! - [`registry`]: nodes that join with nothing but their credentials, and
 //!   a coordinator that forgets a silent node only once no shard names it.
 //! - [`restart`]: a whole-cluster restart while the control store is
@@ -53,6 +55,7 @@ mod handoff;
 mod harness;
 mod learners;
 mod leases;
+mod rebalancing;
 mod registry;
 mod removal;
 mod replacement;

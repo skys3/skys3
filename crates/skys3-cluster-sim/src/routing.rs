@@ -202,6 +202,10 @@ impl NodeServices for RoutedServices {
         self.replicated.ready()
     }
 
+    fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn skys3_coord::HandoffSink>> {
+        self.replicated.handoff_sink(node)
+    }
+
     async fn start(&self, env: NodeEnv) -> Result<RoutingShards, BoxError> {
         let (local, listener) = self.replicated.start_replicas(&env).await?;
         let map = ShardMap::load(Arc::clone(&env.index), BlockingPool::inline("routes")).await?;

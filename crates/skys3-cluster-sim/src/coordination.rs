@@ -19,6 +19,13 @@
 //! have their nodes follow the shard registers
 //! ([`ReplicatedServices::following_registers`](crate::ReplicatedServices::following_registers)).
 //!
+//! With [`CoordinationConfig::rebalancing`] as well, it also rebalances
+//! (plan M3-06): it moves shards to nodes below their share, a node that
+//! joins later ([`ClusterConfig::joining`](crate::ClusterConfig::joining))
+//! included, and asks primaries to hand their shards off over the admin
+//! endpoint, which starts the handoffs through the services'
+//! [`NodeServices::handoff_sink`].
+//!
 //! The audits check what the scenarios need:
 //!
 //! - every accepted change wrote an epoch nobody else wrote, so two nodes
@@ -44,9 +51,10 @@ use skys3_control::{
 };
 use skys3_coord::{
     AdminEndpoint, Announce, Applied, BucketShards, ChangeSet, ControlHints, Coordinator,
-    CoordinatorConfig, Elector, HeartbeatConfig, HeartbeatStatus, Heartbeater, Leadership,
-    LeaseConfig, Lifecycle, NodeEntry, NodeProfile, NodeRegistry, PeerSink, Placement, Pusher,
-    RegistryConfig, Replacement, ReplacementConfig,
+    CoordinatorConfig, Elector, HandoffClient, HandoffSink, HeartbeatConfig, HeartbeatStatus,
+    Heartbeater, Leadership, LeaseConfig, Lifecycle, NodeEntry, NodeProfile, NodeRegistry,
+    PeerSink, Placement, Pusher, RebalanceConfig, Rebalancing, RegistryConfig, Replacement,
+    ReplacementConfig,
 };
 use skys3_io::{Clock, MonoTime, MonotonicClock};
 use skys3_net::TurmoilNetwork;
@@ -66,6 +74,9 @@ pub const PUSH_PORT: u16 = 7401;
 
 /// How long a push may take to reach a node.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a primary may take to answer a handoff request.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The bucket whose shard registers the stand-in placement changes.
 fn bucket() -> BucketId {
@@ -109,6 +120,9 @@ pub struct CoordinationConfig {
     /// by their shard registers, at the `bucket_shards` level (`node` if
     /// it is not set).
     pub replacement: Option<ReplacementConfig>,
+    /// Whether the coordinator also rebalances ([`Rebalancing`], plan
+    /// M3-06), at this pace, inside replacement, which must be set too.
+    pub rebalancing: Option<RebalanceConfig>,
 }
 
 impl Default for CoordinationConfig {
@@ -144,6 +158,7 @@ impl Default for CoordinationConfig {
             },
             bucket_shards: None,
             replacement: None,
+            rebalancing: None,
         }
     }
 }
@@ -496,6 +511,10 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
         self.inner.ready()
     }
 
+    fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
+        self.inner.handoff_sink(node)
+    }
+
     async fn start(&self, env: NodeEnv) -> Result<S::Shards, BoxError> {
         let node = env.node.clone();
         let (position, life, clock) = (env.position, env.life, Arc::clone(&env.clock));
@@ -529,7 +548,10 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
 
         let Some(store) = store else {
             tracing::warn!(%node, "no control store: this life runs no coordinator");
-            let endpoint = AdminEndpoint::new(hints);
+            let mut endpoint = AdminEndpoint::new(hints);
+            if let Some(sink) = self.inner.handoff_sink(&node) {
+                endpoint = endpoint.with_handoffs(sink);
+            }
             tokio::spawn(async move { endpoint.serve(listener).await });
             return Ok(shards);
         };
@@ -585,9 +607,28 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
                     Arc::clone(&clock) as Arc<dyn Clock>,
                     replacement,
                 );
-                SimPlacement::Replacing(Box::new(
-                    BucketShards::new(registry.clone(), level).with_placement(replacing),
-                ))
+                match self.config.rebalancing {
+                    None => SimPlacement::Replacing(Box::new(
+                        BucketShards::new(registry.clone(), level).with_placement(replacing),
+                    )),
+                    Some(rebalance) => {
+                        // Handoff requests go to the port admin messages
+                        // arrive on.
+                        let handoffs = HandoffClient::new(transport.clone(), HANDOFF_TIMEOUT)
+                            .with_admin_port(NonZeroU16::new(PUSH_PORT).expect("a nonzero port"));
+                        let rebalancing = Rebalancing::new(
+                            registry.clone(),
+                            level,
+                            Arc::clone(&clock) as Arc<dyn Clock>,
+                            rebalance,
+                            handoffs,
+                        );
+                        SimPlacement::Rebalancing(Box::new(
+                            BucketShards::new(registry.clone(), level)
+                                .with_placement(replacing.with_placement(rebalancing)),
+                        ))
+                    }
+                }
             }
             (Some(level), None) => {
                 SimPlacement::Buckets(BucketShards::new(registry.clone(), level))
@@ -602,11 +643,14 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
                 audit: Arc::clone(&self.audit),
             }),
         };
-        let endpoint = AdminEndpoint::new(hints.clone()).with_heartbeats(
+        let mut endpoint = AdminEndpoint::new(hints.clone()).with_heartbeats(
             registry.clone(),
             leadership.clone(),
             Arc::clone(&clock),
         );
+        if let Some(sink) = self.inner.handoff_sink(&node) {
+            endpoint = endpoint.with_handoffs(sink);
+        }
         tokio::spawn(async move { endpoint.serve(listener).await });
 
         // Pushes go only to the nodes the registry lists.
@@ -895,12 +939,16 @@ impl Drop for Restore {
 }
 
 /// The coordinator's placement: the stand-in, bucket and shard creation,
-/// or both creation and replacement.
+/// creation and replacement, or creation, replacement, and rebalancing.
 enum SimPlacement {
     StandIn(EpochPlacement),
     Buckets(BucketShards),
     Replacing(Box<BucketShards<Replacement>>),
+    Rebalancing(Box<RebalancingPlacement>),
 }
+
+/// Bucket and shard creation, around replacement, around rebalancing.
+type RebalancingPlacement = BucketShards<Replacement<Rebalancing<HandoffClient<TurmoilNetwork>>>>;
 
 impl Placement for SimPlacement {
     fn begin_tenure(&mut self) {
@@ -908,6 +956,7 @@ impl Placement for SimPlacement {
             Self::StandIn(placement) => placement.begin_tenure(),
             Self::Buckets(placement) => placement.begin_tenure(),
             Self::Replacing(placement) => placement.begin_tenure(),
+            Self::Rebalancing(placement) => placement.begin_tenure(),
         }
     }
 
@@ -920,6 +969,7 @@ impl Placement for SimPlacement {
             Self::StandIn(placement) => placement.plan(store, proposals).await,
             Self::Buckets(placement) => placement.plan(store, proposals).await,
             Self::Replacing(placement) => placement.plan(store, proposals).await,
+            Self::Rebalancing(placement) => placement.plan(store, proposals).await,
         }
     }
 
@@ -928,6 +978,7 @@ impl Placement for SimPlacement {
             Self::StandIn(placement) => placement.applied(change, applied),
             Self::Buckets(placement) => placement.applied(change, applied),
             Self::Replacing(placement) => placement.applied(change, applied),
+            Self::Rebalancing(placement) => placement.applied(change, applied),
         }
     }
 }

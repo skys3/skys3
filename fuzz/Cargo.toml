@@ -49,6 +49,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "coord_handoff"
+path = "fuzz_targets/coord_handoff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "coord_heartbeat"
 path = "fuzz_targets/coord_heartbeat.rs"
 test = false

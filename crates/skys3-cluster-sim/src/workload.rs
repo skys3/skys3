@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use ::http::{Method, Request, Response, StatusCode};
@@ -32,6 +32,7 @@ use skys3_gateway::ShardRef;
 use skys3_sim::history::{Call, Condition, History, Outcome, Pending};
 use skys3_types::{BucketDocument, NodeId, ShardConfig};
 
+use crate::cluster::WriteTiming;
 use crate::s3::{self, NoAnswer};
 
 /// The shape of the client workload.
@@ -180,6 +181,30 @@ fn unexpected(what: &str, response: &Response<Bytes>) -> Box<dyn std::error::Err
     .into()
 }
 
+/// Where clients record how long their writes took. Clones share the
+/// record.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Timings(Arc<Mutex<Vec<WriteTiming>>>);
+
+impl Timings {
+    fn push(&self, timing: WriteTiming) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(timing);
+    }
+
+    /// Every write recorded so far, leaving none.
+    pub(crate) fn take(&self) -> Vec<WriteTiming> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// The simulated time since the run began.
+fn elapsed() -> Duration {
+    turmoil::sim_elapsed().unwrap_or_default()
+}
+
 /// One client of the workload.
 pub(crate) struct Client {
     pub process: String,
@@ -189,6 +214,8 @@ pub(crate) struct Client {
     pub rng: SmallRng,
     /// The last value this client saw for each key, for `If-Match`.
     seen: BTreeMap<String, String>,
+    /// Where the client records its writes' times, if anywhere.
+    timings: Option<Timings>,
 }
 
 impl Client {
@@ -206,6 +233,26 @@ impl Client {
             workload,
             rng: SmallRng::seed_from_u64(seed),
             seen: BTreeMap::new(),
+            timings: None,
+        }
+    }
+
+    /// The same client, recording how long each write takes in `timings`.
+    pub(crate) fn with_timings(mut self, timings: Timings) -> Self {
+        self.timings = Some(timings);
+        self
+    }
+
+    /// Records a write to `key` in `bucket` sent at `sent` that ended with
+    /// `outcome` now.
+    fn time(&self, bucket: &BucketDocument, key: &str, sent: Duration, outcome: &Outcome) {
+        if let Some(timings) = &self.timings {
+            timings.push(WriteTiming {
+                shard: ShardRef::for_key(bucket, key),
+                sent,
+                took: elapsed().saturating_sub(sent),
+                answered: matches!(outcome, Outcome::Done | Outcome::ConditionFailed),
+            });
         }
     }
 
@@ -350,6 +397,7 @@ impl Client {
             condition: condition.clone(),
         };
         let host = self.host(bucket, key);
+        let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
             return Ok(());
         };
@@ -371,6 +419,7 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
+        self.time(bucket, key, sent, &outcome);
         self.history.answer(pending, outcome);
         Ok(())
     }
@@ -429,6 +478,7 @@ impl Client {
             value: value.clone(),
             condition: condition.clone(),
         };
+        let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
             return Ok(());
         };
@@ -446,6 +496,7 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
+        self.time(bucket, key, sent, &outcome);
         self.history.answer(pending, outcome);
         Ok(())
     }
@@ -498,6 +549,7 @@ impl Client {
         let request = Request::delete(format!("/{}/{key}", bucket.name)).body(Full::default())?;
         let name = history_key(bucket, key);
         let host = self.host(bucket, key);
+        let sent = elapsed();
         let Some((pending, answer)) = self
             .send_recorded(&host, &name, Call::Delete, request)
             .await
@@ -512,6 +564,7 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
+        self.time(bucket, key, sent, &outcome);
         self.history.answer(pending, outcome);
         Ok(())
     }
