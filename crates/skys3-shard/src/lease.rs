@@ -477,7 +477,7 @@ mod tests {
         assert!(!grace.stop_if_passed(epoch(4)));
         grace.step_down(epoch(5));
         assert!(grace.stop_if_passed(epoch(5)));
-        assert!(grace.resume_for(epoch(6)));
+        assert!(grace.resume_for(epoch(6), true));
         assert_eq!(grace.stepped_down(), None);
         let waiting = tokio::time::timeout(ms(10), grace.stepped_down_since(epoch(6)));
         assert!(waiting.await.is_err());
