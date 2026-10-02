@@ -247,12 +247,20 @@ impl Grace {
     /// stopped member follows only if it is newer than the one it proposes
     /// over: the register has then moved past that, so the proposal cannot
     /// land. Returns whether the member grants.
-    pub fn resume_for(&self, epoch: Epoch) -> bool {
+    ///
+    /// A session from a `new_primary`, one the member did not follow
+    /// before, counts as a grant even if the member was not stopped, as a
+    /// lost proposal does ([`Grace::resume`]): the member gives the new
+    /// primary a whole grace to reach it before it proposes over it
+    /// (§6.5). Otherwise a member still waiting out its takeover delay
+    /// when the winner's session arrives would find the grace it counted
+    /// for the old primary passed, and depose the winner at once.
+    pub fn resume_for(&self, epoch: Epoch, new_primary: bool) -> bool {
         let mut stopped = self.lock();
         if stopped.is_some_and(|over| epoch <= over) {
             return false;
         }
-        if stopped.take().is_some() {
+        if stopped.take().is_some() || new_primary {
             self.record_grant();
             self.forget_step_down();
         }
@@ -407,18 +415,20 @@ mod tests {
         assert!(!grace.grant());
         assert!(!granted.has_changed().unwrap());
         // It proposes over epoch 4 next: sessions up to that epoch do not
-        // resume it, a newer one does.
+        // resume it, not even a new primary's, a newer one does.
         assert!(grace.propose_over(epoch(4)));
-        assert!(!grace.resume_for(epoch(4)));
+        assert!(!grace.resume_for(epoch(4), false));
+        assert!(!grace.resume_for(epoch(4), true));
         assert!(grace.is_stopped());
-        assert!(grace.resume_for(epoch(5)));
+        assert!(!granted.has_changed().unwrap());
+        assert!(grace.resume_for(epoch(5), false));
         assert!(!grace.is_stopped());
         assert!(granted.has_changed().unwrap());
         assert!(!grace.has_passed());
         // Resumed, it proposes nothing more until its grace passes again.
         assert!(!grace.propose_over(epoch(5)));
         assert!(!grace.stop_if_passed(epoch(5)));
-        assert!(grace.resume_for(epoch(1)));
+        assert!(grace.resume_for(epoch(1), false));
         tokio::time::advance(ms(600)).await;
         assert!(grace.stop_if_passed(epoch(5)));
         grace.resume();
@@ -427,6 +437,18 @@ mod tests {
         granted.borrow_and_update();
         grace.resume();
         assert!(!granted.has_changed().unwrap());
+        // Nor does a session of the primary it follows.
+        tokio::time::advance(ms(600)).await;
+        assert!(grace.resume_for(epoch(6), false));
+        assert!(!granted.has_changed().unwrap());
+        assert!(grace.has_passed());
+        // A new primary's session, though, counts as a grant, stopped or
+        // not: the member waits a whole grace before it proposes over the
+        // new primary (§6.5).
+        assert!(grace.resume_for(epoch(7), true));
+        assert!(granted.has_changed().unwrap());
+        assert!(!grace.has_passed());
+        assert!(!grace.stop_if_passed(epoch(7)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -455,7 +477,7 @@ mod tests {
         assert!(!grace.stop_if_passed(epoch(4)));
         grace.step_down(epoch(5));
         assert!(grace.stop_if_passed(epoch(5)));
-        assert!(grace.resume_for(epoch(6)));
+        assert!(grace.resume_for(epoch(6), true));
         assert_eq!(grace.stepped_down(), None);
         let waiting = tokio::time::timeout(ms(10), grace.stepped_down_since(epoch(6)));
         assert!(waiting.await.is_err());
