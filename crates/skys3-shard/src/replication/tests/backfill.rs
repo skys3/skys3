@@ -28,7 +28,9 @@ use crate::lineage::Lineage;
 use crate::replication::wire::{
     self, Append, Backfill, BackfillAck, Row, SnapshotRows, Sync, SyncAck,
 };
-use crate::replication::{ControlRegisters, Replication, ReplicationConfig};
+use crate::replication::{
+    ControlRegisters, Replaced, Replication, ReplicationConfig, ShardRegisters as _,
+};
 use crate::set::ShardSet;
 use crate::shard::{Role, Shard};
 
@@ -410,4 +412,71 @@ async fn refusals() {
     let answer: BackfillAck = wire::body(&frame, MessageKind::BackfillAck).unwrap();
     assert!(answer.complete && answer.refused.is_empty(), "{answer:?}");
     assert_eq!(answer.applied(), EpochSeq::new(Epoch::new(1), Seq::new(3)));
+}
+
+#[test]
+fn a_removed_member_that_stayed_up_is_readmitted_as_a_learner() {
+    run(removed_and_readmitted());
+}
+
+/// Node 2 is removed while it is up, and is not told: its replica stays
+/// open as a member of epoch 1. The driver then adds it back as a
+/// learner, without a restart. A member never becomes a learner by a
+/// configuration change, so the node closes that replica and opens again
+/// as a learner, which joins and is promoted.
+async fn removed_and_readmitted() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    let promotions = Promotions {
+        registers: ControlRegisters::new(store.clone(), RetryPolicy::default()),
+        delay: Duration::ZERO,
+        scripted: Mutex::default(),
+        proposed: Arc::default(),
+        epochs: Arc::default(),
+    };
+    let nodes = nodes(&pki, &store, &two_members(), promotions, None).await;
+    let stale = nodes.replications[1].open(&two_members()).await.unwrap();
+    let primary = nodes.replications[0].open(&two_members()).await.unwrap();
+    let leader = Arc::clone(primary.leader().unwrap());
+    until(|| primary.is_serving()).await;
+    primary.commit(put("a", 10)).await.unwrap();
+
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    let removed = ShardConfig {
+        epoch: Epoch::new(2),
+        members: vec![node(1)],
+        min_write_replicas: 1,
+        proposal_id: ProposalId::new("remove-2").unwrap(),
+        ..two_members()
+    };
+    assert_eq!(
+        registers.replace(&two_members(), &removed).await.unwrap(),
+        Replaced::Accepted
+    );
+    nodes.replications[0].open(&removed).await.unwrap();
+    primary.commit(put("b", 10)).await.unwrap();
+    assert_eq!(stale.role(), Role::Member);
+
+    let readmitted = ShardConfig {
+        epoch: Epoch::new(3),
+        learners: vec![node(2)],
+        proposal_id: ProposalId::new("readmit-2").unwrap(),
+        ..removed.clone()
+    };
+    assert_eq!(
+        registers.replace(&removed, &readmitted).await.unwrap(),
+        Replaced::Accepted
+    );
+    let learner = nodes.replications[1].open(&readmitted).await.unwrap();
+    assert_eq!(learner.role(), Role::Learner);
+    assert!(stale.is_stopped());
+    nodes.replications[0].open(&readmitted).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !register(&store).await.is_member(&node(2)) {
+        assert!(tokio::time::Instant::now() < deadline, "no promotion");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    primary.commit(put("c", 10)).await.unwrap();
+    let member = current(&nodes.replications[1]).await;
+    assert!(*member.durable().borrow() >= leader.commit());
 }
