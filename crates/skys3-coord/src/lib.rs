@@ -44,6 +44,11 @@
 //!   register and its placed shard registers in one change, and the
 //!   coordinator finishes a creation cut short and drops the shard
 //!   registers of deleted buckets.
+//! - [`Replacement`]: the coordinator adds learners to the shards with
+//!   fewer than `replicas` members that placement counts, on nodes
+//!   placement chooses, for their primaries to backfill and promote, and
+//!   removes the members placement no longer counts once they are
+//!   replaced, at a pace [`ReplacementConfig`] bounds.
 //! - [`AdminEndpoint`]: serves pushes and heartbeats on a node.
 //!
 //! ```
@@ -86,6 +91,7 @@ mod place;
 mod policy;
 mod push;
 mod registry;
+mod replace;
 #[cfg(test)]
 mod testing;
 
@@ -113,3 +119,4 @@ pub use push::{
 pub use registry::{
     Lifecycle, NodeEntry, NodeRegistry, NodeState, PeerSink, RegistryConfig, Rehoming, ShardScan,
 };
+pub use replace::{Replacement, ReplacementConfig};

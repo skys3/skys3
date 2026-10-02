@@ -480,3 +480,54 @@ async fn removed_and_readmitted() {
     let member = current(&nodes.replications[1]).await;
     assert!(*member.durable().borrow() >= leader.commit());
 }
+
+#[test]
+fn a_learner_a_takeover_left_out_rejoins_under_the_new_primary() {
+    run(rejoining());
+}
+
+/// A learner of node 1 that node 3's takeover left out, and that the
+/// coordinator then added again under node 3, without a restart: a
+/// learner's replica follows only its own primary, so it stops and opens
+/// again as a learner of node 3. A newer configuration of the same
+/// primary is adopted in place.
+async fn rejoining() {
+    let disk = SimDisk::new(43);
+    let clock = Arc::new(MonotonicClock::new());
+    let (log, _) = SegmentLog::open(disk.mount(), LogConfig::default(), clock as _)
+        .await
+        .unwrap();
+    let index =
+        Arc::new(Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap());
+    let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+    let set = ShardSet::new(index, log, pool);
+    let learner = ShardConfig {
+        epoch: Epoch::new(3),
+        members: vec![node(1), node(3)],
+        learners: vec![node(2)],
+        ..initial()
+    };
+    let first = set.open_replica(&learner, &node(2)).await.unwrap();
+    assert_eq!(first.role(), Role::Learner);
+
+    let taken_over = ShardConfig {
+        epoch: Epoch::new(5),
+        primary: node(3),
+        members: vec![node(3)],
+        learners: vec![node(2)],
+        ..initial()
+    };
+    let again = set.open_replica(&taken_over, &node(2)).await.unwrap();
+    assert!(first.is_stopped());
+    assert_eq!(again.role(), Role::Learner);
+    assert_eq!(again.config(), taken_over);
+
+    let another = ShardConfig {
+        epoch: Epoch::new(6),
+        learners: vec![node(2), node(4)],
+        ..taken_over
+    };
+    let same = set.open_replica(&another, &node(2)).await.unwrap();
+    assert!(!again.is_stopped());
+    assert!(same.durable().same_channel(&again.durable()));
+}

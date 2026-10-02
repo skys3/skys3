@@ -30,6 +30,11 @@
 //! - [`learners`]: learners added to every shard and promoted to member
 //!   while writes go on, under slow and faulty control stores, crashes,
 //!   and partitions, with rule R3 checked after every step.
+//! - [`backfill`]: learners that get a snapshot or keep a verified log,
+//!   backfill their payload, and are promoted, with the durability windows
+//!   of a member loss measured.
+//! - [`replacement`]: the coordinator replacing every member a lost node
+//!   held, and forgetting the node once no shard names it.
 //! - [`registry`]: nodes that join with nothing but their credentials, and
 //!   a coordinator that forgets a silent node only once no shard names it.
 //! - [`restart`]: a whole-cluster restart while the control store is
@@ -50,6 +55,7 @@ mod learners;
 mod leases;
 mod registry;
 mod removal;
+mod replacement;
 mod replication;
 mod restart;
 mod routing;
