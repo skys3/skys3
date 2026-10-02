@@ -76,6 +76,11 @@ pub async fn setup(extra: &str) -> Setup {
 }
 
 pub async fn setup_with(config: GatewayConfig) -> Setup {
+    setup_over(config, MemoryShards::new().await).await
+}
+
+/// A gateway over `shards`.
+pub async fn setup_over(config: GatewayConfig, shards: MemoryShards) -> Setup {
     let memory = MemoryControlStore::new();
     let store = FaultyStore::new(memory.clone());
     let policy = RetryPolicy::default();
@@ -87,7 +92,6 @@ pub async fn setup_with(config: GatewayConfig) -> Setup {
     )
     .await
     .unwrap();
-    let shards = MemoryShards::new().await;
     let gateway = Gateway::new(
         config,
         store.clone(),

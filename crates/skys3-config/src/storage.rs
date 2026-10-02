@@ -160,8 +160,8 @@ impl StorageConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
-    /// `hot_cache_bytes_per_node`: the node-local cache of recently read
-    /// objects (§9.2).
+    /// `hot_cache_bytes_per_node`: the node-local, in-memory cache of
+    /// recently read objects (§9.2).
     pub hot_cache_bytes_per_node: u64,
     /// `cache_max_bytes_per_node`: the bound on clean cached payload on a
     /// node, enforced by LRU eviction (§9.3).
@@ -174,7 +174,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            hot_cache_bytes_per_node: 64 * GIB,
+            hot_cache_bytes_per_node: GIB,
             cache_max_bytes_per_node: 1024 * GIB,
             reserve_fraction: 0.10,
         }

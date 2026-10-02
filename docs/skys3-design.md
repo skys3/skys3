@@ -1089,6 +1089,13 @@ An optional periodic **reconciliation scan** re-lists the remote and reports dif
 
 **Hot cache.** Every node can keep recently read objects in a node-local cache (`hot_cache_bytes_per_node`), keyed by bucket, key, and version identity. It is only used for the version named in the primary's read plan, so it never serves a stale version. It spreads reads of hot objects across every gateway without adding copies inside the shard.
 
+**The hot cache, as built** (plan M2-19). The rules the paragraph above leaves open:
+
+- **Memory, whole objects.** The cache is held in memory, which is why `hot_cache_bytes_per_node` defaults to 1 GiB (section 14), and a restarted node starts with it empty. It keeps whole objects, each at most an eighth of it, so one object cannot flush the rest, and drops the least recently used while it holds more than its bound.
+- **Identity.** An entry is keyed by bucket ID and key, and holds one version, named by the position of the record that wrote it and its ETag. A GET looks the cache up after the primary's read plan, before it asks any holder, for the version the plan names. An entry of any other version misses, and the lookup drops it. A version's bytes never change, so an entry serves only reads planned for the version it holds, whatever writes, evictions, or compaction did since; a cached version the primary has evicted is served without a fill.
+- **Filling.** A GET of a whole object fills the cache once it has streamed every byte from a holder on another node, under its registration. A read from the node's own replicas fills nothing, since their copy is local already, and neither does a range or a read that broke off. A read of an earlier version that finishes after a later one was cached keeps the later one.
+- **Metrics:** `skys3_hot_cache_bytes`, `skys3_hot_cache_hits_total`, `skys3_hot_cache_misses_total`, and `skys3_hot_cache_evictions_total`.
+
 ### 9.3 Clean copies and eviction
 
 When a key becomes clean, `clean_copies` members keep the payload as cache, the primary first. The other members mark their copies dead. A bucket with more read load than one copy can serve raises `clean_copies`, up to `replicas`. Eviction is local LRU per node, bounded by `cache_max_bytes_per_node`, and needs no coordination.
@@ -1420,7 +1427,7 @@ read_registration_renew_interval_seconds = 10
 disk_min_free_bytes = 1073741824     # below this, writes get 503 SlowDown (section 13)
 
 [cache]
-hot_cache_bytes_per_node = 68719476736
+hot_cache_bytes_per_node = 1073741824     # held in memory (section 9.2)
 cache_max_bytes_per_node = 1099511627776
 reserve_fraction = 0.10
 

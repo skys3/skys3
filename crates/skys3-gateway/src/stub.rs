@@ -6,6 +6,8 @@
 //! a restarted node does. Helpers commit entries in a given state
 //! ([`MemoryShards::put`]), flush a bucket ([`MemoryShards::flush`]), and
 //! make every request fail ([`MemoryShards::set_unavailable`]).
+//! [`MemoryShards::seen_from`] puts the gateway on another node, which
+//! reads every GET's bytes from this one as a holder.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -50,6 +52,8 @@ pub struct MemoryShards {
     local: LocalShards<SimMount>,
     /// When set, every request fails with [`ShardError::Unavailable`].
     unavailable: Arc<AtomicBool>,
+    /// The node a gateway over these shards runs on, if not theirs.
+    gateway_node: Option<NodeId>,
 }
 
 impl MemoryShards {
@@ -102,6 +106,7 @@ impl MemoryShards {
             disk,
             local: LocalShards::new(ShardSet::new(index, log, pool), node),
             unavailable: Arc::default(),
+            gateway_node: None,
         })
     }
 
@@ -125,6 +130,17 @@ impl MemoryShards {
     #[must_use]
     pub fn local(&self) -> &LocalShards<SimMount> {
         &self.local
+    }
+
+    /// The same shards, for a gateway on `node`, another node than
+    /// theirs: read plans name their node as a holder that is not the
+    /// gateway's own.
+    #[must_use]
+    pub fn seen_from(&self, node: NodeId) -> Self {
+        Self {
+            gateway_node: Some(node),
+            ..self.clone()
+        }
     }
 
     /// Commits a client write of `key` to its shard of `bucket`, leaving the
@@ -325,7 +341,7 @@ impl Shards for MemoryShards {
     }
 
     fn node(&self) -> Option<NodeId> {
-        self.local.node()
+        self.gateway_node.clone().or_else(|| self.local.node())
     }
 
     async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {

@@ -30,8 +30,8 @@ use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
 use skys3_coord::HandoffSink;
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    FillBody, FillError, Fills, Gateway, GatewayConfig, IdSource, LocalShards, ShardRef, Shards,
-    TrustAll,
+    FillBody, FillError, Fills, Gateway, GatewayConfig, HotCache, IdSource, LocalShards, ShardRef,
+    Shards, TrustAll,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{
@@ -49,6 +49,7 @@ use skys3_types::{
     BucketDocument, ClusterId, EpochSeq, Generation, Label, NodeAddress, NodeId, ShardConfig,
 };
 
+use crate::cluster::HotCaches;
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -158,6 +159,8 @@ pub(crate) struct NodeSettings {
     /// Segment compaction, if nodes run it (§10.3): a pass after each
     /// checkpoint interval.
     pub compaction: Option<CompactionSettings>,
+    /// The hot cache each node's gateway keeps (§9.2).
+    pub hot_cache: HotCaches,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -235,6 +238,23 @@ pub(crate) struct Shared<S> {
     pub remote: SimS3,
     /// Segments compaction reclaimed, over every node and life.
     pub compacted: Arc<AtomicU64>,
+    /// The hot cache of every node's every life, by node.
+    pub hot_caches: Mutex<Vec<(NodeId, HotCache)>>,
+}
+
+impl<S> Shared<S> {
+    /// The `GET`s each node served from its hot caches, over every life.
+    pub(crate) fn hot_cache_hits(&self) -> BTreeMap<NodeId, u64> {
+        let mut hits = BTreeMap::new();
+        let caches = self.hot_caches.lock().unwrap_or_else(PoisonError::into_inner);
+        for (node, cache) in caches.iter() {
+            let served = cache.usage().hits;
+            if served > 0 {
+                *hits.entry(node.clone()).or_default() += served;
+            }
+        }
+        hits
+    }
 }
 
 /// The index settings of a simulated node: a small page cache, so redb
@@ -320,6 +340,17 @@ pub(crate) async fn run<S: NodeServices>(
     let shards = shared.services.start(env).await?;
     let flush = Arc::new(flush_service(settings, &shared.remote));
     let mut gateway_config = settings.gateway.clone();
+    // A hot cache of the node's own, empty in each life, as the node
+    // binary's is.
+    gateway_config.hot_cache = HotCache::new(settings.hot_cache.bytes);
+    if settings.hot_cache.ignore_version {
+        gateway_config.hot_cache.ignore_versions();
+    }
+    shared
+        .hot_caches
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((slot.id.clone(), gateway_config.hot_cache.clone()));
     let mut cache = None;
     if let Some(bounds) = settings.clean_cache {
         // The clean cache, and fills of what it evicts, as the node

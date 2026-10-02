@@ -58,6 +58,10 @@ pub struct Workload {
     /// on it or crashed, so writes that fail or reach a node that crashes
     /// are recorded as unknown.
     pub any_gateway: bool,
+    /// The share of operations, in percent, that are `GET`s drawn ahead
+    /// of the usual mix, which has 30% of them; 0, the default, draws
+    /// nothing ahead of it.
+    pub get_percent: u8,
 }
 
 impl Default for Workload {
@@ -70,6 +74,7 @@ impl Default for Workload {
             think_time: Duration::from_millis(200),
             timeout: Duration::from_secs(2),
             any_gateway: false,
+            get_percent: 0,
         }
     }
 }
@@ -280,6 +285,12 @@ impl Client {
             let bucket = self.rng.random_range(0..self.routes.buckets.len());
             let bucket = self.routes.buckets[bucket].clone();
             let key = format!("key-{}", self.rng.random_range(0..self.workload.keys));
+            if self.workload.get_percent > 0
+                && self.rng.random_range(0..100) < self.workload.get_percent
+            {
+                self.read(&bucket, &key, Method::GET).await?;
+                continue;
+            }
             match self.rng.random_range(0..100) {
                 0..24 => self.put(&bucket, &key, n, Condition::None).await?,
                 24..27 => self.multipart(&bucket, &key, n, Condition::None).await?,
