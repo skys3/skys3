@@ -45,6 +45,7 @@ async fn new_learner() {
         delay: Duration::ZERO,
         scripted: Mutex::default(),
         proposed: Arc::default(),
+        epochs: Arc::default(),
     };
     let nodes = nodes(&pki, &store, &two_members(), promotions, None).await;
     nodes.replications[1].open(&two_members()).await.unwrap();

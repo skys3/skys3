@@ -191,11 +191,19 @@ impl<D: Disk> Watchdog<D> {
     }
 
     /// Sends the outstanding promotion `proposed` to the shard's register,
-    /// over the replica's configuration, and acts on the outcome. A failed
-    /// request leaves it outstanding, for a later check to send again.
+    /// over the configuration it was built from, and acts on the outcome.
+    /// A failed request leaves it outstanding, for a later check to send
+    /// again. Once the replica has moved past that configuration, the
+    /// outcome is known and nothing is sent: the replica's configuration
+    /// is the register's, whose epoch the proposal has, or a later one.
     async fn settle(&self, proposed: &ShardConfig) {
         let shard = self.shard.shard();
         let current = self.shard.config();
+        if current.epoch.checked_next() != Some(proposed.epoch)
+            || self.leader.promoting().as_ref() != Some(proposed)
+        {
+            return;
+        }
         match self.removal.registers.replace(&current, proposed).await {
             Ok(Replaced::Accepted) => {
                 tracing::info!(%shard, epoch = %proposed.epoch, "promoted a learner");

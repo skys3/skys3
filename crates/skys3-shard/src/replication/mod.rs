@@ -598,10 +598,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 continue;
             };
             let config = replica.config();
-            if replica.role() == Role::Member
-                || replica.is_stopped()
-                || !is_under_replicated(&config)
-            {
+            if replica.role().follows() || replica.is_stopped() || !is_under_replicated(&config) {
                 continue;
             }
             match replica.stored_bytes().await {
