@@ -9,7 +9,7 @@ use s3s::{S3Error, S3Result, s3_error};
 use skys3_index::{Entry, EntryState, ObjectVersion};
 use skys3_log::RecordBody;
 use skys3_log::record::Adopt;
-use skys3_types::{BucketDocument, BucketMode};
+use skys3_types::{BucketDocument, BucketMode, EpochSeq};
 
 use super::{Found, Objects};
 use crate::buckets::shard_error;
@@ -19,6 +19,9 @@ use crate::shard::{ShardRef, Shards};
 
 /// What a read of a key serves.
 pub(super) struct Lookup {
+    /// The position of the object's version, which names it (§9.2); zero
+    /// for an object only at the remote.
+    pub(super) version: EpochSeq,
     /// The object.
     pub(super) object: ObjectVersion,
     /// Whether the object is only at the remote: the key has no entry, and
@@ -72,6 +75,7 @@ impl<H: Shards> Objects<H> {
                     .map_err(unavailable)?
                     .ok_or_else(no_such_key)?;
                 Ok(Lookup {
+                    version: EpochSeq::default(),
                     object: found.object,
                     remote: true,
                 })
@@ -179,10 +183,11 @@ fn unloaded(entry: &Entry) -> bool {
 
 /// What a read of a local entry serves.
 fn local(entry: Option<Entry>) -> S3Result<Lookup> {
-    let object = entry
-        .and_then(|entry| entry.object)
+    let (version, object) = entry
+        .and_then(|entry| Some((entry.version, entry.object?)))
         .ok_or_else(no_such_key)?;
     Ok(Lookup {
+        version,
         object,
         remote: false,
     })

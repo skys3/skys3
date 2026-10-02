@@ -58,6 +58,7 @@ use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, P
 
 use crate::admission::{Admission, AdmitAll};
 use crate::authz::Permissions;
+use crate::fill::Fills;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
 use crate::remote::RemoteReads;
@@ -101,6 +102,9 @@ pub struct GatewayConfig {
     /// hashed on the request's task, which only tests should do; the node
     /// sets one.
     pub hashing_pool: Option<BlockingPool>,
+    /// Read-through fill of evicted versions of `write_back` buckets
+    /// (§9.2). Without it, a GET of one answers `503`; the node sets it.
+    pub fills: Option<Arc<dyn Fills>>,
     /// The keys that sign and verify ListObjectsV2 continuation tokens
     /// (§9.4). [`GatewayConfig::new`] generates a key, so tokens are valid
     /// on this gateway until it restarts.
@@ -149,6 +153,7 @@ impl GatewayConfig {
             inline_max_bytes: config.storage().inline_max_bytes,
             extent_bytes: config.storage().extent_bytes,
             hashing_pool: None,
+            fills: None,
             list_token_keys: ListTokenKeys::generate(),
             admission: Arc::new(AdmitAll),
             remote: None,

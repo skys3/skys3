@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Write-back flush: sending each `write_back` bucket's committed writes to
-//! its remote target (§7.1, §7.2, §7.4).
+//! its remote target (§7.1, §7.2, §7.4), and reading evicted versions back
+//! from it (§9.2).
 //!
 //! Section numbers (§) refer to the [SkyS3 design](https://github.com/skys3/skys3/blob/main/docs/skys3-design.md).
 //!
@@ -30,9 +31,14 @@
 //! - [`Target`]: what the flushers of one target share: the store, the
 //!   probe's findings, the in-flight byte budget, the settings
 //!   ([`FlushSettings`]), and the remote uploads left to abort.
+//! - [`Filler`]: read-through fill (§9.2). It reads an evicted version from
+//!   the target with `If-Match` and `versionId`, commits it as extents that
+//!   become clean cache, serves ranges while it streams, coalesces
+//!   concurrent reads of one version, and commits `ADOPT` when the remote
+//!   changed out of band.
 //! - [`FlushService`]: every flusher of a node, following its buckets and
-//!   open shards, with each target's capability probe and each bucket's
-//!   namespace import.
+//!   open shards, with each target's capability probe, each bucket's
+//!   namespace import, and each bucket's [`Filler`].
 //! - **Namespace import** (§9.1, [`ImportState`]): a `write_back` bucket
 //!   lists its remote prefix into `IMPORT` records, a page at a time, rate
 //!   limited, with a durable checkpoint after each page that a restart
@@ -40,7 +46,7 @@
 //!   tombstone and HEAD before writing it, and [`RemoteReader`] serves
 //!   client reads that miss locally from the remote.
 //! - [`FlushMetrics`]: `dirty_bytes`, `oldest_dirty_age`,
-//!   `flush_lag_seconds`, and conflict counts, by bucket.
+//!   `flush_lag_seconds`, conflict counts, and fill counts, by bucket.
 //! - [`DirtyBudget`] (§7.6): the flushers' dirty bytes counted against each
 //!   bucket's and the cluster's `max_dirty_bytes`, which admission control
 //!   checks before a write. Each node enforces a share of each budget in
@@ -60,6 +66,7 @@
 
 mod attempt;
 mod budget;
+mod fill;
 mod import;
 mod metrics;
 mod multipart;
@@ -69,6 +76,7 @@ mod target;
 
 pub use attempt::Conflict;
 pub use budget::{DirtyBudget, Exhausted, Usage, share};
+pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
 pub use import::{
     DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject, RemoteReader,
     loaded_metadata,
