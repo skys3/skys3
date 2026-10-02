@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
+use skys3_log::record::{IDENTITY_METADATA, IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN};
 use skys3_peer::{
     Abort, AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges, Capabilities, Commit, Data,
     Hello, MAX_BATCH_ITEMS, MAX_HEADER_LEN, MAX_OBJECT_BYTES, MAX_PAYLOAD_LEN, MAX_PIECE_BYTES,
@@ -203,6 +204,21 @@ fn puts_follow_the_rules_of_log_records() {
         .metadata
         .insert("content-type".to_owned(), "text/plain".to_owned());
     accepted(staged(with_metadata));
+
+    // The metadata leaves room for the write identity the destination
+    // stores with it, so a valid COMMIT always fits in a `PUT` record. An
+    // identity entry already there does not count: it is replaced.
+    let limit = MAX_METADATA_LEN - IDENTITY_METADATA_RESERVED;
+    let name = "x-amz-meta-big";
+    let mut full = put(PutData::Staged { piece: 1 }, 5);
+    full.metadata
+        .insert(name.to_owned(), "v".repeat(limit - name.len()));
+    full.metadata
+        .insert(IDENTITY_METADATA.to_owned(), "c/b/0/1.2".to_owned());
+    accepted(staged(full.clone()));
+    full.metadata
+        .insert(name.to_owned(), "v".repeat(limit - name.len() + 1));
+    refused(staged(full), "put.metadata");
 
     let mut with_tags = put(PutData::Staged { piece: 1 }, 5);
     with_tags.tags.insert(String::new(), "v".to_owned());

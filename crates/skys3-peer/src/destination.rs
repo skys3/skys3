@@ -15,6 +15,15 @@
 //! frames of a stream are in flight to the primaries at once, and the
 //! `DURABLE`s for every append that finished while the last one was being
 //! sent go out as one.
+//!
+//! ```text
+//!   COMMIT       ->     Staging::staged             ->     PUT or DELETE, conditional
+//!                <-     APPLIED                     <-     committed, or the current identity
+//! ```
+//!
+//! A `COMMIT` is applied by a [`CommitSink`], which publishes what the
+//! staging holds in one record of the key's shard. A `COMMIT` that commits
+//! consumes the staging of its identity.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,8 +37,10 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::time::Instant;
 
 use crate::endpoint::PeerConnection;
-use crate::message::{Abort, AbortReason, Applied, ApplyError, Begin, Data, Message, Outcome};
-use crate::staging::{Admitted, Staging};
+use crate::message::{
+    Abort, AbortReason, Applied, ApplyError, Begin, Commit, Data, MAX_REASON_LEN, Message, Outcome,
+};
+use crate::staging::{Admitted, StagedObject, Staging};
 use crate::stream::{InboundSender, InboundStream, StreamError};
 
 /// The most frames of one stream being staged at once. A stream whose
@@ -69,6 +80,36 @@ pub trait ExtentSink: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<ExtentRef, SinkError>> + Send;
 }
 
+/// Where `COMMIT`s are applied: the shard of each key, where the
+/// destination evaluates the precondition in its own log and publishes the
+/// object.
+pub trait CommitSink: Clone + Send + Sync + 'static {
+    /// Applies `commit` and returns its result for `APPLIED`. `staged` is
+    /// what this node holds staged for the commit's identity, if anything;
+    /// its bucket and key are the commit's.
+    ///
+    /// A commit is applied at most once: a sink that finds the commit's
+    /// write already applied, as after a lost `APPLIED`, answers with the
+    /// result it had.
+    fn apply(
+        &self,
+        commit: &Commit,
+        staged: Option<&StagedObject>,
+    ) -> impl Future<Output = Outcome> + Send;
+}
+
+/// A [`CommitSink`] that applies nothing: every `COMMIT` is answered
+/// `unavailable`, so the source retries. A [`StagingService`] uses it until
+/// [`StagingService::with_commits`] gives it a sink.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoCommits;
+
+impl CommitSink for NoCommits {
+    async fn apply(&self, _: &Commit, _: Option<&StagedObject>) -> Outcome {
+        unavailable("this destination does not apply COMMIT")
+    }
+}
+
 /// How a stream's appends report back: to the reporter, which answers the
 /// source, and to the stream's loop, which drops the `DATA` of staging an
 /// append got refused.
@@ -94,24 +135,27 @@ enum Event {
 }
 
 /// Serves the object streams of source clusters: stages their frames
-/// through an [`ExtentSink`] and keeps the index of what is staged in a
-/// [`Staging`] that every stream of the node shares. Cloning it gives
-/// another handle to the same service.
-pub struct StagingService<S> {
+/// through an [`ExtentSink`], keeps the index of what is staged in a
+/// [`Staging`] that every stream of the node shares, and applies `COMMIT`s
+/// through a [`CommitSink`]. Cloning it gives another handle to the same
+/// service.
+pub struct StagingService<S, C = NoCommits> {
     staging: Arc<Staging>,
     sink: S,
+    commits: C,
 }
 
-impl<S: Clone> Clone for StagingService<S> {
+impl<S: Clone, C: Clone> Clone for StagingService<S, C> {
     fn clone(&self) -> Self {
         Self {
             staging: Arc::clone(&self.staging),
             sink: self.sink.clone(),
+            commits: self.commits.clone(),
         }
     }
 }
 
-impl<S> fmt::Debug for StagingService<S> {
+impl<S, C> fmt::Debug for StagingService<S, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StagingService")
             .field("staging", &self.staging)
@@ -121,12 +165,29 @@ impl<S> fmt::Debug for StagingService<S> {
 
 impl<S: ExtentSink> StagingService<S> {
     /// A service that records staging in `staging` and stages frames
-    /// through `sink`.
+    /// through `sink`. It applies no `COMMIT` until
+    /// [`StagingService::with_commits`] gives it a sink.
     #[must_use]
     pub fn new(staging: Arc<Staging>, sink: S) -> Self {
-        Self { staging, sink }
+        Self {
+            staging,
+            sink,
+            commits: NoCommits,
+        }
     }
 
+    /// The service, applying `COMMIT`s through `commits`.
+    #[must_use]
+    pub fn with_commits<C: CommitSink>(self, commits: C) -> StagingService<S, C> {
+        StagingService {
+            staging: self.staging,
+            sink: self.sink,
+            commits,
+        }
+    }
+}
+
+impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     /// The staging the service keeps.
     #[must_use]
     pub fn staging(&self) -> &Arc<Staging> {
@@ -162,8 +223,13 @@ impl<S: ExtentSink> StagingService<S> {
     ///   staging is gone: the source gets an `ABORT` with the reason, and
     ///   the stream's later `DATA` is dropped until a new `BEGIN`.
     /// - `ABORT` discards the staging it names.
-    /// - `COMMIT` and `BATCH` items are answered `unavailable`: this
-    ///   destination does not apply them yet.
+    /// - `COMMIT` waits for the stream's frames in flight, so that the
+    ///   staging holds every frame sent before it, and is answered with the
+    ///   `APPLIED` of the [`CommitSink`]. A commit that commits consumes the
+    ///   staging, and so does one that is refused or whose bytes do not
+    ///   match: the source stages the object again.
+    /// - `BATCH` items are answered `unavailable`: this destination does
+    ///   not apply them yet.
     ///
     /// Frames in flight when the stream fails still settle into the
     /// staging, so the next `RESUME` reports them.
@@ -242,7 +308,23 @@ impl<S: ExtentSink> StagingService<S> {
                         current = None;
                     }
                 }
-                Message::Commit(commit) => stream.send(&not_applied(commit.identity)).await?,
+                Message::Commit(commit) => {
+                    drop(
+                        appends
+                            .acquire_many(MAX_APPENDS_PER_STREAM)
+                            .await
+                            .expect("the semaphore is never closed"),
+                    );
+                    let applied = self.commit(commit).await;
+                    if matches!(applied.outcome, Outcome::Committed { .. })
+                        && current
+                            .as_ref()
+                            .is_some_and(|b| b.identity == applied.identity)
+                    {
+                        current = None;
+                    }
+                    stream.send(&Message::Applied(applied)).await?;
+                }
                 Message::Batch(batch) => {
                     for item in batch.items {
                         stream.send(&not_applied(item.identity)).await?;
@@ -261,6 +343,39 @@ impl<S: ExtentSink> StagingService<S> {
         // The reporter ends once every append has reported.
         let _ = reporter.await;
         stream.finish().await
+    }
+
+    /// Applies `commit` to what is staged for its identity, and consumes the
+    /// staging once nothing more can come of it.
+    async fn commit(&self, commit: Commit) -> Applied {
+        let staged = self.staging.staged(&commit.identity);
+        let outcome = match &staged {
+            Some(staged) if staged.bucket != commit.bucket || staged.key != commit.key => {
+                Outcome::Failed {
+                    error: ApplyError::Refused,
+                    reason: "the identity is staged for another bucket or key".to_owned(),
+                }
+            }
+            staged => self.commits.apply(&commit, staged.as_ref()).await,
+        };
+        let (outcome, consumed) = match outcome {
+            Outcome::Failed { error, reason } => (
+                Outcome::Failed {
+                    error,
+                    reason: truncated(reason),
+                },
+                matches!(error, ApplyError::Refused | ApplyError::ChecksumMismatch),
+            ),
+            committed @ Outcome::Committed { .. } => (committed, true),
+            failed @ Outcome::PreconditionFailed { .. } => (failed, false),
+        };
+        if consumed {
+            self.staging.discard(&commit.identity);
+        }
+        Applied {
+            identity: commit.identity,
+            outcome,
+        }
     }
 
     /// Stages the parts of `data` that the staging of `begin` admitted,
@@ -352,19 +467,31 @@ async fn report(
 
 /// An `ABORT` from the destination.
 fn abort(identity: &WriteIdentity, reason: AbortReason, detail: &str) -> Message {
-    let mut detail = detail.to_owned();
-    if detail.len() > crate::message::MAX_REASON_LEN {
-        let mut end = crate::message::MAX_REASON_LEN;
-        while !detail.is_char_boundary(end) {
-            end -= 1;
-        }
-        detail.truncate(end);
-    }
     Message::Abort(Abort {
         identity: identity.clone(),
         reason,
-        detail,
+        detail: truncated(detail.to_owned()),
     })
+}
+
+/// `reason` cut to the [`MAX_REASON_LEN`] bytes a message carries.
+fn truncated(mut reason: String) -> String {
+    if reason.len() > MAX_REASON_LEN {
+        let mut end = MAX_REASON_LEN;
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+    }
+    reason
+}
+
+/// An `unavailable` result: the source retries.
+fn unavailable(reason: &str) -> Outcome {
+    Outcome::Failed {
+        error: ApplyError::Unavailable,
+        reason: reason.to_owned(),
+    }
 }
 
 /// Why the staging was discarded, for an `ABORT` that answers `DATA`.
@@ -379,13 +506,11 @@ fn discarded(reason: AbortReason) -> &'static str {
     }
 }
 
-/// The `APPLIED` of a `COMMIT` this destination does not apply yet.
+/// The `APPLIED` of a `BATCH` item, which this destination does not apply
+/// yet.
 fn not_applied(identity: WriteIdentity) -> Message {
     Message::Applied(Applied {
         identity,
-        outcome: Outcome::Failed {
-            error: ApplyError::Unavailable,
-            reason: "this destination does not apply COMMIT yet".to_owned(),
-        },
+        outcome: unavailable("this destination does not apply BATCH yet"),
     })
 }

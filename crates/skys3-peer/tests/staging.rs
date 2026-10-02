@@ -16,9 +16,10 @@ use bytes::Bytes;
 use common::*;
 use skys3_log::record::ExtentRef;
 use skys3_peer::{
-    AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges, Commit, Data, ExtentSink, Message,
-    MessageStream, Outcome, PeerEndpoint, PeerTrust, Precondition, Put, PutData, SinkError,
-    Staging, StagingLimits, StagingService, Write,
+    AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges, Commit, CommitSink, Data,
+    ExtentSink, MAX_REASON_LEN, Message, MessageStream, NoCommits, Outcome, PeerEndpoint,
+    PeerTrust, Precondition, Put, PutData, SinkError, StagedObject, Staging, StagingLimits,
+    StagingService, Write,
 };
 use skys3_types::{BucketName, ETag, Epoch, EpochSeq, Seq, WriteIdentity};
 
@@ -136,6 +137,11 @@ struct Setup {
 }
 
 fn setup(sink: TestSink, limits: StagingLimits) -> Setup {
+    setup_with(sink, limits, NoCommits)
+}
+
+/// [`setup`], applying `COMMIT`s through `commits`.
+fn setup_with(sink: TestSink, limits: StagingLimits, commits: impl CommitSink) -> Setup {
     let us = Cluster::new(US);
     let eu = Cluster::new(EU);
     let mut destination_trust = PeerTrust::new();
@@ -147,7 +153,7 @@ fn setup(sink: TestSink, limits: StagingLimits) -> Setup {
     eu.trusted(&mut source_trust, &[]);
     let destination = eu.endpoint("eu-1", destination_trust);
     let staging = Arc::new(Staging::new(limits));
-    let service = StagingService::new(Arc::clone(&staging), sink);
+    let service = StagingService::new(Arc::clone(&staging), sink).with_commits(commits);
     assert!(format!("{service:?}").contains("StagingService"));
     let accepting = destination.clone();
     tokio::spawn(async move {
@@ -452,5 +458,199 @@ async fn staging_that_cannot_continue_is_aborted() {
     assert!(setup.staging.is_empty());
     // Only the frames within the quota reached the sink.
     assert_eq!(sink.appended().len(), 1);
+    connection.close();
+}
+
+/// A commit's identity and what it found staged.
+type Seen = (WriteIdentity, Option<StagedObject>);
+
+/// Stands in for the shard primaries' side of `COMMIT`: records what each
+/// commit found staged, and answers with the outcome set for its identity,
+/// `committed` by default.
+#[derive(Debug, Clone, Default)]
+struct TestCommits {
+    outcomes: Arc<Mutex<BTreeMap<WriteIdentity, Outcome>>>,
+    seen: Arc<Mutex<Vec<Seen>>>,
+}
+
+impl TestCommits {
+    fn answer(&self, identity: &WriteIdentity, outcome: Outcome) {
+        self.outcomes
+            .lock()
+            .unwrap()
+            .insert(identity.clone(), outcome);
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl CommitSink for TestCommits {
+    async fn apply(&self, commit: &Commit, staged: Option<&StagedObject>) -> Outcome {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((commit.identity.clone(), staged.cloned()));
+        self.outcomes
+            .lock()
+            .unwrap()
+            .get(&commit.identity)
+            .cloned()
+            .unwrap_or(Outcome::Committed { etag: None })
+    }
+}
+
+fn staged_commit(identity: &WriteIdentity, key: &str, size: u64) -> Message {
+    Message::Commit(Commit {
+        identity: identity.clone(),
+        bucket: BucketName::new(DESTINATION_BUCKET).unwrap(),
+        key: key.to_owned(),
+        precondition: Precondition::Absent,
+        write: Write::Put(Put {
+            size,
+            etag: ETag::new("5d41402abc4b2a76b9719d911017c592").unwrap(),
+            last_modified_ms: 0,
+            metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksums: BTreeMap::new(),
+            data: PutData::Staged { piece: 1 },
+        }),
+    })
+}
+
+/// The `APPLIED` that answers the next message other than a `DURABLE`.
+async fn applied(stream: &mut MessageStream) -> Applied {
+    loop {
+        match stream.recv().bounded().await.unwrap() {
+            Some(Message::Durable(_)) => {}
+            Some(Message::Applied(applied)) => return applied,
+            other => panic!("expected APPLIED, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_commit_publishes_what_is_staged_and_consumes_it() {
+    let commits = TestCommits::default();
+    let setup = setup_with(TestSink::default(), LIMITS, commits.clone());
+    let (connection, mut stream) = setup.stream().await;
+    let len = 4 * FRAME;
+    let body = body(len);
+
+    // The COMMIT follows the frames at once, and still finds every one of
+    // them staged: the stream's appends settle first.
+    let id = identity(1);
+    stream.send(&begin(&id, "k")).bounded().await.unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    for at in (0..len).step_by(FRAME as usize) {
+        stream
+            .send(&frame(&body, 1, at..at + FRAME))
+            .bounded()
+            .await
+            .unwrap();
+    }
+    stream
+        .send(&staged_commit(&id, "k", len))
+        .bounded()
+        .await
+        .unwrap();
+    let answer = applied(&mut stream).await;
+    assert_eq!(answer.identity, id);
+    assert_eq!(answer.outcome, Outcome::Committed { etag: None });
+    let (seen, staged) = commits.seen().pop().unwrap();
+    assert_eq!(seen, id);
+    let staged = staged.unwrap();
+    assert_eq!(staged.extents(1, len).unwrap().len(), 4);
+    // Committed: the staging is consumed, the stream's later DATA for it is
+    // dropped, and a replay finds nothing staged.
+    assert!(setup.staging.staged(&id).is_none());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    stream
+        .send(&staged_commit(&id, "k", len))
+        .bounded()
+        .await
+        .unwrap();
+    let answer = applied(&mut stream).await;
+    assert_eq!(answer.outcome, Outcome::Committed { etag: None });
+    assert_eq!(commits.seen().pop().unwrap().1, None);
+
+    // A result that leaves the source something to do keeps the staging;
+    // one that makes it stage again discards it.
+    let id = identity(2);
+    stream.send(&begin(&id, "k")).bounded().await.unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    let failed = |error, reason: &str| Outcome::Failed {
+        error,
+        reason: reason.to_owned(),
+    };
+    let long = "é".repeat(MAX_REASON_LEN);
+    for (outcome, kept) in [
+        (
+            Outcome::PreconditionFailed {
+                current: Some(identity(1)),
+            },
+            true,
+        ),
+        (failed(ApplyError::Incomplete, "a gap"), true),
+        (failed(ApplyError::Unavailable, &long), true),
+        (failed(ApplyError::ChecksumMismatch, "bytes differ"), false),
+    ] {
+        commits.answer(&id, outcome.clone());
+        stream
+            .send(&staged_commit(&id, "k", len))
+            .bounded()
+            .await
+            .unwrap();
+        let answer = applied(&mut stream).await;
+        match (&answer.outcome, &outcome) {
+            (
+                Outcome::Failed { error, reason },
+                Outcome::Failed {
+                    error: wanted,
+                    reason: full,
+                },
+            ) => {
+                assert_eq!(error, wanted);
+                assert!(reason.len() <= MAX_REASON_LEN && full.starts_with(reason.as_str()));
+            }
+            _ => assert_eq!(answer.outcome, outcome),
+        }
+        assert_eq!(setup.staging.staged(&id).is_some(), kept, "{outcome:?}");
+    }
+
+    // A COMMIT for another key than its staging's is refused without
+    // applying it, and the staging is discarded.
+    let id = identity(3);
+    stream.send(&begin(&id, "a")).bounded().await.unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    let calls = commits.seen().len();
+    stream
+        .send(&staged_commit(&id, "b", len))
+        .bounded()
+        .await
+        .unwrap();
+    let answer = applied(&mut stream).await;
+    assert!(matches!(
+        answer.outcome,
+        Outcome::Failed {
+            error: ApplyError::Refused,
+            ..
+        }
+    ));
+    assert_eq!(commits.seen().len(), calls);
+    assert!(setup.staging.is_empty());
+
+    stream.finish().unwrap();
+    assert_eq!(stream.recv().bounded().await.unwrap(), None);
     connection.close();
 }
