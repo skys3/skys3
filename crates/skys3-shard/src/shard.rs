@@ -1367,8 +1367,10 @@ impl<D: Disk> Shard<D> {
         let log = &self.inner.log;
         let failed = |error: &dyn fmt::Display| ShardError::unavailable(shard, error);
         let (mut candidates, mut truncates) = (Vec::new(), Vec::new());
-        for segment in log.segments() {
-            let mut scanner = log.scan(segment.id).map_err(|e| failed(&e))?;
+        // Scanners taken at once: compaction may retire a segment while
+        // the scan reads the others, having copied its records into a
+        // segment created after them, which this scan does not see.
+        for mut scanner in log.scan_all().map_err(|e| failed(&e))? {
             while let Some(record) = scanner.next().await.map_err(|e| failed(&e))? {
                 let header = &record.header;
                 let seq = header.position.seq;
