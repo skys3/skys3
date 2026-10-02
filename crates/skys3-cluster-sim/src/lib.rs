@@ -27,7 +27,9 @@
 //!   and `DELETE`, each sent to the primary of its key's shard under the
 //!   static placement the harness writes to the control store (`shards/`
 //!   registers), or to any node, whose gateway routes it
-//!   ([`Workload::any_gateway`]).
+//!   ([`Workload::any_gateway`]). With [`ClusterConfig::create_buckets`],
+//!   a client first creates the buckets through the nodes' gateways, which
+//!   place their shards on the registered nodes (plan M3-04).
 //! - **Faults.** A [`FaultPlan`]: crashes with or without power loss,
 //!   partitions, held links (delay and reordering), random message loss,
 //!   failed syncs, control-store outages, control-store round trips of
@@ -84,6 +86,7 @@
 
 mod cluster;
 mod coordination;
+mod creation;
 mod faults;
 mod node;
 mod pki;

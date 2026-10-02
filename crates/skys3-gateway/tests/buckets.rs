@@ -5,10 +5,11 @@ mod common;
 use bytes::Bytes;
 use common::{config, setup, setup_with};
 use http::Method;
+use skys3_config::FailureDomain;
 use skys3_control::faults::Fault;
 use skys3_control::{ControlStore, Expected, PutOutcome, RegisterKey, TypedKey};
 use skys3_gateway::stub::EntryState;
-use skys3_gateway::{Gateway, IdSource, ShardError, ShardRef, Shards, TrustAll};
+use skys3_gateway::{Gateway, IdSource, ShardError, ShardPlacement, ShardRef, Shards, TrustAll};
 use skys3_types::{BucketMode, RegisterDocument};
 
 #[tokio::test]
@@ -707,4 +708,146 @@ async fn gateways_share_buckets_through_the_control_store() {
         .memory
         .put_if(&stray, Expected::Absent, Bytes::from_static(b"{}"));
     assert!(matches!(written.await.unwrap(), PutOutcome::Written(_)));
+}
+
+/// Registers node `node`, as it does when it starts, or marked
+/// `departing`, as the coordinator marks a node before forgetting it.
+async fn register_node(setup: &common::Setup, node: usize, departing: bool) {
+    let registration = skys3_types::NodeRegistration {
+        node_id: format!("node-{node}").parse().unwrap(),
+        address: format!("10.0.0.{node}:7400").parse().unwrap(),
+        zone: None,
+        rack: None,
+        disks: vec![skys3_types::DiskInfo {
+            disk_id: "nvme0".parse().unwrap(),
+            capacity_bytes: 1 << 40,
+        }],
+        departing,
+        proposal_id: format!("p-node-{node}").parse().unwrap(),
+    };
+    let key = TypedKey::node(&registration.node_id);
+    let value = Bytes::from(registration.to_json().unwrap());
+    let written = setup.memory.put_if(key.key(), Expected::Absent, value);
+    assert!(matches!(written.await.unwrap(), PutOutcome::Written(_)));
+}
+
+#[tokio::test]
+async fn a_cluster_places_new_buckets_on_its_registered_nodes() {
+    let mut config = config("");
+    config.placement = ShardPlacement::Cluster(FailureDomain::Node);
+    let setup = setup_with(config).await;
+
+    // Two nodes cannot hold three replicas apart.
+    register_node(&setup, 1, false).await;
+    register_node(&setup, 2, false).await;
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(400, Some("InvalidRequest"));
+    assert!(setup.register("photos").await.is_none());
+    // Nor can they with a third node that is departing.
+    register_node(&setup, 3, true).await;
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(400, Some("InvalidRequest"));
+
+    register_node(&setup, 4, false).await;
+    let before = setup.generation().await;
+    let bucket = setup.create_local("photos").await;
+    assert_eq!(setup.generation().await.get(), before.get() + 1);
+    for shard in ShardRef::all(&bucket) {
+        let key = TypedKey::shard(&shard.bucket, shard.shard);
+        let config = skys3_control::read(&setup.memory, &key)
+            .await
+            .unwrap()
+            .unwrap()
+            .value;
+        assert_eq!(config.members.len(), 3);
+        assert!(config.is_member(&config.primary));
+        assert!(!config.is_member(&"node-3".parse().unwrap()), "{config:?}");
+    }
+    // No shard is opened here: each node opens its own replicas once it
+    // learns of the bucket.
+    assert!(setup.shards.open_shards(&bucket.bucket_id).await.is_empty());
+    setup
+        .call(Method::HEAD, "/photos", &[], "")
+        .await
+        .assert(200, None);
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(409, Some("BucketAlreadyOwnedByYou"));
+
+    // A store that does not answer creates nothing.
+    setup
+        .store
+        .script(std::iter::repeat_n(Fault::Unavailable, 64));
+    setup
+        .create("videos", "local", None)
+        .await
+        .assert(503, Some("ServiceUnavailable"));
+}
+
+/// Waits, for at most ten seconds, until the generation passes `before`.
+async fn announced_after(setup: &common::Setup, before: u64) -> bool {
+    let wait = async {
+        while setup.generation().await.get() <= before {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn a_creation_whose_announcement_failed_is_announced_later() {
+    let mut config = config("");
+    config.placement = ShardPlacement::Cluster(FailureDomain::Node);
+    let setup = setup_with(config).await;
+    for node in 1..=3 {
+        register_node(&setup, node, false).await;
+    }
+    // The listing, the three registrations, the bucket register, and its
+    // eight shard registers pass; the generation increment, and settling
+    // it, do not.
+    let before = setup.generation().await.get();
+    setup.store.script(
+        std::iter::repeat_n(Fault::Pass, 13).chain(std::iter::repeat_n(Fault::Unavailable, 6)),
+    );
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(503, Some("ServiceUnavailable"));
+    assert!(setup.register("photos").await.is_some());
+    // The gateway keeps settling in the background: nodes hear of the
+    // bucket without another change.
+    assert!(
+        announced_after(&setup, before).await,
+        "the creation was never announced"
+    );
+    setup
+        .create("photos", "local", None)
+        .await
+        .assert(409, Some("BucketAlreadyOwnedByYou"));
+}
+
+#[tokio::test]
+async fn a_deletion_whose_announcement_failed_is_announced_later() {
+    let setup = setup("").await;
+    setup.create_local("photos").await;
+    let before = setup.generation().await.get();
+    // The read of the register and its delete pass; the generation
+    // increment does not.
+    setup.store.script(
+        std::iter::repeat_n(Fault::Pass, 2).chain(std::iter::repeat_n(Fault::Unavailable, 3)),
+    );
+    let deleted = setup.call(Method::DELETE, "/photos", &[], "").await;
+    assert_eq!(deleted.status, 204, "{deleted:?}");
+    assert!(setup.register("photos").await.is_none());
+    assert!(
+        announced_after(&setup, before).await,
+        "the deletion was never announced"
+    );
 }

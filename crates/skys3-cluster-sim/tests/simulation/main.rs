@@ -17,14 +17,18 @@
 //! - [`coordinator`]: the coordinator lease, with a node that wrongly
 //!   believes it is coordinator and with a coordinator cut off from the
 //!   control store, and pushes of every change.
-//! - [`registry`]: nodes that join with nothing but their credentials, and
-//!   a coordinator that forgets a silent node only once no shard names it.
 //! - [`removal`]: primaries removing a member that stops responding, in
 //!   both modes, without the control store, and across a restart.
 //! - [`routing`]: gateways on every node with stale shard maps, routing
 //!   each request to its primary under crashes and partitions.
+//! - [`registry`]: nodes that join with nothing but their credentials, and
+//!   a coordinator that forgets a silent node only once no shard names it.
+//! - [`buckets`]: buckets created through a gateway, with their shards
+//!   placed on the registered nodes, serving reads and writes through
+//!   every node.
 
 mod acks;
+mod buckets;
 mod coordinator;
 mod crash;
 mod harness;
