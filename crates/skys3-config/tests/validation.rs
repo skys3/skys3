@@ -430,6 +430,17 @@ fn peering_rules() {
         "[peering]\npeer_staging_quota_bytes = 1000",
         &["peering.peer_staging_quota_bytes"],
     );
+    // One staging and one frame, each charged at least 64 KiB.
+    assert_violations(
+        "[peering]\npeer_staging_quota_bytes = 327679",
+        &["peering.peer_staging_quota_bytes"],
+    );
+    load("[peering]\npeer_staging_quota_bytes = 327680").unwrap();
+    assert_violations(
+        "[peering]\npeer_frame_bytes = 1024\npeer_staging_quota_bytes = 131071",
+        &["peering.peer_staging_quota_bytes"],
+    );
+    load("[peering]\npeer_frame_bytes = 1024\npeer_staging_quota_bytes = 131072").unwrap();
     assert_violations(
         "[peering]\npeer_frame_bytes = 0",
         &["peering.peer_frame_bytes"],
