@@ -18,7 +18,7 @@ use skys3_net::{
     write_frame,
 };
 use skys3_types::{ClusterId, NodeAddress, NodeId};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 type Conn = Connection<TcpStream>;
@@ -561,13 +561,13 @@ async fn a_client_checks_which_node_it_reached() {
 async fn connection_failures_are_network_errors() {
     let ca = TestCa::new("ca");
     let client = Transport::new(TokioNetwork, &ca.credentials(&Leaf::node("n2")));
-    // A port that was just released refuses connections.
-    let addr = TcpListener::bind("127.0.0.1:0")
-        .bounded()
-        .await
-        .unwrap()
-        .local_addr()
-        .unwrap();
+    // A port bound without listening refuses connections. Holding the
+    // socket keeps the port from being handed to another listener, as a
+    // released port could be, which would accept the connection and leave
+    // the handshake hanging.
+    let refusing = TcpSocket::new_v4().unwrap();
+    refusing.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = refusing.local_addr().unwrap();
     let error = client
         .connect(&node_id("n1"), &address(addr))
         .bounded()
@@ -604,6 +604,7 @@ async fn connection_failures_are_network_errors() {
         .err()
         .unwrap();
     assert!(matches!(error, TransportError::Io(_)), "{error}");
+    drop(refusing);
 }
 
 #[tokio::test]
