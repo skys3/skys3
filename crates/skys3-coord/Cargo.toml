@@ -1,6 +1,6 @@
 [package]
 name = "skys3-coord"
-description = "SkyS3 coordinator: the coordinator lease, the change path that announces every control-store change with a new generation, pushes of new generations to every node, the node registry and lifecycle, the placement engine, bucket and shard creation, and the replacement of lost members."
+description = "SkyS3 coordinator: the coordinator lease, the change path that announces every control-store change with a new generation, pushes of new generations to every node, the node registry and lifecycle, the placement engine, bucket and shard creation, the replacement of lost members, and rebalancing."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

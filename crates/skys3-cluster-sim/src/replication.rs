@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, TypedKey};
+use skys3_coord::{Handoff, HandoffFuture, HandoffSink};
 use skys3_gateway::{
     ConditionFailed, LocalShards, Precondition, ShardError, ShardRef, ShardSummary, Shards,
     UploadParts,
@@ -165,6 +166,29 @@ pub(crate) struct Audit {
     /// The control store without faults, for the checks of the replicas
     /// against their registers.
     registers: Option<S3ControlStore<SimS3>>,
+    /// Each node's replication in its current life, for the handoffs a
+    /// coordinator asks for (plan M3-06).
+    replications: BTreeMap<NodeId, Replication<TurmoilNetwork, SimMount>>,
+    /// The handoffs coordinators asked for and primaries began: the shard,
+    /// the epoch the primary stepped down in, and when, in simulated time.
+    asked: Vec<(ShardRef, Epoch, Duration)>,
+    /// When a primary first served each epoch of each shard, in simulated
+    /// time, as sampled after every step.
+    serving: BTreeMap<(ShardRef, Epoch), Duration>,
+}
+
+/// A planned handoff a coordinator asked for (plan M3-06), and how long
+/// the shard took to serve again under its new primary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffTime {
+    /// The shard.
+    pub shard: ShardRef,
+    /// The epoch the old primary stepped down in.
+    pub epoch: Epoch,
+    /// When it began stepping down, in simulated time since the run began.
+    pub began: Duration,
+    /// How long until a primary served a later epoch, if one did.
+    pub took: Option<Duration>,
 }
 
 /// A node's replica of a shard in its current life, against the shard's
@@ -519,8 +543,142 @@ impl ReplicatedServices {
         }
     }
 
+    /// The configuration each shard's register holds now, for every shard
+    /// a node opened, read without faults.
+    #[must_use]
+    pub fn shard_registers(&self) -> BTreeMap<ShardRef, ShardConfig> {
+        let audit = self.audit();
+        let Some(store) = audit.registers.as_ref() else {
+            return BTreeMap::new();
+        };
+        audit
+            .replicas
+            .iter()
+            .map(|(_, _, replica)| gateway_ref(replica.shard()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|shard| register(store, &shard).map(|config| (shard, config)))
+            .collect()
+    }
+
+    /// What starts the handoffs a coordinator asks `node` for, on its
+    /// replicas in its current life (plan M3-06).
+    #[must_use]
+    pub fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
+        let replication = self.audit().replications.get(node)?.clone();
+        Some(Arc::new(AskedHandoffs {
+            node: node.clone(),
+            replication,
+            audit: Arc::clone(&self.audit),
+        }))
+    }
+
+    /// Records, at `now` in simulated time, which epochs of which shards a
+    /// primary serves, for [`ReplicatedServices::handoff_times`]. Call it
+    /// after every step, as an invariant does; it never fails.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn sample_serving(&self, now: Duration) -> Result<(), String> {
+        let mut audit = self.audit();
+        let serving: Vec<(ShardRef, Epoch)> = audit
+            .current
+            .iter()
+            .filter(|(_, replica)| {
+                replica.leader().is_some() && replica.is_serving() && !replica.is_stopped()
+            })
+            .map(|((_, shard), replica)| (shard.clone(), replica.config().epoch))
+            .collect();
+        for key in serving {
+            audit.serving.entry(key).or_insert(now);
+        }
+        Ok(())
+    }
+
+    /// The handoffs coordinators asked for and primaries began, in the
+    /// order they began, with how long each shard took to serve again, as
+    /// [`ReplicatedServices::sample_serving`] saw it.
+    #[must_use]
+    pub fn handoff_times(&self) -> Vec<HandoffTime> {
+        let audit = self.audit();
+        audit
+            .asked
+            .iter()
+            .map(|(shard, epoch, began)| {
+                let served = audit
+                    .serving
+                    .iter()
+                    .filter(|((of, served), at)| of == shard && served > epoch && *at >= began)
+                    .map(|(_, at)| *at)
+                    .min();
+                HandoffTime {
+                    shard: shard.clone(),
+                    epoch: *epoch,
+                    began: *began,
+                    took: served.map(|at| at - *began),
+                }
+            })
+            .collect()
+    }
+
     fn audit(&self) -> MutexGuard<'_, Audit> {
         lock(&self.audit)
+    }
+}
+
+/// Starts the handoffs a coordinator asks a node for (plan M3-06), as the
+/// node binary will: only on the node's serving primary of the shard, in
+/// the epoch the request names, to another member.
+struct AskedHandoffs {
+    node: NodeId,
+    replication: Replication<TurmoilNetwork, SimMount>,
+    audit: Arc<Mutex<Audit>>,
+}
+
+impl HandoffSink for AskedHandoffs {
+    fn hand_off(&self, handoff: Handoff) -> HandoffFuture<'_> {
+        Box::pin(async move {
+            let shard = skys3_log::ShardRef::new(handoff.bucket.clone(), handoff.shard);
+            let replica = self
+                .replication
+                .set()
+                .get(&shard)
+                .await
+                .ok_or_else(|| format!("shard {shard} is not open here"))?;
+            let config = replica.config();
+            if config.epoch != handoff.epoch {
+                return Err(format!(
+                    "the replica is in epoch {}, not {}",
+                    config.epoch, handoff.epoch
+                ));
+            }
+            if config.primary != self.node || !replica.is_serving() || replica.is_stopped() {
+                return Err("the replica is not the shard's serving primary".to_owned());
+            }
+            if handoff.to == self.node || !config.is_member(&handoff.to) {
+                return Err(format!("{} is not another member", handoff.to));
+            }
+            let at = turmoil::sim_elapsed().unwrap_or_default();
+            {
+                let mut audit = lock(&self.audit);
+                audit.handoffs.begun += 1;
+                audit.asked.push((gateway_ref(&shard), config.epoch, at));
+            }
+            let (replication, audit, to) = (
+                self.replication.clone(),
+                Arc::clone(&self.audit),
+                handoff.to,
+            );
+            tokio::spawn(async move {
+                match replication.hand_off(&shard, &to).await {
+                    Ok(handed) if handed.sent => lock(&audit).handoffs.sent += 1,
+                    Ok(_) => {}
+                    Err(error) => tracing::info!(%shard, %error, "an asked handoff failed"),
+                }
+            });
+            Ok(())
+        })
     }
 }
 
@@ -578,6 +736,10 @@ impl Audit {
 
 impl NodeServices for ReplicatedServices {
     type Shards = ReplicatedShards;
+
+    fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
+        ReplicatedServices::handoff_sink(self, node)
+    }
 
     /// Ready once every primary opened so far serves, and every member
     /// granted it a lease, unless it stopped for good, as a primary that
@@ -650,6 +812,9 @@ impl ReplicatedServices {
             .transport
             .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
             .await?;
+        self.audit()
+            .replications
+            .insert(env.node.clone(), replication.clone());
         if let Some(handoffs) = self.handoffs {
             let driver = HandoffDriver {
                 replication: replication.clone(),

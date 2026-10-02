@@ -1,6 +1,7 @@
 //! The node's endpoint for admin messages from other nodes (design §12):
-//! pushed generations ([`ControlChanged`]) on every node, and heartbeats
-//! ([`Heartbeat`]) on a node that may become coordinator.
+//! pushed generations ([`ControlChanged`]) on every node, heartbeats
+//! ([`Heartbeat`]) on a node that may become coordinator, and requests to
+//! hand a shard off ([`Handoff`]) on a node that leads shards.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,20 +11,23 @@ use skys3_net::{Connection, Listener, MessageKind, Network};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
+use crate::handoff::{Handoff, HandoffAck, HandoffSink};
 use crate::heartbeat::{Heartbeat, HeartbeatAck};
 use crate::lease::Leadership;
 use crate::push::{ControlChanged, ControlHints, PUSH_IDLE_TIMEOUT, PushError, reply};
 use crate::registry::NodeRegistry;
 
 /// Serves the admin messages a node receives from other nodes: records
-/// pushed generations in its [`ControlHints`] and, given a registry,
-/// answers heartbeats.
+/// pushed generations in its [`ControlHints`], answers heartbeats given a
+/// registry, and starts the handoffs it is asked for given a
+/// [`HandoffSink`].
 ///
-/// Clones share the hints and the registry.
+/// Clones share the hints, the registry, and the sink.
 #[derive(Clone)]
 pub struct AdminEndpoint {
     hints: ControlHints,
     heartbeats: Option<Heartbeats>,
+    handoffs: Option<Arc<dyn HandoffSink>>,
 }
 
 /// What answers heartbeats: the registry they are recorded in, and
@@ -40,6 +44,7 @@ impl std::fmt::Debug for AdminEndpoint {
         f.debug_struct("AdminEndpoint")
             .field("hints", &self.hints)
             .field("heartbeats", &self.heartbeats.is_some())
+            .field("handoffs", &self.handoffs.is_some())
             .finish()
     }
 }
@@ -51,7 +56,16 @@ impl AdminEndpoint {
         Self {
             hints,
             heartbeats: None,
+            handoffs: None,
         }
+    }
+
+    /// Also starts the planned handoffs it is asked for ([`Handoff`]),
+    /// through `sink`. Without one, it refuses them.
+    #[must_use]
+    pub fn with_handoffs(mut self, sink: Arc<dyn HandoffSink>) -> Self {
+        self.handoffs = Some(sink);
+        self
     }
 
     /// Also answers heartbeats, recording them in `registry` and telling
@@ -104,7 +118,8 @@ impl AdminEndpoint {
     /// [`PushError`] if the connection fails, stays idle for
     /// [`PUSH_IDLE_TIMEOUT`], or carries a malformed frame, a frame of a
     /// kind this endpoint does not serve, or a heartbeat from a peer that
-    /// is not a node.
+    /// is not a node. A handoff request it cannot serve is answered with a
+    /// refusal.
     pub async fn serve_connection<S>(&self, mut connection: Connection<S>) -> Result<(), PushError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -138,6 +153,20 @@ impl AdminEndpoint {
                             .borrow()
                             .is_coordinator_at(heartbeats.clock.now()),
                         unregistered: !heartbeats.registry.heard(node),
+                    };
+                    Some(ack.frame(request))
+                }
+                (MessageKind::Handoff, _) => {
+                    let handoff = Handoff::from_frame(&frame)?;
+                    let ack = match &self.handoffs {
+                        None => HandoffAck::refused("this node starts no handoffs"),
+                        Some(sink) => {
+                            tracing::info!(peer = %connection.peer(), ?handoff, "asked to hand a shard off");
+                            match sink.hand_off(handoff).await {
+                                Ok(()) => HandoffAck::started(),
+                                Err(reason) => HandoffAck::refused(reason),
+                            }
+                        }
                     };
                     Some(ack.frame(request))
                 }

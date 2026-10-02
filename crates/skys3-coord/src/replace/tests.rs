@@ -496,6 +496,22 @@ async fn a_member_on_a_node_that_has_not_registered_is_left_to_its_primary() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_learner_in_a_members_domain_counts_in_its_place() {
+    // Racks: node-0 and node-1 in rack 0, node-2 in rack 1, node-3 in
+    // rack 2. Rebalancing moves the shard from node-0 to node-1.
+    let store = store_with(4, Some(|n| n.saturating_sub(1))).await;
+    write_shard(&store, 0, &[2, 0, 3], &[1]).await;
+    let mut coordinator = Coordinator::new(FailureDomain::Rack, ReplacementConfig::default());
+    // The learner is kept, and nothing is added.
+    assert!(coordinator.round(&store).await.is_none());
+    // Once it is promoted, the member it replaces goes.
+    write_shard(&store, 0, &[2, 0, 3, 1], &[]).await;
+    coordinator.step(&store).await;
+    assert_eq!(shard_register(&store, 0).await.members, nodes(&[2, 3, 1]));
+    assert!(coordinator.round(&store).await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_removal_that_never_landed_does_not_hold_back_the_next() {
     let store = store(6).await;
     // Shard 0 is short and comes first; shard 1's departing member can go.

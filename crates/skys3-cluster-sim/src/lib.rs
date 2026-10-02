@@ -97,7 +97,7 @@ mod routing;
 mod s3;
 mod workload;
 
-pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View};
+pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View, WriteTiming};
 pub use coordination::{
     Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
 };
@@ -105,8 +105,8 @@ pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use learners::{DurabilityWindows, LearnerCounts};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{
-    HandoffCounts, IoCounts, LateWrites, LeaseCounts, ReplicaState, ReplicatedServices,
-    ReplicatedShards,
+    HandoffCounts, HandoffTime, IoCounts, LateWrites, LeaseCounts, ReplicaState,
+    ReplicatedServices, ReplicatedShards,
 };
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;

@@ -175,11 +175,17 @@ impl<D: Disk> ShardSet<D> {
             // stops, and the node opens again as a learner from its log. So
             // does a learner that a takeover left out and the coordinator
             // added again under the new primary, which a learner's replica
-            // cannot follow either.
+            // cannot follow either, and a learner dropped and added again
+            // under the same primary once members it never knew joined
+            // (as rebalancing and replacement both do, plan M3-06): a
+            // configuration change never makes an unknown node a member.
             let readmitted = node.is_some_and(|node| {
+                let unknown = |member: &NodeId| !held.is_member(member) && !held.is_learner(member);
                 config.epoch > held.epoch
                     && config.is_learner(node)
-                    && (!held.is_learner(node) || held.primary != config.primary)
+                    && (!held.is_learner(node)
+                        || held.primary != config.primary
+                        || config.members.iter().any(unknown))
             });
             if readmitted {
                 shard.abandon("the node is re-admitted as a learner").await;

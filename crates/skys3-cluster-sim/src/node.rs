@@ -25,6 +25,7 @@ use skys3::control::{self, NodeStore};
 use skys3::storage;
 use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
+use skys3_coord::HandoffSink;
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{Gateway, GatewayConfig, IdSource, LocalShards, ShardRef, Shards, TrustAll};
 use skys3_index::{Index, IndexConfig};
@@ -104,6 +105,14 @@ pub trait NodeServices: Clone + 'static {
     /// members up to date. The workload starts once they are.
     fn ready(&self) -> bool {
         true
+    }
+
+    /// What starts the planned handoffs a coordinator asks `node` for
+    /// (plan M3-06), in the life the services last started on it, if the
+    /// services replicate.
+    fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
+        let _ = node;
+        None
     }
 }
 

@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use ::http::{Method, Request, Response, StatusCode};
@@ -32,6 +32,7 @@ use skys3_gateway::ShardRef;
 use skys3_sim::history::{Call, Condition, History, Outcome, Pending};
 use skys3_types::{BucketDocument, NodeId, ShardConfig};
 
+use crate::cluster::WriteTiming;
 use crate::s3::{self, NoAnswer};
 
 /// The shape of the client workload.
@@ -73,11 +74,14 @@ impl Default for Workload {
 }
 
 /// Where the workload sends each key: the bucket documents, each shard's
-/// configuration, whose primary serves it, and every node.
+/// configuration, whose primary serves it, and the nodes clients know.
 #[derive(Clone, Debug)]
 pub(crate) struct Routes {
     pub buckets: Vec<BucketDocument>,
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
+    /// The nodes in the cluster from the start, which any-gateway clients
+    /// draw from: not those that join later
+    /// ([`ClusterConfig::joining`](crate::ClusterConfig::joining)).
     pub nodes: Vec<NodeId>,
 }
 
@@ -180,6 +184,30 @@ fn unexpected(what: &str, response: &Response<Bytes>) -> Box<dyn std::error::Err
     .into()
 }
 
+/// Where clients record how long their writes took. Clones share the
+/// record.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Timings(Arc<Mutex<Vec<WriteTiming>>>);
+
+impl Timings {
+    fn push(&self, timing: WriteTiming) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(timing);
+    }
+
+    /// Every write recorded so far, leaving none.
+    pub(crate) fn take(&self) -> Vec<WriteTiming> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// The simulated time since the run began.
+fn elapsed() -> Duration {
+    turmoil::sim_elapsed().unwrap_or_default()
+}
+
 /// One client of the workload.
 pub(crate) struct Client {
     pub process: String,
@@ -189,6 +217,8 @@ pub(crate) struct Client {
     pub rng: SmallRng,
     /// The last value this client saw for each key, for `If-Match`.
     seen: BTreeMap<String, String>,
+    /// Where the client records its writes' times, if anywhere.
+    timings: Option<Timings>,
 }
 
 impl Client {
@@ -206,6 +236,28 @@ impl Client {
             workload,
             rng: SmallRng::seed_from_u64(seed),
             seen: BTreeMap::new(),
+            timings: None,
+        }
+    }
+
+    /// The same client, recording how long each write takes in `timings`.
+    pub(crate) fn with_timings(mut self, timings: Timings) -> Self {
+        self.timings = Some(timings);
+        self
+    }
+
+    /// Records a write to `key` in `bucket` sent at `sent` that ended with
+    /// `outcome` now. A write that never connected is recorded too, as
+    /// unanswered: the history leaves it out, since it reached no node, but
+    /// the client waited for it all the same.
+    fn time(&self, bucket: &BucketDocument, key: &str, sent: Duration, outcome: &Outcome) {
+        if let Some(timings) = &self.timings {
+            timings.push(WriteTiming {
+                shard: ShardRef::for_key(bucket, key),
+                sent,
+                took: elapsed().saturating_sub(sent),
+                answered: matches!(outcome, Outcome::Done | Outcome::ConditionFailed),
+            });
         }
     }
 
@@ -350,7 +402,9 @@ impl Client {
             condition: condition.clone(),
         };
         let host = self.host(bucket, key);
+        let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
@@ -371,6 +425,7 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
+        self.time(bucket, key, sent, &outcome);
         self.history.answer(pending, outcome);
         Ok(())
     }
@@ -429,7 +484,9 @@ impl Client {
             value: value.clone(),
             condition: condition.clone(),
         };
+        let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
@@ -446,6 +503,7 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
+        self.time(bucket, key, sent, &outcome);
         self.history.answer(pending, outcome);
         Ok(())
     }
@@ -498,10 +556,12 @@ impl Client {
         let request = Request::delete(format!("/{}/{key}", bucket.name)).body(Full::default())?;
         let name = history_key(bucket, key);
         let host = self.host(bucket, key);
+        let sent = elapsed();
         let Some((pending, answer)) = self
             .send_recorded(&host, &name, Call::Delete, request)
             .await
         else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
@@ -512,6 +572,7 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
+        self.time(bucket, key, sent, &outcome);
         self.history.answer(pending, outcome);
         Ok(())
     }
@@ -532,6 +593,75 @@ impl Client {
             if !answered {
                 return Err(format!("the primary of {}/{key} never answered", bucket.name).into());
             }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_control::ProposalIds;
+    use skys3_types::{BucketId, BucketMode, BucketName, ShardCount};
+
+    use super::*;
+
+    /// A write whose connection never opens still counts against the
+    /// client's latency: it is timed, as unanswered, for the whole time
+    /// the client spent trying.
+    #[test]
+    fn writes_that_never_connect_are_timed_as_unanswered() -> turmoil::Result {
+        const TIMEOUT: Duration = Duration::from_secs(2);
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(Duration::from_secs(60))
+            .build();
+        // A node whose messages from the client are held, never delivered.
+        sim.host("node-0", || async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let timings = Timings::default();
+        let recorded = timings.clone();
+        sim.client("client", async move {
+            let bucket = BucketDocument {
+                bucket_id: BucketId::new("b-test")?,
+                name: BucketName::new("bucket-test")?,
+                mode: BucketMode::Local,
+                shards: ShardCount::new(1)?,
+                replicas: 1,
+                min_write_replicas: 1,
+                clean_copies: 1,
+                target: None,
+                created_unix_ms: 0,
+                proposal_id: ProposalIds::seeded(1).next_id(),
+            };
+            let routes = Routes {
+                buckets: vec![bucket.clone()],
+                placement: Arc::new(BTreeMap::new()),
+                nodes: vec![NodeId::new("node-0")?],
+            };
+            let workload = Workload {
+                timeout: TIMEOUT,
+                any_gateway: true,
+                ..Workload::default()
+            };
+            let mut client = Client::new("client".to_owned(), routes, History::new(), workload, 1)
+                .with_timings(timings);
+            turmoil::hold("client", "node-0");
+            client.put(&bucket, "key-0", 0, Condition::None).await?;
+            client
+                .multipart(&bucket, "key-0", 1, Condition::None)
+                .await?;
+            client.delete(&bucket, "key-0").await?;
+            Ok(())
+        });
+        sim.run()?;
+        let writes = recorded.take();
+        // The multipart upload never got as far as its completion, the
+        // only part of it that is a write.
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        for write in &writes {
+            assert!(!write.answered, "{write:?}");
+            assert!(write.took >= TIMEOUT, "{write:?}");
         }
         Ok(())
     }

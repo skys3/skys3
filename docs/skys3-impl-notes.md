@@ -3949,6 +3949,172 @@ of this file. A task with nothing unexpected keeps "None."
   - **Pushes to a dead node still take their timeout** per change (M3-02
     notes); batching makes it a cost per change, not per shard.
 
+### M3-06 Rebalancing
+
+- **The coordinator asks the primary with a `Handoff` admin message
+  (decided, design §6.7).** Only a primary can hand off (R1). M2-02 had
+  already reserved `MessageKind::Handoff` in the admin class, and M6-01's
+  peer protocol has nothing for it, so no new kind was needed. Its body
+  names the bucket, the shard, the epoch the coordinator read, and the
+  member; the answer (`HandoffAck`) says whether the handoff started. The
+  node starts it only on its serving primary in that epoch, to another
+  member, so a request from an older register or a former coordinator
+  does nothing. `AdminEndpoint::with_handoffs` serves it through a
+  `HandoffSink` (the extension point for the binary's replication), and
+  `HandoffClient` sends it. A proptest and the `coord_handoff` fuzz target
+  cover the decoder.
+- **Shares (decided).** Among live eligible nodes, members follow disk
+  capacity and primaries are split equally. A shard moves from `a` to `t`
+  while `(s_a − 1) / c_a ≥ (s_t + 1) / c_t`, which stops with every node
+  within one shard of the others at equal capacity and never moves a
+  shard back; a primary moves alone only from a node that leads two more.
+  A move whose source leads the shard moves the primary to the target
+  when that helps primary balance, so a new node mostly gets its
+  primaries without a primary being moved alone.
+- **Composition with replacement (decided).** `Rebalancing` is the
+  placement `Replacement` wraps, so it plans only in rounds where nothing
+  needs repair. It starts moves only in a settled cluster (no learner, no
+  surplus member, no outstanding handoff, no suspect node), one batch at a
+  time, counting each move as done when it plans the next, so a batch
+  never overshoots. The member that leaves is the one the move named, or
+  after a coordinator failover the one on the node furthest over its
+  share, so moves complete without state that must survive a failover.
+- **Moves within a domain fought replacement (found).** At the `rack`
+  level, a new node in a rack every shard already uses could only replace
+  the member in its own rack. Replacement counted the member first, so it
+  dropped the learner as co-located, and after a promotion it would have
+  removed the new member. `Census` now counts the later of two non-primary
+  nodes in one domain (a learner after the members), which is what a move
+  appends; the primary keeps its domain, so rebalancing moves a primary
+  only across domains. For a relabeled node this changes which of two
+  co-located members replacement removes, not how many count. Recorded in
+  §6.7.
+- **A re-added learner could not follow its shard (found).** In the
+  two-join scenario (seed 1), the second new node was suspect for a moment
+  after joining, so replacement swapped its learners for live nodes; those
+  were promoted, and rebalancing then added the new node again. Its
+  replica, still a learner of the older epoch under the same primary,
+  refused the new configuration ("a member joins only as a learner": a
+  member it never knew had joined), so it never caught up and the shard
+  kept a learner for the rest of the run. M3-05's fix reopened a learner
+  only when its primary changed; `ShardSet` now also reopens a learner
+  whose new configuration has members it never knew. A shard test covers
+  it.
+- **A departing primary, and primaries moved alone.** A primary that does
+  not count is handed off once the other members that count reach
+  `replicas`, which replacement brings about. A primary moved alone
+  leaves the shard short one member until replacement adds a learner,
+  since a handoff drops the old primary (M2-13); rebalancing moves one
+  only once no shard needs to move.
+- **Pace (decided).** `RebalanceConfig`: at most 4 moves per batch, a
+  handoff every 2 s at most across the cluster (one shard's writes wait
+  for a handoff at a time), and a handoff that did not land asked for
+  again after 10 s. Named `rebalance_max_moves`,
+  `rebalance_handoff_interval`, and `rebalance_handoff_retry` in §6.7;
+  like M3-05's pace, they get configuration keys when the binary runs the
+  coordinator.
+- **The harness grew joining nodes and write timing.**
+  `ClusterConfig::joining` holds the last nodes back, with empty disks
+  and no shards, until a `Fault::Join`. `Report::writes` times every
+  client write end to end, and `ReplicatedServices::handoff_times` times
+  each handoff the coordinator asked for, from the step-down until a
+  primary served the next epoch (`sample_serving`). The sim's handoff sink
+  (`NodeServices::handoff_sink`) checks epoch, role, and member, and runs
+  `Replication::hand_off`.
+- **A write can fail fast while its primary is behind the register
+  (found, left open).** In one seed a gateway learned a shard's new epoch
+  from the register before the primary followed it (the sim's 100 ms
+  register poll stands in for propagation, M2-08b). Every member answered
+  with an older epoch, the gateway had read the register within
+  `register_interval`, and it answered 503 after 20 ms. It is not a stall,
+  happens after every coordinator change (replacement's too), and
+  retrying an "is still in epoch" answer in the routing client, or pushes
+  to replicas, would remove it.
+- **Handoffs went to silent nodes (found in review).** `successor` took
+  the move's target whenever it was still a member that counts, even
+  once its node turned suspect, and its fallback only sorted live nodes
+  first, so with none live it still chose a suspect one. A handoff to a
+  node that does not answer stops a healthy primary and leaves the shard
+  to another member's `primary_grace`. A handoff now goes only to a
+  member on a live node, and none is asked for while no successor is
+  live: the primary keeps serving (§6.7).
+- **The latency check left out writes that never connected, which hid a
+  harness flaw (found in review).** A `PUT`, multipart completion, or
+  `DELETE` whose connection failed or timed out returned before it was
+  timed. Timed now, as unanswered, the two-join scenario failed: a write
+  waited 2.4 s, and others up to the client's whole 8 s timeout, outside
+  the moves as well. Every one was sent to a node that had not joined
+  yet: `Routes::nodes` listed every node, so any-gateway clients drew
+  nodes still down, the connection hanging until the client gave up or
+  the node started (and failed then). Nothing in rebalancing stalled.
+  Clients and the bucket creator now address only the nodes present
+  from the start, as `ClusterConfig::joining` already said; no write
+  then failed to connect, and the bound held unchanged.
+- **Writes on a write-back bucket wait up to 1 s per commit behind lazy
+  `FLUSHED` records (found in CI, left open).** CI's seed set (8 seeds of
+  each scenario) failed seed 3: a `PUT` on a shard no move touched (it
+  stayed at epoch 1 all run) took 2.011 s. Traced with timing prints:
+  its extent commit took 1.0 s, then its index record 1.0 s, with no
+  register read over 200 ms and no slow round trip. A replicated shard's
+  pipeline is ordered (M2-07): before it queues a record of the other
+  segment class it drains every record in flight. The flusher commits
+  `FLUSHED` (hot class) lazily (M1-16), and a lazy record becomes durable
+  only once another record starts a group commit or `LAZY_MAX_DELAY`
+  (1 s) passes. An extent (bulk class) queued after one therefore waits
+  out the full delay: the drain holds back the very record that would
+  have committed it. An index record queued behind such extents waits
+  again. Setting `LAZY_MAX_DELAY` to 300 ms made the same seed's slowest
+  write 388 ms, against 2.011 s, and the slowest write outside the moves
+  317 ms, against 1.017 s. So the ~1 s write latency seen throughout
+  these scenarios was this delay, not control-store faults on register
+  reads, as the notes said before. It contradicts the log's promise
+  that a lazy record delays others only while nothing else is written,
+  and it costs every replicated write-back bucket up to 2 s per `PUT`.
+  The fix belongs to the log and the shard pipeline, not to
+  rebalancing: for instance, a way to commit the waiting lazy records
+  now, called by the pipeline before a class-switch drain. Until then
+  the scenarios' bound for a write that meets no handoff is derived from
+  it: two `LAZY_MAX_DELAY` waits plus `ROUTING_SLACK` (2.8 s), checked to
+  stay below `member_suspect_after` (3 s), the shortest wait a write
+  held up by a membership change would see. Comparing with the run's
+  own writes outside the moves was considered and rejected: two waits in
+  one write are rare enough that a run's baseline often has none, as in
+  seed 3 (1.017 s).
+- **Numbers.** CI's seed set: 8 seeds of one node joining four, and 8
+  of two nodes joining one after the other (`SKYS3_SIM_SEEDS=256` over a
+  cost of 32), with two buckets of four shards and three members each,
+  one of them `write_back`, four clients writing through any of the
+  initial nodes' gateways, and the commit, R3, lease, and routing audits
+  after every step. Each new node ended with its share: 4 or 5 of 24
+  members and 1 or 2 of 8 primaries (4 members and 1 or 2 primaries
+  each with six nodes). A join took 4 moves (8 to 14 promotions for two
+  joins, a seed with replacement swapping learners as above);
+  promotions' compare-and-swaps took at most 60 ms. One or two handoffs
+  per run moved primaries, each serving again after 22 to 58 ms (about
+  30 ms on average). No shard had fewer than `replicas` members after
+  the review fixes; before them, once for 204 to 316 ms in one two-join
+  seed. With every write timed, including any that never connected,
+  writes in flight while shards moved and meeting no handoff took at
+  most 2.011 s (seed 3, two lazy-record waits on a shard no move
+  touched, above), otherwise at most 1.75 s, against up to 2.0 s before
+  and after the moves: the same lazy-record waits, not moves. Up to
+  three per run were unanswered, fast 503s (above). Writes meeting a
+  handoff took at most 27 ms, at most 10 ms after the review fixes, most
+  of them fast 503s. So the only stall moves cause is the handoff, tens
+  of milliseconds. (Measured before and after merging M6-04 and the
+  M3-05 removal-timer fixes, after the review fixes, and on CI's seed
+  set; ranges cover all runs.)
+- **Left for later.**
+  - **Configuration keys** for the pace, with the coordinator's wiring.
+  - **Rebalancing scans the shard registers itself**, a fourth listing per
+    round (M3-05 notes).
+  - **Primaries moved alone cost a short durability window.** Re-adding
+    the old primary as the learner, rather than letting placement choose,
+    would keep its verified log; the old primary is likely to be chosen
+    anyway, since it lost a shard.
+  - **A new node that is briefly suspect** gets its rebalancing learners
+    swapped by replacement. Nothing breaks, but the moves take longer.
+
 ## M6 Native peer transport
 
 ### M6-01 Peer protocol messages
