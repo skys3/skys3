@@ -2428,6 +2428,22 @@ of this file. A task with nothing unexpected keeps "None."
   filled up during a first full s3-tests run, and the node answered
   `503 SlowDown` (admission control's free-space reserve) to most of the
   later tests. The runs counted above were made with enough space.
+- **Test ports can be taken before the binary binds them.** In one full
+  workspace run the matrix's node exited at start; its log was lost, but
+  the likely cause is the tests' `free_port`, which binds port 0 and
+  drops the socket, so a test running in parallel can bind the port
+  before the binary does (also while a node is down between restarts),
+  and two calls could even return the same port. `Process::start` now
+  recognises an exit whose log says `Address already in use`, rewrites
+  the configuration's `[gateway]` and `[admin]` addresses with fresh
+  ports, and starts again, five times at most; any other early exit still
+  panics with the log. Callers read the addresses from the returned
+  `Process`. Readiness waits for the node's own `serving` line before
+  probing `/readyz`, with a deadline per probe, because until the node
+  holds the admin port another process may answer there, or accept and
+  never answer. `free_ports` holds its listeners until all are chosen, so
+  a gateway and an admin port never coincide. A test holds a configured
+  port and checks the node moves.
 
 ## M2 Replicated shards
 

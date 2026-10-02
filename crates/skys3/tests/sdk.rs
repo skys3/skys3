@@ -47,7 +47,7 @@ use skys3_sts::{OidcProvider, ProviderDocument};
 use skys3_types::policy::PolicyDocument;
 use skys3_types::{ProposalId, RoleDocument};
 use support::issuer::Issuer;
-use support::process::{Process, free_port};
+use support::process::{Process, fresh_addresses};
 use support::{ACCESS_KEY, SECRET_KEY, body, config_text, tls_file};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -97,8 +97,7 @@ impl Matrix {
         let dir = tempfile::tempdir().unwrap();
         let ca = dir.path().join("ca.pem");
         std::fs::copy(tls_file("ca.pem"), &ca).unwrap();
-        let gateway = format!("127.0.0.1:{}", free_port());
-        let admin = format!("127.0.0.1:{}", free_port());
+        let (gateway, admin) = fresh_addresses();
         let config = dir.path().join("skys3.toml");
         std::fs::write(&config, matrix_config(dir.path(), &gateway, &admin)).unwrap();
         let log = dir.path().join("node.log");
@@ -108,11 +107,12 @@ impl Matrix {
 
         // The first start creates the control store. The identity registers
         // go in while the node is down: the file store is read when opened.
-        let node = Process::start_with_env(&config, &gateway, &admin, &log, &env).await;
+        // Either start may move the node to other ports (`Process::start`).
+        let node = Process::start_with_env(&config, &log, &env).await;
         assert!(node.terminate().await.success());
         let issuer = Arc::new(Issuer::start().await);
         write_identity(&dir.path().join("data/control"), &issuer);
-        let node = Process::start_with_env(&config, &gateway, &admin, &log, &env).await;
+        let node = Process::start_with_env(&config, &log, &env).await;
 
         let token_dir = dir.path().join("web-identity");
         std::fs::create_dir(&token_dir).unwrap();
@@ -128,7 +128,7 @@ impl Matrix {
             }
         });
         Matrix {
-            endpoint: format!("https://{gateway}"),
+            endpoint: format!("https://{}", node.gateway),
             dir,
             node,
             token_file,

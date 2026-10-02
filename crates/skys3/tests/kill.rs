@@ -321,11 +321,11 @@ async fn kill_9_loops_lose_no_acknowledged_write() {
     let mut rng = SmallRng::seed_from_u64(seed);
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("node.log");
-    let (config, gateway, admin) = configure(dir.path());
+    let config = configure(dir.path());
     let history = History::new();
 
     for round in 0..rounds {
-        let node = Process::start(&config, &gateway, &admin, &log).await;
+        let node = Process::start(&config, &log).await;
         if round == 0 {
             node.s3()
                 .create_bucket()
@@ -361,7 +361,7 @@ async fn kill_9_loops_lose_no_acknowledged_write() {
     }
 
     // Recover once more and read every key back.
-    let node = Process::start(&config, &gateway, &admin, &log).await;
+    let node = Process::start(&config, &log).await;
     let mut verifier = Client::new("verifier".to_owned(), node.s3(), history.clone(), seed);
     let mut survivors = BTreeMap::new();
     for n in 0..KEYS {
