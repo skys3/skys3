@@ -402,16 +402,24 @@ impl Shared {
                         "only the hold conflict policy is implemented; conflicts are held");
                 }
             }
+            // Before the reconcile awaits: a bucket made since the last
+            // round may already have clean entries.
+            self.install_clean_copies(&buckets);
             self.flush.reconcile(&buckets, self.shards.set()).await;
-            if let Some(cache) = self.shards.set().cache() {
-                cache.set_clean_copies(
-                    buckets
-                        .iter()
-                        .map(|bucket| (bucket.bucket_id.clone(), bucket.clean_copies)),
-                );
-            }
             self.flush.refresh_metrics();
             tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+        }
+    }
+
+    /// Gives the clean cache each bucket's `clean_copies` (§9.3). The
+    /// cache keeps every copy of a bucket until it is told.
+    fn install_clean_copies(&self, buckets: &[BucketDocument]) {
+        if let Some(cache) = self.shards.set().cache() {
+            cache.set_clean_copies(
+                buckets
+                    .iter()
+                    .map(|bucket| (bucket.bucket_id.clone(), bucket.clean_copies)),
+            );
         }
     }
 
@@ -1060,6 +1068,9 @@ impl Node {
         background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(watch_space(space, watched, DISK_WATCH_INTERVAL));
         {
+            // The policies go in before the cache scans the replicas open
+            // already, so that the scans apply them at once.
+            shared.install_clean_copies(&shared.gateway.buckets());
             let set = storage.shards.set().clone();
             background.spawn(async move { cache.run(set).await });
         }

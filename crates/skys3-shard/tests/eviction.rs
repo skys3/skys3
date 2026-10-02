@@ -244,6 +244,7 @@ fn copies_are_ranked_by_the_configuration() {
         let mut config = replicated();
         config.primary = "node-3".parse().unwrap();
         let cache = cache(1000);
+        cache.set_clean_copies([(shard(0).bucket.clone(), 1)]);
         let set = set(&index, &log, &cache).await;
         // Node 1 is the first member after the primary: rank 1, and one
         // copy is kept, on the primary.
@@ -258,5 +259,35 @@ fn copies_are_ranked_by_the_configuration() {
             .unwrap();
         assert_eq!(entry.state, EntryState::Evicted);
         assert_eq!(entry.version, at(1));
+    });
+}
+
+#[test]
+fn a_member_opened_before_the_bucket_policy_keeps_its_copies() {
+    // A restarted node opens its replicas, and scans them, before it
+    // reads the buckets' `clean_copies`: the scan must not evict copies
+    // the policy keeps.
+    runtime().block_on(async {
+        let disk = SimDisk::new(2);
+        let log = open_log(disk.mount()).await;
+        let index =
+            Arc::new(Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap());
+        apply(&index, &record(at(1), put("a", 20, 1)));
+        apply(&index, &record(at(2), flushed("a", 1, false)));
+        let cache = cache(1000);
+        let set = set(&index, &log, &cache).await;
+        // Node 2 ranks 1, within two copies.
+        let node = "node-2".parse::<NodeId>().unwrap();
+        let replica = set.open_replica(&replicated(), &node).await.unwrap();
+        assert_eq!(cache.reclaim(&set).await, 0);
+        assert_eq!(cache.usage().bytes, 20);
+        cache.set_clean_copies([(shard(0).bucket.clone(), 2)]);
+        assert_eq!(cache.reclaim(&set).await, 0);
+        assert_eq!(state(&replica, "a").await.0, EntryState::Clean);
+        // The policy lowered to one copy evicts it.
+        cache.set_clean_copies([(shard(0).bucket.clone(), 1)]);
+        assert_eq!(cache.reclaim(&set).await, 1);
+        assert_eq!(state(&replica, "a").await.0, EntryState::Evicted);
+        assert_eq!(cache.usage().bytes, 0);
     });
 }
