@@ -1,18 +1,27 @@
 //! What every shard flusher of one remote target shares: the store, the
 //! preconditions it honors, and the settings.
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use skys3_config::FlushConfig;
 use skys3_io::{SystemWallClock, WallClock};
 use skys3_log::ShardRef;
+use skys3_remote::UploadId;
 use skys3_remote::probe::ConditionalWrites;
 use skys3_types::{ClusterId, EpochSeq, WriteIdentity};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::metrics::Counters;
+
+/// The most abandoned remote uploads a target keeps to abort; beyond it,
+/// they are left to the remote bucket's lifecycle rule (§7.3).
+const MAX_ORPHANS: usize = 4096;
+
+/// Remote multipart uploads left open, by remote key and upload ID.
+type Orphans = VecDeque<(String, UploadId)>;
 
 /// How far a namespace import has got (§9.1), as the flusher needs to know.
 ///
@@ -101,6 +110,8 @@ pub struct Target<S> {
     /// The in-flight budget, in KiB.
     inflight: Semaphore,
     inflight_kib: u32,
+    /// Remote multipart uploads that flushes left open, oldest first.
+    orphans: Mutex<Orphans>,
 }
 
 impl<S> fmt::Debug for Target<S> {
@@ -140,6 +151,7 @@ impl<S> Target<S> {
             counters: Counters::default(),
             inflight: Semaphore::new(inflight_kib as usize),
             inflight_kib,
+            orphans: Mutex::default(),
         }
     }
 
@@ -169,6 +181,35 @@ impl<S> Target<S> {
         &self.writes
     }
 
+    /// How many remote multipart uploads flushes left open, because their
+    /// abort failed or their flusher stopped mid-flight, wait to be
+    /// aborted (`Target::abort_orphaned_uploads`).
+    pub fn orphaned_uploads(&self) -> usize {
+        self.lock_orphans().len()
+    }
+
+    /// Keeps the open remote upload `upload_id` of the remote key `key` to
+    /// abort later.
+    pub(crate) fn orphan(&self, key: String, upload_id: UploadId) {
+        let mut orphans = self.lock_orphans();
+        if orphans.len() < MAX_ORPHANS {
+            orphans.push_back((key, upload_id));
+        } else {
+            tracing::warn!(key, %upload_id,
+                "a remote upload is left open for the bucket's lifecycle rule to abort");
+        }
+    }
+
+    /// Takes the oldest open remote upload kept to abort.
+    pub(crate) fn take_orphan(&self) -> Option<(String, UploadId)> {
+        self.lock_orphans().pop_front()
+    }
+
+    fn lock_orphans(&self) -> MutexGuard<'_, Orphans> {
+        // Every update is a single push or pop.
+        self.orphans.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The write identity of the record at `position` of `shard` (§7.2).
     pub(crate) fn identity(&self, shard: &ShardRef, position: EpochSeq) -> WriteIdentity {
         WriteIdentity::new(
@@ -186,5 +227,49 @@ impl<S> Target<S> {
             .unwrap_or(u32::MAX)
             .clamp(1, self.inflight_kib);
         self.inflight.acquire_many(kib).await.ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_remote::probe::{OperationSupport, PreconditionSupport};
+
+    use super::*;
+
+    fn target() -> Target<()> {
+        let honored = OperationSupport {
+            if_none_match: Some(PreconditionSupport::Honored),
+            if_match: PreconditionSupport::Honored,
+        };
+        let writes = ConditionalWrites {
+            put_object: honored,
+            complete_multipart_upload: honored,
+            delete_object: honored,
+        };
+        let cluster = ClusterId::new("c-test").unwrap();
+        Target::new(
+            Arc::new(()),
+            "p/",
+            writes,
+            cluster,
+            FlushSettings::default(),
+        )
+    }
+
+    #[test]
+    fn orphaned_uploads_are_kept_oldest_first_up_to_a_limit() {
+        let target = target();
+        assert_eq!(target.take_orphan(), None);
+        for n in 0..=MAX_ORPHANS {
+            target.orphan(format!("p/k{n}"), UploadId(format!("u{n}")));
+        }
+        // The one past the limit is left to the lifecycle rule.
+        assert_eq!(target.orphaned_uploads(), MAX_ORPHANS);
+        assert_eq!(
+            target.take_orphan(),
+            Some(("p/k0".to_owned(), UploadId("u0".to_owned())))
+        );
+        assert_eq!(target.orphaned_uploads(), MAX_ORPHANS - 1);
+        assert!(format!("{target:?}").contains("p/"));
     }
 }

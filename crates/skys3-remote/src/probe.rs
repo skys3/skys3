@@ -590,12 +590,7 @@ impl<S: ObjectStore> Run<'_, S> {
                 return Err((step, error));
             }
         };
-        let part = UploadPart {
-            key: key.to_owned(),
-            upload_id: upload_id.clone(),
-            part_number: 1,
-            body: BODY.into(),
-        };
+        let part = UploadPart::new(key, upload_id.clone(), 1, BODY);
         let result = match self.store.upload_part(part).await {
             Ok(etag) => {
                 let request = CompleteMultipartUpload {

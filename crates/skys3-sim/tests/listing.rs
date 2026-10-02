@@ -145,6 +145,7 @@ proptest! {
                     upload_id: upload_id.clone(),
                     part_number,
                     body,
+content_md5: None,
                 };
                 store.upload_part(request).await.unwrap();
             }
