@@ -44,6 +44,7 @@
 mod download;
 mod upload;
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::request::Parts;
@@ -60,6 +61,7 @@ use skys3_log::record::{MAX_METADATA_LEN, Metadata, Put, PutData};
 use skys3_types::checksum::ChecksumAlgorithm;
 use skys3_types::{BucketDocument, WriteIdentity};
 
+use crate::admission::Admission;
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, no_such_key, s3_etag};
@@ -217,6 +219,7 @@ pub(crate) struct Objects<H> {
     inline_max_bytes: usize,
     extent_bytes: usize,
     pool: Option<BlockingPool>,
+    admission: Arc<dyn Admission>,
 }
 
 impl<H: Shards> Objects<H> {
@@ -226,7 +229,17 @@ impl<H: Shards> Objects<H> {
             inline_max_bytes: usize::try_from(config.inline_max_bytes).unwrap_or(usize::MAX),
             extent_bytes: usize::try_from(config.extent_bytes).unwrap_or(usize::MAX),
             pool: config.hashing_pool.clone(),
+            admission: Arc::clone(&config.admission),
         }
+    }
+
+    /// Asks admission control whether a write that adds data to `shard`
+    /// may proceed (§7.6, §13).
+    fn admit(&self, bucket: &BucketDocument, shard: &ShardRef) -> S3Result<()> {
+        self.admission.admit(bucket, shard).map_err(|refusal| {
+            tracing::debug!(%shard, %refusal, "admission control refused a write");
+            S3Error::from(refusal)
+        })
     }
 
     pub(crate) async fn put(
@@ -262,6 +275,7 @@ impl<H: Shards> Objects<H> {
         let condition =
             Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         let shard = ShardRef::for_key(bucket, &input.key);
+        self.admit(bucket, &shard)?;
         if condition != Precondition::None {
             let entry = self
                 .shards

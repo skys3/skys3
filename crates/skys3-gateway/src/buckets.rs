@@ -31,7 +31,7 @@
 //! deletion, and answers `204` (design §4.1).
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::rngs::SmallRng;
@@ -46,6 +46,7 @@ use skys3_control::{
 use skys3_io::BlockingPool;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
+use crate::admission::{Admission, AdmitAll};
 use crate::authz::Permissions;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
@@ -93,6 +94,10 @@ pub struct GatewayConfig {
     /// (§9.4). [`GatewayConfig::new`] generates a key, so tokens are valid
     /// on this gateway until it restarts.
     pub list_token_keys: ListTokenKeys,
+    /// Admission control: whether a write that adds data may proceed
+    /// (§7.6, §13). [`GatewayConfig::new`] admits everything; the node
+    /// checks the dirty-data budgets and free disk space.
+    pub admission: Arc<dyn Admission>,
 }
 
 impl GatewayConfig {
@@ -112,6 +117,7 @@ impl GatewayConfig {
             extent_bytes: config.storage().extent_bytes,
             hashing_pool: None,
             list_token_keys: ListTokenKeys::generate(),
+            admission: Arc::new(AdmitAll),
         }
     }
 }
