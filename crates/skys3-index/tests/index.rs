@@ -9,12 +9,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_config::StorageConfig;
 use skys3_index::{
-    Applier, ControlEntry, Entry, EntryState, Index, IndexConfig, IndexError, IndexWriter, LogState,
+    Applier, ControlEntry, Entry, EntryState, ImportCheckpoint, Index, IndexConfig, IndexError,
+    IndexWriter, LogState,
 };
 use skys3_io::{SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_log::record::{Delete, RecordBody};
 use skys3_log::{LogRecord, RecordLocation, SegmentId};
-use skys3_types::{Epoch, EpochSeq, Generation, Seq};
+use skys3_types::{BucketId, Epoch, EpochSeq, Generation, Seq};
 use support::{
     TestApplier, Workload, apply, disk_label, disk_label_of, index_config, log_of, open_node,
     open_node_on, pool, runtime, shard,
@@ -126,7 +127,7 @@ fn rejects_an_index_of_another_format() {
         {
             let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
             let mut table = txn.open_table(meta).unwrap();
-            table.insert("format_version", 3).unwrap();
+            table.insert("format_version", 4).unwrap();
         }
         txn.commit().unwrap();
     }
@@ -135,8 +136,8 @@ fn rejects_an_index_of_another_format() {
         matches!(
             error,
             IndexError::UnsupportedFormat {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             }
         ),
         "{error}"
@@ -147,6 +148,47 @@ fn rejects_an_index_of_another_format() {
     )
     .unwrap_err();
     assert!(matches!(error, IndexError::Io(_)), "{error}");
+}
+
+#[test]
+fn import_checkpoints_are_durable_and_an_older_index_gets_their_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.redb");
+    // A version 2 index, from before the imports table.
+    {
+        let db = redb::Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
+            txn.open_table(meta)
+                .unwrap()
+                .insert("format_version", 2)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let bucket = BucketId::new("b-import").unwrap();
+    let running = ImportCheckpoint::Running {
+        after: Some("photos/cat.jpg".to_owned()),
+    };
+    {
+        let index = Index::open(&path, &IndexConfig::default()).unwrap();
+        assert_eq!(index.import_checkpoint(&bucket).unwrap(), None);
+        index
+            .set_import_checkpoint(&bucket, Some(&running))
+            .unwrap();
+    }
+    let index = Index::open(&path, &IndexConfig::default()).unwrap();
+    assert_eq!(index.import_checkpoint(&bucket).unwrap(), Some(running));
+    index
+        .set_import_checkpoint(&bucket, Some(&ImportCheckpoint::Done))
+        .unwrap();
+    assert_eq!(
+        index.import_checkpoint(&bucket).unwrap(),
+        Some(ImportCheckpoint::Done)
+    );
+    index.set_import_checkpoint(&bucket, None).unwrap();
+    assert_eq!(index.import_checkpoint(&bucket).unwrap(), None);
 }
 
 #[test]

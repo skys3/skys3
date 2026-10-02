@@ -64,7 +64,8 @@ use skys3_types::{BucketDocument, WriteIdentity};
 use crate::admission::Admission;
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
-use crate::conditions::{Precondition, ReadConditions, last_modified, no_such_key, s3_etag};
+use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
+use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
 pub(crate) use copy::copy_source;
@@ -209,6 +210,7 @@ macro_rules! describe {
 mod copy;
 mod delete;
 mod multipart;
+mod namespace;
 mod tagging;
 
 pub use multipart::{MAX_MULTIPART_OBJECT_BYTES, MIN_PART_BYTES, parse_upload_id, upload_id};
@@ -220,6 +222,7 @@ pub(crate) struct Objects<H> {
     extent_bytes: usize,
     pool: Option<BlockingPool>,
     admission: Arc<dyn Admission>,
+    remote: Option<Arc<dyn RemoteReads>>,
 }
 
 impl<H: Shards> Objects<H> {
@@ -230,6 +233,7 @@ impl<H: Shards> Objects<H> {
             extent_bytes: usize::try_from(config.extent_bytes).unwrap_or(usize::MAX),
             pool: config.hashing_pool.clone(),
             admission: Arc::clone(&config.admission),
+            remote: config.remote.clone(),
         }
     }
 
@@ -380,13 +384,17 @@ impl<H: Shards> Objects<H> {
                 input.part_number,
             )
             .await?;
-        let body = download::read(
-            &self.shards,
-            &found.shard,
-            &found.object.payload,
-            found.bytes.clone(),
-        )
-        .await?;
+        let body = if found.remote {
+            self.read_remote(bucket, &input.key, &found).await?
+        } else {
+            download::read(
+                &self.shards,
+                &found.shard,
+                &found.object.payload,
+                found.bytes.clone(),
+            )
+            .await?
+        };
         let mut output = GetObjectOutput {
             body: Some(body),
             ..GetObjectOutput::default()
@@ -433,57 +441,65 @@ impl<H: Shards> Objects<H> {
         part_number: Option<i32>,
     ) -> S3Result<Found> {
         let shard = ShardRef::for_key(bucket, key);
-        let object = self
-            .shards
-            .entry(&shard, key)
-            .await
-            .map_err(shard_error)?
-            .and_then(|entry| entry.object)
-            .ok_or_else(no_such_key)?;
-        conditions.check(&object)?;
-        let bytes = match (range, part_number) {
-            (Some(_), Some(_)) => {
-                return Err(s3_error!(
-                    InvalidRequest,
-                    "Cannot specify both Range header and partNumber query parameter"
-                ));
-            }
-            (Some(range), None) => {
-                let bytes = range.check(object.size).map_err(|_| {
-                    s3_error!(InvalidRange, "The requested range is not satisfiable")
-                })?;
-                return Ok(Found::range(shard, object, bytes, None));
-            }
-            (None, Some(number)) => {
-                if let Payload::Parts { parts, .. } = &object.payload {
-                    // A multipart object's parts are numbered in order from
-                    // 1, whatever numbers they were uploaded as.
-                    let index = usize::try_from(number)
-                        .ok()
-                        .and_then(|n| n.checked_sub(1))
-                        .filter(|&i| i < parts.len())
-                        .ok_or_else(invalid_part_number)?;
-                    let start: u64 = parts[..index].iter().map(|part| part.size).sum();
-                    let bytes = start..start + parts[index].size;
-                    let count = i32::try_from(parts.len()).ok();
-                    return Ok(Found::range(shard, object, bytes, count));
-                }
-                // An object stored by a single PUT has one part.
-                if number != 1 {
-                    return Err(invalid_part_number());
-                }
-                0..object.size
-            }
-            (None, None) => 0..object.size,
-        };
-        Ok(Found {
-            shard,
-            object,
-            bytes,
-            content_range: None,
-            parts_count: None,
-        })
+        let found = self.lookup(bucket, &shard, key).await?;
+        conditions.check(&found.object)?;
+        let mut selected = select(shard, found.object, range, part_number)?;
+        selected.remote = found.remote;
+        Ok(selected)
     }
+}
+
+/// Selects the bytes of `object` a read serves: a `Range`, a part, or the
+/// whole object.
+fn select(
+    shard: ShardRef,
+    object: ObjectVersion,
+    range: Option<Range>,
+    part_number: Option<i32>,
+) -> S3Result<Found> {
+    let bytes = match (range, part_number) {
+        (Some(_), Some(_)) => {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Cannot specify both Range header and partNumber query parameter"
+            ));
+        }
+        (Some(range), None) => {
+            let bytes = range
+                .check(object.size)
+                .map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
+            return Ok(Found::range(shard, object, bytes, None));
+        }
+        (None, Some(number)) => {
+            if let Payload::Parts { parts, .. } = &object.payload {
+                // A multipart object's parts are numbered in order from
+                // 1, whatever numbers they were uploaded as.
+                let index = usize::try_from(number)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .filter(|&i| i < parts.len())
+                    .ok_or_else(invalid_part_number)?;
+                let start: u64 = parts[..index].iter().map(|part| part.size).sum();
+                let bytes = start..start + parts[index].size;
+                let count = i32::try_from(parts.len()).ok();
+                return Ok(Found::range(shard, object, bytes, count));
+            }
+            // An object stored by a single PUT has one part.
+            if number != 1 {
+                return Err(invalid_part_number());
+            }
+            0..object.size
+        }
+        (None, None) => 0..object.size,
+    };
+    Ok(Found {
+        shard,
+        object,
+        bytes,
+        content_range: None,
+        parts_count: None,
+        remote: false,
+    })
 }
 
 /// A resolved read.
@@ -497,6 +513,9 @@ struct Found {
     /// The number of parts of a multipart object, for a read of one of
     /// them (`x-amz-mp-parts-count`).
     parts_count: Option<i32>,
+    /// Whether the object is only at the remote, which serves its bytes
+    /// (§9.1).
+    remote: bool,
 }
 
 impl Found {
@@ -516,6 +535,7 @@ impl Found {
             bytes,
             content_range,
             parts_count,
+            remote: false,
         }
     }
 }

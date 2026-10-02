@@ -26,7 +26,10 @@
 //!   remote multipart uploads still open are those whose
 //!   `CreateMultipartUpload` answer never reached the flusher: every other
 //!   upload was completed or aborted.
+//!
+//! The namespace import racing client writes is in `import_simulation`.
 
+mod import_simulation;
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +64,11 @@ type Outcome = Result<(), Box<dyn std::error::Error>>;
 #[test]
 fn flushes_reach_the_remote_through_faults() {
     Runner::new().run(scenario);
+}
+
+#[test]
+fn imports_never_resurrect_a_delete_or_overwrite_a_local_write() {
+    Runner::new().run(import_simulation::scenario);
 }
 
 fn scenario(context: &mut SimContext) -> Outcome {

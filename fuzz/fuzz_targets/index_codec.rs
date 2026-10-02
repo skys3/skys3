@@ -53,6 +53,10 @@ fn check(data: &[u8]) {
         let encoded = codec::encode_control(&control).expect("a decoded copy encodes");
         same(data, &encoded, &control, |b| codec::decode_control(b).ok());
     }
+    if let Ok(import) = codec::decode_import(data) {
+        let encoded = codec::encode_import(&import).expect("a decoded checkpoint encodes");
+        same(data, &encoded, &import, |b| codec::decode_import(b).ok());
+    }
     if let Ok(location) = codec::decode_location(data) {
         let encoded = codec::encode_location(&location);
         same(data, &encoded, &location, |b| codec::decode_location(b).ok());
