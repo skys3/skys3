@@ -62,6 +62,9 @@ struct Promotions {
     scripted: Mutex<VecDeque<Result<Replaced, ControlError>>>,
     /// How many promotions were proposed.
     proposed: Arc<Mutex<usize>>,
+    /// The epochs of each promotion's compare-and-swap: the one it
+    /// expects, and the one it writes.
+    epochs: Arc<Mutex<Vec<(Epoch, Epoch)>>>,
 }
 
 impl ShardRegisters for Promotions {
@@ -75,6 +78,7 @@ impl ShardRegisters for Promotions {
                 return self.registers.replace(current, next).await;
             }
             *lock(&self.proposed) += 1;
+            lock(&self.epochs).push((current.epoch, next.epoch));
             tokio::time::sleep(self.delay).await;
             let scripted = lock(&self.scripted).pop_front();
             match scripted {
@@ -222,6 +226,7 @@ async fn promotion() {
         delay: ms(600),
         scripted: Mutex::default(),
         proposed: Arc::clone(&proposed),
+        epochs: Arc::default(),
     };
     let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
@@ -297,6 +302,7 @@ async fn silence() {
         delay: Duration::ZERO,
         scripted: Mutex::default(),
         proposed: Arc::default(),
+        epochs: Arc::default(),
     };
     let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
@@ -350,6 +356,7 @@ async fn lost() {
         delay: ms(50),
         scripted: Mutex::new(scripted),
         proposed: Arc::clone(&proposed),
+        epochs: Arc::default(),
     };
     let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
@@ -385,6 +392,7 @@ async fn handoff() {
         delay: ms(20),
         scripted: Mutex::new((0..1000).map(|_| down()).collect()),
         proposed: Arc::default(),
+        epochs: Arc::default(),
     };
     let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
     nodes.replications[1].open(&two_members()).await.unwrap();
@@ -397,5 +405,93 @@ async fn handoff() {
     assert!(
         matches!(&refused, Err(ShardError::Unavailable { reason, .. }) if reason.contains("promotion")),
         "{refused:?}"
+    );
+}
+
+#[test]
+fn a_promotion_expects_the_configuration_it_was_built_from() {
+    run(overtaken());
+}
+
+/// The register moves on while the primary records its promotion: the
+/// proposal, built over epoch 2, must not be written over epoch 3.
+async fn overtaken() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    let (opened, gate) = watch::channel(false);
+    let epochs = Arc::default();
+    let promotions = Promotions {
+        registers: ControlRegisters::new(store.clone(), RetryPolicy::default()),
+        delay: Duration::ZERO,
+        scripted: Mutex::default(),
+        proposed: Arc::default(),
+        epochs: Arc::clone(&epochs),
+    };
+    let nodes = nodes(&pki, &store, &two_members(), promotions, gate).await;
+    nodes.replications[1].open(&two_members()).await.unwrap();
+    let primary = nodes.replications[0].open(&two_members()).await.unwrap();
+    let leader = Arc::clone(primary.leader().unwrap());
+    until(|| primary.is_serving()).await;
+    timed_put(&primary, "a").await;
+    let (added, _learner) = add_learner(&store, &nodes, &two_members()).await;
+    until(|| leader.acking() == [node(3)]).await;
+
+    // Hold the primary's index, so that recording the promotion waits.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (holding, hold) = std::sync::mpsc::channel();
+    let index = Arc::clone(primary.index());
+    let holder = std::thread::spawn(move || {
+        index
+            .update_control(|_| {
+                holding.send(()).unwrap();
+                let _ = held.recv();
+                Ok(())
+            })
+            .unwrap();
+    });
+    hold.recv().unwrap();
+    opened.send_replace(true);
+    until(|| leader.promoting().is_some()).await;
+
+    // Meanwhile the coordinator removes member 2, and the primary adopts
+    // that.
+    let removed = ShardConfig {
+        epoch: Epoch::new(3),
+        members: vec![node(1)],
+        proposal_id: ProposalId::new("removed").unwrap(),
+        ..added.clone()
+    };
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    assert_eq!(
+        registers.replace(&added, &removed).await.unwrap(),
+        Replaced::Accepted
+    );
+    let adopting = {
+        let (primary, removed) = (primary.clone(), removed.clone());
+        tokio::spawn(async move { primary.reconfigure(&removed).await })
+    };
+    until(|| primary.config() == removed).await;
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    adopting.await.unwrap().unwrap();
+
+    // The stale promotion is never written over the newer register, which
+    // would bring node 2 back; a new one, over epoch 3, may be.
+    let promoted = || async {
+        let now = register(&store).await;
+        now.epoch > Epoch::new(3) && now.is_member(&node(3))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !promoted().await {
+        assert!(Instant::now() < deadline, "no promotion over epoch 3");
+        tokio::time::sleep(ms(10)).await;
+    }
+    let now = register(&store).await;
+    assert_eq!(now.epoch, Epoch::new(4));
+    assert_eq!(now.members, [node(1), node(3)]);
+    let epochs = lock(&epochs).clone();
+    assert!(
+        epochs.iter().all(|(over, to)| over.get() + 1 == to.get()),
+        "{epochs:?}"
     );
 }
