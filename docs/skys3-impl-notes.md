@@ -3116,6 +3116,23 @@ of this file. A task with nothing unexpected keeps "None."
   grace later. Without that, the simulation found a member proposing over
   epoch `e` forever after the winner crashed. A loser the register no
   longer names stays stopped.
+- **A new primary's session restarts the grace.** A loser can learn of the
+  winner from the winner's session rather than from its own refused
+  compare-and-swap: the session arrives while it still waits out its
+  takeover delay, before it stopped granting. It adopted the winner's
+  configuration but granted nothing yet, so once the delay ended its
+  grace, still counted from the old primary's last grant, had passed,
+  and it proposed over the winner at once: a second takeover, epoch
+  `e+2`, milliseconds after the first. Leases kept that safe (it had
+  granted the winner nothing), but it deposed a live primary, against
+  §6.5's "if the winner stays silent for `primary_grace` too". The
+  loopback takeover test caught it under CPU load (about 4% of runs).
+  `Grace::resume_for` now counts a session from a primary the member
+  did not follow before as a grant, as a lost proposal already did
+  (`Grace::resume`), under the same lock, and still refuses a session no
+  newer than the epoch a stopped candidate proposes over. A session of
+  the same primary in a newer epoch (its removal of other members) does
+  not restart it, so a candidate still proposes over that at once.
 - **The proposal is not recorded (decided, design §6.3).** §6.3 asks a
   candidate to record its proposal before the compare-and-swap. A lost
   answer is retried while the candidate stays stopped, and after a restart
