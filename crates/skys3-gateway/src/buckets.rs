@@ -32,11 +32,14 @@
 //! finds the register announces it. A deletion of unknown outcome keeps its
 //! seals and is remembered; a retried DeleteBucket that finds the register
 //! gone, or naming a new bucket, drops the old shards, announces the
-//! deletion, and answers `204` (design §4.1).
+//! deletion, and answers `204` (design §4.1). A generation increment that
+//! fails is retried in the background until it succeeds, and so is the
+//! settling of a cluster creation whose write or increment got no answer
+//! (design §6.7): nodes refresh only when the generation moves.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -49,7 +52,7 @@ use skys3_control::{
     RegisterKind, RetryPolicy, TypedKey, Version, Versioned, bump_generation, propose_delete,
     propose_document, read, read_with_retries,
 };
-use skys3_coord::{Creation, CreationError, create_bucket};
+use skys3_coord::{Creation, CreationError, Pending, create_bucket, settle};
 use skys3_io::BlockingPool;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
@@ -224,6 +227,9 @@ impl IdSource {
 /// oldest is forgotten: its shards stay sealed until a restart, and startup
 /// recovery reclaims them if the register is gone.
 const MAX_PENDING_DELETIONS: usize = 256;
+
+/// The longest pause between two attempts at an announcement still owed.
+const OWED_MAX_PAUSE: Duration = Duration::from_secs(30);
 
 /// A DeleteBucket whose register delete may or may not have applied. Its
 /// seals are still held, so no write is acknowledged into a bucket that may
@@ -440,6 +446,14 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 "The cluster cannot place the bucket's shards: {unsatisfiable}"
             )),
             Err(CreationError::Control(error)) => Err(control_error(&error)),
+            Err(CreationError::Unsettled { pending, source }) => {
+                // The bucket may exist, but nodes may not hear of it until
+                // its writes are settled and announced: keep at it, and
+                // answer as for a write of unknown outcome. A retried
+                // CreateBucket finds the register and announces it.
+                self.settle_later(Some(*pending));
+                Err(control_error(&source))
+            }
             Err(error) => {
                 tracing::error!(%error, "a new bucket's registers are invalid");
                 Err(s3_error!(InternalError))
@@ -604,16 +618,53 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     }
 
     /// Increments the generation, which announces a bucket change to every
-    /// node. A failure is only logged: the next increment announces every
-    /// change before it (design §6.2).
+    /// node. An increment that fails is retried in the background until it
+    /// succeeds: nodes refresh their copies only when the generation moves
+    /// (design §6.2).
     async fn announce(&self) {
         let mut ids = lock(&self.ids).proposal_ids();
         let cluster = &self.config.cluster_id;
         if let Err(error) =
             bump_generation(&self.store, cluster, &mut ids, &self.config.retry).await
         {
-            tracing::warn!(%error, "a bucket change was not announced; the next change announces it");
+            tracing::warn!(%error, "a bucket change is not announced yet; retrying in the background");
+            self.settle_later(None);
         }
+    }
+
+    /// Settles `pending` in the background, or with `None` only increments
+    /// the generation, until it succeeds, pausing longer after each
+    /// failure (design §6.7). It ends with the process: a gateway that
+    /// restarts owes nothing it remembers, as after a crash between a
+    /// write and its announcement.
+    fn settle_later(&self, pending: Option<Pending>) {
+        let (store, cluster) = (self.store.clone(), self.config.cluster_id.clone());
+        let retry = self.config.retry;
+        let mut ids = lock(&self.ids).proposal_ids();
+        tokio::spawn(async move {
+            let mut pause = retry.max_backoff.max(Duration::from_millis(100));
+            loop {
+                tokio::time::sleep(pause).await;
+                let done = match &pending {
+                    Some(pending) => settle(&store, &cluster, pending, &mut ids, &retry)
+                        .await
+                        .map(drop),
+                    None => bump_generation(&store, &cluster, &mut ids, &retry)
+                        .await
+                        .map(drop),
+                };
+                match done {
+                    Ok(()) => {
+                        tracing::info!("announced a bucket change that was owed");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "a bucket change is still not announced");
+                    }
+                }
+                pause = (pause * 2).min(OWED_MAX_PAUSE);
+            }
+        });
     }
 
     async fn unseal(&self, shards: &[ShardRef]) {
