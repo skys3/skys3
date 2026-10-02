@@ -255,16 +255,47 @@ impl MessageStream {
 /// reaches the caller.
 #[derive(Debug)]
 pub struct InboundStream {
-    stream: MessageStream,
+    receiver: MessageReceiver,
+    sender: InboundSender,
     peer: ClusterId,
     trust: Arc<PeerTrust>,
     begun: bool,
 }
 
+/// The sending half of an [`InboundStream`], which tasks share: a
+/// destination answers `DURABLE`s as appends finish while it goes on
+/// receiving `DATA`. Each message is written whole before the next one
+/// starts. Cloning it gives another handle to the same half.
+#[derive(Debug, Clone)]
+pub struct InboundSender(Arc<tokio::sync::Mutex<MessageSender>>);
+
+impl InboundSender {
+    /// Sends `message`; see [`MessageSender::send`].
+    ///
+    /// # Errors
+    ///
+    /// As [`MessageSender::send`].
+    pub async fn send(&self, message: &Message) -> Result<(), StreamError> {
+        self.0.lock().await.send(message).await
+    }
+
+    /// Ends the stream in this direction once every message sent is
+    /// delivered; see [`MessageSender::finish`].
+    ///
+    /// # Errors
+    ///
+    /// As [`MessageSender::finish`].
+    pub async fn finish(&self) -> Result<(), StreamError> {
+        self.0.lock().await.finish()
+    }
+}
+
 impl InboundStream {
     pub(crate) fn new(stream: MessageStream, peer: ClusterId, trust: Arc<PeerTrust>) -> Self {
+        let (sender, receiver) = stream.split();
         Self {
-            stream,
+            receiver,
+            sender: InboundSender(Arc::new(tokio::sync::Mutex::new(sender))),
             peer,
             trust,
             begun: false,
@@ -289,7 +320,7 @@ impl InboundStream {
     /// still be read; [`StreamError::DataWithoutBegin`]; and the errors of
     /// [`MessageReceiver::recv`].
     pub async fn recv(&mut self) -> Result<Option<Message>, StreamError> {
-        let Some(message) = self.stream.recv().await? else {
+        let Some(message) = self.receiver.recv().await? else {
             return Ok(None);
         };
         let refusal = match &message {
@@ -298,7 +329,7 @@ impl InboundStream {
             Message::Abort(abort) => self.check(&abort.identity, None),
             Message::Batch(batch) => return self.authorize_batch(batch).await,
             Message::Data(_) if !self.begun => {
-                self.stream.receiver.stop(STREAM_REFUSED);
+                self.receiver.stop(STREAM_REFUSED);
                 return Err(StreamError::DataWithoutBegin);
             }
             _ => Ok(()),
@@ -318,8 +349,8 @@ impl InboundStream {
     /// # Errors
     ///
     /// As [`MessageSender::send`].
-    pub async fn send(&mut self, message: &Message) -> Result<(), StreamError> {
-        self.stream.send(message).await
+    pub async fn send(&self, message: &Message) -> Result<(), StreamError> {
+        self.sender.send(message).await
     }
 
     /// Ends the stream in this direction; see [`MessageSender::finish`].
@@ -327,8 +358,15 @@ impl InboundStream {
     /// # Errors
     ///
     /// As [`MessageSender::finish`].
-    pub fn finish(&mut self) -> Result<(), StreamError> {
-        self.stream.finish()
+    pub async fn finish(&self) -> Result<(), StreamError> {
+        self.sender.finish().await
+    }
+
+    /// Another handle to the sending half, for a task that answers while
+    /// this one receives.
+    #[must_use]
+    pub fn sender(&self) -> InboundSender {
+        self.sender.clone()
     }
 
     /// The peer cluster the stream belongs to.
@@ -364,8 +402,8 @@ impl InboundStream {
                     detail,
                 }))
                 .await?;
-                self.stream.finish()?;
-                self.stream.receiver.stop(STREAM_REFUSED);
+                self.sender.finish().await?;
+                self.receiver.stop(STREAM_REFUSED);
             }
             Message::Abort(abort) => {
                 self.send(&Message::Abort(Abort {

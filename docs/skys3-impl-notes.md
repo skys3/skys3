@@ -3627,3 +3627,64 @@ of this file. A task with nothing unexpected keeps "None."
   `AsyncUdpSocket` adapter for turmoil's UDP. That belongs to M6-08 (peer
   protocol simulation). This PR tests over loopback, with every network
   wait bounded at 30 s.
+
+### M6-03 Destination staging, DURABLE, and RESUME
+
+- **The staging index lives on the accepting node, not the primary.**
+  The plan has the primary stage frames and acknowledge durable ranges.
+  The primary does append each frame, as an `EXTENT` record of the key
+  through the shard's normal commit path, and answers only once every
+  member holds it. But the index of what is staged (identity, pieces,
+  durable ranges, extent positions) stays on the node that accepted the
+  stream, which reports `DURABLE` and `RESUME`. Kept on the primary, it
+  would be lost at every primary change (failure, planned handoff, and
+  M3's rebalancing), and the relay would need new forwarding requests.
+  On the accepting node it survives primary changes, because a reported
+  extent is committed and a new primary keeps every committed record
+  (§6.6); and the relay is M2-08's existing `AppendExtent` request
+  (`PeerExtents` over the gateway's `Shards`). The cost: a source that
+  reconnects to a different destination node, or outlives the node,
+  restages the object. Recorded in §7.8.
+- **Compaction would have dropped staged extents.** §10.3 drops
+  `EXTENT` records that no entry references, and a staged extent is
+  unreferenced until its `COMMIT`. §10.3 now keeps them until their
+  segment is older than `peer_staging_ttl_seconds`. Compaction is not
+  implemented yet, so nothing changes in code.
+- **A resent frame can overlap what is held.** After a reconnect the
+  source may frame the missing ranges differently, and frames still in
+  flight from the old connection may land after their bytes are resent.
+  Staged extents must not overlap, or a `COMMIT`'s `PUT` could not list
+  them. The destination stages only the parts of a frame that are
+  neither durable nor in flight, so a frame can become several extents,
+  or none. A piece is capped at `MAX_EXTENTS` extents, the most a `PUT`
+  references; past it the staging is refused.
+- **An inbound stream could not answer while it received.**
+  `InboundStream::recv` is not cancel-safe (a frame is read in several
+  steps), so a loop cannot `select!` between it and finished appends,
+  and `DURABLE`s would wait for the source's next frame. The sending
+  half is now shared (`InboundSender`), so a reporter task sends
+  `DURABLE`s while the stream's loop receives; `InboundStream::finish`
+  became `async`, and two M6-02 tests changed with it.
+- **Quota and TTL had no scope.** The quota counts bytes staged or in
+  flight per source cluster on each destination node; a node cannot see
+  the others' staging. The TTL runs from the staging's last `BEGIN` or
+  `DATA`, not its creation, so a multipart upload that takes days keeps
+  its staging while its parts arrive. Expiry is checked lazily, at most
+  once a minute, as staging is used.
+- **How it is tested.** Quinn under turmoil still needs M6-08's UDP
+  adapter, so the reconnect scenario runs twice below the simulation
+  harness. A proptest drives the staging table as a source with random
+  frame sizes, failed appends, appends still in flight across a
+  reconnect, and several reconnects. It checks that each `RESUME` reports
+  exactly what is durable, that the source resends only the rest, that
+  no byte is staged twice, and that the piece's extents assemble to its
+  body. With trimming against in-flight ranges removed, it fails. A
+  loopback QUIC test then drops a connection with two frames not
+  acknowledged, and checks that the source resends exactly those two
+  frames. `PeerExtents` is tested over real shards on a simulated disk.
+  Every network wait is bounded at 30 s.
+- **`COMMIT` and `BATCH` are answered `unavailable`.** Until M6-04 they
+  get `APPLIED` with `unavailable`, so a source retries.
+  `Staging::staged` and `StagedObject::extents` are the extension point:
+  the extents a `PUT` references for a piece, or `None` if the piece is
+  incomplete. Nothing is wired into the binary yet.

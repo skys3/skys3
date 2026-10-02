@@ -10,8 +10,8 @@
 //!
 //! A source cluster's flusher sends objects to a destination cluster over
 //! QUIC. This crate holds the protocol's vocabulary, as pure functions,
-//! and the QUIC endpoint and connection pool that carry it; staging and
-//! the flusher are built on them (plan M6-03 to M6-07).
+//! the QUIC endpoint and connection pool that carry it, and the
+//! destination's staging; the flusher is built on them.
 //!
 //! ```text
 //! source                                           destination
@@ -60,6 +60,14 @@
 //! - **Pool** ([`ConnectionPool`]): the connections of every shard a node
 //!   hosts, pooled per destination, with a count that adapts like REST
 //!   flush concurrency ([`AdaptiveLimit`]).
+//! - **Staging** ([`StagingService`], [`Staging`]): the destination's end
+//!   of object streams. Each frame is relayed to the primary of its key's
+//!   shard, which stages it as an `EXTENT` record on every member of the
+//!   shard through an [`ExtentSink`]; the node that accepted the stream
+//!   keeps the index of what is staged, bounded by
+//!   `peer_staging_quota_bytes` and `peer_staging_ttl_seconds`, answers
+//!   each `BEGIN` with a `RESUME`, and reports durable ranges with
+//!   cumulative `DURABLE`s.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -97,6 +105,7 @@
 //! # }
 //! ```
 
+mod destination;
 mod endpoint;
 mod error;
 mod frame;
@@ -104,11 +113,13 @@ mod message;
 mod negotiation;
 mod pool;
 mod ranges;
+mod staging;
 mod stream;
 mod tls;
 mod trust;
 mod wire;
 
+pub use destination::{ExtentSink, MAX_APPENDS_PER_STREAM, SinkError, StagingService};
 pub use endpoint::{
     ConnectError, Destination, EndpointSettings, IDLE_TIMEOUT, INITIAL_WINDOW, Incoming,
     KEEP_ALIVE_INTERVAL, MAX_STREAMS_PER_CONNECTION, PeerConnection, PeerEndpoint, WINDOW_INTERVAL,
@@ -131,8 +142,10 @@ pub use pool::{
     PoolStats, Sample, ShardLease,
 };
 pub use ranges::ByteRanges;
+pub use staging::{SWEEP_INTERVAL, StagedObject, Staging, StagingLimits};
 pub use stream::{
-    InboundStream, MessageReceiver, MessageSender, MessageStream, STREAM_REFUSED, StreamError,
+    InboundSender, InboundStream, MessageReceiver, MessageSender, MessageStream, STREAM_REFUSED,
+    StreamError,
 };
 pub use tls::{ALPN, PeerTls};
 pub use trust::{PeerTrust, TrustError, Unauthorized};
