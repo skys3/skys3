@@ -261,8 +261,10 @@ async fn race(
         let (node, filler, key) = (Arc::clone(node), filler.clone(), key.to_owned());
         tokio::spawn(async move { read(&node, &filler, &key).await })
     };
+    // Sleep rather than yield, so that the paused clock can advance: the
+    // reader may have joined a fill whose request is waiting on a timer.
     while store.stats().requests == requests && !reader.is_finished() {
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
     let seq = node.put(key, &format!("{key} local {op}")).await;
     world.local.insert(key.to_owned(), seq);
