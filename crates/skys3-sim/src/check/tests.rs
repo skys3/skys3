@@ -116,7 +116,7 @@ fn unanswered_writes_may_apply_late_or_never() {
 }
 
 #[test]
-fn failed_writes_never_apply_after_their_answer() {
+fn failed_writes_never_apply_over_a_later_write() {
     // Seen before its failure was answered: fine.
     let history = Builder::new()
         .put("a", (1, Some(4)), Outcome::Failed)
@@ -127,11 +127,43 @@ fn failed_writes_never_apply_after_their_answer() {
         .put("a", (1, Some(2)), Outcome::Failed)
         .get(None, (3, Some(4)));
     assert!(history.linearizable());
-    // Resurfacing over a later acknowledged write breaks §5.2.
+    // Committed after its failure was answered, with no later write: fine,
+    // also after a read that missed it.
+    let history = Builder::new()
+        .put("a", (1, Some(2)), Outcome::Failed)
+        .get(None, (3, Some(4)))
+        .get(Some("a"), (5, Some(6)));
+    assert!(history.linearizable());
+    // Resurfacing over a later acknowledged write breaks §5.2, a PUT or a
+    // DELETE.
     let history = Builder::new()
         .put("a", (1, Some(2)), Outcome::Failed)
         .put("b", (3, Some(4)), Outcome::Done)
         .get(Some("a"), (5, Some(6)));
+    assert!(!history.linearizable());
+    let history = Builder::new()
+        .put("a", (1, Some(2)), Outcome::Failed)
+        .op("k", Call::Delete, (3, Some(4)), Outcome::Done)
+        .get(Some("a"), (5, Some(6)));
+    assert!(!history.linearizable());
+    // A conditional write refused on a read may miss it too.
+    let history = Builder::new()
+        .put("b", (1, Some(2)), Outcome::Done)
+        .op("k", Call::Delete, (3, Some(4)), Outcome::Failed)
+        .put_if(
+            "c",
+            Condition::IfAbsent,
+            (5, Some(6)),
+            Outcome::ConditionFailed,
+        )
+        .get(None, (7, Some(8)));
+    assert!(history.linearizable());
+    // So does resurfacing over a later failed write seen to take effect.
+    let history = Builder::new()
+        .put("a", (1, Some(2)), Outcome::Failed)
+        .put("b", (3, Some(4)), Outcome::Failed)
+        .get(Some("b"), (5, Some(6)))
+        .get(Some("a"), (7, Some(8)));
     assert!(!history.linearizable());
     // Failed and unanswered reads constrain nothing.
     let history = Builder::new()

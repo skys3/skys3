@@ -645,6 +645,13 @@ pub(crate) fn shard_error(error: ShardError) -> S3Error {
             tracing::error!(%error, "a shard refused a record");
             s3_error!(InternalError)
         }
+        ShardError::NotAcknowledged { .. } => {
+            tracing::warn!(%error, "a shard did not acknowledge a write in time");
+            s3_error!(
+                SlowDown,
+                "The write was not acknowledged in time and may still take effect; retry later"
+            )
+        }
         other => {
             tracing::warn!(error = %other, "a shard request failed");
             s3_error!(
@@ -758,6 +765,13 @@ mod tests {
         };
         let sealed = shard_error(ShardError::Sealed(shard.clone()));
         assert_eq!(*sealed.code(), S3ErrorCode::OperationAborted);
+        let late = shard_error(ShardError::NotAcknowledged {
+            shard: shard.clone(),
+            position: None,
+            reason: "a member is late".into(),
+        });
+        assert_eq!(*late.code(), S3ErrorCode::SlowDown);
+        assert_eq!(late.code().status_code().map(|s| s.as_u16()), Some(503));
         let missing = shard_error(ShardError::NotFound(shard));
         assert_eq!(*missing.code(), S3ErrorCode::ServiceUnavailable);
     }

@@ -1,6 +1,7 @@
 //! Node services that replicate every shard to the members of its static
 //! placement (plan M2-07), with the audits the replication scenarios check:
-//! commits (M2-07) and reads under leases (M2-09).
+//! commits (M2-07) and reads under leases (M2-09). Writes wait for the
+//! members at most the configured acknowledgement timeout (M2-10).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -46,8 +47,15 @@ pub struct ReplicatedServices {
     config: ReplicationConfig,
     /// A seeded bug: primaries commit alone.
     alone: bool,
+    /// A seeded bug: writes that were not acknowledged are sent again.
+    resubmit: bool,
     audit: Arc<Mutex<Audit>>,
 }
+
+/// How long the seeded bug of
+/// [`ReplicatedServices::resubmitting_failed_writes`] waits before it
+/// sends a failed write again.
+const RESUBMIT_DELAY: Duration = Duration::from_secs(1);
 
 impl fmt::Debug for ReplicatedServices {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -73,6 +81,20 @@ struct Audit {
     leases: LeaseCounts,
     /// Reads served after a member's grace had passed.
     stale: Vec<String>,
+    /// Writes that were not acknowledged in time after they got a
+    /// position, by shard.
+    late: Vec<(ShardRef, EpochSeq)>,
+}
+
+/// Writes that were not acknowledged in time over a run (§5.2), as the
+/// acknowledgement audit counted them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LateWrites {
+    /// Writes answered `503 SlowDown` after their record got a position.
+    pub sequenced: usize,
+    /// Those whose record a primary of their shard committed later: not
+    /// acknowledged, but applied.
+    pub committed: usize,
 }
 
 /// Reads at primaries of replicated shards over a run, as the lease audit
@@ -105,6 +127,7 @@ impl ReplicatedServices {
         Self {
             config,
             alone: false,
+            resubmit: false,
             audit: Arc::default(),
         }
     }
@@ -117,6 +140,19 @@ impl ReplicatedServices {
         Self {
             alone: true,
             ..Self::default()
+        }
+    }
+
+    /// Services whose links use `config`, with a seeded bug for the checks
+    /// to catch: a write the members did not acknowledge in time is sent
+    /// again a second after its failure was answered, as a gateway that
+    /// retried it on its own would. It then takes a new position, and can
+    /// take effect over a write sent after the failure (§5.2).
+    #[must_use]
+    pub fn resubmitting_failed_writes(config: ReplicationConfig) -> Self {
+        Self {
+            resubmit: true,
+            ..Self::new(config)
         }
     }
 
@@ -187,6 +223,30 @@ impl ReplicatedServices {
     #[must_use]
     pub fn leases(&self) -> LeaseCounts {
         self.audit().leases
+    }
+
+    /// The writes that were not acknowledged in time after they got a
+    /// position, and how many of them a primary has committed since.
+    #[must_use]
+    pub fn late_writes(&self) -> LateWrites {
+        let audit = self.audit();
+        let committed = audit
+            .late
+            .iter()
+            .filter(|(shard, position)| {
+                audit.replicas.iter().any(|(_, config, replica)| {
+                    config.bucket_id == shard.bucket
+                        && config.shard == shard.shard
+                        && replica
+                            .leader()
+                            .is_some_and(|leader| leader.commit() >= position.seq)
+                })
+            })
+            .count();
+        LateWrites {
+            sequenced: audit.late.len(),
+            committed,
+        }
     }
 
     fn audit(&self) -> MutexGuard<'_, Audit> {
@@ -279,6 +339,7 @@ impl NodeServices for ReplicatedServices {
             node: env.node,
             clock: env.clock,
             alone: self.alone,
+            resubmit: self.resubmit,
             audit: Arc::clone(&self.audit),
             followed: Arc::default(),
         })
@@ -297,6 +358,7 @@ pub struct ReplicatedShards {
     /// The node's clock in this life.
     clock: Arc<MonotonicClock>,
     alone: bool,
+    resubmit: bool,
     audit: Arc<Mutex<Audit>>,
     /// The shards whose grace this life follows.
     followed: Arc<Mutex<BTreeSet<ShardRef>>>,
@@ -500,7 +562,25 @@ impl Shards for ReplicatedShards {
         body: RecordBody,
         condition: Precondition,
     ) -> Result<Result<EpochSeq, ConditionFailed>, ShardError> {
-        let written = self.local.write(shard, body, condition).await?;
+        let again = self.resubmit.then(|| (body.clone(), condition.clone()));
+        let written = self.local.write(shard, body, condition).await;
+        if let (Err(ShardError::NotAcknowledged { .. }), Some((body, condition))) =
+            (&written, again)
+        {
+            let (local, shard) = (self.local.clone(), shard.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(RESUBMIT_DELAY).await;
+                let _ = local.write(&shard, body, condition).await;
+            });
+        }
+        if let Err(ShardError::NotAcknowledged {
+            position: Some(position),
+            ..
+        }) = &written
+        {
+            lock(&self.audit).late.push((shard.clone(), *position));
+        }
+        let written = written?;
         if let Ok(position) = written {
             self.audit_acknowledged(shard, position);
         }

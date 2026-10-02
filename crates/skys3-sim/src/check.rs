@@ -82,9 +82,13 @@ fn by_key(operations: &[Operation]) -> BTreeMap<&str, Vec<&Operation>> {
 /// without a value.
 ///
 /// Writes that failed or got no answer may be left out of the order, since
-/// they may not have taken effect; a failed one, if it is in the order,
-/// lies before its answer (§5.2: a failed write never takes effect over a
-/// later one). Reads without an answer constrain nothing and are ignored.
+/// they may not have taken effect. A failed one, if it is in the order,
+/// lies before every write called after its answer (§5.2: a failed write
+/// never takes effect over a later one), but a read called after its answer
+/// may still come before it, since the write may commit only later. So may
+/// a write refused for its condition, which a gateway may refuse on a read
+/// before it writes anything. Reads without an answer constrain nothing
+/// and are ignored.
 ///
 /// # Errors
 ///
@@ -237,6 +241,12 @@ impl<'a> Search<'a> {
         self.operations[index].answered.unwrap_or(u64::MAX)
     }
 
+    /// Whether the operation is a write that failed with an answer.
+    fn failed_write(&self, index: usize) -> bool {
+        let operation = self.operations[index];
+        operation.call.is_write() && operation.outcome == Outcome::Failed
+    }
+
     /// Whether the operation must be in the order: one that surely took
     /// effect, or a read or refused write whose answer must be explained.
     fn required(&self, index: usize) -> bool {
@@ -285,15 +295,26 @@ impl<'a> Search<'a> {
             return false;
         }
         // Only operations called before every pending one was answered can
-        // come next.
-        let horizon = pending
-            .iter()
-            .map(|&index| self.answered(index))
-            .min()
-            .unwrap_or(u64::MAX);
+        // come next, except that a failed write's answer holds back only
+        // writes that may have written: it may commit after its answer,
+        // but before any write sent later.
+        let horizon = |reads: bool| {
+            pending
+                .iter()
+                .filter(|&&index| !(reads && self.failed_write(index)))
+                .map(|&index| self.answered(index))
+                .min()
+                .unwrap_or(u64::MAX)
+        };
+        let (writes_horizon, reads_horizon) = (horizon(false), horizon(true));
         let is_pending = |done: &[u64], index: usize| done[index / 64] & (1 << (index % 64)) == 0;
         for &index in &pending {
             let waits = self.before[index].is_some_and(|first| is_pending(done, first));
+            let horizon = if self.operations[index].may_have_written() {
+                writes_horizon
+            } else {
+                reads_horizon
+            };
             if self.operations[index].called > horizon || waits {
                 continue;
             }

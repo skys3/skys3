@@ -22,7 +22,9 @@
 //!
 //! Replication (M2) runs the same state machine on every member; only the
 //! commit rule changes, and a primary serves reads only while every member
-//! grants it a lease ([`Grace`] is a member's side of that, §5.4).
+//! grants it a lease ([`Grace`] is a member's side of that, §5.4). An
+//! [`AckTimeout`] bounds how long a replicated shard waits for its members
+//! (§5.2).
 //!
 //! ```
 //! use skys3_index::{Index, IndexConfig};
@@ -48,6 +50,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod ack;
 mod error;
 mod leader;
 mod lease;
@@ -58,6 +61,7 @@ pub mod replication;
 mod set;
 mod shard;
 
+pub use ack::{AckMode, AckTimeout};
 pub use error::ShardError;
 pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;
