@@ -149,7 +149,10 @@ pub(super) async fn part_extents<H: Shards>(
                 }
             }
             Payload::Extents(part_extents) => extents.extend(part_extents),
-            _ => {
+            // The object was evicted since the read resolved it, or is a
+            // copy of an evicted one.
+            Payload::None => return Err(not_cached()),
+            Payload::Parts { .. } => {
                 return Err(s3_error!(InternalError, "a part has no bytes"));
             }
         }

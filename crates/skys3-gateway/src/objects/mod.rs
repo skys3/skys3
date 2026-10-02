@@ -401,7 +401,7 @@ impl<H: Shards> Objects<H> {
                 let body = self.read_remote(bucket, &input.key, &found).await?;
                 break (found, body);
             }
-            if !matches!(found.object.payload, Payload::None) {
+            if !found.evicted && !matches!(found.object.payload, Payload::None) {
                 let body = download::read(
                     &self.shards,
                     &found.shard,
@@ -498,6 +498,7 @@ impl<H: Shards> Objects<H> {
         conditions.check(&found.object)?;
         let mut selected = select(shard, found.version, found.object, range, part_number)?;
         selected.remote = found.remote;
+        selected.evicted = found.evicted;
         Ok(selected)
     }
 }
@@ -554,6 +555,7 @@ fn select(
         content_range: None,
         parts_count: None,
         remote: false,
+        evicted: false,
     })
 }
 
@@ -573,6 +575,8 @@ struct Found {
     /// Whether the object is only at the remote, which serves its bytes
     /// (§9.1).
     remote: bool,
+    /// Whether the entry is evicted, so a fill serves its bytes (§9.2).
+    evicted: bool,
 }
 
 impl Found {
@@ -595,6 +599,7 @@ impl Found {
             content_range,
             parts_count,
             remote: false,
+            evicted: false,
         }
     }
 }

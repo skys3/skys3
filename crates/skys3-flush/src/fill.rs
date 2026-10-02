@@ -11,7 +11,9 @@
 //! - **Committing.** Each chunk is committed as `EXTENT` records of the
 //!   shard, `extent_bytes` each, like the body of a PUT (§5.1), but no
 //!   larger than a chunk: one remote read never spans more than a chunk,
-//!   even where `extent_bytes` is larger. Once every
+//!   even where `extent_bytes` is larger. The chunks of an evicted multipart
+//!   object end at its part boundaries, so each part gets extents of its
+//!   own. Once every
 //!   extent is committed, [`Shard::fill`] makes the entry clean with those
 //!   extents as its payload (§4.2, Evicted → Clean), unless a write
 //!   replaced the version meanwhile. The fill's bytes still serve the reads
@@ -267,10 +269,15 @@ impl<S: ObjectStore> Filler<S> {
         };
         let size = object.size;
         let chunk = self.inner.chunk;
+        // A multipart object's extents end at its part boundaries, so that
+        // each part gets its own (§9.3).
+        let mut boundaries = part_ends(&object.payload).into_iter().peekable();
         let mut extents = Vec::new();
         let mut offset = 0;
         loop {
-            let len = (size - offset).min(chunk);
+            while boundaries.next_if(|&end| end <= offset).is_some() {}
+            let end = boundaries.peek().map_or(size, |&end| end.min(size));
+            let len = (end - offset).min(chunk);
             let mut request =
                 GetObject::new(self.remote_key(key)).with_if_match(remote_etag.clone());
             request.version_id = entry.remote_version_id.clone().map(VersionId);
@@ -477,6 +484,21 @@ fn check_chunk(output: &GetOutput, size: u64, len: u64) -> Result<(), FillError>
         )));
     }
     Ok(())
+}
+
+/// Where each part of a multipart object `payload` ends, in object
+/// order; none for any other payload.
+fn part_ends(payload: &Payload) -> Vec<u64> {
+    let Payload::Parts { parts, .. } = payload else {
+        return Vec::new();
+    };
+    parts
+        .iter()
+        .scan(0, |end, part| {
+            *end += part.size;
+            Some(*end)
+        })
+        .collect()
 }
 
 /// `body` cut into pieces of at most `extent_bytes`, each with its offset

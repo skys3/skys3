@@ -15,6 +15,8 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
+use std::ops::Range;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -27,7 +29,10 @@ use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
 use skys3_coord::HandoffSink;
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
-use skys3_gateway::{Gateway, GatewayConfig, IdSource, LocalShards, ShardRef, Shards, TrustAll};
+use skys3_gateway::{
+    FillBody, FillError, Fills, Gateway, GatewayConfig, IdSource, LocalShards, ShardRef, Shards,
+    TrustAll,
+};
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{
     BlockingPool, Clock, Drift, MonotonicClock, SimDisk, SimMount, SimPower, WallClock,
@@ -35,8 +40,11 @@ use skys3_io::{
 use skys3_log::LogConfig;
 use skys3_net::{Credentials, Transport, TurmoilNetwork};
 use skys3_obs::MetricsRegistry;
+use skys3_shard::{CacheMetrics, CacheSettings, CleanCache};
 use skys3_sim::{NodeClock, SimS3};
-use skys3_types::{BucketDocument, ClusterId, Generation, Label, NodeAddress, NodeId, ShardConfig};
+use skys3_types::{
+    BucketDocument, ClusterId, EpochSeq, Generation, Label, NodeAddress, NodeId, ShardConfig,
+};
 
 use crate::s3;
 
@@ -140,6 +148,8 @@ pub(crate) struct NodeSettings {
     pub retry: RetryPolicy,
     pub poll_interval: Duration,
     pub flush: FlushSettings,
+    /// The clean cache each node keeps, if any (§9.3).
+    pub clean_cache: Option<CacheSettings>,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -297,8 +307,22 @@ pub(crate) async fn run<S: NodeServices>(
         seed: seed.rotate_left(17),
     };
     let shards = shared.services.start(env).await?;
+    let flush = Arc::new(flush_service(settings, &shared.remote));
+    let mut gateway_config = settings.gateway.clone();
+    let mut cache = None;
+    if let Some(bounds) = settings.clean_cache {
+        // The clean cache, and fills of what it evicts, as the node
+        // binary keeps them; it runs once the bucket policies are in.
+        let clean = CleanCache::new(bounds, CacheMetrics::default());
+        recovered.shards.set().use_cache(&clean).await;
+        cache = Some(clean);
+        gateway_config.fills = Some(Arc::new(SimFills {
+            shards: recovered.shards.clone(),
+            flush: Arc::clone(&flush),
+        }));
+    }
     let gateway = Gateway::new(
-        settings.gateway.clone(),
+        gateway_config,
         store.clone(),
         shards.clone(),
         IdSource::seeded(seed),
@@ -306,8 +330,12 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
     open_shards(&shards, &gateway.buckets()).await?;
+    if let Some(cache) = cache {
+        install_clean_copies(&recovered.shards, &gateway.buckets());
+        let set = recovered.shards.set().clone();
+        tokio::spawn(async move { cache.run(set).await });
+    }
     {
-        let flush = flush_service(settings, &shared.remote);
         let (gateway, local) = (gateway.clone(), recovered.shards.clone());
         tokio::spawn(async move { follow_flushes(&flush, &gateway, &local).await });
     }
@@ -364,16 +392,71 @@ fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3,
     .with_wall_clock(Arc::new(SimWallClock))
 }
 
-/// Keeps a flusher on every `write_back` bucket shard open on the node, as
-/// the node binary does (§7.1).
+/// Keeps a flusher on every `write_back` bucket shard open on the node, and
+/// gives the clean cache each bucket's `clean_copies`, as the node binary
+/// does (§7.1, §9.3).
 async fn follow_flushes(
     flush: &FlushService<SimS3, SimMount>,
     gateway: &Gateway<TrustAll>,
     shards: &LocalShards<SimMount>,
 ) {
     loop {
-        flush.reconcile(&gateway.buckets(), shards.set()).await;
+        let buckets = gateway.buckets();
+        install_clean_copies(shards, &buckets);
+        flush.reconcile(&buckets, shards.set()).await;
         tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+    }
+}
+
+/// Gives the clean cache each bucket's `clean_copies`, before it scans
+/// or a flush lands, as the node binary does (§9.3).
+fn install_clean_copies(shards: &LocalShards<SimMount>, buckets: &[BucketDocument]) {
+    if let Some(cache) = shards.set().cache() {
+        let copies = buckets
+            .iter()
+            .map(|b| (b.bucket_id.clone(), b.clean_copies));
+        cache.set_clean_copies(copies);
+    }
+}
+
+/// Read-through fills into the node's own replica of a shard (§9.2), as
+/// the node binary's are, without its free-space check: a simulated disk
+/// does not run out of space.
+#[derive(Debug)]
+struct SimFills {
+    shards: LocalShards<SimMount>,
+    flush: Arc<FlushService<SimS3, SimMount>>,
+}
+
+impl Fills for SimFills {
+    fn read(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        range: Range<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>> {
+        let (shard, key) = (shard.clone(), key.to_owned());
+        Box::pin(async move {
+            let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
+            let local = self
+                .shards
+                .set()
+                .get(&(&shard).into())
+                .await
+                .ok_or_else(|| unavailable("the shard is not open on this node"))?;
+            let filler = self
+                .flush
+                .filler(&shard.bucket)
+                .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
+            filler
+                .read(&local, &key, version, range)
+                .await
+                .map_err(|error| match error {
+                    skys3_flush::FillError::Changed => FillError::Changed,
+                    other => FillError::Unavailable(other.to_string()),
+                })
+        })
     }
 }
 

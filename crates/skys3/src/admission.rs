@@ -19,6 +19,7 @@ use skys3_flush::{DirtyBudget, Exhausted};
 use skys3_gateway::{Admission, Refusal, ShardRef};
 use skys3_io::BlockingPool;
 use skys3_obs::MetricsRegistry;
+use skys3_shard::CleanCache;
 use skys3_types::{BucketDocument, Label};
 
 /// A place whose free space is watched.
@@ -47,6 +48,8 @@ pub(crate) type Watched = (Place, PathBuf, BlockingPool);
 pub(crate) struct DiskSpace {
     min_free: u64,
     low: Mutex<BTreeSet<Place>>,
+    /// The clean cache, told the space of each log disk (design §9.3).
+    cache: Option<CleanCache>,
 }
 
 impl DiskSpace {
@@ -55,6 +58,15 @@ impl DiskSpace {
         Self {
             min_free,
             low: Mutex::default(),
+            cache: None,
+        }
+    }
+
+    /// Also tells `cache` the space of each log disk at every refresh.
+    pub(crate) fn with_cache(self, cache: CleanCache) -> Self {
+        Self {
+            cache: Some(cache),
+            ..self
         }
     }
 
@@ -80,16 +92,20 @@ impl DiskSpace {
     /// Reads the free space of every place in `watched`. A place whose
     /// space cannot be read keeps its last state.
     pub(crate) async fn refresh(&self, watched: &[Watched]) {
-        if self.min_free == 0 {
+        if self.min_free == 0 && self.cache.is_none() {
             return;
         }
         for (place, path, pool) in watched {
             let path = path.clone();
-            match pool
-                .run(move || skys3_io::disk::available_bytes(&path))
-                .await
-            {
-                Ok(Ok(available)) => self.update(place, available),
+            match pool.run(move || skys3_io::disk::space(&path)).await {
+                Ok(Ok(space)) => {
+                    if let (Some(cache), Place::Disk(disk)) = (&self.cache, place) {
+                        cache.set_space(disk, space);
+                    }
+                    if self.min_free > 0 {
+                        self.update(place, space.available);
+                    }
+                }
                 Ok(Err(error)) => tracing::warn!(%place, %error, "cannot read the free space"),
                 Err(error) => tracing::warn!(%place, %error, "cannot read the free space"),
             }
@@ -262,11 +278,20 @@ mod tests {
             !space.is_low(&label("disk-1")),
             "the data directory is unread"
         );
-        // The check is off at 0.
-        let off = DiskSpace::new(0);
+        // The check is off at 0, and the clean cache learns each disk's
+        // room still.
+        let cache = CleanCache::new(
+            skys3_shard::CacheSettings {
+                max_bytes: u64::MAX,
+                reserve_fraction: 0.0,
+            },
+            skys3_shard::CacheMetrics::default(),
+        );
+        let off = DiskSpace::new(0).with_cache(cache.clone());
         off.update(&Place::DataDir, 0);
         off.refresh(&watched).await;
         assert!(!off.is_low(&disk));
+        assert!(cache.usage().limit < u64::MAX);
         pool.shutdown();
         space.refresh(&watched).await;
         assert!(space.is_low(&disk), "an unread place keeps its state");

@@ -16,9 +16,10 @@ use skys3_control::{
 };
 use skys3_flush::FlushSettings;
 use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
-use skys3_index::{EntryState, Index};
+use skys3_index::{Entry, EntryState, Index, IndexReader, Payload};
 use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SyncCut};
 use skys3_log::LogConfig;
+use skys3_shard::CacheSettings;
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
 use skys3_sim::history::{History, Operation, Outcome};
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
@@ -92,6 +93,12 @@ pub struct ClusterConfig {
     /// then gives them their share (plan M3-06). The workload starts
     /// without them.
     pub joining: usize,
+    /// The clean cache every node keeps (§9.3), with read-through fills of
+    /// what it evicts (§9.2); `None` for no cache, in which clean payload
+    /// stays. With a cache, a dirty copy whose bytes its node does not
+    /// hold counts as no copy when the checkers look for acknowledged
+    /// writes: dirty payload must never be evicted.
+    pub clean_cache: Option<CacheSettings>,
 }
 
 impl Default for ClusterConfig {
@@ -122,6 +129,7 @@ impl Default for ClusterConfig {
             remote_faults: SimS3Faults::default(),
             create_buckets: false,
             joining: 0,
+            clean_cache: None,
         }
     }
 }
@@ -194,6 +202,9 @@ pub struct Report {
     /// What each shard's register holds at the end, after every fault
     /// healed; a shard without one is left out.
     pub registers: BTreeMap<ShardRef, ShardConfig>,
+    /// Copies of keys whose payload their member evicted, at the end, over
+    /// every member of every key's shard.
+    pub evicted: usize,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -566,7 +577,7 @@ impl<S: NodeServices> Cluster<S> {
             sim.crash(slot.host.as_str());
         }
         let operations = history.operations();
-        let survivors = world.survivors(&routes, workload.keys)?;
+        let (survivors, evicted) = world.survivors(&routes, workload.keys)?;
         check_linearizable(&operations).map_err(RunError::Check)?;
         check_durable(&operations, &survivors).map_err(RunError::Check)?;
         if self.config.every_member_durable {
@@ -604,6 +615,7 @@ impl<S: NodeServices> Cluster<S> {
             writes: writes.take(),
             rebuilds: driver.rebuilds,
             registers,
+            evicted,
         })
     }
 
@@ -844,12 +856,13 @@ impl<S: NodeServices> World<S> {
     /// Recovers every node from its disks, outside the simulation, and
     /// reads each key's value on every member of its shard and, for a
     /// `write_back` bucket, whether the member's entry is clean, and the
-    /// key's value in the remote store.
+    /// key's value in the remote store. Also returns how many of those
+    /// copies are evicted.
     fn survivors(
         &self,
         routes: &Routes,
         keys: usize,
-    ) -> Result<BTreeMap<String, Survivors>, BoxError> {
+    ) -> Result<(BTreeMap<String, Survivors>, usize), BoxError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
@@ -873,6 +886,7 @@ impl<S: NodeServices> World<S> {
             indexes.insert(slot.id.clone(), storage.index);
         }
         let mut survivors = BTreeMap::new();
+        let mut evicted = 0;
         for (name, bucket, key) in routes.keys(keys) {
             let shard = ShardRef::for_key(&bucket, &key);
             // The members now: a member removed (§6.4) misses the writes
@@ -883,14 +897,27 @@ impl<S: NodeServices> World<S> {
             let write_back = bucket.mode == BucketMode::WriteBack;
             let mut survivor = Survivors::default();
             for member in &members {
-                let entry = indexes[member].read()?.entry(&(&shard).into(), &key)?;
+                let read = indexes[member].read()?;
+                let entry = read.entry(&(&shard).into(), &key)?;
+                evicted += usize::from(
+                    entry
+                        .as_ref()
+                        .is_some_and(|e| e.state == EntryState::Evicted),
+                );
                 // No entry claims what a clean one does: the remote store
                 // matches, here by holding nothing.
                 let clean = entry.as_ref().is_none_or(|entry| {
                     matches!(entry.state, EntryState::Clean | EntryState::Evicted)
                 });
+                // With a cache, a dirty copy must still hold its bytes.
+                let held = clean
+                    || self.shared.settings.clean_cache.is_none()
+                    || entry
+                        .as_ref()
+                        .is_some_and(|entry| holds_bytes(&read, &shard, entry));
                 survivor.copies.push(
                     entry
+                        .filter(|_| held)
                         .and_then(|entry| entry.object)
                         .map(|o| o.local_etag.to_string()),
                 );
@@ -905,7 +932,35 @@ impl<S: NodeServices> World<S> {
             }
             survivors.insert(name, survivor);
         }
-        Ok(survivors)
+        Ok((survivors, evicted))
+    }
+}
+
+/// Whether the node that `read` is of holds the bytes of `entry`, a dirty
+/// entry of `shard`: every record its payload names is located there.
+fn holds_bytes(read: &IndexReader, shard: &ShardRef, entry: &Entry) -> bool {
+    let shard = &shard.into();
+    let located = |position| matches!(read.location(shard, position), Ok(Some(_)));
+    let Some(object) = &entry.object else {
+        return true;
+    };
+    match &object.payload {
+        Payload::None => object.size == 0,
+        Payload::Inline(position) => located(*position),
+        Payload::Extents(extents) => extents.iter().all(|e| located(e.position)),
+        Payload::Parts { upload, parts } => {
+            read.parts(shard, *upload, 0, parts.len())
+                .is_ok_and(|rows| {
+                    rows.len() == parts.len()
+                        && rows.iter().all(|(_, part)| match &part.payload {
+                            Payload::Inline(position) => located(*position),
+                            Payload::Extents(extents) => {
+                                extents.iter().all(|e| located(e.position))
+                            }
+                            _ => false,
+                        })
+                })
+        }
     }
 }
 
@@ -1025,6 +1080,8 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         retry: gateway.retry,
         gateway,
         flush: FlushSettings {
+            // Fills commit extents as small as a PUT's.
+            extent_bytes: 512,
             concurrency: 2,
             min_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(1),
@@ -1033,6 +1090,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         checkpoint_interval: Duration::from_secs(1),
         drift: Drift::NONE,
         poll_interval: Duration::from_millis(500),
+        clean_cache: shape.clean_cache,
     })
 }
 
