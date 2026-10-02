@@ -147,11 +147,13 @@ fn a_lost_complete_answer_is_recognized_by_the_upload_identity() {
         // the upload left over (it is gone), uploads the parts again, and
         // completes conditioned on the first object's ETag: that fails,
         // and the HEAD finds the second object's `MPU_CREATE` identity, so
-        // its new upload is aborted and the flush is done.
-        let second = node.multipart("k", &["xy", "z"]).await;
+        // its new upload is aborted and the flush is done. The flusher
+        // follows applied writes, so it may start before the write below
+        // returns: the faults and the count come first.
         store.inject(Operation::CompleteMultipartUpload, Fault::LostResponse);
         store.inject(Operation::AbortMultipartUpload, Fault::InternalError);
         let before = store.stats().requests;
+        let second = node.multipart("k", &["xy", "z"]).await;
         node.settle(&flusher).await;
         assert_flushed(&node, &store, "k", &second, "xyz").await;
         // Create, 2 parts, complete, abort; abort; create, 2 parts,
@@ -184,10 +186,12 @@ fn uploads_that_fail_are_aborted() {
         assert_eq!(flusher.status().last_error, None);
 
         // An abort that fails leaves the upload to the target, and the
-        // next multipart flush aborts it first.
-        let second = node.multipart("b", &["de", "f"]).await;
+        // next multipart flush aborts it first. The faults are queued
+        // before the write, which the running flusher may start on before
+        // it returns.
         store.inject(Operation::UploadPart, Fault::InternalError);
         store.inject(Operation::AbortMultipartUpload, Fault::SlowDown);
+        let second = node.multipart("b", &["de", "f"]).await;
         wait_until("a backoff", || {
             matches!(flusher.phase("b"), Some(Phase::Backoff(_)))
         })
