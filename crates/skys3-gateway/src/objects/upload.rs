@@ -189,8 +189,8 @@ impl<H: Shards> Upload<H> {
         match self.started {
             Some(started) if started.elapsed() > self.max_duration => Err(s3_error!(
                 RequestTimeout,
-                "The body took longer than {} seconds to arrive",
-                self.max_duration.as_secs()
+                "The body took longer than {:?} to arrive",
+                self.max_duration
             )),
             _ => Ok(()),
         }

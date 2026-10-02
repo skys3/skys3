@@ -58,7 +58,9 @@ struct Active<F> {
 ///
 /// A lazy record does not start a group: it waits, in queue order, until
 /// another record starts one and joins it, or until it has waited
-/// [`LAZY_MAX_DELAY`], and then commits with the lazy records queued so far.
+/// [`LAZY_MAX_DELAY`] or an appender asks for it
+/// ([`SegmentLog::commit_lazy_now`](crate::SegmentLog::commit_lazy_now)),
+/// and then commits with the lazy records queued so far.
 ///
 /// The first I/O error ends the write path for good: the committer fails
 /// the group it was committing and every record queued after it, and the
@@ -119,9 +121,12 @@ impl<D: Disk> Committer<D> {
                 Some(oldest) => {
                     let deadline = oldest.arrival.saturating_add(LAZY_MAX_DELAY);
                     let at = self.clock.runtime_deadline(deadline);
-                    tokio::time::timeout_at(at, self.requests.recv())
-                        .await
-                        .unwrap_or(None)
+                    tokio::select! {
+                        next = tokio::time::timeout_at(at, self.requests.recv()) => {
+                            next.unwrap_or(None)
+                        }
+                        () = self.shared.lazy_now.notified() => None,
+                    }
                 }
             };
             match next {
@@ -133,7 +138,8 @@ impl<D: Disk> Committer<D> {
                     group.append(&mut waiting);
                     self.gather(first, &mut group).await;
                 }
-                // Lazy records waited long enough, or every handle is gone.
+                // Lazy records waited long enough or were asked for, or
+                // every handle is gone.
                 None if !waiting.is_empty() => group.append(&mut waiting),
                 None => return,
             }

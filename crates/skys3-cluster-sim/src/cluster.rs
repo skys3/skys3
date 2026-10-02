@@ -1152,8 +1152,9 @@ impl<S: NodeServices> World<S> {
 
 /// The settings every simulated node runs with: small log segments and
 /// inline bodies, so a short workload exercises extents and several
-/// segments; frequent checkpoints; and a low streaming threshold, so that
-/// longer PUTs to `write_back` buckets commit an `UPLOAD_BEGIN` (§7.2).
+/// segments; frequent checkpoints; a low streaming threshold, so that
+/// longer PUTs to `write_back` buckets commit an `UPLOAD_BEGIN` (§7.2); and
+/// a body deadline of half the compaction TTL (§10.3).
 fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, BoxError> {
     // Buckets the gateways create get the shape's shards and replicas.
     let defaults = format!(
@@ -1173,6 +1174,11 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     gateway.inline_max_bytes = 512;
     gateway.extent_bytes = 512;
     gateway.streaming_flush_min_bytes = Some(1024);
+    // A body streams for at most half the TTL after which compaction drops
+    // extents that nothing names, as the gateway's own configuration has it.
+    if let Some(compaction) = shape.compaction {
+        gateway.max_body_duration = compaction.unreferenced_ttl / 2;
+    }
     gateway.read_registration_renew_interval = shape.read_registration.renew_every;
     gateway.retry = RetryPolicy {
         max_attempts: 5,

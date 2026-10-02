@@ -1002,6 +1002,20 @@ fn lazy_records_ride_the_next_group_commit() {
         assert_eq!(alone.offset, eager.end());
         assert_eq!(log.stats().group_commits, 2);
         assert_eq!(log.read(alone).await.unwrap(), delete(0, 3));
+
+        // Asked for, it commits at once, in a group of its own.
+        let started = Instant::now();
+        let asked = tokio::spawn({
+            let log = log.clone();
+            async move { log.append_lazy(&delete(0, 4)).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!asked.is_finished());
+        log.commit_lazy_now();
+        let asked = asked.await.unwrap();
+        assert!(started.elapsed() < skys3_log::LAZY_MAX_DELAY);
+        assert_eq!(asked.offset, alone.end());
+        assert_eq!(log.stats().group_commits, 3);
     });
 }
 

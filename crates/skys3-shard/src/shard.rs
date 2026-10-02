@@ -537,6 +537,7 @@ impl<D: Disk> Shard<D> {
             leader: Arc::clone(&leader),
             ordered: role != Role::Alone,
             in_flight: JoinSet::new(),
+            lazy: 0,
             class: SegmentClass::Hot,
         };
         tokio::spawn(task.run(jobs));
@@ -3088,17 +3089,22 @@ impl PipelineTask {
 /// independently, so a crash could otherwise keep a record without an
 /// earlier one of the other class (§10.1). The replica's log therefore
 /// always holds a run of the shard's records with no holes, which is what
-/// its acknowledgements and catching up after a restart rely on. A
-/// primary hands each record to its [`Leader`], to send to its members, as
-/// soon as it is encoded.
+/// its acknowledgements and catching up after a restart rely on. Lazy
+/// records it waits for are committed at once
+/// ([`SegmentLog::commit_lazy_now`]): nothing else would start their group
+/// while it waits. A primary hands each record to its [`Leader`], to send
+/// to its members, as soon as it is encoded.
 struct Appender<D: Disk> {
     log: SegmentLog<D>,
     pipeline: mpsc::UnboundedSender<Message>,
     leader: Arc<OnceLock<Arc<Leader>>>,
     /// Whether records of different classes are queued in order.
     ordered: bool,
-    /// The appends queued and not yet acknowledged.
-    in_flight: JoinSet<()>,
+    /// The appends queued and not yet acknowledged, each telling whether
+    /// it was lazy.
+    in_flight: JoinSet<bool>,
+    /// How many of them are lazy.
+    lazy: usize,
     /// The class of the records in flight.
     class: SegmentClass,
 }
@@ -3108,7 +3114,9 @@ impl<D: Disk> Appender<D> {
     /// flight then are acknowledged.
     async fn run(mut self, mut jobs: mpsc::UnboundedReceiver<Job>) {
         while let Some(job) = jobs.recv().await {
-            while self.in_flight.try_join_next().is_some() {}
+            while let Some(joined) = self.in_flight.try_join_next() {
+                self.joined(joined);
+            }
             match job {
                 Job::Settle(reply) => {
                     self.drain().await;
@@ -3125,8 +3133,25 @@ impl<D: Disk> Appender<D> {
         self.drain().await;
     }
 
+    /// Waits until every append in flight is acknowledged, committing the
+    /// lazy ones now rather than waiting for another record to.
     async fn drain(&mut self) {
-        while self.in_flight.join_next().await.is_some() {}
+        if self.lazy > 0 {
+            self.log.commit_lazy_now();
+        }
+        while let Some(joined) = self.in_flight.join_next().await {
+            self.joined(joined);
+        }
+    }
+
+    /// Counts an append that is no longer in flight.
+    fn joined(&mut self, joined: Result<bool, tokio::task::JoinError>) {
+        // A task that panicked or was cancelled was lazy or not; the count
+        // only decides whether a drain asks for lazy records, so it may
+        // stay high, at the cost of one sync.
+        if let Ok(true) = joined {
+            self.lazy = self.lazy.saturating_sub(1);
+        }
     }
 
     async fn append(&mut self, record: LogRecord, encoded: Option<Bytes>, lazy: bool) {
@@ -3152,6 +3177,7 @@ impl<D: Disk> Appender<D> {
             Err(error) => return self.resolved(position, Err(error.to_string())),
         };
         let pipeline = self.pipeline.clone();
+        self.lazy += usize::from(lazy);
         self.in_flight.spawn(async move {
             let result = match queued.durable().await {
                 Ok(location) => Ok(Box::new((record, location))),
@@ -3159,6 +3185,7 @@ impl<D: Disk> Appender<D> {
             };
             // The pipeline is gone only if the shard is; nobody waits then.
             let _ = pipeline.send(Message::Appended { position, result });
+            lazy
         });
     }
 
@@ -3193,6 +3220,7 @@ impl<D: Disk> Appender<D> {
         };
         self.in_flight.spawn(async move {
             done(queued.durable().await.map(drop).map_err(|e| e.to_string()));
+            false
         });
     }
 }

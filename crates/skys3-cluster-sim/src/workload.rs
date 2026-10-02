@@ -175,6 +175,13 @@ fn multipart_etags_digest_the_part_digests() {
     assert_eq!(element(xml, "Key"), None);
 }
 
+/// Whether `response` refused a body that took longer to stream than the
+/// gateway allows (§10.3), as one a fault held up may.
+fn timed_out(response: &Response<Bytes>) -> bool {
+    response.status() == StatusCode::BAD_REQUEST
+        && element(&String::from_utf8_lossy(response.body()), "Code") == Some("RequestTimeout")
+}
+
 /// An answer the workload does not expect, which fails the simulation.
 fn unexpected(what: &str, response: &Response<Bytes>) -> Box<dyn std::error::Error> {
     format!(
@@ -430,6 +437,7 @@ impl Client {
                     Outcome::ConditionFailed
                 }
                 status if status.is_server_error() => self.write_failed(),
+                _ if timed_out(&response) => self.write_failed(),
                 _ => return Err(unexpected("a PUT", &response)),
             },
             Err(_) => Outcome::Unknown,
@@ -473,7 +481,9 @@ impl Client {
         let request =
             Request::put(format!("{path}?partNumber=1&uploadId={id}")).body(Full::new(part))?;
         match self.send(&host, request).await {
-            Ok(response) if response.status().is_server_error() => return Ok(()),
+            Ok(response) if response.status().is_server_error() || timed_out(&response) => {
+                return Ok(());
+            }
             Ok(response) if response.status() == StatusCode::OK => {}
             Ok(response) => return Err(unexpected("an UploadPart", &response)),
             Err(_) => return Ok(()),

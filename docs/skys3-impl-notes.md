@@ -5086,6 +5086,37 @@ of this file. A task with nothing unexpected keeps "None."
   without a new one. With `SKYS3_SIM_SEEDS=256` in a debug build, all 66
   cluster scenarios passed in 1,734 s (29 min). This machine has no
   baseline time from the same build.
+- **Merging M2-18: compaction reclaimed nothing, and a 1 s stall.** With
+  M2-18 merged, `replicated_compaction_survives_power_loss_at_its_syncs`
+  reclaimed no segment at seeds 0 and 1 (5 of the first 16 seeds). It was
+  not M2-18's rules alone, nor `UPLOAD_BEGIN` itself:
+  - An overwritten body's unnamed `EXTENT` waits out the TTL from its
+    segment's seal, and only then the release delay, from the first pass
+    after it (M2-18). That order is needed: before the TTL, an extent may
+    still be named and unnamed again between two passes, so an earlier
+    sighting proves nothing. With 2 s each and a pass a second, a segment
+    went about 4.3 s after its seal, and the workload's writes end about
+    4 s in.
+  - M2-18's runs lasted longer only because of a stall. A replica's
+    `Appender` drains before a record of the other class, and a lazy
+    `FLUSHED` in flight was then committed only after `LAZY_MAX_DELAY`,
+    since the record held back was the one that would have started its
+    group. So on a `write_back` shard, the first extent after a flush
+    waited up to a second (about 0.9 s seen), as did every write behind
+    it. An `UPLOAD_BEGIN`, a hot record, started the group first and hid
+    the stall, so M4-01's runs were 1.5 to 2.5 s shorter.
+  - The fix for the stall: `SegmentLog::commit_lazy_now` wakes the
+    committer, and the appender calls it before any drain while a lazy
+    record of its own is in flight. `a_lazy_record_does_not_hold_up_one_of_the_other_class`
+    (shard) took 1.0 s before and passes now; the log test checks the
+    call. With the stall gone, the scenario failed at 14 of 16 seeds.
+  - The fix for the scenario: a 1 s TTL and a 1 s release delay, with the
+    budget written in its doc comment. All 16 seeds pass, and both
+    compaction scenarios pass at `SKYS3_SIM_SEEDS=2048`. The cluster
+    nodes' gateways now get half the compaction TTL as their body deadline,
+    as a real configuration has it; before, a 12 h deadline beside a 2 s
+    TTL left bodies unbounded. The workload takes a `400 RequestTimeout`
+    as a failed write, which faults now cause.
 - **Left open.** M4-03 opens the remote multipart upload where the
   `UPLOAD_BEGIN` commits (`Upload::begin`). It must log the remote upload
   ID itself, because compaction drops the `UPLOAD_BEGIN`, and nothing finds
