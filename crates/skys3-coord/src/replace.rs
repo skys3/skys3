@@ -87,8 +87,9 @@ impl Default for ReplacementConfig {
 /// A shard's members and learners, as placement counts them.
 #[derive(Debug, Default)]
 struct Census {
-    /// The members and learners that count, one per domain: the primary
-    /// first, then the other members, then the learners.
+    /// The members and learners that count, at most one per domain (a
+    /// member on an unregistered node in none): the primary first, then the
+    /// other members, then the learners.
     counted: Vec<NodeId>,
     /// How many of `counted` are members.
     members: usize,

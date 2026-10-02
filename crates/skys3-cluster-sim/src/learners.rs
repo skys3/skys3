@@ -182,7 +182,7 @@ impl ShardRegisters for Audited {
 impl ReplicatedServices {
     /// The same services, whose nodes follow the shard registers that name
     /// them, as the coordinator's change propagation will have them do
-    /// (plan M2-16), and whose primaries add a spare node to each shard
+    /// (plan M2-08b), and whose primaries add a spare node to each shard
     /// they serve as a learner from `at` on, by a compare-and-swap of its
     /// register through the node's faulty control store: the test driver
     /// of §6.7's add-learner step. A spare is a node outside the shard's
@@ -201,7 +201,7 @@ impl ReplicatedServices {
 
     /// The same services, whose nodes follow the shard registers that name
     /// them, as the coordinator's change propagation will have them do
-    /// (plan M2-16), and add no learner themselves: the coordinator's
+    /// (plan M2-08b), and add no learner themselves: the coordinator's
     /// replacement does (plan M3-05,
     /// [`CoordinationConfig::replacement`](crate::CoordinationConfig::replacement)).
     /// The primaries backfill and promote the learners;

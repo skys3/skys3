@@ -3788,6 +3788,122 @@ of this file. A task with nothing unexpected keeps "None."
   - **Runtime dropping of a deleted bucket's replicas on other members**,
     and the seal gaps above.
 
+### M3-05 Replacement
+
+- **The coordinator and the primary are equals (decided, design §6.7).**
+  The coordinator adds a learner by a compare-and-swap of the shard
+  register from epoch `e` to `e+1` over the version its scan read, under
+  its lease, in a change announced by one generation increment. The
+  primary's removals and promotions are compare-and-swaps over the same
+  register, so the first to land wins and neither retries over the other.
+  A primary whose change loses already adopted a configuration that keeps
+  it primary and adds no member that was not a learner (M2-14's
+  `can_adopt`), and proposes again over it; a coordinator change that
+  loses is dropped, and the next round plans from the register. §6.4 said
+  the primary adopts only a change that "only removes members", which is
+  narrower than the code and than replacement needs; it now says what the
+  code does.
+- **Shards are counted the way cluster health counts them (decided).** A
+  member or learner counts if it is on a registered node that is not
+  departing, carries the label the level needs, and is in a domain no
+  counted node of the shard is in (primary first, then members, then
+  learners): M3-03's measure, with the exception below. Learners are added
+  while the counted nodes are fewer than `replicas`, with
+  `Topology::place` keeping the counted nodes and avoiding every node the
+  shard names. Learners that do not count are dropped. Members that do not
+  count (never the primary) are removed only once the counted members
+  reach `replicas` without them, that is, after their replacements were
+  promoted, so a removal never takes a shard below `replicas` members or
+  below `replicas` counted ones. A departing primary is left to a handoff
+  (M3-06), since only a new primary may write a configuration that names
+  it (R1).
+- **A member on an unregistered node is left alone (found).** The first
+  version counted such a member for nothing, as cluster health does. In
+  the simulation, whose harness writes the shard registers before the
+  nodes register, a coordinator that listed the nodes before a slow node
+  registered added learners to every shard that node held. Once they were
+  promoted, those shards had four members, and the later node loss left
+  them at three, so no window opened and the scenario failed (seed 104 of
+  320). A node is forgotten only once no shard names it, so an
+  unregistered member belongs to a node that has not registered yet, or
+  to M3-02's rare stalled-planner race: nothing shows it lost. It now
+  counts, in no domain, and is left to its primary, which removes it if
+  it does not respond; the shard is then short and replaced. Recorded in
+  §6.7.
+- **Pace (decided).** `ReplacementConfig`: one change writes at most 32
+  shard registers, the most urgent (fewest counted members) first; the
+  registers may name at most 64 learners at once, which bounds concurrent
+  backfills; member removals are at most one per 10 s across the cluster.
+  Learner additions are not delayed, since they shorten the exposure
+  window. These have no configuration keys yet: the binary does not run
+  the coordinator, and the keys belong with that wiring (§14), as M3-02's
+  labels do.
+- **A learner on a dead node is swapped (decided).** A coordinator that
+  has just taken over judges every node live for `suspect_after`, so when
+  the lost node was coordinator, its successor can give a learner to the
+  lost node itself; a learner's node can also die during backfill. Such a
+  learner never joins, and the shard would stay short until
+  `node_forget_after`. A learner on a suspect node is swapped, one per
+  shard and round, for a live node when placement has one in a domain the
+  shard does not otherwise use. With no live candidate (a three-node
+  cluster), the learner stays, and the lost node rejoins when it returns.
+- **A learner a takeover left out could not be added back (found).** The
+  coordinator added a learner to a shard whose primary had died; the
+  takeover dropped it (a candidate proposes no learners), and the
+  coordinator added the same node again under the new primary. The node's
+  replica, a learner of the old primary, refused the new configuration
+  ("a new primary takes over by proposing itself"), every open failed, and
+  the shard stayed short (seed 0 of the forgetting scenario). The base's
+  fix in the same place (c40f33e) reopens a stale member or primary as a
+  learner; the merge extends it to a learner whose primary changed, which
+  stops and opens again as a learner of the new primary, as a restart
+  would. A shard test fails without it. Recorded with re-admission in
+  §6.7.
+- **No plan before the registry has listed the nodes (decided).** An
+  empty registry, as at the start of a tenure, makes every learner look
+  unregistered and every node ineligible. `Replacement` plans nothing
+  until `NodeRegistry::is_listed` says this tenure has listed `nodes/`.
+- **The simulation's driver is gone.**
+  `ReplicatedServices::replacing_lost_members` became
+  `following_registers`: nodes follow the registers that name them (a
+  100 ms poll, a stand-in for propagation to replicas, which the binary
+  does not wire yet, M2-08b) and add nothing. `CoordinationConfig::replacement`
+  runs `BucketShards` around `Replacement` in every node's coordinator.
+  M2-15's backfill scenarios now run on it unchanged, and
+  `DurabilityWindows` gained `restored`, the time until the register had
+  `replicas` members again.
+- **Numbers.** Over 10 seeds of each scenario (from seed 100), with the
+  commit and R3 audits after every step: with five nodes and two buckets,
+  losing the first node (often the coordinator) left four shards short
+  about 3 s later (`member_suspect_after`); new writes had three copies
+  again within 1.71 s of the removal, all data within 1.72 s, and every
+  shard had three members within 1.84 s. With four nodes, losing a node
+  for good and losing one that was then forgotten, every shard had three
+  members within 2.91 s; the slowest are shards whose primary was lost,
+  timed from the takeover, whose first learner the takeover dropped. With
+  three nodes, the lost node rejoined as a learner, and its shards had
+  three members 3.3 to 3.4 s after the removal, the rest of its 6 s
+  downtime. With `node_forget_after` at 5 s, the lost node was forgotten
+  10.3 to 11.6 s into the run. Twenty seeds of random crashes,
+  partitions, message loss, and control-store faults ran clean. M2-15's
+  driver, which ran on the primary, took about 0.4 s: the coordinator's
+  rounds, the generation's push, and the nodes' register polls cost up to
+  another second and a half.
+- **Left for later.**
+  - **Departing primaries and surplus members** are rebalancing's (M3-06):
+    the coordinator never removes a primary, and removes only members that
+    do not count.
+  - **One change's writes are sequential.** `apply` sends a change's
+    compare-and-swaps one after another, so 32 shards cost 32 round trips,
+    and a node loss in a large cluster takes several changes. Sending them
+    in parallel needs `apply` to report a set of outcomes, not a prefix.
+  - **Each wrapped placement scans the shard registers itself.**
+    `PolicyWatch`, `BucketShards`, and `Replacement` each list `shards/`
+    every round (reading only changed registers); sharing one
+    `ClusterScan` would save two listings per round.
+  - **Pushes to a dead node still take their timeout** per change (M3-02
+    notes); batching makes it a cost per change, not per shard.
+
 ## M6 Native peer transport
 
 ### M6-01 Peer protocol messages
