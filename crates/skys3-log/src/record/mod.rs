@@ -63,8 +63,8 @@
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
 //! [`MpuComplete`], [`MpuAbort`], [`Tags`], [`Flushed`], [`Import`],
 //! [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
-//! without the bucket, shard, and epoch the fixed header holds, and
-//! `TRUNCATE`, which has no fields):
+//! without the bucket, shard, and epoch the fixed header holds, `TRUNCATE`,
+//! which has no fields, and [`ImportProgress`]):
 //!
 //! - integers as fixed-width little-endian values; positions as epoch then
 //!   sequence number; timestamps as milliseconds since the Unix epoch,
@@ -82,7 +82,11 @@
 //! - an `MPU_CREATE`'s checksum as an option of the algorithm's code (`u8`)
 //!   and the type (`u8`: 0 for `FULL_OBJECT`, 1 for `COMPOSITE`), and an
 //!   `MPU_COMPLETE`'s parts as a `u16` count followed by each part's
-//!   number (`u16`) and position, in increasing part number.
+//!   number (`u16`) and position, in increasing part number,
+//! - an `IMPORT_PROGRESS`'s ranges as a `u16` count from 1 to
+//!   [`MAX_IMPORT_RANGES`] followed by each range's optional end and its
+//!   checkpoint: a tag byte, 0 for a running range followed by its optional
+//!   last imported key, or 1 for a done one.
 //!
 //! # Decoding
 //!
@@ -108,9 +112,10 @@ use skys3_types::{EpochSeq, KeyHash, limits};
 
 pub use body::{
     Adopt, CopySource, Delete, Extent, ExtentRef, Flushed, IDENTITY_METADATA,
-    IDENTITY_METADATA_RESERVED, Import, MAX_EXTENTS, MAX_KEY_LEN, MAX_METADATA_LEN,
-    MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN,
-    Metadata, Put, PutData, RecordBody, TagSet, Tags,
+    IDENTITY_METADATA_RESERVED, Import, ImportCheckpoint, ImportProgress, ImportRange, MAX_EXTENTS,
+    MAX_IMPORT_RANGES, MAX_KEY_LEN, MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
+    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet,
+    Tags,
 };
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};

@@ -70,10 +70,10 @@ mod target;
 pub use attempt::Conflict;
 pub use budget::{DirtyBudget, Exhausted, Usage, share};
 pub use import::{
-    DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject, RemoteReader,
-    loaded_metadata,
+    Commit, DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject,
+    RemoteReader, loaded_metadata,
 };
 pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
-pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
+pub use target::{FlushSettings, Target};

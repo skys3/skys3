@@ -15,7 +15,7 @@ use skys3_remote::ObjectStore;
 use skys3_types::{BucketId, ETag};
 
 /// [`RemoteReads`] over a node's flush service.
-pub(crate) struct NodeRemote<S, D>(pub(crate) Arc<FlushService<S, D>>);
+pub struct NodeRemote<S, D>(pub Arc<FlushService<S, D>>);
 
 impl<S, D> fmt::Debug for NodeRemote<S, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

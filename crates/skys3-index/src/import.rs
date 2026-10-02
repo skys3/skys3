@@ -1,25 +1,8 @@
 //! A bucket's namespace import as the index stores it (§9.1): the key
 //! ranges its listing streams cover, each with its own checkpoint.
 
-use crate::entry::ImportCheckpoint;
-
-/// The most key ranges an import is split into, one listing stream each.
-pub const MAX_IMPORT_RANGES: usize = 256;
-
-/// One key range of a namespace import and how far its listing has got.
-///
-/// A range holds the keys after the previous range's end, or every key
-/// from the start for the first range, up to and including its own `end`.
-/// The last range has no end.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportRange {
-    /// The range's last key, without the target's prefix; `None` for the
-    /// last range.
-    pub end: Option<String>,
-    /// How far the range's listing has got. A running range's `after` is a
-    /// key of the range, or `None` before its first page.
-    pub checkpoint: ImportCheckpoint,
-}
+use skys3_log::record::ImportProgress;
+pub use skys3_log::record::{ImportCheckpoint, ImportRange, MAX_IMPORT_RANGES};
 
 /// The key ranges of a bucket's namespace import (§9.1), in key order, each
 /// listed by its own stream and checkpointed apart.
@@ -183,6 +166,16 @@ impl ImportRanges {
             }
         }
         ImportCheckpoint::Done
+    }
+
+    /// The `IMPORT_PROGRESS` record that stores the ranges as progress
+    /// number `update` (§9.1).
+    #[must_use]
+    pub fn to_progress(&self, update: u64) -> ImportProgress {
+        ImportProgress {
+            update,
+            ranges: self.ranges.clone(),
+        }
     }
 
     /// How many ranges are done.

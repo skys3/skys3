@@ -217,6 +217,71 @@ pub struct Adopt {
     pub checksums: Checksums,
 }
 
+/// The most key ranges a namespace import is split into, one listing
+/// stream each (§9.1), and so the most an `IMPORT_PROGRESS` names.
+pub const MAX_IMPORT_RANGES: usize = 256;
+
+/// How far one key range of a namespace import has got (§9.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportCheckpoint {
+    /// The range's listing is running. Every remote object of the range
+    /// whose key is at most `after` has its `IMPORT` record applied; `None`
+    /// before the first.
+    Running {
+        /// The last key imported, without the target's prefix.
+        after: Option<String>,
+    },
+    /// Every object of the range that the remote held when it was listed
+    /// is imported.
+    Done,
+}
+
+impl ImportCheckpoint {
+    /// Whether the listing has passed `key`: the remote object at `key`,
+    /// if the listing found one, has its `IMPORT` record applied.
+    #[must_use]
+    pub fn passed(&self, key: &str) -> bool {
+        match self {
+            Self::Running { after } => after.as_deref().is_some_and(|after| key <= after),
+            Self::Done => true,
+        }
+    }
+}
+
+/// One key range of a namespace import and how far its listing has got.
+///
+/// A range holds the keys after the previous range's end, or every key
+/// from the start for the first range, up to and including its own `end`.
+/// The last range has no end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRange {
+    /// The range's last key, without the target's prefix; `None` for the
+    /// last range.
+    pub end: Option<String>,
+    /// How far the range's listing has got. A running range's `after` is a
+    /// key of the range, or `None` before its first page.
+    pub checkpoint: ImportCheckpoint,
+}
+
+/// How far the namespace import of the record's bucket has got (§9.1):
+/// `IMPORT_PROGRESS(update, ranges)`.
+///
+/// The import's owner, the primary of the bucket's shard 0, commits one to
+/// every shard of the bucket once the `IMPORT` records of every key the
+/// ranges have passed are applied on every shard, so that each replica
+/// knows which keys the import has passed and a new owner resumes from it.
+/// A shard keeps the progress with the highest `update`; the state machine
+/// checks that the ranges are in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportProgress {
+    /// The progress's number, which grows with every progress any owner of
+    /// the import commits.
+    pub update: u64,
+    /// The import's key ranges in key order, from 1 to
+    /// [`MAX_IMPORT_RANGES`] of them.
+    pub ranges: Vec<ImportRange>,
+}
+
 /// The kind-specific content of a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -252,6 +317,8 @@ pub enum RecordBody {
     /// ([`truncated_by`](super::truncated_by)). It has no kind-specific
     /// fields.
     Truncate,
+    /// `IMPORT_PROGRESS(update, ranges)`.
+    ImportProgress(ImportProgress),
 }
 
 impl RecordBody {
@@ -272,6 +339,7 @@ impl RecordBody {
             Self::Adopt(_) => RecordKind::Adopt,
             Self::Config(_) => RecordKind::Config,
             Self::Truncate => RecordKind::Truncate,
+            Self::ImportProgress(_) => RecordKind::ImportProgress,
         }
     }
 
@@ -290,7 +358,7 @@ impl RecordBody {
             | Self::Flushed(Flushed { key, .. })
             | Self::Import(Import { key, .. })
             | Self::Adopt(Adopt { key, .. }) => Some(key),
-            Self::Config(_) | Self::Truncate => None,
+            Self::Config(_) | Self::Truncate | Self::ImportProgress(_) => None,
         }
     }
 
@@ -330,6 +398,7 @@ impl RecordBody {
             Self::Adopt(adopt) => adopt.encode(w),
             Self::Config(config) => encode_config(w, config, shard, position),
             Self::Truncate => Ok(()),
+            Self::ImportProgress(progress) => progress.encode(w),
         }
     }
 
@@ -363,6 +432,7 @@ impl RecordBody {
             RecordKind::Adopt => Self::Adopt(Adopt::decode(&mut r)?),
             RecordKind::Config => Self::Config(decode_config(&mut r, shard, position)?),
             RecordKind::Truncate => Self::Truncate,
+            RecordKind::ImportProgress => Self::ImportProgress(ImportProgress::decode(&mut r)?),
             // `RecordHeader::decode` admits only defined kinds.
             _ => {
                 return Err(FieldError::new(
@@ -680,6 +750,54 @@ impl Import {
             etag: read_etag(r, "import.etag")?,
             storage_class: read_option_str(r, "import.storage_class", MAX_STORAGE_CLASS_LEN)?,
         })
+    }
+}
+
+impl ImportProgress {
+    fn encode(&self, w: &mut Writer<'_>) -> Result<(), FieldError> {
+        w.u64(self.update);
+        w.len16(
+            "import_progress.ranges",
+            self.ranges.len(),
+            1,
+            MAX_IMPORT_RANGES,
+        )?;
+        for range in &self.ranges {
+            write_option_str(w, "import_progress.end", range.end.as_deref(), MAX_KEY_LEN)?;
+            match &range.checkpoint {
+                ImportCheckpoint::Running { after } => {
+                    w.u8(0);
+                    write_option_str(w, "import_progress.after", after.as_deref(), MAX_KEY_LEN)?;
+                }
+                ImportCheckpoint::Done => w.u8(1),
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Self, FieldError> {
+        let update = r.u64("import_progress.update")?;
+        let count = r.len16("import_progress.ranges", 1, MAX_IMPORT_RANGES)?;
+        // Each range takes at least two bytes: a presence byte and a tag.
+        r.check_count("import_progress.ranges", count, 2)?;
+        let mut ranges = Vec::with_capacity(count);
+        for _ in 0..count {
+            let end = read_option_str(r, "import_progress.end", MAX_KEY_LEN)?;
+            let checkpoint = match r.u8("import_progress.state")? {
+                0 => ImportCheckpoint::Running {
+                    after: read_option_str(r, "import_progress.after", MAX_KEY_LEN)?,
+                },
+                1 => ImportCheckpoint::Done,
+                tag => {
+                    return Err(FieldError::new(
+                        "import_progress.state",
+                        Problem::InvalidTag(tag),
+                    ));
+                }
+            };
+            ranges.push(ImportRange { end, checkpoint });
+        }
+        Ok(Self { update, ranges })
     }
 }
 

@@ -278,8 +278,9 @@ impl<D: Disk> ShardSet<D> {
         }
     }
 
-    /// The namespace import ranges of `bucket` on this node and their
-    /// checkpoints (§9.1), read on the index's pool.
+    /// The namespace import ranges of `bucket` and their checkpoints (§9.1)
+    /// as a build that kept them in the node's index stored them, read on
+    /// the index's pool ([`Index::import_ranges`]).
     ///
     /// # Errors
     ///

@@ -432,3 +432,35 @@ fn an_error_is_reported_until_its_key_gets_past_it() {
         assert_eq!(flusher.status().last_error, None);
     });
 }
+
+#[test]
+fn a_later_write_of_the_shard_at_the_remote_is_never_replaced() {
+    runtime().block_on(async {
+        let node = Node::open(27).await;
+        let store = remote(27, false);
+        let seq = node.put("k", "ours").await;
+        // A newer primary flushed a later write of the key, which this
+        // replica has not applied: an old primary's flusher must leave it.
+        let mut metadata = UserMetadata::new();
+        metadata.insert("skys3-wid", identity(seq + 50)).unwrap();
+        store
+            .put_object(PutObject::new("k", "later").with_metadata(metadata))
+            .await
+            .unwrap();
+        let flusher = node.flusher(&target(&store));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            remote_object(&store, "k"),
+            Some(("later".to_owned(), Some(identity(seq + 50))))
+        );
+        assert!(flusher.status().conflicts.is_empty());
+        assert_eq!(node.entry("k").await.unwrap().state, EntryState::Dirty);
+
+        // Nor is it deleted.
+        node.delete("k").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(remote_object(&store, "k").unwrap().0, "later");
+        assert!(flusher.status().conflicts.is_empty());
+        assert!(node.entry("k").await.is_some());
+    });
+}

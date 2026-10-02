@@ -259,13 +259,13 @@ fn encoder_follows_the_documented_layout() {
 #[test]
 fn record_kinds_have_fixed_codes_and_names() {
     let codes: Vec<u16> = RecordKind::ALL.iter().map(|k| k.code()).collect();
-    assert_eq!(codes, (1..=18).collect::<Vec<_>>());
+    assert_eq!(codes, (1..=19).collect::<Vec<_>>());
     for kind in RecordKind::ALL {
         assert_eq!(RecordKind::from_code(kind.code()), Some(kind));
         assert_eq!(kind.to_string(), kind.name());
     }
     assert_eq!(RecordKind::from_code(0), None);
-    assert_eq!(RecordKind::from_code(19), None);
+    assert_eq!(RecordKind::from_code(20), None);
     let names: Vec<&str> = RecordKind::ALL.iter().map(|k| k.name()).collect();
     assert_eq!(
         names,
@@ -288,6 +288,7 @@ fn record_kinds_have_fixed_codes_and_names() {
             "EC_RELEASE",
             "TRUNCATE",
             "CONFIG",
+            "IMPORT_PROGRESS",
         ]
     );
     let defined: Vec<&str> = RecordKind::ALL
@@ -310,10 +311,12 @@ fn record_kinds_have_fixed_codes_and_names() {
             "IMPORT",
             "ADOPT",
             "TRUNCATE",
-            "CONFIG"
+            "CONFIG",
+            "IMPORT_PROGRESS"
         ]
     );
     assert!(!RecordKind::Config.has_key() && !RecordKind::Truncate.has_key());
+    assert!(!RecordKind::ImportProgress.has_key());
     assert!(RecordKind::MpuPart.has_key());
 }
 
@@ -399,7 +402,7 @@ fn framing_is_checked_before_the_rest() {
 
 #[test]
 fn unknown_and_reserved_kinds_are_rejected() {
-    for code in [0, 19, u16::MAX] {
+    for code in [0, 20, u16::MAX] {
         let bytes = Frame::new(code).build(&[], &[]);
         assert_eq!(decode_err(&bytes), DecodeError::UnknownKind(code));
     }

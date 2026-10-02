@@ -321,6 +321,9 @@ impl<H: Shards> Objects<H> {
             Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
+        if condition != Precondition::None {
+            self.conditional_entry(bucket, &shard, &input.key).await?;
+        }
         let every_part = (0, MAX_PARTS as usize);
         let (upload, state, stored) = open_upload(
             &self.shards,

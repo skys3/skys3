@@ -17,9 +17,7 @@ use skys3_remote::probe::ConditionalProbe;
 use skys3_remote::{ObjectStore, PutObject};
 use skys3_sim::SimS3;
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
-use skys3_types::{
-    BucketDocument, BucketId, BucketMode, BucketName, ProposalId, RemoteTarget, ShardCount,
-};
+use skys3_types::{BucketDocument, BucketMode, BucketName, ProposalId, RemoteTarget, ShardCount};
 use support::{Node, Patience, cluster, runtime, settings, shard_ref};
 use tokio::time::Instant;
 
@@ -119,6 +117,12 @@ async fn indexed(node: &Node) -> Vec<String> {
     entries.into_iter().map(|(key, _)| key).collect()
 }
 
+/// The import progress the node's shard applied last (§9.1).
+async fn stored(node: &Node) -> Option<ImportRanges> {
+    let progress = node.shard.import_progress().await.unwrap();
+    progress.map(|(_, ranges)| ranges)
+}
+
 /// Whether every range has imported a page and none is done.
 fn every_range_running(ranges: &ImportRanges) -> bool {
     ranges.ranges().iter().all(|range| {
@@ -143,7 +147,7 @@ fn a_parallel_import_lists_its_ranges_together_and_imports_every_key_once() {
         loop {
             let status = status(&service);
             if status.ranges.ranges().len() == 4 && every_range_running(&status.ranges) {
-                let stored = node.set.import_ranges(&bucket().bucket_id).await.unwrap();
+                let stored = stored(&node).await;
                 let stored = stored.unwrap();
                 assert_eq!(stored.ranges().len(), 4);
                 assert!(every_range_running(&stored), "{stored:?}");
@@ -157,7 +161,7 @@ fn a_parallel_import_lists_its_ranges_together_and_imports_every_key_once() {
         assert_eq!((status.imported, status.error), (150, None));
         assert_eq!(status.ranges, ImportCheckpoint::Done.into());
         assert_eq!(indexed(&node).await, keys);
-        let stored = node.set.import_ranges(&bucket().bucket_id).await.unwrap();
+        let stored = stored(&node).await;
         assert_eq!(stored, Some(ImportCheckpoint::Done.into()));
         service.shutdown().await;
     });
@@ -183,7 +187,7 @@ fn a_restart_mid_import_resumes_every_range() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         first.shutdown().await;
-        let stored = node.set.import_ranges(&bucket().bucket_id).await.unwrap();
+        let stored = stored(&node).await;
         let stored = stored.unwrap();
         assert_eq!(stored.ranges().len(), 4);
         assert!(every_range_running(&stored), "{stored:?}");
@@ -272,16 +276,13 @@ fn shutdown_waits_for_a_checkpoint_write_in_flight() {
         // anyone still waits for it.
         let node = Node::open(95).await;
         // Keys under the probe's scratch prefix are listed but never
-        // imported, so a page uses the index only to store its
-        // checkpoint, and a bucket with no shard open here has no flusher
-        // that could use it. Far more pages than the test lets through.
+        // imported, so a page uses the index only to apply its progress,
+        // and the shard's flusher has nothing to flush. Far more pages than
+        // the test lets through.
         let scratch = ConditionalProbe::SCRATCH_DIR;
         let keys: Vec<String> = (0..990).map(|n| format!("{scratch}k{n:03}")).collect();
         let store = remote(95, &keys).await;
-        let bucket = BucketDocument {
-            bucket_id: BucketId::new("b-elsewhere").unwrap(),
-            ..bucket()
-        };
+        let bucket = bucket();
         let checkpoint = |service: &FlushService<SimS3, SimMount>| {
             service.status(&bucket.bucket_id).unwrap().import.checkpoint
         };
@@ -349,7 +350,7 @@ fn shutdown_waits_for_a_checkpoint_write_in_flight() {
         // shutdown returned, and nothing came after it.
         let page = |key: &str| -> usize { key[key.len() - 3..].parse().unwrap() };
         let next = format!("{scratch}k{:03}", page(&before) + 10);
-        let stored = node.set.import_ranges(&bucket.bucket_id).await.unwrap();
+        let stored = stored(&node).await;
         assert_eq!(
             stored.map(|ranges| ranges.position()),
             Some(ImportCheckpoint::Running { after: Some(next) })
@@ -374,7 +375,7 @@ fn a_bucket_followed_again_resumes_its_ranges() {
         // import waits for the old one to stop, and resumes its ranges.
         service.reconcile(&[], &node.set).await;
         assert!(service.status(&bucket().bucket_id).is_none());
-        let stored = node.set.import_ranges(&bucket().bucket_id).await.unwrap();
+        let stored = stored(&node).await;
         let stored = stored.unwrap();
         assert_eq!(stored.ranges().len(), 4);
         let passed = keys.iter().filter(|key| stored.passed(key)).count();

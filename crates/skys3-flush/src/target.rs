@@ -23,28 +23,6 @@ const MAX_ORPHANS: usize = 4096;
 /// Remote multipart uploads left open, by remote key and upload ID.
 type Orphans = VecDeque<(String, UploadId)>;
 
-/// How far a namespace import has got (§9.1), as the flusher needs to know.
-///
-/// A key the import has passed is in the index exactly as the remote held
-/// it, so a key without a remote ETag is absent there. Before the import
-/// passes a key, its remote state is unknown, and a tombstone must stay in
-/// the index (§4.2). A bucket's import ([`ImportState`](crate::ImportState))
-/// implements it; [`ImportDone`] says every key is passed.
-pub trait ImportProgress: Send + Sync + 'static {
-    /// Whether the import has passed `key`.
-    fn passed(&self, key: &str) -> bool;
-}
-
-/// The [`ImportProgress`] of a bucket whose import is complete.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ImportDone;
-
-impl ImportProgress for ImportDone {
-    fn passed(&self, _key: &str) -> bool {
-        true
-    }
-}
-
 /// How a shard flusher paces itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushSettings {
@@ -119,7 +97,9 @@ pub struct Target<S> {
     pub(crate) writes: ConditionalWrites,
     pub(crate) cluster: ClusterId,
     pub(crate) settings: FlushSettings,
-    pub(crate) import: Arc<dyn ImportProgress>,
+    /// Whether the bucket has a namespace import, whose progress each
+    /// shard keeps (§9.1).
+    pub(crate) import: bool,
     pub(crate) wall: Arc<dyn WallClock>,
     pub(crate) counters: Counters,
     /// The in-flight budget, in KiB.
@@ -161,7 +141,7 @@ impl<S> Target<S> {
             writes,
             cluster,
             settings,
-            import: Arc::new(ImportDone),
+            import: false,
             wall: Arc::new(SystemWallClock),
             counters: Counters::default(),
             inflight: Semaphore::new(inflight_kib as usize),
@@ -170,10 +150,21 @@ impl<S> Target<S> {
         }
     }
 
-    /// Sets how far the bucket's import has got.
+    /// Makes the flushers follow the bucket's namespace import (§9.1): a
+    /// key counts as imported once the `IMPORT_PROGRESS` its shard applied
+    /// has passed it ([`Shard::import_progress`]), and not before.
+    ///
+    /// A key the import has passed is in the index exactly as the remote
+    /// held it, so a key without a remote ETag is absent there. Before the
+    /// import passes a key, its remote state is unknown, and a tombstone
+    /// must stay in the index (§4.2). The shard's own progress decides,
+    /// not the bucket's on this node: an `IMPORT` of the key delivered late
+    /// is dropped only by a shard whose progress has passed it.
+    ///
+    /// [`Shard::import_progress`]: skys3_shard::Shard::import_progress
     #[must_use]
-    pub fn with_import(mut self, import: Arc<dyn ImportProgress>) -> Self {
-        self.import = import;
+    pub fn with_import(mut self) -> Self {
+        self.import = true;
         self
     }
 

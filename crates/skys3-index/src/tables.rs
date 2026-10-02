@@ -14,6 +14,7 @@ use skys3_types::{Epoch, EpochSeq, Generation, ShardConfig};
 use crate::codec;
 use crate::entry::{ControlEntry, Entry, Part, Upload};
 use crate::error::IndexError;
+use crate::import::ImportRanges;
 use crate::listing::{self, ListPage, ListQuery};
 
 type Bytes = &'static [u8];
@@ -33,7 +34,9 @@ pub(crate) const PARTS: TableDefinition<Bytes, Bytes> = TableDefinition::new("pa
 pub(crate) const COVERAGE: TableDefinition<Bytes, Bytes> = TableDefinition::new("coverage");
 /// The node's local copy of control state, keyed by register key.
 pub(crate) const CONTROL: TableDefinition<&str, Bytes> = TableDefinition::new("control");
-/// Each bucket's namespace import checkpoint, keyed by bucket ID.
+/// Each bucket's namespace import checkpoint, keyed by bucket ID, as builds
+/// stored it before the progress moved into the log ([`IMPORT_PROGRESS`]):
+/// an import resumes from it only when its shard 0 holds no progress.
 pub(crate) const IMPORTS: TableDefinition<&str, Bytes> = TableDefinition::new("imports");
 /// The gateway's shard map (§6.2): the newest configuration the node knows
 /// of each shard, keyed by shard. It is a cache that is safe when stale,
@@ -63,6 +66,14 @@ pub(crate) const CONFIGS: TableDefinition<Bytes, Bytes> = TableDefinition::new("
 /// again in the epoch it proposed over, so it came with a new format
 /// version.
 pub(crate) const TAKEOVERS: TableDefinition<Bytes, Bytes> = TableDefinition::new("takeovers");
+/// How far the namespace import of each shard's bucket has got, as the
+/// latest `IMPORT_PROGRESS` record the shard applied (§9.1), keyed by
+/// shard. The state machine keeps it as it applies the record, so replay
+/// restores it, and a snapshot carries it. Applying an `IMPORT` reads it,
+/// so a build that ignored it could resurrect a deleted key: it came with
+/// a new format version.
+pub(crate) const IMPORT_PROGRESS: TableDefinition<Bytes, Bytes> =
+    TableDefinition::new("import_progress");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -155,6 +166,18 @@ fn applied<T: ReadableTable<Bytes, Bytes>>(
         .map_err(IndexError::codec("shards"))
 }
 
+fn import_progress<T: ReadableTable<Bytes, Bytes>>(
+    table: &T,
+    shard: &ShardRef,
+) -> Result<Option<(u64, ImportRanges)>, IndexError> {
+    let Some(value) = table.get(codec::shard_key(shard).as_slice())? else {
+        return Ok(None);
+    };
+    codec::decode_import_progress(value.value())
+        .map(Some)
+        .map_err(IndexError::codec("import_progress"))
+}
+
 /// Reads every row of a table keyed and valued by bytes, decoding both.
 fn read_all<T, K, V>(
     table: &T,
@@ -219,11 +242,18 @@ pub enum ShardTable {
     Uploads,
     /// The parts of uploads and multipart objects.
     Parts,
+    /// The shard's import progress (§9.1).
+    ImportProgress,
 }
 
 impl ShardTable {
     /// Every table, in the order a snapshot sends them.
-    pub const ALL: [Self; 3] = [Self::Namespace, Self::Uploads, Self::Parts];
+    pub const ALL: [Self; 4] = [
+        Self::Namespace,
+        Self::Uploads,
+        Self::Parts,
+        Self::ImportProgress,
+    ];
 
     /// The table's code in a snapshot.
     #[must_use]
@@ -232,6 +262,7 @@ impl ShardTable {
             Self::Namespace => 1,
             Self::Uploads => 2,
             Self::Parts => 3,
+            Self::ImportProgress => 4,
         }
     }
 
@@ -257,6 +288,10 @@ impl ShardTable {
                 codec::decode_part(value).map_err(|e| e.to_string())?;
                 codec::decode_part_key(key).map(|(shard, ..)| shard)
             }
+            Self::ImportProgress => {
+                codec::decode_import_progress(value).map_err(|e| e.to_string())?;
+                codec::decode_shard_key(key)
+            }
         }
         .map_err(|e| e.to_string())?;
         if theirs == *shard {
@@ -279,6 +314,7 @@ pub struct IndexWriter<'txn> {
     uploads: Table<'txn, Bytes, Bytes>,
     parts: Table<'txn, Bytes, Bytes>,
     configs: Table<'txn, Bytes, Bytes>,
+    import_progress: Table<'txn, Bytes, Bytes>,
 }
 
 impl<'txn> IndexWriter<'txn> {
@@ -290,7 +326,40 @@ impl<'txn> IndexWriter<'txn> {
             uploads: txn.open_table(UPLOADS)?,
             parts: txn.open_table(PARTS)?,
             configs: txn.open_table(CONFIGS)?,
+            import_progress: txn.open_table(IMPORT_PROGRESS)?,
         })
+    }
+
+    /// Returns the import progress `shard` applied last (§9.1): the number
+    /// of its `IMPORT_PROGRESS` record and its ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> Result<Option<(u64, ImportRanges)>, IndexError> {
+        import_progress(&self.import_progress, shard)
+    }
+
+    /// Keeps `ranges`, numbered `update`, as the import progress of
+    /// `shard`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if a key is too long or the write fails.
+    pub fn put_import_progress(
+        &mut self,
+        shard: &ShardRef,
+        update: u64,
+        ranges: &ImportRanges,
+    ) -> Result<(), IndexError> {
+        let value = codec::encode_import_progress(update, ranges)
+            .map_err(IndexError::codec("import_progress"))?;
+        self.import_progress
+            .insert(codec::shard_key(shard).as_slice(), value.as_slice())?;
+        Ok(())
     }
 
     /// Keeps `config` as the configuration of the latest `CONFIG` record
@@ -549,6 +618,7 @@ impl<'txn> IndexWriter<'txn> {
         }
         self.shards.remove(prefix.as_slice())?;
         self.configs.remove(prefix.as_slice())?;
+        self.import_progress.remove(prefix.as_slice())?;
         Ok(())
     }
 
@@ -698,6 +768,7 @@ pub struct IndexReader {
     promotions: ReadOnlyTable<Bytes, Bytes>,
     configs: ReadOnlyTable<Bytes, Bytes>,
     takeovers: ReadOnlyTable<Bytes, Bytes>,
+    import_progress: ReadOnlyTable<Bytes, Bytes>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
 
@@ -715,8 +786,23 @@ impl IndexReader {
             promotions: txn.open_table(PROMOTIONS)?,
             configs: txn.open_table(CONFIGS)?,
             takeovers: txn.open_table(TAKEOVERS)?,
+            import_progress: txn.open_table(IMPORT_PROGRESS)?,
             meta: txn.open_table(META)?,
         })
+    }
+
+    /// Returns the import progress `shard` applied last (§9.1): the number
+    /// of its latest `IMPORT_PROGRESS` record and its ranges, or `None` if
+    /// it applied none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> Result<Option<(u64, ImportRanges)>, IndexError> {
+        import_progress(&self.import_progress, shard)
     }
 
     /// Returns the epoch in which this node's replica of `shard` stepped
@@ -1048,6 +1134,7 @@ impl IndexReader {
             ShardTable::Namespace => &self.namespace,
             ShardTable::Uploads => &self.uploads,
             ShardTable::Parts => &self.parts,
+            ShardTable::ImportProgress => &self.import_progress,
         };
         let (mut rows, mut bytes) = (Vec::new(), 0);
         for row in table.range(prefix.as_slice()..end.as_slice())? {

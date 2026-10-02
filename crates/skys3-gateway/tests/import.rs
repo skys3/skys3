@@ -570,3 +570,64 @@ async fn keys_a_later_range_has_passed_are_read_from_the_index_alone() {
         .await;
     assert_eq!(listed(&rolled.body), ["a", "z"]);
 }
+
+#[tokio::test]
+async fn a_conditional_write_sees_an_object_only_at_the_remote() {
+    let remote = Arc::new(Remote::default());
+    let (setup, bucket) = setup(&remote).await;
+    remote.running(None);
+    let a = remote.put("a.txt", "hello");
+    let b = remote.put("b.txt", "world");
+    let c = remote.put("c.txt", "again");
+
+    // The remote's object fails `If-None-Match: *`, and its `IMPORT`,
+    // committed first, leaves the key's stub.
+    let absent = [("if-none-match", "*")];
+    let put = setup.call(Method::PUT, "/photos/a.txt", &absent, "x").await;
+    put.assert(412, Some("PreconditionFailed"));
+    let stub = entry(&setup, &bucket, "a.txt").await.unwrap();
+    assert_eq!(stub.state, EntryState::Evicted);
+    assert_eq!(stub.remote_etag.as_ref(), Some(&a));
+
+    // `If-Match` on its ETag holds, and the write replaces it there.
+    let quoted = format!("\"{b}\"");
+    let matches = [("if-match", quoted.as_str())];
+    let put = setup
+        .call(Method::PUT, "/photos/b.txt", &matches, "x")
+        .await;
+    put.assert(200, None);
+    let written = entry(&setup, &bucket, "b.txt").await.unwrap();
+    assert_eq!(written.state, EntryState::Dirty);
+    assert_eq!(written.remote_etag.as_ref(), Some(&b));
+
+    // A conditional delete is checked the same way.
+    let wrong = [("if-match", "\"0123456789abcdef0123456789abcdef\"")];
+    let delete = setup
+        .call(Method::DELETE, "/photos/c.txt", &wrong, "")
+        .await;
+    delete.assert(412, Some("PreconditionFailed"));
+    let quoted = format!("\"{c}\"");
+    let matches = [("if-match", quoted.as_str())];
+    let delete = setup
+        .call(Method::DELETE, "/photos/c.txt", &matches, "")
+        .await;
+    delete.assert(204, None);
+
+    // A key the remote does not hold is absent.
+    let put = setup.call(Method::PUT, "/photos/new", &absent, "x").await;
+    put.assert(200, None);
+
+    // A remote that cannot answer cannot decide the condition.
+    remote.put("d.txt", "later");
+    remote.lock().failing = true;
+    let put = setup.call(Method::PUT, "/photos/d.txt", &absent, "x").await;
+    put.assert(503, Some("ServiceUnavailable"));
+    remote.lock().failing = false;
+
+    // Once the import has passed a key, the index alone decides.
+    remote.running(Some("z"));
+    let heads = remote.lock().heads;
+    let put = setup.call(Method::PUT, "/photos/d.txt", &absent, "x").await;
+    put.assert(200, None);
+    assert_eq!(remote.lock().heads, heads);
+}

@@ -86,11 +86,13 @@ pub enum RecordKind {
     Truncate,
     /// A replica's full shard configuration (defined).
     Config,
+    /// How far the bucket's namespace import has got (defined).
+    ImportProgress,
 }
 
 impl RecordKind {
     /// Every kind, in code order.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Put,
         Self::Delete,
         Self::Extent,
@@ -109,9 +111,10 @@ impl RecordKind {
         Self::EcRelease,
         Self::Truncate,
         Self::Config,
+        Self::ImportProgress,
     ];
 
-    /// The kind's code in the fixed header, from 1 to 18. Code 0 is never
+    /// The kind's code in the fixed header, from 1 to 19. Code 0 is never
     /// used, so zeroed bytes are never a valid kind.
     #[must_use]
     pub const fn code(self) -> u16 {
@@ -134,6 +137,7 @@ impl RecordKind {
             Self::EcRelease => 16,
             Self::Truncate => 17,
             Self::Config => 18,
+            Self::ImportProgress => 19,
         }
     }
 
@@ -165,6 +169,7 @@ impl RecordKind {
             Self::EcRelease => "EC_RELEASE",
             Self::Truncate => "TRUNCATE",
             Self::Config => "CONFIG",
+            Self::ImportProgress => "IMPORT_PROGRESS",
         }
     }
 
@@ -187,14 +192,16 @@ impl RecordKind {
                 | Self::Adopt
                 | Self::Truncate
                 | Self::Config
+                | Self::ImportProgress
         )
     }
 
     /// Whether records of this kind name an object key, and so carry its
-    /// [`KeyHash`]. `CONFIG` and `TRUNCATE` concern the whole shard.
+    /// [`KeyHash`]. `CONFIG`, `TRUNCATE`, and `IMPORT_PROGRESS` concern the
+    /// whole shard.
     #[must_use]
     pub const fn has_key(self) -> bool {
-        !matches!(self, Self::Truncate | Self::Config)
+        !matches!(self, Self::Truncate | Self::Config | Self::ImportProgress)
     }
 }
 

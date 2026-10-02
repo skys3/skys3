@@ -116,8 +116,11 @@ fn an_attached_bucket_imports_its_remote_namespace_once() {
             })
             .collect();
         assert_eq!(imported, etags);
+        // The progress is in the shard's log, not the node's own table.
+        let (_, progress) = node.shard.import_progress().await.unwrap().unwrap();
+        assert_eq!(progress, ImportCheckpoint::Done.into());
         let checkpoint = node.set.import_ranges(&bucket().bucket_id).await;
-        assert_eq!(checkpoint.unwrap(), Some(ImportCheckpoint::Done.into()));
+        assert_eq!(checkpoint.unwrap(), None);
 
         // A restarted node finds the import done and lists nothing.
         service.shutdown().await;
@@ -140,6 +143,8 @@ fn an_import_resumes_from_its_checkpoint_at_its_rate() {
         for n in 0..40 {
             remote_put(&store, &format!("{PREFIX}k{n:02}"), "body").await;
         }
+        // A checkpoint a build that kept it in the node's index stored,
+        // before progress moved into the log.
         let after = ImportCheckpoint::Running {
             after: Some("k09".to_owned()),
         };

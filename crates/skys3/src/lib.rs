@@ -16,6 +16,8 @@
 //!   does not answer.
 //! - [`storage`]: recovery of the storage engine, the part of startup the
 //!   cluster simulation shares with the node.
+//! - [`remote`]: the gateway's reads of `write_back` targets through the
+//!   flush service, which the cluster simulation shares with the node.
 //! - [`sessions`]: STS session records in the internal system bucket.
 //! - [`admin`]: the admin API under `/v1/`: health and bucket status.
 //! - [`tls`]: the gateway's TLS configuration.
@@ -25,7 +27,7 @@ mod admission;
 pub mod control;
 pub mod datadir;
 mod node;
-mod remote;
+pub mod remote;
 pub mod sessions;
 pub mod storage;
 pub mod tls;

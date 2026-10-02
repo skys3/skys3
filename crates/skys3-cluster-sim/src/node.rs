@@ -22,11 +22,14 @@ use std::time::Duration;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use skys3::control::{self, NodeStore};
+use skys3::remote::NodeRemote;
 use skys3::storage;
 use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
-use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
-use skys3_gateway::{Gateway, GatewayConfig, IdSource, LocalShards, ShardRef, Shards, TrustAll};
+use skys3_flush::{Commit, FlushMetrics, FlushService, FlushSettings};
+use skys3_gateway::{
+    Gateway, GatewayConfig, IdSource, LocalShards, Precondition, ShardRef, Shards, TrustAll,
+};
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{
     BlockingPool, Clock, Drift, MonotonicClock, SimDisk, SimMount, SimPower, WallClock,
@@ -288,8 +291,12 @@ pub(crate) async fn run<S: NodeServices>(
         seed: seed.rotate_left(17),
     };
     let shards = shared.services.start(env).await?;
+    let flush =
+        Arc::new(flush_service(settings, &shared.remote).with_commit(commit_through(&shards)));
+    let mut gateway_config = settings.gateway.clone();
+    gateway_config.remote = Some(Arc::new(NodeRemote(Arc::clone(&flush))));
     let gateway = Gateway::new(
-        settings.gateway.clone(),
+        gateway_config,
         store.clone(),
         shards.clone(),
         IdSource::seeded(seed),
@@ -298,7 +305,6 @@ pub(crate) async fn run<S: NodeServices>(
     .await?;
     open_shards(&shards, &gateway.buckets()).await?;
     {
-        let flush = flush_service(settings, &shared.remote);
         let (gateway, local) = (gateway.clone(), recovered.shards.clone());
         tokio::spawn(async move { follow_flushes(&flush, &gateway, &local).await });
     }
@@ -353,6 +359,26 @@ fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3,
         FlushMetrics::register(&MetricsRegistry::new()),
     )
     .with_wall_clock(Arc::new(SimWallClock))
+}
+
+/// Commits the records of an import this node owns through `shards`, the
+/// shards the gateway calls, which reach each shard's primary wherever it
+/// is (§9.1).
+fn commit_through<H: Shards>(shards: &H) -> Commit {
+    let shards = shards.clone();
+    Arc::new(move |shard, body| {
+        let shards = shards.clone();
+        Box::pin(async move {
+            let shard = ShardRef {
+                bucket: shard.bucket,
+                shard: shard.shard,
+            };
+            match shards.write(&shard, body, Precondition::None).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    })
 }
 
 /// Keeps a flusher on every `write_back` bucket shard open on the node, as

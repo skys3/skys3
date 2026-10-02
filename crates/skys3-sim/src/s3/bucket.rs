@@ -704,6 +704,21 @@ impl Bucket {
             .collect()
     }
 
+    /// Returns the write identity (`skys3-wid` metadata) of every object
+    /// version, delete markers left out, with its key.
+    pub(super) fn identities(&self) -> Vec<(String, Option<String>)> {
+        self.keys
+            .iter()
+            .flat_map(|(key, versions)| {
+                versions.iter().filter_map(move |v| {
+                    let object = v.object.as_ref()?;
+                    let identity = object.metadata.write_identity().map(str::to_owned);
+                    Some((key.clone(), identity))
+                })
+            })
+            .collect()
+    }
+
     /// Returns every open multipart upload and its key, in upload-ID order.
     pub(super) fn uploads(&self) -> Vec<(UploadId, String)> {
         self.uploads

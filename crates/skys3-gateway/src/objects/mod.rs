@@ -281,11 +281,7 @@ impl<H: Shards> Objects<H> {
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
         if condition != Precondition::None {
-            let entry = self
-                .shards
-                .entry(&shard, &input.key)
-                .await
-                .map_err(shard_error)?;
+            let entry = self.conditional_entry(bucket, &shard, &input.key).await?;
             condition.check(entry.as_ref())?;
         }
 

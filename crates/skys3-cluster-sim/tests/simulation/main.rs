@@ -43,6 +43,10 @@
 //! - [`buckets`]: buckets created through a gateway, with their shards
 //!   placed on the registered nodes, serving reads and writes through
 //!   every node.
+//! - [`primary_work`]: primaries that fail over or hand off in the middle
+//!   of flushes and of a namespace import, against a faulty remote store,
+//!   with the flushes and the import finished and checked after the run
+//!   settles.
 
 mod acks;
 mod backfill;
@@ -53,6 +57,7 @@ mod handoff;
 mod harness;
 mod learners;
 mod leases;
+mod primary_work;
 mod registry;
 mod removal;
 mod replacement;

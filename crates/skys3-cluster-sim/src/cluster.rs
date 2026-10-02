@@ -15,11 +15,12 @@ use skys3_control::{
 };
 use skys3_flush::FlushSettings;
 use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
-use skys3_index::{EntryState, Index};
+use skys3_index::{EntryState, ImportCheckpoint, Index};
 use skys3_io::{Drift, MonotonicClock, SimDiskFaults, SyncCut};
 use skys3_log::LogConfig;
+use skys3_remote::{ObjectStore, PutObject};
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
-use skys3_sim::history::{History, Operation, Outcome};
+use skys3_sim::history::{Call, Condition, History, Operation, Outcome};
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
 use skys3_sim::{SimContext, SimS3};
 use skys3_types::{
@@ -35,7 +36,7 @@ use crate::node::{
 };
 use crate::pki::Pki;
 use crate::replication::register;
-use crate::workload::{Client, Routes, Workload};
+use crate::workload::{Client, Routes, Workload, etag_of};
 
 /// The shape of a simulated cluster.
 #[derive(Clone, Debug, PartialEq)]
@@ -76,7 +77,8 @@ pub struct ClusterConfig {
     pub control_rates: FaultRates,
     /// The shortest and longest latency of each network message.
     pub latency: (Duration, Duration),
-    /// Faults of the remote store that `write_back` buckets flush to.
+    /// Faults of the remote store that `write_back` buckets flush to, from
+    /// the start of the workload on.
     pub remote_faults: SimS3Faults,
     /// Whether the buckets are created through the S3 API, each by a
     /// different node's gateway, before the workload starts, with their
@@ -85,6 +87,24 @@ pub struct ClusterConfig {
     /// placement. The nodes must register themselves
     /// ([`CoordinatedServices`](crate::CoordinatedServices)).
     pub create_buckets: bool,
+    /// Above zero, the remote store holds objects under each `write_back`
+    /// bucket's prefix before the cluster starts, which the namespace
+    /// import (§9.1) brings in: one at every key of the workload, recorded
+    /// in the history as written before anything else, and this many
+    /// more, which no client touches.
+    pub remote_objects: usize,
+    /// Whether the remote store keeps every version, so that the settled
+    /// check can find a write flushed twice.
+    pub remote_versioning: bool,
+    /// The most keys a second each bucket's import lists, if not the
+    /// default; pages then hold a tenth of a second's keys, so that an
+    /// import takes many pages.
+    pub import_keys_per_second: Option<u64>,
+    /// Above zero, how long the cluster runs on after the final reads,
+    /// with every fault healed, the remote store's too, before the power
+    /// loss; the run then also checks that it settled
+    /// ([`Cluster::run`]).
+    pub settle: Duration,
 }
 
 impl Default for ClusterConfig {
@@ -114,6 +134,10 @@ impl Default for ClusterConfig {
             latency: (Duration::from_millis(1), Duration::from_millis(5)),
             remote_faults: SimS3Faults::default(),
             create_buckets: false,
+            remote_objects: 0,
+            remote_versioning: false,
+            import_keys_per_second: None,
+            settle: Duration::ZERO,
         }
     }
 }
@@ -396,6 +420,13 @@ impl<S: NodeServices> Cluster<S> {
     /// every node, and checks the history: linearizable per key, and every
     /// acknowledged write present on a surviving member after recovery.
     ///
+    /// With [`ClusterConfig::settle`], the cluster runs on for that long
+    /// before the power loss, and the run checks that the primary-scoped
+    /// work finished (§7.1, §9.1): every `write_back` key, the workload's
+    /// and the imported ones, is clean on every member and the remote
+    /// holds exactly its value, every shard's import is done, and no write
+    /// identity is on two versions of a remote object.
+    ///
     /// # Errors
     ///
     /// [`RunError`] for a failed simulation, setup, or check.
@@ -405,13 +436,21 @@ impl<S: NodeServices> Cluster<S> {
         workload: &Workload,
         plan: &FaultPlan,
     ) -> Result<Report, RunError> {
-        let world = World::build(context, &self.config, self.services.clone())?;
+        let world = World::build(context, &self.config, self.services.clone(), workload.keys)?;
         if let Some(planned) = self.cut {
             world.slots[planned.node]
                 .power
                 .cut_at_sync(planned.sync, planned.cut);
         }
         let history = History::new();
+        for (name, value) in &world.initial {
+            let call = Call::Put {
+                value: value.clone(),
+                condition: Condition::None,
+            };
+            let pending = history.call("remote", name, call);
+            history.answer(pending, Outcome::Done);
+        }
         let mut builder = context.builder();
         builder
             .simulation_duration(TIME_LIMIT)
@@ -466,6 +505,9 @@ impl<S: NodeServices> Cluster<S> {
             world.routes.clone()
         };
         driver.origin = Some(sim.elapsed());
+        // From here on, so that the nodes' capability probes, which need
+        // every request of a run to succeed, do not hold up the start.
+        world.remote.set_faults(self.config.remote_faults.clone());
         for index in 0..workload.clients {
             let client = Client::new(
                 client_host(index),
@@ -489,6 +531,17 @@ impl<S: NodeServices> Cluster<S> {
         );
         sim.client("verifier", reader.read_all(FINAL_READ_ATTEMPTS));
         self.drive(&mut sim, &mut driver, &history, true)?;
+        if !self.config.settle.is_zero() {
+            // The remote heals too: a node whose capability probe keeps
+            // failing never starts its flushers (§7.2).
+            world.remote.set_faults(SimS3Faults::NONE);
+            let settle = self.config.settle;
+            sim.client("settler", async move {
+                tokio::time::sleep(settle).await;
+                Ok(())
+            });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
 
         // Power loss everywhere: what survives is what the checkers see.
         let syncs = world.slots.iter().map(|slot| slot.power.syncs()).collect();
@@ -497,7 +550,12 @@ impl<S: NodeServices> Cluster<S> {
             sim.crash(slot.host.as_str());
         }
         let operations = history.operations();
-        let survivors = world.survivors(&routes, workload.keys)?;
+        let (survivors, indexes) = world.survivors(&routes, workload.keys)?;
+        if !self.config.settle.is_zero() {
+            world
+                .check_settled(&routes, workload.keys, &survivors, &indexes)
+                .map_err(|error| RunError::Simulation(format!("not settled: {error}")))?;
+        }
         check_linearizable(&operations).map_err(RunError::Check)?;
         check_durable(&operations, &survivors).map_err(RunError::Check)?;
         if self.config.every_member_durable {
@@ -639,6 +697,12 @@ struct World<S> {
     base_control: SimS3Faults,
     rates: FaultRates,
     remote: SimS3,
+    /// The value of each workload key the remote store held at the start,
+    /// by its name in the history.
+    initial: Vec<(String, String)>,
+    /// The keys of each `write_back` bucket the remote store held at the
+    /// start that no client touches.
+    imported: Vec<(BucketDocument, String)>,
 }
 
 impl<S: NodeServices> World<S> {
@@ -649,11 +713,14 @@ impl<S: NodeServices> World<S> {
         context: &mut SimContext,
         config: &ClusterConfig,
         services: S,
+        keys: usize,
     ) -> Result<Self, BoxError> {
         let cluster = ClusterId::new(CLUSTER)?;
         let control = context.s3(SimS3Config::default());
-        let remote = context.s3(SimS3Config::default());
-        remote.set_faults(config.remote_faults.clone());
+        let remote = context.s3(SimS3Config {
+            versioning: config.remote_versioning,
+            ..SimS3Config::default()
+        });
         let settings = settings(&cluster, config)?;
         let store = S3ControlStore::new(
             control.clone(),
@@ -676,12 +743,14 @@ impl<S: NodeServices> World<S> {
         } else {
             &buckets[..]
         };
-        tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
-            .build()?
-            .block_on(write_registers(
-                &store, &cluster, written, &placement, &mut ids,
-            ))?;
+            .build()?;
+        runtime.block_on(write_registers(
+            &store, &cluster, written, &placement, &mut ids,
+        ))?;
+        let (initial, imported) =
+            runtime.block_on(fill_remote(&remote, &buckets, keys, config.remote_objects))?;
 
         let pki = Pki::new()?;
         let mut slots = Vec::new();
@@ -734,6 +803,8 @@ impl<S: NodeServices> World<S> {
             registers: store,
             rates: config.control_rates,
             remote,
+            initial,
+            imported,
         })
     }
 
@@ -765,11 +836,12 @@ impl<S: NodeServices> World<S> {
     /// reads each key's value on every member of its shard and, for a
     /// `write_back` bucket, whether the member's entry is clean, and the
     /// key's value in the remote store.
+    #[allow(clippy::type_complexity)]
     fn survivors(
         &self,
         routes: &Routes,
         keys: usize,
-    ) -> Result<BTreeMap<String, Survivors>, BoxError> {
+    ) -> Result<(BTreeMap<String, Survivors>, BTreeMap<NodeId, Arc<Index>>), BoxError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
@@ -825,7 +897,91 @@ impl<S: NodeServices> World<S> {
             }
             survivors.insert(name, survivor);
         }
-        Ok(survivors)
+        Ok((survivors, indexes))
+    }
+
+    /// Checks that the primary-scoped work of every `write_back` bucket
+    /// finished (§7.1, §9.1), from the members' recovered `indexes`: every
+    /// key of the workload is clean on every member, which holds exactly
+    /// what the remote store holds; every key the remote store held at the
+    /// start that no client touched is a clean stub of it on every member;
+    /// every member's import progress is done; and no write identity is on
+    /// two versions of a remote object.
+    fn check_settled(
+        &self,
+        routes: &Routes,
+        keys: usize,
+        survivors: &BTreeMap<String, Survivors>,
+        indexes: &BTreeMap<NodeId, Arc<Index>>,
+    ) -> Result<(), BoxError> {
+        for (name, bucket, _) in routes.keys(keys) {
+            if bucket.mode != BucketMode::WriteBack {
+                continue;
+            }
+            let survivor = &survivors[&name];
+            let flushed = survivor.flushed.clone().unwrap_or_default();
+            for (copy, clean) in survivor.copies.iter().zip(&survivor.clean) {
+                if !clean || *copy != flushed {
+                    return Err(format!(
+                        "{name} holds {copy:?} (clean: {clean}), the remote {flushed:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        for (bucket, key) in &self.imported {
+            let shard = ShardRef::for_key(bucket, key);
+            let remote = self
+                .remote
+                .object(&format!("{}{key}", remote_prefix(bucket)));
+            let remote = remote.map(|object| object.info.etag);
+            for member in self.members(routes, &shard) {
+                let entry = indexes[&member].read()?.entry(&(&shard).into(), key)?;
+                let clean = entry
+                    .as_ref()
+                    .is_some_and(|e| matches!(e.state, EntryState::Clean | EntryState::Evicted));
+                let local = entry.and_then(|e| e.object).map(|o| o.local_etag);
+                if !clean || local.is_none() || local != remote {
+                    return Err(format!(
+                        "{key}, imported, is {local:?} (clean: {clean}) on {member}, \
+                        the remote {remote:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        for bucket in &routes.buckets {
+            if bucket.mode != BucketMode::WriteBack {
+                continue;
+            }
+            for shard in ShardRef::all(bucket) {
+                for member in self.members(routes, &shard) {
+                    let progress = indexes[&member].read()?.import_progress(&(&shard).into())?;
+                    let done =
+                        progress.is_some_and(|(_, r)| r.position() == ImportCheckpoint::Done);
+                    if !done {
+                        return Err(
+                            format!("the import of {shard:?} is not done on {member}").into()
+                        );
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, identity) in self.remote.identities() {
+            if let Some(identity) = identity
+                && !seen.insert((key.clone(), identity.clone()))
+            {
+                return Err(format!("{key} has two versions written as {identity}").into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The members of `shard`'s configuration now.
+    fn members(&self, routes: &Routes, shard: &ShardRef) -> Vec<NodeId> {
+        register(&self.registers, shard)
+            .map_or_else(|| routes.placement[shard].members.clone(), |c| c.members)
     }
 }
 
@@ -869,6 +1025,14 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
             concurrency: 2,
             min_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(1),
+            import_keys_per_second: shape
+                .import_keys_per_second
+                .unwrap_or(FlushSettings::default().import_keys_per_second),
+            import_page_keys: shape
+                .import_keys_per_second
+                .map_or(FlushSettings::default().import_page_keys, |rate| {
+                    u32::try_from(rate / 10).unwrap_or(u32::MAX).max(1)
+                }),
             ..FlushSettings::default()
         },
         checkpoint_interval: Duration::from_secs(1),
@@ -945,6 +1109,40 @@ fn remote_prefix(bucket: &BucketDocument) -> &str {
         .as_ref()
         .and_then(|target| target.prefix.as_deref())
         .unwrap_or_default()
+}
+
+/// Fills the remote store before the cluster starts, if `objects` is
+/// above zero: under each `write_back` bucket's prefix, an object at each
+/// of the workload's `keys` keys and at `objects` more. Returns the
+/// workload keys' values by their names in the history, and the other
+/// keys.
+async fn fill_remote(
+    remote: &SimS3,
+    buckets: &[BucketDocument],
+    keys: usize,
+    objects: usize,
+) -> Result<(Vec<(String, String)>, Vec<(BucketDocument, String)>), BoxError> {
+    let (mut initial, mut imported) = (Vec::new(), Vec::new());
+    if objects == 0 {
+        return Ok((initial, imported));
+    }
+    for bucket in buckets.iter().filter(|b| b.mode == BucketMode::WriteBack) {
+        let workload = (0..keys).map(|n| (true, format!("key-{n}")));
+        let others = (0..objects).map(|n| (false, format!("imported-{n:04}")));
+        for (touched, key) in workload.chain(others) {
+            let body = format!("remote {} {key}", bucket.name);
+            let remote_key = format!("{}{key}", remote_prefix(bucket));
+            remote
+                .put_object(PutObject::new(remote_key, body.clone()))
+                .await?;
+            if touched {
+                initial.push((format!("{}/{key}", bucket.name), etag_of(body.as_bytes())));
+            } else {
+                imported.push((bucket.clone(), key));
+            }
+        }
+    }
+    Ok((initial, imported))
 }
 
 /// Writes `cluster.json`, every bucket register, and every shard register,

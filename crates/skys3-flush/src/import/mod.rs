@@ -1,9 +1,17 @@
 //! The namespace import of a `write_back` bucket (§9.1): listing the
 //! remote prefix into `IMPORT` records, in key ranges listed in parallel,
 //! and reading the remote for keys the import has not reached.
+//!
+//! The import runs on its **owner**, the node whose replica of the bucket's
+//! shard 0 serves as primary. It commits each `IMPORT` to its shard's
+//! primary, wherever that is, and its progress, as `IMPORT_PROGRESS`
+//! records, to shard 0 on its own replica first and then to every other
+//! shard. A new owner resumes from the progress shard 0 holds.
 
 mod split;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -19,13 +27,42 @@ use skys3_remote::{
     ByteRange, GetObject, HeadObject, ListObjectsV2, ListedObject, ObjectInfo, ObjectStore,
     S3Error, S3ErrorKind,
 };
-use skys3_shard::ShardSet;
-use skys3_types::{BucketDocument, ETag, WriteIdentity, shard_for_key};
+use skys3_shard::{Shard, ShardSet};
+use skys3_types::{BucketDocument, ETag, ShardId, WriteIdentity, shard_for_key};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
-use crate::target::{FlushSettings, ImportProgress};
+use crate::target::FlushSettings;
+
+/// Commits a record to a shard on whichever node is the shard's primary,
+/// and resolves once the primary has applied it: how the import's owner
+/// commits `IMPORT` and `IMPORT_PROGRESS` records to shards it is not the
+/// primary of. [`FlushService::with_commit`](crate::FlushService::with_commit)
+/// sets it; without one, records go to the node's own replicas, which
+/// suits a node that is the primary of every shard.
+pub type Commit = Arc<
+    dyn Fn(ShardRef, RecordBody) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A [`Commit`] to the node's own replicas in `set`.
+pub(crate) fn local_commit<D: Disk>(set: ShardSet<D>) -> Commit {
+    Arc::new(move |shard, body| {
+        let set = set.clone();
+        Box::pin(async move {
+            let Some(shard) = set.get(&shard).await else {
+                return Err(format!("shard {shard} is not open"));
+            };
+            shard
+                .commit(body)
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+        })
+    })
+}
 
 /// The most keys one listing request asks for: S3's page size.
 pub const IMPORT_PAGE_KEYS: u32 = 1000;
@@ -36,13 +73,17 @@ pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 /// The prefix of user metadata names in stored metadata.
 const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 
-/// Where a bucket's import is, shared by the import task, the bucket's
-/// flushers ([`ImportProgress`]), and the reads that fall through to the
-/// remote ([`RemoteReader`]).
+/// Where a bucket's import is as this node knows it, for the reads that
+/// fall through to the remote ([`RemoteReader`]) and the admin API.
 ///
-/// It starts with nothing passed, which is safe whatever the stored
-/// checkpoints say: until the import task has read them, keys fall through
-/// to the remote and tombstones are kept.
+/// It shows the newest `IMPORT_PROGRESS` that the import task stored, if
+/// it runs here, or that a replica of one of the bucket's shards on the
+/// node applied ([`FlushService::reconcile`](crate::FlushService::reconcile)).
+/// Each is a bound that holds for the whole bucket, since the owner stores
+/// progress only once the `IMPORT` records it covers are applied on every
+/// shard. It starts with nothing passed, which is safe: keys fall through
+/// to the remote until it shows more. The flushers ask their own shard
+/// instead ([`Target::with_import`](crate::Target::with_import)).
 #[derive(Debug, Default)]
 pub struct ImportState {
     inner: Mutex<StateInner>,
@@ -51,6 +92,8 @@ pub struct ImportState {
 #[derive(Debug, Default)]
 struct StateInner {
     ranges: ImportRanges,
+    /// The number of the `IMPORT_PROGRESS` that `ranges` come from, if any.
+    update: Option<u64>,
     imported: u64,
     error: Option<String>,
 }
@@ -97,13 +140,23 @@ impl ImportState {
         }
     }
 
-    /// Shows `ranges`, which are durable, if any, and counts `imported`
-    /// more records.
-    fn advance(&self, ranges: Option<ImportRanges>, imported: u64) {
+    /// Shows `ranges`, the progress numbered `update`, unless the state
+    /// shows a later one.
+    pub(crate) fn observe(&self, update: u64, ranges: ImportRanges) {
         let mut inner = self.lock();
-        if let Some(ranges) = ranges {
+        if inner.update.is_none_or(|shown| shown < update) {
             inner.ranges = ranges;
+            inner.update = Some(update);
         }
+    }
+
+    /// Shows `progress`, which is committed, if any, and counts
+    /// `imported` more records.
+    fn advance(&self, progress: Option<(u64, ImportRanges)>, imported: u64) {
+        if let Some((update, ranges)) = progress {
+            self.observe(update, ranges);
+        }
+        let mut inner = self.lock();
         inner.imported += imported;
         inner.error = None;
     }
@@ -118,12 +171,6 @@ impl ImportState {
     }
 }
 
-impl ImportProgress for ImportState {
-    fn passed(&self, key: &str) -> bool {
-        ImportState::passed(self, key)
-    }
-}
-
 /// What a bucket's import task runs on.
 pub(crate) struct ImportJob<S, D: Disk> {
     /// The bucket's remote target.
@@ -134,6 +181,10 @@ pub(crate) struct ImportJob<S, D: Disk> {
     pub(crate) bucket: BucketDocument,
     /// The node's shards.
     pub(crate) set: ShardSet<D>,
+    /// The node's replica of the bucket's shard 0, its primary.
+    pub(crate) owner: Shard<D>,
+    /// How records reach the bucket's other shards.
+    pub(crate) commit: Commit,
     /// The import's rate, page size, and backoffs.
     pub(crate) settings: FlushSettings,
     /// How many ranges a new import is split into, one stream each:
@@ -189,23 +240,26 @@ impl Stop {
 
 /// Imports the remote namespace of the job's bucket from its target,
 /// under the target's prefix, into the bucket's shards, resuming from the
-/// ranges and checkpoints the index holds, at most
+/// progress the owner's shard 0 holds, at most
 /// `settings.import_keys_per_second` keys a second over all streams.
 ///
-/// An import with no stored ranges, or with one, which a single-stream
-/// import stored, first discovers split points for `streams` streams
-/// after its checkpoint ([`split::split_points`]) and stores the ranges
-/// durably. Stored ranges are resumed as they are, whatever `streams` says
-/// now.
+/// Without progress in shard 0, it resumes from the checkpoint a build
+/// that kept it in the node's index stored, if any. An import with no
+/// progress, or with one range, which a single-stream import stored, first
+/// discovers split points for `streams` streams after its checkpoint
+/// ([`split::split_points`]) and stores the ranges as progress. Stored
+/// ranges are resumed as they are, whatever `streams` says now.
 ///
 /// Each range is then listed by its own stream, one page at a time, with
 /// `StartAfter` its checkpoint, or its start, up to its end: the page's
 /// objects become `IMPORT` records, committed to their shards concurrently
 /// once the rate allows ([`Throttle`]), and once every one is applied, the
-/// page's last key is stored as the range's checkpoint, durably, and only
-/// then shown in the state. A failed request or commit is retried after
-/// the flush backoff; the import never gives up. Keys under the capability
-/// probe's scratch prefix (§7.2) are never imported.
+/// ranges with the page's last key as the range's checkpoint are stored as
+/// the next progress ([`ImportRun::store`]), and only then shown in the
+/// state. A failed request or commit is retried after the flush backoff;
+/// the import never gives up, but stops when told to, as when the node is
+/// no longer the owner. Keys under the capability probe's scratch prefix
+/// (§7.2) are never imported.
 pub(crate) async fn run<S: ObjectStore, D: Disk>(mut job: ImportJob<S, D>) {
     let mut stop = job.stop.clone();
     for previous in std::mem::take(&mut job.previous) {
@@ -216,37 +270,29 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(mut job: ImportJob<S, D>) {
     let streams = job.streams.clamp(1, MAX_IMPORT_RANGES);
     let mut retry = Retry::new(&job.bucket, &job.state, &job.settings, &job.stop);
     let stored = loop {
-        let Some(read) = stop
-            .unless(job.set.import_ranges(&job.bucket.bucket_id))
-            .await
-        else {
+        let Some(read) = stop.unless(resume_point(&job)).await else {
             return;
         };
         match read {
             Ok(stored) => break stored,
             Err(error) => {
-                if !retry.wait(error.to_string()).await {
+                if !retry.wait(error).await {
                     return;
                 }
             }
         }
     };
-    let ranges = match stored {
-        Some(ranges) if ranges.is_done() || ranges.ranges().len() > 1 => ranges,
+    let (update, stored) = match stored {
+        Some((update, ranges)) => (update, Some(ranges)),
+        None => (0, None),
+    };
+    let (ranges, split) = match stored {
+        Some(ranges) if ranges.is_done() || ranges.ranges().len() > 1 => (ranges, false),
         stored => {
             let after = match stored.map(|ranges| ranges.position()) {
                 Some(ImportCheckpoint::Running { after }) => after,
                 _ => None,
             };
-            job.state.advance(
-                Some(
-                    ImportCheckpoint::Running {
-                        after: after.clone(),
-                    }
-                    .into(),
-                ),
-                0,
-            );
             let splits = loop {
                 let discovery =
                     split::split_points(&job.store, &job.prefix, after.as_deref(), streams);
@@ -263,31 +309,31 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(mut job: ImportJob<S, D>) {
                     }
                 }
             };
-            let ranges = ImportRanges::split(after, splits);
-            while ranges.ranges().len() > 1
-                && let Err(error) = job
-                    .set
-                    .set_import_ranges(&job.bucket.bucket_id, Some(ranges.clone()))
-                    .await
-            {
-                let error = format!("storing the import ranges failed: {error}");
-                if !retry.wait(error).await {
-                    return;
-                }
-            }
-            ranges
+            (ImportRanges::split(after, splits), true)
         }
     };
-    job.state.advance(Some(ranges.clone()), 0);
+    drop(retry);
+    let import = ImportRun::new(job, update, ranges.clone());
+    let mut retry = Retry::new(
+        &import.bucket,
+        &import.state,
+        &import.settings,
+        &import.stop,
+    );
+    if split && ranges.ranges().len() > 1 && !import.checkpoint(None, 0, &mut retry).await {
+        return;
+    }
+    drop(retry);
+    import.state.advance(Some((update, ranges.clone())), 0);
     if ranges.is_done() {
         return;
     }
     tracing::info!(
-        bucket = %job.bucket.name,
+        bucket = %import.bucket.name,
         ranges = ranges.ranges().len(),
         "the namespace import is running"
     );
-    let import = Arc::new(ImportRun::new(job, ranges.clone()));
+    let import = Arc::new(import);
     let mut streams = JoinSet::new();
     for (index, range) in ranges.ranges().iter().enumerate() {
         if let ImportCheckpoint::Running { after } = &range.checkpoint {
@@ -310,12 +356,29 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(mut job: ImportJob<S, D>) {
     tracing::info!(bucket = %import.bucket.name, "the namespace import is done");
 }
 
+/// Where an import resumes: the progress the owner's shard 0 holds, or
+/// else the checkpoint a build that kept it in the node's index stored, as
+/// progress number 0.
+async fn resume_point<S, D: Disk>(
+    job: &ImportJob<S, D>,
+) -> Result<Option<(u64, ImportRanges)>, String> {
+    match job.owner.import_progress().await {
+        Ok(Some(progress)) => Ok(Some(progress)),
+        Ok(None) => match job.set.import_ranges(&job.bucket.bucket_id).await {
+            Ok(legacy) => Ok(legacy.map(|ranges| (0, ranges))),
+            Err(error) => Err(error.to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// A running import, shared by its streams.
 struct ImportRun<S, D: Disk> {
     store: Arc<S>,
     prefix: String,
     bucket: BucketDocument,
-    set: ShardSet<D>,
+    owner: Shard<D>,
+    commit: Commit,
     settings: FlushSettings,
     wall: Arc<dyn WallClock>,
     state: Arc<ImportState>,
@@ -323,9 +386,10 @@ struct ImportRun<S, D: Disk> {
     throttle: Throttle,
     /// The most keys a listing request asks for.
     page_keys: u32,
-    /// Every stream's latest checkpoint, and how many updates it holds.
+    /// Every stream's latest checkpoint, and the progress number it
+    /// would be stored as.
     latest: Mutex<(ImportRanges, u64)>,
-    /// How many updates the stored ranges hold. Held while they are
+    /// The number of the latest progress stored. Held while progress is
     /// stored, so that a store never replaces a later one.
     stored: tokio::sync::Mutex<u64>,
     /// When to stop.
@@ -345,7 +409,9 @@ struct Stream {
 }
 
 impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
-    fn new(job: ImportJob<S, D>, ranges: ImportRanges) -> Self {
+    /// The import of `job` from `ranges`, whose progress so far is
+    /// numbered `update`.
+    fn new(job: ImportJob<S, D>, update: u64, ranges: ImportRanges) -> Self {
         let throttle = Throttle::new(job.settings.import_keys_per_second);
         // A page is never larger than a second's keys, so that the
         // throttle can admit it whole.
@@ -358,14 +424,15 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
             store: job.store,
             prefix: job.prefix,
             bucket: job.bucket,
-            set: job.set,
+            owner: job.owner,
+            commit: job.commit,
             settings: job.settings,
             wall: job.wall,
             state: job.state,
             throttle,
             page_keys,
-            latest: Mutex::new((ranges, 0)),
-            stored: tokio::sync::Mutex::new(0),
+            latest: Mutex::new((ranges, update)),
+            stored: tokio::sync::Mutex::new(update),
             stop: job.stop,
         }
     }
@@ -421,9 +488,10 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
                 return;
             }
             // A commit dropped midway may still apply: harmless, since an
-            // `IMPORT` is conditional and the next import repeats it.
-            let Some(committed) = stop.unless(commit(&self.set, &self.bucket, imports)).await
-            else {
+            // `IMPORT` is conditional, and dropped once the progress of
+            // its shard has passed its key.
+            let commit = commit(&self.commit, &self.bucket, imports);
+            let Some(committed) = stop.unless(commit).await else {
                 return;
             };
             if let Err(error) = committed {
@@ -436,7 +504,7 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
             };
             // Never dropped midway: see `Stop`.
             if !self
-                .checkpoint(stream.index, next.clone(), count, &mut retry)
+                .checkpoint(Some((stream.index, next.clone())), count, &mut retry)
                 .await
             {
                 return;
@@ -449,41 +517,82 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
         }
     }
 
-    /// Records `checkpoint` as range `index`'s, stores every stream's
-    /// latest checkpoint durably unless a store since has, and shows them.
-    /// Streams that finish pages together share one store. `false` if the
-    /// import was stopped while a failed store waited to be retried.
+    /// Records `checkpoint` as its range's, if given, stores every
+    /// stream's latest checkpoint as the next progress unless a store
+    /// since has, and shows it. Streams that finish pages together share
+    /// one store. `false` if the import was stopped while a failed store
+    /// waited to be retried.
     async fn checkpoint(
         &self,
-        index: usize,
-        checkpoint: ImportCheckpoint,
+        checkpoint: Option<(usize, ImportCheckpoint)>,
         imported: u64,
         retry: &mut Retry<'_>,
     ) -> bool {
+        // Counted now: the records are committed, and a node may show the
+        // progress from its shard before this store returns.
+        self.state.advance(None, imported);
         let update = {
             let mut latest = lock(&self.latest);
-            latest.0.set(index, checkpoint);
+            if let Some((index, checkpoint)) = checkpoint {
+                latest.0.set(index, checkpoint);
+            }
             latest.1 += 1;
             latest.1
         };
         let mut stored = self.stored.lock().await;
         if *stored >= update {
-            self.state.advance(None, imported);
             return true;
         }
-        let (ranges, updates) = lock(&self.latest).clone();
-        while let Err(error) = self
-            .set
-            .set_import_ranges(&self.bucket.bucket_id, Some(ranges.clone()))
-            .await
-        {
-            let error = format!("storing the checkpoint failed: {error}");
+        let (ranges, update) = lock(&self.latest).clone();
+        if !self.store(update, &ranges, retry).await {
+            return false;
+        }
+        *stored = update;
+        self.state.advance(Some((update, ranges)), 0);
+        true
+    }
+
+    /// Commits `ranges` as progress number `update`: to the owner's own
+    /// replica of shard 0 first, which fails once another node has taken
+    /// the shard over, and then to every other shard of the bucket. A new
+    /// owner resumes from shard 0's progress, so no shard holds progress
+    /// that shard 0 lacks, and the new owner's progress, numbered after
+    /// it, is never behind what a shard holds. `false` if the import was
+    /// stopped while a failed commit waited to be retried.
+    async fn store(&self, update: u64, ranges: &ImportRanges, retry: &mut Retry<'_>) -> bool {
+        let body = RecordBody::ImportProgress(ranges.to_progress(update));
+        while let Err(error) = self.owner.commit(body.clone()).await {
+            let error = format!("storing the import progress failed: {error}");
             if !retry.wait(error).await {
                 return false;
             }
         }
-        *stored = updates;
-        self.state.advance(Some(ranges), imported);
+        let mut pending: Vec<ShardId> = self.bucket.shards.shards().skip(1).collect();
+        while !pending.is_empty() {
+            let mut commits = JoinSet::new();
+            for shard in pending.drain(..) {
+                let shard_ref = ShardRef::new(self.bucket.bucket_id.clone(), shard);
+                let committed = (self.commit)(shard_ref, body.clone());
+                commits.spawn(async move { (shard, committed.await) });
+            }
+            let mut failed = None;
+            while let Some(done) = commits.join_next().await {
+                match done {
+                    Ok((_, Ok(()))) => {}
+                    Ok((shard, Err(error))) => {
+                        pending.push(shard);
+                        failed = Some(error);
+                    }
+                    Err(error) => failed = Some(error.to_string()),
+                }
+            }
+            if let Some(error) = failed {
+                let error = format!("storing the import progress failed: {error}");
+                if !retry.wait(error).await {
+                    return false;
+                }
+            }
+        }
         true
     }
 }
@@ -594,10 +703,10 @@ fn import_of(object: ListedObject, prefix: &str, wall: &dyn WallClock) -> Option
     })
 }
 
-/// Commits `imports` to their shards concurrently, and returns once every
-/// one is applied.
-async fn commit<D: Disk>(
-    set: &ShardSet<D>,
+/// Commits `imports` to their shards concurrently, through `commit`, and
+/// returns once every one is applied.
+async fn commit(
+    commit: &Commit,
     bucket: &BucketDocument,
     imports: Vec<Import>,
 ) -> Result<(), String> {
@@ -607,17 +716,10 @@ async fn commit<D: Disk>(
             bucket.bucket_id.clone(),
             shard_for_key(&bucket.bucket_id, import.key.as_bytes(), bucket.shards),
         );
-        let Some(shard) = set.get(&shard).await else {
-            return Err(format!("shard {shard} is not open"));
-        };
-        commits.spawn(async move { shard.commit(RecordBody::Import(import)).await });
+        commits.spawn(commit(shard, RecordBody::Import(import)));
     }
     while let Some(done) = commits.join_next().await {
-        match done {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => return Err(error.to_string()),
-            Err(error) => return Err(error.to_string()),
-        }
+        done.map_err(|error| error.to_string())??;
     }
     Ok(())
 }

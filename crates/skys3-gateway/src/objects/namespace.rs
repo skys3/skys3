@@ -8,7 +8,7 @@ use s3s::dto::StreamingBlob;
 use s3s::{S3Error, S3Result, s3_error};
 use skys3_index::{Entry, EntryState, ObjectVersion};
 use skys3_log::RecordBody;
-use skys3_log::record::Adopt;
+use skys3_log::record::{Adopt, Import};
 use skys3_types::{BucketDocument, BucketMode};
 
 use super::{Found, Objects};
@@ -77,6 +77,22 @@ impl<H: Shards> Objects<H> {
                 })
             }
         }
+    }
+
+    /// The entry of `key` in `shard` that a conditional write is checked
+    /// against: the key's entry, after an object only at the remote is
+    /// imported (§9.1). See [`conditional_entry`].
+    ///
+    /// # Errors
+    ///
+    /// As [`conditional_entry`].
+    pub(super) async fn conditional_entry(
+        &self,
+        bucket: &BucketDocument,
+        shard: &ShardRef,
+        key: &str,
+    ) -> S3Result<Option<Entry>> {
+        conditional_entry(&self.shards, self.remote_of(bucket), bucket, shard, key).await
     }
 
     /// Loads the metadata of `entry`, an imported stub of `key`, from the
@@ -164,6 +180,56 @@ impl<H: Shards> Objects<H> {
             .ok_or_else(|| unavailable(gone()))?;
         Ok(StreamingBlob::from_bytes(bytes))
     }
+}
+
+/// The entry of `key` in `shard` that a conditional write is checked
+/// against, here and by the shard when it commits the write.
+///
+/// A key with no entry that the bucket's import has not passed may still
+/// hold an object at the remote, which a condition must see (§9.1): if a
+/// remote HEAD finds one, the key's `IMPORT` is committed first, as the
+/// import would commit it, and the condition then holds or fails against
+/// its stub. The `IMPORT` is a no-op once anything else committed the key,
+/// or once the shard's import progress has passed it (§4.2).
+///
+/// # Errors
+///
+/// `503 ServiceUnavailable` if the remote cannot answer, and the shard's
+/// errors.
+pub(super) async fn conditional_entry<H: Shards>(
+    shards: &H,
+    remote: Option<&Arc<dyn RemoteReads>>,
+    bucket: &BucketDocument,
+    shard: &ShardRef,
+    key: &str,
+) -> S3Result<Option<Entry>> {
+    let entry = shards.entry(shard, key).await.map_err(shard_error)?;
+    let Some(remote) = remote.filter(|_| bucket.mode == BucketMode::WriteBack) else {
+        return Ok(entry);
+    };
+    if entry.is_some() || remote.passed(&bucket.bucket_id, key) {
+        return Ok(entry);
+    }
+    let Some(found) = remote
+        .head(&bucket.bucket_id, key)
+        .await
+        .map_err(unavailable)?
+    else {
+        return Ok(None);
+    };
+    let import = Import {
+        key: key.to_owned(),
+        size: found.object.size,
+        last_modified_ms: found.object.last_modified_ms,
+        etag: found.object.local_etag,
+        storage_class: found.object.storage_class,
+    };
+    shards
+        .write(shard, RecordBody::Import(import), Precondition::None)
+        .await
+        .map_err(shard_error)?
+        .map_err(S3Error::from)?;
+    shards.entry(shard, key).await.map_err(shard_error)
 }
 
 /// Whether `entry` is an imported stub whose metadata is not loaded yet:

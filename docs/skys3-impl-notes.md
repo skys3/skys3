@@ -3439,6 +3439,145 @@ of this file. A task with nothing unexpected keeps "None."
   replays a `CONFIG` record, so such a replica resumes only once its
   register can be read. About 900 lines of non-test code.
 
+### M2-17 Primary-scoped work across failover
+
+- **Primary-scoped work follows the serving role (decided, design
+  §7.1, §9.1).** `FlushService::reconcile` runs every second on the node
+  and more often in the simulation. It keeps a flusher on each replica
+  that is `is_serving()`, not following, and not stopped, and stops every
+  other flusher.
+  - A takeover, a handoff, a learner's promotion, or a restart starts the
+    flusher once the new primary serves.
+  - A step-down, a deposition, or a stop ends it at the next reconcile.
+  - The import of a bucket runs on its owner: the replica of shard 0 that
+    serves as primary. The same reconcile starts and stops it. It no
+    longer starts when the bucket is first flushed.
+  - A stopped import finishes the progress commit it has started, and
+    the next import waits for that commit.
+- **A new primary rebuilds the flusher from its index (decided).** The
+  pending set is every entry that is not clean, tombstones included. It
+  carries the remote ETags that applied `FLUSHED` records left. Every
+  member's log yields the same set, so the new primary needs nothing
+  from the old one. A flush whose `FLUSHED` never committed is sent again
+  and recognized by its write identity (§7.2). Two guards are new in
+  `attempt.rs`:
+  - `check_readable()` runs before every conditional write round and
+    before every delete. A primary that has lost its leases stops writing
+    the remote before a member can take over.
+  - A remote object that carries a *later* write identity of the same
+    shard (`Found::Later`, `Failure::Later`) is never overwritten or
+    deleted. Only a newer primary can have written it, so this replica is
+    behind or deposed, and the flush retries later.
+- **Import progress is a log record (decided, design §4.2, §9.1,
+  §10.1).** `IMPORT_PROGRESS(update, ranges)` is kind 19, keyless, with
+  at most 256 ranges.
+  - For each shard, the state machine keeps the progress with the highest
+    `update` in the index table `import_progress`. That table is index
+    format 7, and snapshots carry it as table code 4. Stale or
+    out-of-order progress is rejected.
+  - After each page, the owner commits the progress to shard 0 on its own
+    replica first, then to the other shards through `Commit`. In the
+    simulation `Commit` is the gateway's routing; in the binary it is the
+    local shard set. Each commit is retried until it succeeds.
+  - A new owner resumes from shard 0's progress and numbers its own
+    progress after it. A deposed owner cannot commit to shard 0 after a
+    takeover, so any progress it commits late loses to the new owner's
+    higher number.
+  - The node-local `imports` table (format 3) is now legacy. It is never
+    written, and is read only to resume a checkpoint stored by an older
+    build, as update 0.
+- **The IMPORT guard keeps deleted keys deleted (decided, design
+  §4.2).** A replica applies an `IMPORT` of a key that its shard's
+  progress has passed as a no-op (`Rejection::ImportPassed`).
+  - A late copy cannot recreate a key whose tombstone was flushed and
+    removed. Late copies come from a routing retry, from a deposed owner,
+    or from a page that a new owner lists again.
+  - The flusher drops a tombstone only once its own shard's progress has
+    passed the key (`Target::with_import`). Only that progress makes the
+    shard drop the late `IMPORT`.
+  - Gateway reads and listings use the newest progress that any local
+    replica of the bucket has applied (`ImportState::observe`).
+- **Conflicts stay in memory (decided, design §4.2).** A new primary
+  finds a conflict again with one conditional request and one HEAD. A
+  logged conflict would outlive the out-of-band write that caused it.
+- **Conditional writes see objects that exist only at the remote (found
+  in testing, design §9.1).** Before this change, a conditional `PUT`,
+  copy, completion, or delete of a key with no entry was checked only
+  against the index. So `If-None-Match: *` replaced a remote object that
+  the import had not reached yet, and `If-Match` on such an object
+  failed. The new scenarios showed this as a linearizability failure once
+  the remote held the workload's keys from the start. Now
+  `namespace::conditional_entry` HEADs the remote while the import has
+  not passed the key. If the remote holds an object there, the key's
+  `IMPORT` is committed before the check, so the shard checks the
+  condition against the stub when it commits the write. If the remote
+  cannot answer, the write fails with `503`.
+- **FLUSHED piggybacking and `member_suspect_after` (found in
+  testing).** A member's acknowledgement can wait up to a second for a
+  `FLUSHED` record to be synced (§7.1). The primary's watchdog counts a
+  member that has not acknowledged what was sequenced as silent. So with
+  the takeover scenarios' 700 ms `member_suspect_after`, every primary
+  that flushed removed both of its members about two seconds into the
+  run. No takeover could follow: a crashed primary's shard stayed down
+  until the node came back. The new scenarios use 1.6 s, with a lease of
+  1.5 s and a grace of 2.2 s. The defaults (3 s) are not affected.
+- **A failing probe holds a restarted node's flushers (found in
+  testing).** A restarted node starts no flusher until its capability
+  probe succeeds. The probe needs about twenty requests in a row to
+  succeed, and its backoff grows to 30 s. Against the faulty remote, a
+  restarted node that still led a shard (one whose members had been
+  removed) left that shard's tombstones unflushed for the whole settle.
+  To reach their end state, the simulation's remote now starts its faults
+  with the workload rather than at build, and heals them for the settle.
+  This also changes when the existing `workload` and `harness` scenarios
+  inject remote faults.
+- **Simulation.** `primary_work.rs` runs three scenarios on a
+  `write_back` bucket of four shards, with every shard on every node.
+  - The remote is versioned and faulty: errors, lost requests and
+    answers, and delays of 1 to 40 ms. Before the start it already holds
+    the workload's keys plus 80 to 120 other objects, imported at 30 keys
+    a second.
+  - The scenarios:
+    - a primary crashes mid-flush (node `seed % 3`, at 2 to 3 s, down
+      for 6 s);
+    - the import owner (node 0) crashes mid-import;
+    - handoffs every 0.5 to 0.75 s over 8 s, on four nodes.
+  - The existing audits run after every step. Every history is checked
+    for linearizability, with the remote's objects as the keys' first
+    values.
+  - After a 30 s settle (`ClusterConfig::settle`), `check_settled`
+    requires:
+    - every workload key is clean on every member and equal to the
+      remote, so a deleted key is neither at the remote nor in any index;
+    - every imported key is a clean stub of the remote's object on every
+      member;
+    - every shard's import is done on every member;
+    - no write identity appears on two remote versions
+      (`SimS3::identities`), so no repeated flush created a duplicate.
+  - The simulated gateway now reads the remote
+    (`skys3::remote::NodeRemote`). Forwarded writes may carry `IMPORT`,
+    `IMPORT_PROGRESS`, and `ADOPT`.
+  - Seeds 0 to 19 of each scenario passed (`SKYS3_SIM_SEEDS=640`, cost
+    32): 60 runs in 468 s, three at a time, 14 to 29 s each. A seed run
+    alone takes 6 to 8 s. The flush scenario took over 1 or 2 shards per
+    seed, the import scenario 2, and the handoff scenario made 9 to 12
+    handoffs.
+  - Mutations, checked by hand:
+    - Treating a later write identity as foreign fails the new flusher
+      test (`a_later_write_of_the_shard_at_the_remote_is_never_replaced`).
+    - Dropping the `IMPORT` guard failed none of 30 simulation seeds:
+      a late duplicate `IMPORT` behind a removed tombstone is rare there.
+      The guard is covered by
+      `import_progress_keeps_the_newest_and_drops_imports_it_has_passed`.
+- **Left open.**
+  - Configuration loading does not check that `member_suspect_after`
+    exceeds the `FLUSHED` sync delay.
+  - A conditional write of a key that the import has not passed costs a
+    remote HEAD.
+  - The binary still commits imports to its local shards (M2-08b).
+- **Size.** About 1,170 lines of non-test code added (net +840), with
+  the cluster-simulation harness counted.
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation

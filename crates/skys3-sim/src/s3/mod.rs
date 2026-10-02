@@ -320,6 +320,14 @@ impl SimS3 {
         self.state().bucket.versions()
     }
 
+    /// Returns the write identity of every object version the bucket keeps,
+    /// with its key, without a request: every version on a versioned
+    /// bucket, the current one on an unversioned one. Keys are in order,
+    /// and each key's versions oldest first.
+    pub fn identities(&self) -> Vec<(String, Option<String>)> {
+        self.state().bucket.identities()
+    }
+
     /// Returns every multipart upload in progress and its key, without a
     /// request.
     pub fn uploads(&self) -> Vec<(UploadId, String)> {

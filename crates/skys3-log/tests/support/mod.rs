@@ -10,9 +10,9 @@ use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
     Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
-    Extent, ExtentRef, Flushed, Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
-    MpuComplete, MpuCreate, MpuPart, Put, PutData, RecordBody, ShardRef, TagSet, Tags,
-    UploadChecksum,
+    Extent, ExtentRef, Flushed, Import, ImportCheckpoint, ImportProgress, ImportRange, LogRecord,
+    MAX_IMPORT_RANGES, MAX_PAYLOAD_LEN, Metadata, MpuAbort, MpuComplete, MpuCreate, MpuPart, Put,
+    PutData, RecordBody, ShardRef, TagSet, Tags, UploadChecksum,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -363,7 +363,30 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
             ),
         shard_config(shard, position.epoch).prop_map(RecordBody::Config),
         Just(RecordBody::Truncate),
+        import_progress().prop_map(RecordBody::ImportProgress),
     ]
+}
+
+/// Any `IMPORT_PROGRESS`: the log checks the fields' bounds, not the order
+/// of the ranges, which the state machine checks.
+pub fn import_progress() -> impl Strategy<Value = ImportProgress> {
+    let checkpoint = prop_oneof![
+        proptest::option::of(key()).prop_map(|after| ImportCheckpoint::Running { after }),
+        Just(ImportCheckpoint::Done),
+    ];
+    let range = (proptest::option::of(key()), checkpoint)
+        .prop_map(|(end, checkpoint)| ImportRange { end, checkpoint })
+        .boxed();
+    prop_oneof![
+        8 => vec(range.clone(), 1..4),
+        1 => vec(range, MAX_IMPORT_RANGES..=MAX_IMPORT_RANGES),
+    ]
+    .prop_flat_map(|ranges| {
+        any::<u64>().prop_map(move |update| ImportProgress {
+            update,
+            ranges: ranges.clone(),
+        })
+    })
 }
 
 /// Any valid record of a defined kind.

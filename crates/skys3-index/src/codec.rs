@@ -26,6 +26,7 @@
 //! | configs | shard | the [`ShardConfig`] of the shard's latest applied `CONFIG` record, as its register's JSON |
 //! | takeovers | shard | the [`ShardConfig`] a member proposed to take over in, as its register's JSON |
 //! | imports | bucket ID (UTF-8) | [`ImportRanges`]: one range as its [`ImportCheckpoint`] alone, a tag (0 running, 1 done) and for a running import the last key imported, as an option; or several as tag 2, a `u16` count of at least two, and each range's end, as an option present on all but the last, followed by its checkpoint |
+//! | import_progress | shard | the latest `IMPORT_PROGRESS` the shard applied: its number (`u64`), then its [`ImportRanges`] as in imports |
 //!
 //! An upload key ends with a fixed 17 bytes, so it decodes whatever bytes
 //! the object key holds, and a shard's uploads sort by key, then by age.
@@ -58,10 +59,9 @@ use skys3_types::{
 };
 
 use crate::entry::{
-    ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
-    Upload,
+    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
 };
-use crate::import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
+use crate::import::{ImportCheckpoint, ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 
 /// The format byte every value this build writes starts with, and the
 /// newest format it reads.
@@ -626,18 +626,49 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlEntry> {
 /// Returns a [`CodecError`] if a key is longer than an object key may be.
 pub fn encode_import(import: &ImportRanges) -> Result<Vec<u8>> {
     let mut w = Writer::value();
+    encode_ranges(&mut w, import)?;
+    Ok(w.0)
+}
+
+/// Encodes a shard's import progress: the number of the latest
+/// `IMPORT_PROGRESS` record it applied and its ranges.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if a key is too long.
+pub fn encode_import_progress(update: u64, import: &ImportRanges) -> Result<Vec<u8>> {
+    let mut w = Writer::value();
+    w.u64(update);
+    encode_ranges(&mut w, import)?;
+    Ok(w.0)
+}
+
+/// Decodes a shard's import progress.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded import progress.
+pub fn decode_import_progress(bytes: &[u8]) -> Result<(u64, ImportRanges)> {
+    let mut r = Reader::value(bytes, "import_progress")?;
+    let update = r.u64("import_progress.update")?;
+    let import = decode_ranges(&mut r)?;
+    r.finish("import_progress")?;
+    Ok((update, import))
+}
+
+fn encode_ranges(w: &mut Writer, import: &ImportRanges) -> Result<()> {
     match import.ranges() {
-        [only] => encode_checkpoint(&mut w, &only.checkpoint)?,
+        [only] => encode_checkpoint(w, &only.checkpoint)?,
         ranges => {
             w.u8(2);
             w.len16("import.ranges", ranges.len(), MAX_IMPORT_RANGES)?;
             for range in ranges {
                 w.option_str("import.end", range.end.as_deref(), MAX_KEY_LEN)?;
-                encode_checkpoint(&mut w, &range.checkpoint)?;
+                encode_checkpoint(w, &range.checkpoint)?;
             }
         }
     }
-    Ok(w.0)
+    Ok(())
 }
 
 fn encode_checkpoint(w: &mut Writer, checkpoint: &ImportCheckpoint) -> Result<()> {
@@ -660,6 +691,12 @@ fn encode_checkpoint(w: &mut Writer, checkpoint: &ImportCheckpoint) -> Result<()
 /// invariants of [`ImportRanges::from_ranges`].
 pub fn decode_import(bytes: &[u8]) -> Result<ImportRanges> {
     let mut r = Reader::value(bytes, "import")?;
+    let import = decode_ranges(&mut r)?;
+    r.finish("import")?;
+    Ok(import)
+}
+
+fn decode_ranges(r: &mut Reader<'_>) -> Result<ImportRanges> {
     let import = match r.u8("import.state")? {
         2 => {
             let count = r.len16("import.ranges", MAX_IMPORT_RANGES)?;
@@ -672,15 +709,14 @@ pub fn decode_import(bytes: &[u8]) -> Result<ImportRanges> {
             for _ in 0..count {
                 let end = r.option_str("import.end", MAX_KEY_LEN)?;
                 let tag = r.u8("import.state")?;
-                let checkpoint = decode_checkpoint(&mut r, tag)?;
+                let checkpoint = decode_checkpoint(r, tag)?;
                 ranges.push(ImportRange { end, checkpoint });
             }
             ImportRanges::from_ranges(ranges)
                 .ok_or_else(|| CodecError::new("import.ranges", "ranges out of order"))?
         }
-        tag => decode_checkpoint(&mut r, tag)?.into(),
+        tag => decode_checkpoint(r, tag)?.into(),
     };
-    r.finish("import")?;
     Ok(import)
 }
 

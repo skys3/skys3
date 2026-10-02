@@ -18,8 +18,12 @@
 use std::cell::RefCell;
 use std::fmt;
 
-use skys3_index::{Applier, Entry, EntryState, IndexError, IndexWriter, ObjectVersion, Payload};
-use skys3_log::record::{Adopt, Delete, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags};
+use skys3_index::{
+    Applier, Entry, EntryState, ImportRanges, IndexError, IndexWriter, ObjectVersion, Payload,
+};
+use skys3_log::record::{
+    Adopt, Delete, Flushed, IDENTITY_METADATA, Import, ImportProgress, Put, PutData, Tags,
+};
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
 use skys3_types::{EpochSeq, Seq};
 
@@ -74,6 +78,8 @@ pub enum Effect {
     RemoteRecorded,
     /// An `IMPORT` created a stub.
     Imported,
+    /// An `IMPORT_PROGRESS` became the shard's import progress.
+    Progressed,
     /// An `ADOPT` replaced a clean version with the remote's.
     Adopted,
     /// An `EXTENT` was entered into the location map.
@@ -149,6 +155,22 @@ pub enum Rejection {
         /// The part number.
         number: u16,
     },
+    /// An `IMPORT` of a key the shard's import progress has passed: a
+    /// copy of a record applied before, delivered late, or a page listed
+    /// again. Its key's entry, or its absence, is newer (§9.1).
+    #[error("the import has passed the key")]
+    ImportPassed,
+    /// An `IMPORT_PROGRESS` no newer than the progress the shard holds.
+    #[error("the shard holds import progress {current}, not older than {update}")]
+    StaleProgress {
+        /// The record's progress number.
+        update: u64,
+        /// The progress number the shard holds.
+        current: u64,
+    },
+    /// An `IMPORT_PROGRESS` whose ranges are out of order.
+    #[error("the import ranges are out of order")]
+    InvalidProgress,
     /// A record kind this state machine does not apply.
     #[error("{0:?} records are not applied by this build")]
     Unsupported(RecordKind),
@@ -204,6 +226,7 @@ impl StateMachine {
             RecordBody::Tags(tags) => set_tags(index, shard, position, tags)?,
             RecordBody::Flushed(flushed) => flush(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
+            RecordBody::ImportProgress(progress) => import_progress(index, shard, progress)?,
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
             // A replica's own bookkeeping: the configuration it adopted,
             // which the index keeps as the replica's local copy of it
@@ -432,12 +455,23 @@ fn flush(
 /// records what the remote held instead, as its remote ETag, so the
 /// flush replaces that object with `If-Match` (§7.2) rather than finding
 /// it foreign. Every other entry rejects it.
+///
+/// An `IMPORT` of a key the shard's import progress has passed is dropped
+/// first: the key's own `IMPORT` was applied before the progress, so this
+/// is a late copy, and the key may have been deleted and its tombstone
+/// removed since (§9.1).
 fn import_stub(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
     position: EpochSeq,
     import: &Import,
 ) -> Result<Rule, IndexError> {
+    if index
+        .import_progress(shard)?
+        .is_some_and(|(_, ranges)| ranges.passed(&import.key))
+    {
+        return Ok(Err(Rejection::ImportPassed));
+    }
     if let Some(mut entry) = index.entry(shard, &import.key)? {
         let unknown = matches!(entry.state, EntryState::Dirty | EntryState::Conflict)
             && entry.remote_etag.is_none();
@@ -468,6 +502,29 @@ fn import_stub(
     };
     index.put_entry(shard, &import.key, &entry)?;
     Ok(Ok(Effect::Imported))
+}
+
+/// `IMPORT_PROGRESS`: the import's progress replaces the shard's if it is
+/// newer (§9.1). Progress records reach a shard from the import's owner
+/// and, delayed, from earlier owners; the number keeps the latest.
+fn import_progress(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    progress: &ImportProgress,
+) -> Result<Rule, IndexError> {
+    let Some(ranges) = ImportRanges::from_ranges(progress.ranges.clone()) else {
+        return Ok(Err(Rejection::InvalidProgress));
+    };
+    if let Some((current, _)) = index.import_progress(shard)?
+        && current >= progress.update
+    {
+        return Ok(Err(Rejection::StaleProgress {
+            update: progress.update,
+            current,
+        }));
+    }
+    index.put_import_progress(shard, progress.update, &ranges)?;
+    Ok(Ok(Effect::Progressed))
 }
 
 /// `ADOPT`: the remote changed out of band, and the entry is still clean at
