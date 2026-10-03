@@ -12,7 +12,7 @@ use skys3_log::record::RemoteStep;
 use skys3_log::{RecordBody, RecordKind, SegmentLog};
 use skys3_shard::{
     Change, Committed, Effect, Outcome, Role, Shard, ShardError, ShardSet, ShardSummary,
-    StateMachine,
+    StateMachine, StreamedBody,
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
@@ -789,6 +789,53 @@ fn subscribers_see_applied_client_writes() {
         assert!(shard.is_stopped());
         assert!(newer.recv().await.is_none());
         assert!(shard.subscribe().recv().await.is_none());
+    });
+}
+
+#[test]
+fn announcements_of_a_streamed_body_reach_the_subscriber_before_its_put() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let body = |upload, extents| StreamedBody {
+            key: "big".into(),
+            upload,
+            metadata: Default::default(),
+            tags: Default::default(),
+            extents,
+        };
+        // Without a subscriber an announcement goes nowhere.
+        shard.announce(body(at(1), Vec::new())).unwrap();
+        let mut changes = shard.subscribe();
+        let begun = shard.commit(upload_begin("big")).await.unwrap().position;
+        let extent = shard.append_extent(extent("big", 0, 5)).await.unwrap();
+        let announced = body(begun, vec![(0, extent)]);
+        shard.announce(announced.clone()).unwrap();
+        // The PUT names the identity it inherits: its stream's upload.
+        let RecordBody::Put(mut streamed) = put_extents("big", vec![extent], 1) else {
+            unreachable!("put_extents makes a PUT")
+        };
+        streamed.inherited_identity = Some(begun);
+        let stored = shard.commit(RecordBody::Put(streamed)).await.unwrap();
+        assert_eq!(
+            changes.recv().await,
+            Some(Change::Streamed(announced.clone()))
+        );
+        assert_eq!(
+            changes.recv().await,
+            Some(Change::Stored {
+                key: "big".into(),
+                position: stored.position,
+                size: Some(5),
+                upload: Some(begun),
+            })
+        );
+        // A stopped shard refuses announcements.
+        shard.close().await.unwrap();
+        assert!(matches!(
+            shard.announce(announced),
+            Err(ShardError::Unavailable { .. })
+        ));
     });
 }
 

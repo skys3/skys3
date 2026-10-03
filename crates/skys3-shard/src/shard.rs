@@ -2436,8 +2436,10 @@ impl<D: Disk> Shard<D> {
     /// Reports every client write applied from now on, in position order:
     /// each `PUT`, `DELETE`, `TAGS`, and `MPU_COMPLETE` that stored a new
     /// version, and each `MPU_CREATE`, `MPU_PART`, and `MPU_ABORT` that
-    /// opened, filled, or aborted an upload. The shard's flusher follows it
-    /// (§7.1, §7.3). A shard has one subscriber; a
+    /// opened, filled, or aborted an upload, interleaved with the
+    /// [announcements](Self::announce) of streamed bodies as they arrive.
+    /// The shard's flusher follows it (§7.1, §7.3). A shard has one
+    /// subscriber; a
     /// new subscription replaces the previous one, whose stream then ends.
     /// The stream also ends when the shard stops.
     ///
