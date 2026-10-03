@@ -68,12 +68,17 @@ pub fn listen_address(text: &str, section: &str) -> String {
 /// Moves the gateway and the admin listener of the configuration at
 /// `config` to fresh ports.
 fn move_to_fresh_ports(config: &Path) {
-    let text = std::fs::read_to_string(config).unwrap();
-    let old = |section| format!("listen = \"{}\"", listen_address(&text, section));
     let (gateway, admin) = fresh_addresses();
-    let moved = text
-        .replace(&old("[gateway]"), &format!("listen = \"{gateway}\""))
-        .replace(&old("[admin]"), &format!("listen = \"{admin}\""));
+    set_listen_address(config, "[gateway]", &gateway);
+    set_listen_address(config, "[admin]", &admin);
+}
+
+/// Rewrites the `listen` address of the configuration's `section`
+/// (`"[gateway]"`) at `config` to `address`.
+pub fn set_listen_address(config: &Path, section: &str, address: &str) {
+    let text = std::fs::read_to_string(config).unwrap();
+    let old = format!("listen = \"{}\"", listen_address(&text, section));
+    let moved = text.replacen(&old, &format!("listen = \"{address}\""), 1);
     std::fs::write(config, moved).unwrap();
 }
 

@@ -6,7 +6,7 @@ mod support;
 
 use std::process::Command;
 
-use support::process::{BINARY, Process, configure, listen_address};
+use support::process::{BINARY, Process, configure, listen_address, set_listen_address};
 use support::{body, get, put};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -63,10 +63,19 @@ async fn a_taken_port_moves_the_node_to_fresh_ones() {
     let log = dir.path().join("node.log");
     let config = configure(dir.path());
     let configured = |section| listen_address(&std::fs::read_to_string(&config).unwrap(), section);
-    let taken_gateway = std::net::TcpListener::bind(configured("[gateway]")).unwrap();
+    // The test holds a port of its own choosing and points the
+    // configuration at it, so the node surely finds it taken: binding a
+    // configured port instead could fail, since another test may have
+    // taken it since it was chosen.
+    let take = |section| {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = held.local_addr().unwrap().to_string();
+        set_listen_address(&config, section, &address);
+        (held, address)
+    };
+    let (_held_gateway, taken) = take("[gateway]");
 
     let node = Process::start(&config, &log).await;
-    let taken = taken_gateway.local_addr().unwrap().to_string();
     assert_ne!(node.gateway, taken);
     assert_eq!(node.gateway, configured("[gateway]"));
     assert_eq!(node.admin, configured("[admin]"));
@@ -77,10 +86,16 @@ async fn a_taken_port_moves_the_node_to_fresh_ones() {
     assert!(log_text.contains("Address already in use"), "{log_text}");
     assert!(node.terminate().await.success());
 
-    let taken_admin = std::net::TcpListener::bind(configured("[admin]")).unwrap();
+    let (_held_admin, taken) = take("[admin]");
     let node = Process::start(&config, &log).await;
-    assert_ne!(node.admin, taken_admin.local_addr().unwrap().to_string());
+    assert_ne!(node.admin, taken);
+    assert_eq!(node.admin, configured("[admin]"));
     assert_eq!(get(&node.s3(), "data", "k").await, b"moved");
+    let log_text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        log_text.matches("Address already in use").count() >= 2,
+        "{log_text}"
+    );
     assert!(node.terminate().await.success());
 }
 
