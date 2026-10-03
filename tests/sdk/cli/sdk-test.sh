@@ -80,6 +80,19 @@ static aws s3 cp --only-show-errors "s3://$bucket/multipart" "$work/large.out"
 same "$work/large" "$work/large.out"
 log "multipart upload ($etag)"
 
+# `aws s3 cp` between objects copies a large one part by part with
+# UploadPartCopy. The parts have the source's boundaries, so their MD5s,
+# and the copy's multipart ETag, are the source's, as in S3.
+static aws s3 cp --only-show-errors --debug "s3://$bucket/multipart" "s3://$bucket/multipart-copy" \
+    2>"$work/copy.debug"
+parts=$(grep -c 'OperationModel(name=UploadPartCopy)' "$work/copy.debug" || true)
+[ "$parts" = 3 ] || fail "$parts UploadPartCopy requests"
+copied=$(static aws s3api head-object --bucket "$bucket" --key multipart-copy --query ETag --output text)
+[ "$copied" = "$etag" ] || fail "copy ETag $copied, source $etag"
+static aws s3 cp --only-show-errors "s3://$bucket/multipart-copy" "$work/copy.out"
+same "$work/large" "$work/copy.out"
+log "multipart copy by UploadPartCopy ($copied)"
+
 # A presigned GET, used with curl. The CLI presigns only GETs.
 url=$(static aws s3 presign "s3://$bucket/default" --expires-in 300)
 curl -fsS --cacert "$SKYS3_CA_FILE" -o "$work/presigned.out" "$url" || fail "presigned GET"
@@ -119,13 +132,15 @@ case "$first" in ASIA*) ;; *) fail "access key $first" ;; esac
 deadline=$(($(date +%s) + SKYS3_LOAD_SECONDS))
 # Each worker has its own home: the CLI caches sessions in files under
 # ~/.aws/cli/cache, and concurrent processes sharing them fail with a
-# KeyError when one replaces an entry another is reading.
+# KeyError when one replaces an entry another is reading. So each worker
+# must show a refresh of its own: a key other than its first.
 worker() {
     n=$1
     i=0
     export HOME="$work/home-$n"
     mkdir -p "$HOME"
     head -c $((1000 + n * 100)) /dev/urandom >"$work/load-$n"
+    key_id >"$work/keys-$n"
     while [ "$(date +%s)" -lt "$deadline" ]; do
         aws s3api put-object --bucket "$wi" --key "load/$n/$((i % 4))" --body "$work/load-$n" >/dev/null
         aws s3api get-object --bucket "$wi" --key "load/$n/$((i % 4))" "$work/load-$n.out" >/dev/null
@@ -143,8 +158,11 @@ done
 for pid in $pids; do
     wait "$pid" || fail "a worker failed"
 done
-sessions=$( (echo "$first"; cat "$work"/keys-*) | sort -u | wc -l)
-[ "$sessions" -ge 2 ] || fail "the session was never refreshed"
+for n in 0 1 2 3 4 5 6 7; do
+    own=$(sort -u "$work/keys-$n" | wc -l)
+    [ "$own" -ge 2 ] || fail "worker $n never refreshed its session: $(cat "$work/keys-$n")"
+done
+sessions=$(cat "$work"/keys-* | sort -u | wc -l)
 count=0
 for file in "$work"/count-*; do
     count=$((count + 2 * $(cat "$file")))
