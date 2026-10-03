@@ -4,7 +4,8 @@
 //!
 //! Every client checks the same features: SDK-default checksums and every
 //! other checksum algorithm, `aws-chunked` uploads, multipart uploads,
-//! presigned URLs, and web-identity credentials from the default chain,
+//! multipart copies by UploadPartCopy (through the SDK's copy helper where
+//! it has one), presigned URLs, and web-identity credentials from the default chain,
 //! configured only by `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL_STS`,
 //! `AWS_ROLE_ARN`, and `AWS_WEB_IDENTITY_TOKEN_FILE`, refreshed while
 //! requests run. Sessions last 900 seconds, the shortest STS allows, and
@@ -569,6 +570,7 @@ async fn rust_features(matrix: &Matrix) {
     );
 
     rust_multipart(&s3, bucket).await;
+    rust_part_copy(&s3, bucket).await;
     rust_presigned(&s3, bucket, &matrix.ca()).await;
 
     // Listing, copies, tags, ranges, and batch deletes.
@@ -715,6 +717,95 @@ async fn rust_multipart(s3: &aws_sdk_s3::Client, bucket: &str) {
         .unwrap();
     assert_eq!(second.parts_count(), Some(3));
     assert_eq!(bytes(second).await, data[PART..2 * PART]);
+}
+
+/// UploadPartCopy of `multipart`, range by range at its own part
+/// boundaries, under `x-amz-copy-source-if-match`: each part's ETag is the
+/// MD5 of its bytes, so the copy's multipart ETag is the source's, as in
+/// S3. A failed source condition answers `412`.
+async fn rust_part_copy(s3: &aws_sdk_s3::Client, bucket: &str) {
+    use md5::Digest as _;
+
+    let data = body(40, 2 * PART + 1_000_000);
+    let source = s3
+        .head_object()
+        .bucket(bucket)
+        .key("multipart")
+        .send()
+        .await
+        .unwrap();
+    let source_etag = source.e_tag().unwrap();
+    let upload = s3
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("part-copy")
+        .send()
+        .await
+        .unwrap();
+    let id = upload.upload_id().unwrap();
+    let refused = s3
+        .upload_part_copy()
+        .bucket(bucket)
+        .key("part-copy")
+        .upload_id(id)
+        .part_number(1)
+        .copy_source(format!("{bucket}/multipart"))
+        .copy_source_if_none_match(source_etag)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Some("PreconditionFailed"), "{refused:?}");
+    let mut parts = Vec::new();
+    for (i, chunk) in data.chunks(PART).enumerate() {
+        let number = i32::try_from(i).unwrap() + 1;
+        let first = i * PART;
+        let copied = s3
+            .upload_part_copy()
+            .bucket(bucket)
+            .key("part-copy")
+            .upload_id(id)
+            .part_number(number)
+            .copy_source(format!("{bucket}/multipart"))
+            .copy_source_range(format!("bytes={first}-{}", first + chunk.len() - 1))
+            .copy_source_if_match(source_etag)
+            .send()
+            .await
+            .unwrap();
+        let etag = copied.copy_part_result().unwrap().e_tag().unwrap();
+        let md5: String = md5::Md5::digest(chunk)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(etag, format!("\"{md5}\""));
+        parts.push(
+            CompletedPart::builder()
+                .part_number(number)
+                .e_tag(etag)
+                .build(),
+        );
+    }
+    let done = s3
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key("part-copy")
+        .upload_id(id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.e_tag(), Some(source_etag));
+    let object = s3
+        .get_object()
+        .bucket(bucket)
+        .key("part-copy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bytes(object).await, data);
 }
 
 /// Presigned GET and PUT URLs, used by a plain HTTPS client.

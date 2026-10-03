@@ -52,7 +52,8 @@
 //!
 //! DeleteObject and DeleteObjects are in `delete`, CopyObject in `copy`,
 //! GetObjectTagging, PutObjectTagging, and DeleteObjectTagging in `tagging`,
-//! and multipart uploads in `multipart`.
+//! multipart uploads in `multipart`, and UploadPartCopy, which reads its
+//! source as a GET does, in `part_copy`.
 
 mod download;
 mod holders;
@@ -236,7 +237,11 @@ mod copy;
 mod delete;
 mod multipart;
 mod namespace;
+mod part_copy;
 mod tagging;
+
+#[cfg(feature = "test-util")]
+pub(crate) use part_copy::CopyRange;
 
 pub use multipart::{MAX_MULTIPART_OBJECT_BYTES, MIN_PART_BYTES, parse_upload_id, upload_id};
 
@@ -428,24 +433,50 @@ impl<H: Shards> Objects<H> {
             if_modified_since: input.if_modified_since.as_ref(),
             if_unmodified_since: input.if_unmodified_since.as_ref(),
         };
+        let (range, part_number) = (input.range, input.part_number);
+        let (found, body) = self
+            .open(bucket, &input.key, conditions, |shard, version, object| {
+                select(shard, version, object, range, part_number)
+            })
+            .await?;
+        let mut output = GetObjectOutput {
+            body: Some(body),
+            ..GetObjectOutput::default()
+        };
+        describe!(output, found, input.checksum_mode, overrides);
+        Ok(output)
+    }
+
+    /// Resolves a read of `key` whose bytes `selector` chooses, and opens
+    /// them: at the remote for a key only there (§9.1), from the hot cache,
+    /// from a holder the read plan names, or through a fill for an evicted
+    /// version (§9.2). A GET reads this way, and so does UploadPartCopy its
+    /// source. When no holder still has the planned version, or a fill finds
+    /// the key changed, the key is resolved again, at most
+    /// [`MAX_FILL_ROUNDS`] times.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Objects::resolve`], and `503 ServiceUnavailable`
+    /// when the bytes cannot be read.
+    async fn open(
+        &self,
+        bucket: &BucketDocument,
+        key: &str,
+        conditions: ReadConditions<'_>,
+        selector: impl Fn(ShardRef, EpochSeq, ObjectVersion) -> S3Result<Found>,
+    ) -> S3Result<(Found, StreamingBlob)> {
         let mut rounds = 0;
-        let (found, body) = loop {
+        loop {
             let found = self
-                .resolve(
-                    bucket,
-                    &input.key,
-                    conditions,
-                    input.range,
-                    input.part_number,
-                    true,
-                )
+                .resolve(bucket, key, conditions, &selector, true)
                 .await?;
             if found.remote {
-                let body = self.read_remote(bucket, &input.key, &found).await?;
-                break (found, body);
+                let body = self.read_remote(bucket, key, &found).await?;
+                return Ok((found, body));
             }
-            if let Some(body) = self.read_hot(bucket, &input.key, &found) {
-                break (found, body);
+            if let Some(body) = self.read_hot(bucket, key, &found) {
+                return Ok((found, body));
             }
             if !found.evicted {
                 if found.holders.is_empty() {
@@ -453,8 +484,8 @@ impl<H: Shards> Objects<H> {
                     // of an evicted object.
                     return Err(download::not_cached());
                 }
-                match self.read_held(bucket, &input.key, &found).await {
-                    Some(body) => break (found, body),
+                match self.read_held(bucket, key, &found).await {
+                    Some(body) => return Ok((found, body)),
                     // No holder still has the version: it was replaced or
                     // evicted since the plan, so the key is resolved again.
                     None if rounds + 1 < MAX_FILL_ROUNDS => {
@@ -469,8 +500,8 @@ impl<H: Shards> Objects<H> {
                     }
                 }
             }
-            match self.fill(bucket, &input.key, &found).await? {
-                Ok(body) => break (found, body),
+            match self.fill(bucket, key, &found).await? {
+                Ok(body) => return Ok((found, body)),
                 Err(FillError::Changed) if rounds + 1 < MAX_FILL_ROUNDS => rounds += 1,
                 Err(error) => {
                     return Err(s3_error!(
@@ -479,13 +510,7 @@ impl<H: Shards> Objects<H> {
                     ));
                 }
             }
-        };
-        let mut output = GetObjectOutput {
-            body: Some(body),
-            ..GetObjectOutput::default()
-        };
-        describe!(output, found, input.checksum_mode, overrides);
-        Ok(output)
+        }
     }
 
     pub(crate) async fn head(
@@ -501,15 +526,10 @@ impl<H: Shards> Objects<H> {
             if_modified_since: input.if_modified_since.as_ref(),
             if_unmodified_since: input.if_unmodified_since.as_ref(),
         };
+        let (range, part_number) = (input.range, input.part_number);
+        let selector = |shard, version, object| select(shard, version, object, range, part_number);
         let found = self
-            .resolve(
-                bucket,
-                &input.key,
-                conditions,
-                input.range,
-                input.part_number,
-                false,
-            )
+            .resolve(bucket, &input.key, conditions, selector, false)
             .await?;
         let mut output = HeadObjectOutput::default();
         describe!(output, found, input.checksum_mode, overrides);
@@ -609,20 +629,20 @@ impl<H: Shards> Objects<H> {
     }
 
     /// Resolves a read: the key's object, the conditions checked, and the
-    /// bytes to serve, with where to read them if `planned`.
+    /// bytes `selector` chooses to serve, with where to read them if
+    /// `planned`.
     async fn resolve(
         &self,
         bucket: &BucketDocument,
         key: &str,
         conditions: ReadConditions<'_>,
-        range: Option<Range>,
-        part_number: Option<i32>,
+        selector: impl Fn(ShardRef, EpochSeq, ObjectVersion) -> S3Result<Found>,
         planned: bool,
     ) -> S3Result<Found> {
         let shard = ShardRef::for_key(bucket, key);
         let found = self.lookup(bucket, &shard, key, planned).await?;
         conditions.check(&found.object)?;
-        let mut selected = select(shard, found.version, found.object, range, part_number)?;
+        let mut selected = selector(shard, found.version, found.object)?;
         selected.remote = found.remote;
         selected.evicted = found.evicted;
         selected.layout = found.layout;

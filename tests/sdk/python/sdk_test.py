@@ -115,6 +115,42 @@ def features():
     assert part["PartsCount"] == 3 and part["Body"].read() == data[PART : 2 * PART]
     log(f"multipart upload ({head['ETag']}, checksum type {head.get('ChecksumType')})")
 
+    # The transfer manager copies a large object part by part with
+    # UploadPartCopy, each part a range of the source under If-Match with
+    # the source's ETag. The parts have the source's boundaries, so their
+    # MD5s, and the copy's multipart ETag, are the source's, as in S3.
+    copies = []
+    s3.meta.events.register(
+        "before-call.s3.UploadPartCopy",
+        lambda params, **_: copies.append(params["headers"]),
+    )
+    s3.copy({"Bucket": BUCKET, "Key": "multipart"}, BUCKET, "multipart-copy", Config=transfer)
+    assert len(copies) == 3, copies
+    for headers in copies:
+        assert "x-amz-copy-source-range" in headers, headers
+        assert headers.get("x-amz-copy-source-if-match") == head["ETag"], headers
+    copied = s3.head_object(Bucket=BUCKET, Key="multipart-copy")
+    assert copied["ETag"] == head["ETag"], (copied, head)
+    out = io.BytesIO()
+    s3.download_fileobj(BUCKET, "multipart-copy", out, Config=transfer)
+    assert out.getvalue() == data
+    # A failed source condition answers 412.
+    upload = s3.create_multipart_upload(Bucket=BUCKET, Key="refused-copy")
+    try:
+        s3.upload_part_copy(
+            Bucket=BUCKET,
+            Key="refused-copy",
+            UploadId=upload["UploadId"],
+            PartNumber=1,
+            CopySource={"Bucket": BUCKET, "Key": "multipart"},
+            CopySourceIfMatch='"0123"',
+        )
+        raise AssertionError("a failed copy-source condition was copied")
+    except ClientError as error:
+        assert error.response["Error"]["Code"] == "PreconditionFailed", error
+    s3.abort_multipart_upload(Bucket=BUCKET, Key="refused-copy", UploadId=upload["UploadId"])
+    log(f"multipart copy by UploadPartCopy ({copied['ETag']})")
+
     # Presigned URLs, used without the SDK.
     url = s3.generate_presigned_url("get_object", Params={"Bucket": BUCKET, "Key": "default"}, ExpiresIn=300)
     answer = requests.get(url, verify=CA, timeout=30)

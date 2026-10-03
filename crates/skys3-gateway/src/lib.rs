@@ -41,6 +41,9 @@
 //!   upload's ID ([`upload_id`]) is the position of its `MPU_CREATE`, the
 //!   write identity of the object it completes, which keeps its parts'
 //!   boundaries for GetObject's `partNumber` and the multipart ETag.
+//!   UploadPartCopy reads its source, or a byte range of it, as a GET
+//!   reads it, from any bucket of the cluster, and stores the bytes as a
+//!   part whose ETag is their MD5, as S3 does.
 //! - [`Admission`] control (§7.6, §13): before a write that adds data,
 //!   the gateway asks whether it may proceed, and answers `503 SlowDown`
 //!   with the [`Refusal`] if not, such as when the bucket's dirty-data

@@ -7,13 +7,16 @@
 // non-zero on the first failed check.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import https from "node:https";
 import { Readable } from "node:stream";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import {
+  CompleteMultipartUploadCommand,
   CopyObjectCommand,
   CreateBucketCommand,
+  CreateMultipartUploadCommand,
   DeleteBucketCommand,
   DeleteObjectsCommand,
   GetObjectCommand,
@@ -23,6 +26,7 @@ import {
   PutObjectCommand,
   PutObjectTaggingCommand,
   S3Client,
+  UploadPartCopyCommand,
 } from "@aws-sdk/client-s3";
 import { fromTokenFile } from "@aws-sdk/credential-providers";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -139,6 +143,7 @@ async function features() {
   assert.equal(got.PartsCount, 3);
   assert.deepEqual(await bytes(got), data.subarray(PART, 2 * PART));
   log(`multipart upload (${head.ETag}, checksum type ${head.ChecksumType})`);
+  await multipartCopy(s3, head.ETag, data);
 
   // Presigned URLs, used without the SDK.
   const getUrl = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: "default" }), {
@@ -178,6 +183,50 @@ async function features() {
   assert.equal(deleted.Deleted.length, objects.length);
   await s3.send(new DeleteBucketCommand({ Bucket: bucket }));
   log("listing, copy, tagging, ranges, and batch delete");
+}
+
+/**
+ * Copies the object "multipart", which holds `data` and has the ETag
+ * `etag`, part by part with UploadPartCopy, as the AWS documentation's
+ * multipart copy does: lib-storage has no copy helper. Each part is a range
+ * of the source under If-Match, at the source's own part boundaries, so the
+ * copy's multipart ETag is the source's, as in S3.
+ */
+async function multipartCopy(s3, etag, data) {
+  const target = { Bucket: bucket, Key: "multipart-copy" };
+  const CopySource = `${bucket}/multipart`;
+  const { UploadId } = await s3.send(new CreateMultipartUploadCommand(target));
+  await assert.rejects(
+    s3.send(
+      new UploadPartCopyCommand({ ...target, UploadId, PartNumber: 1, CopySource, CopySourceIfNoneMatch: etag }),
+    ),
+    { name: "PreconditionFailed" },
+  );
+  const Parts = [];
+  for (let first = 0; first < data.length; first += PART) {
+    const last = Math.min(first + PART, data.length) - 1;
+    const PartNumber = first / PART + 1;
+    const { CopyPartResult } = await s3.send(
+      new UploadPartCopyCommand({
+        ...target,
+        UploadId,
+        PartNumber,
+        CopySource,
+        CopySourceRange: `bytes=${first}-${last}`,
+        CopySourceIfMatch: etag,
+      }),
+    );
+    const md5 = createHash("md5")
+      .update(data.subarray(first, last + 1))
+      .digest("hex");
+    assert.equal(CopyPartResult.ETag, `"${md5}"`, `part ${PartNumber}`);
+    Parts.push({ PartNumber, ETag: CopyPartResult.ETag });
+  }
+  const done = await s3.send(new CompleteMultipartUploadCommand({ ...target, UploadId, MultipartUpload: { Parts } }));
+  assert.equal(done.ETag, etag);
+  const got = await s3.send(new GetObjectCommand(target));
+  assert.deepEqual(await bytes(got), data);
+  log(`multipart copy by UploadPartCopy (${etag})`);
 }
 
 /**
