@@ -407,7 +407,8 @@ async fn check(
         }
         if remote != expected && !foreign {
             return Err(format!("{key}: the remote holds {remote:?}, not {expected:?}").into());
-        }    }
+        }
+    }
     if store.config().versioning {
         for key in touched {
             check_history(store, key).await?;

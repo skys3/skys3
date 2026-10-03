@@ -288,7 +288,10 @@ fn a_retagged_streamed_put_is_sent_whole_and_its_upload_aborted() {
         let begun = node.begin("big").await;
         let extents = node.extents("big", body, 8).await;
         node.announce("big", begun, &extents);
-        wait_until("the parts", async || remote_parts(&store, "big").await.len() == 2).await;
+        wait_until("the parts", async || {
+            remote_parts(&store, "big").await.len() == 2
+        })
+        .await;
         node.complete_extents("big", body, begun, &extents).await;
         // A `TAGS` before the flush gives the version an identity of its
         // own, which the stream does not carry.

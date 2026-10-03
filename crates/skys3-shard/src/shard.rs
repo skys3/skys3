@@ -2458,8 +2458,9 @@ impl<D: Disk> Shard<D> {
 
     /// Passes the announcement of a streamed single PUT's body on to the
     /// subscriber, if the shard has one: its flusher, on the primary
-    /// (§7.3). It commits nothing, and a replica without a flusher drops
-    /// it.
+    /// (§7.3). It commits nothing, and a replica without a subscriber
+    /// drops it. Only a primary that serves client requests takes it, as
+    /// only one takes the body's `PUT`.
     ///
     /// The subscriber hears of it in order with the writes applied: an
     /// announcement made before the body's `PUT` is sent comes before the
@@ -2467,10 +2468,12 @@ impl<D: Disk> Shard<D> {
     ///
     /// # Errors
     ///
-    /// [`ShardError::Unavailable`] if the shard stopped.
+    /// [`ShardError::NotPrimary`] on a member, and
+    /// [`ShardError::Unavailable`] if the shard stopped or its primary does
+    /// not serve.
     pub fn announce(&self, body: StreamedBody) -> Result<(), ShardError> {
         let sequencer = self.sequencer();
-        sequencer.check_running(self.shard())?;
+        sequencer.check_serving(self.shard())?;
         if let Some(subscriber) = &sequencer.subscriber {
             // A subscriber that went away needs nothing.
             let _ = subscriber.send(Change::Streamed(body));

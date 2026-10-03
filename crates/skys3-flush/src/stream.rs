@@ -168,7 +168,10 @@ pub(crate) fn part_range(number: u16, part_bytes: u64) -> (u64, u64) {
 /// The extents of `extents`, by offset, that hold every byte of `range`,
 /// or `None` if they leave a gap.
 pub(crate) fn span(extents: &BTreeMap<u64, ExtentRef>, (start, end): (u64, u64)) -> Option<Span> {
-    let first = extents.range(..=start).next_back().map(|(offset, _)| *offset)?;
+    let first = extents
+        .range(..=start)
+        .next_back()
+        .map(|(offset, _)| *offset)?;
     let mut span = Vec::new();
     let mut covered = first;
     for (&offset, &extent) in extents.range(first..) {
@@ -898,7 +901,17 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
     /// Sends the bytes `range` of a streamed body, held by `span`, as part
     /// `number` of the remote upload `id`.
     async fn send_span(&self, id: &UploadId, number: u16, range: (u64, u64), span: &Span) -> Sent {
-        match upload_span(&self.shard, &self.target, &self.key, id, number, range, span).await {
+        match upload_span(
+            &self.shard,
+            &self.target,
+            &self.key,
+            id,
+            number,
+            range,
+            span,
+        )
+        .await
+        {
             Ok(etag) => Sent::Done(etag, Instant::now()),
             Err(failure) => self.failed(number, &failure),
         }
@@ -997,7 +1010,8 @@ pub(crate) async fn upload_span<S: ObjectStore, D: Disk>(
         }
         // The part's bytes within the extent.
         let within = |at: u64| {
-            usize::try_from(at.saturating_sub(*offset)).map_or(bytes.len(), |at| at.min(bytes.len()))
+            usize::try_from(at.saturating_sub(*offset))
+                .map_or(bytes.len(), |at| at.min(bytes.len()))
         };
         body.extend_from_slice(&bytes[within(start)..within(end)]);
     }

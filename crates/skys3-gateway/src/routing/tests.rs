@@ -930,16 +930,13 @@ fn announcements_round_trip_and_malformed_ones_are_refused() {
     let Request::Announce(body) = request else {
         unreachable!("an announcement")
     };
-    let Ok(wire::Op::Announce(valid)) = wire::request_frame(
-        &shard,
-        Epoch::new(1),
-        &Request::Announce(body.clone()),
-    )
-    .map(|frame| {
-        prost::Message::decode(frame.header.body)
-            .map(|forward: wire::Forward| forward.op.unwrap())
-            .unwrap()
-    }) else {
+    let Ok(wire::Op::Announce(valid)) =
+        wire::request_frame(&shard, Epoch::new(1), &Request::Announce(body.clone())).map(|frame| {
+            prost::Message::decode(frame.header.body)
+                .map(|forward: wire::Forward| forward.op.unwrap())
+                .unwrap()
+        })
+    else {
         panic!("an announcement encodes as one");
     };
     let refused = |change: &dyn Fn(&mut wire::Announcement)| {

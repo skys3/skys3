@@ -199,7 +199,13 @@ async fn streamed_puts_announce_their_body_to_the_primary() {
     let setup = setup_with(config).await;
     let bucket = setup.create_write_back("remote").await;
     let shard = ShardRef::for_key(&bucket, "big");
-    let replica = setup.shards.local().set().get(&(&shard).into()).await.unwrap();
+    let replica = setup
+        .shards
+        .local()
+        .set()
+        .get(&(&shard).into())
+        .await
+        .unwrap();
     let mut changes = replica.subscribe();
 
     let headers = [("x-amz-meta-color", "blue"), ("x-amz-tagging", "team=a")];
