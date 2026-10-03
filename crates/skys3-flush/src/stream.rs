@@ -1152,9 +1152,8 @@ mod tests {
         // No part size yet: nothing is queued.
         assert!(body.covered().is_empty());
         body.part_bytes = Some(5);
-        let first = EpochSeq::new(Epoch::new(1), Seq::new(1));
-        let second = EpochSeq::new(Epoch::new(1), Seq::new(2));
-        assert_eq!(body.covered(), vec![(1, first), (2, second)]);
+        // Part 2, bytes 5 to 10, starts in the first extent.
+        assert_eq!(body.covered(), vec![(1, position(1)), (2, position(1))]);
         assert!(body.covered().is_empty());
         body.extents.insert(12, extent(3, 3));
         assert_eq!(body.covered().len(), 1);
