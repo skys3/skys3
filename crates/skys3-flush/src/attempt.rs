@@ -145,8 +145,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// ETag, `If-None-Match: *` where the key is known to be absent, and a
     /// HEAD first where the remote state is unknown. A version made of
     /// parts is sent as a remote multipart upload with the same part
-    /// boundaries, so that the remote ETag is the local one (§7.4); any
-    /// other version with `PutObject`.
+    /// boundaries, so that the remote ETag is the local one (§7.4); a
+    /// streamed single PUT by completing the remote upload its body
+    /// streamed to (§7.3); any other version with `PutObject`.
     async fn put(
         &self,
         entry: &Entry,
@@ -173,6 +174,16 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         if let Payload::Parts { upload, parts } = &object.payload {
             return self
                 .put_parts(version, object, *upload, parts, &identity, expected)
+                .await;
+        }
+        // A streamed single PUT completes the remote upload its body
+        // streamed to (§7.3); a `TAGS` version has an identity of its own.
+        if let Some(upload) = object.write_identity
+            && self.streamable(object)
+            && let Some(claim) = self.streams.claim(upload).await
+        {
+            return self
+                .complete_body(version, object, upload, claim, &identity, expected)
                 .await;
         }
         let request = put_request(self.remote_key(), object, &identity)?;

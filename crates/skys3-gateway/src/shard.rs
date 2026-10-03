@@ -16,7 +16,7 @@ use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{ReadId, ReadPlan, Registered};
+use skys3_shard::{ReadId, ReadPlan, Registered, StreamedBody};
 use skys3_types::{BucketDocument, BucketId, Epoch, EpochSeq, NodeId, ShardId, shard_for_key};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -321,6 +321,21 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         shard: &ShardRef,
         extent: Extent,
     ) -> impl Future<Output = Result<ExtentRef, ShardError>> + Send;
+
+    /// Announces more of the body of a streamed single PUT to the shard's
+    /// primary, whose flusher sends it to the remote while the client
+    /// uploads (§7.3, [`StreamedBody`]). Nothing is committed: if an
+    /// announcement is lost, the flusher sends those bytes once the `PUT`
+    /// commits.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shards::entry`].
+    fn announce(
+        &self,
+        shard: &ShardRef,
+        body: StreamedBody,
+    ) -> impl Future<Output = Result<(), ShardError>> + Send;
 
     /// Commits `body`, a record that names a key (a `PUT`, a `DELETE`, a
     /// `TAGS`, a `FLUSHED`, or a multipart record), if `condition` holds of

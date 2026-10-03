@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+md-5.workspace = true
 prometheus-client.workspace = true
 skys3-config.workspace = true
 skys3-index.workspace = true
@@ -29,7 +30,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 http.workspace = true
-md-5.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 s3s.workspace = true
