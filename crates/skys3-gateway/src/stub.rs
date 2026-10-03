@@ -420,6 +420,11 @@ impl Shards for MemoryShards {
         self.local.append_extent(shard, extent).await
     }
 
+    async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
+        self.check(shard)?;
+        self.local.announce(shard, body).await
+    }
+
     async fn write(
         &self,
         shard: &ShardRef,
