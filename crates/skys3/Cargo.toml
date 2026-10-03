@@ -38,11 +38,19 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread"
 tracing.workspace = true
 
 [dev-dependencies]
+# `test-util` lets the SDK matrix configure the default credential chain
+# from an environment of its own.
+aws-config = { workspace = true, features = ["test-util"] }
+aws-credential-types.workspace = true
 aws-sdk-s3.workspace = true
 aws-smithy-http-client.workspace = true
+aws-types.workspace = true
 md-5.workspace = true
 # Enables `test-util` for the in-memory shards in unit tests.
 skys3-gateway = { workspace = true, features = ["test-util"] }
 skys3-sim.workspace = true
+# Enables `test-util` for the token minting of the SDK matrix's issuer.
+skys3-sts = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
+tokio-rustls.workspace = true

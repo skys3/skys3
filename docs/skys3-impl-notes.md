@@ -2350,6 +2350,114 @@ of this file. A task with nothing unexpected keeps "None."
   `MaxSessionDuration`; here `DurationSeconds` is bounded by
   `session_maximum_seconds` only, which keeps the role register small.
 
+### M1-25 SDK matrix
+
+- **The matrix needs HTTPS.** botocore sends `aws-chunked` bodies with
+  trailing checksums only over TLS, and plain HTTP would have left the
+  trailer forms untested. The node serves the test certificate from
+  `crates/skys3/tests/data/`, and every client is told to trust its CA:
+  `AWS_CA_BUNDLE` (Python, Go, CLI), `NODE_EXTRA_CA_CERTS`, a TLS context
+  (Rust), and, for Java, a PKCS12 trust store the client writes at start
+  and makes the JVM default, since the STS client inside the web-identity
+  provider ignores any HTTP client the test configures. Every SDK client
+  checks that at least one upload went as
+  `STREAMING-UNSIGNED-PAYLOAD-TRAILER`.
+- **Getting an issuer and a role into the binary.** The node fetches OIDC
+  documents over HTTPS from the system roots only, and nothing writes
+  identity registers but the control store's own API. The test starts the
+  binary with `SSL_CERT_FILE` naming the test CA (which
+  `rustls-native-certs` honours), runs its own issuer with the test
+  certificate (`tests/support/issuer.rs`), and writes the provider and
+  role registers as files into the file control store while the node is
+  down: it starts the node once to create the store, stops it, writes
+  them, and starts it again, since the store reads its files when opened.
+- **Sessions cannot be short, so each SDK is told to refresh early.**
+  900 seconds is the STS minimum, too long to wait for in CI. Go's
+  `ExpiryWindow`, Java's `prefetchTime` and `staleTime`, and a `memoize`
+  around JavaScript's `fromTokenFile` (the default chain's own cache
+  refreshes five minutes before expiry and cannot be told otherwise)
+  refresh five seconds after issue. botocore (Python and the CLI)
+  refreshes within 15 minutes of expiry, so with 900-second sessions every
+  request refreshes. The Rust SDK's identity cache jitters its buffer by up
+  to half, so no buffer gives a short fixed refresh age; a buffer of twice
+  the session makes every request due, as in botocore, while the cache
+  still loads one session at a time. Under load that is about one STS
+  call per request: locally, Rust issued 475 to 1,700 sessions in 20
+  seconds, each a `PUT` in `sys-sessions`, without a failed request.
+- **Refresh must be proven per provider, and with expiring tokens.** A
+  review found three ways the first version could pass without a
+  refresh. JavaScript seeded its set of keys with the default chain's
+  first key, so the tested provider's own first session made two. The
+  CLI's workers have their own caches, so their first sessions made
+  eight between them. And tokens lasted 60 seconds plus the node's 60
+  seconds of skew, longer than the load, so a client that never reread
+  the token file still worked. Now every client seeds its keys from the
+  provider or cache under test (each CLI worker needs two of its own),
+  and the node accepts a token for at most seven seconds
+  (`oidc_clock_skew_seconds = 1`, tokens of six seconds) while the file
+  gets a new one every two, written atomically since clients read it at
+  any moment. The Rust client checks after the load that the token it
+  read before it is refused with `ExpiredTokenException` and the current
+  one accepted, so the clients that kept working reread the file.
+- **SDK defaults differ.** botocore presigns with SigV2 unless told
+  `signature_version="s3v4"`, which SkyS3 refuses as designed. The CLI's
+  default checksum is CRC64NVME (it bundles the Common Runtime), the
+  others' CRC32. Java needs `aws-crt` for CRC32C and CRC64NVME, and
+  Python `botocore[crt]`. The SDKs' checksum enums now also list MD5,
+  SHA512, and XXHASH algorithms, which SkyS3 answers with
+  `501 NotImplemented` (design section 7.4); the clients test the five
+  design section 11 names.
+- **The CLI's session cache is not safe across processes.** Concurrent
+  `aws` processes sharing a home failed with a `KeyError` on the cache
+  file under `~/.aws/cli/cache` that another process was replacing. Each
+  load worker of the CLI client has its own home.
+- **s3-tests cleans up with versioning APIs.** Before and after every test
+  it lists object versions, which SkyS3 rejects with `501`, so every test
+  failed in teardown. A pytest plugin (`skys3_s3tests.py`) lists with
+  ListObjectsV2 instead; nothing else about the tests changes. A full run
+  of `test_s3.py` and `test_headers.py` at the pinned commit passed 236
+  tests; the subset is the 209 of them that do not pass only by accident
+  or slowly, and `subset.txt` lists why the rest are out. No failure was
+  a gateway bug that this PR could fix in scope: most are rejected or
+  unbuilt features, and the remaining differences (the encoding of a
+  space as `+`, an echoed empty `Delimiter`, re-completing a completed
+  upload, `BadDigest` for a malformed whole-object checksum, and others
+  `subset.txt` names) are design decisions or need checking against AWS
+  S3 first, which M7-01 owns.
+- **Rust runs in the test, the rest in images.** The Rust client is part
+  of `cargo test -p skys3 --test sdk`, so it runs in every `rust` and
+  `coverage` job too; an image would rebuild `aws-sdk-s3` for versions
+  `Cargo.lock` already pins. The other clients run in images built from
+  digests of pinned tags, with versions pinned by `requirements.txt`,
+  `go.sum`, `package-lock.json`, `pom.xml`, and the s3-tests commit.
+- **Run locally without containers.** The docker daemon was not running in
+  the sandbox, so the images were never built here: CI's `sdk` job is
+  their first build. Every client ran on the host instead
+  (`SKYS3_SDK_LOCAL=1`), with the same SDK versions but other runtimes:
+  Python 3.11, Go 1.24.7, Node 22.22, Ubuntu's OpenJDK 21 with Maven
+  3.9.16, and AWS CLI 2.37.8 from its installer. All seven passed at once
+  in three minutes, the s3-tests subset being the longest at 2.5 minutes.
+- **A full disk looks like a broken gateway.** The sandbox's shared disk
+  filled up during a first full s3-tests run, and the node answered
+  `503 SlowDown` (admission control's free-space reserve) to most of the
+  later tests. The runs counted above were made with enough space.
+- **Test ports can be taken before the binary binds them.** In one full
+  workspace run the matrix's node exited at start; its log was lost, but
+  the likely cause is the tests' `free_port`, which binds port 0 and
+  drops the socket, so a test running in parallel can bind the port
+  before the binary does (also while a node is down between restarts),
+  and two calls could even return the same port. `Process::start` now
+  recognises an exit whose log says `Address already in use`, rewrites
+  the configuration's `[gateway]` and `[admin]` addresses with fresh
+  ports, and starts again, five times at most; any other early exit still
+  panics with the log. Callers read the addresses from the returned
+  `Process`. Readiness waits for the node's own `serving` line before
+  probing `/readyz`, with a deadline per probe, because until the node
+  holds the admin port another process may answer there, or accept and
+  never answer. `free_ports` holds its listeners until all are chosen, so
+  a gateway and an admin port never coincide. A test holds a configured
+  port and checks the node moves.
+
 ## M2 Replicated shards
 
 ### M2-01 Protocol model

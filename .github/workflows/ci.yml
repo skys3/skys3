@@ -388,6 +388,38 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
 
+  # The SDK matrix (plan M1-25, design section 16.2): the binary serving
+  # HTTPS and STS against the AWS SDKs for Python, Go, JavaScript, Java,
+  # and Rust, the AWS CLI, and the ceph/s3-tests subset, all at once
+  # (crates/skys3/tests/sdk.rs). Each client but Rust runs in its own
+  # image with pinned versions (tests/sdk/run.sh), built while the test
+  # compiles.
+  sdk:
+    name: SDK matrix
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build the test and the client images
+        run: |
+          sh tests/sdk/run.sh build &
+          images=$!
+          cargo test -p skys3 --test sdk --no-run
+          wait "$images"
+
+      - name: Run the matrix
+        run: cargo test -p skys3 --test sdk -- --nocapture
+        env:
+          SKYS3_SDK_CLIENTS: python go javascript java cli s3-tests
+
   # Model-checks the shard protocol (spec/ShardProtocol.tla) with TLC at the
   # PR bounds, and checks that every seeded bug is still caught, so the
   # model cannot silently lose its teeth. spec/check.sh downloads the pinned
@@ -416,7 +448,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny, simulation, etcd, fuzz, model]
+    needs: [changes, rust, docs, coverage, msrv, deny, simulation, etcd, fuzz, sdk, model]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
