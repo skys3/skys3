@@ -47,7 +47,8 @@ use std::time::Duration;
 use skys3_config::FailureDomain;
 use skys3_control::faults::FaultRates;
 use skys3_control::{
-    ControlError, ControlStore, ProposalIds, RegisterKind, RetryPolicy, TypedKey, Version, read,
+    ControlError, ControlStore, ProposalIds, RegisterKey, RegisterKind, RetryPolicy, TypedKey,
+    Version, read,
 };
 use skys3_coord::{
     AdminEndpoint, Announce, Applied, BucketShards, ChangeSet, ControlHints, Coordinator,
@@ -65,6 +66,7 @@ use skys3_types::{
 use tokio::sync::watch;
 
 use crate::cluster::View;
+use crate::faults::Fault;
 use crate::node::{BoxError, ControlHandle, NodeEnv, NodeServices};
 
 /// The port pushes of new generations arrive on. Replication holds the
@@ -123,6 +125,59 @@ pub struct CoordinationConfig {
     /// Whether the coordinator also rebalances ([`Rebalancing`], plan
     /// M3-06), at this pace, inside replacement, which must be set too.
     pub rebalancing: Option<RebalanceConfig>,
+    /// How many racks the nodes' `rack` labels name: the node at position
+    /// `p` registers `rack-{p mod racks}`. Two by default.
+    pub racks: usize,
+    /// Whether to crash the coordinator in the middle of a change, and
+    /// how ([`CoordinatorLoss`]).
+    pub lose_coordinator: Option<CoordinatorLoss>,
+}
+
+/// Where in a change [`CoordinatorLoss`] crashes the coordinator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeStage {
+    /// Once the change is planned: the crash falls while its writes are
+    /// in flight, between two of them, or before the generation increment
+    /// that announces them, so the change may land in part, or land
+    /// unannounced.
+    Planned,
+    /// Once some of the change's writes landed: the crash falls between
+    /// the steps of a membership change, such as a learner added whose
+    /// promotion and the removal that follows it are still to come.
+    Applied,
+}
+
+/// A crash of the coordinator in the middle of a change
+/// ([`CoordinationConfig::lose_coordinator`]): the first change a node
+/// makes under the lease that writes a shard register, a learner added
+/// or a member removed by placement, crashes that node at `stage`. The
+/// crash is a fault the services trigger
+/// ([`NodeServices::triggered_faults`]); what happened is in
+/// [`CoordinatedServices::lost_coordinator`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoordinatorLoss {
+    /// Where in the change the coordinator crashes.
+    pub stage: ChangeStage,
+    /// Whether its host loses power too.
+    pub power_loss: bool,
+    /// How long it stays down.
+    pub downtime: Duration,
+}
+
+/// The coordinator a [`CoordinatorLoss`] crashed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LostCoordinator {
+    /// When, in simulated time.
+    pub at: Duration,
+    /// The node.
+    pub node: NodeId,
+    /// Its position in the cluster.
+    pub position: usize,
+    /// Where in the change it crashed.
+    pub stage: ChangeStage,
+    /// The shard registers the change wrote (at [`ChangeStage::Applied`])
+    /// or was to write (at [`ChangeStage::Planned`]).
+    pub registers: Vec<RegisterKey>,
 }
 
 impl Default for CoordinationConfig {
@@ -159,6 +214,8 @@ impl Default for CoordinationConfig {
             bucket_shards: None,
             replacement: None,
             rebalancing: None,
+            racks: 2,
+            lose_coordinator: None,
         }
     }
 }
@@ -228,6 +285,10 @@ struct Audit {
     registered: BTreeMap<NodeId, Vec<Duration>>,
     /// How many shard registers coordinators wrote.
     shard_writes: usize,
+    /// The coordinator crashed in the middle of a change, if one was.
+    lost: Option<LostCoordinator>,
+    /// Faults triggered since the driver last took them.
+    triggered: Vec<Fault>,
 }
 
 /// Node services that add the coordinator of plan M3-01 to `S`.
@@ -479,6 +540,13 @@ impl<S: NodeServices> CoordinatedServices<S> {
         self.audit().shard_writes
     }
 
+    /// The coordinator crashed in the middle of a change
+    /// ([`CoordinationConfig::lose_coordinator`]), if one was.
+    #[must_use]
+    pub fn lost_coordinator(&self) -> Option<LostCoordinator> {
+        self.audit().lost.clone()
+    }
+
     /// How many generations were announced.
     #[must_use]
     pub fn announcements(&self) -> usize {
@@ -515,6 +583,12 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
         self.inner.handoff_sink(node)
     }
 
+    fn triggered_faults(&self) -> Vec<Fault> {
+        let mut triggered = std::mem::take(&mut self.audit().triggered);
+        triggered.extend(self.inner.triggered_faults());
+        triggered
+    }
+
     async fn start(&self, env: NodeEnv) -> Result<S::Shards, BoxError> {
         let node = env.node.clone();
         let (position, life, clock) = (env.position, env.life, Arc::clone(&env.clock));
@@ -526,7 +600,7 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
             node: node.clone(),
             address: env.peers[&node].clone(),
             zone: None,
-            rack: Some(rack(position)),
+            rack: Some(rack(position, self.config.racks)),
             disks: env
                 .disks
                 .iter()
@@ -658,7 +732,9 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
             Pusher::new(transport.clone(), BTreeMap::new(), PUSH_TIMEOUT).with_local(hints);
         let placement = Observed {
             node: node.clone(),
+            position,
             stale,
+            lose: self.config.lose_coordinator,
             lifecycle: Lifecycle::new(registry.clone(), placement)
                 .with_peers(PushPeers(pusher.clone())),
             audit: Arc::clone(&self.audit),
@@ -703,9 +779,9 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
     }
 }
 
-/// The rack label of the node at `position`: two racks, alternating.
-fn rack(position: usize) -> Label {
-    Label::new(format!("rack-{}", position % 2)).expect("a valid label")
+/// The rack label of the node at `position`, of `racks` racks in turn.
+fn rack(position: usize, racks: usize) -> Label {
+    Label::new(format!("rack-{}", position % racks.max(1))).expect("a valid label")
 }
 
 /// The capacity each simulated disk registers.
@@ -753,7 +829,11 @@ pub struct RegistryView {
 /// registry lists and which nodes it forgets.
 struct Observed<P> {
     node: NodeId,
+    position: usize,
     stale: bool,
+    /// Whether to crash this node in the middle of its first change of a
+    /// shard register.
+    lose: Option<CoordinatorLoss>,
     lifecycle: Lifecycle<P>,
     audit: Arc<Mutex<Audit>>,
 }
@@ -769,6 +849,10 @@ impl<P: Placement> Placement for Observed<P> {
         proposals: &mut ProposalIds,
     ) -> Result<Option<ChangeSet>, ControlError> {
         let planned = self.lifecycle.plan(store, proposals).await;
+        if let Ok(Some(change)) = &planned {
+            let registers = change.writes().iter().map(|write| write.key().clone());
+            self.lose_at(ChangeStage::Planned, registers);
+        }
         if !self.stale {
             lock(&self.audit).view = Some(RegistryView {
                 at: elapsed(),
@@ -780,6 +864,8 @@ impl<P: Placement> Placement for Observed<P> {
     }
 
     fn applied(&mut self, change: &ChangeSet, applied: &Applied) {
+        let written = applied.written.iter().map(|(key, _)| key.clone());
+        self.lose_at(ChangeStage::Applied, written);
         for (key, version) in &applied.written {
             match (key.kind(), version) {
                 (RegisterKind::Node(node), None) => {
@@ -794,6 +880,37 @@ impl<P: Placement> Placement for Observed<P> {
             }
         }
         self.lifecycle.applied(change, applied);
+    }
+}
+
+impl<P> Observed<P> {
+    /// Crashes this node, the coordinator, if it is to be lost at `stage`
+    /// and `registers` include a shard register, unless a coordinator was
+    /// lost already.
+    fn lose_at(&self, stage: ChangeStage, registers: impl Iterator<Item = RegisterKey>) {
+        let Some(loss) = self.lose.filter(|loss| loss.stage == stage && !self.stale) else {
+            return;
+        };
+        let registers: Vec<RegisterKey> = registers
+            .filter(|key| matches!(key.kind(), RegisterKind::Shard(..)))
+            .collect();
+        let mut audit = lock(&self.audit);
+        if registers.is_empty() || audit.lost.is_some() {
+            return;
+        }
+        tracing::info!(node = %self.node, ?stage, "the coordinator is lost in the middle of a change");
+        audit.lost = Some(LostCoordinator {
+            at: elapsed(),
+            node: self.node.clone(),
+            position: self.position,
+            stage,
+            registers,
+        });
+        audit.triggered.push(Fault::Crash {
+            node: self.position,
+            power_loss: loss.power_loss,
+            downtime: loss.downtime,
+        });
     }
 }
 

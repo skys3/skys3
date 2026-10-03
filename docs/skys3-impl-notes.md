@@ -4807,6 +4807,95 @@ of this file. A task with nothing unexpected keeps "None."
     would bootstrap one. The rebuild and the generation check make both
     safe, but they should wait for `cluster.json`.
 
+### M3-08 Heal tests
+
+- **No real-cluster heal test is possible yet (left open).** The node
+  binary serves every shard alone (`LocalShards`), with the file control
+  store only. It runs no coordinator and no replication, and does not
+  wire the transport (M2-08, M3-04, and M3-07 notes). Several binaries are
+  therefore several one-node clusters, and none of the four scenarios can
+  be run against them. No plan task owns the binary's multi-node wiring,
+  which M2-20's kill and partition tests need as well. The heal tests run
+  the real node code under the cluster harness instead, and the
+  real-binary versions wait for that wiring.
+- **Nodes did not follow the registers of buckets created through a
+  gateway (found, harness).** `ReplicatedServices::following_registers`
+  looped over the static placement only, and the static placement is
+  empty when the gateways create the buckets (`create_buckets`). So a
+  primary never adopted the coordinator's learner additions for those
+  buckets. In the rack scenario (seed 0) gateways answered 503 ("still in
+  epoch 1") for 40 s, and a shard kept two members and a learner until
+  the run ended. M3-04's scenarios do not follow registers, and M3-05's
+  and M3-06's use the static placement, so the gap never showed. Nodes now
+  follow every shard register in the store. The node code was not at
+  fault.
+- **Clients stalled on a lost node (found, harness).** Any-gateway clients
+  draw from the initial nodes, and a connection to a crashed host waits
+  out the whole request timeout (8 s). With one of five nodes lost, four
+  clients managed about 1.5 operations a second, and the first run of the
+  node scenario lasted 600 s of simulated time, until the lost node came
+  back. `Workload::connect_timeout` (300 ms here) lets clients move on
+  from a node that is down, as clients behind a load balancer would. The
+  default is unchanged. M3-05's replacement scenarios have the same stall,
+  which is likely why each of their seeds costs 140 to 160 s; giving
+  them a connect timeout would cut that.
+- **A coordinator lost in the middle of a change needed a fault the
+  services trigger.** A fault plan names nodes by position at fixed times,
+  but which node coordinates, and when its first move starts, depend on
+  the seed. `NodeServices::triggered_faults` (default: none) hands the
+  driver faults that fall at a protocol state. With
+  `CoordinationConfig::lose_coordinator`, the first change that writes a
+  shard register crashes its coordinator, either once the change is
+  planned (`ChangeStage::Planned`: writes in flight, or landed but not
+  announced) or once some of its writes landed (`ChangeStage::Applied`:
+  learners added, with promotion and removal still to come).
+  `CoordinatedServices::lost_coordinator` reports what was lost.
+- **Rack labels and the gateways' level were fixed.** The harness labelled
+  nodes with two alternating racks, and gateways created buckets at the
+  `node` level. `CoordinationConfig::racks` and
+  `ClusterConfig::failure_domain` make both configurable, with the old
+  values as defaults. The rack scenario runs six nodes in four racks
+  (`rack-0` and `rack-1` hold two nodes each) and loses `rack-0`, so three
+  racks remain for three replicas.
+- **Rebalancing raced the rack loss (seen, not a bug).** In seed 0 the
+  coordinator planned two moves 80 ms after both `rack-0` nodes crashed,
+  each onto one of them, because neither was suspect yet. Once they were,
+  replacement swapped those learners (M3-05's rule), and the shards healed
+  in 16.5 s.
+- **Each scenario fails when a heal step is broken.** Seed 0 fails in each
+  case, which is the seed CI runs:
+  - Node loss and addition, with forgetting disabled
+    (`node_forget_after` of an hour): the lost node stays suspect,
+    rebalancing never starts, and the new node ends with no primary ("the
+    load is uneven").
+  - Rack loss, with the coordinator placing at the `node` level while
+    gateways place at `rack`: a shard ends with two members in `rack-1`.
+  - Rack loss, with the harness gap above put back: a shard ends with a
+    learner that never joins.
+  - Coordinator loss, with rebalancing's failover rule removed (only the
+    member the coordinator's own move named may leave): a shard ends with
+    four members. Before this run the mapping was the other way round
+    (even seeds `Planned`), and seed 0 healed while seed 1 failed. So the
+    even seeds now lose the coordinator after its writes landed, the case
+    that catches this bug.
+- **No product bug was found.** Every failure traced back to the harness
+  or to the scenarios.
+- **Numbers.** Seeds 0 to 15 of each scenario passed, with the commit and
+  R3 audits after every step and the history checks at the end. Times are
+  until the cluster was healed for good, from the fault:
+  - Node lost for good, new node joining 2 s later: 11.6 to 13.1 s. The
+    lost node was forgotten about 7 to 8 s after the loss.
+  - Rack lost: 10.4 to 16.6 s.
+  - Coordinator lost: 3.0 to 5.4 s when it came back after 2 s, and 11.4
+    to 13.6 s when it was lost for good and forgotten.
+
+  Every heal finished while the clients were still writing, as the check
+  requires. A seed takes 30 to 40 s in a debug build. Each scenario
+  declares `8 * COST`, so CI's fixed set (`SKYS3_SIM_SEEDS=256`) runs one
+  seed of each: 31 s, 35 s, and 32 s, about 100 s added to the simulation
+  job. At `SKYS3_SIM_SEEDS=1024`, four seeds of each passed, in 220 s with
+  the three scenarios running side by side.
+
 ## M6 Native peer transport
 
 ### M6-01 Peer protocol messages
