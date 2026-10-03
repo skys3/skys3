@@ -5352,7 +5352,8 @@ of this file. A task with nothing unexpected keeps "None."
   a GET does, and every other form than `bytes=first-last` with both
   offsets `400 InvalidArgument`. The S3 documentation was unreachable from
   the sandbox, so M7-01 should confirm both against AWS S3. The parser
-  has a proptest and a fuzz target, `gateway_copy_range`.
+  has a proptest and a fuzz target, `gateway_copy_range`; a 30-second
+  run executed about 5.3 million inputs with no failure.
 - **SDK copy helpers.** boto3's `copy` (s3transfer 0.19.2) and the AWS
   CLI's `aws s3 cp` between objects use UploadPartCopy above their
   multipart threshold, and s3transfer sends each part with
@@ -5373,7 +5374,7 @@ of this file. A task with nothing unexpected keeps "None."
   client ran on the host (`SKYS3_SDK_LOCAL=1`). This sandbox had no AWS
   CLI or boto3: the CLI 2.37.8 came from its installer and the Python
   packages from the pinned requirements, into scratch directories. All
-  seven clients passed together in three minutes.
+  seven clients passed together in about four minutes.
 - **No new simulation scenario.** The copy adds nothing to the
   replication, flush, encoding, or peer paths: its source read is M2-18's
   holder read, already simulated, and its write is an ordinary
