@@ -15,7 +15,7 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput,
     CompleteMultipartUploadOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
     ListMultipartUploadsInput, ListMultipartUploadsOutput, ListPartsInput, ListPartsOutput,
-    UploadPartInput, UploadPartOutput,
+    UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use s3s::dto::{
     Bucket, CopyObjectInput, CopyObjectOutput, CreateBucketInput, CreateBucketOutput,
@@ -236,7 +236,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let bucket = self.writable(&req.input.bucket)?;
-        let (source, _) = copy_source(&req.input)?;
+        let (source, _) = copy_source(&req.input.copy_source)?;
         let source = self.bucket(source)?;
         ok(self.objects.copy(&bucket, &source, req).await?)
     }
@@ -279,6 +279,16 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let bucket = self.writable(&req.input.bucket)?;
         ok(self.objects.upload_part(&bucket, req).await?)
+    }
+
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        let bucket = self.writable(&req.input.bucket)?;
+        let (source, _) = copy_source(&req.input.copy_source)?;
+        let source = self.bucket(source)?;
+        ok(self.objects.upload_part_copy(&bucket, &source, req).await?)
     }
 
     async fn complete_multipart_upload(

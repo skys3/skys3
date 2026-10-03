@@ -7,10 +7,9 @@
 # feature, except those that pass only by accident: tests of rejected
 # features (SSE-C, SSE-KMS, Object Lock, ACLs other than private, which
 # answer an error the test happens to accept), POST object uploads (not
-# supported; their tests expect an error), UploadPartCopy (plan M4-05),
-# and three slow ones (the 1,000-key DeleteObjects limits and
-# delimiter_not_skip_special, about 35 s together) whose features other
-# tests here cover.
+# supported; their tests expect an error), and three slow ones (the
+# 1,000-key DeleteObjects limits and delimiter_not_skip_special, about
+# 35 s together) whose features other tests here cover.
 #
 # Not included, and why (from a full run of both files):
 # - Rejected features (design section 11): versioning, SSE-S3, SSE-KMS,
@@ -18,7 +17,7 @@
 #   object ownership other than BucketOwnerEnforced.
 # - Features SkyS3 does not offer: bucket policies, public access blocks,
 #   lifecycle configuration APIs, CORS, website, logging, POST object,
-#   GetObjectAttributes, UploadPartCopy (plan M4-05), STS other than
+#   GetObjectAttributes, STS other than
 #   AssumeRoleWithWebIdentity, IAM, SNS, S3 Select, and RGW extensions
 #   (unordered listings, account usage, tenants, append).
 # - SigV2 (refused by design), and conditional writes SkyS3 answers with
@@ -221,6 +220,16 @@ s3tests/functional/test_s3.py::test_multipart_upload_missing_part
 s3tests/functional/test_s3.py::test_multipart_upload_incorrect_etag
 s3tests/functional/test_s3.py::test_atomic_multipart_upload_write
 s3tests/functional/test_s3.py::test_set_multipart_tagging
+
+# UploadPartCopy (plan M4-05). Not included: the versioned and SSE
+# variants (rejected features), and those of bucket policies and logging.
+s3tests/functional/test_s3.py::test_multipart_copy_small
+s3tests/functional/test_s3.py::test_multipart_copy_invalid_range
+s3tests/functional/test_s3.py::test_multipart_copy_improper_range
+s3tests/functional/test_s3.py::test_multipart_copy_without_range
+s3tests/functional/test_s3.py::test_multipart_copy_special_names
+s3tests/functional/test_s3.py::test_multipart_copy_multiple_sizes
+s3tests/functional/test_s3.py::test_upload_part_copy_percent_encoded_key
 
 # Tagging
 s3tests/functional/test_s3.py::test_get_obj_tagging

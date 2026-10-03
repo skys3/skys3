@@ -84,18 +84,19 @@ impl Directive {
     }
 }
 
-/// The source of a CopyObject request: its bucket's name and its key.
+/// The bucket name and key of a CopyObject's or UploadPartCopy's source,
+/// its `x-amz-copy-source`.
 ///
 /// # Errors
 ///
 /// `501 NotImplemented` for an access point or outpost ARN, and
 /// `400 InvalidArgument` for a version ID other than `null`.
-pub(crate) fn copy_source(input: &CopyObjectInput) -> S3Result<(&str, &str)> {
+pub(crate) fn copy_source(source: &S3CopySource) -> S3Result<(&str, &str)> {
     let S3CopySource::Bucket {
         bucket,
         key,
         version_id,
-    } = &input.copy_source
+    } = source
     else {
         return Err(s3_error!(
             NotImplemented,
@@ -122,7 +123,7 @@ impl<H: Shards> Objects<H> {
             .get::<CopiedTags>()
             .is_some_and(|copied| copied.allowed());
         let input = req.input;
-        let (_, source_key) = copy_source(&input)?;
+        let (_, source_key) = copy_source(&input.copy_source)?;
         let source_key = source_key.to_owned();
         let metadata_directive = Directive::parse(
             input.metadata_directive.as_ref().map(|d| d.as_str()),
@@ -450,13 +451,13 @@ mod tests {
             })
             .build()
             .unwrap();
-        assert_eq!(copy_source(&input).unwrap(), ("src", "a/b"));
+        assert_eq!(copy_source(&input.copy_source).unwrap(), ("src", "a/b"));
         input.copy_source = S3CopySource::Bucket {
             bucket: "src".into(),
             key: "a/b".into(),
             version_id: Some("3HL4kqtJlcpXroDTDmJ".into()),
         };
-        let error = copy_source(&input).unwrap_err();
+        let error = copy_source(&input.copy_source).unwrap_err();
         assert_eq!(*error.code(), S3ErrorCode::InvalidArgument);
         input.copy_source = S3CopySource::AccessPoint {
             partition: "aws".into(),
@@ -466,7 +467,7 @@ mod tests {
             key: "k".into(),
             version_id: None,
         };
-        let error = copy_source(&input).unwrap_err();
+        let error = copy_source(&input.copy_source).unwrap_err();
         assert_eq!(*error.code(), S3ErrorCode::NotImplemented);
     }
 }

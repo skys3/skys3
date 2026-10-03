@@ -5312,3 +5312,94 @@ of this file. A task with nothing unexpected keeps "None."
   was sealed. A transfer that stages for longer than
   `peer_staging_ttl_seconds` can lose its first extents before its
   `COMMIT`.
+
+### M4-05 UploadPartCopy
+
+- **The source is read as a GET reads it, not through the primary.**
+  CopyObject (M1-10) reads its source's payload through the source
+  shard's primary and answers `503` for an evicted source. The plan asks
+  for a copy "from any source object in the cluster", so GET's loop
+  (remote for a key the import has not reached, hot cache, holders on any
+  node, fill of an evicted version, resolve again up to three times)
+  moved out of `get` into `Objects::open`, which takes a selector of the
+  bytes to serve; GET and UploadPartCopy both call it. An UploadPartCopy
+  of an evicted source therefore fills just its range, and one on another
+  node streams from a holder. CopyObject was left as it was (its whole-
+  object `PUT` with a copy source is M4-07's to revisit). No record kind,
+  wire operation, or index format changed: a copied part is an
+  `MPU_PART` like any other, so completion, ListParts, `partNumber` reads,
+  and the multipart flush (M1-16b) needed nothing.
+- **ETag rule and known values.** A copied part's ETag is the MD5 of the
+  bytes copied, which is S3's rule for objects without SSE-KMS or SSE-C,
+  so the completed ETag is S3's. The tests take S3's answers from
+  ceph/s3-tests at the pinned commit
+  (`test_multipart_reupload_checksum_and_etag` and
+  `test_multipart_use_cksum_helper_*`, which run against AWS S3 and are
+  not marked as failing there): three ranged copies of one 15 MiB object
+  of `A`, `B`, and `C` complete with `b2add96cc9702bbf4efb0ccdfc6b7747-3`
+  and S3's per-part and whole-object checksums for SHA256, SHA1, CRC64NVME
+  (also as the default), CRC32, and CRC32C. Every SDK client also checks
+  that a copy at the source's own part boundaries has the source's ETag.
+- **Checksums of a copied part.** UploadPart without checksum headers
+  stores CRC64NVME beside the upload's algorithm (the validator always
+  stores the request's algorithm or its default). A copy has no request
+  checksum, so it computes only MD5 and the upload's algorithm, and the
+  `CopyPartResult` carries only that one, as S3's does.
+- **Which error for a range past the end.** s3-tests'
+  `test_multipart_copy_invalid_range` accepts `400` or `416` but requires
+  `InvalidRange`; S3-compatible servers that copy AWS's messages answer
+  `400 InvalidArgument` there. The gateway answers `416 InvalidRange`, as
+  a GET does, and every other form than `bytes=first-last` with both
+  offsets `400 InvalidArgument`. The S3 documentation was unreachable from
+  the sandbox, so M7-01 should confirm both against AWS S3. The parser
+  has a proptest and a fuzz target, `gateway_copy_range`; a 30-second
+  run executed about 5.3 million inputs with no failure.
+- **Ranges need a source over 5 MiB (review).** The first version copied
+  a range of any source. The UploadPartCopy API reference says a range
+  may be copied only from a source larger than 5 MB, and AWS answers a
+  smaller one with `400 InvalidRequest` ("The specified copy source is
+  not supported as a byte-range copy source"). The check
+  (`MIN_RANGED_SOURCE_BYTES`, 5 MiB) runs after the range is checked
+  against the source, so a range past the end of a small source is still
+  `416 InvalidRange`, which s3-tests' invalid-range test expects of a
+  5-byte source; its improper-range test sends malformed ranges, which
+  are refused before the source is read. No pinned s3-tests test, and no
+  SDK client, makes a valid ranged copy of a source of 5 MiB or less. The
+  gateway tests that did now use larger sources, and a test copies a
+  range of 5 MiB + 1 and is refused one of exactly 5 MiB.
+- **SDK copy helpers.** boto3's `copy` (s3transfer 0.19.2) and the AWS
+  CLI's `aws s3 cp` between objects use UploadPartCopy above their
+  multipart threshold, and s3transfer sends each part with
+  `x-amz-copy-source-if-match` naming the ETag its HeadObject saw; the
+  Python client asserts both. The Java transfer manager's copy needed the
+  `s3-transfer-manager` artifact, over the multipart-enabled async client.
+  The SDK for Go v2 has no copy helper (`feature/s3/manager` 1.23.11 and
+  `feature/s3/transfermanager` 0.4.13 have none), nor has `lib-storage`
+  for JavaScript, so those clients copy part by part with UploadPartCopy
+  as the AWS documentation's examples do, as does the Rust client. Each
+  also checks that a failed source condition answers `412`.
+- **s3-tests.** Seven UploadPartCopy tests joined the subset (small,
+  invalid and improper ranges, without a range, special key names,
+  multiple sizes, and a percent-encoded key); the versioned, SSE, bucket
+  policy, and logging variants stay out with their features. The subset
+  now has 216 tests.
+- **Local run.** As in M1-25 the docker daemon was not running, so every
+  client ran on the host (`SKYS3_SDK_LOCAL=1`). This sandbox had no AWS
+  CLI or boto3: the CLI 2.37.8 came from its installer and the Python
+  packages from the pinned requirements, into scratch directories. All
+  seven clients passed together in about four minutes.
+- **No new simulation scenario.** The copy adds nothing to the
+  replication, flush, encoding, or peer paths: its source read is M2-18's
+  holder read, already simulated, and its write is an ordinary
+  `MPU_PART`.
+- **A slow source is not the client's fault.** A copy streams into the
+  shard through the same `Upload` as a client body, with the same
+  deadline (`max_body_duration`, half the compaction TTL, M4-01), which
+  keeps compaction from dropping its first extents before the `MPU_PART`
+  names them. Missing it answers a client `400 RequestTimeout`; for a copy
+  the source was slow (a slow fill or holder), so the copy maps it to
+  `503 ServiceUnavailable`, which SDKs retry.
+- **Left open.** CopyObject still reads through the primary and still
+  answers `503` for an evicted source. With M4-02, a copied part must also be
+  streamed to the remote upload; it reaches the shard through the same
+  `Upload` as an UploadPart body.

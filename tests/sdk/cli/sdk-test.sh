@@ -80,6 +80,19 @@ static aws s3 cp --only-show-errors "s3://$bucket/multipart" "$work/large.out"
 same "$work/large" "$work/large.out"
 log "multipart upload ($etag)"
 
+# `aws s3 cp` between objects copies a large one part by part with
+# UploadPartCopy. The parts have the source's boundaries, so their MD5s,
+# and the copy's multipart ETag, are the source's, as in S3.
+static aws s3 cp --only-show-errors --debug "s3://$bucket/multipart" "s3://$bucket/multipart-copy" \
+    2>"$work/copy.debug"
+parts=$(grep -c 'OperationModel(name=UploadPartCopy)' "$work/copy.debug" || true)
+[ "$parts" = 3 ] || fail "$parts UploadPartCopy requests"
+copied=$(static aws s3api head-object --bucket "$bucket" --key multipart-copy --query ETag --output text)
+[ "$copied" = "$etag" ] || fail "copy ETag $copied, source $etag"
+static aws s3 cp --only-show-errors "s3://$bucket/multipart-copy" "$work/copy.out"
+same "$work/large" "$work/copy.out"
+log "multipart copy by UploadPartCopy ($copied)"
+
 # A presigned GET, used with curl. The CLI presigns only GETs.
 url=$(static aws s3 presign "s3://$bucket/default" --expires-in 300)
 curl -fsS --cacert "$SKYS3_CA_FILE" -o "$work/presigned.out" "$url" || fail "presigned GET"
