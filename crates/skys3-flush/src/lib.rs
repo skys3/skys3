@@ -95,3 +95,7 @@ pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
 pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
+
+/// Failpoints for tests (the `test-util` feature).
+#[cfg(feature = "test-util")]
+pub use stream::test_hooks;
