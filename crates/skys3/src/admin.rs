@@ -29,6 +29,8 @@
 //!   remote object's ETag and write identity;
 //! - `orphaned_uploads`: remote multipart uploads that flushes left open
 //!   and that wait to be aborted, as the metric of the same name;
+//! - `streamed_uploads`: remote multipart uploads that stream open local
+//!   uploads, or wait to be completed or aborted (§7.3);
 //! - `errors`: the latest flush error of each shard that has one, until
 //!   a later attempt gets its key past it;
 //! - `import`: the namespace import (§9.1): `state` (`running` or `done`),
@@ -267,6 +269,7 @@ fn flush_status(status: &BucketStatus) -> Value {
         "probe_error": probe_error,
         "unprotected": unprotected,
         "dirty": shards.clone().map(|shard| shard.dirty).sum::<u64>(),
+        "streamed_uploads": shards.clone().map(|shard| shard.streams).sum::<u64>(),
         "flushing": shards.map(|shard| shard.flushing).sum::<u64>(),
         "dirty_bytes": gauges.dirty_bytes,
         "dirty_budget_bytes": gauges.dirty_budget,

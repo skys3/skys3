@@ -13,8 +13,8 @@ use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, CompletedPart, DecodeError, Delete, EncodeError,
     ErrorClass, Extent, ExtentRef, FORMAT_VERSION, FieldError, LogRecord, MAGIC, MAX_HEADER_LEN,
     MAX_PAYLOAD_LEN, MAX_TAGS, MIN_FORMAT_VERSION, MpuAbort, MpuComplete, MpuCreate, MpuPart,
-    Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef, UploadBegin,
-    UploadChecksum,
+    PartFlushed, Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, RemoteStep, ShardRef,
+    UploadBegin, UploadChecksum,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -29,6 +29,7 @@ const MPU_PART: u16 = 5;
 const MPU_COMPLETE: u16 = 6;
 const MPU_ABORT: u16 = 7;
 const UPLOAD_BEGIN: u16 = 8;
+const PART_FLUSHED: u16 = 10;
 const CONFIG: u16 = 18;
 const TRUNCATE: u16 = 17;
 
@@ -309,6 +310,7 @@ fn record_kinds_have_fixed_codes_and_names() {
             "MPU_ABORT",
             "UPLOAD_BEGIN",
             "FLUSHED",
+            "PART_FLUSHED",
             "TAGS",
             "IMPORT",
             "ADOPT",
@@ -1026,9 +1028,9 @@ fn errors_are_classified_and_described() {
             "unknown log record kind 99",
         ),
         (
-            DecodeError::UnsupportedKind(RecordKind::PartFlushed),
+            DecodeError::UnsupportedKind(RecordKind::EcPublish),
             ErrorClass::Unsupported,
-            "log record kind PART_FLUSHED is reserved but not yet supported",
+            "log record kind EC_PUBLISH is reserved but not yet supported",
         ),
         (
             DecodeError::Malformed(FieldError {
@@ -1218,6 +1220,120 @@ fn upload_begin_records_follow_the_documented_layout() {
     let trailing = Body::default().str16("k").u8(0);
     let trailing = Frame::new(UPLOAD_BEGIN).keyed("k").build(&trailing.0, &[]);
     assert_eq!(malformed(&trailing).field, "body");
+}
+
+#[test]
+fn part_flushed_records_follow_the_documented_layout() {
+    let etag = ETag::new("5d41402abc4b2a76b9719d911017c592").unwrap();
+    let steps = [
+        (RemoteStep::Opened, Body::default().u8(0)),
+        (
+            RemoteStep::Part {
+                number: 3,
+                position: position(5, 7),
+                remote_etag: etag.clone(),
+            },
+            Body::default()
+                .u8(1)
+                .u16(3)
+                .u64(5)
+                .u64(7)
+                .str16(etag.as_str()),
+        ),
+        (RemoteStep::Ended, Body::default().u8(2)),
+    ];
+    for (step, tail) in steps {
+        let flushed = RecordBody::PartFlushed(PartFlushed {
+            key: "k".into(),
+            upload: position(5, 2),
+            remote_upload_id: "up-1".into(),
+            step,
+        });
+        let body = Body::default()
+            .str16("k")
+            .u64(5)
+            .u64(2)
+            .str16("up-1")
+            .raw(&tail.0);
+        let expected = Frame::new(PART_FLUSHED).keyed("k").build(&body.0, &[]);
+        let bytes = record(flushed.clone()).to_bytes().unwrap();
+        assert_eq!(hex(&bytes), hex(&expected));
+        let (decoded, len) = LogRecord::decode(&bytes).unwrap();
+        assert_eq!((decoded.body, len), (flushed, bytes.len()));
+    }
+
+    // The upload precedes the record, the part follows the upload and
+    // precedes the record, and the part number and upload ID are bounded.
+    let part = |upload, number, at| {
+        RecordBody::PartFlushed(PartFlushed {
+            key: "k".into(),
+            upload,
+            remote_upload_id: "up-1".into(),
+            step: RemoteStep::Part {
+                number,
+                position: at,
+                remote_etag: etag.clone(),
+            },
+        })
+    };
+    let cases = [
+        (
+            part(position(5, 9), 1, position(5, 8)),
+            "part_flushed.upload",
+        ),
+        (
+            part(position(5, 2), 0, position(5, 3)),
+            "part_flushed.number",
+        ),
+        (
+            part(position(5, 2), 10_001, position(5, 3)),
+            "part_flushed.number",
+        ),
+        (
+            part(position(5, 2), 1, position(5, 2)),
+            "part_flushed.position",
+        ),
+        (
+            part(position(5, 2), 1, position(5, 9)),
+            "part_flushed.position",
+        ),
+    ];
+    for (body, field) in cases {
+        assert_eq!(encode_err(body).field, field);
+    }
+    for id in [String::new(), "u".repeat(1025)] {
+        let body = RecordBody::PartFlushed(PartFlushed {
+            key: "k".into(),
+            upload: position(5, 2),
+            remote_upload_id: id,
+            step: RemoteStep::Ended,
+        });
+        assert_eq!(encode_err(body).field, "part_flushed.remote_upload_id");
+    }
+    let head = Body::default().str16("k").u64(5).u64(2).str16("up-1");
+    let unknown = Frame::new(PART_FLUSHED)
+        .keyed("k")
+        .build(&head.raw(&[3]).0, &[]);
+    assert_eq!(
+        malformed(&unknown),
+        FieldError {
+            field: "part_flushed.step",
+            problem: Problem::InvalidTag(3)
+        }
+    );
+    // A part named at the record's own position is refused on decoding too.
+    let late = Body::default()
+        .str16("k")
+        .u64(5)
+        .u64(2)
+        .str16("up-1")
+        .u8(1)
+        .u16(1)
+        .u64(5)
+        .u64(9)
+        .str16(etag.as_str());
+    let late = Frame::new(PART_FLUSHED).keyed("k").build(&late.0, &[]);
+    assert_eq!(malformed(&late).field, "part_flushed.position");
 }
 
 #[test]

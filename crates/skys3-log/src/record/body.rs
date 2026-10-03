@@ -15,7 +15,7 @@ use skys3_types::{
 };
 
 use super::error::{FieldError, Problem};
-use super::multipart::{MpuAbort, MpuComplete, MpuCreate, MpuPart};
+use super::multipart::{MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed};
 use super::wire::{Reader, Writer};
 use super::{MAX_PAYLOAD_LEN, RecordKind, ShardRef};
 
@@ -251,6 +251,8 @@ pub enum RecordBody {
     Tags(Tags),
     /// `FLUSHED`.
     Flushed(Flushed),
+    /// `PART_FLUSHED`.
+    PartFlushed(PartFlushed),
     /// `IMPORT`.
     Import(Import),
     /// `ADOPT`.
@@ -281,6 +283,7 @@ impl RecordBody {
             Self::UploadBegin(_) => RecordKind::UploadBegin,
             Self::Tags(_) => RecordKind::Tags,
             Self::Flushed(_) => RecordKind::Flushed,
+            Self::PartFlushed(_) => RecordKind::PartFlushed,
             Self::Import(_) => RecordKind::Import,
             Self::Adopt(_) => RecordKind::Adopt,
             Self::Config(_) => RecordKind::Config,
@@ -302,6 +305,7 @@ impl RecordBody {
             | Self::UploadBegin(UploadBegin { key })
             | Self::Tags(Tags { key, .. })
             | Self::Flushed(Flushed { key, .. })
+            | Self::PartFlushed(PartFlushed { key, .. })
             | Self::Import(Import { key, .. })
             | Self::Adopt(Adopt { key, .. }) => Some(key),
             Self::Config(_) | Self::Truncate => None,
@@ -341,6 +345,7 @@ impl RecordBody {
                 write_tags(w, "tags.tags", &tags.tags)
             }
             Self::Flushed(flushed) => flushed.encode(w),
+            Self::PartFlushed(flushed) => flushed.encode(w, position),
             Self::Import(import) => import.encode(w),
             Self::Adopt(adopt) => adopt.encode(w),
             Self::Config(config) => encode_config(w, config, shard, position),
@@ -377,6 +382,7 @@ impl RecordBody {
                 tags: read_tags(&mut r, "tags.tags")?,
             }),
             RecordKind::Flushed => Self::Flushed(Flushed::decode(&mut r)?),
+            RecordKind::PartFlushed => Self::PartFlushed(PartFlushed::decode(&mut r, position)?),
             RecordKind::Import => Self::Import(Import::decode(&mut r)?),
             RecordKind::Adopt => Self::Adopt(Adopt::decode(&mut r)?),
             RecordKind::Config => Self::Config(decode_config(&mut r, shard, position)?),

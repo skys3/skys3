@@ -23,8 +23,18 @@
 //!   with the client's part boundaries, so the remote ETag is the local
 //!   one. The remote `CreateMultipartUpload` carries the write identity of
 //!   the upload's `MPU_CREATE`, and the `CompleteMultipartUpload` carries
-//!   the precondition. An upload that does not complete is aborted, and
-//!   one whose abort fails is kept by the [`Target`] to abort later.
+//!   the precondition.
+//! - **Streaming** (§7.3). The remote upload is opened when the local one
+//!   is, each part is sent once it commits while the client uploads more,
+//!   and the remote upload is completed by the flush of the completed
+//!   version, never before the local completion commits; every step is
+//!   recorded with a `PART_FLUSHED`, so the shard log keeps the remote
+//!   upload IDs and a restarted flusher resumes. Aborted and abandoned
+//!   remote uploads are aborted. A version that cannot use its stream,
+//!   such as one retagged by `TAGS`, is sent after commit: a new remote
+//!   upload filled from the local log. An upload of that kind that does
+//!   not complete is aborted, and one whose abort fails is kept by the
+//!   [`Target`] to abort later.
 //! - **Tags** (`TAGS`) need no request of their own: a version made by
 //!   `TAGS` is flushed like any other, the bytes uploaded again with the
 //!   new tags and the `TAGS` record's write identity.
@@ -52,8 +62,7 @@
 //!   checks before a write. Each node enforces a share of each budget in
 //!   proportion to the shards whose primary it is ([`share`]).
 //!
-//! Streaming multipart flush (M4-02) opens the remote upload while the
-//! client uploads, and adaptive concurrency (M4-10) replaces the fixed
+//! Adaptive concurrency (M4-10) replaces the fixed
 //! [`FlushSettings::concurrency`].
 //!
 //! ```
@@ -72,6 +81,7 @@ mod metrics;
 mod multipart;
 mod service;
 mod shard;
+mod stream;
 mod target;
 
 pub use attempt::Conflict;

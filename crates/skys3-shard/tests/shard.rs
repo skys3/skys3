@@ -8,14 +8,16 @@ use std::sync::Arc;
 use skys3_index::{EntryState, Index, IndexDump};
 use skys3_io::{BlockingPool, SimDisk, SimMount};
 use skys3_log::record::ExtentRef;
+use skys3_log::record::RemoteStep;
 use skys3_log::{RecordBody, RecordKind, SegmentLog};
 use skys3_shard::{
-    Committed, Effect, Outcome, Role, Shard, ShardError, ShardSet, ShardSummary, StateMachine,
+    Change, Committed, Effect, Outcome, Role, Shard, ShardError, ShardSet, ShardSummary,
+    StateMachine,
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
-    at, config, delete, extent, flushed, import, index_config, mpu_complete, mpu_create, mpu_part,
-    open_log, pool, put, put_extents, runtime, shard, tags, upload_begin,
+    at, config, delete, extent, flushed, import, index_config, mpu_abort, mpu_complete, mpu_create,
+    mpu_part, open_log, part_flushed, pool, put, put_extents, runtime, shard, tags, upload_begin,
 };
 
 /// A node's disk, log, index, and pool.
@@ -715,13 +717,23 @@ fn subscribers_see_applied_client_writes() {
         let first = shard.commit(put("a", 3, 1)).await.unwrap();
         let tagged = shard.commit(tags("a", "x")).await.unwrap();
         let deleted = shard.commit(delete("b")).await.unwrap();
-        // An upload and its parts change no version; its completion does.
+        // An upload is reported as it opens, takes a part, and completes.
         let upload = shard.commit(mpu_create("m")).await.unwrap().position;
         let part = shard.commit(mpu_part("m", upload, 1, 4, vec![])).await;
-        let parts = [(1, part.unwrap().position)];
-        let completed = shard.commit(mpu_complete("m", upload, &parts, 4)).await;
+        let part = part.unwrap().position;
+        // Its remote upload's steps are not reported.
+        let opened = part_flushed("m", upload, "r-1", RemoteStep::Opened);
+        assert!(shard.commit(opened).await.unwrap().outcome.is_applied());
+        let completed = shard
+            .commit(mpu_complete("m", upload, &[(1, part)], 4))
+            .await;
         let completed = completed.unwrap();
         assert!(completed.outcome.is_applied());
+        // So is an aborted upload, but not a part refused after the abort.
+        let aborted = shard.commit(mpu_create("n")).await.unwrap().position;
+        let abort = shard.commit(mpu_abort("n", aborted)).await.unwrap();
+        let late = shard.commit(mpu_part("n", aborted, 1, 4, vec![])).await;
+        assert!(!late.unwrap().outcome.is_applied());
         // A rejected TAGS and a FLUSHED change no version and are not
         // reported. The lazy FLUSHED rides the next commit's group.
         shard.commit(tags("missing", "x")).await.unwrap();
@@ -729,19 +741,40 @@ fn subscribers_see_applied_client_writes() {
         let (lazy, next) = tokio::join!(lazy, shard.commit(put("c", 1, 2)));
         assert!(lazy.unwrap().outcome.is_applied());
         let next = next.unwrap();
+        let stored = |key: &str, position, size, upload| Change::Stored {
+            key: key.to_owned(),
+            position,
+            size,
+            upload,
+        };
         let expected = [
-            ("a", first.position, Some(3)),
-            ("a", tagged.position, None),
-            ("b", deleted.position, Some(0)),
-            ("m", completed.position, Some(4)),
-            ("c", next.position, Some(1)),
+            stored("a", first.position, Some(3), None),
+            stored("a", tagged.position, None, None),
+            stored("b", deleted.position, Some(0), None),
+            Change::Opened {
+                key: "m".into(),
+                upload,
+            },
+            Change::Part {
+                key: "m".into(),
+                upload,
+                number: 1,
+                position: part,
+            },
+            stored("m", completed.position, Some(4), Some(upload)),
+            Change::Opened {
+                key: "n".into(),
+                upload: aborted,
+            },
+            Change::Aborted {
+                key: "n".into(),
+                upload: aborted,
+            },
+            stored("c", next.position, Some(1), None),
         ];
-        for (key, position, size) in expected {
-            let change = changes.recv().await.unwrap();
-            assert_eq!(
-                (change.key.as_str(), change.position, change.size),
-                (key, position, size)
-            );
+        assert!(abort.outcome.is_applied());
+        for expected in expected {
+            assert_eq!(changes.recv().await.unwrap(), expected);
         }
         let entries = shard.entries(None, 10).await.unwrap();
         let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
@@ -835,9 +868,12 @@ fn a_subscription_during_an_apply_hears_of_it() {
         let committed = commit.await.unwrap().unwrap();
         assert!(committed.outcome.is_applied());
         let change = changes.try_recv().expect("the write is reported");
-        assert_eq!(
-            (change.key.as_str(), change.position, change.size),
-            ("a", committed.position, Some(3))
-        );
+        let expected = Change::Stored {
+            key: "a".into(),
+            position: committed.position,
+            size: Some(3),
+            upload: None,
+        };
+        assert_eq!(change, expected);
     });
 }

@@ -5299,3 +5299,153 @@ of this file. A task with nothing unexpected keeps "None."
   was sealed. A transfer that stages for longer than
   `peer_staging_ttl_seconds` can lose its first extents before its
   `COMMIT`.
+
+### M4-02 Streaming multipart flush
+
+- **Parts are sent from local extents, not teed from the body.** Design
+  §7.3 said each remote part streams "from the incoming body and also from
+  the local extents". A tee is not possible at the flusher: a part's body
+  reaches the primary as `EXTENT` records, from its own gateway or
+  forwarded by another node's, and an `EXTENT` names a key and an offset
+  but not the upload or the part. Parts of one upload also arrive
+  concurrently. Teeing in the gateway would need a remote connection for
+  each part being uploaded, on every node, and would touch the gateway's
+  part creation, which M4-05 is changing in parallel. So the primary's
+  flusher sends a part once its `MPU_PART` is applied, reading the extents
+  just written, which the page cache usually still holds, through the
+  target's in-flight budget. The client gets its part ETag after the local
+  commit, as before, and the transfer of part *n* overlaps the upload of
+  the parts after it. The design's diagram and first bullet now say this,
+  and a new "as built" list under §7.3 records the decisions. A part that
+  fails local validation never commits, so it is never sent and never
+  listed. A number uploaded again is sent again once the earlier send of
+  that number ends, so the remote holds the later bytes.
+- **`PART_FLUSHED` records each step; the log format is unchanged.**
+  `PART_FLUSHED` was already a reserved kind of log version 2 (code 10), so
+  defining it needs no new log version. Its body is the key, the local
+  upload's position, the remote upload ID (1 to 1,024 bytes), and a step:
+  *opened*; a *part* with its number, the `MPU_PART` position it sent, and
+  the remote ETag; or *ended*. Each rides a lazy group commit
+  (`commit_lazy`), like `FLUSHED`, from a detached task. The flusher awaits
+  the *opened* record before it sends any part, so the ID is in the log
+  before any data reaches the remote. It does not await part records.
+  `ShardFlusher::stop` awaits every record still in flight, so a stopping
+  flusher does not lose one. The state machine applies a step only to the
+  remote upload the index holds with the same ID (`Rejection::NoRemoteUpload`
+  otherwise), and an *opened* step replaces any earlier one. Applying it
+  changes no entry, so compaction drops it once applied, like other
+  metadata records.
+- **Index format 8: two new tables.** This is a format change. The index
+  `FORMAT_VERSION` goes from 7 to 8. Version 8 adds `remote_uploads`,
+  keyed by `(shard, upload position)` (the same bytes as that upload's
+  parts prefix), holding the key and the remote upload ID, and
+  `remote_parts`, keyed by `(shard, upload position, part number)`, holding
+  the `MPU_PART` position sent and the remote ETag. Rows outlive the local
+  upload until an *ended* step, so the flusher can still complete or abort
+  the remote upload after the local one is gone. Older builds refuse
+  version 8, since they would forget those remote uploads. The value format
+  stays 3; the new values decode only at format 3. Learner snapshots carry
+  both tables (`ShardTable::RemoteUploads` = 4, `RemoteParts` = 5). Codec
+  property tests, a table test, and the `index_codec` fuzz target cover
+  them.
+- **`Change` is now an enum.** `Shard::subscribe` reported only
+  committed versions. The flusher now also needs uploads opened, parts
+  stored, and uploads aborted, so `Change` has the variants `Stored`,
+  `Opened`, `Part`, and `Aborted`. `Stored` carries the upload whose
+  completion stored it. The flusher is the only subscriber.
+- **Completion goes through the key's ordinary flush.** The version a
+  local `MPU_COMPLETE` committed is flushed in the per-key order of §7.1.
+  When the version's write identity is the upload, `put_parts` claims the
+  stream. The claim waits for sends in flight. The flush then sends every
+  kept part the remote does not hold from that same `MPU_PART`, lists
+  exactly the kept parts, and completes with the §7.2 precondition.
+  - A version without a stream takes the M1-16b after-commit path. That
+    covers a version a `TAGS` record retagged, one whose remote upload is
+    gone, and one whose flusher has streaming off.
+  - A `404 NoSuchUpload` from the Complete aborts the stream. The flush is
+    done if a HEAD then finds the version's identity (a lost answer);
+    otherwise the next attempt sends the version after commit.
+  - The remote multipart ETag equals the local one in every streaming
+    test.
+- **Aborts, and when a stream is reaped.** A remote upload is aborted when
+  its local upload aborts, when the remote no longer has it, and when its
+  key is clean or held in conflict without it. In those last two cases
+  nothing will complete it. The conflict case was found in the
+  simulation: a conflicted key's stream otherwise stayed open forever.
+  Aborts are retried until `Ok` or `NoSuchUpload`, then recorded as
+  *ended*. `FlushSettings::streaming` (default on) turns streaming off for
+  new uploads. Remote uploads already recorded are still completed or
+  aborted.
+- **Load the streams before the entry scan.** The restart test raced: a
+  stream loaded after the scan found its key untracked and was doomed
+  wrongly. `run` now loads streams first, scans, and then reaps the
+  streams of keys the scan left untracked.
+- **Overlap metric.** `skys3_flush_streaming_overlap_ratio{bucket}` is a
+  histogram, observed once per streamed completion: the fraction of the
+  kept bytes the remote held when the local completion applied (snapshot
+  taken on the `Stored` change, not when the flush runs).
+  Because Prometheus histograms have no `count()` or `sum()` outside
+  test-util, the service test reads them from the encoded registry. The
+  admin status gains `streamed_uploads` (the open streams). Both are in
+  `docs/skys3-metrics.md` and §16.3.
+- **Tests.** `tests/streaming.rs` has eight tests:
+  - parts stream before completion, with one more request for the
+    Complete and an overlap of 1.0;
+  - a completion lists exactly its kept parts;
+  - a part re-uploaded during a slow send follows it;
+  - aborted and abandoned uploads are aborted at the remote;
+  - a retagged object is sent after commit;
+  - a restarted flusher resumes from the index;
+  - a vanished remote upload is replaced after commit;
+  - a lost Complete answer is recognized by the upload identity.
+
+  The shard tests cover the new `Change` variants and `PART_FLUSHED`
+  application. The log tests cover its layout and round trip.
+- **Simulation.** `streamed_uploads_reach_the_remote_only_after_their_local_commit`
+  (`Runner::with_cost(8, 2)`) mixes the following on an AWS-like or
+  R2-like `SimS3`:
+  - concurrent uploads with random part sizes, re-uploaded numbers, and
+    completions that keep a subset of the parts;
+  - aborts, PUTs, `TAGS`, and DELETEs;
+  - flusher restarts and injected faults.
+
+  Before each local commit it checks that no remote object or version
+  carries the upload's identity. Afterwards it checks that the remote
+  object's ETag is the local one and that aborted identities never appear
+  anywhere. It ends when no remote upload is open beyond the creates whose
+  answers were lost, and no stream, orphan, or index row is left. The
+  existing flush scenario now streams on half its seeds. Two fixes came
+  from it:
+  - `check_unpublished` retried a GET forever after a flush deleted the
+    object, so a 404 now ends its wait.
+  - M1-16b orphans left remote uploads open (seed 127), so the final
+    check aborts them with `abort_orphaned_uploads` and requires none.
+- **Seeded bugs the simulation catches.**
+  - Completing the remote upload from `pump` as soon as the local
+    upload's parts were sent, before the local commit, fails at
+    **seed 0**: "upload c-test/b-flush/0/1.47 is at the remote before its
+    local commit".
+  - Listing every part the remote holds, instead of the kept parts
+    (which lists a part the completion dropped or one replaced since),
+    fails at **seed 1**: the flush never settles, with `400 InvalidPart`
+    for part 2.
+  - Both runs used `SKYS3_SIM_SEEDS=256`, and both mutations are reverted.
+- **Timings.** At `SKYS3_SIM_SEEDS=256` in a debug build, the new scenario
+  took 14.7 s alone (CI runs 128 of its seeds), and
+  `flushes_reach_the_remote_through_faults` took 44.6 s on a loaded
+  machine (28.1 s earlier in this task). All four flush scenarios
+  together took 50.8 s. Streaming is on by default, so the cluster
+  simulation's one-part multipart uploads now stream across forwarding,
+  takeovers, crashes, and compaction. CI's whole simulation set
+  (`cargo test --workspace --all-features --test simulation`,
+  `SKYS3_SIM_SEEDS=256`) passed, with the 75 cluster scenarios taking
+  2,337 s.
+- **Left open.**
+  - Plan M4-04 adds the `ListParts` reconciliation. Until then, a part
+    whose `PART_FLUSHED` was lost is sent again, which is correct but
+    costs a transfer.
+  - A remote upload whose `CreateMultipartUpload` answer was lost, or
+    whose *opened* record a crash lost, is left to the bucket's
+    abort-incomplete-uploads lifecycle rule (§7.3).
+  - There is no tee of the incoming body (see the first bullet), so a
+    part is read back from the local log once.

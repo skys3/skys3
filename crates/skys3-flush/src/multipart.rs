@@ -2,7 +2,12 @@
 //! multipart upload with the client's part boundaries, so that the remote
 //! ETag is the local one.
 //!
-//! An attempt opens a remote upload whose `CreateMultipartUpload` carries
+//! **Streamed.** An object whose upload streamed to the remote while the
+//! client uploaded (see the `stream` module) completes that remote upload:
+//! the attempt sends the parts the stream did not, and completes it with
+//! exactly the parts the local completion kept.
+//!
+//! **After commit.** Otherwise, an attempt opens a remote upload whose `CreateMultipartUpload` carries
 //! the version's write identity (the upload's `MPU_CREATE`, or the `TAGS`
 //! that retagged the object), uploads each part from the local log under
 //! its own part number with `Content-MD5`, and completes the upload with
@@ -25,15 +30,17 @@
 
 use skys3_index::{ObjectPart, ObjectVersion, Part};
 use skys3_io::Disk;
+use skys3_log::record::{Metadata, RemoteStep, TagSet};
 use skys3_remote::{
     AbortMultipartUpload, CompleteMultipartUpload, CompletedPart, CreateMultipartUpload,
-    ObjectStore, PutObject, S3ErrorKind, UploadId, UploadPart, WritePrecondition,
+    ObjectStore, PutObject, S3ErrorKind, UploadId, WritePrecondition,
 };
 use skys3_types::{ETag, EpochSeq, WriteIdentity};
 
 use crate::attempt::{
-    Attempt, Failure, Found, Outcome, Write, content_md5, flushed, put_request, written,
+    Attempt, Failure, Found, Outcome, Write, flushed, put_request, request_headers, written,
 };
+use crate::stream::{self, Claim, Verdict};
 use crate::target::Target;
 
 /// How many abandoned uploads one multipart flush tries to abort before it
@@ -54,9 +61,25 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         expected: Option<ETag>,
     ) -> Result<Outcome, Failure> {
         let parts = self.parts(upload, layout).await?;
+        // A stream carries the `MPU_CREATE` identity; a `TAGS` version
+        // needs its own.
+        if object.write_identity == Some(upload)
+            && let Some(claim) = self.streams.claim(upload).await
+        {
+            return self
+                .complete_stream(version, upload, &parts, claim, identity, expected)
+                .await;
+        }
         self.target.abort_orphaned_uploads().await;
         let key = self.remote_key();
-        let create = create_request(put_request(key.clone(), object, identity)?);
+        let put = put_request(key.clone(), object, identity)?;
+        let create = CreateMultipartUpload {
+            key: put.key,
+            metadata: put.metadata,
+            content_type: put.content_type,
+            headers: put.headers,
+            tags: put.tags,
+        };
         let upload_id = self
             .target
             .store
@@ -66,7 +89,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         let open = OpenUpload::new(self.target, key.clone(), upload_id.clone());
         let mut completed = Vec::with_capacity(parts.len());
         for (number, part) in &parts {
-            match self.upload_part(&key, &upload_id, *number, part).await {
+            match self.upload_part(&upload_id, *number, part).await {
                 Ok(etag) => completed.push(CompletedPart {
                     part_number: u32::from(*number),
                     etag,
@@ -108,6 +131,108 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         }
     }
 
+    /// Completes the stream of the upload opened at `upload`, which the
+    /// attempt claimed, as the multipart version at `version` made of
+    /// `parts`, conditioned on `expected` (§7.2, §7.3). It sends each part
+    /// the remote does not hold from the `MPU_PART` the version kept, and
+    /// lists exactly those parts.
+    async fn complete_stream(
+        &self,
+        version: EpochSeq,
+        upload: EpochSeq,
+        parts: &[(u16, Part)],
+        claim: Claim,
+        identity: &WriteIdentity,
+        expected: Option<ETag>,
+    ) -> Result<Outcome, Failure> {
+        let streams = self.streams;
+        if let Some(at_completion) = &claim.at_completion {
+            let total: u64 = parts.iter().map(|(_, part)| part.size).sum();
+            let streamed: u64 = parts
+                .iter()
+                .filter(|(number, part)| at_completion.get(number) == Some(&part.position))
+                .map(|(_, part)| part.size)
+                .sum();
+            if total > 0 {
+                #[allow(clippy::cast_precision_loss, reason = "a ratio")]
+                let overlap = streamed as f64 / total as f64;
+                self.target.counters.streaming_overlap.observe(overlap);
+            }
+        }
+        let mut completed = Vec::with_capacity(parts.len());
+        for (number, part) in parts {
+            let etag = match claim.flushed.get(number) {
+                Some((position, etag)) if *position == part.position => etag.clone(),
+                _ => {
+                    let sent = stream::upload_part(
+                        self.shard,
+                        self.target,
+                        self.key,
+                        &claim.id,
+                        *number,
+                        part,
+                    )
+                    .await;
+                    match sent {
+                        Ok(etag) => {
+                            streams.sent(upload, *number, part.position, etag.clone());
+                            let step = RemoteStep::Part {
+                                number: *number,
+                                position: part.position,
+                                remote_etag: etag.clone(),
+                            };
+                            drop(streams.record(self.shard, self.key, upload, &claim.id, step));
+                            etag
+                        }
+                        Err(failure) => {
+                            streams.release(upload, verdict_after(&failure));
+                            return Err(failure);
+                        }
+                    }
+                }
+            };
+            completed.push(CompletedPart {
+                part_number: u32::from(*number),
+                etag,
+            });
+        }
+        let request = CompleteMultipartUpload {
+            key: self.remote_key(),
+            upload_id: claim.id.clone(),
+            parts: completed,
+            precondition: WritePrecondition::None,
+        };
+        match self
+            .conditional(Write::Complete(&request), identity, version, expected)
+            .await
+        {
+            Ok(Ok(output)) => {
+                streams.release(upload, Verdict::Completed);
+                let ended = RemoteStep::Ended;
+                drop(streams.record(self.shard, self.key, upload, &claim.id, ended));
+                Ok(written(version, output))
+            }
+            // The remote holds this version from an earlier flush, or
+            // another writer's object: this upload never completes.
+            Ok(Err(outcome)) => {
+                streams.release(upload, Verdict::Abort);
+                Ok(outcome)
+            }
+            Err(failure) => {
+                let verdict = verdict_after(&failure);
+                streams.release(upload, verdict);
+                // A Complete whose answer was lost may have been applied,
+                // which consumed the upload: the retry finds it gone.
+                if verdict == Verdict::Abort
+                    && let Found::Mine(info) = self.inspect(identity, version, None).await?
+                {
+                    return Ok(flushed(version, Some(info), true));
+                }
+                Err(failure)
+            }
+        }
+    }
+
     /// The parts of the upload opened at `upload`, as the index holds them,
     /// checked against the object's layout. A newer version of the key
     /// removes them, so they may be gone.
@@ -133,20 +258,21 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// in-flight budget, and returns the remote part's ETag.
     async fn upload_part(
         &self,
-        key: &str,
         upload_id: &UploadId,
         number: u16,
         part: &Part,
     ) -> Result<ETag, Failure> {
-        let _permit = self.target.reserve(part.size).await;
-        let body = self.read(&part.payload, part.size).await?;
-        let mut request = UploadPart::new(key, upload_id.clone(), u32::from(number), body);
-        request.content_md5 = content_md5(&part.etag);
-        self.target
-            .store
-            .upload_part(request)
-            .await
-            .map_err(Failure::Remote)
+        stream::upload_part(self.shard, self.target, self.key, upload_id, number, part).await
+    }
+}
+
+/// What a failed streamed completion leaves of its stream: a remote upload
+/// that is gone is aborted (which records its end), anything else is kept
+/// for the retry.
+fn verdict_after(failure: &Failure) -> Verdict {
+    match failure {
+        Failure::Remote(error) if error.kind() == S3ErrorKind::NoSuchUpload => Verdict::Abort,
+        _ => Verdict::Keep,
     }
 }
 
@@ -230,14 +356,21 @@ impl<S> Drop for OpenUpload<'_, S> {
 }
 
 /// The `CreateMultipartUpload` that gives the completed object what a
-/// `PutObject` of the version would: metadata with the write identity,
-/// standard headers, and tags.
-fn create_request(put: PutObject) -> CreateMultipartUpload {
-    CreateMultipartUpload {
+/// `PutObject` of it would: `metadata` split into user metadata,
+/// `Content-Type`, and the other standard headers, `tags`, and the write
+/// identity.
+pub(crate) fn create_request(
+    key: String,
+    metadata: &Metadata,
+    tags: &TagSet,
+    identity: &WriteIdentity,
+) -> Result<CreateMultipartUpload, Failure> {
+    let put: PutObject = request_headers(key, metadata, tags, identity)?;
+    Ok(CreateMultipartUpload {
         key: put.key,
         metadata: put.metadata,
         content_type: put.content_type,
         headers: put.headers,
         tags: put.tags,
-    }
+    })
 }

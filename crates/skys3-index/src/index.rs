@@ -34,8 +34,10 @@ use crate::tables::{
 /// version 6 the configuration of each shard's latest `CONFIG` record and
 /// the takeovers a member proposed (§6.2, §6.3). Version 7 changes no
 /// table: a part of a completed upload may hold no bytes, once its object
-/// is evicted (§9.3), which older builds fail to decode.
-pub const FORMAT_VERSION: u64 = 7;
+/// is evicted (§9.3), which older builds fail to decode. Version 8 adds
+/// the remote uploads of streaming flushes and their parts (§7.3); an
+/// older build would never complete or abort them.
+pub const FORMAT_VERSION: u64 = 8;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -237,6 +239,8 @@ impl Index {
                 tables::SHARDS,
                 tables::UPLOADS,
                 tables::PARTS,
+                tables::REMOTE_UPLOADS,
+                tables::REMOTE_PARTS,
             ] {
                 txn.open_table(table)?;
             }
@@ -462,6 +466,8 @@ impl Index {
                 tables::ShardTable::Namespace => tables::NAMESPACE,
                 tables::ShardTable::Uploads => tables::UPLOADS,
                 tables::ShardTable::Parts => tables::PARTS,
+                tables::ShardTable::RemoteUploads => tables::REMOTE_UPLOADS,
+                tables::ShardTable::RemoteParts => tables::REMOTE_PARTS,
             };
             let mut table = txn.open_table(definition)?;
             for (key, value) in rows {
