@@ -23,8 +23,11 @@
 //! - **Range** (`x-amz-copy-source-range`): `bytes=first-last`, both
 //!   offsets given, zero-based and inclusive ([`CopyRange`]). Any other
 //!   form answers `400 InvalidArgument`, and a range the source cannot
-//!   satisfy, `last` at or past its end, `416 InvalidRange`. Without a
-//!   range the part is the whole source. A part is at most 5 GiB
+//!   satisfy, `last` at or past its end, `416 InvalidRange`. As in S3, a
+//!   range may be copied only from a source larger than
+//!   [`MIN_RANGED_SOURCE_BYTES`] (5 MiB); a valid range of a smaller one
+//!   answers `400 InvalidRequest`. Without a range the part is the whole
+//!   source, whatever its size. A part is at most 5 GiB
 //!   (`400 InvalidRequest`), but a range may come from a larger multipart
 //!   source.
 //! - **Conditions.** `x-amz-copy-source-if-match`, `-if-none-match`,
@@ -38,7 +41,8 @@
 //!
 //! The request is checked in this order: the part number, the source and
 //! the range's form, admission control, the upload (`404 NoSuchUpload`),
-//! then the source (`404 NoSuchKey`, `412`, `416`).
+//! then the source (`404 NoSuchKey`, `412`, `416`, then `400
+//! InvalidRequest` for a range of a small source or a part over 5 GiB).
 
 use std::ops::Range;
 
@@ -58,6 +62,11 @@ use crate::buckets::shard_error;
 use crate::checksum::PooledHasher;
 use crate::conditions::{Precondition, ReadConditions, precondition_failed};
 use crate::shard::{ShardRef, Shards};
+
+/// The size a copy source must exceed for a range of it to be copied: S3
+/// copies a range only of a source larger than 5 MiB, and answers
+/// `400 InvalidRequest` otherwise.
+pub const MIN_RANGED_SOURCE_BYTES: u64 = 5 << 20;
 
 /// The bytes of a copy source that `x-amz-copy-source-range` names:
 /// `bytes=first-last`, zero-based and inclusive.
@@ -270,7 +279,18 @@ fn select(
     range: Option<CopyRange>,
 ) -> S3Result<Found> {
     let bytes = match range {
-        Some(range) => range.within(object.size)?,
+        // The range is checked against the source first, so a range past
+        // the end of a small source is still `416 InvalidRange`.
+        Some(range) => {
+            let bytes = range.within(object.size)?;
+            if object.size <= MIN_RANGED_SOURCE_BYTES {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "The specified copy source is not supported as a byte-range copy source"
+                ));
+            }
+            bytes
+        }
         None => 0..object.size,
     };
     if bytes.end - bytes.start > MAX_OBJECT_BYTES {
@@ -380,14 +400,17 @@ mod tests {
         assert_eq!(*other.code(), S3ErrorCode::InternalError);
     }
 
-    #[test]
-    fn a_part_is_at_most_five_gib() {
-        let shard = ShardRef {
+    fn test_shard() -> ShardRef {
+        ShardRef {
             bucket: skys3_types::BucketId::new("b-test").unwrap(),
             shard: skys3_types::ShardId::new(0),
-        };
-        let object = ObjectVersion {
-            size: 7 << 30,
+        }
+    }
+
+    /// An object of `size` bytes, whose bytes `select` never reads.
+    fn sized(size: u64) -> ObjectVersion {
+        ObjectVersion {
+            size,
             last_modified_ms: 0,
             local_etag: ETag::from_md5(&[0; 16]),
             write_identity: None,
@@ -397,7 +420,34 @@ mod tests {
             storage_class: None,
             copy_source: None,
             payload: skys3_index::Payload::None,
-        };
+        }
+    }
+
+    fn selected(size: u64, range: Option<CopyRange>) -> S3Result<Range<u64>> {
+        select(test_shard(), EpochSeq::default(), sized(size), range).map(|found| found.bytes)
+    }
+
+    #[test]
+    fn ranges_need_a_source_over_five_mib() {
+        let first_byte = Some(CopyRange { first: 0, last: 0 });
+        let refused = selected(MIN_RANGED_SOURCE_BYTES, first_byte).unwrap_err();
+        assert_eq!(*refused.code(), S3ErrorCode::InvalidRequest);
+        assert_eq!(
+            selected(MIN_RANGED_SOURCE_BYTES + 1, first_byte).unwrap(),
+            0..1
+        );
+        // Whole small sources copy, and a range past the end of one is
+        // still unsatisfiable rather than unsupported.
+        assert_eq!(selected(5, None).unwrap(), 0..5);
+        assert_eq!(selected(0, None).unwrap(), 0..0);
+        let past = selected(5, Some(CopyRange { first: 0, last: 21 })).unwrap_err();
+        assert_eq!(*past.code(), S3ErrorCode::InvalidRange);
+    }
+
+    #[test]
+    fn a_part_is_at_most_five_gib() {
+        let shard = test_shard();
+        let object = sized(7 << 30);
         let whole = select(shard.clone(), EpochSeq::default(), object.clone(), None);
         assert_eq!(*whole.err().unwrap().code(), S3ErrorCode::InvalidRequest);
         let range = CopyRange {

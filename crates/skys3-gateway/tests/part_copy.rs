@@ -520,22 +520,66 @@ async fn ranges_must_be_well_formed_and_within_the_source() {
         answer.assert(416, Some("InvalidRange"));
     }
 
-    // The last byte, one byte, and an empty source copied whole.
-    let last = setup
-        .copied("/photos/k", &id, 1, "media/five", Some("bytes=4-4"))
+    // A valid range of a source of 5 MiB or less is not supported, as in
+    // S3; the whole source is.
+    let headers = [("x-amz-copy-source-range", "bytes=4-4")];
+    let answer = setup
+        .copy_part("/photos/k", &id, 1, "media/five", &headers)
         .await;
-    assert_eq!(last, etag_of(b"e"));
+    answer.assert(400, Some("InvalidRequest"));
+    let whole = setup.copied("/photos/k", &id, 1, "media/five", None).await;
+    assert_eq!(whole, etag_of(b"abcde"));
+
+    // An empty source copied whole, and a range of one byte.
     let empty = setup.copied("/photos/k", &id, 2, "media/empty", None).await;
     assert_eq!(empty, "\"d41d8cd98f00b204e9800998ecf8427e\"");
     let complete = setup
-        .complete("/photos/k", &id, &[(1, &last, None), (2, &empty, None)])
+        .complete("/photos/k", &id, &[(1, &whole, None), (2, &empty, None)])
         .await;
     complete.assert(400, Some("EntityTooSmall"));
-    let complete = setup.complete("/photos/k", &id, &[(1, &last, None)]).await;
+    let complete = setup.complete("/photos/k", &id, &[(1, &whole, None)]).await;
     complete.assert(200, None);
     let got = setup.call(Method::GET, "/photos/k", &[], "").await;
-    assert_eq!(got.body, "e");
-    assert_eq!(got.header("etag"), Some(&*multipart_etag(&[b"e"])));
+    assert_eq!(got.body, "abcde");
+    assert_eq!(got.header("etag"), Some(&*multipart_etag(&[b"abcde"])));
+}
+
+/// S3 copies a range only of a source larger than 5 MiB: a source of
+/// exactly 5 MiB is refused, one byte more is accepted, and the last byte
+/// of it is a part of its own.
+#[tokio::test]
+async fn ranged_copies_need_a_source_larger_than_five_mib() {
+    let (setup, _) = local().await;
+    let limit = letters(PART);
+    let over = letters(PART + 1);
+    setup
+        .put("/media/limit", &[], limit.clone())
+        .await
+        .assert(200, None);
+    setup
+        .put("/media/over", &[], over.clone())
+        .await
+        .assert(200, None);
+    let id = setup.create_upload("/photos/k", &[]).await;
+    let first = [("x-amz-copy-source-range", "bytes=0-0")];
+    let answer = setup
+        .copy_part("/photos/k", &id, 1, "media/limit", &first)
+        .await;
+    answer.assert(400, Some("InvalidRequest"));
+    let whole = setup.copied("/photos/k", &id, 1, "media/limit", None).await;
+    assert_eq!(whole, etag_of(&limit));
+
+    let range = format!("bytes={PART}-{PART}");
+    let last = setup
+        .copied("/photos/k", &id, 2, "media/over", Some(&range))
+        .await;
+    assert_eq!(last, etag_of(&over[PART..]));
+    let complete = setup
+        .complete("/photos/k", &id, &[(1, &whole, None), (2, &last, None)])
+        .await;
+    complete.assert(200, None);
+    let got = setup.call(Method::GET, "/photos/k", &[], "").await;
+    assert_eq!(got.body.as_bytes(), [&limit[..], &over[PART..]].concat());
 }
 
 /// Requests that name no upload, source, or valid part are refused as S3
@@ -655,23 +699,23 @@ async fn a_source_on_another_node_is_read_from_its_holder() {
         .seen_from("node-2".parse().unwrap());
     let setup = setup_over(mib_extents(), shards).await;
     setup.create_local("photos").await;
-    let source = letters(3 * MIB + 5);
+    let source = letters(PART + 3 * MIB);
     setup
         .put("/photos/source", &[], source.clone())
         .await
         .assert(200, None);
     let id = setup.create_upload("/photos/copy", &[]).await;
-    let range = format!("bytes=1000-{}", PART.min(source.len()) - 1);
+    let range = format!("bytes=1000-{}", PART - 1);
     let etag = setup
         .copied("/photos/copy", &id, 1, "photos/source", Some(&range))
         .await;
-    assert_eq!(etag, etag_of(&source[1000..]));
+    assert_eq!(etag, etag_of(&source[1000..PART]));
     setup
         .complete("/photos/copy", &id, &[(1, &etag, None)])
         .await
         .assert(200, None);
     let got = setup.call(Method::GET, "/photos/copy", &[], "").await;
-    assert_eq!(got.body.as_bytes(), &source[1000..]);
+    assert_eq!(got.body.as_bytes(), &source[1000..PART]);
 }
 
 /// Fills that serve a fixed object, and record the ranges asked for.
@@ -703,9 +747,12 @@ impl Fills for FixedFills {
 /// bucket: the copy reads the range it needs through a fill (§9.2).
 #[tokio::test]
 async fn an_evicted_source_is_read_through_a_fill() {
-    const OBJECT: &[u8] = b"hello, evicted world";
+    // Over 5 MiB, so that a range of it may be copied.
+    let mut data = b"hello, evicted world".to_vec();
+    data.resize(PART + 20, b'.');
+    let object: &'static [u8] = Box::leak(data.into_boxed_slice());
     let fills = Arc::new(FixedFills {
-        object: OBJECT,
+        object,
         ..FixedFills::default()
     });
     let mut config = mib_extents();
@@ -714,7 +761,7 @@ async fn an_evicted_source_is_read_through_a_fill() {
     let remote = setup.create_write_back("remote").await;
     setup.create_local("photos").await;
     setup
-        .put("/remote/k", &[], Bytes::from_static(OBJECT))
+        .put("/remote/k", &[], Bytes::from_static(object))
         .await
         .assert(200, None);
     setup.shards.flush(&remote.bucket_id).await;

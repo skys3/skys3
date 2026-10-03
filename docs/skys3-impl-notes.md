@@ -5354,6 +5354,19 @@ of this file. A task with nothing unexpected keeps "None."
   the sandbox, so M7-01 should confirm both against AWS S3. The parser
   has a proptest and a fuzz target, `gateway_copy_range`; a 30-second
   run executed about 5.3 million inputs with no failure.
+- **Ranges need a source over 5 MiB (review).** The first version copied
+  a range of any source. The UploadPartCopy API reference says a range
+  may be copied only from a source larger than 5 MB, and AWS answers a
+  smaller one with `400 InvalidRequest` ("The specified copy source is
+  not supported as a byte-range copy source"). The check
+  (`MIN_RANGED_SOURCE_BYTES`, 5 MiB) runs after the range is checked
+  against the source, so a range past the end of a small source is still
+  `416 InvalidRange`, which s3-tests' invalid-range test expects of a
+  5-byte source; its improper-range test sends malformed ranges, which
+  are refused before the source is read. No pinned s3-tests test, and no
+  SDK client, makes a valid ranged copy of a source of 5 MiB or less. The
+  gateway tests that did now use larger sources, and a test copies a
+  range of 5 MiB + 1 and is refused one of exactly 5 MiB.
 - **SDK copy helpers.** boto3's `copy` (s3transfer 0.19.2) and the AWS
   CLI's `aws s3 cp` between objects use UploadPartCopy above their
   multipart threshold, and s3transfer sends each part with
