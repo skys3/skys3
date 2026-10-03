@@ -5414,6 +5414,16 @@ of this file. A task with nothing unexpected keeps "None."
 
   The shard tests cover the new `Change` variants and `PART_FLUSHED`
   application. The log tests cover its layout and round trip.
+- **Copied parts (after merging M4-05).** UploadPartCopy stores the copied
+  bytes in the upload's shard and commits an ordinary `MPU_PART`, so the
+  flusher streams it like an uploaded part, and no flush code changed.
+  `tests/streamed_copies.rs` checks this end to end through the gateway,
+  real shards, and the flush service: one part copies a whole 6 MiB
+  source, and a second copies a 100-byte range. Both reach the remote
+  upload before the client completes. The completion then sends only the
+  Complete, and the remote object has the local ETag and the copied
+  bytes. With streaming off, the test fails waiting for the remote
+  upload.
 - **Simulation.** `streamed_uploads_reach_the_remote_only_after_their_local_commit`
   (`Runner::with_cost(8, 2)`) mixes the following on an AWS-like or
   R2-like `SimS3`:
