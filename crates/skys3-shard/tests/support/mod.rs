@@ -15,7 +15,7 @@ use skys3_index::{
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{
     Adopt, CompletedPart, Delete, Extent, ExtentRef, Flushed, Import, MpuAbort, MpuComplete,
-    MpuCreate, MpuPart, Put, PutData, Tags, UploadBegin,
+    MpuCreate, MpuPart, PartFlushed, Put, PutData, RemoteStep, Tags, UploadBegin,
 };
 use skys3_log::{
     LogConfig, LogRecord, RecordBody, RecordLocation, SegmentId, SegmentLog, ShardRef,
@@ -212,6 +212,17 @@ pub fn mpu_abort(key: &str, upload: EpochSeq) -> RecordBody {
     RecordBody::MpuAbort(MpuAbort {
         key: key.to_owned(),
         upload,
+    })
+}
+
+/// A `PART_FLUSHED` of the remote upload `id` of `key`'s upload at
+/// `upload`.
+pub fn part_flushed(key: &str, upload: EpochSeq, id: &str, step: RemoteStep) -> RecordBody {
+    RecordBody::PartFlushed(PartFlushed {
+        key: key.to_owned(),
+        upload,
+        remote_upload_id: id.to_owned(),
+        step,
     })
 }
 

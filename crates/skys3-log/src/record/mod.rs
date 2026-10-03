@@ -62,7 +62,7 @@
 //! Each defined kind's fields are encoded in the declaration order of its
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
 //! [`MpuComplete`], [`MpuAbort`], [`UploadBegin`], [`Tags`], [`Flushed`],
-//! [`Import`], [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
+//! [`PartFlushed`], [`Import`], [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
 //! without the bucket, shard, and epoch the fixed header holds, and
 //! `TRUNCATE`, which has no fields):
 //!
@@ -82,7 +82,10 @@
 //! - an `MPU_CREATE`'s checksum as an option of the algorithm's code (`u8`)
 //!   and the type (`u8`: 0 for `FULL_OBJECT`, 1 for `COMPOSITE`), and an
 //!   `MPU_COMPLETE`'s parts as a `u16` count followed by each part's
-//!   number (`u16`) and position, in increasing part number.
+//!   number (`u16`) and position, in increasing part number,
+//! - a `PART_FLUSHED`'s step as a tag byte: 0 for `Opened`, 2 for `Ended`,
+//!   or 1 for a part, followed by its number (`u16`), its `MPU_PART`
+//!   position, and the remote ETag.
 //!
 //! # Decoding
 //!
@@ -114,7 +117,10 @@ pub use body::{
 };
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
-pub use multipart::{CompletedPart, MpuAbort, MpuComplete, MpuCreate, MpuPart, UploadChecksum};
+pub use multipart::{
+    CompletedPart, MAX_UPLOAD_ID_LEN, MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed,
+    RemoteStep, UploadChecksum,
+};
 pub use skys3_types::checksum::{Checksum, ChecksumAlgorithm, ChecksumType, Checksums};
 
 use wire::Writer;

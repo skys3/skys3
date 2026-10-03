@@ -33,11 +33,13 @@
 //!   `CreateMultipartUpload` answer never reached the flusher: every other
 //!   upload was completed or aborted.
 //!
-//! The read-through fill and `ADOPT` scenario is in `fill_simulation`, and
-//! the namespace import racing client writes in `import_simulation`.
+//! The read-through fill and `ADOPT` scenario is in `fill_simulation`, the
+//! namespace import racing client writes in `import_simulation`, and
+//! streaming multipart flush in `stream_simulation`.
 
 mod fill_simulation;
 mod import_simulation;
+mod stream_simulation;
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,7 +52,7 @@ use skys3_remote::{GetObject, ObjectStore, PutObject, UserMetadata};
 use skys3_sim::s3::{Conditionals, Fault, Operation, SimS3Config, SimS3Faults};
 use skys3_sim::{Runner, SimContext, SimS3};
 use skys3_types::ETag;
-use support::{Node, identity, md5_etag, runtime, target_with, writes};
+use support::{Node, Patience, identity, md5_etag, runtime, streaming_target, target_with, writes};
 
 /// Delays, errors, and lost requests and responses on every request.
 const FAULTS: SimS3Faults = SimS3Faults {
@@ -72,6 +74,11 @@ type Outcome = Result<(), Box<dyn std::error::Error>>;
 #[test]
 fn flushes_reach_the_remote_through_faults() {
     Runner::new().run(scenario);
+}
+
+#[test]
+fn streamed_uploads_reach_the_remote_only_after_their_local_commit() {
+    Runner::with_cost(8, 2).run(stream_simulation::scenario);
 }
 
 #[test]
@@ -101,7 +108,14 @@ fn scenario(context: &mut SimContext) -> Outcome {
     };
     let store = context.s3(config);
     store.set_faults(FAULTS);
-    let target = target_with(&store, writes(true, !like_r2, !like_r2));
+    // Multipart uploads stream to the remote on half of the seeds, and
+    // are sent after their completion on the others (§7.3, §7.4).
+    let writes = writes(true, !like_r2, !like_r2);
+    let target = if rng.random_ratio(1, 2) {
+        streaming_target(&store, writes)
+    } else {
+        target_with(&store, writes)
+    };
     runtime().block_on(async move {
         let node = Node::open(seed).await;
         let mut flusher = node.flusher(&target);
@@ -189,22 +203,28 @@ fn scenario(context: &mut SimContext) -> Outcome {
         node.settle(&flusher).await;
         check(&node, &flusher, &store, &latest, &touched).await?;
         check_unpublished(&store, &failed).await?;
-        // Scripted faults may still fail a few aborts.
-        for _ in 0..10 {
-            target.abort_orphaned_uploads().await;
-        }
         // Every upload the flusher knew of was completed or aborted.
-        let open = store.uploads().len() as u64;
-        let unknown = store.unanswered(Operation::CreateMultipartUpload);
-        if open != unknown || target.orphaned_uploads() != 0 {
-            return Err(format!(
-                "{open} remote uploads are open, {unknown} of them never known to the flusher, \
-                 and the target still holds {}",
-                target.orphaned_uploads()
-            )
-            .into());
+        // Scripted faults may still fail a few aborts, and the streams of
+        // uploads end on their own (§7.3).
+        let patience = Patience::new();
+        loop {
+            target.abort_orphaned_uploads().await;
+            let open = store.uploads().len() as u64;
+            let unknown = store.unanswered(Operation::CreateMultipartUpload);
+            let orphans = target.orphaned_uploads();
+            let streams = flusher.status().streams;
+            if open == unknown && orphans == 0 && streams == 0 {
+                return Ok(());
+            }
+            if patience.is_exhausted() {
+                return Err(format!(
+                    "{open} remote uploads are open, {unknown} of them never known to the \
+                     flusher, the target still holds {orphans}, and {streams} streams are open"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Ok(())
     })
 }
 

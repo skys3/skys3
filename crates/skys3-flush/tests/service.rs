@@ -6,7 +6,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, ProbeStatus};
+use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings, ProbeStatus};
 use skys3_io::{ManualWallClock, SimMount, WallClock};
 use skys3_obs::MetricsRegistry;
 use skys3_remote::probe::ConditionalOperation;
@@ -39,9 +39,15 @@ fn bucket(mode: BucketMode) -> BucketDocument {
 
 fn service(store: &SimS3, registry: &MetricsRegistry) -> FlushService<SimS3, SimMount> {
     let store = store.clone();
+    // Multipart uploads stream, so a completion is counted in the
+    // streaming-overlap histogram (§7.3).
+    let settings = FlushSettings {
+        streaming: true,
+        ..settings()
+    };
     FlushService::new(
         cluster(),
-        settings(),
+        settings,
         Box::new(move |target: &RemoteTarget| {
             assert_eq!(target.bucket, "remote");
             store.clone()
@@ -155,6 +161,7 @@ fn flushes_write_back_buckets_under_their_prefix() {
             "skys3_flushes_total{bucket=\"photos\"} 2",
             "skys3_oldest_dirty_age_seconds{bucket=\"photos\"} 100.0",
             "skys3_flush_lag_seconds{bucket=\"photos\"} 0.0",
+            "skys3_flush_streaming_overlap_ratio_count{bucket=\"photos\"} 1",
         ] {
             assert!(text.contains(line), "{line} is not in {text}");
         }

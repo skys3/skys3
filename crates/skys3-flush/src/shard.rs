@@ -18,6 +18,7 @@ use tokio::time::Instant;
 
 use crate::attempt::{Attempt, Conflict, Outcome, Remote};
 use crate::budget::Charge;
+use crate::stream::{Step, Streams};
 use crate::target::Target;
 
 /// The target a flusher sends to, once its capability probe is done.
@@ -96,6 +97,9 @@ pub struct ShardStatus {
     /// cleared once a later attempt flushes or settles the key, or finds it
     /// in conflict.
     pub last_error: Option<String>,
+    /// Remote multipart uploads streamed for the shard's uploads (§7.3)
+    /// that are open: not completed or aborted yet.
+    pub streams: u64,
     /// Whether the flusher stopped, because its shard did.
     pub stopped: bool,
 }
@@ -264,6 +268,17 @@ impl State {
         self.next_error += 1;
     }
 
+    /// Whether a flush of `key` is still to come: it is dirty, and not
+    /// held in conflict. Otherwise the remote uploads streamed for its
+    /// closed uploads will never complete (§7.3): a clean key holds its
+    /// latest version at the remote, and a held one is flushed only once
+    /// its conflict is resolved, by a flush after commit.
+    fn awaits_flush(&self, key: &str) -> bool {
+        self.keys
+            .get(key)
+            .is_some_and(|tracked| !matches!(tracked.phase, Phase::Conflict(_)))
+    }
+
     fn untrack(&mut self, key: &str) {
         self.errors.remove(key);
         if let Some(tracked) = self.keys.remove(key) {
@@ -337,6 +352,7 @@ impl State {
 pub struct ShardFlusher {
     shard: ShardRef,
     state: Arc<Mutex<State>>,
+    streams: Arc<Streams>,
     task: JoinHandle<()>,
 }
 
@@ -363,10 +379,18 @@ impl ShardFlusher {
             ..State::default()
         }));
         let shard_ref = shard.shard().clone();
-        let task = tokio::spawn(run(shard, ready, wall, Arc::clone(&state)));
+        let streams = Arc::new(Streams::default());
+        let task = tokio::spawn(run(
+            shard,
+            ready,
+            wall,
+            Arc::clone(&state),
+            Arc::clone(&streams),
+        ));
         Self {
             shard: shard_ref,
             state,
+            streams,
             task,
         }
     }
@@ -381,6 +405,7 @@ impl ShardFlusher {
     #[must_use]
     pub fn status(&self) -> ShardStatus {
         let mut status = lock(&self.state).status();
+        status.streams = self.streams.len() as u64;
         status.stopped |= self.task.is_finished();
         status
     }
@@ -402,9 +427,13 @@ impl ShardFlusher {
 
     /// Stops the flusher and waits for its task to end. Flushes in flight
     /// are abandoned; their keys stay dirty and are flushed again later.
+    /// The `PART_FLUSHED` records of its streams that it started are
+    /// committed before this returns, so a flusher started next resumes
+    /// every remote upload this one knew of (§7.3).
     pub async fn stop(mut self) {
         self.task.abort();
         let _ = (&mut self.task).await;
+        self.streams.recorded().await;
     }
 }
 
@@ -435,32 +464,40 @@ async fn run<S: ObjectStore, D: Disk>(
     mut ready: Ready<S>,
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
+    streams: Arc<Streams>,
 ) {
     let mut changes = shard.subscribe();
-    if scan(&shard, &*wall, &state).await.is_ok() {
+    // The streams first: an upload that completes in between is then a
+    // dirty key the scan finds, not a closed stream of a clean key.
+    if streams.load(&shard).await.is_ok() && scan(&shard, &*wall, &state).await.is_ok() {
+        streams.reap_untracked(|key| lock(&state).keys.contains_key(key));
         let mut flushes: JoinSet<Done> = JoinSet::new();
         let mut records: JoinSet<Recorded> = JoinSet::new();
+        let mut streaming: JoinSet<Step> = JoinSet::new();
         // Whether a target may still arrive.
         let mut awaiting = true;
         loop {
             let target = ready.borrow_and_update().clone();
             if let Some(target) = &target {
-                dispatch(&shard, target, &state, &mut flushes);
+                dispatch(&shard, target, &state, &streams, &mut flushes);
+                streams.pump(&shard, target, &mut streaming);
             }
             let release = lock(&state).next_release();
             tokio::select! {
                 change = changes.recv() => match change {
-                    Some(Change { key, position, size }) => {
-                        let now = wall.now();
-                        lock(&state).changed(&key, position, size, now);
-                    }
+                    Some(change) => follow(&state, &streams, &*wall, change),
                     // The shard stopped, or another flusher took over.
                     None => break,
                 },
                 Some(done) = flushes.join_next(), if !flushes.is_empty() => {
                     // A flush runs only once there is a target.
                     if let (Ok(done), Some(target)) = (done, &target) {
-                        finish(&shard, target, &state, &mut records, done);
+                        finish(&shard, target, &state, &streams, &mut records, done);
+                    }
+                }
+                Some(step) = streaming.join_next(), if !streaming.is_empty() => {
+                    if let Ok(step) = step {
+                        streams.finish(step);
                     }
                 }
                 Some(recorded) = records.join_next(), if !records.is_empty() => {
@@ -480,6 +517,36 @@ async fn run<S: ObjectStore, D: Disk>(
         }
     }
     lock(&state).stop();
+}
+
+/// Acts on a change the shard applied.
+fn follow(state: &Mutex<State>, streams: &Streams, wall: &dyn WallClock, change: Change) {
+    match change {
+        Change::Stored {
+            key,
+            position,
+            size,
+            upload,
+        } => {
+            if let Some(upload) = upload {
+                streams.completed(upload);
+            }
+            let now = wall.now();
+            let mut state = lock(state);
+            state.changed(&key, position, size, now);
+            if !state.awaits_flush(&key) {
+                streams.reap(&key);
+            }
+        }
+        Change::Opened { key, upload } => streams.opened(&key, upload),
+        Change::Part {
+            upload,
+            number,
+            position,
+            ..
+        } => streams.part(upload, number, position),
+        Change::Aborted { upload, .. } => streams.aborted(upload),
+    }
 }
 
 async fn sleep_until(at: Option<Instant>) {
@@ -530,6 +597,7 @@ fn dispatch<S: ObjectStore, D: Disk>(
     shard: &Shard<D>,
     target: &Arc<Target<S>>,
     state: &Mutex<State>,
+    streams: &Arc<Streams>,
     flushes: &mut JoinSet<Done>,
 ) {
     while flushes.len() < target.settings.concurrency {
@@ -541,12 +609,13 @@ fn dispatch<S: ObjectStore, D: Disk>(
             let pending = state.recording.get(&key).cloned();
             (key, dispatched, pending)
         };
-        let (shard, target) = (shard.clone(), Arc::clone(target));
+        let (shard, target, streams) = (shard.clone(), Arc::clone(target), Arc::clone(streams));
         flushes.spawn(async move {
             let attempt = Attempt {
                 shard: &shard,
                 target: &target,
                 key: &key,
+                streams: &streams,
             };
             let outcome = attempt.run(pending.as_ref()).await;
             (key, dispatched, outcome)
@@ -559,6 +628,7 @@ fn finish<S, D: Disk>(
     shard: &Shard<D>,
     target: &Target<S>,
     state: &Mutex<State>,
+    streams: &Streams,
     records: &mut JoinSet<Recorded>,
     (key, dispatched, outcome): Done,
 ) {
@@ -604,6 +674,9 @@ fn finish<S, D: Disk>(
             let at = Instant::now() + target.settings.backoff(state.wait(&key));
             state.failed(&key, error, at);
         }
+    }
+    if !state.awaits_flush(&key) {
+        streams.reap(&key);
     }
 }
 
