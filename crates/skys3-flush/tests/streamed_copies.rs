@@ -22,7 +22,7 @@ use skys3_remote::{ListParts, ObjectStore};
 use skys3_sim::SimS3;
 use skys3_sim::s3::SimS3Config;
 use skys3_types::{BucketDocument, RemoteTarget};
-use support::{Patience, cluster, runtime, settings};
+use support::{Patience, cluster, settings};
 
 /// The source object's size: more than the smallest part S3 accepts
 /// before the last.
@@ -106,12 +106,18 @@ impl World {
         let response = self.gateway.handle(request).await;
         let status = response.status().as_u16();
         let mut body = response.into_body();
-        let body = body.store_all_limited(1 << 20).await.unwrap();
+        let body = body.store_all_limited(64 << 20).await.unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
     fn bucket(&self) -> BucketDocument {
         self.gateway.buckets().pop().unwrap()
+    }
+
+    /// The keys the bucket's flushers have yet to flush.
+    fn dirty(&self) -> u64 {
+        let status = self.service.status(&self.bucket().bucket_id).unwrap();
+        status.shards.iter().map(|(_, s)| s.dirty).sum()
     }
 
     /// The open streams of the bucket's flushers.
@@ -159,9 +165,20 @@ fn element<'a>(xml: &'a str, tag: &str) -> &'a str {
     &xml[start..end]
 }
 
+/// A runtime whose clock runs in real time. The support runtime pauses
+/// time and advances it whenever every task waits, and a holder's read of
+/// a large source from the simulated disk is such a wait: the clock would
+/// jump past the read registration's TTL and the copy would fail.
+fn real_time() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+}
+
 #[test]
 fn copied_parts_stream_while_the_upload_is_open() {
-    runtime().block_on(async {
+    real_time().block_on(async {
         let world = World::new(SimS3::new(41, SimS3Config::default())).await;
         let source: Vec<u8> = (0..SOURCE).map(|i| (i % 251) as u8).collect();
         let (status, _) = world
@@ -170,7 +187,7 @@ fn copied_parts_stream_while_the_upload_is_open() {
         assert_eq!(status, 200);
         world
             .until("the source is flushed", async |w| {
-                w.store.object("team/src").is_some()
+                w.store.object("team/src").is_some() && w.dirty() == 0
             })
             .await;
 

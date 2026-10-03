@@ -5424,6 +5424,17 @@ of this file. A task with nothing unexpected keeps "None."
   Complete, and the remote object has the local ETag and the copied
   bytes. With streaming off, the test fails waiting for the remote
   upload.
+- **Copied-part test runs in real time.** The flush tests' runtime pauses
+  tokio time, and the paused clock auto-advances whenever every task
+  waits. A holder's read of the 6 MiB source from the simulated disk is
+  such a wait. The clock then jumped past the 30 s read-registration TTL,
+  and the copy answered `503` "The object changed while it was read" in
+  19 of 20 runs.
+  - This is a test-harness trap, not a fault in M4-05: the copy works on
+    a clock that runs normally.
+  - The test now builds a real-time runtime and passed 20 of 20 runs.
+  - Other tests that read large objects through holders on a paused
+    clock would hit the same trap.
 - **Simulation.** `streamed_uploads_reach_the_remote_only_after_their_local_commit`
   (`Runner::with_cost(8, 2)`) mixes the following on an AWS-like or
   R2-like `SimS3`:
