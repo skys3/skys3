@@ -327,7 +327,7 @@ pub(crate) struct Claim {
 #[derive(Debug, Default)]
 pub(crate) struct Streams {
     streams: Mutex<HashMap<EpochSeq, Stream>>,
-    /// Woken whenever a part's send ends.
+    /// Woken whenever a part's send or an open ends.
     idle: Notify,
     /// The `PART_FLUSHED` commits in flight. They run on their own, so a
     /// flusher that stops leaves none half done, and
@@ -541,6 +541,7 @@ impl Streams {
                         streams.remove(&upload);
                     }
                 }
+                self.idle.notify_waiters();
             }
             Step::Sent {
                 upload,
@@ -664,7 +665,8 @@ impl Streams {
     /// completion: no part is started from then on, and once no part of it
     /// is in flight, returns its remote upload and the parts it holds.
     /// Returns `None` if there is no stream with an open remote upload to
-    /// complete.
+    /// complete; a body's stream whose remote upload is being opened is
+    /// waited for.
     pub(crate) async fn claim(&self, upload: EpochSeq) -> Option<Claim> {
         loop {
             let idle = self.idle.notified();
@@ -673,15 +675,21 @@ impl Streams {
             {
                 let mut streams = self.lock();
                 let stream = streams.get_mut(&upload)?;
-                let Remote::Open(id) = &stream.remote else {
-                    return None;
-                };
                 if stream.doomed {
                     return None;
                 }
-                stream.claimed = true;
-                stream.waiting.clear();
-                if stream.sending.is_empty() {
+                let id = match &stream.remote {
+                    Remote::Open(id) => Some(id.clone()),
+                    // A body's `PUT` may commit while its remote upload is
+                    // being opened: the open's request in flight decides.
+                    Remote::Opening if stream.body.is_some() => None,
+                    Remote::Opening | Remote::Unopened => return None,
+                };
+                if id.is_some() {
+                    stream.claimed = true;
+                    stream.waiting.clear();
+                }
+                if let Some(id) = id.filter(|_| stream.sending.is_empty()) {
                     // The parts whose acknowledgement came before the
                     // completion, whichever step the flusher handled first.
                     let at_completion = stream.completed_at.take().map(|completed| {
@@ -699,7 +707,7 @@ impl Streams {
                         .as_ref()
                         .and_then(|body| Some((body.part_bytes?, body.spans.clone())));
                     return Some(Claim {
-                        id: id.clone(),
+                        id,
                         flushed: stream.flushed.clone(),
                         at_completion,
                         body,
@@ -846,6 +854,11 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
                 }
                 Err(error) => {
                     tracing::debug!(key, %upload, %error, "a remote upload was not opened");
+                    // A body whose `PUT` committed meanwhile is sent without
+                    // its stream: its flush waits for no backoff.
+                    if headers.is_some() && !self.streams.wants_open(upload) {
+                        return None;
+                    }
                     tokio::time::sleep(self.target.settings.backoff(attempt)).await;
                 }
             }
