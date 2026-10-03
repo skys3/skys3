@@ -2383,9 +2383,22 @@ of this file. A task with nothing unexpected keeps "None."
   the session makes every request due, as in botocore, while the cache
   still loads one session at a time. Under load that is about one STS
   call per request: locally, Rust issued 475 to 1,700 sessions in 20
-  seconds, each a `PUT` in `sys-sessions`, without a failed request. The
-  token file gets a new token every five seconds, written atomically,
-  since clients read it at any moment.
+  seconds, each a `PUT` in `sys-sessions`, without a failed request.
+- **Refresh must be proven per provider, and with expiring tokens.** A
+  review found three ways the first version could pass without a
+  refresh. JavaScript seeded its set of keys with the default chain's
+  first key, so the tested provider's own first session made two. The
+  CLI's workers have their own caches, so their first sessions made
+  eight between them. And tokens lasted 60 seconds plus the node's 60
+  seconds of skew, longer than the load, so a client that never reread
+  the token file still worked. Now every client seeds its keys from the
+  provider or cache under test (each CLI worker needs two of its own),
+  and the node accepts a token for at most seven seconds
+  (`oidc_clock_skew_seconds = 1`, tokens of six seconds) while the file
+  gets a new one every two, written atomically since clients read it at
+  any moment. The Rust client checks after the load that the token it
+  read before it is refused with `ExpiredTokenException` and the current
+  one accepted, so the clients that kept working reread the file.
 - **SDK defaults differ.** botocore presigns with SigV2 unless told
   `signature_version="s3v4"`, which SkyS3 refuses as designed. The CLI's
   default checksum is CRC64NVME (it bundles the Common Runtime), the

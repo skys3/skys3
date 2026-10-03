@@ -132,13 +132,15 @@ case "$first" in ASIA*) ;; *) fail "access key $first" ;; esac
 deadline=$(($(date +%s) + SKYS3_LOAD_SECONDS))
 # Each worker has its own home: the CLI caches sessions in files under
 # ~/.aws/cli/cache, and concurrent processes sharing them fail with a
-# KeyError when one replaces an entry another is reading.
+# KeyError when one replaces an entry another is reading. So each worker
+# must show a refresh of its own: a key other than its first.
 worker() {
     n=$1
     i=0
     export HOME="$work/home-$n"
     mkdir -p "$HOME"
     head -c $((1000 + n * 100)) /dev/urandom >"$work/load-$n"
+    key_id >"$work/keys-$n"
     while [ "$(date +%s)" -lt "$deadline" ]; do
         aws s3api put-object --bucket "$wi" --key "load/$n/$((i % 4))" --body "$work/load-$n" >/dev/null
         aws s3api get-object --bucket "$wi" --key "load/$n/$((i % 4))" "$work/load-$n.out" >/dev/null
@@ -156,8 +158,11 @@ done
 for pid in $pids; do
     wait "$pid" || fail "a worker failed"
 done
-sessions=$( (echo "$first"; cat "$work"/keys-*) | sort -u | wc -l)
-[ "$sessions" -ge 2 ] || fail "the session was never refreshed"
+for n in 0 1 2 3 4 5 6 7; do
+    own=$(sort -u "$work/keys-$n" | wc -l)
+    [ "$own" -ge 2 ] || fail "worker $n never refreshed its session: $(cat "$work/keys-$n")"
+done
+sessions=$(cat "$work"/keys-* | sort -u | wc -l)
 count=0
 for file in "$work"/count-*; do
     count=$((count + 2 * $(cat "$file")))
