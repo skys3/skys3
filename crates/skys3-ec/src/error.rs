@@ -90,3 +90,15 @@ impl From<GeometryError> for EcError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Geometry;
+
+    #[test]
+    fn an_invalid_geometry_converts() {
+        let error = EcError::from(Geometry::new(0, 2).unwrap_err());
+        assert_eq!(error, EcError::InvalidGeometry { data: 0, parity: 2 });
+    }
+}

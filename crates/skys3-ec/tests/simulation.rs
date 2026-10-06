@@ -46,7 +46,7 @@ const SIZES: [u64; 7] = [64, 1024, 4096, 65_536, 65_600, 131_136, 199_936];
 
 /// Each seed's runs cost about this many typical simulation seeds, so CI's
 /// seed count is divided by it.
-const COST: u64 = 8;
+const COST: u64 = 2;
 
 /// A seed's workload.
 #[derive(Clone, Debug)]
