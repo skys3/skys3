@@ -5709,6 +5709,120 @@ of this file. A task with nothing unexpected keeps "None."
   - A version that falls back to `PutObject` is read whole into memory,
     as every single-PUT flush is.
 
+### M4-04 Upload takeover after a primary change
+
+- **Trusting `PART_FLUSHED` never built a wrong object; it could wedge
+  one.** A `PART_FLUSHED` is written only after the remote acknowledged its
+  part, it names the `MPU_PART` it was read from, and S3 checks every ETag
+  a Complete lists. So M4-02's resumed streams could only cost transfers
+  (a part whose record was lost was sent again), with one exception: a
+  send of the deposed primary that its flusher took for failed, or that
+  was still in flight when it died, can land after the new primary sent
+  that part. The Complete then lists an ETag the remote no longer holds,
+  gets `400 InvalidPart`, and M4-02 kept the stream as it was and retried
+  forever. The simulation shows exactly that when the listing is removed
+  (seeded bug below). The fix has two halves: a resumed stream lists the
+  remote upload before it sends or completes, and an `InvalidPart` makes
+  the stream list again before the retry (`Verdict::Relist`).
+- **When a stream lists (decided, design §7.3).** A stream loaded from the
+  index starts `Listing::Due`. An open one (local upload or body still
+  arriving) lists at once from the flusher's pump, retrying with backoff,
+  and sends nothing until then, so parts still to come are sent only if
+  the remote lacks them. A closed one is listed by its completion. A claim
+  never waits for a listing in flight: it would block a flush slot while
+  the remote fails, without reporting an error. It drops the listing
+  instead (listings are numbered, so a late answer is ignored) and the
+  completion lists itself, which fails and backs off like any request.
+- **What counts as held.** A recorded part counts only if the listing shows
+  its recorded ETag. A part to send is not sent if the listing shows the
+  local part's MD5 under its number: for a multipart part that is the
+  index's ETag, so nothing is read; for a body part the bytes are read and
+  hashed (`upload_span` now hashes before deciding). A multipart part
+  found this way gets its `PART_FLUSHED`, so the index catches up. A
+  number sent since the listing, or whose send failed (it may have
+  landed), is dropped from the listing.
+- **A gone remote upload is the completion's to judge.** The first version
+  doomed any stream whose listing found `404 NoSuchUpload`. For a closed
+  stream that is the "crash during complete" case: the old primary's
+  Complete applied and only its `FLUSHED` was lost. Dooming made the key
+  go the after-commit way, uploading every part again only to find its
+  own object through the 412. Now only an open stream is ended that way;
+  a closed one leaves it to its completion, whose `ListParts` failure goes
+  through the same path as a Complete's (`claim_failed`): `NoSuchUpload`
+  and a HEAD that finds the version's identity mean the flush is done.
+  The test of that case sends three requests (`ListParts`, HEAD, abort).
+- **Body streams are covered (decided, the orchestrator's question).**
+  M4-03 sent every part of a resumed body again. With the listing, the
+  completion keeps each part whose ETag is the MD5 of the `PUT`'s bytes
+  in that part's range and sends only the others, so the resend is gone
+  at the price of a local read. Announcements are still not durable: a
+  body whose *opened* record never committed streams under a new remote
+  upload if more announcements reach the new primary, and is otherwise
+  sent after commit.
+- **No format change.** The log stays at version 2, the index at format 8,
+  and the forwarding wire is untouched. Listing results live in memory.
+- **Simulation.** `primary_changes_at_every_step_of_a_streamed_upload_leave_no_partial_object`
+  (`tests/takeover_simulation`, `Runner::with_cost(8, 4)`, so CI runs 64
+  seeds) interleaves multipart uploads (re-uploaded numbers, partial
+  completions, aborts), streamed PUTs (some never commit, some first
+  announce extents their `PUT` will not name), and plain PUTs on an
+  AWS-like or R2-like `SimS3` with faults. About one operation in six is
+  a primary change aimed at a step: after open (the remote upload is
+  recorded), mid-part (a moment after a part commits), after
+  `PART_FLUSHED` (some parts recorded), or during complete (a moment
+  after the local completion, or once the remote object appears). The
+  flusher is dropped where it is, the node loses power (uncommitted
+  `PART_FLUSHED` and `FLUSHED` records go, as with a dead primary), and a
+  new flusher takes over from the log. At each change the deposed
+  primary's sends of earlier part bodies may land up to 150 ms later.
+  The checks: no identity at the remote before its local commit; every
+  remote object and version with a committed write's identity holds
+  exactly its bytes and ETag; aborted and failed writes never published;
+  every key clean with its latest write and `remote_etag`; every remote
+  upload the log ever recorded completed or aborted.
+- **Seeded bugs it catches** (each run at `SKYS3_SIM_SEEDS=1024`, which is
+  256 seeds of this scenario, and reverted):
+  - Trusting `PART_FLUSHED` without `ListParts` (resumed streams start
+    `Known`, and `InvalidPart` keeps the stream as M4-02 did): **seed 39**,
+    the flush never settles, `400 InvalidPart: part 4`.
+  - Reusing a listed part whose ETag differs from the local MD5, in both
+    `upload_part` and `upload_span`: **seed 7**, the remote object of an
+    upload holds an earlier body of its part 3.
+  - The same for body parts only: **seed 9**, a streamed `PUT`'s remote
+    object starts with the stale extents' bytes. Before the scenario
+    announced stale extents, this bug passed all 256 seeds: the old
+    primary sends a body's own bytes, so only extents the `PUT` does not
+    name make a listed body part wrong.
+  - Earlier in this task, the first version of the scenario caught both
+    of the first two bugs at seed 0.
+- **Timings.** At `SKYS3_SIM_SEEDS=1024` (256 seeds of the scenario) in a
+  debug build, the scenario took 74.2 s alone; CI's 64 seeds take about a
+  quarter of that. CI's whole simulation set (`cargo test --workspace
+  --all-features --test simulation`, `SKYS3_SIM_SEEDS=256`) passed in 39.7 min of wall time, build
+  included: the 78 cluster scenarios in 1,942 s, and the five flush
+  scenarios, this one at 64 seeds, in 64.7 s.
+- **Tests.** `tests/takeover.rs` plays the old primary's requests straight
+  to the remote and counts the new primary's: a part sent without its
+  record is not sent again (after a failed `ListParts`, too); a recorded
+  part a late send replaced is sent again; a refused Complete lists again;
+  a Complete the old primary sent is found by its identity; an open upload
+  whose remote upload vanished is sent after commit; a resumed body sends
+  only the parts whose MD5 the remote lacks; and a store that pages one
+  part at a time, or whose pages stop advancing. Two existing restart
+  tests now count the `ListParts`, and the resumed body test asserts it
+  no longer sends its first part again.
+- **Left open.**
+  - The `InvalidPart` safety net relies on the target checking each part's
+    ETag in `CompleteMultipartUpload`, as S3 and `SimS3` do. A target that
+    assembled whatever its parts hold would let a late send through. The
+    capability probe does not test it.
+  - Remote uploads whose *opened* record died with the primary are still
+    left to the lifecycle rule (§7.3).
+  - The cluster simulation exercises takeovers of streamed uploads, but
+    not aimed at steps; this scenario does that at the flusher, with a
+    power loss standing in for the primary change (a new primary holds
+    every committed record, and may lose the same uncommitted ones).
+
 ### M4-05 UploadPartCopy
 
 - **The source is read as a GET reads it, not through the primary.**

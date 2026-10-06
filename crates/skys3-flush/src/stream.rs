@@ -1477,6 +1477,124 @@ mod tests {
         assert_eq!(part_range(2, u64::MAX), (u64::MAX, u64::MAX));
     }
 
+    fn etag(value: &str) -> ETag {
+        ETag::new(value).unwrap()
+    }
+
+    #[test]
+    fn a_listing_keeps_only_the_parts_the_remote_holds_as_recorded() {
+        let mut flushed = BTreeMap::from([
+            (1, (position(2), etag("a"))),
+            (2, (position(3), etag("b"))),
+            (3, (position(4), etag("c"))),
+        ]);
+        let remote = BTreeMap::from([(1, etag("a")), (2, etag("x"))]);
+        let stale = confirm(&mut flushed, &remote);
+        assert_eq!(stale, [(2, position(3)), (3, position(4))]);
+        assert_eq!(flushed.keys().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    /// A resumed stream that is open: part 1 recorded from the `MPU_PART`
+    /// at 2, part 2 waiting to be sent from 3, and the listing numbered 7
+    /// in flight.
+    fn resumed(streams: &Streams, upload: EpochSeq, open: bool) {
+        let mut stream = Stream::new("k".to_owned(), Remote::Open(UploadId("r".into())), open);
+        stream.flushed.insert(1, (position(2), etag("a")));
+        stream.waiting.insert(2, position(3));
+        stream.listing = Listing::Running(7);
+        streams.lock().insert(upload, stream);
+    }
+
+    fn listed(streams: &Streams, upload: EpochSeq, run: u64, listed: Listed) {
+        streams.finish(Step::Listed {
+            upload,
+            run,
+            listed,
+        });
+    }
+
+    #[test]
+    fn a_listing_requeues_what_the_remote_lacks_and_a_stale_one_is_ignored() {
+        let streams = Streams::default();
+        let upload = position(1);
+        resumed(&streams, upload, true);
+        assert!(streams.wants_listing(upload, 7));
+        assert!(!streams.wants_listing(upload, 6));
+        // An earlier listing's answer changes nothing.
+        let remote = BTreeMap::from([(1, etag("x")), (2, etag("b"))]);
+        listed(&streams, upload, 6, Listed::Parts(remote.clone()));
+        assert_eq!(streams.lock()[&upload].listing, Listing::Running(7));
+
+        // The remote holds another part 1 than recorded: it is sent again.
+        listed(&streams, upload, 7, Listed::Parts(remote));
+        {
+            let map = streams.lock();
+            let stream = &map[&upload];
+            assert_eq!(stream.listing, Listing::Known);
+            assert!(stream.flushed.is_empty());
+            assert_eq!(
+                stream.waiting,
+                BTreeMap::from([(1, position(2)), (2, position(3))])
+            );
+            assert_eq!(stream.listed.len(), 2);
+        }
+        // What the remote holds under a number sent since, or whose send
+        // failed, is no longer known from the listing.
+        let at = Instant::now();
+        for (number, sent) in [(1, Sent::Done(etag("a"), at)), (2, Sent::Failed)] {
+            streams.finish(Step::Sent {
+                upload,
+                number,
+                position: position(u64::from(number) + 1),
+                sent,
+            });
+        }
+        assert!(streams.lock()[&upload].listed.is_empty());
+
+        // An open upload whose remote upload is gone ends its stream.
+        streams.lock().get_mut(&upload).unwrap().listing = Listing::Running(8);
+        listed(&streams, upload, 8, Listed::Gone);
+        assert!(streams.lock()[&upload].doomed);
+        assert!(!streams.wants_listing(upload, 8));
+    }
+
+    #[test]
+    fn a_closed_stream_leaves_a_failed_listing_to_its_completion() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let streams = Streams::default();
+            let upload = position(1);
+            resumed(&streams, upload, false);
+            // A gone remote upload may have been completed: the completion
+            // finds out.
+            listed(&streams, upload, 7, Listed::Gone);
+            let stream = |check: fn(&Stream) -> bool| check(&streams.lock()[&upload]);
+            assert!(stream(|s| s.listing == Listing::Due && !s.doomed));
+
+            // A claim does not wait for a listing in flight: it drops it,
+            // and the completion lists the remote upload itself.
+            streams.lock().get_mut(&upload).unwrap().listing = Listing::Running(9);
+            let claim = streams.claim(upload).await.unwrap();
+            assert_eq!(claim.listed, None);
+            assert!(!streams.wants_listing(upload, 9));
+            listed(&streams, upload, 9, Listed::Dropped);
+            streams.reconciled(upload, BTreeMap::from([(1, etag("a"))]));
+            assert!(stream(
+                |s| s.listing == Listing::Known && s.flushed.len() == 1
+            ));
+
+            // A part the Complete was refused for makes it list again.
+            streams.release(upload, Verdict::Relist);
+            assert!(stream(|s| s.listing == Listing::Due && !s.claimed));
+            let claim = streams.claim(upload).await.unwrap();
+            assert_eq!(claim.listed, None);
+            streams.release(upload, Verdict::Keep);
+        });
+    }
+
     #[test]
     fn a_body_queues_each_covered_part_once() {
         let mut body = Body::new(None);
