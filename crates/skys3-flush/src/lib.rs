@@ -29,7 +29,10 @@
 //!   and the remote upload is completed by the flush of the completed
 //!   version, never before the local completion commits; every step is
 //!   recorded with a `PART_FLUSHED`, so the shard log keeps the remote
-//!   upload IDs and a restarted flusher resumes. Aborted and abandoned
+//!   upload IDs and a restarted flusher, or a new primary's, resumes. A
+//!   resumed stream is reconciled with a remote `ListParts` before it sends
+//!   or completes: a part counts as sent only if the remote holds it with
+//!   the recorded ETag or the local part's MD5. Aborted and abandoned
 //!   remote uploads are aborted. A version that cannot use its stream,
 //!   such as one retagged by `TAGS`, is sent after commit: a new remote
 //!   upload filled from the local log. An upload of that kind that does
