@@ -77,6 +77,10 @@ skip = [
     # are on digest 0.11. Remove once crc-fast moves to digest 0.11.
     { crate = "digest@0.10", reason = "crc-fast (AWS SDK checksums and s3s) is still on digest 0.10" },
     { crate = "crypto-common@0.1", reason = "digest 0.10 through crc-fast (AWS SDK checksums and s3s)" },
+    # reed-solomon-simd 3.1.0 (the erasure codec, skys3-ec) detects SIMD
+    # support with cpufeatures 0.2; sha1, sha2, and chacha20 are on 0.3.
+    # Remove once reed-solomon-simd moves to cpufeatures 0.3.
+    { crate = "cpufeatures@0.2", reason = "reed-solomon-simd is on cpufeatures 0.2; sha1, sha2, and chacha20 on 0.3" },
 ]
 
 [sources]
