@@ -5484,8 +5484,10 @@ of this file. A task with nothing unexpected keeps "None."
   streams of keys the scan left untracked.
 - **Overlap metric.** `skys3_flush_streaming_overlap_ratio{bucket}` is a
   histogram, observed once per streamed completion: the fraction of the
-  kept bytes the remote held when the local completion applied (snapshot
-  taken on the `Stored` change, not when the flush runs).
+  kept bytes the remote held when the local completion applied. Each part's
+  send task timestamps the remote's answer, and the flusher timestamps the
+  completion's `Stored` change when it reads it. The completion counts the
+  parts acknowledged by then.
   Because Prometheus histograms have no `count()` or `sum()` outside
   test-util, the service test reads them from the encoded registry. The
   admin status gains `streamed_uploads` (the open streams). Both are in
@@ -5563,6 +5565,28 @@ of this file. A task with nothing unexpected keeps "None."
   (`cargo test --workspace --all-features --test simulation`,
   `SKYS3_SIM_SEEDS=256`) passed, with the 75 cluster scenarios taking
   2,337 s.
+- **Review fixes.**
+  - *A failed read could orphan an opened remote upload.* After
+    `CreateMultipartUpload` and its *opened* record succeeded, the open
+    read the local parts, and a failed read ended the open as if the local
+    upload had closed. The stream was then dropped while the index still
+    recorded the remote upload. Nothing completed or aborted it, and the
+    completion opened a second one. The open now reads the parts in the
+    read it already retries, before the Create, so nothing fallible
+    follows the record. A part stored after that read reaches the stream
+    by its change.
+  - *Testing it.* `tests/stream_faults.rs` uses a `test-util` failpoint
+    (`skys3_flush::test_hooks`) to fail one such read. Without the fix
+    the parts never stream.
+  - *Overlap depended on event order.* It counted the parts whose step
+    the flusher had handled before the completion's change, and
+    `select!` may take either first. It now compares each part's
+    acknowledgement time with the completion's. A unit test handles the
+    change before both steps, one part acknowledged before it and one
+    after. Without the fix it counts neither part.
+  - *Remaining skew.* A part acknowledged after the completion applied,
+    but before the flusher read its change, still counts. The bound is
+    the change's queueing delay in the flusher's loop.
 - **Left open.**
   - Plan M4-04 adds the `ListParts` reconciliation. Until then, a part
     whose `PART_FLUSHED` was lost is sent again, which is correct but

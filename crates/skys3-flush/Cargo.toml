@@ -11,6 +11,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Failpoints for tests.
+test-util = []
+
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
@@ -34,6 +38,7 @@ rand.workspace = true
 rcgen.workspace = true
 s3s.workspace = true
 skys3-control.workspace = true
+skys3-flush = { path = ".", features = ["test-util"] }
 skys3-gateway = { workspace = true, features = ["test-util"] }
 skys3-net.workspace = true
 skys3-peer.workspace = true

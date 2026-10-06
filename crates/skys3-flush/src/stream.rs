@@ -55,6 +55,7 @@ use skys3_shard::{Shard, ShardError};
 use skys3_types::{ETag, EpochSeq};
 use tokio::sync::{Notify, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 use crate::attempt::{Failure, content_md5, read_payload};
 use crate::multipart::create_request;
@@ -94,9 +95,13 @@ struct Stream {
     doomed: bool,
     /// Its abort is running.
     aborting: bool,
-    /// The parts the remote held when the client completed the upload, for
-    /// the streaming-overlap metric.
-    at_completion: Option<BTreeMap<u16, EpochSeq>>,
+    /// When the remote acknowledged each part in `flushed`, for the
+    /// streaming-overlap metric. A part loaded from the index has none: the
+    /// remote held it before this flusher started.
+    acked: BTreeMap<u16, Instant>,
+    /// When this flusher learned that the local completion committed, until
+    /// a completion claims the stream.
+    completed_at: Option<Instant>,
 }
 
 impl Stream {
@@ -111,7 +116,8 @@ impl Stream {
             claimed: false,
             doomed: false,
             aborting: false,
-            at_completion: None,
+            acked: BTreeMap::new(),
+            completed_at: None,
         }
     }
 
@@ -150,8 +156,9 @@ pub(crate) enum Step {
 /// How a part's send ended.
 #[derive(Debug)]
 pub(crate) enum Sent {
-    /// The remote holds it, with this ETag.
-    Done(ETag),
+    /// The remote holds it, with this ETag, since this instant: when the
+    /// task saw the answer, whenever the flusher gets to the step.
+    Done(ETag, Instant),
     /// It failed, or the part was replaced first; the completion sends it.
     Failed,
     /// The remote upload is gone.
@@ -273,13 +280,7 @@ impl Streams {
     pub(crate) fn completed(&self, upload: EpochSeq) {
         if let Some(stream) = self.lock().get_mut(&upload) {
             stream.open = false;
-            stream.at_completion = Some(
-                stream
-                    .flushed
-                    .iter()
-                    .map(|(number, (position, _))| (*number, *position))
-                    .collect(),
-            );
+            stream.completed_at = Some(Instant::now());
         }
     }
 
@@ -368,8 +369,9 @@ impl Streams {
                 if let Some(stream) = streams.get_mut(&upload) {
                     stream.sending.remove(&number);
                     match sent {
-                        Sent::Done(etag) => {
+                        Sent::Done(etag, at) => {
                             stream.flushed.insert(number, (position, etag));
+                            stream.acked.insert(number, at);
                         }
                         Sent::Failed => {}
                         Sent::Gone => stream.doomed = true,
@@ -474,10 +476,22 @@ impl Streams {
                 stream.claimed = true;
                 stream.waiting.clear();
                 if stream.sending.is_empty() {
+                    // The parts whose acknowledgement came before the
+                    // completion, whichever step the flusher handled first.
+                    let at_completion = stream.completed_at.take().map(|completed| {
+                        stream
+                            .flushed
+                            .iter()
+                            .filter(|(number, _)| {
+                                stream.acked.get(number).is_none_or(|at| *at <= completed)
+                            })
+                            .map(|(number, (position, _))| (*number, *position))
+                            .collect()
+                    });
                     return Some(Claim {
                         id: id.clone(),
                         flushed: stream.flushed.clone(),
-                        at_completion: stream.at_completion.take(),
+                        at_completion,
                     });
                 }
             }
@@ -490,6 +504,7 @@ impl Streams {
     pub(crate) fn sent(&self, upload: EpochSeq, number: u16, position: EpochSeq, etag: ETag) {
         if let Some(stream) = self.lock().get_mut(&upload) {
             stream.flushed.insert(number, (position, etag));
+            stream.acked.insert(number, Instant::now());
         }
     }
 
@@ -547,14 +562,23 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
     /// Opens the remote upload and records its ID, trying again after a
     /// backoff while the local upload is open. Returns the ID and the local
     /// upload's parts, or `None` if the local upload closed first.
+    ///
+    /// The parts are read before the remote upload is opened, by the read
+    /// that is tried again: once the remote upload and its record exist,
+    /// nothing can fail and leave them behind. A part stored after the read
+    /// is queued by its change, since the stream exists before this task.
     async fn open(&self) -> Option<(UploadId, Vec<(u16, EpochSeq)>)> {
         let (key, upload) = (self.key.as_str(), self.upload);
         let identity = self.target.identity(self.shard.shard(), upload);
         let remote_key = format!("{}{key}", self.target.prefix);
         for attempt in 1.. {
-            let local = match self.shard.upload(key, upload, 0, 0).await {
+            let read = match self.shard.upload(key, upload, 0, usize::MAX).await {
+                Ok(_) if test_hooks::fail_parts_read() => Err("a test failed it".to_owned()),
+                read => read.map_err(|error| error.to_string()),
+            };
+            let (local, parts) = match read {
                 Ok(None) => return None,
-                Ok(Some((local, _))) => local,
+                Ok(Some(found)) => found,
                 Err(error) => {
                     tracing::debug!(key, %upload, %error, "a remote upload was not opened");
                     tokio::time::sleep(self.target.settings.backoff(attempt)).await;
@@ -574,7 +598,6 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
                 Ok(id) => {
                     // The ID is in the log before any part is sent.
                     self.record(&id, RemoteStep::Opened).await;
-                    let parts = self.shard.parts(upload, 0, usize::MAX).await.ok()?;
                     let parts = parts.into_iter().map(|(n, p)| (n, p.position)).collect();
                     return Some((id, parts));
                 }
@@ -603,13 +626,14 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
         };
         match upload_part(&self.shard, &self.target, &self.key, id, number, &part).await {
             Ok(etag) => {
+                let at = Instant::now();
                 let step = RemoteStep::Part {
                     number,
                     position,
                     remote_etag: etag.clone(),
                 };
                 drop(self.record(id, step));
-                Sent::Done(etag)
+                Sent::Done(etag, at)
             }
             Err(Failure::Remote(error)) if error.kind() == S3ErrorKind::NoSuchUpload => Sent::Gone,
             Err(failure) => {
@@ -673,4 +697,101 @@ pub(crate) async fn upload_part<S: ObjectStore, D: Disk>(
         .upload_part(request)
         .await
         .map_err(Failure::Remote)
+}
+
+/// A failpoint for tests: reads of an upload's parts by a stream's open
+/// that fail, as an index read may.
+#[cfg(feature = "test-util")]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static FAILING: AtomicU32 = AtomicU32::new(0);
+
+    /// Makes the next `count` reads of an upload's parts by a stream's
+    /// open fail, in every flusher of this process.
+    pub fn fail_parts_reads(count: u32) {
+        FAILING.store(count, Ordering::SeqCst);
+    }
+
+    /// Whether this read fails, counting it.
+    pub(crate) fn fail_parts_read() -> bool {
+        let mut left = FAILING.load(Ordering::SeqCst);
+        while left > 0 {
+            match FAILING.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(now) => left = now,
+            }
+        }
+        false
+    }
+}
+
+#[cfg(not(feature = "test-util"))]
+mod test_hooks {
+    /// No read fails without the `test-util` feature.
+    pub(crate) fn fail_parts_read() -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use skys3_types::{Epoch, Seq};
+
+    use super::*;
+
+    fn position(seq: u64) -> EpochSeq {
+        EpochSeq::new(Epoch::new(1), Seq::new(seq))
+    }
+
+    /// The overlap counts the parts the remote acknowledged before the
+    /// local completion, whichever the flusher handled first: here the
+    /// completion's change comes before both parts' steps, one part
+    /// acknowledged before it and one after.
+    #[test]
+    fn overlap_follows_when_parts_were_acknowledged_not_when_they_were_handled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let streams = Streams::default();
+            let upload = position(1);
+            streams.opened("k", upload);
+            let parts = vec![(1, position(2)), (2, position(3))];
+            streams.finish(Step::Opened(
+                upload,
+                Some((UploadId("r".to_owned()), parts)),
+            ));
+            {
+                let mut map = streams.lock();
+                let stream = map.get_mut(&upload).unwrap();
+                stream.waiting.clear();
+                stream.sending.extend([1, 2]);
+            }
+            let early = Instant::now();
+            tokio::time::advance(Duration::from_millis(5)).await;
+            streams.completed(upload);
+            tokio::time::advance(Duration::from_millis(5)).await;
+            let late = Instant::now();
+            let etag = ETag::new("e").unwrap();
+            for (number, at) in [(1, early), (2, late)] {
+                streams.finish(Step::Sent {
+                    upload,
+                    number,
+                    position: position(u64::from(number) + 1),
+                    sent: Sent::Done(etag.clone(), at),
+                });
+            }
+            let claim = streams.claim(upload).await.unwrap();
+            assert_eq!(claim.flushed.len(), 2);
+            assert_eq!(
+                claim.at_completion,
+                Some(BTreeMap::from([(1, position(2))]))
+            );
+        });
+    }
 }
