@@ -5598,7 +5598,11 @@ of this file. A task with nothing unexpected keeps "None."
   18 (the `remote_etag` check), and with that check off at seed 122 (the
   flusher deletes another writer's object); completing the remote upload
   before the `PUT` commits fails at seed 2 (a failed `PUT`'s identity is
-  published). TIMINGS
+  published). No scenario was added, so no cost changes. At
+  `SKYS3_SIM_SEEDS=256` in a debug build on four loaded cores,
+  `flushes_reach_the_remote_through_faults` took 43.5 s alone (M4-02
+  reported 44.6 s), the four flush scenarios 116 s one at a time, and
+  CI's whole simulation set passed, its cluster simulation in 2,274.5 s.
 - **Cluster simulation.** Gateways now announce bodies, so
   `skys3-cluster-sim` streams every `PUT` of 1,024 bytes or more in
   `write_back` buckets, with 512-byte parts, `min_part_size` 1 on the
