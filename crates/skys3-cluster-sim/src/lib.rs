@@ -105,7 +105,8 @@ pub use cluster::{
     View, WriteTiming,
 };
 pub use coordination::{
-    Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
+    Change, ChangeStage, CoordinatedServices, CoordinationConfig, CoordinatorLoss, Forgotten,
+    LostCoordinator, PUSH_PORT, PushDelays, RegistryView,
 };
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use holders::{HolderCounts, HolderFaults};

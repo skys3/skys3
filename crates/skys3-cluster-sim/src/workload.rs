@@ -52,6 +52,11 @@ pub struct Workload {
     pub think_time: Duration,
     /// How long a client waits for an answer.
     pub timeout: Duration,
+    /// How long a client waits for a connection, if not `timeout`: a
+    /// short one lets clients that send to any node, as through a load
+    /// balancer, move on from a node that is down instead of waiting out
+    /// `timeout` each time they draw it.
+    pub connect_timeout: Option<Duration>,
     /// Whether clients send each request to a node drawn at random, whose
     /// gateway routes it to the primary, rather than to the primary
     /// itself. A forwarded write may still apply after the gateway gave up
@@ -73,9 +78,17 @@ impl Default for Workload {
             max_body: 2048,
             think_time: Duration::from_millis(200),
             timeout: Duration::from_secs(2),
+            connect_timeout: None,
             any_gateway: false,
             get_percent: 0,
         }
+    }
+}
+
+impl Workload {
+    /// How long a client waits for a connection.
+    fn connecting(&self) -> Duration {
+        self.connect_timeout.unwrap_or(self.timeout)
     }
 }
 
@@ -352,7 +365,7 @@ impl Client {
         request: Request<Full<Bytes>>,
     ) -> Result<Response<Bytes>, NoAnswer> {
         let timeout = self.workload.timeout;
-        let answer = match s3::connect(host, timeout).await {
+        let answer = match s3::connect(host, self.workload.connecting()).await {
             Ok(connection) => connection.send(request, timeout).await,
             Err(error) => Err(error),
         };
@@ -373,7 +386,7 @@ impl Client {
         request: Request<Full<Bytes>>,
     ) -> Option<(Pending, Result<Response<Bytes>, NoAnswer>)> {
         let timeout = self.workload.timeout;
-        let connection = match s3::connect(host, timeout).await {
+        let connection = match s3::connect(host, self.workload.connecting()).await {
             Ok(connection) => connection,
             Err(error) => {
                 tracing::debug!(process = %self.process, %host, %error, "no connection");
