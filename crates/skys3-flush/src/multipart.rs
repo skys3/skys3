@@ -5,7 +5,10 @@
 //! **Streamed.** An object whose upload streamed to the remote while the
 //! client uploaded (see the `stream` module) completes that remote upload:
 //! the attempt sends the parts the stream did not, and completes it with
-//! exactly the parts the local completion kept.
+//! exactly the parts the local completion kept. A stream resumed after a
+//! restart or a primary change first lists the remote upload (`ListParts`):
+//! a part counts as sent only if the remote holds it with the ETag the
+//! stream recorded, or with the part's MD5 (§7.3).
 //!
 //! **After commit.** Otherwise, an attempt opens a remote upload whose `CreateMultipartUpload` carries
 //! the version's write identity (the upload's `MPU_CREATE`, or the `TAGS`
@@ -141,11 +144,14 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         version: EpochSeq,
         upload: EpochSeq,
         parts: &[(u16, Part)],
-        claim: Claim,
+        mut claim: Claim,
         identity: &WriteIdentity,
         expected: Option<ETag>,
     ) -> Result<Outcome, Failure> {
         let streams = self.streams;
+        if let Err(failure) = self.reconcile(upload, &mut claim).await {
+            return self.claim_failed(version, upload, failure, identity).await;
+        }
         if let Some(at_completion) = &claim.at_completion {
             let total: u64 = parts.iter().map(|(_, part)| part.size).sum();
             let streamed: u64 = parts
@@ -164,6 +170,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             let etag = match claim.flushed.get(number) {
                 Some((position, etag)) if *position == part.position => etag.clone(),
                 _ => {
+                    // The remote may hold the part already: the old
+                    // primary's send whose record was lost.
+                    let listed = claim.listed.as_ref().and_then(|listed| listed.get(number));
                     let sent = stream::upload_part(
                         self.shard,
                         self.target,
@@ -171,6 +180,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                         &claim.id,
                         *number,
                         part,
+                        listed,
                     )
                     .await;
                     match sent {
@@ -185,8 +195,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                             etag
                         }
                         Err(failure) => {
-                            streams.release(upload, verdict_after(&failure));
-                            return Err(failure);
+                            return self.claim_failed(version, upload, failure, identity).await;
                         }
                     }
                 }
@@ -235,19 +244,46 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 streams.release(upload, Verdict::Abort);
                 Ok(outcome)
             }
-            Err(failure) => {
-                let verdict = verdict_after(&failure);
-                streams.release(upload, verdict);
-                // A Complete whose answer was lost may have been applied,
-                // which consumed the upload: the retry finds it gone.
-                if verdict == Verdict::Abort
-                    && let Found::Mine(info) = self.inspect(identity, version, None).await?
-                {
-                    return Ok(flushed(version, Some(info), true));
-                }
-                Err(failure)
-            }
+            Err(failure) => self.claim_failed(version, upload, failure, identity).await,
         }
+    }
+
+    /// Lists the remote upload of a claimed stream that does not know what
+    /// the remote holds, because it was resumed from the index or the
+    /// remote refused a part it listed (§7.3), and keeps in `claim` only
+    /// the parts the remote holds as recorded.
+    pub(crate) async fn reconcile(
+        &self,
+        upload: EpochSeq,
+        claim: &mut Claim,
+    ) -> Result<(), Failure> {
+        if claim.listed.is_none() {
+            let remote = stream::list_parts(self.target, self.key, &claim.id).await?;
+            self.streams.reconciled(upload, remote.clone());
+            claim.reconcile(remote);
+        }
+        Ok(())
+    }
+
+    /// Ends the claim on the stream of `upload` after `failure`, and
+    /// returns the attempt's outcome. A remote upload that is gone may have
+    /// been consumed by an earlier Complete whose answer was lost: if the
+    /// remote holds the version's identity, the version is flushed (§7.2).
+    pub(crate) async fn claim_failed(
+        &self,
+        version: EpochSeq,
+        upload: EpochSeq,
+        failure: Failure,
+        identity: &WriteIdentity,
+    ) -> Result<Outcome, Failure> {
+        let verdict = verdict_after(&failure);
+        self.streams.release(upload, verdict);
+        if verdict == Verdict::Abort
+            && let Found::Mine(info) = self.inspect(identity, version, None).await?
+        {
+            return Ok(flushed(version, Some(info), true));
+        }
+        Err(failure)
     }
 
     /// The parts of the upload opened at `upload`, as the index holds them,
@@ -279,16 +315,32 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         number: u16,
         part: &Part,
     ) -> Result<ETag, Failure> {
-        stream::upload_part(self.shard, self.target, self.key, upload_id, number, part).await
+        stream::upload_part(
+            self.shard,
+            self.target,
+            self.key,
+            upload_id,
+            number,
+            part,
+            None,
+        )
+        .await
     }
 }
 
 /// What a failed streamed completion leaves of its stream: a remote upload
-/// that is gone is aborted (which records its end), anything else is kept
+/// that is gone is aborted (which records its end); one that refused a
+/// part the completion listed, `400 InvalidPart`, is listed again before
+/// the retry, since the remote does not hold what the stream recorded (a
+/// late send of an old primary replaced the part); anything else is kept
 /// for the retry.
 pub(crate) fn verdict_after(failure: &Failure) -> Verdict {
     match failure {
-        Failure::Remote(error) if error.kind() == S3ErrorKind::NoSuchUpload => Verdict::Abort,
+        Failure::Remote(error) => match error.kind() {
+            S3ErrorKind::NoSuchUpload => Verdict::Abort,
+            S3ErrorKind::InvalidPart => Verdict::Relist,
+            _ => Verdict::Keep,
+        },
         _ => Verdict::Keep,
     }
 }

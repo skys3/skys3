@@ -268,7 +268,8 @@ fn a_restarted_flusher_resumes_the_streams_the_log_records() {
         let before = store.stats().requests;
 
         // The new flusher reads the remote upload and its part from the
-        // index: it opens nothing, and sends only the part it lacks.
+        // index: it opens nothing, lists the remote upload to confirm the
+        // part, and sends only the part it lacks.
         let second = node.part("k", upload, 2, "second").await;
         let flusher = node.flusher(&target);
         let parts = [(1, first, "first; "), (2, second, "second")];
@@ -276,7 +277,7 @@ fn a_restarted_flusher_resumes_the_streams_the_log_records() {
         node.settle(&flusher).await;
         assert_flushed(&node, &store, "k", &object, "first; second").await;
         wait_for_no_streams(&node, &flusher, &store).await;
-        assert_eq!(store.stats().requests - before, 2);
+        assert_eq!(store.stats().requests - before, 3);
 
         // An upload opened while no flusher ran gets its stream when one
         // starts.
