@@ -229,7 +229,7 @@ fn scenario(context: &mut SimContext) -> Outcome {
                         Some(Some(version))
                             if version.streamed.is_some() && version.streamed == at_remote =>
                         {
-                            Some(version.body.clone()).filter(|_| rng.random_bool(0.5))
+                            rng.random_bool(0.5).then(|| version.body.clone())
                         }
                         _ => None,
                     };

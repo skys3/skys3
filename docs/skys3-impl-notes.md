@@ -5579,6 +5579,14 @@ of this file. A task with nothing unexpected keeps "None."
     the inherent limit of ETag preconditions (§7.2); the simulation now
     copies a streamed version only when the remote holds it as its
     multipart object.
+  - *A member took announcements.* `Shard::announce` first checked only
+    that the shard ran, so after a primary change a gateway with a stale
+    map had its announcement accepted by a member, whose flusher never
+    sees the `PUT`; the cluster simulation's routing audit caught it
+    (`routing_while_a_primary_restarts`, seed 0, intermittently). It now
+    checks as a write does: a member answers `NotPrimary`, which
+    redirects the gateway, and a primary that does not serve yet is
+    unavailable.
   - *Crash tests need recovery.* The flusher test support reopened the
     index without replaying the log, which a crash test needs; `open_on`
     now replays with a `Checkpointer`.
