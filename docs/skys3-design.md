@@ -1005,6 +1005,8 @@ A crash before step 3 leaves the replicas authoritative, plus some unreferenced 
 
 If the object is overwritten or deleted while it is being encoded, the `EC_PUBLISH` is dropped when it is applied, because it names a version that is no longer current. Its fragments become orphans.
 
+**Codecs.** A stripe is always decoded by the codec whose ID it records. Codec 1 is systematic Reed-Solomon from `reed-solomon-simd`, always in its high-rate form (the library's default picks high or low rate by a heuristic, and the two produce different parity). For a stripe of `L` bytes in a `k+m` geometry, every fragment is `S` bytes: `⌈L/k⌉` rounded up to a multiple of 64. Data fragment `i` holds bytes `i·S` to `(i+1)·S` of the stripe, cut at `L` and zero-padded; fragments `k` to `k+m−1` are parity. A stripe holds at least one byte and at most 255 fragments. Golden vectors in the repository freeze each codec's output. A change to any fragment byte, including one caused by a library upgrade, is a new codec ID, and earlier IDs stay decodable.
+
 ### 8.5 Reads of coded objects
 
 The read plan (section 9.2) lists the fragment nodes for the requested range. The code is systematic, so a healthy read fetches only the data fragments that cover the range, with no decoding. If a fragment is missing or fails its checksum, the gateway reads any `k` fragments of that stripe and decodes the needed range.

@@ -5913,3 +5913,41 @@ of this file. A task with nothing unexpected keeps "None."
   answers `503` for an evicted source. With M4-02, a copied part must also be
   streamed to the remote upload; it reaches the shard through the same
   `Upload` as an UploadPart body.
+
+## M5 Local erasure coding
+
+### M5-01 EcCodec
+
+- **The library's default rate is not a stable format.** `reed-solomon-simd`
+  has two encodings, high rate and low rate, which produce different parity
+  and cannot decode each other's. Its default encoder picks one per call
+  from the fragment counts with a heuristic (high rate for every design
+  geometry today, low rate for shapes like 2+3). A future release could
+  change the heuristic and silently change fragments, so codec 1 uses the
+  high-rate encoder and decoder explicitly; high rate supports every
+  geometry up to the 255-fragment cap.
+- **Fragment sizes.** Version 3 of the library accepts any even shard size,
+  but its README promises identical output across versions only for
+  multiples of 64. Codec 1 rounds the fragment length up to 64 bytes, at a
+  cost of under `64·k` bytes per stripe.
+- **Golden vectors checked independently.** The vectors were generated with
+  `reed-solomon-simd` 3.1.0 and checked outside the repository against
+  `reed-solomon-16` 0.1.0, the crate it was forked from; the high-rate
+  parity matched byte for byte. A unit test also checks the run-time SIMD
+  engine against the portable one, so a CI runner with a different CPU
+  cannot pass with different bytes.
+- **Decoding is slow unoptimized.** Every decode with a missing data
+  fragment runs a transform over all of GF(2^16), whatever the fragment
+  size. Unoptimized, the exhaustive erasure tests took over 30 seconds, and
+  about 5 with the codec built at `opt-level = 3`, now set for
+  `reed-solomon-simd` in the dev profile of the root `Cargo.toml`. The same
+  cost keeps the fuzz target at about 800 runs per second.
+- **`cpufeatures` 0.2.** `reed-solomon-simd` 3.1.0, the latest release,
+  detects SIMD support with `cpufeatures` 0.2, while `sha1`, `sha2`, and
+  `chacha20` are on 0.3. `deny.toml` skips `cpufeatures@0.2` until it
+  moves.
+- **Left open.** Configuration does not bound `ec.max_data_fragments +
+  ec.parity_fragments` by the 255-fragment cap of `Geometry`; M5-03, which
+  turns the configuration into geometries, should. A codec decodes whole
+  stripes; decoding only the range a coded read needs (§8.5) is left to
+  M5-06.
