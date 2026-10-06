@@ -25,7 +25,7 @@ use skys3_index::{
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Delete, Extent, ExtentRef, Flushed, Put, PutData};
 use skys3_log::{LogConfig, RecordBody, SegmentLog};
-use skys3_shard::{ReadId, ReadPlan, Registered, ShardSet, StateMachine};
+use skys3_shard::{ReadId, ReadPlan, Registered, ShardSet, StateMachine, StreamedBody};
 use skys3_types::{BucketDocument, BucketId, ETag, EpochSeq, Label, NodeId};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -418,6 +418,11 @@ impl Shards for MemoryShards {
     ) -> Result<ExtentRef, ShardError> {
         self.check(shard)?;
         self.local.append_extent(shard, extent).await
+    }
+
+    async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
+        self.check(shard)?;
+        self.local.announce(shard, body).await
     }
 
     async fn write(

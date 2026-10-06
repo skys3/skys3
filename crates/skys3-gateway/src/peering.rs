@@ -1336,6 +1336,13 @@ mod tests {
             ) -> Result<ExtentRef, ShardError> {
                 self.0.append_extent(s, e).await
             }
+            async fn announce(
+                &self,
+                s: &ShardRef,
+                b: skys3_shard::StreamedBody,
+            ) -> Result<(), ShardError> {
+                self.0.announce(s, b).await
+            }
             async fn write(
                 &self,
                 s: &ShardRef,

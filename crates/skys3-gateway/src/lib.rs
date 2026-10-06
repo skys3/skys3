@@ -179,4 +179,4 @@ pub use sigv4::{
     Authenticated, BodyError, CredentialLookup, LookupError, SecretAccessKey, SigV4Authenticator,
     SigningCredential, Trailers,
 };
-pub use skys3_shard::{ReadId, ReadPlan, Registered};
+pub use skys3_shard::{ReadId, ReadPlan, Registered, StreamedBody};

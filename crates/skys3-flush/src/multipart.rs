@@ -196,10 +196,27 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 etag,
             });
         }
+        self.complete_claimed(version, upload, &claim.id, completed, identity, expected)
+            .await
+    }
+
+    /// Completes the remote upload `id` of the stream of `upload`, which
+    /// the attempt claimed, with `parts`, as the version at `version`,
+    /// conditioned on `expected` (§7.2), and ends the claim.
+    pub(crate) async fn complete_claimed(
+        &self,
+        version: EpochSeq,
+        upload: EpochSeq,
+        id: &UploadId,
+        parts: Vec<CompletedPart>,
+        identity: &WriteIdentity,
+        expected: Option<ETag>,
+    ) -> Result<Outcome, Failure> {
+        let streams = self.streams;
         let request = CompleteMultipartUpload {
             key: self.remote_key(),
-            upload_id: claim.id.clone(),
-            parts: completed,
+            upload_id: id.clone(),
+            parts,
             precondition: WritePrecondition::None,
         };
         match self
@@ -209,7 +226,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             Ok(Ok(output)) => {
                 streams.release(upload, Verdict::Completed);
                 let ended = RemoteStep::Ended;
-                drop(streams.record(self.shard, self.key, upload, &claim.id, ended));
+                drop(streams.record(self.shard, self.key, upload, id, ended));
                 Ok(written(version, output))
             }
             // The remote holds this version from an earlier flush, or
@@ -269,7 +286,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
 /// What a failed streamed completion leaves of its stream: a remote upload
 /// that is gone is aborted (which records its end), anything else is kept
 /// for the retry.
-fn verdict_after(failure: &Failure) -> Verdict {
+pub(crate) fn verdict_after(failure: &Failure) -> Verdict {
     match failure {
         Failure::Remote(error) if error.kind() == S3ErrorKind::NoSuchUpload => Verdict::Abort,
         _ => Verdict::Keep,

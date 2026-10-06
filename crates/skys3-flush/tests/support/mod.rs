@@ -10,19 +10,20 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_flush::{FlushSettings, ShardFlusher, Target};
-use skys3_index::{Entry, EntryState, Index, IndexConfig};
+use skys3_index::{Checkpointer, Entry, EntryState, Index, IndexConfig};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{
-    CompletedPart, Delete, MpuAbort, MpuComplete, MpuCreate, MpuPart, Put, PutData, Tags,
-    UploadBegin,
+    CompletedPart, Delete, Extent, ExtentRef, MpuAbort, MpuComplete, MpuCreate, MpuPart, Put,
+    PutData, Tags, UploadBegin,
 };
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
 use skys3_remote::probe::{ConditionalWrites, OperationSupport, PreconditionSupport};
-use skys3_shard::{Shard, ShardSet};
+use skys3_shard::{Shard, ShardSet, StateMachine, StreamedBody};
 use skys3_sim::SimS3;
 use skys3_sim::s3::SimS3Config;
 use skys3_types::{
-    BucketId, ClusterId, ETag, Epoch, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, ShardId,
+    BucketId, ClusterId, ETag, Epoch, EpochSeq, Label, NodeId, ProposalId, Seq, ShardConfig,
+    ShardId,
 };
 
 /// The cluster every test writes as.
@@ -105,7 +106,25 @@ impl Node {
     }
 
     async fn open_with(seed: u64, pool: BlockingPool) -> Node {
-        let disk = SimDisk::new(seed);
+        Self::open_on(SimDisk::new(seed), pool).await
+    }
+
+    /// Loses power, so that only what was synced survives, and opens the
+    /// shard again from what the disk kept, as a node does after a crash.
+    /// Every flusher of the node must be stopped first.
+    pub async fn crash(self) -> Node {
+        let Node {
+            disk,
+            set,
+            shard,
+            pool,
+        } = self;
+        drop((shard, set));
+        disk.crash();
+        Self::open_on(disk, pool).await
+    }
+
+    async fn open_on(disk: SimDisk, pool: BlockingPool) -> Node {
         let mount = disk.mount();
         let log_config = LogConfig {
             inline_max_bytes: 4096,
@@ -121,6 +140,13 @@ impl Node {
             cache_bytes: 1 << 20,
         };
         let index = Arc::new(Index::open_sim(&mount, "index.redb", &index_config).unwrap());
+        // Startup recovery: the index takes the records past its checkpoint.
+        let checkpointer = Checkpointer::new(
+            Arc::clone(&index),
+            BTreeMap::from([(Label::new("disk-0").unwrap(), log.clone())]),
+            pool.clone(),
+        );
+        checkpointer.replay(Arc::new(StateMachine)).await.unwrap();
         let set = ShardSet::new(index, log, pool.clone());
         let shard = set.open(&config()).await.unwrap();
         Node {
@@ -161,6 +187,59 @@ impl Node {
         streamed.inherited_identity = Some(EpochSeq::new(Epoch::new(1), Seq::new(begun)));
         let committed = self.shard.commit(RecordBody::Put(streamed)).await;
         committed.unwrap().position.seq.get()
+    }
+
+    /// Appends `body` as `EXTENT` records of `key` of at most `extent_len`
+    /// bytes, and returns each with its offset in the body.
+    pub async fn extents(&self, key: &str, body: &str, extent_len: usize) -> Vec<(u64, ExtentRef)> {
+        let mut extents = Vec::new();
+        let mut offset = 0;
+        for chunk in body.as_bytes().chunks(extent_len) {
+            let extent = Extent {
+                key: key.to_owned(),
+                offset,
+                data: Bytes::copy_from_slice(chunk),
+            };
+            extents.push((offset, self.shard.append_extent(extent).await.unwrap()));
+            offset += chunk.len() as u64;
+        }
+        extents
+    }
+
+    /// Announces `extents` of the body of the streamed PUT of `key` begun
+    /// at `begun`, as its gateway does (§7.3), with the metadata and tags
+    /// of [`put`].
+    pub fn announce(&self, key: &str, begun: u64, extents: &[(u64, ExtentRef)]) {
+        let RecordBody::Put(headers) = put(key, "") else {
+            unreachable!("put makes a PUT")
+        };
+        let body = StreamedBody {
+            key: key.to_owned(),
+            upload: at(begun),
+            metadata: headers.metadata,
+            tags: headers.tags,
+            extents: extents.to_vec(),
+        };
+        self.shard.announce(body).unwrap();
+    }
+
+    /// Commits the PUT of `key` with `body`, held by `extents`, that
+    /// completes the streamed PUT begun at `begun`, and returns its `seq`.
+    pub async fn complete_extents(
+        &self,
+        key: &str,
+        body: &str,
+        begun: u64,
+        extents: &[(u64, ExtentRef)],
+    ) -> u64 {
+        let RecordBody::Put(mut streamed) = put(key, body) else {
+            unreachable!("put makes a PUT")
+        };
+        streamed.inherited_identity = Some(at(begun));
+        streamed.data = PutData::Extents(extents.iter().map(|(_, extent)| *extent).collect());
+        let committed = self.shard.commit(RecordBody::Put(streamed)).await.unwrap();
+        assert!(committed.outcome.is_applied(), "{:?}", committed.outcome);
+        committed.position.seq.get()
     }
 
     /// Uploads `parts` of `key` as a multipart upload, with user metadata,
@@ -415,6 +494,47 @@ pub fn streaming_target(store: &SimS3, writes: ConditionalWrites) -> Arc<Target<
         cluster(),
         settings,
     ))
+}
+
+/// A target on `store` honoring `writes` that streams multipart uploads and
+/// single PUTs (§7.3), in parts of `part_bytes`, and gives up on a body
+/// whose `PUT` has not committed `body_timeout` after it was last
+/// announced.
+pub fn body_target(
+    store: &SimS3,
+    writes: ConditionalWrites,
+    part_bytes: u64,
+    body_timeout: Duration,
+) -> Arc<Target<SimS3>> {
+    let settings = FlushSettings {
+        streaming: true,
+        part_bytes,
+        body_timeout,
+        ..settings()
+    };
+    Arc::new(Target::new(
+        Arc::new(store.clone()),
+        "",
+        writes,
+        cluster(),
+        settings,
+    ))
+}
+
+/// The ETag of `body` sent as a multipart upload in parts of `part_bytes`,
+/// as a streamed single PUT is (§7.3).
+pub fn streamed_etag(body: &str, part_bytes: usize) -> ETag {
+    let parts: Vec<&str> = body
+        .as_bytes()
+        .chunks(part_bytes)
+        .map(|part| std::str::from_utf8(part).unwrap())
+        .collect();
+    multipart_etag(&parts)
+}
+
+/// The position of the record at `seq` of the test shard.
+pub fn at(seq: u64) -> EpochSeq {
+    EpochSeq::new(Epoch::new(1), Seq::new(seq))
 }
 
 /// The write identity of the record at `seq` of the test shard.

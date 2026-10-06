@@ -25,6 +25,7 @@ use skys3_net::{
     CertificateDer, Credentials, Frame, Header, MessageKind, PeerIdentity, PrivateKeyDer,
     TokioNetwork, Transport,
 };
+use skys3_shard::Change;
 use skys3_shard::replication::{Replication, ReplicationConfig};
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, ClusterId, ETag, Epoch, EpochSeq, NodeAddress, NodeId,
@@ -360,6 +361,15 @@ async fn every_call_is_forwarded_to_the_primary() {
         .await
         .unwrap();
     assert_eq!(payload, Bytes::from_static(b"extent bytes"));
+
+    // A streamed body's announcement reaches the primary's subscriber.
+    let replica = primary.local().set().get(&(&shard).into()).await.unwrap();
+    let mut changes = replica.subscribe();
+    let announced = announcement(extent);
+    timed(gateway.announce(&shard, announced.clone()))
+        .await
+        .unwrap();
+    assert_eq!(changes.recv().await, Some(Change::Streamed(announced)));
 
     // A multipart upload and its parts.
     let create = RecordBody::MpuCreate(MpuCreate {
@@ -888,6 +898,83 @@ fn extent_ref(seq: u64, len: u32) -> skys3_log::record::ExtentRef {
     }
 }
 
+/// An announcement of the streamed body of `big` begun at 4.7, with
+/// metadata, tags, and `extent` at offset 0.
+fn announcement(extent: skys3_log::record::ExtentRef) -> StreamedBody {
+    StreamedBody {
+        key: "big".into(),
+        upload: EpochSeq::new(Epoch::new(4), Seq::new(7)),
+        metadata: BTreeMap::from([("x-amz-meta-color".into(), "blue".into())]),
+        tags: BTreeMap::from([("team".into(), "a".into())]),
+        extents: vec![(0, extent)],
+    }
+}
+
+#[test]
+fn announcements_round_trip_and_malformed_ones_are_refused() {
+    let shard = shard(0);
+    let request = Request::Announce(announcement(extent_ref(9, 100)));
+    let frame = wire::request_frame(&shard, Epoch::new(1), &request).unwrap();
+    assert_eq!(
+        wire::decode_request(&frame),
+        Ok((shard.clone(), Epoch::new(1), request.clone()))
+    );
+    let reply = Reply::Served {
+        response: Response::Announced,
+        epoch: Epoch::new(1),
+        hint: None,
+    };
+    let frame = wire::reply_frame(&reply, 3);
+    assert_eq!(wire::decode_reply(&frame, &shard), Ok(reply));
+
+    let Request::Announce(body) = request else {
+        unreachable!("an announcement")
+    };
+    let Ok(wire::Op::Announce(valid)) =
+        wire::request_frame(&shard, Epoch::new(1), &Request::Announce(body.clone())).map(|frame| {
+            prost::Message::decode(frame.header.body)
+                .map(|forward: wire::Forward| forward.op.unwrap())
+                .unwrap()
+        })
+    else {
+        panic!("an announcement encodes as one");
+    };
+    let refused = |change: &dyn Fn(&mut wire::Announcement)| {
+        let mut announced = valid.clone();
+        change(&mut announced);
+        let forward = wire::Forward {
+            bucket_id: "b-r".into(),
+            shard: 0,
+            epoch: 1,
+            op: Some(wire::Op::Announce(announced)),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::Forward).with_body(prost::Message::encode_to_vec(&forward)),
+            Bytes::new(),
+        );
+        wire::decode_request(&frame).is_err()
+    };
+    assert!(refused(&|a| a.key.clear()));
+    assert!(refused(&|a| a.key = "k".repeat(1025)));
+    assert!(refused(&|a| a.upload = None));
+    assert!(refused(&|a| a.headers = vec![0xff]));
+    assert!(refused(&|a| a.extents[0].extent = None));
+    assert!(refused(&|a| {
+        if let Some(extent) = &mut a.extents[0].extent {
+            extent.len = 0;
+        }
+    }));
+    assert!(refused(&|a| {
+        let extent = a.extents[0].clone();
+        a.extents = vec![extent; skys3_log::record::MAX_EXTENTS + 1];
+    }));
+    // A body announced with too much metadata does not encode.
+    let mut big = body;
+    big.metadata
+        .insert("x-amz-meta-big".into(), "v".repeat(9 * 1024));
+    assert!(wire::request_frame(&shard, Epoch::new(1), &Request::Announce(big)).is_err());
+}
+
 #[test]
 fn malformed_requests_are_refused() {
     let shard = shard(0);
@@ -1132,6 +1219,15 @@ proptest! {
                     shard: shard(3),
                 }),
             },
+            Request::Announce(StreamedBody {
+                key: format!("k{key}"),
+                upload: EpochSeq::new(Epoch::new(epoch), Seq::new(3)),
+                metadata: BTreeMap::from([(format!("x-amz-meta-k{}", limit % 7), key.clone())]),
+                tags: BTreeMap::from([(format!("t{key}"), key.clone())]),
+                extents: (0..limit % 5)
+                    .map(|n| (n as u64 * 9, extent_ref(n as u64, 9)))
+                    .collect(),
+            }),
         ];
         for request in requests {
             let frame = wire::request_frame(&shard(3), Epoch::new(epoch), &request).unwrap();

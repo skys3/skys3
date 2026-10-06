@@ -22,11 +22,11 @@
 use bytes::Bytes;
 use prost::{Message, Oneof};
 use skys3_index::codec;
-use skys3_index::{Entry, EntryState, ListItem, ListPage, ListQuery};
-use skys3_log::record::ExtentRef;
+use skys3_index::{Entry, EntryState, ListItem, ListPage, ListQuery, Upload};
+use skys3_log::record::{ExtentRef, MAX_EXTENTS, MAX_KEY_LEN};
 use skys3_log::{LogRecord, RecordBody};
 use skys3_net::{Frame, Header, MessageKind};
-use skys3_shard::{ReadPlan, Registered};
+use skys3_shard::{ReadPlan, Registered, StreamedBody};
 use skys3_types::{
     BucketId, ClusterId, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig, ShardId,
 };
@@ -53,7 +53,7 @@ pub struct Forward {
     /// The call.
     #[prost(
         oneof = "Op",
-        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
     )]
     pub op: Option<Op>,
 }
@@ -107,6 +107,38 @@ pub enum Op {
     /// The payload at a position for a registered read.
     #[prost(message, tag = "18")]
     Fetch(FetchQuery),
+    /// Announce more of a streamed single PUT's body.
+    #[prost(message, tag = "19")]
+    Announce(Announcement),
+}
+
+/// More of a streamed single PUT's body (design §7.3).
+#[derive(Clone, PartialEq, Message)]
+pub struct Announcement {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The position of the body's `UPLOAD_BEGIN`.
+    #[prost(message, optional, tag = "2")]
+    pub upload: Option<Position>,
+    /// The metadata and tags the `PUT` will store, as the index encodes
+    /// an open upload's, whose other fields are unused.
+    #[prost(bytes = "vec", tag = "3")]
+    pub headers: Vec<u8>,
+    /// Applied extents of the body.
+    #[prost(message, repeated, tag = "4")]
+    pub extents: Vec<BodyExtent>,
+}
+
+/// An extent of a streamed body.
+#[derive(Clone, PartialEq, Message)]
+pub struct BodyExtent {
+    /// Its offset in the body.
+    #[prost(uint64, tag = "1")]
+    pub offset: u64,
+    /// The `EXTENT` record.
+    #[prost(message, optional, tag = "2")]
+    pub extent: Option<ExtentAnswer>,
 }
 
 /// A read registration of a key's version.
@@ -283,7 +315,7 @@ pub struct Answer {
     /// The answer, by the call it answers.
     #[prost(
         oneof = "Result",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
     )]
     pub result: Option<Result>,
 }
@@ -333,6 +365,9 @@ pub enum Result {
     /// The registration was released.
     #[prost(bool, tag = "14")]
     Released(bool),
+    /// The announcement was passed on.
+    #[prost(bool, tag = "15")]
+    Announced(bool),
 }
 
 /// A read plan.
@@ -549,6 +584,7 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
             payload = record(RecordBody::Extent(extent.clone()))?;
             Op::AppendExtent(true)
         }
+        Request::Announce(body) => Op::Announce(announcement(body)?),
         Request::Write { body, condition } => {
             payload = record(body.clone())?;
             Op::Write(match condition {
@@ -716,6 +752,7 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
             read: query.read,
             position: epoch_seq(query.position)?,
         },
+        Op::Announce(announced) => Request::Announce(decode_announcement(announced)?),
     };
     if !matches!(
         request,
@@ -921,6 +958,7 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
         }),
         Response::Renewed(renewed) => Result::Renewed(*renewed),
         Response::Released => Result::Released(true),
+        Response::Announced => Result::Announced(true),
     };
     match failed.into_inner() {
         Some(error) => Err(error),
@@ -1086,6 +1124,66 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
         }),
         Result::Renewed(renewed) => Response::Renewed(renewed),
         Result::Released(_) => Response::Released,
+        Result::Announced(_) => Response::Announced,
+    })
+}
+
+/// The wire form of a streamed body's announcement.
+fn announcement(body: &StreamedBody) -> Decoded<Announcement> {
+    let headers = Upload {
+        initiated_ms: 0,
+        metadata: body.metadata.clone(),
+        tags: body.tags.clone(),
+        checksum: None,
+    };
+    Ok(Announcement {
+        key: body.key.clone(),
+        upload: Some(position(body.upload)),
+        headers: codec::encode_upload(&headers).map_err(|error| error.to_string())?,
+        extents: body
+            .extents
+            .iter()
+            .map(|(offset, extent)| BodyExtent {
+                offset: *offset,
+                extent: Some(ExtentAnswer {
+                    position: Some(position(extent.position)),
+                    len: extent.len,
+                }),
+            })
+            .collect(),
+    })
+}
+
+/// An announcement from its wire form: a key, an upload, metadata and tags
+/// within their limits, and at most a `PUT`'s extents, each with bytes.
+fn decode_announcement(announced: Announcement) -> Decoded<StreamedBody> {
+    if announced.key.is_empty() || announced.key.len() > MAX_KEY_LEN {
+        return Err(format!("a key of {} bytes", announced.key.len()));
+    }
+    if announced.extents.len() > MAX_EXTENTS {
+        return Err(format!("{} extents", announced.extents.len()));
+    }
+    let headers = codec::decode_upload(&announced.headers).map_err(|error| error.to_string())?;
+    let extents = announced
+        .extents
+        .into_iter()
+        .map(|extent| {
+            let offset = extent.offset;
+            let layout = Layout {
+                extents: extent.extent.into_iter().collect(),
+            };
+            match decode_layout(layout)?.as_slice() {
+                [extent] => Ok((offset, *extent)),
+                _ => Err("an announced extent is missing".to_owned()),
+            }
+        })
+        .collect::<Decoded<_>>()?;
+    Ok(StreamedBody {
+        key: announced.key,
+        upload: epoch_seq(announced.upload)?,
+        metadata: headers.metadata,
+        tags: headers.tags,
+        extents,
     })
 }
 

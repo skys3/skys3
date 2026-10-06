@@ -5597,6 +5597,118 @@ of this file. A task with nothing unexpected keeps "None."
   - There is no tee of the incoming body (see the first bullet), so a
     part is read back from the local log once.
 
+### M4-03 Streaming flush for large single PUTs
+
+- **The gateway announces a streamed body; no record names it.** M4-01
+  gave a streamed `PUT` an `UPLOAD_BEGIN` and an inherited write identity,
+  but its `EXTENT` records name a key and an offset, not the upload, and a
+  key may have several bodies arriving at once. The primary's flusher
+  cannot tell which extents belong to which body until the `PUT` commits.
+  So the gateway tells it: a `StreamedBody` announcement (key,
+  `UPLOAD_BEGIN` position, metadata, tags, extents by offset) once at
+  `UPLOAD_BEGIN`, and again each time at least `flush_part_bytes` more
+  extents are committed. `Shards::announce` routes it to the primary,
+  `Shard::announce` passes it to the flusher's subscription as
+  `Change::Streamed`, and nothing is logged. The gateway sends
+  announcements on spawned tasks, so the body's upload never waits for
+  them, and awaits them all before the `PUT` commits, so the flusher sees
+  them before the `PUT`'s `Stored`. Extents are keyed by offset, so their
+  order does not matter. A failed announcement is logged at debug level
+  and only costs overlap: the completion sends what the stream lacks.
+- **Formats.** The log (version 2) and the index (format 8) do not
+  change. The forwarding wire gains operation 19 (`Announcement`, its
+  metadata and tags in the index's upload codec) and answer 15
+  (`Announced`); the existing `gateway_forward` fuzz target decodes it.
+- **Streams reuse M4-02's machinery.** A body stream is a `Stream` keyed
+  by its `UPLOAD_BEGIN` position, opened with the announced metadata,
+  tags, and identity, and recorded with `PART_FLUSHED` *opened* and
+  *ended*. Part *n* is bytes `[(n−1)·P, n·P)`, `P` fixed from
+  `FlushSettings::part_bytes` when the stream first pumps. A part goes out
+  once announced extents cover it, read from the log, with a
+  `Content-MD5` the flusher computes (inline up to 1 MiB, otherwise on the
+  blocking pool). Part records are not written: their `MPU_PART` position
+  does not exist, and a part only counts if it was sent from exactly the
+  extents the `PUT` names in its range, which only memory knows. So a
+  resumed body stream sends every part again.
+- **Completion and ETags.** `Attempt::put` completes the stream when the
+  version's `write_identity` names an open body stream and the version is
+  streamable (bytes in the log, at most 10,000 parts). It shares the tail
+  of the multipart completion (`complete_claimed`): the §7.2 precondition,
+  the `404 NoSuchUpload` handling, and a `FLUSHED` with the remote
+  multipart ETag as `remote_etag`, while `local_etag` stays the MD5 that
+  clients see. The next flush of the key is conditioned on that
+  `remote_etag`. A retagged or unstreamable version goes out as one
+  `PutObject`, and its stream is aborted once the key is clean.
+- **Bodies that never commit.** `FlushSettings::body_timeout` (the node
+  uses `peer_staging_ttl_seconds`, twice the gateway's
+  `max_body_duration`) dooms a body stream whose `PUT` has not committed
+  that long after its last announcement; the flusher's loop sleeps until
+  the next deadline, aborts the remote upload, and records *ended*. After
+  a restart, an open remote upload without a local multipart upload is a
+  body: completed by its key's flush if the `PUT` committed with its
+  identity, otherwise kept for `body_timeout` and aborted. The crash test
+  in `tests/streamed_puts.rs` finds the logged remote upload ID after a
+  crash before the `PUT` and aborts it.
+- **Surprises.**
+  - *`claim` returned nothing while the stream was opening.* A `PUT` that
+    commits right after `UPLOAD_BEGIN` found its stream in
+    `Remote::Opening` and fell back to `PutObject`, aborting a stream that
+    had just begun: in the flush simulation few streams completed. `claim`
+    now waits for an open in flight, and an open whose `Create` failed
+    after the `PUT` committed returns no stream.
+  - *The paused clock times bodies out.* Flusher tests with
+    `start_paused` and the index on the blocking pool let tokio jump the
+    clock past `body_timeout` while a read waited for a pool thread. The
+    new tests and the flush simulation open nodes with
+    `Node::open_inline`, so the index runs on the caller's thread.
+  - *Identical bytes, identical ETags.* The flush simulation copies a
+    flushed object's bytes out of band to make conflicts. A streamed
+    `PUT` flushed as `PutObject` has the same MD5 ETag as such a copy, so
+    the flusher took the copy for its own write and deleted it. That is
+    the inherent limit of ETag preconditions (§7.2); the simulation now
+    copies a streamed version only when the remote holds it as its
+    multipart object.
+  - *A member took announcements.* `Shard::announce` first checked only
+    that the shard ran, so after a primary change a gateway with a stale
+    map had its announcement accepted by a member, whose flusher never
+    sees the `PUT`; the cluster simulation's routing audit caught it
+    (`routing_while_a_primary_restarts`, seed 0, intermittently). It now
+    checks as a write does: a member answers `NotPrimary`, which
+    redirects the gateway, and a primary that does not serve yet is
+    unavailable.
+  - *Crash tests need recovery.* The flusher test support reopened the
+    index without replaying the log, which a crash test needs; `open_on`
+    now replays with a `Checkpointer`.
+- **Simulation.** The flush simulation (`tests/simulation.rs`) streams
+  half of its large `PUT`s with 16-byte parts, two announcements, and a
+  2 s body timeout, on half the seeds, and checks that each entry's
+  `remote_etag` is the remote object's ETag. Seeded bugs: recording the
+  `local_etag` as `remote_etag` after a streamed completion fails at seed
+  18 (the `remote_etag` check), and with that check off at seed 122 (the
+  flusher deletes another writer's object); completing the remote upload
+  before the `PUT` commits fails at seed 2 (a failed `PUT`'s identity is
+  published). No scenario was added, so no cost changes. At
+  `SKYS3_SIM_SEEDS=256` in a debug build on four loaded cores,
+  `flushes_reach_the_remote_through_faults` took 43.5 s alone (M4-02
+  reported 44.6 s), the four flush scenarios 116 s one at a time, and
+  CI's whole simulation set passed, its cluster simulation in 2,274.5 s.
+- **Cluster simulation.** Gateways now announce bodies, so
+  `skys3-cluster-sim` streams every `PUT` of 1,024 bytes or more in
+  `write_back` buckets, with 512-byte parts, `min_part_size` 1 on the
+  remote, and `body_timeout` twice `max_body_duration`. Such a `PUT` has
+  at least two parts, so the durability check maps a remote ETag of two
+  parts or more back to the MD5 of the remote bytes; the workload's own
+  multipart uploads have one part.
+- **Left open.**
+  - Announcements are not durable. After a primary change or restart a
+    body stream resumes only if its *opened* record survived, and then
+    sends every part again; a body announced to a dead primary streams
+    nothing and is sent after commit.
+  - A body that is never completed after a restart waits for the full
+    `body_timeout` (24 h by default) before its abort.
+  - A version that falls back to `PutObject` is read whole into memory,
+    as every single-PUT flush is.
+
 ### M4-05 UploadPartCopy
 
 - **The source is read as a GET reads it, not through the primary.**
