@@ -66,9 +66,22 @@
 //! uploads that have none. A remote upload whose `CreateMultipartUpload`
 //! answer was lost, or whose `PART_FLUSHED` was lost in a crash, is left to
 //! the remote bucket's abort-incomplete-uploads lifecycle rule (§7.3).
+//!
+//! **Takeover.** A stream resumed from the index, by a restarted flusher or
+//! by a new primary's, knows only what the `PART_FLUSHED` records say. Some
+//! may be missing (lost in the crash), and the remote may hold a part other
+//! than the one recorded (a send of the old primary that landed late). So
+//! the stream reconciles with a remote `ListParts` before it sends a part
+//! or completes ([`Listing`]): a recorded part counts only if the remote
+//! holds it with the recorded ETag, and a part to send whose MD5 is the
+//! ETag of the part the remote holds under its number is taken as sent
+//! without sending it. A multipart upload's part has its MD5 in the index;
+//! a body's part is read and hashed. A completion that the remote refuses
+//! with `400 InvalidPart` lists the remote upload again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use base64::Engine as _;
@@ -78,7 +91,9 @@ use skys3_index::{Part, Payload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{ExtentRef, Metadata, PartFlushed, RemoteStep, TagSet};
-use skys3_remote::{AbortMultipartUpload, ObjectStore, S3ErrorKind, UploadId, UploadPart};
+use skys3_remote::{
+    AbortMultipartUpload, ListParts, ObjectStore, S3ErrorKind, UploadId, UploadPart,
+};
 use skys3_shard::{Shard, ShardError, StreamedBody};
 use skys3_types::{ETag, EpochSeq};
 use tokio::sync::{Notify, oneshot};
@@ -165,6 +180,23 @@ pub(crate) fn part_range(number: u16, part_bytes: u64) -> (u64, u64) {
     (start, start.saturating_add(part_bytes))
 }
 
+/// Keeps in `flushed` only the parts `remote` holds with the ETag recorded,
+/// and returns the others' numbers and positions.
+fn confirm(
+    flushed: &mut BTreeMap<u16, (EpochSeq, ETag)>,
+    remote: &BTreeMap<u16, ETag>,
+) -> Vec<(u16, EpochSeq)> {
+    let mut stale = Vec::new();
+    flushed.retain(|number, (position, etag)| {
+        let held = remote.get(number) == Some(etag);
+        if !held {
+            stale.push((*number, *position));
+        }
+        held
+    });
+    stale
+}
+
 /// The extents of `extents`, by offset, that hold every byte of `range`,
 /// or `None` if they leave a gap.
 pub(crate) fn span(extents: &BTreeMap<u64, ExtentRef>, (start, end): (u64, u64)) -> Option<Span> {
@@ -182,6 +214,20 @@ pub(crate) fn span(extents: &BTreeMap<u64, ExtentRef>, (start, end): (u64, u64))
         span.push((offset, extent));
     }
     (covered >= end && !span.is_empty()).then_some(span)
+}
+
+/// Whether a stream knows which parts its remote upload holds (§7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    /// It does: the flusher opened the remote upload and saw every send
+    /// end, or listed the remote upload since.
+    Known,
+    /// It was resumed from the index, or a completion found a part listed
+    /// that the remote does not hold: `flushed` may name parts the remote
+    /// does not hold, and miss some it does. A `ListParts` must tell.
+    Due,
+    /// The `ListParts` with this number is in flight.
+    Running(u64),
 }
 
 /// The remote upload of one local upload or streamed body.
@@ -214,6 +260,12 @@ struct Stream {
     completed_at: Option<Instant>,
     /// For a streamed single PUT, its body; `None` for a multipart upload.
     body: Option<Body>,
+    /// Whether the stream knows what its remote upload holds.
+    listing: Listing,
+    /// The ETags of the parts the last `ListParts` found, but those sent
+    /// since: a part to send whose MD5 is the one listed under its number
+    /// is not sent again.
+    listed: BTreeMap<u16, ETag>,
 }
 
 impl Stream {
@@ -222,6 +274,8 @@ impl Stream {
             key,
             remote,
             open,
+            listing: Listing::Known,
+            listed: BTreeMap::new(),
             flushed: BTreeMap::new(),
             waiting: BTreeMap::new(),
             sending: BTreeSet::new(),
@@ -246,6 +300,28 @@ impl Stream {
         }
         let waiting = self.waiting.entry(number).or_insert(position);
         *waiting = (*waiting).max(position);
+    }
+
+    /// Takes what a `ListParts` found, `remote`: the recorded parts the
+    /// remote does not hold as recorded are no longer counted as sent, and
+    /// while the local upload is open they are sent again.
+    fn reconcile(&mut self, remote: BTreeMap<u16, ETag>) {
+        for (number, position) in confirm(&mut self.flushed, &remote) {
+            self.acked.remove(&number);
+            if self.open {
+                self.queue(number, position);
+            }
+        }
+        self.listed = remote;
+        self.listing = Listing::Known;
+    }
+
+    /// Records that part `number` was sent from `position`, with the remote
+    /// ETag `etag`, at `at`.
+    fn sent(&mut self, number: u16, position: EpochSeq, etag: ETag, at: Instant) {
+        self.flushed.insert(number, (position, etag));
+        self.acked.insert(number, at);
+        self.listed.remove(&number);
     }
 
     /// Fixes a body's part size and queues the parts its extents cover; for
@@ -285,6 +361,24 @@ pub(crate) enum Step {
     },
     /// The remote upload was aborted and its end recorded.
     Ended(EpochSeq),
+    /// The `ListParts` numbered `run` ended.
+    Listed {
+        upload: EpochSeq,
+        run: u64,
+        listed: Listed,
+    },
+}
+
+/// How a stream's `ListParts` ended.
+#[derive(Debug)]
+pub(crate) enum Listed {
+    /// The remote upload holds these parts, with these ETags.
+    Parts(BTreeMap<u16, ETag>),
+    /// The remote upload is gone.
+    Gone,
+    /// The stream no longer wanted it: a completion claimed it, or it was
+    /// doomed.
+    Dropped,
 }
 
 /// How a part's send ended.
@@ -309,6 +403,9 @@ pub(crate) enum Verdict {
     Abort,
     /// The completion failed and is retried: keep the stream.
     Keep,
+    /// The remote refused a part the completion listed: keep the stream,
+    /// and list the remote upload before the retry.
+    Relist,
 }
 
 /// A stream claimed for a completion.
@@ -324,6 +421,18 @@ pub(crate) struct Claim {
     /// For a streamed body, its part size and the extents each part the
     /// stream queued was read from.
     pub(crate) body: Option<(u64, BTreeMap<u16, Span>)>,
+    /// The ETags the last `ListParts` found, but for parts sent since, or
+    /// `None` if the stream does not know what the remote holds: the
+    /// completion lists it first ([`Claim::reconcile`]).
+    pub(crate) listed: Option<BTreeMap<u16, ETag>>,
+}
+
+impl Claim {
+    /// Takes what the completion's `ListParts` found, `remote`.
+    pub(crate) fn reconcile(&mut self, remote: BTreeMap<u16, ETag>) {
+        confirm(&mut self.flushed, &remote);
+        self.listed = Some(remote);
+    }
 }
 
 /// The streams of one shard flusher, shared by its task and its flushes.
@@ -332,6 +441,8 @@ pub(crate) struct Streams {
     streams: Mutex<HashMap<EpochSeq, Stream>>,
     /// Woken whenever a part's send or an open ends.
     idle: Notify,
+    /// The number of the next `ListParts` a stream starts.
+    listings: AtomicU64,
     /// The `PART_FLUSHED` commits in flight. They run on their own, so a
     /// flusher that stops leaves none half done, and
     /// [`Streams::recorded`] waits for them.
@@ -473,6 +584,8 @@ impl Streams {
 
     /// Reads the streams the index holds, and the open uploads, as the
     /// flusher starts. Changes applied meanwhile wait in the subscription.
+    /// Each stream read from the index is reconciled with its remote upload
+    /// before it sends or completes ([`Listing::Due`]).
     ///
     /// A remote upload without an open local upload belongs to a completed
     /// upload if the key's object is made of its parts, or to a streamed
@@ -487,6 +600,9 @@ impl Streams {
             };
             let open = shard.upload(&remote.key, upload, 0, 0).await?.is_some();
             let mut stream = Stream::new(remote.key, Remote::Open(UploadId(remote.id)), open);
+            // The records may be missing parts, or name parts the remote
+            // no longer holds: the remote upload is listed first.
+            stream.listing = Listing::Due;
             stream.flushed = flushed
                 .into_iter()
                 .map(|(number, part)| (number, (part.position, part.etag)))
@@ -555,11 +671,12 @@ impl Streams {
                 if let Some(stream) = streams.get_mut(&upload) {
                     stream.sending.remove(&number);
                     match sent {
-                        Sent::Done(etag, at) => {
-                            stream.flushed.insert(number, (position, etag));
-                            stream.acked.insert(number, at);
+                        Sent::Done(etag, at) => stream.sent(number, position, etag, at),
+                        // The send may have landed: what the remote holds
+                        // under its number is unknown.
+                        Sent::Failed => {
+                            stream.listed.remove(&number);
                         }
-                        Sent::Failed => {}
                         Sent::Gone => stream.doomed = true,
                     }
                 }
@@ -567,6 +684,28 @@ impl Streams {
             }
             Step::Ended(upload) => {
                 streams.remove(&upload);
+            }
+            Step::Listed {
+                upload,
+                run,
+                listed,
+            } => {
+                // A listing a completion claimed the stream from is stale.
+                if let Some(stream) = streams.get_mut(&upload)
+                    && stream.listing == Listing::Running(run)
+                {
+                    match listed {
+                        Listed::Parts(remote) => stream.reconcile(remote),
+                        Listed::Gone if stream.open => {
+                            stream.listing = Listing::Known;
+                            stream.doomed = true;
+                        }
+                        // A closed stream's completion lists it again, and
+                        // a remote upload that is gone may have been
+                        // consumed by an earlier Complete (§7.2).
+                        Listed::Gone | Listed::Dropped => stream.listing = Listing::Due,
+                    }
+                }
             }
         }
     }
@@ -625,6 +764,28 @@ impl Streams {
             if stream.claimed {
                 continue;
             }
+            // A resumed stream sends nothing before it knows what the
+            // remote holds. An open one lists it now, so that the parts
+            // still to come are sent only if the remote lacks them; a
+            // closed one leaves it to its completion.
+            match stream.listing {
+                Listing::Known => {}
+                Listing::Due if stream.open => {
+                    let run = self.listings.fetch_add(1, Ordering::Relaxed);
+                    stream.listing = Listing::Running(run);
+                    let task = Task::new(self, shard, target, &stream.key, upload);
+                    tasks.spawn(async move {
+                        let listed = task.list(&remote, run).await;
+                        Step::Listed {
+                            upload,
+                            run,
+                            listed,
+                        }
+                    });
+                    continue;
+                }
+                Listing::Due | Listing::Running(_) => continue,
+            }
             let ready: Vec<u16> = stream
                 .waiting
                 .keys()
@@ -648,10 +809,14 @@ impl Streams {
                 sending += 1;
                 let task = Task::new(self, shard, target, &stream.key, upload);
                 let id = remote.clone();
+                let listed = stream.listed.get(&number).cloned();
                 tasks.spawn(async move {
+                    let listed = listed.as_ref();
                     let sent = match piece {
-                        Some((range, span)) => task.send_span(&id, number, range, &span).await,
-                        None => task.send(&id, number, position).await,
+                        Some((range, span)) => {
+                            task.send_span(&id, number, range, &span, listed).await
+                        }
+                        None => task.send(&id, number, position, listed).await,
                     };
                     Step::Sent {
                         upload,
@@ -691,6 +856,11 @@ impl Streams {
                 if id.is_some() {
                     stream.claimed = true;
                     stream.waiting.clear();
+                    // The completion lists the remote upload itself rather
+                    // than wait for a listing that may be retrying.
+                    if matches!(stream.listing, Listing::Running(_)) {
+                        stream.listing = Listing::Due;
+                    }
                 }
                 if let Some(id) = id.filter(|_| stream.sending.is_empty()) {
                     // The parts whose acknowledgement came before the
@@ -709,11 +879,13 @@ impl Streams {
                         .body
                         .as_ref()
                         .and_then(|body| Some((body.part_bytes?, body.spans.clone())));
+                    let listed = (stream.listing == Listing::Known).then(|| stream.listed.clone());
                     return Some(Claim {
                         id,
                         flushed: stream.flushed.clone(),
                         at_completion,
                         body,
+                        listed,
                     });
                 }
             }
@@ -725,8 +897,7 @@ impl Streams {
     /// `number` from the `MPU_PART` at `position`.
     pub(crate) fn sent(&self, upload: EpochSeq, number: u16, position: EpochSeq, etag: ETag) {
         if let Some(stream) = self.lock().get_mut(&upload) {
-            stream.flushed.insert(number, (position, etag));
-            stream.acked.insert(number, Instant::now());
+            stream.sent(number, position, etag, Instant::now());
         }
     }
 
@@ -736,9 +907,17 @@ impl Streams {
         if let Some(stream) = self.lock().get_mut(&upload)
             && let Some(body) = &mut stream.body
         {
-            stream.flushed.insert(number, (span[0].1.position, etag));
-            stream.acked.insert(number, Instant::now());
+            let position = span[0].1.position;
             body.spans.insert(number, span);
+            stream.sent(number, position, etag, Instant::now());
+        }
+    }
+
+    /// The completion that claimed the stream of `upload` listed its remote
+    /// upload, which holds `remote`.
+    pub(crate) fn reconciled(&self, upload: EpochSeq, remote: BTreeMap<u16, ETag>) {
+        if let Some(stream) = self.lock().get_mut(&upload) {
+            stream.reconcile(remote);
         }
     }
 
@@ -749,10 +928,13 @@ impl Streams {
             Verdict::Completed => {
                 streams.remove(&upload);
             }
-            Verdict::Abort | Verdict::Keep => {
+            Verdict::Abort | Verdict::Keep | Verdict::Relist => {
                 if let Some(stream) = streams.get_mut(&upload) {
                     stream.claimed = false;
                     stream.doomed |= verdict == Verdict::Abort;
+                    if verdict == Verdict::Relist {
+                        stream.listing = Listing::Due;
+                    }
                 }
             }
         }
@@ -772,6 +954,14 @@ impl Streams {
         self.lock()
             .get(&upload)
             .is_some_and(|stream| stream.open && !stream.doomed)
+    }
+
+    /// Whether the stream of `upload` still waits for its `ListParts`
+    /// numbered `run`.
+    fn wants_listing(&self, upload: EpochSeq, run: u64) -> bool {
+        self.lock()
+            .get(&upload)
+            .is_some_and(|stream| !stream.doomed && stream.listing == Listing::Running(run))
     }
 }
 
@@ -870,8 +1060,15 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
     }
 
     /// Sends the `MPU_PART` at `position`, part `number`, to the remote
-    /// upload `id`, and records it.
-    async fn send(&self, id: &UploadId, number: u16, position: EpochSeq) -> Sent {
+    /// upload `id`, and records it. If the remote holds a part of that
+    /// number with the ETag `listed`, the part's own, it is not sent again.
+    async fn send(
+        &self,
+        id: &UploadId,
+        number: u16,
+        position: EpochSeq,
+        listed: Option<&ETag>,
+    ) -> Sent {
         let part = match self.shard.parts(self.upload, number - 1, 1).await {
             Ok(parts) => parts
                 .into_iter()
@@ -883,7 +1080,16 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
         let Some((_, part)) = part else {
             return Sent::Failed;
         };
-        match upload_part(&self.shard, &self.target, &self.key, id, number, &part).await {
+        let sent = upload_part(
+            &self.shard,
+            &self.target,
+            &self.key,
+            id,
+            number,
+            &part,
+            listed,
+        );
+        match sent.await {
             Ok(etag) => {
                 let at = Instant::now();
                 let step = RemoteStep::Part {
@@ -899,19 +1105,21 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
     }
 
     /// Sends the bytes `range` of a streamed body, held by `span`, as part
-    /// `number` of the remote upload `id`.
-    async fn send_span(&self, id: &UploadId, number: u16, range: (u64, u64), span: &Span) -> Sent {
-        match upload_span(
-            &self.shard,
-            &self.target,
-            &self.key,
-            id,
+    /// `number` of the remote upload `id`, unless their MD5 is `listed`.
+    async fn send_span(
+        &self,
+        id: &UploadId,
+        number: u16,
+        range: (u64, u64),
+        span: &Span,
+        listed: Option<&ETag>,
+    ) -> Sent {
+        let part = Piece {
             number,
             range,
             span,
-        )
-        .await
-        {
+        };
+        match upload_span(&self.shard, &self.target, &self.key, id, part, listed).await {
             Ok(etag) => Sent::Done(etag, Instant::now()),
             Err(failure) => self.failed(number, &failure),
         }
@@ -926,6 +1134,29 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
                 Sent::Failed
             }
         }
+    }
+
+    /// Lists the parts of the remote upload `id` for the `ListParts`
+    /// numbered `run`, trying again after a backoff while the stream waits
+    /// for it.
+    async fn list(&self, id: &UploadId, run: u64) -> Listed {
+        for attempt in 1.. {
+            if !self.streams.wants_listing(self.upload, run) {
+                break;
+            }
+            match list_parts(&self.target, &self.key, id).await {
+                Ok(parts) => return Listed::Parts(parts),
+                Err(Failure::Remote(error)) if error.kind() == S3ErrorKind::NoSuchUpload => {
+                    return Listed::Gone;
+                }
+                Err(failure) => {
+                    tracing::debug!(key = self.key, upload = %self.upload, %failure,
+                        "a remote upload was not listed");
+                    tokio::time::sleep(self.target.settings.backoff(attempt)).await;
+                }
+            }
+        }
+        Listed::Dropped
     }
 
     /// Aborts the remote upload `id` and records its end, trying again
@@ -960,9 +1191,51 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
     }
 }
 
+/// The parts the remote upload `id` of `key` holds, by number, with their
+/// ETags: every page of its `ListParts` (§7.3).
+pub(crate) async fn list_parts<S: ObjectStore>(
+    target: &Target<S>,
+    key: &str,
+    id: &UploadId,
+) -> Result<BTreeMap<u16, ETag>, Failure> {
+    let mut request = ListParts::new(format!("{}{key}", target.prefix), id.clone());
+    let mut parts = BTreeMap::new();
+    loop {
+        let page = target
+            .store
+            .list_parts(request.clone())
+            .await
+            .map_err(Failure::Remote)?;
+        for part in page.parts {
+            // A number outside S3's range is no part SkyS3 sent.
+            if let Ok(number) = u16::try_from(part.part_number) {
+                parts.insert(number, part.etag);
+            }
+        }
+        if !page.is_truncated {
+            return Ok(parts);
+        }
+        match page.next_part_number_marker {
+            Some(next)
+                if request
+                    .part_number_marker
+                    .is_none_or(|marker| next > marker) =>
+            {
+                request.part_number_marker = Some(next);
+            }
+            _ => {
+                return Err(Failure::Local(
+                    "the remote's ListParts pages do not advance".into(),
+                ));
+            }
+        }
+    }
+}
+
 /// Uploads `part`, part `number` of the remote upload `id` of `key`, from
 /// the local log, within the target's in-flight budget, and returns its
-/// remote ETag.
+/// remote ETag. If the remote holds a part of that number with the ETag
+/// `listed` and that is the part's MD5, nothing is sent (§7.3).
 pub(crate) async fn upload_part<S: ObjectStore, D: Disk>(
     shard: &Shard<D>,
     target: &Target<S>,
@@ -970,7 +1243,11 @@ pub(crate) async fn upload_part<S: ObjectStore, D: Disk>(
     id: &UploadId,
     number: u16,
     part: &Part,
+    listed: Option<&ETag>,
 ) -> Result<ETag, Failure> {
+    if listed == Some(&part.etag) {
+        return Ok(part.etag.clone());
+    }
     let _permit = target.reserve(part.size).await;
     let body: Bytes = read_payload(shard, &part.payload, part.size).await?;
     let remote_key = format!("{}{key}", target.prefix);
@@ -983,19 +1260,32 @@ pub(crate) async fn upload_part<S: ObjectStore, D: Disk>(
         .map_err(Failure::Remote)
 }
 
-/// Uploads the bytes `range` of a body, which `span` holds, as part
-/// `number` of the remote upload `id` of `key`, from the local log, within
-/// the target's in-flight budget, with the `Content-MD5` of those bytes,
-/// and returns the part's remote ETag.
+/// A part of a streamed body: its number, the bytes it holds, and the
+/// extents that hold them.
+pub(crate) struct Piece<'a> {
+    pub(crate) number: u16,
+    pub(crate) range: (u64, u64),
+    pub(crate) span: &'a Span,
+}
+
+/// Uploads `part` of a body as that part of the remote upload `id` of
+/// `key`, from the local log, within the target's in-flight budget, with
+/// the `Content-MD5` of its bytes, and returns the part's remote ETag. If
+/// the remote holds a part of that number whose ETag, `listed`, is the MD5
+/// of those bytes, nothing is sent (§7.3).
 pub(crate) async fn upload_span<S: ObjectStore, D: Disk>(
     shard: &Shard<D>,
     target: &Target<S>,
     key: &str,
     id: &UploadId,
-    number: u16,
-    (start, end): (u64, u64),
-    span: &Span,
+    part: Piece<'_>,
+    listed: Option<&ETag>,
 ) -> Result<ETag, Failure> {
+    let Piece {
+        number,
+        range: (start, end),
+        span,
+    } = part;
     let _permit = target.reserve(end - start).await;
     let mut body = BytesMut::new();
     for (offset, extent) in span {
@@ -1022,9 +1312,15 @@ pub(crate) async fn upload_span<S: ObjectStore, D: Disk>(
         )));
     }
     let body = body.freeze();
+    let digest = md5(body.clone()).await?;
+    let etag = ETag::new(hex(&digest))
+        .map_err(|error| Failure::Local(format!("an MD5 is no ETag: {error}")))?;
+    if listed == Some(&etag) {
+        return Ok(etag);
+    }
     let remote_key = format!("{}{key}", target.prefix);
-    let mut request = UploadPart::new(remote_key, id.clone(), u32::from(number), body.clone());
-    request.content_md5 = Some(md5_base64(body).await?);
+    let mut request = UploadPart::new(remote_key, id.clone(), u32::from(number), body);
+    request.content_md5 = Some(base64::engine::general_purpose::STANDARD.encode(digest));
     target
         .store
         .upload_part(request)
@@ -1032,15 +1328,24 @@ pub(crate) async fn upload_span<S: ObjectStore, D: Disk>(
         .map_err(Failure::Remote)
 }
 
-/// The base64 MD5 of `body`, computed off the runtime when it is large.
-async fn md5_base64(body: Bytes) -> Result<String, Failure> {
-    let digest = |body: &[u8]| base64::engine::general_purpose::STANDARD.encode(Md5::digest(body));
+/// The MD5 of `body`, computed off the runtime when it is large.
+async fn md5(body: Bytes) -> Result<[u8; 16], Failure> {
+    let digest = |body: &[u8]| <[u8; 16]>::from(Md5::digest(body));
     if body.len() <= INLINE_HASH_BYTES {
         return Ok(digest(&body));
     }
     tokio::task::spawn_blocking(move || digest(&body))
         .await
         .map_err(|error| Failure::Local(format!("a part could not be hashed: {error}")))
+}
+
+/// `bytes` in lowercase hex, as an MD5 ETag is written.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
 }
 
 /// A failpoint for tests: reads of an upload's parts by a stream's open
@@ -1190,12 +1495,10 @@ mod tests {
     #[tokio::test]
     async fn large_parts_are_hashed_off_the_runtime() {
         let small = Bytes::from_static(b"hello");
-        assert_eq!(
-            md5_base64(small).await.ok().as_deref(),
-            Some("XUFAKrxLKna5cZ2REBfFkg==")
-        );
+        let digest = md5(small).await.ok().unwrap();
+        assert_eq!(hex(&digest), "5d41402abc4b2a76b9719d911017c592");
         let large = Bytes::from(vec![0u8; INLINE_HASH_BYTES + 1]);
-        let expected = base64::engine::general_purpose::STANDARD.encode(Md5::digest(&large[..]));
-        assert_eq!(md5_base64(large).await.ok(), Some(expected));
+        let expected = <[u8; 16]>::from(Md5::digest(&large[..]));
+        assert_eq!(md5(large).await.ok(), Some(expected));
     }
 }
