@@ -1464,6 +1464,7 @@ reserve_fraction = 0.10
 
 [flush]
 ack_policy = "local"          # "local" or "write_through"; a [buckets.<name>] table may override
+write_through_timeout_seconds = 30   # a write_through write's wait for its flush (section 7.5)
 flush_min_concurrency_per_shard = 4
 flush_max_concurrency_per_shard = 64
 flush_max_inflight_bytes_per_target = 1073741824

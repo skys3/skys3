@@ -24,6 +24,7 @@ use tokio::task::JoinSet;
 use crate::ack::{AckMode, AckTimeout};
 use crate::cache::{self, CacheRefusal, CleanCache, Link, Note};
 use crate::error::ShardError;
+use crate::flush_wait::{FlushWait, FlushWaiter};
 use crate::leader::Leader;
 use crate::lineage::{Lineage, Reconcile};
 use crate::machine::{Effect, Outcome, Recorder, StateMachine};
@@ -102,6 +103,13 @@ pub enum Change {
     /// flusher which applied extents the body has so far, so that it can
     /// send them before the `PUT` commits (§7.3).
     Streamed(StreamedBody),
+    /// A write-through write waits for its version to reach the remote
+    /// ([`Shard::await_flush`], §7.5). It comes after the change that
+    /// stored the version, or after the subscription began if the version
+    /// was applied before, so a flusher that does not track the key once
+    /// it reads this has flushed the key's latest version, at or after the
+    /// one waited for.
+    Awaited(FlushWaiter),
 }
 
 /// The body of a streamed single PUT so far, as the gateway that receives
@@ -2481,6 +2489,39 @@ impl<D: Disk> Shard<D> {
         Ok(())
     }
 
+    /// Passes a wait for `version` of `key` to reach the remote target to
+    /// the subscriber, the shard's flusher, and returns the caller's end of
+    /// it (§7.5): a write to a `write_through` bucket is acknowledged once
+    /// the flusher answers [`FlushState::Flushed`](crate::FlushState). `version` must be a
+    /// version of `key` this primary applied, such as one a write it
+    /// acknowledged committed.
+    ///
+    /// The flusher hears of the wait after every change applied before it,
+    /// the version's own included. The wait ends without an answer if the
+    /// flusher stops; nothing is logged, so a new primary's flusher must be
+    /// asked again.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotPrimary`] on a member; [`ShardError::Unavailable`]
+    /// if the shard stopped, its primary does not serve, it has not applied
+    /// `version` yet, or nothing flushes it.
+    pub fn await_flush(&self, key: &str, version: EpochSeq) -> Result<FlushWait, ShardError> {
+        let sequencer = self.sequencer();
+        sequencer.check_serving(self.shard())?;
+        if sequencer.applied < version {
+            return Err(self.unavailable("the version waited for is not applied yet"));
+        }
+        let Some(subscriber) = &sequencer.subscriber else {
+            return Err(self.unavailable("no flusher follows the shard"));
+        };
+        let (waiter, wait) = FlushWaiter::new(key.to_owned(), version);
+        subscriber
+            .send(Change::Awaited(waiter))
+            .map_err(|_| self.unavailable("the shard's flusher stopped"))?;
+        Ok(wait)
+    }
+
     /// Whether the shard stopped: it was closed, or a record failed. A
     /// stopped shard refuses every request until the node reopens it.
     #[must_use]
@@ -2953,7 +2994,7 @@ fn report(
                 Change::Part { .. } => *effect == Effect::PartStored,
                 Change::Aborted { .. } => matches!(effect, Effect::Aborted { .. }),
                 // Never made from a record.
-                Change::Streamed(_) => false,
+                Change::Streamed(_) | Change::Awaited(_) => false,
             }
         };
         if let Some(change) = changes.remove(position).filter(applied) {
@@ -3186,21 +3227,24 @@ impl PipelineTask {
                         // they were applied may have scanned the index
                         // without them, so it must hear of them; one that
                         // subscribes later finds them in the index.
-                        let (subscriber, under) = {
+                        // Every record is past the applied position, so none
+                        // was skipped and each has an outcome.
+                        let mut outcomes: BTreeMap<_, _> = outcomes.into_iter().collect();
+                        let under = {
                             let mut sequencer = lock(&self.sequencer);
                             if let Some(&(last, _)) = positions.last() {
                                 sequencer.applied = last;
                                 sequencer.forget_applied();
                             }
-                            let under = sequencer.under_replicated(&self.shard);
-                            (sequencer.subscriber.clone(), under)
+                            // The subscriber is reported to under the lock
+                            // that advances the applied position, so a flush
+                            // waiter queued for an applied version comes
+                            // after its change (`Shard::await_flush`).
+                            if let Some(subscriber) = &sequencer.subscriber {
+                                report(subscriber, &outcomes, &mut changes);
+                            }
+                            sequencer.under_replicated(&self.shard)
                         };
-                        // Every record is past the applied position, so none
-                        // was skipped and each has an outcome.
-                        let mut outcomes: BTreeMap<_, _> = outcomes.into_iter().collect();
-                        if let Some(subscriber) = subscriber {
-                            report(&subscriber, &outcomes, &mut changes);
-                        }
                         for ((position, client), reply) in positions.into_iter().zip(replies) {
                             let committed = outcomes
                                 .remove(&position)
