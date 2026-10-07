@@ -1348,13 +1348,32 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// A failpoint for tests: reads of an upload's parts by a stream's open
-/// that fail, as an index read may.
+/// Failpoints for tests: reads of an upload's parts by a stream's open
+/// that fail, as an index read may, and a seeded bug of tombstone flushes.
 #[cfg(feature = "test-util")]
 pub mod test_hooks {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAILING: AtomicU32 = AtomicU32::new(0);
+
+    thread_local! {
+        static FORGETTING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Seeds, or with `false` removes, a bug into every flusher this thread
+    /// runs: a tombstone's flush records the key as deleted at the remote
+    /// without deleting it there. A deterministic simulation runs every
+    /// node on its test's thread, so other tests run the real code.
+    #[doc(hidden)]
+    pub fn forget_deletes(forget: bool) {
+        FORGETTING.with(|forgetting| forgetting.set(forget));
+    }
+
+    /// Whether the bug of [`forget_deletes`] is seeded on this thread.
+    pub(crate) fn forgets_deletes() -> bool {
+        FORGETTING.with(Cell::get)
+    }
 
     /// Makes the next `count` reads of an upload's parts by a stream's
     /// open fail, in every flusher of this process.
@@ -1379,6 +1398,11 @@ pub mod test_hooks {
 mod test_hooks {
     /// No read fails without the `test-util` feature.
     pub(crate) fn fail_parts_read() -> bool {
+        false
+    }
+
+    /// No bug is seeded without the `test-util` feature.
+    pub(crate) fn forgets_deletes() -> bool {
         false
     }
 }

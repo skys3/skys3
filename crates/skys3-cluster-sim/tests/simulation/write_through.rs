@@ -115,7 +115,14 @@ fn losing_every_node_after_an_acknowledgement_loses_no_write() {
         let report = Cluster::with_services(config, services()).run(context, &workload, &plan)?;
         assert!(report.count(|o| *o == Outcome::Done) > 0);
         assert!(report.remote_checked > 0, "{report:?}");
-        assert!(report.flushed > 0, "{report:?}");
+        // The remote holds an object, unless the clients deleted every key
+        // of the `write_back` bucket, `bucket-1`, last.
+        let present = report.history.iter().any(|operation| {
+            operation.process == "verifier"
+                && operation.key.starts_with("bucket-1/")
+                && matches!(operation.outcome, Outcome::Read(Some(_)))
+        });
+        assert!(report.flushed > 0 || !present, "{report:?}");
         Ok(())
     });
 }

@@ -17,7 +17,7 @@ use skys3_remote::{
 use skys3_shard::Shard;
 use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
 
-use crate::stream::Streams;
+use crate::stream::{Streams, test_hooks};
 use crate::target::Target;
 
 /// How many times one attempt follows a failed precondition with another
@@ -269,6 +269,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         record: bool,
     ) -> Result<Outcome, Failure> {
         let version = entry.version;
+        if test_hooks::forgets_deletes() {
+            return Ok(flushed(version, None, record));
+        }
         let mut expected = known;
         for _ in 0..MAX_ROUNDS {
             let etag = match expected.take() {
