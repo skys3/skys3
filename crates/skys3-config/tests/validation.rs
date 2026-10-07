@@ -438,6 +438,38 @@ fn ec_rules() {
 }
 
 #[test]
+fn stripes_fit_the_fragment_store_in_the_narrowest_geometry() {
+    const MIB: u64 = 1 << 20;
+    let config = load("").unwrap();
+    assert_eq!(config.ec().narrowest_data_fragments(), 3);
+    assert_eq!(config.ec().fragment_bytes(64 * MIB), 21_845 * 1024 + 384);
+    // The defaults' narrowest geometry is 3+2: three fragments of at most
+    // 256 MiB, each rounded up to 64 bytes.
+    let stripe = |bytes: u64| format!("[buckets.defaults]\nec_stripe_data_bytes = {bytes}");
+    load(&stripe(768 * MIB)).unwrap();
+    assert_violations(
+        &stripe(768 * MIB + 1),
+        &["buckets.defaults.ec_stripe_data_bytes"],
+    );
+    // Fewer eligible nodes narrow it: 1+2 holds 256 MiB a stripe.
+    let narrow = "[ec]\nmin_eligible_nodes = 3";
+    load(&format!("{narrow}\n{}", stripe(256 * MIB))).unwrap();
+    assert_violations(
+        &format!("{narrow}\n{}", stripe(256 * MIB + 64)),
+        &["buckets.defaults.ec_stripe_data_bytes"],
+    );
+    // A bucket is checked where its own table changes the stripe.
+    assert_violations(
+        &format!(
+            "{narrow}\n[buckets.photos]\nec_stripe_data_bytes = {}",
+            512 * MIB
+        ),
+        &["buckets.photos.ec_stripe_data_bytes"],
+    );
+    assert_eq!(skys3_config::MAX_FRAGMENT_BYTES, 256 * MIB);
+}
+
+#[test]
 fn peering_rules() {
     assert_violations(
         "[peering]\npeer_max_inflight_bytes = 1000",
