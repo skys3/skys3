@@ -18,20 +18,22 @@ use skys3_ec::SeededBug as StoreBug;
 use skys3_shard::SeededBug;
 use skys3_sim::{Runner, SimContext};
 
-/// What one seed of these scenarios costs, in seeds of a typical scenario:
-/// two to five runs of a six-node cluster, about a second each in a debug
-/// build. CI's 256 seeds run 16 of each.
-const COST: u64 = 16;
+/// What one run of the six-node cluster costs, in seeds of a typical
+/// scenario: about a second in a debug build. A seed of the crash
+/// scenario makes thirty runs, one of a seeded-bug scenario two.
+const RUN_COST: u64 = 8;
 
-/// A crash at `point` of a target and kind the seed draws.
-fn drawn_crash(context: &mut SimContext, point: CrashPoint) -> CodingConfig {
-    let targets = [
-        CrashTarget::Primary,
-        CrashTarget::Member(1),
-        CrashTarget::Member(2),
-        CrashTarget::Holder,
-        CrashTarget::Holders,
-    ];
+/// Every node a crash can hit.
+const TARGETS: [CrashTarget; 5] = [
+    CrashTarget::Primary,
+    CrashTarget::Member(1),
+    CrashTarget::Member(2),
+    CrashTarget::Holder,
+    CrashTarget::Holders,
+];
+
+/// A crash of `target` at `point`, of a kind and downtime the seed draws.
+fn drawn_crash(context: &mut SimContext, point: CrashPoint, target: CrashTarget) -> CodingConfig {
     let kinds = [
         CrashKind::Kill,
         CrashKind::PowerLoss,
@@ -39,7 +41,7 @@ fn drawn_crash(context: &mut SimContext, point: CrashPoint) -> CodingConfig {
     ];
     let crash = Crash {
         delay: Duration::ZERO,
-        target: *targets.choose(context.rng()).expect("targets"),
+        target,
         kind: *kinds.choose(context.rng()).expect("kinds"),
         downtime: Duration::from_millis(context.rng().random_range(200..2000)),
     };
@@ -51,12 +53,14 @@ fn drawn_crash(context: &mut SimContext, point: CrashPoint) -> CodingConfig {
 
 #[test]
 fn crashes_at_every_encoding_step_keep_every_object_readable() {
-    Runner::with_cost(4, COST).run(|context| {
+    Runner::with_cost(1, 30 * RUN_COST).run(|context| {
         for point in CrashPoint::ALL {
-            let config = drawn_crash(context, point);
-            let report = coding::run(context, &config)
-                .map_err(|error| format!("{point:?} with {:?}: {error}", config.crashes))?;
-            tracing::debug!(?point, ?report, "a crash run passed");
+            for target in TARGETS {
+                let config = drawn_crash(context, point, target);
+                let report = coding::run(context, &config)
+                    .map_err(|error| format!("{:?}: {error}", config.crashes))?;
+                tracing::debug!(?point, ?report, "a crash run passed");
+            }
         }
         Ok(())
     });
@@ -86,7 +90,7 @@ fn caught(
 
 #[test]
 fn publishing_before_every_fragment_is_durable_is_caught() {
-    Runner::with_cost(4, COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         // Every holder of a stripe but the primary loses power at its next
         // sync: the sync that would make its fragment durable.
         let crash = Crash {
@@ -110,7 +114,7 @@ fn publishing_before_every_fragment_is_durable_is_caught() {
 
 #[test]
 fn dropping_replicas_before_the_publish_commits_is_caught() {
-    Runner::with_cost(4, COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         // One member is down long enough that the EC_PUBLISH cannot
         // commit; the other restarts at once and replays it, uncommitted.
         let kill = |delay, member, downtime| Crash {
@@ -137,7 +141,7 @@ fn dropping_replicas_before_the_publish_commits_is_caught() {
 
 #[test]
 fn applying_a_superseded_publish_is_caught() {
-    Runner::with_cost(4, COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         // The first object is overwritten, with as many bytes, while it is
         // encoded.
         let config = CodingConfig {

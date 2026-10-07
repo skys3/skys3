@@ -91,10 +91,11 @@ pub enum CrashPoint {
 
 impl CrashPoint {
     /// Every point, in the order an attempt reaches them.
-    pub const ALL: [CrashPoint; 5] = [
+    pub const ALL: [CrashPoint; 6] = [
         CrashPoint::StripeStarted,
         CrashPoint::MidStripe,
         CrashPoint::StripeWritten,
+        CrashPoint::LastStripeStarted,
         CrashPoint::Appended,
         CrashPoint::Committed,
     ];
