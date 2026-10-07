@@ -1579,6 +1579,7 @@ max_data_fragments = 8
 min_eligible_nodes = 5
 fragment_release_delay_seconds = 60
 fragment_orphan_after_seconds = 3600
+fragment_repair_after_seconds = 600
 repair_bytes_per_second_per_node = 104857600
 
 [buckets.defaults]

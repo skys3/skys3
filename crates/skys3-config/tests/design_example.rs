@@ -235,6 +235,7 @@ max_data_fragments = 6
 min_eligible_nodes = 7
 fragment_release_delay_seconds = 30
 fragment_orphan_after_seconds = 7200
+fragment_repair_after_seconds = 900
 repair_bytes_per_second_per_node = 52428800
 
 [buckets.defaults]
@@ -329,6 +330,7 @@ fn every_key_parses_and_is_resolved() {
     let tls = config.transport().tls_files().expect("all three files");
     assert_eq!(tls.ca, std::path::Path::new("/etc/skys3/ca.crt"));
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
+    assert_eq!(config.ec().fragment_repair_after().as_secs(), 900);
     let node = config.node();
     assert_eq!(node.node_id.as_ref().unwrap().as_str(), "node-7");
     assert_eq!(node.data_dir, std::path::Path::new("/data/skys3"));
