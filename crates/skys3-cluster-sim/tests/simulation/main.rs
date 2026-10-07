@@ -83,6 +83,10 @@
 //!   payload, and with `backup_ack = "write_through"` losing every node
 //!   after an acknowledgement loses no write, under takeovers and remote
 //!   faults, with seeded bugs caught.
+//! - [`conflicts`]: an out-of-band writer at the remote store of a
+//!   `write_back` bucket under takeovers and remote faults, with the final
+//!   remote state audited against each conflict policy, held conflicts
+//!   resolved by an operator, and seeded bugs caught.
 //! - [`snapshots`]: index snapshots of `local` and `write_back` buckets
 //!   under takeovers and faults, and the restore drill of a shard whose
 //!   members are all lost: its lost-key report matches the clients'
@@ -95,6 +99,7 @@ mod buckets;
 mod cache;
 mod coding;
 mod compaction;
+mod conflicts;
 mod coordinator;
 mod crash;
 mod handoff;
