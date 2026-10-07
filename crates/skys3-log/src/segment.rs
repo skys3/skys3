@@ -18,8 +18,9 @@ use crate::record::{RecordKind, ShardRef};
 ///
 /// Small records and bulk payload age differently, so they live in
 /// separate segments and compaction (M1-22) can reclaim each on its own
-/// schedule. Fragment segments for erasure coding are a third class, added
-/// with the fragment store (M5-02).
+/// schedule. Fragment segments for erasure coding are a third class, but
+/// they hold fragment records, not log records: `skys3-ec`'s fragment store
+/// keeps them in files named `frag-<id>.seg`, which the log ignores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum SegmentClass {

@@ -3,49 +3,7 @@
 use std::fmt;
 use std::ops::Range;
 
-use crate::{EcError, Geometry, ReedSolomonV1};
-
-/// The identity of an erasure codec: the code, the fragment layout, and the
-/// exact bytes both produce.
-///
-/// Every stripe records the ID of the codec that encoded it, next to its
-/// geometry (design §8.3), and is always decoded with that codec. A codec ID
-/// is a persistent format: once a stripe may have been written with it, the
-/// codec behind it must keep producing and accepting exactly the same
-/// fragments. Golden vectors in `tests/golden.rs` freeze each one. A change
-/// that alters any fragment byte (a new layout, a different code, or a
-/// library upgrade that changes output) is a new codec with a new ID, and the
-/// old one stays registered so existing stripes still decode.
-///
-/// ID 0 is never assigned, so a zeroed header field cannot name a codec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CodecId(u16);
-
-impl CodecId {
-    /// Systematic Reed-Solomon, version 1: [`ReedSolomonV1`].
-    pub const REED_SOLOMON_V1: Self = Self(1);
-
-    /// The codec that encodes new stripes.
-    pub const CURRENT: Self = Self::REED_SOLOMON_V1;
-
-    /// The codec ID stored as `raw`, whether or not this build knows it.
-    #[must_use]
-    pub const fn new(raw: u16) -> Self {
-        Self(raw)
-    }
-
-    /// The stored form of the ID.
-    #[must_use]
-    pub const fn get(self) -> u16 {
-        self.0
-    }
-}
-
-impl fmt::Display for CodecId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+use crate::{CodecId, EcError, Geometry, ReedSolomonV1};
 
 /// An erasure codec: splits a stripe's data into `k` data fragments, adds
 /// `m` parity fragments, and rebuilds the data or any lost fragment from any
@@ -191,7 +149,5 @@ mod tests {
             let id = CodecId::new(raw);
             assert_eq!(codec(id).unwrap_err(), EcError::UnknownCodec(id));
         }
-        assert_eq!(CodecId::new(7).get(), 7);
-        assert_eq!(CodecId::REED_SOLOMON_V1.to_string(), "1");
     }
 }

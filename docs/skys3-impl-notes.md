@@ -5951,3 +5951,85 @@ of this file. A task with nothing unexpected keeps "None."
   turns the configuration into geometries, should. A codec decodes whole
   stripes; decoding only the range a coded read needs (§8.5) is left to
   M5-06.
+
+### M5-02 Fragment segments and fragment store
+
+- **Fragments do not fit the log.** A fragment of a default 64 MiB stripe
+  at 3+2 is about 21 MiB, past the log's 16 MiB payload limit, and a
+  fragment has no shard position, so log records would distort segment
+  summaries and replay. Fragment segments therefore hold their own record
+  format (`skys3_ec::fragment`), in `frag-<id>.seg` files beside the log's,
+  written by `FragmentStore` with the log's durability rules. The log's
+  recovery already ignored files it does not know, so neither the log nor
+  the index format changes. Compaction (M1-22's open point) only sees the
+  segments `SegmentLog::segments` lists, so it leaves fragment segments
+  alone; a test opens a log and a store on one disk and checks that each
+  ignores the other's files.
+- **The plan's fragment ID ignored disks.** A node has several disks, each
+  with its own store, so an ID unique per disk is not unique per node. The
+  ID is 128 bits: the disk's number (its position in label order), the
+  segment, and the offset where the fragment was first written. That needs
+  no persistent counter, never reuses an acknowledged ID (segment numbers
+  only grow and the last segment stays), and survives moves by compaction.
+  Recovery refuses a disk opened under another number.
+- **`Geometry` and `CodecId` moved to `skys3-types`** (M5-01's open point),
+  with the new `FragmentId` and `AttemptId`. `skys3-ec` now depends on
+  `skys3-log` for the S3 field limits and error classes, so the log could
+  not depend on `skys3-ec` for `EC_PUBLISH` (M5-04); `skys3-ec` re-exports
+  the types, so its API keeps its names. `Geometry::new` now returns a
+  `GeometryError`, which converts into `EcError::InvalidGeometry`.
+- **Range reads need block checksums.** One CRC over a fragment would make
+  a read of a range read the whole fragment to verify it. The header holds
+  a CRC32C per 64 KiB block, and the header's own CRC covers them. A read
+  returns the range with a CRC32C of its bytes, for the transfer to the
+  gateway (M5-06).
+- **Tags go stale in headers.** Tags change with `TAGS` records without a
+  new version, so a header can only hold the tags of when its attempt read
+  the object. Re-indexing takes those of the latest attempt; everything
+  else in the object's metadata must agree across headers.
+- **Re-indexing meets several attempts.** An abandoned encoding, a repair,
+  and a move can each leave headers for the same object version, even with
+  a different stripe count. `rebuild_layouts` keeps, per fragment index,
+  the latest attempt's copy, and per stripe the latest attempt's layout
+  that can be decoded, falling back to an older stripe count when the
+  newest is incomplete. Design §8.4 records the rules.
+- **The tear window depends on the largest fragment.** A crash can leave
+  one group commit plus one record unsynced, and a record can be a 256 MiB
+  fragment, so recovery's damage check only looks past that. The store's
+  `max_fragment_bytes` (default 256 MiB) bounds both writes and the window;
+  tests lower it to exercise the damage path. Configuration does not yet
+  bound `ec_stripe_data_bytes / k` by it: M5-04 should, when it turns the
+  configuration into stripes.
+- **A seeded bug surfaced as a refusal, not a loss.** With recovery's syncs
+  skipped, a process killed at its first data sync left a fragment only in
+  the page cache; the next life kept it, wrote into a new segment, and the
+  next power loss tore it inside a segment that was no longer the last, so
+  recovery refused to start. The kill scenario counts that as a failure,
+  as it should.
+- **The crash simulation.** `crates/skys3-ec/tests/simulation.rs` draws
+  one to four concurrent writers of one to four fragments each, of 64 B to
+  about 195 KiB, on 256 KiB segments and 128 KiB group commits, with torn
+  writes on half the crashes. It cuts the power before and after every
+  sync of the workload (`SimPower`), and kills the process at every sync
+  with a test-side mount that keeps the page cache; after each, every
+  acknowledged fragment must read back whole with its header and a
+  matching CRC32C, and the recovered store must take a fragment that
+  survives the next power cut. Seeded bugs behind the new `test-util`
+  feature (acknowledging before the sync, never syncing the directory,
+  skipping recovery's syncs) each fail it within the first seeds. The
+  scenarios declare a cost of 2: with `SKYS3_SIM_SEEDS=256` in a debug
+  build they run 128 seeds each, in 18 s (power cuts) and 25 s (process
+  crashes).
+- **Fuzzing past the checksums.** The `ec_fragment_header` target decodes
+  arbitrary bytes, and a copy with the payload's block checksums and the
+  header's CRC recomputed, so the field parsers are reached; a decoded
+  record must re-encode to the same bytes. 30 s ran 6.5 million inputs
+  without a failure.
+- **Left open.** The fragment map is rebuilt by reading one header per
+  fragment at startup: a disk of ten million fragments would take ten
+  million small reads, and if that proves too slow the map should move to
+  an index table with checkpoints. Damage in a segment other than the last
+  makes recovery refuse to start, as in the log, although repair (M5-08)
+  could rebuild the fragments lost; skipping the damaged range is a
+  candidate for M7. The store is not wired into the node: the fragment
+  write and read RPCs come with M5-04 and M5-06.

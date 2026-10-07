@@ -78,6 +78,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ec_fragment_header"
+path = "fuzz_targets/ec_fragment_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "gateway_aws_chunked"
 path = "fuzz_targets/gateway_aws_chunked.rs"
 test = false
