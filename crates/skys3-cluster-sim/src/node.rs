@@ -364,7 +364,11 @@ pub(crate) async fn run<S: NodeServices>(
         seed: seed.rotate_left(17),
     };
     let shards = shared.services.start(env).await?;
-    let flush = Arc::new(flush_service(settings, &shared.remote));
+    let flush = Arc::new(flush_service(
+        settings,
+        &shared.remote,
+        seed.rotate_left(29),
+    ));
     shared
         .flushers
         .lock()
@@ -482,8 +486,14 @@ async fn open_shards<H: Shards>(shards: &H, buckets: &[BucketDocument]) -> Resul
 
 /// The node's flushers: every `write_back` bucket flushes to `remote`, the
 /// harness's one remote store, whatever its target names; bucket prefixes
-/// keep their keys apart.
-fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3, SimMount> {
+/// keep their keys apart. Their capability probes take nonces from `seed`,
+/// so that a seed replays the scratch keys they write, which a parallel
+/// import's split points see.
+fn flush_service(
+    settings: &NodeSettings,
+    remote: &SimS3,
+    seed: u64,
+) -> FlushService<SimS3, SimMount> {
     let remote = remote.clone();
     FlushService::new(
         settings.cluster.clone(),
@@ -493,6 +503,7 @@ fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3,
     )
     .with_wall_clock(Arc::new(SimWallClock))
     .with_buckets(settings.buckets.clone())
+    .with_probe_nonces(seed)
 }
 
 /// Keeps a flusher on every shard open on the node of a `write_back`

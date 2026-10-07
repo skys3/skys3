@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -129,6 +130,9 @@ pub struct FlushService<S, D> {
     budget: Arc<DirtyBudget>,
     /// Each bucket's settings, if the service has them.
     bucket_settings: Option<BucketsConfig>,
+    /// The nonce of each capability probe's next run, if they are given
+    /// rather than fresh ([`FlushService::with_probe_nonces`]).
+    probe_nonces: Option<Arc<AtomicU64>>,
     buckets: Mutex<BTreeMap<BucketId, BucketFlusher<S>>>,
     /// The import tasks of buckets no longer followed, told to stop and
     /// not yet waited for: the bucket's next import waits for them first.
@@ -208,6 +212,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             metrics,
             budget: Arc::new(DirtyBudget::unlimited()),
             bucket_settings: None,
+            probe_nonces: None,
             buckets: Mutex::default(),
             stopping: Mutex::default(),
             _disk: std::marker::PhantomData,
@@ -218,6 +223,16 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     #[must_use]
     pub fn with_wall_clock(mut self, wall: Arc<dyn WallClock>) -> Self {
         self.wall = wall;
+        self
+    }
+
+    /// Gives the targets' capability probe runs the nonces `first`,
+    /// `first + 1`, and so on, in the order they start, instead of fresh
+    /// ones: a simulation derives `first` from its seed, so that its probe
+    /// keys, which an import's split points see, replay too.
+    #[must_use]
+    pub fn with_probe_nonces(mut self, first: u64) -> Self {
+        self.probe_nonces = Some(Arc::new(AtomicU64::new(first)));
         self
     }
 
@@ -349,7 +364,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
         let (ready, target) = watch::channel(None);
-        let probe_task = tokio::spawn(run_probe(parts, Arc::clone(&probe), ready));
+        let nonces = self.probe_nonces.clone();
+        let probe_task = tokio::spawn(run_probe(parts, nonces, Arc::clone(&probe), ready));
         BucketFlusher {
             name,
             probe,
@@ -551,6 +567,7 @@ impl<S> TargetParts<S> {
 /// then makes the target ready.
 async fn run_probe<S: ObjectStore>(
     parts: TargetParts<S>,
+    nonces: Option<Arc<AtomicU64>>,
     status: Arc<Mutex<ProbeStatus>>,
     ready: watch::Sender<Option<Arc<Target<S>>>>,
 ) {
@@ -558,7 +575,12 @@ async fn run_probe<S: ObjectStore>(
     loop {
         // A fresh nonce per run: a failed run may leave scratch keys behind,
         // which would fail the next run's `If-None-Match: *` that must hold.
-        let probe = ConditionalProbe::with_fresh_nonce(&parts.prefix);
+        let probe = match &nonces {
+            Some(next) => {
+                ConditionalProbe::new(&parts.prefix, next.fetch_add(1, Ordering::Relaxed))
+            }
+            None => ConditionalProbe::with_fresh_nonce(&parts.prefix),
+        };
         match probe.run(&*parts.store).await {
             Ok(found) => {
                 let unprotected = found.unprotected();

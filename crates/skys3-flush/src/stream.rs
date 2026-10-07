@@ -79,7 +79,7 @@
 //! a body's part is read and hashed. A completion that the remote refuses
 //! with `400 InvalidPart` lists the remote upload again.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -438,7 +438,7 @@ impl Claim {
 /// The streams of one shard flusher, shared by its task and its flushes.
 #[derive(Debug, Default)]
 pub(crate) struct Streams {
-    streams: Mutex<HashMap<EpochSeq, Stream>>,
+    streams: Mutex<BTreeMap<EpochSeq, Stream>>,
     /// Woken whenever a part's send or an open ends.
     idle: Notify,
     /// The number of the next `ListParts` a stream starts.
@@ -450,7 +450,7 @@ pub(crate) struct Streams {
 }
 
 impl Streams {
-    fn lock(&self) -> MutexGuard<'_, HashMap<EpochSeq, Stream>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<EpochSeq, Stream>> {
         // Every update leaves the map consistent.
         self.streams.lock().unwrap_or_else(PoisonError::into_inner)
     }
