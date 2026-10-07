@@ -2658,6 +2658,7 @@ dependencies = [
  "skys3-config",
  "skys3-control",
  "skys3-coord",
+ "skys3-ec",
  "skys3-gateway",
  "skys3-index",
  "skys3-io",
