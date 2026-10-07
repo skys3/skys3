@@ -10,9 +10,11 @@ use bytes::Bytes;
 use skys3_config::{EcConfig, FailureDomain};
 use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, NodeState, Topology};
 use skys3_ec::fragment::FragmentHeader;
+use skys3_ec::orphans::JudgeError;
 use skys3_ec::{
-    AttemptState, EncodeError, EncodeEvent, EncodeStep, Encoded, Encoder, EncoderSettings,
-    FragmentId, FragmentWriter, PlannerSource, Skip, TransferError, codec,
+    AttemptState, Attempts, EncodeError, EncodeEvent, EncodeStep, Encoded, Encoder,
+    EncoderSettings, FragmentId, FragmentWriter, OrphanJudge, PlannerSource, Skip, Suspect,
+    TransferError, Verdict, codec,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{BlockingPool, ManualWallClock, MonotonicClock, SimDisk, SimMount};
@@ -523,5 +525,112 @@ fn attempt_numbers_are_never_reused_across_restarts() {
         let second = f.events.lock().unwrap()[0].attempt;
         assert_eq!(second, AttemptId::new(Epoch::new(1), 64));
         drop(f.disk);
+    });
+}
+
+#[test]
+fn the_judge_confirms_only_fragments_no_committed_layout_will_name() {
+    runtime().block_on(async {
+        let f = Fixture::new().await;
+        write(&f.shard, "photo", &sample(10_000, 12), 12).await;
+        write(&f.shard, "slow", &sample(5000, 13), 13).await;
+        let attempts = Attempts::default();
+        let encoder = f.encoder(6).with_attempts(attempts.clone());
+        let pool = BlockingPool::new("judge", NonZeroUsize::MIN).unwrap();
+        let judge = OrphanJudge::new(f.shard.clone(), attempts.clone(), pool);
+        assert_eq!(judge.shard(), &shard_ref());
+        encoder.encode("photo").await.unwrap();
+        let entry = f.shard.entry("photo").await.unwrap().unwrap();
+        let coded = entry.object.unwrap().coded.unwrap();
+        let location = coded.stripes[1].fragments()[2].clone();
+        let suspect = |id, key: &str, epoch, number| Suspect {
+            id,
+            key: key.to_owned(),
+            attempt: AttemptId::new(Epoch::new(epoch), number),
+        };
+        let suspects = [
+            // Named by the committed layout, on the asking node.
+            suspect(location.fragment, "photo", 1, coded.attempt.number),
+            // An attempt nobody tracks, which no layout names.
+            suspect(FragmentId::new(999), "photo", 1, 50),
+            // An attempt of a later epoch: a newer primary's.
+            suspect(location.fragment, "photo", 2, 0),
+            // A key with no entry.
+            suspect(FragmentId::new(998), "absent", 1, 51),
+        ];
+        let verdicts = judge.judge(&location.node, &suspects).await.unwrap();
+        assert_eq!(
+            verdicts,
+            [
+                Verdict::Referenced,
+                Verdict::Orphan,
+                Verdict::InProgress,
+                Verdict::Orphan
+            ]
+        );
+        // The layout names the fragment on its own node only.
+        let elsewhere = judge.judge(&node(99), &suspects[..1]).await.unwrap();
+        assert_eq!(elsewhere, [Verdict::Orphan]);
+
+        // An attempt still writing is in progress however long it takes,
+        // and is not abandoned: it publishes.
+        let open = f.writer.hold();
+        let asked = async {
+            while attempts.in_progress().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            let attempt = attempts.in_progress()[0];
+            let writing = suspect(FragmentId::new(997), "slow", 1, attempt.number);
+            let verdicts = judge.judge(&node(1), &[writing]).await.unwrap();
+            assert_eq!(attempts.state(attempt), Some(AttemptState::Writing));
+            open.send(true).unwrap();
+            verdicts
+        };
+        let (encoded, verdicts) = tokio::join!(encoder.encode("slow"), asked);
+        assert_eq!(verdicts, [Verdict::InProgress]);
+        assert!(matches!(encoded.unwrap(), Encoded::Published(_)));
+    });
+}
+
+#[test]
+fn only_a_replica_that_leads_and_serves_judges() {
+    runtime().block_on(async {
+        let shard = shard_ref();
+        let config = ShardConfig {
+            bucket_id: shard.bucket.clone(),
+            shard: shard.shard,
+            epoch: Epoch::new(1),
+            primary: node(0),
+            members: vec![node(0), node(1)],
+            learners: Vec::new(),
+            min_write_replicas: 1,
+            replicas: 2,
+            proposal_id: ProposalId::new("p-1").unwrap(),
+        };
+        let suspect = Suspect {
+            id: FragmentId::new(1),
+            key: "photo".to_owned(),
+            attempt: AttemptId::new(Epoch::new(1), 0),
+        };
+        // A primary that has not reconciled its members, and a member.
+        for (n, at) in [node(0), node(1)].into_iter().enumerate() {
+            let disk = SimDisk::new(8 + n as u64);
+            let clock = Arc::new(MonotonicClock::new());
+            let (log, _) = SegmentLog::open(disk.mount(), LogConfig::default(), clock)
+                .await
+                .unwrap();
+            let index =
+                Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
+            let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+            let replica = Shard::open_replica(&config, &at, log, Arc::new(index), pool.clone())
+                .await
+                .unwrap();
+            let judge = OrphanJudge::new(replica, Attempts::default(), pool);
+            let error = judge
+                .judge(&node(2), std::slice::from_ref(&suspect))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, JudgeError::NotLeading(_)), "{error}");
+        }
     });
 }

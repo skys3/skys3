@@ -67,7 +67,7 @@ use skys3_types::{AttemptId, FragmentId};
 pub use judge::{JudgeError, OrphanJudge};
 pub use reclaimer::{OrphanReclaimer, ReclaimObserver, Reclaimed, SweepReport};
 pub use wire::{
-    MAX_SUSPECTS, OrphanClient, OrphanQuery, OrphanServer, OrphanVerdicts, PrimariesOf,
+    MAX_SUSPECTS, OrphanClient, OrphanQuery, OrphanServer, OrphanVerdicts, PrimariesOf, SuspectBody,
 };
 
 #[cfg(feature = "test-util")]
