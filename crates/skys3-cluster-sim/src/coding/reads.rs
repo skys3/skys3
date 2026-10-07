@@ -3,7 +3,9 @@
 //! objects and ranges through the gateways of every node while up to `m`
 //! fragment holders crash, lose power, lose their fragment disk for good,
 //! or send corrupted fragment bytes, and every byte a GET returns must be
-//! the version's that its ETag names.
+//! the version's that its ETag names. Some requests copy a coded object to
+//! a new key with CopyObject, which reads the source from its fragments,
+//! and read the copy back.
 //!
 //! Each node runs a gateway whose shards route to the shard's primary
 //! ([`RoutedShards`], over the node's transport), whose bucket comes from
@@ -81,6 +83,9 @@ pub struct ReadReport {
     pub unavailable: u64,
     /// GETs whose body broke off after the response began.
     pub broken: u64,
+    /// CopyObjects of a coded object answered `200`; each copy is then
+    /// read back as a GET is.
+    pub copied: u64,
     /// Fragment reads of a parity fragment, which only degraded pieces
     /// make.
     pub parity_reads: u64,
@@ -277,6 +282,9 @@ pub(super) async fn start_gateway(
     .parse::<skys3_config::Config>()?;
     let mut gateway_config = GatewayConfig::new(&config);
     gateway_config.hot_cache = HotCache::new(HOT_CACHE_BYTES);
+    // The shard's log takes inline bodies only up to its own bound, so the
+    // copies the gateway writes must keep to it.
+    gateway_config.inline_max_bytes = super::log_config().inline_max_bytes;
     let client = FragmentReadClient::new(node, transport.clone(), world.peers.clone())
         .with_local(fragments.clone());
     gateway_config.fragments = Some(Arc::new(Observed {
@@ -452,8 +460,9 @@ impl Driver<'_> {
     }
 }
 
-/// One client's GETs, each of a drawn object, through a drawn node's
-/// gateway, of the whole object or a drawn range.
+/// One client's requests, each of a drawn object through a drawn node's
+/// gateway: GETs of the whole object or a drawn range, and, one request in
+/// eight, a CopyObject to a new key whose copy is then read back.
 async fn reader(world: &World, n: usize) {
     let reads = world.reads.as_ref().expect("reads in this run");
     let mut rng = StdRng::seed_from_u64(world.seed ^ 0x5245_4144 ^ (n as u64) << 20);
@@ -461,11 +470,22 @@ async fn reader(world: &World, n: usize) {
         .iter()
         .map(|(key, data)| (key.clone(), data.len()))
         .collect();
-    for _ in 0..reads.config.gets {
+    for i in 0..reads.config.gets {
         let (key, size) = keys[rng.random_range(0..keys.len())].clone();
         let host = format!("n{}", rng.random_range(0..NODES));
-        let range = match rng.random_range(0..3) {
-            0 => None,
+        let range = match rng.random_range(0..8) {
+            0 => {
+                // The copy keeps the source's ETag, so its bytes are
+                // checked against the source version's.
+                let target = format!("copy-{n}-{i}");
+                if reads.copied(&key, &host, copy(&host, &key, &target).await) {
+                    let outcome = get(&host, &target, None).await;
+                    reads.count(&target, &host, None, outcome);
+                }
+                tokio::time::sleep(Duration::from_millis(rng.random_range(0..20))).await;
+                continue;
+            }
+            1..=3 => None,
             _ => {
                 let (a, b) = (rng.random_range(0..size), rng.random_range(0..size));
                 Some((a.min(b), a.max(b)))
@@ -478,6 +498,26 @@ async fn reader(world: &World, n: usize) {
 }
 
 impl Reads {
+    /// Counts what a copy of `key` through `host` got, and whether it
+    /// copied.
+    fn copied(&self, key: &str, host: &str, outcome: Result<bool, String>) -> bool {
+        let mut report = lock(&self.report);
+        match outcome {
+            Ok(true) => {
+                report.copied += 1;
+                true
+            }
+            Ok(false) => {
+                report.unavailable += 1;
+                false
+            }
+            Err(what) => {
+                lock(&self.wrong).push(format!("a copy of {key} through {host}: {what}"));
+                false
+            }
+        }
+    }
+
     /// Counts what a GET of `key` through `host` got, and records it if
     /// its bytes are not its version's.
     fn count(&self, key: &str, host: &str, range: Option<(usize, usize)>, outcome: Got) {
@@ -513,6 +553,25 @@ enum Got {
     Unavailable,
     Broken,
     Unexpected(String),
+}
+
+/// Copies `key` to `target` through `host`'s gateway: whether it copied,
+/// or what was wrong with the answer.
+async fn copy(host: &str, key: &str, target: &str) -> Result<bool, String> {
+    let request = Request::put(format!("/{BUCKET}/{target}"))
+        .header("x-amz-copy-source", format!("{BUCKET}/{key}"))
+        .body(Full::new(Bytes::new()))
+        .map_err(|error| format!("a request that does not build: {error}"))?;
+    let answer = match s3::connect(host, GET_TIMEOUT).await {
+        Ok(connection) => connection.send(request, GET_TIMEOUT).await,
+        Err(error) => Err(error),
+    };
+    match answer {
+        Ok(response) if response.status() == StatusCode::OK => Ok(true),
+        Ok(response) if response.status().is_server_error() => Ok(false),
+        Ok(response) => Err(format!("status {}", response.status())),
+        Err(_) => Ok(false),
+    }
 }
 
 /// GETs `key`, or bytes `a` to `b` of it, through `host`'s gateway.
