@@ -5914,6 +5914,88 @@ of this file. A task with nothing unexpected keeps "None."
   streamed to the remote upload; it reaches the shard through the same
   `Upload` as an UploadPart body.
 
+### M4-08 Write-through buckets
+
+- **Which writes wait (decided, design §7.5).** The plan names PUTs only.
+  Every write that makes a version of a key waits: PutObject, CopyObject,
+  CompleteMultipartUpload, DeleteObject, each key of DeleteObjects, and
+  the tagging writes. An acknowledged delete lost with the cluster would
+  bring the object back, which is loss of an acknowledged write too.
+  Parts, CreateMultipartUpload, and AbortMultipartUpload make no version
+  and answer after their local commit. Only `write_back` buckets wait;
+  `local` buckets have `backup_ack` (M4-09).
+- **"The remote flush" needed a definition.** Coalescing (§7.1) means the
+  version a write made may never be sent itself. A write is acknowledged
+  once the remote holds its version or a later one of the key; a delete
+  once `DeleteObject` succeeded, also while its tombstone waits for the
+  import. The answer does not wait for the lazy `FLUSHED`: the remote is
+  the durable copy, and waiting for the record would add up to a second
+  (`LAZY_MAX_DELAY`) to every write on an idle disk.
+- **The flusher had to be told in order.** The gateway cannot see the
+  primary's flusher, which may be on another node, so it asks with a new
+  `Shards::flushed`, forwarded as operation 20 (answer 16). The shard
+  passes the wait to its flusher through the subscription
+  (`Change::Awaited`), after the change that stored the version; then a
+  key the flusher no longer tracks has had its latest version flushed,
+  and needs no index read. That relied on an ordering the shard did not
+  quite give: the apply loop advanced the applied position under the
+  sequencer's lock but reported the changes after releasing it, so a wait
+  queued in between could overtake the version's own `Stored`. The report
+  now happens under the lock, and `Shard::await_flush` refuses a version
+  not applied yet. `Change` lost nothing: `FlushWaiter` compares by key,
+  version, and reply channel, so the enum keeps `Clone` and `Eq`.
+- **What the client sees (decided, design §7.5).** A write is never
+  undone: it is on every member and readable before its answer. A flush
+  that does not finish within the new key `write_through_timeout_seconds`
+  (default 30, added to §14 and the configuration reference) is answered
+  `503 SlowDown`, and the flusher keeps sending it. A held conflict is
+  answered `409 OperationAborted` at once, since a retry cannot succeed
+  before the conflict is resolved. A primary change while a write waits
+  ends the wait unanswered (the old flusher stops, or the replica answers
+  as a member), and the gateway asks again every 100 ms; the new
+  primary's flusher re-flushes the version under the same identity and
+  answers. Each ask waits at most 5 s, and at most half the forwarding
+  timeout, so a forwarded ask never outlives its request.
+- **Tests.** `skys3-flush/tests/write_through.rs` runs the gateway, real
+  shards, and the flush service against a remote whose requests take 5
+  to 20 ms: each kind of write is answered only once the remote holds it
+  (a streamed PUT's ETag is the remote multipart one), an outage gives
+  `503 SlowDown` and the write lands once the remote is back, an
+  out-of-band object gives `409 OperationAborted` (a later DELETE of the
+  held key too), and a write whose flushers stop while it waits is
+  answered by the next ones. With `ack_policy = "local"` all four fail.
+  Unit tests cover the policy lookup, the wire round trip and refusals of
+  operation 20, the forwarded wait, and the shard's ordering and errors.
+- **Simulation.** `ClusterConfig::write_through` makes the cluster's
+  `write_back` buckets write-through and audits them with the remote store
+  as the only survivor, as if every node's disks were destroyed: each
+  client checks the key right after it records an acknowledged write
+  (the workload gained an acknowledgement hook), and the driver checks
+  every key once the clients are done, before any fault heals.
+  `write_through::losing_every_node_after_an_acknowledgement_loses_no_write`
+  (`Runner::with_cost(4, COST)`, so CI runs 8 seeds) runs three
+  replicated nodes with takeovers, any-gateway clients, random crashes,
+  partitions, message loss, and control-store faults, and a remote that
+  delays every request 2 to 15 ms each way and fails or loses 2% of
+  them. With `SKYS3_SIM_SEEDS=8192` (256 seeds of each scenario) in a
+  debug build, both scenarios passed in 711 s, run side by side: about
+  2.8 s a seed, so CI's 8 seeds take about 22 s (21.6 s measured at
+  `SKYS3_SIM_SEEDS=256`).
+- **Seeded bug.** `WriteThrough::AckedLocally` keeps the audit but
+  acknowledges after the local commit, as `ack_policy = "local"` does.
+  `the_audit_catches_writes_acknowledged_after_their_local_commit`
+  (no faults, CI's 8 seeds in 1.8 s) expects it caught, and it was at
+  every one of 256 seeds, first at **seed 0**: `bucket-1/key-0`, a
+  multipart completion acknowledged while the remote held nothing. The
+  remote's 2 to 15 ms delays outlast a message's 1 to 5 ms, so the
+  flush of a write acknowledged early never lands before its answer
+  reaches the client.
+- **Left open.** The native peer transport (§7.8) waits for `APPLIED`;
+  its source side is M6. A destination cluster that receives a `COMMIT`
+  for a write-through bucket of its own does not wait for its own remote.
+  Write-through waits have no metric of their own; a timeout is logged as
+  a warning.
+
 ## M5 Local erasure coding
 
 ### M5-01 EcCodec

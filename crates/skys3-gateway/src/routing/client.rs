@@ -13,7 +13,7 @@ use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_net::{Connection, Frame, Network, Transport};
-use skys3_shard::{ReadId, ReadPlan, Registered, ShardSet, StreamedBody};
+use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, ShardSet, StreamedBody};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeAddress, NodeId, ShardConfig};
 use tokio::time::Instant;
 
@@ -686,6 +686,29 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
     async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
         match self.call(shard, Request::Announce(body)).await? {
             Response::Announced => Ok(()),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> Result<FlushState, ShardError> {
+        // Answered well within the request's timeout: a wait that ends
+        // unanswered is `Pending`, and the caller asks again.
+        let wait = wait
+            .min(self.config.request_timeout / 2)
+            .min(wire::MAX_FLUSH_WAIT);
+        let request = Request::Flushed {
+            key: key.to_owned(),
+            version,
+            wait,
+        };
+        match self.call(shard, request).await? {
+            Response::Flushed(state) => Ok(state),
             _ => Err(mismatched(shard)),
         }
     }
