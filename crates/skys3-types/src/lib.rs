@@ -20,8 +20,9 @@
 //!   identity every flushed object carries (§7.2) and the identity of a
 //!   committed version (§9.2).
 //! - **Erasure coding** ([`Geometry`], [`CodecId`], [`FragmentId`],
-//!   [`AttemptId`]): what a stripe records about how it was coded and where
-//!   its fragments are, and which attempt wrote a fragment (§8.3, §8.4).
+//!   [`FragmentLocation`], [`AttemptId`], [`CodedStripe`]): what a stripe
+//!   records about how it was coded and where its fragments are, and which
+//!   attempt wrote a fragment (§8.3, §8.4).
 //! - **Checksums** ([`checksum`]): the checksum algorithms S3 clients
 //!   use, `FULL_OBJECT` and `COMPOSITE` checksum types, and the stored form
 //!   of an object's checksums (§7.4).
@@ -59,7 +60,10 @@ mod register;
 pub mod shard;
 
 pub use address::{AddressError, DnsName, Host, NodeAddress};
-pub use ec::{AttemptId, CodecId, FragmentId, Geometry, GeometryError};
+pub use ec::{
+    AttemptId, CodecId, CodedStripe, CodedStripeError, FragmentId, FragmentLocation, Geometry,
+    GeometryError,
+};
 pub use id::{BucketId, BucketName, ClusterId, IdError, Label, NodeId, ProposalId};
 pub use identity::{ETag, ETagError, ParseWriteIdentityError, VersionIdentity, WriteIdentity};
 pub use position::{Epoch, EpochSeq, Generation, ParseNumberError, Seq};
