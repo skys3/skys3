@@ -10,12 +10,13 @@ use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
     Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
-    Extent, ExtentRef, Flushed, Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
+    EcPublish, Extent, ExtentRef, Flushed, Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
     MpuComplete, MpuCreate, MpuPart, PartFlushed, Put, PutData, RecordBody, RemoteStep, ShardRef,
     TagSet, Tags, UploadBegin, UploadChecksum,
 };
 use skys3_types::{
-    BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId,
+    FragmentLocation, Geometry, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
     VersionIdentity,
 };
 
@@ -282,6 +283,62 @@ fn put(position: EpochSeq) -> impl Strategy<Value = Put> {
         )
 }
 
+/// A valid `EC_PUBLISH` at `position`: one to four stripes of narrow
+/// geometries, on distinct nodes.
+pub fn ec_publish(position: EpochSeq) -> impl Strategy<Value = EcPublish> {
+    let stripe = (1..=1_000_000_u64, 1..=4_usize, 1..=3_usize, 1..=3_u16).prop_flat_map(
+        |(data_len, k, m, codec)| {
+            (
+                Just((data_len, k, m, codec)),
+                btree_set(node_id(), k + m),
+                vec(any::<u128>(), k + m),
+            )
+        },
+    );
+    (
+        (key(), position_before(position), etag()),
+        (any::<u64>(), any::<u64>()),
+        vec(stripe, 1..=4),
+    )
+        .prop_map(|((key, version, etag), (epoch, number), stripes)| {
+            let mut offset = 0;
+            let stripes: Vec<CodedStripe> = stripes
+                .into_iter()
+                .enumerate()
+                .map(|(number, ((data_len, k, m, codec), nodes, ids))| {
+                    let fragments = nodes
+                        .into_iter()
+                        .zip(ids)
+                        .map(|(node, id)| FragmentLocation {
+                            node,
+                            fragment: FragmentId::new(id),
+                        })
+                        .collect();
+                    let geometry = Geometry::new(k, m).unwrap();
+                    let stripe = CodedStripe::new(
+                        u32::try_from(number).unwrap(),
+                        offset,
+                        data_len,
+                        geometry,
+                        CodecId::new(codec),
+                        fragments,
+                    )
+                    .unwrap();
+                    offset = stripe.end();
+                    stripe
+                })
+                .collect();
+            EcPublish {
+                key,
+                version,
+                etag,
+                attempt: AttemptId::new(Epoch::new(epoch), number),
+                size: offset,
+                stripes,
+            }
+        })
+}
+
 fn node_id() -> impl Strategy<Value = NodeId> {
     label(NodeId::MAX_LEN).prop_map(|s| NodeId::new(s).unwrap())
 }
@@ -391,6 +448,7 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
                     })
                 }
             ),
+        ec_publish(position).prop_map(RecordBody::EcPublish),
         shard_config(shard, position.epoch).prop_map(RecordBody::Config),
         Just(RecordBody::Truncate),
     ]
