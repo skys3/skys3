@@ -16,6 +16,7 @@
 //! which nothing can reach (see the `multipart` module).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use skys3_index::{
@@ -25,7 +26,7 @@ use skys3_log::record::{
     Adopt, Delete, EcPublish, EcRelocate, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags,
 };
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
-use skys3_types::{CodedStripe, EpochSeq, Seq};
+use skys3_types::{CodedStripe, EpochSeq, FragmentLocation, Seq};
 
 use crate::multipart;
 use crate::seeded::{SeededBug, is_seeded};
@@ -645,23 +646,31 @@ fn relocate_coded(
     let Some(coded) = &mut object.coded else {
         return Ok(Err(Rejection::NotCoded));
     };
-    let mut stripes = coded.stripes.clone();
+    // Every move of a stripe lands before the stripe is checked, so two
+    // fragments may trade nodes.
+    let mut moved_stripes: BTreeMap<usize, Vec<FragmentLocation>> = BTreeMap::new();
     for moved in &relocate.moves {
         let rejected = Rejection::Moved {
             stripe: moved.stripe,
             index: moved.index,
         };
-        let Some(stripe) = usize::try_from(moved.stripe)
+        let Some(number) = usize::try_from(moved.stripe)
             .ok()
-            .and_then(|number| stripes.get_mut(number))
+            .filter(|number| *number < coded.stripes.len())
         else {
             return Ok(Err(rejected));
         };
-        let mut fragments = stripe.fragments().to_vec();
+        let fragments = moved_stripes
+            .entry(number)
+            .or_insert_with(|| coded.stripes[number].fragments().to_vec());
         match fragments.get_mut(usize::from(moved.index)) {
             Some(location) if *location == moved.from => *location = moved.to.clone(),
             _ => return Ok(Err(rejected)),
         }
+    }
+    let mut stripes = coded.stripes.clone();
+    for (number, fragments) in moved_stripes {
+        let stripe = &stripes[number];
         let Ok(relocated) = CodedStripe::new(
             stripe.number(),
             stripe.offset(),
@@ -670,9 +679,17 @@ fn relocate_coded(
             stripe.codec(),
             fragments,
         ) else {
-            return Ok(Err(rejected));
+            let index = relocate
+                .moves
+                .iter()
+                .find(|moved| moved.stripe == stripe.number())
+                .map_or(0, |moved| moved.index);
+            return Ok(Err(Rejection::Moved {
+                stripe: stripe.number(),
+                index,
+            }));
         };
-        *stripe = relocated;
+        stripes[number] = relocated;
     }
     for moved in &relocate.moves {
         index.move_fragment(

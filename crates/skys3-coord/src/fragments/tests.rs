@@ -471,6 +471,102 @@ fn arb_policy() -> impl Strategy<Value = GeometryPolicy> {
         .prop_map(|(m, k, extra)| GeometryPolicy::new(m, k, m + 1 + extra).unwrap())
 }
 
+/// A [`ReplaceRequest`] for `count` fragments of `plan`'s stripe 0 that
+/// keeps the fragments of `plan` at the indices `keep`.
+fn replacing<'a>(
+    bucket: &'a BucketId,
+    plan: &StripePlan,
+    keep: &'a [NodeId],
+    count: usize,
+    avoid: &'a [NodeId],
+) -> ReplaceRequest<'a> {
+    ReplaceRequest {
+        bucket,
+        shard: ShardId::new(0),
+        key: "key",
+        stripe: 0,
+        geometry: plan.geometry,
+        data_len: 64 * MIB,
+        keep,
+        count,
+        avoid,
+    }
+}
+
+#[test]
+fn repairs_place_fragments_around_the_ones_a_stripe_keeps() {
+    // Seven flat nodes: 4+2 with one spare node.
+    let mut planner = planner_for(FailureDomain::Node, flat(7));
+    let bucket = bucket();
+    let plan = planner.plan(&request(&bucket, 0)).unwrap();
+    assert_eq!(plan.geometry, Geometry::RS_4_2);
+    let spare = (0..7).map(node).find(|n| !plan.nodes.contains(n)).unwrap();
+    // One lost: it goes to the spare node, never to a kept or lost one.
+    let lost = plan.nodes[2].clone();
+    let keep: Vec<NodeId> = plan.nodes.iter().filter(|n| **n != lost).cloned().collect();
+    let avoid = [lost.clone()];
+    let placed = planner
+        .replace(&replacing(&bucket, &plan, &keep, 1, &avoid))
+        .unwrap();
+    assert_eq!(placed, [spare.clone()]);
+    assert!(planner.held(&spare) >= 16 * MIB);
+    // Two lost and one spare: no room until a node joins.
+    let keep = &plan.nodes[2..];
+    let avoid = [plan.nodes[0].clone(), plan.nodes[1].clone()];
+    assert_eq!(
+        planner.replace(&replacing(&bucket, &plan, keep, 2, &avoid)),
+        None
+    );
+    // A lost fragment's node may take it back when nothing forbids it, as
+    // after its disk was replaced.
+    let keep = &plan.nodes[1..];
+    let placed = planner
+        .replace(&replacing(&bucket, &plan, keep, 2, &[]))
+        .unwrap();
+    let placed: BTreeSet<&NodeId> = placed.iter().collect();
+    assert_eq!(placed, BTreeSet::from([&plan.nodes[0], &spare]));
+}
+
+#[test]
+fn repairs_keep_the_per_domain_cap() {
+    // Three racks of four: 4+2, two fragments per rack. The kept
+    // fragments fill two racks, so the lost ones go to the third.
+    let mut planner = planner_for(FailureDomain::Rack, racks(&[4, 4, 4]));
+    let bucket = bucket();
+    let plan = planner.plan(&request(&bucket, 0)).unwrap();
+    let topology = planner.topology().clone();
+    let rack = |n: &NodeId| topology.domain(n).unwrap();
+    let third = rack(&plan.nodes[0]);
+    let keep: Vec<NodeId> = plan
+        .nodes
+        .iter()
+        .filter(|n| rack(n) != third)
+        .cloned()
+        .collect();
+    assert_eq!(keep.len(), 4);
+    let lost: Vec<NodeId> = plan
+        .nodes
+        .iter()
+        .filter(|n| rack(n) == third)
+        .cloned()
+        .collect();
+    let placed = planner
+        .replace(&replacing(&bucket, &plan, &keep, 2, &lost))
+        .unwrap();
+    assert_eq!(placed.len(), 2);
+    assert!(placed.iter().all(|n| rack(n) == third && !lost.contains(n)));
+    // Only one node left in that rack: no room.
+    let avoid: Vec<NodeId> = lost
+        .iter()
+        .cloned()
+        .chain(placed.iter().take(1).cloned())
+        .collect();
+    assert_eq!(
+        planner.replace(&replacing(&bucket, &plan, &keep, 2, &avoid)),
+        None
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -595,5 +691,71 @@ proptest! {
         let plan = planner.plan(&request(&bucket, 0)).unwrap();
         prop_assert_eq!(plan.geometry, Geometry::RS_4_2);
         check_plan(planner.topology(), &plan, &[]);
+    }
+
+    /// Whatever a stripe keeps, the fragments placed around it keep both
+    /// rules, never land on a kept or avoided node, and fail only when the
+    /// caps leave too few nodes.
+    #[test]
+    fn replaced_stripes_keep_both_rules(
+        sizes in proptest::collection::vec(1..5_usize, 3..7),
+        lost in proptest::collection::btree_set(0..6_usize, 1..=2),
+        avoided in 0..3_usize,
+    ) {
+        let mut planner = planner_for(FailureDomain::Rack, racks(&sizes));
+        let bucket = bucket();
+        let Ok(plan) = planner.plan(&request(&bucket, 0)) else {
+            return Ok(());
+        };
+        let total = plan.geometry.total_fragments();
+        let lost: Vec<usize> = lost.into_iter().filter(|i| *i < total).collect();
+        prop_assume!(!lost.is_empty());
+        let keep: Vec<NodeId> = (0..total)
+            .filter(|i| !lost.contains(i))
+            .map(|i| plan.nodes[i].clone())
+            .collect();
+        let mut avoid: Vec<NodeId> = lost.iter().map(|&i| plan.nodes[i].clone()).collect();
+        let spare: Vec<NodeId> = planner
+            .topology()
+            .candidates()
+            .map(|c| c.node.clone())
+            .filter(|n| !plan.nodes.contains(n))
+            .collect();
+        avoid.extend(spare.iter().take(avoided).cloned());
+        let topology = planner.topology().clone();
+        match planner.replace(&replacing(&bucket, &plan, &keep, lost.len(), &avoid)) {
+            Some(placed) => {
+                prop_assert_eq!(placed.len(), lost.len());
+                let mut nodes = plan.nodes.clone();
+                for (&i, node) in lost.iter().zip(&placed) {
+                    prop_assert!(!keep.contains(node));
+                    nodes[i] = node.clone();
+                }
+                let replaced = StripePlan { geometry: plan.geometry, nodes };
+                check_plan(&topology, &replaced, &[]);
+                prop_assert!(placed.iter().all(|n| !avoid.contains(n)));
+            }
+            None => {
+                // No eligible node outside the kept and avoided ones has
+                // room under the per-domain cap.
+                let m = plan.geometry.parity_fragments();
+                let mut used: BTreeMap<Domain, usize> = BTreeMap::new();
+                for node in &keep {
+                    *used.entry(topology.domain(node).unwrap()).or_default() += 1;
+                }
+                let mut room = 0;
+                let mut free: BTreeMap<Domain, usize> = BTreeMap::new();
+                for candidate in topology.eligible() {
+                    if keep.contains(&candidate.node) || avoid.contains(&candidate.node) {
+                        continue;
+                    }
+                    *free.entry(candidate.domain(topology.level()).unwrap()).or_default() += 1;
+                }
+                for (domain, nodes) in free {
+                    room += nodes.min(m - used.get(&domain).copied().unwrap_or(0).min(m));
+                }
+                prop_assert!(room < lost.len(), "room {} for {}", room, lost.len());
+            }
+        }
     }
 }

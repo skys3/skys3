@@ -234,3 +234,22 @@ fn a_relocation_that_no_longer_fits_is_dropped_whole() {
     );
     assert_eq!(Rejection::NotCoded.to_string(), "the version is not coded");
 }
+
+#[test]
+fn fragments_of_a_stripe_may_trade_nodes() {
+    let (_, index) = new_index();
+    step(&index, 1, put("k", 20, 1));
+    step(&index, 2, publish("k", 1));
+    // Stripe 0 has fragment 0 on n1 and fragment 1 on n2: each moves to
+    // the other's node, which leaves the stripe on distinct nodes only
+    // once both moved.
+    let swap = vec![
+        moved(0, 0, location(1, 0), location(2, 200)),
+        moved(0, 1, location(2, 1), location(1, 201)),
+    ];
+    assert_eq!(step(&index, 3, relocate("k", 1, swap)), RELOCATED);
+    let stripe = &layout(&index, "k")[0];
+    assert_eq!(stripe.fragments()[0], location(2, 200));
+    assert_eq!(stripe.fragments()[1], location(1, 201));
+    assert_eq!(on(&index, 1), [("k".into(), 0, 1, 201)]);
+}
