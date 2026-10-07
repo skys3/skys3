@@ -6280,6 +6280,135 @@ of this file. A task with nothing unexpected keeps "None."
   that starts a write and both message bodies; `log_record` and
   `index_codec` already reach the new record body and values.
 
+### M5-05 Orphan fragment reclamation
+
+- **The plan's fence had two holes.** Confirming only attempts not in
+  progress, after reconciliation, is not enough. A primary deposed
+  without knowing it does not track its successor's attempts, so it
+  would judge their fragments orphans: the judge now treats an attempt of
+  a later epoch than the one its replica sequences in as in progress
+  (the seeded `JudgeBug::IgnoreLaterEpochs` is caught). And the
+  encoder's shard handle outlives epochs, so an attempt started under one
+  primary could publish under a later epoch of the same node, after
+  another primary judged it abandoned: `EC_PUBLISH` now goes through the
+  new `Shard::commit_in`, which appends only while the replica still
+  sequences in the attempt's epoch. Recorded in §8.4.
+- **`Attempts::abandon` was the wrong hook.** It abandons a writing
+  attempt, but the plan counts writing attempts as in progress; using it
+  would abandon every encoding that outlasts
+  `fragment_orphan_after_seconds`, so a large object would never be
+  coded. The judge uses a new `Attempts::orphaned(attempt, epoch)`: a
+  writing attempt of the replica's epoch, or a publishing one, is in
+  progress; one still writing from an earlier epoch cannot publish any
+  more and is abandoned in the same step; an unknown one is not in
+  progress. The encoder also forgets an attempt whose future is dropped
+  before it publishes, which would otherwise stay "writing" forever.
+- **The judge reads the index without leases.** `Shard::entry` admits a
+  read only while the primary holds every member's lease, which a
+  deposed primary loses within `primary_lease`. Reading through it would
+  hide the epoch rule behind a clock bound, so the judge reads its
+  replica's index directly on a blocking pool: the fence relies on
+  epochs, not clocks.
+- **Orphan queries are messages of their own.** `OrphanQuery` (9) and
+  `OrphanVerdicts` (10), in the replication class, with the bodies in
+  the frame's payload: a query of 256 fragments with long keys exceeds
+  the 64 KiB frame header. The asking node is the TLS peer, so a node
+  only learns verdicts on fragments it says it holds. A first version
+  tried the nodes that may lead the shard in turn, each within the
+  transport's 10 s handshake bound; in the takeover runs a node that was
+  down then held every sweep that asked it for 10 s, past the whole
+  window in which the before-reconciliation bug can strike (seed 25 of
+  that scenario let it through even with 2 s per node). A query now goes
+  to every such node at once, and each node gets 1 s, so an outage holds a
+  sweep up about a second. Taking the first verdicts then failed wide
+  runs (seed 7 of the primary-change scenario at 2048, the primary
+  isolated as its `EC_PUBLISH` was appended): the deposed primary, back
+  but still believing it led epoch 1, kept answering "in progress" for
+  its own publishing attempt, at once since it asked itself, and its
+  orphan was never reclaimed. "In progress" is safe but not final, so the
+  first answer counts only if it decides every fragment; otherwise the
+  answers are combined, a decided verdict winning over one in progress
+  and referenced over orphan. A new `ec_orphans` fuzz target decodes and
+  checks both bodies (1.1 million inputs in 30 s, no failure);
+  proptests round-trip them.
+- **Ages without timestamps.** The fragment map keeps no write time, and
+  adding one would change the fragment format. The reclaimer counts a
+  fragment's age from when its life first saw it, so a restart only
+  delays reclamation, and it keeps the fragments a primary judged
+  referenced out of further queries for the rest of the life.
+- **Reclaiming without a format change.** A reclaimed fragment leaves the
+  fragment map, and a segment whose records are all reclaimed is removed
+  unless it is the last (recovery already tolerated gaps in segment
+  numbers). Nothing is written: a restart finds the fragments of
+  surviving segments again, and they are reclaimed again once asked
+  about. Partly reclaimed segments wait for fragment-segment compaction
+  (M5-07).
+- **A member dropped the extents of a `PUT` it had not applied.** In the
+  first takeover runs, the new primary could not encode an object: "no
+  payload is located". The old primary had committed the object's `PUT`
+  and died before its watermark reached the members; a member then held
+  the `PUT` unapplied and, as compaction drops unnamed `EXTENT` records
+  once their segment has been sealed for `unreferenced_ttl` (1 s in the
+  harness), dropped the extents before the takeover applied the `PUT`.
+  The production default is a day, so takeover runs use 15 s, but
+  compaction could keep extents past the replica's applied position
+  instead (an open point for M1-22's owner).
+- **The harness grew rather than forked.** `skys3_cluster_sim::coding`
+  takes `OrphanConfig` (reclaimers and judges on every node, with a
+  seeded `JudgeBug`), `write_delay` (slow fragment writes, through a
+  writer that also records each fragment's attempt), `takeover` (an
+  in-memory shard register, removal and takeover, an encoder on every
+  member that works while it leads), and `CrashKind::Isolate` (the
+  primary cut off from the members and the register, still reachable by
+  fragment holders). Nodes ask all of the first three members, so a
+  stale primary gets asked too. The new check reads the
+  layouts of every replica that leads and serves, since members can
+  replay uncommitted records; the final check reads every member's. A
+  run settles only once every fragment held is named by a member's
+  layout or was published once (released fragments are M5-07's), which
+  is the "orphans are reclaimed" half of Done when. The readability
+  check still spans the first three members, because a new primary
+  applies its predecessor's last commits only after reconciliation, and
+  members are taken from the register everywhere else.
+- **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
+  reclamation racing publication (`orphan_after` 0 to 60 ms, a crash at
+  a drawn step and target, then an overwrite that supersedes an attempt)
+  runs 8 seeds of two runs in 34 s; encodings outlasting `orphan_after`
+  (150 ms per fragment write against 100 ms) 8 seeds in 21 s; a primary
+  change (the primary killed or isolated for 9 to 12 s at a drawn step)
+  2 seeds of two runs in 43 s. Seeded bugs, each run clean first:
+  confirming orphans without the tracker (`IgnoreAttempts`, caught with
+  slow writes) 8 seeds in 26 s; answering before serving
+  (`BeforeServing`: a member killed as the `EC_PUBLISH` is appended, the
+  primary 200 ms later, the survivor taking over and rolling the record
+  forward once it serves) 4 seeds in 36 s; a deposed primary judging a
+  later epoch (`IgnoreLaterEpochs`, the primary isolated for 12 s) 2
+  seeds in 38 s. Every bug is caught on every seed tried, with "which
+  was reclaimed". Wider runs, at `SKYS3_SIM_SEEDS=2048` with the final
+  client, all passed: 64 seeds each of racing, outlasting, and
+  confirming without the tracker; 16 of the primary change; 32 of
+  answering before serving; 16 of the deposed primary. The M5-04
+  scenarios still pass at 256 seeds (44, 62, 46, and 42 s).
+- **How repair and moves join the fence (M5-08, M5-09).** Register each
+  attempt in the node's shared `Attempts` for the shard (`begin`,
+  `publish`, `sequenced`, `finish`, crate-private in `skys3-ec`), append
+  `EC_RELOCATE` with `Shard::commit_in(attempt.epoch, …)`, and have
+  applying it update the entry's coded layout, which the judge reads.
+  The fragment a move or repair replaces is then unreferenced, and an
+  orphan unless M5-07 releases it first. The harness's `write_delay` and
+  `takeover` give the "outlasts `fragment_orphan_after_seconds`" and
+  primary-change scenarios.
+- **Left open.** Nothing runs reclaimers or judges in the node binary
+  yet (M5-04's open point); the harness's accept loop shows the
+  dispatch, and a node will need the shard map (M2-08) as its source of
+  primaries. A version overwritten after it was coded leaves fragments
+  no layout names, which the judge calls orphans: once coded reads exist
+  (M5-06), reclaiming those must also wait for the release delay and
+  read registrations (M5-07), and the reclaimer is the place to check
+  them. The reclaimer keeps one entry per fragment in memory, as the
+  fragment map does. There are no metrics yet; `SweepReport` has the
+  counts.
+
 ### M5-10 Lifecycle expiration and multipart cleanup
 
 - **The configuration lives in the bucket register.** An optional
