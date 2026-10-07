@@ -6084,7 +6084,21 @@ of this file. A task with nothing unexpected keeps "None."
   (`SKYS3_SIM_SEEDS=2048`) in 580 s, run side by side. Their check that
   the backup holds some object, and M4-08's that the remote does, allow
   a run whose clients deleted every key last: M4-08's scenario does at
-  seed 3 on this branch.
+  seed 3 on this branch, where its imports run 32 streams (below).
+- **A seed did not replay.** The simulated flush services now get the
+  node's `BucketsConfig`, which backup targets need, and with it the
+  default `import_parallel_streams` of 32 instead of `FlushSettings`'s 1.
+  A parallel import first discovers split points by listing the remote,
+  and that listing sees the capability probe's scratch keys, whose nonce
+  `FlushService` drew from a randomly keyed hasher and the time: the
+  split points, and so the import's checkpoint stores, differed between
+  two runs of a seed, and `harness::a_seed_replays_exactly` failed at
+  seed 3 with one more disk sync. `FlushService::with_probe_nonces` now
+  gives probe runs consecutive nonces from a seed, which the simulation
+  derives from each life's seed; nodes keep fresh ones. The shard
+  flusher's open streams also moved from a `HashMap` to a `BTreeMap`,
+  since the pump opened streams and handed out part sends in iteration
+  order. The replay test passed seeds 0 to 127 afterwards.
 - **Seeded bugs**, each without faults. The first two are
   `Runner::with_cost(2, COST)`, so CI runs seeds 0 to 7, in 19.4 s and
   2.6 s at `SKYS3_SIM_SEEDS=256`; the third runs twice the operations and
