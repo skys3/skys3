@@ -982,6 +982,15 @@ Two parity fragments survive any two node losses, the same failure budget as thr
 
 Fragments may land on any eligible node, not only the shard's members. Placement follows failure domains (section 6.7) and free space. Each stripe records its geometry, codec ID, and fragment locations, and these are never recomputed from the current cluster size. Growing the cluster changes only new stripes. Rebalancing moves fragments with the same publish-before-retire steps as encoding.
 
+**Geometry and placement, as built** (plan M5-03, `skys3_coord::GeometryPolicy` and `FragmentPlanner`):
+
+- A node is eligible for fragments exactly when it is for shard members (section 6.7): not departing, offering capacity, and carrying the label its level needs. Suspect nodes count.
+- The cluster can hold at most `Σ min(n_D, m)` fragments of one stripe, over the eligible domains `D` with `n_D` eligible nodes each. `⌈(k+m)/m⌉` domains are necessary but not always enough: 11 nodes in racks of 9, 1, and 1 hold only four fragments of a stripe and encode nothing. With at least `m` eligible nodes in every domain the two agree.
+- The geometries form a ladder, narrowest first. The narrowest has `k = min_eligible_nodes − m` (at least 1, at most `max_data_fragments`) and needs no spare node. Wider ones step `k` by multiples of `m` up to `max_data_fragments`, which is always offered: a `k` between two multiples needs as many domains as the next. A cluster supports a geometry when it has `min_eligible_nodes` eligible nodes, room for its `k+m` fragments, and, above the narrowest, at least one eligible node outside the stripe. The coordinator picks the widest supported; with the defaults that is the table above, and none means encoding pauses.
+- `max_data_fragments + parity_fragments` is at most 255, the fragment limit of a stripe.
+- Within the two rules, a stripe's fragments go to live nodes before suspect ones, then to domains holding fewer of its fragments, then to nodes whose zone and rack hold fewer (below the required level), then to nodes with the fewest fragment bytes for their capacity, with a hash of the stripe and the node breaking ties. Data fragments, which healthy reads fetch, are chosen first. Nodes an attempt must avoid, such as one whose fragment write failed, are left out before the geometry is chosen.
+- The plan becomes a `CodedStripe` (`skys3-types`): the stripe's number, offset, and length, its geometry and codec, and one node and fragment ID per index, never two on one node. `EC_PUBLISH` holds one per stripe.
+
 ### 8.4 Encoding: publish before retire
 
 ```mermaid

@@ -6033,3 +6033,50 @@ of this file. A task with nothing unexpected keeps "None."
   could rebuild the fragments lost; skipping the damaged range is a
   candidate for M7. The store is not wired into the node: the fragment
   write and read RPCs come with M5-04 and M5-06.
+
+### M5-03 Geometry and fragment placement
+
+- **The §8.3 table follows no stated rule.** Taking the widest `k` that
+  leaves one spare node gives 5+2 at 8 nodes and 7+2 at 10, where the
+  table has 4+2 and 6+2, and 3+2 at 5 nodes has no spare at all. The rule
+  that reproduces it: the narrowest geometry has `k = min_eligible_nodes −
+  m` and needs no spare; wider ones step `k` by `m` up to
+  `max_data_fragments` and need one spare node. Steps of `m` cost nothing
+  at the `rack` and `zone` levels, since a `k` between two multiples of
+  `m` needs as many domains as the next one. A `max_data_fragments` off
+  the steps is still offered as the widest. Recorded in §8.3.
+- **`⌈(k+m)/m⌉` domains are not always enough.** With uneven domains the
+  cap of `m` per domain binds earlier: 11 nodes in racks of 9, 1, and 1
+  span three racks but hold only four fragments of a stripe. Geometry is
+  chosen from `Σ min(n_D, m)` over the eligible domains, which equals the
+  design's domain count rule when every domain has at least `m` eligible
+  nodes. A greedy placement under the caps then always completes, so the
+  planner never returns a plan short of fragments.
+- **Where the code lives.** Placement reuses `Topology`, `Candidate`, the
+  domains, and the rendezvous hash of M3-03, so it is in `skys3-coord`
+  (`fragments.rs`). The encoder (M5-04) runs on shard primaries and will
+  depend on `skys3-coord` for it, as the gateway already does.
+- **The record type had to leave `skys3-ec`.** `skys3-ec` depends on
+  `skys3-log`, so `EC_PUBLISH` cannot name `skys3-ec`'s `StripeLayout`.
+  `CodedStripe` and `FragmentLocation` are in `skys3-types`; `skys3-ec`
+  re-exports `FragmentLocation` and converts a `CodedStripe` into its
+  rebuilt `StripeLayout`, which keeps optional slots for re-indexing.
+  `StripePlan::locate` joins a plan with the acknowledged fragment IDs.
+- **Free space is not in the registrations.** A registration lists the
+  bytes each disk offers, not what is used, so the planner ranks nodes by
+  fragment bytes it is told they hold (`FragmentPlanner::hold`) plus
+  those it planned. Durability preferences come first: a node in a rack
+  with fewer of the stripe's fragments wins over an emptier node.
+- **Configuration.** `[ec]` now rejects `max_data_fragments +
+  parity_fragments` above 255. The other open bound, keeping a fragment
+  of `ec_stripe_data_bytes` within the fragment store's 256 MiB, depends
+  on the narrowest `k` (`GeometryPolicy::narrowest`) and spans `[ec]` and
+  the bucket tables; it stays with M5-04, which turns the configuration
+  into stripes, as M5-02 recorded.
+- **Left open.** Nothing calls the planner yet: the encoder (M5-04)
+  checks `FragmentPlanner::geometry` before an object qualifies, plans
+  each stripe, and logs the `CodedStripe`s. Cluster health does not yet
+  report a policy whose geometry the cluster cannot support. Repair
+  (M5-08) and moves (M5-09) need placement around fragments a stripe
+  keeps; `choose_nodes` is the place to add kept fragments to the
+  per-domain counts.

@@ -61,7 +61,8 @@ use crate::place::{Candidate, Domain, Seed, Topology, level_name};
 ///   `max_data_fragments` itself. A `k` between two multiples of `m` needs
 ///   as many domains as the next multiple, `⌈(k+m)/m⌉`, so the steps lose
 ///   nothing at the `rack` and `zone` levels, and at the `node` level they
-///   leave between one and `m` nodes outside each stripe.
+///   leave between one and `m` nodes outside each stripe until the widest
+///   geometry is reached.
 ///
 /// A cluster supports a geometry ([`GeometryPolicy::supports`]) when it
 /// has at least `min_eligible_nodes` eligible nodes, room for the
