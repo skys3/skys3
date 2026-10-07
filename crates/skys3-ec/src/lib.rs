@@ -61,8 +61,8 @@ mod transfer;
 
 pub use codec::{EcCodec, codec, current_codec};
 pub use encoder::{
-    AttemptState, Attempts, EncodeError, EncodeEvent, EncodeObserver, EncodeStep, Encoded,
-    Encoder, EncoderSettings, PlannerSource, ScanReport, Skip,
+    AttemptState, Attempts, EncodeError, EncodeEvent, EncodeObserver, EncodeStep, Encoded, Encoder,
+    EncoderSettings, PlannerSource, ScanReport, Skip,
 };
 pub use error::EcError;
 pub use layout::{

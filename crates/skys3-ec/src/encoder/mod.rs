@@ -368,7 +368,10 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
         if let Err(skip) = self.qualifies(&entry) {
             return Ok(Encoded::Skipped(skip));
         }
-        let object = entry.object.as_ref().expect("a qualifying entry has an object");
+        let object = entry
+            .object
+            .as_ref()
+            .expect("a qualifying entry has an object");
         if plan.layout.is_empty() {
             return Ok(Encoded::Skipped(Skip::NoLocalBytes));
         }
@@ -719,7 +722,10 @@ impl Attempt<'_> {
 /// knows. The record is checked exactly before it is appended; this only
 /// avoids writing fragments that could never be published.
 fn fits(key: &str, entry: &Entry, stripes: u32, planner: &FragmentPlanner) -> bool {
-    let etag = entry.object.as_ref().map_or(0, |o| o.local_etag.as_str().len());
+    let etag = entry
+        .object
+        .as_ref()
+        .map_or(0, |o| o.local_etag.as_str().len());
     let node = planner
         .topology()
         .candidates()
