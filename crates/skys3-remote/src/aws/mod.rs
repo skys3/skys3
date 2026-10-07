@@ -366,13 +366,16 @@ mod tests {
         assert_eq!(path.bucket(), "bucket");
     }
 
+    /// What the error says depends on the machine: with no shared AWS
+    /// files at all, as on CI, the provider reports that it loaded
+    /// nothing; with files that lack the profile, it names the profile.
     #[tokio::test]
     async fn a_profile_that_is_not_configured_provides_no_credentials() {
         let provider = profile_credentials("skys3-no-such-profile", "us-east-1");
-        let error = provider.provide_credentials().await.unwrap_err();
+        let error = format!("{:?}", provider.provide_credentials().await.unwrap_err());
         assert!(
-            format!("{error:?}").contains("skys3-no-such-profile"),
-            "{error:?}"
+            error.starts_with("CredentialsNotLoaded") || error.contains("skys3-no-such-profile"),
+            "{error}"
         );
     }
 
