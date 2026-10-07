@@ -246,7 +246,10 @@ pub type PlannerSource = Arc<dyn Fn() -> FragmentPlanner + Send + Sync>;
 /// Sees every step of every attempt.
 pub type EncodeObserver = Arc<dyn Fn(&EncodeEvent) + Send + Sync>;
 
-/// A shard primary's encoder. See the [module documentation](self).
+/// A shard primary's encoder (§8.2, §8.4): it codes the shard's objects
+/// that qualify, stripe by stripe, and publishes each with `EC_PUBLISH`
+/// once every fragment is durable. The crate documentation lists the
+/// steps.
 pub struct Encoder<D: Disk, W: FragmentWriter> {
     shard: Shard<D>,
     writer: Arc<W>,
