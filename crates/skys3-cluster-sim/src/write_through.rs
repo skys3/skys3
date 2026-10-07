@@ -4,7 +4,7 @@
 //!
 //! With [`ClusterConfig::write_through`](crate::ClusterConfig::write_through),
 //! every `write_back` bucket acknowledges writes only once they are
-//! flushed, and the [`RemoteAudit`] checks it twice, each time with the
+//! flushed, and the `RemoteAudit` checks it twice, each time with the
 //! remote store as the only survivor, as if every node's disks were
 //! destroyed: when a client records an acknowledged write, for its key,
 //! and once the clients are done, before any fault heals, for every key.
@@ -25,8 +25,11 @@ use skys3_types::BucketMode;
 use crate::cluster::{remote_prefix, written};
 use crate::workload::{OnAck, Routes};
 
-/// How `write_back` buckets acknowledge writes, and whether the
-/// [`RemoteAudit`] runs.
+/// How `write_back` buckets acknowledge writes (§7.5), and whether the
+/// run audits them: the remote store alone must then hold every
+/// acknowledged write of such a bucket, or one that may have come after
+/// it, when a client records its acknowledgement and once the clients are
+/// done, as if every node's disks were destroyed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WriteThrough {
