@@ -844,6 +844,7 @@ async fn primary(
             stripe_data_bytes: world.run.stripe_data_bytes,
             after: Duration::ZERO,
             replans: 3,
+            after_backup: false,
         },
     )
     .with_attempts(attempts)

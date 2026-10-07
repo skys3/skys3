@@ -41,7 +41,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_config::BucketSettings;
 use skys3_coord::{FragmentPlanner, NoGeometry, StripeRequest};
-use skys3_index::{Entry, IndexError, ObjectVersion, Payload};
+use skys3_index::{Entry, EntryState, IndexError, ObjectVersion, Payload};
 use skys3_io::{Disk, WallClock};
 use skys3_log::record::{EcPublish, ExtentRef, LogRecord, MAX_HEADER_LEN, MAX_STRIPES, RecordBody};
 use skys3_shard::{Effect, Outcome, Rejection, Role, Shard, ShardError};
@@ -78,6 +78,10 @@ pub struct EncoderSettings {
     /// again, without the nodes that failed, before the attempt is
     /// abandoned.
     pub replans: usize,
+    /// Whether the bucket has a backup target (§8.9): a version is then
+    /// encoded only once the backup holds it, its entry clean, since the
+    /// flusher sends it from the local replica that encoding drops.
+    pub after_backup: bool,
 }
 
 impl EncoderSettings {
@@ -89,6 +93,7 @@ impl EncoderSettings {
             stripe_data_bytes: settings.ec_stripe_data_bytes,
             after: settings.ec_after(),
             replans: 3,
+            after_backup: settings.backup_target.is_some(),
         }
     }
 }
@@ -107,6 +112,8 @@ pub enum Skip {
     TooSmall,
     /// The object was written less than `ec_after_seconds` ago.
     TooRecent,
+    /// The bucket's backup target does not hold the version yet (§8.9).
+    NotBackedUp,
     /// The object needs more stripes than one `EC_PUBLISH` record can
     /// name; it stays replicated.
     TooLarge,
@@ -448,6 +455,9 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
         let after = u64::try_from(self.settings.after.as_millis()).unwrap_or(u64::MAX);
         if now.saturating_sub(object.last_modified_ms) < after {
             return Err(Skip::TooRecent);
+        }
+        if self.settings.after_backup && entry.state != EntryState::Clean {
+            return Err(Skip::NotBackedUp);
         }
         Ok(())
     }
