@@ -79,7 +79,9 @@ pub enum Effect {
     RemoteRecorded,
     /// An `IMPORT` created a stub.
     Imported,
-    /// An `ADOPT` replaced a clean version with the remote's.
+    /// An `ADOPT` replaced the version it named with the remote's: a
+    /// clean one after a fill, or a dirty one that a conflict policy
+    /// discarded (§7.2).
     Adopted,
     /// An `EXTENT` was entered into the location map.
     Located,
@@ -121,8 +123,9 @@ pub enum Rejection {
     /// is known.
     #[error("the key already has an entry")]
     HasEntry,
-    /// An `ADOPT` found the entry no longer clean: a local write committed
-    /// after the read plan.
+    /// An `ADOPT` found the entry at another version than it named, and
+    /// not clean: a local write committed after the read plan or the
+    /// conflict it resolves.
     #[error("the entry is {0:?}, not clean")]
     NotClean(EntryState),
     /// An `ADOPT` found the entry clean at another version than the read
@@ -506,11 +509,17 @@ fn import_stub(
     Ok(Ok(Effect::Imported))
 }
 
-/// `ADOPT`: the remote changed out of band, and the entry is still clean at
-/// the version the read plan named (§9.2). The remote version replaces it
-/// as a stub, at the `ADOPT` record's position, so no cache serves the old
-/// version's bytes under the new identity. Its tags are unknown and left
-/// empty.
+/// `ADOPT`: the remote changed out of band, and the entry is still at the
+/// version the record names. The remote version replaces it as a stub, at
+/// the `ADOPT` record's position, so no cache serves the old version's
+/// bytes under the new identity. Its tags are unknown and left empty.
+///
+/// A fill names a clean version, the one its read plan named (§9.2). The
+/// `discard_local` conflict policy names a dirty one, a version or a
+/// tombstone, whose flush found an out-of-band write: the local version is
+/// dropped (§7.2). A clean version never becomes dirty again at its `seq`,
+/// so a fill's `ADOPT` still applies only while its version is clean, and
+/// any write committed after the version named rejects either.
 fn adopt_remote(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -520,10 +529,10 @@ fn adopt_remote(
     let Some(entry) = index.entry(shard, &adopt.key)? else {
         return Ok(Err(Rejection::NoEntry));
     };
-    if !matches!(entry.state, EntryState::Clean | EntryState::Evicted) {
-        return Ok(Err(Rejection::NotClean(entry.state)));
-    }
     if entry.version.seq != adopt.expected_seq {
+        if !matches!(entry.state, EntryState::Clean | EntryState::Evicted) {
+            return Ok(Err(Rejection::NotClean(entry.state)));
+        }
         return Ok(Err(Rejection::VersionChanged {
             expected: adopt.expected_seq,
             current: entry.version.seq,

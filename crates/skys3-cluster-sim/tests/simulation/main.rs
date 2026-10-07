@@ -92,6 +92,10 @@
 //!   one the origin gave, as the reader's credentials see it, within the
 //!   freshness mode's bound, and seeded bugs of revalidation and of the
 //!   credential scope are caught.
+//! - [`conflicts`]: an out-of-band writer at the remote store of a
+//!   `write_back` bucket under takeovers and remote faults, with the final
+//!   remote state audited against each conflict policy, held conflicts
+//!   resolved by an operator, and seeded bugs caught.
 //! - [`snapshots`]: index snapshots of `local` and `write_back` buckets
 //!   under takeovers and faults, and the restore drill of a shard whose
 //!   members are all lost: its lost-key report matches the clients'
@@ -105,6 +109,7 @@ mod cache;
 mod coded_reads;
 mod coding;
 mod compaction;
+mod conflicts;
 mod coordinator;
 mod crash;
 mod handoff;

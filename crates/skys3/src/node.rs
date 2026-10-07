@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
-use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
+use skys3_config::{Config, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
 use skys3_flush::snapshot::SnapshotService;
@@ -399,20 +399,8 @@ impl Shared {
     /// bucket with a snapshot target (§8.9), refreshes the flush gauges, and
     /// gives the clean cache each bucket's `clean_copies` (§9.3).
     async fn follow_flushes(self: Arc<Self>) {
-        let mut warned = BTreeSet::new();
         loop {
             let buckets = self.gateway.buckets();
-            for bucket in &buckets {
-                let policy = self
-                    .config
-                    .buckets()
-                    .get(&bucket.name)
-                    .flush_conflict_policy;
-                if policy != ConflictPolicy::Hold && warned.insert(bucket.bucket_id.clone()) {
-                    tracing::warn!(bucket = %bucket.name, ?policy,
-                        "only the hold conflict policy is implemented; conflicts are held");
-                }
-            }
             // Before the reconcile awaits: a bucket made since the last
             // round may already have clean entries.
             self.install_clean_copies(&buckets);
@@ -1130,7 +1118,7 @@ impl Node {
             disks: storage.disks.clone(),
             control,
             health: health.clone(),
-            flush: Arc::new(move |bucket| flush.status(bucket)),
+            flush,
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?

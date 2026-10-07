@@ -475,6 +475,21 @@ fn settle<'a>(
             ),
         );
     }
+    // `[buckets.defaults]` cannot set it; `resolve` has reported it if it does.
+    if named
+        && table.flush_conflict_policy == Some(ConflictPolicy::DiscardLocal)
+        && values.mode != BucketMode::WriteBack
+    {
+        checker.report(
+            key("flush_conflict_policy"),
+            format!(
+                "\"discard_local\" adopts the remote's version, so only a write_back bucket \
+                 may choose it; a local bucket's backup target is never its system of record \
+                 (§7.2, §8.9); this bucket's mode is {}",
+                values.mode
+            ),
+        );
+    }
     // Checked for named buckets only: the defaults cannot name a target.
     if named
         && values.mode == BucketMode::Local

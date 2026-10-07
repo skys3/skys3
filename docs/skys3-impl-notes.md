@@ -5914,6 +5914,110 @@ of this file. A task with nothing unexpected keeps "None."
   streamed to the remote upload; it reaches the shard through the same
   `Upload` as an UploadPart body.
 
+### M4-06 Conflict policies and conflict administration
+
+- **A resolution is flusher state, not a record (decided, design §4.2,
+  §7.2).** Conflict was already an in-memory phase of the primary
+  flusher. Conflict → Dirty puts the key back in line with the policy to
+  apply attached (`Tracked::resolution`), and the key's next flush carries
+  it out with the usual ordering, retries, and write identity; it is
+  cleared once a flush of the key succeeds. A restarted or new primary
+  finds the conflict again by flushing and applies the bucket's policy,
+  so nothing needs to be durable. `overwrite` and `discard_local` resolve
+  at once, in the same step that finds the conflict.
+- **`discard_local` reuses `ADOPT` (decided, no format change).** The
+  fill's `ADOPT` (M1-06) already turned an entry into an evicted stub of a
+  remote object. Its rule widened from "a clean or evicted entry at the
+  named `seq`" to "the entry at the named `seq`, in any state", so it
+  drops a dirty version or tombstone too; a fill's `ADOPT` is unaffected,
+  since a clean version never becomes dirty again at its `seq`. A
+  different `seq` on an entry that is not clean is still `NotClean`, so
+  a write committed after the version named rejects the discard, and the
+  next attempt names the newer version. Before adopting, the flush HEADs
+  the key: if the foreign object is gone, or is SkyS3's own write, it
+  flushes normally. A replica of an earlier build rejects such an
+  `ADOPT`, so a mixed-build cluster must not discard (upgrade rules,
+  M7-09).
+- **The opt-in (decided, design §7.2).** `discard_local` in `[flush]` was
+  already rejected; it is now also rejected in a `[buckets.<name>]` table
+  whose bucket does not resolve to `write_back`. An operator may still
+  resolve one inspected key with `discard_local` in any `write_back`
+  bucket. A `local` bucket's backup target never discards: its effective
+  policy is `hold` if configured `discard_local` (unreachable through
+  validation, warned about), and the admin API refuses the resolution with
+  `409`, since adopting the backup's object would replace acknowledged
+  data with a version no read path serves (§8.9).
+- **Unprotected operations need nothing new.** They are sent without a
+  precondition under every policy, so an out-of-band write there is
+  overwritten silently; only the HEADs a flush sends anyway (a key the
+  import has not passed, a delete without a known remote ETag) can find
+  a foreign object, and the policy decides as for a 412. Tested per
+  policy in `skys3-flush/tests/conflicts.rs`.
+- **Write-through waits.** A dropped version cannot reach the remote, so
+  `discard_local` answers waiters as for a held conflict, `409
+  OperationAborted`; under `overwrite` they keep waiting for the flush.
+- **Admin API shape (decided, design §12).** `GET
+  /v1/buckets/<name>/conflicts` and `POST
+  /v1/buckets/<name>/conflicts/<policy>/<key>`, with the policy before the
+  key so that the rest of the path, percent-decoded, is the key, slashes
+  included; there is no query string or body to parse. The decoder is
+  twenty lines in `admin.rs`, not a new dependency. `NodeAdmin` reaches
+  the flush service through a small object-safe trait (`Flushers`) so the
+  admin router stays generic only over the disk. Conflicts live on the
+  primary of the key's shard, so the listing and the resolution are
+  node-local; a resolution sent to another node answers `404`.
+- **Surprise: an import replaces foreign objects.** The end-to-end admin
+  test first wrote its out-of-band objects before the namespace import
+  finished; the import passed those keys with the foreign objects as
+  their remote state, so no flush ever met a conflict (§9.1, as designed).
+  The test now waits for the import.
+- **Surprise: imports stall in multi-node clusters.** A node's import
+  commits `IMPORT` records only to shards it leads, and retries forever
+  on one led by another node (`shard ... is served by its primary`), so a
+  foreign object at the remote before every import ends leaves some
+  node's import running, and its tombstones waiting for it. The conflict
+  simulation found it at seed 22 of the `overwrite` scenario; its
+  out-of-band writer now starts once every node's import is done. Fixing
+  the import itself belongs to plan M2-17.
+- **Simulation.** `tests/simulation/conflicts.rs`, with
+  `ClusterConfig::conflicts`: three nodes, three replicas, one `local` and
+  one `write_back` bucket, an out-of-band writer that puts 16 objects
+  straight into the remote at the workload's keys (recorded in the history
+  as `PUT`s that never get an answer), crashes with and without power
+  loss, partitions, message loss, control-store faults, takeovers, and
+  2% remote errors. A final phase drains the flushers, writes about half
+  the keys out of band again (the burst), writes every key once more
+  through the cluster, and drains again; under `hold` an operator then
+  resolves each held key through `FlushService::resolve`, alternating
+  `overwrite` and `discard_local`. After the final recovery the audit
+  checks every key: each member's copy equals the remote object, and the
+  remote object is the final write under `overwrite`, the burst's object
+  for a burst key (adopted) under `discard_local`, and under `hold` what
+  the operator chose for a held key (every burst key must have been held
+  with the burst's object still at the remote). The three policy
+  scenarios run at `Runner::with_cost(4, COST)`: CI runs seeds 0 to 7 of
+  each, 25 to 30 s apiece and 65 s for all five scenarios of the file
+  side by side at `SKYS3_SIM_SEEDS=256` in a debug build. All three
+  passed 64 seeds (`SKYS3_SIM_SEEDS=2048`), 220 to 284 s apiece.
+- **Seeded bugs** (`ConflictBug`, without faults, 20 operations,
+  `Runner::with_cost(2, COST)`, 16 and 19 s at `SKYS3_SIM_SEEDS=256`):
+  - `ConflictBug::DiscardsWithoutOptIn`, flushers that discard whatever
+    the bucket's policy, run under `overwrite`: caught (the remote holds an
+    out-of-band write, "but the rule is overwrite: the final write") at
+    every one of seeds 0 to 63, first
+    at **seed 0**.
+  - `ConflictBug::ResolvesClean`, an operator's resolution that commits
+    `FLUSHED` for the held version instead of returning the key to dirty,
+    run under `hold`: caught (the remote keeps the
+    other writer's object, "but the rule is hold, resolved with
+    overwrite: the final write") at every one of seeds 0 to 63, first at **seed 0**.
+- **Left open.** A resolution is not forwarded to the key's primary, and
+  the listing is per node; an operator asks each node, or a later
+  coordinator view gathers them. A resolution is lost with the flusher
+  that holds it, so after a primary change a `hold` key is held again and
+  must be resolved again. The namespace import's stall (M2-17) is worked
+  around in the simulation, not fixed.
+
 ### M4-08 Write-through buckets
 
 - **Which writes wait (decided, design §7.5).** The plan names PUTs only.

@@ -31,6 +31,12 @@ pub struct Counters {
     pub retries: Counter,
     /// Keys put in conflict.
     pub conflicts: Counter,
+    /// Conflicts resolved by sending the local version unconditionally,
+    /// over the out-of-band write (`overwrite`, §7.2).
+    pub overwritten: Counter,
+    /// Conflicts resolved by adopting the out-of-band write and dropping
+    /// the local version (`discard_local`, §7.2).
+    pub discarded: Counter,
     /// Evicted versions filled from the remote into the clean cache.
     pub fills: Counter,
     /// Fills that found the remote changed out of band (§9.2).
@@ -46,6 +52,8 @@ impl Default for Counters {
             flushes: Counter::default(),
             retries: Counter::default(),
             conflicts: Counter::default(),
+            overwritten: Counter::default(),
+            discarded: Counter::default(),
             fills: Counter::default(),
             fill_conflicts: Counter::default(),
             streaming_overlap: overlap_histogram(),
@@ -83,6 +91,8 @@ pub struct FlushMetrics {
     flushes: Family<Labels, Counter>,
     retries: Family<Labels, Counter>,
     conflicts: Family<Labels, Counter>,
+    overwritten: Family<Labels, Counter>,
+    discarded: Family<Labels, Counter>,
     fills: Family<Labels, Counter>,
     fill_conflicts: Family<Labels, Counter>,
     streaming_overlap: Family<Labels, Histogram, fn() -> Histogram>,
@@ -100,6 +110,8 @@ impl Default for FlushMetrics {
             flushes: Family::default(),
             retries: Family::default(),
             conflicts: Family::default(),
+            overwritten: Family::default(),
+            discarded: Family::default(),
             fills: Family::default(),
             fill_conflicts: Family::default(),
             streaming_overlap: Family::new_with_constructor(overlap_histogram),
@@ -166,6 +178,18 @@ impl FlushMetrics {
             metrics.conflicts.clone(),
         );
         registry.register(
+            "flush_conflicts_overwritten",
+            "Conflicts resolved by flushing the local version unconditionally over the \
+             out-of-band write (the overwrite policy).",
+            metrics.overwritten.clone(),
+        );
+        registry.register(
+            "flush_conflicts_discarded",
+            "Conflicts resolved by adopting the out-of-band write and dropping the local \
+             version, an acknowledged write (the discard_local policy).",
+            metrics.discarded.clone(),
+        );
+        registry.register(
             "fills",
             "Evicted versions filled from the remote target into the clean cache.",
             metrics.fills.clone(),
@@ -194,6 +218,8 @@ impl FlushMetrics {
             flushes: self.flushes.get_or_create_owned(&labels),
             retries: self.retries.get_or_create_owned(&labels),
             conflicts: self.conflicts.get_or_create_owned(&labels),
+            overwritten: self.overwritten.get_or_create_owned(&labels),
+            discarded: self.discarded.get_or_create_owned(&labels),
             fills: self.fills.get_or_create_owned(&labels),
             fill_conflicts: self.fill_conflicts.get_or_create_owned(&labels),
             streaming_overlap: self.streaming_overlap.get_or_create_owned(&labels),
