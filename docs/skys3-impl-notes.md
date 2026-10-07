@@ -6600,6 +6600,26 @@ of this file. A task with nothing unexpected keeps "None."
   check, then re-resolution finds the new version). Release with
   `fragment_release_delay_seconds` and registrations, honoured by the
   reclaimer too, are left to M5-07, which owns release. Recorded in §8.5.
+- **CopyObject reads coded sources from their fragments.** It read its
+  source by the entry's payload positions from the source primary's log,
+  so once the members dropped a coded object's replicas a copy of it
+  failed. A coded source is now read whole through `read_coded`
+  (`Objects::coded_source`), naming the version the copy records, and a
+  stripe that cannot be read answers `503`. UploadPartCopy already read
+  its source as a GET does. `tests/coded.rs` in the gateway codes an
+  object with an `EC_PUBLISH` over in-memory fragments and checks GETs,
+  ranges, and copies, with a fragment of each stripe lost, and the
+  `503`s; both tests fail on the old copy path. Recorded in §8.5 and
+  §9.2.
+- **Other readers of a version's log payload.** The rest were checked:
+  GETs and UploadPartCopy go through `Objects::open`, which serves a
+  coded version from the hot cache or its fragments, never from holders
+  or a remote fill, and fills the hot cache from the fragments; HEAD
+  reads no bytes; a fill (`skys3-flush` `fill.rs`) reads back
+  the extents it just wrote; the encoder reads only versions not yet
+  coded; STS session records live in the system bucket, which nothing
+  codes; the payload reads in `peering.rs` are its tests'. The backup
+  flusher (`attempt.rs`, `stream.rs`) is the one left, below.
 - **Flusher reads of coded objects stay open (M4-09).** The flusher
   reads a version's payload from the primary's log, which a coded
   version no longer has. The encoder codes a version of a bucket with a
@@ -6622,12 +6642,16 @@ of this file. A task with nothing unexpected keeps "None."
   after the coding scenario's objects are coded and their replicas
   dropped, every node runs a gateway (an in-memory control store and
   shard map, routed shard client, hot cache) and three clients send 40
-  whole or ranged GETs each through drawn nodes while, for four seconds,
+  requests each through drawn nodes, whole or ranged GETs and, one in
+  eight, a CopyObject to a new key whose copy is read back, while, for
+  four seconds,
   up to two *lossy* nodes of n1 to n5 (`m` is 2 on six nodes) crash,
   with or without power loss, lose their fragment disk for good, or
   corrupt the bytes they send. Every answer must be its version's bytes,
-  by its ETag; `503` and broken-off bodies are allowed. The harness's
-  fragment source counts parity reads, and the scenario requires some.
+  by its ETag (a copy keeps its source's); `503` and broken-off bodies
+  are allowed. The harness's fragment source counts parity reads, and
+  the scenario requires some, and some copies. The copies stay out of
+  the coding checks, though the encoder may code them during the reads.
 - **Crashes do not replay within one process.** Two runs of a seed in
   one process differed after a crash. A crashed host's runtime drops its
   tasks in an order tokio shards by task ID, and task IDs are global to
@@ -6638,13 +6662,18 @@ of this file. A task with nothing unexpected keeps "None."
   (ECDSA signatures in the handshakes also vary in length, harmlessly:
   nothing depends on their size.)
 - **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
-  replay (cost 128) 2 seeds in 15 s; degraded reads (lossy 2 on
-  even seeds, else 1; cost 32) 8 seeds in 29 s; trusting bad CRCs
-  (corruption only) 4 seeds in 29 s; wrong indices (crashes and lost
-  disks) 4 seeds in 30 s. Both bugs are caught on every seed tried, with
-  "not those of version". At `SKYS3_SIM_SEEDS=2048` all passed: 64
-  seeds of degraded reads, 32 of each bug; replay passed 32 seeds at
-  4096.
+  replay (cost 128) 2 seeds in 18 s; degraded reads (lossy 2 on
+  even seeds, else 1; cost 32) 8 seeds in 40 s; trusting bad CRCs
+  (corruption only) 4 seeds in 37 s; wrong indices (crashes and lost
+  disks) 4 seeds in 42 s. Both bugs are caught on every seed tried, with
+  "not those of version". At `SKYS3_SIM_SEEDS=2048` all passed, copies
+  included: 64 seeds of degraded reads, 32 of each bug, 16 of replay
+  (431 s, four at a time); before the copies, replay passed 32 seeds at
+  4096. The copies add about a third to each run. Adding them first
+  found a harness bug: the harness's gateways used the default
+  `inline_max_bytes`, above the shard log's 512 bytes, so the shard
+  refused every copy's inline body until the gateways took the log's
+  bound.
 - **Hooks for M5-07, M5-08, M5-09.** Release should register fragment
   reads where the gateway resolves a coded plan (`objects/coded.rs`) and
   have `FragmentServer::read` check registrations, like holder reads.
@@ -6654,10 +6683,10 @@ of this file. A task with nothing unexpected keeps "None."
   `EC_RELOCATE`; readers holding the old plan fail on the identity check
   and re-resolve.
 - **Left open.** The node binary does not serve fragment reads or set
-  `GatewayConfig::fragments` yet (as for M5-04's encoder). CopyObject
-  reads its source's payload from the source primary, so copying a coded
-  object fails; it should read through `read_coded`, as GET and
-  UploadPartCopy (which reads its source as a GET does) now do. There are no metrics for degraded reads yet.
+  `GatewayConfig::fragments` yet (as for M5-04's encoder). A CopyObject
+  whose coded source was replaced and reclaimed after the copy read its
+  entry answers `503` rather than resolving again, as a GET would. There
+  are no metrics for degraded reads yet.
 
 ### M5-10 Lifecycle expiration and multipart cleanup
 
