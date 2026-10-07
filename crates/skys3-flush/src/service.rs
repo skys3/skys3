@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use skys3_config::BucketsConfig;
+use skys3_config::{BucketsConfig, ConflictPolicy};
 use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::ObjectStore;
@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::budget::DirtyBudget;
+use crate::conflict::{Unresolved, effective_policy, may_discard};
 use crate::fill::Filler;
 use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
@@ -53,6 +54,8 @@ pub struct BucketStatus {
     /// Whether the target is the backup target of a `local` bucket (§8.9),
     /// rather than a `write_back` bucket's system of record.
     pub backup: bool,
+    /// What a flush that finds an out-of-band write does (§7.2).
+    pub conflict_policy: ConflictPolicy,
     /// The target's capability probe.
     pub probe: ProbeStatus,
     /// Each open shard's flusher.
@@ -119,8 +122,12 @@ impl BucketStatus {
 /// `clean_copies`, so it keeps every payload that a `FLUSHED` made clean
 /// (`skys3_shard::CleanCache::evicts`).
 ///
-/// Only the `hold` conflict policy exists so far (§7.2); `overwrite` and
-/// `discard_local` arrive with plan M4.
+/// **Conflicts** (§7.2). A bucket's flushers apply its
+/// `flush_conflict_policy` from its settings, `hold` without them: a key
+/// held in conflict waits for [`FlushService::resolve`], and `overwrite`
+/// and `discard_local` resolve conflicts as they are found. Only a
+/// `write_back` bucket whose own table names `discard_local` discards; a
+/// backup target holds instead.
 pub struct FlushService<S, D> {
     cluster: ClusterId,
     settings: FlushSettings,
@@ -152,6 +159,10 @@ impl<S, D> fmt::Debug for FlushService<S, D> {
 /// The flushers of one bucket.
 struct BucketFlusher<S> {
     name: String,
+    /// The conflict policy its flushers apply.
+    conflict_policy: ConflictPolicy,
+    /// Whether an operator may resolve its conflicts with `discard_local`.
+    may_discard: bool,
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
     /// The target, once the probe is done.
@@ -243,9 +254,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         self
     }
 
-    /// Takes each bucket's `import_parallel_streams` and `backup_target`
-    /// from `buckets`; otherwise every import has `settings.import_streams`
-    /// streams, and no `local` bucket is flushed.
+    /// Takes each bucket's `import_parallel_streams`, `backup_target`, and
+    /// `flush_conflict_policy` from `buckets`; otherwise every import has
+    /// `settings.import_streams` streams, no `local` bucket is flushed, and
+    /// conflicts are held.
     #[must_use]
     pub fn with_buckets(mut self, buckets: BucketsConfig) -> Self {
         self.bucket_settings = Some(buckets);
@@ -352,6 +364,18 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     ) -> BucketFlusher<S> {
         let name = bucket.name.as_str().to_owned();
         let import = (role == Role::WriteBack).then(|| Arc::new(ImportState::default()));
+        let configured = self
+            .bucket_settings
+            .as_ref()
+            .map_or(ConflictPolicy::Hold, |buckets| {
+                buckets.get(&bucket.name).flush_conflict_policy
+            });
+        let backup = role == Role::Backup;
+        let conflict_policy = effective_policy(configured, backup);
+        if backup && configured == ConflictPolicy::DiscardLocal {
+            tracing::warn!(bucket = name,
+                "a backup target never discards local writes; its conflicts are held");
+        }
         let parts = TargetParts {
             store: Arc::new((self.connect)(target)),
             prefix: target.prefix.clone().unwrap_or_default(),
@@ -360,6 +384,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             wall: Arc::clone(&self.wall),
             counters: self.metrics.counters(&name),
             import: import.clone(),
+            conflict_policy,
         };
         let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
@@ -368,6 +393,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         let probe_task = tokio::spawn(run_probe(parts, nonces, Arc::clone(&probe), ready));
         BucketFlusher {
             name,
+            conflict_policy,
+            may_discard: may_discard(configured, backup),
             probe,
             probe_task,
             target,
@@ -457,6 +484,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         Some(BucketStatus {
             name: flusher.name.clone(),
             backup: flusher.record.is_none(),
+            conflict_policy: flusher.conflict_policy,
             probe: lock(&flusher.probe).clone(),
             shards: flusher
                 .shards
@@ -474,6 +502,41 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .map_or(u64::MAX, |usage| usage.share),
             import: flusher.record.as_ref().map(|record| record.import.status()),
         })
+    }
+
+    /// Resolves the conflict that one of `bucket`'s flushers on this node
+    /// holds `key` in, under `policy`, as an operator asks through the
+    /// admin API (§7.2): the key returns to dirty, and its next flush
+    /// retries the conditional request (`hold`), overwrites the remote's
+    /// write (`overwrite`), or adopts it and drops the local version
+    /// (`discard_local`). See [`ShardFlusher::resolve`].
+    ///
+    /// # Errors
+    ///
+    /// [`Unresolved::NotFlushed`] if the bucket is not flushed here,
+    /// [`Unresolved::NotOptedIn`] for `discard_local` on a bucket whose
+    /// own table does not choose it, or a backup target, and
+    /// [`Unresolved::NotHeld`] if no flusher here holds the key in
+    /// conflict: its shard's primary may be another node.
+    pub async fn resolve(
+        &self,
+        bucket: &BucketId,
+        key: &str,
+        policy: ConflictPolicy,
+    ) -> Result<(), Unresolved> {
+        let resolver = {
+            let flushers = self.lock();
+            let flusher = flushers.get(bucket).ok_or(Unresolved::NotFlushed)?;
+            if policy == ConflictPolicy::DiscardLocal && !flusher.may_discard {
+                return Err(Unresolved::NotOptedIn);
+            }
+            flusher
+                .shards
+                .values()
+                .find_map(|shard| shard.resolver_of(key))
+                .ok_or(Unresolved::NotHeld)?
+        };
+        resolver.resolve(key, policy).await
     }
 
     /// The read-through fills of `bucket`'s target, if the bucket is a
@@ -549,13 +612,15 @@ struct TargetParts<S> {
     /// The bucket's import; `None` for a backup target, which imports
     /// nothing, so every key counts as imported.
     import: Option<Arc<ImportState>>,
+    conflict_policy: ConflictPolicy,
 }
 
 impl<S> TargetParts<S> {
     fn build(self, writes: ConditionalWrites) -> Target<S> {
         let target = Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
             .with_wall_clock(self.wall)
-            .with_counters(self.counters);
+            .with_counters(self.counters)
+            .with_conflict_policy(self.conflict_policy);
         match self.import {
             Some(import) => target.with_import(import),
             None => target,
