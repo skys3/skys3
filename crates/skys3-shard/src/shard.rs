@@ -2492,9 +2492,9 @@ impl<D: Disk> Shard<D> {
     /// Passes a wait for `version` of `key` to reach the remote target to
     /// the subscriber, the shard's flusher, and returns the caller's end of
     /// it (§7.5): a write to a `write_through` bucket is acknowledged once
-    /// the flusher answers [`FlushState::Flushed`](crate::FlushState). `version` must be a
-    /// version of `key` this primary applied, such as one a write it
-    /// acknowledged committed.
+    /// the flusher answers [`FlushState::Flushed`](crate::FlushState).
+    /// `version` must be a version of `key` this primary applied, such as
+    /// one a write it acknowledged committed.
     ///
     /// The flusher hears of the wait after every change applied before it,
     /// the version's own included. The wait ends without an answer if the

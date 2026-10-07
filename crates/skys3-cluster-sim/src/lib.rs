@@ -99,6 +99,7 @@ mod replication;
 mod routing;
 mod s3;
 mod workload;
+mod write_through;
 
 pub use cluster::{
     Cluster, ClusterConfig, HotCaches, Invariant, ReadRegistration, Rebuild, Report, RunError,
@@ -119,6 +120,7 @@ pub use replication::{
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
 pub use workload::Workload;
+pub use write_through::WriteThrough;
 
 /// The control-store fault rates of [`ClusterConfig::control_rates`].
 pub use skys3_control::faults::FaultRates;

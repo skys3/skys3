@@ -17,6 +17,10 @@
 //! write identity (§7.2); a body that fails leaves the record naming no
 //! write.
 //!
+//! **Write-through.** In a `write_back` bucket whose `ack_policy` is
+//! `write_through`, every write that makes a version of a key is answered
+//! only once the remote target holds it (§7.5, `write_through`).
+//!
 //! **Metadata.** The record keeps the standard headers S3 stores
 //! (`Cache-Control`, `Content-Disposition`, `Content-Encoding`,
 //! `Content-Language`, `Content-Type`, `Expires`) and user metadata under

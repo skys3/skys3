@@ -697,10 +697,15 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
         version: EpochSeq,
         wait: Duration,
     ) -> Result<FlushState, ShardError> {
+        // Answered well within the request's timeout: a wait that ends
+        // unanswered is `Pending`, and the caller asks again.
+        let wait = wait
+            .min(self.config.request_timeout / 2)
+            .min(wire::MAX_FLUSH_WAIT);
         let request = Request::Flushed {
             key: key.to_owned(),
             version,
-            wait: wait.min(wire::MAX_FLUSH_WAIT),
+            wait,
         };
         match self.call(shard, request).await? {
             Response::Flushed(state) => Ok(state),
