@@ -174,11 +174,16 @@ fn seeded(context: &mut SimContext, bug: SnapshotBug) -> Result<Report, RunError
     Cluster::with_services(config, services()).run(context, &workload, &FaultPlan::none())
 }
 
-/// Expects the drill to have caught a seeded bug, with `reason` in its
-/// finding.
-fn caught(found: Result<Report, RunError>, reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Expects the drill to have caught a seeded bug, with one of `reasons`
+/// in its finding.
+fn caught(
+    found: Result<Report, RunError>,
+    reasons: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
     match found {
-        Err(RunError::Simulation(error)) if error.contains(reason) => Ok(()),
+        Err(RunError::Simulation(error)) if reasons.iter().any(|reason| error.contains(reason)) => {
+            Ok(())
+        }
         other => Err(format!("the bug went unnoticed: {other:?}").into()),
     }
 }
@@ -189,7 +194,7 @@ fn caught(found: Result<Report, RunError>, reason: &str) -> Result<(), Box<dyn s
 fn the_drill_catches_a_snapshot_without_dirty_entries() {
     Runner::with_cost(2, COST).run(|context| {
         let found = seeded(context, SnapshotBug::SkipsDirty);
-        caught(found, "is not reported")
+        caught(found, &["is not reported"])
     });
 }
 
@@ -200,17 +205,18 @@ fn the_drill_catches_a_snapshot_without_dirty_entries() {
 fn the_drill_catches_deltas_that_forget_deletes() {
     Runner::with_cost(2, 2 * COST).run(|context| {
         let found = seeded(context, SnapshotBug::KeepsRemoved);
-        caught(found, "is reported lost")
+        caught(found, &["is reported lost"])
     });
 }
 
 /// A restore that applies the base alone but dates it as the latest
 /// delta: its window starts after the state it restored, so a key written
-/// in between is reported with its older value, or not at all.
+/// or deleted in between is reported with its older value, reported though
+/// it was deleted, or not reported at all.
 #[test]
 fn the_drill_catches_a_window_that_starts_after_the_restored_state() {
     Runner::with_cost(2, COST).run(|context| {
         let found = seeded(context, SnapshotBug::BaseOnly);
-        caught(found, "but its last value is")
+        caught(found, &["is not reported", "is reported lost"])
     });
 }
