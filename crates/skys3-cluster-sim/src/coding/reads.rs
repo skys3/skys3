@@ -32,7 +32,9 @@ use skys3_control::{
 };
 use skys3_ec::read::ReadFuture;
 use skys3_ec::read::seeded::ReadBug;
-use skys3_ec::{FragmentBytes, FragmentReadClient, FragmentRequest, FragmentServer, FragmentSource};
+use skys3_ec::{
+    FragmentBytes, FragmentReadClient, FragmentRequest, FragmentServer, FragmentSource,
+};
 use skys3_gateway::routing::{ForwardServer, RoutedShards, ShardMap};
 use skys3_gateway::{Gateway, GatewayConfig, HotCache, IdSource, LocalShards, TrustAll};
 use skys3_io::SimMount;
@@ -315,7 +317,8 @@ impl FragmentSource for Observed {
     fn read(&self, request: FragmentRequest) -> ReadFuture<'_> {
         Box::pin(async move {
             let reads = self.world.reads.as_ref().expect("reads in this run");
-            if usize::from(request.identity.index) >= request.identity.stripe.geometry.data_fragments()
+            if usize::from(request.identity.index)
+                >= request.identity.stripe.geometry.data_fragments()
             {
                 reads.parity_reads.fetch_add(1, Ordering::SeqCst);
             }

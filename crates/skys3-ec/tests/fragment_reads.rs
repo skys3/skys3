@@ -100,8 +100,8 @@ async fn cluster(
     let id = timed(writer.write(&node(2), &header("k", 256, 3), data.clone()))
         .await
         .unwrap();
-    let reader = FragmentReadClient::new(node(1), pki.transport(&node(1)), peers)
-        .with_local(server().await);
+    let reader =
+        FragmentReadClient::new(node(1), pki.transport(&node(1)), peers).with_local(server().await);
     (addr, id, data, reader)
 }
 
@@ -115,7 +115,10 @@ async fn a_node_serves_the_fragment_a_read_names() {
         let read = timed(reader.read(request(node(2), id, &header, range.clone())))
             .await
             .unwrap();
-        assert_eq!(read.data, data.slice(range.start as usize..range.end as usize));
+        assert_eq!(
+            read.data,
+            data.slice(range.start as usize..range.end as usize)
+        );
         assert_eq!(read.crc32c, crc32c::crc32c(&read.data));
     }
 
@@ -141,9 +144,15 @@ async fn a_node_serves_the_fragment_a_read_names() {
     let error = timed(reader.read(request(node(5), id, &header, 0..8)))
         .await
         .unwrap_err();
-    assert!(matches!(error, FragmentReadError::Unreachable { .. }), "{error}");
+    assert!(
+        matches!(error, FragmentReadError::Unreachable { .. }),
+        "{error}"
+    );
     let local = timed(reader.read(request(node(1), id, &header, 0..8))).await;
-    assert!(matches!(local, Err(FragmentReadError::NotHeld { .. })), "{local:?}");
+    assert!(
+        matches!(local, Err(FragmentReadError::NotHeld { .. })),
+        "{local:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -171,7 +180,9 @@ async fn a_node_answers_malformed_reads_and_stops_at_other_frames() {
     .into_iter()
     .enumerate()
     {
-        timed(connection.send(&ask(body, n as u64 + 7))).await.unwrap();
+        timed(connection.send(&ask(body, n as u64 + 7)))
+            .await
+            .unwrap();
         let answer = timed(connection.recv()).await.unwrap().unwrap();
         assert_eq!(answer.header.kind, MessageKind::FragmentData);
         assert_eq!(answer.header.request_id, n as u64 + 7);

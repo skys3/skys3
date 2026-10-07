@@ -38,7 +38,12 @@ enum Loss {
     Corrupt,
 }
 
-const LOSSES: [Loss; 4] = [Loss::NotHeld, Loss::Damaged, Loss::Unreachable, Loss::Corrupt];
+const LOSSES: [Loss; 4] = [
+    Loss::NotHeld,
+    Loss::Damaged,
+    Loss::Unreachable,
+    Loss::Corrupt,
+];
 
 /// Fragments held in memory by node and ID, failing as planned, with
 /// every request recorded.
@@ -85,7 +90,10 @@ impl FragmentSource for Nodes {
                 return Err(failure(Loss::NotHeld));
             };
             // A node serves only the fragment the request names.
-            assert_eq!(*identity, request.identity, "the request names its fragment");
+            assert_eq!(
+                *identity, request.identity,
+                "the request names its fragment"
+            );
             let range = request.range.start as usize..request.range.end as usize;
             let data = bytes.slice(range);
             let crc32c = crc32c::crc32c(&data);
@@ -257,7 +265,10 @@ fn every_loss_pattern_up_to_m_reads_back() {
                         ))
                         .unwrap_or_else(|e| panic!("{geometry}, lost {indices:?}: {e}"));
                     let expected = &data[range.start as usize..range.end as usize];
-                    assert!(read == expected, "{geometry}, lost {indices:?} as {kinds:b}");
+                    assert!(
+                        read == expected,
+                        "{geometry}, lost {indices:?} as {kinds:b}"
+                    );
                 }
                 patterns += 1;
             }
@@ -313,11 +324,20 @@ fn long_fragments_are_read_and_decoded_in_pieces() {
         .unwrap();
     assert!(read == data);
     let requests = nodes.requests();
-    let of = |index: u8| requests.iter().filter(|r| r.identity.index == index).count();
+    let of = |index: u8| {
+        requests
+            .iter()
+            .filter(|r| r.identity.index == index)
+            .count()
+    };
     // Fragment 0, 2.5 MiB, is asked once; its three pieces are decoded
     // from fragments 1 and 2, and fragment 1's own three pieces are read.
     assert_eq!((of(0), of(1), of(2)), (1, 6, 3));
-    assert!(requests.iter().all(|r| r.range.end - r.range.start <= PIECE_LEN));
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.range.end - r.range.start <= PIECE_LEN)
+    );
 }
 
 /// A node that does not answer is not asked again during the read, for
@@ -383,9 +403,12 @@ fn more_than_m_losses_fail_the_read() {
         assert!(error.to_string().contains("3 of the 4"), "{error}");
         assert!(pieces[..pieces.len() - 1].iter().all(Result::is_ok));
 
-        let error = read_coded(nodes, request(stripes, size, stripe_len as u64..size as u64))
-            .await
-            .unwrap_err();
+        let error = read_coded(
+            nodes,
+            request(stripes, size, stripe_len as u64..size as u64),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error,
             CodedReadError::Unreadable {

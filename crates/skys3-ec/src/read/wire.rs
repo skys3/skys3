@@ -27,17 +27,14 @@ use prost::Message;
 use skys3_io::Disk;
 use skys3_log::ShardRef;
 use skys3_log::record::MAX_KEY_LEN;
-use skys3_net::{
-    Connection, Frame, Header, MessageKind, Network, Receiver, Sender, Transport,
-};
+use skys3_net::{Connection, Frame, Header, MessageKind, Network, Receiver, Sender, Transport};
 use skys3_types::{
     BucketId, CodecId, Epoch, EpochSeq, FragmentId, Geometry, NodeAddress, NodeId, Seq, ShardId,
 };
 use tokio::time::Instant;
 
 use super::{
-    FragmentBytes, FragmentIdentity, FragmentReadError, FragmentRequest, FragmentSource,
-    ReadFuture,
+    FragmentBytes, FragmentIdentity, FragmentReadError, FragmentRequest, FragmentSource, ReadFuture,
 };
 use crate::fragment::StripeInfo;
 use crate::{FragmentError, FragmentServer, FragmentStore};
@@ -293,7 +290,11 @@ impl<N: Network, D: Disk> FragmentReadClient<N, D> {
     /// The client of node `node`, which reaches the nodes at `peers`
     /// through `transport`.
     #[must_use]
-    pub fn new(node: NodeId, transport: Transport<N>, peers: BTreeMap<NodeId, NodeAddress>) -> Self {
+    pub fn new(
+        node: NodeId,
+        transport: Transport<N>,
+        peers: BTreeMap<NodeId, NodeAddress>,
+    ) -> Self {
         Self {
             inner: Arc::new(ClientInner {
                 node,
@@ -451,12 +452,14 @@ impl<D: Disk> FragmentServer<D> {
             .iter()
             .find(|store| store.len(id).is_some())
             .ok_or_else(|| NotServed::NotHeld(format!("no fragment {id}")))?;
-        let read = FragmentStore::read(store, id, range).await.map_err(|error| match error {
-            FragmentError::UnknownFragment(_) | FragmentError::OutOfRange { .. } => {
-                NotServed::NotHeld(error.to_string())
-            }
-            other => NotServed::Damaged(other.to_string()),
-        })?;
+        let read = FragmentStore::read(store, id, range)
+            .await
+            .map_err(|error| match error {
+                FragmentError::UnknownFragment(_) | FragmentError::OutOfRange { .. } => {
+                    NotServed::NotHeld(error.to_string())
+                }
+                other => NotServed::Damaged(other.to_string()),
+            })?;
         if !identity.matches(&read.header) {
             return Err(NotServed::NotHeld(format!(
                 "fragment {id} is fragment {} of stripe {} of {} at {}",

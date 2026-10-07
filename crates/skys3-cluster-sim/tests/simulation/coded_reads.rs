@@ -80,14 +80,12 @@ fn read_bug_caught(context: &mut SimContext, corrupt_only: bool, bug: ReadBug) -
 
 #[test]
 fn trusting_bytes_that_fail_their_crc_is_caught() {
-    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
-        read_bug_caught(context, true, ReadBug::TrustCrc)
-    });
+    Runner::with_cost(4, 2 * RUN_COST)
+        .run(|context| read_bug_caught(context, true, ReadBug::TrustCrc));
 }
 
 #[test]
 fn decoding_with_the_wrong_fragment_indices_is_caught() {
-    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
-        read_bug_caught(context, false, ReadBug::WrongIndices)
-    });
+    Runner::with_cost(4, 2 * RUN_COST)
+        .run(|context| read_bug_caught(context, false, ReadBug::WrongIndices));
 }

@@ -509,7 +509,8 @@ pub mod seeded {
 
     pub(super) fn arrange(slots: &[Option<Bytes>]) -> Vec<Option<&[u8]>> {
         if BUG.get() == Some(ReadBug::WrongIndices) {
-            let mut present: Vec<Option<&[u8]>> = slots.iter().flatten().map(|f| Some(&f[..])).collect();
+            let mut present: Vec<Option<&[u8]>> =
+                slots.iter().flatten().map(|f| Some(&f[..])).collect();
             present.resize(slots.len(), None);
             return present;
         }

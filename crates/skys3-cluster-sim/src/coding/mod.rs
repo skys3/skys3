@@ -623,7 +623,11 @@ async fn open_storage(
 async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     let slot = &world.nodes[index];
     *lock(&slot.view) = None;
-    if world.reads.as_ref().is_some_and(|reads| reads.takes_new_disk(index)) {
+    if world
+        .reads
+        .as_ref()
+        .is_some_and(|reads| reads.takes_new_disk(index))
+    {
         // The node's fragment disk was lost: it starts on an empty one.
         let disk = SimDisk::new(world.seed ^ (index as u64) << 8 ^ slot.log_disk.crashes());
         disk.set_power(&slot.power);
@@ -660,7 +664,9 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
         .await?;
     let forwards = match &world.reads {
-        Some(_) => Some(reads::start_gateway(world, index, &storage, &transport, &fragments).await?),
+        Some(_) => {
+            Some(reads::start_gateway(world, index, &storage, &transport, &fragments).await?)
+        }
         None => None,
     };
     {
