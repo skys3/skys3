@@ -104,7 +104,9 @@ pub struct ObjectVersion {
     pub payload: Payload,
     /// The version's erasure-coded layout, once an `EC_PUBLISH` of it was
     /// applied (§8.4); `None` while it is only replicated. A `TAGS` record
-    /// keeps it, as it keeps the bytes; any other write replaces it.
+    /// keeps it, as it keeps the bytes, though it moves [`Entry::version`]
+    /// past the version the fragments name ([`Coded::version`]); any other
+    /// write replaces it.
     pub coded: Option<Coded>,
 }
 
@@ -115,6 +117,12 @@ pub struct Coded {
     /// The position of the `EC_PUBLISH` record. Replicas drop the
     /// version's replicated bytes once they know it committed.
     pub publish: EpochSeq,
+    /// The position of the record that committed the version the
+    /// fragments were written for, as the `EC_PUBLISH` named it: with the
+    /// object's ETag, the version identity the fragment headers carry. It
+    /// precedes [`publish`](Self::publish), and stays when a `TAGS` record
+    /// moves [`Entry::version`] past it.
+    pub version: EpochSeq,
     /// The attempt that wrote the fragments.
     pub attempt: AttemptId,
     /// The stripes, in order, covering the object exactly once.

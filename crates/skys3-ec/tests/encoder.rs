@@ -240,6 +240,7 @@ fn an_object_is_encoded_stripe_by_stripe_and_published() {
         assert_eq!(entry.version, version);
         let coded = entry.object.unwrap().coded.unwrap();
         assert_eq!(coded.publish, position);
+        assert_eq!(coded.version, version);
         assert_eq!(coded.attempt, AttemptId::new(Epoch::new(1), 0));
         let lens: Vec<_> = coded.stripes.iter().map(|s| s.data_len()).collect();
         assert_eq!(lens, [4096, 4096, 1808]);
