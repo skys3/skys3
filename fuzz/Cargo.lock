@@ -2351,6 +2351,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "skys3-flush"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "md-5",
+ "prometheus-client",
+ "skys3-config",
+ "skys3-index",
+ "skys3-io",
+ "skys3-log",
+ "skys3-obs",
+ "skys3-remote",
+ "skys3-shard",
+ "skys3-types",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "skys3-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -2362,6 +2383,7 @@ dependencies = [
  "skys3-control",
  "skys3-coord",
  "skys3-ec",
+ "skys3-flush",
  "skys3-gateway",
  "skys3-index",
  "skys3-log",

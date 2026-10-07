@@ -246,6 +246,13 @@ impl History {
         operation.outcome = outcome;
     }
 
+    /// The moment of the latest event recorded so far: every operation
+    /// called or answered from now on gets a later one.
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        self.state().clock
+    }
+
     /// Every operation so far, in the order they were called.
     #[must_use]
     pub fn operations(&self) -> Vec<Operation> {

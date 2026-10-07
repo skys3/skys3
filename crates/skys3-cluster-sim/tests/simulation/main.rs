@@ -87,6 +87,10 @@
 //!   payload, and with `backup_ack = "write_through"` losing every node
 //!   after an acknowledgement loses no write, under takeovers and remote
 //!   faults, with seeded bugs caught.
+//! - [`snapshots`]: index snapshots of `local` and `write_back` buckets
+//!   under takeovers and faults, and the restore drill of a shard whose
+//!   members are all lost: its lost-key report matches the clients'
+//!   history, and seeded bugs of snapshots and restores are caught.
 
 mod acks;
 mod backfill;
@@ -114,6 +118,7 @@ mod replacement;
 mod replication;
 mod restart;
 mod routing;
+mod snapshots;
 mod takeover;
 mod workload;
 mod write_through;

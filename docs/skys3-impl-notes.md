@@ -6135,6 +6135,86 @@ of this file. A task with nothing unexpected keeps "None."
   Backup lag has no metric of its own: the flush metrics carry it under
   the bucket's name.
 
+### M4-11 Index snapshots and lost-key report
+
+- **Configuration was already there.** `index_snapshot_interval_seconds`
+  and `snapshot_target` (defaulting to `backup_target`) were in §14, the
+  configuration reference, and `skys3-config` since M0-03. Nothing names a
+  default for a `write_back` bucket, so one without a `snapshot_target`
+  writes no snapshots (decided, design §8.9).
+- **Rows as a learner's snapshot sends them.** The snapshot reuses M2-14's
+  read: one read transaction at the applied position
+  (`Shard::snapshot`, `Shard::snapshot_rows`, now public), and the rows as
+  the index stores them, so the object format adds only a header, the
+  digests of removed rows, and an MD5 trailer (`snapshot::Snapshot`). It
+  ships with a proptest and the fuzz target `flush_snapshot`.
+- **When a snapshot is valid (decided, §8.9).** The time is read before
+  the rows, and the snapshot is written only if the replica serves reads,
+  with a lease from every member, both before and after reading them: a
+  write is applied before it is acknowledged, and no other primary can
+  acknowledge one while those leases hold, so every write acknowledged
+  before that time is in the rows.
+- **Across primary changes (decided).** Snapshots are primary-scoped, as
+  M5-10's lifecycle passes are, but not stateless: a `local` bucket's
+  deltas need the previous snapshot. A writer keeps its chain in memory
+  and extends it only in the epoch it started it in, and chains are named
+  by that epoch first. A new primary, a restarted one, or one leading
+  again later starts a chain of its own that sorts after every older one,
+  so a deposed primary's late delta only extends a chain no restore
+  picks. Naming chains by their base position alone was the first plan;
+  it fails when a new primary's first base has the same applied position
+  as the old primary's base (nothing applied in the new epoch yet), and
+  the two would interleave deltas under one name.
+- **Deltas need removed rows.** A `local` bucket without a backup removes
+  a tombstone at once, so "rows changed since the last position" misses
+  deletes. The writer keeps the MD5 digest of every row key with a digest
+  of its value, in memory (about 24 bytes and a map node per row of each
+  shard it leads), and a delta lists the digests of the rows gone. A new
+  base starts once the deltas wrote as many rows as the base, or after 64.
+- **Restoring from a backup** (left open by M4-09) is not needed for the
+  report: a backup is read only as a durable home, with a `HeadObject` per
+  candidate key that compares write identities. Copying a backup back into
+  a cluster stays open.
+- **The drill as a model of loss.** Losing every member of a shard with
+  three replicas on three nodes is losing the cluster, after which the
+  run's other checks cannot go on. As M4-08's `RemoteAudit` does, the
+  driver instead forks the remote store at random moments
+  (`SimS3::fork`, new) and builds the reports from the forks after the
+  run. The window's start, on the nodes' wall clock, maps to the history's
+  moments through the moment the driver notes at each step
+  (`History::now`, new), two steps early.
+- **Simulation cost.** `tests/simulation/snapshots.rs`: two scenarios
+  (with and without backup targets) under crashes, partitions, message
+  loss, control-store faults, and remote faults, `Runner::with_cost(4,
+  COST)`: CI runs seeds 0 to 7 of each, 38 s side by side at
+  `SKYS3_SIM_SEEDS=256` in a debug build, and 70 s for all five
+  scenarios of the file with the seeded bugs below. Both passed 64 seeds
+  (`SKYS3_SIM_SEEDS=2048`) in 331 s side by side. Each run checks 21 to
+  46 keys against the history over 36 reports, all from a snapshot.
+- **Seeded bugs**, each without faults and with `local` buckets that are
+  not backed up:
+  - `SnapshotBug::SkipsDirty`, a snapshot without dirty entries: caught
+    ("is not reported") at every one of seeds 0 to 63, first at **seed 0**.
+  - `SnapshotBug::BaseOnly`, a restore that applies the base alone but
+    dates it as the last delta, so the window starts after the state it
+    restored: caught at seeds 0 to 16, first at **seed 0**, as a key not
+    reported, one reported with an older value, or a deleted one reported;
+    missed at seed 17: the bug shows only when a loss restores a chain
+    whose deltas changed a key that is not written again before the
+    loss.
+  - `SnapshotBug::KeepsRemoved`, deltas without removed rows: caught ("is
+    reported lost") at seeds 0 to 25, missed at **seed 26**: a delete
+    shows only if it falls between two snapshots of one chain and the key
+    is not written again before the loss, and small shards start new
+    bases often. It runs 16 keys, twice the operations, and six losses,
+    at `Runner::with_cost(2, 2 * COST)`.
+- **Left open.** No operator command builds the report yet; it is a
+  library call (`skys3_flush::snapshot::{latest, lost_keys}`) for the
+  restore drills of M5-11, whose hook is `Restored::rows`. There are no
+  snapshot metrics, and the admin API does not show
+  `SnapshotService::status`. A pass reads the whole shard index locally
+  each interval; only what it writes is bounded by the changes.
+
 ## M5 Local erasure coding
 
 ### M5-01 EcCodec
