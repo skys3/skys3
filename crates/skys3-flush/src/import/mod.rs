@@ -575,10 +575,14 @@ impl<'a> Retry<'a> {
 
 /// The `IMPORT` record of a listed object, or `None` for a key outside the
 /// prefix, the empty key, a key too long, or one under the probe's scratch
-/// prefix.
+/// prefix or the index snapshots' directory (§8.9).
 fn import_of(object: ListedObject, prefix: &str, wall: &dyn WallClock) -> Option<Import> {
     let key = object.key.strip_prefix(prefix)?;
-    if key.is_empty() || key.len() > MAX_KEY_LEN || key.starts_with(ConditionalProbe::SCRATCH_DIR) {
+    if key.is_empty()
+        || key.len() > MAX_KEY_LEN
+        || key.starts_with(ConditionalProbe::SCRATCH_DIR)
+        || key.starts_with(crate::snapshot::SNAPSHOT_DIR)
+    {
         return None;
     }
     Some(Import {

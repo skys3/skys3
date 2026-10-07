@@ -1,46 +1,7 @@
 //! Index snapshot objects: their encoding and their keys at the snapshot
 //! target (§8.9).
 //!
-//! # Keys
-//!
-//! A shard's snapshots live under
-//! `<prefix>.skys3-snapshots/<bucket ID>/<shard>/`, where `<prefix>` is
-//! the snapshot target's. Each object is one snapshot of a **chain**: a
-//! base, numbered 0, and the deltas a primary wrote after it, numbered
-//! from 1. The key is `<chain>/<number>`, in fixed-width lowercase hex, so
-//! keys sort as chains and numbers do:
-//!
-//! ```text
-//! <dir><epoch:016x>-<base epoch:016x>-<base seq:016x>-<taken ms:016x>/<number:08x>
-//! ```
-//!
-//! [`ChainId`] names a chain by the epoch its primary sequenced in, the
-//! position its base was taken at, and when. A later primary sequences in
-//! a later epoch, so its chains sort after every chain of an earlier one.
-//!
-//! # Encoding
-//!
-//! An object is a header, the rows, the digests of removed rows, and a
-//! trailer, every integer big-endian:
-//!
-//! | Field | Encoding |
-//! |---|---|
-//! | magic | the 8 bytes `SKYS3IXS` |
-//! | format | `u16`, [`FORMAT`] |
-//! | index format | `u64`: the index format of the rows (`skys3_index::FORMAT_VERSION`) |
-//! | contents | `u8`: [`Contents::code`] |
-//! | bucket ID | `u16` length, then UTF-8 |
-//! | shard | `u8` |
-//! | chain | epoch `u64`, base epoch `u64`, base seq `u64`, taken ms `u64` |
-//! | number | `u32` |
-//! | position | epoch `u64`, seq `u64`: the applied position the rows were read at |
-//! | taken | `u64`: milliseconds since the Unix epoch, read before the rows |
-//! | rows | `u64` count; each: table `u32` ([`ShardTable::code`]), key `u32` length and bytes, value `u32` length and bytes |
-//! | removed | `u64` count; each: a 16-byte [`RowDigest`] |
-//! | trailer | the MD5 of every byte before it |
-//!
-//! Rows are stored as the index stores them (`skys3_index::codec`), as a
-//! learner's snapshot sends them (§6.7).
+//! See [`Snapshot`] for the layout of an object and its key.
 
 use md5::{Digest, Md5};
 use skys3_index::{ShardRow, ShardTable};
@@ -123,6 +84,47 @@ pub(crate) fn value_digest(value: &[u8]) -> u64 {
 }
 
 /// One snapshot object: a base, or a delta of its chain.
+///
+/// # Keys
+///
+/// A shard's snapshots live under
+/// `<prefix>.skys3-snapshots/<bucket ID>/<shard>/`, where `<prefix>` is
+/// the snapshot target's. Each object is one snapshot of a **chain**: a
+/// base, numbered 0, and the deltas a primary wrote after it, numbered
+/// from 1. The key is `<chain>/<number>`, in fixed-width lowercase hex, so
+/// keys sort as chains and numbers do:
+///
+/// ```text
+/// <dir><epoch:016x>-<base epoch:016x>-<base seq:016x>-<taken ms:016x>/<number:08x>
+/// ```
+///
+/// [`ChainId`] names a chain by the epoch its primary sequenced in, the
+/// position its base was taken at, and when. A later primary sequences in
+/// a later epoch, so its chains sort after every chain of an earlier one.
+///
+/// # Encoding
+///
+/// An object is a header, the rows, the digests of removed rows, and a
+/// trailer, every integer big-endian:
+///
+/// | Field | Encoding |
+/// |---|---|
+/// | magic | the 8 bytes `SKYS3IXS` |
+/// | format | `u16`, [`FORMAT`] |
+/// | index format | `u64`: the index format of the rows (`skys3_index::FORMAT_VERSION`) |
+/// | contents | `u8`: [`Contents::code`] |
+/// | bucket ID | `u16` length, then UTF-8 |
+/// | shard | `u8` |
+/// | chain | epoch `u64`, base epoch `u64`, base seq `u64`, taken ms `u64` |
+/// | number | `u32` |
+/// | position | epoch `u64`, seq `u64`: the applied position the rows were read at |
+/// | taken | `u64`: milliseconds since the Unix epoch, read before the rows |
+/// | rows | `u64` count; each: table `u32` ([`ShardTable::code`]), key `u32` length and bytes, value `u32` length and bytes |
+/// | removed | `u64` count; each: a 16-byte [`RowDigest`] |
+/// | trailer | the MD5 of every byte before it |
+///
+/// Rows are stored as the index stores them (`skys3_index::codec`), as a
+/// learner's snapshot sends them (§6.7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// The shard.
@@ -192,7 +194,11 @@ impl Snapshot {
         out.push(self.contents.code());
         let bucket = self.shard.bucket.as_str().as_bytes();
         // Bucket IDs are far shorter than 64 KiB.
-        out.extend_from_slice(&u16::try_from(bucket.len()).unwrap_or(u16::MAX).to_be_bytes());
+        out.extend_from_slice(
+            &u16::try_from(bucket.len())
+                .unwrap_or(u16::MAX)
+                .to_be_bytes(),
+        );
         out.extend_from_slice(bucket);
         out.push(self.shard.shard.get());
         out.extend_from_slice(&self.chain.epoch.get().to_be_bytes());
@@ -223,7 +229,10 @@ impl Snapshot {
     /// [`FormatError`] if the bytes are not a whole snapshot of a format
     /// this build reads. The rows themselves are not decoded.
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
-        let body_len = bytes.len().checked_sub(TRAILER).ok_or(FormatError::Truncated)?;
+        let body_len = bytes
+            .len()
+            .checked_sub(TRAILER)
+            .ok_or(FormatError::Truncated)?;
         let (body, trailer) = bytes.split_at(body_len);
         let mut reader = Reader(body);
         if reader.take(MAGIC.len())? != MAGIC {
@@ -237,8 +246,7 @@ impl Snapshot {
         if <[u8; 16]>::from(Md5::digest(body)) != trailer {
             return Err(FormatError::Checksum);
         }
-        let contents =
-            Contents::from_code(reader.u8()?).ok_or(FormatError::Invalid("contents"))?;
+        let contents = Contents::from_code(reader.u8()?).ok_or(FormatError::Invalid("contents"))?;
         let bucket_len = usize::from(reader.u16()?);
         let bucket = std::str::from_utf8(reader.take(bucket_len)?)
             .ok()
@@ -290,7 +298,9 @@ impl Snapshot {
     fn validate(&self) -> Result<(), FormatError> {
         let base = self.number == 0;
         if base && (self.position != self.chain.base || self.taken_ms != self.chain.taken_ms) {
-            return Err(FormatError::Invalid("a base taken elsewhere than its chain"));
+            return Err(FormatError::Invalid(
+                "a base taken elsewhere than its chain",
+            ));
         }
         if base && !self.removed.is_empty() {
             return Err(FormatError::Invalid("a base with removed rows"));
@@ -349,7 +359,10 @@ impl<'a> Reader<'a> {
     }
 
     fn position(&mut self) -> Result<EpochSeq, FormatError> {
-        Ok(EpochSeq::new(Epoch::new(self.u64()?), Seq::new(self.u64()?)))
+        Ok(EpochSeq::new(
+            Epoch::new(self.u64()?),
+            Seq::new(self.u64()?),
+        ))
     }
 
     fn bytes(&mut self) -> Result<&'a [u8], FormatError> {
@@ -512,7 +525,9 @@ mod tests {
             &format!("{dir}0000000000000004-0/00000007"),
             &format!("{key}0"),
             &format!("{}A", &key[..key.len() - 1]),
-            &format!("{dir}0000000000000004-0000000000000003-0000000000000011-00000000000003e8-1/00000007"),
+            &format!(
+                "{dir}0000000000000004-0000000000000003-0000000000000011-00000000000003e8-1/00000007"
+            ),
         ] {
             assert_eq!(parse_object_key(&dir, bad), None, "{bad}");
         }

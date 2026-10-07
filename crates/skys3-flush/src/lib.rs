@@ -75,6 +75,10 @@
 //!   checks before a write. Each node enforces a share of each budget in
 //!   proportion to the shards whose primary it is ([`share`]).
 //!
+//! - [`snapshot`]: index snapshots of each shard to its bucket's
+//!   `snapshot_target`, and the lost-key report of a shard whose members
+//!   are all lost (§6.9, §8.9).
+//!
 //! Adaptive concurrency (M4-10) replaces the fixed
 //! [`FlushSettings::concurrency`].
 //!
@@ -95,6 +99,7 @@ mod multipart;
 mod service;
 mod shard;
 mod single;
+pub mod snapshot;
 mod stream;
 mod target;
 
@@ -110,6 +115,9 @@ pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
 pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
 
-/// Failpoints for tests (the `test-util` feature).
+/// Failpoints and seeded bugs for tests (the `test-util` feature).
 #[cfg(feature = "test-util")]
-pub use stream::test_hooks;
+pub mod test_hooks {
+    pub use crate::snapshot::hooks::{SnapshotBug, seed_snapshot_bug};
+    pub use crate::stream::test_hooks::*;
+}
