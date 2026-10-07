@@ -10,8 +10,8 @@ pub enum SnapshotBug {
     /// No bug.
     #[default]
     None,
-    /// A `write_back` bucket's snapshot leaves out dirty entries, keeping
-    /// only those being flushed or in conflict.
+    /// A snapshot leaves out dirty entries, keeping only those being
+    /// flushed, in conflict, or clean.
     SkipsDirty,
     /// A delta lists no removed rows, so a deleted key stays in the
     /// restored index.
@@ -28,6 +28,7 @@ thread_local! {
 /// Seeds `bug` into every snapshot writer and restore this thread runs. A
 /// deterministic simulation runs every node on its test's thread, so other
 /// tests run the real code.
+#[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub fn seed_snapshot_bug(bug: SnapshotBug) {
     BUG.with(|seeded| seeded.set(bug));

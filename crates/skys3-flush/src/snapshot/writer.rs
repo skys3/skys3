@@ -250,6 +250,12 @@ impl<S: ObjectStore, D: Disk> ShardWriter<S, D> {
                 rows.extend(chunk.into_iter().map(|row| (table, row)));
             }
         }
+        if hooks::snapshot_bug() == SnapshotBug::SkipsDirty {
+            rows.retain(|(table, (_, value))| {
+                *table != ShardTable::Namespace
+                    || codec::decode_entry(value).is_ok_and(|e| e.state != EntryState::Dirty)
+            });
+        }
         match self.contents {
             Contents::Full => Ok(rows),
             Contents::Unflushed => unflushed(rows),
@@ -311,7 +317,6 @@ fn delta(chain: &Chain, state: &BTreeMap<RowDigest, u64>, rows: Rows) -> (Rows, 
 /// multipart objects, and the streaming flush's remote uploads (§8.9).
 fn unflushed(rows: Rows) -> Result<Rows, SnapshotError> {
     let invalid = |error: codec::CodecError| SnapshotError::Row(error.to_string());
-    let skips_dirty = hooks::snapshot_bug() == SnapshotBug::SkipsDirty;
     // `ShardTable::ALL` reads the namespace and the uploads before the
     // parts.
     let mut uploads = BTreeSet::<EpochSeq>::new();
@@ -320,11 +325,7 @@ fn unflushed(rows: Rows) -> Result<Rows, SnapshotError> {
         let keep = match table {
             ShardTable::Namespace => {
                 let entry = codec::decode_entry(&value).map_err(invalid)?;
-                let unclean = match entry.state {
-                    EntryState::Clean | EntryState::Evicted => false,
-                    EntryState::Dirty => !skips_dirty,
-                    _ => true,
-                };
+                let unclean = !matches!(entry.state, EntryState::Clean | EntryState::Evicted);
                 if unclean
                     && let Some(Payload::Parts { upload, .. }) =
                         entry.object.as_ref().map(|object| &object.payload)
