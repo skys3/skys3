@@ -53,6 +53,14 @@ pub enum MessageKind {
     /// Shard primary to fragment node: a verdict per fragment of an
     /// [`MessageKind::OrphanQuery`], or why it gives none.
     OrphanVerdicts = 10,
+    /// Gateway to fragment node: a byte range of one fragment of a coded
+    /// object, which must be the fragment of the stripe and object version
+    /// the request names (§8.5).
+    FragmentRead = 11,
+    /// Fragment node to gateway: the bytes of a
+    /// [`MessageKind::FragmentRead`] with their CRC32C, or why the node
+    /// does not serve them.
+    FragmentData = 12,
 
     /// Primary to member or learner: a lease beacon sent at a primary-local
     /// time, carrying the commit watermark as a heartbeat (§5.4).
@@ -87,7 +95,8 @@ pub enum MessageKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageClass {
     /// Log replication, reconciliation, and backfill (§5.1, §6.4, §6.6),
-    /// and the fragment writes and orphan queries of erasure coding (§8.4).
+    /// and the fragment writes, orphan queries, and fragment reads of
+    /// erasure coding (§8.4, §8.5).
     Replication,
     /// Leases and planned handoff (§5.4).
     Lease,
@@ -113,7 +122,9 @@ impl MessageKind {
             | Self::FragmentWrite
             | Self::FragmentWritten
             | Self::OrphanQuery
-            | Self::OrphanVerdicts => MessageClass::Replication,
+            | Self::OrphanVerdicts
+            | Self::FragmentRead
+            | Self::FragmentData => MessageClass::Replication,
             Self::Beacon | Self::BeaconAck | Self::StepDown => MessageClass::Lease,
             Self::Forward | Self::ForwardReply => MessageClass::Request,
             Self::NodeHeartbeat | Self::ControlChanged | Self::Handoff | Self::AdminReply => {
@@ -152,7 +163,7 @@ impl Role {
 mod tests {
     use super::*;
 
-    const ALL: [MessageKind; 20] = [
+    const ALL: [MessageKind; 22] = [
         MessageKind::Unspecified,
         MessageKind::Append,
         MessageKind::AppendAck,
@@ -164,6 +175,8 @@ mod tests {
         MessageKind::FragmentWritten,
         MessageKind::OrphanQuery,
         MessageKind::OrphanVerdicts,
+        MessageKind::FragmentRead,
+        MessageKind::FragmentData,
         MessageKind::Beacon,
         MessageKind::BeaconAck,
         MessageKind::StepDown,
@@ -190,7 +203,7 @@ mod tests {
             assert_eq!(kind.class(), expected, "{kind:?}");
             assert_eq!(MessageKind::try_from(kind as i32), Ok(kind));
         }
-        assert!(MessageKind::try_from(11).is_err());
+        assert!(MessageKind::try_from(13).is_err());
     }
 
     #[test]
