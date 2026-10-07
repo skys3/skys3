@@ -184,6 +184,16 @@ fn read_registration_renewal_must_be_shorter_than_its_ttl() {
     );
 }
 
+#[test]
+fn lifecycle_passes_need_an_interval() {
+    assert_violations(
+        "[storage]\nlifecycle_interval_seconds = 0",
+        &["storage.lifecycle_interval_seconds"],
+    );
+    let config = load("").unwrap();
+    assert_eq!(config.storage().lifecycle_interval().as_secs(), 3600);
+}
+
 // Reporting.
 
 #[test]

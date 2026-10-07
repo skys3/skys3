@@ -6279,3 +6279,60 @@ of this file. A task with nothing unexpected keeps "None."
 - **Fuzzing.** A new target, `ec_transfer`, decodes the fragment header
   that starts a write and both message bodies; `log_record` and
   `index_codec` already reach the new record body and values.
+
+### M5-10 Lifecycle expiration and multipart cleanup
+
+- **The configuration lives in the bucket register.** An optional
+  `lifecycle` field of `BucketDocument`, written only when set (as
+  `departing` is on a node registration), so registers without one keep
+  their bytes and no format bump was needed. It travels with the
+  generation and the local copies, and a rebuild keeps it. The field had
+  to be added to some two dozen `BucketDocument` literals across the crates.
+  Validation (`skys3_types::lifecycle`) runs both in the gateway and in
+  `BucketDocument::validate`, which also refuses a configuration on a
+  bucket that is not `local`.
+- **Only `local` buckets.** A `write_back` (or `write_through`) bucket
+  answers PUT with `501 NotImplemented`: its durable home is the remote,
+  and expiring the local copy alone would be undone by an import or
+  diverge from the remote's own rules. Recorded in §8.7.
+- **What is supported.** Prefix, tag, and size filters and `And`,
+  `Expiration` by `Days` or `Date`, and `AbortIncompleteMultipartUpload`;
+  transitions, noncurrent-version actions, and `ExpiredObjectDeleteMarker`
+  set to true answer `501`. `ExpiredObjectDeleteMarker` set to false is
+  accepted and ignored, as there are no delete markers, so a rule that has
+  only it answers `400 InvalidRequest` for having no action. s3s does not
+  require `Content-MD5` on this PUT, so the gateway does. Recorded in §11.
+- **`Days` rounds to midnight UTC.** S3 counts a rule's days from
+  `Last-Modified` and rounds up to the next midnight UTC, so an object
+  written at 23:59 with `Days = 1` expires two minutes later at the
+  earliest. The evaluator and the property test's reference evaluator do
+  the same. `s3s` hands a `Date` as a `time` value, so the gateway gained
+  the `time` crate, already in the tree, to convert it.
+- **Passes keep no state.** Each expiration is a `DELETE` committed with
+  `Shard::commit_all_if` only if the entry still holds the version the
+  page read, followed by a `FLUSHED` that removes the tombstone, as for
+  any delete in a `local` bucket. A pass resumes after a primary change
+  simply because the new primary runs the next one; it skips a primary
+  that is not serving yet, so it never judges an index that lacks what
+  the earlier primaries committed.
+- **The simulation needs its own clock.** The gateway stamps
+  `Last-Modified` from the real wall clock, not simulated time, so the
+  cluster simulation cannot age objects. Its passes read a lifecycle
+  clock instead, which starts at a midnight in the 23rd century when the
+  workload starts and runs a day per simulated second; `Date` rules fall
+  at chosen moments of the run and `Days` rules at its first pass.
+- **Abandoned deletes are not always truncated.** In the simulation, a
+  deposed primary that the coordinator then replaced keeps the `DELETE`s
+  it never committed in its log with no `TRUNCATE` after them. The audit
+  therefore counts as abandoned every `DELETE` some node's log holds that
+  the final primary's does not commit, and checks exactly-once on the
+  final primary's log. Holding the primary's messages across a rule's
+  date must last less than `member_suspect_after`, or the primary removes
+  its members and nothing is taken over.
+- **Simulation cost.** Both scenarios together take about 18 s in a
+  debug build at CI's 256 seeds (8 seeds each, cost 32), and 75 s at 1,024.
+- **Left open.** A pass over a large shard runs to its end in one interval
+  with no rate limit; deletes of a page share group commits. Expired
+  objects stay readable until the next pass, as S3 allows. There are no
+  per-bucket lifecycle metrics, and bucket status does not report the
+  last pass.

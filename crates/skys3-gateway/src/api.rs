@@ -37,15 +37,22 @@ use s3s::dto::{
     PutObjectOutput, PutObjectRetentionInput, PutObjectRetentionOutput, PutObjectTaggingInput,
     PutObjectTaggingOutput, Timestamp,
 };
+use s3s::dto::{
+    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, GetBucketLifecycleConfigurationInput,
+    GetBucketLifecycleConfigurationOutput, PutBucketLifecycleConfigurationInput,
+    PutBucketLifecycleConfigurationOutput,
+};
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use skys3_control::ControlStore;
 use skys3_types::{BucketDocument, BucketName};
 
 use crate::buckets::{Buckets, MODE_HEADER, TARGET_HEADER};
+use crate::checksum::ExpectedChecksums;
 use crate::features::{
     BUCKET_OWNER_ENFORCED, acls_not_supported, missing_object_lock, object_lock_not_implemented,
     ownership_not_implemented, sse_not_implemented, versioning_not_implemented,
 };
+use crate::lifecycle;
 use crate::listing::Listings;
 use crate::objects::{Objects, copy_source};
 use crate::shard::Shards;
@@ -189,6 +196,61 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         // SkyS3 has no regions: every bucket answers as one in us-east-1.
         self.bucket(&req.input.bucket)?;
         ok(GetBucketLocationOutput::default())
+    }
+
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        let name = bucket_name(&req.input.bucket)?;
+        self.buckets.require(&name)?;
+        // As in S3, the body must come with a digest, which the gateway
+        // checked before `s3s` parsed it.
+        let expected = ExpectedChecksums::from_headers(&req.headers)?;
+        if expected.content_md5().is_none() && expected.checksum().is_none() {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Missing required header for this request: Content-MD5 or x-amz-checksum-*"
+            ));
+        }
+        let Some(configuration) = req.input.lifecycle_configuration else {
+            return Err(s3_error!(
+                MalformedXML,
+                "The request needs a LifecycleConfiguration"
+            ));
+        };
+        let configuration = lifecycle::from_s3(configuration)?;
+        self.buckets
+            .set_lifecycle(&name, Some(configuration))
+            .await?;
+        ok(PutBucketLifecycleConfigurationOutput::default())
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        let Some(configuration) = &bucket.lifecycle else {
+            return Err(s3_error!(
+                NoSuchLifecycleConfiguration,
+                "The lifecycle configuration does not exist"
+            ));
+        };
+        ok(GetBucketLifecycleConfigurationOutput {
+            rules: Some(lifecycle::to_s3(configuration)),
+            ..GetBucketLifecycleConfigurationOutput::default()
+        })
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        let name = bucket_name(&req.input.bucket)?;
+        self.buckets.require(&name)?;
+        self.buckets.set_lifecycle(&name, None).await?;
+        ok(DeleteBucketLifecycleOutput::default())
     }
 
     async fn put_object(

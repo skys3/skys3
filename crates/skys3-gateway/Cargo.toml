@@ -49,6 +49,7 @@ skys3-peer.workspace = true
 skys3-shard.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 tracing.workspace = true

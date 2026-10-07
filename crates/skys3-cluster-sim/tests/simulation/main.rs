@@ -71,6 +71,9 @@
 //!   hot cache, only for the version the read plan names, while
 //!   overwrites, evictions, compaction, crashes, and message loss race
 //!   them.
+//! - [`lifecycle`]: lifecycle rules expiring objects and aborting
+//!   uploads while primaries crash, lose power, and are taken over: each
+//!   version is expired by exactly one committed `DELETE`.
 //! - [`write_through`]: writes to a `write_through` bucket acknowledged
 //!   only once the remote store holds them, so that losing every node
 //!   after an acknowledgement loses none, under takeovers and remote
@@ -90,6 +93,7 @@ mod heal;
 mod hot_cache;
 mod learners;
 mod leases;
+mod lifecycle;
 mod reads;
 mod rebalancing;
 mod rebuild;

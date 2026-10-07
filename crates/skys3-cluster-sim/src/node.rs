@@ -51,6 +51,7 @@ use skys3_types::{
 
 use crate::cluster::HotCaches;
 use crate::faults::Fault;
+use crate::lifecycle::{self, Lifecycle};
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -170,6 +171,8 @@ pub(crate) struct NodeSettings {
     pub compaction: Option<CompactionSettings>,
     /// The hot cache each node's gateway keeps (§9.2).
     pub hot_cache: HotCaches,
+    /// Lifecycle passes, if nodes run them (§8.7).
+    pub lifecycle: Option<Lifecycle>,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -392,6 +395,10 @@ pub(crate) async fn run<S: NodeServices>(
     {
         let (gateway, local) = (gateway.clone(), recovered.shards.clone());
         tokio::spawn(async move { follow_flushes(&flush, &gateway, &local).await });
+    }
+    if let Some(lifecycle) = settings.lifecycle.clone() {
+        let (gateway, set) = (gateway.clone(), recovered.shards.set().clone());
+        tokio::spawn(async move { lifecycle::follow(&lifecycle, &gateway, &set).await });
     }
 
     let checkpointer = Arc::clone(&recovered.checkpointer);
