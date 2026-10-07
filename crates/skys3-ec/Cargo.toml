@@ -1,6 +1,6 @@
 [package]
 name = "skys3-ec"
-description = "SkyS3 erasure coding: the versioned EcCodec interface and its Reed-Solomon codec (design §8)."
+description = "SkyS3 erasure coding: the versioned EcCodec interface, its Reed-Solomon codec, and the fragment store (design §8)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,26 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test support: seeding bugs in a fragment store, for tests that show the
+# crash simulation catches them.
+test-util = []
+
 [dependencies]
+bytes.workspace = true
+crc32c.workspace = true
 reed-solomon-simd.workspace = true
+skys3-config.workspace = true
+skys3-io.workspace = true
+skys3-log.workspace = true
+skys3-types.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
 proptest.workspace = true
+rand.workspace = true
+# Enables `test-util` for this crate's own tests.
+skys3-ec = { path = ".", features = ["test-util"] }
+skys3-sim.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

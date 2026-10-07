@@ -18,10 +18,20 @@
 //!   from `reed-solomon-simd`, frozen by the golden vectors in
 //!   `tests/golden.rs`.
 //!
-//! The fragment store and fragment segments (M5-02), placement (M5-03), and
-//! the encoder that drives a codec stripe by stripe and publishes the result
-//! (M5-04) build on this crate. A codec works on whole stripes in memory;
-//! those layers decide where fragments live and how they are checksummed.
+//! - **Fragments** ([`fragment`]): the fragment record format. A fragment's
+//!   header names its object version, stripe, geometry, codec, and the
+//!   attempt that wrote it, so headers alone rebuild a lost index's coded
+//!   objects.
+//! - **Fragment store** ([`FragmentStore`]): a disk's fragment segments. It
+//!   makes each fragment durable before it returns the fragment's ID, reads
+//!   ranges verified against block checksums, and recovers from crashes
+//!   without losing an acknowledged fragment.
+//! - **Layouts** ([`rebuild_layouts`]): each stripe's layout and codec,
+//!   rebuilt from the fragment headers found on the nodes.
+//!
+//! Placement (M5-03) and the encoder that drives a codec stripe by stripe,
+//! writes the fragments, and publishes the result (M5-04) build on this
+//! crate.
 //!
 //! ```
 //! use skys3_ec::{CodecId, EcCodec, Geometry, codec, current_codec};
@@ -42,10 +52,23 @@
 
 mod codec;
 mod error;
-mod geometry;
+pub mod fragment;
+mod layout;
 mod reed_solomon;
+mod store;
 
-pub use codec::{CodecId, EcCodec, codec, current_codec};
+pub use codec::{EcCodec, codec, current_codec};
 pub use error::EcError;
-pub use geometry::Geometry;
+pub use layout::{
+    FoundFragment, FragmentLocation, ObjectLayout, ObjectVersion, RebuildError, StripeLayout,
+    rebuild_layouts,
+};
 pub use reed_solomon::ReedSolomonV1;
+pub use skys3_types::{AttemptId, CodecId, FragmentId, Geometry, GeometryError};
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub use store::SeededBug;
+pub use store::{
+    FragmentError, FragmentRange, FragmentSegment, FragmentStore, FragmentStoreConfig,
+    RecoveryError, RecoveryReport, TornTail,
+};
