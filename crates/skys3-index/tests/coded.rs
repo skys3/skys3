@@ -11,8 +11,8 @@ use skys3_index::{
 use skys3_io::SimDisk;
 use skys3_log::record::{ExtentRef, ShardRef};
 use skys3_types::{
-    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId,
-    FragmentLocation, Geometry, NodeId, Seq, ShardId,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Geometry, NodeId, Seq, ShardId,
 };
 
 fn shard(number: u8) -> ShardRef {
@@ -92,9 +92,20 @@ fn coded_entries_round_trip_and_must_cover_their_object() {
     // Stripes that do not cover the object, or out of order, are refused.
     let mut short = coded_entry.clone();
     short.object.as_mut().unwrap().size = 99;
-    assert_eq!(codec::encode_entry(&short).unwrap_err().field(), "object.coded");
+    assert_eq!(
+        codec::encode_entry(&short).unwrap_err().field(),
+        "object.coded"
+    );
     let mut reversed = coded_entry.clone();
-    reversed.object.as_mut().unwrap().coded.as_mut().unwrap().stripes.reverse();
+    reversed
+        .object
+        .as_mut()
+        .unwrap()
+        .coded
+        .as_mut()
+        .unwrap()
+        .stripes
+        .reverse();
     assert_eq!(
         codec::encode_entry(&reversed).unwrap_err().field(),
         "object.coded"
@@ -104,7 +115,10 @@ fn coded_entries_round_trip_and_must_cover_their_object() {
     let at = 1 + 16 + 1 + 1 + 1 + 1;
     let mut bad = bytes.clone();
     bad[at] = 99;
-    assert_eq!(codec::decode_entry(&bad).unwrap_err().field(), "object.coded");
+    assert_eq!(
+        codec::decode_entry(&bad).unwrap_err().field(),
+        "object.coded"
+    );
     // Every truncation fails cleanly.
     for len in 0..bytes.len() {
         assert!(codec::decode_entry(&bytes[..len]).is_err(), "{len} bytes");
@@ -179,11 +193,10 @@ fn the_node_index_follows_coded_versions() {
     // A coded entry names its replicated bytes as coded.
     let holders = reader.holders(&one, "k").unwrap();
     assert_eq!(holders.len(), 2);
-    assert!(
-        holders
-            .values()
-            .all(|h| *h == Holder::Coded { publish: position(9) })
-    );
+    assert!(holders.values().all(|h| *h
+        == Holder::Coded {
+            publish: position(9)
+        }));
 
     // A snapshot carries the rows, which a learner checks.
     let rows = reader
@@ -195,15 +208,34 @@ fn the_node_index_follows_coded_versions() {
     learner
         .install_rows(&one, ShardTable::Fragments, &rows)
         .unwrap();
-    assert_eq!(learner.read().unwrap().fragments_on(&one, &node(1)).unwrap().len(), 2);
-    assert!(learner.install_rows(&two, ShardTable::Fragments, &rows).is_err());
+    assert_eq!(
+        learner
+            .read()
+            .unwrap()
+            .fragments_on(&one, &node(1))
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        learner
+            .install_rows(&two, ShardTable::Fragments, &rows)
+            .is_err()
+    );
     drop(reader);
 
     // Removing a layout, or the shard, removes its rows.
     index
         .update_durable(|writer| writer.remove_fragments(&one, "k", &coded(100)))
         .unwrap();
-    assert!(index.read().unwrap().fragments_on(&one, &node(1)).unwrap().is_empty());
+    assert!(
+        index
+            .read()
+            .unwrap()
+            .fragments_on(&one, &node(1))
+            .unwrap()
+            .is_empty()
+    );
     index.remove_shard(&two).unwrap();
     assert!(index.read().unwrap().dump().unwrap().fragments.is_empty());
 }

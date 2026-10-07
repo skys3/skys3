@@ -70,10 +70,7 @@ fn a_publish_codes_the_current_version_and_keeps_it() {
     assert_eq!(coded.stripes.len(), 1);
     assert_eq!(on(&index, 2), 1);
     let holders = index.read().unwrap().holders(&shard(0), "k").unwrap();
-    assert_eq!(
-        holders.get(&at(1)),
-        Some(&Holder::Coded { publish: at(2) })
-    );
+    assert_eq!(holders.get(&at(1)), Some(&Holder::Coded { publish: at(2) }));
 
     // A second publish of the version is refused; tags keep the layout.
     assert_eq!(

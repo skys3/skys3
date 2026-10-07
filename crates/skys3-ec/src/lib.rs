@@ -56,6 +56,7 @@ pub mod fragment;
 mod layout;
 mod reed_solomon;
 mod store;
+mod transfer;
 
 pub use codec::{EcCodec, codec, current_codec};
 pub use error::EcError;
@@ -72,4 +73,8 @@ pub use store::SeededBug;
 pub use store::{
     FragmentError, FragmentRange, FragmentSegment, FragmentStore, FragmentStoreConfig,
     RecoveryError, RecoveryReport, TornTail,
+};
+pub use transfer::{
+    CHUNK_LEN, FragmentClient, FragmentServer, FragmentWrite, FragmentWriter, FragmentWritten,
+    TransferError,
 };

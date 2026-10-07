@@ -7,8 +7,8 @@ use skys3_log::record::{
     ShardRef,
 };
 use skys3_types::{
-    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId,
-    FragmentLocation, Geometry, KeyHash, NodeId, Seq, ShardId,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Geometry, KeyHash, NodeId, Seq, ShardId,
 };
 use support::{Body, Frame};
 
@@ -89,8 +89,10 @@ fn body() -> Body {
         .u64(7) // the attempt
         .u64(300)
         .u32(2); // stripes
-    for (number, data_len, nodes) in [(0u128, 200, ["n1", "n2", "n3"]), (1, 100, ["n2", "n3", "n4"])]
-    {
+    for (number, data_len, nodes) in [
+        (0u128, 200, ["n1", "n2", "n3"]),
+        (1, 100, ["n2", "n3", "n4"]),
+    ] {
         body = body.u64(data_len).u8(2).u8(1).u16(1);
         for (node, id) in nodes.iter().zip(1u128..) {
             body = body.str8(node).raw(&(id << 64 | number).to_le_bytes());

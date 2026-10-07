@@ -12,6 +12,7 @@ use skys3_types::{
     AttemptId, BucketId, CodecId, ETag, Epoch, EpochSeq, Geometry, ShardId, VersionIdentity,
 };
 
+use super::record::{FragmentDecodeError, FragmentEncodeError};
 use super::wire::{Reader, Writer, inconsistent, insert_sorted, invalid};
 
 /// A fragment's header: enough on its own to rebuild its stripe's layout
@@ -103,6 +104,32 @@ pub struct PartSize {
 }
 
 impl FragmentHeader {
+    /// Encodes the header's fields alone, as a fragment record holds them
+    /// after its fixed header: what a writer sends a fragment node with the
+    /// fragment's bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`FragmentEncodeError`] if a field breaks the format.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FragmentEncodeError> {
+        let mut out = Vec::new();
+        self.encode(&mut out)?;
+        Ok(out)
+    }
+
+    /// Decodes fields that [`FragmentHeader::to_bytes`] encoded, which must
+    /// fill `bytes` exactly.
+    ///
+    /// # Errors
+    ///
+    /// [`FragmentDecodeError::Malformed`] if a field breaks the format.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FragmentDecodeError> {
+        let mut r = Reader::new(bytes);
+        let header = Self::decode(&mut r)?;
+        r.finish("header")?;
+        Ok(header)
+    }
+
     /// The identity of the object version the fragment belongs to (§9.2).
     #[must_use]
     pub fn version_identity(&self) -> VersionIdentity {
