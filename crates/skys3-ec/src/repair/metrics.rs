@@ -33,7 +33,7 @@ impl Default for RepairMetrics {
         Self {
             repaired: Counter::default(),
             bytes: Counter::default(),
-            // From a second to about four and a half days.
+            // From a second to about three days.
             duration: Histogram::new(exponential_buckets(1.0, 2.0, 19)),
             unrepaired: Gauge::default(),
             oldest: Gauge::default(),

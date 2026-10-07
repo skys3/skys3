@@ -22,7 +22,7 @@
 //!   fragments held by nodes that are not lost, within `bound` of the
 //!   losses: the repair time the report gives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -177,8 +177,12 @@ pub(super) struct RepairLog {
     events: std::sync::Mutex<Vec<(usize, u64, RepairEvent)>>,
     /// Every transfer's start and bytes, by the node and life of its
     /// repairer.
-    transfers: std::sync::Mutex<BTreeMap<(usize, u64), Vec<(Duration, u64)>>>,
+    transfers: std::sync::Mutex<Transfers>,
 }
+
+/// The start and bytes of each transfer, by the node and life of its
+/// repairer.
+type Transfers = BTreeMap<(usize, u64), Vec<(Duration, u64)>>;
 
 impl RepairLog {
     /// Records a transfer of `bytes` by node `node`'s repairer of life
@@ -316,26 +320,100 @@ impl Driver<'_> {
         }
     }
 
-    /// Loses the run's holders, drawn from the seed.
-    fn lose_holders(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, config: &RepairConfig) {
+    /// The nodes that hold each stripe of each object, by a member's
+    /// layouts.
+    fn stripe_holders(&self) -> Vec<BTreeSet<usize>> {
+        let views = self.views();
+        let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
+        let Some(view) = self
+            .world
+            .members()
+            .into_iter()
+            .find_map(|n| views[n].clone())
+        else {
+            return Vec::new();
+        };
+        let Ok(reader) = view.index.read() else {
+            return Vec::new();
+        };
+        let mut holders = Vec::new();
+        for key in &keys {
+            let Ok(Some(entry)) = reader.entry(&self.world.shard, key) else {
+                continue;
+            };
+            let Some(coded) = entry.object.and_then(|object| object.coded) else {
+                continue;
+            };
+            for stripe in &coded.stripes {
+                let nodes = stripe.fragments().iter();
+                holders.push(
+                    nodes
+                        .filter_map(|location| self.world.position(&location.node))
+                        .collect(),
+                );
+            }
+        }
+        holders
+    }
+
+    /// The holders to lose, one for each of `losses`, drawn from the seed:
+    /// lost for good ones from the nodes outside the shard, lost disks from
+    /// any node but the first. Of two, the first pair that leaves some
+    /// stripes missing two fragments and others one, else two, if any.
+    fn holders_to_lose(&self, losses: &[Loss]) -> Vec<(usize, Loss)> {
         let mut rng = StdRng::seed_from_u64(self.world.seed ^ 0x5245_5041_4952);
         let mut outside: Vec<usize> = (MEMBERS..NODES).collect();
         let mut any: Vec<usize> = (1..NODES).collect();
         outside.shuffle(&mut rng);
         any.shuffle(&mut rng);
-        let mut taken = Vec::new();
-        for loss in &config.losses {
-            let pool = match loss {
-                Loss::ForGood => &outside,
-                Loss::Disk => &any,
+        let pool = |loss: &Loss| match loss {
+            Loss::ForGood => &outside,
+            Loss::Disk => &any,
+        };
+        if let [first, second] = losses {
+            let holders = self.stripe_holders();
+            let lost = |a: usize, b: usize, count: usize| {
+                holders
+                    .iter()
+                    .filter(|nodes| {
+                        usize::from(nodes.contains(&a)) + usize::from(nodes.contains(&b)) == count
+                    })
+                    .count()
             };
-            let Some(&node) = pool.iter().find(|node| !taken.contains(*node)) else {
-                continue;
-            };
-            taken.push(node);
-            self.repair.lost.push((node, *loss));
+            let pairs = pool(first)
+                .iter()
+                .flat_map(|&a| pool(second).iter().map(move |&b| (a, b)))
+                .filter(|(a, b)| a != b);
+            let mut best: Option<((bool, bool), (usize, usize))> = None;
+            for (a, b) in pairs {
+                let score = (lost(a, b, 2) > 0 && lost(a, b, 1) > 0, lost(a, b, 2) > 0);
+                if best.is_none_or(|(top, _)| score > top) {
+                    best = Some((score, (a, b)));
+                }
+            }
+            if let Some((_, (a, b))) = best {
+                return vec![(a, *first), (b, *second)];
+            }
+        }
+        let mut taken: Vec<(usize, Loss)> = Vec::new();
+        for loss in losses {
+            if let Some(&node) = pool(loss)
+                .iter()
+                .find(|node| taken.iter().all(|(taken, _)| taken != *node))
+            {
+                taken.push((node, *loss));
+            }
+        }
+        taken
+    }
+
+    /// Loses the run's holders.
+    fn lose_holders(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, config: &RepairConfig) {
+        let mut rng = StdRng::seed_from_u64(self.world.seed ^ 0x444f_574e);
+        for (node, loss) in self.holders_to_lose(&config.losses) {
+            self.repair.lost.push((node, loss));
             let slot = &self.world.nodes[node];
-            match loss {
+            match &loss {
                 Loss::ForGood => {
                     self.world.lost[node].store(true, Ordering::SeqCst);
                     self.crash(sim, now, node, true, FOREVER);
@@ -386,6 +464,18 @@ impl Driver<'_> {
             return;
         };
         tracing::debug!(?event, node, "the repair crash point is reached");
+        if crash.target == RepairTarget::NewHolder && crash.kind == CrashKind::PowerAtNextSync {
+            // The new holder's next sync may be another's than the rebuilt
+            // fragment's, which waits for the bandwidth cap first: the cut
+            // is armed as the fragment's write leaves.
+            let slot = &self.world.nodes[node];
+            self.world.cut_at_repair_write[node].store(true, Ordering::SeqCst);
+            self.cut[node] = false;
+            self.report
+                .crashes
+                .push((slot.id.to_string(), CrashKind::PowerAtNextSync));
+            return;
+        }
         let crash = Crash {
             delay: Duration::ZERO,
             target: CrashTarget::Primary,
@@ -401,6 +491,7 @@ impl Driver<'_> {
         let views = self.views();
         let shard = &self.world.shard;
         let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
+        let written = lock(&self.world.fragments);
         for member in self.world.members() {
             let Some(view) = &views[member] else {
                 return Err(format!("member n{member} is down"));
@@ -412,13 +503,18 @@ impl Driver<'_> {
                     return Err(format!("member n{member} has not coded {key}"));
                 };
                 for stripe in &coded.stripes {
-                    for location in stripe.fragments() {
-                        let held = self.world.position(&location.node).is_some_and(|n| {
-                            !self.world.lost[n].load(Ordering::SeqCst)
-                                && views[n].as_ref().is_some_and(|view| {
-                                    view.fragments.stores()[0].len(location.fragment).is_some()
-                                })
-                        });
+                    for (index, location) in stripe.fragments().iter().enumerate() {
+                        let named = (key.as_str(), stripe.number(), index);
+                        let current = self.world.generation_of(&location.node);
+                        let on_disk =
+                            self.world.named_generation(&written, location, named) == Some(current);
+                        let held = on_disk
+                            && self.world.position(&location.node).is_some_and(|n| {
+                                !self.world.lost[n].load(Ordering::SeqCst)
+                                    && views[n].as_ref().is_some_and(|view| {
+                                        view.fragments.stores()[0].len(location.fragment).is_some()
+                                    })
+                            });
                         if !held {
                             return Err(format!(
                                 "{key} stripe {} names {} on {}, which is not held",
@@ -463,25 +559,36 @@ impl Driver<'_> {
                 };
                 for stripe in &coded.stripes {
                     for (index, location) in stripe.fragments().iter().enumerate() {
-                        let fragment = (location.node.clone(), location.fragment);
                         let Some(n) = self.world.position(&location.node) else {
                             continue;
                         };
-                        let Some(record) = written.get(&fragment) else {
+                        // A fragment on a disk its node lost since is the
+                        // repairs' to rebuild.
+                        let named = (key.as_str(), stripe.number(), index);
+                        let current = self.world.generation[n].load(Ordering::SeqCst);
+                        let generation = self.world.named_generation(&written, location, named);
+                        let other = (location.node.clone(), 0, location.fragment);
+                        if generation.is_none() && current == 0 && written.contains_key(&other) {
+                            return Err(format!(
+                                "the committed layout of {key} names fragment {} of stripe {} \
+                                 on {}, which holds another fragment",
+                                location.fragment,
+                                stripe.number(),
+                                location.node
+                            ));
+                        }
+                        if generation != Some(current) {
                             continue;
-                        };
+                        }
+                        let fragment = (location.node.clone(), current, location.fragment);
                         let node_view = match &views[n] {
                             Some(view) if !reclaimed.contains(&fragment) => view,
                             _ => continue,
                         };
-                        if record.generation != self.world.generation[n].load(Ordering::SeqCst) {
-                            continue;
-                        }
-                        let named = (key.as_str(), stripe.number(), index);
                         let holds = node_view.fragments.stores()[0]
                             .len(location.fragment)
                             .is_some();
-                        if !holds || record.identity() != named {
+                        if !holds {
                             return Err(format!(
                                 "the committed layout of {key} names fragment {} of stripe {} \
                                  on {}, which lost it",

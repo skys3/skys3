@@ -2575,6 +2575,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32c",
+ "prometheus-client",
  "proptest",
  "prost",
  "rand 0.9.5",
@@ -2587,6 +2588,7 @@ dependencies = [
  "skys3-io",
  "skys3-log",
  "skys3-net",
+ "skys3-obs",
  "skys3-shard",
  "skys3-sim",
  "skys3-types",

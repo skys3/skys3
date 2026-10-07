@@ -21,7 +21,7 @@ use skys3_ec::{
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{BlockingPool, ManualWallClock, MonotonicClock, SimDisk, SimMount};
-use skys3_log::record::{Extent, Put, PutData};
+use skys3_log::record::{Extent, Put, PutData, Tags};
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
 use skys3_shard::Shard;
 use skys3_types::{
@@ -456,6 +456,31 @@ fn a_node_that_lost_its_disk_is_repaired_at_once() {
 }
 
 #[test]
+fn a_version_retagged_after_coding_is_left_be() {
+    runtime().block_on(async {
+        let f = Fixture::coded(2, 6, EcConfig::default()).await;
+        let before = f.layouts().await;
+        // Tags change object-0's version after its EC_PUBLISH: its
+        // fragments' headers name the version before, which no check
+        // matches.
+        let tags = Tags {
+            key: "object-0".to_owned(),
+            tags: BTreeMap::from([("k".to_owned(), "v".to_owned())]),
+        };
+        f.shard.commit(RecordBody::Tags(tags)).await.unwrap();
+        let lost = f.on(2).await;
+        f.nodes.wipe(2);
+        let repairer = f.repairer(planner(6, EcConfig::default(), Vec::new()), SETTINGS);
+        let report = repairer.pass().await;
+        assert_eq!(report.unrecoverable, 0, "{report:?}");
+        assert!(report.repaired > 0 && report.repaired < lost, "{report:?}");
+        let after = f.layouts().await;
+        assert_eq!(after["object-0"], before["object-0"]);
+        assert_ne!(after["object-1"], before["object-1"]);
+    });
+}
+
+#[test]
 fn a_departing_node_is_repaired_without_checks() {
     runtime().block_on(async {
         let f = Fixture::coded(1, 6, EcConfig::default()).await;
@@ -520,13 +545,14 @@ fn stripes_that_lost_two_fragments_go_first() {
         assert_eq!(lost.first(), Some(&2));
         f.check_whole().await;
 
-        // With the priority ignored, they go in key order.
+        // With the priority turned around, a stripe that lost one goes
+        // first.
         let g = Fixture::coded(4, 8, two_plus_two()).await;
         g.nodes.wipe(a);
         g.nodes.wipe(b);
         let repairer = g
             .repairer(planner(8, two_plus_two(), Vec::new()), settings)
-            .with_bug(Some(RepairBug::IgnorePriority));
+            .with_bug(Some(RepairBug::LeastLostFirst));
         repairer.pass().await;
         let lost: Vec<usize> = g
             .steps()
@@ -536,6 +562,7 @@ fn stripes_that_lost_two_fragments_go_first() {
                 _ => None,
             })
             .collect();
+        assert_eq!(lost.first(), Some(&1), "{lost:?}");
         assert!(lost.windows(2).any(|pair| pair[0] < pair[1]), "{lost:?}");
     });
 }

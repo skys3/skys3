@@ -96,8 +96,8 @@ use skys3_shard::{
 };
 use skys3_sim::SimContext;
 use skys3_types::{
-    AttemptId, BucketId, ClusterId, ETag, Epoch, FragmentId, Label, NodeAddress, NodeId,
-    ProposalId, ShardConfig, ShardId,
+    AttemptId, BucketId, ClusterId, ETag, Epoch, FragmentId, FragmentLocation, Label, NodeAddress,
+    NodeId, ProposalId, ShardConfig, ShardId,
 };
 
 use crate::node::{BoxError, TRANSPORT_PORT};
@@ -358,10 +358,12 @@ struct World {
     register: Mutex<ShardConfig>,
     /// Whether each node is cut off from the register.
     cut_off: Vec<AtomicBool>,
-    /// Every fragment reclaimed, by node and ID.
-    reclaimed: Mutex<BTreeSet<(NodeId, FragmentId)>>,
-    /// Every fragment whose write was acknowledged, by node and ID.
-    fragments: Mutex<HashMap<(NodeId, FragmentId), Written>>,
+    /// Every fragment reclaimed, by node, disk generation, and ID.
+    reclaimed: Mutex<BTreeSet<OnDisk>>,
+    /// Every fragment whose write was acknowledged, by node, disk
+    /// generation, and ID: a new disk hands out the IDs of the old one
+    /// again.
+    fragments: Mutex<HashMap<OnDisk, Written>>,
     /// The reads through the gateways, in a run with reads.
     reads: Option<reads::Reads>,
     /// Whether each node is lost for good.
@@ -376,16 +378,22 @@ struct World {
     generation: Vec<AtomicU64>,
     /// How many lives each node has started.
     lives: Vec<AtomicU64>,
+    /// Whether each node is to lose power at the sync after the next
+    /// repair write reaches it.
+    cut_at_repair_write: Vec<AtomicBool>,
     /// What the repairers did.
     repair: repair::RepairLog,
 }
 
-/// A fragment whose write was acknowledged: the attempt, the node's disk
-/// generation it was written to, and what it is.
+/// A fragment on one of a node's disks: the node, the disk's generation,
+/// and the fragment's ID on it.
+type OnDisk = (NodeId, u64, FragmentId);
+
+/// A fragment whose write was acknowledged: the attempt that wrote it, and
+/// what it is.
 #[derive(Debug, Clone)]
 struct Written {
     attempt: AttemptId,
-    generation: u64,
     key: String,
     stripe: u32,
     index: u8,
@@ -410,6 +418,28 @@ impl World {
     /// The position of `node` in the cluster.
     fn position(&self, node: &NodeId) -> Option<usize> {
         self.nodes.iter().position(|slot| slot.id == *node)
+    }
+
+    /// The generation of `node`'s current fragment disk.
+    fn generation_of(&self, node: &NodeId) -> u64 {
+        self.position(node)
+            .map_or(0, |n| self.generation[n].load(Ordering::SeqCst))
+    }
+
+    /// The disk generation of the fragment `location` names as fragment
+    /// `named` (key, stripe, index): the latest whose write under that ID
+    /// was of that fragment, if any was.
+    fn named_generation(
+        &self,
+        written: &HashMap<OnDisk, Written>,
+        location: &FragmentLocation,
+        named: (&str, u32, usize),
+    ) -> Option<u64> {
+        (0..=self.generation_of(&location.node)).rev().find(|&g| {
+            written
+                .get(&(location.node.clone(), g, location.fragment))
+                .is_some_and(|record| record.identity() == named)
+        })
     }
 }
 
@@ -584,6 +614,7 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         disk_gone: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
         generation: (0..NODES).map(|_| AtomicU64::new(0)).collect(),
         lives: (0..NODES).map(|_| AtomicU64::new(0)).collect(),
+        cut_at_repair_write: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
         repair: repair::RepairLog::default(),
         config: shard_config,
         run: config.clone(),
@@ -786,7 +817,8 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         );
         let observed = Arc::clone(world);
         let observer = Arc::new(move |reclaimed: &Reclaimed| {
-            let fragment = (reclaimed.node.clone(), reclaimed.suspect.id);
+            let generation = observed.generation_of(&reclaimed.node);
+            let fragment = (reclaimed.node.clone(), generation, reclaimed.suspect.id);
             lock(&observed.reclaimed).insert(fragment);
         });
         let reclaimer = OrphanReclaimer::new(
@@ -968,6 +1000,12 @@ impl FragmentWriter for Writer {
         let position = self.world.position(node);
         let generation = |n: usize| self.world.generation[n].load(Ordering::SeqCst);
         let before = position.map(generation);
+        if let Some(n) = position.filter(|_| self.repairer.is_some())
+            && self.world.cut_at_repair_write[n].swap(false, Ordering::SeqCst)
+        {
+            let power = &self.world.nodes[n].power;
+            power.cut_at_sync(power.syncs(), SyncCut::Before);
+        }
         let id = self.inner.write(node, header, data).await?;
         // A fragment written to a disk that failed meanwhile is not on the
         // node's current one.
@@ -975,12 +1013,11 @@ impl FragmentWriter for Writer {
         {
             let written = Written {
                 attempt: header.attempt,
-                generation,
                 key: header.key.clone(),
                 stripe: header.stripe.number,
                 index: header.index,
             };
-            lock(&self.world.fragments).insert((node.clone(), id), written);
+            lock(&self.world.fragments).insert((node.clone(), generation, id), written);
         }
         let ack_delay = self
             .world
@@ -1460,6 +1497,7 @@ impl Driver<'_> {
     /// applied only committed records, has a coded layout naming a
     /// reclaimed fragment.
     fn check_reclaimed(&self, views: &[Option<View>], keys: &[String]) -> Result<(), String> {
+        let written = lock(&self.world.fragments);
         let reclaimed = lock(&self.world.reclaimed);
         if reclaimed.is_empty() {
             return Ok(());
@@ -1471,7 +1509,7 @@ impl Driver<'_> {
             });
             if leads {
                 let reader = view.index.read().map_err(|e| e.to_string())?;
-                no_reclaimed_fragment(&reader, &self.world.shard, keys, &reclaimed)
+                no_reclaimed_fragment(self.world, &written, &reader, keys, &reclaimed)
                     .map_err(|e| format!("the serving primary n{n}: {e}"))?;
             }
         }
@@ -1565,9 +1603,12 @@ impl Driver<'_> {
                 }
                 return Err(format!("{} has not recovered", slot.id));
             };
+            let generation = self.world.generation[n].load(Ordering::SeqCst);
             for id in view.fragments.stores()[0].ids() {
                 let fragment = (slot.id.clone(), id);
-                let attempt = written.get(&fragment).map(|written| written.attempt);
+                let attempt = written
+                    .get(&(slot.id.clone(), generation, id))
+                    .map(|written| written.attempt);
                 let published = attempt.is_some_and(|attempt| {
                     published.contains(&attempt) || self.world.repair.relocated(attempt)
                 });
@@ -1584,21 +1625,27 @@ impl Driver<'_> {
 }
 
 /// Checks that no coded layout of `keys` in `reader` names a fragment in
-/// `reclaimed`.
+/// `reclaimed`: the one of the disk generation it was written to, or, if
+/// no record says, of the node's current disk.
 fn no_reclaimed_fragment(
+    world: &World,
+    written: &HashMap<OnDisk, Written>,
     reader: &IndexReader,
-    shard: &ShardRef,
     keys: &[String],
-    reclaimed: &BTreeSet<(NodeId, FragmentId)>,
+    reclaimed: &BTreeSet<OnDisk>,
 ) -> Result<(), String> {
     for key in keys {
-        let entry = reader.entry(shard, key).map_err(|e| e.to_string())?;
+        let entry = reader.entry(&world.shard, key).map_err(|e| e.to_string())?;
         let Some(coded) = entry.and_then(|e| e.object).and_then(|o| o.coded) else {
             continue;
         };
         for stripe in &coded.stripes {
-            for location in stripe.fragments() {
-                if reclaimed.contains(&(location.node.clone(), location.fragment)) {
+            for (index, location) in stripe.fragments().iter().enumerate() {
+                let named = (key.as_str(), stripe.number(), index);
+                let generation = world
+                    .named_generation(written, location, named)
+                    .unwrap_or_else(|| world.generation_of(&location.node));
+                if reclaimed.contains(&(location.node.clone(), generation, location.fragment)) {
                     return Err(format!(
                         "the committed layout of {key} at {} names fragment {} on {}, \
                          which was reclaimed",
@@ -1656,10 +1703,11 @@ fn final_check(world: &World) -> Result<(), String> {
         let expected = lock(&world.expected).clone();
         let members = world.members();
         let keys: Vec<String> = expected.keys().cloned().collect();
+        let written = lock(&world.fragments).clone();
         let reclaimed = lock(&world.reclaimed).clone();
         for &member in &members {
             let reader = storages[member].index.read().map_err(|e| e.to_string())?;
-            no_reclaimed_fragment(&reader, &world.shard, &keys, &reclaimed)
+            no_reclaimed_fragment(world, &written, &reader, &keys, &reclaimed)
                 .map_err(|e| format!("member n{member}: {e}"))?;
         }
         for (key, data) in &expected {

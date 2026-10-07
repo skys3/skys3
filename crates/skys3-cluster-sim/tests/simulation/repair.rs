@@ -91,14 +91,18 @@ fn a_lost_holder_is_repaired_while_reads_go_on() {
     });
 }
 
+/// Two holders lost for good fall silent together, and their losses are
+/// found in one pass, which must start the stripes that lost both first.
+/// A lost disk's losses are found once its node answers again, which may
+/// be passes apart from the other's.
 #[test]
 fn stripes_missing_two_fragments_are_repaired_first() {
     Runner::with_cost(4, 2 * RUN_COST).run(|context| {
-        let losses = vec![drawn_loss(context), drawn_loss(context)];
+        let losses = vec![Loss::ForGood, drawn_loss(context)];
         let report = coding::run(context, &losing(losses.clone(), true, two_plus_two()))
             .map_err(|error| format!("{losses:?}: {error}"))?;
         let repair = repairs(&report)?;
-        if repair.most_lost < 2 {
+        if losses == [Loss::ForGood; 2] && repair.most_lost < 2 {
             return Err(format!("no stripe lost two fragments: {repair:?}").into());
         }
         Ok(())
@@ -201,7 +205,6 @@ fn relocating_a_fragment_before_it_is_durable_is_caught() {
 #[test]
 fn repairs_out_of_order_or_past_the_cap_are_caught() {
     Runner::with_cost(2, 4 * RUN_COST).run(|context| {
-        let config = losing(vec![Loss::Disk, Loss::Disk], false, two_plus_two());
         let seeded = |bug| {
             move |config: &mut CodingConfig| {
                 if let Some(repair) = &mut config.repair {
@@ -209,15 +212,17 @@ fn repairs_out_of_order_or_past_the_cap_are_caught() {
                 }
             }
         };
+        let silent = losing(vec![Loss::ForGood, Loss::ForGood], false, two_plus_two());
         caught(
             context,
-            &config,
-            seeded(RepairBug::IgnorePriority),
+            &silent,
+            seeded(RepairBug::LeastLostFirst),
             &["fragments, before"],
         )?;
+        let disks = losing(vec![Loss::Disk, Loss::Disk], false, two_plus_two());
         caught(
             context,
-            &config,
+            &disks,
             seeded(RepairBug::Unthrottled),
             &["past the bandwidth cap"],
         )

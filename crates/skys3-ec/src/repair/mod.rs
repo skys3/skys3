@@ -240,8 +240,8 @@ pub enum RepairBug {
     /// Registers an attempt with the tracker only once its fragments are
     /// written, so orphan reclamation's fence does not see it writing.
     Unfenced,
-    /// Repairs stripes in key order, whatever they lost.
-    IgnorePriority,
+    /// Starts the stripes that lost the fewest fragments first.
+    LeastLostFirst,
     /// Transfers without taking the bandwidth cap.
     Unthrottled,
 }
@@ -398,6 +398,10 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     pub async fn pass(&self) -> RepairReport {
         let mut report = RepairReport::default();
         if !leads(&self.shard) {
+            // What a replica that no longer leads knew lost is its
+            // successor's to find and report.
+            self.state().lost.clear();
+            self.metrics.backlog(self.shard.shard(), 0, None);
             return report;
         }
         let pass = self.passes.fetch_add(1, Ordering::Relaxed) + 1;
@@ -481,6 +485,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                         };
                         let named = entries
                             .get(&row.key)
+                            .filter(|entry| !retagged(entry))
                             .and_then(|entry| coded_stripe(entry, row.stripe))
                             .and_then(|stripe| stripe.fragments().get(usize::from(row.index)))
                             == Some(&location);
@@ -648,10 +653,11 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
 
     /// Orders `damaged` most lost fragments first, then by key and stripe.
     fn order(&self, damaged: &mut [Damaged]) {
-        if self.has_bug(RepairBug::IgnorePriority) {
+        if self.has_bug(RepairBug::LeastLostFirst) {
+            damaged.sort_by_key(|stripe| stripe.lost.len());
             return;
         }
-        damaged.sort_by(|a, b| b.lost.len().cmp(&a.lost.len()));
+        damaged.sort_by_key(|stripe| std::cmp::Reverse(stripe.lost.len()));
     }
 
     /// Repairs one stripe as a fragment-writing attempt: whether its
@@ -978,7 +984,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepairBug {
     Unfenced,
-    IgnorePriority,
+    LeastLostFirst,
     Unthrottled,
 }
 
@@ -1017,6 +1023,19 @@ async fn check_node(
         }
     }
     outcome
+}
+
+/// Whether `entry`'s version was retagged after it was coded: a `TAGS`
+/// record moves the entry's version and keeps the layout, while the
+/// fragments' headers name the version they were written for, which the
+/// entry no longer records. No check or read can match them, so repair
+/// leaves them be rather than count every one lost (§8.6).
+fn retagged(entry: &Entry) -> bool {
+    entry
+        .object
+        .as_ref()
+        .and_then(|object| object.coded.as_ref())
+        .is_some_and(|coded| entry.version > coded.publish)
 }
 
 /// Stripe `stripe` of `entry`'s coded layout, if it has one.
