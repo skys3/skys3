@@ -5977,7 +5977,19 @@ of this file. A task with nothing unexpected keeps "None."
   replicated nodes with takeovers, any-gateway clients, random crashes,
   partitions, message loss, and control-store faults, and a remote that
   delays every request 2 to 15 ms each way and fails or loses 2% of
-  them. SEEDS_PLACEHOLDER
+  them. With `SKYS3_SIM_SEEDS=8192` (256 seeds of each scenario) in a
+  debug build, both scenarios passed in 711 s, run side by side: about
+  2.8 s a seed, so CI's 8 seeds take about 22 s (21.6 s measured at
+  `SKYS3_SIM_SEEDS=256`).
+- **Seeded bug.** `WriteThrough::AckedLocally` keeps the audit but
+  acknowledges after the local commit, as `ack_policy = "local"` does.
+  `the_audit_catches_writes_acknowledged_after_their_local_commit`
+  (no faults, CI's 8 seeds in 1.8 s) expects it caught, and it was at
+  every one of 256 seeds, first at **seed 0**: `bucket-1/key-0`, a
+  multipart completion acknowledged while the remote held nothing. The
+  remote's 2 to 15 ms delays outlast a message's 1 to 5 ms, so the
+  flush of a write acknowledged early never lands before its answer
+  reaches the client.
 - **Left open.** The native peer transport (§7.8) waits for `APPLIED`;
   its source side is M6. A destination cluster that receives a `COMMIT`
   for a write-through bucket of its own does not wait for its own remote.
