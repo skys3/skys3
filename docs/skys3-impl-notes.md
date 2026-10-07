@@ -6872,6 +6872,107 @@ of this file. A task with nothing unexpected keeps "None."
   entry answers `503` rather than resolving again, as a GET would. There
   are no metrics for degraded reads yet.
 
+### M5-08 Repair
+
+- **When is a node lost?** The plan said "when a node is lost" and left
+  the moment open. The topology's *departing* comes after
+  `node_forget_after_hours` (24 h), far too late for fragments, and a
+  node that restarts on an empty disk is never silent at all. Repair
+  therefore checks fragments itself: each pass reads one byte of a few
+  of each node's fragments in turn, under the identity the layout
+  expects, and checks all of a node's fragments once one is missing. A
+  node silent for the new `fragment_repair_after_seconds` (default 600)
+  has lost them all, so a restart costs no rebuild. Recorded in §8.6 and
+  the configuration reference.
+- **`EC_RELOCATE` needed no format bump.** Kind 15 was reserved, so it
+  is defined in log format version 2 as the multipart records were. The
+  index format is unchanged too: applying it rewrites the entry's coded
+  layout and moves the `fragments` rows (`IndexWriter::move_fragment`),
+  and `IndexReader::fragment_nodes` lists the nodes with a seek per node.
+- **Moves apply a stripe at a time.** The first version applied each
+  move and checked the stripe after it, so a relocation in which two
+  fragments of a stripe trade nodes was rejected: after the first move,
+  two fragments shared a node. Now all of a stripe's moves apply before
+  `CodedStripe::new` checks it (`fragments_of_a_stripe_may_trade_nodes`).
+- **One fence for every attempt.** Attempt numbers (`AttemptNumbers`),
+  the guard that forgets a dropped attempt (`Writing`), and publishing
+  under the attempt's epoch (`publish`) moved from the encoder into
+  `encoder/attempts.rs`, so a repair is fenced exactly as an encoding is.
+  The seeded `RepairBug::Unfenced`, which registers the attempt only once
+  its fragments are written, is caught by orphan reclamation reclaiming
+  a fragment a committed layout names.
+- **Placement keeps the stripe's other fragments.**
+  `FragmentPlanner::replace` places rebuilt fragments counting the kept
+  ones toward each failure domain's cap and avoiding their nodes, so a
+  repaired stripe obeys the same rules as a new one (a proptest over
+  random topologies checks both rules).
+- **A retagged coded version cannot be checked.** `TAGS` moves the
+  entry's version and keeps the layout, but fragment headers name the
+  version they were written for. Every check of such a version's
+  fragments reads as missing, so the repairer would count them all lost
+  and report the stripes unrecoverable at every pass. It now skips a
+  version whose position is after its `EC_PUBLISH`
+  (`a_version_retagged_after_coding_is_left_be`). Coded reads (M5-06)
+  have the same gap, which needs the layout to record the coded
+  version: an index format change, left open in §8.6.
+- **A new disk repeats fragment IDs.** IDs are disk, segment, and
+  offset, so a node restarting on an empty disk hands out IDs its old
+  disk used. At 256 seeds the harness reported layouts naming fragments
+  "which lost it" that were in fact the old disk's: it now keys
+  acknowledged and reclaimed fragments by node, disk generation, and ID,
+  and takes a layout fragment's generation from the record of the same
+  key, stripe, and index. The system itself is safe: a check or read
+  names the header it expects, so a reused ID reads as missing.
+- **Outlasting `orphan_after` needed a slow acknowledgement.** Rebuilt
+  fragments were acknowledged within milliseconds, so with orphan
+  reclamation asking after 100 ms the `Unfenced` bug went unnoticed. The
+  harness can now hold each repair write's answer back (`ack_delay`,
+  300 ms) after the fragment is durable.
+- **A power cut armed at placement hit another sync.** Cutting the new
+  holder's power at its next sync from the `Placed` step let a seeded
+  `AcknowledgeBeforeSync` through at seed 5: the node synced something
+  else while the write waited for the bandwidth cap. The cut is now
+  armed as the repair write leaves.
+- **Priority is per pass, over what the pass knows.** Losses of two
+  lost disks are found as each node answers again, possibly passes
+  apart, so a stripe that lost both may be repaired first as having lost
+  one. The order check holds in every run, but the scenario requires a
+  stripe found missing two only when both holders are lost for good,
+  which one pass finds together; the harness picks, by the seed, a pair
+  of holders that shares some stripes and not others. The seeded bug
+  became `LeastLostFirst`, which turns the order around, since key order
+  only sometimes puts a stripe that lost one first.
+- **Readers avoided the lost node late.** Readers picked a gateway at
+  random, the lost node included, and waited out 10 s timeouts on it;
+  a run settled at 75 s. They now skip lost nodes (about 4 s a run).
+  Downtime `Duration::MAX` for a node lost for good overflowed the
+  clock; it is now 2^40 s.
+- **Seeds and costs.** A repair run costs 16 typical seeds: the
+  encoding of the coding scenarios, then seconds of repairs at a 64 KiB/s
+  cap. At `SKYS3_SIM_SEEDS=256` each scenario runs 4 to 16 seeds, and
+  all seven passed, one test thread each: a lost holder with reads (8
+  seeds, 30 s), two lost holders (8, 37 s), crashes during repairs (16,
+  54 s), repairs outlasting `orphan_after` (8, 34 s), and the seeded
+  bugs, each seed run with and without the bug: `Unfenced` (4, 24 s),
+  `AcknowledgeBeforeSync` at the new holder (8, 43 s), and
+  `LeastLostFirst` and `Unthrottled` (4, 40 s); about 260 s in all.
+  Each bug is caught at every seed run: 0 to 3, 0 to 7, and 0 to 3.
+  Seeds 1 and 5 found the harness problems above.
+- **Hooks for M5-07 and M5-09.** A fragment an `EC_RELOCATE` replaced is
+  named by no layout, so orphan reclamation reclaims it, from a node
+  that comes back, without waiting for read registrations: fragment
+  release should release moved-from fragments as it does replaced
+  versions'. Rebalancing (M5-09) can commit the same `EC_RELOCATE`, with
+  moves across stripes, take its writes from the node's
+  `RepairBandwidth` or one like it, and share the `Attempts` tracker.
+- **Left open.** The node binary does not run repairers, as it runs no
+  encoder or reclaimer yet. A check costs a header read and one block
+  read on the holder; a node holding many fragments would want a
+  batched presence check. Each pass loads every fragment row of the
+  shard, so memory grows with the shard's fragments. Unrecoverable
+  stripes are logged and counted in the pass report, with no metric of
+  their own.
+
 ### M5-10 Lifecycle expiration and multipart cleanup
 
 - **The configuration lives in the bucket register.** An optional

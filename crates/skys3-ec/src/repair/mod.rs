@@ -15,7 +15,9 @@
 //!    fragment the node answers it does not hold, or holds damaged, is
 //!    lost, and the node's other fragments are then all checked, as after
 //!    a lost disk. A node that has answered none of the checks for
-//!    `fragment_repair_after_seconds` has lost them all.
+//!    `fragment_repair_after_seconds` has lost them all. A version
+//!    retagged after it was coded is left alone: its fragments' headers
+//!    name the version before the tags, which no check matches.
 //! 2. **Orders the stripes.** Stripes with more fragments lost go first,
 //!    then key and stripe order. A stripe that lost more than `m` cannot be
 //!    rebuilt and is reported.

@@ -135,7 +135,8 @@ impl RepairPoint {
 pub enum RepairTarget {
     /// The repairing primary.
     Primary,
-    /// The new holder of the fragment the repair placed first.
+    /// The new holder of the fragment the repair placed first. A power cut
+    /// at its next sync is armed as the next repair write to it leaves.
     NewHolder,
 }
 
