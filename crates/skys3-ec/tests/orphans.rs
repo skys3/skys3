@@ -326,8 +326,8 @@ fn malformed_queries_and_answers_are_refused() {
     assert!(answer(vec![4], "").parse(1).is_err());
 }
 
-/// A shard alone in epoch 1 on node 2, with nothing written.
-async fn alone_shard(disk: &SimDisk) -> Shard<SimMount> {
+/// A shard alone in `epoch` on node `n`, with nothing written.
+async fn alone_shard(disk: &SimDisk, n: u8, epoch: u64) -> Shard<SimMount> {
     let clock = Arc::new(MonotonicClock::new());
     let (log, _) = SegmentLog::open(disk.mount(), LogConfig::default(), clock)
         .await
@@ -337,9 +337,9 @@ async fn alone_shard(disk: &SimDisk) -> Shard<SimMount> {
     let config = ShardConfig {
         bucket_id: shard().bucket.clone(),
         shard: shard().shard,
-        epoch: Epoch::new(1),
-        primary: node(2),
-        members: vec![node(2)],
+        epoch: Epoch::new(epoch),
+        primary: node(n),
+        members: vec![node(n)],
         learners: Vec::new(),
         min_write_replicas: 1,
         replicas: 1,
@@ -355,12 +355,13 @@ async fn queries_reach_the_primary_over_the_transport() {
     let pki = Pki::new();
     // Node 2 leads the shard; node 3 has no replica of it.
     let disk = SimDisk::new(3);
-    let primary = alone_shard(&disk).await;
+    let primary = alone_shard(&disk, 2, 1).await;
     let judges = OrphanServer::default();
     let pool = BlockingPool::new("judge", NonZeroUsize::MIN).unwrap();
     judges.insert(OrphanJudge::new(primary, Attempts::default(), pool));
+    let successor = OrphanServer::default();
     let mut peers = BTreeMap::new();
-    for (n, server) in [(2, judges.clone()), (3, OrphanServer::default())] {
+    for (n, server) in [(2, judges.clone()), (3, successor.clone())] {
         let listener = pki
             .transport(&node(n))
             .bind("127.0.0.1:0".parse().unwrap())
@@ -426,10 +427,28 @@ async fn queries_reach_the_primary_over_the_transport() {
         pki.transport(&node(2)),
         BTreeMap::new(),
         Arc::new(move |_| order.clone()),
-        judges,
+        judges.clone(),
     );
     let verdicts = local.confirm(&shard(), &suspects[..1]).await.unwrap();
     assert_eq!(verdicts, [Verdict::Orphan]);
+
+    // Node 2, deposed without knowing it, keeps the later epoch's attempt
+    // in progress; node 3, which leads in that epoch, finds it orphaned,
+    // and its verdict wins.
+    let disk = SimDisk::new(4);
+    let pool = BlockingPool::new("judge", NonZeroUsize::MIN).unwrap();
+    let shard_of_3 = alone_shard(&disk, 3, 2).await;
+    successor.insert(OrphanJudge::new(shard_of_3, Attempts::default(), pool));
+    let both = vec![node(2), node(3)];
+    let merging = OrphanClient::<TokioNetwork, SimMount>::new(
+        node(2),
+        pki.transport(&node(2)),
+        peers.clone(),
+        Arc::new(move |_| both.clone()),
+        judges.clone(),
+    );
+    let verdicts = merging.confirm(&shard(), &suspects).await.unwrap();
+    assert_eq!(verdicts, [Verdict::Orphan, Verdict::Orphan]);
 
     // A frame that is not a well-formed query is refused.
     let mut connection = pki

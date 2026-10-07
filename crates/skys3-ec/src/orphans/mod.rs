@@ -48,6 +48,12 @@
 //!   not. The index holds every committed record the replica applied; a
 //!   record committed after it could only be one the tracker still shows.
 //!
+//! A [`Verdict::InProgress`] is not final, though: a primary deposed
+//! without knowing it may hold its own unfinished attempt in progress for
+//! good. So a fragment node asks every replica that may lead, and an
+//! orphan verdict from any of them wins over one in progress
+//! ([`OrphanClient`]).
+//!
 //! Every attempt that writes fragments on a node shares that node's
 //! [`Attempts`] for the shard with the judge: the [`Encoder`] here, and
 //! repair (M5-08) and moves (M5-09) later.

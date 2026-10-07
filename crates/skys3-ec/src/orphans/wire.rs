@@ -11,7 +11,7 @@
 //! header holds. The asking node is the one mutual TLS names, so a node
 //! only learns verdicts on fragments it says it holds, and reclaims only
 //! its own. Each query uses a connection of its own, and goes to every
-//! node that may lead the shard at once.
+//! node that may lead the shard at once (see [`OrphanClient`]).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -32,9 +32,10 @@ use super::{OrphanConfirmer, OrphanJudge, Suspect, Unanswered, Verdict};
 pub const MAX_SUSPECTS: usize = 256;
 
 /// How long a node waits for another node's verdicts, connecting
-/// included. A query waits for every node it asks unless one answers, so
-/// a node that is down holds a sweep up this long; unanswered fragments
-/// are asked about again at the next sweep.
+/// included. A query waits for every node it asks unless one decides
+/// every fragment asked about, so a node that is down holds a sweep up
+/// this long; unanswered fragments are asked about again at the next
+/// sweep.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The body of an `OrphanQuery` frame.
@@ -162,11 +163,16 @@ pub type PrimariesOf = Arc<dyn Fn(&ShardRef) -> Vec<NodeId> + Send + Sync>;
 /// Asks shard primaries about this node's fragments over the transport,
 /// and this node's own judges directly.
 ///
-/// A query goes to every node that may lead the shard at once, and the
-/// first verdicts that come back count: only a replica that leads gives
-/// any, and any such replica's are final (see [the module](crate::orphans)),
-/// so a node that is down, or a member that no longer leads, never holds a
-/// query up.
+/// A query goes to every node that may lead the shard at once. Only a
+/// replica that leads gives verdicts, and any such replica's orphan and
+/// referenced verdicts are final (see [the module](crate::orphans)), so
+/// the first answer that decides every suspect counts, and a node that is
+/// down, or a member that no longer leads, never holds a query up. An
+/// answer with fragments in progress waits for the others: a primary
+/// deposed without knowing it keeps its own unfinished attempt in progress
+/// for good, while its successor finds it orphaned. The answers are then
+/// combined, a decided verdict winning over one in progress and referenced
+/// over orphan.
 pub struct OrphanClient<N: Network, D: Disk> {
     inner: Arc<ClientInner<N, D>>,
 }
@@ -258,14 +264,28 @@ impl<N: Network, D: Disk> OrphanConfirmer for OrphanClient<N, D> {
                 (node, answer)
             });
         }
-        // Dropping the set when verdicts arrive stops the other asks.
+        // Dropping the set once every suspect is decided stops the other
+        // asks.
+        let mut merged: Option<Vec<Verdict>> = None;
         let mut reasons = Vec::new();
         while let Some(joined) = asks.join_next().await {
             match joined {
-                Ok((_, Ok(verdicts))) => return Ok(verdicts),
+                Ok((_, Ok(verdicts))) => {
+                    let verdicts = match merged.take() {
+                        Some(earlier) => merge(earlier, &verdicts),
+                        None => verdicts,
+                    };
+                    if !verdicts.contains(&Verdict::InProgress) {
+                        return Ok(verdicts);
+                    }
+                    merged = Some(verdicts);
+                }
                 Ok((node, Err(reason))) => reasons.push(format!("{node}: {reason}")),
                 Err(error) => reasons.push(error.to_string()),
             }
+        }
+        if let Some(verdicts) = merged {
+            return Ok(verdicts);
         }
         reasons.sort();
         Err(Unanswered {
@@ -277,6 +297,26 @@ impl<N: Network, D: Disk> OrphanConfirmer for OrphanClient<N, D> {
             },
         })
     }
+}
+
+/// Combines two replicas' verdicts on the same suspects. Each replica
+/// that leads gives safe verdicts, but only its decided ones are final: a
+/// primary deposed without knowing it may call an attempt of its own in
+/// progress for good. So a decided verdict wins over one in progress, and
+/// a fragment one replica still finds referenced is kept.
+fn merge(earlier: Vec<Verdict>, later: &[Verdict]) -> Vec<Verdict> {
+    fn rank(verdict: Verdict) -> u8 {
+        match verdict {
+            Verdict::InProgress => 0,
+            Verdict::Orphan => 1,
+            Verdict::Referenced => 2,
+        }
+    }
+    earlier
+        .into_iter()
+        .zip(later.iter().copied())
+        .map(|(a, b)| if rank(b) > rank(a) { b } else { a })
+        .collect()
 }
 
 /// A node's end of orphan queries: the judges of the shards it has
