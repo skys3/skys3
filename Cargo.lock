@@ -2813,6 +2813,7 @@ dependencies = [
  "skys3-log",
  "skys3-net",
  "skys3-obs",
+ "skys3-shard",
  "skys3-sim",
  "skys3-types",
  "thiserror",
