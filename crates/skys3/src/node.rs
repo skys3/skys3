@@ -23,7 +23,7 @@ use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
-use skys3_remote::aws::{AwsS3, default_credentials};
+use skys3_remote::aws::{AwsS3, default_credentials, profile_credentials};
 use skys3_shard::lifecycle::{self, LifecycleMetrics};
 use skys3_shard::{
     CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
@@ -1016,8 +1016,22 @@ impl Node {
         );
         let region = config.flush().target_region.clone();
         let credentials = default_credentials(&region).await;
-        let connect = move |target: &skys3_types::RemoteTarget| {
-            AwsS3::builder(target, region.clone(), credentials.clone())
+        let connect = {
+            let (region, credentials) = (region.clone(), credentials.clone());
+            move |target: &skys3_types::RemoteTarget| {
+                AwsS3::builder(target, region.clone(), credentials.clone())
+                    .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
+                    .build()
+            }
+        };
+        // A `read_only` bucket's origin is read with its `origin_profile`'s
+        // credentials, or the default chain's (§9.5).
+        let connect_origin = move |target: &skys3_types::RemoteTarget, profile: Option<&str>| {
+            let credentials = profile.map_or_else(
+                || credentials.clone(),
+                |profile| profile_credentials(profile, &region),
+            );
+            AwsS3::builder(target, region.clone(), credentials)
                 .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
                 .build()
         };
@@ -1038,7 +1052,8 @@ impl Node {
                     FlushMetrics::register(&metrics.registry),
                 )
                 .with_budget(budget)
-                .with_buckets(config.buckets().clone()),
+                .with_buckets(config.buckets().clone())
+                .with_origin_connect(Box::new(connect_origin)),
             )
         };
         let mut gateway_config = GatewayConfig::new(&config);

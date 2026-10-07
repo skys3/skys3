@@ -66,6 +66,7 @@ use crate::hot_cache::HotCache;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
 use crate::objects::backed_up;
+use crate::origin::OriginValidations;
 use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
@@ -73,9 +74,9 @@ use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 /// `local`, or `read_only`. S3 has no field for it.
 pub const MODE_HEADER: &str = "x-skys3-bucket-mode";
 
-/// The CreateBucket header that names a `write_back` bucket's target, as a
-/// path-style URL: `https://host[:port]/bucket` or
-/// `https://host[:port]/bucket/prefix`.
+/// The CreateBucket header that names a `write_back` bucket's target, or a
+/// `read_only` bucket's origin, as a path-style URL:
+/// `https://host[:port]/bucket` or `https://host[:port]/bucket/prefix`.
 pub const TARGET_HEADER: &str = "x-skys3-bucket-target";
 
 /// What the gateway needs from the node's configuration.
@@ -135,8 +136,16 @@ pub struct GatewayConfig {
     pub admission: Arc<dyn Admission>,
     /// The remote targets of `write_back` buckets, which reads of keys the
     /// namespace import has not reached and lazily loaded metadata use
-    /// (§9.1). [`GatewayConfig::new`] has none: every read is local.
+    /// (§9.1), and the origins of `read_only` buckets, which every read of
+    /// one checks and every listing of one is forwarded to (§9.5).
+    /// [`GatewayConfig::new`] has none: every read is local, and a
+    /// `read_only` bucket answers `503`.
     pub remote: Option<Arc<dyn RemoteReads>>,
+    /// What the origins of `read_only` buckets were seen to hold, which
+    /// reads under `freshness = "ttl"` use (§9.5). Clones of a
+    /// configuration share it, so gateways built from clones on several
+    /// nodes need one each.
+    pub origin_validations: OriginValidations,
     /// Where new buckets' shards live. [`GatewayConfig::new`] keeps them
     /// on this node, as a single-node cluster does.
     pub placement: ShardPlacement,
@@ -197,6 +206,7 @@ impl GatewayConfig {
             list_token_keys: ListTokenKeys::generate(),
             admission: Arc::new(AdmitAll),
             remote: None,
+            origin_validations: OriginValidations::new(),
             placement: ShardPlacement::Local,
             read_registration_renew_interval: config.storage().read_registration_renew_interval(),
             write_through_timeout: config.flush().write_through_timeout(),
@@ -366,9 +376,16 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     /// writes from this cluster's clients: a bucket that receives native
     /// replication from a peer cluster (`peer_source`) is read-only to them,
     /// so each key has a single writer, unless `peer_local_writes` is set
-    /// (design §7.8).
+    /// (design §7.8), and a `read_only` bucket takes none (§9.5).
     pub(crate) fn require_writable(&self, name: &BucketName) -> Result<BucketDocument, S3Error> {
         let bucket = self.require(name)?;
+        if bucket.mode == BucketMode::ReadOnly {
+            return Err(s3_error!(
+                AccessDenied,
+                "Bucket {name} is a read_only bucket: it caches an origin that SkyS3 does not \
+                 own, and takes no writes"
+            ));
+        }
         let settings = self.config.buckets.get(name);
         match &settings.peer_source {
             Some(source) if !settings.peer_local_writes => Err(s3_error!(
@@ -414,20 +431,14 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             None => settings.mode,
         };
         let target = match (mode, target) {
-            (BucketMode::ReadOnly, _) => {
-                return Err(s3_error!(
-                    NotImplemented,
-                    "read_only buckets are not supported yet"
-                ));
-            }
-            (BucketMode::WriteBack, None) => {
+            (BucketMode::WriteBack | BucketMode::ReadOnly, None) => {
                 return Err(s3_error!(
                     InvalidArgument,
-                    "A write_back bucket needs a target: set the {TARGET_HEADER} header to \
+                    "A {mode} bucket needs a target: set the {TARGET_HEADER} header to \
                      https://host[:port]/bucket or https://host[:port]/bucket/prefix"
                 ));
             }
-            (BucketMode::WriteBack, Some(url)) => {
+            (BucketMode::WriteBack | BucketMode::ReadOnly, Some(url)) => {
                 let target = parse_target(url).map_err(|e| s3_error!(InvalidArgument, "{e}"))?;
                 self.config
                     .control_store
