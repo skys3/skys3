@@ -8,19 +8,54 @@
 //! fragments sends the GET back to resolve the key again. A read of the
 //! whole object fills the hot cache once every byte has streamed, as a
 //! read from another node's holder does.
+//!
+//! CopyObject reads a coded source the same way, whole, from the layout of
+//! the source's entry ([`Objects::coded_source`]); UploadPartCopy reads
+//! its source as a GET does.
 
 use std::sync::Arc;
 
-use s3s::S3Result;
 use s3s::dto::StreamingBlob;
+use s3s::{S3Error, S3Result, s3_error};
 use skys3_ec::{CodedBody, CodedRead, CodedReadError, read_coded};
-use skys3_types::BucketDocument;
+use skys3_index::ObjectVersion;
+use skys3_types::{BucketDocument, EpochSeq};
 use tokio::sync::mpsc;
 
 use super::{Found, Objects, download, empty_blob, hot_names};
-use crate::shard::Shards;
+use crate::shard::{ShardRef, Shards};
 
 impl<H: Shards> Objects<H> {
+    /// The whole of `object`, the coded version at `version` of `key` in
+    /// `shard`, read from its fragments for a copy.
+    ///
+    /// # Errors
+    ///
+    /// `503 ServiceUnavailable` if this gateway reads no fragments, or a
+    /// stripe has too few readable fragments for the read to start.
+    pub(super) async fn coded_source(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        object: &ObjectVersion,
+    ) -> S3Result<CodedBody> {
+        let (Some(source), Some(coded)) = (&self.fragments, &object.coded) else {
+            return Err(download::not_cached());
+        };
+        let read = CodedRead {
+            shard: shard.into(),
+            key: key.to_owned(),
+            version,
+            size: object.size,
+            stripes: coded.stripes.clone(),
+            range: 0..object.size,
+        };
+        read_coded(Arc::clone(source), read)
+            .await
+            .map_err(unreadable_source)
+    }
+
     /// The bytes of `found`, a coded version of `key`, read from its
     /// fragments: the inner error if a stripe has too few readable
     /// fragments for the read to start.
@@ -96,4 +131,13 @@ impl<H: Shards> Objects<H> {
         });
         receiver
     }
+}
+
+/// A copy source whose fragments could not be read, before or while the
+/// copy streamed them.
+pub(super) fn unreadable_source(error: impl std::fmt::Display) -> S3Error {
+    s3_error!(
+        ServiceUnavailable,
+        "The copy source's fragments could not be read: {error}"
+    )
 }

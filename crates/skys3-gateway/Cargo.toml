@@ -61,6 +61,7 @@ aws-credential-types.workspace = true
 aws-sdk-s3.workspace = true
 aws-sigv4.workspace = true
 aws-smithy-http-client.workspace = true
+crc32c.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 proptest.workspace = true
 rcgen.workspace = true

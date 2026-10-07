@@ -2638,6 +2638,7 @@ dependencies = [
  "base64",
  "bytes",
  "crc-fast",
+ "crc32c",
  "http",
  "http-body",
  "http-body-util",
