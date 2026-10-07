@@ -15,7 +15,7 @@ use super::coding::caught;
 
 /// What one run costs, in seeds of a typical scenario: the encoding of
 /// the coding scenarios, then about four seconds of reads under faults.
-const RUN_COST: u64 = 16;
+const RUN_COST: u64 = 32;
 
 /// A run whose readers send `gets` GETs each while `lossy` nodes fail.
 fn reading(lossy: usize, corrupt_only: bool, bug: Option<ReadBug>) -> CodingConfig {
@@ -29,6 +29,20 @@ fn reading(lossy: usize, corrupt_only: bool, bug: Option<ReadBug>) -> CodingConf
         }),
         ..CodingConfig::default()
     }
+}
+
+#[test]
+fn a_seed_of_coded_reads_replays_exactly() {
+    Runner::with_cost(1, 4 * RUN_COST).run(|context| {
+        let config = reading(2, false, None);
+        let mut replay = SimContext::with_scale(context.seed(), context.scale());
+        let first = coding::run(&mut replay, &config)?;
+        let second = coding::run(context, &config)?;
+        if format!("{first:?}") != format!("{second:?}") {
+            return Err(format!("two runs differ: {first:?} and {second:?}").into());
+        }
+        Ok(())
+    });
 }
 
 #[test]
