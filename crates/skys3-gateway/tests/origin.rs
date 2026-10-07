@@ -147,7 +147,7 @@ impl RemoteReads for Origin {
     ) -> RemoteFuture<'a, Option<RemoteObject>> {
         Box::pin(async move {
             match self.revalidate(bucket, key).await? {
-                OriginHead::Found(found) => Ok(Some(found)),
+                OriginHead::Found(found) => Ok(Some(*found)),
                 OriginHead::Missing => Ok(None),
                 OriginHead::Denied => Err(RemoteError("403 AccessDenied".to_owned())),
             }
@@ -240,7 +240,7 @@ impl RemoteReads for Origin {
                 OriginHead::Denied
             } else {
                 match state.objects.get(key) {
-                    Some((object, _)) => OriginHead::Found(object.clone()),
+                    Some((object, _)) => OriginHead::Found(Box::new(object.clone())),
                     None => OriginHead::Missing,
                 }
             };

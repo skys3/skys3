@@ -103,10 +103,10 @@ impl<S: ObjectStore, D: Disk> RemoteReads for NodeRemote<S, D> {
         Box::pin(async move {
             let reader = self.reader(bucket)?;
             match reader.head(key).await {
-                Ok(Some(found)) => Ok(OriginHead::Found(RemoteObject {
+                Ok(Some(found)) => Ok(OriginHead::Found(Box::new(RemoteObject {
                     object: found.object,
                     version_id: found.version_id,
-                })),
+                }))),
                 Ok(None) => Ok(OriginHead::Missing),
                 Err(error) if error.status() == Some(FORBIDDEN) => Ok(OriginHead::Denied),
                 Err(error) => Err(failed(error)),

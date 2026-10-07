@@ -22,8 +22,9 @@
 //!   reach: a key cached on its primary and then overwritten at the origin
 //!   (a read that skips revalidation serves the old copy), and a key
 //!   cached by both buckets, then denied to [`GUEST`] while `origin-full`
-//!   keeps reading it (an answer kept without its credential scope serves
-//!   `origin-guest` past its denial).
+//!   keeps reading it through one node, and `origin-guest` reads it there
+//!   (an answer kept without its credential scope serves `origin-guest`
+//!   past its denial).
 //!
 //! **The check** ([`audit`]): each answer must be one the origin, as the
 //! reader's credentials see it, gave at some moment from the read's start,
@@ -347,6 +348,10 @@ pub(crate) async fn read(
     Ok(())
 }
 
+/// A key's state at the origin from a moment on: its ETag, if it has an
+/// object, and whether it is denied to [`GUEST`].
+type State = (Duration, Option<String>, bool);
+
 /// The stager: the two races of the module documentation, on keys of their
 /// own, through chosen nodes.
 pub(crate) async fn stage(
@@ -397,13 +402,13 @@ pub(crate) async fn stage(
         get(credentials, STAGED_DENIAL, &primary).await?;
     }
     deny(&remote, &log, STAGED_DENIAL, true);
+    // Validations are each gateway's own, so both read through one node.
     let step = (ttl / 3).max(Duration::from_millis(100));
-    let full = routes.primary(FULL, STAGED_DENIAL);
-    let guest = routes.primary(GUEST, STAGED_DENIAL);
+    let node = routes.primary(FULL, STAGED_DENIAL);
     for round in 0..9 {
-        get(FULL, STAGED_DENIAL, &full).await?;
+        get(FULL, STAGED_DENIAL, &node).await?;
         if round >= 6 {
-            get(GUEST, STAGED_DENIAL, &guest).await?;
+            get(GUEST, STAGED_DENIAL, &node).await?;
         }
         tokio::time::sleep(step).await;
     }
@@ -501,7 +506,7 @@ pub(crate) fn audit(origin: &Origin, log: &OriginLog) -> Result<OriginAudit, Str
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     // Each key's states, from no object, each with the time it began.
-    let mut timelines: BTreeMap<&str, Vec<(Duration, Option<String>, bool)>> = BTreeMap::new();
+    let mut timelines: BTreeMap<&str, Vec<State>> = BTreeMap::new();
     for (at, key, change) in &changes {
         let timeline = timelines
             .entry(key.as_str())
@@ -522,7 +527,7 @@ pub(crate) fn audit(origin: &Origin, log: &OriginLog) -> Result<OriginAudit, Str
     for read in &reads {
         audit.reads += 1;
         let timeline = timelines.get(read.key.as_str()).unwrap_or(&initial);
-        let seen = |(_, etag, denied): &(Duration, Option<String>, bool)| Seen {
+        let seen = |(_, etag, denied): &State| Seen {
             etag: etag.clone(),
             denied: *denied && read.credentials == GUEST,
         };

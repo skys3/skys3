@@ -150,7 +150,7 @@ pub trait RemoteReads: fmt::Debug + Send + Sync + 'static {
     ) -> RemoteFuture<'a, OriginHead> {
         Box::pin(async move {
             Ok(match self.head(bucket, key).await? {
-                Some(found) => OriginHead::Found(found),
+                Some(found) => OriginHead::Found(Box::new(found)),
                 None => OriginHead::Missing,
             })
         })

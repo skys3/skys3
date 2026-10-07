@@ -119,11 +119,11 @@ impl<H: Shards> Objects<H> {
             let head = remote
                 .revalidate(&bucket.bucket_id, key)
                 .await
-                .map_err(|error| origin_unavailable(error))?;
+                .map_err(origin_unavailable)?;
             self.validations
                 .record(&scope, key, sent, Seen::from(&head));
             let found = match head {
-                OriginHead::Found(found) => found,
+                OriginHead::Found(found) => *found,
                 OriginHead::Missing => return Err(no_such_key()),
                 OriginHead::Denied => return Err(denied()),
             };

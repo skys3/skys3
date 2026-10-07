@@ -87,7 +87,7 @@ impl fmt::Display for OriginScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginHead {
     /// The object the origin holds.
-    Found(RemoteObject),
+    Found(Box<RemoteObject>),
     /// The origin has no object at the key.
     Missing,
     /// The origin refused the bucket's credentials the object: `403`.
