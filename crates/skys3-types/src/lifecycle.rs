@@ -364,7 +364,8 @@ mod tests {
         assert_eq!(after_days(15 * DAY_MS + 37_800_000, 3), 19 * DAY_MS);
         assert_eq!(after_days(15 * DAY_MS, 1), 17 * DAY_MS);
         assert_eq!(after_days(15 * DAY_MS - 1, 1), 16 * DAY_MS);
-        assert_eq!(after_days(u64::MAX - 5, 3), u64::MAX / DAY_MS * DAY_MS);
+        // Past the last midnight `u64` can hold: never.
+        assert_eq!(after_days(u64::MAX - 5, 3), u64::MAX);
     }
 
     #[test]
