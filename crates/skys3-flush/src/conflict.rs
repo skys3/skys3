@@ -13,9 +13,17 @@
 //! - `discard_local` resolves it at once too: the key returns to dirty, and
 //!   its next flush HEADs the key and commits an `ADOPT` of the remote's
 //!   write, naming the dirty version, which drops it. It loses
-//!   acknowledged writes, so only a `write_back` bucket whose own
-//!   `[buckets.<name>]` table names it may use it ([`effective_policy`]),
-//!   automatically or through the admin API.
+//!   acknowledged writes, so it applies automatically only to a
+//!   `write_back` bucket whose own `[buckets.<name>]` table names it: the
+//!   configuration rejects it anywhere else.
+//!
+//! An operator resolves a held conflict under any of the three
+//! ([`FlushService::resolve`](crate::FlushService::resolve)): `hold`
+//! retries the conditional flush, for example once the other writer's
+//! object was removed, and `overwrite` and `discard_local` act as the
+//! policies do. The per-bucket opt-in guards the automatic policy, which
+//! drops writes nobody looked at; an operator's resolution names one key
+//! the operator inspected, so it needs none.
 //!
 //! Resolving moves the key from Conflict back to Dirty (§4.2), never to
 //! Clean: the resolution is carried out by the key's next flush, with the
@@ -26,9 +34,10 @@
 //! by the bucket's policy, or holds it for the operator again.
 //!
 //! A backup target (§8.9) is not the system of record of its `local`
-//! bucket, so its flushers hold or overwrite, but never discard: adopting
-//! the backup's object would replace acknowledged data in the cluster with
-//! a write that no read path serves.
+//! bucket, so its conflicts are held or overwritten, never discarded, by
+//! the flushers or an operator: adopting the backup's object would replace
+//! acknowledged data in the cluster with a write that no read path serves
+//! ([`effective_policy`]).
 
 use std::fmt;
 
@@ -42,8 +51,9 @@ pub enum Unresolved {
     /// No flusher on this node holds the key in conflict: it is clean,
     /// dirty, or being flushed, or its shard's primary is another node.
     NotHeld,
-    /// `discard_local` was asked of a bucket that did not opt into it.
-    NotOptedIn,
+    /// `discard_local` was asked of a backup target, whose conflicts are
+    /// never discarded.
+    Backup,
     /// The flusher that held the key stopped.
     Stopped,
 }
@@ -53,9 +63,9 @@ impl fmt::Display for Unresolved {
         f.write_str(match self {
             Self::NotFlushed => "the bucket is not flushed on this node",
             Self::NotHeld => "the key is not held in conflict on this node",
-            Self::NotOptedIn => {
-                "discard_local loses acknowledged writes, and the bucket's \
-                 [buckets.<name>] table does not opt into it"
+            Self::Backup => {
+                "a backup target's conflicts are never discarded: the local bucket is \
+                 the system of record"
             }
             Self::Stopped => "the key's flusher stopped",
         })
@@ -78,10 +88,10 @@ pub(crate) fn effective_policy(policy: ConflictPolicy, backup: bool) -> Conflict
     }
 }
 
-/// Whether an operator may resolve the bucket's conflicts with
-/// `discard_local`: only where its flushers would apply it themselves.
-pub(crate) fn may_discard(policy: ConflictPolicy, backup: bool) -> bool {
-    effective_policy(policy, backup) == ConflictPolicy::DiscardLocal
+/// Whether an operator may resolve a conflict with `discard_local`: on
+/// any target but a backup.
+pub(crate) fn may_discard(backup: bool) -> bool {
+    !backup
 }
 
 /// A bug seeded into the conflict handling of every flusher on this
@@ -148,9 +158,7 @@ mod tests {
             effective_policy(ConflictPolicy::DiscardLocal, true),
             ConflictPolicy::Hold
         );
-        assert!(may_discard(ConflictPolicy::DiscardLocal, false));
-        assert!(!may_discard(ConflictPolicy::DiscardLocal, true));
-        assert!(!may_discard(ConflictPolicy::Overwrite, false));
+        assert!(may_discard(false) && !may_discard(true));
     }
 
     #[test]
@@ -158,7 +166,7 @@ mod tests {
         for refusal in [
             Unresolved::NotFlushed,
             Unresolved::NotHeld,
-            Unresolved::NotOptedIn,
+            Unresolved::Backup,
             Unresolved::Stopped,
         ] {
             assert!(!refusal.to_string().is_empty());

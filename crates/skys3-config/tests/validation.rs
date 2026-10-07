@@ -1021,6 +1021,36 @@ fn backup_targets_belong_to_local_buckets() {
 }
 
 #[test]
+fn only_write_back_buckets_discard_local_writes() {
+    for mode in ["local", "read_only"] {
+        assert_violations(
+            &format!(
+                "[buckets.vault]\nmode = \"{mode}\"\nflush_conflict_policy = \"discard_local\""
+            ),
+            &["buckets.vault.flush_conflict_policy"],
+        );
+    }
+    // Inherited from the defaults' mode too.
+    assert_violations(
+        "[buckets.defaults]\nmode = \"local\"\n\
+         [buckets.vault]\nflush_conflict_policy = \"discard_local\"",
+        &["buckets.vault.flush_conflict_policy"],
+    );
+    let config = load(
+        "[buckets.defaults]\nmode = \"local\"\n\
+         [buckets.vault]\nmode = \"local\"\nbackup_target = \"https://h/b\"\n\
+         flush_conflict_policy = \"overwrite\"\n\
+         [buckets.cache]\nmode = \"write_back\"\nflush_conflict_policy = \"discard_local\"",
+    )
+    .unwrap();
+    let vault = config.buckets().get(&BucketName::new("vault").unwrap());
+    assert_eq!(
+        vault.flush_conflict_policy,
+        skys3_config::ConflictPolicy::Overwrite
+    );
+}
+
+#[test]
 fn target_urls_are_checked() {
     assert_violations(
         "[buckets.alpha]\nmode = \"local\"\nbackup_target = \"s3://bucket\"\n\

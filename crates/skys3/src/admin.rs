@@ -7,6 +7,8 @@
 //! | `GET /v1/health` | The node and cluster IDs, readiness, whether the control store answers or the node serves its local copy, and each disk's state. |
 //! | `GET /v1/buckets` | The status of every bucket. |
 //! | `GET /v1/buckets/<name>` | The status of one bucket, or 404. |
+//! | `GET /v1/buckets/<name>/conflicts` | The keys of the bucket that this node's flushers hold in conflict (§7.2). |
+//! | `POST /v1/buckets/<name>/conflicts/<policy>/<key>` | Resolves the conflict `key` is held in under `policy` (M4-06, below). |
 //!
 //! Answers are JSON objects; later fields are added, never renamed. A
 //! bucket's status counts the objects and the unflushed entries (dirty,
@@ -25,8 +27,10 @@
 //!   above it (§7.6);
 //! - `oldest_dirty_age_seconds` and `flush_lag_seconds`, as the metrics of
 //!   the same names;
-//! - `conflicts`: each key held in conflict, with the local `seq` and the
-//!   remote object's ETag and write identity;
+//! - `conflict_policy`: what a flush that finds an out-of-band write does
+//!   (§7.2): `hold`, `overwrite`, or `discard_local`;
+//! - `conflicts`: each key held in conflict, with its `shard`, the local
+//!   `seq`, and the remote object's ETag and write identity;
 //! - `orphaned_uploads`: remote multipart uploads that flushes left open
 //!   and that wait to be aborted, as the metric of the same name;
 //! - `streamed_uploads`: remote multipart uploads that stream open local
@@ -41,9 +45,35 @@
 //!
 //! Once the node runs the coordinator, `health` gains a `placement` object
 //! from `skys3_coord::PlacementHealth` (design §12), and bucket status the
-//! shards' members (M3-04); M4-06 adds its own fields.
+//! shards' members (M3-04).
+//!
+//! **Conflicts** (§7.2, plan M4-06). A conflict is held by the flusher of
+//! the key's shard on that shard's primary, so a node lists and resolves
+//! only the conflicts its own flushers hold; an operator asks each node.
+//! `GET /v1/buckets/<name>/conflicts` answers the bucket's `name`, its
+//! `conflict_policy` (`null` where no flusher of it runs here), and its
+//! `conflicts` as in the `flush` object. `POST
+//! /v1/buckets/<name>/conflicts/<policy>/<key>`, where `key` is the rest of
+//! the path, percent-decoded, returns a held key to dirty, and its next
+//! flush carries out `policy`: `hold` retries the conditional flush, for
+//! example once the operator has removed the other writer's object;
+//! `overwrite` replaces the remote's write with the local version; and
+//! `discard_local` adopts the remote's write and drops the local version,
+//! an acknowledged write. The operator chooses per key, so a `discard_local`
+//! resolution needs no opt-in in the bucket's table, unlike the policy;
+//! a `local` bucket's backup target never discards. It answers `200`
+//! with the `bucket`, `key`, `policy`, and `state` (`dirty`); `400` for an
+//! unknown policy or a key that is not valid percent-encoded UTF-8; `404`
+//! for an unknown bucket, a bucket not flushed here, or a key not held
+//! here; `409` for `discard_local` on a backup target; and `503`
+//! if the key's flusher stopped meanwhile. A resolution lives in the
+//! flusher's memory until the key's next flush succeeds: if the primary
+//! changes first, the new primary finds the conflict again and applies the
+//! bucket's policy, holding it for the operator again under `hold`.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -51,12 +81,14 @@ use bytes::Bytes;
 use http::{Method, Response, StatusCode, header};
 use http_body_util::Full;
 use serde_json::{Value, json};
-use skys3_flush::{BucketStatus, ProbeStatus};
+use skys3_config::ConflictPolicy;
+use skys3_flush::{BucketStatus, FlushService, ProbeStatus, Unresolved};
 use skys3_gateway::{LocalShards, ShardRef};
 use skys3_index::ImportCheckpoint;
 use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::SegmentLog;
 use skys3_obs::{AdminApi, ApiFuture, Health};
+use skys3_remote::ObjectStore;
 use skys3_types::{BucketDocument, BucketId, ClusterId, Generation, NodeId};
 
 use crate::datadir::DiskDir;
@@ -77,8 +109,39 @@ pub struct ControlState {
 /// The source of the gateway's bucket list.
 pub type BucketList = Arc<dyn Fn() -> Vec<BucketDocument> + Send + Sync>;
 
-/// The source of a bucket's flush status, if it is flushed on this node.
-pub type FlushStatus = Arc<dyn Fn(&BucketId) -> Option<BucketStatus> + Send + Sync>;
+/// The future of [`Flushers::resolve`].
+pub type ResolveFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Unresolved>> + Send + 'a>>;
+
+/// What the admin API asks of the node's flushers: a
+/// [`FlushService`] of any store.
+pub trait Flushers: Send + Sync + 'static {
+    /// The flush state of `bucket`, if it is flushed on this node.
+    fn status(&self, bucket: &BucketId) -> Option<BucketStatus>;
+
+    /// Resolves the conflict `key` of `bucket` is held in under `policy`
+    /// ([`FlushService::resolve`]).
+    fn resolve<'a>(
+        &'a self,
+        bucket: &'a BucketId,
+        key: &'a str,
+        policy: ConflictPolicy,
+    ) -> ResolveFuture<'a>;
+}
+
+impl<S: ObjectStore, D: Disk> Flushers for FlushService<S, D> {
+    fn status(&self, bucket: &BucketId) -> Option<BucketStatus> {
+        FlushService::status(self, bucket)
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        bucket: &'a BucketId,
+        key: &'a str,
+        policy: ConflictPolicy,
+    ) -> ResolveFuture<'a> {
+        Box::pin(FlushService::resolve(self, bucket, key, policy))
+    }
+}
 
 /// The node's admin API.
 pub struct NodeAdmin<D: Disk> {
@@ -96,8 +159,8 @@ pub struct NodeAdmin<D: Disk> {
     pub control: Arc<Mutex<ControlState>>,
     /// The node's readiness.
     pub health: Health,
-    /// The flushers' status by bucket.
-    pub flush: FlushStatus,
+    /// The node's flushers.
+    pub flush: Arc<dyn Flushers>,
 }
 
 impl<D: Disk> fmt::Debug for NodeAdmin<D> {
@@ -193,10 +256,60 @@ impl<D: Disk> NodeAdmin<D> {
             "unflushed": unflushed,
             "errors": errors,
         });
-        if let Some(flush) = (self.flush)(&bucket.bucket_id) {
+        if let Some(flush) = self.flush.status(&bucket.bucket_id) {
             status["flush"] = flush_status(&flush);
         }
         status
+    }
+
+    /// The answer to `GET /v1/buckets/<name>/conflicts`.
+    fn conflicts(&self, bucket: &BucketDocument) -> Value {
+        let flush = self.flush.status(&bucket.bucket_id);
+        json!({
+            "bucket": bucket.name.as_str(),
+            "conflict_policy": flush.as_ref().map(|flush| policy_name(flush.conflict_policy)),
+            "conflicts": flush.as_ref().map_or_else(Vec::new, conflicts),
+        })
+    }
+
+    /// The answer to `POST /v1/buckets/<name>/conflicts/<policy>/<key>`,
+    /// with `rest` the path after `conflicts/`.
+    async fn resolve(&self, bucket: &BucketDocument, rest: &str) -> Response<Full<Bytes>> {
+        let error = |status, message: &str| json_response(status, &json!({ "error": message }));
+        let Some((policy, key)) = rest.split_once('/') else {
+            return error(StatusCode::NOT_FOUND, "not found");
+        };
+        let Some(policy) = parse_policy(policy) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "the policy is hold, overwrite, or discard_local",
+            );
+        };
+        let Some(key) = percent_decode(key).filter(|key| !key.is_empty()) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "the key is not valid percent-encoded UTF-8",
+            );
+        };
+        match self.flush.resolve(&bucket.bucket_id, &key, policy).await {
+            Ok(()) => json_response(
+                StatusCode::OK,
+                &json!({
+                    "bucket": bucket.name.as_str(),
+                    "key": key,
+                    "policy": policy_name(policy),
+                    "state": "dirty",
+                }),
+            ),
+            Err(refusal) => {
+                let status = match refusal {
+                    Unresolved::Backup => StatusCode::CONFLICT,
+                    Unresolved::Stopped => StatusCode::SERVICE_UNAVAILABLE,
+                    Unresolved::NotFlushed | Unresolved::NotHeld => StatusCode::NOT_FOUND,
+                };
+                error(status, &refusal.to_string())
+            }
+        }
     }
 
     async fn route(&self, method: &Method, path: &str) -> Option<Response<Full<Bytes>>> {
@@ -205,15 +318,46 @@ impl<D: Disk> NodeAdmin<D> {
         if !known {
             return None;
         }
-        if method != Method::GET && method != Method::HEAD {
+        // `buckets/<name>/conflicts/<policy>/<key>` resolves; every other
+        // route only reads.
+        let conflict = route
+            .strip_prefix("buckets/")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(name, rest)| Some((name, rest.strip_prefix("conflicts")?)));
+        let resolving = conflict.and_then(|(name, rest)| Some((name, rest.strip_prefix('/')?)));
+        let allowed = if resolving.is_some() {
+            method == Method::POST
+        } else {
+            method == Method::GET || method == Method::HEAD
+        };
+        if !allowed {
             let mut response = json_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 &json!({"error": "method not allowed"}),
             );
+            let allow = if resolving.is_some() {
+                "POST"
+            } else {
+                "GET, HEAD"
+            };
             response
                 .headers_mut()
-                .insert(header::ALLOW, http::HeaderValue::from_static("GET, HEAD"));
+                .insert(header::ALLOW, http::HeaderValue::from_static(allow));
             return Some(response);
+        }
+        let find = |name: &str| {
+            (self.buckets)()
+                .into_iter()
+                .find(|bucket| bucket.name.as_str() == name)
+        };
+        if let Some((name, rest)) = resolving {
+            return Some(self.resolve(&find(name)?, rest).await);
+        }
+        if let Some((name, rest)) = conflict {
+            if !rest.is_empty() {
+                return None;
+            }
+            return Some(json_response(StatusCode::OK, &self.conflicts(&find(name)?)));
         }
         let body = match route {
             "health" => self.health().await,
@@ -226,32 +370,78 @@ impl<D: Disk> NodeAdmin<D> {
             }
             _ => {
                 let name = route.strip_prefix("buckets/")?;
-                let bucket = (self.buckets)()
-                    .into_iter()
-                    .find(|bucket| bucket.name.as_str() == name)?;
-                self.bucket(&bucket).await
+                self.bucket(&find(name)?).await
             }
         };
         Some(json_response(StatusCode::OK, &body))
     }
 }
 
-/// The `flush` object of a bucket's status.
-fn flush_status(status: &BucketStatus) -> Value {
-    let gauges = status.gauges(SystemWallClock.now());
-    let shards = status.shards.iter().map(|(_, shard)| shard);
-    let conflicts: Vec<_> = shards
-        .clone()
-        .flat_map(|shard| &shard.conflicts)
-        .map(|conflict| {
+/// The name of `policy` in configuration and in the admin API.
+fn policy_name(policy: ConflictPolicy) -> &'static str {
+    match policy {
+        ConflictPolicy::Hold => "hold",
+        ConflictPolicy::Overwrite => "overwrite",
+        ConflictPolicy::DiscardLocal => "discard_local",
+    }
+}
+
+/// The policy named `name`, as [`policy_name`] names it.
+fn parse_policy(name: &str) -> Option<ConflictPolicy> {
+    [
+        ConflictPolicy::Hold,
+        ConflictPolicy::Overwrite,
+        ConflictPolicy::DiscardLocal,
+    ]
+    .into_iter()
+    .find(|policy| policy_name(*policy) == name)
+}
+
+/// Decodes a percent-encoded path segment, or returns `None` if an escape
+/// is not two hex digits or the bytes are not UTF-8.
+fn percent_decode(encoded: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(encoded.len());
+    let mut rest = encoded.as_bytes();
+    while let Some((&byte, after)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = after.get(..2)?;
+            let text = std::str::from_utf8(hex).ok()?;
+            if !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            bytes.push(u8::from_str_radix(text, 16).ok()?);
+            rest = &after[2..];
+        } else {
+            bytes.push(byte);
+            rest = after;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Each key `status`'s flushers hold in conflict.
+fn conflicts(status: &BucketStatus) -> Vec<Value> {
+    status
+        .shards
+        .iter()
+        .flat_map(|(shard, status)| status.conflicts.iter().map(move |c| (shard, c)))
+        .map(|(shard, conflict)| {
             json!({
                 "key": conflict.key,
+                "shard": shard.get(),
                 "seq": conflict.seq.get(),
                 "remote_etag": conflict.remote_etag.as_ref().map(|etag| etag.as_str()),
                 "remote_identity": conflict.remote_identity,
             })
         })
-        .collect();
+        .collect()
+}
+
+/// The `flush` object of a bucket's status.
+fn flush_status(status: &BucketStatus) -> Value {
+    let gauges = status.gauges(SystemWallClock.now());
+    let shards = status.shards.iter().map(|(_, shard)| shard);
+    let conflicts = conflicts(status);
     let errors: Vec<_> = shards
         .clone()
         .filter_map(|shard| shard.last_error.clone())
@@ -275,6 +465,7 @@ fn flush_status(status: &BucketStatus) -> Value {
         "dirty_budget_bytes": gauges.dirty_budget,
         "oldest_dirty_age_seconds": gauges.oldest_dirty_age,
         "flush_lag_seconds": gauges.flush_lag,
+        "conflict_policy": policy_name(status.conflict_policy),
         "conflicts": conflicts,
         "orphaned_uploads": gauges.orphaned_uploads,
         "errors": errors,

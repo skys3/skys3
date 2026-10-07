@@ -126,8 +126,8 @@ impl BucketStatus {
 /// `flush_conflict_policy` from its settings, `hold` without them: a key
 /// held in conflict waits for [`FlushService::resolve`], and `overwrite`
 /// and `discard_local` resolve conflicts as they are found. Only a
-/// `write_back` bucket whose own table names `discard_local` discards; a
-/// backup target holds instead.
+/// `write_back` bucket whose own table names `discard_local` discards by
+/// itself, and a backup target never discards: it holds instead.
 pub struct FlushService<S, D> {
     cluster: ClusterId,
     settings: FlushSettings,
@@ -161,7 +161,8 @@ struct BucketFlusher<S> {
     name: String,
     /// The conflict policy its flushers apply.
     conflict_policy: ConflictPolicy,
-    /// Whether an operator may resolve its conflicts with `discard_local`.
+    /// Whether an operator may resolve its conflicts with `discard_local`:
+    /// it is not a backup target.
     may_discard: bool,
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
@@ -373,8 +374,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         let backup = role == Role::Backup;
         let conflict_policy = effective_policy(configured, backup);
         if backup && configured == ConflictPolicy::DiscardLocal {
-            tracing::warn!(bucket = name,
-                "a backup target never discards local writes; its conflicts are held");
+            tracing::warn!(
+                bucket = name,
+                "a backup target never discards local writes; its conflicts are held"
+            );
         }
         let parts = TargetParts {
             store: Arc::new((self.connect)(target)),
@@ -394,7 +397,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         BucketFlusher {
             name,
             conflict_policy,
-            may_discard: may_discard(configured, backup),
+            may_discard: may_discard(backup),
             probe,
             probe_task,
             target,
@@ -514,8 +517,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// # Errors
     ///
     /// [`Unresolved::NotFlushed`] if the bucket is not flushed here,
-    /// [`Unresolved::NotOptedIn`] for `discard_local` on a bucket whose
-    /// own table does not choose it, or a backup target, and
+    /// [`Unresolved::Backup`] for `discard_local` on a backup target, and
     /// [`Unresolved::NotHeld`] if no flusher here holds the key in
     /// conflict: its shard's primary may be another node.
     pub async fn resolve(
@@ -528,7 +530,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let flushers = self.lock();
             let flusher = flushers.get(bucket).ok_or(Unresolved::NotFlushed)?;
             if policy == ConflictPolicy::DiscardLocal && !flusher.may_discard {
-                return Err(Unresolved::NotOptedIn);
+                return Err(Unresolved::Backup);
             }
             flusher
                 .shards

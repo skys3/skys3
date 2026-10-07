@@ -20,7 +20,7 @@
 //!   else is a conflict. Operations the capability probe found
 //!   unprotected are sent unconditionally.
 //! - **Conflict policies** (§7.2). A conflict is held under `hold`, the
-//!   default, until an operator resolves it
+//!   default, until an operator resolves it under a chosen policy
 //!   ([`FlushService::resolve`]); `overwrite` resolves it by sending the
 //!   local version unconditionally, and `discard_local`, which a
 //!   `write_back` bucket's own table must choose, by adopting the remote's

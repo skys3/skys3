@@ -16,7 +16,7 @@ use skys3_remote::probe::ConditionalWrites;
 use skys3_remote::{ObjectStore, PutObject, UserMetadata};
 use skys3_shard::FlushState;
 use skys3_sim::SimS3;
-use skys3_sim::s3::{Conditionals, ConditionalSupport, SimS3Config, SimS3Faults};
+use skys3_sim::s3::{ConditionalSupport, Conditionals, SimS3Config, SimS3Faults};
 use support::{Node, at, cluster, identity, md5_etag, runtime, settings, writes};
 
 /// A target on `store` honoring `writes` that applies `policy`.
@@ -113,10 +113,7 @@ fn hold_keeps_out_of_band_writes_until_an_operator_resolves_them() {
         let status = flusher.status();
         assert_eq!(status.conflicts.len(), 1);
         assert_eq!(status.conflicts[0].seq.get(), seq);
-        assert_eq!(
-            status.conflicts[0].remote_etag,
-            Some(md5_etag(b"k theirs"))
-        );
+        assert_eq!(status.conflicts[0].remote_etag, Some(md5_etag(b"k theirs")));
         assert_eq!(node.entry("k").await.unwrap().state, EntryState::Dirty);
         // Only a held key can be resolved.
         assert_eq!(
@@ -281,12 +278,13 @@ fn resolving_a_held_conflict_returns_the_key_to_dirty_under_each_policy() {
         node.settle(&flusher).await;
         assert_eq!(flusher.status().conflicts.len(), 3);
 
-        // Conflict → Dirty: the key is back in line, no longer held.
-        flusher.resolve("a", ConflictPolicy::Overwrite).await.unwrap();
-        assert!(matches!(
-            flusher.phase("a"),
-            Some(Phase::Dirty | Phase::Flushing)
-        ));
+        // Conflict → Dirty: the key is back in line, no longer held, or
+        // flushed already.
+        flusher
+            .resolve("a", ConflictPolicy::Overwrite)
+            .await
+            .unwrap();
+        assert!(!matches!(flusher.phase("a"), Some(Phase::Conflict(_))));
         flusher
             .resolve("b", ConflictPolicy::DiscardLocal)
             .await
@@ -324,7 +322,10 @@ fn a_resolution_lasts_only_as_long_as_its_flusher() {
         // The remote is down, so the resolution cannot be carried out
         // before the flusher stops, as on a primary change.
         store.set_faults(SimS3Faults::OUTAGE);
-        flusher.resolve("k", ConflictPolicy::Overwrite).await.unwrap();
+        flusher
+            .resolve("k", ConflictPolicy::Overwrite)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         flusher.stop().await;
         store.set_faults(SimS3Faults::NONE);
@@ -436,7 +437,10 @@ fn a_resolution_answers_write_through_waits() {
         let newer = node.put("k", "k newer").await;
         let mut wait = node.shard.await_flush("k", at(newer)).unwrap();
         assert_eq!(wait.answered().await, Some(FlushState::Conflict));
-        flusher.resolve("k", ConflictPolicy::Overwrite).await.unwrap();
+        flusher
+            .resolve("k", ConflictPolicy::Overwrite)
+            .await
+            .unwrap();
         let mut wait = node.shard.await_flush("k", at(newer)).unwrap();
         assert_eq!(wait.answered().await, Some(FlushState::Flushed));
         assert_eq!(remote_object(&store, "k"), ours("k newer", newer));

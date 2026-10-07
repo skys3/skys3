@@ -496,7 +496,11 @@ pub(crate) struct Resolver(mpsc::UnboundedSender<Resolve>);
 
 impl Resolver {
     /// See [`ShardFlusher::resolve`].
-    pub(crate) async fn resolve(&self, key: &str, policy: ConflictPolicy) -> Result<(), Unresolved> {
+    pub(crate) async fn resolve(
+        &self,
+        key: &str,
+        policy: ConflictPolicy,
+    ) -> Result<(), Unresolved> {
         let (reply, answer) = oneshot::channel();
         let resolve = Resolve {
             key: key.to_owned(),
@@ -947,4 +951,137 @@ fn recorded_flush(state: &Mutex<State>, (key, seq, result): Recorded) -> bool {
         state.record_error(&key, error.to_string());
     }
     result.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_shard::FlushWait;
+    use skys3_types::Epoch;
+
+    use super::*;
+
+    fn position(seq: u64) -> EpochSeq {
+        EpochSeq::new(Epoch::new(1), Seq::new(seq))
+    }
+
+    fn conflict() -> Conflict {
+        Conflict {
+            seq: Seq::new(1),
+            remote_etag: Some(ETag::new("theirs").unwrap()),
+            remote_identity: None,
+        }
+    }
+
+    /// A state tracking `k`, dirty at seq 1, whose flush was just taken.
+    fn flushing() -> State {
+        let mut state = State::default();
+        state.changed("k", position(1), Some(10), Duration::from_secs(1));
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(1), None))
+        );
+        state
+    }
+
+    fn phase(state: &State) -> Phase {
+        state.keys["k"].phase.clone()
+    }
+
+    /// The answer `wait` has now, if any.
+    fn answer_now(wait: &mut FlushWait) -> Option<FlushState> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(1), wait.answered())
+                .await
+                .ok()
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn hold_keeps_the_key_until_it_is_resolved_back_to_dirty() {
+        let mut state = flushing();
+        state.conflicted("k", conflict(), ConflictPolicy::Hold);
+        assert_eq!(phase(&state), Phase::Conflict(conflict()));
+        assert!(state.ready.is_empty() && state.pending.is_empty());
+        assert_eq!(state.status().conflicts.len(), 1);
+        assert_eq!(
+            state.resolve("other", ConflictPolicy::Overwrite),
+            Err(Unresolved::NotHeld)
+        );
+
+        // Conflict → Dirty, in line again, with the resolution its next
+        // flush carries out.
+        state.resolve("k", ConflictPolicy::Overwrite).unwrap();
+        assert_eq!(phase(&state), Phase::Dirty);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(1), Some(ConflictPolicy::Overwrite)))
+        );
+        // A failed attempt keeps the resolution; a flush ends it.
+        let now = Instant::now();
+        state.failed("k", "the remote failed".to_owned(), now);
+        state.release_due(now);
+        let (_, _, resolution) = state.take_ready().unwrap();
+        assert_eq!(resolution, Some(ConflictPolicy::Overwrite));
+        state.changed("k", position(2), Some(5), Duration::from_secs(2));
+        state.finished("k", position(1));
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(2), None))
+        );
+        assert_eq!(
+            state.resolve("k", ConflictPolicy::Hold),
+            Err(Unresolved::NotHeld),
+            "a key being flushed is not held"
+        );
+    }
+
+    #[test]
+    fn other_policies_resolve_at_once() {
+        for policy in [ConflictPolicy::Overwrite, ConflictPolicy::DiscardLocal] {
+            let mut state = flushing();
+            let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(1));
+            state.awaited(waiter);
+            state.conflicted("k", conflict(), policy);
+            assert_eq!(phase(&state), Phase::Dirty);
+            assert!(state.status().conflicts.is_empty());
+            assert_eq!(
+                state.take_ready(),
+                Some(("k".to_owned(), position(1), Some(policy)))
+            );
+            // A write waiting for the version learns of the conflict only
+            // if the version will be dropped.
+            let expected = (policy == ConflictPolicy::DiscardLocal).then_some(FlushState::Conflict);
+            assert_eq!(answer_now(&mut wait), expected, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn a_discard_answers_the_writes_waiting_for_what_it_dropped() {
+        let mut state = flushing();
+        state.changed("k", position(3), Some(5), Duration::from_secs(2));
+        let (dropped, mut dropped_wait) = FlushWaiter::new("k".to_owned(), position(1));
+        let (later, mut later_wait) = FlushWaiter::new("k".to_owned(), position(3));
+        state.awaited(dropped);
+        state.awaited(later);
+        state.discarded("k", position(1));
+        assert_eq!(answer_now(&mut dropped_wait), Some(FlushState::Conflict));
+        assert_eq!(answer_now(&mut later_wait), None);
+        assert_eq!(state.keys["k"].waiters.len(), 1);
+    }
+
+    #[test]
+    fn the_seeded_bug_untracks_a_held_key() {
+        let mut state = flushing();
+        assert_eq!(state.resolve_clean("k"), Err(Unresolved::NotHeld));
+        state.conflicted("k", conflict(), ConflictPolicy::Hold);
+        assert_eq!(state.resolve_clean("k"), Ok((Seq::new(1), conflict())));
+        assert!(state.keys.is_empty() && state.dirty_bytes == 0);
+    }
 }
