@@ -10,7 +10,8 @@
 //! of [`MAX_SUSPECTS`] fragments with long keys exceeds what a frame
 //! header holds. The asking node is the one mutual TLS names, so a node
 //! only learns verdicts on fragments it says it holds, and reclaims only
-//! its own. Each query uses a connection of its own.
+//! its own. Each query uses a connection of its own, and goes to every
+//! node that may lead the shard at once.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -23,16 +24,18 @@ use skys3_log::ShardRef;
 use skys3_log::record::MAX_KEY_LEN;
 use skys3_net::{Frame, Header, MessageKind, Network, Receiver, Sender, Transport};
 use skys3_types::{AttemptId, BucketId, Epoch, FragmentId, NodeAddress, NodeId, ShardId};
+use tokio::task::JoinSet;
 
 use super::{OrphanConfirmer, OrphanJudge, Suspect, Unanswered, Verdict};
 
 /// The most fragments one query names.
 pub const MAX_SUSPECTS: usize = 256;
 
-/// How long a node waits for one node's verdicts, connecting included,
-/// before it asks the next: a node that is down holds the query up no
-/// longer.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a node waits for another node's verdicts, connecting
+/// included. A query waits for every node it asks unless one answers, so
+/// a node that is down holds a sweep up this long; unanswered fragments
+/// are asked about again at the next sweep.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The body of an `OrphanQuery` frame.
 #[derive(Clone, PartialEq, Message)]
@@ -153,13 +156,22 @@ impl OrphanVerdicts {
     }
 }
 
-/// The nodes that may lead a shard, most likely first: whom a fragment
-/// node asks, in order, until one answers.
+/// The nodes that may lead a shard: whom a fragment node asks.
 pub type PrimariesOf = Arc<dyn Fn(&ShardRef) -> Vec<NodeId> + Send + Sync>;
 
 /// Asks shard primaries about this node's fragments over the transport,
 /// and this node's own judges directly.
+///
+/// A query goes to every node that may lead the shard at once, and the
+/// first verdicts that come back count: only a replica that leads gives
+/// any, and any such replica's are final (see [the module](crate::orphans)),
+/// so a node that is down, or a member that no longer leads, never holds a
+/// query up.
 pub struct OrphanClient<N: Network, D: Disk> {
+    inner: Arc<ClientInner<N, D>>,
+}
+
+struct ClientInner<N: Network, D: Disk> {
     node: NodeId,
     transport: Transport<N>,
     peers: BTreeMap<NodeId, NodeAddress>,
@@ -169,8 +181,8 @@ pub struct OrphanClient<N: Network, D: Disk> {
 
 impl<N: Network, D: Disk> OrphanClient<N, D> {
     /// The client of node `node`, which reaches the nodes at `peers`
-    /// through `transport`, asks the nodes `primaries` names for a shard in
-    /// turn, and asks `local`, its own server, without a connection.
+    /// through `transport`, asks the nodes `primaries` names for a shard,
+    /// and asks `local`, its own server, without a connection.
     #[must_use]
     pub fn new(
         node: NodeId,
@@ -180,14 +192,18 @@ impl<N: Network, D: Disk> OrphanClient<N, D> {
         local: OrphanServer<D>,
     ) -> Self {
         Self {
-            node,
-            transport,
-            peers,
-            primaries,
-            local,
+            inner: Arc::new(ClientInner {
+                node,
+                transport,
+                peers,
+                primaries,
+                local,
+            }),
         }
     }
+}
 
+impl<N: Network, D: Disk> ClientInner<N, D> {
     /// Asks `node` about `suspects` of `shard`.
     async fn ask(
         &self,
@@ -233,13 +249,25 @@ impl<N: Network, D: Disk> OrphanConfirmer for OrphanClient<N, D> {
         shard: &ShardRef,
         suspects: &[Suspect],
     ) -> Result<Vec<Verdict>, Unanswered> {
+        let mut asks = JoinSet::new();
+        for node in (self.inner.primaries)(shard) {
+            let inner = Arc::clone(&self.inner);
+            let (shard, suspects) = (shard.clone(), suspects.to_vec());
+            asks.spawn(async move {
+                let answer = inner.ask(&node, &shard, &suspects).await;
+                (node, answer)
+            });
+        }
+        // Dropping the set when verdicts arrive stops the other asks.
         let mut reasons = Vec::new();
-        for node in (self.primaries)(shard) {
-            match self.ask(&node, shard, suspects).await {
-                Ok(verdicts) => return Ok(verdicts),
-                Err(reason) => reasons.push(format!("{node}: {reason}")),
+        while let Some(joined) = asks.join_next().await {
+            match joined {
+                Ok((_, Ok(verdicts))) => return Ok(verdicts),
+                Ok((node, Err(reason))) => reasons.push(format!("{node}: {reason}")),
+                Err(error) => reasons.push(error.to_string()),
             }
         }
+        reasons.sort();
         Err(Unanswered {
             shard: shard.clone(),
             reason: if reasons.is_empty() {

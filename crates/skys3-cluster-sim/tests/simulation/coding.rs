@@ -29,7 +29,9 @@ use skys3_sim::{Runner, SimContext};
 
 /// What one run of the six-node cluster costs, in seeds of a typical
 /// scenario: about a second in a debug build. A seed of the crash
-/// scenario makes thirty runs, one of a seeded-bug scenario two.
+/// scenario makes thirty runs, one of a seeded-bug scenario two. Runs
+/// with slow fragment writes take about three seconds, and runs with a
+/// primary change about ten, so those scenarios declare more.
 const RUN_COST: u64 = 8;
 
 /// Every node a crash can hit.
@@ -179,7 +181,7 @@ fn reclaiming(orphan_after: Duration, bug: Option<JudgeBug>) -> Option<OrphanCon
 
 #[test]
 fn reclamation_racing_publication_reclaims_only_orphans() {
-    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
         // Fragments are asked about while their attempts write and
         // publish. A crash at a drawn step leaves orphans, as does the
         // first object's overwrite, which supersedes its attempt.
@@ -218,7 +220,7 @@ fn outlasting(bug: Option<JudgeBug>) -> CodingConfig {
 
 #[test]
 fn encodings_outlasting_orphan_after_keep_their_fragments() {
-    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
         let report = coding::run(context, &outlasting(None))?;
         if report.published < 4 {
             return Err(format!("objects were left unpublished: {report:?}").into());
@@ -229,7 +231,7 @@ fn encodings_outlasting_orphan_after_keep_their_fragments() {
 
 #[test]
 fn confirming_an_orphan_of_an_attempt_in_progress_is_caught() {
-    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
         caught(
             context,
             &outlasting(None),
@@ -263,7 +265,7 @@ fn strike(target: CrashTarget, kind: CrashKind, delay: u64, downtime: u64) -> Cr
 
 #[test]
 fn reclamation_across_a_primary_change_reclaims_only_orphans() {
-    Runner::with_cost(2, 4 * RUN_COST).run(|context| {
+    Runner::with_cost(1, 16 * RUN_COST).run(|context| {
         // The primary dies, or is cut off from its members and the shard
         // register while fragment holders still reach it, at a drawn
         // step, for longer than the members' grace: one of them takes
@@ -286,7 +288,7 @@ fn reclamation_across_a_primary_change_reclaims_only_orphans() {
 
 #[test]
 fn answering_before_reconciliation_is_caught() {
-    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
+    Runner::with_cost(2, 8 * RUN_COST).run(|context| {
         // A member dies as an attempt's EC_PUBLISH is appended, so the
         // record cannot commit; the primary dies once the other member
         // holds it. That member takes over while the first is still down,
@@ -294,7 +296,7 @@ fn answering_before_reconciliation_is_caught() {
         // first is back or removed.
         let crashes = vec![
             strike(CrashTarget::Member(2), CrashKind::Kill, 0, 12_000),
-            strike(CrashTarget::Primary, CrashKind::Kill, 5, 16_000),
+            strike(CrashTarget::Primary, CrashKind::Kill, 200, 16_000),
         ];
         let point = CrashPoint::Appended;
         let config = primary_change(point, crashes.clone(), None);
@@ -310,7 +312,7 @@ fn answering_before_reconciliation_is_caught() {
 
 #[test]
 fn a_deposed_primary_judging_a_later_epoch_is_caught() {
-    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
+    Runner::with_cost(2, 16 * RUN_COST).run(|context| {
         // The primary is cut off from its members and the register, and
         // fragment holders ask it about its successor's fragments.
         let crashes = vec![strike(CrashTarget::Primary, CrashKind::Isolate, 0, 12_000)];
