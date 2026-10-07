@@ -16,7 +16,9 @@
 //!   since the page was read is left alone, and is judged again by the
 //!   next pass. The deletes of a page are sequenced together and share
 //!   group commits. As for any delete in a `local` bucket, a `FLUSHED`
-//!   then removes the tombstone.
+//!   then removes the tombstone ([`Tombstones::Remove`]); in a bucket with
+//!   a backup target, the backup's flusher does, once it has deleted the
+//!   key there ([`Tombstones::Keep`], §8.9).
 //! - **Abandoned uploads.** A pass reads the shard's open uploads and
 //!   aborts, with an `MPU_ABORT`, each one whose abort time
 //!   ([`LifecycleConfiguration::aborts_at`]) has passed. An abort of an
@@ -51,6 +53,16 @@ use crate::shard::Shard;
 /// How many entries or uploads a pass reads per index transaction, and so
 /// the most expirations it sequences together.
 const PAGE: usize = 256;
+
+/// What becomes of the tombstone an expiration leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tombstones {
+    /// A `FLUSHED` removes it at once: the bucket is never flushed.
+    Remove,
+    /// It stays until the flusher of the bucket's backup target has
+    /// deleted the key there and commits the `FLUSHED` itself (§8.9).
+    Keep,
+}
 
 /// What a pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -107,13 +119,15 @@ impl LifecycleMetrics {
 /// Runs one lifecycle pass over every shard of `buckets` whose replica on
 /// this node is the primary: the shards of each `local` bucket with a
 /// lifecycle configuration, at the wall-clock time `now_ms` (milliseconds
-/// since the Unix epoch). A shard whose pass fails is reported in
+/// since the Unix epoch), leaving each bucket's tombstones as
+/// `tombstones` says. A shard whose pass fails is reported in
 /// [`LifecycleReport::failed`] and tried again by the next pass.
 pub async fn run_pass<D: Disk>(
     set: &ShardSet<D>,
     buckets: &[BucketDocument],
     now_ms: u64,
     metrics: &LifecycleMetrics,
+    tombstones: impl Fn(&BucketDocument) -> Tombstones,
 ) -> LifecycleReport {
     let mut total = LifecycleReport::default();
     for bucket in buckets {
@@ -131,7 +145,7 @@ pub async fn run_pass<D: Disk>(
             if replica.is_stopped() || replica.role().follows() || !replica.is_serving() {
                 continue;
             }
-            let report = match expire(&replica, config, now_ms).await {
+            let report = match expire(&replica, config, now_ms, tombstones(bucket)).await {
                 Ok(report) => report,
                 Err((report, error)) => {
                     tracing::debug!(%shard, %error, "a lifecycle pass stopped early");
@@ -148,7 +162,8 @@ pub async fn run_pass<D: Disk>(
     total
 }
 
-/// Runs one lifecycle pass of `config` over `shard`, at `now_ms`.
+/// Runs one lifecycle pass of `config` over `shard`, at `now_ms`, leaving
+/// the tombstones of expired keys as `tombstones` says.
 ///
 /// # Errors
 ///
@@ -159,6 +174,7 @@ pub async fn expire<D: Disk>(
     shard: &Shard<D>,
     config: &LifecycleConfiguration,
     now_ms: u64,
+    tombstones: Tombstones,
 ) -> Result<LifecycleReport, (LifecycleReport, ShardError)> {
     let mut report = LifecycleReport::default();
     if config.expires_objects() {
@@ -173,7 +189,7 @@ pub async fn expire<D: Disk>(
                 .filter(|(key, entry)| is_due(config, key, entry, now_ms))
                 .map(|(key, entry)| (key, entry.version))
                 .collect();
-            let (expired, failure) = expire_versions(shard, due).await;
+            let (expired, failure) = expire_versions(shard, due, tombstones).await;
             report.expired += expired;
             if let Some(error) = failure {
                 return Err((report, error));
@@ -224,12 +240,14 @@ fn is_due(config: &LifecycleConfiguration, key: &str, entry: &Entry, now_ms: u64
 }
 
 /// Commits a `DELETE` of each key in `due` that still holds the version
-/// given with it, sequenced together, and then the `FLUSHED` records that
-/// remove their tombstones. Returns how many deletes committed, and the
-/// first error of those that did not.
+/// given with it, sequenced together, and then, with
+/// [`Tombstones::Remove`], the `FLUSHED` records that remove their
+/// tombstones. Returns how many deletes committed, and the first error of
+/// those that did not.
 async fn expire_versions<D: Disk>(
     shard: &Shard<D>,
     due: Vec<(String, EpochSeq)>,
+    tombstones: Tombstones,
 ) -> (u64, Option<ShardError>) {
     if due.is_empty() {
         return (0, None);
@@ -246,11 +264,11 @@ async fn expire_versions<D: Disk>(
             if unchanged { Ok(()) } else { Err(()) }
         })
         .await;
-    let mut tombstones = Vec::new();
+    let mut removals = Vec::new();
     let mut failure = None;
     for (key, result) in keys.into_iter().zip(results) {
         match result {
-            Ok(Ok(committed)) => tombstones.push(RecordBody::Flushed(Flushed {
+            Ok(Ok(committed)) => removals.push(RecordBody::Flushed(Flushed {
                 key,
                 seq: committed.position.seq,
                 remote_etag: None,
@@ -263,14 +281,12 @@ async fn expire_versions<D: Disk>(
             }
         }
     }
-    let expired = tombstones.len() as u64;
-    if !tombstones.is_empty() {
-        // A local bucket is never flushed, so a FLUSHED removes each
-        // tombstone unless the key was written again. One that is lost only
-        // takes space.
-        let removed = shard
-            .commit_all_if(tombstones, |_, _| Ok::<(), ()>(()))
-            .await;
+    let expired = removals.len() as u64;
+    if tombstones == Tombstones::Remove && !removals.is_empty() {
+        // A local bucket without a backup target is never flushed, so a
+        // FLUSHED removes each tombstone unless the key was written again.
+        // One that is lost only takes space.
+        let removed = shard.commit_all_if(removals, |_, _| Ok::<(), ()>(())).await;
         if let Some(error) = removed.into_iter().find_map(Result::err) {
             tracing::debug!(shard = %shard.shard(), %error, "an expired key's tombstone was not removed");
         }

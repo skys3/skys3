@@ -12,14 +12,15 @@
 //! `If-None-Match: *` and `If-Match` are checked by the shard when it
 //! sequences the `PUT` ([`Precondition`]), and once before the body is read,
 //! so a write bound to fail does not upload its body first. A body of a
-//! `write_back` bucket that reaches `streaming_flush_min_bytes` commits an
-//! `UPLOAD_BEGIN` while it streams, and its `PUT` inherits that record's
-//! write identity (§7.2); a body that fails leaves the record naming no
-//! write.
+//! `write_back` bucket, or of a `local` one with a backup target, that
+//! reaches `streaming_flush_min_bytes` commits an `UPLOAD_BEGIN` while it
+//! streams, and its `PUT` inherits that record's write identity (§7.2); a
+//! body that fails leaves the record naming no write.
 //!
 //! **Write-through.** In a `write_back` bucket whose `ack_policy` is
-//! `write_through`, every write that makes a version of a key is answered
-//! only once the remote target holds it (§7.5, `write_through`).
+//! `write_through`, and a `local` one whose `backup_ack` is, every write
+//! that makes a version of a key is answered only once the remote target or
+//! the backup target holds it (§7.5, §8.9, `write_through`).
 //!
 //! **Metadata.** The record keeps the standard headers S3 stores
 //! (`Cache-Control`, `Content-Disposition`, `Content-Encoding`,
@@ -95,12 +96,13 @@ use crate::sigv4::{Authenticated, BodyError, Trailers};
 pub(crate) use copy::copy_source;
 pub use delete::MAX_DELETE_KEYS;
 use holders::{HolderReads, Keep};
-pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 pub(crate) use tagging::tags_from_xml;
+pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use tagging::{parse_tagging_header, tagging_header};
 use upload::{Streaming, Upload};
 use write_through::WriteThrough;
+pub(crate) use write_through::backed_up;
 
 /// How many times a GET resolves its key again after a read-through fill
 /// found the key changed, such as after the fill adopted the remote's
@@ -367,10 +369,14 @@ impl<H: Shards> Objects<H> {
         let expected = ExpectedChecksums::from_headers(&headers)?;
         let trailers = extensions.get::<Trailers>().cloned();
         let validator = ChecksumValidator::on(expected, trailers, self.pool.clone())?;
-        // Only a bucket with a remote target streams a PUT to it (§7.3).
+        // Only a bucket with a remote target streams a PUT to it (§7.3): a
+        // `write_back` bucket, or a `local` one with a backup target
+        // (§8.9).
         let stream = self
             .streaming_flush_min_bytes
-            .filter(|_| bucket.mode == BucketMode::WriteBack)
+            .filter(|_| {
+                bucket.mode == BucketMode::WriteBack || self.write_through.backed_up(bucket)
+            })
             .map(|min_bytes| Streaming {
                 min_bytes,
                 part_bytes: self.flush_part_bytes,

@@ -70,7 +70,7 @@ async fn import(service: &FlushService<SimS3, SimMount>, node: &Node) -> ImportS
     let patience = Patience::new();
     loop {
         service.reconcile(&[bucket()], &node.set).await;
-        let status = service.status(&bucket().bucket_id).unwrap().import;
+        let status = service.status(&bucket().bucket_id).unwrap().import.unwrap();
         if status.checkpoint == ImportCheckpoint::Done {
             return status;
         }
@@ -187,7 +187,7 @@ fn an_import_of_one_page_keeps_to_its_rate() {
                 "{} keys after {elapsed:?}",
                 entries.len()
             );
-            let status = service.status(&bucket().bucket_id).unwrap().import;
+            let status = service.status(&bucket().bucket_id).unwrap().import.unwrap();
             if status.checkpoint == ImportCheckpoint::Done {
                 assert_eq!(status.imported, 3);
                 break;

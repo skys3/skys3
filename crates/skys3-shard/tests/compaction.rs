@@ -14,8 +14,8 @@ use skys3_io::{SimDisk, SimMount};
 use skys3_log::{LogRecord, RecordBody, SegmentLog};
 use skys3_obs::MetricsRegistry;
 use skys3_shard::{
-    CacheMetrics, CacheRefusal, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
-    Effect, Outcome, ReadSettings, Shard, ShardSet, StateMachine,
+    CacheMetrics, CacheRefusal, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings,
+    Compactor, Effect, Outcome, ReadSettings, Shard, ShardSet, StateMachine,
 };
 use skys3_types::{NodeId, Seq, ShardConfig};
 use support::{

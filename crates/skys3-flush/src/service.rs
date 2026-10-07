@@ -1,5 +1,6 @@
-//! The flushers of every `write_back` bucket whose shards are open on a
-//! node, each with its target's capability probe.
+//! The flushers of every `write_back` bucket, and of every `local` bucket
+//! with a backup target, whose shards are open on a node, each with its
+//! target's capability probe.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -48,6 +49,9 @@ pub enum ProbeStatus {
 pub struct BucketStatus {
     /// The bucket's name.
     pub name: String,
+    /// Whether the target is the backup target of a `local` bucket (§8.9),
+    /// rather than a `write_back` bucket's system of record.
+    pub backup: bool,
     /// The target's capability probe.
     pub probe: ProbeStatus,
     /// Each open shard's flusher.
@@ -58,8 +62,8 @@ pub struct BucketStatus {
     /// This node's share of the bucket's dirty-data budget
     /// ([`DirtyBudget`]).
     pub dirty_budget: u64,
-    /// The bucket's namespace import (§9.1).
-    pub import: ImportStatus,
+    /// The bucket's namespace import (§9.1); a backup target has none.
+    pub import: Option<ImportStatus>,
 }
 
 impl BucketStatus {
@@ -99,6 +103,21 @@ impl BucketStatus {
 /// by its progress, and [`FlushService::remote`] reads the remote for the
 /// keys it has not reached.
 ///
+/// **Backup targets** (§8.9). A `local` bucket whose settings
+/// ([`FlushService::with_buckets`]) name a `backup_target` is flushed to
+/// it by the same flushers, with the same probe, ordering, conditional
+/// writes, write identity, and streaming. What differs comes from the
+/// target not being the bucket's system of record. Nothing is imported
+/// from it, so every key counts as imported, and a key without a remote
+/// ETag is sent with `If-None-Match: *`. Nothing is read from it, so the
+/// bucket has no [`Filler`] and no [`RemoteReader`]. Its flushers count
+/// no dirty bytes against the [`DirtyBudget`], since the cluster holds
+/// them durably and a backup outage must not stop the bucket's writes;
+/// the flush metrics measure how far the backup lags. And nothing is
+/// evicted: the node's clean cache is never told a `local` bucket's
+/// `clean_copies`, so it keeps every payload that a `FLUSHED` made clean
+/// (`skys3_shard::CleanCache::evicts`).
+///
 /// Only the `hold` conflict policy exists so far (§7.2); `overwrite` and
 /// `discard_local` arrive with plan M4.
 pub struct FlushService<S, D> {
@@ -131,6 +150,17 @@ struct BucketFlusher<S> {
     name: String,
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
+    /// The target, once the probe is done.
+    target: Ready<S>,
+    shards: BTreeMap<ShardId, ShardFlusher>,
+    /// What only the target of a `write_back` bucket, its system of
+    /// record, has; `None` for a backup target.
+    record: Option<SystemOfRecord<S>>,
+}
+
+/// What only a `write_back` bucket's target has: the bucket's namespace
+/// import (§9.1) and reads of the target (§9.2).
+struct SystemOfRecord<S> {
     /// What client reads of the remote use.
     remote: RemoteReader<S>,
     import: Arc<ImportState>,
@@ -138,9 +168,6 @@ struct BucketFlusher<S> {
     stop_import: watch::Sender<bool>,
     /// The import's task, until it is waited for or handed on.
     import_task: Option<JoinHandle<()>>,
-    /// The target, once the probe is done.
-    target: Ready<S>,
-    shards: BTreeMap<ShardId, ShardFlusher>,
     filler: Filler<S>,
 }
 
@@ -149,8 +176,19 @@ impl<S> Drop for BucketFlusher<S> {
         self.probe_task.abort();
         // Not aborted: the import stops between steps, and its task ends
         // once no checkpoint write of it is pending (`import::Stop`).
-        self.stop_import.send_replace(true);
+        if let Some(record) = &self.record {
+            record.stop_import.send_replace(true);
+        }
     }
+}
+
+/// What a bucket's flushers send its writes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// The target of a `write_back` bucket, its system of record.
+    WriteBack,
+    /// The backup target of a `local` bucket (§8.9).
+    Backup,
 }
 
 impl<S: ObjectStore, D: Disk> FlushService<S, D> {
@@ -190,8 +228,9 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         self
     }
 
-    /// Takes each bucket's `import_parallel_streams` from `buckets`;
-    /// otherwise every import has `settings.import_streams` streams.
+    /// Takes each bucket's `import_parallel_streams` and `backup_target`
+    /// from `buckets`; otherwise every import has `settings.import_streams`
+    /// streams, and no `local` bucket is flushed.
     #[must_use]
     pub fn with_buckets(mut self, buckets: BucketsConfig) -> Self {
         self.bucket_settings = Some(buckets);
@@ -204,13 +243,34 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         &self.budget
     }
 
+    /// The target `bucket`'s writes are flushed to, if any: a `write_back`
+    /// bucket's own, or a `local` bucket's backup target (§8.9). Index
+    /// snapshots (§8.9, plan M4-11) go to a `local` bucket's backup target
+    /// by default.
+    #[must_use]
+    pub fn target_of(&self, bucket: &BucketDocument) -> Option<RemoteTarget> {
+        self.followed(bucket).map(|(target, _)| target)
+    }
+
+    /// The target `bucket`'s writes are flushed to, and its role.
+    fn followed(&self, bucket: &BucketDocument) -> Option<(RemoteTarget, Role)> {
+        match (bucket.mode, &bucket.target) {
+            (BucketMode::WriteBack, Some(target)) => Some((target.clone(), Role::WriteBack)),
+            (BucketMode::Local, _) => {
+                let settings = self.bucket_settings.as_ref()?.get(&bucket.name);
+                Some((settings.backup_target.clone()?, Role::Backup))
+            }
+            _ => None,
+        }
+    }
+
     /// Starts and stops flushers so that every `write_back` bucket in
-    /// `buckets` with shards open in `set` as their primary is flushed, and
-    /// nothing else.
+    /// `buckets`, and every `local` one with a backup target, with shards
+    /// open in `set` as their primary is flushed, and nothing else.
     pub async fn reconcile(&self, buckets: &[BucketDocument], set: &ShardSet<D>) {
         let mut open = Vec::new();
         for bucket in buckets {
-            let (BucketMode::WriteBack, Some(target)) = (bucket.mode, &bucket.target) else {
+            let Some((target, role)) = self.followed(bucket) else {
                 continue;
             };
             let mut shards = Vec::new();
@@ -226,12 +286,16 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                     shards.push(shard);
                 }
             }
-            open.push((bucket, target, shards));
+            open.push((bucket, target, role, shards));
         }
+        // What waits for a backup is durable in the cluster: it counts
+        // against no budget.
         self.budget.plan(
-            open.iter().map(|(bucket, _, shards)| {
-                (*bucket, u32::try_from(shards.len()).unwrap_or(u32::MAX))
-            }),
+            open.iter()
+                .filter(|(_, _, role, _)| *role == Role::WriteBack)
+                .map(|(bucket, _, _, shards)| {
+                    (*bucket, u32::try_from(shards.len()).unwrap_or(u32::MAX))
+                }),
         );
         let mut flushers = self.lock();
         let wanted: BTreeSet<&BucketId> =
@@ -240,55 +304,79 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let keep = wanted.contains(id);
             if !keep {
                 self.metrics.remove(&flusher.name);
-                flusher.stop_import.send_replace(true);
-                if let Some(task) = flusher.import_task.take() {
-                    let mut stopping = lock(&self.stopping);
-                    let tasks = stopping.entry(id.clone()).or_default();
-                    tasks.retain(|task| !task.is_finished());
-                    tasks.push(task);
+                if let Some(record) = &mut flusher.record {
+                    record.stop_import.send_replace(true);
+                    if let Some(task) = record.import_task.take() {
+                        let mut stopping = lock(&self.stopping);
+                        let tasks = stopping.entry(id.clone()).or_default();
+                        tasks.retain(|task| !task.is_finished());
+                        tasks.push(task);
+                    }
                 }
             }
             keep
         });
-        for (bucket, target, shards) in open {
+        for (bucket, target, role, shards) in open {
             let flusher = flushers
                 .entry(bucket.bucket_id.clone())
-                .or_insert_with(|| self.start(bucket, target, set));
-            self.follow(&bucket.bucket_id, flusher, shards);
+                .or_insert_with(|| self.start(bucket, &target, role, set));
+            let charged = role == Role::WriteBack;
+            self.follow(&bucket.bucket_id, flusher, shards, charged);
         }
     }
 
     /// Starts a bucket's flushers with its target's probe, which makes the
-    /// target ready once it succeeds, and its namespace import.
+    /// target ready once it succeeds, and, for a `write_back` bucket, its
+    /// namespace import.
     fn start(
         &self,
         bucket: &BucketDocument,
         target: &RemoteTarget,
+        role: Role,
         set: &ShardSet<D>,
     ) -> BucketFlusher<S> {
         let name = bucket.name.as_str().to_owned();
-        let store = Arc::new((self.connect)(target));
-        let prefix = target.prefix.clone().unwrap_or_default();
-        let import = Arc::new(ImportState::default());
+        let import = (role == Role::WriteBack).then(|| Arc::new(ImportState::default()));
         let parts = TargetParts {
-            store: Arc::clone(&store),
-            prefix: prefix.clone(),
+            store: Arc::new((self.connect)(target)),
+            prefix: target.prefix.clone().unwrap_or_default(),
             cluster: self.cluster.clone(),
             settings: self.settings.clone(),
             wall: Arc::clone(&self.wall),
             counters: self.metrics.counters(&name),
-            import: Arc::clone(&import),
+            import: import.clone(),
         };
+        let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
+        let (ready, target) = watch::channel(None);
+        let probe_task = tokio::spawn(run_probe(parts, Arc::clone(&probe), ready));
+        BucketFlusher {
+            name,
+            probe,
+            probe_task,
+            target,
+            shards: BTreeMap::new(),
+            record,
+        }
+    }
+
+    /// Starts the namespace import of `bucket`, a `write_back` bucket whose
+    /// target `parts` holds, and makes the reads of the target.
+    fn system_of_record(
+        &self,
+        bucket: &BucketDocument,
+        parts: &TargetParts<S>,
+        import: Arc<ImportState>,
+        set: &ShardSet<D>,
+    ) -> SystemOfRecord<S> {
+        let (store, prefix) = (Arc::clone(&parts.store), parts.prefix.clone());
         let filler = Filler::new(
-            Arc::clone(&parts.store),
-            parts.prefix.clone(),
+            Arc::clone(&store),
+            prefix.clone(),
             parts.settings.clone(),
             parts.counters.clone(),
             Arc::clone(&parts.wall),
         );
-        let (ready, target) = watch::channel(None);
-        let probe_task = tokio::spawn(run_probe(parts, Arc::clone(&probe), ready));
         let streams =
             self.bucket_settings
                 .as_ref()
@@ -312,23 +400,25 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             stop,
             previous,
         }));
-        BucketFlusher {
-            name,
-            probe,
-            probe_task,
+        SystemOfRecord {
             remote: RemoteReader::new(store, prefix, Arc::clone(&import), Arc::clone(&self.wall)),
             import,
             stop_import,
             import_task: Some(import_task),
-            target,
-            shards: BTreeMap::new(),
             filler,
         }
     }
 
-    /// Runs a flusher for each of `shards`, and stops the bucket's other
+    /// Runs a flusher for each of `shards`, with their dirty bytes counted
+    /// against the budget if `charged`, and stops the bucket's other
     /// flushers.
-    fn follow(&self, bucket: &BucketId, flusher: &mut BucketFlusher<S>, shards: Vec<Shard<D>>) {
+    fn follow(
+        &self,
+        bucket: &BucketId,
+        flusher: &mut BucketFlusher<S>,
+        shards: Vec<Shard<D>>,
+        charged: bool,
+    ) {
         let open: BTreeSet<ShardId> = shards.iter().map(|shard| shard.shard().shard).collect();
         flusher
             .shards
@@ -336,9 +426,9 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         for shard in shards {
             let id = shard.shard().shard;
             flusher.shards.entry(id).or_insert_with(|| {
-                let charge = self.budget.charge(bucket);
+                let charge = charged.then(|| self.budget.charge(bucket));
                 let (ready, wall) = (flusher.target.clone(), Arc::clone(&self.wall));
-                ShardFlusher::start(shard, ready, wall, Some(charge))
+                ShardFlusher::start(shard, ready, wall, charge)
             });
         }
     }
@@ -350,6 +440,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         let flusher = flushers.get(bucket)?;
         Some(BucketStatus {
             name: flusher.name.clone(),
+            backup: flusher.record.is_none(),
             probe: lock(&flusher.probe).clone(),
             shards: flusher
                 .shards
@@ -365,7 +456,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .budget
                 .usage(bucket)
                 .map_or(u64::MAX, |usage| usage.share),
-            import: flusher.import.status(),
+            import: flusher.record.as_ref().map(|record| record.import.status()),
         })
     }
 
@@ -373,9 +464,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// `write_back` bucket this node follows.
     #[must_use]
     pub fn filler(&self, bucket: &BucketId) -> Option<Filler<S>> {
-        self.lock()
-            .get(bucket)
-            .map(|flusher| flusher.filler.clone())
+        let flushers = self.lock();
+        Some(flushers.get(bucket)?.record.as_ref()?.filler.clone())
     }
 
     /// The remote target of `bucket` and its import's progress, for client
@@ -383,9 +473,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// (§9.1), if the bucket is a `write_back` bucket this node follows.
     #[must_use]
     pub fn remote(&self, bucket: &BucketId) -> Option<RemoteReader<S>> {
-        self.lock()
-            .get(bucket)
-            .map(|flusher| flusher.remote.clone())
+        let flushers = self.lock();
+        Some(flushers.get(bucket)?.record.as_ref()?.remote.clone())
     }
 
     /// Sets the flush gauges of every bucket flushed here.
@@ -407,9 +496,11 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         for (_, mut flusher) in flushers {
             // The import stops between steps; once its task ends, none of
             // its checkpoint writes is pending (`import::Stop`).
-            flusher.stop_import.send_replace(true);
-            if let Some(task) = flusher.import_task.take() {
-                let _ = task.await;
+            if let Some(record) = &mut flusher.record {
+                record.stop_import.send_replace(true);
+                if let Some(task) = record.import_task.take() {
+                    let _ = task.await;
+                }
             }
             for (_, shard) in std::mem::take(&mut flusher.shards) {
                 shard.stop().await;
@@ -439,15 +530,20 @@ struct TargetParts<S> {
     settings: FlushSettings,
     wall: Arc<dyn WallClock>,
     counters: Counters,
-    import: Arc<ImportState>,
+    /// The bucket's import; `None` for a backup target, which imports
+    /// nothing, so every key counts as imported.
+    import: Option<Arc<ImportState>>,
 }
 
 impl<S> TargetParts<S> {
     fn build(self, writes: ConditionalWrites) -> Target<S> {
-        Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
+        let target = Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
             .with_wall_clock(self.wall)
-            .with_counters(self.counters)
-            .with_import(self.import)
+            .with_counters(self.counters);
+        match self.import {
+            Some(import) => target.with_import(import),
+            None => target,
+        }
     }
 }
 

@@ -24,6 +24,7 @@ use super::learners::{Promotions, add_learner, current, nodes, two_members};
 use super::removal::{initial, put, register, until};
 use super::takeover::run;
 use super::{Link, Pki, WAIT, connect, durable_through, next, node, shard};
+use crate::cache::{CacheMetrics, CacheSettings, CleanCache};
 use crate::lineage::Lineage;
 use crate::replication::wire::{
     self, Append, Backfill, BackfillAck, Row, SnapshotRows, Sync, SyncAck,
@@ -31,7 +32,6 @@ use crate::replication::wire::{
 use crate::replication::{
     ControlRegisters, Replaced, Replication, ReplicationConfig, ShardRegisters as _,
 };
-use crate::cache::{CacheMetrics, CacheSettings, CleanCache};
 use crate::set::ShardSet;
 use crate::shard::{Role, Shard};
 

@@ -16,7 +16,7 @@ use skys3_ec::{
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{BlockingPool, ManualWallClock, MonotonicClock, SimDisk, SimMount};
-use skys3_log::record::{Delete, Extent, Put, PutData};
+use skys3_log::record::{Delete, Extent, Flushed, Put, PutData};
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
 use skys3_shard::{Rejection, Shard};
 use skys3_types::{
@@ -182,6 +182,7 @@ const SETTINGS: EncoderSettings = EncoderSettings {
     stripe_data_bytes: 4096,
     after: Duration::from_secs(60),
     replans: 3,
+    after_backup: false,
 };
 
 struct Fixture {
@@ -303,6 +304,42 @@ fn an_object_is_encoded_stripe_by_stripe_and_published() {
             encoder.encode("photo").await.unwrap(),
             Encoded::Skipped(Skip::Coded)
         );
+    });
+}
+
+#[test]
+fn a_backed_up_bucket_encodes_only_what_its_backup_holds() {
+    runtime().block_on(async {
+        let f = Fixture::new().await;
+        let version = write(&f.shard, "photo", &sample(5000, 1), 1).await;
+        let encoder = Encoder::new(
+            f.shard.clone(),
+            Arc::clone(&f.writer),
+            planner(6),
+            Arc::new(f.clock.clone()),
+            EncoderSettings {
+                after_backup: true,
+                ..SETTINGS
+            },
+        );
+        // The flusher sends a version from the replica encoding drops, so
+        // the version waits until its backup holds it (§8.9).
+        assert_eq!(
+            encoder.encode("photo").await.unwrap(),
+            Encoded::Skipped(Skip::NotBackedUp)
+        );
+        assert!(f.writer.nodes().is_empty());
+        let flushed = Flushed {
+            key: "photo".to_owned(),
+            seq: version.seq,
+            remote_etag: Some(ETag::new(format!("{:032x}", 1)).unwrap()),
+            remote_version_id: None,
+        };
+        f.shard.commit(RecordBody::Flushed(flushed)).await.unwrap();
+        assert!(matches!(
+            encoder.encode("photo").await.unwrap(),
+            Encoded::Published(_)
+        ));
     });
 }
 
