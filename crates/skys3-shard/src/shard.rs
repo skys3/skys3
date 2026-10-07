@@ -1985,10 +1985,13 @@ impl<D: Disk> Shard<D> {
         let (entry, layout) = run(&self.inner.pool, self.shard(), move || {
             let reader = index.read()?;
             let entry = reader.entry(&shard, &owned)?;
+            // A coded version is read from its fragments, which its entry
+            // names (§8.5); its replicas are dropped.
             let object = entry
                 .as_ref()
                 .filter(|entry| entry.state != EntryState::Evicted)
-                .and_then(|entry| entry.object.as_ref());
+                .and_then(|entry| entry.object.as_ref())
+                .filter(|object| object.coded.is_none());
             let layout = match object {
                 Some(object) => reads::layout(&reader, &shard, object)?,
                 None => None,

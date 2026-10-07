@@ -281,9 +281,11 @@ impl<D: Disk> FragmentServer<D> {
     }
 
     /// Accepts connections on `listener` until it fails, serving each
-    /// fragment write on a task of its own. A node whose transport carries
-    /// other messages too accepts connections itself and hands the links
-    /// whose first frame is a `FragmentWrite` to [`FragmentServer::serve`].
+    /// fragment write, or each connection's fragment reads, on a task of
+    /// its own. A node whose transport carries other messages too accepts
+    /// connections itself and hands the links whose first frame is a
+    /// `FragmentWrite` to [`FragmentServer::serve`], and those whose first
+    /// frame is a `FragmentRead` to [`FragmentServer::serve_reads`].
     pub async fn serve_listener<N: Network>(&self, listener: Listener<N>) {
         loop {
             let Ok(incoming) = listener.accept().await else {
@@ -299,7 +301,11 @@ impl<D: Disk> FragmentServer<D> {
                 if let Ok(Ok(Some(first))) =
                     tokio::time::timeout(FRAME_TIMEOUT, receiver.recv()).await
                 {
-                    server.serve((receiver, sender), first).await;
+                    if first.header.kind == MessageKind::FragmentRead {
+                        server.serve_reads((receiver, sender), first).await;
+                    } else {
+                        server.serve((receiver, sender), first).await;
+                    }
                 }
             });
         }

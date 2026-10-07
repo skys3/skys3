@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn headers_with_unknown_kinds_or_bad_protobuf_are_refused() {
-        for kind in [0, 11, -1, 1000] {
+        for kind in [0, 13, -1, 1000] {
             let wire = WireHeader {
                 kind,
                 request_id: 1,
