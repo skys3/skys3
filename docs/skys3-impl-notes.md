@@ -6583,7 +6583,8 @@ of this file. A task with nothing unexpected keeps "None."
   share it. The node computes the CRC32C from the bytes it verified
   against the fragment's block checksums, so corruption on the way is
   caught by the gateway. A new `ec_read` fuzz target decodes and checks
-  both bodies; a proptest round-trips them. Nothing on disk changed.
+  both bodies (1.5 million inputs in 30 s, no failure); a proptest
+  round-trips them. Nothing on disk changed.
 - **Coded plans name no holders.** `Shard::plan` gave a coded version
   the layout of its dropped replica payload, so the gateway would ask
   each member and be refused before reading fragments. The plan of a
@@ -6637,10 +6638,10 @@ of this file. A task with nothing unexpected keeps "None."
   (ECDSA signatures in the handshakes also vary in length, harmlessly:
   nothing depends on their size.)
 - **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
-  replay (cost 128) 2 seeds in REPLAY_TIME; degraded reads (lossy 2 on
-  even seeds, else 1; cost 32) 8 seeds in 32 s; trusting bad CRCs
-  (corruption only) 4 seeds in 30 s; wrong indices (crashes and lost
-  disks) 4 seeds in 29 s. Both bugs are caught on every seed tried, with
+  replay (cost 128) 2 seeds in 15 s; degraded reads (lossy 2 on
+  even seeds, else 1; cost 32) 8 seeds in 29 s; trusting bad CRCs
+  (corruption only) 4 seeds in 29 s; wrong indices (crashes and lost
+  disks) 4 seeds in 30 s. Both bugs are caught on every seed tried, with
   "not those of version". At `SKYS3_SIM_SEEDS=2048` all passed: 64
   seeds of degraded reads, 32 of each bug; replay passed 32 seeds at
   4096.

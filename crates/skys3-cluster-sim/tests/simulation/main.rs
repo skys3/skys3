@@ -60,6 +60,10 @@
 //!   fragment holders crash or lose power at each step of an attempt, with
 //!   every object readable from its replicas or `k` fragments of each
 //!   stripe throughout, and seeded bugs of the publish steps caught.
+//! - [`coded_reads`]: `GET`s of coded objects through every node's
+//!   gateway, decoding stripes while fragment holders crash, lose their
+//!   fragment disk, or corrupt what they send, with seeded read bugs
+//!   caught.
 //! - [`compaction`]: segment compaction on replicated shards under
 //!   crashes, message loss, and power losses at sync boundaries, with
 //!   every member's dirty bytes and every shard's latest `CONFIG` record
