@@ -93,6 +93,7 @@ mod creation;
 mod faults;
 mod holders;
 mod learners;
+mod lifecycle;
 mod node;
 mod pki;
 mod replication;
@@ -112,6 +113,7 @@ pub use coordination::{
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use holders::{HolderCounts, HolderFaults};
 pub use learners::{DurabilityWindows, LearnerCounts};
+pub use lifecycle::{Lifecycle, LifecycleAudit, LifecycleObject, LifecycleStart, ORIGIN_DAY};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{
     HandoffCounts, HandoffTime, IoCounts, LateWrites, LeaseCounts, ReplicaState,

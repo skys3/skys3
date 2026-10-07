@@ -19,7 +19,7 @@ use skys3_flush::FlushSettings;
 use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
 use skys3_index::{Entry, EntryState, Index, IndexReader, Payload};
 use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SimMount, SyncCut};
-use skys3_log::{LogConfig, RecordBody, RecordKind, SegmentId};
+use skys3_log::{LogConfig, LogRecord, RecordBody, RecordKind, SegmentId};
 use skys3_shard::{CacheSettings, CompactionSettings, ReadSettings};
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
 use skys3_sim::history::{History, Operation, Outcome};
@@ -32,6 +32,7 @@ use skys3_types::{
 
 use crate::creation;
 use crate::faults::{Endpoint, Fault, FaultPlan};
+use crate::lifecycle::{self, Lifecycle, LifecycleAudit, ShardLogs};
 use crate::node::{
     self, BoxError, ControlHandle, INDEX_FILE, LocalServices, NodeServices, NodeSettings, NodeSlot,
     Shared, TRANSPORT_PORT,
@@ -122,6 +123,12 @@ pub struct ClusterConfig {
     /// acknowledged write, at its acknowledgement and when the clients are
     /// done ([`WriteThrough`]). Off by default.
     pub write_through: WriteThrough,
+    /// Lifecycle rules on every `local` bucket the harness writes, with
+    /// passes on every node, a client that writes objects and uploads for
+    /// them to expire, and an audit of the final logs that each version
+    /// was expired by exactly one committed `DELETE` ([`Lifecycle`]).
+    /// `None` by default.
+    pub lifecycle: Option<Lifecycle>,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -192,6 +199,7 @@ impl Default for ClusterConfig {
             compaction: None,
             hot_cache: HotCaches::default(),
             write_through: WriteThrough::Off,
+            lifecycle: None,
         }
     }
 }
@@ -279,6 +287,9 @@ pub struct Report {
     /// remote store alone when they were acknowledged
     /// ([`ClusterConfig::write_through`]).
     pub remote_checked: u64,
+    /// What the audit of the final logs found of the lifecycle rules'
+    /// expirations ([`ClusterConfig::lifecycle`]).
+    pub lifecycle: LifecycleAudit,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -614,6 +625,9 @@ impl<S: NodeServices> Cluster<S> {
             world.routes.clone()
         };
         driver.origin = Some(sim.elapsed());
+        if let Some(lifecycle) = &self.config.lifecycle {
+            lifecycle.start(sim.elapsed());
+        }
         driver.audit = self.config.write_through.audited().then(|| {
             RemoteAudit::new(
                 world.remote.clone(),
@@ -634,6 +648,10 @@ impl<S: NodeServices> Cluster<S> {
             .with_timings(writes.clone())
             .with_acks(driver.audit.as_ref().map(RemoteAudit::on_ack));
             sim.client(client_host(index), client.run());
+        }
+        if let Some(lifecycle) = &self.config.lifecycle {
+            let client = lifecycle::client(lifecycle.clone(), routes.clone(), workload.timeout);
+            sim.client("lifecycle", client);
         }
         self.drive(&mut sim, &mut driver, &history, false)?;
         // The last acknowledgements' audits, then the whole cluster lost
@@ -669,6 +687,15 @@ impl<S: NodeServices> Cluster<S> {
             sim.crash(slot.host.as_str());
         }
         let operations = history.operations();
+        let lifecycle = match &self.config.lifecycle {
+            Some(lifecycle) => {
+                let logs = world.shard_logs(&routes)?;
+                let end = lifecycle.at(sim.elapsed()).unwrap_or(0);
+                lifecycle::audit(lifecycle, &logs, &routes.buckets, end)
+                    .map_err(RunError::Simulation)?
+            }
+            None => LifecycleAudit::default(),
+        };
         let (survivors, evicted) = world.survivors(&routes, workload.keys)?;
         check_linearizable(&operations).map_err(RunError::Check)?;
         check_durable(&operations, &survivors).map_err(RunError::Check)?;
@@ -712,6 +739,7 @@ impl<S: NodeServices> Cluster<S> {
             compacted: world.shared.compacted.load(Ordering::Relaxed),
             hot_cache_hits: world.shared.hot_cache_hits(),
             remote_checked: driver.audit.as_ref().map_or(0, RemoteAudit::checked),
+            lifecycle,
         })
     }
 
@@ -953,6 +981,67 @@ impl<S: NodeServices> World<S> {
             placement: Arc::new(placement),
             nodes: self.routes.nodes.clone(),
         })
+    }
+
+    /// Recovers every node from its disks, outside the simulation, and
+    /// reads the records of each shard of `routes` from its log, in the
+    /// order the log holds them: the final primary's, and every other
+    /// node's that holds some.
+    fn shard_logs(&self, routes: &Routes) -> Result<BTreeMap<ShardRef, ShardLogs>, BoxError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        let settings = &self.shared.settings;
+        let primaries: BTreeMap<&ShardRef, NodeId> = routes
+            .placement
+            .iter()
+            .map(|(shard, placed)| {
+                let primary = register(&self.registers, shard)
+                    .map_or_else(|| placed.primary.clone(), |config| config.primary);
+                (shard, primary)
+            })
+            .collect();
+        let mut logs: BTreeMap<ShardRef, ShardLogs> = BTreeMap::new();
+        for slot in &self.slots {
+            let mounts: Vec<_> = slot
+                .disks
+                .iter()
+                .map(|(label, disk)| (label.clone(), disk.mount()))
+                .collect();
+            let index = Index::open_sim(&mounts[0].1, INDEX_FILE, &node::index_config(settings))?;
+            let storage = runtime.block_on(skys3::storage::recover(
+                mounts,
+                settings.log.clone(),
+                Arc::new(MonotonicClock::new()),
+                Arc::new(index),
+                skys3_io::BlockingPool::inline("recovery"),
+                slot.id.clone(),
+            ))?;
+            let mut held: BTreeMap<ShardRef, Vec<LogRecord>> = BTreeMap::new();
+            for (_, log) in storage.shards.set().logs() {
+                for mut scanner in log.scan_all()? {
+                    while let Some(scanned) = runtime.block_on(scanner.next())? {
+                        let record = scanned.decode()?;
+                        let shard = ShardRef {
+                            bucket: record.shard.bucket.clone(),
+                            shard: record.shard.shard,
+                        };
+                        if primaries.contains_key(&shard) {
+                            held.entry(shard).or_default().push(record);
+                        }
+                    }
+                }
+            }
+            for (shard, records) in held {
+                let entry = logs.entry(shard.clone()).or_default();
+                if primaries.get(&shard) == Some(&slot.id) {
+                    entry.primary = records;
+                } else {
+                    entry.others.push(records);
+                }
+            }
+        }
+        Ok(logs)
     }
 
     /// Recovers every node from its disks, outside the simulation, and
@@ -1293,6 +1382,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         },
         compaction: shape.compaction,
         hot_cache: shape.hot_cache,
+        lifecycle: shape.lifecycle.clone(),
     })
 }
 
@@ -1331,7 +1421,11 @@ fn registers(
             clean_copies: config.clean_copies,
             target,
             created_unix_ms: 0,
-            lifecycle: None,
+            lifecycle: config
+                .lifecycle
+                .as_ref()
+                .filter(|_| mode == BucketMode::Local)
+                .map(|lifecycle| lifecycle.configuration.clone()),
             proposal_id: ids.next_id(),
         };
         for shard in ShardRef::all(&bucket) {

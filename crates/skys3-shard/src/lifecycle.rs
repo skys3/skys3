@@ -125,7 +125,10 @@ pub async fn run_pass<D: Disk>(
             let Some(replica) = set.get(&shard).await else {
                 continue;
             };
-            if replica.is_stopped() || replica.role().follows() {
+            // A primary serves once its members hold its whole log and it
+            // applied every record of it (§6.5): a pass reads what the
+            // earlier primaries committed.
+            if replica.is_stopped() || replica.role().follows() || !replica.is_serving() {
                 continue;
             }
             let report = match expire(&replica, config, now_ms).await {
