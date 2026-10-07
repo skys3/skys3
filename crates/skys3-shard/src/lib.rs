@@ -11,7 +11,9 @@
 //!   which cleans an entry only at its current `seq` (§7.1). It depends on
 //!   nothing but the record and the index, so every replica, and replay
 //!   after a crash, reaches the same index. It plugs into the index as its
-//!   [`Applier`](skys3_index::Applier).
+//!   [`Applier`](skys3_index::Applier). It also applies `EC_PUBLISH`,
+//!   which marks an object version coded, only if the version is still
+//!   the key's current one (§8.4).
 //! - [`Shard`]: one shard replica with `replicas = 1`. It gives each record
 //!   the shard's next position `(epoch, seq)`, commits it once the log has
 //!   made it durable, and applies records in position order, whatever order
@@ -77,6 +79,7 @@ mod multipart;
 mod pipeline;
 pub mod reads;
 pub mod replication;
+mod seeded;
 mod set;
 mod shard;
 
@@ -91,5 +94,10 @@ pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
 pub use reads::{ReadCounts, ReadId, ReadPlan, ReadSettings, Reads, Registered};
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub use seeded::seed_bug;
+#[doc(hidden)]
+pub use seeded::SeededBug;
 pub use set::ShardSet;
 pub use shard::{Change, Committed, Role, Shard, ShardSummary, StreamedBody};

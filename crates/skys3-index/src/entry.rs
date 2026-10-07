@@ -2,7 +2,7 @@
 //! their parts, and control-state copies.
 
 use skys3_log::record::{Checksums, CopySource, ExtentRef, Metadata, TagSet, UploadChecksum};
-use skys3_types::{ETag, EpochSeq, Generation};
+use skys3_types::{AttemptId, CodedStripe, ETag, EpochSeq, Generation};
 
 /// Where an entry is in its life cycle (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,8 +97,28 @@ pub struct ObjectVersion {
     pub storage_class: Option<String>,
     /// For a copy, its source (§11).
     pub copy_source: Option<CopySource>,
-    /// Where the object's bytes are on this replica.
+    /// Where the object's bytes are on this replica, as the write that
+    /// stored them named them. Once the version is [`coded`](Self::coded),
+    /// the replicas drop them (§8.4) and the positions may no longer be
+    /// located.
     pub payload: Payload,
+    /// The version's erasure-coded layout, once an `EC_PUBLISH` of it was
+    /// applied (§8.4); `None` while it is only replicated. A `TAGS` record
+    /// keeps it, as it keeps the bytes; any other write replaces it.
+    pub coded: Option<Coded>,
+}
+
+/// An object version's erasure-coded layout, as its `EC_PUBLISH` record
+/// gave it (§8.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coded {
+    /// The position of the `EC_PUBLISH` record. Replicas drop the
+    /// version's replicated bytes once they know it committed.
+    pub publish: EpochSeq,
+    /// The attempt that wrote the fragments.
+    pub attempt: AttemptId,
+    /// The stripes, in order, covering the object exactly once.
+    pub stripes: Vec<CodedStripe>,
 }
 
 /// Where an object version's bytes are, by log position.

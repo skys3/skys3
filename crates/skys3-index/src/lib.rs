@@ -62,7 +62,7 @@ mod tables;
 
 pub use checkpointer::{Checkpointer, ReplayReport};
 pub use entry::{
-    ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
+    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
     RemotePart, RemoteParts, RemoteUpload, Upload,
 };
 pub use error::IndexError;

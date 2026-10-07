@@ -7,7 +7,7 @@ use proptest::option;
 use proptest::prelude::*;
 use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 use skys3_index::{
-    ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges, ObjectPart,
+    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges, ObjectPart,
     ObjectVersion, Part, Payload, RemotePart, RemoteUpload, Upload,
 };
 use skys3_log::record::{
@@ -16,7 +16,8 @@ use skys3_log::record::{
 };
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::{
-    BucketId, ETag, Epoch, EpochSeq, Generation, Label, Seq, ShardId, VersionIdentity,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId,
+    FragmentLocation, Generation, Geometry, Label, NodeId, Seq, ShardId, VersionIdentity,
 };
 
 fn position() -> impl Strategy<Value = EpochSeq> {
@@ -90,6 +91,54 @@ fn copy_source() -> impl Strategy<Value = CopySource> {
     )
 }
 
+fn node() -> impl Strategy<Value = NodeId> {
+    "[a-z0-9]([a-z0-9-]{0,10}[a-z0-9])?".prop_map(|s| NodeId::new(s).unwrap())
+}
+
+/// A coded layout with one to three stripes of up to 3+2, and the object
+/// size its stripes cover.
+fn coded() -> impl Strategy<Value = (Coded, u64)> {
+    let stripe = (1..=u64::from(u32::MAX), 1..=3_usize, 1..=2_usize).prop_flat_map(
+        |(len, k, m)| {
+            (
+                Just((len, Geometry::new(k, m).unwrap())),
+                proptest::collection::btree_set(node(), k + m),
+                vec(any::<u128>(), k + m),
+            )
+        },
+    );
+    (position(), (any::<u64>(), any::<u64>()), vec(stripe, 1..4)).prop_map(
+        |(publish, (epoch, number), stripes)| {
+            let mut offset = 0;
+            let stripes = stripes
+                .into_iter()
+                .zip(0..)
+                .map(|(((len, geometry), nodes, ids), number)| {
+                    let fragments = nodes
+                        .into_iter()
+                        .zip(ids)
+                        .map(|(node, id)| FragmentLocation {
+                            node,
+                            fragment: FragmentId::new(id),
+                        })
+                        .collect();
+                    let stripe =
+                        CodedStripe::new(number, offset, len, geometry, CodecId::CURRENT, fragments)
+                            .unwrap();
+                    offset = stripe.end();
+                    stripe
+                })
+                .collect();
+            let coded = Coded {
+                publish,
+                attempt: AttemptId::new(Epoch::new(epoch), number),
+                stripes,
+            };
+            (coded, offset)
+        },
+    )
+}
+
 fn object() -> impl Strategy<Value = ObjectVersion> {
     (
         (any::<u64>(), any::<u64>(), etag(), option::of(position())),
@@ -99,14 +148,17 @@ fn object() -> impl Strategy<Value = ObjectVersion> {
             checksums(),
         ),
         (option::of(text(12)), option::of(copy_source()), payload()),
+        option::of(coded()),
     )
         .prop_map(
             |(
                 (size, last_modified_ms, local_etag, write_identity),
                 (metadata, tags, checksums),
                 (storage_class, copy_source, payload),
+                coded,
             )| ObjectVersion {
-                size,
+                // A coded object's stripes cover it exactly.
+                size: coded.as_ref().map_or(size, |(_, size)| *size),
                 last_modified_ms,
                 local_etag,
                 write_identity,
@@ -116,6 +168,7 @@ fn object() -> impl Strategy<Value = ObjectVersion> {
                 storage_class,
                 copy_source,
                 payload,
+                coded: coded.map(|(coded, _)| coded),
             },
         )
 }
@@ -329,6 +382,7 @@ fn sample_entry() -> Entry {
                 position: EpochSeq::new(Epoch::new(1), Seq::new(1)),
                 len: 3,
             }]),
+            coded: None,
         }),
         remote_etag: None,
         remote_version_id: None,
@@ -400,6 +454,7 @@ fn format_1_entries_still_decode() {
             storage_class: None,
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         }),
         remote_etag: None,
         remote_version_id: None,
@@ -408,7 +463,8 @@ fn format_1_entries_still_decode() {
     // It re-encodes in the current format: a part count, zero, after each
     // digest.
     let v2 = codec::encode_entry(&entry).unwrap();
-    let mut expected_v2 = ENTRY_V1.replacen("01", "03", 1);
+    // And no coded layout.
+    let mut expected_v2 = ENTRY_V1.replacen("01", "04", 1) + "00";
     expected_v2 = expected_v2.replace("0101020304", "01010203040000");
     expected_v2 = expected_v2.replace("0c0d0e0f", "0c0d0e0f0000");
     assert_eq!(v2, unhex(&expected_v2));
@@ -429,7 +485,7 @@ fn rejects_broken_entries() {
     let bytes = codec::encode_entry(&sample_entry()).unwrap();
     let decode = |bytes: &[u8]| codec::decode_entry(bytes).unwrap_err().field();
     assert_eq!(decode(&[]), "entry");
-    for format in [0, 4, u8::MAX] {
+    for format in [0, 5, u8::MAX] {
         assert_eq!(decode(&with(&bytes, 0, format)), "entry", "format {format}");
     }
     // The state code follows the format byte and the version.
@@ -440,11 +496,13 @@ fn rejects_broken_entries() {
     let b = bytes.iter().position(|&b| b == b'b').unwrap();
     let swapped = with(&with(&bytes, a, b'b'), b, b'a');
     assert_eq!(decode(&swapped), "object.metadata");
-    // An extent of zero bytes, at the very end.
-    let zero = with(&bytes, bytes.len() - 4, 0);
+    // An extent of zero bytes, just before the coded layout's presence
+    // byte, which ends the entry.
+    let zero = with(&bytes, bytes.len() - 5, 0);
     assert_eq!(decode(&zero), "object.extents");
     // An invalid payload tag: the byte before the extent count.
-    assert_eq!(decode(&with(&bytes, bytes.len() - 25, 9)), "object.payload");
+    assert_eq!(decode(&with(&bytes, bytes.len() - 26, 9)), "object.payload");
+    assert_eq!(decode(&with(&bytes, bytes.len() - 1, 2)), "object.coded");
     // A checksum algorithm that does not exist: find the CRC32 code.
     let crc = bytes
         .windows(7)

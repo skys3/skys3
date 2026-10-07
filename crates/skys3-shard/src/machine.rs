@@ -18,12 +18,17 @@
 use std::cell::RefCell;
 use std::fmt;
 
-use skys3_index::{Applier, Entry, EntryState, IndexError, IndexWriter, ObjectVersion, Payload};
-use skys3_log::record::{Adopt, Delete, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags};
+use skys3_index::{
+    Applier, Coded, Entry, EntryState, IndexError, IndexWriter, ObjectVersion, Payload,
+};
+use skys3_log::record::{
+    Adopt, Delete, EcPublish, Flushed, IDENTITY_METADATA, Import, Put, PutData, Tags,
+};
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
 use skys3_types::{EpochSeq, Seq};
 
 use crate::multipart;
+use crate::seeded::{SeededBug, is_seeded};
 
 /// The shard state machine. It holds no state of its own: everything it
 /// decides comes from the record and the index.
@@ -95,6 +100,8 @@ pub enum Effect {
     /// (§7.2). It changes no entry: only the `PUT` that inherits the
     /// identity does.
     UploadBegun,
+    /// An `EC_PUBLISH` marked the key's current version coded (§8.4).
+    Published,
     /// A `CONFIG` or `TRUNCATE`, which change no entry.
     Unchanged,
 }
@@ -161,6 +168,15 @@ pub enum Rejection {
     /// another.
     #[error("the remote upload is not recorded")]
     NoRemoteUpload,
+    /// An `EC_PUBLISH` names a version that is no longer the key's
+    /// current one: an overwrite, a delete, or a tag change committed
+    /// after the encoder read it (§8.4). Its fragments become orphans.
+    #[error("the published version is superseded")]
+    Superseded,
+    /// An `EC_PUBLISH` names a version that another `EC_PUBLISH` coded
+    /// already: an attempt that outlived its primary's life.
+    #[error("the version is coded already")]
+    AlreadyCoded,
     /// A record kind this state machine does not apply.
     #[error("{0:?} records are not applied by this build")]
     Unsupported(RecordKind),
@@ -221,6 +237,7 @@ impl StateMachine {
             RecordBody::PartFlushed(flushed) => multipart::part_flushed(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
+            RecordBody::EcPublish(publish) => publish_coded(index, shard, position, publish)?,
             // A replica's own bookkeeping: the configuration it adopted,
             // which the index keeps as the replica's local copy of it
             // (§6.2), or where reconciliation cut its log (§6.6).
@@ -317,6 +334,7 @@ fn put_object(
         storage_class: None,
         copy_source: put.copy_source.clone(),
         payload,
+        coded: None,
     };
     store(index, shard, &put.key, position, state, Some(object), prior)?;
     Ok(Ok(Effect::Stored { state }))
@@ -348,6 +366,7 @@ pub(crate) fn store(
     prior: Option<Entry>,
 ) -> Result<(), IndexError> {
     multipart::drop_parts(index, shard, prior.as_ref())?;
+    release_coded(index, shard, key, prior.as_ref())?;
     let (remote_etag, remote_version_id) = prior.map_or((None, None), |prior| {
         (prior.remote_etag, prior.remote_version_id)
     });
@@ -478,6 +497,7 @@ fn import_stub(
             storage_class: import.storage_class.clone(),
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         }),
         remote_etag: Some(import.etag.clone()),
         remote_version_id: None,
@@ -523,11 +543,70 @@ fn adopt_remote(
             storage_class: None,
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         }),
         remote_etag: Some(adopt.remote_etag.clone()),
         remote_version_id: adopt.remote_version_id.clone(),
     };
     multipart::drop_parts(index, shard, Some(&entry))?;
+    release_coded(index, shard, &adopt.key, Some(&entry))?;
     index.put_entry(shard, &adopt.key, &adopted)?;
     Ok(Ok(Effect::Adopted))
+}
+
+/// `EC_PUBLISH`: the version the record names is coded, if it is still the
+/// key's current version and not coded yet (§8.4). Its stripes become the
+/// version's layout, and their fragments enter the shard's index from node
+/// to fragments. The entry keeps its version, state, and payload: the
+/// replicas drop the replicated bytes only once they know the record
+/// committed (see [`Holder::Coded`](skys3_index::Holder::Coded)).
+fn publish_coded(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    position: EpochSeq,
+    publish: &EcPublish,
+) -> Result<Rule, IndexError> {
+    let Some(mut entry) = index.entry(shard, &publish.key)? else {
+        return Ok(Err(Rejection::NoEntry));
+    };
+    let Some(object) = &mut entry.object else {
+        return Ok(Err(Rejection::Deleted));
+    };
+    let current = entry.version == publish.version
+        && object.local_etag == publish.etag
+        && object.size == publish.size;
+    if !current && !(is_seeded(SeededBug::PublishSuperseded) && object.size == publish.size) {
+        return Ok(Err(Rejection::Superseded));
+    }
+    if object.coded.is_some() {
+        return Ok(Err(Rejection::AlreadyCoded));
+    }
+    let coded = Coded {
+        publish: position,
+        attempt: publish.attempt,
+        stripes: publish.stripes.clone(),
+    };
+    index.put_fragments(shard, &publish.key, &coded)?;
+    object.coded = Some(coded);
+    index.put_entry(shard, &publish.key, &entry)?;
+    Ok(Ok(Effect::Published))
+}
+
+/// Removes the fragments of `prior`'s coded layout, if it has one, from the
+/// shard's index from node to fragments, as a write replaces the version.
+/// The fragments themselves stay until the version is released (plan
+/// M5-07).
+fn release_coded(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    key: &str,
+    prior: Option<&Entry>,
+) -> Result<(), IndexError> {
+    if let Some(coded) = prior
+        .and_then(|prior| prior.object.as_ref())
+        .and_then(|object| object.coded.as_ref())
+    {
+        index.remove_fragments(shard, key, coded)?;
+    }
+    Ok(())
 }
