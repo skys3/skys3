@@ -675,6 +675,21 @@ async fn a_gateway_that_cannot_fill_reads_the_origin_directly() {
 }
 
 #[tokio::test]
+async fn under_a_ttl_a_direct_read_of_a_changed_object_asks_again() {
+    let world = World::new("freshness = \"ttl\"\nfreshness_ttl_seconds = 60\n").await;
+    world.bucket("mirror", "default").await;
+    world.fills.available.store(false, Ordering::SeqCst);
+    world.origin.put("k", b"first");
+    assert_eq!(world.get("/mirror/k").await.body, "first");
+    // Within the TTL the change is not looked for, but a read that finds
+    // the version gone at the origin forgets what it knew.
+    world.origin.put("k", b"second");
+    let got = world.get("/mirror/k").await;
+    got.assert(200, None);
+    assert_eq!(got.body, "second");
+}
+
+#[tokio::test]
 async fn an_origin_that_cannot_answer_fails_reads_with_503() {
     let world = World::new("freshness = \"ttl\"\nfreshness_ttl_seconds = 60\n").await;
     world.bucket("mirror", "default").await;

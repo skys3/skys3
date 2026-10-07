@@ -228,6 +228,13 @@ impl OriginValidations {
         state.trim();
     }
 
+    /// Forgets what was seen of `key` at `scope`, which turned out to have
+    /// changed since: the next read asks the origin.
+    pub(crate) fn forget(&self, scope: &OriginScope, key: &str) {
+        let name = self.name(scope, key);
+        self.lock().seen.remove(&name);
+    }
+
     /// The name answers for `key` at `scope` are kept under.
     fn name(&self, scope: &OriginScope, key: &str) -> Name {
         let scope = if self.inner.ignore_credentials.load(Ordering::Relaxed) {
@@ -315,6 +322,8 @@ mod tests {
         validations.record(&scope, "k", early, Seen::Present(etag(1)));
         let fresh = validations.fresh(&scope, "k", Duration::from_secs(5));
         assert_eq!(fresh, Some(Seen::Missing));
+        validations.forget(&scope, "k");
+        assert_eq!(validations.fresh(&scope, "k", Duration::from_secs(5)), None);
     }
 
     #[tokio::test(start_paused = true)]

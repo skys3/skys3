@@ -237,6 +237,10 @@ impl<H: Shards> Objects<H> {
             .await
             .map_err(origin_unavailable)?
         else {
+            // What a HEAD saw is out of date: the next round asks again.
+            if let Some(scope) = read.remote.origin_scope(&bucket.bucket_id) {
+                self.validations.forget(&scope, key);
+            }
             return Ok(None);
         };
         if first.end == bytes.end {
