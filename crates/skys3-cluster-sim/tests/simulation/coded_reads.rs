@@ -31,10 +31,15 @@ fn reading(lossy: usize, corrupt_only: bool, bug: Option<ReadBug>) -> CodingConf
     }
 }
 
+/// Two runs of a seed in one process see the same reads. The run has no
+/// crash: a crashed host's sockets close in the order its runtime drops
+/// its tasks, which follows task IDs that are global to the process, so
+/// the closes, and the latencies drawn after them, differ between two runs
+/// of a seed in one process (a run in a fresh process replays exactly).
 #[test]
 fn a_seed_of_coded_reads_replays_exactly() {
     Runner::with_cost(1, 4 * RUN_COST).run(|context| {
-        let config = reading(2, false, None);
+        let config = reading(2, true, None);
         let mut replay = SimContext::with_scale(context.seed(), context.scale());
         let first = coding::run(&mut replay, &config)?;
         let second = coding::run(context, &config)?;
