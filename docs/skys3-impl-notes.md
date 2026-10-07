@@ -6548,6 +6548,116 @@ of this file. A task with nothing unexpected keeps "None."
   fragment map does. There are no metrics yet; `SweepReport` has the
   counts.
 
+### M5-06 Coded reads
+
+- **Ranged decoding needed two codec methods.** `EcCodec` could only
+  decode whole fragments, so a degraded 1 MiB read of a 64 MiB stripe
+  would have read and decoded all of it. reed-solomon-simd's high-rate
+  code works on each 64-byte column on its own, so `EcCodec` gained
+  `columns` (the 64-byte-aligned columns that hold a range of a
+  fragment) and `decode_columns` (the data fragments' bytes of those
+  columns from any `k` fragments' bytes of the same columns). Both are
+  required trait methods; codec 1 implements them with the same checks
+  as whole decoding, and a new `EcError::OutsideFragment` refuses
+  columns past the fragment's length. Recorded in §8.5.
+- **The reader is transport-free.** `skys3_ec::read::read_coded` takes a
+  `FragmentSource` (one async `read` of a fragment range) and a
+  `CodedRead` (the entry's coded layout, the object's size, the range)
+  and returns a channel of body pieces, the first read before it
+  returns. Pieces are at most 1 MiB within one data fragment. A failed
+  fragment (not held, damaged, CRC32C mismatch, short) is skipped for
+  the rest of its stripe and an unreachable node for the rest of the
+  read; a degraded piece takes data fragments first, then parity, in
+  index order. `FragmentReadClient` is the network source, with a local
+  shortcut to the node's own `FragmentServer`.
+- **Reads name what they expect.** A fragment ID alone is not enough: a
+  fragment reclaimed since the plan (M5-05) or an ID reused on a
+  replaced disk would serve another fragment's bytes, which pass their
+  checksums. A `FragmentRead` names the shard, key, version, stripe,
+  geometry, codec, and index, and the node answers "not held" unless
+  the fragment's header matches. Recorded in §8.5.
+- **Two message kinds, no format change.** `FragmentRead` (11) and
+  `FragmentData` (12), replication class, request in the frame header
+  (it is small), bytes in the payload with their CRC32C. The fragment
+  listener dispatches on the first frame's kind, so writes and reads
+  share it. The node computes the CRC32C from the bytes it verified
+  against the fragment's block checksums, so corruption on the way is
+  caught by the gateway. A new `ec_read` fuzz target decodes and checks
+  both bodies; a proptest round-trips them. Nothing on disk changed.
+- **Coded plans name no holders.** `Shard::plan` gave a coded version
+  the layout of its dropped replica payload, so the gateway would ask
+  each member and be refused before reading fragments. The plan of a
+  coded version now has no layout and no holders, and the gateway reads
+  the entry's coded layout instead (`GatewayConfig::fragments`; without
+  a source a coded GET answers `503`). A stripe with fewer than `k`
+  readable fragments re-resolves the key like a holder miss, up to three
+  times, then `503`. Whole reads fill the hot cache. Recorded in §9.2.
+- **No fragment read registrations (the M5-05 open point).** A
+  registration only matters once something removes fragments a plan may
+  still name. Today that is only the orphan reclaimer, for a version
+  overwritten after it was coded; such a read fails cleanly (identity
+  check, then re-resolution finds the new version). Release with
+  `fragment_release_delay_seconds` and registrations, honoured by the
+  reclaimer too, are left to M5-07, which owns release. Recorded in §8.5.
+- **Flusher reads of coded objects stay open (M4-09).** The flusher
+  reads a version's payload from the primary's log, which a coded
+  version no longer has. The encoder codes a version of a bucket with a
+  backup target only once the backup holds it (M5-04), so a regular
+  flush never needs a coded version's bytes; one that must send a coded
+  version again would fail and retry. Reading through `read_coded`
+  there touches the flusher, which M4-11 is changing in parallel, so it
+  is left for a follow-up.
+- **The property test.** `tests/reads.rs` reads, for every geometry of
+  the design's table, every set of up to `m` lost fragments, each
+  missing or corrupt in flight, over three stripes, for the whole object
+  and a range cutting through fragments; a proptest draws geometries
+  1+1 to 10+4, object and stripe sizes, ranges, and up to `m` losses per
+  stripe of any kind (not held, damaged, unreachable, corrupt). More
+  than `m` losses fail with `Unreadable`. The seeded bugs
+  `ReadBug::TrustCrc` (keep bytes that fail their CRC32C) and
+  `ReadBug::WrongIndices` (decode with the fragments read packed into
+  the first slots) read wrong bytes there.
+- **The simulation.** `skys3_cluster_sim::coding` takes a `ReadConfig`:
+  after the coding scenario's objects are coded and their replicas
+  dropped, every node runs a gateway (an in-memory control store and
+  shard map, routed shard client, hot cache) and three clients send 40
+  whole or ranged GETs each through drawn nodes while, for four seconds,
+  up to two *lossy* nodes of n1 to n5 (`m` is 2 on six nodes) crash,
+  with or without power loss, lose their fragment disk for good, or
+  corrupt the bytes they send. Every answer must be its version's bytes,
+  by its ETag; `503` and broken-off bodies are allowed. The harness's
+  fragment source counts parity reads, and the scenario requires some.
+- **Crashes do not replay within one process.** Two runs of a seed in
+  one process differed after a crash. A crashed host's runtime drops its
+  tasks in an order tokio shards by task ID, and task IDs are global to
+  the process, so its sockets close in another order on the second run
+  and the latencies drawn after them differ. A fresh process replays a
+  seed exactly. The replay scenario therefore runs coded reads with
+  corruption only; the crashing scenarios still check every answer.
+  (ECDSA signatures in the handshakes also vary in length, harmlessly:
+  nothing depends on their size.)
+- **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
+  replay (cost 128) 2 seeds in REPLAY_TIME; degraded reads (lossy 2 on
+  even seeds, else 1; cost 32) 8 seeds in 32 s; trusting bad CRCs
+  (corruption only) 4 seeds in 30 s; wrong indices (crashes and lost
+  disks) 4 seeds in 29 s. Both bugs are caught on every seed tried, with
+  "not those of version". At `SKYS3_SIM_SEEDS=2048` all passed: 64
+  seeds of degraded reads, 32 of each bug; replay passed 32 seeds at
+  4096.
+- **Hooks for M5-07, M5-08, M5-09.** Release should register fragment
+  reads where the gateway resolves a coded plan (`objects/coded.rs`) and
+  have `FragmentServer::read` check registrations, like holder reads.
+  Repair (M5-08) can reuse `read_coded`'s column decoding through
+  `EcCodec::decode_columns`, or read whole fragments through
+  `FragmentReadClient`. A move (M5-09) changes the coded layout by
+  `EC_RELOCATE`; readers holding the old plan fail on the identity check
+  and re-resolve.
+- **Left open.** The node binary does not serve fragment reads or set
+  `GatewayConfig::fragments` yet (as for M5-04's encoder). CopyObject
+  reads its source's payload from the source primary, so copying a coded
+  object fails; it should read through `read_coded`, as GET and
+  UploadPartCopy (which reads its source as a GET does) now do. There are no metrics for degraded reads yet.
+
 ### M5-10 Lifecycle expiration and multipart cleanup
 
 - **The configuration lives in the bucket register.** An optional
