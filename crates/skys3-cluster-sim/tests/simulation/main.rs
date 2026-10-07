@@ -89,6 +89,7 @@ mod backfill;
 mod backup;
 mod buckets;
 mod cache;
+mod coded_reads;
 mod coding;
 mod compaction;
 mod coordinator;

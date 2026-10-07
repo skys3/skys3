@@ -52,6 +52,10 @@
 //! simulation. Then each member's entry of each object must read back the
 //! last bytes written: from its own log, or decoded from the fragments
 //! its coded layout names, none of them reclaimed.
+//!
+//! Runs may also read the coded objects through every node's gateway
+//! while fragment holders fail ([`CodingConfig::reads`], plan M5-06):
+//! see [`ReadConfig`].
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -95,6 +99,10 @@ use skys3_types::{
 
 use crate::node::{BoxError, TRANSPORT_PORT};
 use crate::pki::Pki;
+
+mod reads;
+
+pub use reads::{ReadConfig, ReadFault, ReadReport};
 
 /// Where in an attempt the driver crashes nodes: at the first time the
 /// encoder reports the step.
@@ -220,6 +228,9 @@ pub struct CodingConfig {
     /// opens its replica as the register names it, and runs an encoder
     /// that works while it leads.
     pub takeover: bool,
+    /// Reads through the gateways once every object is coded, while
+    /// fragment holders fail (plan M5-06).
+    pub reads: Option<ReadConfig>,
 }
 
 impl Default for CodingConfig {
@@ -234,6 +245,7 @@ impl Default for CodingConfig {
             orphans: None,
             write_delay: Duration::ZERO,
             takeover: false,
+            reads: None,
         }
     }
 }
@@ -270,6 +282,8 @@ pub struct CodingReport {
     pub reclaimed: usize,
     /// The shard's epoch at the end.
     pub epoch: u64,
+    /// What the readers saw, in a run with reads.
+    pub reads: Option<ReadReport>,
 }
 
 const NODES: usize = 6;
@@ -284,16 +298,26 @@ const SUPERVISOR_DELAY: Duration = Duration::from_millis(500);
 const CUT_GRACE: Duration = Duration::from_millis(3);
 /// When a run that has not settled fails.
 const SETTLE_LIMIT: Duration = Duration::from_secs(120);
+/// How long the faults of a run with reads go on once the reads start.
+const READ_WINDOW: Duration = Duration::from_secs(4);
 
 /// One node: its disks, power, and credentials, and its current life's
 /// handles, which the driver inspects.
 struct NodeSlot {
     id: NodeId,
     log_disk: SimDisk,
-    fragment_disk: SimDisk,
+    /// Replaced by an empty disk when a run's reads lose it.
+    fragment_disk: Mutex<SimDisk>,
     power: SimPower,
     credentials: Credentials,
     view: Mutex<Option<View>>,
+}
+
+impl NodeSlot {
+    /// The node's current fragment disk.
+    fn fragment_disk(&self) -> SimDisk {
+        lock(&self.fragment_disk).clone()
+    }
 }
 
 /// What the driver reads of a running node.
@@ -325,6 +349,8 @@ struct World {
     reclaimed: Mutex<BTreeSet<(NodeId, FragmentId)>>,
     /// The attempt of every fragment whose write was acknowledged.
     fragments: Mutex<HashMap<(NodeId, FragmentId), AttemptId>>,
+    /// The reads through the gateways, in a run with reads.
+    reads: Option<reads::Reads>,
 }
 
 impl World {
@@ -334,6 +360,11 @@ impl World {
         (0..NODES)
             .filter(|&n| register.is_member(&self.nodes[n].id))
             .collect()
+    }
+
+    /// The position of `node` in the cluster.
+    fn position(&self, node: &NodeId) -> Option<usize> {
+        self.nodes.iter().position(|slot| slot.id == *node)
     }
 }
 
@@ -347,6 +378,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// The first check that fails, or a failure of the simulation.
 pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingReport, String> {
+    skys3_ec::read::seeded::seed_read_bug(config.reads.and_then(|reads| reads.bug));
     let world = Arc::new(build(context, config).map_err(|e| e.to_string())?);
     let mut sim = context
         .builder()
@@ -376,6 +408,9 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         due: Vec::new(),
         committed: 0,
         report: CodingReport::default(),
+        reading: false,
+        read_faults: Vec::new(),
+        healing: Vec::new(),
     };
     let mut next_check = CHECK_INTERVAL;
     loop {
@@ -383,10 +418,12 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
             .map_err(|e| format!("the simulation failed: {e}"))?;
         let now = sim.elapsed();
         driver.advance(&mut sim, now);
+        driver.read_faults(&mut sim, now);
         if now >= next_check {
             next_check = now + CHECK_INTERVAL;
             driver.check()?;
             match driver.settled() {
+                Ok(()) if driver.reads_pending(&mut sim, &world, now) => {}
                 Ok(()) => {
                     driver.report.settled_at = now;
                     break;
@@ -404,7 +441,7 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
     }
     for slot in &world.nodes {
         slot.log_disk.crash();
-        slot.fragment_disk.crash();
+        slot.fragment_disk().crash();
         *lock(&slot.view) = None;
         sim.crash(slot.id.as_str());
     }
@@ -424,6 +461,9 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
     drop(events);
     driver.report.reclaimed = lock(&world.reclaimed).len();
     driver.report.epoch = lock(&world.register).epoch.get();
+    if let Some(reads) = &world.reads {
+        driver.report.reads = Some(reads.report()?);
+    }
     let report = driver.report.clone();
     drop(sim);
     final_check(&world)?;
@@ -444,7 +484,7 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
             credentials: pki.node(&cluster, &id)?,
             id,
             log_disk,
-            fragment_disk,
+            fragment_disk: Mutex::new(fragment_disk),
             power,
             view: Mutex::new(None),
         }));
@@ -471,6 +511,10 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         replicas: MEMBERS as u8,
         proposal_id: ProposalId::new("p-coding")?,
     };
+    let reads = config
+        .reads
+        .map(|reads| reads::Reads::new(reads, cluster.clone(), &shard_config, context.fork_seed()))
+        .transpose()?;
     let sizes = (0..config.objects)
         .map(|_| context.rng().random_range(config.object_bytes.clone()))
         .collect();
@@ -482,6 +526,7 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         cut_off: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
         reclaimed: Mutex::default(),
         fragments: Mutex::default(),
+        reads,
         config: shard_config,
         run: config.clone(),
         sizes,
@@ -566,7 +611,7 @@ async fn open_storage(
         slot.id.clone(),
     )
     .await?;
-    let fragments = slot.fragment_disk.mount();
+    let fragments = slot.fragment_disk().mount();
     let (store, _) = match bug {
         Some(bug) => FragmentStore::open_with_bug(fragments, store_config(), bug).await?,
         None => FragmentStore::open(fragments, store_config()).await?,
@@ -578,6 +623,12 @@ async fn open_storage(
 async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     let slot = &world.nodes[index];
     *lock(&slot.view) = None;
+    if world.reads.as_ref().is_some_and(|reads| reads.takes_new_disk(index)) {
+        // The node's fragment disk was lost: it starts on an empty one.
+        let disk = SimDisk::new(world.seed ^ (index as u64) << 8 ^ slot.log_disk.crashes());
+        disk.set_power(&slot.power);
+        *lock(&slot.fragment_disk) = disk;
+    }
     let bug = world.run.store_bug.filter(|_| index != 0);
     let (storage, store) = open_storage(slot, bug).await?;
     let set = storage.shards.set().clone();
@@ -608,8 +659,17 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     let listener = transport
         .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
         .await?;
+    let forwards = match &world.reads {
+        Some(_) => Some(reads::start_gateway(world, index, &storage, &transport, &fragments).await?),
+        None => None,
+    };
     {
-        let services = (replication.clone(), fragments.clone(), orphans.clone());
+        let services = (
+            replication.clone(),
+            fragments.clone(),
+            orphans.clone(),
+            forwards,
+        );
         tokio::spawn(async move { serve(listener, services).await });
     }
     let shard = if world.run.takeover {
@@ -693,8 +753,9 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Accepts links on the node's transport port: fragment writes go to the
-/// fragment server, orphan queries to the judges, everything else to
+/// Accepts links on the node's transport port: fragment writes and reads
+/// go to the fragment server, orphan queries to the judges, requests a
+/// gateway forwards to the node's shards, and everything else to
 /// replication.
 async fn serve(
     listener: Listener<TurmoilNetwork>,
@@ -702,6 +763,7 @@ async fn serve(
         Replication<TurmoilNetwork, SimMount>,
         FragmentServer<SimMount>,
         OrphanServer<SimMount>,
+        Option<reads::Forwards>,
     ),
 ) {
     loop {
@@ -709,7 +771,7 @@ async fn serve(
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let (replication, fragments, orphans) = services.clone();
+        let (replication, fragments, orphans, forwards) = services.clone();
         tokio::spawn(async move {
             let Ok(connection) = incoming.handshake().await else {
                 return;
@@ -719,9 +781,15 @@ async fn serve(
             let Ok(Ok(Some(first))) = first else {
                 return;
             };
-            match first.header.kind {
-                MessageKind::FragmentWrite => fragments.serve((receiver, sender), first).await,
-                MessageKind::OrphanQuery => orphans.serve((receiver, sender), first).await,
+            match (first.header.kind, forwards) {
+                (MessageKind::FragmentWrite, _) => fragments.serve((receiver, sender), first).await,
+                (MessageKind::FragmentRead, _) => {
+                    fragments.serve_reads((receiver, sender), first).await;
+                }
+                (MessageKind::OrphanQuery, _) => orphans.serve((receiver, sender), first).await,
+                (MessageKind::Forward, Some(forwards)) => {
+                    forwards.serve((receiver, sender), first).await;
+                }
                 _ => replication.follow((receiver, sender), first).await,
             }
         });
@@ -916,7 +984,10 @@ fn bytes(seed: u64, n: u64, len: usize) -> Vec<u8> {
 /// and records it as the key's expected bytes.
 async fn put(world: &World, shard: &Shard<SimMount>, key: &str, data: Vec<u8>) {
     loop {
-        if let Ok(()) = try_put(shard, key, &data).await {
+        if let Ok(etag) = try_put(shard, key, &data).await {
+            if let Some(reads) = &world.reads {
+                reads.written(&etag, &data);
+            }
             lock(&world.expected).insert(key.to_owned(), data);
             return;
         }
@@ -924,7 +995,8 @@ async fn put(world: &World, shard: &Shard<SimMount>, key: &str, data: Vec<u8>) {
     }
 }
 
-async fn try_put(shard: &Shard<SimMount>, key: &str, data: &[u8]) -> Result<(), BoxError> {
+/// Writes `data` as `key` and returns its ETag once the write commits.
+async fn try_put(shard: &Shard<SimMount>, key: &str, data: &[u8]) -> Result<String, BoxError> {
     // The extents go out together, as a streamed body's do.
     let mut appends = tokio::task::JoinSet::new();
     for (n, chunk) in data.chunks(4000).enumerate() {
@@ -946,11 +1018,12 @@ async fn try_put(shard: &Shard<SimMount>, key: &str, data: &[u8]) -> Result<(), 
     let digest = data
         .iter()
         .fold(0u64, |h, b| h.rotate_left(5) ^ u64::from(*b));
+    let etag = format!("{digest:032x}");
     let body = RecordBody::Put(Put {
         key: key.to_owned(),
         size: data.len() as u64,
         last_modified_ms: now,
-        etag: ETag::new(format!("{digest:032x}"))?,
+        etag: ETag::new(etag.clone())?,
         inherited_identity: None,
         metadata: BTreeMap::new(),
         tags: BTreeMap::new(),
@@ -959,7 +1032,7 @@ async fn try_put(shard: &Shard<SimMount>, key: &str, data: &[u8]) -> Result<(), 
         data: PutData::Extents(extents),
     });
     shard.commit(body).await?;
-    Ok(())
+    Ok(etag)
 }
 
 /// The driver's state between steps.
@@ -979,6 +1052,12 @@ struct Driver<'a> {
     /// The highest commit watermark any replica has learned.
     committed: u64,
     report: CodingReport,
+    /// Whether the readers started.
+    reading: bool,
+    /// Faults of lossy nodes due at a time, during the reads.
+    read_faults: Vec<(Duration, usize, ReadFault)>,
+    /// When each node sending corrupted fragments stops.
+    healing: Vec<(Duration, usize)>,
 }
 
 impl Driver<'_> {
@@ -1111,10 +1190,10 @@ impl Driver<'_> {
         let slot = &self.world.nodes[node];
         if power_loss {
             slot.log_disk.crash();
-            slot.fragment_disk.crash();
+            slot.fragment_disk().crash();
         } else {
             slot.log_disk.kill();
-            slot.fragment_disk.kill();
+            slot.fragment_disk().kill();
         }
         *lock(&slot.view) = None;
         sim.crash(slot.id.as_str());
@@ -1294,6 +1373,8 @@ impl Driver<'_> {
             || self.isolated.iter().any(Option::is_some)
             || self.crashes.is_some()
             || !self.due.is_empty()
+            || !self.read_faults.is_empty()
+            || !self.healing.is_empty()
         {
             return Err("crashes are pending".to_owned());
         }
