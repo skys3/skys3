@@ -1,0 +1,598 @@
+//! Repair after fragment holders are lost (plan M5-08, design §8.6): once
+//! every object is coded and its replicas are dropped, one or two holders
+//! are lost, for good or by losing their fragment disk, while clients may
+//! keep reading, and the shard primary's [`Repairer`] must make every
+//! stripe whole again.
+//!
+//! Every node that may lead the shard runs a repairer whose steps the
+//! driver watches; crashes may strike the primary or a rebuilt fragment's
+//! new holder at a chosen step. On top of the coding checks, the driver
+//! checks:
+//!
+//! - **Durability.** No layout a serving primary applied names a fragment
+//!   that its node, up and on the disk the fragment was written to, no
+//!   longer holds, or whose ID now names another fragment.
+//! - **Priority.** Within each pass of each repairer, stripes are started
+//!   in order of fragments lost, most first.
+//! - **Bandwidth.** Each repairer's transfers start no sooner than the cap
+//!   allows: between the starts of two transfers of one repairer, at least
+//!   the bytes of those between them at `bytes_per_second`, give or take a
+//!   tick.
+//! - **Time.** Every stripe of every member's layout names `k + m`
+//!   fragments held by nodes that are not lost, within `bound` of the
+//!   losses: the repair time the report gives.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
+use skys3_ec::read::ReadFuture;
+use skys3_ec::repair::RepairBug;
+use skys3_ec::{
+    Attempts, FragmentReadClient, FragmentRequest, FragmentSource, RepairEvent, RepairSettings,
+    RepairStep, Repairer,
+};
+use skys3_io::{BlockingPool, SimMount};
+use skys3_net::TurmoilNetwork;
+use skys3_shard::Shard;
+
+use super::{Crash, CrashKind, CrashTarget, Driver, MEMBERS, NODES, World, Writer, lock, planner};
+
+/// How long a node lost for good stays down: past the end of any run.
+const FOREVER: Duration = Duration::from_secs(1 << 40);
+
+/// How a run loses holders and repairs them.
+#[derive(Debug, Clone)]
+pub struct RepairConfig {
+    /// The losses, each of a distinct holder: lost for good ones are drawn
+    /// from the nodes outside the shard, `n3` to `n5`, and lost disks from
+    /// `n1` to `n5`.
+    pub losses: Vec<Loss>,
+    /// A crash during the repairs, if any.
+    pub crash: Option<RepairCrash>,
+    /// `repair_bytes_per_second_per_node`.
+    pub bytes_per_second: u64,
+    /// `fragment_repair_after_seconds`.
+    pub lost_after: Duration,
+    /// How long after the losses every stripe must be whole again.
+    pub bound: Duration,
+    /// How long each rebuilt fragment's write waits once its node made it
+    /// durable, before the repairer learns its ID: what makes repairs
+    /// outlast `fragment_orphan_after_seconds`.
+    pub ack_delay: Duration,
+    /// A bug seeded into every repairer.
+    pub bug: Option<RepairBug>,
+}
+
+impl Default for RepairConfig {
+    fn default() -> Self {
+        Self {
+            losses: vec![Loss::ForGood],
+            crash: None,
+            bytes_per_second: 64 * 1024,
+            lost_after: Duration::from_secs(1),
+            bound: Duration::from_secs(15),
+            ack_delay: Duration::ZERO,
+            bug: None,
+        }
+    }
+}
+
+/// How a holder is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loss {
+    /// The node loses power and never comes back.
+    ForGood,
+    /// The node's fragment disk fails; the node restarts at once with an
+    /// empty one.
+    Disk,
+}
+
+/// Where in a stripe's repair a crash strikes: the first time a repairer
+/// reports the step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairPoint {
+    /// The repair started.
+    Started,
+    /// The rebuilt fragments were placed, and none is written yet.
+    Placed,
+    /// A rebuilt fragment is durable.
+    Written,
+    /// The `EC_RELOCATE` is sequenced, not yet committed.
+    Appended,
+    /// The `EC_RELOCATE` committed.
+    Committed,
+}
+
+impl RepairPoint {
+    /// Every point, in the order a repair reaches them.
+    pub const ALL: [RepairPoint; 5] = [
+        RepairPoint::Started,
+        RepairPoint::Placed,
+        RepairPoint::Written,
+        RepairPoint::Appended,
+        RepairPoint::Committed,
+    ];
+
+    fn reached(self, step: &RepairStep) -> bool {
+        matches!(
+            (self, step),
+            (RepairPoint::Started, RepairStep::Started { .. })
+                | (RepairPoint::Placed, RepairStep::Placed { .. })
+                | (RepairPoint::Written, RepairStep::Written { .. })
+                | (RepairPoint::Appended, RepairStep::Appended)
+                | (RepairPoint::Committed, RepairStep::Committed { .. })
+        )
+    }
+}
+
+/// Whom a crash during the repairs strikes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairTarget {
+    /// The repairing primary.
+    Primary,
+    /// The new holder of the fragment the repair placed first.
+    NewHolder,
+}
+
+/// A crash during the repairs: `kind` strikes `target` at `point`, which
+/// restarts `downtime` later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairCrash {
+    /// The step.
+    pub point: RepairPoint,
+    /// The node.
+    pub target: RepairTarget,
+    /// How.
+    pub kind: CrashKind,
+    /// How long the node stays down.
+    pub downtime: Duration,
+}
+
+/// What the repairs did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairOutcome {
+    /// The nodes lost, and how.
+    pub lost: Vec<(String, Loss)>,
+    /// `EC_RELOCATE`s that committed and were applied.
+    pub relocated: usize,
+    /// Repairs started.
+    pub started: usize,
+    /// The most fragments one repair started for.
+    pub most_lost: usize,
+    /// Bytes the repairers read and wrote.
+    pub bytes: u64,
+    /// From the losses until every stripe was whole again.
+    pub repair_time: Duration,
+}
+
+/// What the repairers did, as the driver sees it.
+#[derive(Default)]
+pub(super) struct RepairLog {
+    /// Every repair step, with the node and life of its repairer.
+    events: std::sync::Mutex<Vec<(usize, u64, RepairEvent)>>,
+    /// Every transfer's start and bytes, by the node and life of its
+    /// repairer.
+    transfers: std::sync::Mutex<BTreeMap<(usize, u64), Vec<(Duration, u64)>>>,
+}
+
+impl RepairLog {
+    /// Records a transfer of `bytes` by node `node`'s repairer of life
+    /// `life`, starting now.
+    pub(super) fn transfer(&self, node: usize, life: u64, bytes: u64) {
+        let now = turmoil::since_epoch().unwrap_or_default();
+        lock(&self.transfers)
+            .entry((node, life))
+            .or_default()
+            .push((now, bytes));
+    }
+
+    /// Whether the attempt of a repair committed and relocated.
+    pub(super) fn relocated(&self, attempt: skys3_types::AttemptId) -> bool {
+        lock(&self.events).iter().any(|(_, _, event)| {
+            event.attempt == attempt
+                && matches!(
+                    event.step,
+                    RepairStep::Committed {
+                        relocated: true,
+                        ..
+                    }
+                )
+        })
+    }
+}
+
+/// A repairer's fragment reads, counted as its transfers, but for the
+/// one-byte checks.
+struct Counted {
+    client: FragmentReadClient<TurmoilNetwork, SimMount>,
+    world: Arc<World>,
+    node: usize,
+    life: u64,
+}
+
+impl std::fmt::Debug for Counted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Counted")
+            .field("node", &self.node)
+            .field("life", &self.life)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FragmentSource for Counted {
+    fn read(&self, request: FragmentRequest) -> ReadFuture<'_> {
+        let len = request.range.end - request.range.start;
+        if len > 1 {
+            self.world.repair.transfer(self.node, self.life, len);
+        }
+        self.client.read(request)
+    }
+}
+
+/// Starts node `index`'s repairer of life `life` on its replica `shard`,
+/// sharing the node's attempt tracker `attempts`.
+pub(super) fn start(
+    world: &Arc<World>,
+    index: usize,
+    life: u64,
+    shard: Shard<SimMount>,
+    client: FragmentReadClient<TurmoilNetwork, SimMount>,
+    writer: Writer,
+    attempts: Attempts,
+) {
+    let Some(config) = &world.run.repair else {
+        return;
+    };
+    let source = Counted {
+        client,
+        world: Arc::clone(world),
+        node: index,
+        life,
+    };
+    let ec = world.run.ec.clone();
+    let settings = RepairSettings {
+        interval: Duration::from_millis(100),
+        lost_after: config.lost_after,
+        checks_per_node: 4,
+        replans: 3,
+        bytes_per_second: config.bytes_per_second,
+    };
+    let observed = Arc::clone(world);
+    let repairer = Repairer::new(
+        shard,
+        Arc::new(source),
+        Arc::new(writer),
+        Arc::new(move || planner(&ec)),
+        BlockingPool::inline("repair"),
+        settings,
+    )
+    .with_attempts(attempts)
+    .with_bug(config.bug)
+    .with_observer(Arc::new(move |event: &RepairEvent| {
+        lock(&observed.repair.events).push((index, life, event.clone()));
+    }));
+    tokio::spawn(repairer.run());
+}
+
+/// The repair phase of the driver.
+#[derive(Debug, Default)]
+pub(super) struct Phase {
+    /// When the holders were lost.
+    lost_at: Option<Duration>,
+    /// When every stripe was whole again.
+    whole_at: Option<Duration>,
+    /// The crash to strike, until it does.
+    crash: Option<RepairCrash>,
+    /// How many repair events the crash point was looked for in.
+    seen: usize,
+    /// The nodes lost, and how.
+    lost: Vec<(usize, Loss)>,
+}
+
+impl Driver<'_> {
+    /// Whether the repairs keep the run going: the first time the objects
+    /// settle it loses the holders, and the run goes on until every stripe
+    /// is whole again.
+    pub(super) fn repair_pending(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration) -> bool {
+        let Some(config) = self.world.run.repair.clone() else {
+            return false;
+        };
+        if self.repair.lost_at.is_none() {
+            self.lose_holders(sim, now, &config);
+            return true;
+        }
+        self.repair.whole_at.is_none()
+    }
+
+    /// Notes when every stripe is whole again after the losses.
+    pub(super) fn repair_progress(&mut self, now: Duration) {
+        if self.repair.lost_at.is_some() && self.repair.whole_at.is_none() && self.whole().is_ok() {
+            self.repair.whole_at = Some(now);
+        }
+    }
+
+    /// Loses the run's holders, drawn from the seed.
+    fn lose_holders(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, config: &RepairConfig) {
+        let mut rng = StdRng::seed_from_u64(self.world.seed ^ 0x5245_5041_4952);
+        let mut outside: Vec<usize> = (MEMBERS..NODES).collect();
+        let mut any: Vec<usize> = (1..NODES).collect();
+        outside.shuffle(&mut rng);
+        any.shuffle(&mut rng);
+        let mut taken = Vec::new();
+        for loss in &config.losses {
+            let pool = match loss {
+                Loss::ForGood => &outside,
+                Loss::Disk => &any,
+            };
+            let Some(&node) = pool.iter().find(|node| !taken.contains(*node)) else {
+                continue;
+            };
+            taken.push(node);
+            self.repair.lost.push((node, *loss));
+            let slot = &self.world.nodes[node];
+            match loss {
+                Loss::ForGood => {
+                    self.world.lost[node].store(true, Ordering::SeqCst);
+                    self.crash(sim, now, node, true, FOREVER);
+                }
+                Loss::Disk => {
+                    self.lose_disk(node);
+                    let down = Duration::from_millis(rng.random_range(20..300));
+                    self.crash(sim, now, node, true, down);
+                }
+            }
+            self.report
+                .crashes
+                .push((slot.id.to_string(), CrashKind::PowerLoss));
+        }
+        self.repair.lost_at = Some(now);
+        self.repair.crash = config.crash;
+        self.repair.seen = lock(&self.world.repair.events).len();
+    }
+
+    /// Strikes the repair crash once its point is reached.
+    pub(super) fn repair_crash(&mut self, now: Duration) {
+        let Some(crash) = self.repair.crash else {
+            return;
+        };
+        let events = lock(&self.world.repair.events);
+        let reached = events[self.repair.seen..]
+            .iter()
+            .find(|(_, _, event)| crash.point.reached(&event.step))
+            .cloned();
+        self.repair.seen = events.len();
+        let placed = events
+            .iter()
+            .rev()
+            .find_map(|(_, _, event)| match &event.step {
+                RepairStep::Placed { nodes } => nodes.first().map(|(_, node)| node.clone()),
+                _ => None,
+            });
+        drop(events);
+        let Some((primary, _, event)) = reached else {
+            return;
+        };
+        let node = match crash.target {
+            RepairTarget::Primary => Some(primary),
+            RepairTarget::NewHolder => placed.and_then(|node| self.world.position(&node)),
+        };
+        self.repair.crash = None;
+        let Some(node) = node.filter(|node| !self.world.lost[*node].load(Ordering::SeqCst)) else {
+            return;
+        };
+        tracing::debug!(?event, node, "the repair crash point is reached");
+        let crash = Crash {
+            delay: Duration::ZERO,
+            target: CrashTarget::Primary,
+            kind: crash.kind,
+            downtime: crash.downtime,
+        };
+        self.due.push((now, node, crash));
+    }
+
+    /// Checks that every member's layout of every object names `k + m`
+    /// fragments its nodes hold and that are not lost; or says why not.
+    fn whole(&self) -> Result<(), String> {
+        let views = self.views();
+        let shard = &self.world.shard;
+        let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
+        for member in self.world.members() {
+            let Some(view) = &views[member] else {
+                return Err(format!("member n{member} is down"));
+            };
+            let reader = view.index.read().map_err(|e| e.to_string())?;
+            for key in &keys {
+                let entry = reader.entry(shard, key).map_err(|e| e.to_string())?;
+                let Some(coded) = entry.and_then(|e| e.object).and_then(|o| o.coded) else {
+                    return Err(format!("member n{member} has not coded {key}"));
+                };
+                for stripe in &coded.stripes {
+                    for location in stripe.fragments() {
+                        let held = self.world.position(&location.node).is_some_and(|n| {
+                            !self.world.lost[n].load(Ordering::SeqCst)
+                                && views[n].as_ref().is_some_and(|view| {
+                                    view.fragments.stores()[0].len(location.fragment).is_some()
+                                })
+                        });
+                        if !held {
+                            return Err(format!(
+                                "{key} stripe {} names {} on {}, which is not held",
+                                stripe.number(),
+                                location.fragment,
+                                location.node
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that no layout a serving primary applied names a fragment
+    /// its node lost while on the disk it was written to.
+    pub(super) fn check_held(&self) -> Result<(), String> {
+        if self.world.run.repair.is_none() {
+            return Ok(());
+        }
+        let views = self.views();
+        let shard = &self.world.shard;
+        let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
+        let written = lock(&self.world.fragments);
+        let reclaimed = lock(&self.world.reclaimed);
+        for view in views.iter().flatten() {
+            let leads = view.shard.as_ref().is_some_and(|shard| {
+                matches!(
+                    shard.role(),
+                    skys3_shard::Role::Primary | skys3_shard::Role::Alone
+                ) && shard.is_serving()
+            });
+            if !leads {
+                continue;
+            }
+            let reader = view.index.read().map_err(|e| e.to_string())?;
+            for key in &keys {
+                let entry = reader.entry(shard, key).map_err(|e| e.to_string())?;
+                let Some(coded) = entry.and_then(|e| e.object).and_then(|o| o.coded) else {
+                    continue;
+                };
+                for stripe in &coded.stripes {
+                    for (index, location) in stripe.fragments().iter().enumerate() {
+                        let fragment = (location.node.clone(), location.fragment);
+                        let Some(n) = self.world.position(&location.node) else {
+                            continue;
+                        };
+                        let Some(record) = written.get(&fragment) else {
+                            continue;
+                        };
+                        let node_view = match &views[n] {
+                            Some(view) if !reclaimed.contains(&fragment) => view,
+                            _ => continue,
+                        };
+                        if record.generation != self.world.generation[n].load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        let named = (key.as_str(), stripe.number(), index);
+                        let holds = node_view.fragments.stores()[0]
+                            .len(location.fragment)
+                            .is_some();
+                        if !holds || record.identity() != named {
+                            return Err(format!(
+                                "the committed layout of {key} names fragment {} of stripe {} \
+                                 on {}, which lost it",
+                                location.fragment,
+                                stripe.number(),
+                                location.node
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The outcome of the repairs, once every stripe is whole again within
+    /// the bound, after checking the order and the pace of the repairs.
+    pub(super) fn repair_outcome(&self) -> Result<Option<RepairOutcome>, String> {
+        let Some(config) = &self.world.run.repair else {
+            return Ok(None);
+        };
+        let (Some(lost_at), Some(whole_at)) = (self.repair.lost_at, self.repair.whole_at) else {
+            return Err("the repairs did not end".to_owned());
+        };
+        let repair_time = whole_at - lost_at;
+        if repair_time > config.bound {
+            return Err(format!(
+                "the stripes were whole again {repair_time:?} after the losses, past {:?}",
+                config.bound
+            ));
+        }
+        let events = lock(&self.world.repair.events);
+        let mut outcome = RepairOutcome {
+            lost: self
+                .repair
+                .lost
+                .iter()
+                .map(|(node, loss)| (self.world.nodes[*node].id.to_string(), *loss))
+                .collect(),
+            repair_time,
+            ..RepairOutcome::default()
+        };
+        // Within a pass, stripes that lost more fragments start first.
+        let mut last: BTreeMap<(usize, u64, u64), (usize, String)> = BTreeMap::new();
+        for (node, life, event) in events.iter() {
+            match &event.step {
+                RepairStep::Started { pass, lost } => {
+                    outcome.started += 1;
+                    outcome.most_lost = outcome.most_lost.max(lost.len());
+                    let what = format!("{} stripe {}", event.key, event.stripe);
+                    if let Some((before, earlier)) = last.get(&(*node, *life, *pass))
+                        && *before < lost.len()
+                    {
+                        return Err(format!(
+                            "n{node} repaired {earlier}, which lost {before} fragments, before \
+                             {what}, which lost {}",
+                            lost.len()
+                        ));
+                    }
+                    last.insert((*node, *life, *pass), (lost.len(), what));
+                }
+                RepairStep::Committed {
+                    relocated: true, ..
+                } => outcome.relocated += 1,
+                _ => {}
+            }
+        }
+        drop(events);
+        // Each repairer's transfers keep to the cap: between the starts of
+        // two transfers, at least the bytes of those started before the
+        // second at the cap, give or take a tick.
+        let transfers = lock(&self.world.repair.transfers);
+        let rate = u128::from(config.bytes_per_second.max(1));
+        let tick = Duration::from_millis(2);
+        for ((node, _), starts) in transfers.iter() {
+            for (i, &(from, _)) in starts.iter().enumerate() {
+                let mut bytes: u64 = 0;
+                for j in i + 1..starts.len() {
+                    bytes += starts[j - 1].1;
+                    let nanos = u128::from(bytes) * 1_000_000_000 / rate;
+                    let least = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+                    let at = starts[j].0;
+                    if at + tick < from + least {
+                        return Err(format!(
+                            "n{node}'s repairs started {bytes} bytes of transfers within {:?},                              past the bandwidth cap of {} bytes a second",
+                            at - from,
+                            config.bytes_per_second
+                        ));
+                    }
+                }
+            }
+            outcome.bytes += starts.iter().map(|(_, len)| len).sum::<u64>();
+        }
+        Ok(Some(outcome))
+    }
+}
+
+/// Whether node `node` is known to hold nothing of what it held before
+/// it went down: lost for good, or restarting on a new fragment disk.
+pub(super) fn holds_nothing(world: &World, node: usize) -> bool {
+    world.lost[node].load(Ordering::SeqCst) || world.disk_gone[node].load(Ordering::SeqCst)
+}
+
+impl Driver<'_> {
+    /// Fails node `node`'s fragment disk under it; it starts on an empty
+    /// one at its next life.
+    pub(super) fn lose_disk(&mut self, node: usize) {
+        let slot = &self.world.nodes[node];
+        slot.fragment_disk().crash();
+        self.world.lose_disk[node].store(true, Ordering::SeqCst);
+        self.world.disk_gone[node].store(true, Ordering::SeqCst);
+        self.world.generation[node].fetch_add(1, Ordering::SeqCst);
+    }
+}

@@ -129,8 +129,6 @@ pub(super) struct Reads {
     versions: Mutex<BTreeMap<String, Vec<u8>>>,
     /// Whether each node's fragment bytes arrive corrupted.
     corrupt: Vec<AtomicBool>,
-    /// Whether each node's fragment disk is to be replaced when it starts.
-    lose_disk: Vec<AtomicBool>,
     clients_done: AtomicU64,
     parity_reads: AtomicU64,
     failed_fragment_reads: AtomicU64,
@@ -158,7 +156,6 @@ impl Reads {
             store,
             versions: Mutex::default(),
             corrupt: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
-            lose_disk: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
             clients_done: AtomicU64::new(0),
             parity_reads: AtomicU64::new(0),
             failed_fragment_reads: AtomicU64::new(0),
@@ -170,12 +167,6 @@ impl Reads {
     /// Records the bytes of a version written.
     pub(super) fn written(&self, etag: &str, data: &[u8]) {
         lock(&self.versions).insert(etag.to_owned(), data.to_vec());
-    }
-
-    /// Whether node `index` is to start with an empty fragment disk, which
-    /// it takes once.
-    pub(super) fn takes_new_disk(&self, index: usize) -> bool {
-        self.lose_disk[index].swap(false, Ordering::SeqCst)
     }
 
     /// Whether every client is done.
@@ -414,8 +405,7 @@ impl Driver<'_> {
                     // The disk fails under the running node, which reads
                     // its fragments as damaged until it restarts on a new
                     // one.
-                    slot.fragment_disk().crash();
-                    reads.lose_disk[node].store(true, Ordering::SeqCst);
+                    self.lose_disk(node);
                     self.read_faults.push((
                         now + down,
                         node,
@@ -472,7 +462,13 @@ async fn reader(world: &World, n: usize) {
         .collect();
     for i in 0..reads.config.gets {
         let (key, size) = keys[rng.random_range(0..keys.len())].clone();
-        let host = format!("n{}", rng.random_range(0..NODES));
+        // A client never picks a node lost for good: no gateway answers
+        // there.
+        let mut host = rng.random_range(0..NODES);
+        while world.lost[host].load(Ordering::SeqCst) {
+            host = rng.random_range(0..NODES);
+        }
+        let host = format!("n{host}");
         let range = match rng.random_range(0..8) {
             0 => {
                 // The copy keeps the source's ETag, so its bytes are
