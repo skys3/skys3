@@ -493,3 +493,35 @@ impl<D: Disk> AdminApi for NodeAdmin<D> {
         Box::pin(self.route(method, path))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policies_round_trip_through_their_names() {
+        for policy in [
+            ConflictPolicy::Hold,
+            ConflictPolicy::Overwrite,
+            ConflictPolicy::DiscardLocal,
+        ] {
+            assert_eq!(parse_policy(policy_name(policy)), Some(policy));
+        }
+        assert_eq!(parse_policy("discard-local"), None);
+        assert_eq!(parse_policy(""), None);
+    }
+
+    #[test]
+    fn keys_are_percent_decoded() {
+        assert_eq!(percent_decode("a/b c").as_deref(), Some("a/b c"));
+        assert_eq!(
+            percent_decode("b%20key%2F%c3%a9").as_deref(),
+            Some("b key/\u{e9}")
+        );
+        assert_eq!(percent_decode("100%"), None);
+        assert_eq!(percent_decode("%2"), None);
+        assert_eq!(percent_decode("%zz"), None);
+        assert_eq!(percent_decode("%+1"), None);
+        assert_eq!(percent_decode("%ff"), None);
+    }
+}
