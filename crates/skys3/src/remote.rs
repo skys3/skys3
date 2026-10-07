@@ -16,8 +16,18 @@ use skys3_io::Disk;
 use skys3_remote::ObjectStore;
 use skys3_types::{BucketId, ETag};
 
-/// [`RemoteReads`] over a node's flush service.
-pub(crate) struct NodeRemote<S, D>(pub(crate) Arc<FlushService<S, D>>);
+/// [`RemoteReads`] over a node's flush service: the gateway's reads of
+/// `write_back` targets and `read_only` origins, as the node binary makes
+/// them. Simulations build theirs from it too.
+pub struct NodeRemote<S, D>(Arc<FlushService<S, D>>);
+
+impl<S, D> NodeRemote<S, D> {
+    /// The reads of the targets and origins `flush` follows.
+    #[must_use]
+    pub fn new(flush: Arc<FlushService<S, D>>) -> Self {
+        Self(flush)
+    }
+}
 
 impl<S, D> fmt::Debug for NodeRemote<S, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

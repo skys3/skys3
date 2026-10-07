@@ -40,6 +40,7 @@ use crate::node::{
     self, BoxError, ControlHandle, INDEX_FILE, LocalServices, NodeServices, NodeSettings, NodeSlot,
     Shared, TRANSPORT_PORT,
 };
+use crate::origin::{self, Origin, OriginAudit, OriginLog, OriginRoutes};
 use crate::pki::Pki;
 use crate::replication::register;
 use crate::snapshots::{self, Drill, SnapshotAudit, Snapshots};
@@ -141,6 +142,12 @@ pub struct ClusterConfig {
     /// the lost-key reports built from them ([`Snapshots`]). `None` by
     /// default.
     pub snapshots: Option<Snapshots>,
+    /// Two `read_only` buckets over an origin in the remote store, beside
+    /// the others, with an out-of-band writer, readers through every node,
+    /// and the audit of every read against the origin's history
+    /// ([`Origin`]). `None` by default. Nodes then read origins through
+    /// the node binary's own reads, and need a clean cache for fills.
+    pub origin: Option<Origin>,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -214,6 +221,7 @@ impl Default for ClusterConfig {
             lifecycle: None,
             backup: Backup::Off,
             snapshots: None,
+            origin: None,
         }
     }
 }
@@ -313,6 +321,9 @@ pub struct Report {
     pub lifecycle: LifecycleAudit,
     /// What the restore drill found ([`ClusterConfig::snapshots`]).
     pub snapshots: SnapshotAudit,
+    /// What the audit of the reads of `read_only` buckets found
+    /// ([`ClusterConfig::origin`]).
+    pub origin: OriginAudit,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -702,7 +713,44 @@ impl<S: NodeServices> Cluster<S> {
             let client = lifecycle::client(lifecycle.clone(), routes.clone(), workload.timeout);
             sim.client("lifecycle", client);
         }
+        let origin_log = self.config.origin.as_ref().map(|origin| {
+            let log = Arc::new(OriginLog::default());
+            let origin_routes = OriginRoutes {
+                buckets: world.origin_buckets.clone(),
+                placement: Arc::clone(&routes.placement),
+                nodes: routes.nodes.clone(),
+            };
+            let (remote, seed) = (world.remote.clone(), context.fork_seed());
+            sim.client(
+                "origin-writer",
+                origin::write(origin.clone(), remote.clone(), Arc::clone(&log), seed),
+            );
+            let stager = origin::stage(
+                origin.clone(),
+                remote,
+                origin_routes.clone(),
+                Arc::clone(&log),
+                context.fork_seed(),
+            );
+            sim.client("origin-stager", stager);
+            for reader in 0..origin.readers {
+                let client = origin::read(
+                    origin.clone(),
+                    origin_routes.clone(),
+                    Arc::clone(&log),
+                    context.fork_seed(),
+                );
+                sim.client(format!("origin-reader-{reader}"), client);
+            }
+            log
+        });
         self.drive(&mut sim, &mut driver, &history, false)?;
+        let origin_audit = match (&self.config.origin, &origin_log) {
+            (Some(origin), Some(log)) => {
+                origin::audit(origin, log).map_err(RunError::Simulation)?
+            }
+            _ => OriginAudit::default(),
+        };
         if let Some(drill) = &mut driver.drill {
             drill.finish(sim.since_epoch(), &history, &world.remote);
         }
@@ -834,6 +882,7 @@ impl<S: NodeServices> Cluster<S> {
             lifecycle,
             backed_up,
             backups_drained: drained.load(Ordering::SeqCst),
+            origin: origin_audit,
         })
     }
 
@@ -944,6 +993,9 @@ struct World<S> {
     base_control: SimS3Faults,
     rates: FaultRates,
     remote: SimS3,
+    /// The `read_only` buckets of [`ClusterConfig::origin`], which the
+    /// workload's clients leave alone.
+    origin_buckets: Vec<BucketDocument>,
 }
 
 impl<S: NodeServices> World<S> {
@@ -978,6 +1030,10 @@ impl<S: NodeServices> World<S> {
         // Nodes that join later hold nothing at first.
         let initial = &node_ids[..config.nodes.saturating_sub(config.joining).max(1)];
         let (buckets, mut placement) = registers(config, initial, &mut ids)?;
+        let (origin_buckets, workload_buckets): (Vec<_>, Vec<_>) = buckets
+            .iter()
+            .cloned()
+            .partition(|bucket| bucket.mode == BucketMode::ReadOnly);
         if config.create_buckets {
             // The gateways create the buckets, and their placement.
             placement.clear();
@@ -1039,7 +1095,7 @@ impl<S: NodeServices> World<S> {
                 flushers: Arc::default(),
             }),
             routes: Routes {
-                buckets,
+                buckets: workload_buckets,
                 placement,
                 // Clients and the bucket creator address only the nodes in
                 // the cluster from the start: one that joins later is down
@@ -1051,6 +1107,7 @@ impl<S: NodeServices> World<S> {
             registers: store,
             rates: config.control_rates,
             remote,
+            origin_buckets,
         })
     }
 
@@ -1443,11 +1500,16 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         let backups = shape
             .backup
             .tables(local.iter().map(String::as_str), gateway);
+        let origin = shape
+            .origin
+            .as_ref()
+            .map(Origin::tables)
+            .unwrap_or_default();
         Ok(format!(
             "[cluster]\ncluster_id = \"{cluster}\"\n\
              [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n\
              [flush]\nack_policy = \"{ack_policy}\"\n\
-             {defaults}{snapshot_defaults}{backups}{snapshot_tables}"
+             {defaults}{snapshot_defaults}{backups}{snapshot_tables}{origin}"
         )
         .parse()?)
     };
@@ -1509,6 +1571,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         buckets: config.buckets().clone(),
         evict_local: shape.backup.evicts_local(),
         snapshots: shape.snapshots.is_some(),
+        origin: shape.origin.clone(),
     })
 }
 
@@ -1525,9 +1588,26 @@ fn registers(
     let mut buckets = Vec::new();
     let mut placement = BTreeMap::new();
     let local_buckets = config.buckets.saturating_sub(config.write_back_buckets);
-    for b in 0..config.buckets {
-        let name = BucketName::new(format!("bucket-{b}"))?;
-        let (mode, target) = if b < local_buckets {
+    // The `read_only` buckets of an origin come last.
+    let origins = if config.origin.is_some() {
+        [origin::FULL, origin::GUEST].as_slice()
+    } else {
+        &[]
+    };
+    for b in 0..config.buckets + origins.len() {
+        let name = match origins.get(b.wrapping_sub(config.buckets)) {
+            Some(credentials) if b >= config.buckets => format!("origin-{credentials}"),
+            _ => format!("bucket-{b}"),
+        };
+        let name = BucketName::new(name)?;
+        let (mode, target) = if b >= config.buckets {
+            let target = RemoteTarget {
+                endpoint: "https://remote.sim.internal".to_owned(),
+                bucket: "remote".to_owned(),
+                prefix: Some(origin::ORIGIN_PREFIX.to_owned()),
+            };
+            (BucketMode::ReadOnly, Some(target))
+        } else if b < local_buckets {
             (BucketMode::Local, None)
         } else {
             let target = RemoteTarget {

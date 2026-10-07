@@ -1065,7 +1065,7 @@ impl Node {
             flush: Arc::clone(&flush),
             space: Arc::clone(&space),
         }));
-        gateway_config.remote = Some(Arc::new(NodeRemote(Arc::clone(&flush))));
+        gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
         gateway_config.hot_cache = HotCache::with_metrics(
             config.cache().hot_cache_bytes_per_node,
             HotCacheMetrics::register(&metrics.registry),
