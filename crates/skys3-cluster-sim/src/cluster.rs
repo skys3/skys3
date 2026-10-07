@@ -1331,6 +1331,7 @@ fn registers(
             clean_copies: config.clean_copies,
             target,
             created_unix_ms: 0,
+            lifecycle: None,
             proposal_id: ids.next_id(),
         };
         for shard in ShardRef::all(&bucket) {

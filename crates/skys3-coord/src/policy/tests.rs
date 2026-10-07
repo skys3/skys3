@@ -54,6 +54,7 @@ fn bucket(b: usize, shards: u32, replicas: u8) -> BucketDocument {
         clean_copies: 0,
         target: None,
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new(format!("p-b{b}")).unwrap(),
     }
 }

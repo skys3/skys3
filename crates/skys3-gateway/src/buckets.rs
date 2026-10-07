@@ -4,9 +4,10 @@
 //! Bucket registers live in the control store, keyed by S3 name
 //! (`buckets/<name>.json`). The gateway answers HeadBucket, ListBuckets,
 //! and GetBucketLocation from its local copy, so those requests never
-//! touch the control store (§6.2). CreateBucket and DeleteBucket write the
-//! register, then increment the generation in `cluster.json`, which
-//! announces the change to every node.
+//! touch the control store (§6.2). CreateBucket, DeleteBucket, and the
+//! lifecycle operations (`crate::lifecycle`) write the register, then
+//! increment the generation in `cluster.json`, which announces the change
+//! to every node.
 //!
 //! **Creation.** A request picks a bucket's mode with the
 //! [`MODE_HEADER`] header, defaulting to the `mode` of the bucket's
@@ -54,6 +55,7 @@ use skys3_control::{
 };
 use skys3_coord::{Creation, CreationError, Pending, create_bucket, settle};
 use skys3_io::BlockingPool;
+use skys3_types::lifecycle::LifecycleConfiguration;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
 use crate::admission::{Admission, AdmitAll};
@@ -268,6 +270,10 @@ impl IdSource {
 /// recovery reclaims them if the register is gone.
 const MAX_PENDING_DELETIONS: usize = 256;
 
+/// How many times a lifecycle change reads the bucket register and swaps
+/// it before it gives up on a register that keeps changing.
+const LIFECYCLE_ATTEMPTS: usize = 3;
+
 /// The longest pause between two attempts at an announcement still owed.
 const OWED_MAX_PAUSE: Duration = Duration::from_secs(30);
 
@@ -444,6 +450,7 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             clean_copies: settings.replication.clean_copies,
             target,
             created_unix_ms: unix_ms(SystemTime::now()),
+            lifecycle: None,
             proposal_id,
         };
         if let ShardPlacement::Cluster(level) = self.config.placement {
@@ -631,6 +638,67 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 Err(control_error(&error))
             }
         }
+    }
+
+    /// Sets the lifecycle configuration of the bucket `name`, or removes it
+    /// with `None` (design §8.7): a compare-and-swap of the bucket's
+    /// register, announced to every node like any bucket change. A swap
+    /// that loses to another change of the register is tried again from a
+    /// fresh read, up to [`LIFECYCLE_ATTEMPTS`] times.
+    ///
+    /// # Errors
+    ///
+    /// `404 NoSuchBucket`; `501 NotImplemented` for a configuration of a
+    /// bucket that is not `local`; `409 OperationAborted` once the attempts
+    /// are used up; and `503` if the control store does not answer.
+    pub(crate) async fn set_lifecycle(
+        &self,
+        name: &BucketName,
+        lifecycle: Option<LifecycleConfiguration>,
+    ) -> Result<(), S3Error> {
+        let key = TypedKey::bucket(name);
+        let retry = &self.config.retry;
+        for _ in 0..LIFECYCLE_ATTEMPTS {
+            let current = read_with_retries(&self.store, &key, retry)
+                .await
+                .map_err(|error| control_error(&error))?;
+            let Some(current) = current else {
+                self.remember(name, None);
+                return Err(no_such_bucket());
+            };
+            if lifecycle.is_some() && current.value.mode != BucketMode::Local {
+                return Err(s3_error!(
+                    NotImplemented,
+                    "Lifecycle configurations are supported on local buckets only; a {} \
+                     bucket's objects follow its remote target's lifecycle rules",
+                    current.value.mode
+                ));
+            }
+            if current.value.lifecycle == lifecycle {
+                self.remember(name, Some(current.value));
+                return Ok(());
+            }
+            let bucket = BucketDocument {
+                lifecycle: lifecycle.clone(),
+                proposal_id: lock(&self.ids).proposal_id(),
+                ..current.value
+            };
+            let expected = Expected::Version(current.version);
+            match propose_document(&self.store, &key, expected, &bucket, retry).await {
+                Ok(ProposalOutcome::Accepted(_)) => {
+                    self.remember(name, Some(bucket));
+                    self.announce().await;
+                    return Ok(());
+                }
+                Ok(ProposalOutcome::Rejected) => {}
+                Err(error) => return Err(control_error(&error)),
+            }
+        }
+        Err(s3_error!(
+            OperationAborted,
+            "A conflicting conditional operation is currently in progress against this \
+             resource. Please try again."
+        ))
     }
 
     /// Drops a deleted bucket's shards and announces the deletion.
@@ -870,6 +938,7 @@ mod tests {
                 clean_copies: 0,
                 target: None,
                 created_unix_ms: 0,
+                lifecycle: None,
                 proposal_id: "p".parse().unwrap(),
             },
             version: Version::new("1"),
