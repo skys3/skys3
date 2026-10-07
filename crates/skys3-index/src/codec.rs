@@ -57,21 +57,21 @@ use std::fmt;
 
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, MAX_EXTENTS,
-    MAX_KEY_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
-    MAX_STRIPES, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_UPLOAD_ID_LEN, MAX_VERSION_ID_LEN, Metadata, ShardRef, TagSet,
-    UploadChecksum,
+    MAX_KEY_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_STRIPES,
+    MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_UPLOAD_ID_LEN, MAX_VERSION_ID_LEN, Metadata,
+    ShardRef, TagSet, UploadChecksum,
 };
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::limits::MAX_PARTS;
 use skys3_types::{
-    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId,
-    FragmentLocation, Generation, Geometry, Label, NodeId, RegisterDocument, Seq, ShardConfig,
-    ShardId, VersionIdentity,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Generation, Geometry, Label, NodeId, RegisterDocument, Seq, ShardConfig, ShardId,
+    VersionIdentity,
 };
 
 use crate::entry::{
-    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
-    RemotePart, RemoteUpload, Upload,
+    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part,
+    Payload, RemotePart, RemoteUpload, Upload,
 };
 use crate::import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 
@@ -1156,7 +1156,10 @@ fn write_coded(w: &mut Writer, coded: &Coded, size: u64) -> Result<()> {
         }
     }
     if offset != size {
-        return Err(CodecError::new("object.coded", "stripes do not cover the object"));
+        return Err(CodecError::new(
+            "object.coded",
+            "stripes do not cover the object",
+        ));
     }
     Ok(())
 }
@@ -1248,8 +1251,8 @@ pub fn decode_fragment_key(bytes: &[u8]) -> Result<FragmentKey> {
     let mut r = Reader(bytes, VALUE_FORMAT);
     let shard = r.shard(field)?;
     let len = r.len8(field, NodeId::MAX_LEN)?;
-    let node =
-        NodeId::new(Reader::text(field, r.take(field, len)?)?).map_err(|e| CodecError::new(field, e))?;
+    let node = NodeId::new(Reader::text(field, r.take(field, len)?)?)
+        .map_err(|e| CodecError::new(field, e))?;
     let Some(key_len) = r.0.len().checked_sub(FRAGMENT_KEY_SUFFIX_LEN) else {
         return Err(CodecError::new(field, "truncated"));
     };

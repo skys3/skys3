@@ -15,9 +15,8 @@ use skys3_log::record::{
     TagSet, Tags, UploadBegin, UploadChecksum,
 };
 use skys3_types::{
-    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId,
-    FragmentLocation, Geometry, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
-    VersionIdentity,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Geometry, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId, VersionIdentity,
 };
 
 /// A lowercase DNS-label identifier of 1 to `max` bytes.

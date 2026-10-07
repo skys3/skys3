@@ -12,14 +12,14 @@
 //! before it, so they take no bytes.
 
 use skys3_types::{
-    AttemptId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
-    Geometry, NodeId,
+    AttemptId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation, Geometry,
+    NodeId,
 };
 
+use super::MAX_KEY_LEN;
 use super::body::{check_precedes, invalid, read_etag, write_etag};
 use super::error::{FieldError, Problem};
 use super::wire::{Reader, Writer};
-use super::MAX_KEY_LEN;
 
 /// The most stripes an `EC_PUBLISH` lists. The 2 MiB header bound binds
 /// first for all but the narrowest stripes: an object that needs more than
@@ -147,8 +147,8 @@ fn write_stripe(w: &mut Writer<'_>, stripe: &CodedStripe) -> Result<(), FieldErr
 fn read_stripe(r: &mut Reader<'_>, number: u32, offset: u64) -> Result<CodedStripe, FieldError> {
     let data_len = r.u64("ec_publish.data_len")?;
     let (k, m) = (r.u8("ec_publish.geometry")?, r.u8("ec_publish.geometry")?);
-    let geometry = Geometry::new(k.into(), m.into())
-        .map_err(|error| invalid("ec_publish.geometry", error))?;
+    let geometry =
+        Geometry::new(k.into(), m.into()).map_err(|error| invalid("ec_publish.geometry", error))?;
     let codec = CodecId::new(r.u16("ec_publish.codec")?);
     if codec.get() == 0 {
         return Err(invalid("ec_publish.codec", "codec ID 0 is never assigned"));

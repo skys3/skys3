@@ -7,8 +7,8 @@ use proptest::option;
 use proptest::prelude::*;
 use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 use skys3_index::{
-    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges, ObjectPart,
-    ObjectVersion, Part, Payload, RemotePart, RemoteUpload, Upload,
+    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges,
+    ObjectPart, ObjectVersion, Part, Payload, RemotePart, RemoteUpload, Upload,
 };
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, ShardRef,
@@ -16,8 +16,8 @@ use skys3_log::record::{
 };
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::{
-    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId,
-    FragmentLocation, Generation, Geometry, Label, NodeId, Seq, ShardId, VersionIdentity,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Generation, Geometry, Label, NodeId, Seq, ShardId, VersionIdentity,
 };
 
 fn position() -> impl Strategy<Value = EpochSeq> {
@@ -98,15 +98,14 @@ fn node() -> impl Strategy<Value = NodeId> {
 /// A coded layout with one to three stripes of up to 3+2, and the object
 /// size its stripes cover.
 fn coded() -> impl Strategy<Value = (Coded, u64)> {
-    let stripe = (1..=u64::from(u32::MAX), 1..=3_usize, 1..=2_usize).prop_flat_map(
-        |(len, k, m)| {
+    let stripe =
+        (1..=u64::from(u32::MAX), 1..=3_usize, 1..=2_usize).prop_flat_map(|(len, k, m)| {
             (
                 Just((len, Geometry::new(k, m).unwrap())),
                 proptest::collection::btree_set(node(), k + m),
                 vec(any::<u128>(), k + m),
             )
-        },
-    );
+        });
     (position(), (any::<u64>(), any::<u64>()), vec(stripe, 1..4)).prop_map(
         |(publish, (epoch, number), stripes)| {
             let mut offset = 0;
@@ -122,9 +121,15 @@ fn coded() -> impl Strategy<Value = (Coded, u64)> {
                             fragment: FragmentId::new(id),
                         })
                         .collect();
-                    let stripe =
-                        CodedStripe::new(number, offset, len, geometry, CodecId::CURRENT, fragments)
-                            .unwrap();
+                    let stripe = CodedStripe::new(
+                        number,
+                        offset,
+                        len,
+                        geometry,
+                        CodecId::CURRENT,
+                        fragments,
+                    )
+                    .unwrap();
                     offset = stripe.end();
                     stripe
                 })

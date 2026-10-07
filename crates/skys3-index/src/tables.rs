@@ -960,8 +960,8 @@ impl IndexReader {
         let mut rows = Vec::new();
         for row in self.fragments.range(prefix.as_slice()..end.as_slice())? {
             let (key, value) = row?;
-            let key = codec::decode_fragment_key(key.value())
-                .map_err(IndexError::codec("fragments"))?;
+            let key =
+                codec::decode_fragment_key(key.value()).map_err(IndexError::codec("fragments"))?;
             let fragment =
                 codec::decode_fragment(value.value()).map_err(IndexError::codec("fragments"))?;
             rows.push((key, fragment));

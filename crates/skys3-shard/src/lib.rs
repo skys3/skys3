@@ -94,10 +94,10 @@ pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
 pub use reads::{ReadCounts, ReadId, ReadPlan, ReadSettings, Reads, Registered};
+#[doc(hidden)]
+pub use seeded::SeededBug;
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub use seeded::seed_bug;
-#[doc(hidden)]
-pub use seeded::SeededBug;
 pub use set::ShardSet;
 pub use shard::{Change, Committed, Role, Shard, ShardSummary, StreamedBody};
