@@ -6162,3 +6162,120 @@ of this file. A task with nothing unexpected keeps "None."
   (M5-08) and moves (M5-09) need placement around fragments a stripe
   keeps; `choose_nodes` is the place to add kept fragments to the
   per-domain counts.
+
+### M5-04 Encoder and EC_PUBLISH
+
+- **No new log version; index format 9.** `EC_PUBLISH` was reserved kind
+  14, so defining its body (`skys3_log::record::EcPublish`) keeps log
+  version 2: the key, the version's position and ETag, the attempt, the
+  size, and per stripe its length, `k`, `m`, codec, and each fragment's
+  node and ID. The index moves from format 8 to 9 for two tables,
+  `fragments` (the per-shard index from node to fragments, keyed by
+  shard, node, key, stripe, and index) and `attempts`, and its values
+  from format 3 to 4 for the entry's coded layout (`ObjectVersion::coded`:
+  the `EC_PUBLISH` position, the attempt, the stripes). Both recorded in
+  §10.1 and §10.2.
+- **What supersedes a publish.** Applying `EC_PUBLISH` codes the version
+  only if the entry still has its position, ETag, and size and is not
+  coded; otherwise it is rejected (`Rejection::Superseded`,
+  `AlreadyCoded`, `NoEntry`, `Deleted`). `TAGS` moves `Entry::version`,
+  so tags changed during an attempt supersede it, which is conservative;
+  `TAGS` after a publish keeps the layout. `PUT`, `DELETE`, `ADOPT`, and
+  `MPU_COMPLETE` replace the layout and remove its `fragments` rows.
+- **Members drop replicas through compaction, gated on the commit.** A
+  coded version's payload is `Holder::Coded` in the index. Compaction
+  treats it as unreferenced only once the replica's commit watermark
+  (`Shard::replicated_through`) covers the `EC_PUBLISH`, or the replica is
+  alone, and then waits the release delay as for any unreferenced
+  payload. The gate is needed because replay applies a log's uncommitted
+  tail: a member that restarts holding an uncommitted `EC_PUBLISH` codes
+  the entry, and a takeover could still truncate the record.
+- **Fragment writes use the cluster transport, not the forwarding wire
+  op.** Two message kinds in the replication class, `FragmentWrite` (7)
+  and `FragmentWritten` (8), so mutual TLS names both ends and an admin
+  certificate cannot write fragments. A write is the encoded
+  `FragmentHeader` (`to_bytes`/`from_bytes`, new) and the fragment in
+  frames of at most 8 MiB, under the transport's 32 MiB payload limit;
+  the first frame's body carries both lengths and the fragment's CRC32C,
+  and the receiver checks the lengths before it buffers anything. The
+  receiver keeps the fragment in its store holding the fewest bytes and
+  answers once it is durable. One connection per write, the answer read
+  while frames go out so an early refusal never stalls both ends, and a
+  node writes its own fragments without a connection.
+- **Attempt numbers are reserved durably.** `Index::reserve_attempts`
+  hands out blocks of 64 per shard in one durable commit and never goes
+  back, so a primary that restarts in the same epoch never reuses a
+  number. The encoder's `Attempts` tracks each attempt as writing, then
+  publishing, until its record commits: `Attempts::abandon` succeeds only
+  while it writes, which is the fence M5-05 needs, and an attempt whose
+  commit was not confirmed stays publishing until the primary applies the
+  record.
+- **The encoder lives in `skys3-ec`** and now depends on `skys3-shard`,
+  `skys3-coord`, `skys3-index`, and `skys3-net`. It reads the object from
+  the primary's replica (`Shard::plan`, `Shard::payload`), plans each
+  stripe with `FragmentPlanner`, writes the fragments in parallel through
+  the `FragmentWriter` trait, re-plans a stripe without nodes whose writes
+  failed (three times), and commits `EC_PUBLISH` on a task of its own so
+  it is appended even if the encoder is dropped. An `EncodeObserver` sees
+  each step; the simulation crashes nodes at them.
+- **Stripe size bound.** Configuration validation now rejects an
+  `ec_stripe_data_bytes` whose fragments in the narrowest geometry
+  (`k = min_eligible_nodes − m`, clamped as `GeometryPolicy::narrowest`
+  does) would exceed the fragment store's 256 MiB: at
+  `[buckets.defaults]` and at each bucket whose table changes the stripe
+  size. With the defaults the limit is 768 MiB. `skys3_config` exports
+  `MAX_FRAGMENT_BYTES`, which the encoder asserts equals
+  `MAX_FRAGMENT_LEN`.
+- **The simulation has its own harness.** `Cluster::run` reads objects
+  back through `GET` and checks survivors by replicated payload, neither
+  of which understands a coded object until M5-06, so
+  `skys3_cluster_sim::coding` runs six real nodes itself: one shard with
+  members n0 to n2 under a static configuration, a fragment store and a
+  fragment server on every node, checkpoints, and compaction with a
+  300 ms release delay. Every 10 ms it checks that each object is
+  readable from a member's replica or from `k` listed fragments of each
+  stripe of a coded layout (nodes that are down count as holding what
+  they held), and that no member dropped a coded version's bytes before
+  some replica learned a watermark past its `EC_PUBLISH`. Once every
+  object is coded and its replicas dropped, every node loses power and
+  is recovered outside the simulation, and each member's entry must read
+  back the last bytes written, from its log or decoded from fragments
+  whose headers name that version, stripe, and index.
+- **Crashes and seeded bugs.** The crash scenario covers, each seed,
+  every step (a stripe's start, two fragments durable, a stripe's end,
+  the last stripe's start, `EC_PUBLISH` sequenced, and committed) against
+  every target (the primary, either member, one holder outside the shard,
+  every holder of the stripe but the primary), with a kill, a power loss,
+  or a power cut at the next sync drawn per run. A host whose disks lost
+  power at a sync stops 3 ms later, so what it sent before the sync still
+  leaves. Each seeded bug is first run clean and must pass: a fragment
+  store that acknowledges before its sync (holders of the last stripe
+  cut at their next sync) is caught by the read-back, since the lost
+  fragments' IDs are reused for later fragments; members dropping
+  replicas on an uncommitted `EC_PUBLISH` (`SeededBug::DropBeforeCommit`,
+  one member down 3 s and the other restarted at once) is caught by the
+  drop rule; and applying a superseded `EC_PUBLISH`
+  (`SeededBug::PublishSuperseded`, the first object overwritten with as
+  many bytes during its encoding) is caught by the read-back.
+- **Seeds and cost.** CI's 256 seeds run seed 0 of the crash scenario
+  (30 runs, 35 s in a debug build) and seeds 0 to 15 of each seeded-bug
+  scenario (about 36 s, 40 s, and 55 s). All pass, every bug is caught
+  on every one of them, and the crash scenario also passed seeds 1 to
+  40 (1,200 runs, 25 minutes). The live check counts listed fragments
+  without reading them, so a fragment lost under a reused ID shows only
+  in the read-back.
+- **Left open.** The node binary runs neither replication nor fragment
+  stores yet, so nothing starts the encoder outside tests; the harness's
+  accept loop (a first frame of kind `FragmentWrite` goes to the fragment
+  server, anything else to replication) is how a node will dispatch.
+  Cluster health does not report that no geometry is supportable;
+  `ScanReport::paused` carries the `NoGeometry` for it. An object whose
+  layout cannot fit the 2 MiB record header stays replicated. While an
+  attempt's commit is unconfirmed the next scan may encode the object
+  again, and the later `EC_PUBLISH` is rejected as `AlreadyCoded`. Orphan
+  reclamation (M5-05) can use `Attempts::abandon` and
+  `Attempts::in_progress`; coded reads (M5-06) have `ObjectVersion::coded`;
+  repair (M5-08) has `IndexReader::fragments_on`.
+- **Fuzzing.** A new target, `ec_transfer`, decodes the fragment header
+  that starts a write and both message bodies; `log_record` and
+  `index_codec` already reach the new record body and values.
