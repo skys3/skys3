@@ -5996,6 +5996,131 @@ of this file. A task with nothing unexpected keeps "None."
   Write-through waits have no metric of their own; a timeout is logged as
   a warning.
 
+### M4-09 Backup targets for local buckets
+
+- **A backup is a flush target without a system of record.** The flush
+  service now follows a `local` bucket whose `[buckets.<name>]` table
+  names a `backup_target` (`FlushService::followed`, `Role::Backup`), with
+  the same `ShardFlusher`s as a `write_back` bucket, so ordering,
+  coalescing, conditional writes, write identity, and streaming are the
+  ones M1-16 to M4-04 built. What a remote of record has and a backup
+  does not is now optional (`SystemOfRecord`): no import (the target is
+  `ImportDone`, so a key without a remote ETag is written with
+  `If-None-Match: *` and a foreign object there is a conflict), no filler
+  or `RemoteReader`, and no dirty budget, so a slow backup never refuses
+  writes. `BucketStatus` gained `backup` and its `import` became an
+  `Option`, which the admin flush status shows.
+- **Clean, not evictable (decided, design §8.9, §9.3).** A backup's
+  `FLUSHED` makes an entry clean, as in a `write_back` bucket, and every
+  path that drops clean payload would then have dropped a `local` bucket's
+  durable copy: the cache's LRU and its copies beyond `clean_copies`,
+  compaction, and a learner's snapshot and backfill. Rather than make
+  each of them ask the bucket's mode, the clean cache now evicts only the
+  buckets it was told a `clean_copies` for (`CleanCache::evicts`), and the
+  node tells it only of non-`local` ones. `Shard::evict` refuses the
+  others (`CacheRefusal::Kept`), compaction copies their clean payload,
+  and snapshots and backfill carry it (`Shard::evicts_clean`, also false
+  with no cache). The same rule now covers a bucket whose policy the node
+  has not read yet: M1-21 kept its copies but let LRU evict them, and now
+  it is kept in full, and its replicas are scanned again once the cache
+  is told. Read plans already named every member while the cache was not
+  told, so a backed-up version is read from any member.
+- **Deletes keep their tombstone (decided, design §4.2, §8.7).** In a
+  `local` bucket without a backup the gateway commits the tombstone's
+  `FLUSHED` itself (M1-09). With a backup it must not, or the backup
+  flusher, finding no entry, would never delete the key there. The
+  gateway's `Removal` and lifecycle expiration (`lifecycle::Tombstones`)
+  both leave it to the backup's flush, so **lifecycle expirations reach
+  the backup as ordinary deletes**, with no path of their own; the
+  backup's own lifecycle rules are its business. DeleteBucket refuses a
+  backed-up bucket with `409 BucketNotEmpty` while a tombstone remains,
+  since detaching would stop its flusher and leave the object at the
+  backup.
+- **Relation to M4-08.** `backup_ack = "write_through"` is the M4-08 wait
+  unchanged: `WriteThrough::wait_of` now decides by mode (`write_back` by
+  `ack_policy`, `local` by a backup target and `backup_ack`), and the
+  gateway then calls the same `reach_remote`, operation 20, and
+  `Change::Awaited`, with `write_through_timeout_seconds`, `503 SlowDown`,
+  and `409 OperationAborted`. The flusher answers the wait whichever role
+  it has. The gateway also streams large single PUTs (`UPLOAD_BEGIN`,
+  M4-03) to a backed-up `local` bucket, which a write-through wait on a
+  large object needs.
+- **Encoding waits for the backup (decided, design §8.4).** The flusher
+  reads a version from the local replica, which encoding drops, so the
+  encoder skips a version of a backed-up bucket that is not clean yet
+  (`EncoderSettings::after_backup`, `Skip::NotBackedUp`). A later `TAGS`
+  of a coded version cannot be flushed until the flusher reads coded
+  objects; it stays dirty and visible in the flush metrics.
+- **Base build fix.** The M5-10 base did not build the node binary
+  without the `test-util` feature: the lifecycle module uses
+  `tags_from_xml`, whose re-export was gated. It no longer is.
+- **Tests.** `skys3-flush/tests/backup.rs` runs the gateway, real shards
+  with a cache that has no room, and the flush service against a remote
+  delaying requests 5 to 20 ms: every kind of write reaches the backup
+  (a streamed PUT with its identity, a copy, tags), nothing is evicted, a
+  delete keeps its tombstone through an outage, a bucket detaches only
+  once its deletes reached the backup, and with `write_through` each
+  write is answered once the backup holds it, `503` through an outage and
+  `409` on a conflict. Unit and crate tests cover the cache, compaction,
+  backfill, lifecycle, encoder, and gateway rules above.
+- **Simulation.** `ClusterConfig::backup` gives the cluster's `local`
+  buckets a backup target in the same `SimS3`, under `backup/<bucket>/`,
+  and audits it. Once the clients are done and faults healed, a drain
+  waits (at most 60 s of simulated time) until every live node's backup
+  flushers are idle, and after the final power loss the backup must hold
+  exactly what every member holds of each key, deletes included
+  (`backup::audit`). Members are still checked to hold every
+  acknowledged write's bytes, clean entries included. With
+  `Backup::WriteThrough`, M4-08's `RemoteAudit`, now given a key prefix
+  per bucket, checks each acknowledgement and every key against the
+  backup alone, as if every node's disks were destroyed. Both scenarios
+  in `tests/simulation/backup.rs` run three replicated nodes with
+  takeovers, any-gateway clients, random crashes, partitions, message
+  loss, and control-store faults, a remote delaying requests 2 to 15 ms
+  each way and failing or losing 2% of them, a 2 KiB clean cache, and
+  compaction. They are `Runner::with_cost(4, COST)`, so CI runs seeds 0
+  to 7: 37 s for the asynchronous one and 40 s for the write-through one
+  at `SKYS3_SIM_SEEDS=256` in a debug build. Both passed 64 seeds each
+  (`SKYS3_SIM_SEEDS=2048`) in 580 s, run side by side. Their check that
+  the backup holds some object, and M4-08's that the remote does, allow
+  a run whose clients deleted every key last: M4-08's scenario does at
+  seed 3 on this branch.
+- **Seeded bugs**, each without faults. The first two are
+  `Runner::with_cost(2, COST)`, so CI runs seeds 0 to 7, in 19.4 s and
+  2.6 s at `SKYS3_SIM_SEEDS=256`; the third runs twice the operations and
+  is `Runner::with_cost(2, 2 * COST)`, seeds 0 to 3 in 16.3 s:
+  - `Backup::EvictsLocal` tells the caches the `local` buckets'
+    `clean_copies`, with a 1 MiB cache and no compaction, so only copies
+    beyond it go and every read still succeeds. The member audit finds a
+    lost copy ("is lost") at every one of seeds 0 to 63, first at
+    **seed 0**.
+  - `Backup::AckedLocally` acknowledges after the local commit while the
+    audit expects `write_through`. The audit at acknowledgement finds a
+    write the backup lacks ("is lost") at every one of seeds 0 to 63,
+    first at **seed 0**.
+  - `Backup::ForgetsDeletes` records each delete as flushed without
+    deleting the key at the backup, through a `test-util` hook in
+    `skys3-flush` (`test_hooks::forget_deletes`, thread-local as
+    `skys3_shard::seed_bug` is). The final audit finds an object the
+    members deleted ("the backup target holds") at every one of seeds 0
+    to 127, first at **seed 0**. A lost delete shows only if it is a
+    key's last change and the backup held the key, so this scenario runs
+    16 keys and twice the operations; with the common workload seed 33
+    missed it. Making the gateway remove the tombstone itself, the bug
+    the design rules out, was tried first and went unnoticed even at seed
+    0: the flusher nearly always reads the entry before it goes.
+- **Hooks left.** M4-11 finds a bucket's backup with
+  `FlushService::target_of`, for snapshots and the lost-key report. M6-06
+  sees backups as ordinary `ShardFlusher`s, so a native transport for
+  them comes with the one for `write_back` targets.
+- **Left open.** `backup_target` is per-node configuration, as
+  `ack_policy` is: a node whose table lacks it neither flushes the bucket
+  nor keeps its tombstones, so tables must agree across nodes. The
+  backup is assumed empty under its prefix; restoring from a backup, and
+  a backup that already holds the bucket's objects, are left to M4-11.
+  Backup lag has no metric of its own: the flush metrics carry it under
+  the bucket's name.
+
 ## M5 Local erasure coding
 
 ### M5-01 EcCodec

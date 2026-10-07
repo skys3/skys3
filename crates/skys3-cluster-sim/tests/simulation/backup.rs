@@ -225,10 +225,11 @@ fn the_checkers_catch_a_local_eviction_of_backed_up_data() {
 }
 
 /// The seeded bug of recording a delete as flushed without deleting the
-/// key at the backup: the backup keeps an object the members deleted.
+/// key at the backup: the backup keeps an object the members deleted. A
+/// seed runs twice the operations of the others, and costs twice as much.
 #[test]
 fn the_audit_catches_a_delete_that_never_reaches_the_backup() {
-    Runner::with_cost(2, COST).run(|context| match seeded(context, Backup::ForgetsDeletes) {
+    Runner::with_cost(2, 2 * COST).run(|context| match seeded(context, Backup::ForgetsDeletes) {
         Err(RunError::Check(violation)) => {
             assert!(
                 violation.reason.contains("backup target holds"),
