@@ -51,6 +51,7 @@
 //! ```
 
 mod codec;
+mod encoder;
 mod error;
 pub mod fragment;
 mod layout;
@@ -59,6 +60,10 @@ mod store;
 mod transfer;
 
 pub use codec::{EcCodec, codec, current_codec};
+pub use encoder::{
+    AttemptState, Attempts, EncodeError, EncodeEvent, EncodeObserver, EncodeStep, Encoded,
+    Encoder, EncoderSettings, PlannerSource, ScanReport, Skip,
+};
 pub use error::EcError;
 pub use layout::{
     FoundFragment, ObjectLayout, ObjectVersion, RebuildError, StripeLayout, rebuild_layouts,

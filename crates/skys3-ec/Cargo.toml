@@ -22,9 +22,12 @@ crc32c.workspace = true
 prost.workspace = true
 reed-solomon-simd.workspace = true
 skys3-config.workspace = true
+skys3-coord.workspace = true
+skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
 skys3-net.workspace = true
+skys3-shard.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
