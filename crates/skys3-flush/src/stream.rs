@@ -1395,7 +1395,7 @@ pub mod test_hooks {
 }
 
 #[cfg(not(feature = "test-util"))]
-mod test_hooks {
+pub(crate) mod test_hooks {
     /// No read fails without the `test-util` feature.
     pub(crate) fn fail_parts_read() -> bool {
         false
