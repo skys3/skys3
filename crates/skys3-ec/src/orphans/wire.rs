@@ -29,8 +29,10 @@ use super::{OrphanConfirmer, OrphanJudge, Suspect, Unanswered, Verdict};
 /// The most fragments one query names.
 pub const MAX_SUSPECTS: usize = 256;
 
-/// How long a node waits for a primary's verdicts.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a node waits for one node's verdicts, connecting included,
+/// before it asks the next: a node that is down holds the query up no
+/// longer.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The body of an `OrphanQuery` frame.
 #[derive(Clone, PartialEq, Message)]

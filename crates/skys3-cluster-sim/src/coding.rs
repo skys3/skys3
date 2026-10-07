@@ -4,6 +4,14 @@
 //! step of an attempt, and the object must stay readable in full from its
 //! replicas or from `k` fragments of each stripe throughout.
 //!
+//! Runs may also reclaim orphan fragments on every node (plan M5-05,
+//! [`OrphanConfig`]), slow the fragment writes so that attempts outlast
+//! `fragment_orphan_after_seconds`, and let the members take over from a
+//! silent primary through an in-memory shard register
+//! ([`CodingConfig::takeover`]), or isolate the primary from the members
+//! and the register while fragment holders still reach it
+//! ([`CrashKind::Isolate`]).
+//!
 //! # The cluster
 //!
 //! Six nodes, `n0` to `n5`, each with a log disk and a fragment disk on
@@ -30,26 +38,41 @@
 //!   version's bytes dropped them only once the record committed: some
 //!   replica learned a commit watermark at or past it.
 //!
-//! Once every object is coded on the primary and no member locates its
-//! replicated bytes, every node loses power and is recovered outside the
+//! With orphan reclamation, also:
+//!
+//! - no replica that leads the shard and serves, and so applied only
+//!   committed records, has a coded layout naming a fragment some node
+//!   reclaimed.
+//!
+//! The members are those of the shard's register. Once every object is
+//! coded on the primary and no member locates its replicated bytes, and,
+//! with orphan reclamation, every fragment the nodes hold is named by a
+//! member's layout or was published once (released fragments are plan
+//! M5-07's), every node loses power and is recovered outside the
 //! simulation. Then each member's entry of each object must read back the
 //! last bytes written: from its own log, or decoded from the fragments
-//! its coded layout names.
+//! its coded layout names, none of them reclaimed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use skys3::storage::{self, Storage};
 use skys3_config::{EcConfig, FailureDomain};
+use skys3_control::{ControlError, ProposalIds};
 use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, NodeState, Topology};
+use skys3_ec::fragment::FragmentHeader;
+use skys3_ec::orphans::{JudgeBug, PrimariesOf, Reclaimed};
 use skys3_ec::{
-    EncodeEvent, EncodeStep, Encoder, EncoderSettings, FragmentClient, FragmentServer,
-    FragmentStore, FragmentStoreConfig, SeededBug as StoreBug, codec,
+    Attempts, EncodeEvent, EncodeStep, Encoder, EncoderSettings, FragmentClient, FragmentServer,
+    FragmentStore, FragmentStoreConfig, FragmentWriter, OrphanClient, OrphanJudge, OrphanReclaimer,
+    OrphanServer, SeededBug as StoreBug, TransferError, codec,
 };
 use skys3_index::{Entry, Index, IndexConfig, IndexReader};
 use skys3_io::{
@@ -58,13 +81,16 @@ use skys3_io::{
 use skys3_log::record::{Extent, ExtentRef, Put, PutData};
 use skys3_log::{LogConfig, RecordBody, ShardRef};
 use skys3_net::{Credentials, Listener, MessageKind, Transport, TurmoilNetwork};
-use skys3_shard::replication::{Replication, ReplicationConfig};
+use skys3_shard::replication::{
+    BoxFuture, Replaced, Replication, ReplicationConfig, ShardRegisters,
+};
 use skys3_shard::{
-    CompactionMetrics, CompactionSettings, Compactor, ReadSettings, SeededBug, Shard,
+    CompactionMetrics, CompactionSettings, Compactor, ReadSettings, Role, SeededBug, Shard,
 };
 use skys3_sim::SimContext;
 use skys3_types::{
-    BucketId, ClusterId, ETag, Epoch, Label, NodeAddress, NodeId, ProposalId, ShardConfig, ShardId,
+    AttemptId, BucketId, ClusterId, ETag, Epoch, FragmentId, Label, NodeAddress, NodeId,
+    ProposalId, ShardConfig, ShardId,
 };
 
 use crate::node::{BoxError, TRANSPORT_PORT};
@@ -148,6 +174,9 @@ pub enum CrashKind {
     PowerLoss,
     /// The power fails at the node's next sync, before it takes effect.
     PowerAtNextSync,
+    /// The node is cut off from the shard's other members and from the
+    /// shard register, but not from fragment holders, and keeps running.
+    Isolate,
 }
 
 /// One crash: `delay` after its point is reached, `kind` hits `target`,
@@ -180,6 +209,17 @@ pub struct CodingConfig {
     pub overwrite: bool,
     /// A fragment-store bug seeded into every node but the primary.
     pub store_bug: Option<StoreBug>,
+    /// Orphan reclamation on every node, if any.
+    pub orphans: Option<OrphanConfig>,
+    /// How long each fragment write waits before it is sent, so that
+    /// attempts last.
+    pub write_delay: Duration,
+    /// Whether members take over from a primary they have not heard from
+    /// for `primary_grace`, and primaries remove members that do not
+    /// respond, through the shard register (§6.4, §6.5). Each node then
+    /// opens its replica as the register names it, and runs an encoder
+    /// that works while it leads.
+    pub takeover: bool,
 }
 
 impl Default for CodingConfig {
@@ -191,8 +231,24 @@ impl Default for CodingConfig {
             crashes: None,
             overwrite: false,
             store_bug: None,
+            orphans: None,
+            write_delay: Duration::ZERO,
+            takeover: false,
         }
     }
+}
+
+/// Orphan reclamation on every node (plan M5-05): each sweeps its
+/// fragment store and asks the shard's members, in an order drawn per
+/// query, until one leads and answers.
+#[derive(Debug, Clone, Copy)]
+pub struct OrphanConfig {
+    /// `fragment_orphan_after_seconds`.
+    pub orphan_after: Duration,
+    /// How often each node sweeps.
+    pub sweep: Duration,
+    /// A bug seeded into every node's judge.
+    pub bug: Option<JudgeBug>,
 }
 
 /// What a run saw.
@@ -210,6 +266,10 @@ pub struct CodingReport {
     pub crashes: Vec<(String, CrashKind)>,
     /// When every object was coded and its replicas dropped.
     pub settled_at: Duration,
+    /// Fragments reclaimed as orphans.
+    pub reclaimed: usize,
+    /// The shard's epoch at the end.
+    pub epoch: u64,
 }
 
 const NODES: usize = 6;
@@ -257,6 +317,24 @@ struct World {
     /// The bytes last acknowledged for each key.
     expected: Mutex<BTreeMap<String, Vec<u8>>>,
     written: AtomicBool,
+    /// The shard's register, which takeovers and removals replace.
+    register: Mutex<ShardConfig>,
+    /// Whether each node is cut off from the register.
+    cut_off: Vec<AtomicBool>,
+    /// Every fragment reclaimed, by node and ID.
+    reclaimed: Mutex<BTreeSet<(NodeId, FragmentId)>>,
+    /// The attempt of every fragment whose write was acknowledged.
+    fragments: Mutex<HashMap<(NodeId, FragmentId), AttemptId>>,
+}
+
+impl World {
+    /// The positions of the nodes the register names as members.
+    fn members(&self) -> Vec<usize> {
+        let register = lock(&self.register);
+        (0..NODES)
+            .filter(|&n| register.is_member(&self.nodes[n].id))
+            .collect()
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -291,6 +369,7 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
     let mut driver = Driver {
         world: &world,
         down: vec![None; NODES],
+        isolated: vec![None; NODES],
         cut: vec![false; NODES],
         crashes: config.crashes.clone(),
         seen: 0,
@@ -307,15 +386,20 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         if now >= next_check {
             next_check = now + CHECK_INTERVAL;
             driver.check()?;
-            if driver.settled() {
-                driver.report.settled_at = now;
-                break;
+            match driver.settled() {
+                Ok(()) => {
+                    driver.report.settled_at = now;
+                    break;
+                }
+                Err(why) if now > SETTLE_LIMIT => {
+                    return Err(format!(
+                        "the objects were not all coded with their replicas dropped by \
+                         {now:?}: {why} ({})",
+                        driver.replicas()
+                    ));
+                }
+                Err(_) => {}
             }
-        }
-        if now > SETTLE_LIMIT {
-            return Err(format!(
-                "the objects were not all coded with their replicas dropped by {now:?}"
-            ));
         }
     }
     for slot in &world.nodes {
@@ -338,6 +422,8 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         }
     }
     drop(events);
+    driver.report.reclaimed = lock(&world.reclaimed).len();
+    driver.report.epoch = lock(&world.register).epoch.get();
     let report = driver.report.clone();
     drop(sim);
     final_check(&world)?;
@@ -392,6 +478,10 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         nodes,
         peers,
         shard,
+        register: Mutex::new(shard_config.clone()),
+        cut_off: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+        reclaimed: Mutex::default(),
+        fragments: Mutex::default(),
         config: shard_config,
         run: config.clone(),
         sizes,
@@ -495,29 +585,48 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         ttl: Duration::from_secs(30),
         release_delay: RELEASE_DELAY,
     });
-    let fragments = FragmentServer::new(vec![store]);
+    let fragments = FragmentServer::new(vec![store.clone()]);
     let transport = Transport::new(TurmoilNetwork, &slot.credentials);
-    let clock = Arc::new(MonotonicClock::new());
-    let replication = Replication::new(
+    let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+    let mut replication = Replication::new(
         slot.id.clone(),
         set.clone(),
         transport.clone(),
         world.peers.clone(),
-        clock as Arc<dyn Clock>,
+        Arc::clone(&clock),
         replication_config(),
     );
+    if world.run.takeover {
+        let registers = SimRegisters {
+            world: Arc::clone(world),
+            node: index,
+        };
+        let ids = ProposalIds::seeded(world.seed ^ index as u64);
+        replication = replication.with_removal(registers, ids).with_takeover();
+    }
+    let orphans = OrphanServer::default();
     let listener = transport
         .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
         .await?;
     {
-        let (replication, fragments) = (replication.clone(), fragments.clone());
-        tokio::spawn(async move { serve(listener, replication, fragments).await });
+        let services = (replication.clone(), fragments.clone(), orphans.clone());
+        tokio::spawn(async move { serve(listener, services).await });
     }
-    let shard = if index < MEMBERS {
+    let shard = if world.run.takeover {
+        replication.resume(&world.shard).await?
+    } else if index < MEMBERS {
         Some(replication.open(&world.config).await?)
     } else {
         None
     };
+    // One tracker of the shard's attempts on this node, which its encoder
+    // and its judge share.
+    let attempts = Attempts::default();
+    if let Some(shard) = &shard {
+        let pool = BlockingPool::inline("judge");
+        let judge = OrphanJudge::new(shard.clone(), attempts.clone(), pool);
+        orphans.insert(judge.with_bug(world.run.orphans.and_then(|o| o.bug)));
+    }
     *lock(&slot.view) = Some(View {
         index: Arc::clone(&storage.index),
         shard: shard.clone(),
@@ -527,7 +636,14 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     let checkpoints = tokio::spawn(async move { checkpointer.run(CHECKPOINT_INTERVAL).await });
     let settings = CompactionSettings {
         live_threshold: 0.5,
-        unreferenced_ttl: Duration::from_secs(1),
+        // A member keeps the extents of a `PUT` it holds but has not
+        // applied only this long. A takeover applies such a `PUT` once the
+        // members' grace has passed, so the extents must outlast it.
+        unreferenced_ttl: if world.run.takeover {
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(1)
+        },
     };
     let compactor = Compactor::new(set, settings, CompactionMetrics::default());
     tokio::spawn(async move {
@@ -538,10 +654,39 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
             }
         }
     });
-    if let (0, Some(shard)) = (index, shard) {
+    if let Some(config) = world.run.orphans {
+        let client = OrphanClient::new(
+            slot.id.clone(),
+            transport.clone(),
+            world.peers.clone(),
+            primaries(world, index),
+            orphans,
+        );
+        let observed = Arc::clone(world);
+        let observer = Arc::new(move |reclaimed: &Reclaimed| {
+            let fragment = (reclaimed.node.clone(), reclaimed.suspect.id);
+            lock(&observed.reclaimed).insert(fragment);
+        });
+        let reclaimer = OrphanReclaimer::new(
+            slot.id.clone(),
+            vec![store],
+            client,
+            clock,
+            config.orphan_after,
+        )
+        .with_observer(observer);
+        tokio::spawn(reclaimer.run(config.sweep));
+    }
+    if let Some(shard) = shard
+        && (index == 0 || world.run.takeover)
+    {
         let client = FragmentClient::new(transport, world.peers.clone())
             .with_local(slot.id.clone(), fragments);
-        tokio::spawn(primary(Arc::clone(world), shard, client));
+        let writer = Writer {
+            inner: client,
+            world: Arc::clone(world),
+        };
+        tokio::spawn(primary(Arc::clone(world), index, shard, writer, attempts));
     }
     let error = checkpoints.await;
     tracing::warn!(node = index, ?error, "a checkpoint failed; the node stops");
@@ -549,18 +694,22 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
 }
 
 /// Accepts links on the node's transport port: fragment writes go to the
-/// fragment server, everything else to replication.
+/// fragment server, orphan queries to the judges, everything else to
+/// replication.
 async fn serve(
     listener: Listener<TurmoilNetwork>,
-    replication: Replication<TurmoilNetwork, SimMount>,
-    fragments: FragmentServer<SimMount>,
+    services: (
+        Replication<TurmoilNetwork, SimMount>,
+        FragmentServer<SimMount>,
+        OrphanServer<SimMount>,
+    ),
 ) {
     loop {
         let Ok(incoming) = listener.accept().await else {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let (replication, fragments) = (replication.clone(), fragments.clone());
+        let (replication, fragments, orphans) = services.clone();
         tokio::spawn(async move {
             let Ok(connection) = incoming.handshake().await else {
                 return;
@@ -570,25 +719,114 @@ async fn serve(
             let Ok(Ok(Some(first))) = first else {
                 return;
             };
-            if first.header.kind == MessageKind::FragmentWrite {
-                fragments.serve((receiver, sender), first).await;
-            } else {
-                replication.follow((receiver, sender), first).await;
+            match first.header.kind {
+                MessageKind::FragmentWrite => fragments.serve((receiver, sender), first).await,
+                MessageKind::OrphanQuery => orphans.serve((receiver, sender), first).await,
+                _ => replication.follow((receiver, sender), first).await,
             }
         });
     }
 }
 
-/// The primary's work: write the objects once, overwrite the first while
-/// it is encoded if asked, encode, and write unreferenced extents once
-/// every object is coded, so the segments holding their replicas stop
-/// being the last.
+/// The shard's register as node `node` reaches it: not at all while the
+/// node is cut off.
+struct SimRegisters {
+    world: Arc<World>,
+    node: usize,
+}
+
+impl SimRegisters {
+    fn reachable(&self) -> Result<(), ControlError> {
+        if self.world.cut_off[self.node].load(Ordering::SeqCst) {
+            Err(ControlError::Unavailable("the node is cut off".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ShardRegisters for SimRegisters {
+    fn replace<'a>(
+        &'a self,
+        current: &'a ShardConfig,
+        next: &'a ShardConfig,
+    ) -> BoxFuture<'a, Result<Replaced, ControlError>> {
+        Box::pin(async move {
+            self.reachable()?;
+            let mut held = lock(&self.world.register);
+            if *held == *next {
+                return Ok(Replaced::Accepted);
+            }
+            if *held != *current {
+                return Ok(Replaced::Holds(Some(held.clone())));
+            }
+            *held = next.clone();
+            Ok(Replaced::Accepted)
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        _shard: &'a ShardRef,
+    ) -> BoxFuture<'a, Result<Option<ShardConfig>, ControlError>> {
+        Box::pin(async move {
+            self.reachable()?;
+            Ok(Some(lock(&self.world.register).clone()))
+        })
+    }
+}
+
+/// Whom node `index` asks about its fragments: the shard's first members,
+/// in an order drawn for each query, as a node whose shard map may be
+/// stale might.
+fn primaries(world: &World, index: usize) -> PrimariesOf {
+    let rng = Mutex::new(StdRng::seed_from_u64(world.seed ^ (index as u64) << 32));
+    let nodes: Vec<NodeId> = world.nodes[..MEMBERS]
+        .iter()
+        .map(|slot| slot.id.clone())
+        .collect();
+    Arc::new(move |_| {
+        let mut order = nodes.clone();
+        order.shuffle(&mut *lock(&rng));
+        order
+    })
+}
+
+/// A primary's fragment writes: each waits the run's `write_delay` first,
+/// and the driver learns the attempt of every fragment acknowledged.
+struct Writer {
+    inner: FragmentClient<TurmoilNetwork, SimMount>,
+    world: Arc<World>,
+}
+
+impl FragmentWriter for Writer {
+    async fn write(
+        &self,
+        node: &NodeId,
+        header: &FragmentHeader,
+        data: Bytes,
+    ) -> Result<FragmentId, TransferError> {
+        if !self.world.run.write_delay.is_zero() {
+            tokio::time::sleep(self.world.run.write_delay).await;
+        }
+        let id = self.inner.write(node, header, data).await?;
+        lock(&self.world.fragments).insert((node.clone(), id), header.attempt);
+        Ok(id)
+    }
+}
+
+/// A member's work while it leads: node 0 writes the objects once and
+/// overwrites the first while it is encoded if asked; every member that
+/// leads encodes, and writes unreferenced extents once every object is
+/// coded, so the segments holding their replicas stop being the last.
 async fn primary(
     world: Arc<World>,
+    index: usize,
     shard: Shard<SimMount>,
-    writer: FragmentClient<TurmoilNetwork, SimMount>,
+    writer: Writer,
+    attempts: Attempts,
 ) {
-    if !world.written.load(Ordering::SeqCst) {
+    if index == 0 && !world.written.load(Ordering::SeqCst) {
         for (n, size) in world.sizes.iter().enumerate() {
             let data = bytes(world.seed, n as u64, *size);
             put(&world, &shard, &key(n), data).await;
@@ -608,11 +846,12 @@ async fn primary(
             replans: 3,
         },
     )
+    .with_attempts(attempts)
     .with_observer(Arc::new(move |event: &EncodeEvent| {
         lock(&events.events).push(event.clone());
     }));
     tokio::spawn(encoder.run(SCAN_INTERVAL));
-    if world.run.overwrite {
+    if index == 0 && world.run.overwrite {
         overwrite(&world, &shard).await;
     }
     // Once every object is coded on the primary, roll the bulk segment.
@@ -727,6 +966,8 @@ struct Driver<'a> {
     world: &'a World,
     /// When each node that is down restarts.
     down: Vec<Option<Duration>>,
+    /// When each node that is isolated is reachable again.
+    isolated: Vec<Option<Duration>>,
     /// Whether each node's planned power cut was handled.
     cut: Vec<bool>,
     crashes: Option<(CrashPoint, Vec<Crash>)>,
@@ -778,10 +1019,18 @@ impl Driver<'_> {
                     slot.power.cut_at_sync(slot.power.syncs(), SyncCut::Before);
                     self.cut[node] = false;
                 }
+                CrashKind::Isolate => self.isolate(sim, now, node, crash.downtime),
             }
         }
         for node in 0..NODES {
             let slot = &self.world.nodes[node];
+            if self.isolated[node].is_some_and(|at| at <= now) {
+                self.isolated[node] = None;
+                self.world.cut_off[node].store(false, Ordering::SeqCst);
+                for other in self.others(node) {
+                    sim.repair(slot.id.as_str(), self.world.nodes[other].id.as_str());
+                }
+            }
             if !self.cut[node] && slot.power.is_cut() {
                 // The disks lost power inside a sync. The host stops a
                 // moment later, so what it sent before the sync, such as
@@ -871,6 +1120,56 @@ impl Driver<'_> {
         self.down[node] = Some(now + downtime);
     }
 
+    /// The first members but `node`, which an isolated node cannot reach.
+    fn others(&self, node: usize) -> impl Iterator<Item = usize> {
+        (0..MEMBERS).filter(move |other| *other != node)
+    }
+
+    /// Cuts `node` off from the other first members and the register for
+    /// `downtime`.
+    fn isolate(
+        &mut self,
+        sim: &mut turmoil::Sim<'_>,
+        now: Duration,
+        node: usize,
+        downtime: Duration,
+    ) {
+        if self.isolated[node].is_some() {
+            return;
+        }
+        self.world.cut_off[node].store(true, Ordering::SeqCst);
+        let slot = &self.world.nodes[node];
+        for other in self.others(node) {
+            sim.partition(slot.id.as_str(), self.world.nodes[other].id.as_str());
+        }
+        self.isolated[node] = Some(now + downtime);
+    }
+
+    /// What each node's replica of the shard is doing, for a failure's
+    /// message.
+    fn replicas(&self) -> String {
+        let replicas: Vec<String> = self
+            .views()
+            .iter()
+            .zip(&self.world.nodes)
+            .map(
+                |(view, slot)| match view.as_ref().map(|view| view.shard.as_ref()) {
+                    None => format!("{}: down", slot.id),
+                    Some(None) => format!("{}: no replica", slot.id),
+                    Some(Some(shard)) => format!(
+                        "{}: {:?} in {}, serving {}, applied {}",
+                        slot.id,
+                        shard.role(),
+                        shard.sequencing(),
+                        shard.is_serving(),
+                        shard.applied()
+                    ),
+                },
+            )
+            .collect();
+        replicas.join("; ")
+    }
+
     /// The views of the nodes that are up and have recovered.
     fn views(&self) -> Vec<Option<View>> {
         self.world
@@ -893,13 +1192,16 @@ impl Driver<'_> {
             }
         }
         let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
-        for key in keys {
-            self.check_key(&views, &key)
+        for key in &keys {
+            self.check_key(&views, key)
                 .map_err(|e| format!("{key}: {e}"))?;
         }
-        Ok(())
+        self.check_reclaimed(&views, &keys)
     }
 
+    /// Checks one object over every node that was ever a member: one that
+    /// is down still holds what it held, and a new primary applies its
+    /// predecessor's last commits only once it has reconciled the members.
     fn check_key(&self, views: &[Option<View>], key: &str) -> Result<(), String> {
         let shard = &self.world.shard;
         let mut replica = false;
@@ -957,35 +1259,148 @@ impl Driver<'_> {
         }
     }
 
-    /// Whether every object is coded on the primary and no member that is
-    /// up locates its replicated bytes, with every node up.
-    fn settled(&self) -> bool {
-        if !self.world.written.load(Ordering::SeqCst)
-            || self.down.iter().any(Option::is_some)
+    /// Checks that no replica that leads the shard and serves, and so
+    /// applied only committed records, has a coded layout naming a
+    /// reclaimed fragment.
+    fn check_reclaimed(&self, views: &[Option<View>], keys: &[String]) -> Result<(), String> {
+        let reclaimed = lock(&self.world.reclaimed);
+        if reclaimed.is_empty() {
+            return Ok(());
+        }
+        for (n, view) in views.iter().enumerate() {
+            let Some(view) = view else { continue };
+            let leads = view.shard.as_ref().is_some_and(|shard| {
+                matches!(shard.role(), Role::Primary | Role::Alone) && shard.is_serving()
+            });
+            if leads {
+                let reader = view.index.read().map_err(|e| e.to_string())?;
+                no_reclaimed_fragment(&reader, &self.world.shard, keys, &reclaimed)
+                    .map_err(|e| format!("the serving primary n{n}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that every object is coded on the primary and no member that is
+    /// up locates its replicated bytes, with every node up and reachable,
+    /// and, with orphan reclamation, every fragment the nodes hold named
+    /// by a member's layout or of an attempt that published; or says why not.
+    fn settled(&self) -> Result<(), String> {
+        if !self.world.written.load(Ordering::SeqCst) {
+            return Err("the objects are not written".to_owned());
+        }
+        if self.down.iter().any(Option::is_some)
+            || self.isolated.iter().any(Option::is_some)
             || self.crashes.is_some()
             || !self.due.is_empty()
         {
-            return false;
+            return Err("crashes are pending".to_owned());
         }
         let views = self.views();
-        if views.iter().any(Option::is_none) {
-            return false;
+        if let Some(n) = views.iter().position(Option::is_none) {
+            return Err(format!("n{n} has not recovered"));
         }
         let shard = &self.world.shard;
         let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
-        views.iter().take(MEMBERS).flatten().all(|view| {
-            let Ok(reader) = view.index.read() else {
-                return false;
+        let mut referenced = BTreeSet::new();
+        for member in self.world.members() {
+            let Some(view) = &views[member] else {
+                return Err(format!("member n{member} has not recovered"));
             };
-            keys.iter().all(|key| {
-                let Ok(Some(entry)) = reader.entry(shard, key) else {
-                    return false;
+            let reader = view.index.read().map_err(|e| e.to_string())?;
+            for key in &keys {
+                let entry = reader.entry(shard, key).map_err(|e| e.to_string())?;
+                let Some(entry) = entry else {
+                    return Err(format!("member n{member} has no {key}"));
                 };
-                let coded = entry.object.as_ref().is_some_and(|o| o.coded.is_some());
-                coded && locates(&reader, shard, &entry) == Ok(false)
-            })
-        })
+                let Some(coded) = entry.object.as_ref().and_then(|o| o.coded.clone()) else {
+                    return Err(format!("member n{member} has not coded {key}"));
+                };
+                if locates(&reader, shard, &entry) != Ok(false) {
+                    return Err(format!("member n{member} keeps the replica of {key}"));
+                }
+                for stripe in &coded.stripes {
+                    for location in stripe.fragments() {
+                        referenced.insert((location.node.clone(), location.fragment));
+                    }
+                }
+            }
+        }
+        if self.world.run.orphans.is_some() {
+            self.orphans_reclaimed(&views, &referenced)?;
+        }
+        Ok(())
     }
+
+    /// Checks that every fragment the nodes hold is `referenced` or of an
+    /// attempt that published: a fragment released by a later write is
+    /// fragment release's to reclaim (plan M5-07), not this one's.
+    fn orphans_reclaimed(
+        &self,
+        views: &[Option<View>],
+        referenced: &BTreeSet<(NodeId, FragmentId)>,
+    ) -> Result<(), String> {
+        let published: BTreeSet<AttemptId> = lock(&self.world.events)
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.step,
+                    EncodeStep::Committed {
+                        published: true,
+                        ..
+                    }
+                )
+            })
+            .map(|event| event.attempt)
+            .collect();
+        let written = lock(&self.world.fragments);
+        for (view, slot) in views.iter().zip(&self.world.nodes) {
+            let Some(view) = view else {
+                return Err(format!("{} has not recovered", slot.id));
+            };
+            for id in view.fragments.stores()[0].ids() {
+                let fragment = (slot.id.clone(), id);
+                let attempt = written.get(&fragment);
+                if !referenced.contains(&fragment)
+                    && !attempt.is_some_and(|attempt| published.contains(attempt))
+                {
+                    return Err(format!(
+                        "{} holds orphan {id} of attempt {attempt:?}",
+                        slot.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Checks that no coded layout of `keys` in `reader` names a fragment in
+/// `reclaimed`.
+fn no_reclaimed_fragment(
+    reader: &IndexReader,
+    shard: &ShardRef,
+    keys: &[String],
+    reclaimed: &BTreeSet<(NodeId, FragmentId)>,
+) -> Result<(), String> {
+    for key in keys {
+        let entry = reader.entry(shard, key).map_err(|e| e.to_string())?;
+        let Some(coded) = entry.and_then(|e| e.object).and_then(|o| o.coded) else {
+            continue;
+        };
+        for stripe in &coded.stripes {
+            for location in stripe.fragments() {
+                if reclaimed.contains(&(location.node.clone(), location.fragment)) {
+                    return Err(format!(
+                        "the committed layout of {key} at {} names fragment {} on {}, \
+                         which was reclaimed",
+                        coded.publish, location.fragment, location.node
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether this replica locates every byte of `entry`'s version.
@@ -1028,8 +1443,17 @@ fn final_check(world: &World) -> Result<(), String> {
             stores.insert(slot.id.clone(), store);
         }
         let expected = lock(&world.expected).clone();
+        let members = world.members();
+        let keys: Vec<String> = expected.keys().cloned().collect();
+        let reclaimed = lock(&world.reclaimed).clone();
+        for &member in &members {
+            let reader = storages[member].index.read().map_err(|e| e.to_string())?;
+            no_reclaimed_fragment(&reader, &world.shard, &keys, &reclaimed)
+                .map_err(|e| format!("member n{member}: {e}"))?;
+        }
         for (key, data) in &expected {
-            for (member, storage) in storages.iter().enumerate().take(MEMBERS) {
+            for &member in &members {
+                let storage = &storages[member];
                 let read = read_back(world, storage, &stores, key)
                     .await
                     .map_err(|e| format!("{key} on n{member}: {e}"))?;
