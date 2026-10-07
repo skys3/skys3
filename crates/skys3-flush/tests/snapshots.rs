@@ -383,7 +383,9 @@ fn a_bucket_without_a_target_or_a_primary_is_not_snapshotted() {
         written(&service, &node, &document, 1).await;
         // A shard that is gone stops its writer.
         node.set.close_all().await.unwrap();
-        service.reconcile(&[document.clone()], &node.set).await;
+        service
+            .reconcile(std::slice::from_ref(&document), &node.set)
+            .await;
         assert!(service.status(&document.bucket_id).is_empty());
     });
 }
