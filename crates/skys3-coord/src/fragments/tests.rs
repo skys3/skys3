@@ -508,7 +508,7 @@ fn repairs_place_fragments_around_the_ones_a_stripe_keeps() {
     let placed = planner
         .replace(&replacing(&bucket, &plan, &keep, 1, &avoid))
         .unwrap();
-    assert_eq!(placed, [spare.clone()]);
+    assert_eq!(placed, std::slice::from_ref(&spare));
     assert!(planner.held(&spare) >= 16 * MIB);
     // Two lost and one spare: no room until a node joins.
     let keep = &plan.nodes[2..];
