@@ -1,5 +1,5 @@
 //! `[buckets.defaults]` and `[buckets.<name>]`: per-bucket settings (§4.1,
-//! §7.2, §7.5, §7.6, §7.8, §8, §9.1).
+//! §7.2, §7.5, §7.6, §7.8, §8, §9.1, §9.5).
 //!
 //! Settings resolve in three layers: built-in defaults, then
 //! `[buckets.defaults]`, then the `[buckets.<name>]` table of the bucket with
@@ -38,6 +38,24 @@ pub enum TargetTransport {
     Native,
     /// S3 REST only.
     S3,
+}
+
+/// The longest `freshness_ttl_seconds`: a day.
+pub const MAX_FRESHNESS_TTL_SECONDS: u64 = 86_400;
+
+/// The longest `origin_profile`, in bytes.
+pub const MAX_ORIGIN_PROFILE_BYTES: usize = 128;
+
+/// How the reads of a `read_only` bucket check its origin (§9.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Freshness {
+    /// Every GET and HEAD asks the origin for the key's current version.
+    #[default]
+    Revalidate,
+    /// A read may serve what the origin held up to
+    /// `freshness_ttl_seconds` ago: bounded staleness.
+    Ttl,
 }
 
 /// The resolved settings of one bucket, or of every bucket without a table
@@ -88,6 +106,16 @@ pub struct BucketSettings {
     /// `max_dirty_bytes`: the bucket's dirty-data budget (§7.6); by default
     /// the cluster's, `flush.max_dirty_bytes`.
     pub max_dirty_bytes: u64,
+    /// `freshness`: how a `read_only` bucket's reads check its origin
+    /// (§9.5).
+    pub freshness: Freshness,
+    /// `freshness_ttl_seconds`: with `freshness = "ttl"`, how stale a read
+    /// of a `read_only` bucket may be (§9.5).
+    pub freshness_ttl_seconds: u64,
+    /// `origin_profile`: the profile of the shared AWS configuration whose
+    /// credentials a `read_only` bucket's origin is read with; `None` for
+    /// the default chain, as `write_back` targets are (§9.5).
+    pub origin_profile: Option<String>,
 }
 
 crate::durations! {
@@ -96,6 +124,8 @@ crate::durations! {
         ec_after => ec_after_seconds, Duration::from_secs;
         /// `index_snapshot_interval_seconds`.
         index_snapshot_interval => index_snapshot_interval_seconds, Duration::from_secs;
+        /// `freshness_ttl_seconds`.
+        freshness_ttl => freshness_ttl_seconds, Duration::from_secs;
     }
 }
 
@@ -144,6 +174,9 @@ pub(crate) struct BucketTable {
     snapshot_target: Option<String>,
     peer_source: Option<String>,
     peer_local_writes: Option<bool>,
+    freshness: Option<Freshness>,
+    freshness_ttl_seconds: Option<u64>,
+    origin_profile: Option<String>,
 }
 
 /// The built-in defaults of every bucket-level key that has one.
@@ -163,6 +196,9 @@ struct Defaults {
     max_dirty_bytes: u64,
     ack_policy: AckPolicy,
     flush_conflict_policy: ConflictPolicy,
+    freshness: Freshness,
+    freshness_ttl_seconds: u64,
+    origin_profile: Option<String>,
 }
 
 impl Defaults {
@@ -183,6 +219,9 @@ impl Defaults {
             max_dirty_bytes: flush.max_dirty_bytes,
             ack_policy: flush.ack_policy,
             flush_conflict_policy: flush.flush_conflict_policy,
+            freshness: Freshness::Revalidate,
+            freshness_ttl_seconds: 60,
+            origin_profile: None,
         }
     }
 
@@ -214,6 +253,14 @@ impl Defaults {
             flush_conflict_policy: table
                 .flush_conflict_policy
                 .unwrap_or(self.flush_conflict_policy),
+            freshness: table.freshness.unwrap_or(self.freshness),
+            freshness_ttl_seconds: table
+                .freshness_ttl_seconds
+                .unwrap_or(self.freshness_ttl_seconds),
+            origin_profile: table
+                .origin_profile
+                .clone()
+                .or_else(|| self.origin_profile.clone()),
         }
     }
 }
@@ -359,6 +406,11 @@ fn settle<'a>(
             table.max_dirty_bytes.is_some(),
             values.max_dirty_bytes,
         ),
+        (
+            "freshness_ttl_seconds",
+            table.freshness_ttl_seconds.is_some(),
+            values.freshness_ttl_seconds,
+        ),
     ] {
         if value == 0 {
             valid = false;
@@ -376,6 +428,28 @@ fn settle<'a>(
                 format!("must be at most {MAX_IMPORT_PARALLEL_STREAMS}"),
             );
         }
+    }
+
+    if values.freshness_ttl_seconds > MAX_FRESHNESS_TTL_SECONDS {
+        valid = false;
+        if table.freshness_ttl_seconds.is_some() {
+            checker.report(
+                key("freshness_ttl_seconds"),
+                format!("must be at most {MAX_FRESHNESS_TTL_SECONDS}"),
+            );
+        }
+    }
+    if let Some(profile) = &table.origin_profile
+        && !valid_profile(profile)
+    {
+        valid = false;
+        checker.report(
+            key("origin_profile"),
+            format!(
+                "must be 1 to {MAX_ORIGIN_PROFILE_BYTES} visible ASCII characters other than \
+                 `[` and `]`"
+            ),
+        );
     }
 
     let mut parse_target = |name: &str, url: Option<&String>| {
@@ -467,7 +541,19 @@ fn settle<'a>(
         peer_source,
         peer_local_writes,
         max_dirty_bytes: values.max_dirty_bytes,
+        freshness: values.freshness,
+        freshness_ttl_seconds: values.freshness_ttl_seconds,
+        origin_profile: values.origin_profile.clone(),
     })
+}
+
+/// Whether `profile` can name a profile of the shared AWS configuration:
+/// visible ASCII, without the brackets of a section header.
+fn valid_profile(profile: &str) -> bool {
+    (1..=MAX_ORIGIN_PROFILE_BYTES).contains(&profile.len())
+        && profile
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b'[' && b != b']')
 }
 
 /// Every replication rule `settings` breaks. [`ReplicationSettings::validate`]

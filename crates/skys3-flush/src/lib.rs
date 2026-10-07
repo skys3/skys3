@@ -62,6 +62,10 @@
 //! - [`FlushService`]: every flusher of a node, following its buckets and
 //!   open shards, with each target's capability probe, each bucket's
 //!   namespace import, and each bucket's [`Filler`].
+//! - [`Origin`]: how a node reads a `read_only` bucket's origin (§9.5),
+//!   which the flush service keeps beside the flushers: a
+//!   [`RemoteReader`] and a [`Filler`], with the credentials of the
+//!   bucket's `origin_profile`, and no flusher, probe, or import.
 //! - **Namespace import** (§9.1, [`ImportState`]): a `write_back` bucket
 //!   lists its remote prefix into `IMPORT` records, a page at a time, rate
 //!   limited, with a durable checkpoint after each page that a restart
@@ -96,6 +100,7 @@ mod fill;
 mod import;
 mod metrics;
 mod multipart;
+mod origin;
 mod service;
 mod shard;
 mod single;
@@ -111,6 +116,7 @@ pub use import::{
     loaded_metadata,
 };
 pub use metrics::{Counters, FlushMetrics, Gauges};
+pub use origin::{DEFAULT_CREDENTIALS, Origin, OriginConnect, profile_credentials};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
 pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
