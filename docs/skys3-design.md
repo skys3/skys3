@@ -1485,6 +1485,7 @@ compaction_live_threshold = 0.5
 read_registration_ttl_seconds = 30
 read_registration_renew_interval_seconds = 10
 disk_min_free_bytes = 1073741824     # below this, writes get 503 SlowDown (section 13)
+lifecycle_interval_seconds = 3600    # how often shard primaries apply lifecycle rules (section 8.7)
 
 [cache]
 hot_cache_bytes_per_node = 1073741824     # held in memory (section 9.2)
