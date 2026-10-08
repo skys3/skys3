@@ -44,6 +44,7 @@
 //! streaming multipart flush in `stream_simulation`, and primary changes
 //! at each step of a streamed upload in `takeover_simulation`.
 
+mod concurrency_simulation;
 mod fill_simulation;
 mod import_simulation;
 mod stream_simulation;
@@ -102,6 +103,21 @@ fn streamed_uploads_reach_the_remote_only_after_their_local_commit() {
 #[test]
 fn primary_changes_at_every_step_of_a_streamed_upload_leave_no_partial_object() {
     Runner::with_cost(8, 4).run(takeover_simulation::scenario);
+}
+
+#[test]
+fn flush_concurrency_approaches_the_bandwidth_delay_product() {
+    Runner::with_cost(5, 8).run(concurrency_simulation::reaches_the_bandwidth_delay_product);
+}
+
+#[test]
+fn flush_concurrency_backs_off_under_a_rate_limit_and_recovers() {
+    Runner::with_cost(2, 16).run(concurrency_simulation::backs_off_under_a_rate_limit);
+}
+
+#[test]
+fn flush_concurrency_scenarios_catch_seeded_bugs() {
+    concurrency_simulation::catch_seeded_bugs();
 }
 
 #[test]

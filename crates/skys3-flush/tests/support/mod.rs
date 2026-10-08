@@ -83,7 +83,8 @@ pub fn writes(put: bool, complete: bool, delete: bool) -> ConditionalWrites {
 /// ([`streaming_target`]).
 pub fn settings() -> FlushSettings {
     FlushSettings {
-        concurrency: 4,
+        min_concurrency: 4,
+        max_concurrency: 4,
         min_backoff: Duration::from_millis(10),
         max_backoff: Duration::from_millis(200),
         streaming: false,

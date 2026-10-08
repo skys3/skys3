@@ -35,6 +35,13 @@
 //!   write, to model stores the control-store probe must refuse (design
 //!   §6.1).
 //!
+//! - **The network path** ([`SimLink`], [`SimS3::set_link`]): a round-trip
+//!   time, a bandwidth that request and response bodies queue for, and a
+//!   request-rate limit beyond which requests get `503 SlowDown`, for
+//!   flush concurrency to adapt to (design §7.7). [`SimS3Stats`] keeps the
+//!   most requests and request-body bytes the store had in progress at
+//!   once.
+//!
 //! Faults come from a generator seeded at creation, and the store never
 //! reads the wall clock, so a simulation seed replays them exactly. Delays
 //! sleep on the caller's Tokio clock: under `turmoil`, the calling host's
@@ -58,6 +65,7 @@
 
 mod bucket;
 mod faults;
+mod link;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -73,10 +81,13 @@ use skys3_remote::{
     WritePrecondition,
 };
 use skys3_types::ETag;
+use tokio::time::Instant;
 
 use bucket::Bucket;
 pub use faults::{Fault, Operation, SimS3Faults};
 use faults::{Injector, Plan};
+use link::{BodyBytes, Link};
+pub use link::{RateLimit, SimLink};
 
 /// How a provider treats one kind of write precondition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -206,14 +217,23 @@ pub struct SimS3Stats {
     pub requests: u64,
     /// `500 InternalError` responses injected before applying a request.
     pub internal_errors: u64,
-    /// `503 SlowDown` responses injected.
+    /// `503 SlowDown` responses injected, including those of the rate
+    /// limit.
     pub slow_downs: u64,
+    /// `503 SlowDown` responses of the link's rate limit ([`SimLink`]).
+    pub rate_limited: u64,
     /// Requests lost before they were applied.
     pub lost_requests: u64,
     /// Responses lost after their request was processed.
     pub lost_responses: u64,
     /// `409 ConditionalRequestConflict` responses, injected or from races.
     pub conflicts: u64,
+    /// The most requests in progress at once, from the moment each was
+    /// sent until its answer arrived or its caller gave up.
+    pub max_in_flight: u64,
+    /// The most request-body bytes (`PutObject`, `UploadPart`) in progress
+    /// at once.
+    pub max_in_flight_bytes: u64,
 }
 
 /// A simulated S3 bucket.
@@ -242,6 +262,9 @@ struct State {
     in_flight: BTreeMap<u64, (String, bool)>,
     next_request: u64,
     stats: SimS3Stats,
+    link: Link,
+    /// Requests in progress, and their request-body bytes.
+    in_progress: (u64, u64),
     /// Successful requests whose caller never got the answer, by operation.
     unanswered: HashMap<Operation, u64>,
     /// The `(credentials, key)` pairs whose reads are refused.
@@ -250,19 +273,22 @@ struct State {
     applied: Vec<(Operation, String)>,
 }
 
-/// A request's effect on conflict detection.
+/// A request's effect on conflict detection, and its body.
 #[derive(Clone, Copy)]
 struct Tracking<'a> {
     /// The key the request writes, if it is a write.
     writes: Option<&'a str>,
     /// Whether the request is a conditional write, and so can conflict.
     conditional: bool,
+    /// The bytes of the request's body.
+    body: u64,
 }
 
 impl Tracking<'_> {
     const NONE: Tracking<'static> = Tracking {
         writes: None,
         conditional: false,
+        body: 0,
     };
 }
 
@@ -278,6 +304,8 @@ impl SimS3 {
                     in_flight: BTreeMap::new(),
                     next_request: 0,
                     stats: SimS3Stats::default(),
+                    link: Link::default(),
+                    in_progress: (0, 0),
                     unanswered: HashMap::new(),
                     denied: BTreeSet::new(),
                     applied: Vec::new(),
@@ -304,6 +332,8 @@ impl SimS3 {
                     in_flight: BTreeMap::new(),
                     next_request: 0,
                     stats: SimS3Stats::default(),
+                    link: Link::default(),
+                    in_progress: (0, 0),
                     unanswered: HashMap::new(),
                     denied: BTreeSet::new(),
                     applied: Vec::new(),
@@ -378,6 +408,18 @@ impl SimS3 {
     /// Returns the random faults currently injected.
     pub fn faults(&self) -> SimS3Faults {
         self.state().injector.faults.clone()
+    }
+
+    /// Replaces the network path of later requests and the store's rate
+    /// limit: for example a 100 ms round trip at 10 MB/s, or a limit that
+    /// starts and later ends. Bodies already queued keep their place.
+    pub fn set_link(&self, link: SimLink) {
+        self.state().link.config = link;
+    }
+
+    /// Returns the network path of requests.
+    pub fn link(&self) -> SimLink {
+        self.state().link.config
     }
 
     /// Queues `fault` for the next request of `operation`, in place of a
@@ -465,16 +507,18 @@ impl SimS3 {
     /// Runs one request: draws its faults and delays, waits, applies it
     /// unless a fault stops it, waits again, and answers unless the
     /// response is lost. `apply` learns whether a read is stale.
-    async fn request<T>(
+    async fn request<T: BodyBytes>(
         &self,
         operation: Operation,
         tracking: Tracking<'_>,
         apply: impl FnOnce(&mut Bucket, bool) -> S3Result<T>,
     ) -> S3Result<T> {
-        let (plan, in_flight) = {
+        let (plan, in_flight, arrival, _progress) = {
             let mut state = self.state();
             state.stats.requests += 1;
             let plan = state.injector.plan(operation);
+            let arrival = state.link.arrival(Instant::now(), tracking.body);
+            let progress = InProgress::start(self, &mut state, tracking.body);
             let in_flight = match tracking.writes {
                 Some(key) if tracking.conditional => {
                     let id = state.next_request;
@@ -484,14 +528,18 @@ impl SimS3 {
                 }
                 _ => None,
             };
-            (plan, in_flight)
+            (plan, in_flight, arrival, progress)
         };
+        sleep_until(arrival).await;
         sleep(plan.request_delay).await;
         let result = self.process(operation, plan, in_flight, tracking.writes, apply);
         let unanswered = result.is_ok().then(|| Unanswered {
             store: self,
             operation,
         });
+        let bytes = result.as_ref().map_or(0, BodyBytes::body_bytes);
+        let delivery = self.state().link.delivery(Instant::now(), bytes);
+        sleep_until(delivery).await;
         sleep(plan.response_delay).await;
         if plan.fault == Some(Fault::LostResponse) {
             self.state().stats.lost_responses += 1;
@@ -518,8 +566,14 @@ impl SimS3 {
     ) -> S3Result<T> {
         let mut state = self.state();
         let conflicted = in_flight.is_some_and(|in_flight| in_flight.finish(&mut state));
+        let limited = !state.link.admit(Instant::now());
         let stats = &mut state.stats;
         let injected = match plan.fault {
+            _ if limited => {
+                stats.slow_downs += 1;
+                stats.rate_limited += 1;
+                Some((S3ErrorKind::SlowDown, "please reduce your request rate"))
+            }
             Some(Fault::InternalError) => {
                 stats.internal_errors += 1;
                 Some((S3ErrorKind::InternalError, "injected internal error"))
@@ -648,6 +702,34 @@ impl Drop for InFlight<'_> {
     }
 }
 
+/// A request in progress, counted in the store's peaks until it is
+/// answered or its caller gives up.
+struct InProgress<'a> {
+    store: &'a SimS3,
+    body: u64,
+}
+
+impl<'a> InProgress<'a> {
+    fn start(store: &'a SimS3, state: &mut State, body: u64) -> Self {
+        let (requests, bytes) = &mut state.in_progress;
+        *requests += 1;
+        *bytes += body;
+        let (requests, bytes) = (*requests, *bytes);
+        state.stats.max_in_flight = state.stats.max_in_flight.max(requests);
+        state.stats.max_in_flight_bytes = state.stats.max_in_flight_bytes.max(bytes);
+        InProgress { store, body }
+    }
+}
+
+impl Drop for InProgress<'_> {
+    fn drop(&mut self) {
+        let mut state = self.store.state();
+        let (requests, bytes) = &mut state.in_progress;
+        *requests -= 1;
+        *bytes -= self.body;
+    }
+}
+
 /// A successful request whose answer has not reached its caller yet.
 /// Dropping it, because the response is lost or the caller gave up,
 /// counts it in [`SimS3::unanswered`].
@@ -673,6 +755,13 @@ async fn sleep(duration: Duration) {
     }
 }
 
+/// Sleeps until `at`, unless it is now: an instant link never yields.
+async fn sleep_until(at: Instant) {
+    if at > Instant::now() {
+        tokio::time::sleep_until(at).await;
+    }
+}
+
 impl ObjectStore for SimS3 {
     async fn put_object(&self, mut request: PutObject) -> S3Result<WriteOutput> {
         let support = self.shared.config.conditionals.put_object;
@@ -681,6 +770,7 @@ impl ObjectStore for SimS3 {
         let tracking = Tracking {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(WritePrecondition::is_some),
+            body: request.body.len() as u64,
         };
         self.request(Operation::PutObject, tracking, |bucket, _| {
             request.precondition = gated?;
@@ -714,6 +804,7 @@ impl ObjectStore for SimS3 {
         let tracking = Tracking {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(Option::is_some),
+            body: 0,
         };
         self.request(Operation::DeleteObject, tracking, |bucket, _| {
             request.if_match = gated?;
@@ -748,6 +839,7 @@ impl ObjectStore for SimS3 {
         let tracking = Tracking {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(|(p, _)| p.is_some()),
+            body: 0,
         };
         self.request(Operation::CopyObject, tracking, |bucket, _| {
             (request.precondition, request.source_if_match) = gated?;
@@ -766,7 +858,11 @@ impl ObjectStore for SimS3 {
     }
 
     async fn upload_part(&self, request: UploadPart) -> S3Result<ETag> {
-        self.request(Operation::UploadPart, Tracking::NONE, |bucket, _| {
+        let tracking = Tracking {
+            body: request.body.len() as u64,
+            ..Tracking::NONE
+        };
+        self.request(Operation::UploadPart, tracking, |bucket, _| {
             bucket.upload_part(request)
         })
         .await
@@ -782,6 +878,7 @@ impl ObjectStore for SimS3 {
         let tracking = Tracking {
             writes: Some(&key),
             conditional: gated.as_ref().is_ok_and(WritePrecondition::is_some),
+            body: 0,
         };
         self.request(Operation::CompleteMultipartUpload, tracking, |bucket, _| {
             request.precondition = gated?;
@@ -806,6 +903,21 @@ impl ObjectStore for SimS3 {
         .await
     }
 }
+
+impl BodyBytes for GetOutput {
+    fn body_bytes(&self) -> u64 {
+        self.body.len() as u64
+    }
+}
+
+impl BodyBytes for WriteOutput {}
+impl BodyBytes for ObjectInfo {}
+impl BodyBytes for DeleteOutput {}
+impl BodyBytes for ListObjectsV2Output {}
+impl BodyBytes for UploadId {}
+impl BodyBytes for ETag {}
+impl BodyBytes for ListPartsOutput {}
+impl BodyBytes for () {}
 
 #[cfg(test)]
 mod tests;

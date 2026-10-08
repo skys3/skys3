@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::budget::DirtyBudget;
+use crate::concurrency::ConcurrencyStatus;
 use crate::conflict::{Unresolved, effective_policy, may_discard};
 use crate::fill::Filler;
 use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
@@ -69,6 +70,9 @@ pub struct BucketStatus {
     /// Remote multipart uploads that flushes left open and that wait to be
     /// aborted ([`Target::orphaned_uploads`]).
     pub orphaned_uploads: u64,
+    /// The window of requests in flight to the target (§7.7), once the
+    /// probe is done ([`Target::concurrency`]).
+    pub concurrency: Option<ConcurrencyStatus>,
     /// This node's share of the bucket's dirty-data budget
     /// ([`DirtyBudget`]).
     pub dirty_budget: u64,
@@ -90,6 +94,12 @@ impl BucketStatus {
             conflicted_keys: statuses.map(|s| s.conflicts.len() as u64).sum(),
             orphaned_uploads: self.orphaned_uploads,
             dirty_budget: self.dirty_budget,
+            concurrency: self.concurrency.map_or(0, |window| u64::from(window.limit)),
+            inflight_bytes: self.concurrency.map_or(0, |window| window.inflight_bytes),
+            base_round_trip: self
+                .concurrency
+                .and_then(|window| window.base_round_trip)
+                .map_or(0.0, |base| base.as_secs_f64()),
         }
     }
 }
@@ -606,6 +616,11 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .borrow()
                 .as_ref()
                 .map_or(0, |target| target.orphaned_uploads() as u64),
+            concurrency: flusher
+                .target
+                .borrow()
+                .as_ref()
+                .map(|target| target.concurrency()),
             dirty_budget: self
                 .budget
                 .usage(bucket)
@@ -770,6 +785,9 @@ async fn run_probe<S: ObjectStore>(
 ) {
     let prefix = parts.prefix.clone();
     let settings = parts.settings.clone();
+    // Probes are not flushes: they go to the store directly, outside the
+    // target's window (§7.7).
+    let store = Arc::clone(&parts.store);
     // A fresh nonce per run: a failed run may leave scratch keys behind,
     // which would fail the next run's `If-None-Match: *` that must hold.
     let probe = || match &nonces {
@@ -808,7 +826,7 @@ async fn run_probe<S: ObjectStore>(
     };
     let mut failures = 0;
     let support = loop {
-        match probe().run_copies(&*target.store).await {
+        match probe().run_copies(&*store).await {
             Ok(support) => break support,
             Err(error) => {
                 failures += 1;

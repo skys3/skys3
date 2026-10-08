@@ -66,7 +66,8 @@
 //!   that changed at the remote, or a target that refuses the copy, gets an
 //!   upload instead, never a conflict.
 //! - [`Target`]: what the flushers of one target share: the store, the
-//!   probe's findings, the in-flight byte budget, the settings
+//!   probe's findings, the window of requests in flight and the in-flight
+//!   byte budget ([`Target::concurrency`]), the settings
 //!   ([`FlushSettings`]), and the remote uploads left to abort.
 //! - [`Filler`]: read-through fill (§9.2). It reads an evicted version from
 //!   the target with `If-Match` and `versionId`, commits it as extents that
@@ -97,8 +98,14 @@
 //!   `snapshot_target`, and the lost-key report of a shard whose members
 //!   are all lost (§6.9, §8.9).
 //!
-//! Adaptive concurrency (M4-10) replaces the fixed
-//! [`FlushSettings::concurrency`].
+//! - **Adaptive concurrency** (§7.7, [`ConcurrencyStatus`]): every request
+//!   of a target's flushers goes through the target's window, which grows
+//!   additively while latency stays near the target's base round trip and
+//!   requests wait for it, and shrinks multiplicatively on rising latency
+//!   and on throttles such as `503 SlowDown`, between
+//!   `flush_min_concurrency_per_shard` and `flush_max_concurrency_per_shard`
+//!   times the shards flushing to it; the bytes held for requests stay
+//!   within `flush_max_inflight_bytes_per_target`.
 //!
 //! ```
 //! use skys3_flush::FlushSettings;
@@ -110,6 +117,7 @@
 
 mod attempt;
 mod budget;
+mod concurrency;
 mod conflict;
 mod copy;
 mod fill;
@@ -126,6 +134,10 @@ mod target;
 
 pub use attempt::Conflict;
 pub use budget::{DirtyBudget, Exhausted, Usage, share};
+pub use concurrency::{
+    BASE_ROUNDS, ConcurrencyStatus, LATENCY_MIN_FACTOR, LATENCY_TARGET, LATENCY_TOLERANCE,
+    THROTTLE_DECREASE,
+};
 pub use conflict::Unresolved;
 pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
 pub use import::{
@@ -141,6 +153,7 @@ pub use target::{CopySources, FlushSettings, ImportDone, ImportProgress, Target}
 /// Failpoints and seeded bugs for tests (the `test-util` feature).
 #[cfg(feature = "test-util")]
 pub mod test_hooks {
+    pub use crate::concurrency::{ConcurrencyBug, seed_concurrency_bug};
     pub use crate::conflict::{ConflictBug, seed_conflict_bug};
     pub use crate::copy::{CopyBug, seed_copy_bug};
     pub use crate::snapshot::hooks::{SnapshotBug, seed_snapshot_bug};

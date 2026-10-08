@@ -38,7 +38,7 @@ pub mod model;
 pub mod probe;
 mod store;
 
-pub use error::{S3Error, S3ErrorKind};
+pub use error::{S3Error, S3ErrorKind, THROTTLE_CODES};
 pub use metadata::{MetadataError, UserMetadata};
 pub use model::{
     AbortMultipartUpload, ByteRange, CompleteMultipartUpload, CompletedPart, CopyObject,

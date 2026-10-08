@@ -1898,3 +1898,81 @@ async fn credentials_can_be_refused_reads() {
         "new"
     );
 }
+
+// The network path and the rate limit.
+
+#[tokio::test(start_paused = true)]
+async fn bodies_queue_for_the_bandwidth_and_wait_a_round_trip() {
+    let store = store();
+    store.set_link(SimLink {
+        round_trip: Duration::from_millis(10),
+        bandwidth: std::num::NonZeroU64::new(1_000_000),
+        rate_limit: None,
+    });
+    assert_eq!(store.link().round_trip, Duration::from_millis(10));
+    let start = Instant::now();
+    let timed = |key: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .put_object(PutObject::new(key, vec![0u8; 1_000]))
+                .await
+                .unwrap();
+            start.elapsed()
+        }
+    };
+    // 1 ms to send each body, the second after the first, and a round trip.
+    let (first, second) = tokio::join!(timed("a"), timed("b"));
+    assert_eq!(first, Duration::from_millis(11));
+    assert_eq!(second, Duration::from_millis(12));
+    assert_eq!(store.stats().max_in_flight, 2);
+    assert_eq!(store.stats().max_in_flight_bytes, 2_000);
+    // A read's body comes back the same way.
+    let start = Instant::now();
+    let read = store.get_object(GetObject::new("a")).await.unwrap();
+    assert_eq!(read.body.len(), 1_000);
+    assert_eq!(start.elapsed(), Duration::from_millis(11));
+    let head = Instant::now();
+    store.head_object(HeadObject::new("a")).await.unwrap();
+    assert_eq!(head.elapsed(), Duration::from_millis(10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_beyond_the_rate_limit_slow_down_and_are_not_applied() {
+    let store = store();
+    store.set_link(SimLink {
+        rate_limit: Some(RateLimit {
+            requests_per_second: std::num::NonZeroU32::new(10).unwrap(),
+            burst: 1,
+        }),
+        ..SimLink::with_round_trip(Duration::from_millis(2))
+    });
+    let mut kinds = Vec::new();
+    for n in 0..4 {
+        let result = store.put_object(PutObject::new(format!("k{n}"), "x")).await;
+        kinds.push(result.err().map(|error| error.kind()));
+    }
+    assert_eq!(
+        kinds,
+        [
+            None,
+            None,
+            Some(S3ErrorKind::SlowDown),
+            Some(S3ErrorKind::SlowDown)
+        ]
+    );
+    assert_eq!(store.keys(), ["k0", "k1"]);
+    let stats = store.stats();
+    assert_eq!((stats.slow_downs, stats.rate_limited), (2, 2));
+    // The limit refills at its rate.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    store.put_object(PutObject::new("k4", "x")).await.unwrap();
+    // A path without a limit admits everything.
+    store.set_link(SimLink::default());
+    for n in 5..20 {
+        store
+            .put_object(PutObject::new(format!("k{n}"), "x"))
+            .await
+            .unwrap();
+    }
+}

@@ -1716,7 +1716,8 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
             part_bytes: 512,
             // The flusher gives up a body twice as late as its gateway.
             body_timeout,
-            concurrency: 2,
+            min_concurrency: 2,
+            max_concurrency: 2,
             min_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(1),
             ..FlushSettings::default()
