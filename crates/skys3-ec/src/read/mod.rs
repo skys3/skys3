@@ -21,10 +21,13 @@
 //! for the rest of the read.
 //!
 //! Every fragment is read by its node and ID together with what its header
-//! must say: the shard, key, and version, the stripe, and the fragment's
-//! index ([`FragmentIdentity`]). A node serves a fragment only if its
-//! header matches, so a fragment reclaimed since the plan, or an ID reused
-//! on a replaced disk, reads as missing, never as other bytes.
+//! must say: the shard, key, and version identity, the stripe, and the
+//! fragment's index ([`FragmentIdentity`]). A node serves a fragment only
+//! if its header matches, so a fragment reclaimed since the plan, or an ID
+//! reused on a replaced disk, reads as missing, never as other bytes. The
+//! version identity is the coded layout's version and the object's ETag,
+//! the version the fragments were written for (§8.4): a `TAGS` record
+//! moves the entry's version past it, but not the fragments'.
 //!
 //! Fragments travel on the intra-cluster transport ([`FragmentReadClient`],
 //! served by [`FragmentServer::serve_reads`]); a [`FragmentSource`] is what
@@ -44,7 +47,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use skys3_log::ShardRef;
-use skys3_types::{CodedStripe, EpochSeq, FragmentId, NodeId};
+use skys3_types::{CodedStripe, ETag, EpochSeq, FragmentId, NodeId};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -58,15 +61,20 @@ pub use wire::{FragmentData, FragmentRead, FragmentReadClient, MAX_READ_LEN};
 pub const PIECE_LEN: u64 = 1 << 20;
 
 /// What a fragment's header must say for a read of it to be served: the
-/// object version, the stripe, and the fragment's index in it.
+/// object's version identity, the stripe, and the fragment's index in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentIdentity {
     /// The object's shard.
     pub shard: ShardRef,
     /// The object's key.
     pub key: String,
-    /// The position of the record that committed the version.
+    /// The position of the record that committed the version the fragments
+    /// were written for: the coded layout's version
+    /// ([`Coded::version`](skys3_index::Coded::version)), never the
+    /// entry's, which a retag moves past it.
     pub version: EpochSeq,
+    /// The object's ETag, which no retag changes.
+    pub etag: ETag,
     /// The stripe, as every fragment of it describes it.
     pub stripe: StripeInfo,
     /// The fragment's index within the stripe.
@@ -82,6 +90,7 @@ impl FragmentIdentity {
         header.shard == self.shard
             && header.key == self.key
             && header.version == self.version
+            && header.object.etag == self.etag
             && header.stripe == self.stripe
             && header.index == self.index
     }
@@ -161,8 +170,12 @@ pub struct CodedRead {
     pub shard: ShardRef,
     /// The object's key.
     pub key: String,
-    /// The position of the record that committed the version.
+    /// The version the fragments were written for: the coded layout's
+    /// [`Coded::version`](skys3_index::Coded::version), not the entry's
+    /// version, which a `TAGS` record moves (§8.4).
     pub version: EpochSeq,
+    /// The object's ETag.
+    pub etag: ETag,
     /// The object's size.
     pub size: u64,
     /// The version's stripes, as its coded layout gives them.
@@ -358,6 +371,7 @@ impl Reader {
             shard: self.read.shard.clone(),
             key: self.read.key.clone(),
             version: self.read.version,
+            etag: self.read.etag.clone(),
             stripe: StripeInfo {
                 number: coded.number(),
                 count: self.stripe_count,

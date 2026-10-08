@@ -385,9 +385,10 @@ pub(crate) fn store(
 
 /// `TAGS`: replaces a live object's tags as a new version, which the
 /// flusher must send to the remote. The new version keeps the object's
-/// bytes and `Last-Modified`, and its write identity names the `TAGS`
-/// record: an identity the object carried from another cluster (§7.8) is
-/// dropped with its metadata entry.
+/// bytes, `Last-Modified`, and coded layout (§8.4), whose fragments still
+/// name the version they were written for, and its write identity names
+/// the `TAGS` record: an identity the object carried from another cluster
+/// (§7.8) is dropped with its metadata entry.
 fn set_tags(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -565,7 +566,8 @@ fn adopt_remote(
 
 /// `EC_PUBLISH`: the version the record names is coded, if it is still the
 /// key's current version and not coded yet (§8.4). Its stripes become the
-/// version's layout, and their fragments enter the shard's index from node
+/// version's layout, which records that version as the one its fragments
+/// were written for, and their fragments enter the shard's index from node
 /// to fragments. The entry keeps its version, state, and payload: the
 /// replicas drop the replicated bytes only once they know the record
 /// committed (see [`Holder::Coded`](skys3_index::Holder::Coded)).
@@ -592,6 +594,7 @@ fn publish_coded(
     }
     let coded = Coded {
         publish: position,
+        version: publish.version,
         attempt: publish.attempt,
         stripes: publish.stripes.clone(),
     };

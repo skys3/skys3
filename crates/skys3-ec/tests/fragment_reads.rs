@@ -20,7 +20,7 @@ use skys3_ec::{
 };
 use skys3_io::{SimDisk, SimMount};
 use skys3_net::{Frame, Header, MessageKind, TokioNetwork};
-use skys3_types::{NodeAddress, NodeId};
+use skys3_types::{ETag, NodeAddress, NodeId};
 use support::pki::Pki;
 use support::{header, sample};
 
@@ -56,6 +56,7 @@ fn identity(header: &FragmentHeader) -> FragmentIdentity {
         shard: header.shard.clone(),
         key: header.key.clone(),
         version: header.version,
+        etag: header.object.etag.clone(),
         stripe: header.stripe,
         index: header.index,
     }
@@ -134,6 +135,17 @@ async fn a_node_serves_the_fragment_a_read_names() {
     not_held(timed(reader.read(other)).await, "fragment 3 of stripe 0");
     let other = request(node(2), id, &support::header("j", 256, 3), 0..8);
     not_held(timed(reader.read(other)).await, "of k at");
+    // Another version, as a retagged entry's, or another ETag: the header
+    // names the version the fragment was written for, and its ETag.
+    let mut moved = request(node(2), id, &header, 0..8);
+    moved.identity.version = support::position(9, 99);
+    not_held(timed(reader.read(moved)).await, "of k at");
+    let mut retagged = request(node(2), id, &header, 0..8);
+    retagged.identity.etag = ETag::new("0123456789abcdef0123456789abcdef").unwrap();
+    not_held(
+        timed(reader.read(retagged)).await,
+        "9b2cf535f27731c974343645a3985328",
+    );
     let unknown = request(node(2), FragmentId::new(77), &header, 0..8);
     not_held(timed(reader.read(unknown)).await, "no fragment");
     let past = request(node(2), id, &header, 200..300);
@@ -238,7 +250,7 @@ proptest! {
         prop_assert_eq!(identity, request.identity);
         prop_assert_eq!(range, request.range);
 
-        let broken: [fn(&mut FragmentRead); 9] = [
+        let broken: [fn(&mut FragmentRead); 11] = [
             |b| b.id.pop().map(drop).unwrap_or(()),
             |b| b.shard = 256,
             |b| b.key.clear(),
@@ -248,6 +260,8 @@ proptest! {
             |b| b.data_len = 0,
             |b| b.end = b.start,
             |b| b.end = b.start + MAX_READ_LEN + 1,
+            |b| b.etag.clear(),
+            |b| b.etag.push('"'),
         ];
         for breaks in broken {
             let mut bad = body.clone();

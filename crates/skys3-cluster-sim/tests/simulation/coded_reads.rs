@@ -2,9 +2,10 @@
 //! coding cluster is coded and its replicas are dropped, clients read
 //! whole objects and ranges through every node's gateway while up to `m`
 //! fragment holders crash, lose power, lose their fragment disk for good,
-//! or send corrupted fragment bytes, and copy some of them to new keys
-//! with CopyObject. Every GET that answers, of an object or of a copy,
-//! must return its version's bytes. Seeded bugs show that the checks catch a reader
+//! or send corrupted fragment bytes, copy some of them to new keys with
+//! CopyObject, and retag some, which moves their entries' versions past
+//! the ones their fragments were written for. Every GET that answers, of
+//! an object or of a copy, must return its version's bytes. Seeded bugs show that the checks catch a reader
 //! that trusts bytes failing their CRC32C, and one that decodes with the
 //! wrong fragment indices. See `skys3_cluster_sim::coding`.
 
@@ -61,8 +62,8 @@ fn degraded_reads_through_the_gateway_return_the_written_bytes() {
         if reads.served == 0 || reads.parity_reads == 0 {
             return Err(format!("no degraded read was served: {reads:?}").into());
         }
-        if reads.copied == 0 {
-            return Err(format!("no coded object was copied: {reads:?}").into());
+        if reads.copied == 0 || reads.retagged == 0 {
+            return Err(format!("no coded object was copied or retagged: {reads:?}").into());
         }
         Ok(())
     });
