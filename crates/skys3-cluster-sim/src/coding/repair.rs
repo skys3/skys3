@@ -278,6 +278,7 @@ pub(super) fn start(
         checks_per_node: 4,
         replans: 3,
         bytes_per_second: config.bytes_per_second,
+        moves_per_pass: 0,
     };
     let observed = Arc::clone(world);
     let repairer = Repairer::new(
