@@ -54,7 +54,10 @@
 //!   coded objects lost, rebuilds each damaged stripe's on other nodes
 //!   from `k` survivors, most damaged stripes first and within the node's
 //!   repair bandwidth, and relocates them with an `EC_RELOCATE` record
-//!   ([`Repairer`]).
+//!   ([`Repairer`]). Once nothing is lost, the same repairer moves
+//!   fragments off nodes that are no longer eligible, out of failure
+//!   domains over their cap, and toward each node's share, one
+//!   `EC_RELOCATE` a fragment, after repairs on the bandwidth cap.
 //!
 //! ```
 //! use skys3_ec::{CodecId, EcCodec, Geometry, codec, current_codec};
@@ -104,7 +107,7 @@ pub use read::{
 pub use reed_solomon::ReedSolomonV1;
 pub use repair::{
     RepairBandwidth, RepairError, RepairEvent, RepairMetrics, RepairObserver, RepairReport,
-    RepairSettings, RepairStep, Repairer,
+    RepairSettings, RepairStep, Repairer, Repairing,
 };
 pub use skys3_types::{
     AttemptId, CodecId, CodedStripe, FragmentId, FragmentLocation, Geometry, GeometryError,

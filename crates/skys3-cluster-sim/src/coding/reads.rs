@@ -149,14 +149,15 @@ pub(super) struct Reads {
 }
 
 impl Reads {
-    /// The read side of a run of `config` in cluster `cluster`, with the
-    /// coded bucket and its shard, `shard`, registered in a fresh control
-    /// store.
+    /// The read side of a run of `config` in cluster `cluster` of `nodes`
+    /// nodes, with the coded bucket and its shard, `shard`, registered in a
+    /// fresh control store.
     pub(super) fn new(
         config: ReadConfig,
         cluster: ClusterId,
         shard: &ShardConfig,
         seed: u64,
+        nodes: usize,
     ) -> Result<Self, BoxError> {
         let store = MemoryControlStore::new();
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -166,7 +167,7 @@ impl Reads {
             cluster,
             store,
             versions: Mutex::default(),
-            corrupt: (0..NODES).map(|_| AtomicBool::new(false)).collect(),
+            corrupt: (0..nodes).map(|_| AtomicBool::new(false)).collect(),
             clients_done: AtomicU64::new(0),
             parity_reads: AtomicU64::new(0),
             failed_fragment_reads: AtomicU64::new(0),

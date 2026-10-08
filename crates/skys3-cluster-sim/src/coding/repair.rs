@@ -40,10 +40,11 @@ use skys3_io::{BlockingPool, SimMount};
 use skys3_net::TurmoilNetwork;
 use skys3_shard::Shard;
 
-use super::{Crash, CrashKind, CrashTarget, Driver, MEMBERS, NODES, World, Writer, lock, planner};
+use super::{Crash, CrashKind, CrashTarget, Driver, MEMBERS, NODES, World, Writer, lock};
 
-/// How long a node lost for good stays down: past the end of any run.
-const FOREVER: Duration = Duration::from_secs(1 << 40);
+/// How long a node lost for good, or still to join, stays down: past the
+/// end of any run.
+pub(super) const FOREVER: Duration = Duration::from_secs(1 << 40);
 
 /// How a run loses holders and repairs them.
 #[derive(Debug, Clone)]
@@ -184,8 +185,9 @@ pub struct RepairOutcome {
 /// What the repairers did, as the driver sees it.
 #[derive(Default)]
 pub(super) struct RepairLog {
-    /// Every repair step, with the node and life of its repairer.
-    events: std::sync::Mutex<Vec<(usize, u64, RepairEvent)>>,
+    /// Every repair step, a move's too, with the node and life of its
+    /// repairer.
+    pub(super) events: std::sync::Mutex<Vec<(usize, u64, RepairEvent)>>,
     /// Every transfer's start and bytes, by the node and life of its
     /// repairer.
     transfers: std::sync::Mutex<Transfers>,
@@ -208,7 +210,7 @@ impl RepairLog {
             .push((now, bytes));
     }
 
-    /// Whether the attempt of a repair committed and relocated.
+    /// Whether the attempt of a repair or a move committed and relocated.
     pub(super) fn relocated(&self, attempt: skys3_types::AttemptId) -> bool {
         lock(&self.events).iter().any(|(_, _, event)| {
             event.attempt == attempt
@@ -271,26 +273,29 @@ pub(super) fn start(
         node: index,
         life,
     };
-    let ec = world.run.ec.clone();
     let settings = RepairSettings {
         interval: Duration::from_millis(100),
         lost_after: config.lost_after,
         checks_per_node: 4,
         replans: 3,
         bytes_per_second: config.bytes_per_second,
+        // Moves only in a run that rebalances.
+        moves_per_pass: world.run.rebalance.as_ref().map_or(0, |r| r.moves_per_pass),
     };
     let observed = Arc::clone(world);
+    let planned = Arc::clone(world);
     let repairer = Repairer::new(
         shard,
         Arc::new(source),
         Arc::new(writer),
-        Arc::new(move || planner(&ec)),
+        super::moves::planner_source(planned),
         BlockingPool::inline("repair"),
         settings,
     )
     .with_attempts(attempts)
     .with_bug(config.bug)
     .with_observer(Arc::new(move |event: &RepairEvent| {
+        super::moves::observe(&observed, event);
         lock(&observed.repair.events).push((index, life, event.clone()));
     }));
     tokio::spawn(repairer.run());
@@ -335,6 +340,8 @@ pub(super) struct Phase {
     lost: Vec<(usize, Loss)>,
     /// Whether the retags before the losses started.
     retagging: bool,
+    /// Why the repairs had not ended at the last check.
+    unfinished: String,
 }
 
 impl Driver<'_> {
@@ -362,6 +369,7 @@ impl Driver<'_> {
                 }
             }
             self.lose_holders(sim, now, &config);
+            self.start_moves(now);
             return true;
         }
         // Repairs that do not end within the bound end the run, which the
@@ -370,10 +378,15 @@ impl Driver<'_> {
         self.repair.whole_at.is_none() && now <= lost_at + config.bound
     }
 
-    /// Notes when every stripe is whole again after the losses.
+    /// Notes when every stripe is whole again after the losses, and, in a
+    /// run that rebalances, the drains and the balance are done.
     pub(super) fn repair_progress(&mut self, now: Duration) {
-        if self.repair.lost_at.is_some() && self.repair.whole_at.is_none() && self.whole().is_ok() {
-            self.repair.whole_at = Some(now);
+        if self.repair.lost_at.is_none() || self.repair.whole_at.is_some() {
+            return;
+        }
+        match self.whole().and_then(|()| self.rebalanced()) {
+            Ok(()) => self.repair.whole_at = Some(now),
+            Err(why) => self.repair.unfinished = why,
         }
     }
 
@@ -544,7 +557,7 @@ impl Driver<'_> {
 
     /// Checks that every member's layout of every object names `k + m`
     /// fragments its nodes hold and that are not lost; or says why not.
-    fn whole(&self) -> Result<(), String> {
+    pub(super) fn whole(&self) -> Result<(), String> {
         let views = self.views();
         let shard = &self.world.shard;
         let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
@@ -668,7 +681,10 @@ impl Driver<'_> {
             return Ok(None);
         };
         let (Some(lost_at), Some(whole_at)) = (self.repair.lost_at, self.repair.whole_at) else {
-            return Err(format!("the repairs did not end within {:?}", config.bound));
+            return Err(format!(
+                "the repairs did not end within {:?}: {}",
+                config.bound, self.repair.unfinished
+            ));
         };
         let repair_time = whole_at - lost_at;
         if repair_time > config.bound {
@@ -681,6 +697,7 @@ impl Driver<'_> {
             .clone()
             .unwrap_or_default();
         let events = lock(&self.world.repair.events);
+        let moves = super::moves::move_attempts(&events);
         let mut outcome = RepairOutcome {
             lost: self
                 .repair
@@ -713,7 +730,7 @@ impl Driver<'_> {
                 }
                 RepairStep::Committed {
                     relocated: true, ..
-                } => {
+                } if !moves.contains(&event.attempt) => {
                     outcome.relocated += 1;
                     if retagged.contains(&event.key) {
                         outcome.retagged_relocated += 1;
