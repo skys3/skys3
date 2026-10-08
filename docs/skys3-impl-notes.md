@@ -6374,6 +6374,20 @@ of this file. A task with nothing unexpected keeps "None."
   found the same, still fresh, validation and read the same version. A
   failed direct read now forgets the key's validation
   (`OriginValidations::forget`), so the next round asks the origin.
+- **Fill readers woke in a random order.** CI's replay of seed 1 found
+  two runs one stale read apart; it failed about half the time locally
+  too, with or without load. Two reads on one node joined one fill, and
+  their answers left in either order. A fill's readers followed it
+  through a `watch` channel, which registers each waiter with one of 8
+  notifiers that tokio's thread-local random number generator picks,
+  and wakes them notifier by notifier. That generator is not seeded in a
+  simulation, since turmoil seeds it only under `--cfg tokio_unstable`;
+  a build with that flag replayed 12 of 12 times. The filler now keeps
+  each fill's progress behind a `Notify` (`fill::Tracker`), which wakes
+  readers in the order they began waiting. Other `watch` channels with
+  several waiters, and unbiased `tokio::select!`, draw from the same
+  generator; they are left as they are, and are the first suspects if
+  another replay diverges.
 - **Listings are forwarded, not cached.** `listing::forward` lists the
   origin with the request's prefix and delimiter, starting after the
   gateway's own start point, and follows the origin's continuation tokens
