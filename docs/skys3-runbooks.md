@@ -557,19 +557,37 @@ remote. Coded objects survive in their fragments (design section 6.9).
      coded objects' fragments survive, and re-indexing them is the restore
      drill.
 
-**Remediation.** Tell the bucket's owners which keys, or which window, were
-lost. For a `write_back` bucket, the cluster serves what the remote holds
-once the shard has members again. For a `local` bucket, the restore drill
-re-indexes coded objects from their fragment headers; it has no command
-yet. Give the bucket a `snapshot_target` (and a `local` bucket a
-`backup_target`) so that a later loss can be reported.
+**Remediation.** This build cannot bring a fully lost shard back. Its
+register still names the lost primary and members; the coordinator only
+adds learners, which the primary must backfill and promote, and only a
+member of the configuration may take over (rule R1, design section 6.3).
+No command resets the shard's configuration, installs a restored index,
+or deletes the bucket: DeleteBucket seals every shard first, and the lost
+one cannot be sealed. Until such a command exists (section 8), the shard's
+keys answer `503`, and the bucket's other shards serve on.
 
-**Verification.** The shard serves again, and the lost keys are accounted
-for.
+1. Tell the bucket's owners which keys, or which window, were lost.
+2. For a `write_back` bucket, what the remote holds can still be served,
+   read-only: create a `read_only` bucket under another name with the lost
+   bucket's target as its origin (`x-skys3-bucket-mode: read_only`,
+   `x-skys3-bucket-target: <the target URL>`). Its reads go to the origin
+   (design section 9.5), and every write to it answers `403
+   AccessDenied`. Do not create a second `write_back` bucket on the same
+   target: its flushes would meet the old bucket's writes as out-of-band
+   writes.
+3. For a `local` bucket, nothing serves the shard's keys: re-indexing its
+   coded objects is the restore drill, which has no command yet.
+4. Give the bucket a `snapshot_target` (and a `local` bucket a
+   `backup_target`) so that a later loss can be reported.
+
+**Verification.** The lost keys and the window are accounted for, and a
+`read_only` bucket over the target serves its objects.
 
 **Do not.** Do not start a node with a data directory copied from another
 node: the data directory's instance ID names one node, and a copy can serve
-records no other member knows.
+records no other member knows. Do not edit the shard's register by hand to
+name new members: a member that holds no records would take over as if it
+held every committed one.
 
 ### Provisioning
 
@@ -1025,7 +1043,7 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Network partition](#network-partition) | `simulation::takeover::competing_candidates_across_a_partition` | Across a partition, one candidate's CAS wins and the shard serves on the majority side; no acknowledged write is lost. | Not drilled on the binary, as above. |
 | [Placement policy](#placement-policy) | `skys3_coord::policy::tests::losing_a_rack_leaves_buckets_unsatisfied_without_co_location`; `skys3_coord::metrics::tests::the_gauges_follow_tenures_and_reports`; `simulation::heal::a_lost_rack_is_replaced_across_the_remaining_racks` | The report names short and co-located shards and unlabeled nodes without co-locating; the gauges follow the coordinator's report; a lost rack heals across the others. | Not drilled on the binary, which does not run the coordinator, so `GET /v1/health` has no `placement` yet. |
 | [Coordinator](#coordinator) | `simulation::coordinator::coordinator_failover_delays_only_placement_work`; `simulation::heal::a_coordinator_lost_in_the_middle_of_a_change_is_succeeded` | Another node takes the lease; only placement work waits; a change cut short is completed by the successor. | Not drilled on the binary, as above. |
-| [Shard lost](#shard-lost) | `simulation::drills::restore_drills_match_the_history`; `simulation::snapshots::the_lost_key_report_matches_the_history_with_backups` | The lost-key report and the restore drill match the history: the keys only the members held, the window after the snapshot, and coded objects re-indexed from their fragments. | The report and the drill have no command, so an operator cannot run them yet (section 8). |
+| [Shard lost](#shard-lost) | `simulation::drills::restore_drills_match_the_history`; `simulation::snapshots::the_lost_key_report_matches_the_history_with_backups` | The lost-key report and the restore drill match the history: the keys only the members held, the window after the snapshot, and coded objects re-indexed from their fragments. | The report and the drill have no command, so an operator cannot run them yet, and nothing gives the shard members again; the runbook first said the shard would serve again (section 8). |
 | [Provisioning](#provisioning) | `simulation::registry::a_node_with_valid_credentials_joins_with_no_other_action`; `simulation::rebalancing::a_new_node_receives_its_share_of_shards_and_primaries`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one` | A node with valid credentials joins and receives its share; a lost node is replaced, forgotten, and succeeded. | No command retires a node sooner than `node_forget_after_hours`, and node labels have no configuration key (section 8). |
 | [Node down](#node-down) | `runbooks::drill_node_down`; `simulation::takeover::a_crashed_primary_fails_over_within_ten_seconds` | After `SIGKILL`, scrapes and `/healthz` fail; a restart recovers every acknowledged write and reports `ready` with every disk in service. A crashed primary's shards fail over within 10 seconds. | Nothing. |
 | [Cluster power loss](#cluster-power-loss) | `runbooks::drill_node_down`; `simulation::restart::a_whole_cluster_restart_while_the_control_store_is_unreachable` | A node that restarts while its control store cannot be opened serves from its copy (`live` false), then opens the store by itself and logs it. In a cluster, unchanged shards serve again and changed ones stay fenced. | Nothing. |
@@ -1057,6 +1075,12 @@ meets today, not a plan of this document.
   a node that runs from its copy answers `503`.
 - **Lost-key report and restore drill commands.** `skys3_flush::snapshot`
   builds both, but no command or endpoint runs them.
+- **Recreating a fully lost shard.** Nothing gives a shard whose every
+  member is lost new members: replacement keeps the registered primary and
+  adds learners that only that primary backfills and promotes, and rule R1
+  lets only a member take over. An operator needs a command that writes a
+  new configuration for the shard, empty or from the restore drill's index,
+  and a way to delete a bucket one of whose shards cannot be sealed.
 - **Placement and membership status.** `GET /v1/health` `placement` and
   bucket status with each shard's members arrive with the coordinator and
   replication in the binary.
