@@ -264,9 +264,10 @@ that every node is scraped by a job named `skys3`.
 - **Thresholds.** They are starting points for the default configuration
   ([configuration reference](skys3-config.md)). The dirty-age thresholds in
   particular should follow the loss exposure (RPO) a deployment accepts.
-- **Runbooks.** Every rule's `runbook_url` links a section of
-  `docs/skys3-runbooks.md` (plan M7-05) by the anchor in the Runbook column.
-  The anchors are stable: the runbooks keep a section for each.
+- **Runbooks.** Every rule's `runbook_url` links a section of the
+  [runbooks](skys3-runbooks.md) by the anchor in the Runbook column. The
+  anchors are stable: the runbooks keep a section for each, and their tests
+  fail for an anchor that has none.
 - **External series.** Two rules read series no SkyS3 node exports: `up`, which
   Prometheus records for every scrape target, and `node_timex_sync_status`,
   which node_exporter's timex collector exports (1 while the kernel clock is
@@ -343,7 +344,7 @@ on, or cannot be shown yet; the notes say why.
 | Primary dead | `up`, `skys3_under_replicated_bytes`, `skys3_oldest_under_replicated_age_seconds` | `SkyS3NodeDown`, `SkyS3UnderReplicated` | The new primary runs without the dead member until it is replaced. The failover itself (under 10 s) shows to clients as `503` answers; the gateway exports no request metrics yet. |
 | Two of three members dead | `up`, `skys3_under_replicated_bytes`, `skys3_oldest_under_replicated_age_seconds` | `SkyS3NodeDown`, `SkyS3UnderReplicated`, `SkyS3UnderReplicatedLong` | The shard refuses client writes until a learner catches up; no metric counts those refusals. |
 | Whole cluster loses power | `up`, `skys3_control_store_live`, `skys3_control_store_last_success_timestamp_seconds` | `SkyS3NodeDown`, `SkyS3ControlStoreUnreachable` | Every node is down, then replays its logs. A node that restarts while the control store is unreachable serves its local copy and reports `skys3_control_store_live` 0. |
-| Every member of a shard permanently lost | `up`, `skys3_oldest_dirty_age_seconds`, `skys3_dirty_bytes`, `skys3_oldest_under_replicated_age_seconds` | `SkyS3NodeDown`, `SkyS3DirtyDataOld`, `SkyS3UnderReplicatedLong` | What was lost is bounded by the dirty bytes and dirty age before the loss. The lost keys are reported from the latest index snapshot (design section 6.9), not by a metric. |
+| Every member of a shard permanently lost | `up`, `skys3_oldest_dirty_age_seconds`, `skys3_dirty_bytes`, `skys3_oldest_under_replicated_age_seconds` | `SkyS3NodeDown`, `SkyS3DirtyDataOld`, `SkyS3UnderReplicatedLong` | The dirty bytes and dirty age before the loss show the writes at risk in a `write_back` bucket, but not all its deletes (a tombstone counts 0 bytes and, after a restart, its age runs from the restart), nor what a `local` bucket without a backup risked. The lost keys are reported from the latest index snapshot (design section 6.9), not by a metric, and no command runs that report yet. |
 | Node holding EC fragments lost | `up`, `skys3_unrepaired_fragments`, `skys3_oldest_unrepaired_age_seconds`, `skys3_repaired_fragments_total`, `skys3_repair_duration_seconds` | `SkyS3NodeDown`, `SkyS3FragmentsUnrepaired` | Degraded reads go on; the repair metrics show the rebuild's progress. |
 | Node fails while the control store is unreachable | `up`, `skys3_control_store_last_success_timestamp_seconds`, `skys3_control_store_live` | `SkyS3NodeDown`, `SkyS3ControlStoreUnreachable` | Both alerts at once mean that the failed node's shards take no writes until the store returns. |
 | Remote target unreachable | `skys3_flush_lag_seconds`, `skys3_flush_retries_total`, `skys3_oldest_dirty_age_seconds`, `skys3_dirty_bytes`, `skys3_dirty_budget_bytes`, `skys3_admission_refusals_total` | `SkyS3FlushStalled`, `SkyS3DirtyDataOld`, `SkyS3DirtyBudgetNearlyFull`, `SkyS3WritesRefusedOverBudget` | Writes go on until the budget is used up. Reads of evicted data fail: `skys3_fills_total` stops growing, and the gateway exports no error rate yet. |
