@@ -47,6 +47,7 @@ fn bucket() -> BucketDocument {
             prefix: Some(PREFIX.to_owned()),
         }),
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new("p-1").unwrap(),
     }
 }
