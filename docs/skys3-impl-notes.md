@@ -6124,8 +6124,8 @@ of this file. A task with nothing unexpected keeps "None."
   `CopyObject` (`Copies::stalls`), and after some it writes the source
   again (`Copies::rewrites`), so the source changes at the remote before
   the stalled copy's retry. After a final drain the audit reads every
-  copier key on every member and checks the members agree and the remote
-  holds their version: bytes by MD5, user metadata, content type, tags,
+  copier key on every member and checks the members agree on its version
+  and the remote holds that version: bytes by MD5, user metadata, content type, tags,
   and the write identity of the version's record; any key held in
   conflict fails it. The main scenario adds crashes with and without
   power loss, partitions, message loss, control-store faults, and 2% of
@@ -6731,6 +6731,15 @@ of this file. A task with nothing unexpected keeps "None."
   copied part is flushed as an `UploadPart` from the local log, so the
   audit of multipart objects is unchanged. The orphan sweep now runs
   alongside the copy probe, once the target is ready.
+- **What the merge's seeds found.** M4-07's copy audit required the
+  members to agree on each key's state as well as its version, though
+  the final power loss may cut a lazy `FLUSHED` on some members and not
+  others: `the_audit_catches_copies_without_their_identity` seed 1 ended
+  with one member clean and two dirty at the same version. The audit now
+  compares versions and checks each member's entry against the remote
+  (a clean one must record the remote's ETag). The seeded bug of given-up
+  aborts fails half the aborts instead of a quarter: a seed ends a dozen
+  or so streamed uploads, and seed 0 after the merge failed none.
 - **A real bug: uploads left open with no later flush.** An upload whose
   abort failed, or whose flush was cancelled, was aborted only before
   the target's next multipart flush. When the key's next version was a

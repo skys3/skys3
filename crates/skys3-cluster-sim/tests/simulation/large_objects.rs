@@ -300,12 +300,13 @@ fn the_audit_catches_a_wrong_etag_recorded_after_a_lost_complete() {
 }
 
 /// Giving up a failed abort leaves a remote upload open whose ID a log
-/// recorded.
+/// recorded. Half the aborts fail: a seed ends a dozen or so streamed
+/// uploads, and with a quarter failing, one seed in forty failed none.
 #[test]
 fn the_audit_catches_remote_uploads_left_open() {
     Runner::with_cost(2, COST).run(|context| {
         let failing = SimS3Faults {
-            internal_error_probability: 0.25,
+            internal_error_probability: 0.5,
             ..DELAYS
         };
         caught(
