@@ -4,8 +4,9 @@
 //! With [`ClusterConfig::large_objects`](crate::ClusterConfig::large_objects),
 //! clients send the large-object mix (streamed single `PUT`s, multipart
 //! uploads of several parts with UploadPartCopy, re-uploaded and dropped
-//! parts, aborts), every multipart step and `PutObject` at the remote store
-//! fails or loses its answer more often ([`LargeObjects::step_faults`]),
+//! parts, aborts), every multipart step, `PutObject`, and `CopyObject` at
+//! the remote store fails or loses its answer more often
+//! ([`LargeObjects::step_faults`]),
 //! a node may crash right after the remote applied one of its steps
 //! ([`LargeObjects::step_crash_probability`]), and the run audits the
 //! remote store:
@@ -64,14 +65,14 @@ use crate::lifecycle::ShardLogs;
 pub struct LargeObjects {
     /// The random faults of each multipart step (`CreateMultipartUpload`,
     /// `UploadPart`, `ListParts`, `CompleteMultipartUpload`,
-    /// `AbortMultipartUpload`) or `PutObject` named here at the remote
-    /// store, in place of
+    /// `AbortMultipartUpload`), `PutObject`, or `CopyObject` named here at
+    /// the remote store, in place of
     /// [`ClusterConfig::remote_faults`](crate::ClusterConfig::remote_faults).
     pub step_faults: Vec<(Operation, SimS3Faults)>,
     /// The probability that a node crashes, with or without power loss,
-    /// right after the remote store applied one of its multipart steps or
-    /// `PutObject`s: before it learns the answer, or before it records
-    /// what the answer said.
+    /// right after the remote store applied one of its multipart steps,
+    /// `PutObject`s, or `CopyObject`s: before it learns the answer, or
+    /// before it records what the answer said.
     pub step_crash_probability: f64,
     /// The most crashes aimed at steps in one run.
     pub step_crashes: usize,
@@ -84,14 +85,17 @@ pub struct LargeObjects {
 }
 
 impl LargeObjects {
-    /// The multipart steps and `PutObject`.
-    pub const STEPS: [Operation; 6] = [
+    /// The multipart steps, `PutObject`, and `CopyObject`, which flushes
+    /// of copies send (M4-07). No `UploadPartCopy` reaches the remote: a
+    /// copied part is flushed as an `UploadPart` from the local log.
+    pub const STEPS: [Operation; 7] = [
         Operation::CreateMultipartUpload,
         Operation::UploadPart,
         Operation::ListParts,
         Operation::CompleteMultipartUpload,
         Operation::AbortMultipartUpload,
         Operation::PutObject,
+        Operation::CopyObject,
     ];
 
     /// `faults` for every one of [`LargeObjects::STEPS`].

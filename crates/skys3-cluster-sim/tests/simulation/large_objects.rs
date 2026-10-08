@@ -13,12 +13,13 @@
 //!
 //! The faults: crashes with and without power loss, of primaries and
 //! members alike, which move primaries; crashes aimed at a node right
-//! after the remote store applied one of its multipart steps or
-//! `PutObject`s; partitions, held links, and message loss between nodes;
-//! a node's link to the remote store dropped; and control-store faults.
-//! The remote store fails each multipart step and `PutObject` with `500`
-//! or `503 SlowDown`, and loses requests and answers, more often than
-//! other requests. A quarter of the `write_back` seeds flush without
+//! after the remote store applied one of its multipart steps,
+//! `PutObject`s, or `CopyObject`s (the capability probe's, since the mix
+//! has no client `CopyObject`); partitions, held links, and message loss
+//! between nodes; a node's link to the remote store dropped; and
+//! control-store faults. The remote store fails each multipart step,
+//! `PutObject`, and `CopyObject` with `500` or `503 SlowDown`, and loses
+//! requests and answers, more often than other requests. A quarter of the `write_back` seeds flush without
 //! streaming, so that multipart versions go as the flusher's own uploads
 //! after their commit.
 //!
@@ -64,8 +65,8 @@ const DELAYS: SimS3Faults = SimS3Faults {
 
 /// Three nodes, every shard on all of them, two buckets flushing to
 /// `target` in a remote store whose requests take 2 to 15 ms each way
-/// and fail or lose 1% of them, and every multipart step and `PutObject`
-/// as `large` says.
+/// and fail or lose 1% of them, and every multipart step, `PutObject`,
+/// and `CopyObject` as `large` says.
 fn config(target: Target, large: LargeObjects) -> ClusterConfig {
     let (write_back_buckets, write_through, backup) = match target {
         Target::WriteBack => (2, WriteThrough::Off, Backup::Off),

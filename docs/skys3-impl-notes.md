@@ -6720,8 +6720,17 @@ of this file. A task with nothing unexpected keeps "None."
   sources, read first and copied under `x-amz-copy-source-if-match`.
   Parts but the last are 520 to 900 bytes, never the 512 of a streamed
   body, so a multipart ETag tells a client's upload from a streamed PUT.
-  On this base remote copies are not in `ObjectStore` (M4-07), so copied
-  parts reach the remote as `UploadPart`s from the local log.
+- **Remote copies (after merging M4-07).** Copies of clean sources now
+  flush as remote `CopyObject`s, so `CopyObject` is among the faulted
+  steps and the steps crashes are aimed after. The large-object mix
+  sends no client `CopyObject` (M4-07's `copies` scenario audits those
+  flushes under crashes and faults), so here only the capability
+  probe's copies meet these faults, which keeps the probe's copy run
+  honest under a flaky store; their keys are not audited. No
+  `UploadPartCopy` reaches the remote: `ObjectStore` has none, and a
+  copied part is flushed as an `UploadPart` from the local log, so the
+  audit of multipart objects is unchanged. The orphan sweep now runs
+  alongside the copy probe, once the target is ready.
 - **A real bug: uploads left open with no later flush.** An upload whose
   abort failed, or whose flush was cancelled, was aborted only before
   the target's next multipart flush. When the key's next version was a
