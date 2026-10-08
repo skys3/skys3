@@ -2361,6 +2361,7 @@ dependencies = [
  "md-5",
  "prometheus-client",
  "skys3-config",
+ "skys3-ec",
  "skys3-index",
  "skys3-io",
  "skys3-log",
