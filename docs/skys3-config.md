@@ -190,7 +190,7 @@ Erasure coding of `local` buckets (§8).
 | `ec_after_seconds` | integer | `600` | May be 0. |
 | `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). `"write_through"` answers a write once the backup holds it, with `flush.write_through_timeout_seconds` as for `ack_policy` (§7.5). |
 | `index_snapshot_interval_seconds` | integer | `3600` | Positive (§8.9). |
-| `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. |
+| `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. On a node with `[peering.peers]` tables, `auto` uses QUIC when the target serves a peer descriptor that verifies and a handshake succeeds, and S3 REST otherwise; `native` uses QUIC only, and waits while it cannot; `s3` never looks for a peer. Without peers, `auto` is S3 REST and a `native` target is not flushed. |
 | `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets take one: what a `local` bucket's backup lacks is not charged (§8.9). |
 | `freshness` | `"revalidate"` or `"ttl"` | `"revalidate"` | Only `read_only` buckets use it (§9.5). `"revalidate"` asks the origin on every GET and HEAD; `"ttl"` lets a read use what a HEAD sent up to `freshness_ttl_seconds` earlier saw. |
 | `freshness_ttl_seconds` | integer | `60` | From 1 to 86400. How stale a read of a `read_only` bucket with `freshness = "ttl"` may be (§9.5). |
@@ -216,9 +216,10 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `quic_listen` | socket address | `"0.0.0.0:7443"` | |
+| `quic_advertise` | array of strings | `[]` | At most 16 addresses, each `host:port` in at most 255 bytes: a host of ASCII letters, digits, `.`, and `-`, or a bracketed IPv6 address, and a port from 1 to 65535. The addresses of this node's QUIC endpoint as peers reach it, which the peer descriptors of its receiving buckets name and its `[transport]` key signs (§7.8). Empty: the node serves no descriptor, and sources reach its buckets over S3 REST only. |
 | `congestion_control` | `"cubic"`, `"new_reno"`, or `"bbr"` | `"cubic"` | BBR is experimental in Quinn. |
 | `peer_frame_bytes` | integer | `262144` (256 KiB) | From 1 to 16777216 (16 MiB). The size of a `DATA` frame and the largest object in a `BATCH`; a destination stages each frame as one log record. |
-| `peer_connect_timeout_ms` | integer | `3000` | Positive. |
+| `peer_connect_timeout_ms` | integer | `3000` | Positive. How long a source's handshake with a peer, `HELLO`s included, may take before the target falls back to S3 REST (§7.8). |
 | `peer_connections_per_shard` | integer | `64` | Positive. |
 | `peer_max_inflight_bytes` | integer | `268435456` (256 MiB) | At least `peer_frame_bytes`. |
 | `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least 64 KiB plus the larger of `peer_frame_bytes` and 64 KiB: one staging and one frame, each charged at least 64 KiB (design §7.8). |
@@ -232,6 +233,7 @@ A peer cluster this node trusts, keyed by its cluster ID (§12). Peer connection
 |---|---|---|---|
 | `ca_file` | path | required | Not empty. The peer's CA bundle in PEM; the peer's node certificates must lead to it and name the peer's cluster in their SPIFFE ID. |
 | `buckets` | array of `{ source, destination }` tables | `[]` | The bucket pairs the peer may write as a source: `source` is the peer's bucket ID, which its write identities carry, and `destination` is this cluster's bucket name. No pair appears twice. Empty for a peer this node only sends to. |
+| `s3_access_key_ids` | array of strings | `[]` | ASCII letters and digits, each listed for one peer only. The access keys the peer's flushers sign S3 requests with when they fall back to S3 REST (§7.8, §12): requests signed with one may write the buckets whose `peer_source` is the peer, with the peer's write identities (`x-amz-meta-skys3-wid`) for its bucket pairs. The keys themselves are this cluster's identities, as any client's. |
 
 ## `[identity]`
 

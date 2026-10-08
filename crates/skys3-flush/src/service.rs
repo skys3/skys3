@@ -181,10 +181,13 @@ impl BucketStatus {
 ///   held rather than discarded, since adopting the peer's write would
 ///   read it over S3.
 /// - **Over S3 REST to a peer** the target needs no probe either, since a
-///   SkyS3 gateway honors every precondition, but it is ready only after
-///   the transport's quarantine ([`PeerTransport::quarantine`]), so that no
-///   `COMMIT` an earlier flusher sent over QUIC can still apply once a key
-///   is flushed over S3.
+///   SkyS3 gateway honors every precondition, but each shard flusher that
+///   starts on it, with the target or later as it takes a shard over,
+///   sends nothing before the transport's quarantine passed
+///   ([`PeerTransport::quarantine`]): no `COMMIT` sent over QUIC before it
+///   started, here or on an earlier primary, can then still apply once a
+///   key is flushed over S3. So does one on a target whose descriptor was
+///   refused.
 /// - **A change of transport** builds the target anew and restarts the
 ///   bucket's shard flushers on it, as a restart or a takeover does: keys
 ///   in flight stay dirty, and the new flushers send them again with the

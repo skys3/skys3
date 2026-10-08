@@ -22,7 +22,8 @@
 //!   other `4xx`), the target is not a peer, and the discovery ends; a
 //!   refused descriptor is read again after the backoff. A target that
 //!   served a descriptor, refused or not, may be a peer that took native
-//!   commits, so its probe waits out the quarantine first.
+//!   commits, so its shard flushers wait out the quarantine as they
+//!   start.
 //! - **Waiting** ([`Choice::Waiting`]) until the descriptor can be read,
 //!   and for a target whose `target_transport` is `native` for as long as
 //!   QUIC cannot be used: nothing is flushed meanwhile.
@@ -95,8 +96,8 @@ pub(crate) enum Choice {
     /// S3 REST to a store that is not a verified SkyS3 peer: probed.
     PlainS3 {
         /// Whether the store served a descriptor, which did not verify:
-        /// it may be a peer that took native commits, so the probe waits
-        /// out the quarantine.
+        /// it may be a peer that took native commits, so the shard
+        /// flushers wait out the quarantine.
         found: bool,
     },
 }

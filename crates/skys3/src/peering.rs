@@ -286,3 +286,186 @@ impl PeerDescriptors for NodeDescriptors {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use base64::Engine as _;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+        KeyPair, KeyUsagePurpose, SanType, date_time_ymd,
+    };
+    use skys3_io::ManualWallClock;
+    use skys3_peer::Expected;
+
+    use super::*;
+
+    /// How long a test waits on the network before it fails.
+    const WAIT: Duration = Duration::from_secs(30);
+
+    fn pem(label: &str, der: &[u8]) -> String {
+        let text = base64::engine::general_purpose::STANDARD.encode(der);
+        let lines: Vec<&str> = text
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.join("\n")
+        )
+    }
+
+    /// Writes a CA for `cluster` and a certificate of its node `n1` into
+    /// `dir`, as `<cluster>-ca.pem`, `<cluster>.pem`, and `<cluster>.key`.
+    fn issue(dir: &Path, cluster: &str) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.distinguished_name.push(DnType::CommonName, cluster);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca = params.self_signed(&key).unwrap();
+        let issuer = Issuer::new(params, key);
+        let leaf = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let uri = format!("spiffe://{cluster}/node/n1");
+        params.subject_alt_names = vec![SanType::URI(uri.as_str().try_into().unwrap())];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        (params.not_before, params.not_after) =
+            (date_time_ymd(2000, 1, 1), date_time_ymd(4000, 1, 1));
+        let cert = params.signed_by(&leaf, &issuer).unwrap();
+        let write = |name: String, text: String| std::fs::write(dir.join(name), text).unwrap();
+        write(format!("{cluster}-ca.pem"), pem("CERTIFICATE", ca.der()));
+        write(format!("{cluster}.pem"), pem("CERTIFICATE", cert.der()));
+        write(
+            format!("{cluster}.key"),
+            pem("PRIVATE KEY", &leaf.serialize_der()),
+        );
+    }
+
+    /// The configuration of node `n1` of `cluster`, which trusts `peer`.
+    fn config(dir: &Path, cluster: &str, peer: &str, extra: &str) -> Config {
+        let path = |name: String| dir.join(name).display().to_string();
+        format!(
+            "[cluster]\ncluster_id = \"{cluster}\"\n\
+             [control_store]\netcd_endpoints = [\"http://e:2379\"]\n\
+             [transport]\ntls_cert_file = \"{}\"\ntls_key_file = \"{}\"\n\
+             tls_ca_file = \"{}\"\n\
+             [peering]\nquic_listen = \"127.0.0.1:0\"\npeer_connect_timeout_ms = 5000\n{extra}\n\
+             [peering.peers.{peer}]\nca_file = \"{}\"\n\
+             buckets = [{{ source = \"b-1\", destination = \"archive\" }}]\n",
+            path(format!("{cluster}.pem")),
+            path(format!("{cluster}.key")),
+            path(format!("{cluster}-ca.pem")),
+            path(format!("{peer}-ca.pem")),
+        )
+        .parse()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_node_without_peers_has_no_endpoint() {
+        let config: Config = "[cluster]\ncluster_id = \"a\"\n\
+                              [control_store]\netcd_endpoints = [\"http://e:2379\"]"
+            .parse()
+            .unwrap();
+        let wall = Arc::new(ManualWallClock::new(Duration::ZERO));
+        assert!(NodePeering::open(&config, wall).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_source_verifies_the_descriptor_and_reaches_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        issue(dir.path(), "src");
+        issue(dir.path(), "dst");
+        let now = Duration::from_secs(1_800_000_000);
+        let wall = ManualWallClock::new(now);
+        let dst = NodePeering::open(
+            &config(
+                dir.path(),
+                "dst",
+                "src",
+                "quic_advertise = [\"localhost:1\"]",
+            ),
+            Arc::new(wall.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        let src_config = config(dir.path(), "src", "dst", "");
+        let src = NodePeering::open(&src_config, Arc::new(wall.clone()))
+            .unwrap()
+            .unwrap();
+        assert!(src.descriptors().is_none(), "{src:?}");
+        let _transport = src.transport(&src_config);
+
+        // The destination signs its receiving buckets' descriptors, once
+        // per half lifetime, and the source verifies them.
+        let descriptors = dst.descriptors().unwrap();
+        let archive = BucketName::new("archive").unwrap();
+        let source = ClusterId::new("src").unwrap();
+        let first = descriptors.descriptor(&archive, &source).unwrap();
+        assert_eq!(
+            descriptors.descriptor(&archive, &source),
+            Some(first.clone())
+        );
+        let expected = Expected {
+            bucket: &archive,
+            source: &source,
+        };
+        let verifier = src.tls.descriptor_verifier();
+        let descriptor = verifier.verify(&first, now, expected).unwrap();
+        assert_eq!(descriptor.addresses, ["localhost:1"]);
+        wall.advance(DESCRIPTOR_LIFETIME / 2);
+        let second = descriptors.descriptor(&archive, &source).unwrap();
+        assert_ne!(first, second);
+        assert!(verifier.verify(&second, wall.now(), expected).is_ok());
+        assert!(format!("{descriptors:?}").contains("localhost:1"));
+
+        // The destination accepts connections; the source's handshake
+        // reaches it at its address, and finds nothing at an address that
+        // does not resolve.
+        let endpoint = dst.closer();
+        let address = endpoint.local_addr().unwrap();
+        let accepting = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            while let Some(incoming) = endpoint.accept().await {
+                if let Ok(connection) = incoming.establish().await {
+                    connections.push(connection);
+                }
+            }
+        });
+        let cluster = ClusterId::new("dst").unwrap();
+        let reached = tokio::time::timeout(
+            WAIT,
+            handshake(
+                &src.endpoint,
+                &src.pool,
+                cluster.clone(),
+                &[address.to_string()],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(reached.is_ok(), "{:?}", reached.err());
+        let nowhere = ["no-such-host.invalid:7443".to_owned()];
+        let unresolved =
+            tokio::time::timeout(WAIT, handshake(&src.endpoint, &src.pool, cluster, &nowhere))
+                .await
+                .unwrap();
+        let error = unresolved.err().unwrap();
+        assert!(error.to_string().contains("resolves"), "{error}");
+        let adapt = tokio::spawn(src.adapt_pool());
+        adapt.abort();
+        src.closer().close();
+        dst.closer().close();
+        tokio::time::timeout(WAIT, accepting)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}

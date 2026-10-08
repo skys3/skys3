@@ -157,18 +157,18 @@ impl PeerTransport {
         self
     }
 
-    /// Sets how long a target that falls back to S3 REST waits before its
-    /// first S3 flush ([`PeerTransport::quarantine`]).
+    /// Sets how long a shard flusher that starts on S3 REST to a peer waits
+    /// before its first S3 flush ([`PeerTransport::quarantine`]).
     #[must_use]
     pub fn with_quarantine(mut self, quarantine: Duration) -> Self {
         self.quarantine = Some(quarantine);
         self
     }
 
-    /// How long a peer target whose flushers start on S3 REST, after a
-    /// fallback, a restart, or a takeover, waits before its first S3
-    /// flush: until no `COMMIT` an earlier flusher sent over QUIC, on this
-    /// node or on an earlier primary, can still apply (§7.8). A `COMMIT`
+    /// How long each shard flusher that starts on S3 REST to a peer, after
+    /// a fallback, a restart, or a takeover, waits before its first S3
+    /// flush: until no `COMMIT` sent over QUIC before it started, on this
+    /// node or by an earlier primary, can still apply (§7.8). A `COMMIT`
     /// reaches the destination only on a live connection, a connection its
     /// source stopped using dies within the QUIC idle timeout, and the
     /// destination applies what it read within an answer timeout. By
@@ -264,8 +264,8 @@ pub enum PeerBug {
     /// times: a forged or expired descriptor sends the flushes wherever it
     /// points.
     UnverifiedDescriptor,
-    /// A peer target that falls back to S3 REST flushes at once, while
-    /// `COMMIT`s sent over QUIC may still apply.
+    /// A shard flusher that starts on S3 REST to a peer flushes at once,
+    /// while `COMMIT`s sent over QUIC may still apply.
     NoQuarantine,
 }
 

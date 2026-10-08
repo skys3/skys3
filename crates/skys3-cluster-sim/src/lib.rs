@@ -33,6 +33,8 @@
 //! - **Faults.** A [`FaultPlan`]: crashes with or without power loss,
 //!   partitions, held links (delay and reordering), random message loss,
 //!   a node's link to the remote store dropped ([`Fault::RemoteLink`]),
+//!   UDP blocked between every node and a SkyS3 peer
+//!   ([`Fault::UdpBlock`]),
 //!   failed syncs, control-store outages, control-store round trips of
 //!   100 ms and more, lost control-store answers, and a lost control
 //!   store, which an operator rebuilds from the nodes' exports (plan
