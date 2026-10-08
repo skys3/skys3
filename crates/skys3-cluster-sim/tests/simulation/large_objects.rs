@@ -319,10 +319,8 @@ fn the_audit_catches_remote_uploads_left_open() {
 
 /// A seed of the large-object mix replays exactly, with every step's
 /// faults, the remote store's, and dropped links to it. Node faults are
-/// left out: a crash drops the node's tasks in an order tokio takes from
-/// task IDs, which the whole test process shares, and tokio wakes some
-/// waiters in an order it draws at random unless built with
-/// `tokio_unstable`.
+/// left out: around crashes and takeovers, tokio wakes some waiters in an
+/// order it draws at random unless built with `tokio_unstable`.
 #[test]
 fn a_large_object_seed_replays_exactly() {
     let run = |seed| {
