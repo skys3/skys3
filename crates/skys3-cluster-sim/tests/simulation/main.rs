@@ -133,6 +133,7 @@ mod coding;
 mod compaction;
 mod conflicts;
 mod coordinator;
+mod copies;
 mod crash;
 mod drills;
 mod fragment_moves;

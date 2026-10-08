@@ -91,8 +91,9 @@ use rand::rngs::SmallRng;
 use skys3_remote::{
     AbortMultipartUpload, CompleteMultipartUpload, CopyObject, CreateMultipartUpload, DeleteObject,
     DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
-    ListPartsOutput, ObjectInfo, ObjectStore, PutObject, S3Error, S3ErrorKind, S3Result, UploadId,
-    UploadPart, UserMetadata, VersionId, WriteOutput, WritePrecondition,
+    ListPartsOutput, MetadataDirective, ObjectInfo, ObjectStore, PutObject, S3Error, S3ErrorKind,
+    S3Result, TaggingDirective, UploadId, UploadPart, UserMetadata, VersionId, WriteOutput,
+    WritePrecondition,
 };
 use skys3_types::ETag;
 use tokio::time::Instant;
@@ -167,6 +168,34 @@ impl Conditionals {
     }
 }
 
+/// How a simulated provider treats the `REPLACE` directives of
+/// `CopyObject`, with the outcomes of [`ConditionalSupport`]: an ignored
+/// directive copies the source's metadata or tags as `COPY` does, and a
+/// rejected one fails the copy with `501 NotImplemented`. A flush sends a
+/// copy as `CopyObject` only if both are honored (design §7.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CopyDirectives {
+    /// `x-amz-metadata-directive: REPLACE`.
+    pub metadata: ConditionalSupport,
+    /// `x-amz-tagging-directive: REPLACE`.
+    pub tagging: ConditionalSupport,
+}
+
+impl CopyDirectives {
+    /// Both directives honored, as on AWS S3.
+    pub const AWS_S3: CopyDirectives = CopyDirectives {
+        metadata: ConditionalSupport::Honored,
+        tagging: ConditionalSupport::Honored,
+    };
+
+    /// A provider without object tags, such as Cloudflare R2: copies keep
+    /// whatever tags the source has, here none, whatever the request says.
+    pub const WITHOUT_TAGS: CopyDirectives = CopyDirectives {
+        metadata: ConditionalSupport::Honored,
+        tagging: ConditionalSupport::Ignored,
+    };
+}
+
 /// The behavior of a simulated bucket, fixed when it is created.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SimS3Config {
@@ -174,6 +203,8 @@ pub struct SimS3Config {
     pub versioning: bool,
     /// Which write preconditions it honors.
     pub conditionals: Conditionals,
+    /// Which `CopyObject` directives it honors.
+    pub copy_directives: CopyDirectives,
     /// The smallest size of every part of a multipart upload but the last.
     /// S3's is 5 MiB; simulations may lower it to keep objects small.
     pub min_part_size: u64,
@@ -187,6 +218,7 @@ impl Default for SimS3Config {
         SimS3Config {
             versioning: false,
             conditionals: Conditionals::AWS_S3,
+            copy_directives: CopyDirectives::AWS_S3,
             min_part_size: 5 << 20,
             max_metadata_size: UserMetadata::S3_LIMIT,
         }
@@ -278,6 +310,8 @@ struct State {
     unanswered: HashMap<Operation, u64>,
     /// The `(credentials, key)` pairs whose reads are refused.
     denied: BTreeSet<(String, String)>,
+    /// Every write the store applied, in order: its operation and key.
+    applied: Vec<(Operation, String)>,
     /// The links of the sources whose link dropped at least once.
     sources: BTreeMap<String, SourceLink>,
     /// What is called after each request the store applied.
@@ -306,6 +340,7 @@ impl State {
             in_progress: (0, 0),
             unanswered: HashMap::new(),
             denied: BTreeSet::new(),
+            applied: Vec::new(),
             sources: BTreeMap::new(),
             observer: None,
         }
@@ -527,6 +562,18 @@ impl SimS3 {
         self.state().stats
     }
 
+    /// Returns the keys of every write of `operation` the store applied,
+    /// in the order it applied them, answered or not: for example the
+    /// destinations of every `CopyObject`.
+    pub fn applied(&self, operation: Operation) -> Vec<String> {
+        self.state()
+            .applied
+            .iter()
+            .filter(|(applied, _)| *applied == operation)
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
+
     /// Returns how many requests of `operation` succeeded at the store
     /// without their caller learning it: the response was lost, or the
     /// caller stopped waiting for it after the store had applied it. For
@@ -726,6 +773,7 @@ impl SimS3 {
                     *conflicted = true;
                 }
             }
+            state.applied.push((operation, key.to_owned()));
         }
         let observer = state.observer.clone().filter(|_| result.is_ok());
         if let Some(Observed(observer)) = observer {
@@ -771,6 +819,21 @@ impl SimS3 {
         } else {
             WritePrecondition::None
         })
+    }
+
+    /// Turns a `REPLACE` directive the provider ignores into `COPY`, or
+    /// returns the error of one it rejects.
+    fn gate_directives(&self, request: &mut CopyObject) -> S3Result<()> {
+        let support = self.shared.config.copy_directives;
+        let replaces = !matches!(request.metadata_directive, MetadataDirective::Copy);
+        if !Self::gate(support.metadata, replaces, "x-amz-metadata-directive")? {
+            request.metadata_directive = MetadataDirective::Copy;
+        }
+        let replaces = !matches!(request.tagging_directive, TaggingDirective::Copy);
+        if !Self::gate(support.tagging, replaces, "x-amz-tagging-directive")? {
+            request.tagging_directive = TaggingDirective::Copy;
+        }
+        Ok(())
     }
 
     /// Strips an ignored `If-Match`, or returns a rejected one's error.
@@ -927,7 +990,11 @@ impl ObjectStore for SimS3 {
 
     async fn copy_object(&self, mut request: CopyObject) -> S3Result<WriteOutput> {
         let conditionals = self.shared.config.conditionals;
-        let gated = Self::gate_precondition(conditionals.copy_object, request.precondition.clone())
+        let directives = self.gate_directives(&mut request);
+        let gated = directives
+            .and_then(|()| {
+                Self::gate_precondition(conditionals.copy_object, request.precondition.clone())
+            })
             .and_then(|precondition| {
                 let source_if_match = Self::gate_etag(
                     conditionals.copy_source,

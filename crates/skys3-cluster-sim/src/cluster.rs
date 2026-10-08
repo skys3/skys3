@@ -34,6 +34,7 @@ use skys3_types::{
 
 use crate::backup::{self, Backup};
 use crate::conflicts::{self, ConflictAudit, Conflicts, Final};
+use crate::copies::{self, Copies, CopyAudit};
 use crate::creation;
 use crate::faults::{Endpoint, Fault, FaultPlan};
 use crate::large_objects::{self, LargeObjectAudit, LargeObjects, Versions};
@@ -161,6 +162,11 @@ pub struct ClusterConfig {
     /// the audit that no partial remote object is ever visible and that
     /// ETags match ([`LargeObjects`]). `None` by default.
     pub large_objects: Option<LargeObjects>,
+    /// A copier that copies clean objects of the `write_back` buckets,
+    /// whose flushes go to the remote store as server-side copies, and the
+    /// audit of what every copy's flush left there ([`Copies`]). `None` by
+    /// default.
+    pub copies: Option<Copies>,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -237,6 +243,7 @@ impl Default for ClusterConfig {
             origin: None,
             conflicts: None,
             large_objects: None,
+            copies: None,
         }
     }
 }
@@ -345,6 +352,9 @@ pub struct Report {
     /// What the audit of large objects found
     /// ([`ClusterConfig::large_objects`]).
     pub large_objects: LargeObjectAudit,
+    /// What the copier did and the audit of its copies found
+    /// ([`ClusterConfig::copies`]).
+    pub copies: CopyAudit,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -642,6 +652,9 @@ impl<S: NodeServices> Cluster<S> {
                 .as_ref()
                 .map_or_else(Default::default, |l| l.bug),
         );
+        skys3_flush::test_hooks::seed_copy_bug(
+            self.config.copies.map_or_else(Default::default, |c| c.bug),
+        );
         if let Some(planned) = self.cut {
             world.slots[planned.node]
                 .power
@@ -825,6 +838,18 @@ impl<S: NodeServices> Cluster<S> {
             );
             sim.client("out-of-band", writer);
         }
+        let copy_log = copies::Shared::default();
+        if let Some(copies) = self.config.copies {
+            let copier = copies::Copier {
+                copies,
+                routes: routes.clone(),
+                workload: workload.clone(),
+                store: world.remote.clone(),
+                seed: context.fork_seed(),
+                log: Arc::clone(&copy_log),
+            };
+            sim.client("copier", copies::copier(copier));
+        }
         self.drive(&mut sim, &mut driver, &history, false)?;
         let origin_audit = match (&self.config.origin, &origin_log) {
             (Some(origin), Some(log)) => {
@@ -907,6 +932,16 @@ impl<S: NodeServices> Cluster<S> {
                 phase: Arc::clone(&final_phase),
             };
             sim.client("conflicts", conflicts::finish(run));
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
+        // Every copy's flush lands, and none is held.
+        if self.config.copies.is_some() {
+            let drain = copies::finish(
+                Arc::clone(&world.shared.flushers),
+                routes.clone(),
+                Arc::clone(&copy_log),
+            );
+            sim.client("copies-drain", drain);
             self.drive(&mut sim, &mut driver, &history, true)?;
         }
 
@@ -999,6 +1034,21 @@ impl<S: NodeServices> Cluster<S> {
             .map_err(RunError::Check)?,
             None => ConflictAudit::default(),
         };
+        let copies = if self.config.copies.is_some() {
+            let entries = world
+                .entries(&routes, &copies::keys(&routes))
+                .map_err(|error| RunError::Simulation(error.to_string()))?;
+            copies::audit(
+                &copy_log,
+                &world.remote,
+                &world.shared.settings.cluster,
+                &routes,
+                &entries,
+            )
+            .map_err(RunError::Check)?
+        } else {
+            CopyAudit::default()
+        };
         let snapshots = match (&driver.drill, &self.config.snapshots) {
             (Some(drill), Some(_)) => snapshots::audit(
                 drill,
@@ -1015,6 +1065,7 @@ impl<S: NodeServices> Cluster<S> {
             snapshots,
             conflicts,
             large_objects,
+            copies,
             history: operations,
             faults: driver.faults,
             lives: world.slots.iter().map(|slot| slot.lives()).sum(),
@@ -1452,6 +1503,50 @@ impl<S: NodeServices> World<S> {
             survivors.insert(name, survivor);
         }
         Ok((survivors, evicted))
+    }
+
+    /// Recovers every node from its disks, outside the simulation, and
+    /// reads the entry of each of `keys` on every member of its shard, by
+    /// bucket name and key.
+    fn entries(
+        &self,
+        routes: &Routes,
+        keys: &[(BucketDocument, String)],
+    ) -> Result<copies::Entries, BoxError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
+        let settings = &self.shared.settings;
+        let mut indexes = BTreeMap::new();
+        for slot in &self.slots {
+            let mounts: Vec<_> = slot
+                .disks
+                .iter()
+                .map(|(label, disk)| (label.clone(), disk.mount()))
+                .collect();
+            let index = Index::open_sim(&mounts[0].1, INDEX_FILE, &node::index_config(settings))?;
+            let storage = runtime.block_on(skys3::storage::recover(
+                mounts,
+                settings.log.clone(),
+                Arc::new(MonotonicClock::new()),
+                Arc::new(index),
+                skys3_io::BlockingPool::inline("recovery"),
+                slot.id.clone(),
+            ))?;
+            indexes.insert(slot.id.clone(), storage.index);
+        }
+        let mut entries = BTreeMap::new();
+        for (bucket, key) in keys {
+            let shard = ShardRef::for_key(bucket, key);
+            let members = register(&self.registers, &shard)
+                .map_or_else(|| routes.placement[&shard].members.clone(), |c| c.members);
+            let mut found = Vec::new();
+            for member in &members {
+                found.push(indexes[member].read()?.entry(&(&shard).into(), key)?);
+            }
+            entries.insert((bucket.name.as_str().to_owned(), key.clone()), found);
+        }
+        Ok(entries)
     }
 }
 

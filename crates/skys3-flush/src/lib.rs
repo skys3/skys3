@@ -58,6 +58,13 @@
 //! - **Tags** (`TAGS`) need no request of their own: a version made by
 //!   `TAGS` is flushed like any other, the bytes uploaded again with the
 //!   new tags and the `TAGS` record's write identity.
+//! - **Server-side copies** (§11). A copy of a version that was clean, from
+//!   a bucket flushing to the same remote bucket ([`CopySources`]), is
+//!   sent as a remote `CopyObject` with `REPLACE` directives, its own write
+//!   identity, `x-amz-copy-source-if-match`, and the destination
+//!   precondition, where the probe found all of them honored. A source
+//!   that changed at the remote, or a target that refuses the copy, gets an
+//!   upload instead, never a conflict.
 //! - [`Target`]: what the flushers of one target share: the store, the
 //!   probe's findings, the window of requests in flight and the in-flight
 //!   byte budget ([`Target::concurrency`]), the settings
@@ -112,6 +119,7 @@ mod attempt;
 mod budget;
 mod concurrency;
 mod conflict;
+mod copy;
 mod fill;
 mod import;
 mod metrics;
@@ -140,13 +148,14 @@ pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use origin::{DEFAULT_CREDENTIALS, Origin, OriginConnect, profile_credentials};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
-pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
+pub use target::{CopySources, FlushSettings, ImportDone, ImportProgress, Target};
 
 /// Failpoints and seeded bugs for tests (the `test-util` feature).
 #[cfg(feature = "test-util")]
 pub mod test_hooks {
     pub use crate::concurrency::{ConcurrencyBug, seed_concurrency_bug};
     pub use crate::conflict::{ConflictBug, seed_conflict_bug};
+    pub use crate::copy::{CopyBug, seed_copy_bug};
     pub use crate::multipart::{LargeObjectBug, seed_large_object_bug};
     pub use crate::snapshot::hooks::{SnapshotBug, seed_snapshot_bug};
     pub use crate::stream::test_hooks::*;
