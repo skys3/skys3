@@ -20,6 +20,8 @@ use tokio::time::Instant;
 use crate::attempt::{Attempt, Conflict, Outcome, Remote};
 use crate::budget::Charge;
 use crate::conflict::{ConflictBug, Unresolved, conflict_bug};
+use crate::peer::hooks as peer_hooks;
+use crate::peer::{Bodies, BodyStep, FlushedRecord, PeerBug};
 use crate::stream::{Step, Streams};
 use crate::target::Target;
 
@@ -148,7 +150,8 @@ pub struct ShardStatus {
     /// in conflict.
     pub last_error: Option<String>,
     /// Remote multipart uploads streamed for the shard's uploads (§7.3)
-    /// that are open: not completed or aborted yet.
+    /// that are open, not completed or aborted yet; for a native target,
+    /// the streamed bodies being staged (§7.8).
     pub streams: u64,
     /// Whether the flusher stopped, because its shard did.
     pub stopped: bool,
@@ -419,6 +422,13 @@ impl State {
     fn reached(&mut self, key: &str, version: EpochSeq) {
         if let Some(tracked) = self.keys.get_mut(key) {
             tracked.remote = tracked.remote.max(Some(version));
+        }
+        self.answer_waits(key, version);
+    }
+
+    /// Answers the write-through waits of `key` that `version` covers.
+    fn answer_waits(&mut self, key: &str, version: EpochSeq) {
+        if let Some(tracked) = self.keys.get_mut(key) {
             tracked.waiters.retain(|waiter| {
                 let covered = waiter.version() <= version;
                 if covered {
@@ -553,6 +563,7 @@ pub struct ShardFlusher {
     shard: ShardRef,
     state: Arc<Mutex<State>>,
     streams: Arc<Streams>,
+    bodies: Arc<Bodies>,
     resolver: Resolver,
     task: JoinHandle<()>,
 }
@@ -609,19 +620,21 @@ impl ShardFlusher {
         }));
         let shard_ref = shard.shard().clone();
         let streams = Arc::new(Streams::default());
+        let bodies = Arc::new(Bodies::default());
         let (commands, resolutions) = mpsc::unbounded_channel();
         let task = tokio::spawn(run(
             shard,
             ready,
             wall,
             Arc::clone(&state),
-            Arc::clone(&streams),
+            (Arc::clone(&streams), Arc::clone(&bodies)),
             resolutions,
         ));
         Self {
             shard: shard_ref,
             state,
             streams,
+            bodies,
             resolver: Resolver(commands),
             task,
         }
@@ -637,7 +650,7 @@ impl ShardFlusher {
     #[must_use]
     pub fn status(&self) -> ShardStatus {
         let mut status = lock(&self.state).status();
-        status.streams = self.streams.len() as u64;
+        status.streams = (self.streams.len() + self.bodies.len()) as u64;
         status.stopped |= self.task.is_finished();
         status
     }
@@ -717,17 +730,22 @@ async fn run<S: ObjectStore, D: Disk>(
     ready: Arc<Ready<S>>,
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
-    streams: Arc<Streams>,
+    (streams, bodies): (Arc<Streams>, Arc<Bodies>),
     mut resolutions: mpsc::UnboundedReceiver<Resolve>,
 ) {
     let mut changes = shard.subscribe();
+    // A native target is ready from the start: its bodies are staged at the
+    // peer, and no remote multipart upload is ever opened (§7.8).
+    let native = ready.get().is_some_and(|target| target.native.is_some());
     // The streams first: an upload that completes in between is then a
     // dirty key the scan finds, not a closed stream of a clean key.
-    if streams.load(&shard).await.is_ok() && scan(&shard, &*wall, &state).await.is_ok() {
+    let loaded = native || streams.load(&shard).await.is_ok();
+    if loaded && scan(&shard, &*wall, &state).await.is_ok() {
         streams.reap_untracked(|key| lock(&state).keys.contains_key(key));
         let mut flushes: JoinSet<Done> = JoinSet::new();
         let mut records: JoinSet<Recorded> = JoinSet::new();
         let mut streaming: JoinSet<Step> = JoinSet::new();
+        let mut staging: JoinSet<BodyStep> = JoinSet::new();
         // The flusher's place among those sending to the target, which
         // sizes the target's window (§7.7).
         let mut membership = None;
@@ -743,16 +761,26 @@ async fn run<S: ObjectStore, D: Disk>(
             let target = ready.get();
             if let Some(target) = &target {
                 membership.get_or_insert_with(|| target.join());
-                dispatch(&shard, target, &state, &streams, &mut flushes);
-                streams.pump(&shard, target, &mut streaming);
+                dispatch(&shard, target, &state, (&streams, &bodies), &mut flushes);
+                if native {
+                    bodies.pump(&shard, target, &mut staging);
+                } else {
+                    streams.pump(&shard, target, &mut streaming);
+                }
             }
             let release = lock(&state).next_release();
-            let timeout = target
-                .as_ref()
-                .and_then(|target| streams.next_timeout(&target.settings));
+            let timeout = target.as_ref().and_then(|target| {
+                if native {
+                    bodies.next_wake(&target.settings)
+                } else {
+                    streams.next_timeout(&target.settings)
+                }
+            });
+            let staged = native.then_some(&*bodies);
             // Branches ready at once are taken in the order written, not at
             // random, so a simulation seed replays exactly. The flusher's
-            // own tasks come first: there are only as many as it started,
+            // own tasks, bodies staged at a peer included, come first:
+            // there are only as many as it started,
             // so the shard's changes, which a busy shard sends without end,
             // cannot hold them back. The timers only wake the loop, which
             // does their work on every turn.
@@ -761,12 +789,19 @@ async fn run<S: ObjectStore, D: Disk>(
                 Some(done) = flushes.join_next(), if !flushes.is_empty() => {
                     // A flush runs only once there is a target.
                     if let (Ok(done), Some(target)) = (done, &target) {
-                        finish(&shard, target, &state, &streams, &mut records, done);
+                        let streamed = (&*streams, &*bodies);
+                        finish(&shard, target, &state, streamed, &mut records, done);
                     }
                 }
                 Some(step) = streaming.join_next(), if !streaming.is_empty() => {
                     if let Ok(step) = step {
                         streams.finish(step);
+                    }
+                }
+                Some(step) = staging.join_next(), if !staging.is_empty() => {
+                    // A body is staged only once there is a target.
+                    if let (Ok(step), Some(target)) = (step, &target) {
+                        bodies.finish(step, &target.settings);
                     }
                 }
                 Some(recorded) = records.join_next(), if !records.is_empty() => {
@@ -780,7 +815,7 @@ async fn run<S: ObjectStore, D: Disk>(
                     resolved(&shard, &state, &mut records, resolve);
                 }
                 change = changes.recv() => match change {
-                    Some(change) => follow(&state, &streams, &*wall, change),
+                    Some(change) => follow(&state, &streams, staged, &*wall, change),
                     // The shard stopped, or another flusher took over.
                     None => break,
                 },
@@ -794,17 +829,31 @@ async fn run<S: ObjectStore, D: Disk>(
     lock(&state).stop();
 }
 
-/// Acts on a change the shard applied.
-fn follow(state: &Mutex<State>, streams: &Streams, wall: &dyn WallClock, change: Change) {
-    match change {
-        Change::Stored {
-            key,
-            position,
-            size,
-            upload,
-        } => {
+/// Acts on a change the shard applied. With a native target's `bodies`,
+/// streamed bodies are staged at the peer, and multipart uploads are sent
+/// once they complete (§7.8).
+fn follow(
+    state: &Mutex<State>,
+    streams: &Streams,
+    bodies: Option<&Bodies>,
+    wall: &dyn WallClock,
+    change: Change,
+) {
+    match (change, bodies) {
+        (
+            Change::Stored {
+                key,
+                position,
+                size,
+                upload,
+            },
+            bodies,
+        ) => {
             if let Some(upload) = upload {
-                streams.completed(upload);
+                match bodies {
+                    Some(bodies) => bodies.completed(upload),
+                    None => streams.completed(upload),
+                }
             }
             let now = wall.now();
             let mut state = lock(state);
@@ -813,16 +862,21 @@ fn follow(state: &Mutex<State>, streams: &Streams, wall: &dyn WallClock, change:
                 streams.reap(&key);
             }
         }
-        Change::Opened { key, upload } => streams.opened(&key, upload),
-        Change::Part {
-            upload,
-            number,
-            position,
-            ..
-        } => streams.part(upload, number, position),
-        Change::Aborted { upload, .. } => streams.aborted(upload),
-        Change::Streamed(body) => streams.announced(body),
-        Change::Awaited(waiter) => lock(state).awaited(waiter),
+        (Change::Awaited(waiter), _) => lock(state).awaited(waiter),
+        (Change::Streamed(body), Some(bodies)) => bodies.announced(body),
+        (Change::Opened { .. } | Change::Part { .. } | Change::Aborted { .. }, Some(_)) => {}
+        (Change::Opened { key, upload }, None) => streams.opened(&key, upload),
+        (
+            Change::Part {
+                upload,
+                number,
+                position,
+                ..
+            },
+            None,
+        ) => streams.part(upload, number, position),
+        (Change::Aborted { upload, .. }, None) => streams.aborted(upload),
+        (Change::Streamed(body), None) => streams.announced(body),
     }
 }
 
@@ -873,8 +927,8 @@ fn dirty_since(entry: &Entry, now: Duration) -> (u64, Duration) {
 fn dispatch<S: ObjectStore, D: Disk>(
     shard: &Shard<D>,
     target: &Arc<Target<S>>,
-    state: &Mutex<State>,
-    streams: &Arc<Streams>,
+    state: &Arc<Mutex<State>>,
+    (streams, bodies): (&Arc<Streams>, &Arc<Bodies>),
     flushes: &mut JoinSet<Done>,
 ) {
     while flushes.len() < target.settings.max_concurrency as usize {
@@ -887,6 +941,8 @@ fn dispatch<S: ObjectStore, D: Disk>(
             (key, dispatched, resolution, pending)
         };
         let (shard, target, streams) = (shard.clone(), Arc::clone(target), Arc::clone(streams));
+        let bodies = Arc::clone(bodies);
+        let early = early_answer(state, &key, dispatched);
         flushes.spawn(async move {
             let attempt = Attempt {
                 shard: &shard,
@@ -894,6 +950,8 @@ fn dispatch<S: ObjectStore, D: Disk>(
                 key: &key,
                 streams: &streams,
                 resolution,
+                bodies: &bodies,
+                early: early.as_deref(),
             };
             let outcome = attempt.run(pending.as_ref()).await;
             (key, dispatched, resolution, outcome)
@@ -901,12 +959,27 @@ fn dispatch<S: ObjectStore, D: Disk>(
     }
 }
 
+/// The seeded bug [`PeerBug::AnsweredOnCommit`]: what answers the
+/// write-through writes waiting for `key`, up to `version`, once its
+/// `COMMIT` is sent.
+fn early_answer(
+    state: &Arc<Mutex<State>>,
+    key: &str,
+    version: EpochSeq,
+) -> Option<Box<dyn Fn() + Send + Sync>> {
+    if peer_hooks::peer_bug() != PeerBug::AnsweredOnCommit {
+        return None;
+    }
+    let (state, key) = (Arc::clone(state), key.to_owned());
+    Some(Box::new(move || lock(&state).answer_waits(&key, version)))
+}
+
 /// Acts on a finished flush.
 fn finish<S, D: Disk>(
     shard: &Shard<D>,
     target: &Target<S>,
     state: &Mutex<State>,
-    streams: &Streams,
+    (streams, bodies): (&Streams, &Bodies),
     records: &mut JoinSet<Recorded>,
     (key, dispatched, resolution, outcome): Done,
 ) {
@@ -931,6 +1004,21 @@ fn finish<S, D: Disk>(
                     remote_etag: remote.etag.clone(),
                     remote_version_id: remote.version_id.clone(),
                 };
+                if target.native.is_some() {
+                    // A delete's `COMMIT` carries the identity of its
+                    // tombstone; a version's, the one its record names.
+                    let identity = remote
+                        .version_id
+                        .clone()
+                        .unwrap_or_else(|| target.identity(shard.shard(), version).to_string());
+                    peer_hooks::flushed(&FlushedRecord {
+                        shard: shard.shard().clone(),
+                        key: key.clone(),
+                        version,
+                        identity,
+                        delete: remote.version_id.is_none(),
+                    });
+                }
                 state.recording.insert(key.clone(), remote);
                 let (shard, recorded) = (shard.clone(), key.clone());
                 records.spawn(async move {
@@ -974,6 +1062,7 @@ fn finish<S, D: Disk>(
     }
     if !state.awaits_flush(&key) {
         streams.reap(&key);
+        bodies.reap(&key);
     }
 }
 
