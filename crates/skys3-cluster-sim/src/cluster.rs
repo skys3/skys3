@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use skys3::storage::Storage;
 use skys3_config::FailureDomain;
 use skys3_control::faults::{FaultRates, FaultyStore};
@@ -40,6 +42,7 @@ use crate::node::{
 };
 use crate::pki::Pki;
 use crate::replication::register;
+use crate::snapshots::{self, Drill, SnapshotAudit, Snapshots};
 use crate::workload::{Client, Routes, Timings, Workload, etag_of};
 use crate::write_through::{self, RemoteAudit, WriteThrough, write_back_prefix};
 
@@ -134,6 +137,10 @@ pub struct ClusterConfig {
     /// store (§8.9), how its writes are acknowledged, and the audit that
     /// the backup gets every committed change ([`Backup`]). Off by default.
     pub backup: Backup,
+    /// Index snapshots on every node, and the restore drill that checks
+    /// the lost-key reports built from them ([`Snapshots`]). `None` by
+    /// default.
+    pub snapshots: Option<Snapshots>,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -206,6 +213,7 @@ impl Default for ClusterConfig {
             write_through: WriteThrough::Off,
             lifecycle: None,
             backup: Backup::Off,
+            snapshots: None,
         }
     }
 }
@@ -303,6 +311,8 @@ pub struct Report {
     /// What the audit of the final logs found of the lifecycle rules'
     /// expirations ([`ClusterConfig::lifecycle`]).
     pub lifecycle: LifecycleAudit,
+    /// What the restore drill found ([`ClusterConfig::snapshots`]).
+    pub snapshots: SnapshotAudit,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -572,6 +582,11 @@ impl<S: NodeServices> Cluster<S> {
         let world = World::build(context, &self.config, self.services.clone())?;
         // Every node runs on this thread, and so does the seeded bug, if any.
         skys3_flush::test_hooks::forget_deletes(self.config.backup.forgets_deletes());
+        skys3_flush::test_hooks::seed_snapshot_bug(
+            self.config
+                .snapshots
+                .map_or_else(Default::default, |s| s.bug),
+        );
         if let Some(planned) = self.cut {
             world.slots[planned.node]
                 .power
@@ -621,6 +636,15 @@ impl<S: NodeServices> Cluster<S> {
             rebuilds: Vec::new(),
             failure: None,
             audit: None,
+            drill: self.config.snapshots.map(|config| {
+                let mut rng = SmallRng::seed_from_u64(context.fork_seed());
+                let span = config.latest.saturating_sub(config.earliest);
+                Drill::new(
+                    (0..config.losses)
+                        .map(|_| config.earliest + span.mul_f64(rng.random::<f64>()))
+                        .collect(),
+                )
+            }),
         };
         // The clients start once every node serves, and the faults with
         // them.
@@ -679,6 +703,9 @@ impl<S: NodeServices> Cluster<S> {
             sim.client("lifecycle", client);
         }
         self.drive(&mut sim, &mut driver, &history, false)?;
+        if let Some(drill) = &mut driver.drill {
+            drill.finish(sim.since_epoch(), &history, &world.remote);
+        }
         // The last acknowledgements' audits, then the whole cluster lost
         // once the clients are done, before any fault heals: the remote
         // store alone holds every acknowledged write of a write-through
@@ -771,7 +798,20 @@ impl<S: NodeServices> Cluster<S> {
         } else {
             0
         };
+        let snapshots = match (&driver.drill, &self.config.snapshots) {
+            (Some(drill), Some(_)) => snapshots::audit(
+                drill,
+                &routes,
+                workload.keys,
+                self.config.backup,
+                &world.shared.settings.cluster,
+                &operations,
+            )
+            .map_err(RunError::Simulation)?,
+            _ => SnapshotAudit::default(),
+        };
         Ok(Report {
+            snapshots,
             history: operations,
             faults: driver.faults,
             lives: world.slots.iter().map(|slot| slot.lives()).sum(),
@@ -1392,6 +1432,13 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     let local: Vec<String> = (0..shape.buckets.saturating_sub(shape.write_back_buckets))
         .map(|b| format!("bucket-{b}"))
         .collect();
+    let write_back: Vec<String> = (local.len()..shape.buckets)
+        .map(|b| format!("bucket-{b}"))
+        .collect();
+    let (snapshot_defaults, snapshot_tables) = shape
+        .snapshots
+        .map(|snapshots| snapshots.tables(&local, &write_back, shape.backup))
+        .unwrap_or_default();
     let parse = |gateway: bool| -> Result<skys3_config::Config, BoxError> {
         let backups = shape
             .backup
@@ -1399,7 +1446,8 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         Ok(format!(
             "[cluster]\ncluster_id = \"{cluster}\"\n\
              [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n\
-             [flush]\nack_policy = \"{ack_policy}\"\n{defaults}{backups}"
+             [flush]\nack_policy = \"{ack_policy}\"\n\
+             {defaults}{snapshot_defaults}{backups}{snapshot_tables}"
         )
         .parse()?)
     };
@@ -1460,6 +1508,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         lifecycle: shape.lifecycle.clone(),
         buckets: config.buckets().clone(),
         evict_local: shape.backup.evicts_local(),
+        snapshots: shape.snapshots.is_some(),
     })
 }
 
@@ -1597,6 +1646,8 @@ struct Driver<'a, S> {
     failure: Option<String>,
     /// The audit of write-through acknowledgements, once the clients run.
     audit: Option<RemoteAudit>,
+    /// The restore drill, with index snapshots.
+    drill: Option<Drill>,
 }
 
 impl<S: NodeServices> Driver<'_, S> {
@@ -1624,6 +1675,15 @@ impl<S: NodeServices> Driver<'_, S> {
     /// more faults and heals everything now.
     fn advance(&mut self, sim: &mut turmoil::Sim<'_>, heal_all: bool) {
         let now = sim.elapsed();
+        if let Some(drill) = &mut self.drill {
+            let since_origin = self.origin.map(|origin| now.saturating_sub(origin));
+            drill.step(
+                sim.since_epoch(),
+                since_origin,
+                &self.history,
+                &self.world.remote,
+            );
+        }
         if heal_all {
             self.plan.clear();
         }

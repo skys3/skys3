@@ -2604,6 +2604,7 @@ dependencies = [
  "http-body",
  "md-5",
  "prometheus-client",
+ "proptest",
  "rand 0.9.5",
  "rcgen",
  "s3s",
