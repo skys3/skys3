@@ -7855,3 +7855,64 @@ of this file. A task with nothing unexpected keeps "None."
   of a shard at once holds them all in memory; nothing stops reclamation
   on a node whose shard still has a live primary elsewhere (the drill
   assumes none).
+
+## M7 Hardening
+
+### M7-04 Metrics, alerts, and dashboards
+
+- **A labeled family is invisible until it has a series.** `prometheus-client`
+  leaves a `Family` with no label set out of the exposition entirely, so
+  neither a scrape nor `MetricsRegistry::encode` shows
+  `skys3_admission_refusals_total` or `skys3_admin_requests_total` before
+  their first event. Checking the reference against an encoding would
+  therefore miss them. `MetricsRegistry` now records each registration
+  (`registered()`: the family name with its unit, and its type), and the
+  reference test builds a catalog from that: a test in the `skys3` crate
+  registers every component's metrics in one registry, as a node does,
+  without running one.
+- **The catalog cannot know about a new component.** A metric registered by a
+  struct the catalog does not build would slip through, so a second test
+  scans `crates/*/src` for `.register("name", ...)` and
+  `.register_with_unit("name", ...)` calls (skipping comments, test files,
+  and trailing `mod tests`) and fails for a name the catalog lacks.
+- **`skys3_control_store_live` does not show a later outage.** It is set at
+  startup and when a node first syncs from the store, and never goes back to
+  0: a store that stops answering after startup left no trace in the
+  metrics. Its meaning is documented as is, and not changed (dashboards may
+  rely on it). The node now also exports
+  `skys3_control_store_last_success_timestamp_seconds`, set on every
+  successful generation read or sync, and the identity copy's sync time and
+  `identity_max_staleness`, so that the identity-staleness alert compares
+  with each node's own setting.
+- **Several §13 rows had no metric in the code.** The coordinator's tenure
+  and placement health existed only in the admin API's report. They are now
+  gauges in `skys3-coord` (`CoordinatorMetrics`), cleared when a tenure
+  begins or ends so that only the coordinator reports a judgement (a
+  `Drop` guard clears them also if the coordinator's task is dropped). The
+  coordinator, replication, and repair do not run in the node binary yet,
+  so their metrics are "defined" and their alerts cannot fire until they
+  are wired in.
+- **Rows that cannot be shown, or not yet.** Clock rate drift cannot be
+  measured by a node against its own clock; the alert uses node_exporter's
+  `node_timex_sync_status`, so the rules need node_exporter on every host.
+  A high-latency control-store link is not measured because the node
+  binary only runs the file control store. UDP blocked between peer
+  clusters needs the fallback of M6-07, so its metric
+  (`skys3_flush_transport`) is listed as planned for M6-07. The gateway
+  exports no S3 request or error metrics, so the `503`s of a failover, and
+  reads of evicted data failing during a remote outage, are not counted;
+  the coverage table says so.
+- **No YAML parser in the tree, and no `promtool`.** `serde_yaml` is
+  deprecated by its author, and `serde_yml` is unsound (RUSTSEC-2025-0068,
+  which `cargo deny` rejects), so the rules test uses
+  `yaml-rust2` 0.13 with default features off (a dev-dependency of `skys3`;
+  it adds `arraydeque` and `hashlink` and no duplicate versions).
+  `promtool` is not installed, and was not installed: the test parses the
+  rules, checks each rule's fields against the reference's alert table, and
+  extracts the metric names of each PromQL expression with a small scanner
+  (strings, label matchers, ranges, functions, aggregation operators, and
+  modifier label lists removed), but it does not check PromQL syntax.
+- **Where the files live.** The rules and the dashboard are under `deploy/`
+  (`deploy/prometheus/`, `deploy/grafana/`), not `docs/`: they are
+  configuration installed as is. The plan's repository layout lists the new
+  directory.
