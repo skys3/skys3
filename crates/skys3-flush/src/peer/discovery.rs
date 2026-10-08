@@ -20,7 +20,9 @@
 //!   does not verify ([`Choice::PlainS3`]): the target is probed and
 //!   flushed as any S3 store. With no descriptor at all (`404`, or any
 //!   other `4xx`), the target is not a peer, and the discovery ends; a
-//!   refused descriptor is read again after the backoff.
+//!   refused descriptor is read again after the backoff. A target that
+//!   served a descriptor, refused or not, may be a peer that took native
+//!   commits, so its probe waits out the quarantine first.
 //! - **Waiting** ([`Choice::Waiting`]) until the descriptor can be read,
 //!   and for a target whose `target_transport` is `native` for as long as
 //!   QUIC cannot be used: nothing is flushed meanwhile.
@@ -91,7 +93,12 @@ pub(crate) enum Choice {
     /// S3 REST to a verified SkyS3 peer, which honors every precondition.
     PeerS3,
     /// S3 REST to a store that is not a verified SkyS3 peer: probed.
-    PlainS3,
+    PlainS3 {
+        /// Whether the store served a descriptor, which did not verify:
+        /// it may be a peer that took native commits, so the probe waits
+        /// out the quarantine.
+        found: bool,
+    },
 }
 
 impl Choice {
@@ -99,7 +106,7 @@ impl Choice {
         match self {
             Choice::Waiting => None,
             Choice::Native(_) => Some(Transport::Quic),
-            Choice::PeerS3 | Choice::PlainS3 => Some(Transport::S3),
+            Choice::PeerS3 | Choice::PlainS3 { .. } => Some(Transport::S3),
         }
     }
 
@@ -116,7 +123,7 @@ impl std::fmt::Debug for Choice {
             Choice::Waiting => "Waiting",
             Choice::Native(_) => "Native",
             Choice::PeerS3 => "PeerS3",
-            Choice::PlainS3 => "PlainS3",
+            Choice::PlainS3 { .. } => "PlainS3",
         })
     }
 }
@@ -310,7 +317,7 @@ async fn run<S: ObjectStore>(probe: Probe<S>, shared: Arc<Shared>) {
                 Some(probe.peers.reprobe_after(failures))
             }
             Fetched::Absent(reason) => {
-                shared.choose(Choice::PlainS3, false, reason);
+                shared.choose(Choice::PlainS3 { found: false }, false, reason);
                 return;
             }
             Fetched::Found(bytes) => match verify(&probe, &bytes) {
@@ -318,7 +325,7 @@ async fn run<S: ObjectStore>(probe: Probe<S>, shared: Arc<Shared>) {
                     let choice = if native_only {
                         Choice::Waiting
                     } else {
-                        Choice::PlainS3
+                        Choice::PlainS3 { found: true }
                     };
                     tracing::warn!(reason, "the target's peer descriptor is refused");
                     shared.choose(choice, false, reason);
@@ -454,7 +461,7 @@ mod tests {
             (status.in_use, status.peer, status.switches),
             (Some(Transport::S3), true, 0)
         );
-        shared.choose(Choice::PlainS3, false, "refused".to_owned());
+        shared.choose(Choice::PlainS3 { found: true }, false, "refused".to_owned());
         assert_eq!(discovery.current().0, 2);
         assert_eq!(discovery.status().switches, 1);
         shared.note("a later round failed".to_owned());

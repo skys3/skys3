@@ -602,17 +602,18 @@ impl ShardFlusher {
     /// Starts flushing `shard` to `target` on the current Tokio runtime.
     pub fn spawn<S: ObjectStore, D: Disk>(shard: Shard<D>, target: Arc<Target<S>>) -> Self {
         let wall = Arc::clone(&target.wall);
-        Self::start(shard, Ready::new(Some(target)), wall, None)
+        Self::start(shard, Ready::new(Some(target)), wall, None, Duration::ZERO)
     }
 
     /// Starts tracking `shard`'s dirty keys at once, with their bytes
     /// counted against `charge`, and flushing them once `ready` holds the
-    /// target. Ages are measured on `wall`.
+    /// target and `quarantine` passed (§7.8). Ages are measured on `wall`.
     pub(crate) fn start<S: ObjectStore, D: Disk>(
         shard: Shard<D>,
         ready: Arc<Ready<S>>,
         wall: Arc<dyn WallClock>,
         charge: Option<Charge>,
+        quarantine: Duration,
     ) -> Self {
         let state = Arc::new(Mutex::new(State {
             charge,
@@ -622,9 +623,10 @@ impl ShardFlusher {
         let streams = Arc::new(Streams::default());
         let bodies = Arc::new(Bodies::default());
         let (commands, resolutions) = mpsc::unbounded_channel();
+        let not_before = Instant::now() + quarantine;
         let task = tokio::spawn(run(
             shard,
-            ready,
+            (ready, not_before),
             wall,
             Arc::clone(&state),
             (Arc::clone(&streams), Arc::clone(&bodies)),
@@ -727,7 +729,7 @@ type Recorded = (String, Seq, Result<(), ShardError>);
 /// and flushes them once the target is ready.
 async fn run<S: ObjectStore, D: Disk>(
     shard: Shard<D>,
-    ready: Arc<Ready<S>>,
+    (ready, not_before): (Arc<Ready<S>>, Instant),
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
     (streams, bodies): (Arc<Streams>, Arc<Bodies>),
@@ -758,7 +760,9 @@ async fn run<S: ObjectStore, D: Disk>(
             let set = ready.set.notified();
             tokio::pin!(set);
             set.as_mut().enable();
-            let target = ready.get();
+            // Nothing is sent before the quarantine passed.
+            let quarantined = Instant::now() < not_before;
+            let target = if quarantined { None } else { ready.get() };
             if let Some(target) = &target {
                 membership.get_or_insert_with(|| target.join());
                 dispatch(&shard, target, &state, (&streams, &bodies), &mut flushes);
@@ -822,6 +826,7 @@ async fn run<S: ObjectStore, D: Disk>(
                 () = sleep_until(release), if release.is_some() => {}
                 // The next pump gives up on the body whose `PUT` timed out.
                 () = sleep_until(timeout), if timeout.is_some() => {}
+                () = sleep_until(Some(not_before)), if quarantined => {}
                 () = &mut set, if target.is_none() => {}
             }
         }

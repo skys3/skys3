@@ -245,6 +245,11 @@ struct BucketFlusher<S> {
     may_discard: bool,
     /// Whether its target is a SkyS3 peer over the native protocol.
     native: bool,
+    /// How long each shard flusher it starts waits before it sends
+    /// anything: the quarantine of a SkyS3 peer reached over S3 REST
+    /// (§7.8), during which a native `COMMIT` sent before the flusher
+    /// started may still apply; zero for any other target.
+    quarantine: Duration,
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
     /// The target, once the probe is done.
@@ -510,6 +515,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             conflict_policy: configured_policy,
             may_discard: may_discard(backup),
             native: false,
+            quarantine: Duration::ZERO,
             probe: Arc::new(Mutex::new(ProbeStatus::Running { error: None })),
             probe_task: tokio::spawn(async {}),
             target: Ready::new(None),
@@ -519,7 +525,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             discovery: discovery.map(|discovery| (discovery, u64::MAX)),
         };
         if plain {
-            self.install(&mut flusher, Choice::PlainS3);
+            self.install(&mut flusher, Choice::PlainS3 { found: false });
         } else {
             self.follow_transport(&mut flusher);
         }
@@ -588,6 +594,13 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         flusher.conflict_policy = effective_policy(flusher.configured_policy, holds);
         flusher.may_discard = may_discard(holds);
         flusher.native = native;
+        // Over S3 REST to what may be a peer that took native commits, each
+        // shard flusher waits them out as it starts: here, and as it takes
+        // a shard over later.
+        flusher.quarantine = match choice {
+            Choice::PeerS3 | Choice::PlainS3 { found: true } => self.quarantine(),
+            _ => Duration::ZERO,
+        };
         if holds && flusher.configured_policy == ConflictPolicy::DiscardLocal {
             tracing::warn!(
                 bucket = flusher.name,
@@ -613,14 +626,15 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 let target = Ready::new(Some(Arc::new(parts.build(native_writes(), native))));
                 (target, done(), tokio::spawn(async {}))
             }
+            // The shard flushers wait out the quarantine before they use
+            // it.
             Choice::PeerS3 => {
-                let ready = Ready::new(None);
-                let quarantine = self.quarantine();
                 let target = Arc::new(parts.build(native_writes(), None));
-                let task = tokio::spawn(after_quarantine(target, Arc::clone(&ready), quarantine));
+                let ready = Ready::new(Some(Arc::clone(&target)));
+                let task = tokio::spawn(after_quarantine(target, flusher.quarantine));
                 (ready, done(), task)
             }
-            Choice::PlainS3 => {
+            Choice::PlainS3 { .. } => {
                 let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
                 let ready = Ready::new(None);
                 let nonces = self.probe_nonces.clone();
@@ -808,7 +822,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             flusher.shards.entry(id).or_insert_with(|| {
                 let charge = charged.then(|| self.budget.charge(bucket));
                 let (ready, wall) = (Arc::clone(&flusher.target), Arc::clone(&self.wall));
-                ShardFlusher::start(shard, ready, wall, charge)
+                ShardFlusher::start(shard, ready, wall, charge, flusher.quarantine)
             });
         }
     }
@@ -1022,16 +1036,10 @@ fn done() -> ProbeStatus {
     }
 }
 
-/// Makes `target`, a SkyS3 peer's S3 endpoint, ready once `quarantine`
-/// passed, and then aborts the uploads its flushes leave open for as long
-/// as it is used.
-async fn after_quarantine<S: ObjectStore>(
-    target: Arc<Target<S>>,
-    ready: Arc<Ready<S>>,
-    quarantine: Duration,
-) {
+/// Once `quarantine` passed, aborts the uploads the flushes to `target`,
+/// a SkyS3 peer's S3 endpoint, leave open, for as long as it is used.
+async fn after_quarantine<S: ObjectStore>(target: Arc<Target<S>>, quarantine: Duration) {
     tokio::time::sleep(quarantine).await;
-    ready.set(Arc::clone(&target));
     abort_orphans(&target).await;
 }
 
