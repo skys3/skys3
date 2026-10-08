@@ -1067,7 +1067,8 @@ async fn read_back(
             let mut slots: Vec<Option<Bytes>> = Vec::new();
             for (index, location) in stripe.fragments().iter().enumerate() {
                 // A fragment counts only if it is the one the layout names:
-                // readable, verified, and with a header of this stripe.
+                // readable, verified, and with a header of this stripe of
+                // the version the layout's fragments were written for.
                 let store = &stores[&location.node];
                 let len = store.len(location.fragment).unwrap_or(0);
                 let read = store.read(location.fragment, 0..len).await.ok();
@@ -1075,7 +1076,7 @@ async fn read_back(
                     read.filter(|read| {
                         let header = &read.header;
                         header.key == key
-                            && header.version == entry.version
+                            && header.version == coded.version
                             && header.stripe.number == stripe.number()
                             && usize::from(header.index) == index
                     })

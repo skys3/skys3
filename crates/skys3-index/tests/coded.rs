@@ -43,6 +43,7 @@ fn coded(first: u128) -> Coded {
     };
     Coded {
         publish: position(9),
+        version: position(3),
         attempt: AttemptId::new(Epoch::new(1), 4),
         stripes: vec![stripe(0, 0, 60, [0, 1, 2]), stripe(1, 60, 40, [1, 2, 3])],
     }
@@ -122,6 +123,55 @@ fn coded_entries_round_trip_and_must_cover_their_object() {
     // Every truncation fails cleanly.
     for len in 0..bytes.len() {
         assert!(codec::decode_entry(&bytes[..len]).is_err(), "{len} bytes");
+    }
+}
+
+/// Encodes `at` as a value does: epoch, then seq, little-endian.
+fn encoded(at: EpochSeq) -> Vec<u8> {
+    [at.epoch.get().to_le_bytes(), at.seq.get().to_le_bytes()].concat()
+}
+
+#[test]
+fn a_layout_records_the_version_its_fragments_were_written_for() {
+    // The layout follows the payload: its presence byte, the publish, and
+    // then the version.
+    let uncoded = codec::encode_entry(&entry(None)).unwrap();
+    let start = uncoded.len();
+    let coded_entry = entry(Some(coded(100)));
+    let bytes = codec::encode_entry(&coded_entry).unwrap();
+    assert_eq!(bytes[..start - 1], uncoded[..start - 1]);
+    assert_eq!(bytes[start - 1], 1);
+    assert_eq!(bytes[start..start + 16], encoded(position(9)));
+    assert_eq!(bytes[start + 16..start + 32], encoded(position(3)));
+
+    // A retag moves the entry's version past the layout's, which stays.
+    let mut retagged = coded_entry.clone();
+    retagged.version = position(12);
+    let bytes = codec::encode_entry(&retagged).unwrap();
+    let decoded = codec::decode_entry(&bytes).unwrap();
+    assert_eq!(decoded, retagged);
+    assert_eq!(decoded.object.unwrap().coded.unwrap().version, position(3));
+
+    // The version must precede the publish, in either direction.
+    for version in [position(9), position(10)] {
+        let mut late = coded_entry.clone();
+        late.object
+            .as_mut()
+            .unwrap()
+            .coded
+            .as_mut()
+            .unwrap()
+            .version = version;
+        assert_eq!(
+            codec::encode_entry(&late).unwrap_err().field(),
+            "object.coded"
+        );
+        let mut bad = codec::encode_entry(&coded_entry).unwrap();
+        bad[start + 16..start + 32].copy_from_slice(&encoded(version));
+        assert_eq!(
+            codec::decode_entry(&bad).unwrap_err().field(),
+            "object.coded"
+        );
     }
 }
 
