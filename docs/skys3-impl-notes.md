@@ -7953,7 +7953,12 @@ of this file. A task with nothing unexpected keeps "None."
   segments, so the next segment cannot be created: the node takes the disk
   out of service, and cannot write the fence into the missing directory,
   which it logs. The fenced start is drilled by writing the fence with the
-  node's own `skys3::datadir::fence`.
+  node's own `skys3::datadir::fence`. A review found that the drill first
+  moved a fixed disk away, but a bucket's random ID places its shards on
+  the disks by hash, so in about one run in sixteen every shard was on the
+  other disk and the drill timed out. It now computes the placement as
+  `ShardSet::disk_of` does and moves the disk that holds the most of the
+  bucket's shards.
 - **Low disk space, for real.** The drill writes 256 MiB of ballast, sets
   `disk_min_free_bytes` to half of it above the free space left, and removes
   the ballast: the node admits writes again within a second, as the runbook

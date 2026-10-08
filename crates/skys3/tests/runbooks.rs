@@ -20,7 +20,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,8 +46,8 @@ use skys3_shard::{Shard, ShardSet};
 use skys3_sim::SimS3;
 use skys3_sim::s3::SimS3Config;
 use skys3_types::{
-    BucketDocument, BucketId, BucketMode, BucketName, ClusterId, Epoch, Label, NodeId, ProposalId,
-    RemoteTarget, ShardConfig, ShardCount, ShardId,
+    BucketDocument, BucketId, BucketMode, BucketName, ClusterId, Epoch, KeyHash, Label, NodeId,
+    ProposalId, RemoteTarget, ShardConfig, ShardCount, ShardId,
 };
 use support::process::{BINARY, Process, configure};
 use support::{admin_json, body, get, http_get, put};
@@ -547,6 +547,33 @@ fn disk_entry(health: &Value, path: &Path) -> Value {
         .clone()
 }
 
+/// The paths of the node's two disks: the one that holds the most shards
+/// of the bucket whose status is `status`, then the other. A shard's disk
+/// is its hash modulo the number of disks, among the disks in label order
+/// (`skys3_shard::ShardSet::disk_of`).
+fn disks_by_share(status: &Value, health: &Value) -> (PathBuf, PathBuf) {
+    let bucket = BucketId::new(status["bucket_id"].as_str().unwrap()).unwrap();
+    let shards = u8::try_from(status["shards"].as_u64().unwrap()).unwrap();
+    let mut disks: Vec<(String, PathBuf)> = health["disks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|disk| {
+            let label = disk["label"].as_str().unwrap().to_owned();
+            (label, PathBuf::from(disk["path"].as_str().unwrap()))
+        })
+        .collect();
+    disks.sort();
+    assert_eq!(disks.len(), 2, "{health}");
+    let mut held = [0_usize; 2];
+    for shard in 0..shards {
+        let hash = KeyHash::of(&bucket, &[shard]).get();
+        held[usize::try_from(hash % 2).unwrap()] += 1;
+    }
+    let most = usize::from(held[1] > held[0]);
+    (disks[most].1.clone(), disks[1 - most].1.clone())
+}
+
 /// `disk-out-of-service`: a disk's directory goes away under a running
 /// node, and its next segment cannot be created; the node takes the disk
 /// out of service. The operator stops the node, brings the disk back,
@@ -571,13 +598,21 @@ async fn drill_disk_out_of_service() {
         acknowledged.insert(key, data);
     }
 
+    // The disk that goes away must hold shards of the bucket, whose random
+    // ID places them: take the disk that holds the most of them.
+    let status = admin_json(&node.admin, "/v1/buckets/data").await;
+    let health = admin_json(&node.admin, "/v1/health").await;
+    let (disk, other) = disks_by_share(&status, &health);
+
     // The disk goes away: its directory is no longer where the node
-    // creates segments.
-    let disk = dir.path().join("disk-a");
-    let away = dir.path().join("disk-a-away");
+    // creates segments. Writes go on until one needs a new segment there.
+    let away = dir.path().join("disk-away");
     std::fs::rename(&disk, &away).unwrap();
-    for i in 0..40_u8 {
-        let (key, data) = (format!("during/{i}"), body(100 + i, 20_000));
+    for i in 0..200_u8 {
+        if i % 10 == 0 && metric(&node, "skys3_disks_out_of_service").await == 1.0 {
+            break;
+        }
+        let (key, data) = (format!("during/{i}"), body(i, 20_000));
         let answer = s3
             .put_object()
             .bucket("data")
@@ -607,10 +642,7 @@ async fn drill_disk_out_of_service() {
     let failed = disk_entry(&health, &disk);
     assert_eq!(failed["in_service"], false, "{health}");
     assert!(failed["error"].is_string(), "{health}");
-    assert_eq!(
-        disk_entry(&health, &dir.path().join("disk-b"))["in_service"],
-        true
-    );
+    assert_eq!(disk_entry(&health, &other)["in_service"], true);
     let label = failed["label"].as_str().unwrap().to_owned();
     let log = log_text(dir.path());
     assert!(log.contains("a disk was taken out of service"), "{log}");
