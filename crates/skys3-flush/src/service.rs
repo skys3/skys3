@@ -921,6 +921,12 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         Some(flushers.get(bucket)?.record.as_ref()?.remote.clone())
     }
 
+    /// The metrics [`FlushService::refresh_metrics`] sets.
+    #[must_use]
+    pub fn metrics(&self) -> &FlushMetrics {
+        &self.metrics
+    }
+
     /// Sets the flush gauges of every bucket flushed here.
     pub fn refresh_metrics(&self) {
         let now = self.wall.now();

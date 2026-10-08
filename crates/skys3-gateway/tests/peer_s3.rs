@@ -109,6 +109,8 @@ async fn a_receiving_bucket_serves_its_descriptor() {
     got.assert(200, None);
     assert_eq!(got.body, "descriptor of archive");
     assert_eq!(got.headers["content-type"], "application/x-protobuf");
+    // The MD5 of its bytes.
+    assert_eq!(got.headers["etag"], "\"81e1dc64b0752d6777859c7c0a716f89\"");
     let head = call(&gateway, Method::HEAD, &path, &[], "").await;
     head.assert(200, None);
     assert_eq!(head.headers["content-length"], "21");

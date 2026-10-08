@@ -119,6 +119,14 @@ impl<C: ControlStore, H: Shards> Api<C, H> {
     }
 }
 
+/// A descriptor's ETag, as of an object of its bytes: the MD5 of its
+/// encoding, which changes whenever it is signed again.
+fn descriptor_etag(descriptor: &[u8]) -> s3s::dto::ETag {
+    use md5::Digest as _;
+    let md5: [u8; 16] = md5::Md5::digest(descriptor).into();
+    s3s::dto::ETag::Strong(skys3_types::ETag::from_md5(&md5).as_str().to_owned())
+}
+
 fn bucket_name(name: &str) -> S3Result<BucketName> {
     BucketName::new(name).map_err(|error| s3_error!(InvalidBucketName, "{error}"))
 }
@@ -297,6 +305,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
             return ok(GetObjectOutput {
                 content_length: i64::try_from(descriptor.len()).ok(),
                 content_type: Some(DESCRIPTOR_CONTENT_TYPE.to_owned()),
+                e_tag: Some(descriptor_etag(&descriptor)),
                 body: Some(StreamingBlob::from_bytes(descriptor)),
                 ..GetObjectOutput::default()
             });
@@ -316,6 +325,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
             return ok(HeadObjectOutput {
                 content_length: i64::try_from(descriptor.len()).ok(),
                 content_type: Some(DESCRIPTOR_CONTENT_TYPE.to_owned()),
+                e_tag: Some(descriptor_etag(&descriptor)),
                 ..HeadObjectOutput::default()
             });
         }

@@ -107,6 +107,7 @@ mod lifecycle;
 mod node;
 mod origin;
 mod peer;
+mod peer_s3;
 mod pki;
 mod replication;
 mod routing;
@@ -133,7 +134,7 @@ pub use learners::{DurabilityWindows, LearnerCounts};
 pub use lifecycle::{Lifecycle, LifecycleAudit, LifecycleObject, LifecycleStart, ORIGIN_DAY};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use origin::{FULL, GUEST, Origin, OriginAudit, OriginBug, OriginFreshness};
-pub use peer::{Peer, PeerAudit};
+pub use peer::{AimedBlocks, DescriptorKind, Peer, PeerAudit};
 pub use replication::{
     HandoffCounts, HandoffTime, IoCounts, LateWrites, LeaseCounts, ReplicaState,
     ReplicatedServices, ReplicatedShards,
