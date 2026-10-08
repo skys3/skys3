@@ -2520,6 +2520,7 @@ dependencies = [
  "skys3-log",
  "skys3-net",
  "skys3-obs",
+ "skys3-peer",
  "skys3-remote",
  "skys3-shard",
  "skys3-sim",

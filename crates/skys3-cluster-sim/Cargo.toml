@@ -39,12 +39,14 @@ skys3-log.workspace = true
 # `turmoil` for the transport over the simulated network.
 skys3-net = { workspace = true, features = ["turmoil"] }
 skys3-obs.workspace = true
+skys3-peer.workspace = true
 skys3-remote.workspace = true
 # `test-util` for the shard bugs of the coding scenarios.
 skys3-shard = { workspace = true, features = ["test-util"] }
 skys3-sim.workspace = true
 skys3-types.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+# `io-util` and `sync` for the SkyS3 peer's streams.
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 tracing.workspace = true
 turmoil.workspace = true
 
