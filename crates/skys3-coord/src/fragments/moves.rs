@@ -104,8 +104,12 @@ pub struct PlannedMove {
 
 impl FragmentPlanner {
     /// Plans up to `request.limit` fragment moves of the shard's stripes,
-    /// for the reasons the [module documentation](self) gives, in that
-    /// order: each to a node that keeps the stripe's placement rules,
+    /// in this order: fragments of a stripe over a failure domain's cap
+    /// ([`MoveReason::Domain`]), fragments on a listed node that is no
+    /// longer eligible ([`MoveReason::Drain`]), and fragments whose move
+    /// brings both nodes closer to their shares of the shard's fragment
+    /// bytes, `(b_a − f) / c_a ≥ (b_t + f) / c_t` ([`MoveReason::Balance`]).
+    /// Each goes to a node that keeps the stripe's placement rules,
     /// counting the moves planned before it. A fragment moves at most once
     /// in a plan. A topology that lists no node plans nothing.
     #[must_use]

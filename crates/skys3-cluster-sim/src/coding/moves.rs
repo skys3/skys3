@@ -324,7 +324,7 @@ impl Driver<'_> {
         self.moves.started = true;
         self.moves.crash = config.crash;
         self.moves.seen = lock(&self.world.repair.events).len();
-        let mut rng = StdRng::seed_from_u64(self.world.seed ^ 0x4452_4149_4e);
+        let mut rng = StdRng::seed_from_u64(self.world.seed ^ 0x0044_5241_494e);
         let mut pool: Vec<usize> = (1..NODES).collect();
         pool.shuffle(&mut rng);
         let mut topology = lock(&self.world.topology);
