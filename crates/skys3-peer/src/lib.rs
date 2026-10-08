@@ -69,6 +69,11 @@
 //!   each `BEGIN` with a `RESUME`, and reports durable ranges with
 //!   cumulative `DURABLE`s. A [`CommitSink`] applies each `COMMIT` in the
 //!   shard of its key, which publishes what is staged in one record.
+//! - **Discovery** ([`PeerDescriptor`]): a destination bucket's S3
+//!   endpoint answers a GET of [`DESCRIPTOR_KEY`] with a descriptor of
+//!   its QUIC endpoint, signed with the serving node's peer identity
+//!   ([`DescriptorSigner`]); a source verifies it against the trust bundle
+//!   of the cluster it names ([`DescriptorVerifier`]) before it tries QUIC.
 //! - **Batches** ([`BatchBuilder`], [`send_batch`]): objects of up to one
 //!   frame ([`skips_staging`]) skip staging and travel many to a `BATCH`,
 //!   with their bytes inline. A batch costs one round trip, and the
@@ -112,6 +117,7 @@
 //! ```
 
 mod batch;
+mod descriptor;
 mod destination;
 mod endpoint;
 mod error;
@@ -127,6 +133,11 @@ mod trust;
 mod wire;
 
 pub use batch::{BatchBuilder, DEFAULT_BATCH_RECORD_BYTES, Refusal, send_batch, skips_staging};
+pub use descriptor::{
+    DESCRIPTOR_CLOCK_SKEW, DESCRIPTOR_KEY, DESCRIPTOR_LIFETIME, DescriptorError, DescriptorSigner,
+    DescriptorVerifier, Expected, MAX_CHAIN_LEN, MAX_DESCRIPTOR_LEN, MAX_DESCRIPTOR_LIFETIME,
+    PeerDescriptor,
+};
 pub use destination::{
     CommitSink, ExtentSink, MAX_APPENDS_PER_STREAM, NoCommits, SinkError, StagingService,
 };

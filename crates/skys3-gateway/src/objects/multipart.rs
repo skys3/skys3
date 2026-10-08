@@ -220,8 +220,13 @@ impl<H: Shards> Objects<H> {
         bucket: &BucketDocument,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<CreateMultipartUploadOutput> {
+        let carrier = self.carrier(bucket, &req.extensions);
+        let metadata = metadata_of(
+            standard_headers!(req.input),
+            req.input.metadata.as_ref(),
+            carrier,
+        )?;
         let input = req.input;
-        let metadata = metadata_of(standard_headers!(input), input.metadata.as_ref())?;
         // The tags are the completed object's, kept in the `MPU_CREATE`.
         let tags = input
             .tagging

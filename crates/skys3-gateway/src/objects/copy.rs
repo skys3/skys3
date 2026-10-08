@@ -64,6 +64,7 @@ use crate::checksum::{DEFAULT_ALGORITHM, Digests, PooledHasher, parse_algorithm}
 use crate::conditions::{
     Precondition, ReadConditions, last_modified, no_such_key, precondition_failed, s3_etag,
 };
+use crate::peer_s3::Carrier;
 use crate::shard::{ShardRef, Shards};
 
 /// What a copy does with the source's metadata or tags.
@@ -152,6 +153,7 @@ impl<H: Shards> Objects<H> {
             Directive::Replace => Some(metadata_of(
                 standard_headers!(input),
                 input.metadata.as_ref(),
+                Carrier::Client,
             )?),
         };
         let replaced_tags = match tagging_directive {

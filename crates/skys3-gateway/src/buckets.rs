@@ -67,6 +67,7 @@ use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
 use crate::objects::backed_up;
 use crate::origin::OriginValidations;
+use crate::peer_s3::{PeerAccess, PeerDescriptors};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
@@ -172,6 +173,13 @@ pub struct GatewayConfig {
     /// without metrics. Clones of a configuration share it, so gateways
     /// built from clones on several nodes need one each.
     pub hot_cache: HotCache,
+    /// The access keys of peer clusters' flushers on this S3 endpoint, and
+    /// the bucket pairs each peer may write (§7.8, §12).
+    pub peer_access: PeerAccess,
+    /// Signs the peer descriptors of the buckets that receive native
+    /// replication (§7.8). [`GatewayConfig::new`] has none, so the node
+    /// serves no descriptor and sources flush to it over S3 REST.
+    pub descriptors: Option<Arc<dyn PeerDescriptors>>,
 }
 
 /// Where CreateBucket puts a new bucket's shards (design §4.1, §6.7).
@@ -219,6 +227,8 @@ impl GatewayConfig {
             write_through_timeout: config.flush().write_through_timeout(),
             hot_cache: HotCache::new(config.cache().hot_cache_bytes_per_node),
             fragments: None,
+            peer_access: PeerAccess::from_config(config.peering()),
+            descriptors: None,
         }
     }
 }
@@ -383,8 +393,14 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     /// writes from this cluster's clients: a bucket that receives native
     /// replication from a peer cluster (`peer_source`) is read-only to them,
     /// so each key has a single writer, unless `peer_local_writes` is set
-    /// (design §7.8), and a `read_only` bucket takes none (§9.5).
-    pub(crate) fn require_writable(&self, name: &BucketName) -> Result<BucketDocument, S3Error> {
+    /// (design §7.8), and a `read_only` bucket takes none (§9.5). A write
+    /// from the flusher of `peer`, over S3 REST, may write the buckets that
+    /// receive from that peer.
+    pub(crate) fn require_writable(
+        &self,
+        name: &BucketName,
+        peer: Option<&ClusterId>,
+    ) -> Result<BucketDocument, S3Error> {
         let bucket = self.require(name)?;
         if bucket.mode == BucketMode::ReadOnly {
             return Err(s3_error!(
@@ -395,13 +411,18 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
         }
         let settings = self.config.buckets.get(name);
         match &settings.peer_source {
-            Some(source) if !settings.peer_local_writes => Err(s3_error!(
+            Some(source) if !settings.peer_local_writes && peer != Some(source) => Err(s3_error!(
                 AccessDenied,
                 "Bucket {name} receives native replication from cluster {source} and is \
                  read-only to this cluster's clients"
             )),
             _ => Ok(bucket),
         }
+    }
+
+    /// The settings of the bucket named `name`.
+    pub(crate) fn settings(&self, name: &BucketName) -> &skys3_config::BucketSettings {
+        self.config.buckets.get(name)
     }
 
     /// Every bucket, in name order, from the local copy.
