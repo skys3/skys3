@@ -167,11 +167,11 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
         loop {
             self.settle().await;
             if self.tenure().is_some() {
-                // `serve_tenure` returns only once the tenure has ended,
-                // so each call serves a new tenure.
-                // Cleared when the tenure ends, also if this task is
+                // Reported until the tenure ends, also if this task is
                 // dropped during it.
                 let _tenure = TenureGauge::begin(self.metrics.clone());
+                // `serve_tenure` returns only once the tenure has ended,
+                // so each call serves a new tenure.
                 self.placement.begin_tenure();
                 self.serve_tenure().await;
             } else if !self.pending.is_empty() {

@@ -29,7 +29,7 @@
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use prometheus_client::encoding::{EncodeMetric, text};
+use prometheus_client::encoding::text;
 use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::{Metric, Registry, Unit};
 

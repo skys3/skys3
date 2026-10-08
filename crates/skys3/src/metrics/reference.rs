@@ -280,7 +280,9 @@ fn registered_in_sources(dir: &Path, found: &mut Vec<(String, String)>) {
                 let Some(rest) = rest.strip_prefix('"') else {
                     continue;
                 };
-                let (base, rest) = rest.split_once('"').unwrap();
+                let Some((base, rest)) = rest.split_once('"') else {
+                    continue;
+                };
                 // A metric registration has a help text after the name; a
                 // health component's has nothing.
                 let name = base

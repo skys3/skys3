@@ -22,7 +22,7 @@ use skys3_gateway::{
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
-use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
+use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health};
 use skys3_remote::aws::{AwsS3, default_credentials, profile_credentials};
 use skys3_shard::lifecycle::{self, LifecycleMetrics};
 use skys3_shard::{
