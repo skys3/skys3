@@ -1343,6 +1343,15 @@ mod tests {
             ) -> Result<(), ShardError> {
                 self.0.announce(s, b).await
             }
+            async fn flushed(
+                &self,
+                s: &ShardRef,
+                k: &str,
+                v: EpochSeq,
+                w: std::time::Duration,
+            ) -> Result<skys3_shard::FlushState, ShardError> {
+                self.0.flushed(s, k, v, w).await
+            }
             async fn write(
                 &self,
                 s: &ShardRef,

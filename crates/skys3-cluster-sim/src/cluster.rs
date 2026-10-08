@@ -39,6 +39,7 @@ use crate::node::{
 use crate::pki::Pki;
 use crate::replication::register;
 use crate::workload::{Client, Routes, Timings, Workload, etag_of};
+use crate::write_through::{self, RemoteAudit, WriteThrough};
 
 /// The shape of a simulated cluster.
 #[derive(Clone, Debug, PartialEq)]
@@ -116,6 +117,11 @@ pub struct ClusterConfig {
     pub read_registration: ReadRegistration,
     /// The hot cache every node's gateway keeps (§9.2): none by default.
     pub hot_cache: HotCaches,
+    /// Whether the `write_back` buckets acknowledge writes only once they
+    /// are flushed (§7.5), checked by the remote store alone holding every
+    /// acknowledged write, at its acknowledgement and when the clients are
+    /// done ([`WriteThrough`]). Off by default.
+    pub write_through: WriteThrough,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -185,6 +191,7 @@ impl Default for ClusterConfig {
             read_registration: ReadRegistration::default(),
             compaction: None,
             hot_cache: HotCaches::default(),
+            write_through: WriteThrough::Off,
         }
     }
 }
@@ -268,6 +275,10 @@ pub struct Report {
     /// `GET`s each node's gateway served from its hot cache, over every
     /// life; nodes that served none are left out.
     pub hot_cache_hits: BTreeMap<NodeId, u64>,
+    /// Acknowledged writes of `write_back` buckets checked against the
+    /// remote store alone when they were acknowledged
+    /// ([`ClusterConfig::write_through`]).
+    pub remote_checked: u64,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -579,6 +590,7 @@ impl<S: NodeServices> Cluster<S> {
             fences: 0,
             rebuilds: Vec::new(),
             failure: None,
+            audit: None,
         };
         // The clients start once every node serves, and the faults with
         // them.
@@ -602,6 +614,14 @@ impl<S: NodeServices> Cluster<S> {
             world.routes.clone()
         };
         driver.origin = Some(sim.elapsed());
+        driver.audit = self.config.write_through.audited().then(|| {
+            RemoteAudit::new(
+                world.remote.clone(),
+                &routes,
+                workload.keys,
+                history.clone(),
+            )
+        });
         let writes = Timings::default();
         for index in 0..workload.clients {
             let client = Client::new(
@@ -611,10 +631,19 @@ impl<S: NodeServices> Cluster<S> {
                 workload.clone(),
                 context.fork_seed(),
             )
-            .with_timings(writes.clone());
+            .with_timings(writes.clone())
+            .with_acks(driver.audit.as_ref().map(RemoteAudit::on_ack));
             sim.client(client_host(index), client.run());
         }
         self.drive(&mut sim, &mut driver, &history, false)?;
+        // The last acknowledgements' audits, then the whole cluster lost
+        // once the clients are done, before any fault heals: the remote
+        // store alone holds every acknowledged write of a write-through
+        // bucket.
+        driver.check()?;
+        if let Some(audit) = &driver.audit {
+            audit.lose_every_node().map_err(RunError::Check)?;
+        }
 
         // Heal everything, and read every key back.
         driver.advance(&mut sim, true);
@@ -682,6 +711,7 @@ impl<S: NodeServices> Cluster<S> {
             evicted,
             compacted: world.shared.compacted.load(Ordering::Relaxed),
             hot_cache_hits: world.shared.hot_cache_hits(),
+            remote_checked: driver.audit.as_ref().map_or(0, RemoteAudit::checked),
         })
     }
 
@@ -1024,7 +1054,7 @@ impl<S: NodeServices> World<S> {
 /// wrote: its ETag, but the MD5 of its bytes for a streamed single `PUT`,
 /// which completes a multipart upload of two parts or more (§7.4). The
 /// workload's multipart uploads have one part.
-fn written(body: &[u8], etag: &ETag) -> String {
+pub(crate) fn written(body: &[u8], etag: &ETag) -> String {
     match etag.as_str().rsplit_once('-') {
         Some((_, parts)) if parts.parse::<u32>().is_ok_and(|parts| parts >= 2) => etag_of(body),
         _ => etag.to_string(),
@@ -1199,9 +1229,15 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         shape.shards_per_bucket,
         shape.replicas.clamp(1, shape.nodes.max(1)),
     );
+    let ack_policy = if shape.write_through.waits() {
+        "write_through"
+    } else {
+        "local"
+    };
     let config: skys3_config::Config = format!(
         "[cluster]\ncluster_id = \"{cluster}\"\n\
-         [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n{defaults}"
+         [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n\
+         [flush]\nack_policy = \"{ack_policy}\"\n{defaults}"
     )
     .parse()?;
     let mut gateway = GatewayConfig::new(&config);
@@ -1219,6 +1255,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     }
     let body_timeout = gateway.max_body_duration * 2;
     gateway.read_registration_renew_interval = shape.read_registration.renew_every;
+    gateway.write_through_timeout = write_through::TIMEOUT;
     gateway.retry = RetryPolicy {
         max_attempts: 5,
         initial_backoff: Duration::from_millis(20),
@@ -1321,7 +1358,7 @@ fn registers(
 }
 
 /// The key prefix of a `write_back` bucket in the remote store.
-fn remote_prefix(bucket: &BucketDocument) -> &str {
+pub(crate) fn remote_prefix(bucket: &BucketDocument) -> &str {
     bucket
         .target
         .as_ref()
@@ -1386,11 +1423,18 @@ struct Driver<'a, S> {
     /// Why the harness itself failed while applying a fault, which fails
     /// the run.
     failure: Option<String>,
+    /// The audit of write-through acknowledgements, once the clients run.
+    audit: Option<RemoteAudit>,
 }
 
 impl<S: NodeServices> Driver<'_, S> {
-    /// Fails the run if the harness failed to apply a fault.
+    /// Fails the run if the harness failed to apply a fault, or if the
+    /// remote store lacked an acknowledged write of a write-through bucket
+    /// when it was acknowledged.
     fn check(&mut self) -> Result<(), RunError> {
+        if let Some(violation) = self.audit.as_ref().and_then(RemoteAudit::violation) {
+            return Err(RunError::Check(violation));
+        }
         match self.failure.take() {
             Some(failure) => Err(RunError::Simulation(failure)),
             None => Ok(()),
