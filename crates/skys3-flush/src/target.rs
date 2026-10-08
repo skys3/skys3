@@ -10,7 +10,7 @@ use skys3_config::{ConflictPolicy, FlushConfig, PeeringConfig};
 use skys3_io::{SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::UploadId;
-use skys3_remote::probe::ConditionalWrites;
+use skys3_remote::probe::{ConditionalWrites, CopySupport};
 use skys3_types::{BucketId, ClusterId, EpochSeq, WriteIdentity};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
@@ -193,6 +193,9 @@ pub struct Target<S> {
     pub(crate) conflict_policy: ConflictPolicy,
     /// Where copies find their sources for a server-side copy.
     pub(crate) copy_sources: CopySources,
+    /// The server-side copy support the probe found: `writes.copy_object`
+    /// until a later probe of copies alone replaces it.
+    copies: Mutex<CopySupport>,
     /// The in-flight budget, in KiB.
     inflight: Semaphore,
     inflight_kib: u32,
@@ -226,6 +229,7 @@ impl<S> Target<S> {
         let inflight_kib = u32::try_from(settings.max_inflight_bytes.div_ceil(1024))
             .unwrap_or(u32::MAX)
             .clamp(1, u32::try_from(Semaphore::MAX_PERMITS).unwrap_or(u32::MAX));
+        let copies = Mutex::new(writes.copy_object);
         Self {
             store,
             prefix: prefix.into(),
@@ -237,6 +241,7 @@ impl<S> Target<S> {
             counters: Counters::default(),
             conflict_policy: ConflictPolicy::Hold,
             copy_sources: CopySources::new(),
+            copies,
             inflight: Semaphore::new(inflight_kib as usize),
             inflight_kib,
             orphans: Mutex::default(),
@@ -291,9 +296,23 @@ impl<S> Target<S> {
         self.conflict_policy
     }
 
-    /// The preconditions the target honors.
+    /// The preconditions the target honors. Its `copy_object` is the
+    /// copy support the target was built with; [`Target::copy_support`]
+    /// is the current one.
     pub fn writes(&self) -> &ConditionalWrites {
         &self.writes
+    }
+
+    /// What the target supports of a server-side copy (§11): what it was
+    /// built with, until the flush service's probe of copies alone
+    /// replaces it.
+    pub fn copy_support(&self) -> CopySupport {
+        *self.copies.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces what the target supports of a server-side copy.
+    pub(crate) fn set_copy_support(&self, support: CopySupport) {
+        *self.copies.lock().unwrap_or_else(PoisonError::into_inner) = support;
     }
 
     /// The counters its flushers count events in.

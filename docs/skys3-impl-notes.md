@@ -6075,6 +6075,16 @@ of this file. A task with nothing unexpected keeps "None."
   the probe tests and the AWS mock's `501` test changed. The flush
   service logs at info when a target's copies will be uploaded, and the
   admin flush status has `server_side_copy`.
+- **The copies are probed apart (decided).** The probe does not retry,
+  and a run fails on any transient error, so the copy steps' requests
+  (about 20 more) made a run on a store failing or losing 7% of
+  requests succeed several times less often; with the backoff, a
+  flusher of the conflicts scenario at seed 2 did not drain in time. The
+  flush service now probes the writes alone (`run_writes`), starts
+  flushing, and then probes the copies alone (`run_copies`), retried
+  with the same backoff; the target's copy support is a cell the second
+  run fills (`Target::copy_support`), and copies are uploaded until it
+  does. `ConditionalProbe::run` still probes both.
 - **Surprise: tags are seen through HEAD.** Checking the tagging
   directive needs the destination's tags, and the object-store interface
   had no `GetObjectTagging`. `HeadObject` returns `x-amz-tagging-count`,

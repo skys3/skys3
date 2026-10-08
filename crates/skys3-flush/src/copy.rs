@@ -76,7 +76,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     pub(crate) fn copy_source(&self, object: &ObjectVersion) -> Option<Source> {
         let source = object.copy_source.as_ref()?;
         let etag = source.remote_etag.clone()?;
-        if !self.target.writes.copy_object.is_usable() || object.size > MAX_COPY_BYTES {
+        if !self.target.copy_support().is_usable() || object.size > MAX_COPY_BYTES {
             return None;
         }
         let prefix = self.target.copy_sources.prefix(&source.bucket)?;

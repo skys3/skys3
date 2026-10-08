@@ -118,6 +118,36 @@ async fn r2_leaves_complete_and_delete_unprotected() {
 }
 
 #[tokio::test]
+async fn writes_and_copies_are_probed_apart_as_together() {
+    for (conditionals, versioning) in [(Conditionals::AWS_S3, false), (Conditionals::R2, true)] {
+        let store = store(conditionals, versioning);
+        let whole = probe().run(&store).await.unwrap();
+        let copied = store.applied(Operation::CopyObject).len();
+        assert!(copied > 0);
+        let writes = probe().run_writes(&store).await.unwrap();
+        assert_eq!(store.applied(Operation::CopyObject).len(), copied);
+        assert_eq!(
+            writes,
+            ConditionalWrites {
+                copy_object: CopySupport::NONE,
+                ..whole
+            }
+        );
+        let copies = probe().run_copies(&store).await.unwrap();
+        assert_eq!(copies, whole.copy_object);
+        assert_clean(&store);
+    }
+
+    // A failed step of the copies fails their probe alone.
+    let store = store(Conditionals::AWS_S3, false);
+    store.inject(Operation::CopyObject, Fault::InternalError);
+    let error = probe().run_copies(&store).await.unwrap_err();
+    assert_eq!(error.error.kind(), S3ErrorKind::InternalError);
+    assert!(probe().run_writes(&store).await.is_ok());
+    assert_clean(&store);
+}
+
+#[tokio::test]
 async fn copies_are_usable_only_with_every_directive_and_precondition() {
     let store = store(Conditionals::AWS_S3, false);
     let writes = probe().run(&store).await.unwrap();

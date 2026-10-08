@@ -46,7 +46,8 @@ pub enum ProbeStatus {
         unprotected: Vec<ConditionalOperation>,
         /// Whether copies of clean sources in the same remote bucket are
         /// sent as server-side copies; otherwise they are uploaded (§7.2,
-        /// §11).
+        /// §11). Copies are probed after the writes, so that flushing need
+        /// not wait for them: until that probe succeeds, this is `false`.
         server_side_copy: bool,
     },
 }
@@ -756,25 +757,28 @@ impl<S> TargetParts<S> {
     }
 }
 
-/// Probes the target until a run succeeds, backing off between runs, and
-/// then makes the target ready.
+/// Probes the target's writes until a run succeeds, backing off between
+/// runs, and then makes the target ready, without server-side copies.
+/// Then it probes copies alone the same way, and lets the target copy
+/// server-side once a run finds it supports them: a flaky store fails the
+/// copy steps' many requests more often, and flushing need not wait.
 async fn run_probe<S: ObjectStore>(
     parts: TargetParts<S>,
     nonces: Option<Arc<AtomicU64>>,
     status: Arc<Mutex<ProbeStatus>>,
     ready: watch::Sender<Option<Arc<Target<S>>>>,
 ) {
+    let prefix = parts.prefix.clone();
+    let settings = parts.settings.clone();
+    // A fresh nonce per run: a failed run may leave scratch keys behind,
+    // which would fail the next run's `If-None-Match: *` that must hold.
+    let probe = || match &nonces {
+        Some(next) => ConditionalProbe::new(&prefix, next.fetch_add(1, Ordering::Relaxed)),
+        None => ConditionalProbe::with_fresh_nonce(&prefix),
+    };
     let mut failures = 0;
-    loop {
-        // A fresh nonce per run: a failed run may leave scratch keys behind,
-        // which would fail the next run's `If-None-Match: *` that must hold.
-        let probe = match &nonces {
-            Some(next) => {
-                ConditionalProbe::new(&parts.prefix, next.fetch_add(1, Ordering::Relaxed))
-            }
-            None => ConditionalProbe::with_fresh_nonce(&parts.prefix),
-        };
-        match probe.run(&*parts.store).await {
+    let target = loop {
+        match probe().run_writes(&*parts.store).await {
             Ok(found) => {
                 let unprotected = found.unprotected();
                 if !unprotected.is_empty() {
@@ -784,19 +788,13 @@ async fn run_probe<S: ObjectStore>(
                         these operations are sent unconditionally (§7.2)"
                     );
                 }
-                let server_side_copy = found.copy_object.is_usable();
-                if !server_side_copy {
-                    tracing::info!(
-                        copy = %found.copy_object,
-                        "the target cannot take server-side copies; copies are uploaded (§7.2)"
-                    );
-                }
                 *lock(&status) = ProbeStatus::Done {
                     unprotected,
-                    server_side_copy,
+                    server_side_copy: false,
                 };
-                ready.send_replace(Some(Arc::new(parts.build(found))));
-                return;
+                let target = Arc::new(parts.build(found));
+                ready.send_replace(Some(Arc::clone(&target)));
+                break target;
             }
             Err(error) => {
                 failures += 1;
@@ -804,8 +802,33 @@ async fn run_probe<S: ObjectStore>(
                 *lock(&status) = ProbeStatus::Running {
                     error: Some(error.to_string()),
                 };
-                tokio::time::sleep(parts.settings.backoff(failures)).await;
+                tokio::time::sleep(settings.backoff(failures)).await;
             }
         }
+    };
+    let mut failures = 0;
+    let support = loop {
+        match probe().run_copies(&*target.store).await {
+            Ok(support) => break support,
+            Err(error) => {
+                failures += 1;
+                tracing::warn!(%error, "the target's server-side copy probe failed");
+                tokio::time::sleep(settings.backoff(failures)).await;
+            }
+        }
+    };
+    target.set_copy_support(support);
+    let usable = support.is_usable();
+    if !usable {
+        tracing::info!(
+            copy = %support,
+            "the target cannot take server-side copies; copies are uploaded (§11)"
+        );
+    }
+    if let ProbeStatus::Done {
+        server_side_copy, ..
+    } = &mut *lock(&status)
+    {
+        *server_side_copy = usable;
     }
 }

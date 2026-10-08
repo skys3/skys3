@@ -41,6 +41,12 @@
 //! reads as ignored, and copies are sent as regular uploads, which is
 //! always correct.
 //!
+//! [`ConditionalProbe::run`] probes both. The flush service probes the
+//! writes alone first ([`ConditionalProbe::run_writes`]) and then the
+//! copies ([`ConditionalProbe::run_copies`]): every run fails on any
+//! transient error, and the copy steps more than double the requests of a
+//! run, so on a flaky store a combined run would hold flushing back.
+//!
 //! # Scratch keys
 //!
 //! The probe writes only under its scratch prefix,
@@ -365,7 +371,8 @@ impl ConditionalProbe {
         &self.scratch_prefix
     }
 
-    /// Probes `store` and removes the scratch keys.
+    /// Probes `store`, writes and server-side copies, and removes the
+    /// scratch keys.
     ///
     /// # Errors
     ///
@@ -374,12 +381,49 @@ impl ConditionalProbe {
     /// AccessDenied`, or if the cleanup fails. Either way, the probe has
     /// tried to remove everything it created.
     pub async fn run<S: ObjectStore>(&self, store: &S) -> Result<ConditionalWrites, ProbeError> {
+        self.run_part(store, Part::All).await
+    }
+
+    /// Probes the writes of `store` alone, as [`ConditionalProbe::run`]
+    /// does, and reports no server-side copy support
+    /// ([`CopySupport::NONE`]). With [`ConditionalProbe::run_copies`], it
+    /// lets a flusher start without waiting for the copy steps, whose
+    /// requests a flaky store fails more often than the writes' alone.
+    ///
+    /// # Errors
+    ///
+    /// As [`ConditionalProbe::run`].
+    pub async fn run_writes<S: ObjectStore>(
+        &self,
+        store: &S,
+    ) -> Result<ConditionalWrites, ProbeError> {
+        self.run_part(store, Part::Writes).await
+    }
+
+    /// Probes the server-side copy support of `store` alone, as
+    /// [`ConditionalProbe::run`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`ConditionalProbe::run`].
+    pub async fn run_copies<S: ObjectStore>(&self, store: &S) -> Result<CopySupport, ProbeError> {
+        self.run_part(store, Part::Copies)
+            .await
+            .map(|writes| writes.copy_object)
+    }
+
+    /// Probes `part` of what [`ConditionalProbe::run`] does.
+    async fn run_part<S: ObjectStore>(
+        &self,
+        store: &S,
+        part: Part,
+    ) -> Result<ConditionalWrites, ProbeError> {
         let mut run = Run {
             store,
             prefix: &self.scratch_prefix,
             created: Vec::new(),
         };
-        let result = run.probe().await;
+        let result = run.probe(part).await;
         let cleanup = run.clean_up().await;
         let ((step, error), leftovers) = match (result, cleanup) {
             (Ok(writes), Ok(())) => return Ok(writes),
@@ -550,6 +594,17 @@ impl Creating {
     }
 }
 
+/// What a run of the probe tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// Writes and server-side copies.
+    All,
+    /// Writes alone.
+    Writes,
+    /// Server-side copies alone.
+    Copies,
+}
+
 /// One run of the probe against a store.
 struct Run<'a, S> {
     store: &'a S,
@@ -558,13 +613,27 @@ struct Run<'a, S> {
 }
 
 impl<S: ObjectStore> Run<'_, S> {
-    async fn probe(&mut self) -> Result<ConditionalWrites, StepError> {
-        Ok(ConditionalWrites {
-            put_object: self.probe_creating(Creating::Put).await?,
-            complete_multipart_upload: self.probe_creating(Creating::Complete).await?,
-            delete_object: self.probe_delete().await?,
-            copy_object: self.probe_copy().await?,
-        })
+    /// Probes `part`; what it leaves out reads as unsupported.
+    async fn probe(&mut self, part: Part) -> Result<ConditionalWrites, StepError> {
+        let unprobed = OperationSupport {
+            if_none_match: Some(PreconditionSupport::Ignored),
+            if_match: PreconditionSupport::Ignored,
+        };
+        let mut writes = ConditionalWrites {
+            put_object: unprobed,
+            complete_multipart_upload: unprobed,
+            delete_object: unprobed,
+            copy_object: CopySupport::NONE,
+        };
+        if part != Part::Copies {
+            writes.put_object = self.probe_creating(Creating::Put).await?;
+            writes.complete_multipart_upload = self.probe_creating(Creating::Complete).await?;
+            writes.delete_object = self.probe_delete().await?;
+        }
+        if part != Part::Writes {
+            writes.copy_object = self.probe_copy().await?;
+        }
+        Ok(writes)
     }
 
     /// Probes what a server-side copy of a flush sends (see the module
