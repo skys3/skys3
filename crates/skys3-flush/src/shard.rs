@@ -1,7 +1,7 @@
 //! The flusher of one shard (§7.1): which keys are dirty, which are being
 //! flushed, which are held in conflict, and the task that drives them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -28,6 +28,10 @@ pub(crate) type Ready<S> = watch::Receiver<Option<Arc<Target<S>>>>;
 
 /// How many entries the startup scan reads per index transaction.
 const SCAN_PAGE: usize = 512;
+
+/// How many keys' dropped versions a flusher remembers for the
+/// write-through waits that reach it after the drop ([`State::awaited`]).
+const MAX_DISCARDS: usize = 4096;
 
 /// Where a dirty key is in its flush (§4.2). `Clean` has no phase: a clean
 /// key is not tracked.
@@ -139,6 +143,12 @@ struct State {
     stopped: bool,
     /// The budget `dirty_bytes` counts against, until the flusher stops.
     charge: Option<Charge>,
+    /// The newest version `discard_local` dropped of each key, for the
+    /// write-through waits that reach the flusher only after the drop
+    /// untracked the key.
+    discards: HashMap<String, EpochSeq>,
+    /// The keys of `discards`, oldest first: at most [`MAX_DISCARDS`].
+    discard_order: VecDeque<String>,
 }
 
 impl State {
@@ -329,8 +339,20 @@ impl State {
 
     /// Records that `discard_local` dropped `version` of `key` for the
     /// remote's write: the writes waiting for it, or an older version,
-    /// learn of the conflict.
+    /// learn of the conflict, now or when their wait arrives.
     fn discarded(&mut self, key: &str, version: EpochSeq) {
+        match self.discards.get_mut(key) {
+            Some(dropped) => *dropped = (*dropped).max(version),
+            None => {
+                self.discards.insert(key.to_owned(), version);
+                self.discard_order.push_back(key.to_owned());
+                if self.discard_order.len() > MAX_DISCARDS
+                    && let Some(oldest) = self.discard_order.pop_front()
+                {
+                    self.discards.remove(&oldest);
+                }
+            }
+        }
         if let Some(tracked) = self.keys.get_mut(key) {
             tracked.waiters.retain(|waiter| {
                 let dropped = waiter.version() <= version;
@@ -373,8 +395,14 @@ impl State {
     /// Takes a write-through write's wait for its version (§7.5). The
     /// shard passes it after the change that stored the version, so an
     /// untracked key has had its latest version, at or after the one
-    /// waited for, flushed.
+    /// waited for, flushed, unless `discard_local` dropped it: the flush
+    /// may have dropped it, and untracked the key, before the wait
+    /// arrived, so the drop is remembered for it.
     fn awaited(&mut self, waiter: FlushWaiter) {
+        let dropped = self.discards.get(waiter.key());
+        if dropped.is_some_and(|dropped| waiter.version() <= *dropped) {
+            return waiter.answer(FlushState::Conflict);
+        }
         let Some(tracked) = self.keys.get_mut(waiter.key()) else {
             return waiter.answer(FlushState::Flushed);
         };
@@ -1074,6 +1102,57 @@ mod tests {
         assert_eq!(answer_now(&mut dropped_wait), Some(FlushState::Conflict));
         assert_eq!(answer_now(&mut later_wait), None);
         assert_eq!(state.keys["k"].waiters.len(), 1);
+    }
+
+    /// The flusher may drop a version, and stop tracking its key, before
+    /// the write-through wait for it arrives through the subscription: the
+    /// wait still learns of the conflict, and only for what was dropped.
+    #[test]
+    fn a_wait_that_arrives_after_the_discard_learns_of_it() {
+        let mut state = flushing();
+        state.discarded("k", position(1));
+        state.finished("k", position(1));
+        assert!(state.keys.is_empty());
+        let (dropped, mut dropped_wait) = FlushWaiter::new("k".to_owned(), position(1));
+        state.awaited(dropped);
+        assert_eq!(answer_now(&mut dropped_wait), Some(FlushState::Conflict));
+
+        // A later version builds on the adopted write and is flushed; a
+        // wait for the dropped one, even while the later one is tracked,
+        // still learns of the conflict.
+        state.changed("k", position(2), Some(5), Duration::from_secs(2));
+        let (late, mut late_wait) = FlushWaiter::new("k".to_owned(), position(1));
+        state.awaited(late);
+        assert_eq!(answer_now(&mut late_wait), Some(FlushState::Conflict));
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(2), None))
+        );
+        state.finished("k", position(2));
+        let (flushed, mut flushed_wait) = FlushWaiter::new("k".to_owned(), position(2));
+        state.awaited(flushed);
+        assert_eq!(answer_now(&mut flushed_wait), Some(FlushState::Flushed));
+
+        // A key flushed without a discard, as under `overwrite`, or never
+        // tracked, answers that the remote holds the version.
+        let mut state = flushing();
+        state.finished("k", position(1));
+        let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(1));
+        state.awaited(waiter);
+        assert_eq!(answer_now(&mut wait), Some(FlushState::Flushed));
+    }
+
+    #[test]
+    fn the_flusher_remembers_the_latest_drops() {
+        let mut state = State::default();
+        for n in 0..=MAX_DISCARDS {
+            state.discarded(&format!("k{n}"), position(1));
+        }
+        state.discarded("k1", position(2));
+        assert_eq!(state.discards.len(), MAX_DISCARDS);
+        assert_eq!(state.discard_order.len(), MAX_DISCARDS);
+        assert!(!state.discards.contains_key("k0"));
+        assert_eq!(state.discards["k1"], position(2));
     }
 
     #[test]
