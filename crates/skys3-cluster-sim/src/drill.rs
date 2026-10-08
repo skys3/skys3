@@ -474,6 +474,10 @@ impl World {
                 checks_per_node: 1 << 16,
                 replans: 3,
                 bytes_per_second: 1 << 40,
+                // Repairs only: fragment moves (M5-09) are proved in the
+                // coding harness, and here would only reshuffle the
+                // fragments each drill must find.
+                moves_per_pass: 0,
             },
         )
         .with_attempts(attempts.clone());
