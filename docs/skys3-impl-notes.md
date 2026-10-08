@@ -6025,6 +6025,156 @@ of this file. A task with nothing unexpected keeps "None."
   must be resolved again. The namespace import's stall (M2-17) is worked
   around in the simulation, not fixed.
 
+### M4-07 Remote server-side copy
+
+- **"The same target" is the same remote bucket (decided, design §11).**
+  Every flush target is reached with the node's one set of target
+  credentials (`connect`), so one endpoint and bucket name are one remote
+  bucket the flusher can read as well as write. The flush service keeps,
+  per endpoint and bucket, the buckets it follows that flush there, with
+  their prefixes (`CopySources`, shared by every `Target` of that bucket
+  and refreshed on each reconcile; a list is emptied, never dropped,
+  since a target being built may hold it). A copy's flush looks its
+  source's bucket up there. A `read_only` origin has its own credentials
+  and is never listed; a copy from one is already refused (M4-12).
+- **"Clean" is checked by the remote, not by the flusher (decided).** The
+  copy's `PUT` already records the source's `remote_etag`, present only
+  if the source was clean or evicted when the copy read it, and the
+  flush sends it as `x-amz-copy-source-if-match`. Whether the source
+  is clean when the copy flushes does not matter: the remote either still
+  holds the version copied, and copies exactly its bytes, or the copy
+  fails.
+- **A changed source is never a conflict (decided, design §11).** A `412`
+  (or `404`, the remote's answer for a missing source or destination)
+  does not say which precondition failed. The flusher HEADs the
+  destination as after any failed precondition: its own write identity
+  is a landed copy whose answer was lost; a destination still as the
+  copy was conditioned on (the expected ETag, or absent under
+  `If-None-Match: *`) means its precondition held, so the source's
+  failed, and the copy falls back to a regular upload of its local bytes
+  with the same precondition and identity. Anything else follows the
+  §7.2 rule. A `409` writes nothing and is retried as a copy. Under an
+  `overwrite` resolution only the source has a precondition, so any
+  failed precondition falls back.
+- **Refusals fall back too.** A `501` or another `400` to the copy itself
+  (a stale probe result, a source the store cannot copy) is answered
+  with an upload, so a wrong probe costs a round trip, never a stuck key.
+- **Sizes (decided).** The gateway already refuses copy sources over
+  5 GiB, S3's `CopyObject` limit, so every copy fits one request; the
+  flusher checks the limit anyway and uploads a larger version.
+- **Backup targets copy too (decided, M4-09).** A `local` bucket's backup
+  is followed like a `write_back` target, and a clean entry's
+  `remote_etag` is the backup's ETag, so a copy within or between
+  buckets backed up to one remote bucket is copied from the backup's own
+  object. Write-through buckets likewise.
+- **The probe (design §7.2).** `ConditionalWrites` gained `copy_object:
+  CopySupport` (metadata directive, tagging directive, source `If-Match`,
+  destination preconditions), and copies flush server-side only if every
+  one is honored (`CopySupport::is_usable`). Within the scratch prefix it
+  writes `copy-source` with metadata and a tag, copies it to
+  `copy-object` with each `REPLACE` directive and HEADs the result, sends
+  a failing and a holding `x-amz-copy-source-if-match`, and probes the
+  destination preconditions on `copy-destination` as for `PutObject`.
+  A directive the store ignores leaves the source's metadata or tag
+  count; one it rejects fails the copy. A probe now sends 6 `PutObject`,
+  8 `CopyObject` (7 to an R2-like store, which ignores the destination
+  preconditions), and 2 `HeadObject` in all, so the request counts in
+  the probe tests and the AWS mock's `501` test changed. The flush
+  service logs at info when a target's copies will be uploaded, and the
+  admin flush status has `server_side_copy`.
+- **The copies are probed apart (decided).** The probe does not retry,
+  and a run fails on any transient error, so the copy steps' requests
+  (about 20 more) made a run on a store failing or losing 7% of
+  requests succeed several times less often; with the backoff, a
+  flusher of the conflicts scenario at seed 2 did not drain in time. The
+  flush service now probes the writes alone (`run_writes`), starts
+  flushing, and then probes the copies alone (`run_copies`), retried
+  with the same backoff; the target's copy support is a cell the second
+  run fills (`Target::copy_support`), and copies are uploaded until it
+  does. `ConditionalProbe::run` still probes both.
+- **Surprise: tags are seen through HEAD.** Checking the tagging
+  directive needs the destination's tags, and the object-store interface
+  had no `GetObjectTagging`. `HeadObject` returns `x-amz-tagging-count`,
+  so `ObjectInfo` gained `tag_count`. S3 sends it only to a caller with
+  `s3:GetObjectTagging`; without it the directive reads as ignored, which
+  costs uploads, never a wrong copy.
+- **Surprise: `MetadataDirective::Replace` lacked the standard headers.**
+  It carried user metadata and content type only; a copy must carry the
+  version's `cache-control`, `content-disposition`, `content-encoding`,
+  `content-language`, and `expires` too, so it gained `headers`, filled
+  from the same `request_headers` an upload uses. `CopyObject` gained a
+  `TaggingDirective`.
+- **Simulated store.** `SimS3Config::copy_directives` says whether the
+  directives are honored, ignored (copied as `COPY`), or rejected
+  (`501`): `CopyDirectives::AWS_S3`, and `WITHOUT_TAGS` for a store
+  without the tagging directive. The copy-source precondition and the
+  destination preconditions already existed. The store now logs the keys
+  each operation applied (`SimS3::applied`), so tests and audits can tell
+  a server-side copy from an upload, answered or not.
+- **Flush tests** (`skys3-flush/tests/copies.rs`): copies within and
+  across buckets of one remote bucket flush as `CopyObject`, dirty sources
+  and sources in another remote bucket as uploads; a lost copy answer
+  then a `412` retry recognizes its own identity, over a new and an
+  existing destination, also when the source changed meanwhile; a source
+  overwritten or deleted at the remote falls back to an upload, over a
+  new and an existing destination; targets without the tagging
+  directive or with the metadata directive rejected get uploads, and a
+  stale probe gets one fallback per copy; `overwrite`, `hold`, and a
+  `409` race.
+- **Cluster simulation** (`tests/simulation/copies.rs`,
+  `ClusterConfig::copies`). A copier client writes two source keys in
+  each of two `write_back` buckets that flush to one remote bucket, then
+  copies them within and across the buckets through any node, with
+  `REPLACE` metadata and, for every other copy, tags. Before most copies
+  it waits until the remote holds the source's last write and its lazy
+  `FLUSHED` is due; before some it makes the remote fail its next
+  `CopyObject` (`Copies::stalls`), and after some it writes the source
+  again (`Copies::rewrites`), so the source changes at the remote before
+  the stalled copy's retry. After a final drain the audit reads every
+  copier key on every member and checks the members agree and the remote
+  holds their version: bytes by MD5, user metadata, content type, tags,
+  and the write identity of the version's record; any key held in
+  conflict fails it. The main scenario adds crashes with and without
+  power loss, partitions, message loss, control-store faults, and 2% of
+  remote requests failing or losing their answer, and requires some
+  copies applied as `CopyObject`.
+- **Surprise: the last `FLUSHED` records may be lost.** The audit first
+  required every copier key clean after the drain. `FLUSHED` rides a
+  later group commit, which the final power loss can cut, so the audit
+  allows a dirty entry and still requires the remote to hold its version.
+- **Surprise: a high remote error rate disables copies.** The first
+  version failed a quarter of remote requests to hold copies back while
+  their sources changed. The probe sends about 30 requests and does not
+  retry, so it almost never passed and every copy was uploaded, and the
+  test of a seeded bug passed on a drain failure, whose message contains
+  the flusher's state and so the word "conflicts". Copies are now stalled by a scripted
+  `InternalError` on the next `CopyObject`, without random errors, and
+  the bug tests match the start of the audit's reason.
+- **Costs.** At 2% remote errors, 25% stalls, and a third of sources
+  rewritten, a seed of the main scenario takes about 7 s in a debug
+  build and the seeded ones 3 to 5 s, so all three run at
+  `Runner::with_cost(_, 2 * COST)`: CI runs seeds 0 to 3 of each, 29 s
+  for the main scenario, 11 and 21 s for the seeded ones, and 27 s for
+  the three side by side at `SKYS3_SIM_SEEDS=256`. All three passed 64
+  seeds (`SKYS3_SIM_SEEDS=4096`), 475 s side by side.
+- **Seeded bugs** (`CopyBug`, without faults, 12 operations and 12
+  copies, `Runner::with_cost(2, 2 * COST)`):
+  - `CopyBug::WithoutIdentity`, copies sent without the copy's write
+    identity: caught ("the remote object has the write identity None")
+    at every one of seeds 0 to 63, first at **seed 0**.
+  - `CopyBug::SourceFailureAsConflict`, a failed source precondition
+    taken for a conflict at the destination, with every copy stalled and
+    its source rewritten: caught ("a conflict was reported for the
+    cluster's own write") at every one of seeds 0 to 63, first at
+    **seed 0**.
+- **No format changes.** No record, index, or wire format changed; the
+  probe result and the admin status gained fields.
+- **Left open.** A copy of a source in another remote bucket is
+  uploaded; S3 could copy across buckets the credentials can read, but
+  that would need a probe per pair. A server-side copy's entry records
+  whatever ETag the remote gives the copy as its `remote_etag`, as for
+  any flush; the ETag clients see stays the local one (§7.4).
+
 ### M4-08 Write-through buckets
 
 - **Which writes wait (decided, design §7.5).** The plan names PUTs only.

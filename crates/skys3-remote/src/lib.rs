@@ -45,6 +45,6 @@ pub use model::{
     CreateMultipartUpload, DeleteObject, DeleteOutput, GetObject, GetOutput, HeadObject,
     ListObjectsV2, ListObjectsV2Output, ListParts, ListPartsOutput, ListedObject, ListedPart,
     MAX_KEY_LEN, MAX_LIST_KEYS, MAX_LIST_PARTS, MetadataDirective, ObjectInfo, PART_NUMBERS,
-    PutObject, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
+    PutObject, TaggingDirective, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
 };
 pub use store::{ObjectStore, S3Result};
