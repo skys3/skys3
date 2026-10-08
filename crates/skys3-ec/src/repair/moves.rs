@@ -3,10 +3,11 @@
 //! [`FragmentPlanner::moves`] plans them, publish before retire.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use skys3_coord::{FragmentPlanner, MoveRequest, PlannedMove, ShardStripe};
-use skys3_index::Entry;
+use skys3_index::{Entry, Index};
 use skys3_io::Disk;
 use skys3_log::record::FragmentMove;
 use skys3_types::{AttemptId, FragmentLocation, NodeId};
@@ -63,10 +64,24 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             if !leads(&self.shard) {
                 break;
             }
-            let Some(entry) = inventory.entries.get(&planned.key) else {
-                continue;
+            // The entry as it is now, not as the pass found it: a write or
+            // a retag since would reject the move's record.
+            let entry = match self.current(&planned.key).await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(shard = %shard, %error, "moves cannot read the index");
+                    break;
+                }
             };
-            match self.make_move(pass, entry, &planned).await {
+            let located = coded_stripe(&entry, planned.stripe)
+                .and_then(|stripe| stripe.fragments().get(usize::from(planned.index)));
+            if located != Some(&planned.from) {
+                // The layout changed since the plan: the next pass plans
+                // again.
+                continue;
+            }
+            match self.make_move(pass, &entry, &planned).await {
                 Ok(true) => {
                     report.moved += 1;
                     self.metrics.moved_fragment();
@@ -85,6 +100,18 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                 }
             }
         }
+    }
+
+    /// The entry of `key` in the shard's index now.
+    async fn current(&self, key: &str) -> Result<Option<Entry>, RepairError> {
+        let index: Arc<Index> = Arc::clone(self.shard.index());
+        let shard = self.shard.shard().clone();
+        let key = key.to_owned();
+        self.pool
+            .run(move || index.read()?.entry(&shard, &key))
+            .await
+            .map_err(|_| RepairError::PoolClosed)?
+            .map_err(RepairError::from)
     }
 
     /// Moves one fragment as a fragment-writing attempt: whether its
