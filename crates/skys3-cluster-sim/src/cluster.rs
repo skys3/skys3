@@ -44,7 +44,9 @@ use crate::node::{
     Shared, TRANSPORT_PORT,
 };
 use crate::origin::{self, Origin, OriginAudit, OriginLog, OriginRoutes};
-use crate::peer::{self, DescriptorKind, Destination, Peer, PeerAudit, TransportAudit};
+use crate::peer::{
+    self, Aim, AimScope, DescriptorKind, Destination, Peer, PeerAudit, TransportAudit,
+};
 use crate::peer_s3;
 use crate::pki::Pki;
 use crate::replication::register;
@@ -1413,11 +1415,13 @@ impl<S: NodeServices> World<S> {
                 Destination::new(
                     context.disk_with_faults(config.disk_faults.clone()),
                     &cluster,
+                    &node_ids,
                     &sources,
                     peer,
                     settings.log.clone(),
                     node::index_config(&settings),
                     settings.checkpoint_interval,
+                    context.fork_seed(),
                 )
                 .map(Arc::new)
             })
@@ -2240,18 +2244,11 @@ impl<S: NodeServices> Driver<'_, S> {
                 self.start(sim, now, fault);
             }
         }
-        // UDP blocked between every node and the peer as a `COMMIT` is on
-        // its way.
-        let hold = self.world.destination.as_ref().and_then(|d| d.take_aim());
-        if let Some(duration) = hold.filter(|_| !heal_all && self.udp_block.is_none()) {
-            self.start(
-                sim,
-                now,
-                Fault::UdpBlock {
-                    hold: true,
-                    duration,
-                },
-            );
+        // Faults aimed at a `COMMIT` on its way.
+        while let Some(aim) = self.world.destination.as_ref().and_then(|d| d.take_aim()) {
+            if !heal_all {
+                self.aim(sim, now, aim);
+            }
         }
         let aimed = self.large.as_ref().map(Versions::take_crashes);
         for fault in aimed.into_iter().flatten() {
@@ -2492,6 +2489,41 @@ impl<S: NodeServices> Driver<'_, S> {
                 };
                 self.fences += 1;
                 self.crash(sim, now, node, true, downtime);
+            }
+        }
+    }
+
+    /// Starts a fault aimed at a `COMMIT` that the node `aim.node` sent:
+    /// UDP blocked between every node and the peer, its own link to the
+    /// peer held, or both and the node cut off from the others, so that a
+    /// member deposes it while its `COMMIT` waits.
+    fn aim(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, aim: Aim) {
+        let (node, peer) = (Endpoint::Node(aim.node), Endpoint::Peer);
+        let hold = Fault::Hold {
+            a: node,
+            b: peer,
+            duration: aim.hold,
+        };
+        match aim.scope {
+            AimScope::Udp if self.udp_block.is_none() => {
+                let block = Fault::UdpBlock {
+                    hold: true,
+                    duration: aim.hold,
+                };
+                self.start(sim, now, block);
+            }
+            AimScope::Udp => {}
+            AimScope::Sender => self.start(sim, now, hold),
+            AimScope::Deposed { isolated } => {
+                for other in (0..self.world.slots.len()).filter(|other| *other != aim.node) {
+                    let cut = Fault::Partition {
+                        a: node,
+                        b: Endpoint::Node(other),
+                        duration: isolated,
+                    };
+                    self.start(sim, now, cut);
+                }
+                self.start(sim, now, hold);
             }
         }
     }

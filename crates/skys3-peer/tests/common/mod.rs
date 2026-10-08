@@ -159,6 +159,7 @@ pub fn settings() -> EndpointSettings {
         connect_timeout: Duration::from_secs(5),
         max_inflight_bytes: 64 << 20,
         capabilities: Capabilities::KNOWN,
+        idle_timeout: skys3_peer::IDLE_TIMEOUT,
     }
 }
 

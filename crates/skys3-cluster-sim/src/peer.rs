@@ -10,16 +10,20 @@
 //! apply through the gateway's peer commits, and its S3 gateway, which
 //! serves the bucket's signed peer descriptor and takes the source's
 //! flushes over S3 REST under the access key of its peer. The nodes reach
-//! the native service over TCP on the simulated network, one connection
-//! per stream, so that partitions, holds, message loss, and restarts of
-//! the peer ([`Fault::PeerRestart`]) cut streams in the middle, and the
-//! gateway through a relay host (see [`peer_s3`](crate::peer_s3)), which
-//! those faults do not cut: they block the native transport as a firewall
-//! that blocks UDP would. The destination ends a stream that sends nothing
-//! for [`Peer::idle`], as a QUIC connection's idle timeout does.
+//! the native service over real QUIC on the simulated network
+//! ([`peer_wire`](crate::peer_wire)): Quinn's endpoints, the node binary's
+//! handshake and connection pool, and the destination's stream service,
+//! with mutual TLS against each side's trust bundle. Partitions, holds,
+//! message loss, and restarts of the peer ([`Fault::PeerRestart`]) lose
+//! datagrams, stall connections until their idle timeout
+//! ([`Peer::idle`]), and cut streams in the middle; the destination also
+//! loses protocol messages and drops connections itself
+//! ([`ProtocolFaults`]). The nodes reach the gateway through a relay host
+//! (see [`peer_s3`](crate::peer_s3)), which those faults do not cut: they
+//! block the native transport as a firewall that blocks UDP would.
 //!
 //! The nodes' discovery reads the descriptor through the gateway, checks
-//! it against the destination's CA, and tries a TCP connection to the
+//! it against the destination's CA, and tries a QUIC handshake with the
 //! address it names within [`Peer::connect_timeout`]: QUIC if that
 //! succeeds, S3 REST through the relay if not.
 //!
@@ -48,27 +52,34 @@
 //!   its status does, and its count of switches grows whenever that
 //!   changes. With `target_transport = "auto"` and a descriptor that
 //!   verifies, every peer target is back on QUIC once the faults healed.
+//! - **The protocol itself** (plan M6-08), on every stream the
+//!   destination serves ([`peer_wire`](crate::peer_wire)): no `DATA`
+//!   resends a byte its stream's `RESUME` reported durable
+//!   (`PeerBug::ResendDurable` breaks this); every `APPLIED` for the
+//!   identity the key's current version carries says `committed` with its
+//!   ETag, however many copies of the `COMMIT` arrive and from whichever
+//!   node; and a `COMMIT` whose stream covered its whole object is never
+//!   answered `incomplete`. Once the run is over, the staging that is
+//!   left expires and gives back its whole quota charge.
 //!
 //! [`Fault::PeerRestart`]: crate::Fault::PeerRestart
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::Request;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use s3s::{Body, S3Error};
-use skys3_config::{BucketPair, TargetTransport};
+use skys3_config::{BucketPair, PeeringConfig, TargetTransport};
 use skys3_control::{
     Expected, MemoryControlStore, ProposalIds, ProposalOutcome, RetryPolicy, TypedKey, bootstrap,
     bump_generation, propose_document,
 };
-use skys3_flush::{
-    BoxFuture, FlushService, FlushedRecord, LinkError, PeerBug, PeerLink, PeerReceive, PeerSend,
-    PeerStream, PeerTransport, Transport,
-};
+use skys3_flush::{FlushService, FlushedRecord, PeerBug, Transport};
 use skys3_gateway::sigv4::{AuthMethod, Authenticated};
 use skys3_gateway::{
     Authenticator, BucketLookup, Gateway, GatewayConfig, IdSource, PeerCommits, PeerDescriptors,
@@ -79,30 +90,28 @@ use skys3_io::{BlockingPool, Drift, MonoTime, SimDisk, SimMount};
 use skys3_log::record::IDENTITY_METADATA;
 use skys3_log::{LogConfig, RecordBody};
 use skys3_peer::{
-    DescriptorSigner, DescriptorVerifier, Inbound, Message, Outbound, Outcome, PREFIX_LEN,
-    PeerDescriptor, PeerTls, PeerTrust, Staging, StagingLimits, StagingService, StreamError,
-    parse_prefix,
+    Applied, DescriptorSigner, DescriptorVerifier, EndpointSettings, Outcome, PeerDescriptor,
+    PeerTls, PeerTrust, Staging, StagingLimits, StagingService,
 };
 use skys3_sim::NodeClock;
 use skys3_sim::check::Violation;
+use skys3_types::WriteIdentity;
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, BucketName, ClusterId, Label, NodeId, ProposalId,
     ShardCount,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use turmoil::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use turmoil::net::{TcpListener, TcpStream};
 
 use crate::backup::Flushers;
 use crate::node::{BoxError, INDEX_FILE};
 use crate::peer_s3::{ACCESS_KEY, ACCESS_KEY_HEADER, SimStore};
+pub use crate::peer_wire::ProtocolFaults;
 use crate::pki::Pki;
-use crate::s3;
+use crate::{peer_wire, s3};
 
 /// The destination's host.
 pub(crate) const HOST: &str = "peer";
-/// The port its peer service listens on.
-const PORT: u16 = 7600;
+/// The port its peer endpoint listens on.
+pub(crate) const PORT: u16 = 7600;
 /// The endpoint that native targets name.
 pub(crate) const ENDPOINT: &str = "https://peer.sim.internal";
 /// The destination bucket, which every source bucket flushes to under a
@@ -143,21 +152,23 @@ pub struct Peer {
     /// The least and the most time between re-probes of a target that
     /// fell back.
     pub reprobe: (Duration, Duration),
-    /// How long the destination waits for the next message of a stream
-    /// before it ends the stream, as a QUIC connection's idle timeout.
+    /// The QUIC idle timeout of every connection, at both ends: a
+    /// connection that hears nothing for this long is lost, with its
+    /// streams. Quiet connections send keep-alives six times as often.
     pub idle: Duration,
     /// The descriptor the destination serves.
     pub descriptor: DescriptorKind,
-    /// UDP blocks aimed at `COMMIT`s: the first `count` times a node sends
-    /// a `COMMIT`, at least `every` apart, the links between every node
-    /// and the peer are held for `hold`, which catches the `COMMIT` on its
-    /// way.
+    /// Faults aimed at `COMMIT`s: the first `count` times a node sends
+    /// a `COMMIT`, at least `every` apart, links are held for `hold`,
+    /// which catches the `COMMIT` on its way.
     pub aimed: AimedBlocks,
+    /// Messages the destination loses and connections it drops.
+    pub faults: ProtocolFaults,
     /// A seeded bug of the flushers' native transport.
     pub bug: PeerBug,
 }
 
-/// UDP blocks aimed at `COMMIT`s on their way ([`Peer::aimed`]).
+/// Faults aimed at `COMMIT`s on their way ([`Peer::aimed`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AimedBlocks {
     /// How many.
@@ -166,6 +177,39 @@ pub struct AimedBlocks {
     pub hold: Duration,
     /// The least time between the starts of two.
     pub every: Duration,
+    /// Which links.
+    pub scope: AimScope,
+}
+
+/// Which links a fault aimed at a `COMMIT` holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AimScope {
+    /// UDP blocked between every node and the peer.
+    #[default]
+    Udp,
+    /// The link between the node that sent the `COMMIT` and the peer: its
+    /// `COMMIT` arrives late, while the other nodes' streams go on.
+    Sender,
+    /// The sender deposed: it is cut off from the other nodes for
+    /// `isolated`, long enough for a member to take its shards over and
+    /// flush the same write again, while its link to the peer is held, so
+    /// that its own `COMMIT` arrives too, after its successor's or before.
+    Deposed {
+        /// How long the sender is cut off from the other nodes.
+        isolated: Duration,
+    },
+}
+
+/// A fault aimed at a `COMMIT` that a node sent: the driver starts it at
+/// once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Aim {
+    /// The node that sent the `COMMIT`, by position.
+    pub node: usize,
+    /// How long the links are held.
+    pub hold: Duration,
+    /// Which links.
+    pub scope: AimScope,
 }
 
 /// The descriptor the destination serves.
@@ -198,46 +242,13 @@ impl Default for Peer {
             idle: Duration::from_secs(8),
             descriptor: DescriptorKind::Signed,
             aimed: AimedBlocks::default(),
+            faults: ProtocolFaults::default(),
             bug: PeerBug::None,
         }
     }
 }
 
 impl Peer {
-    /// How the nodes' flush services reach the peer, whose descriptors
-    /// `verifier` checks and whose `COMMIT`s `log` records.
-    pub(crate) fn transport(
-        self,
-        verifier: DescriptorVerifier,
-        log: Arc<PeerLog>,
-    ) -> PeerTransport {
-        PeerTransport::new(
-            Box::new(move |descriptor: &PeerDescriptor| {
-                let (address, log) = (descriptor.addresses.first().cloned(), Arc::clone(&log));
-                Box::pin(async move {
-                    let address = address.ok_or_else(|| LinkError::new("no address"))?;
-                    let (host, port) = address
-                        .rsplit_once(':')
-                        .and_then(|(host, port)| Some((host.to_owned(), port.parse().ok()?)))
-                        .ok_or_else(|| LinkError::new("not host:port"))?;
-                    // The handshake: a connection the destination accepts.
-                    drop(
-                        TcpStream::connect((host.as_str(), port))
-                            .await
-                            .map_err(link)?,
-                    );
-                    Ok(Arc::new(TcpLink { host, port, log }) as Arc<dyn PeerLink>)
-                })
-            }),
-            verifier,
-            self.frame_bytes,
-        )
-        .with_timeout(self.timeout)
-        .with_connect_timeout(self.connect_timeout)
-        .with_reprobe(self.reprobe.0, self.reprobe.1)
-        .with_quarantine(self.quarantine())
-    }
-
     /// How long a node's flushers wait before they flush a shard over S3
     /// REST to the peer: as the node binary's, twice the timeout of a
     /// stream and the destination's idle timeout.
@@ -245,13 +256,26 @@ impl Peer {
     pub fn quarantine(self) -> Duration {
         2 * self.timeout + self.idle
     }
+
+    /// The settings of every peer endpoint, the nodes' and the
+    /// destination's.
+    pub(crate) fn settings(self) -> EndpointSettings {
+        EndpointSettings {
+            connect_timeout: self.connect_timeout,
+            idle_timeout: self.idle,
+            ..EndpointSettings::from_config(&PeeringConfig::default())
+        }
+    }
 }
 
-/// What the nodes know of the peer: how to check its descriptors, and the
-/// record the audits keep.
+/// What the nodes know of the peer: how to check its descriptors, each
+/// node's peer certificate, by position, the settings of their endpoints,
+/// and the record the audits keep.
 #[derive(Clone, Debug)]
 pub(crate) struct PeerSide {
     pub verifier: DescriptorVerifier,
+    pub nodes: Vec<PeerTls>,
+    pub settings: EndpointSettings,
     pub log: Arc<PeerLog>,
 }
 
@@ -270,10 +294,10 @@ pub(crate) struct PeerLog {
     /// S3 writes the destination acknowledged.
     acknowledged: AtomicU64,
     violation: Mutex<Option<Violation>>,
-    /// The aimed blocks still to start, and when the last one started.
+    /// The aimed faults still to start, and when the last one started.
     aimed: Mutex<(AimedBlocks, Option<Duration>)>,
-    /// Whether an aimed block is due.
-    aim: AtomicBool,
+    /// The aimed faults due.
+    aims: Mutex<Vec<Aim>>,
 }
 
 impl PeerLog {
@@ -285,16 +309,16 @@ impl PeerLog {
         }
     }
 
-    /// Whether a block aimed at a `COMMIT` on its way is due: the driver
-    /// starts it at once.
-    pub(crate) fn take_aim(&self) -> Option<Duration> {
-        self.aim
-            .swap(false, Ordering::Relaxed)
-            .then(|| lock(&self.aimed).0.hold)
+    /// The next fault aimed at a `COMMIT` on its way, if one is due: the
+    /// driver starts it at once.
+    pub(crate) fn take_aim(&self) -> Option<Aim> {
+        let mut aims = lock(&self.aims);
+        (!aims.is_empty()).then(|| aims.remove(0))
     }
 
-    /// A node sent the `COMMIT` of `identity`, a write of `key`.
-    fn commit_sent(&self, identity: String, key: String) {
+    /// The node at `node` sent the `COMMIT` of `identity`, a write of
+    /// `key`.
+    pub(crate) fn commit_sent(&self, identity: String, key: String, node: usize) {
         {
             let mut aimed = lock(&self.aimed);
             let now = now();
@@ -302,7 +326,11 @@ impl PeerLog {
             if blocks.count > 0 && last.is_none_or(|last| now >= last + blocks.every) {
                 blocks.count -= 1;
                 *last = Some(now);
-                self.aim.store(true, Ordering::Relaxed);
+                lock(&self.aims).push(Aim {
+                    node,
+                    hold: blocks.hold,
+                    scope: blocks.scope,
+                });
             }
         }
         lock(&self.commits).insert(identity, (key, now()));
@@ -512,6 +540,82 @@ pub struct PeerAudit {
     pub on_quic: u64,
     /// Changes of transport, over every target sampled.
     pub switches: u64,
+    /// Bytes of `DATA` frames the destination received.
+    pub data_bytes: u64,
+    /// `RESUME`s that reported durable bytes, and those bytes: what the
+    /// sources did not send again after a reconnect.
+    pub resumes: u64,
+    /// Bytes the `RESUME`s reported durable.
+    pub resumed_bytes: u64,
+    /// Messages the destination lost ([`ProtocolFaults`]).
+    pub lost: u64,
+    /// Connections the destination dropped ([`ProtocolFaults`]).
+    pub dropped: u64,
+    /// `COMMIT`s answered `incomplete`.
+    pub incomplete: u64,
+    /// `ABORT`s that told a source its staging had expired.
+    pub expired: u64,
+    /// Write identities whose `COMMIT` arrived more than once.
+    pub replayed: u64,
+    /// Write identities whose `COMMIT` arrived from more than one node: a
+    /// deposed primary's and its successor's.
+    pub from_two_nodes: u64,
+}
+
+/// What the destination counts of the protocol, for [`PeerAudit`].
+#[derive(Debug, Default)]
+pub(crate) struct ProtocolCounts {
+    data_bytes: AtomicU64,
+    resumes: AtomicU64,
+    resumed_bytes: AtomicU64,
+    lost: AtomicU64,
+    dropped: AtomicU64,
+    incomplete: AtomicU64,
+    expired: AtomicU64,
+}
+
+impl ProtocolCounts {
+    pub(crate) fn data(&self, bytes: u64) {
+        self.data_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn resumed(&self, bytes: u64) {
+        if bytes > 0 {
+            self.resumes.fetch_add(1, Ordering::Relaxed);
+            self.resumed_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn lost(&self) {
+        self.lost.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn incomplete(&self) {
+        self.incomplete.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn expired(&self) {
+        self.expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `audit`, with the counts.
+    fn add_to(&self, audit: PeerAudit) -> PeerAudit {
+        let load = |count: &AtomicU64| count.load(Ordering::Relaxed);
+        PeerAudit {
+            data_bytes: load(&self.data_bytes),
+            resumes: load(&self.resumes),
+            resumed_bytes: load(&self.resumed_bytes),
+            lost: load(&self.lost),
+            dropped: load(&self.dropped),
+            incomplete: load(&self.incomplete),
+            expired: load(&self.expired),
+            ..audit
+        }
+    }
 }
 
 /// What the destination holds at the end, by key, and what the run found.
@@ -554,23 +658,43 @@ pub(crate) struct Destination {
     signer: DescriptorSigner,
     forger: DescriptorSigner,
     ca: skys3_net::CertificateDer<'static>,
-    /// How long a stream may send nothing.
-    idle: Duration,
     record: Arc<PeerLog>,
+    /// Its TLS identity on its peer endpoint, which trusts the source's
+    /// peer CA, and the settings of every peer endpoint.
+    tls: PeerTls,
+    settings: EndpointSettings,
+    /// The nodes' peer certificates, by position.
+    nodes: Vec<PeerTls>,
+    /// What its endpoints draw from, mixed with the life.
+    seed: u64,
+    /// The faults it injects, and what it draws them from.
+    faults: ProtocolFaults,
+    rng: Mutex<SmallRng>,
+    counts: ProtocolCounts,
+    /// How many times each write identity's `COMMIT` arrived, and from
+    /// which nodes.
+    arrivals: Mutex<BTreeMap<String, (u64, BTreeSet<String>)>>,
+    /// The identities whose staging a source aborted.
+    aborted: Mutex<BTreeSet<WriteIdentity>>,
+    /// The staging of its latest life.
+    staging: Mutex<Option<Arc<Staging>>>,
 }
 
 impl Destination {
-    /// A destination on `disk` that receives from `source`, into its
-    /// bucket from each of `buckets`, with the log and index settings of
-    /// the nodes.
+    /// A destination on `disk` that receives from `source`, whose nodes
+    /// are `nodes`, into its bucket from each of `buckets`, with the log
+    /// and index settings of the nodes, and whose draws come from `seed`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         disk: SimDisk,
         source: &ClusterId,
+        nodes: &[NodeId],
         buckets: &[BucketId],
         peer: Peer,
         log: LogConfig,
         index: IndexConfig,
         checkpoints: Duration,
+        seed: u64,
     ) -> Result<Self, BoxError> {
         let pairs: Vec<String> = buckets
             .iter()
@@ -590,9 +714,31 @@ impl Destination {
         );
         let cluster = ClusterId::new(CLUSTER)?;
         let node = NodeId::new("peer-1")?;
-        // The destination's own CA, and one the source does not trust that
-        // forges its descriptors.
-        let (pki, forgery) = (Pki::ed25519()?, Pki::ed25519()?);
+        // The destination's own CA, one the source does not trust that
+        // forges its descriptors, and the source's peer CA. Ed25519 keys
+        // give every handshake the same size in every run.
+        let (pki, forgery, sources) = (Pki::ed25519()?, Pki::ed25519()?, Pki::ed25519()?);
+        let destination = BucketName::new(BUCKET)?;
+        let pairs = || {
+            buckets.iter().map(|bucket| BucketPair {
+                source: bucket.clone(),
+                destination: destination.clone(),
+            })
+        };
+        let mut trust = PeerTrust::new();
+        trust.add(source.clone(), std::slice::from_ref(sources.ca()), pairs())?;
+        let tls = PeerTls::new(&pki.node(&cluster, &node)?, Arc::new(trust))
+            .ok_or("the destination's certificate names no node")?;
+        let mut trust = PeerTrust::new();
+        trust.add(cluster.clone(), std::slice::from_ref(pki.ca()), pairs())?;
+        let trust = Arc::new(trust);
+        let nodes = nodes
+            .iter()
+            .map(|id| {
+                PeerTls::new(&sources.node(source, id)?, Arc::clone(&trust))
+                    .ok_or_else(|| BoxError::from("a node's certificate names no node"))
+            })
+            .collect::<Result<Vec<_>, BoxError>>()?;
         let signer = |pki: &Pki| -> Result<DescriptorSigner, BoxError> {
             let credentials = pki.node(&cluster, &node)?;
             let tls = PeerTls::new(&credentials, Arc::new(PeerTrust::new()))
@@ -637,8 +783,17 @@ impl Destination {
             signer,
             forger,
             ca: pki.ca().clone(),
-            idle: peer.idle,
             record: Arc::new(PeerLog::new(peer.descriptor, peer.aimed)),
+            tls,
+            settings: peer.settings(),
+            nodes,
+            seed,
+            faults: peer.faults,
+            rng: Mutex::new(SmallRng::seed_from_u64(seed)),
+            counts: ProtocolCounts::default(),
+            arrivals: Mutex::default(),
+            aborted: Mutex::default(),
+            staging: Mutex::default(),
         })
     }
 
@@ -657,8 +812,133 @@ impl Destination {
         )?;
         Ok(PeerSide {
             verifier: DescriptorVerifier::new(Arc::new(trust)),
+            nodes: self.nodes.clone(),
+            settings: self.settings.clone(),
             log: Arc::clone(&self.record),
         })
+    }
+
+    /// Its TLS identity on its peer endpoint.
+    pub(crate) fn tls(&self) -> &PeerTls {
+        &self.tls
+    }
+
+    /// The settings of its peer endpoint.
+    pub(crate) fn settings(&self) -> &EndpointSettings {
+        &self.settings
+    }
+
+    /// What its endpoints draw from.
+    pub(crate) fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// The faults it injects into the protocol.
+    pub(crate) fn faults(&self) -> ProtocolFaults {
+        self.faults
+    }
+
+    /// Whether a fault of `per_mille` strikes now. Nothing is drawn for a
+    /// fault that never strikes, so runs without one draw as before.
+    pub(crate) fn draw(&self, per_mille: u16) -> bool {
+        per_mille > 0 && lock(&self.rng).random_range(0..1000) < per_mille
+    }
+
+    /// What it counts of the protocol.
+    pub(crate) fn counts(&self) -> &ProtocolCounts {
+        &self.counts
+    }
+
+    /// Records the first violation the protocol's audits find.
+    pub(crate) fn violate(&self, key: String, reason: String) {
+        lock(&self.violation).get_or_insert(Violation {
+            key,
+            reason,
+            operations: Vec::new(),
+        });
+    }
+
+    /// The `COMMIT` of `identity`, a write of `key`, arrived from `node`,
+    /// alone or in a batch.
+    pub(crate) fn commit_arrived(&self, identity: &WriteIdentity, key: &str, node: &str) {
+        let identity = identity.to_string();
+        self.record.commit_received(&identity, key);
+        let mut arrivals = lock(&self.arrivals);
+        let (count, nodes) = arrivals.entry(identity).or_default();
+        *count += 1;
+        nodes.insert(node.to_owned());
+    }
+
+    /// A source aborted the staging of `identity`.
+    pub(crate) fn aborted(&self, identity: &WriteIdentity) {
+        lock(&self.aborted).insert(identity.clone());
+    }
+
+    /// Whether a source ever aborted the staging of `identity`.
+    pub(crate) fn was_aborted(&self, identity: &WriteIdentity) -> bool {
+        lock(&self.aborted).contains(identity)
+    }
+
+    /// The destination answers `applied`, the result of a `COMMIT` of
+    /// `key`, if the tap knows its key: what it answered `committed`, or
+    /// named as the key's current identity, is applied; and an identity
+    /// the key's current version carries is answered `committed` with
+    /// that version's ETag, as often as its `COMMIT` arrives.
+    pub(crate) fn answered(&self, applied: &Applied, key: Option<&str>) {
+        {
+            let mut known = lock(&self.applied);
+            match &applied.outcome {
+                Outcome::Committed { .. } => {
+                    known.insert(applied.identity.to_string());
+                }
+                Outcome::PreconditionFailed {
+                    current: Some(current),
+                } => {
+                    known.insert(current.to_string());
+                }
+                _ => {}
+            }
+        }
+        let identity = applied.identity.to_string();
+        let Some((key, (Some(carried), etag))) =
+            key.and_then(|key| Some((key, self.current(key)?)))
+        else {
+            return;
+        };
+        if carried != identity {
+            return;
+        }
+        let consistent = matches!(
+            &applied.outcome,
+            Outcome::Committed { etag: Some(answered) } if answered.as_str() == etag
+        );
+        if !consistent {
+            self.violate(
+                key.to_owned(),
+                format!(
+                    "the peer's current version of {key} carries {identity}, with ETag {etag},                      yet a COMMIT of it was answered {:?}",
+                    applied.outcome
+                ),
+            );
+        }
+    }
+
+    /// The write identity the current version of `key` carries, if any,
+    /// and its ETag; `None` if it has none, or while the destination is
+    /// down.
+    fn current(&self, key: &str) -> Option<(Option<String>, String)> {
+        let view = lock(&self.view);
+        let index = view.index.as_ref()?;
+        let shard = ShardRef::for_key(&self.document, key);
+        let entry = index
+            .read()
+            .and_then(|read| read.entry(&(&shard).into(), key))
+            .ok()??;
+        let object = entry.object?;
+        Some((
+            object.metadata.get(IDENTITY_METADATA).cloned(),
+            object.local_etag.to_string(),
+        ))
     }
 
     /// Stops the destination's disk: a power loss drops what was not
@@ -751,9 +1031,8 @@ impl Destination {
         })));
     }
 
-    /// Whether a UDP block aimed at a `COMMIT` on its way is due, and how
-    /// long it holds the links.
-    pub(crate) fn take_aim(&self) -> Option<Duration> {
+    /// The next fault aimed at a `COMMIT` on its way, if one is due.
+    pub(crate) fn take_aim(&self) -> Option<Aim> {
         self.record.take_aim()
     }
 
@@ -798,6 +1077,18 @@ impl Destination {
                 operations: puts.clone(),
             }));
         }
+        if let Some(violation) = self.staging_left() {
+            return Ok(Err(violation));
+        }
+        let (replayed, from_two_nodes) =
+            lock(&self.arrivals)
+                .values()
+                .fold((0, 0), |(replayed, two), (times, nodes)| {
+                    (
+                        replayed + u64::from(*times > 1),
+                        two + u64::from(nodes.len() > 1),
+                    )
+                });
         let audit = PeerAudit {
             flushed: self.flushed.load(Ordering::Relaxed),
             lives: self.lives.load(Ordering::Relaxed),
@@ -805,9 +1096,33 @@ impl Destination {
             writes: writes.len(),
             commits: self.record.received.load(Ordering::Relaxed),
             s3_writes: self.record.acknowledged.load(Ordering::Relaxed),
+            replayed,
+            from_two_nodes,
             ..PeerAudit::default()
         };
-        Ok(Ok(Finished { objects, audit }))
+        Ok(Ok(Finished {
+            objects,
+            audit: self.counts.add_to(audit),
+        }))
+    }
+
+    /// Expires every staging of the destination's last life, as once its
+    /// TTL passed with nothing more of it, abandoned bodies included: the
+    /// quota charged to the source must come back whole.
+    fn staging_left(&self) -> Option<Violation> {
+        let staging = lock(&self.staging).clone()?;
+        let later = tokio::time::Instant::now() + Duration::from_secs(1 << 30);
+        staging.expire(later);
+        let used = staging.used(&self.source);
+        (used != 0 || !staging.is_empty()).then(|| Violation {
+            key: self.source.to_string(),
+            reason: format!(
+                "once every staging expired, {} remain and {used} bytes of the source's quota \
+                 are still charged",
+                staging.len()
+            ),
+            operations: Vec::new(),
+        })
     }
 
     /// What the writes of `objects`, by key and ETag, wrote: as for the
@@ -896,8 +1211,10 @@ pub(crate) async fn run(destination: Arc<Destination>) -> Result<(), BoxError> {
     // The flushers' parts are as small as the nodes' gateways take.
     gateway.min_part_bytes = 1;
     gateway.descriptors = Some(Arc::new(Descriptors(Arc::clone(&destination))));
+    let staging = Arc::new(Staging::new(destination.limits));
+    *lock(&destination.staging) = Some(Arc::clone(&staging));
     let service = StagingService::new(
-        Arc::new(Staging::new(destination.limits)),
+        staging,
         PeerExtents::new(storage.shards.clone(), Arc::clone(&lookup)),
     )
     .with_commits(PeerCommits::new(storage.shards.clone(), lookup, &gateway));
@@ -917,188 +1234,11 @@ pub(crate) async fn run(destination: Arc<Destination>) -> Result<(), BoxError> {
             tracing::debug!(%error, "the peer's gateway stopped");
         }
     });
-    let listener = TcpListener::bind(("0.0.0.0", PORT)).await?;
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let (read, write) = stream.into_split();
-        let inbound = TcpInbound {
-            read,
-            idle: destination.idle,
-            log: Arc::clone(&destination.record),
-            sender: TcpOutbound {
-                write: Arc::new(tokio::sync::Mutex::new(Some(write))),
-                destination: Arc::clone(&destination),
-            },
-        };
-        let service = service.clone();
-        tokio::spawn(async move {
-            if let Err(error) = service.serve(inbound).await {
-                tracing::debug!(%error, "a peer stream failed");
-            }
-        });
-    }
+    peer_wire::serve(destination, service, life).await
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Reads the next frame from `read`, or `None` at the end of the stream.
-async fn read_frame<R: AsyncRead + Unpin>(read: &mut R) -> io::Result<Option<Message>> {
-    let mut prefix = [0; PREFIX_LEN];
-    let mut filled = 0;
-    while filled < PREFIX_LEN {
-        match read.read(&mut prefix[filled..]).await? {
-            0 if filled == 0 => return Ok(None),
-            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-            n => filled += n,
-        }
-    }
-    let invalid = |error| io::Error::new(io::ErrorKind::InvalidData, error);
-    let (header_len, payload_len) = parse_prefix(&prefix).map_err(invalid)?;
-    let mut header = vec![0; header_len];
-    read.read_exact(&mut header).await?;
-    let mut payload = vec![0; payload_len];
-    read.read_exact(&mut payload).await?;
-    Message::decode_parts(&header, Bytes::from(payload))
-        .map(Some)
-        .map_err(invalid)
-}
-
-/// Writes `message` as one frame to `write`.
-async fn write_frame(write: &mut OwnedWriteHalf, message: &Message) -> io::Result<()> {
-    let frame = message
-        .encode()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    write.write_all(&frame).await
-}
-
-/// A node's link to the peer at `host:port`: a TCP connection per
-/// stream, whose `COMMIT`s `log` records.
-struct TcpLink {
-    host: String,
-    port: u16,
-    log: Arc<PeerLog>,
-}
-
-impl PeerLink for TcpLink {
-    fn open(&self) -> BoxFuture<'_, Result<PeerStream, LinkError>> {
-        Box::pin(async {
-            let stream = TcpStream::connect((self.host.as_str(), self.port))
-                .await
-                .map_err(link)?;
-            let (read, write) = stream.into_split();
-            Ok(PeerStream {
-                sender: Box::new(TcpSend(Some(write), Arc::clone(&self.log))),
-                receiver: Box::new(TcpReceive(read)),
-                batches: true,
-            })
-        })
-    }
-}
-
-fn link(error: io::Error) -> LinkError {
-    LinkError::new(error.to_string())
-}
-
-struct TcpSend(Option<OwnedWriteHalf>, Arc<PeerLog>);
-
-impl PeerSend for TcpSend {
-    fn send<'a>(&'a mut self, message: &'a Message) -> BoxFuture<'a, Result<(), LinkError>> {
-        Box::pin(async move {
-            if let Message::Commit(commit) = message {
-                self.1
-                    .commit_sent(commit.identity.to_string(), commit.key.clone());
-            }
-            let write = self
-                .0
-                .as_mut()
-                .ok_or_else(|| LinkError::new("the stream is finished"))?;
-            write_frame(write, message).await.map_err(link)
-        })
-    }
-
-    fn finish(&mut self) -> Result<(), LinkError> {
-        // Dropping the write half ends the stream.
-        self.0.take();
-        Ok(())
-    }
-}
-
-struct TcpReceive(OwnedReadHalf);
-
-impl PeerReceive for TcpReceive {
-    fn recv(&mut self) -> BoxFuture<'_, Result<Option<Message>, LinkError>> {
-        Box::pin(async { read_frame(&mut self.0).await.map_err(link) })
-    }
-}
-
-/// A stream the destination accepted, which ends once it sent nothing for
-/// `idle`.
-struct TcpInbound {
-    read: OwnedReadHalf,
-    idle: Duration,
-    log: Arc<PeerLog>,
-    sender: TcpOutbound,
-}
-
-impl Inbound for TcpInbound {
-    type Sender = TcpOutbound;
-
-    async fn recv(&mut self) -> Result<Option<Message>, StreamError> {
-        let message = tokio::time::timeout(self.idle, read_frame(&mut self.read))
-            .await
-            .map_err(|_| StreamError::Transport("the stream idled out".to_owned()))?
-            .map_err(|error| StreamError::Transport(error.to_string()))?;
-        if let Some(Message::Commit(commit)) = &message {
-            self.log
-                .commit_received(&commit.identity.to_string(), &commit.key);
-        }
-        Ok(message)
-    }
-
-    fn sender(&self) -> TcpOutbound {
-        self.sender.clone()
-    }
-}
-
-/// The destination's side of a stream it answers on, which notes what it
-/// answers for the audits.
-#[derive(Clone)]
-struct TcpOutbound {
-    write: Arc<tokio::sync::Mutex<Option<OwnedWriteHalf>>>,
-    destination: Arc<Destination>,
-}
-
-impl Outbound for TcpOutbound {
-    async fn send(&self, message: &Message) -> Result<(), StreamError> {
-        if let Message::Applied(applied) = message {
-            let mut known = lock(&self.destination.applied);
-            match &applied.outcome {
-                Outcome::Committed { .. } => {
-                    known.insert(applied.identity.to_string());
-                }
-                Outcome::PreconditionFailed {
-                    current: Some(current),
-                } => {
-                    known.insert(current.to_string());
-                }
-                _ => {}
-            }
-        }
-        let mut write = self.write.lock().await;
-        let write = write
-            .as_mut()
-            .ok_or_else(|| StreamError::Transport("the stream is finished".to_owned()))?;
-        write_frame(write, message)
-            .await
-            .map_err(|error| StreamError::Transport(error.to_string()))
-    }
-
-    async fn finish(&self) -> Result<(), StreamError> {
-        self.write.lock().await.take();
-        Ok(())
-    }
 }
 
 /// Registers the destination's bucket in its control store, once, outside
@@ -1179,32 +1319,5 @@ impl Authenticator for PeerKeys {
             method: AuthMethod::Header,
         });
         Ok(request)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frames_are_read_back_whole_or_not_at_all() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let message = Message::Abort(skys3_peer::Abort {
-            identity: "src/b-1/0/1.2".parse().unwrap(),
-            reason: skys3_peer::AbortReason::Cancelled,
-            detail: "gone".to_owned(),
-        });
-        let frame = message.encode().unwrap();
-        runtime.block_on(async {
-            let mut whole = &frame[..];
-            assert_eq!(read_frame(&mut whole).await.unwrap(), Some(message));
-            assert_eq!(read_frame(&mut whole).await.unwrap(), None);
-            let mut cut = &frame[..3];
-            assert!(read_frame(&mut cut).await.is_err());
-            let mut garbage = &[0xff; 16][..];
-            assert!(read_frame(&mut garbage).await.is_err());
-        });
     }
 }

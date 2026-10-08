@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use rand::Rng;
 use skys3_cluster_sim::{
-    AimedBlocks, Backup, Cluster, ClusterConfig, DescriptorKind, Fault, FaultPlan, FaultProfile,
-    Peer, PeerBug, ReplicatedServices, Report, RoutedServices, RunError, Workload,
+    AimScope, AimedBlocks, Backup, Cluster, ClusterConfig, DescriptorKind, Fault, FaultPlan,
+    FaultProfile, Peer, PeerBug, ReplicatedServices, Report, RoutedServices, RunError, Workload,
 };
 use skys3_config::TargetTransport;
 use skys3_gateway::routing::RoutingConfig;
@@ -178,6 +178,7 @@ fn with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic() {
                 count: 2,
                 hold,
                 every: Duration::from_secs(8),
+                scope: AimScope::Udp,
             },
             ..peer(DescriptorKind::Signed, PeerBug::None)
         });
@@ -289,6 +290,7 @@ fn the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding() {
                 count: 3,
                 hold: Duration::from_secs(5),
                 every: Duration::from_secs(10),
+                scope: AimScope::Udp,
             },
             ..peer(DescriptorKind::Signed, PeerBug::NoQuarantine)
         };

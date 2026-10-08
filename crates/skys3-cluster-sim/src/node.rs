@@ -60,6 +60,7 @@ use crate::lifecycle::{self, Lifecycle};
 use crate::origin::{Origin, OriginBug};
 use crate::peer::{self, Peer, PeerSide};
 use crate::peer_s3::{PeerS3, SimStore};
+use crate::peer_wire::NodePeering;
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -382,7 +383,17 @@ pub(crate) async fn run<S: NodeServices>(
     let shards = shared.services.start(env).await?;
     // The node's own link to the remote store, which can drop.
     let remote = shared.remote.from_source(&slot.host);
-    let flush = Arc::new(flush_service(settings, &remote, seed.rotate_left(29)));
+    // The node's peer endpoint, in each life, with draws of its own.
+    let peering = match &settings.peer_side {
+        Some(side) => Some(NodePeering::bind(side, slot.position, seed.rotate_left(41)).await?),
+        None => None,
+    };
+    let flush = Arc::new(flush_service(
+        settings,
+        &remote,
+        seed.rotate_left(29),
+        peering.as_ref().map(|peering| (peering, slot.position)),
+    ));
     shared
         .flushers
         .lock()
@@ -524,11 +535,13 @@ async fn open_shards<H: Shards>(shards: &H, buckets: &[BucketDocument]) -> Resul
 /// at the SkyS3 peer, which they reach over S3 REST through its gateway;
 /// bucket prefixes keep their keys apart. Their capability probes take
 /// nonces from `seed`, so that a seed replays the scratch keys they write,
-/// which a parallel import's split points see.
+/// which a parallel import's split points see. With a peer, they reach it
+/// over QUIC through `peering`, the endpoint of the node at its position.
 fn flush_service(
     settings: &NodeSettings,
     remote: &SimS3,
     seed: u64,
+    peering: Option<(&NodePeering, usize)>,
 ) -> FlushService<SimStore, SimMount> {
     let (remote, origin) = (remote.clone(), remote.clone());
     let at_peer = settings
@@ -553,9 +566,10 @@ fn flush_service(
     .with_wall_clock(Arc::new(SimWallClock))
     .with_buckets(settings.buckets.clone())
     .with_probe_nonces(seed);
-    match (settings.peer, &settings.peer_side) {
-        (Some(peer), Some(side)) => service
-            .with_peer_transport(peer.transport(side.verifier.clone(), Arc::clone(&side.log))),
+    match (settings.peer, &settings.peer_side, peering) {
+        (Some(peer), Some(side), Some((peering, node))) => {
+            service.with_peer_transport(peering.transport(peer, side, node))
+        }
         _ => service,
     }
 }

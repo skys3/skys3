@@ -136,6 +136,7 @@ impl Ca {
             connect_timeout: Duration::from_secs(5),
             max_inflight_bytes: 64 << 20,
             capabilities: Capabilities::KNOWN,
+            idle_timeout: skys3_peer::IDLE_TIMEOUT,
         };
         PeerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &tls, settings).unwrap()
     }
