@@ -13,7 +13,7 @@ use skys3_log::{RecordBody, ShardRef};
 use skys3_remote::ObjectStore;
 use skys3_shard::{Change, FlushState, FlushWaiter, Shard, ShardError};
 use skys3_types::{ETag, EpochSeq, Seq};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
@@ -23,8 +23,42 @@ use crate::conflict::{ConflictBug, Unresolved, conflict_bug};
 use crate::stream::{Step, Streams};
 use crate::target::Target;
 
-/// The target a flusher sends to, once its capability probe is done.
-pub(crate) type Ready<S> = watch::Receiver<Option<Arc<Target<S>>>>;
+/// The target a bucket's flushers send to, once its capability probe is
+/// done.
+///
+/// Not a `watch` channel: a `watch` wakes the receivers waiting on it in
+/// an order it draws at random, so the shard flushers of a bucket would
+/// start flushing in an order that no simulation seed decides. A `Notify`
+/// wakes them in the order they began to wait.
+#[derive(Debug)]
+pub(crate) struct Ready<S> {
+    target: Mutex<Option<Arc<Target<S>>>>,
+    set: Notify,
+}
+
+impl<S> Ready<S> {
+    /// A cell holding `target`.
+    pub(crate) fn new(target: Option<Arc<Target<S>>>) -> Arc<Self> {
+        Arc::new(Self {
+            target: Mutex::new(target),
+            set: Notify::new(),
+        })
+    }
+
+    /// The target, if the probe is done.
+    pub(crate) fn get(&self) -> Option<Arc<Target<S>>> {
+        self.target
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Makes `target` the target, and wakes every flusher waiting for it.
+    pub(crate) fn set(&self, target: Arc<Target<S>>) {
+        *self.target.lock().unwrap_or_else(PoisonError::into_inner) = Some(target);
+        self.set.notify_waiters();
+    }
+}
 
 /// How many entries the startup scan reads per index transaction.
 const SCAN_PAGE: usize = 512;
@@ -201,8 +235,11 @@ impl State {
     fn stop(&mut self) {
         self.stopped = true;
         // Unanswered, a wait ends, and its writer asks the flusher started
-        // next, here or on a new primary.
-        for tracked in self.keys.values_mut() {
+        // next, here or on a new primary. The waits end in key order, not
+        // the map's, so a simulation seed replays exactly.
+        let mut keys: Vec<_> = self.keys.iter_mut().collect();
+        keys.sort_unstable_by_key(|(key, _)| *key);
+        for (_, tracked) in keys {
             tracked.waiters.clear();
         }
         if let Some(charge) = self.charge.take() {
@@ -554,9 +591,7 @@ impl ShardFlusher {
     /// Starts flushing `shard` to `target` on the current Tokio runtime.
     pub fn spawn<S: ObjectStore, D: Disk>(shard: Shard<D>, target: Arc<Target<S>>) -> Self {
         let wall = Arc::clone(&target.wall);
-        // The sender may go: the target is ready for good.
-        let (_, ready) = watch::channel(Some(target));
-        Self::start(shard, ready, wall, None)
+        Self::start(shard, Ready::new(Some(target)), wall, None)
     }
 
     /// Starts tracking `shard`'s dirty keys at once, with their bytes
@@ -564,7 +599,7 @@ impl ShardFlusher {
     /// target. Ages are measured on `wall`.
     pub(crate) fn start<S: ObjectStore, D: Disk>(
         shard: Shard<D>,
-        ready: Ready<S>,
+        ready: Arc<Ready<S>>,
         wall: Arc<dyn WallClock>,
         charge: Option<Charge>,
     ) -> Self {
@@ -679,7 +714,7 @@ type Recorded = (String, Seq, Result<(), ShardError>);
 /// and flushes them once the target is ready.
 async fn run<S: ObjectStore, D: Disk>(
     shard: Shard<D>,
-    mut ready: Ready<S>,
+    ready: Arc<Ready<S>>,
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
     streams: Arc<Streams>,
@@ -693,13 +728,19 @@ async fn run<S: ObjectStore, D: Disk>(
         let mut flushes: JoinSet<Done> = JoinSet::new();
         let mut records: JoinSet<Recorded> = JoinSet::new();
         let mut streaming: JoinSet<Step> = JoinSet::new();
-        // Whether a target may still arrive.
-        let mut awaiting = true;
         // The flusher's place among those sending to the target, which
         // sizes the target's window (§7.7).
         let mut membership = None;
         loop {
-            let target = ready.borrow_and_update().clone();
+            // Backoffs that ended are released on every turn, so that no
+            // run of other events holds them back.
+            lock(&state).release_due(Instant::now());
+            // Waits for the target from before it is read, so that a target
+            // set in between still wakes the loop.
+            let set = ready.set.notified();
+            tokio::pin!(set);
+            set.as_mut().enable();
+            let target = ready.get();
             if let Some(target) = &target {
                 membership.get_or_insert_with(|| target.join());
                 dispatch(&shard, target, &state, &streams, &mut flushes);
@@ -709,12 +750,14 @@ async fn run<S: ObjectStore, D: Disk>(
             let timeout = target
                 .as_ref()
                 .and_then(|target| streams.next_timeout(&target.settings));
+            // Branches ready at once are taken in the order written, not at
+            // random, so a simulation seed replays exactly. The flusher's
+            // own tasks come first: there are only as many as it started,
+            // so the shard's changes, which a busy shard sends without end,
+            // cannot hold them back. The timers only wake the loop, which
+            // does their work on every turn.
             tokio::select! {
-                change = changes.recv() => match change {
-                    Some(change) => follow(&state, &streams, &*wall, change),
-                    // The shard stopped, or another flusher took over.
-                    None => break,
-                },
+                biased;
                 Some(done) = flushes.join_next(), if !flushes.is_empty() => {
                     // A flush runs only once there is a target.
                     if let (Ok(done), Some(target)) = (done, &target) {
@@ -733,17 +776,18 @@ async fn run<S: ObjectStore, D: Disk>(
                         break;
                     }
                 }
-                () = sleep_until(release), if release.is_some() => {
-                    lock(&state).release_due(Instant::now());
-                }
                 Some(resolve) = resolutions.recv() => {
                     resolved(&shard, &state, &mut records, resolve);
                 }
+                change = changes.recv() => match change {
+                    Some(change) => follow(&state, &streams, &*wall, change),
+                    // The shard stopped, or another flusher took over.
+                    None => break,
+                },
+                () = sleep_until(release), if release.is_some() => {}
                 // The next pump gives up on the body whose `PUT` timed out.
                 () = sleep_until(timeout), if timeout.is_some() => {}
-                changed = ready.changed(), if target.is_none() && awaiting => {
-                    awaiting = changed.is_ok();
-                }
+                () = &mut set, if target.is_none() => {}
             }
         }
     }

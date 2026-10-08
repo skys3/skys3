@@ -373,11 +373,9 @@ pub(crate) async fn run<S: NodeServices>(
         seed: seed.rotate_left(17),
     };
     let shards = shared.services.start(env).await?;
-    let flush = Arc::new(flush_service(
-        settings,
-        &shared.remote,
-        seed.rotate_left(29),
-    ));
+    // The node's own link to the remote store, which can drop.
+    let remote = shared.remote.from_source(&slot.host);
+    let flush = Arc::new(flush_service(settings, &remote, seed.rotate_left(29)));
     shared
         .flushers
         .lock()
@@ -437,7 +435,7 @@ pub(crate) async fn run<S: NodeServices>(
         tokio::spawn(async move { cache.run(set).await });
     }
     let snapshots = settings.snapshots.then(|| {
-        let remote = shared.remote.clone();
+        let remote = remote.clone();
         SnapshotService::new(Box::new(move |_| remote.clone()), settings.buckets.clone())
             .with_wall_clock(Arc::new(SimWallClock))
     });

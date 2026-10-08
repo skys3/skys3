@@ -322,7 +322,12 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 Err(error) => return Err(Failure::Remote(error)),
             };
             match self.inspect(identity, version, expected.as_ref()).await? {
-                Found::Mine(info) => return Ok(Err(flushed(version, Some(info), true))),
+                Found::Mine(mut info) => {
+                    if matches!(write, Write::Complete(_)) {
+                        self.seeded_etag(&mut info).await;
+                    }
+                    return Ok(Err(flushed(version, Some(info), true)));
+                }
                 Found::Supersede(etag) => expected = Some(etag),
                 // The object the flush conditioned on is gone, perhaps
                 // deleted by an earlier flush whose answer was lost: no

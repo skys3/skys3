@@ -257,7 +257,10 @@ impl<N: Network, D: Disk> Link<N, D> {
                 let every = self.config.beacon_every(true);
                 let due = last_beacon.map_or_else(Instant::now, |at| at + every);
                 let woken = async {
+                    // Polled in order, not at random, so a simulation
+                    // seed replays exactly.
                     tokio::select! {
+                        biased;
                         _ = changes.changed() => {}
                         _ = durable.changed(), if learner => {}
                     }
