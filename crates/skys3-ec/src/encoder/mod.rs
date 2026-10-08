@@ -25,9 +25,12 @@
 //! step 4 commits leaves the replicas authoritative and some orphan
 //! fragments; one after leaves extra replicas that compaction drops.
 //!
-//! The [`Attempts`] of the encoder are the fence orphan reclamation (plan
-//! M5-05) needs: an attempt is in progress from step 1 until its record
-//! commits or the encoder abandons it before appending the record.
+//! The [`Attempts`] of the encoder are the fence orphan reclamation
+//! ([`crate::orphans`]) needs: an attempt is in progress from step 1 until
+//! its record commits or the encoder abandons it before appending the
+//! record. The record is appended only while the shard still sequences in
+//! the attempt's epoch ([`Shard::commit_in`]), so a later primary never
+//! publishes it.
 
 mod attempts;
 
@@ -298,6 +301,15 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
         self
     }
 
+    /// Tracks this encoder's attempts in `attempts`, which the shard's
+    /// [`OrphanJudge`](crate::OrphanJudge) on this node shares: one tracker
+    /// per shard and node, for every kind of fragment-writing attempt.
+    #[must_use]
+    pub fn with_attempts(mut self, attempts: Attempts) -> Self {
+        self.attempts = attempts;
+        self
+    }
+
     /// The attempts in progress.
     #[must_use]
     pub fn attempts(&self) -> &Attempts {
@@ -400,6 +412,11 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
 
         let attempt = self.next_attempt()?;
         self.attempts.begin(attempt);
+        // Forgets the attempt if this future is dropped before it appends.
+        let _writing = Writing {
+            attempts: &self.attempts,
+            attempt,
+        };
         self.emit(key, attempt, EncodeStep::Started { stripes });
         let request = Attempt {
             key,
@@ -620,8 +637,13 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
         // sequenced before it commits.
         let before = self.shard.last_sequenced();
         let shard = self.shard.clone();
-        let commit =
-            tokio::spawn(async move { shard.commit(RecordBody::EcPublish(publish)).await });
+        // Only in the attempt's epoch: a later primary may have judged its
+        // fragments orphans (§8.4).
+        let commit = tokio::spawn(async move {
+            shard
+                .commit_in(attempt.epoch, RecordBody::EcPublish(publish))
+                .await
+        });
         while self.shard.last_sequenced() == before && !commit.is_finished() {
             tokio::task::yield_now().await;
         }
@@ -677,6 +699,19 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
                 step,
             });
         }
+    }
+}
+
+/// An attempt being written: dropped before the attempt publishes, it
+/// forgets the attempt, which then never publishes.
+struct Writing<'a> {
+    attempts: &'a Attempts,
+    attempt: AttemptId,
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.attempts.release(self.attempt);
     }
 }
 

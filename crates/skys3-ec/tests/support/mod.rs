@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod pki;
+
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
