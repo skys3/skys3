@@ -18,7 +18,9 @@
 //!
 //! - `probe`: `running` until the target's capability probe succeeds, with
 //!   `probe_error` from its last failed run, then `done`, with
-//!   `unprotected` listing the operations sent unconditionally;
+//!   `unprotected` listing the operations sent unconditionally, and
+//!   `server_side_copy`, whether copies of clean sources are sent as remote
+//!   `CopyObject` requests rather than uploaded;
 //! - `dirty`, `flushing`, and `dirty_bytes`: keys whose latest change is not
 //!   at the remote (conflicts excluded), those being flushed, and the bytes
 //!   of every version not at the remote;
@@ -446,18 +448,23 @@ fn flush_status(status: &BucketStatus) -> Value {
         .clone()
         .filter_map(|shard| shard.last_error.clone())
         .collect();
-    let (probe, probe_error, unprotected) = match &status.probe {
-        ProbeStatus::Running { error } => ("running", error.clone(), Vec::new()),
-        ProbeStatus::Done { unprotected } => (
+    let (probe, probe_error, unprotected, server_side_copy) = match &status.probe {
+        ProbeStatus::Running { error } => ("running", error.clone(), Vec::new(), false),
+        ProbeStatus::Done {
+            unprotected,
+            server_side_copy,
+        } => (
             "done",
             None,
             unprotected.iter().map(|op| op.as_str()).collect(),
+            *server_side_copy,
         ),
     };
     json!({
         "probe": probe,
         "probe_error": probe_error,
         "unprotected": unprotected,
+        "server_side_copy": server_side_copy,
         "dirty": shards.clone().map(|shard| shard.dirty).sum::<u64>(),
         "streamed_uploads": shards.clone().map(|shard| shard.streams).sum::<u64>(),
         "flushing": shards.map(|shard| shard.flushing).sum::<u64>(),

@@ -100,7 +100,8 @@ fn flushes_write_back_buckets_under_their_prefix() {
         assert_eq!(
             probe,
             ProbeStatus::Done {
-                unprotected: Vec::new()
+                unprotected: Vec::new(),
+                server_side_copy: true,
             }
         );
         let patience = Patience::new();
@@ -227,7 +228,9 @@ fn the_probe_finds_unprotected_operations_and_retries() {
                 unprotected: vec![
                     ConditionalOperation::CompleteMultipartUpload,
                     ConditionalOperation::DeleteObject
-                ]
+                ],
+                // The copies' destination preconditions are ignored too.
+                server_side_copy: false,
             }
         );
         // Once the probe is done, the tracked key is flushed.

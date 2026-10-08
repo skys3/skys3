@@ -25,7 +25,7 @@ use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, St
 use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::origin::{self, Origin, OriginConnect};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
-use crate::target::{FlushSettings, Target};
+use crate::target::{CopySources, FlushSettings, Target};
 
 /// Builds the store of a bucket's remote target.
 pub type Connect<S> = Box<dyn Fn(&RemoteTarget) -> S + Send + Sync>;
@@ -44,6 +44,10 @@ pub enum ProbeStatus {
     Done {
         /// The operations whose preconditions the target does not honor.
         unprotected: Vec<ConditionalOperation>,
+        /// Whether copies of clean sources in the same remote bucket are
+        /// sent as server-side copies; otherwise they are uploaded (§7.2,
+        /// §11).
+        server_side_copy: bool,
     },
 }
 
@@ -154,6 +158,8 @@ pub struct FlushService<S, D> {
     /// rather than fresh ([`FlushService::with_probe_nonces`]).
     probe_nonces: Option<Arc<AtomicU64>>,
     buckets: Mutex<BTreeMap<BucketId, BucketFlusher<S>>>,
+    /// The copy sources of each remote bucket the buckets flush to.
+    copy_sources: Mutex<BTreeMap<Location, CopySources>>,
     /// The import tasks of buckets no longer followed, told to stop and
     /// not yet waited for: the bucket's next import waits for them first.
     stopping: Mutex<BTreeMap<BucketId, Vec<JoinHandle<()>>>>,
@@ -241,6 +247,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             bucket_settings: None,
             probe_nonces: None,
             buckets: Mutex::default(),
+            copy_sources: Mutex::default(),
             stopping: Mutex::default(),
             _disk: std::marker::PhantomData,
         }
@@ -322,6 +329,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// open in `set` as their primary is flushed, and nothing else.
     pub async fn reconcile(&self, buckets: &[BucketDocument], set: &ShardSet<D>) {
         self.follow_origins(buckets);
+        self.follow_copy_sources(buckets);
         let mut open = Vec::new();
         for bucket in buckets {
             let Some((target, role)) = self.followed(bucket) else {
@@ -414,6 +422,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             counters: self.metrics.counters(&name),
             import: import.clone(),
             conflict_policy,
+            copy_sources: self.copy_sources_of(target),
         };
         let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
@@ -479,6 +488,44 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             import_task: Some(import_task),
             filler,
         }
+    }
+
+    /// Lists, for each remote bucket the buckets in `buckets` flush to,
+    /// the buckets whose objects it holds: the sources a copy flushed there
+    /// may be copied from server-side (§7.2, §11). Every target is reached
+    /// with the node's own credentials (`connect`), so one endpoint and
+    /// bucket name one remote bucket with one set of credentials. Origins
+    /// have their own and are never sources: a copy from one is refused.
+    fn follow_copy_sources(&self, buckets: &[BucketDocument]) {
+        let mut lists: BTreeMap<Location, BTreeMap<BucketId, String>> = BTreeMap::new();
+        for bucket in buckets {
+            if let Some((target, _)) = self.followed(bucket) {
+                let prefix = target.prefix.clone().unwrap_or_default();
+                lists
+                    .entry(location(&target))
+                    .or_default()
+                    .insert(bucket.bucket_id.clone(), prefix);
+            }
+        }
+        // Lists are emptied rather than dropped: a target being built may
+        // hold one already.
+        let mut sources = lock(&self.copy_sources);
+        for (at, list) in sources.iter() {
+            if !lists.contains_key(at) {
+                list.set(BTreeMap::new());
+            }
+        }
+        for (at, list) in lists {
+            sources.entry(at).or_default().set(list);
+        }
+    }
+
+    /// The copy sources of the remote bucket `target` names.
+    fn copy_sources_of(&self, target: &RemoteTarget) -> CopySources {
+        lock(&self.copy_sources)
+            .entry(location(target))
+            .or_default()
+            .clone()
     }
 
     /// Keeps how to read the origin of every `read_only` bucket in
@@ -673,6 +720,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A remote bucket: its endpoint and name.
+type Location = (String, String);
+
+fn location(target: &RemoteTarget) -> Location {
+    (target.endpoint.clone(), target.bucket.clone())
+}
+
 /// What a bucket's [`Target`] is built from once its probe is done.
 struct TargetParts<S> {
     store: Arc<S>,
@@ -685,6 +739,7 @@ struct TargetParts<S> {
     /// nothing, so every key counts as imported.
     import: Option<Arc<ImportState>>,
     conflict_policy: ConflictPolicy,
+    copy_sources: CopySources,
 }
 
 impl<S> TargetParts<S> {
@@ -692,7 +747,8 @@ impl<S> TargetParts<S> {
         let target = Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
             .with_wall_clock(self.wall)
             .with_counters(self.counters)
-            .with_conflict_policy(self.conflict_policy);
+            .with_conflict_policy(self.conflict_policy)
+            .with_copy_sources(self.copy_sources);
         match self.import {
             Some(import) => target.with_import(import),
             None => target,
@@ -728,7 +784,17 @@ async fn run_probe<S: ObjectStore>(
                         these operations are sent unconditionally (§7.2)"
                     );
                 }
-                *lock(&status) = ProbeStatus::Done { unprotected };
+                let server_side_copy = found.copy_object.is_usable();
+                if !server_side_copy {
+                    tracing::info!(
+                        copy = %found.copy_object,
+                        "the target cannot take server-side copies; copies are uploaded (§7.2)"
+                    );
+                }
+                *lock(&status) = ProbeStatus::Done {
+                    unprotected,
+                    server_side_copy,
+                };
                 ready.send_replace(Some(Arc::new(parts.build(found))));
                 return;
             }

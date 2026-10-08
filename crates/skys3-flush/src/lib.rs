@@ -104,6 +104,7 @@
 mod attempt;
 mod budget;
 mod conflict;
+mod copy;
 mod fill;
 mod import;
 mod metrics;
@@ -128,12 +129,13 @@ pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use origin::{DEFAULT_CREDENTIALS, Origin, OriginConnect, profile_credentials};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
-pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
+pub use target::{CopySources, FlushSettings, ImportDone, ImportProgress, Target};
 
 /// Failpoints and seeded bugs for tests (the `test-util` feature).
 #[cfg(feature = "test-util")]
 pub mod test_hooks {
     pub use crate::conflict::{ConflictBug, seed_conflict_bug};
+    pub use crate::copy::{CopyBug, seed_copy_bug};
     pub use crate::snapshot::hooks::{SnapshotBug, seed_snapshot_bug};
     pub use crate::stream::test_hooks::*;
 }

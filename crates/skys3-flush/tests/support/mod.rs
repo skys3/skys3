@@ -17,7 +17,7 @@ use skys3_log::record::{
     PutData, Tags, UploadBegin,
 };
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
-use skys3_remote::probe::{ConditionalWrites, OperationSupport, PreconditionSupport};
+use skys3_remote::probe::{ConditionalWrites, CopySupport, OperationSupport, PreconditionSupport};
 use skys3_shard::{Shard, ShardSet, StateMachine, StreamedBody};
 use skys3_sim::SimS3;
 use skys3_sim::s3::SimS3Config;
@@ -67,6 +67,13 @@ pub fn writes(put: bool, complete: bool, delete: bool) -> ConditionalWrites {
         delete_object: OperationSupport {
             if_none_match: None,
             if_match: support(delete),
+        },
+        // Copies are sent as `CopyObject` where a store takes them like
+        // `PutObject`.
+        copy_object: if put {
+            CopySupport::FULL
+        } else {
+            CopySupport::NONE
         },
     }
 }
