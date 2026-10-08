@@ -638,8 +638,8 @@ not late).
 
 **Impact.** A write or sync on the disk failed. After a failed sync the
 page cache can show bytes the disk lost, so the node stops using the disk
-for the rest of the process (design section 10.4). The shards on it stop
-serving; in a cluster their members on this node are removed and replaced.
+for the rest of the process (design section 10.4). Writes to the shards on
+it fail; in a cluster their members on this node are removed and replaced.
 
 **Diagnosis.**
 
