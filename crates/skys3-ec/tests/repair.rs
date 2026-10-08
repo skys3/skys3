@@ -1,6 +1,8 @@
 //! Repair on a shard alone (§8.6): which fragments count as lost, the
 //! order stripes are repaired in, what an `EC_RELOCATE` moves, and how a
-//! repair fails.
+//! repair fails; and the fragment moves of a pass that found nothing lost
+//! (§8.3, plan M5-09): drains, balance, their fence, and their place after
+//! repairs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -10,15 +12,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_config::{EcConfig, FailureDomain};
-use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, NodeState, Topology};
+use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, MoveReason, NodeState, Topology};
 use skys3_ec::fragment::FragmentHeader;
 use skys3_ec::read::ReadFuture;
 use skys3_ec::repair::RepairBug;
 use skys3_ec::{
     Attempts, CodedRead, Encoded, Encoder, EncoderSettings, FoundFragment, FragmentBytes,
     FragmentId, FragmentLocation, FragmentReadError, FragmentRequest, FragmentSource,
-    FragmentWriter, PlannerSource, RepairEvent, RepairMetrics, RepairReport, RepairSettings,
-    RepairStep, Repairer, TransferError, codec, read_coded, rebuild_layouts,
+    FragmentWriter, PlannerSource, RepairBandwidth, RepairEvent, RepairMetrics, RepairReport,
+    RepairSettings, RepairStep, Repairer, TransferError, codec, read_coded, rebuild_layouts,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{BlockingPool, ManualWallClock, MonotonicClock, SimDisk, SimMount};
@@ -115,6 +117,8 @@ struct Nodes {
     gate: Mutex<Option<watch::Receiver<bool>>>,
     next: Mutex<u128>,
     reads: Mutex<u64>,
+    /// Nodes that answer one-byte checks but fail longer reads.
+    unreadable: Mutex<BTreeSet<NodeId>>,
 }
 
 impl Nodes {
@@ -189,6 +193,9 @@ impl FragmentSource for Nodes {
                 });
             }
             let held = self.get(&request.node, request.fragment);
+            let unreadable = request.range.end - request.range.start > 1
+                && self.unreadable.lock().unwrap().contains(&request.node);
+            let held = held.filter(|_| !unreadable);
             let Some((_, bytes)) = held.filter(|(h, _)| request.identity.matches(h)) else {
                 return Err(FragmentReadError::NotHeld {
                     node: request.node,
@@ -248,6 +255,13 @@ const SETTINGS: RepairSettings = RepairSettings {
     checks_per_node: 2,
     replans: 2,
     bytes_per_second: 1 << 40,
+    moves_per_pass: 0,
+};
+
+/// [`SETTINGS`], moving up to 64 fragments a pass.
+const MOVING: RepairSettings = RepairSettings {
+    moves_per_pass: 64,
+    ..SETTINGS
 };
 
 struct Fixture {
@@ -555,14 +569,20 @@ fn a_version_retagged_after_coding_is_repaired_and_reads_back() {
 }
 
 #[test]
-fn a_departing_node_is_repaired_without_checks() {
+fn a_forgotten_node_is_repaired_without_checks() {
     runtime().block_on(async {
         let f = Fixture::coded(1, 6, EcConfig::default()).await;
-        let lost = f.on(4).await;
-        let repairer = f.repairer(planner(6, EcConfig::default(), vec![4]), SETTINGS);
+        // Departing, but answering: nothing is lost. Moves drain it.
+        let departing = f.repairer(planner(6, EcConfig::default(), vec![4]), SETTINGS);
+        assert_eq!(departing.pass().await.lost, 0);
+
+        // A node the topology no longer lists is lost at once, though it
+        // answers.
+        let lost = f.on(5).await;
+        let repairer = f.repairer(planner(5, EcConfig::default(), Vec::new()), SETTINGS);
         let report = repairer.pass().await;
         assert_eq!((report.lost, report.repaired), (lost, lost));
-        assert_eq!(f.on(4).await, 0);
+        assert_eq!(f.on(5).await, 0);
         f.check_whole().await;
 
         // A topology that lists no node yet says nothing of any.
@@ -818,5 +838,307 @@ fn repairs_keep_to_the_bandwidth_cap() {
             started.elapsed()
         );
         f.check_whole().await;
+    });
+}
+
+impl Fixture {
+    /// How many fragments the layouts place on each of nodes `0..nodes`.
+    async fn spread(&self, nodes: usize) -> Vec<usize> {
+        let mut spread = Vec::new();
+        for n in 0..nodes {
+            spread.push(self.on(n).await);
+        }
+        spread
+    }
+
+    /// The steps of each attempt that started as a move, in order.
+    fn moves(&self) -> Vec<Vec<RepairStep>> {
+        let events = self.events.lock().unwrap();
+        let mut moves: Vec<(skys3_ec::AttemptId, Vec<RepairStep>)> = Vec::new();
+        for event in events.iter() {
+            if matches!(event.step, RepairStep::MoveStarted { .. }) {
+                moves.push((event.attempt, Vec::new()));
+            }
+            if let Some((_, steps)) = moves.iter_mut().find(|(a, _)| *a == event.attempt) {
+                steps.push(event.step.clone());
+            }
+        }
+        moves.into_iter().map(|(_, steps)| steps).collect()
+    }
+
+    /// Runs passes of `repairer` until one moves nothing, at most ten:
+    /// the fragments moved.
+    async fn settle(&self, repairer: &Repairer<SimMount, Nodes>) -> usize {
+        let mut moved = 0;
+        for _ in 0..10 {
+            let report = repairer.pass().await;
+            assert_eq!((report.lost, report.unmoved), (0, 0), "{report:?}");
+            if report.moved == 0 {
+                return moved;
+            }
+            moved += report.moved;
+        }
+        panic!("moves did not settle in ten passes");
+    }
+}
+
+#[test]
+fn joined_nodes_receive_fragments_by_moves() {
+    runtime().block_on(async {
+        let f = Fixture::coded(3, 6, EcConfig::default()).await;
+        // A retag moves object-0's entry past its coded version, which the
+        // copies' headers must keep naming.
+        let tags = Tags {
+            key: "object-0".to_owned(),
+            tags: BTreeMap::from([("k".to_owned(), "v".to_owned())]),
+        };
+        f.shard.commit(RecordBody::Tags(tags)).await.unwrap();
+        let nodes = Arc::new(AtomicUsize::new(6));
+        let source = growing(Arc::clone(&nodes), EcConfig::default(), Vec::new());
+        let repairer = f.repairer(source, MOVING);
+        let before = f.settle(&repairer).await;
+        let moves = f.moves().len();
+        assert_eq!(moves, before);
+
+        // Two nodes join: they receive fragments until every node holds
+        // its share, within a fragment or two of the others.
+        nodes.store(8, Ordering::SeqCst);
+        let moved = f.settle(&repairer).await;
+        let spread = f.spread(8).await;
+        assert!(moved >= 6, "{moved} moves: {spread:?}");
+        let (least, most) = (spread.iter().min(), spread.iter().max());
+        assert!(most.unwrap() - least.unwrap() <= 2, "{spread:?}");
+        f.check_whole().await;
+        assert_eq!(f.metrics.moved(), (before + moved) as u64);
+        assert!(f.attempts.in_progress().is_empty());
+
+        // A move's steps, in order: a read of the fragment, its copy, and
+        // the record that relocates it.
+        let steps = &f.moves()[moves];
+        assert!(matches!(
+            &steps[0],
+            RepairStep::MoveStarted { reason: MoveReason::Balance, to, .. }
+                if *to == node(6) || *to == node(7)
+        ));
+        assert!(matches!(&steps[1], RepairStep::Read { .. }));
+        assert!(matches!(&steps[2], RepairStep::Placed { nodes } if nodes.len() == 1));
+        assert!(matches!(&steps[3], RepairStep::Written { .. }));
+        assert_eq!(steps[4], RepairStep::Appended);
+        assert!(matches!(
+            steps[5],
+            RepairStep::Committed {
+                relocated: true,
+                ..
+            }
+        ));
+        // A moved fragment of the retagged object holds the retag's tags.
+        let entry = f.shard.entry("object-0").await.unwrap().unwrap();
+        let coded = entry.object.unwrap().coded.unwrap();
+        for location in coded.stripes.iter().flat_map(CodedStripe::fragments) {
+            let (header, _) = f.nodes.get(&location.node, location.fragment).unwrap();
+            if header.attempt != coded.attempt {
+                assert_eq!(header.object.tags["k"], "v");
+            }
+        }
+    });
+}
+
+#[test]
+fn a_departing_node_is_drained_by_moves_while_it_answers() {
+    runtime().block_on(async {
+        let f = Fixture::coded(2, 6, EcConfig::default()).await;
+        let held = f.on(4).await;
+        assert!(held > 0);
+        // Each drained fragment costs one read and one write.
+        let lens: u64 = f
+            .layouts()
+            .await
+            .values()
+            .flatten()
+            .filter(|stripe| stripe.fragments().iter().any(|l| l.node == node(4)))
+            .map(|stripe| {
+                codec(stripe.codec())
+                    .unwrap()
+                    .fragment_len(stripe.geometry(), stripe.data_len())
+                    .unwrap()
+            })
+            .sum();
+        let settings = RepairSettings {
+            moves_per_pass: held,
+            ..MOVING
+        };
+        let repairer = f.repairer(planner(7, EcConfig::default(), vec![4]), settings);
+        let report = repairer.pass().await;
+        assert_eq!((report.lost, report.repaired), (0, 0), "{report:?}");
+        assert_eq!(report.moved, held, "{report:?}");
+        assert_eq!(f.on(4).await, 0);
+        assert_eq!(f.metrics.bytes(), 2 * lens);
+        assert!(f.moves().iter().all(|steps| matches!(
+            &steps[0],
+            RepairStep::MoveStarted { reason: MoveReason::Drain, from, .. } if *from == node(4)
+        )));
+        // The drained node still holds the fragments it gave up: orphans,
+        // for orphan reclamation.
+        let left = f
+            .nodes
+            .fragments
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(holder, _)| *holder == node(4))
+            .count();
+        assert_eq!(left, held);
+        f.check_whole().await;
+
+        // A departing node that falls silent is lost like any other, and
+        // its fragments are rebuilt.
+        let g = Fixture::coded(2, 6, EcConfig::default()).await;
+        let held = g.on(4).await;
+        g.nodes.silence(4);
+        let repairer = g.repairer(planner(7, EcConfig::default(), vec![4]), MOVING);
+        // Silent, it is avoided: no move reads from it, though the others
+        // balance onto the seventh node.
+        let report = repairer.pass().await;
+        assert_eq!(report.lost, 0, "{report:?}");
+        assert!(g.moves().iter().all(|steps| !matches!(
+            &steps[0],
+            RepairStep::MoveStarted { from, .. } if *from == node(4)
+        )));
+        tokio::time::sleep(SETTINGS.lost_after).await;
+        let report = repairer.pass().await;
+        assert_eq!((report.lost, report.repaired), (held, held), "{report:?}");
+        assert_eq!(report.moved, 0, "a pass with losses moves nothing");
+        assert_eq!(g.on(4).await, 0);
+        g.check_whole().await;
+    });
+}
+
+#[test]
+fn moves_come_after_repairs() {
+    runtime().block_on(async {
+        // Moves wait while another repairer of the node has repairs to
+        // make.
+        let shared = RepairBandwidth::new(1 << 40);
+        let f = Fixture::coded(2, 6, EcConfig::default()).await;
+        let repairer = Arc::new(
+            f.repairer(planner(8, EcConfig::default(), Vec::new()), MOVING)
+                .with_bandwidth(shared.clone()),
+        );
+        let repairing = shared.repairing();
+        let pass = tokio::spawn({
+            let repairer = Arc::clone(&repairer);
+            async move { repairer.pass().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!pass.is_finished());
+        let moves = f.moves();
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!(moves[0].len(), 1, "the move waits to read: {moves:?}");
+        drop(repairing);
+        let report = pass.await.unwrap();
+        assert!(report.moved > 0, "{report:?}");
+        f.check_whole().await;
+
+        // With the moves seeded before the repairs, a pass that repairs
+        // moves too, first, and its moves may supersede its repairs.
+        let g = Fixture::coded(2, 6, EcConfig::default()).await;
+        let lost = g.on(2).await;
+        g.nodes.wipe(2);
+        let repairer = g
+            .repairer(planner(8, EcConfig::default(), Vec::new()), MOVING)
+            .with_bug(Some(RepairBug::MovesBeforeRepairs));
+        let report = repairer.pass().await;
+        assert_eq!(report.lost, lost, "{report:?}");
+        assert!(report.moved > 0 && report.repaired > 0, "{report:?}");
+        assert!(matches!(g.steps()[0], RepairStep::MoveStarted { .. }));
+    });
+}
+
+#[test]
+fn a_move_that_fails_is_abandoned_and_retried() {
+    runtime().block_on(async {
+        let f = Fixture::coded(1, 6, EcConfig::default()).await;
+        let before = f.layouts().await;
+        // Every node answers its checks but fails to serve a fragment
+        // whole: no move reads its fragment.
+        f.nodes.unreadable.lock().unwrap().extend((0..6).map(node));
+        let repairer = f.repairer(planner(8, EcConfig::default(), Vec::new()), MOVING);
+        let report = repairer.pass().await;
+        assert_eq!(report.moved, 0, "{report:?}");
+        assert!(report.unmoved > 0, "{report:?}");
+        assert!(
+            f.moves()
+                .iter()
+                .all(|steps| steps.last() == Some(&RepairStep::Abandoned))
+        );
+        assert_eq!(f.layouts().await, before);
+        assert!(f.attempts.in_progress().is_empty());
+
+        // The first write fails: that move, and the pass's others to its
+        // node, wait for the next pass; the others go on.
+        f.nodes.unreadable.lock().unwrap().clear();
+        *f.nodes.failures.lock().unwrap() = 1;
+        let report = repairer.pass().await;
+        assert!(report.unmoved >= 1, "{report:?}");
+        assert!(report.moved > 0, "{report:?}");
+        f.settle(&repairer).await;
+        f.check_whole().await;
+    });
+}
+
+#[test]
+fn moves_are_fenced_like_repairs() {
+    runtime().block_on(async {
+        let one = RepairSettings {
+            moves_per_pass: 1,
+            ..MOVING
+        };
+        // A move writes: it is in progress, and a judge in its epoch leaves
+        // it be; abandoning it while it writes stops it.
+        let f = Fixture::coded(1, 6, EcConfig::default()).await;
+        let before = f.layouts().await;
+        let gate = f.nodes.hold();
+        let repairer = Arc::new(f.repairer(planner(8, EcConfig::default(), Vec::new()), one));
+        let pass = tokio::spawn({
+            let repairer = Arc::clone(&repairer);
+            async move { repairer.pass().await }
+        });
+        let attempt = loop {
+            if let Some(&attempt) = f.attempts.in_progress().first() {
+                break attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        assert!(!f.attempts.orphaned(attempt, Epoch::new(1)));
+        assert!(f.attempts.abandon(attempt));
+        gate.send(true).unwrap();
+        let report = pass.await.unwrap();
+        assert_eq!((report.moved, report.unmoved), (0, 1), "{report:?}");
+        assert_eq!(f.layouts().await, before);
+
+        // Seeded unfenced, a move writes while the tracker knows nothing
+        // of it, so orphan reclamation would reclaim its copy.
+        let g = Fixture::coded(1, 6, EcConfig::default()).await;
+        let gate = g.nodes.hold();
+        let repairer = Arc::new(
+            g.repairer(planner(8, EcConfig::default(), Vec::new()), one)
+                .with_bug(Some(RepairBug::UnfencedMove)),
+        );
+        let pass = tokio::spawn({
+            let repairer = Arc::clone(&repairer);
+            async move { repairer.pass().await }
+        });
+        while !g
+            .steps()
+            .iter()
+            .any(|step| matches!(step, RepairStep::Placed { .. }))
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(g.attempts.in_progress().is_empty());
+        gate.send(true).unwrap();
+        let report = pass.await.unwrap();
+        assert_eq!(report.moved, 1, "{report:?}");
+        g.check_whole().await;
     });
 }

@@ -7165,6 +7165,112 @@ of this file. A task with nothing unexpected keeps "None."
   stripes are logged and counted in the pass report, with no metric of
   their own.
 
+### M5-09 Fragment rebalancing
+
+- **What moves a fragment (decided).** The plan named the steps, not the
+  triggers. `FragmentPlanner::moves` (skys3-coord) plans moves for three
+  reasons, in order: a stripe over a failure domain's cap of `m` (as
+  after a relabel), a fragment on a node that is listed but no longer
+  eligible (departing, no capacity, or unlabeled: a drain), and balance:
+  a fragment of `f` bytes moves from `a` to `t` only while
+  `(b_a − f) / c_a ≥ (b_t + f) / c_t`, M3-06's rule in bytes, which makes
+  `Σ b² / c` fall with every move, so moves settle and never go back (a
+  proptest over random clusters that change under their stripes checks
+  the rules and that moves settle). Targets are live eligible nodes
+  outside the stripe whose domain stays within the cap, the emptiest
+  first. Recorded in §8.3.
+- **Shares are each shard's own (decided).** Nothing counts fragment
+  bytes across the cluster: `FragmentPlanner::hold` exists, but no node
+  reports what it stores. Each primary balances its own shard's
+  fragments, which it knows exactly from the `fragments` table; shards
+  that each spread their own spread the cluster's, to within a fragment
+  per shard and node.
+- **A departing node is drained, not rebuilt (changed M5-08's rule).**
+  Repair treated a departing node's fragments as lost at once, which
+  would rebuild every fragment of a decommissioned node from `k` reads
+  while the node could still serve each with one. Repair now checks a
+  departing node like any other; moves drain it while it answers, and if
+  it falls silent it is lost after `fragment_repair_after_seconds`, as
+  any node. A node the topology no longer lists is still lost at once.
+  `a_departing_node_is_repaired_without_checks` became
+  `a_forgotten_node_is_repaired_without_checks`. §8.6 is updated.
+- **Repairs keep priority twice over (decided).** A pass that finds any
+  fragment lost repairs and moves nothing; moves run only in a pass that
+  found none, at most `moves_per_pass` (16, a constant like
+  `checks_per_node`, so no new configuration key). Across shards, moves
+  share the node's `RepairBandwidth` (`repair_bytes_per_second_per_node`)
+  but wait to take it while any repairer of the node holds a `Repairing`
+  guard (`take_after_repairs`); a repair waits for at most the move
+  transfers already started. The cap's metric `skys3_repair_bytes_total`
+  counts moves too; `skys3_moved_fragments_total` is new.
+- **Moves reuse the repair machinery whole.** A move is an attempt in the
+  shard's `Attempts` from its start, with a number from the reserved
+  blocks, published with `publish` under its epoch, and commits an
+  `EC_RELOCATE` with one move: the record needed no change, and repair's
+  commit step became `Repairer::relocate`, which both share. The moves
+  live in the repairer (`repair/moves.rs`), since they need its
+  inventory, silence tracking, bandwidth, and fence, and must follow its
+  repairs.
+- **Retiring is orphan reclamation's (decided, safe).** A move deletes
+  nothing: the old fragment is retired only once no committed layout
+  names it, so a stripe always keeps `k + m` named fragments and a reader
+  holding an older plan still finds the old one.
+- **Moved-from fragments keep their space while their holder runs
+  (found, left open).** The outlasting scenario first required the
+  fragments moves leave to be reclaimed, and none was: a fragment node
+  asks about a fragment once, and a fragment it was told is referenced is
+  not asked about again until the node restarts (M5-05). M5-08's
+  replaced fragments sit on nodes that were down, which ask again when
+  they return; a move's old holder is up. Safe, but balancing frees no
+  space on the source until it restarts. Fragment release (M5-07) should
+  release moved-from fragments as it does replaced versions', or the
+  reclaimer should ask again about referenced fragments now and then.
+- **Moves planned from the pass's snapshot were rejected by retags
+  (found).** The harness's readers retag objects; a move names the
+  entry's version, so a retag between the pass's index read and a move
+  later in the pass rejected it, wasting a copy (six of the first seven
+  moves after the joins in seed 0). Each move now re-reads the entry and skips a move whose
+  layout changed. A pass also stops moving from a node it could not read
+  or to one it could not write, which would otherwise cost a write
+  timeout per planned move.
+- **The harness's balance check had to count the readers' copies
+  (found).** `CopyObject` copies are coded too, so the shard holds more
+  coded objects than the run wrote; a check over the written keys found
+  the nodes unbalanced while the primary, which balances them all,
+  rightly planned nothing. The checks now take every key with fragment
+  rows.
+- **The harness grew joins, drains, and racks.**
+  `CodingConfig::rebalance` (`RebalanceConfig`) adds nodes `n6` on,
+  crashed before the run starts and counted lost until they join, and
+  lists each in the planner's topology once its software is up; drains
+  mark a node departing; the topology is now a world field the encoder's
+  and repairers' planners read, optionally at the `rack` level (three
+  racks of two, one node joining the first rack). Joins and drains strike
+  with the repair losses. The driver checks the domain caps at every
+  step, that no pass both repairs and moves, and, within the repair
+  bound, that drained nodes hold nothing, joined ones hold fragments,
+  and the live nodes' fragment bytes are within two fragments of each
+  other. `MoveCrash` strikes the primary or the moved fragment's old or
+  new holder at each step of a move.
+- **Seeds and costs.** At `SKYS3_SIM_SEEDS=256`, one test thread each,
+  every scenario passed every seed it runs: two nodes joining under
+  reads and a drawn loss (4 seeds, 28 s), a node drained as another
+  joins, under reads and a drawn loss (4, 24 s), joins at the `rack`
+  level (8, 18 s), crashes at a drawn step of a move of the primary or
+  a moved fragment's old or new holder (16, 36 s), moves outlasting
+  `orphan_after` (8, 27 s), and the seeded bugs, each seed run with and
+  without the bug and caught at every seed run: `UnfencedMove` (seeds 0
+  to 3, 17 s), `RebalanceBug::RetireEarly` with the primary killed once
+  a copy is placed (0 to 3, 10 s), `AcknowledgeBeforeSync` at a copy's
+  new holder (0 to 3, 13 s), and `MovesBeforeRepairs` and
+  `RebalanceBug::NodeLevel` (0 and 1, 16 s); about 190 s in all. The
+  coding, coded-read, and repair scenarios, which share the harness,
+  pass at 256 seeds too.
+- **Left open.** The node binary runs no repairer, so no mover either.
+  Moves are planned per shard from the pass's index read, one fragment
+  per `EC_RELOCATE`; moves of one stripe could share a record. The space
+  moved-from fragments keep is above.
+
 ### M5-10 Lifecycle expiration and multipart cleanup
 
 - **The configuration lives in the bucket register.** An optional

@@ -7,8 +7,9 @@
 //! 1. **Finds lost fragments.** It lists the nodes that hold the shard's
 //!    fragments and each node's fragments from the shard's index from node
 //!    to fragments ([`IndexReader::fragments_on`]). Every fragment of a
-//!    node that the cluster's topology no longer lists as eligible
-//!    (departing, or forgotten) is lost. Other nodes are checked: each pass
+//!    node that the cluster's topology no longer lists (forgotten) is
+//!    lost. Other nodes are checked, a departing one too, whose fragments
+//!    are moved off while it answers (below): each pass
 //!    reads one byte of a few of a node's fragments in turn
 //!    ([`RepairSettings::checks_per_node`]), which a node serves only if it
 //!    holds the fragment intact under the header the layout expects. A
@@ -34,8 +35,25 @@
 //!    moves them. A write that fails places that fragment again without
 //!    its node, a few times.
 //!
-//! Every byte a repair reads or writes first takes its share of the node's
-//! [`RepairBandwidth`] (`repair_bytes_per_second_per_node`).
+//! A pass that found no fragment lost then **moves fragments** (plan
+//! M5-09): up to [`RepairSettings::moves_per_pass`] of them, as
+//! [`FragmentPlanner::moves`] plans, off a node that is listed but no
+//! longer eligible (a departing node is drained while it answers, at one
+//! read a fragment rather than the `k` a rebuild costs), out of a failure
+//! domain that holds more than `m` of a stripe, and toward each node's
+//! share of the shard's fragment bytes, so a node that joins receives
+//! fragments. Each move is a fragment-writing attempt, fenced like a
+//! repair: it reads the fragment whole from its node, writes it to the
+//! new one, and once the copy is durable commits an `EC_RELOCATE` that
+//! moves it, publish before retire. The fragment it leaves is named by no
+//! committed layout from then on, and orphan reclamation reclaims it
+//! (§8.4). A move whose fragment cannot be read is abandoned: the
+//! fragment may be lost, which the next pass's checks find.
+//!
+//! Every byte a repair or a move reads or writes first takes its share of
+//! the node's [`RepairBandwidth`] (`repair_bytes_per_second_per_node`).
+//! Repairs come first: a move's transfer waits while any repairer on the
+//! node has repairs to make.
 //!
 //! Nothing of a repair is kept: a new primary, or this one after a
 //! restart, finds the lost fragments again from its index and its own
@@ -48,6 +66,7 @@
 
 mod bandwidth;
 mod metrics;
+mod moves;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,7 +75,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_config::EcConfig;
-use skys3_coord::{FragmentPlanner, NodeState, ReplaceRequest};
+use skys3_coord::{FragmentPlanner, MoveReason, ReplaceRequest};
 use skys3_index::{Entry, Index, IndexError};
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::{EcRelocate, FragmentMove};
@@ -65,7 +84,7 @@ use skys3_types::{AttemptId, CodedStripe, EpochSeq, FragmentId, FragmentLocation
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-pub use bandwidth::RepairBandwidth;
+pub use bandwidth::{RepairBandwidth, Repairing};
 pub use metrics::RepairMetrics;
 
 use crate::encoder::{
@@ -93,6 +112,9 @@ pub struct RepairSettings {
     /// `repair_bytes_per_second_per_node`, for the cap
     /// [`Repairer::new`] makes when none is shared.
     pub bytes_per_second: u64,
+    /// The most fragments a pass that found none lost moves (plan M5-09);
+    /// 0 moves none.
+    pub moves_per_pass: usize,
 }
 
 impl RepairSettings {
@@ -101,6 +123,10 @@ impl RepairSettings {
 
     /// How many of a node's fragments a pass checks by default.
     pub const CHECKS_PER_NODE: usize = 16;
+
+    /// How many fragments a pass moves at most by default: few enough that
+    /// the next pass, and the losses it may find, is never far off.
+    pub const MOVES_PER_PASS: usize = 16;
 
     /// The settings `[ec]` gives.
     #[must_use]
@@ -111,6 +137,7 @@ impl RepairSettings {
             checks_per_node: Self::CHECKS_PER_NODE,
             replans: 3,
             bytes_per_second: config.repair_bytes_per_second_per_node,
+            moves_per_pass: Self::MOVES_PER_PASS,
         }
     }
 }
@@ -159,6 +186,21 @@ pub enum RepairStep {
         /// Its node.
         node: NodeId,
     },
+    /// A move started, in pass `pass`, instead of a repair: fragment
+    /// `index` goes from `from` to `to`. Its steps follow as a repair's
+    /// do, a read of the fragment, its placement, and its write.
+    MoveStarted {
+        /// The pass, counted from 1 in this repairer's life.
+        pass: u64,
+        /// The fragment's index.
+        index: u8,
+        /// The node it moves from.
+        from: NodeId,
+        /// The node it moves to.
+        to: NodeId,
+        /// Why it moves.
+        reason: MoveReason,
+    },
     /// The `EC_RELOCATE` record is sequenced, and not yet known to commit.
     Appended,
     /// The record committed: `relocated` if it was applied, false if the
@@ -192,6 +234,10 @@ pub struct RepairReport {
     pub failed: usize,
     /// Stripes that lost more fragments than they can rebuild.
     pub unrecoverable: usize,
+    /// Fragments whose move's `EC_RELOCATE` committed and was applied.
+    pub moved: usize,
+    /// Moves that failed or were rejected; the next pass plans again.
+    pub unmoved: usize,
 }
 
 /// Why a stripe's repair failed. Unless the error is
@@ -221,9 +267,13 @@ pub enum RepairError {
     /// placement rules: the repair waits for a node (§8.3).
     #[error("no eligible node has room for the rebuilt fragments")]
     NoRoom,
-    /// A rebuilt fragment could not be written, after every re-plan.
-    #[error("a rebuilt fragment could not be written: {0}")]
+    /// A rebuilt fragment could not be written, after every re-plan, or a
+    /// moved one could not be.
+    #[error("a rebuilt or moved fragment could not be written: {0}")]
     Fragments(TransferError),
+    /// The fragment to move could not be read from its node.
+    #[error("the fragment to move could not be read: {0}")]
+    Source(FragmentReadError),
     /// The attempt was abandoned, by orphan reclamation's fence, before it
     /// appended its record.
     #[error("attempt {0} was abandoned")]
@@ -247,6 +297,12 @@ pub enum RepairBug {
     LeastLostFirst,
     /// Transfers without taking the bandwidth cap.
     Unthrottled,
+    /// Registers a move's attempt with the tracker only once its fragment
+    /// is written, so orphan reclamation's fence does not see it writing.
+    UnfencedMove,
+    /// Moves fragments in every pass, before its repairs, and without
+    /// waiting for other repairers' repairs.
+    MovesBeforeRepairs,
 }
 
 /// A shard primary's repairer (§8.6). The module documentation describes a
@@ -422,6 +478,13 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         report.lost = lost.len();
         let mut damaged = self.damaged(&inventory, &lost);
         self.order(&mut damaged);
+        let moves_first = self.has_bug(RepairBug::MovesBeforeRepairs);
+        if moves_first {
+            self.rebalance(pass, &inventory, &planner, &silent, &mut report)
+                .await;
+        }
+        // Moves on every shard this node leads wait for these repairs.
+        let _repairing = (!damaged.is_empty()).then(|| self.bandwidth.repairing());
         for stripe in damaged {
             if !leads(&self.shard) {
                 break;
@@ -460,6 +523,13 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                     );
                 }
             }
+        }
+        // Moves only once the shard has nothing to repair: a pass that
+        // found a fragment lost repairs first, and the next pass checks
+        // again.
+        if !moves_first && report.lost == 0 {
+            self.rebalance(pass, &inventory, &planner, &silent, &mut report)
+                .await;
         }
         report
     }
@@ -525,12 +595,11 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         {
             let mut state = self.state();
             for (node, held) in &inventory.nodes {
-                let departed = known
-                    && planner
-                        .topology()
-                        .get(node)
-                        .is_none_or(|candidate| candidate.state == NodeState::Departing);
-                if departed {
+                // A departing node that still answers is drained by moves,
+                // one read a fragment, not rebuilt from `k`; once silent it
+                // is lost like any other.
+                let forgotten = known && planner.topology().get(node).is_none();
+                if forgotten {
                     lost.extend(held.iter().map(|held| (node.clone(), held.fragment)));
                     continue;
                 }
@@ -716,9 +785,41 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         if unfenced {
             self.attempts.begin(attempt);
         }
+        let relocated = self
+            .relocate(key, damaged.stripe, entry, attempt, moves.clone())
+            .await?;
+        if relocated {
+            let now = Instant::now();
+            let mut state = self.state();
+            for moved in &moves {
+                let since = state
+                    .lost
+                    .remove(&(moved.from.node.clone(), moved.from.fragment))
+                    .unwrap_or(now);
+                self.metrics.repaired_after(now.duration_since(since));
+            }
+            let oldest = state.lost.values().min().copied();
+            self.metrics
+                .backlog(self.shard.shard(), state.lost.len() as u64, oldest);
+        }
+        Ok(relocated)
+    }
+
+    /// Commits the `EC_RELOCATE` of `attempt`, whose fragments `moves` are
+    /// durable, for stripe `stripe` of `key`'s version `entry`: whether it
+    /// was applied.
+    async fn relocate(
+        &self,
+        key: &str,
+        stripe: u32,
+        entry: &Entry,
+        attempt: AttemptId,
+        moves: Vec<FragmentMove>,
+    ) -> Result<bool, RepairError> {
+        let emit = |step| self.emit(key, stripe, attempt, step);
         // The entry's version, not the layout's: a retag since this attempt
-        // read the entry rejects the record, and the next pass rebuilds the
-        // fragments with the new tags.
+        // read the entry rejects the record, and the next pass rebuilds or
+        // moves the fragments with the new tags.
         let body = skys3_log::RecordBody::EcRelocate(EcRelocate {
             key: key.to_owned(),
             version: entry.version,
@@ -728,7 +829,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                 .map(|object| object.local_etag.clone())
                 .expect("a coded entry has an object"),
             attempt,
-            moves: moves.clone(),
+            moves,
         });
         let appended = || emit(RepairStep::Appended);
         let committed = match publish(&self.shard, &self.attempts, attempt, body, appended).await {
@@ -748,20 +849,6 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             position: committed.position,
             relocated,
         });
-        if relocated {
-            let now = Instant::now();
-            let mut state = self.state();
-            for moved in &moves {
-                let since = state
-                    .lost
-                    .remove(&(moved.from.node.clone(), moved.from.fragment))
-                    .unwrap_or(now);
-                self.metrics.repaired_after(now.duration_since(since));
-            }
-            let oldest = state.lost.values().min().copied();
-            self.metrics
-                .backlog(self.shard.shard(), state.lost.len() as u64, oldest);
-        }
         Ok(relocated)
     }
 
@@ -799,12 +886,15 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             if read == geometry.data_fragments() {
                 break;
             }
-            self.check_writing(attempt)?;
+            self.check_writing(attempt, self.has_bug(RepairBug::Unfenced))?;
             let location = &stripe.fragments()[usize::from(index)];
             let identity = self
                 .identity(key, entry, damaged.stripe, index)
                 .ok_or(RepairError::Unreadable { read, needed: 1 })?;
-            match self.read_whole(location, identity, len).await {
+            match self
+                .read_whole(location, identity, len, Transfer::Repair)
+                .await
+            {
                 Ok(bytes) => {
                     slots[usize::from(index)] = Some(bytes);
                     read += 1;
@@ -845,7 +935,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         let mut written: BTreeMap<u8, FragmentLocation> = BTreeMap::new();
         let mut last = None;
         for _ in 0..=self.settings.replans {
-            self.check_writing(attempt)?;
+            self.check_writing(attempt, self.has_bug(RepairBug::Unfenced))?;
             let request = ReplaceRequest {
                 bucket: &self.shard.shard().bucket,
                 shard: self.shard.shard().shard,
@@ -939,14 +1029,13 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         location: &FragmentLocation,
         identity: FragmentIdentity,
         len: u64,
+        transfer: Transfer,
     ) -> Result<Vec<u8>, FragmentReadError> {
         let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
         let mut start = 0;
         while start < len {
             let end = (start + MAX_READ_LEN).min(len);
-            if let Some(bandwidth) = self.throttle() {
-                bandwidth.take(end - start).await;
-            }
+            self.pace(transfer, end - start).await;
             let request = FragmentRequest {
                 node: location.node.clone(),
                 fragment: location.fragment,
@@ -968,9 +1057,9 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         Ok(data)
     }
 
-    /// Fails if `attempt` was abandoned by orphan reclamation's fence.
-    fn check_writing(&self, attempt: AttemptId) -> Result<(), RepairError> {
-        let unfenced = self.has_bug(RepairBug::Unfenced);
+    /// Fails if `attempt` was abandoned by orphan reclamation's fence,
+    /// unless a seeded bug left it `unfenced`.
+    fn check_writing(&self, attempt: AttemptId, unfenced: bool) -> Result<(), RepairError> {
         if unfenced || self.attempts.state(attempt) == Some(crate::AttemptState::Writing) {
             Ok(())
         } else {
@@ -981,6 +1070,19 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     /// The bandwidth cap transfers take, unless a seeded bug skips it.
     fn throttle(&self) -> Option<&RepairBandwidth> {
         (!self.has_bug(RepairBug::Unthrottled)).then_some(&self.bandwidth)
+    }
+
+    /// Waits until a transfer of `bytes` may start under the cap: a
+    /// move's only once no repairer on the node has repairs to make.
+    async fn pace(&self, transfer: Transfer, bytes: u64) {
+        let Some(bandwidth) = self.throttle() else {
+            return;
+        };
+        if transfer == Transfer::Move && !self.has_bug(RepairBug::MovesBeforeRepairs) {
+            bandwidth.take_after_repairs(bytes).await;
+        } else {
+            bandwidth.take(bytes).await;
+        }
     }
 
     fn emit(&self, key: &str, stripe: u32, attempt: AttemptId, step: RepairStep) {
@@ -1016,6 +1118,16 @@ enum RepairBug {
     Unfenced,
     LeastLostFirst,
     Unthrottled,
+    UnfencedMove,
+    MovesBeforeRepairs,
+}
+
+/// Whose transfer takes the bandwidth cap: a repair's, or a move's, which
+/// waits for repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+    Repair,
+    Move,
 }
 
 /// What a node's checks found.

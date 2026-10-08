@@ -69,6 +69,11 @@
 //!   within a bound, most damaged first and within the bandwidth cap,
 //!   through crashes of the primary and the new holders, with seeded
 //!   repair bugs caught.
+//! - [`fragment_moves`]: nodes joining or drained while holders are lost
+//!   and reads go on, with fragments moved after repairs, publish before
+//!   retire, never leaving a stripe below `k` readable fragments or a
+//!   failure domain over its cap, through crashes at each step of a move,
+//!   with seeded move bugs caught.
 //! - [`compaction`]: segment compaction on replicated shards under
 //!   crashes, message loss, and power losses at sync boundaries, with
 //!   every member's dirty bytes and every shard's latest `CONFIG` record
@@ -124,6 +129,7 @@ mod conflicts;
 mod coordinator;
 mod crash;
 mod drills;
+mod fragment_moves;
 mod handoff;
 mod harness;
 mod heal;
