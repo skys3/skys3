@@ -19,7 +19,8 @@
 //!   the headers: the version its coded layout names
 //!   ([`Coded::version`]), or the entry's own version if it was coded after
 //!   the snapshot. A coded entry whose fragments cannot be rebuilt is
-//!   unrecoverable.
+//!   unrecoverable, and so is a replicated one whose encoding left headers
+//!   too few to rebuild: its replicas are lost either way.
 //! - **Everything else is superseded.** Header versions at or before the
 //!   snapshot's position that its entry does not name were overwritten or
 //!   deleted by then: their fragments are orphans, and restoring them
@@ -31,12 +32,17 @@
 //!   snapshot's entry and the version's latest attempt names the later
 //!   position; what only an entry holds (payload positions, a copy's
 //!   source, the storage class, the remote ETag) comes from the snapshot.
-//! - **Locations.** Each fragment's location comes from the latest attempt
-//!   that holds it ([`rebuild_layouts`]). A fragment no header was found
-//!   for keeps the location the snapshot's layout gives it, if any, or is
-//!   placed on a lost node the stripe does not use, else on any node it
-//!   does not use, as [`UNKNOWN_FRAGMENT`]: reads find it missing and
-//!   decode around it, and repair rebuilds it (§8.6).
+//! - **Locations.** [`rebuild_layouts`] picks each stripe's layout. Its
+//!   fragments are then placed one per node from every copy found, the
+//!   latest attempt's preferred, by a maximum matching of indices to
+//!   nodes: an older attempt's copy can share a node with a later one's,
+//!   once a node comes back holding a fragment that was rebuilt elsewhere.
+//!   A fragment no copy is placed for keeps the location the snapshot's
+//!   layout gives it, if any, or is placed on a lost node the stripe does
+//!   not use, else on any node it does not use, as [`UNKNOWN_FRAGMENT`]:
+//!   reads find it missing and decode around it, and repair rebuilds it
+//!   (§8.6). A stripe with fewer than `k` fragments on distinct nodes is
+//!   unrecoverable.
 //!
 //! The restored shard must start in an epoch after [`Reindexed::epoch`],
 //! so that its attempts and records follow every one the headers and the

@@ -105,6 +105,12 @@
 //!   under takeovers and faults, and the restore drill of a shard whose
 //!   members are all lost: its lost-key report matches the clients'
 //!   history, and seeded bugs of snapshots and restores are caught.
+//! - [`drills`]: the restore drill of a shard whose member, with up to two
+//!   other nodes, is lost while coded and replicated objects are written,
+//!   retagged, overwritten, deleted, and repaired: coded objects, those
+//!   written after the latest snapshot included, are re-indexed from
+//!   fragment headers and read back, the lost-key report matches the
+//!   history, and seeded bugs of re-indexing are caught.
 
 mod acks;
 mod backfill;

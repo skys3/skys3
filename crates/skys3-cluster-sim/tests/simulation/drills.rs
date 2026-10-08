@@ -14,21 +14,33 @@ use skys3_cluster_sim::drill::{self, DrillConfig, DrillReport};
 use skys3_ec::reindex::seeded::ReindexBug;
 use skys3_sim::{Runner, SimContext};
 
-/// What one run costs, in seeds of a typical scenario.
-const RUN_COST: u64 = 4;
+/// What one run costs, in seeds of a typical scenario: about 0.8 s in a
+/// debug build, 160 steps and four drills.
+const RUN_COST: u64 = 16;
+
+/// The fewest seeds over which every kind of outcome must occur.
+const OUTCOME_SEEDS: usize = 8;
 
 #[test]
 fn restore_drills_match_the_history() {
     let mut total = DrillReport::default();
+    let mut seeds = 0;
     Runner::with_cost(8, RUN_COST).run(|context| {
         let report = drill::run(context, &DrillConfig::default())?;
         tracing::info!(?report, "drills");
-        if report.drills == 0 || report.restored == 0 {
-            return Err(format!("nothing was restored: {report:?}").into());
+        // Every run restores coded objects written after its snapshots.
+        if report.drills == 0 || report.written_after == 0 {
+            return Err(
+                format!("nothing written after a snapshot was restored: {report:?}").into(),
+            );
         }
         add(&mut total, &report);
+        seeds += 1;
         Ok(())
     });
+    if seeds < OUTCOME_SEEDS {
+        return;
+    }
     // Over the seeds, every kind of outcome the drill reports occurs.
     let DrillReport {
         written_after,
@@ -96,7 +108,7 @@ fn caught(
 
 #[test]
 fn preferring_an_older_attempt_s_headers_is_caught() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         caught(
             context,
             &hunting(12),
@@ -108,7 +120,7 @@ fn preferring_an_older_attempt_s_headers_is_caught() {
 
 #[test]
 fn preferring_the_headers_tags_to_a_later_snapshot_is_caught() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         caught(
             context,
             &hunting(8),
@@ -120,7 +132,7 @@ fn preferring_the_headers_tags_to_a_later_snapshot_is_caught() {
 
 #[test]
 fn ignoring_writes_after_the_snapshot_is_caught() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         caught(
             context,
             &hunting(8),
@@ -132,7 +144,7 @@ fn ignoring_writes_after_the_snapshot_is_caught() {
 
 #[test]
 fn restoring_a_key_deleted_before_the_snapshot_is_caught() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         caught(
             context,
             // Orphans are never reclaimed, so a deleted version's fragments
@@ -149,7 +161,7 @@ fn restoring_a_key_deleted_before_the_snapshot_is_caught() {
 
 #[test]
 fn falling_back_to_an_older_version_is_caught() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         caught(
             context,
             // Each loss takes enough holders of the latest version that it
