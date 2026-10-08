@@ -131,6 +131,9 @@ fn the_defaults_are_the_design_example_values() {
     // The example's peer cluster has no default.
     assert_eq!(peering.peers.len(), 1);
     peering.peers.clear();
+    // Nor do the addresses it advertises.
+    assert_eq!(peering.quic_advertise.len(), 1);
+    peering.quic_advertise.clear();
     assert_eq!(minimal.peering(), &peering);
     let mut identity = example.identity().clone();
     // The example's static credential has no default.
@@ -285,6 +288,7 @@ peer_local_writes = true
 
 [peering]
 quic_listen = "[::]:8443"
+quic_advertise = ["gw.c1.example.com:8443"]
 congestion_control = "bbr"
 peer_frame_bytes = 131072
 peer_connect_timeout_ms = 1000
@@ -296,6 +300,7 @@ peer_staging_ttl_seconds = 3600
 [peering.peers.c2]
 ca_file = "/etc/skys3/peers/c2.crt"
 buckets = [{ source = "b-91c2", destination = "mirror" }]
+s3_access_key_ids = ["AKIAPEERC2"]
 
 [identity]
 anonymous_access = true
