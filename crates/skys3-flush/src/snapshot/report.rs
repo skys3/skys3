@@ -1,8 +1,9 @@
 //! The lost-key report of a shard whose members are all lost (§6.9).
 
+use skys3_ec::reindex::ReindexError;
 use skys3_index::{Entry, EntryState};
 use skys3_log::ShardRef;
-use skys3_remote::{HeadObject, ObjectInfo, ObjectStore, S3ErrorKind};
+use skys3_remote::{HeadObject, ObjectStore, S3ErrorKind};
 use skys3_types::{ClusterId, ETag, EpochSeq, WriteIdentity};
 
 use super::SnapshotError;
@@ -12,7 +13,7 @@ use super::restore::Restored;
 /// Where a bucket's data is durable besides its members: a `write_back`
 /// bucket's remote target or a `local` bucket's backup target (§8.1,
 /// §8.9).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct DurableHome<'a, S> {
     /// The target's store.
     pub store: &'a S,
@@ -21,6 +22,14 @@ pub struct DurableHome<'a, S> {
     /// The cluster whose write identities the target's objects carry.
     pub cluster: &'a ClusterId,
 }
+
+impl<S> Clone for DurableHome<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S> Copy for DurableHome<'_, S> {}
 
 /// What a shard's members held that nothing else holds, as far as its
 /// latest snapshot tells (§6.9).
@@ -40,8 +49,10 @@ pub struct LostKeyReport {
     /// lost with the members.
     pub uploads: Vec<LostUpload>,
     /// Keys whose version is erasure-coded: their fragments outlive the
-    /// members, and re-indexing them from their fragment headers recovers
-    /// them (plan M5-11).
+    /// members. In the report of [`lost_keys`], the keys the snapshot holds
+    /// coded, which re-indexing recovers; in a restore drill's
+    /// ([`super::drill()`]), the keys it restored, coded before or after
+    /// the snapshot, while those it could not restore are lost.
     pub coded: Vec<String>,
 }
 
@@ -81,6 +92,10 @@ pub struct LostKey {
     /// The object, or `None` for a delete that did not reach the durable
     /// home: the home may still hold an older object at the key.
     pub object: Option<LostObject>,
+    /// For a coded version that a restore drill could not re-index from
+    /// its fragment headers, why; `None` for a version that existed only
+    /// on the members.
+    pub coded: Option<ReindexError>,
 }
 
 /// What a lost object was.
@@ -155,7 +170,7 @@ pub async fn lost_keys<S: ObjectStore>(
         let Some(object) = &entry.object else {
             // A delete of a bucket without a home lost nothing.
             if let Some(home) = &home
-                && !holds(home, shard, &key, &entry).await?
+                && !holds(home, shard, &key, entry.version, None).await?
             {
                 report.lost.push(lost(key, &entry));
             }
@@ -165,8 +180,9 @@ pub async fn lost_keys<S: ObjectStore>(
             report.coded.push(key);
             continue;
         }
+        let identity = object.write_identity.unwrap_or(entry.version);
         let held = match &home {
-            Some(home) => holds(home, shard, &key, &entry).await?,
+            Some(home) => holds(home, shard, &key, entry.version, Some(identity)).await?,
             None => false,
         };
         if !held {
@@ -196,38 +212,61 @@ fn lost(key: String, entry: &Entry) -> LostKey {
             etag: object.local_etag.clone(),
             last_modified_ms: object.last_modified_ms,
         }),
+        coded: None,
     }
 }
 
-/// Whether `home` holds `entry`'s version of `key`, or a later write of
-/// the shard.
-async fn holds<S: ObjectStore>(
+/// What a durable home holds at a key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AtHome {
+    /// The position the object's write identity names, if this cluster
+    /// wrote it from this bucket and shard.
+    pub written: Option<EpochSeq>,
+    /// Its ETag.
+    pub etag: ETag,
+}
+
+/// What `home` holds at `key`, or `None` if it holds no object there.
+pub(super) async fn at_home<S: ObjectStore>(
     home: &DurableHome<'_, S>,
     shard: &ShardRef,
     key: &str,
-    entry: &Entry,
-) -> Result<bool, SnapshotError> {
+) -> Result<Option<AtHome>, SnapshotError> {
     let request = HeadObject::new(format!("{}{key}", home.prefix));
-    let found = match home.store.head_object(request).await {
-        Ok(info) => Some(info),
-        Err(error) if error.kind() == S3ErrorKind::NoSuchKey => None,
+    let info = match home.store.head_object(request).await {
+        Ok(info) => info,
+        Err(error) if error.kind() == S3ErrorKind::NoSuchKey => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let written = |info: &ObjectInfo| {
-        let wid = info
-            .metadata
-            .write_identity()?
-            .parse::<WriteIdentity>()
-            .ok()?;
-        (wid.cluster == *home.cluster && wid.bucket == shard.bucket && wid.shard == shard.shard)
-            .then_some(wid.position)
-    };
-    Ok(match (&entry.object, found) {
+    let written = info
+        .metadata
+        .write_identity()
+        .and_then(|wid| wid.parse::<WriteIdentity>().ok())
+        .filter(|wid| {
+            wid.cluster == *home.cluster && wid.bucket == shard.bucket && wid.shard == shard.shard
+        })
+        .map(|wid| wid.position);
+    Ok(Some(AtHome {
+        written,
+        etag: info.etag,
+    }))
+}
+
+/// Whether `home` holds the version of `key` at `version` whose write
+/// identity names `identity`, or, for `None`, a delete; or a later write
+/// of the shard.
+pub(super) async fn holds<S: ObjectStore>(
+    home: &DurableHome<'_, S>,
+    shard: &ShardRef,
+    key: &str,
+    version: EpochSeq,
+    identity: Option<EpochSeq>,
+) -> Result<bool, SnapshotError> {
+    let found = at_home(home, shard, key).await?;
+    Ok(match (identity, found) {
         (None, None) => true,
-        (None, Some(info)) => written(&info).is_some_and(|at| at > entry.version),
+        (None, Some(found)) => found.written.is_some_and(|at| at > version),
         (Some(_), None) => false,
-        (Some(object), Some(info)) => {
-            written(&info).is_some_and(|at| at >= object.write_identity.unwrap_or(entry.version))
-        }
+        (Some(identity), Some(found)) => found.written.is_some_and(|at| at >= identity),
     })
 }
