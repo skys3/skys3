@@ -2,6 +2,23 @@
 
 use std::fmt;
 
+/// Error codes with which stores, and the proxies and gateways in front of
+/// them, ask a client to send less, whatever their status: S3's
+/// `SlowDown`, and the throttling codes of other AWS services and
+/// S3-compatible providers.
+pub const THROTTLE_CODES: [&str; 10] = [
+    "SlowDown",
+    "Throttling",
+    "ThrottlingException",
+    "ThrottledException",
+    "RequestThrottled",
+    "RequestThrottledException",
+    "TooManyRequests",
+    "TooManyRequestsException",
+    "RequestLimitExceeded",
+    "BandwidthLimitExceeded",
+];
+
 /// The kind of an [`S3Error`]: an S3 error code, or a failure to get a
 /// response at all.
 ///
@@ -249,6 +266,19 @@ impl S3Error {
         }
     }
 
+    /// Whether the store asked the caller to send less: any `503`
+    /// ([`S3ErrorKind::SlowDown`], [`S3ErrorKind::ServiceUnavailable`], or
+    /// another code), a `429 Too Many Requests`, or one of the
+    /// [`THROTTLE_CODES`] with another status. Nothing was applied. Flush
+    /// concurrency shrinks on it (design §7.7).
+    pub fn is_throttle(&self) -> bool {
+        matches!(
+            self.kind,
+            S3ErrorKind::SlowDown | S3ErrorKind::ServiceUnavailable
+        ) || matches!(self.status(), Some(429 | 503))
+            || THROTTLE_CODES.contains(&self.code())
+    }
+
     /// `<status> <code>`, or the code alone without a status.
     fn describe(&self) -> String {
         match self.status() {
@@ -337,5 +367,34 @@ mod tests {
         let proxy = S3Error::new(S3ErrorKind::InternalError, "").with_status(504);
         assert_eq!(proxy.to_string(), "504 InternalError: ");
         assert!(proxy.may_have_applied());
+    }
+
+    #[test]
+    fn throttles_are_503s_429s_and_throttling_codes() {
+        let throttles = [
+            S3Error::new(S3ErrorKind::SlowDown, ""),
+            S3Error::new(S3ErrorKind::ServiceUnavailable, ""),
+            S3Error::new(S3ErrorKind::Other, "").with_status(429),
+            S3Error::new(S3ErrorKind::Other, "").with_status(503),
+            S3Error::new(S3ErrorKind::Other, "")
+                .with_status(400)
+                .with_code("RequestLimitExceeded"),
+            S3Error::new(S3ErrorKind::Other, "").with_code("Throttling"),
+        ];
+        for error in throttles {
+            assert!(error.is_throttle(), "{error}");
+        }
+        let others = [
+            S3Error::new(S3ErrorKind::InternalError, ""),
+            S3Error::new(S3ErrorKind::Timeout, ""),
+            S3Error::new(S3ErrorKind::PreconditionFailed, ""),
+            S3Error::new(S3ErrorKind::Other, "").with_status(502),
+            S3Error::new(S3ErrorKind::Other, "")
+                .with_status(403)
+                .with_code("AccessDenied"),
+        ];
+        for error in others {
+            assert!(!error.is_throttle(), "{error}");
+        }
     }
 }

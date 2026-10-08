@@ -1,8 +1,10 @@
 //! What every shard flusher of one remote target shares: the store, the
-//! preconditions it honors, and the settings.
+//! preconditions it honors, the settings, and the window and byte bound of
+//! its requests in flight (§7.7).
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -14,6 +16,7 @@ use skys3_remote::probe::ConditionalWrites;
 use skys3_types::{ClusterId, EpochSeq, WriteIdentity};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+use crate::concurrency::{ConcurrencyBug, ConcurrencyStatus, Membership, Paced, Window, hooks};
 use crate::metrics::Counters;
 
 /// The most abandoned remote uploads a target keeps to abort; beyond it,
@@ -48,14 +51,18 @@ impl ImportProgress for ImportDone {
 /// How a shard flusher paces itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushSettings {
-    /// Keys flushed at once per shard. Fixed at
-    /// `flush_min_concurrency_per_shard` until adaptive concurrency
-    /// (plan M4-10) moves it between that and
-    /// `flush_max_concurrency_per_shard` (§7.7).
-    pub concurrency: usize,
+    /// `flush_min_concurrency_per_shard`: the least requests per shard the
+    /// adaptive window of a target allows in flight (§7.7).
+    pub min_concurrency: u32,
+    /// `flush_max_concurrency_per_shard`: the most requests per shard the
+    /// window allows, and the most keys, and parts of streamed uploads,
+    /// one shard flushes at once. Equal bounds fix the window.
+    pub max_concurrency: u32,
     /// `flush_max_inflight_bytes_per_target`: the bytes all flushers of a
-    /// target hold in memory for requests at once. A larger object takes
-    /// the whole budget.
+    /// target hold in memory for requests at once: a whole object's body
+    /// for a single PUT, and a part's for each part of a multipart or
+    /// streamed upload in flight, from reading it until its answer. A
+    /// larger body takes the whole budget.
     pub max_inflight_bytes: u64,
     /// `import_max_keys_per_second`: the most remote keys a bucket's
     /// namespace import lists a second (§9.1).
@@ -96,8 +103,10 @@ impl FlushSettings {
     #[must_use]
     pub fn from_config(config: &FlushConfig) -> Self {
         Self {
-            concurrency: usize::try_from(config.flush_min_concurrency_per_shard)
-                .unwrap_or(usize::MAX)
+            min_concurrency: config.flush_min_concurrency_per_shard.max(1),
+            max_concurrency: config
+                .flush_max_concurrency_per_shard
+                .max(config.flush_min_concurrency_per_shard)
                 .max(1),
             max_inflight_bytes: config.flush_max_inflight_bytes_per_target,
             import_keys_per_second: config.import_max_keys_per_second,
@@ -119,8 +128,9 @@ impl FlushSettings {
 impl Default for FlushSettings {
     fn default() -> Self {
         Self {
-            concurrency: 4,
-            max_inflight_bytes: 1 << 30,
+            min_concurrency: FlushConfig::default().flush_min_concurrency_per_shard,
+            max_concurrency: FlushConfig::default().flush_max_concurrency_per_shard,
+            max_inflight_bytes: FlushConfig::default().flush_max_inflight_bytes_per_target,
             import_keys_per_second: FlushConfig::default().import_max_keys_per_second,
             import_page_keys: crate::IMPORT_PAGE_KEYS,
             import_streams: 1,
@@ -136,7 +146,10 @@ impl Default for FlushSettings {
 
 /// One remote target as its shard flushers see it.
 pub struct Target<S> {
-    pub(crate) store: Arc<S>,
+    /// The store, each request through the window.
+    pub(crate) store: Paced<S>,
+    /// The requests in flight (§7.7).
+    window: Arc<Window>,
     pub(crate) prefix: String,
     pub(crate) writes: ConditionalWrites,
     pub(crate) cluster: ClusterId,
@@ -149,6 +162,8 @@ pub struct Target<S> {
     /// The in-flight budget, in KiB.
     inflight: Semaphore,
     inflight_kib: u32,
+    /// The bytes reserved from it.
+    inflight_bytes: AtomicU64,
     /// Remote multipart uploads that flushes left open, oldest first.
     orphans: Mutex<Orphans>,
 }
@@ -179,8 +194,13 @@ impl<S> Target<S> {
         let inflight_kib = u32::try_from(settings.max_inflight_bytes.div_ceil(1024))
             .unwrap_or(u32::MAX)
             .clamp(1, u32::try_from(Semaphore::MAX_PERMITS).unwrap_or(u32::MAX));
+        let window = Arc::new(Window::new((
+            settings.min_concurrency,
+            settings.max_concurrency,
+        )));
         Self {
-            store,
+            store: Paced::new(store, Arc::clone(&window)),
+            window,
             prefix: prefix.into(),
             writes,
             cluster,
@@ -191,6 +211,7 @@ impl<S> Target<S> {
             conflict_policy: ConflictPolicy::Hold,
             inflight: Semaphore::new(inflight_kib as usize),
             inflight_kib,
+            inflight_bytes: AtomicU64::new(0),
             orphans: Mutex::default(),
         }
     }
@@ -212,6 +233,7 @@ impl<S> Target<S> {
     /// Sets the counters flushes, retries, and conflicts are counted in.
     #[must_use]
     pub fn with_counters(mut self, counters: Counters) -> Self {
+        self.window.count_throttles(counters.throttles.clone());
         self.counters = counters;
         self
     }
@@ -241,6 +263,21 @@ impl<S> Target<S> {
     /// The counters its flushers count events in.
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// The window of requests in flight to the target, and the bytes held
+    /// for them (§7.7).
+    pub fn concurrency(&self) -> ConcurrencyStatus {
+        ConcurrencyStatus {
+            inflight_bytes: self.inflight_bytes.load(Ordering::Relaxed),
+            ..self.window.status()
+        }
+    }
+
+    /// Counts a shard's flusher among those sending to the target, which
+    /// widens the window's bounds, until the membership is dropped.
+    pub(crate) fn join(&self) -> Membership {
+        self.window.join()
     }
 
     /// How many remote multipart uploads flushes left open, because their
@@ -283,12 +320,35 @@ impl<S> Target<S> {
     }
 
     /// Waits until `size` bytes fit the target's in-flight budget, and
-    /// holds them until the permit is dropped.
-    pub(crate) async fn reserve(&self, size: u64) -> Option<SemaphorePermit<'_>> {
+    /// holds them until the reservation is dropped.
+    pub(crate) async fn reserve(&self, size: u64) -> Reservation<'_> {
         let kib = u32::try_from(size.div_ceil(1024))
             .unwrap_or(u32::MAX)
             .clamp(1, self.inflight_kib);
-        self.inflight.acquire_many(kib).await.ok()
+        let permit = if hooks::bug() == ConcurrencyBug::IgnoresInflightBytes {
+            None
+        } else {
+            self.inflight.acquire_many(kib).await.ok()
+        };
+        self.inflight_bytes.fetch_add(size, Ordering::Relaxed);
+        Reservation {
+            _permit: permit,
+            bytes: size,
+            counted: &self.inflight_bytes,
+        }
+    }
+}
+
+/// Bytes held within a target's in-flight budget, until dropped.
+pub(crate) struct Reservation<'t> {
+    _permit: Option<SemaphorePermit<'t>>,
+    bytes: u64,
+    counted: &'t AtomicU64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.counted.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 

@@ -44,6 +44,9 @@ pub struct Counters {
     /// For each streamed multipart object, the fraction of its bytes the
     /// remote held when the client completed it (§7.3, §16.3).
     pub streaming_overlap: Histogram,
+    /// Requests the target answered with a throttle, such as `503
+    /// SlowDown`, which shrinks the window of requests in flight (§7.7).
+    pub throttles: Counter,
 }
 
 impl Default for Counters {
@@ -57,6 +60,7 @@ impl Default for Counters {
             fills: Counter::default(),
             fill_conflicts: Counter::default(),
             streaming_overlap: overlap_histogram(),
+            throttles: Counter::default(),
         }
     }
 }
@@ -77,6 +81,12 @@ pub struct Gauges {
     pub orphaned_uploads: u64,
     /// This node's share of the bucket's dirty-data budget, in bytes.
     pub dirty_budget: u64,
+    /// The requests the flushers may have in flight to the target (§7.7).
+    pub concurrency: u64,
+    /// The bytes the flushers hold for requests to the target.
+    pub inflight_bytes: u64,
+    /// The base round trip of the target, in seconds; 0 until measured.
+    pub base_round_trip: f64,
 }
 
 /// The flush metrics of a node.
@@ -88,6 +98,10 @@ pub struct FlushMetrics {
     flush_lag: Family<Labels, Gauge<f64, AtomicU64>>,
     conflicted_keys: Family<Labels, Gauge>,
     orphaned_uploads: Family<Labels, Gauge>,
+    concurrency: Family<Labels, Gauge>,
+    inflight_bytes: Family<Labels, Gauge>,
+    base_round_trip: Family<Labels, Gauge<f64, AtomicU64>>,
+    throttles: Family<Labels, Counter>,
     flushes: Family<Labels, Counter>,
     retries: Family<Labels, Counter>,
     conflicts: Family<Labels, Counter>,
@@ -107,6 +121,10 @@ impl Default for FlushMetrics {
             flush_lag: Family::default(),
             conflicted_keys: Family::default(),
             orphaned_uploads: Family::default(),
+            concurrency: Family::default(),
+            inflight_bytes: Family::default(),
+            base_round_trip: Family::default(),
+            throttles: Family::default(),
             flushes: Family::default(),
             retries: Family::default(),
             conflicts: Family::default(),
@@ -161,6 +179,33 @@ impl FlushMetrics {
             "Remote multipart uploads that flushes left open, because an abort failed or a \
              flusher stopped, and that wait to be aborted.",
             metrics.orphaned_uploads.clone(),
+        );
+        registry.register(
+            "flush_concurrency",
+            "Requests the flushers may have in flight to the remote target: the adaptive \
+             window, between flush_min_concurrency_per_shard and \
+             flush_max_concurrency_per_shard times the flushing shards.",
+            metrics.concurrency.clone(),
+        );
+        registry.register_with_unit(
+            "flush_inflight",
+            "Bytes the flushers hold in memory for requests in flight to the remote target, \
+             bounded by flush_max_inflight_bytes_per_target.",
+            Unit::Bytes,
+            metrics.inflight_bytes.clone(),
+        );
+        registry.register_with_unit(
+            "flush_base_round_trip",
+            "The remote target's base round trip, which adaptive flush concurrency compares \
+             latency with: the smallest mean latency of recent rounds.",
+            Unit::Seconds,
+            metrics.base_round_trip.clone(),
+        );
+        registry.register(
+            "flush_throttles",
+            "Flush requests the remote target answered with a throttle (503 SlowDown, 429, or \
+             a throttling code), each of which may shrink the flush concurrency.",
+            metrics.throttles.clone(),
         );
         registry.register(
             "flushes",
@@ -223,6 +268,7 @@ impl FlushMetrics {
             fills: self.fills.get_or_create_owned(&labels),
             fill_conflicts: self.fill_conflicts.get_or_create_owned(&labels),
             streaming_overlap: self.streaming_overlap.get_or_create_owned(&labels),
+            throttles: self.throttles.get_or_create_owned(&labels),
         }
     }
 
@@ -246,6 +292,15 @@ impl FlushMetrics {
         self.orphaned_uploads
             .get_or_create(&labels)
             .set(saturate(gauges.orphaned_uploads));
+        self.concurrency
+            .get_or_create(&labels)
+            .set(saturate(gauges.concurrency));
+        self.inflight_bytes
+            .get_or_create(&labels)
+            .set(saturate(gauges.inflight_bytes));
+        self.base_round_trip
+            .get_or_create(&labels)
+            .set(gauges.base_round_trip);
     }
 
     /// Forgets `bucket`'s series, once it is no longer flushed here.
@@ -257,6 +312,9 @@ impl FlushMetrics {
         self.flush_lag.remove(&labels);
         self.conflicted_keys.remove(&labels);
         self.orphaned_uploads.remove(&labels);
+        self.concurrency.remove(&labels);
+        self.inflight_bytes.remove(&labels);
+        self.base_round_trip.remove(&labels);
     }
 }
 

@@ -68,7 +68,8 @@ fn rest_round_trips() -> u64 {
         // As many requests in flight as a shard flushes to a far target
         // (§7.7): the count of round trips does not depend on it.
         let settings = FlushSettings {
-            concurrency: 64,
+            min_concurrency: 64,
+            max_concurrency: 64,
             ..settings()
         };
         let target = Arc::new(Target::new(
