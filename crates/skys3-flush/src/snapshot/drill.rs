@@ -204,9 +204,10 @@ pub async fn drill<S: ObjectStore, H: HeaderSource>(
             if found.written.is_some_and(|at| at > object.entry.version) {
                 continue;
             }
+            // The write identity names the version; the home's ETag may
+            // differ from the local one, as a multipart flush's does.
             let same = object.entry.object.as_ref().is_some_and(|o| {
                 found.written == Some(o.write_identity.unwrap_or(object.entry.version))
-                    && found.etag == o.local_etag
             });
             if same && object.entry.state == EntryState::Dirty {
                 object.entry.state = EntryState::Clean;
