@@ -66,6 +66,11 @@ pub struct RepairConfig {
     pub ack_delay: Duration,
     /// A bug seeded into every repairer.
     pub bug: Option<RepairBug>,
+    /// How many objects, the first in key order, are retagged through
+    /// `n0`'s gateway once every object is coded and before the losses: a
+    /// retag moves the entry's version past its coded layout's, which the
+    /// fragments' headers keep naming. Only a run with reads has gateways.
+    pub retag: usize,
 }
 
 impl Default for RepairConfig {
@@ -78,6 +83,7 @@ impl Default for RepairConfig {
             bound: Duration::from_secs(15),
             ack_delay: Duration::ZERO,
             bug: None,
+            retag: 0,
         }
     }
 }
@@ -169,6 +175,10 @@ pub struct RepairOutcome {
     pub bytes: u64,
     /// From the losses until every stripe was whole again.
     pub repair_time: Duration,
+    /// Objects retagged before the losses.
+    pub retagged: usize,
+    /// `EC_RELOCATE`s that committed and were applied for those objects.
+    pub retagged_relocated: usize,
 }
 
 /// What the repairers did, as the driver sees it.
@@ -179,6 +189,8 @@ pub(super) struct RepairLog {
     /// Every transfer's start and bytes, by the node and life of its
     /// repairer.
     transfers: std::sync::Mutex<Transfers>,
+    /// The objects retagged before the losses, once every retag is done.
+    retagged: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 /// The start and bytes of each transfer, by the node and life of its
@@ -284,6 +296,30 @@ pub(super) fn start(
     tokio::spawn(repairer.run());
 }
 
+/// Retags the first `count` objects in key order through `n0`'s gateway,
+/// each until it is done, and records them once all are.
+fn start_retags(sim: &mut turmoil::Sim<'_>, world: &Arc<World>, count: usize) {
+    let world = Arc::clone(world);
+    sim.client("retagger", async move {
+        let keys: Vec<String> = lock(&world.expected).keys().take(count).cloned().collect();
+        let mut done = Vec::new();
+        for key in keys {
+            for _ in 0..40 {
+                match super::reads::retag("n0", &key, "before-the-losses").await {
+                    Ok(true) => {
+                        done.push(key.clone());
+                        break;
+                    }
+                    Ok(false) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    Err(error) => return Err(format!("a retag of {key}: {error}").into()),
+                }
+            }
+        }
+        *lock(&world.repair.retagged) = Some(done);
+        Ok(())
+    });
+}
+
 /// The repair phase of the driver.
 #[derive(Debug, Default)]
 pub(super) struct Phase {
@@ -297,21 +333,41 @@ pub(super) struct Phase {
     seen: usize,
     /// The nodes lost, and how.
     lost: Vec<(usize, Loss)>,
+    /// Whether the retags before the losses started.
+    retagging: bool,
 }
 
 impl Driver<'_> {
-    /// Whether the repairs keep the run going: the first time the objects
-    /// settle it loses the holders, and the run goes on until every stripe
-    /// is whole again.
-    pub(super) fn repair_pending(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration) -> bool {
+    /// Whether the repairs keep the run going: once the objects settle it
+    /// retags the objects the run asks for, then loses the holders once
+    /// the retags are done, and the run goes on until every stripe is whole
+    /// again, or the bound passes.
+    pub(super) fn repair_pending(
+        &mut self,
+        sim: &mut turmoil::Sim<'_>,
+        world: &Arc<World>,
+        now: Duration,
+    ) -> bool {
         let Some(config) = self.world.run.repair.clone() else {
             return false;
         };
         if self.repair.lost_at.is_none() {
+            if config.retag > 0 && self.world.reads.is_some() {
+                if !self.repair.retagging {
+                    self.repair.retagging = true;
+                    start_retags(sim, world, config.retag);
+                }
+                if lock(&self.world.repair.retagged).is_none() {
+                    return true;
+                }
+            }
             self.lose_holders(sim, now, &config);
             return true;
         }
-        self.repair.whole_at.is_none()
+        // Repairs that do not end within the bound end the run, which the
+        // outcome then reports.
+        let lost_at = self.repair.lost_at.unwrap_or_default();
+        self.repair.whole_at.is_none() && now <= lost_at + config.bound
     }
 
     /// Notes when every stripe is whole again after the losses.
@@ -505,7 +561,7 @@ impl Driver<'_> {
                 };
                 for stripe in &coded.stripes {
                     for (index, location) in stripe.fragments().iter().enumerate() {
-                        let named = (key.as_str(), stripe.number(), index);
+                        let named = (key.as_str(), coded.version, stripe.number(), index);
                         let current = self.world.generation_of(&location.node);
                         let on_disk =
                             self.world.named_generation(&written, location, named) == Some(current);
@@ -565,7 +621,7 @@ impl Driver<'_> {
                         };
                         // A fragment on a disk its node lost since is the
                         // repairs' to rebuild.
-                        let named = (key.as_str(), stripe.number(), index);
+                        let named = (key.as_str(), coded.version, stripe.number(), index);
                         let current = self.world.generation[n].load(Ordering::SeqCst);
                         let generation = self.world.named_generation(&written, location, named);
                         let other = (location.node.clone(), 0, location.fragment);
@@ -612,7 +668,7 @@ impl Driver<'_> {
             return Ok(None);
         };
         let (Some(lost_at), Some(whole_at)) = (self.repair.lost_at, self.repair.whole_at) else {
-            return Err("the repairs did not end".to_owned());
+            return Err(format!("the repairs did not end within {:?}", config.bound));
         };
         let repair_time = whole_at - lost_at;
         if repair_time > config.bound {
@@ -621,6 +677,9 @@ impl Driver<'_> {
                 config.bound
             ));
         }
+        let retagged = lock(&self.world.repair.retagged)
+            .clone()
+            .unwrap_or_default();
         let events = lock(&self.world.repair.events);
         let mut outcome = RepairOutcome {
             lost: self
@@ -630,6 +689,7 @@ impl Driver<'_> {
                 .map(|(node, loss)| (self.world.nodes[*node].id.to_string(), *loss))
                 .collect(),
             repair_time,
+            retagged: retagged.len(),
             ..RepairOutcome::default()
         };
         // Within a pass, stripes that lost more fragments start first.
@@ -653,7 +713,12 @@ impl Driver<'_> {
                 }
                 RepairStep::Committed {
                     relocated: true, ..
-                } => outcome.relocated += 1,
+                } => {
+                    outcome.relocated += 1;
+                    if retagged.contains(&event.key) {
+                        outcome.retagged_relocated += 1;
+                    }
+                }
                 _ => {}
             }
         }

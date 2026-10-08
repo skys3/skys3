@@ -76,13 +76,22 @@ fn repairs(report: &CodingReport) -> Result<&RepairOutcome, String> {
     Ok(repair)
 }
 
+/// Three of the four objects are retagged before the loss, which moves
+/// their entries' versions past their coded layouts': checks, reads, and
+/// rebuilt fragments must name the version the fragments were written for.
 #[test]
 fn a_lost_holder_is_repaired_while_reads_go_on() {
     Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         let loss = drawn_loss(context);
-        let report = coding::run(context, &losing(vec![loss], true, EcConfig::default()))
-            .map_err(|error| format!("{loss:?}: {error}"))?;
-        repairs(&report)?;
+        let mut config = losing(vec![loss], true, EcConfig::default());
+        if let Some(repair) = &mut config.repair {
+            repair.retag = 3;
+        }
+        let report = coding::run(context, &config).map_err(|error| format!("{loss:?}: {error}"))?;
+        let repair = repairs(&report)?;
+        if repair.retagged != 3 || repair.retagged_relocated == 0 {
+            return Err(format!("no retagged object was repaired: {repair:?}").into());
+        }
         let reads = report.reads.as_ref().ok_or("no reads")?;
         if reads.served == 0 {
             return Err(format!("no read was served: {reads:?}").into());

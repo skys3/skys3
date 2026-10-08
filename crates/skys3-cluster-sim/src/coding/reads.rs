@@ -619,7 +619,7 @@ async fn copy(host: &str, key: &str, target: &str) -> Result<bool, String> {
 
 /// Sets `key`'s tags to one, `reader` = `value`, through `host`'s gateway:
 /// whether it was set, or what was wrong with the answer.
-async fn retag(host: &str, key: &str, value: &str) -> Result<bool, String> {
+pub(super) async fn retag(host: &str, key: &str, value: &str) -> Result<bool, String> {
     let body = format!(
         "<Tagging><TagSet><Tag><Key>reader</Key><Value>{value}</Value></Tag></TagSet></Tagging>"
     );

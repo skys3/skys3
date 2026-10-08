@@ -96,8 +96,8 @@ use skys3_shard::{
 };
 use skys3_sim::SimContext;
 use skys3_types::{
-    AttemptId, BucketId, ClusterId, ETag, Epoch, FragmentId, FragmentLocation, Label, NodeAddress,
-    NodeId, ProposalId, ShardConfig, ShardId,
+    AttemptId, BucketId, ClusterId, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation, Label,
+    NodeAddress, NodeId, ProposalId, ShardConfig, ShardId,
 };
 
 use crate::node::{BoxError, TRANSPORT_PORT};
@@ -390,19 +390,30 @@ struct World {
 type OnDisk = (NodeId, u64, FragmentId);
 
 /// A fragment whose write was acknowledged: the attempt that wrote it, and
-/// what it is.
+/// what its header says it is.
 #[derive(Debug, Clone)]
 struct Written {
     attempt: AttemptId,
     key: String,
+    version: EpochSeq,
     stripe: u32,
     index: u8,
 }
 
+/// What a layout names a fragment as: its key, the version its header must
+/// name (the layout's, which a retag leaves behind the entry's), and its
+/// stripe and index.
+type Named<'a> = (&'a str, EpochSeq, u32, usize);
+
 impl Written {
-    /// The key, stripe, and index of the fragment.
-    fn identity(&self) -> (&str, u32, usize) {
-        (self.key.as_str(), self.stripe, usize::from(self.index))
+    /// The key, version, stripe, and index of the fragment.
+    fn identity(&self) -> Named<'_> {
+        (
+            self.key.as_str(),
+            self.version,
+            self.stripe,
+            usize::from(self.index),
+        )
     }
 }
 
@@ -427,13 +438,13 @@ impl World {
     }
 
     /// The disk generation of the fragment `location` names as fragment
-    /// `named` (key, stripe, index): the latest whose write under that ID
+    /// `named` (key, version, stripe, index): the latest whose write under that ID
     /// was of that fragment, if any was.
     fn named_generation(
         &self,
         written: &HashMap<OnDisk, Written>,
         location: &FragmentLocation,
-        named: (&str, u32, usize),
+        named: Named<'_>,
     ) -> Option<u64> {
         (0..=self.generation_of(&location.node)).rev().find(|&g| {
             written
@@ -502,7 +513,7 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
             driver.repair_progress(now);
             match driver.settled() {
                 Ok(()) => {
-                    let repairing = driver.repair_pending(&mut sim, now);
+                    let repairing = driver.repair_pending(&mut sim, &world, now);
                     let reading = driver.reads_pending(&mut sim, &world, now);
                     if !repairing && !reading {
                         driver.report.settled_at = now;
@@ -1014,6 +1025,7 @@ impl FragmentWriter for Writer {
             let written = Written {
                 attempt: header.attempt,
                 key: header.key.clone(),
+                version: header.version,
                 stripe: header.stripe.number,
                 index: header.index,
             };
@@ -1641,7 +1653,7 @@ fn no_reclaimed_fragment(
         };
         for stripe in &coded.stripes {
             for (index, location) in stripe.fragments().iter().enumerate() {
-                let named = (key.as_str(), stripe.number(), index);
+                let named = (key.as_str(), coded.version, stripe.number(), index);
                 let generation = world
                     .named_generation(written, location, named)
                     .unwrap_or_else(|| world.generation_of(&location.node));
