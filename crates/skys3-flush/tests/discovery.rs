@@ -5,7 +5,9 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,8 +17,8 @@ use rcgen::{
 };
 use skys3_config::{BucketsConfig, Config};
 use skys3_flush::{
-    FlushMetrics, FlushService, LinkError, PeerBug, PeerLink, PeerTransport, Transport,
-    TransportStatus, test_hooks,
+    BoxFuture, FlushMetrics, FlushService, LinkError, PeerBug, PeerConnect, PeerLink, PeerStream,
+    PeerTransport, Transport, TransportStatus, test_hooks,
 };
 use skys3_io::{ManualWallClock, SimMount};
 use skys3_net::{CertificateDer, Credentials, PrivateKeyDer};
@@ -81,11 +83,17 @@ fn pki(cluster: &str) -> Pki {
 
 /// The destination's descriptor of its bucket, signed by `pki`.
 fn descriptor(pki: &Pki, cluster: &str, issued: Duration) -> Bytes {
+    descriptor_at(pki, cluster, issued, "dest.example.internal:7443")
+}
+
+/// The destination's descriptor of its bucket at `address`, signed by
+/// `pki`.
+fn descriptor_at(pki: &Pki, cluster: &str, issued: Duration, address: &str) -> Bytes {
     let descriptor = PeerDescriptor::new(
         ClusterId::new(cluster).unwrap(),
         BucketName::new(BUCKET).unwrap(),
         support::cluster(),
-        vec!["dest.example.internal:7443".to_owned()],
+        vec![address.to_owned()],
         issued,
     );
     pki.signer.sign(&descriptor).unwrap()
@@ -134,9 +142,28 @@ struct World {
 /// A node whose service flushes `photos` to the destination, with
 /// `target_transport` as given, trusting the destination's CA.
 async fn world(transport: &str) -> World {
+    let destination = Destination::start(true).await;
+    let to = Arc::clone(&destination);
+    let connect: PeerConnect = Box::new(move |_descriptor: &PeerDescriptor| {
+        let to = Arc::clone(&to);
+        Box::pin(async move {
+            if to.faults().down {
+                return Err(LinkError::new("UDP is blocked"));
+            }
+            Ok(Arc::new(Link(to)) as Arc<dyn PeerLink>)
+        })
+    });
+    world_connecting(transport, destination, connect).await
+}
+
+/// A node as [`world`] gives, whose handshakes `connect` makes.
+async fn world_connecting(
+    transport: &str,
+    destination: Arc<Destination>,
+    connect: PeerConnect,
+) -> World {
     let node = Node::open(7).await;
     let store = SimS3::new(7, SimS3Config::default());
-    let destination = Destination::start(true).await;
     let pki = pki(DESTINATION);
     let mut trust = PeerTrust::new();
     trust
@@ -146,24 +173,11 @@ async fn world(transport: &str) -> World {
             [],
         )
         .unwrap();
-    let to = Arc::clone(&destination);
-    let peers = PeerTransport::new(
-        Box::new(move |_descriptor: &PeerDescriptor| {
-            let to = Arc::clone(&to);
-            Box::pin(async move {
-                if to.faults().down {
-                    return Err(LinkError::new("UDP is blocked"));
-                }
-                Ok(Arc::new(Link(to)) as Arc<dyn PeerLink>)
-            })
-        }),
-        DescriptorVerifier::new(Arc::new(trust)),
-        1024,
-    )
-    .with_timeout(Duration::from_secs(1))
-    .with_connect_timeout(Duration::from_millis(500))
-    .with_reprobe(Duration::from_millis(500), Duration::from_secs(2))
-    .with_quarantine(QUARANTINE);
+    let peers = PeerTransport::new(connect, DescriptorVerifier::new(Arc::new(trust)), 1024)
+        .with_timeout(Duration::from_secs(1))
+        .with_connect_timeout(Duration::from_millis(500))
+        .with_reprobe(Duration::from_millis(500), Duration::from_secs(2))
+        .with_quarantine(QUARANTINE);
     let metrics = FlushMetrics::register(&MetricsRegistry::new());
     let service = FlushService::new(
         cluster(),
@@ -396,5 +410,108 @@ fn a_native_target_waits_for_quic() {
         world.destination.faults().down = false;
         world.until_at_destination("a").await;
         assert!(!world.at_store("a"));
+    });
+}
+
+/// The destination's addresses that are gone, and what each link learned
+/// of the shard flushers that use it.
+#[derive(Default)]
+struct Addresses {
+    gone: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    shards: Mutex<Vec<(String, usize)>>,
+}
+
+impl Addresses {
+    fn gone(&self, address: &str) -> Arc<AtomicBool> {
+        let mut gone = self.gone.lock().unwrap();
+        Arc::clone(gone.entry(address.to_owned()).or_default())
+    }
+
+    fn counted(&self, address: &str, shards: usize) -> bool {
+        let entry = (address.to_owned(), shards);
+        self.shards.lock().unwrap().contains(&entry)
+    }
+}
+
+/// A link to the destination at one address, which fails for good once
+/// the address is gone.
+struct AtAddress {
+    link: Link,
+    address: String,
+    gone: Arc<AtomicBool>,
+    addresses: Arc<Addresses>,
+}
+
+impl PeerLink for AtAddress {
+    fn open(&self) -> BoxFuture<'_, Result<PeerStream, LinkError>> {
+        if self.gone.load(Ordering::Relaxed) {
+            return Box::pin(async { Err(LinkError::new("the connection is closed")) });
+        }
+        self.link.open()
+    }
+
+    fn set_shards(&self, shards: usize) {
+        let entry = (self.address.clone(), shards);
+        self.addresses.shards.lock().unwrap().push(entry);
+    }
+}
+
+#[test]
+fn a_link_that_fails_moves_to_the_address_a_new_handshake_found() {
+    runtime().block_on(async {
+        let destination = Destination::start(true).await;
+        let addresses = Arc::new(Addresses::default());
+        let connect: PeerConnect = Box::new({
+            let (to, addresses) = (Arc::clone(&destination), Arc::clone(&addresses));
+            move |descriptor: &PeerDescriptor| {
+                let address = descriptor.addresses[0].clone();
+                let link = AtAddress {
+                    link: Link(Arc::clone(&to)),
+                    gone: addresses.gone(&address),
+                    address,
+                    addresses: Arc::clone(&addresses),
+                };
+                Box::pin(async move {
+                    if link.gone.load(Ordering::Relaxed) {
+                        return Err(LinkError::new("no route to the address"));
+                    }
+                    Ok(Arc::new(link) as Arc<dyn PeerLink>)
+                })
+            }
+        });
+        let world = world_connecting("auto", destination, connect).await;
+        let old = "old.dest.example.internal:7443";
+        let new = "new.dest.example.internal:7443";
+        world
+            .serve_descriptor(descriptor_at(&world.pki, DESTINATION, NOW, old))
+            .await;
+        world.node.put("a", "at the old address").await;
+        world.until_at_destination("a").await;
+        // The bucket's one shard flusher counts against the link's pool.
+        assert!(addresses.counted(old, 1));
+
+        // The destination moves: the descriptor names the new address,
+        // and the old connection dies.
+        world
+            .serve_descriptor(descriptor_at(&world.pki, DESTINATION, NOW, new))
+            .await;
+        addresses.gone(old).store(true, Ordering::Relaxed);
+        world.node.put("b", "at the new address").await;
+        world.until_at_destination("b").await;
+        assert!(!world.at_store("b"));
+        let transport = world
+            .service
+            .status(&bucket().bucket_id)
+            .unwrap()
+            .transport
+            .unwrap();
+        // Still QUIC, on a new link: no switch, and no quarantine.
+        assert_eq!(
+            (transport.in_use, transport.switches),
+            (Some(Transport::Quic), 0),
+            "{transport:?}"
+        );
+        assert!(transport.reason.contains(new), "{transport:?}");
+        assert!(addresses.counted(new, 1));
     });
 }

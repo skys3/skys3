@@ -5431,6 +5431,22 @@ of this file. A task with nothing unexpected keeps "None."
   waits 2 × the answer timeout + the QUIC idle timeout (90 s) from its
   own start. That covers fallbacks, restarts, and takeovers alike. The
   exactly-once argument is in §7.8.
+- **A new link is a new choice (found in review).** A choice was the
+  same as the last when its kind was, so the link of a handshake that
+  followed a broken one was dropped. The target stayed on QUIC with the
+  dead link, its flushes failing, until a handshake failed and it fell
+  back. Now each new link is a new generation, and the shard flushers
+  restart on it without a quarantine, since every `COMMIT` stays on QUIC
+  as after any native restart. Only a change between QUIC and S3 REST
+  counts as a switch.
+- **The pool counts the shard flushers (found in review).** The node's
+  handshake attached one lease of the pool for a target, which all its
+  shard flushers shared, so a bucket got one shard's connection budget
+  however many shards this node flushed. `PeerLink::set_shards` now
+  tells the link how many shard flushers use it, after each reconcile,
+  and a `ShardLease` can stand for that many shards
+  (`ShardLease::set_shards`), at least one. A link per shard flusher
+  would not fit: the batcher and the uploads share the target's link.
 - **The node binary peers.** `NodePeering` binds the QUIC endpoint when
   peers are configured. It serves `StagingService` with `PeerCommits`
   over the node's shards, adapts the pool every second, and signs the

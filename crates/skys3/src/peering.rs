@@ -196,7 +196,10 @@ impl NodePeering {
 
 /// Connects to the first of `addresses` of `cluster` that completes a
 /// fresh handshake, `HELLO`s included, and returns a link through `pool`
-/// to it. The probe connection is closed: flushes use the pool's.
+/// to it. The probe connection is closed: flushes use the pool's. The link
+/// is one lease of the pool, which the flush service tells how many of the
+/// target's shard flushers use it, so the destination's ceiling is
+/// `peer_connections_per_shard` for each.
 async fn handshake(
     endpoint: &PeerEndpoint,
     pool: &ConnectionPool,
