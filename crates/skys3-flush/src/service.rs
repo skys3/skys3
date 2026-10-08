@@ -17,7 +17,9 @@ use skys3_remote::probe::{
     PreconditionSupport,
 };
 use skys3_shard::{Shard, ShardSet};
-use skys3_types::{BucketDocument, BucketId, BucketMode, ClusterId, RemoteTarget, ShardId};
+use skys3_types::{
+    BucketDocument, BucketId, BucketMode, BucketName, ClusterId, RemoteTarget, ShardId,
+};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -28,7 +30,8 @@ use crate::fill::Filler;
 use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::origin::{self, Origin, OriginConnect};
-use crate::peer::{Native, PeerTransport};
+use crate::peer::discovery::{Choice, Discovery, Probe};
+use crate::peer::{Native, PeerBug, PeerTransport, TransportStatus, hooks as peer_hooks};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{CopySources, FlushSettings, Target};
 
@@ -85,6 +88,11 @@ pub struct BucketStatus {
     /// Whether the target is a SkyS3 peer flushed to over the native
     /// protocol (§7.8), rather than over S3 REST.
     pub native: bool,
+    /// What the discovery of a target that may be a SkyS3 peer found: the
+    /// transport in use and why (§7.8). `None` for a target flushed over
+    /// S3 REST only, by its `target_transport` or because the node reaches
+    /// no peers.
+    pub transport: Option<TransportStatus>,
 }
 
 impl BucketStatus {
@@ -159,14 +167,32 @@ impl BucketStatus {
 /// `write_back` bucket whose own table names `discard_local` discards by
 /// itself, and a backup target never discards: it holds instead.
 ///
-/// **SkyS3 peers** (§7.8). A bucket whose `target_transport` is `native`
-/// is flushed over the native peer protocol, if the service can reach the
-/// peer ([`FlushService::with_peer_transport`]); otherwise over S3 REST,
-/// with a warning. Its target is ready at once, without a probe: the
-/// destination evaluates every precondition itself. Its conflicts are
-/// held rather than discarded, since adopting the peer's write would read
-/// it over S3. A `write_back` bucket still imports its namespace from, and
-/// fills from, the target's S3 endpoint.
+/// **SkyS3 peers** (§7.8). On a service that reaches peers
+/// ([`FlushService::with_peer_transport`]), the target of a bucket whose
+/// `target_transport` is `auto` (the default) or `native` has a discovery
+/// that chooses its transport (`peer::discovery`): QUIC to a SkyS3 peer
+/// whose descriptor verifies and whose handshake succeeds, S3 REST to that
+/// peer while its QUIC path fails (`auto` only), or S3 REST to a store
+/// that is not a peer. Without peer transport, `auto` means S3 REST and a
+/// `native` target is never flushed.
+///
+/// - **Over QUIC** a target is ready at once, without a probe: the
+///   destination evaluates every precondition itself. Its conflicts are
+///   held rather than discarded, since adopting the peer's write would
+///   read it over S3.
+/// - **Over S3 REST to a peer** the target needs no probe either, since a
+///   SkyS3 gateway honors every precondition, but it is ready only after
+///   the transport's quarantine ([`PeerTransport::quarantine`]), so that no
+///   `COMMIT` an earlier flusher sent over QUIC can still apply once a key
+///   is flushed over S3.
+/// - **A change of transport** builds the target anew and restarts the
+///   bucket's shard flushers on it, as a restart or a takeover does: keys
+///   in flight stay dirty, and the new flushers send them again with the
+///   same write identities and preconditions, which the destination
+///   evaluates whichever transport carried an earlier copy.
+///
+/// A `write_back` bucket imports its namespace from, and fills from, the
+/// target's S3 endpoint, whatever its transport.
 pub struct FlushService<S, D> {
     cluster: ClusterId,
     settings: FlushSettings,
@@ -184,8 +210,8 @@ pub struct FlushService<S, D> {
     /// The nonce of each capability probe's next run, if they are given
     /// rather than fresh ([`FlushService::with_probe_nonces`]).
     probe_nonces: Option<Arc<AtomicU64>>,
-    /// How `native` targets reach their SkyS3 peers, if they can.
-    peers: Option<PeerTransport>,
+    /// How `auto` and `native` targets reach SkyS3 peers, if they can.
+    peers: Option<Arc<PeerTransport>>,
     buckets: Mutex<BTreeMap<BucketId, BucketFlusher<S>>>,
     /// The copy sources of each remote bucket the buckets flush to.
     copy_sources: Mutex<BTreeMap<Location, CopySources>>,
@@ -207,10 +233,15 @@ impl<S, D> fmt::Debug for FlushService<S, D> {
 /// The flushers of one bucket.
 struct BucketFlusher<S> {
     name: String,
+    /// The policy the bucket's settings name, before the target's
+    /// transport restricts it.
+    configured_policy: ConflictPolicy,
+    /// Whether the target is a backup target.
+    backup: bool,
     /// The conflict policy its flushers apply.
     conflict_policy: ConflictPolicy,
     /// Whether an operator may resolve its conflicts with `discard_local`:
-    /// it is not a backup target or a SkyS3 peer.
+    /// it is not a backup target or a SkyS3 peer over QUIC.
     may_discard: bool,
     /// Whether its target is a SkyS3 peer over the native protocol.
     native: bool,
@@ -222,6 +253,11 @@ struct BucketFlusher<S> {
     /// What only the target of a `write_back` bucket, its system of
     /// record, has; `None` for a backup target.
     record: Option<SystemOfRecord<S>>,
+    /// What the target is built from.
+    parts: TargetParts<S>,
+    /// The transport selection of a target that may be a SkyS3 peer, and
+    /// the generation of the choice the target was built for.
+    discovery: Option<(Discovery, u64)>,
 }
 
 /// What only a `write_back` bucket's target has: the bucket's namespace
@@ -312,12 +348,14 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         self
     }
 
-    /// Flushes the buckets whose `target_transport` is `native` to their
-    /// SkyS3 peers over the native protocol, reached through `peers`
-    /// (§7.8). Without it, every target is flushed over S3 REST.
+    /// Looks for SkyS3 peers behind the targets of buckets whose
+    /// `target_transport` is `auto` or `native`, and flushes to them over
+    /// the native protocol, reached through `peers`, when it can (§7.8).
+    /// Without it, every target is flushed over S3 REST, and `native` ones
+    /// not at all.
     #[must_use]
     pub fn with_peer_transport(mut self, peers: PeerTransport) -> Self {
-        self.peers = Some(peers);
+        self.peers = Some(Arc::new(peers));
         self
     }
 
@@ -423,14 +461,15 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let flusher = flushers
                 .entry(bucket.bucket_id.clone())
                 .or_insert_with(|| self.start(bucket, &target, role, set));
+            self.follow_transport(flusher);
             let charged = role == Role::WriteBack;
             self.follow(&bucket.bucket_id, flusher, shards, charged);
         }
     }
 
-    /// Starts a bucket's flushers with its target's probe, which makes the
-    /// target ready once it succeeds, and, for a `write_back` bucket, its
-    /// namespace import.
+    /// Starts a bucket's flushers, on the target its discovery chooses or
+    /// with its target's probe, which makes the target ready once it
+    /// succeeds, and, for a `write_back` bucket, its namespace import.
     fn start(
         &self,
         bucket: &BucketDocument,
@@ -440,24 +479,15 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     ) -> BucketFlusher<S> {
         let name = bucket.name.as_str().to_owned();
         let import = (role == Role::WriteBack).then(|| Arc::new(ImportState::default()));
-        let configured = self
+        let settings = self
             .bucket_settings
             .as_ref()
-            .map_or(ConflictPolicy::Hold, |buckets| {
-                buckets.get(&bucket.name).flush_conflict_policy
-            });
+            .map(|buckets| buckets.get(&bucket.name));
+        let configured_policy = settings.map_or(ConflictPolicy::Hold, |settings| {
+            settings.flush_conflict_policy
+        });
+        let transport = settings.map_or(TargetTransport::Auto, |s| s.target_transport);
         let backup = role == Role::Backup;
-        let native = self.native_of(bucket, target);
-        // Adopting the peer's write would read it over S3 (§7.8).
-        let holds = backup || native.is_some();
-        let conflict_policy = effective_policy(configured, holds);
-        if holds && configured == ConflictPolicy::DiscardLocal {
-            tracing::warn!(
-                bucket = name,
-                "a backup target or a SkyS3 peer never discards local writes; \
-                its conflicts are held"
-            );
-        }
         let parts = TargetParts {
             store: Arc::new((self.connect)(target)),
             prefix: target.prefix.clone().unwrap_or_default(),
@@ -466,60 +496,177 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             wall: Arc::clone(&self.wall),
             counters: self.metrics.counters(&name),
             import: import.clone(),
-            conflict_policy,
+            conflict_policy: configured_policy,
             copy_sources: self.copy_sources_of(target),
-            native,
+            bucket: target.bucket.parse().ok(),
         };
         let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
-        let native = parts.native.is_some();
-        let (target, probe, probe_task) = if native {
+        let discovery = self.discovery(&name, target, transport, &parts);
+        let plain = discovery.is_none();
+        let mut flusher = BucketFlusher {
+            name,
+            configured_policy,
+            backup,
+            conflict_policy: configured_policy,
+            may_discard: may_discard(backup),
+            native: false,
+            probe: Arc::new(Mutex::new(ProbeStatus::Running { error: None })),
+            probe_task: tokio::spawn(async {}),
+            target: Ready::new(None),
+            shards: BTreeMap::new(),
+            record,
+            parts,
+            discovery: discovery.map(|discovery| (discovery, u64::MAX)),
+        };
+        if plain {
+            self.install(&mut flusher, Choice::PlainS3);
+        } else {
+            self.follow_transport(&mut flusher);
+        }
+        flusher
+    }
+
+    /// The discovery of a target that may be a SkyS3 peer (§7.8): one whose
+    /// `target_transport` is `auto` on a service that reaches peers, or
+    /// `native`.
+    fn discovery(
+        &self,
+        name: &str,
+        target: &RemoteTarget,
+        configured: TargetTransport,
+        parts: &TargetParts<S>,
+    ) -> Option<Discovery> {
+        let stuck = |reason: &str| {
+            tracing::warn!(bucket = name, reason, "a native target is not flushed");
+            Some(Discovery::stuck(configured, reason))
+        };
+        match (configured, &self.peers) {
+            (TargetTransport::S3, _) | (TargetTransport::Auto, None) => None,
+            (TargetTransport::Native, None) => stuck("this node has no peer transport"),
+            (_, Some(peers)) => match target.bucket.parse::<BucketName>() {
+                Ok(bucket) => Some(Discovery::spawn(Probe {
+                    store: Arc::clone(&parts.store),
+                    bucket,
+                    configured,
+                    peers: Arc::clone(peers),
+                    cluster: self.cluster.clone(),
+                    wall: Arc::clone(&self.wall),
+                })),
+                // A SkyS3 bucket name it is not, so no peer holds it.
+                Err(_) if configured == TargetTransport::Auto => None,
+                Err(error) => stuck(&format!(
+                    "the target's bucket is not a bucket name: {error}"
+                )),
+            },
+        }
+    }
+
+    /// Builds the bucket's target anew for its discovery's current choice,
+    /// if that changed since the target was built. A target without
+    /// discovery is built once, as it starts, and probed.
+    fn follow_transport(&self, flusher: &mut BucketFlusher<S>) {
+        let Some((discovery, built)) = &mut flusher.discovery else {
+            return;
+        };
+        let (generation, choice) = discovery.current();
+        if generation != *built {
+            *built = generation;
+            self.install(flusher, choice);
+        }
+    }
+
+    /// Builds the bucket's target for `choice`, and restarts the bucket's
+    /// shard flushers on it.
+    fn install(&self, flusher: &mut BucketFlusher<S>, choice: Choice) {
+        flusher.probe_task.abort();
+        // The flushers of the old target stop, as on a restart; their keys
+        // stay dirty, and the new flushers send them again.
+        flusher.shards.clear();
+        let native = matches!(choice, Choice::Native(_));
+        // Adopting the peer's write would read it over S3 (§7.8).
+        let holds = flusher.backup || native;
+        flusher.conflict_policy = effective_policy(flusher.configured_policy, holds);
+        flusher.may_discard = may_discard(holds);
+        flusher.native = native;
+        if holds && flusher.configured_policy == ConflictPolicy::DiscardLocal {
+            tracing::warn!(
+                bucket = flusher.name,
+                "a backup target or a SkyS3 peer never discards local writes; \
+                its conflicts are held"
+            );
+        }
+        let mut parts = flusher.parts.clone();
+        parts.conflict_policy = flusher.conflict_policy;
+        let (target, probe, probe_task) = match choice {
+            // Nothing is flushed until the discovery chooses.
+            Choice::Waiting => (
+                Ready::new(None),
+                ProbeStatus::Running { error: None },
+                tokio::spawn(async {}),
+            ),
             // The peer evaluates every precondition itself: nothing to
             // probe, and the target is ready before its flushers start.
             // Nothing to sweep either: a native target opens no remote
             // multipart upload, so none is ever left open (§7.8).
-            let target = Ready::new(Some(Arc::new(parts.build(native_writes()))));
-            let done = ProbeStatus::Done {
-                unprotected: Vec::new(),
-                server_side_copy: false,
-            };
-            (target, Arc::new(Mutex::new(done)), tokio::spawn(async {}))
-        } else {
-            let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
-            let target = Ready::new(None);
-            let ready = Arc::clone(&target);
-            let nonces = self.probe_nonces.clone();
-            let probe_task = tokio::spawn(run_probe(parts, nonces, Arc::clone(&probe), ready));
-            (target, probe, probe_task)
+            Choice::Native(link) => {
+                let native = self.native(&flusher.parts, link, flusher.discovery.as_ref());
+                let target = Ready::new(Some(Arc::new(parts.build(native_writes(), native))));
+                (target, done(), tokio::spawn(async {}))
+            }
+            Choice::PeerS3 => {
+                let ready = Ready::new(None);
+                let quarantine = self.quarantine();
+                let target = Arc::new(parts.build(native_writes(), None));
+                let task = tokio::spawn(after_quarantine(target, Arc::clone(&ready), quarantine));
+                (ready, done(), task)
+            }
+            Choice::PlainS3 => {
+                let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
+                let ready = Ready::new(None);
+                let nonces = self.probe_nonces.clone();
+                let task = tokio::spawn(run_probe(
+                    parts,
+                    nonces,
+                    Arc::clone(&probe),
+                    Arc::clone(&ready),
+                ));
+                flusher.probe = probe;
+                flusher.target = ready;
+                flusher.probe_task = task;
+                return;
+            }
         };
-        BucketFlusher {
-            name,
-            conflict_policy,
-            may_discard: may_discard(holds),
-            native,
-            probe,
-            probe_task,
-            target,
-            shards: BTreeMap::new(),
-            record,
-        }
+        flusher.probe = Arc::new(Mutex::new(probe));
+        flusher.target = target;
+        flusher.probe_task = probe_task;
     }
 
-    /// The native transport of `bucket`'s `target`, if the bucket's
-    /// `target_transport` is `native` and the service can reach the peer.
-    fn native_of(&self, bucket: &BucketDocument, target: &RemoteTarget) -> Option<Native> {
-        let settings = self.bucket_settings.as_ref()?.get(&bucket.name);
-        if settings.target_transport != TargetTransport::Native {
-            return None;
+    /// The native transport over `link` of a target built from `parts`,
+    /// which tells its `discovery` of failed links.
+    fn native(
+        &self,
+        parts: &TargetParts<S>,
+        link: Arc<dyn crate::peer::PeerLink>,
+        discovery: Option<&(Discovery, u64)>,
+    ) -> Option<Native> {
+        let peers = self.peers.as_ref()?;
+        let bucket = parts.bucket.clone()?;
+        let native = Native::new(link, bucket, peers.frame_bytes, peers.timeout);
+        Some(match discovery {
+            Some((discovery, _)) => native.with_alarm(discovery.alarm()),
+            None => native,
+        })
+    }
+
+    /// How long a peer target's S3 REST flushes wait after their flushers
+    /// start ([`PeerTransport::quarantine`]).
+    fn quarantine(&self) -> Duration {
+        if peer_hooks::peer_bug() == PeerBug::NoQuarantine {
+            return Duration::ZERO;
         }
-        let native = self.peers.as_ref().and_then(|peers| peers.native(target));
-        if native.is_none() {
-            tracing::warn!(
-                bucket = %bucket.name,
-                "the bucket's target_transport is native, but this node cannot reach the \
-                peer; it is flushed over S3 REST"
-            );
-        }
-        native
+        self.peers
+            .as_ref()
+            .map_or(Duration::ZERO, |peers| peers.quarantine())
     }
 
     /// Starts the namespace import of `bucket`, a `write_back` bucket whose
@@ -692,6 +839,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .map_or(u64::MAX, |usage| usage.share),
             import: flusher.record.as_ref().map(|record| record.import.status()),
             native: flusher.native,
+            transport: flusher
+                .discovery
+                .as_ref()
+                .map(|(discovery, _)| discovery.status()),
         })
     }
 
@@ -763,6 +914,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         for id in ids {
             if let Some(status) = self.status(&id) {
                 self.metrics.set(&status.name, status.gauges(now));
+                self.metrics
+                    .set_transport(&status.name, status.transport.as_ref());
             }
         }
     }
@@ -809,7 +962,8 @@ fn location(target: &RemoteTarget) -> Location {
     (target.endpoint.clone(), target.bucket.clone())
 }
 
-/// What a bucket's [`Target`] is built from once its probe is done.
+/// What a bucket's [`Target`] is built from once its probe is done, or
+/// its discovery chose a transport.
 struct TargetParts<S> {
     store: Arc<S>,
     prefix: String,
@@ -822,23 +976,63 @@ struct TargetParts<S> {
     import: Option<Arc<ImportState>>,
     conflict_policy: ConflictPolicy,
     copy_sources: CopySources,
-    /// The native transport of a SkyS3 peer, if the target is one.
-    native: Option<Native>,
+    /// The destination bucket, if the target's bucket is a bucket name.
+    bucket: Option<BucketName>,
+}
+
+impl<S> Clone for TargetParts<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            prefix: self.prefix.clone(),
+            cluster: self.cluster.clone(),
+            settings: self.settings.clone(),
+            wall: Arc::clone(&self.wall),
+            counters: self.counters.clone(),
+            import: self.import.clone(),
+            conflict_policy: self.conflict_policy,
+            copy_sources: self.copy_sources.clone(),
+            bucket: self.bucket.clone(),
+        }
+    }
 }
 
 impl<S> TargetParts<S> {
-    fn build(self, writes: ConditionalWrites) -> Target<S> {
+    /// The target, honoring `writes`, over the native protocol if `native`
+    /// is given.
+    fn build(self, writes: ConditionalWrites, native: Option<Native>) -> Target<S> {
         let target = Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
             .with_wall_clock(self.wall)
             .with_counters(self.counters)
             .with_conflict_policy(self.conflict_policy)
             .with_copy_sources(self.copy_sources)
-            .with_native(self.native);
+            .with_native(native);
         match self.import {
             Some(import) => target.with_import(import),
             None => target,
         }
     }
+}
+
+/// A finished probe that found every precondition honored.
+fn done() -> ProbeStatus {
+    ProbeStatus::Done {
+        unprotected: Vec::new(),
+        server_side_copy: false,
+    }
+}
+
+/// Makes `target`, a SkyS3 peer's S3 endpoint, ready once `quarantine`
+/// passed, and then aborts the uploads its flushes leave open for as long
+/// as it is used.
+async fn after_quarantine<S: ObjectStore>(
+    target: Arc<Target<S>>,
+    ready: Arc<Ready<S>>,
+    quarantine: Duration,
+) {
+    tokio::time::sleep(quarantine).await;
+    ready.set(Arc::clone(&target));
+    abort_orphans(&target).await;
 }
 
 /// What a SkyS3 peer honors: every precondition of every write, which the
@@ -916,7 +1110,7 @@ async fn run_probe<S: ObjectStore>(
                     unprotected,
                     server_side_copy: false,
                 };
-                let target = Arc::new(parts.build(found));
+                let target = Arc::new(parts.build(found, None));
                 ready.set(Arc::clone(&target));
                 break target;
             }

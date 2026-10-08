@@ -132,7 +132,7 @@ they measure what the backup lacks.
 | `skys3_flush_inflight_bytes` | gauge | `bucket` | §7.7 | exported (M4-10) | Bytes this node's flushers hold in memory for requests to the bucket's target, bounded by `flush_max_inflight_bytes_per_target`: single PUT bodies and multipart or streamed parts, from reading them until their answer. |
 | `skys3_flush_base_round_trip_seconds` | gauge | `bucket` | §7.7 | exported (M4-10) | The target's base round trip, which the window compares latency with: the smallest mean latency of a round of requests among the last 1,024 rounds. 0 until a round has ended. |
 | `skys3_flush_throttles_total` | counter | `bucket` | §7.7 | exported (M4-10) | Flush requests the target answered with a throttle (any `503`, `429`, or a throttling error code), each of which may shrink `skys3_flush_concurrency`. Their keys are retried and also counted in `skys3_flush_retries_total`. |
-| `skys3_flush_transport` | gauge | `bucket`, `transport` | §7.8 | planned (M6-07) | 1 for the transport the flushers of a bucket whose target is a peer SkyS3 cluster use now: QUIC, or S3 REST once `target_transport = "auto"` fell back, for example because UDP is blocked (design section 13). M6-07 decides the name and labels; the target status of the admin API reports the same. |
+| `skys3_flush_transport` | gauge | `bucket`, `transport` (`quic`, `s3`) | §7.8, §13 | exported (M6-07) | 1 for the transport this node's flushers of the bucket use now, 0 for the other: `quic`, or `s3` once `target_transport = "auto"` fell back, for example because UDP is blocked (design section 13). Only buckets whose target is a verified peer SkyS3 cluster, or that are configured `native`, have the series; both are 0 while flushing waits for a transport. The bucket's flush status in the admin API reports the same, with the reason. |
 
 The `bucket` label is the bucket's name. A node exports the gauges and the
 counters for every `write_back` bucket it knows, counting the shards open on
@@ -277,6 +277,7 @@ that every node is scraped by a job named `skys3`.
 | `SkyS3DirtyDataOld` | warning | 10m | `dirty-data-age` | A bucket's `skys3_oldest_dirty_age_seconds` (the maximum over the nodes) is over 15 minutes. |
 | `SkyS3DirtyDataVeryOld` | critical | 10m | `dirty-data-age` | The same age is over an hour. |
 | `SkyS3FlushStalled` | warning | 10m | `flush-stalled` | A bucket's `skys3_flush_lag_seconds` is over 10 minutes while its flushes are being retried: the remote target is unreachable, refusing, or throttling. |
+| `SkyS3PeerTransportFallback` | warning | 30m | `peer-transport-fallback` | A bucket's flushers reach their peer SkyS3 cluster over S3 REST instead of QUIC (`skys3_flush_transport` with transport `s3`): UDP is blocked, or the QUIC handshake keeps failing for another reason. A descriptor that does not verify is not counted: the target is then flushed as a plain S3 store, and the bucket's flush status in the admin API says why. |
 | `SkyS3DirtyBudgetNearlyFull` | warning | 5m | `dirty-budget` | A node's `skys3_dirty_bytes` for a bucket is over 80% of its `skys3_dirty_budget_bytes`. |
 | `SkyS3WritesRefusedOverBudget` | critical | 5m | `dirty-budget` | A node refuses writes because a dirty-data budget is used up (`skys3_admission_refusals_total` with reason `bucket_budget` or `cluster_budget`). |
 | `SkyS3ConflictsHeld` | warning | 5m | `held-conflicts` | A bucket holds keys in conflict (`skys3_conflicted_keys`), which need an operator. |
@@ -325,9 +326,9 @@ and filters by node (`instance`) and bucket. Its rows:
 - **Caches and reads:** the clean cache against its limit, evictions and
   fills, and the hot cache.
 - **Remote and peer transport:** the adaptive flush window, bytes in flight,
-  the target's base round trip, and throttles (design section 7.7). These
-  cover a peer SkyS3 cluster reached over S3 REST; the native peer
-  transport's metric is planned with M6-07 (`skys3_flush_transport`).
+  the target's base round trip, and throttles (design section 7.7), and the
+  transport each peer target's flushers use (`skys3_flush_transport`, design
+  section 7.8).
 - **Admin listener:** requests by endpoint and status code.
 
 ## 6. Failure matrix coverage
@@ -347,7 +348,7 @@ on, or cannot be shown yet; the notes say why.
 | Node fails while the control store is unreachable | `up`, `skys3_control_store_last_success_timestamp_seconds`, `skys3_control_store_live` | `SkyS3NodeDown`, `SkyS3ControlStoreUnreachable` | Both alerts at once mean that the failed node's shards take no writes until the store returns. |
 | Remote target unreachable | `skys3_flush_lag_seconds`, `skys3_flush_retries_total`, `skys3_oldest_dirty_age_seconds`, `skys3_dirty_bytes`, `skys3_dirty_budget_bytes`, `skys3_admission_refusals_total` | `SkyS3FlushStalled`, `SkyS3DirtyDataOld`, `SkyS3DirtyBudgetNearlyFull`, `SkyS3WritesRefusedOverBudget` | Writes go on until the budget is used up. Reads of evicted data fail: `skys3_fills_total` stops growing, and the gateway exports no error rate yet. |
 | Link to a peer SkyS3 cluster drops or flaps | `skys3_oldest_dirty_age_seconds`, `skys3_flush_lag_seconds`, `skys3_dirty_bytes` | `SkyS3DirtyDataOld` | Objects stay dirty at the source until `APPLIED` arrives (plan M6-06), so a link that stays down shows as dirty age. A flap that resumes shows nothing, as intended. |
-| UDP blocked between peer clusters | `skys3_flush_transport` | None | Not shown by a metric yet: the fallback to S3 REST is plan M6-07's, and M6-07 adds the planned metric. The target status of the admin API reports the transport, and flushing over S3 REST keeps the flush metrics healthy. |
+| UDP blocked between peer clusters | `skys3_flush_transport` | `SkyS3PeerTransportFallback` | Flushing falls back to S3 REST and goes on, so the flush metrics stay healthy; the transport metric shows `s3`, and the bucket's flush status in the admin API says why. The flushers return to QUIC once a re-probe's handshake succeeds. |
 | Control store unreachable | `skys3_control_store_last_success_timestamp_seconds`, `skys3_control_store_live`, `skys3_identity_synced_timestamp_seconds`, `skys3_identity_max_staleness_seconds` | `SkyS3ControlStoreUnreachable`, `SkyS3IdentityCopyAging`, `SkyS3IdentityCopyStale` | The data path continues; STS stops issuing sessions once the identity copy is stale. |
 | High-latency link to the control store | `skys3_oldest_under_replicated_age_seconds` | None | Not a fault to page on: client requests are unaffected. Its cost, slower failover and member removal, shows as longer under-replication after a member loss. The round trip itself is not measured: the node binary runs the file control store, whose latency is a local disk's. The PR that runs the S3 or etcd backend in the node binary adds a request-duration metric. |
 | Coordinator dies | `skys3_coordinator`, `up` | `SkyS3CoordinatorMissing`, `SkyS3NodeDown` | Another node takes the lease after about `coordinator_lease`; the alert fires only if none does. |

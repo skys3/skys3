@@ -157,7 +157,12 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             return self
                 .native(native, &entry, known, passed)
                 .await
-                .unwrap_or_else(|error| Outcome::Retry(error.to_string()));
+                .unwrap_or_else(|error| {
+                    if matches!(error, Failure::Link(_)) {
+                        native.link_failed();
+                    }
+                    Outcome::Retry(error.to_string())
+                });
         }
         if self.resolution == Some(ConflictPolicy::DiscardLocal) {
             match self.discard(&entry).await {

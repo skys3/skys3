@@ -28,6 +28,7 @@ pub mod control;
 pub mod datadir;
 mod metrics;
 mod node;
+mod peering;
 pub mod rebuild;
 pub mod remote;
 pub mod sessions;

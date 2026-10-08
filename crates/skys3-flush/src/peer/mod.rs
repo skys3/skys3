@@ -2,11 +2,12 @@
 //! flushing to another SkyS3 cluster with `COMMIT`s that the destination
 //! evaluates in its own shard log, instead of S3 REST requests.
 //!
-//! - **Which targets.** A bucket whose `target_transport` is `native`,
-//!   when the flush service can reach the peer
-//!   ([`FlushService::with_peer_transport`](crate::FlushService::with_peer_transport)).
-//!   Its target is ready at once: the destination honors every
-//!   precondition, so nothing is probed.
+//! - **Which targets.** A bucket whose `target_transport` is `auto` or
+//!   `native`, on a node whose flush service can reach peers
+//!   ([`FlushService::with_peer_transport`](crate::FlushService::with_peer_transport)),
+//!   once its target's discovery chose QUIC ([`discovery`]). Its target is
+//!   ready at once: the destination honors every precondition, so nothing
+//!   is probed.
 //! - **Preconditions** (§7.2). A version is committed under `Matches` the
 //!   destination's current write identity, `Absent` where the key is known
 //!   to be absent, or `Unconditional` under an `overwrite` resolution. A
@@ -45,18 +46,22 @@
 mod batch;
 mod bodies;
 mod commit;
+pub(crate) mod discovery;
 mod link;
 mod upload;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use skys3_types::{BucketName, RemoteTarget};
+use skys3_peer::{DescriptorVerifier, IDLE_TIMEOUT, PeerDescriptor};
+use skys3_types::BucketName;
 
 pub(crate) use bodies::{Bodies, BodyStep};
+pub use discovery::{Transport, TransportStatus};
 pub use link::{BoxFuture, LinkError, PeerLink, PeerReceive, PeerSend, PeerStream};
 
 use batch::Batcher;
+use discovery::LinkAlarm;
 
 /// The piece that holds a staged object's bytes. One write identity names
 /// one write, whose bytes at an offset never change, so its staging needs
@@ -67,16 +72,33 @@ pub(crate) const PIECE: u64 = 0;
 /// fails and is retried: the QUIC idle timeout (plan M6-02).
 pub const DEFAULT_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Builds the link to the SkyS3 cluster a `native` target names, or
-/// `None` if the node cannot reach one there.
-pub type PeerConnect = Box<dyn Fn(&RemoteTarget) -> Option<Arc<dyn PeerLink>> + Send + Sync>;
+/// The least time between two handshakes a target falling back to S3 REST
+/// tries (§7.8); it doubles after each one that fails.
+pub const DEFAULT_REPROBE_MIN: Duration = Duration::from_secs(15);
 
-/// How a flush service reaches the SkyS3 peers its `native` targets name
-/// (§7.8).
+/// The most time between two handshakes a target on S3 REST tries.
+pub const DEFAULT_REPROBE_MAX: Duration = Duration::from_secs(300);
+
+/// Makes a link to the destination a verified descriptor names, once a
+/// fresh QUIC handshake with it, `HELLO`s included, succeeded: the probe
+/// that decides whether a target uses QUIC (§7.8). An error says why the
+/// handshake failed.
+pub type PeerConnect = Box<
+    dyn Fn(&PeerDescriptor) -> BoxFuture<'static, Result<Arc<dyn PeerLink>, LinkError>>
+        + Send
+        + Sync,
+>;
+
+/// How a flush service reaches the SkyS3 peers its `auto` and `native`
+/// targets name (§7.8).
 pub struct PeerTransport {
     pub(crate) connect: PeerConnect,
+    pub(crate) verifier: DescriptorVerifier,
     pub(crate) frame_bytes: u64,
     pub(crate) timeout: Duration,
+    pub(crate) connect_timeout: Duration,
+    pub(crate) reprobe: (Duration, Duration),
+    pub(crate) quarantine: Option<Duration>,
 }
 
 impl std::fmt::Debug for PeerTransport {
@@ -84,20 +106,29 @@ impl std::fmt::Debug for PeerTransport {
         f.debug_struct("PeerTransport")
             .field("frame_bytes", &self.frame_bytes)
             .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("reprobe", &self.reprobe)
+            .field("quarantine", &self.quarantine())
             .finish_non_exhaustive()
     }
 }
 
 impl PeerTransport {
-    /// Reaches each target's peer through `connect`, with `DATA` frames of
-    /// `frame_bytes` (`peer_frame_bytes`), which is also the largest
-    /// object a `BATCH` carries.
+    /// Reaches peers through `connect`, once their descriptors pass
+    /// `verifier`, with `DATA` frames of `frame_bytes`
+    /// (`peer_frame_bytes`), which is also the largest object a `BATCH`
+    /// carries. Handshakes must finish within 3 s (the default
+    /// `peer_connect_timeout_ms`).
     #[must_use]
-    pub fn new(connect: PeerConnect, frame_bytes: u64) -> Self {
+    pub fn new(connect: PeerConnect, verifier: DescriptorVerifier, frame_bytes: u64) -> Self {
         Self {
             connect,
+            verifier,
             frame_bytes: frame_bytes.max(1),
             timeout: DEFAULT_ANSWER_TIMEOUT,
+            connect_timeout: Duration::from_secs(3),
+            reprobe: (DEFAULT_REPROBE_MIN, DEFAULT_REPROBE_MAX),
+            quarantine: None,
         }
     }
 
@@ -109,19 +140,48 @@ impl PeerTransport {
         self
     }
 
-    /// The native transport of `target`, whose objects go to the bucket
-    /// its URL names, if the peer can be reached.
-    pub(crate) fn native(&self, target: &RemoteTarget) -> Option<Native> {
-        let link = (self.connect)(target)?;
-        let bucket = match target.bucket.parse::<BucketName>() {
-            Ok(bucket) => bucket,
-            Err(error) => {
-                tracing::warn!(bucket = target.bucket, %error,
-                    "a native target's bucket is not a valid bucket name");
-                return None;
-            }
-        };
-        Some(Native::new(link, bucket, self.frame_bytes, self.timeout))
+    /// Sets how long a handshake may take before the target falls back to
+    /// S3 REST (`peer_connect_timeout_ms`).
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Sets the least and the most time between two handshakes of a target
+    /// on S3 REST ([`DEFAULT_REPROBE_MIN`] and [`DEFAULT_REPROBE_MAX`] by
+    /// default).
+    #[must_use]
+    pub fn with_reprobe(mut self, min: Duration, max: Duration) -> Self {
+        self.reprobe = (min, max.max(min));
+        self
+    }
+
+    /// Sets how long a target that falls back to S3 REST waits before its
+    /// first S3 flush ([`PeerTransport::quarantine`]).
+    #[must_use]
+    pub fn with_quarantine(mut self, quarantine: Duration) -> Self {
+        self.quarantine = Some(quarantine);
+        self
+    }
+
+    /// How long a peer target whose flushers start on S3 REST, after a
+    /// fallback, a restart, or a takeover, waits before its first S3
+    /// flush: until no `COMMIT` an earlier flusher sent over QUIC, on this
+    /// node or on an earlier primary, can still apply (§7.8). A `COMMIT`
+    /// reaches the destination only on a live connection, a connection its
+    /// source stopped using dies within the QUIC idle timeout, and the
+    /// destination applies what it read within an answer timeout. By
+    /// default twice the answer timeout plus the idle timeout: 90 s.
+    #[must_use]
+    pub fn quarantine(&self) -> Duration {
+        self.quarantine
+            .unwrap_or(self.timeout.saturating_mul(2) + IDLE_TIMEOUT)
+    }
+
+    /// The wait before the next handshake after `failures` failed rounds.
+    pub(crate) fn reprobe_after(&self, failures: u32) -> Duration {
+        discovery::backoff(self.reprobe.0, self.reprobe.1, failures)
     }
 }
 
@@ -137,6 +197,8 @@ pub(crate) struct Native {
     pub(crate) timeout: Duration,
     /// The batches every flusher of the target shares.
     pub(crate) batcher: Batcher,
+    /// Tells the target's discovery when a link fails, if it has one.
+    alarm: Option<LinkAlarm>,
 }
 
 impl Native {
@@ -155,6 +217,20 @@ impl Native {
             frame_bytes: frame_bytes.max(1),
             timeout,
             batcher,
+            alarm: None,
+        }
+    }
+
+    /// Tells `alarm` of every link that fails.
+    pub(crate) fn with_alarm(mut self, alarm: LinkAlarm) -> Self {
+        self.alarm = Some(alarm);
+        self
+    }
+
+    /// A flush's link failed: the discovery, if any, checks the path.
+    pub(crate) fn link_failed(&self) {
+        if let Some(alarm) = &self.alarm {
+            alarm.link_failed();
         }
     }
 }
@@ -184,6 +260,13 @@ pub enum PeerBug {
     /// `COMMIT` is sent, before `APPLIED`; the `FLUSHED` record still waits
     /// for it.
     AnsweredOnCommit,
+    /// A peer descriptor is used without checking its chain, signature, or
+    /// times: a forged or expired descriptor sends the flushes wherever it
+    /// points.
+    UnverifiedDescriptor,
+    /// A peer target that falls back to S3 REST flushes at once, while
+    /// `COMMIT`s sent over QUIC may still apply.
+    NoQuarantine,
 }
 
 /// What a flusher records as flushed to a native target, as the
