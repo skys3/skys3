@@ -2601,6 +2601,7 @@ dependencies = [
  "base64",
  "bytes",
  "http",
+ "http-body",
  "md-5",
  "prometheus-client",
  "proptest",
