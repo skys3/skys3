@@ -140,8 +140,10 @@ fn faults(context: &mut SimContext, config: &ClusterConfig, workload: &Workload)
         config.disks_per_node,
         workload.clients,
     );
+    // The blocks start early enough to heal well before the clients stop
+    // writing, so that the flushers carry writes over QUIC again.
     let blocked = (Duration::from_secs(8), Duration::from_secs(12));
-    block_udp(context, &mut plan, 2, end, blocked);
+    block_udp(context, &mut plan, 2, end / 2, blocked);
     plan
 }
 
@@ -164,7 +166,9 @@ fn check(report: &Report) {
 /// the transport metric and status follow every switch.
 #[test]
 fn with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic() {
-    Runner::with_cost(4, COST).run(|context| {
+    // Writes for about 25 s, longer than the blocks and their aftermath,
+    // and twice as long as a typical peer scenario.
+    Runner::with_cost(4, 2 * COST).run(|context| {
         // Besides the blocks the plan draws, UDP blocked twice as a
         // `COMMIT` is on its way, for a while that ends within the peer's
         // idle timeout or after it.
@@ -177,7 +181,7 @@ fn with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic() {
             },
             ..peer(DescriptorKind::Signed, PeerBug::None)
         });
-        let workload = workload(context, 160);
+        let workload = workload(context, 200);
         let plan = faults(context, &config, &workload);
         let report = Cluster::with_services(config, services()).run(context, &workload, &plan)?;
         check(&report);
@@ -276,7 +280,7 @@ fn the_audit_catches_an_unverified_descriptor() {
 /// the same key was written over S3.
 #[test]
 fn the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding() {
-    Runner::with_cost(2, COST).run(|context| {
+    Runner::with_cost(2, 2 * COST).run(|context| {
         // UDP blocked as `COMMIT`s are on their way, for longer than it
         // takes to fall back but not than the peer's idle timeout.
         let peer = Peer {
