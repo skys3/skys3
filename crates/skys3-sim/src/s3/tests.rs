@@ -1964,7 +1964,10 @@ async fn observers_see_every_request_applied_and_the_key_it_left() {
     assert!(store.complete_multipart_upload(complete).await.is_err());
     store.delete_object(DeleteObject::new("a")).await.unwrap();
     store.observe(None);
-    store.put_object(PutObject::new("c", "unseen")).await.unwrap();
+    store
+        .put_object(PutObject::new("c", "unseen"))
+        .await
+        .unwrap();
     assert_eq!(
         *seen.lock().unwrap(),
         [
