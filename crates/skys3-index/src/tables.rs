@@ -9,7 +9,7 @@ use std::time::Duration;
 use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
 use skys3_log::RecordLocation;
 use skys3_log::record::ShardRef;
-use skys3_types::{Epoch, EpochSeq, FragmentId, Generation, NodeId, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, FragmentId, FragmentLocation, Generation, NodeId, ShardConfig};
 
 use crate::codec;
 use crate::codec::FragmentKey;
@@ -229,7 +229,7 @@ fn decode_config<T: ReadableTable<Bytes, Bytes>>(
 
 /// Each fragment of `coded`: its stripe's number, its index, and where it
 /// is.
-fn fragment_rows(coded: &Coded) -> impl Iterator<Item = (u32, u8, &skys3_types::FragmentLocation)> {
+fn fragment_rows(coded: &Coded) -> impl Iterator<Item = (u32, u8, &FragmentLocation)> {
     coded.stripes.iter().flat_map(|stripe| {
         stripe
             .fragments()
@@ -412,6 +412,29 @@ impl<'txn> IndexWriter<'txn> {
             let row = codec::fragment_key(shard, &location.node, key, stripe, index);
             self.fragments.remove(row.as_slice())?;
         }
+        Ok(())
+    }
+
+    /// Moves fragment `index` of stripe `stripe` of `key`'s current version
+    /// from `from` to `to` in the shard's index from node to fragments, as
+    /// an `EC_RELOCATE` moves it (§8.6).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn move_fragment(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        (stripe, index): (u32, u8),
+        from: &FragmentLocation,
+        to: &FragmentLocation,
+    ) -> Result<(), IndexError> {
+        let old = codec::fragment_key(shard, &from.node, key, stripe, index);
+        self.fragments.remove(old.as_slice())?;
+        let row = codec::fragment_key(shard, &to.node, key, stripe, index);
+        let value = codec::encode_fragment(to.fragment);
+        self.fragments.insert(row.as_slice(), value.as_slice())?;
         Ok(())
     }
 
@@ -942,6 +965,34 @@ impl IndexReader {
             fragments: txn.open_table(FRAGMENTS)?,
             meta: txn.open_table(META)?,
         })
+    }
+
+    /// Returns every node that holds a fragment of the coded versions of
+    /// `shard`'s keys, in the index's order: one seek per node, however
+    /// many fragments each holds (§8.6).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn fragment_nodes(&self, shard: &ShardRef) -> Result<Vec<NodeId>, IndexError> {
+        let prefix = codec::shard_key(shard);
+        let end = prefix_end(&prefix);
+        let mut nodes = Vec::new();
+        let mut from = prefix.clone();
+        loop {
+            let Some(row) = self
+                .fragments
+                .range(from.as_slice()..end.as_slice())?
+                .next()
+            else {
+                return Ok(nodes);
+            };
+            let (key, _) = row?;
+            let key =
+                codec::decode_fragment_key(key.value()).map_err(IndexError::codec("fragments"))?;
+            from = prefix_end(&codec::fragment_node_prefix(shard, &key.node));
+            nodes.push(key.node);
+        }
     }
 
     /// Returns the fragments `node` holds of the coded versions of

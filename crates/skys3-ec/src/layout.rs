@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use skys3_log::record::ShardRef;
+use skys3_log::record::{IDENTITY_METADATA, ShardRef};
 use skys3_types::{CodecId, CodedStripe, EpochSeq, FragmentLocation, Geometry};
 
 use crate::fragment::{FragmentHeader, ObjectMeta};
@@ -81,7 +81,9 @@ impl From<CodedStripe> for StripeLayout {
 pub struct ObjectLayout {
     /// The object version.
     pub version: ObjectVersion,
-    /// The object's metadata, with the tags of the latest attempt.
+    /// The object's metadata, with the tags, write identity, and identity
+    /// metadata of the latest attempt, which a `TAGS` record may have
+    /// changed since earlier ones.
     pub object: ObjectMeta,
     /// The stripes, which cover the object's bytes in order.
     pub stripes: Vec<StripeLayout>,
@@ -174,9 +176,19 @@ fn rebuild_object(
     // deterministic.
     fragments.sort_by(|a, b| (b.header.attempt, &a.location).cmp(&(a.header.attempt, &b.location)));
     let reference = &fragments[0];
-    let fixed = |object: &ObjectMeta| ObjectMeta {
-        tags: Default::default(),
-        ..object.clone()
+    // A `TAGS` record changes the tags, and makes itself the version's
+    // write identity in place of an inherited one or one carried from
+    // another cluster: a later attempt, such as a repair, holds the newer
+    // ones, so only the rest of the metadata must agree.
+    let fixed = |object: &ObjectMeta| {
+        let mut metadata = object.metadata.clone();
+        metadata.remove(IDENTITY_METADATA);
+        ObjectMeta {
+            tags: Default::default(),
+            identity: EpochSeq::default(),
+            metadata,
+            ..object.clone()
+        }
     };
     let expected = fixed(&reference.header.object);
     if let Some(other) = fragments
