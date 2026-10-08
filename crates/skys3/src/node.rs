@@ -43,6 +43,7 @@ use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
+use crate::metrics::{ControlMetrics, NodeMetrics};
 use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
@@ -256,7 +257,7 @@ struct Shared {
     identity: Arc<IdentityCopy>,
     sts: Option<Arc<Sts>>,
     control: Arc<Mutex<ControlState>>,
-    control_live: Gauge,
+    control_metrics: ControlMetrics,
     flush: Arc<NodeFlush>,
     snapshots: NodeSnapshots,
 }
@@ -268,14 +269,16 @@ impl Shared {
         match &self.sts {
             Some(sts) => {
                 sts.sync_identity_as_of(&self.store, &self.retry, started)
-                    .await
+                    .await?;
             }
-            None => self
-                .identity
-                .sync_as_of(&self.store, &self.retry, started)
-                .await
-                .map(drop),
+            None => {
+                self.identity
+                    .sync_as_of(&self.store, &self.retry, started)
+                    .await?;
+            }
         }
+        self.control_metrics.identity_synced(started);
+        Ok(())
     }
 
     /// Opens the shards of every bucket the gateway knows.
@@ -329,8 +332,9 @@ impl Shared {
     async fn sync(&self) -> Result<(), StartError> {
         let copy = self.refresh_copy().await?;
         let started = copy.synced_at;
+        self.control_metrics.store_answered(self.wall.now());
         self.store.go_live();
-        self.control_live.set(1);
+        self.control_metrics.set_live(true);
         self.gateway.reload_buckets().await?;
         self.sync_identity(started).await?;
         self.open_bucket_shards().await?;
@@ -378,7 +382,10 @@ impl Shared {
                 },
             };
             let moved = match read_cluster(&store, &cluster, &self.retry).await {
-                Ok(current) => Some(current.value.generation) != known,
+                Ok(current) => {
+                    self.control_metrics.store_answered(self.wall.now());
+                    Some(current.value.generation) != known
+                }
                 Err(error) => {
                     tracing::warn!(%error, "cannot read the control store's generation");
                     continue;
@@ -524,37 +531,6 @@ async fn watch_disks(
             }
         }
         tokio::time::sleep(DISK_WATCH_INTERVAL).await;
-    }
-}
-
-/// The node's metrics beyond the admin listener's own.
-struct NodeMetrics {
-    registry: MetricsRegistry,
-    disks_out_of_service: Gauge,
-    control_store_live: Gauge,
-}
-
-impl NodeMetrics {
-    fn new() -> Self {
-        let registry = MetricsRegistry::new();
-        let disks_out_of_service = Gauge::default();
-        registry.register(
-            "disks_out_of_service",
-            "Disks taken out of service after an I/O error; used again after a host restart.",
-            disks_out_of_service.clone(),
-        );
-        let control_store_live = Gauge::default();
-        registry.register(
-            "control_store_live",
-            "1 once the control store answered since startup; 0 while the node serves its \
-             local copy of control state.",
-            control_store_live.clone(),
-        );
-        Self {
-            registry,
-            disks_out_of_service,
-            control_store_live,
-        }
     }
 }
 
@@ -881,7 +857,7 @@ impl Node {
         tracing::info!(%node_id, %cluster, "starting");
         let storage = open_storage(&config, data_dir, &mut pools, &mut opened.index).await?;
 
-        let metrics = NodeMetrics::new();
+        let metrics = NodeMetrics::new(config.identity().identity_max_staleness());
         let health = Health::new();
         let serving = health.register("gateway");
         let storage_ready = health.register("storage");
@@ -906,7 +882,10 @@ impl Node {
             wall.now(),
         )
         .await?;
-        metrics.control_store_live.set(i64::from(store.is_live()));
+        metrics.control.set_live(store.is_live());
+        if store.is_live() {
+            metrics.control.store_answered(wall.now());
+        }
         let control = Arc::new(Mutex::new(ControlState {
             live: store.is_live(),
             generation: Some(copy.generation),
@@ -1084,7 +1063,7 @@ impl Node {
             identity,
             sts,
             control: Arc::clone(&control),
-            control_live: metrics.control_store_live.clone(),
+            control_metrics: metrics.control.clone(),
             flush: Arc::clone(&flush),
             snapshots,
         });

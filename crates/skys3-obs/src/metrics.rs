@@ -29,7 +29,7 @@
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use prometheus_client::encoding::text;
+use prometheus_client::encoding::{EncodeMetric, text};
 use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::{Metric, Registry, Unit};
 
@@ -59,7 +59,27 @@ const RESERVED_SUFFIXES: &[&str] = &[
 /// version of the running binary as a label.
 #[derive(Clone)]
 pub struct MetricsRegistry {
-    inner: Arc<RwLock<Registry>>,
+    inner: Arc<RwLock<Inner>>,
+}
+
+/// The registry and what was registered in it.
+struct Inner {
+    registry: Registry,
+    registered: Vec<Registered>,
+}
+
+/// A metric family as it was registered, for listing what a registry
+/// holds without encoding it: a family with labels but no series yet is
+/// left out of the encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Registered {
+    /// The family's exported name without its type suffix: the prefix, the
+    /// base name, and the unit, such as `skys3_dirty_bytes` or
+    /// `skys3_flushes`.
+    pub family: String,
+    /// The family's OpenMetrics type, such as `counter`, `gauge`,
+    /// `histogram`, or `info`.
+    pub kind: String,
 }
 
 impl MetricsRegistry {
@@ -67,7 +87,10 @@ impl MetricsRegistry {
     #[must_use]
     pub fn new() -> Self {
         let registry = Self {
-            inner: Arc::new(RwLock::new(Registry::with_prefix(METRIC_PREFIX))),
+            inner: Arc::new(RwLock::new(Inner {
+                registry: Registry::with_prefix(METRIC_PREFIX),
+                registered: Vec::new(),
+            })),
         };
         registry.register(
             "build",
@@ -89,7 +112,9 @@ impl MetricsRegistry {
     /// component registering it.
     pub fn register(&self, name: &str, help: &str, metric: impl Metric) {
         assert_valid_base_name(name);
-        self.write().register(name, help, metric);
+        let mut inner = self.write();
+        inner.record(format!("{METRIC_PREFIX}_{name}"), &metric);
+        inner.registry.register(name, help, metric);
     }
 
     /// Registers a metric measured in `unit`.
@@ -103,7 +128,16 @@ impl MetricsRegistry {
     /// Panics if `name` breaks the [naming conventions](self).
     pub fn register_with_unit(&self, name: &str, help: &str, unit: Unit, metric: impl Metric) {
         assert_valid_base_name(name);
-        self.write().register_with_unit(name, help, unit, metric);
+        let mut inner = self.write();
+        inner.record(format!("{METRIC_PREFIX}_{name}_{}", unit.as_str()), &metric);
+        inner.registry.register_with_unit(name, help, unit, metric);
+    }
+
+    /// Every metric family registered so far, in registration order,
+    /// whether or not it has a series yet.
+    #[must_use]
+    pub fn registered(&self) -> Vec<Registered> {
+        self.read().registered.clone()
     }
 
     /// Encodes every registered metric in the OpenMetrics text format,
@@ -115,15 +149,25 @@ impl MetricsRegistry {
     /// metric types this crate re-exports never do.
     pub fn encode(&self) -> Result<String, fmt::Error> {
         let mut out = String::new();
-        let registry = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        text::encode(&mut out, &registry)?;
+        text::encode(&mut out, &self.read().registry)?;
         Ok(out)
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Registry> {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         // Registration either completes or panics before it mutates the
         // registry, so a poisoned lock still guards a consistent registry.
         self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Inner {
+    fn record(&mut self, family: String, metric: &impl Metric) {
+        let kind = metric.metric_type().as_str().to_owned();
+        self.registered.push(Registered { family, kind });
     }
 }
 
@@ -172,6 +216,7 @@ fn check_base_name(name: &str) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use prometheus_client::metrics::counter::Counter;
+    use prometheus_client::metrics::family::Family;
     use prometheus_client::metrics::gauge::Gauge;
 
     use super::*;
@@ -201,6 +246,28 @@ mod tests {
         assert!(text.contains("# UNIT skys3_dirty_bytes bytes\n"), "{text}");
         assert!(text.contains("skys3_dirty_bytes 42\n"), "{text}");
         assert!(text.contains("skys3_conflicts_total 3\n"), "{text}");
+    }
+
+    #[test]
+    fn registered_families_are_listed_before_they_have_series() {
+        let registry = MetricsRegistry::new();
+        let family = Family::<Vec<(String, String)>, Counter>::default();
+        registry.register("refusals", "Refusals.", family);
+        registry.register_with_unit("lag", "Lag.", Unit::Seconds, Gauge::<i64>::default());
+        let text = registry.encode().unwrap();
+        assert!(!text.contains("refusals"), "{text}");
+        let listed: Vec<_> = registry
+            .registered()
+            .into_iter()
+            .map(|registered| (registered.family, registered.kind))
+            .collect();
+        let expected = [
+            ("skys3_build", "info"),
+            ("skys3_refusals", "counter"),
+            ("skys3_lag_seconds", "gauge"),
+        ]
+        .map(|(family, kind)| (family.to_owned(), kind.to_owned()));
+        assert_eq!(listed, expected);
     }
 
     #[test]

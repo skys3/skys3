@@ -18,6 +18,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::change::{Applied, ChangeSet, Pending, apply, settle};
 use crate::lease::Leadership;
+use crate::metrics::CoordinatorMetrics;
 use crate::push::Announce;
 
 /// The placement work a coordinator does: the extension point for the
@@ -105,6 +106,7 @@ pub struct Coordinator<S, P, A> {
     wake: Arc<Notify>,
     /// Changes whose announcement is still owed.
     pending: Vec<Pending>,
+    metrics: CoordinatorMetrics,
 }
 
 impl<S, P, A> std::fmt::Debug for Coordinator<S, P, A> {
@@ -138,7 +140,18 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
             proposals,
             wake: Arc::new(Notify::new()),
             pending: Vec::new(),
+            metrics: CoordinatorMetrics::default(),
         }
+    }
+
+    /// Reports each tenure in `metrics` (`skys3_coordinator`), and clears
+    /// its placement gauges when a tenure begins or ends. Pass the same
+    /// metrics to the [`PolicyWatch`](crate::PolicyWatch) the placement
+    /// runs, if any.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: CoordinatorMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Wakes the coordinator to plan before its idle wait ends, for
@@ -156,6 +169,9 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
             if self.tenure().is_some() {
                 // `serve_tenure` returns only once the tenure has ended,
                 // so each call serves a new tenure.
+                // Cleared when the tenure ends, also if this task is
+                // dropped during it.
+                let _tenure = TenureGauge::begin(self.metrics.clone());
                 self.placement.begin_tenure();
                 self.serve_tenure().await;
             } else if !self.pending.is_empty() {
@@ -275,6 +291,22 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
             () = self.wake.notified() => {}
             () = self.clock.sleep_until(deadline) => {}
         }
+    }
+}
+
+/// Reports a tenure in the coordinator metrics while it lives.
+struct TenureGauge(CoordinatorMetrics);
+
+impl TenureGauge {
+    fn begin(metrics: CoordinatorMetrics) -> Self {
+        metrics.set_coordinator(true);
+        Self(metrics)
+    }
+}
+
+impl Drop for TenureGauge {
+    fn drop(&mut self) {
+        self.0.set_coordinator(false);
     }
 }
 
