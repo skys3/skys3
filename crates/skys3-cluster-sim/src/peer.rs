@@ -553,6 +553,8 @@ pub struct PeerAudit {
     pub dropped: u64,
     /// `COMMIT`s answered `incomplete`.
     pub incomplete: u64,
+    /// `COMMIT`s that arrived late ([`ProtocolFaults`]).
+    pub late: u64,
     /// `ABORT`s that told a source its staging had expired.
     pub expired: u64,
     /// Write identities whose `COMMIT` arrived more than once.
@@ -571,6 +573,7 @@ pub(crate) struct ProtocolCounts {
     lost: AtomicU64,
     dropped: AtomicU64,
     incomplete: AtomicU64,
+    late: AtomicU64,
     expired: AtomicU64,
 }
 
@@ -598,6 +601,10 @@ impl ProtocolCounts {
         self.incomplete.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn late(&self) {
+        self.late.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn expired(&self) {
         self.expired.fetch_add(1, Ordering::Relaxed);
     }
@@ -612,6 +619,7 @@ impl ProtocolCounts {
             lost: load(&self.lost),
             dropped: load(&self.dropped),
             incomplete: load(&self.incomplete),
+            late: load(&self.late),
             expired: load(&self.expired),
             ..audit
         }
@@ -867,6 +875,13 @@ impl Destination {
         let (count, nodes) = arrivals.entry(identity).or_default();
         *count += 1;
         nodes.insert(node.to_owned());
+    }
+
+    /// Whether the destination holds staging of `identity` now.
+    pub(crate) fn is_staged(&self, identity: &WriteIdentity) -> bool {
+        lock(&self.staging)
+            .as_ref()
+            .is_some_and(|staging| staging.staged(identity).is_some())
     }
 
     /// A source aborted the staging of `identity`.
@@ -1213,6 +1228,17 @@ pub(crate) async fn run(destination: Arc<Destination>) -> Result<(), BoxError> {
     gateway.descriptors = Some(Arc::new(Descriptors(Arc::clone(&destination))));
     let staging = Arc::new(Staging::new(destination.limits));
     *lock(&destination.staging) = Some(Arc::clone(&staging));
+    // Staging expires as streams use it. A destination that serves other
+    // sources too sweeps it at least once a TTL; this one sweeps on a
+    // timer, so that staging expires whether or not the nodes stream.
+    let (sweeping, ttl) = (Arc::clone(&staging), destination.limits.ttl);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(ttl);
+        loop {
+            ticks.tick().await;
+            sweeping.expire(tokio::time::Instant::now());
+        }
+    });
     let service = StagingService::new(
         staging,
         PeerExtents::new(storage.shards.clone(), Arc::clone(&lookup)),

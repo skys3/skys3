@@ -17,9 +17,11 @@
 //!   ETag, however many copies of the `COMMIT` arrive and from whichever
 //!   node: a replay after a lost `APPLIED`, or the copies of a deposed
 //!   primary and of its successor.
-//! - **Staging a live `COMMIT` needs stays.** A `COMMIT` that arrives on a
-//!   stream whose `RESUME` and `DATA` covered its whole object is never
-//!   answered `incomplete`: expiry must not take staging from under it.
+//! - **Staging a live `COMMIT` needs stays.** A `COMMIT` that arrives
+//!   while its staging is there, on a stream whose `RESUME` and `DATA`
+//!   covered its whole object, is never answered `incomplete`: expiry
+//!   must not take staging from under it. Staging that expired before its
+//!   `COMMIT` arrived is answered `incomplete`, and staged again.
 //!
 //! What a node sends and what the destination answers are recorded for
 //! the audits of [`peer`](crate::peer), and `COMMIT`s on their way can aim
@@ -201,6 +203,12 @@ pub struct ProtocolFaults {
     /// after it sends a `DURABLE`, and right after it sends an `APPLIED`,
     /// which may then be lost with it. Its source reconnects.
     pub drop_per_mille: u16,
+    /// A `COMMIT` arrives `late_by` after the rest of its stream with this
+    /// probability, as when the packet that carried it was lost and sent
+    /// again: staging the stream left idle may expire meanwhile.
+    pub late_per_mille: u16,
+    /// How late a late `COMMIT` arrives.
+    pub late_by: Duration,
 }
 
 /// What the tap does with a message.
@@ -293,6 +301,14 @@ impl Inbound for Tapped {
             let Some(message) = self.stream.recv().await? else {
                 return Ok(None);
             };
+            let tap = &self.sender.tap;
+            let faults = tap.destination.faults();
+            if let Message::Commit(_) = message
+                && tap.destination.draw(faults.late_per_mille)
+            {
+                tap.destination.counts().late();
+                tokio::time::sleep(faults.late_by).await;
+            }
             match self.sender.tap.arrived(&message) {
                 Verdict::Pass => return Ok(Some(message)),
                 Verdict::Lose => {}
@@ -419,6 +435,7 @@ impl Tap {
                     && let PutData::Staged { piece } = put.data
                     && state.begun.as_ref() == Some(&commit.identity)
                     && covers(state.covered.get(&piece), put.size)
+                    && destination.is_staged(&commit.identity)
                 {
                     state.whole.insert(commit.identity.clone());
                 }

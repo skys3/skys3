@@ -246,7 +246,8 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     ///   the stream's later `DATA` is dropped until a new `BEGIN`.
     /// - `ABORT` discards the staging it names.
     /// - `COMMIT` waits for the stream's frames in flight, so that the
-    ///   staging holds every frame sent before it, and is answered with the
+    ///   staging holds every frame sent before it, and keeps the staging
+    ///   from expiring meanwhile ([`Staging::pin`]). It is answered with the
     ///   `APPLIED` of the [`CommitSink`]. A commit that commits consumes the
     ///   staging, and so does one that is refused or whose bytes do not
     ///   match: the source stages the object again.
@@ -333,6 +334,10 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     }
                 }
                 Message::Commit(commit) => {
+                    // Staging live as the COMMIT arrives stays until it is
+                    // applied, however long its frames in flight take.
+                    let identity = commit.identity.clone();
+                    let pinned = self.staging.pin(&identity);
                     drop(
                         appends
                             .acquire_many(MAX_APPENDS_PER_STREAM)
@@ -340,6 +345,9 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                             .expect("the semaphore is never closed"),
                     );
                     let applied = self.commit(commit).await;
+                    if let Some(generation) = pinned {
+                        self.staging.unpin(&identity, generation);
+                    }
                     if matches!(applied.outcome, Outcome::Committed { .. })
                         && current
                             .as_ref()

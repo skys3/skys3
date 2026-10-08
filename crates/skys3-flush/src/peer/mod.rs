@@ -267,6 +267,13 @@ pub enum PeerBug {
     /// A shard flusher that starts on S3 REST to a peer flushes at once,
     /// while `COMMIT`s sent over QUIC may still apply.
     NoQuarantine,
+    /// Staging ignores the `RESUME`: every byte of the object is sent
+    /// again, durable ranges included.
+    ResendDurable,
+    /// A `COMMIT` answered `incomplete`, or staging the destination
+    /// reports expired, counts as committed: the key is recorded flushed
+    /// although the destination never applied it.
+    ExpiredAsCommitted,
 }
 
 /// What a flusher records as flushed to a native target, as the

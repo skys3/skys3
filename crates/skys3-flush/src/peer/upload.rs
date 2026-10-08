@@ -182,6 +182,12 @@ impl<S, D: Disk> Staged<'_, S, D> {
         durable: &ByteRanges,
     ) -> Result<(), Failure> {
         let frame = self.native.frame_bytes;
+        let nothing = ByteRanges::default();
+        let durable = if peer_bug() == PeerBug::ResendDurable {
+            &nothing
+        } else {
+            durable
+        };
         for segment in &layout.0 {
             let end = segment.offset + segment.len;
             let wanted: Vec<_> = durable
@@ -249,6 +255,9 @@ impl<S, D: Disk> Staged<'_, S, D> {
                 Ok(opened) => opened,
                 Err(ended) => {
                     refused(&ended)?;
+                    if expired_as_committed(&ended) {
+                        return Ok(assumed_committed(commit));
+                    }
                     continue;
                 }
             };
@@ -266,6 +275,9 @@ impl<S, D: Disk> Staged<'_, S, D> {
                 .await
                 .map_err(Failure::link)?;
             refused(&ended)?;
+            if expired_as_committed(&ended) {
+                return Ok(assumed_committed(commit));
+            }
             match ended {
                 Ended::Applied(Outcome::Failed {
                     error: ApplyError::Incomplete,
@@ -279,6 +291,19 @@ impl<S, D: Disk> Staged<'_, S, D> {
             "the destination found the staging of {identity} incomplete {STAGE_ROUNDS} times"
         )))
     }
+}
+
+/// Whether the seeded bug [`PeerBug::ExpiredAsCommitted`] takes `ended`,
+/// staging found incomplete or expired, for a commit.
+fn expired_as_committed(ended: &Ended) -> bool {
+    peer_bug() == PeerBug::ExpiredAsCommitted
+        && matches!(
+            ended,
+            Ended::Applied(Outcome::Failed {
+                error: ApplyError::Incomplete,
+                ..
+            }) | Ended::Aborted(AbortReason::Expired, _)
+        )
 }
 
 /// Fails with the destination's refusal if `ended` is one: staging again
