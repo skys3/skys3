@@ -651,6 +651,8 @@ This protocol is PacificA's[^pacifica] with a control-store register as the conf
 - **Loss of a majority of voters** in an etcd or embedded-Raft control store.
 - **Every member of a shard lost.** Data that had not reached its durable home is lost. The shard's index is lost too, so the cluster alone cannot list every lost key. SkyS3 reports what it can from the latest index snapshot (section 8.9): the keys whose data existed only on the lost members, and the time window after the snapshot in which other keys may also have been lost. For `local` buckets, coded objects are re-indexed from their fragment headers (section 8.4) by an operator-run recovery, the restore drill (section 8.9), which also restores those written after the snapshot.
 
+The [runbooks](skys3-runbooks.md) give the procedure for each of these.
+
 ### 6.10 Control-store outages and the choice of referee
 
 Local copies (section 6.2) let a cluster run **indefinitely** without its control store, not just for a grace period, as long as no shard needs a membership change. Reads, writes, flushing, encoding, and fragment repair all continue. STS is the one bounded exception (`identity_max_staleness`).
@@ -1568,7 +1570,7 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 | Disk full or sync failure | No acknowledgement is issued. Admission control engages, and the disk is taken out of service on a sync error. A node checks the free space of its log disks and data directory every second: below `disk_min_free_bytes`, writes that add data to the shards on a disk get `503 SlowDown` (all of them for the data directory), and deletes are still admitted. The margin keeps the disk from filling, since any write error takes it out of service (section 10.4). |
 | Clock rate drift beyond `ρ` | Read linearizability is at risk. Write safety is unaffected. |
 
-The [metrics reference](skys3-metrics.md) (section 6) names the metrics and alerts that show each row.
+The [metrics reference](skys3-metrics.md) (section 6) names the metrics and alerts that show each row, and the [runbooks](skys3-runbooks.md) what an operator does about each.
 
 ## 14. Illustrative configuration
 

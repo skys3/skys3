@@ -264,9 +264,10 @@ that every node is scraped by a job named `skys3`.
 - **Thresholds.** They are starting points for the default configuration
   ([configuration reference](skys3-config.md)). The dirty-age thresholds in
   particular should follow the loss exposure (RPO) a deployment accepts.
-- **Runbooks.** Every rule's `runbook_url` links a section of
-  `docs/skys3-runbooks.md` (plan M7-05) by the anchor in the Runbook column.
-  The anchors are stable: the runbooks keep a section for each.
+- **Runbooks.** Every rule's `runbook_url` links a section of the
+  [runbooks](skys3-runbooks.md) by the anchor in the Runbook column. The
+  anchors are stable: the runbooks keep a section for each, and their tests
+  fail for an anchor that has none.
 - **External series.** Two rules read series no SkyS3 node exports: `up`, which
   Prometheus records for every scrape target, and `node_timex_sync_status`,
   which node_exporter's timex collector exports (1 while the kernel clock is

@@ -7916,3 +7916,60 @@ of this file. A task with nothing unexpected keeps "None."
   (`deploy/prometheus/`, `deploy/grafana/`), not `docs/`: they are
   configuration installed as is. The plan's repository layout lists the new
   directory.
+
+### M7-05 Runbooks
+
+- **A SkyS3 node cannot be another node's S3 REST target.** The drills were
+  meant to run two binaries, one the remote target of the other. Every
+  flush failed with `400 InvalidArgument: x-amz-meta-skys3-wid is reserved
+  for SkyS3's write identity`: a gateway refuses the write-identity
+  metadata from clients, and every S3 REST flush sends it. So a SkyS3
+  cluster reached over S3 REST, the fallback of `target_transport = "auto"`
+  when UDP is blocked (design sections 7.8 and 13), fails every flush as
+  the code stands. Left for plan M6-07, which builds the fallback, and
+  listed in the runbooks' open points. The flush and conflict drills run
+  the node's flush service, metrics, and admin API in process over a
+  simulated remote whose link an outage drops, as the M4-06 conflict test
+  does.
+- **The file control store does not come back by itself after a failed
+  write.** It answers reads from memory, so a store whose directory goes
+  away under a running node is noticed only at the next write, which fails
+  and makes the store refuse every later request until it is opened again.
+  The node reopens only a store it could not open, so it needs a restart
+  once the directory is back, although design section 6.2 has it use the
+  store "once it answers". The CreateBucket that hit the failure answered
+  `500 InternalError` ("The cluster's control store failed"), not the
+  `503` the design gives a node that runs from its copy. Both are
+  documented in the runbook and its open points rather than changed here,
+  since the node's control-store loop is shared with work in flight.
+- **An outage that starts after startup shows only in the last-success
+  gauge.** `skys3_control_store_live` stays 1 through it (as M7-04 found),
+  so the runbook diagnoses it from
+  `skys3_control_store_last_success_timestamp_seconds`, and the drill checks
+  that the gauge stops and resumes.
+- **Drilling a disk failure without privileges.** A sync cannot be made to
+  fail on a real file system without root, and the node uses its real disk.
+  The drill moves a disk's directory away under a running node with small
+  segments, so the next segment cannot be created: the node takes the disk
+  out of service, and cannot write the fence into the missing directory,
+  which it logs. The fenced start is drilled by writing the fence with the
+  node's own `skys3::datadir::fence`.
+- **Low disk space, for real.** The drill writes 256 MiB of ballast, sets
+  `disk_min_free_bytes` to half of it above the free space left, and removes
+  the ballast: the node admits writes again within a second, as the runbook
+  says, with 128 MiB of slack either way for other writers on the file
+  system. It skips itself on a file system with less than 1 GiB free.
+- **Most multi-node runbooks cannot be drilled on the binary.** Replication,
+  the coordinator, encoding and repair, the peer transport, and the etcd and
+  S3 control stores do not run in the node binary. Those runbooks cite the
+  simulation scenarios that exercise the automatic recovery they rely on
+  (all 23 cited scenarios pass at the default seed count); no new scenario
+  was added, so the simulation job's time is unchanged. etcd majority loss
+  is not drilled at all: CI's etcd job runs a single member.
+- **Keeping the runbooks honest.** A test next to the metrics reference
+  tests (`crates/skys3/src/metrics/runbooks.rs`) checks that every alert's
+  anchor is a heading (computed as GitHub computes anchors), that the
+  index lists every row of design section 13 and every item of section 6.9
+  in order, that every runbook has its parts and a drill row, that every
+  drill names a test function that exists, and that every metric the
+  runbooks name is in the metrics reference.
