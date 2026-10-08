@@ -6666,9 +6666,23 @@ of this file. A task with nothing unexpected keeps "None."
 - **Reads name what they expect.** A fragment ID alone is not enough: a
   fragment reclaimed since the plan (M5-05) or an ID reused on a
   replaced disk would serve another fragment's bytes, which pass their
-  checksums. A `FragmentRead` names the shard, key, version, stripe,
-  geometry, codec, and index, and the node answers "not held" unless
-  the fragment's header matches. Recorded in §8.5.
+  checksums. A `FragmentRead` names the shard, key, version, ETag,
+  stripe, geometry, codec, and index, and the node answers "not held"
+  unless the fragment's header matches. Recorded in §8.5.
+- **Reads name the layout's version, not the entry's.** A `TAGS` record
+  after an `EC_PUBLISH` moves the entry's version but keeps the coded
+  layout, whose fragments' headers name the version the encoder read.
+  Reads first named the entry's version, so a retagged coded object
+  failed every identity check and its GETs, UploadPartCopy, and
+  CopyObject answered `503`. Once #83 recorded that version in the
+  layout (`Coded::version`), every read names it with the object's
+  ETag, which no retag changes; `FragmentIdentity` and `CodedRead`
+  gained the ETag and `FragmentRead` carries it (field 17). The read
+  plan, the hot cache, and a copy's source reference still name the
+  entry's version. The gateway test
+  `a_coded_object_retagged_after_its_publish_reads_its_bytes` (retag,
+  then GET whole and by range, HEAD, GetObjectTagging, and a degraded
+  copy) fails on the entry's version. Recorded in §8.5.
 - **Two message kinds, no format change.** `FragmentRead` (11) and
   `FragmentData` (12), replication class, request in the frame header
   (it is small), bytes in the payload with their CRC32C. The fragment
@@ -6736,15 +6750,19 @@ of this file. A task with nothing unexpected keeps "None."
   dropped, every node runs a gateway (an in-memory control store and
   shard map, routed shard client, hot cache) and three clients send 40
   requests each through drawn nodes, whole or ranged GETs and, one in
-  eight, a CopyObject to a new key whose copy is read back, while, for
-  four seconds,
+  eight each, a CopyObject to a new key whose copy is read back and a
+  PutObjectTagging followed by a whole GET, while, for four seconds,
   up to two *lossy* nodes of n1 to n5 (`m` is 2 on six nodes) crash,
   with or without power loss, lose their fragment disk for good, or
   corrupt the bytes they send. Every answer must be its version's bytes,
   by its ETag (a copy keeps its source's); `503` and broken-off bodies
   are allowed. The harness's fragment source counts parity reads, and
-  the scenario requires some, and some copies. The copies stay out of
-  the coding checks, though the encoder may code them during the reads.
+  the scenario requires some, and some copies and retags. The copies
+  stay out of the coding checks, though the encoder may code them during
+  the reads. Since a `503` is allowed under faults, each client GETs
+  every object it retagged again once the faults are over, up to 40
+  times 250 ms apart, and one never served fails the run: with the
+  gateway naming the entry's version, seed 0 fails so.
 - **Crashes do not replay within one process.** Two runs of a seed in
   one process differed after a crash. A crashed host's runtime drops its
   tasks in an order tokio shards by task ID, and task IDs are global to
@@ -6755,14 +6773,15 @@ of this file. A task with nothing unexpected keeps "None."
   (ECDSA signatures in the handshakes also vary in length, harmlessly:
   nothing depends on their size.)
 - **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
-  replay (cost 128) 2 seeds in 18 s; degraded reads (lossy 2 on
-  even seeds, else 1; cost 32) 8 seeds in 40 s; trusting bad CRCs
-  (corruption only) 4 seeds in 37 s; wrong indices (crashes and lost
-  disks) 4 seeds in 42 s. Both bugs are caught on every seed tried, with
-  "not those of version". At `SKYS3_SIM_SEEDS=2048` all passed, copies
-  included: 64 seeds of degraded reads, 32 of each bug, 16 of replay
-  (431 s, four at a time); before the copies, replay passed 32 seeds at
-  4096. The copies add about a third to each run. Adding them first
+  replay (cost 128) 2 seeds in 16 s; degraded reads (lossy 2 on
+  even seeds, else 1; cost 32) 8 seeds in 34 s; trusting bad CRCs
+  (corruption only) 4 seeds in 32 s; wrong indices (crashes and lost
+  disks) 4 seeds in 37 s, with copies and retags. Both bugs are caught
+  on every seed tried, with "not those of version". At
+  `SKYS3_SIM_SEEDS=2048` all passed, copies and retags included: 64
+  seeds of degraded reads, 32 of each bug, 16 of replay (273 s, four at
+  a time); before the copies, replay passed 32 seeds at 4096. The copies
+  added about a third to each run. Adding copies first
   found a harness bug: the harness's gateways used the default
   `inline_max_bytes`, above the shard log's 512 bytes, so the shard
   refused every copy's inline body until the gateways took the log's
