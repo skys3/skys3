@@ -106,6 +106,8 @@ they measure what the backup lacks.
 | `skys3_flush_conflicts_overwritten_total` | counter | `bucket` | exported (M4-06) | Conflicts resolved by flushing the local version unconditionally over the out-of-band write: by the `overwrite` policy, or by an operator's `overwrite` resolution (design section 7.2). |
 | `skys3_flush_conflicts_discarded_total` | counter | `bucket` | exported (M4-06) | Conflicts resolved by adopting the out-of-band write and dropping the local version, an acknowledged write: by the `discard_local` policy, or by an operator's `discard_local` resolution (design section 7.2). |
 | `skys3_flushes_total` | counter | `bucket` | exported (M1-16) | Versions flushed: the remote accepted them, or a retry found them there by their write identity. |
+| `skys3_flush_copies_total` | counter | `bucket` | exported (M4-07) | Copies flushed as a remote server-side `CopyObject` of their clean source, without uploading their bytes (design section 11). A copy whose answer was lost and that a retry found by its write identity counts under `skys3_flushes_total` only. |
+| `skys3_flush_copy_fallbacks_total` | counter | `bucket` | exported (M4-07) | Server-side copies given up for a regular upload: the source changed or was deleted at the remote since the copy committed, or the target refused the copy (design section 11). A steady rate where sources are not rewritten means the target lacks support the probe found. |
 | `skys3_flush_retries_total` | counter | `bucket` | exported (M1-16) | Flush attempts that failed (`5xx`, `503 SlowDown`, a lost response, another error) and are retried after a backoff. |
 
 The `bucket` label is the bucket's name. A node exports the gauges and the

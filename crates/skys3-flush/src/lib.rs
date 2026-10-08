@@ -58,6 +58,13 @@
 //! - **Tags** (`TAGS`) need no request of their own: a version made by
 //!   `TAGS` is flushed like any other, the bytes uploaded again with the
 //!   new tags and the `TAGS` record's write identity.
+//! - **Server-side copies** (§11). A copy of a version that was clean, from
+//!   a bucket flushing to the same remote bucket ([`CopySources`]), is
+//!   sent as a remote `CopyObject` with `REPLACE` directives, its own write
+//!   identity, `x-amz-copy-source-if-match`, and the destination
+//!   precondition, where the probe found all of them honored. A source
+//!   that changed at the remote, or a target that refuses the copy, gets an
+//!   upload instead, never a conflict.
 //! - [`Target`]: what the flushers of one target share: the store, the
 //!   probe's findings, the in-flight byte budget, the settings
 //!   ([`FlushSettings`]), and the remote uploads left to abort.
