@@ -537,11 +537,21 @@ remote. Coded objects survive in their fragments (design section 6.9).
    shows the snapshot's time, which starts the window.
 4. Without a snapshot there is no list of keys and no start of the window
    from SkyS3:
-   - a `write_back` bucket lost what was dirty. The last scraped
-     `skys3_oldest_dirty_age_seconds` and `skys3_dirty_bytes` of the
-     shard's primary before the loss bound it: keys written in that window
-     before the loss. Comparing a listing of the remote target with the
-     writers' own records of that window finds the keys;
+   - a `write_back` bucket lost what was dirty: writes and deletes not yet
+     at the remote. For writes, the last scraped
+     `skys3_oldest_dirty_age_seconds` of the shard's primary before the
+     loss bounds the window: comparing a listing of the remote target with
+     the writers' own records of the writes in that window finds the keys.
+     This holds while the primary did not restart after the writes; after a
+     restart, a write found dirty is dated by its `Last-Modified`, which
+     still bounds it. Deletes have no such bound: a tombstone counts 0 in
+     `skys3_dirty_bytes`, and one found dirty at a restart is dated from the
+     restart, since it has no `Last-Modified`. An acknowledged delete the
+     remote never received leaves the remote's object looking current. So
+     audit the writers' delete records back to the last time the shard was
+     known fully flushed (`skys3_oldest_dirty_age_seconds` 0 on its
+     primary), or to the bucket's creation if that is unknown, and delete
+     at the remote what they deleted;
    - a `local` bucket without a backup lost every replicated object of the
      shard, whenever written. Only the writers' records name them. Its
      coded objects' fragments survive, and re-indexing them is the restore
@@ -1070,5 +1080,13 @@ meets today, not a plan of this document.
   backends are not ordered, and nothing compares them now. Until then the
   [etcd majority loss](#etcd-majority-loss) runbook rebuilds after any
   recovery that may have lost a write.
+- **The dirty age of deletes after a restart.** A tombstone found dirty at
+  startup is dated from the startup (`dirty_since` in
+  `crates/skys3-flush/src/shard.rs`), because a delete records no time, and
+  it counts 0 in `skys3_dirty_bytes`. After a restart,
+  `skys3_oldest_dirty_age_seconds` can therefore understate the loss
+  exposure of unflushed deletes, and nothing bounds which deletes a lost
+  shard took with it. Dating them would need the delete's commit time in
+  its record or in the index.
 - **etcd in the binary**, and a multi-member etcd harness to drill majority
   loss.
