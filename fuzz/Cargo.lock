@@ -2335,13 +2335,19 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32c",
+ "prost",
  "reed-solomon-simd",
  "skys3-config",
+ "skys3-coord",
+ "skys3-index",
  "skys3-io",
  "skys3-log",
+ "skys3-net",
+ "skys3-shard",
  "skys3-types",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2350,6 +2356,7 @@ version = "0.0.0"
 dependencies = [
  "crc32c",
  "libfuzzer-sys",
+ "prost",
  "serde_json",
  "skys3-control",
  "skys3-coord",

@@ -56,6 +56,10 @@
 //!   than the workload: copies dropped beyond `clean_copies`, LRU
 //!   eviction, fills of what was evicted, and no dirty byte lost under
 //!   crashes.
+//! - [`coding`]: a primary encoding its objects while it, a member, or
+//!   fragment holders crash or lose power at each step of an attempt, with
+//!   every object readable from its replicas or `k` fragments of each
+//!   stripe throughout, and seeded bugs of the publish steps caught.
 //! - [`compaction`]: segment compaction on replicated shards under
 //!   crashes, message loss, and power losses at sync boundaries, with
 //!   every member's dirty bytes and every shard's latest `CONFIG` record
@@ -79,6 +83,7 @@ mod acks;
 mod backfill;
 mod buckets;
 mod cache;
+mod coding;
 mod compaction;
 mod coordinator;
 mod crash;

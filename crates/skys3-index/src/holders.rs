@@ -25,6 +25,13 @@ pub enum Holder {
         /// The entry's version.
         version: EpochSeq,
     },
+    /// The key's entry, whose version is coded by the `EC_PUBLISH` at
+    /// `publish` (§8.4): the record holds the version's replicated bytes,
+    /// which a replica keeps only until it knows that record committed.
+    Coded {
+        /// The position of the `EC_PUBLISH` record.
+        publish: EpochSeq,
+    },
     /// A part of an open multipart upload of the key.
     Upload,
 }
@@ -51,9 +58,14 @@ where
     if let Some(entry) = tables::entry(namespace, shard, key)?
         && let Some(object) = &entry.object
     {
-        let holder = Holder::Entry {
-            state: entry.state,
-            version: entry.version,
+        let holder = match &object.coded {
+            Some(coded) => Holder::Coded {
+                publish: coded.publish,
+            },
+            None => Holder::Entry {
+                state: entry.state,
+                version: entry.version,
+            },
         };
         match &object.payload {
             Payload::Parts { upload, .. } => {

@@ -29,9 +29,17 @@
 //! - **Layouts** ([`rebuild_layouts`]): each stripe's layout and codec,
 //!   rebuilt from the fragment headers found on the nodes.
 //!
-//! Placement (M5-03) and the encoder that drives a codec stripe by stripe,
-//! writes the fragments, and publishes the result (M5-04) build on this
-//! crate.
+//! - **Fragment writes** ([`FragmentClient`], [`FragmentServer`]): a
+//!   fragment sent to its node over the cluster transport, as the
+//!   `FragmentWrite` and `FragmentWritten` messages, and acknowledged
+//!   only once the node's fragment store made it durable.
+//! - **Encoding** ([`Encoder`]): on a shard's primary, objects that
+//!   qualify (§8.2) are read from the local replica, encoded stripe by
+//!   stripe, placed by `skys3_coord::FragmentPlanner`, written through a
+//!   [`FragmentWriter`], and published with an `EC_PUBLISH` record once
+//!   every fragment is durable. Each attempt has an [`AttemptId`] drawn
+//!   from numbers the index reserves durably, and [`Attempts`] tracks
+//!   those in progress, the fence orphan reclamation needs (§8.4).
 //!
 //! ```
 //! use skys3_ec::{CodecId, EcCodec, Geometry, codec, current_codec};
@@ -51,13 +59,19 @@
 //! ```
 
 mod codec;
+mod encoder;
 mod error;
 pub mod fragment;
 mod layout;
 mod reed_solomon;
 mod store;
+mod transfer;
 
 pub use codec::{EcCodec, codec, current_codec};
+pub use encoder::{
+    AttemptState, Attempts, EncodeError, EncodeEvent, EncodeObserver, EncodeStep, Encoded, Encoder,
+    EncoderSettings, PlannerSource, ScanReport, Skip,
+};
 pub use error::EcError;
 pub use layout::{
     FoundFragment, ObjectLayout, ObjectVersion, RebuildError, StripeLayout, rebuild_layouts,
@@ -72,4 +86,8 @@ pub use store::SeededBug;
 pub use store::{
     FragmentError, FragmentRange, FragmentSegment, FragmentStore, FragmentStoreConfig,
     RecoveryError, RecoveryReport, TornTail,
+};
+pub use transfer::{
+    CHUNK_LEN, FragmentClient, FragmentServer, FragmentWrite, FragmentWriter, FragmentWritten,
+    TransferError,
 };

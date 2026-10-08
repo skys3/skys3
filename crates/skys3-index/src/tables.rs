@@ -9,10 +9,13 @@ use std::time::Duration;
 use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
 use skys3_log::RecordLocation;
 use skys3_log::record::ShardRef;
-use skys3_types::{Epoch, EpochSeq, Generation, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, FragmentId, Generation, NodeId, ShardConfig};
 
 use crate::codec;
-use crate::entry::{ControlEntry, Entry, Part, RemotePart, RemoteParts, RemoteUpload, Upload};
+use crate::codec::FragmentKey;
+use crate::entry::{
+    Coded, ControlEntry, Entry, Part, RemotePart, RemoteParts, RemoteUpload, Upload,
+};
 use crate::error::IndexError;
 use crate::holders::{self, Holders};
 use crate::listing::{self, ListPage, ListQuery};
@@ -72,6 +75,17 @@ pub(crate) const CONFIGS: TableDefinition<Bytes, Bytes> = TableDefinition::new("
 /// again in the epoch it proposed over, so it came with a new format
 /// version.
 pub(crate) const TAKEOVERS: TableDefinition<Bytes, Bytes> = TableDefinition::new("takeovers");
+/// The fragments of each shard's coded versions, keyed by shard, the node
+/// that holds the fragment, the object key, the stripe, and the fragment's
+/// index (§8.6): the per-shard index from node to fragments that repair
+/// reads when a node is lost. The state machine keeps it as it applies
+/// `EC_PUBLISH` records and the writes that replace a coded version, so
+/// every replica holds the same rows.
+pub(crate) const FRAGMENTS: TableDefinition<Bytes, Bytes> = TableDefinition::new("fragments");
+/// The next attempt number this node may use as the primary of each shard
+/// (§8.4), keyed by shard. Numbers are reserved in blocks by durable
+/// commits, so a primary that restarts in its epoch never reuses one.
+pub(crate) const ATTEMPTS: TableDefinition<Bytes, u64> = TableDefinition::new("attempts");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -213,6 +227,18 @@ fn decode_config<T: ReadableTable<Bytes, Bytes>>(
         .map_err(IndexError::codec(name))
 }
 
+/// Each fragment of `coded`: its stripe's number, its index, and where it
+/// is.
+fn fragment_rows(coded: &Coded) -> impl Iterator<Item = (u32, u8, &skys3_types::FragmentLocation)> {
+    coded.stripes.iter().flat_map(|stripe| {
+        stripe
+            .fragments()
+            .iter()
+            .zip(0u8..)
+            .map(move |(location, index)| (stripe.number(), index, location))
+    })
+}
+
 /// Returns the smallest key greater than every key that starts with
 /// `prefix`. A shard key ends with its shard number and starts with a
 /// bucket ID length below 255, so it never consists of `0xff` bytes alone.
@@ -245,16 +271,19 @@ pub enum ShardTable {
     RemoteUploads,
     /// The parts of those remote uploads.
     RemoteParts,
+    /// The fragments of coded versions, by node (§8.6).
+    Fragments,
 }
 
 impl ShardTable {
     /// Every table, in the order a snapshot sends them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Namespace,
         Self::Uploads,
         Self::Parts,
         Self::RemoteUploads,
         Self::RemoteParts,
+        Self::Fragments,
     ];
 
     /// The table's code in a snapshot.
@@ -266,6 +295,7 @@ impl ShardTable {
             Self::Parts => 3,
             Self::RemoteUploads => 4,
             Self::RemoteParts => 5,
+            Self::Fragments => 6,
         }
     }
 
@@ -299,6 +329,10 @@ impl ShardTable {
                 codec::decode_remote_part(value).map_err(|e| e.to_string())?;
                 codec::decode_part_key(key).map(|(shard, ..)| shard)
             }
+            Self::Fragments => {
+                codec::decode_fragment(value).map_err(|e| e.to_string())?;
+                codec::decode_fragment_key(key).map(|key| key.shard)
+            }
         }
         .map_err(|e| e.to_string())?;
         if theirs == *shard {
@@ -323,6 +357,7 @@ pub struct IndexWriter<'txn> {
     remote_uploads: Table<'txn, Bytes, Bytes>,
     remote_parts: Table<'txn, Bytes, Bytes>,
     configs: Table<'txn, Bytes, Bytes>,
+    fragments: Table<'txn, Bytes, Bytes>,
 }
 
 impl<'txn> IndexWriter<'txn> {
@@ -336,7 +371,48 @@ impl<'txn> IndexWriter<'txn> {
             remote_uploads: txn.open_table(REMOTE_UPLOADS)?,
             remote_parts: txn.open_table(REMOTE_PARTS)?,
             configs: txn.open_table(CONFIGS)?,
+            fragments: txn.open_table(FRAGMENTS)?,
         })
+    }
+
+    /// Adds every fragment of `coded`, the layout of `key`'s current
+    /// version, to the shard's index from node to fragments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn put_fragments(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        coded: &Coded,
+    ) -> Result<(), IndexError> {
+        for (stripe, index, location) in fragment_rows(coded) {
+            let row = codec::fragment_key(shard, &location.node, key, stripe, index);
+            let value = codec::encode_fragment(location.fragment);
+            self.fragments.insert(row.as_slice(), value.as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// Removes every fragment of `coded`, the layout of a version of `key`
+    /// that a write replaced, from the shard's index from node to
+    /// fragments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the write fails.
+    pub fn remove_fragments(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        coded: &Coded,
+    ) -> Result<(), IndexError> {
+        for (stripe, index, location) in fragment_rows(coded) {
+            let row = codec::fragment_key(shard, &location.node, key, stripe, index);
+            self.fragments.remove(row.as_slice())?;
+        }
+        Ok(())
     }
 
     /// Keeps `config` as the configuration of the latest `CONFIG` record
@@ -678,6 +754,7 @@ impl<'txn> IndexWriter<'txn> {
             &mut self.parts,
             &mut self.remote_uploads,
             &mut self.remote_parts,
+            &mut self.fragments,
         ] {
             let range = prefix.as_slice()..end.as_slice();
             table.retain_in(range, |key, _| !key.starts_with(&prefix))?;
@@ -818,6 +895,9 @@ pub struct IndexDump {
     pub remote_uploads: BTreeMap<(ShardRef, EpochSeq), RemoteUpload>,
     /// Parts of remote uploads by shard, local upload, and part number.
     pub remote_parts: BTreeMap<(ShardRef, EpochSeq, u16), RemotePart>,
+    /// The fragments of coded versions, by shard, node, key, stripe, and
+    /// index.
+    pub fragments: BTreeMap<FragmentKey, FragmentId>,
     /// The local copy of control state, by register key.
     pub control: BTreeMap<String, ControlEntry>,
     /// The generation the control-state copy is complete up to.
@@ -839,6 +919,7 @@ pub struct IndexReader {
     promotions: ReadOnlyTable<Bytes, Bytes>,
     configs: ReadOnlyTable<Bytes, Bytes>,
     takeovers: ReadOnlyTable<Bytes, Bytes>,
+    fragments: ReadOnlyTable<Bytes, Bytes>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
 
@@ -858,8 +939,34 @@ impl IndexReader {
             promotions: txn.open_table(PROMOTIONS)?,
             configs: txn.open_table(CONFIGS)?,
             takeovers: txn.open_table(TAKEOVERS)?,
+            fragments: txn.open_table(FRAGMENTS)?,
             meta: txn.open_table(META)?,
         })
+    }
+
+    /// Returns the fragments `node` holds of the coded versions of
+    /// `shard`'s keys, in key, stripe, and index order (§8.6).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn fragments_on(
+        &self,
+        shard: &ShardRef,
+        node: &NodeId,
+    ) -> Result<Vec<(FragmentKey, FragmentId)>, IndexError> {
+        let prefix = codec::fragment_node_prefix(shard, node);
+        let end = prefix_end(&prefix);
+        let mut rows = Vec::new();
+        for row in self.fragments.range(prefix.as_slice()..end.as_slice())? {
+            let (key, value) = row?;
+            let key =
+                codec::decode_fragment_key(key.value()).map_err(IndexError::codec("fragments"))?;
+            let fragment =
+                codec::decode_fragment(value.value()).map_err(IndexError::codec("fragments"))?;
+            rows.push((key, fragment));
+        }
+        Ok(rows)
     }
 
     /// Returns the epoch in which this node's replica of `shard` stepped
@@ -1261,6 +1368,7 @@ impl IndexReader {
             ShardTable::Parts => &self.parts,
             ShardTable::RemoteUploads => &self.remote_uploads,
             ShardTable::RemoteParts => &self.remote_parts,
+            ShardTable::Fragments => &self.fragments,
         };
         let (mut rows, mut bytes) = (Vec::new(), 0);
         for row in table.range(prefix.as_slice()..end.as_slice())? {
@@ -1322,6 +1430,12 @@ impl IndexReader {
                 "remote_parts",
                 codec::decode_part_key,
                 codec::decode_remote_part,
+            )?,
+            fragments: read_all(
+                &self.fragments,
+                "fragments",
+                codec::decode_fragment_key,
+                codec::decode_fragment,
             )?,
             control,
             control_generation: self.control_generation()?,

@@ -77,7 +77,7 @@ pub enum RecordKind {
     Import,
     /// Adopts a remote version that changed out of band (defined).
     Adopt,
-    /// Publishes an erasure-coded object (reserved for M5).
+    /// Publishes an erasure-coded object version's layout (defined).
     EcPublish,
     /// Moves erasure-coded fragments (reserved for M5).
     EcRelocate,
@@ -188,6 +188,7 @@ impl RecordKind {
                 | Self::Tags
                 | Self::Import
                 | Self::Adopt
+                | Self::EcPublish
                 | Self::Truncate
                 | Self::Config
         )

@@ -80,7 +80,7 @@ mod transport;
 pub use admin::{AdminConfig, LogFormat, LoggingConfig};
 pub use buckets::{BucketSettings, BucketsConfig, MAX_IMPORT_PARALLEL_STREAMS, TargetTransport};
 pub use cluster::{ClusterConfig, ControlStoreBackend, ControlStoreConfig, FailureDomain};
-pub use ec::EcConfig;
+pub use ec::{EcConfig, MAX_FRAGMENT_BYTES};
 pub use error::{ConfigError, Violation, Violations};
 pub use flush::{AckPolicy, ConflictPolicy, FlushConfig};
 pub use identity::{IdentityConfig, StaticCredentialConfig};
@@ -210,6 +210,12 @@ impl Config {
         raw.admin.check(&mut checker);
         check_control_store_independence(&control_store, &named_buckets, &mut checker);
         check_peer_sources(&raw.peering, &named_buckets, &mut checker);
+        check_stripes(
+            &raw.ec,
+            bucket_defaults.as_ref(),
+            &named_buckets,
+            &mut checker,
+        );
         checker.finish()?;
 
         // Each resolver returns `None` only after reporting a violation.
@@ -358,6 +364,33 @@ fn check_peer_sources(
                 &format!("{}.peer_source", key_path("buckets", name.as_str())),
                 || format!("names {source}, which has no [peering.peers.{source}] table"),
             );
+        }
+    }
+}
+
+/// Checks each bucket's stripes against the fragment store's limit: the
+/// defaults, and each bucket whose own table changes the stripe size.
+fn check_stripes(
+    ec: &EcConfig,
+    defaults: Option<&BucketSettings>,
+    buckets: &BTreeMap<BucketName, BucketSettings>,
+    checker: &mut Checker,
+) {
+    let inherited = defaults.map(|defaults| defaults.ec_stripe_data_bytes);
+    if let Some(bytes) = inherited {
+        let key = format!(
+            "{}.ec_stripe_data_bytes",
+            key_path("buckets", buckets::DEFAULTS)
+        );
+        ec.check_stripe(&key, bytes, checker);
+    }
+    for (name, settings) in buckets {
+        if Some(settings.ec_stripe_data_bytes) != inherited {
+            let key = format!(
+                "{}.ec_stripe_data_bytes",
+                key_path("buckets", name.as_str())
+            );
+            ec.check_stripe(&key, settings.ec_stripe_data_bytes, checker);
         }
     }
 }
