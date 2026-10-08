@@ -7140,14 +7140,16 @@ of this file. A task with nothing unexpected keeps "None."
 - **Seeds and costs.** A repair run costs 16 typical seeds: the
   encoding of the coding scenarios, then seconds of repairs at a 64 KiB/s
   cap. At `SKYS3_SIM_SEEDS=256` each scenario runs 4 to 16 seeds, and
-  all seven passed, one test thread each: a lost holder with reads (8
-  seeds, 30 s), two lost holders (8, 37 s), crashes during repairs (16,
-  54 s), repairs outlasting `orphan_after` (8, 34 s), and the seeded
-  bugs, each seed run with and without the bug: `Unfenced` (4, 24 s),
-  `AcknowledgeBeforeSync` at the new holder (8, 43 s), and
-  `LeastLostFirst` and `Unthrottled` (4, 40 s); about 260 s in all.
+  all seven passed, one test thread each: a lost holder with reads and
+  retags (8 seeds, 27 s), two lost holders (8, 27 s), crashes during
+  repairs (16, 32 s), repairs outlasting `orphan_after` (8, 21 s), and
+  the seeded bugs, each seed run with and without the bug: `Unfenced`
+  (4, 15 s), `AcknowledgeBeforeSync` at the new holder (8, 25 s), and
+  `LeastLostFirst` and `Unthrottled` (4, 24 s); about 170 s in all.
   Each bug is caught at every seed run: 0 to 3, 0 to 7, and 0 to 3.
-  Seeds 1 and 5 found the harness problems above.
+  Seeds 1 and 5 found the harness problems above. Repairs that do not
+  end within the run's bound now end the run, which then fails; before,
+  such a run went on indefinitely.
 - **Hooks for M5-07 and M5-09.** A fragment an `EC_RELOCATE` replaced is
   named by no layout, so orphan reclamation reclaims it, from a node
   that comes back, without waiting for read registrations: fragment
