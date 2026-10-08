@@ -80,7 +80,7 @@ fn crashes_at_every_encoding_step_keep_every_object_readable() {
 /// Runs `config` without a bug, which must pass, then with `seed`
 /// seeding a bug, which a check must catch with an error containing one
 /// of `caught`.
-fn caught(
+pub(crate) fn caught(
     context: &mut SimContext,
     config: &CodingConfig,
     seed: impl FnOnce(&mut CodingConfig),

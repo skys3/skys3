@@ -18,6 +18,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+bytes = "1"
 crc32c = "0.6"
 libfuzzer-sys = "0.4"
 prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
@@ -89,6 +90,13 @@ bench = false
 [[bin]]
 name = "ec_orphans"
 path = "fuzz_targets/ec_orphans.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_read"
+path = "fuzz_targets/ec_read.rs"
 test = false
 doc = false
 bench = false

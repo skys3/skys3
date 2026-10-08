@@ -276,6 +276,15 @@ fn an_object_is_encoded_stripe_by_stripe_and_published() {
             assert_eq!(decoded, data[range]);
         }
 
+        // A read plan names no replica: the entry's layout names the
+        // fragments a GET reads (§8.5).
+        let plan = f.shard.plan("photo").await.unwrap();
+        assert!(plan.layout.is_empty() && plan.holders.is_empty());
+        assert_eq!(
+            plan.entry.and_then(|e| e.object?.coded).map(|c| c.publish),
+            Some(position)
+        );
+
         // The steps, in order.
         let steps = f.steps();
         assert_eq!(steps[0], EncodeStep::Started { stripes: 3 });
