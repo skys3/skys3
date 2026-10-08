@@ -6144,12 +6144,12 @@ of this file. A task with nothing unexpected keeps "None."
   `InternalError` on the next `CopyObject`, without random errors, and
   the bug tests match the start of the audit's reason.
 - **Costs.** At 2% remote errors, 25% stalls, and a third of sources
-  rewritten, a seed of the main scenario takes about 9 s in a debug
-  build and the seeded ones 3 to 6 s, so all three run at
-  `Runner::with_cost(_, 2 * COST)`: CI runs seeds 0 to 3 of each, 35 s
-  for the main scenario, 12 and 24 s for the seeded ones, and 39 s for
+  rewritten, a seed of the main scenario takes about 7 s in a debug
+  build and the seeded ones 3 to 5 s, so all three run at
+  `Runner::with_cost(_, 2 * COST)`: CI runs seeds 0 to 3 of each, 29 s
+  for the main scenario, 11 and 21 s for the seeded ones, and 27 s for
   the three side by side at `SKYS3_SIM_SEEDS=256`. All three passed 64
-  seeds (`SKYS3_SIM_SEEDS=4096`), 763 s side by side.
+  seeds (`SKYS3_SIM_SEEDS=4096`), 475 s side by side.
 - **Seeded bugs** (`CopyBug`, without faults, 12 operations and 12
   copies, `Runner::with_cost(2, 2 * COST)`):
   - `CopyBug::WithoutIdentity`, copies sent without the copy's write
