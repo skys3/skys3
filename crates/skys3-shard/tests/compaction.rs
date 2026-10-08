@@ -14,8 +14,8 @@ use skys3_io::{SimDisk, SimMount};
 use skys3_log::{LogRecord, RecordBody, SegmentLog};
 use skys3_obs::MetricsRegistry;
 use skys3_shard::{
-    CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
-    Effect, Outcome, ReadSettings, Shard, ShardSet, StateMachine,
+    CacheMetrics, CacheRefusal, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings,
+    Compactor, Effect, Outcome, ReadSettings, Shard, ShardSet, StateMachine,
 };
 use skys3_types::{NodeId, Seq, ShardConfig};
 use support::{
@@ -319,6 +319,7 @@ fn cold_clean_payload_is_evicted_and_hot_payload_copied() {
             },
             CacheMetrics::default(),
         );
+        cache.set_clean_copies([(shard_ref(0).bucket, 1)]);
         node.set.use_cache(&cache).await;
         let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
         // Ten clean keys, then garbage after them.
@@ -516,6 +517,49 @@ fn a_replica_holds_what_its_members_may_lack() {
         node.checkpointer.checkpoint().await.unwrap();
         let report = node.compactor(Duration::ZERO).compact().await.unwrap();
         assert!(report.segments > 0, "{report:?}");
+    });
+}
+
+/// A bucket the cache is not told the `clean_copies` of, such as a `local`
+/// bucket whose backup target made its entries clean (§8.9), keeps its
+/// payload: compaction copies it, and evicts none.
+#[test]
+fn clean_payload_of_a_bucket_the_cache_keeps_is_copied() {
+    runtime().block_on(async {
+        let disk = SimDisk::new(8);
+        let node = Node::open(&disk).await;
+        let cache = CleanCache::new(
+            CacheSettings {
+                max_bytes: 1 << 20,
+                reserve_fraction: 0.0,
+            },
+            CacheMetrics::default(),
+        );
+        node.set.use_cache(&cache).await;
+        let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
+        let clean = |n: u64| format!("clean-{n}");
+        for n in 0..10 {
+            let written = shard.commit(put(&clean(n), 400, n)).await.unwrap();
+            let seq = written.position.seq.get();
+            shard.commit(flushed(&clean(n), seq, false)).await.unwrap();
+        }
+        cache.reclaim(&node.set).await;
+        assert_eq!(cache.usage().bytes, 0);
+        overwrite(&shard, 1, 60).await;
+        node.checkpointer.checkpoint().await.unwrap();
+        let report = node.compactor(Duration::ZERO).compact().await.unwrap();
+        assert!(report.segments > 0, "{report:?}");
+        assert_eq!(report.evictions, 0, "{report:?}");
+        for n in 0..10 {
+            let entry = node.index.read().unwrap().entry(shard.shard(), &clean(n));
+            assert_eq!(entry.unwrap().unwrap().state, EntryState::Clean);
+            assert_eq!(node.bytes(&shard, &clean(n)).await, Some(pattern(400)));
+        }
+        // The replica refuses an eviction of the bucket too.
+        let entry = shard.entry(&clean(0)).await.unwrap().unwrap();
+        let refused = shard.evict(&clean(0), entry.version).await.unwrap();
+        assert_eq!(refused, Err(CacheRefusal::Kept));
+        assert!(!shard.evicts_clean());
     });
 }
 

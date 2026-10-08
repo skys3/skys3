@@ -1,11 +1,13 @@
-//! Write-through acknowledgement (design §7.5).
+//! Write-through acknowledgement (design §7.5, §8.9).
 //!
 //! A write to a `write_back` bucket whose `ack_policy` is `write_through`
 //! is answered only once its version has reached the bucket's remote
 //! target as well as every member: PutObject, CopyObject,
 //! CompleteMultipartUpload, DeleteObject, each key of DeleteObjects, and
 //! the tagging writes. Multipart parts are not objects and are answered
-//! after their local commit; their completion waits.
+//! after their local commit; their completion waits. A write to a `local`
+//! bucket whose `backup_ack` is `write_through` waits the same way for the
+//! bucket's backup target, which its flusher sends it to.
 //!
 //! After the local commit the gateway asks the shard's primary, whose
 //! flusher answers once the remote holds the version or a later one of the
@@ -52,12 +54,32 @@ impl WriteThrough {
     }
 
     /// How long a write to `bucket` waits for its flush, or `None` if the
-    /// bucket acknowledges writes after their local commit.
+    /// bucket acknowledges writes after their local commit: a `write_back`
+    /// bucket with `ack_policy = "write_through"`, or a `local` bucket with
+    /// a backup target and `backup_ack = "write_through"` (§8.9).
     pub(crate) fn wait_of(&self, bucket: &BucketDocument) -> Option<Duration> {
-        let write_through = bucket.mode == BucketMode::WriteBack
-            && self.buckets.get(&bucket.name).ack_policy == AckPolicy::WriteThrough;
+        let settings = self.buckets.get(&bucket.name);
+        let write_through = match bucket.mode {
+            BucketMode::WriteBack => settings.ack_policy == AckPolicy::WriteThrough,
+            BucketMode::Local => {
+                settings.backup_target.is_some() && settings.backup_ack == AckPolicy::WriteThrough
+            }
+            BucketMode::ReadOnly => false,
+        };
         write_through.then_some(self.timeout)
     }
+
+    /// Whether `bucket` is a `local` bucket with a backup target (§8.9),
+    /// whose flusher sends its writes there.
+    pub(crate) fn backed_up(&self, bucket: &BucketDocument) -> bool {
+        backed_up(&self.buckets, bucket)
+    }
+}
+
+/// Whether `bucket` is a `local` bucket whose settings in `buckets` name a
+/// backup target (§8.9).
+pub(crate) fn backed_up(buckets: &BucketsConfig, bucket: &BucketDocument) -> bool {
+    bucket.mode == BucketMode::Local && buckets.get(&bucket.name).backup_target.is_some()
 }
 
 /// Waits up to `timeout` until the remote target holds `version` of
@@ -160,6 +182,38 @@ mod tests {
         let local = config("");
         let policy = WriteThrough::new(local.buckets().clone(), timeout);
         assert_eq!(policy.wait_of(&photos), None);
+    }
+
+    #[test]
+    fn local_buckets_wait_for_a_backup_with_the_policy() {
+        let timeout = Duration::from_secs(3);
+        let backup = |ack: &str| {
+            let text = format!(
+                "[buckets.photos]\nmode = \"local\"\n\
+                 backup_target = \"https://backup.example.com/vault/photos\"\n\
+                 backup_ack = \"{ack}\""
+            );
+            WriteThrough::new(config(&text).buckets().clone(), timeout)
+        };
+        let photos = bucket("b-1", 1);
+        assert_eq!(photos.mode, BucketMode::Local);
+        let policy = backup("write_through");
+        assert_eq!(policy.wait_of(&photos), Some(timeout));
+        assert!(policy.backed_up(&photos));
+        let policy = backup("local");
+        assert_eq!(policy.wait_of(&photos), None);
+        assert!(policy.backed_up(&photos));
+
+        // Without a backup target, a local bucket has nothing to wait for:
+        // `ack_policy` is the `write_back` buckets' setting.
+        let plain = config("[flush]\nack_policy = \"write_through\"");
+        let policy = WriteThrough::new(plain.buckets().clone(), timeout);
+        assert_eq!(policy.wait_of(&photos), None);
+        assert!(!policy.backed_up(&photos));
+        let mut origin = photos;
+        origin.mode = BucketMode::ReadOnly;
+        assert_eq!(policy.wait_of(&origin), None);
+        assert!(!policy.backed_up(&origin));
     }
 
     #[tokio::test(start_paused = true)]

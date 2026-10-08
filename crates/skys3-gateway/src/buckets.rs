@@ -64,6 +64,7 @@ use crate::fill::Fills;
 use crate::hot_cache::HotCache;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
+use crate::objects::backed_up;
 use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
@@ -589,7 +590,8 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 }
             }
         }
-        if let Some(refusal) = refuse_detach(bucket.mode, summary) {
+        let backed_up = backed_up(&self.config.buckets, bucket);
+        if let Some(refusal) = refuse_detach(bucket.mode, backed_up, summary) {
             // Held seals came from a check that passed, and no client write
             // has committed since, so they cannot lead here; they are kept
             // all the same while the earlier delete may apply.
@@ -810,13 +812,21 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     }
 }
 
-/// Why a bucket with these contents cannot be detached, if it cannot.
-fn refuse_detach(mode: BucketMode, summary: ShardSummary) -> Option<S3Error> {
+/// Why a bucket with these contents cannot be detached, if it cannot. A
+/// `local` bucket with a backup target (`backed_up`) also waits until its
+/// deletes reached the backup: their tombstones exist nowhere else (§8.9).
+fn refuse_detach(mode: BucketMode, backed_up: bool, summary: ShardSummary) -> Option<S3Error> {
     match mode {
         BucketMode::Local if summary.objects > 0 => Some(s3_error!(
             BucketNotEmpty,
             "The bucket you tried to delete is not empty: it holds {} objects",
             summary.objects
+        )),
+        BucketMode::Local if backed_up && summary.unflushed > 0 => Some(s3_error!(
+            BucketNotEmpty,
+            "The bucket has {} deletes not yet sent to its backup target; delete it once \
+                 they are sent",
+            summary.unflushed
         )),
         BucketMode::WriteBack | BucketMode::ReadOnly if summary.unflushed > 0 => Some(s3_error!(
             BucketNotEmpty,
@@ -981,10 +991,14 @@ mod tests {
     #[test]
     fn detach_refusals_follow_the_mode() {
         let summary = |objects, unflushed| ShardSummary { objects, unflushed };
-        assert!(refuse_detach(BucketMode::Local, summary(0, 0)).is_none());
-        assert!(refuse_detach(BucketMode::Local, summary(1, 1)).is_some());
-        assert!(refuse_detach(BucketMode::WriteBack, summary(5, 0)).is_none());
-        let refusal = refuse_detach(BucketMode::WriteBack, summary(5, 2)).unwrap();
+        assert!(refuse_detach(BucketMode::Local, false, summary(0, 0)).is_none());
+        assert!(refuse_detach(BucketMode::Local, false, summary(1, 1)).is_some());
+        // Tombstones waiting for a backup target hold a local bucket.
+        assert!(refuse_detach(BucketMode::Local, false, summary(0, 2)).is_none());
+        let refusal = refuse_detach(BucketMode::Local, true, summary(0, 2)).unwrap();
+        assert!(refusal.message().unwrap().contains("2 deletes"));
+        assert!(refuse_detach(BucketMode::WriteBack, false, summary(5, 0)).is_none());
+        let refusal = refuse_detach(BucketMode::WriteBack, false, summary(5, 2)).unwrap();
         assert_eq!(*refusal.code(), S3ErrorCode::BucketNotEmpty);
         assert!(refusal.message().unwrap().contains("2 changes"));
     }

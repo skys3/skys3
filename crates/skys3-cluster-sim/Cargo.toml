@@ -28,7 +28,8 @@ skys3-control = { workspace = true, features = ["test-util"] }
 skys3-coord.workspace = true
 # `test-util` for the fragment-store bugs of the coding scenarios.
 skys3-ec = { workspace = true, features = ["test-util"] }
-skys3-flush.workspace = true
+# `test-util` for the seeded bug of the backup scenarios.
+skys3-flush = { workspace = true, features = ["test-util"] }
 # `test-util` for the authenticator that trusts every request.
 skys3-gateway = { workspace = true, features = ["test-util"] }
 skys3-index.workspace = true

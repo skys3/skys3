@@ -79,7 +79,7 @@
 //! a body's part is read and hashed. A completion that the remote refuses
 //! with `400 InvalidPart` lists the remote upload again.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -438,7 +438,7 @@ impl Claim {
 /// The streams of one shard flusher, shared by its task and its flushes.
 #[derive(Debug, Default)]
 pub(crate) struct Streams {
-    streams: Mutex<HashMap<EpochSeq, Stream>>,
+    streams: Mutex<BTreeMap<EpochSeq, Stream>>,
     /// Woken whenever a part's send or an open ends.
     idle: Notify,
     /// The number of the next `ListParts` a stream starts.
@@ -450,7 +450,7 @@ pub(crate) struct Streams {
 }
 
 impl Streams {
-    fn lock(&self) -> MutexGuard<'_, HashMap<EpochSeq, Stream>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<EpochSeq, Stream>> {
         // Every update leaves the map consistent.
         self.streams.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1348,13 +1348,32 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// A failpoint for tests: reads of an upload's parts by a stream's open
-/// that fail, as an index read may.
+/// Failpoints for tests: reads of an upload's parts by a stream's open
+/// that fail, as an index read may, and a seeded bug of tombstone flushes.
 #[cfg(feature = "test-util")]
 pub mod test_hooks {
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static FAILING: AtomicU32 = AtomicU32::new(0);
+
+    thread_local! {
+        static FORGETTING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Seeds, or with `false` removes, a bug into every flusher this thread
+    /// runs: a tombstone's flush records the key as deleted at the remote
+    /// without deleting it there. A deterministic simulation runs every
+    /// node on its test's thread, so other tests run the real code.
+    #[doc(hidden)]
+    pub fn forget_deletes(forget: bool) {
+        FORGETTING.with(|forgetting| forgetting.set(forget));
+    }
+
+    /// Whether the bug of [`forget_deletes`] is seeded on this thread.
+    pub(crate) fn forgets_deletes() -> bool {
+        FORGETTING.with(Cell::get)
+    }
 
     /// Makes the next `count` reads of an upload's parts by a stream's
     /// open fail, in every flusher of this process.
@@ -1376,9 +1395,14 @@ pub mod test_hooks {
 }
 
 #[cfg(not(feature = "test-util"))]
-mod test_hooks {
+pub(crate) mod test_hooks {
     /// No read fails without the `test-util` feature.
     pub(crate) fn fail_parts_read() -> bool {
+        false
+    }
+
+    /// No bug is seeded without the `test-util` feature.
+    pub(crate) fn forgets_deletes() -> bool {
         false
     }
 }
