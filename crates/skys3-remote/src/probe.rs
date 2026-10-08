@@ -17,6 +17,30 @@
 //! operations unconditionally and the bucket status lists them as
 //! unprotected ([`ConditionalWrites::unprotected`]).
 //!
+//! # Server-side copies
+//!
+//! The flusher sends a copy of a clean source as a remote `CopyObject`
+//! only if the store supports everything such a copy needs (design §7.2,
+//! §11): `x-amz-metadata-directive: REPLACE`, `x-amz-tagging-directive:
+//! REPLACE`, `x-amz-copy-source-if-match`, and both destination
+//! preconditions. The probe classifies each the same three ways
+//! ([`CopySupport`]). It writes a source with one tag and a metadata
+//! mark, and copies it:
+//!
+//! - with each directive set to `REPLACE` in turn, the other one `COPY`,
+//!   and HEADs the copy: the directive is honored if the copy has the
+//!   replaced mark, or two tags (`x-amz-tagging-count`), ignored if it has
+//!   the source's, and rejected if the copy fails;
+//! - with `x-amz-copy-source-if-match` naming another ETag and then the
+//!   source's, as a precondition;
+//! - to a new key with `If-None-Match: *` and `If-Match`, as
+//!   `PutObject` is probed.
+//!
+//! S3 sends `x-amz-tagging-count` only to callers allowed
+//! `s3:GetObjectTagging`. Without that permission the tagging directive
+//! reads as ignored, and copies are sent as regular uploads, which is
+//! always correct.
+//!
 //! # Scratch keys
 //!
 //! The probe writes only under its scratch prefix,
@@ -24,7 +48,8 @@
 //! prefix SkyS3 owns in the remote bucket (empty for a whole bucket) and the
 //! nonce is 16 hex digits, fresh for every run. The nonce keeps concurrent
 //! probes of one target, from several nodes, apart. The keys under it are
-//! `put-object`, `complete-multipart-upload`, and `delete-object`.
+//! `put-object`, `complete-multipart-upload`, `delete-object`,
+//! `copy-source`, `copy-object`, and `copy-destination`.
 //!
 //! The probe removes everything it created before it returns, whether or
 //! not it succeeded: each version it wrote and each delete marker it added
@@ -47,6 +72,7 @@
 //! assert_eq!(probe.scratch_prefix(), "team-a/.skys3-probe/000000000000002a/");
 //! ```
 
+use std::collections::BTreeMap;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
@@ -55,13 +81,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use skys3_types::ETag;
 
 use crate::model::{
-    AbortMultipartUpload, CompleteMultipartUpload, CompletedPart, CreateMultipartUpload,
-    DeleteObject, HeadObject, PutObject, UploadId, UploadPart, VersionId, WriteOutput,
-    WritePrecondition,
+    AbortMultipartUpload, CompleteMultipartUpload, CompletedPart, CopyObject,
+    CreateMultipartUpload, DeleteObject, HeadObject, MetadataDirective, ObjectInfo, PutObject,
+    TaggingDirective, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
 };
-use crate::{ObjectStore, S3Error, S3ErrorKind, S3Result};
+use crate::{ObjectStore, S3Error, S3ErrorKind, S3Result, UserMetadata};
 
-/// How a store treats one write-precondition header on one operation.
+/// How a store treats one write-precondition header on one operation, or
+/// one `CopyObject` directive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PreconditionSupport {
     /// The precondition is evaluated: a failed one is `412` and writes
@@ -162,7 +189,73 @@ impl fmt::Display for OperationSupport {
     }
 }
 
-/// What the probe found: which write preconditions a store honors.
+/// How a store treats what a server-side copy of a flush sends (design
+/// §7.2, §11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CopySupport {
+    /// `x-amz-metadata-directive: REPLACE`: honored if the copy gets the
+    /// request's metadata, ignored if it keeps the source's.
+    pub metadata_directive: PreconditionSupport,
+    /// `x-amz-tagging-directive: REPLACE`: honored if the copy gets the
+    /// request's tags, ignored if it keeps the source's.
+    pub tagging_directive: PreconditionSupport,
+    /// `x-amz-copy-source-if-match`.
+    pub source_if_match: PreconditionSupport,
+    /// `If-None-Match: *` and `If-Match` on the destination.
+    pub destination: OperationSupport,
+}
+
+impl CopySupport {
+    /// Support for nothing: a store that rejects every copy.
+    pub const NONE: CopySupport = CopySupport {
+        metadata_directive: PreconditionSupport::Rejected,
+        tagging_directive: PreconditionSupport::Rejected,
+        source_if_match: PreconditionSupport::Rejected,
+        destination: OperationSupport {
+            if_none_match: Some(PreconditionSupport::Rejected),
+            if_match: PreconditionSupport::Rejected,
+        },
+    };
+
+    /// Support for everything, as on AWS S3.
+    pub const FULL: CopySupport = CopySupport {
+        metadata_directive: PreconditionSupport::Honored,
+        tagging_directive: PreconditionSupport::Honored,
+        source_if_match: PreconditionSupport::Honored,
+        destination: OperationSupport {
+            if_none_match: Some(PreconditionSupport::Honored),
+            if_match: PreconditionSupport::Honored,
+        },
+    };
+
+    /// Whether the flusher may send copies as `CopyObject`: the store
+    /// honors both directives, the source precondition, and both
+    /// destination preconditions. Otherwise copies are sent as regular
+    /// uploads.
+    pub fn is_usable(&self) -> bool {
+        self.metadata_directive.is_honored()
+            && self.tagging_directive.is_honored()
+            && self.source_if_match.is_honored()
+            && self.destination.is_protected()
+    }
+}
+
+impl fmt::Display for CopySupport {
+    /// Writes, for example, `x-amz-metadata-directive honored,
+    /// x-amz-tagging-directive ignored, x-amz-copy-source-if-match honored,
+    /// If-None-Match honored, If-Match honored`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "x-amz-metadata-directive {}, x-amz-tagging-directive {}, \
+             x-amz-copy-source-if-match {}, {}",
+            self.metadata_directive, self.tagging_directive, self.source_if_match, self.destination
+        )
+    }
+}
+
+/// What the probe found: which write preconditions a store honors, and
+/// whether it can take the server-side copies of a flush.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ConditionalWrites {
     /// `PutObject`.
@@ -171,6 +264,9 @@ pub struct ConditionalWrites {
     pub complete_multipart_upload: OperationSupport,
     /// `DeleteObject`.
     pub delete_object: OperationSupport,
+    /// `CopyObject`, which the flusher uses only if it is usable
+    /// ([`CopySupport::is_usable`]); it is never sent unprotected.
+    pub copy_object: CopySupport,
 }
 
 impl ConditionalWrites {
@@ -196,11 +292,10 @@ impl ConditionalWrites {
 impl fmt::Display for ConditionalWrites {
     /// Writes each operation and its support, separated by `; `.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, operation) in ConditionalOperation::ALL.into_iter().enumerate() {
-            let separator = if i == 0 { "" } else { "; " };
-            write!(f, "{separator}{operation}: {}", self.operation(operation))?;
+        for operation in ConditionalOperation::ALL {
+            write!(f, "{operation}: {}; ", self.operation(operation))?;
         }
-        Ok(())
+        write!(f, "CopyObject: {}", self.copy_object)
     }
 }
 
@@ -429,6 +524,8 @@ fn passing<T>(step: Step, result: S3Result<T>) -> Result<Option<T>, StepError> {
 enum Creating {
     Put,
     Complete,
+    /// `CopyObject` of the copy source ([`COPY_SOURCE`]).
+    Copy,
 }
 
 impl Creating {
@@ -436,6 +533,7 @@ impl Creating {
         match self {
             Creating::Put => "PutObject",
             Creating::Complete => "CompleteMultipartUpload",
+            Creating::Copy => "CopyObject",
         }
     }
 
@@ -443,6 +541,7 @@ impl Creating {
         match self {
             Creating::Put => "put-object",
             Creating::Complete => "complete-multipart-upload",
+            Creating::Copy => "copy-destination",
         }
     }
 
@@ -464,7 +563,91 @@ impl<S: ObjectStore> Run<'_, S> {
             put_object: self.probe_creating(Creating::Put).await?,
             complete_multipart_upload: self.probe_creating(Creating::Complete).await?,
             delete_object: self.probe_delete().await?,
+            copy_object: self.probe_copy().await?,
         })
+    }
+
+    /// Probes what a server-side copy of a flush sends (see the module
+    /// documentation).
+    async fn probe_copy(&mut self) -> Result<CopySupport, StepError> {
+        let source = format!("{}{COPY_SOURCE}", self.prefix);
+        let step = Step("PutObject", "of the copy source");
+        let request = PutObject::new(&source, BODY)
+            .with_content_type("text/plain")
+            .with_metadata(marked("source"))
+            .with_tags(probe_tags(1));
+        let result = self.store.put_object(request).await;
+        self.record_write(&source, &result);
+        let etag = result.map_err(|error| (step, error))?.etag;
+        let copied = format!("{}copy-object", self.prefix);
+
+        let step = Step("CopyObject", "with x-amz-metadata-directive: REPLACE");
+        let replace = MetadataDirective::Replace {
+            metadata: marked("replaced"),
+            content_type: Some("text/plain".to_owned()),
+            headers: BTreeMap::new(),
+        };
+        let request = CopyObject::new(&source, &copied).with_metadata_directive(replace);
+        let metadata_directive = match passing(step, self.copy(request).await)? {
+            Some(_) => {
+                let info = self.head(step, &copied).await?;
+                replaced(info.metadata.get(MARK) == Some("replaced"))
+            }
+            None => PreconditionSupport::Rejected,
+        };
+
+        let step = Step("CopyObject", "with x-amz-tagging-directive: REPLACE");
+        let request = CopyObject::new(&source, &copied)
+            .with_tagging_directive(TaggingDirective::Replace(probe_tags(2)));
+        let tagging_directive = match passing(step, self.copy(request).await)? {
+            Some(_) => replaced(self.head(step, &copied).await?.tag_count == 2),
+            None => PreconditionSupport::Rejected,
+        };
+
+        let step = Step(
+            "CopyObject",
+            "with x-amz-copy-source-if-match with a different ETag",
+        );
+        let request = CopyObject::new(&source, &copied).with_source_if_match(mismatch());
+        let source_if_match = match failing(step, self.copy(request).await)? {
+            Failing::Refused => {
+                let step = Step(
+                    "CopyObject",
+                    "with x-amz-copy-source-if-match with the source's ETag",
+                );
+                let request = CopyObject::new(&source, &copied).with_source_if_match(etag);
+                match passing(step, self.copy(request).await)? {
+                    Some(_) => PreconditionSupport::Honored,
+                    None => PreconditionSupport::Rejected,
+                }
+            }
+            Failing::Applied(_) => PreconditionSupport::Ignored,
+            Failing::Rejected => PreconditionSupport::Rejected,
+        };
+
+        Ok(CopySupport {
+            metadata_directive,
+            tagging_directive,
+            source_if_match,
+            destination: self.probe_creating(Creating::Copy).await?,
+        })
+    }
+
+    /// `CopyObject`, recording the version it created.
+    async fn copy(&mut self, request: CopyObject) -> S3Result<WriteOutput> {
+        let key = request.key.clone();
+        let result = self.store.copy_object(request).await;
+        self.record_write(&key, &result);
+        result
+    }
+
+    /// HEADs `key`, which `step` just wrote.
+    async fn head(&self, step: Step, key: &str) -> Result<ObjectInfo, StepError> {
+        let request = HeadObject::new(key);
+        self.store
+            .head_object(request)
+            .await
+            .map_err(|error| (step, error))
     }
 
     /// Probes `If-None-Match: *` and then `If-Match` on `PutObject` or
@@ -559,6 +742,11 @@ impl<S: ObjectStore> Run<'_, S> {
         match op {
             Creating::Put => Ok(self.put(key, precondition).await),
             Creating::Complete => self.complete(step, key, precondition).await,
+            Creating::Copy => {
+                let source = format!("{}{COPY_SOURCE}", self.prefix);
+                let request = CopyObject::new(source, key).with_precondition(precondition);
+                Ok(self.copy(request).await)
+            }
         }
     }
 
@@ -771,3 +959,36 @@ fn may_have_applied(error: &S3Error) -> bool {
 
 /// The body of every object and part the probe writes.
 const BODY: &str = "skys3 capability probe";
+
+/// The scratch key the probe's copies copy.
+const COPY_SOURCE: &str = "copy-source";
+
+/// The user-metadata key that tells the copy source's metadata from the
+/// metadata a copy replaces it with.
+const MARK: &str = "skys3-probe";
+
+/// User metadata with the probe's mark set to `value`.
+fn marked(value: &str) -> UserMetadata {
+    let mut metadata = UserMetadata::new();
+    metadata
+        .insert(MARK, value)
+        .expect("the probe's mark is valid metadata");
+    metadata
+}
+
+/// `count` tags, which tell the copy source's tags (one) from those a copy
+/// replaces them with (two).
+fn probe_tags(count: usize) -> BTreeMap<String, String> {
+    (0..count)
+        .map(|n| (format!("skys3-probe-{n}"), "probe".to_owned()))
+        .collect()
+}
+
+/// A directive that a copy applied if `replaced`, and otherwise ignored.
+fn replaced(replaced: bool) -> PreconditionSupport {
+    if replaced {
+        PreconditionSupport::Honored
+    } else {
+        PreconditionSupport::Ignored
+    }
+}
