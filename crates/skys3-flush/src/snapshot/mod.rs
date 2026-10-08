@@ -38,8 +38,15 @@
 //!   bucket's durable home when it has one, the uploads in progress, and
 //!   the window from the snapshot to the loss in which any key written may
 //!   also be lost. Coded objects are listed apart: re-indexing from their
-//!   fragment headers (plan M5-11) recovers them.
+//!   fragment headers recovers them.
+//! - **The restore drill** ([`drill()`]): the operator-run recovery of a
+//!   shard whose members are all lost. It combines the latest snapshot
+//!   with the fragment headers of every surviving node to re-index the
+//!   shard's coded objects (`skys3_ec::reindex`), including those written
+//!   after the snapshot, into a [`RestoredIndex`] a new member can install,
+//!   and reports what nothing restores.
 
+mod drill;
 mod format;
 pub(crate) mod hooks;
 mod report;
@@ -60,6 +67,7 @@ use tokio::task::JoinHandle;
 
 use crate::service::Connect;
 
+pub use drill::{Drill, DrillRequest, RestoredIndex, RestoredKey, drill};
 pub use format::{
     ChainId, Contents, FORMAT, FormatError, RowDigest, SNAPSHOT_DIR, Snapshot, object_key,
     parse_object_key, row_digest, shard_dir,

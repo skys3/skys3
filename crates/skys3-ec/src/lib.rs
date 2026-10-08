@@ -50,6 +50,10 @@
 //!   `k` fragments of a stripe that lost one, missing or corrupt, through
 //!   a [`FragmentSource`] ([`FragmentReadClient`] over the cluster
 //!   transport, served by [`FragmentServer::serve_reads`]).
+//! - **Re-indexing** ([`reindex`]): a lost shard's coded objects
+//!   restored from its latest index snapshot and the fragment headers its
+//!   surviving nodes hold ([`HeaderSource`]), the restore drill's core
+//!   (§6.9, §8.9).
 //! - **Repair** ([`repair`]): a shard primary finds the fragments its
 //!   coded objects lost, rebuilds each damaged stripe's on other nodes
 //!   from `k` survivors, most damaged stripes first and within the node's
@@ -81,6 +85,7 @@ mod layout;
 pub mod orphans;
 pub mod read;
 mod reed_solomon;
+pub mod reindex;
 pub mod repair;
 mod store;
 mod transfer;
@@ -102,6 +107,7 @@ pub use read::{
     FragmentReadError, FragmentRequest, FragmentSource, read_coded,
 };
 pub use reed_solomon::ReedSolomonV1;
+pub use reindex::{HeaderError, HeaderSource, Reindexed, SnapshotState, reindex};
 pub use repair::{
     RepairBandwidth, RepairError, RepairEvent, RepairMetrics, RepairObserver, RepairReport,
     RepairSettings, RepairStep, Repairer,
