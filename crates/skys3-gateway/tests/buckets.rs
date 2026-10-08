@@ -115,12 +115,8 @@ async fn modes_and_targets_come_from_headers_or_configuration() {
         ("write_back", Some("https://host"), 400, "InvalidArgument"),
         ("local", Some("https://host/bucket"), 400, "InvalidArgument"),
         ("cache", None, 400, "InvalidArgument"),
-        (
-            "read_only",
-            Some("https://host/bucket"),
-            501,
-            "NotImplemented",
-        ),
+        ("read_only", None, 400, "InvalidArgument"),
+        ("read_only", Some("https://host"), 400, "InvalidArgument"),
     ];
     for (mode, target, status, code) in cases {
         let answer = setup.create("other", mode, target).await;
