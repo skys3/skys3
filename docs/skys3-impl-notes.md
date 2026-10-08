@@ -6392,8 +6392,8 @@ of this file. A task with nothing unexpected keeps "None."
   `fragments` (the per-shard index from node to fragments, keyed by
   shard, node, key, stripe, and index) and `attempts`, and its values
   from format 3 to 4 for the entry's coded layout (`ObjectVersion::coded`:
-  the `EC_PUBLISH` position, the attempt, the stripes). Both recorded in
-  §10.1 and §10.2.
+  the `EC_PUBLISH` position, the version its fragments were written for,
+  the attempt, the stripes). Both recorded in §10.1 and §10.2.
 - **What supersedes a publish.** Applying `EC_PUBLISH` codes the version
   only if the entry still has its position, ETag, and size and is not
   coded; otherwise it is rejected (`Rejection::Superseded`,
@@ -6401,6 +6401,19 @@ of this file. A task with nothing unexpected keeps "None."
   so tags changed during an attempt supersede it, which is conservative;
   `TAGS` after a publish keeps the layout. `PUT`, `DELETE`, `ADOPT`, and
   `MPU_COMPLETE` replace the layout and remove its `fragments` rows.
+- **A retagged layout records its fragments' version.** The layout first
+  held only the publish position, the attempt, and the stripes, so after
+  a `TAGS` record moved `Entry::version` nothing named the version the
+  fragment headers carry, and a read (M5-06) or repair (M5-08) checking a
+  fragment's identity against the entry's version refused every fragment
+  of a retagged coded object. `Coded::version` now records the position
+  the `EC_PUBLISH` named (set as it is applied, so a superseded publish
+  under `SeededBug::PublishSuperseded` records the version it named, not
+  the entry's), and a fragment's identity is `Coded::version` with the
+  object's ETag, which a retag does not change. It is encoded right after
+  the publish position and must precede it, as in the record. Index
+  format 9 and value format 4 are new in this PR, so the field went into
+  them rather than a new format.
 - **Members drop replicas through compaction, gated on the commit.** A
   coded version's payload is `Holder::Coded` in the index. Compaction
   treats it as unreferenced only once the replica's commit watermark
@@ -6459,7 +6472,7 @@ of this file. A task with nothing unexpected keeps "None."
   object is coded and its replicas dropped, every node loses power and
   is recovered outside the simulation, and each member's entry must read
   back the last bytes written, from its log or decoded from fragments
-  whose headers name that version, stripe, and index.
+  whose headers name the layout's version, the stripe, and the index.
 - **Crashes and seeded bugs.** The crash scenario covers, each seed,
   every step (a stripe's start, two fragments durable, a stripe's end,
   the last stripe's start, `EC_PUBLISH` sequenced, and committed) against

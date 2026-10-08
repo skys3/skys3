@@ -66,6 +66,7 @@ fn a_publish_codes_the_current_version_and_keeps_it() {
     assert_eq!(object.payload, before.object.unwrap().payload);
     let coded = object.coded.unwrap();
     assert_eq!(coded.publish, at(2));
+    assert_eq!(coded.version, at(1));
     assert_eq!(coded.attempt, AttemptId::new(Epoch::new(1), 7));
     assert_eq!(coded.stripes.len(), 1);
     assert_eq!(on(&index, 2), 1);
@@ -87,6 +88,36 @@ fn a_publish_codes_the_current_version_and_keeps_it() {
     step(&index, 5, put("k", 10, 5));
     assert!(entry(&index, "k").unwrap().object.unwrap().coded.is_none());
     assert_eq!(on(&index, 1), 0);
+}
+
+#[test]
+fn a_retag_keeps_the_layout_and_the_version_its_fragments_name() {
+    let (_, index) = new_index();
+    step(&index, 1, put("k", 10, 1));
+    assert_eq!(step(&index, 2, publish("k", 1, 1, 10)), PUBLISHED);
+    let coded = entry(&index, "k").unwrap().object.unwrap().coded.unwrap();
+    assert_eq!((coded.publish, coded.version), (at(2), at(1)));
+
+    // Each retag moves the entry's version; the layout stays as published,
+    // naming the version its fragments were written for.
+    for seq in [3, 4] {
+        step(&index, seq, tags("k", &format!("v{seq}")));
+        let tagged = entry(&index, "k").unwrap();
+        assert_eq!(tagged.version, at(seq));
+        assert_eq!(tagged.object.unwrap().coded.as_ref(), Some(&coded));
+    }
+    assert_eq!(on(&index, 2), 1);
+
+    // The retagged version is coded already; a publish naming it, or the
+    // version the fragments name, is refused.
+    assert_eq!(
+        step(&index, 5, publish("k", 4, 1, 10)),
+        Outcome::Rejected(Rejection::AlreadyCoded)
+    );
+    assert_eq!(
+        step(&index, 6, publish("k", 1, 1, 10)),
+        Outcome::Rejected(Rejection::Superseded)
+    );
 }
 
 #[test]
@@ -131,7 +162,10 @@ fn a_seeded_bug_applies_a_superseded_publish() {
     let outcome = step(&index, 3, publish("k", 1, 1, 10));
     skys3_shard::seed_bug(None);
     assert_eq!(outcome, PUBLISHED);
-    assert_eq!(entry(&index, "k").unwrap().version, at(2));
+    let seeded = entry(&index, "k").unwrap();
+    assert_eq!(seeded.version, at(2));
+    // The layout names the version the record named.
+    assert_eq!(seeded.object.unwrap().coded.unwrap().version, at(1));
 }
 
 #[test]
