@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use skys3_config::{
-    AckPolicy, AckTimeoutMode, Config, ControlStoreBackend, FailureDomain, LogFormat,
+    AckPolicy, AckTimeoutMode, Config, ControlStoreBackend, FailureDomain, Freshness, LogFormat,
     TargetTransport,
 };
 use skys3_types::{BucketMode, BucketName, ShardCount};
@@ -252,6 +252,13 @@ backup_ack = "write_through"
 index_snapshot_interval_seconds = 600
 target_transport = "s3"
 max_dirty_bytes = 107374182400
+freshness = "ttl"
+freshness_ttl_seconds = 30
+
+[buckets.datasets]
+mode = "read_only"
+freshness = "revalidate"
+origin_profile = "datasets-reader"
 
 [buckets."logs.example"]
 mode = "write_back"
@@ -375,6 +382,14 @@ fn every_key_parses_and_is_resolved() {
     );
     assert_eq!(mirror.peer_source.as_ref().unwrap().as_str(), "c2");
     assert!(mirror.peer_local_writes);
+
+    assert_eq!(defaults.freshness, Freshness::Ttl);
+    assert_eq!(defaults.freshness_ttl().as_secs(), 30);
+    let datasets = config.buckets().get(&BucketName::new("datasets").unwrap());
+    assert_eq!(datasets.mode, BucketMode::ReadOnly);
+    assert_eq!(datasets.freshness, Freshness::Revalidate);
+    assert_eq!(datasets.freshness_ttl_seconds, 30, "inherited");
+    assert_eq!(datasets.origin_profile.as_deref(), Some("datasets-reader"));
 
     let unnamed = config.buckets().get(&BucketName::new("other").unwrap());
     assert_eq!(unnamed, defaults);

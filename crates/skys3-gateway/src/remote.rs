@@ -1,5 +1,5 @@
 //! Reads of a `write_back` bucket's remote target, as the gateway makes
-//! them (design §9.1).
+//! them (design §9.1), and of a `read_only` bucket's origin (§9.5).
 //!
 //! While a bucket's namespace import runs, the index does not yet hold the
 //! keys the import has not reached. A read that finds no entry for such a
@@ -9,6 +9,11 @@
 //! from the remote and commits them as an `ADOPT`. The node implements
 //! [`RemoteReads`] over its flush service; without one, none of this
 //! happens.
+//!
+//! A `read_only` bucket's target is an origin: every read asks it for the
+//! key's current version ([`RemoteReads::revalidate`]), or, under a TTL,
+//! remembers its answers for a while, keyed by the bucket's
+//! [`OriginScope`]; listings are forwarded to it.
 
 use std::fmt;
 use std::future::Future;
@@ -18,6 +23,8 @@ use std::pin::Pin;
 use bytes::Bytes;
 use skys3_index::{ImportCheckpoint, ListItem, ObjectVersion};
 use skys3_types::{BucketId, ETag};
+
+use crate::origin::{OriginHead, OriginScope};
 
 /// What a [`RemoteReads`] method returns.
 pub type RemoteFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, RemoteError>> + Send + 'a>>;
@@ -62,7 +69,8 @@ pub struct RemotePage {
     pub next: Option<String>,
 }
 
-/// The remote targets of `write_back` buckets, as the gateway reads them.
+/// The remote targets of `write_back` buckets, and the origins of
+/// `read_only` ones, as the gateway reads them.
 ///
 /// Keys are the bucket's, without the target's prefix. The methods return
 /// boxed futures so that the gateway can hold any implementation behind one
@@ -117,4 +125,34 @@ pub trait RemoteReads: fmt::Debug + Send + Sync + 'static {
         bucket: &'a BucketId,
         listing: RemoteListing,
     ) -> RemoteFuture<'a, RemotePage>;
+
+    /// The origin of `bucket`, a `read_only` bucket, and the scope of the
+    /// credentials this node reads it with (§9.5), or `None` if this node
+    /// does not read it. By default, none is read.
+    fn origin_scope(&self, bucket: &BucketId) -> Option<OriginScope> {
+        let _ = bucket;
+        None
+    }
+
+    /// HEADs `key` at the origin of `bucket`, a `read_only` bucket, to
+    /// learn its current version (§9.5). By default, a [`head`] that
+    /// cannot tell a refusal from a failure.
+    ///
+    /// # Errors
+    ///
+    /// Why the origin could not answer.
+    ///
+    /// [`head`]: RemoteReads::head
+    fn revalidate<'a>(
+        &'a self,
+        bucket: &'a BucketId,
+        key: &'a str,
+    ) -> RemoteFuture<'a, OriginHead> {
+        Box::pin(async move {
+            Ok(match self.head(bucket, key).await? {
+                Some(found) => OriginHead::Found(Box::new(found)),
+                None => OriginHead::Missing,
+            })
+        })
+    }
 }

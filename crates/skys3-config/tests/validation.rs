@@ -1116,6 +1116,45 @@ fn peer_local_writes_needs_a_peer_source() {
     );
 }
 
+#[test]
+fn read_only_freshness_and_credentials() {
+    let config = load(
+        "[buckets.defaults]\nfreshness = \"ttl\"\nfreshness_ttl_seconds = 30\n\
+         [buckets.mirror]\nmode = \"read_only\"\norigin_profile = \"datasets-reader\"\n\
+         [buckets.strict]\nmode = \"read_only\"\nfreshness = \"revalidate\"",
+    )
+    .unwrap();
+    let mirror = config.buckets().get(&BucketName::new("mirror").unwrap());
+    assert_eq!(mirror.freshness, skys3_config::Freshness::Ttl);
+    assert_eq!(mirror.freshness_ttl(), std::time::Duration::from_secs(30));
+    assert_eq!(mirror.origin_profile.as_deref(), Some("datasets-reader"));
+    let strict = config.buckets().get(&BucketName::new("strict").unwrap());
+    assert_eq!(strict.freshness, skys3_config::Freshness::Revalidate);
+    assert_eq!(strict.origin_profile, None);
+    let defaults = load("").unwrap();
+    let defaults = &defaults.buckets().defaults;
+    assert_eq!(defaults.freshness, skys3_config::Freshness::Revalidate);
+    assert_eq!(defaults.freshness_ttl_seconds, 60);
+
+    assert_violations(
+        "[buckets.defaults]\nfreshness_ttl_seconds = 0\n\
+         [buckets.mirror]\nfreshness_ttl_seconds = 86401\norigin_profile = \"\"\n\
+         [buckets.other]\norigin_profile = \"[profile x]\"",
+        &[
+            "buckets.defaults.freshness_ttl_seconds",
+            "buckets.mirror.freshness_ttl_seconds",
+            "buckets.mirror.origin_profile",
+            "buckets.other.origin_profile",
+        ],
+    );
+    assert!(
+        parse_error(&format!(
+            "{BASE}\n[buckets.defaults]\nfreshness = \"never\""
+        ))
+        .contains("freshness")
+    );
+}
+
 // Rules keep running after an early failure.
 
 #[test]

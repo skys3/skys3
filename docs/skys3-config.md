@@ -157,7 +157,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
 | `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
 | `import_max_keys_per_second` | integer | `100000` | Positive. The most remote keys the namespace import of one bucket lists a second (§9.1), so an attach does not crowd out client writes on the shards' logs or exceed the target's request rate. |
-| `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain. |
+| `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets and `read_only` origins for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain, or an origin's `origin_profile`. |
 
 ## `[ec]`
 
@@ -192,6 +192,9 @@ Erasure coding of `local` buckets (§8).
 | `index_snapshot_interval_seconds` | integer | `3600` | Positive (§8.9). |
 | `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. |
 | `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets take one: what a `local` bucket's backup lacks is not charged (§8.9). |
+| `freshness` | `"revalidate"` or `"ttl"` | `"revalidate"` | Only `read_only` buckets use it (§9.5). `"revalidate"` asks the origin on every GET and HEAD; `"ttl"` lets a read use what a HEAD sent up to `freshness_ttl_seconds` earlier saw. |
+| `freshness_ttl_seconds` | integer | `60` | From 1 to 86400. How stale a read of a `read_only` bucket with `freshness = "ttl"` may be (§9.5). |
+| `origin_profile` | string | none | 1 to 128 visible ASCII characters other than `[` and `]`. The profile of the shared AWS configuration whose credentials a `read_only` bucket's origin is read with; without it, the default credential chain's, as for `write_back` targets. It names the credential scope that what gateways learn of the origin is keyed by (§9.5). Every node needs the same value. |
 
 Keys allowed only in a `[buckets.<name>]` table:
 

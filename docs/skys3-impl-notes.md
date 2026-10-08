@@ -6319,6 +6319,137 @@ of this file. A task with nothing unexpected keeps "None."
   `SnapshotService::status`. A pass reads the whole shard index locally
   each interval; only what it writes is bounded by the changes.
 
+### M4-12 Read-only origin buckets
+
+- **Configuration.** `freshness` (`revalidate` by default, or `ttl`),
+  `freshness_ttl_seconds` (default 60, from 1 to 86,400), and
+  `origin_profile` (a profile of the shared AWS configuration, 1 to 128
+  visible ASCII bytes without brackets) are new bucket settings, in §14,
+  the configuration reference, and `skys3-config`. The plan names no
+  credential setting; one was needed (below).
+- **How revalidation asks the origin (decided, §9.5).** A `HeadObject`,
+  not a conditional GET: it answers the current ETag without a body, and
+  a changed object's metadata, which the `ADOPT` that records it needs.
+  The bytes are then read by the fill, or straight from the origin, under
+  `If-Match`, so a change between the HEAD and the read resolves the key
+  again instead of caching another version's bytes. A read gives up after
+  three rounds with `503`.
+- **How the TTL bounds staleness (decided, §9.5).** Each gateway keeps
+  what its HEADs saw (`OriginValidations`, in memory, at most 65,536
+  keys, oldest first out), timed from when the HEAD was sent, so a read
+  within the TTL serves what the origin held at most the TTL before it.
+  Answers are not kept in the shards: a TTL in a replicated entry would
+  need a clock the replicas agree on, and each gateway asking on its own
+  only costs one HEAD per key per TTL per node. Missing and refused keys
+  are kept too, so a deleted or refused key also costs one HEAD per TTL.
+- **The cache key (decided, §9.5).** Validations are keyed by the origin
+  scope, the origin's endpoint, bucket, and prefix with the credential
+  scope (`profile:<name>` or `default`), so two buckets of one origin
+  with different credentials never share an answer. Bytes stay keyed by
+  bucket ID, as for every bucket.
+- **Credentials need a profile.** Every `write_back` target is read with
+  one default credential chain, but the plan asks that the cache key
+  include the credential scope, which only means something if buckets can
+  have different ones. `origin_profile` names a profile of the shared AWS
+  configuration (`skys3_remote::aws::profile_credentials`); the flush
+  service builds each origin's store with it (`OriginConnect`,
+  `FlushService::with_origin_connect`).
+- **Entries are made with `IMPORT` then `ADOPT`.** An `ADOPT` changes an
+  existing entry only, and a `read_only` bucket has no namespace import
+  to create them, so a read of a key without an entry first commits an
+  `IMPORT` stub, which applies only where a key has no entry, then
+  `ADOPT`s the origin's version onto the entry, conditional on its
+  sequence number. Routed writes refused both record kinds, since only a
+  node's own import or flusher sent them; `routing::wire` now carries
+  them.
+- **Fills are not forwarded, so other nodes read the origin directly.**
+  Only a shard's primary fills (M3-04), and a gateway on another node had
+  no way to ask it to. Rather than forward fills, which is a larger change
+  of the shard protocol, a non-primary gateway reads an evicted version
+  from the origin itself in ranged GETs of 8 MiB under `If-Match`, and
+  caches nothing (`objects::origin::read_origin`). A clean copy is still
+  read from its holders. Forwarding fills stays open.
+- **A direct read under a TTL could loop.** Its first version was a 503:
+  a direct read whose `If-Match` failed resolved the key again, which
+  found the same, still fresh, validation and read the same version. A
+  failed direct read now forgets the key's validation
+  (`OriginValidations::forget`), so the next round asks the origin.
+- **Fill readers woke in a random order.** CI's replay of seed 1 found
+  two runs one stale read apart; it failed about half the time locally
+  too, with or without load. Two reads on one node joined one fill, and
+  their answers left in either order. A fill's readers followed it
+  through a `watch` channel, which registers each waiter with one of 8
+  notifiers that tokio's thread-local random number generator picks,
+  and wakes them notifier by notifier. That generator is not seeded in a
+  simulation, since turmoil seeds it only under `--cfg tokio_unstable`;
+  a build with that flag replayed 12 of 12 times. The filler now keeps
+  each fill's progress behind a `Notify` (`fill::Tracker`), which wakes
+  readers in the order they began waiting. Other `watch` channels with
+  several waiters, and unbiased `tokio::select!`, draw from the same
+  generator; they are left as they are, and are the first suspects if
+  another replay diverges.
+- **Listings are forwarded, not cached.** `listing::forward` lists the
+  origin with the request's prefix and delimiter, starting after the
+  gateway's own start point, and follows the origin's continuation tokens
+  until the page is full, at most 64 origin pages. The gateway's tokens
+  are its own HMAC-signed ones (§9.4), so an origin token never reaches a
+  client.
+- **What a `read_only` bucket refuses.** Writes answer `403 AccessDenied`
+  (`require_writable`). CopyObject from a `read_only` source and
+  GetObjectTagging on one answer `501`: a copy reads its source's entry
+  without revalidating it, and tags are not read from an origin.
+  UploadPartCopy from one is allowed, since it reads its source as a GET.
+- **The simulated store had no access control.** `SimS3::with_credentials`
+  makes handles that name credentials, and `SimS3::deny` refuses their
+  `GetObject` and `HeadObject` of a key with `403`, as a bucket policy
+  would. The refusal is checked outside the store's lock.
+- **The simulation.** `skys3_cluster_sim::origin`: three nodes, two
+  `read_only` buckets over one origin prefix, one read with the default
+  credentials and one with a guest profile. An out-of-band writer makes
+  40 changes to 4 keys, one every 150 ms: a new body, a delete, or a
+  refusal of the key to the guest imposed or lifted. Three readers send
+  60 GETs and HEADs each, each to a random node's gateway. The audit
+  checks each answer (body, `404`, or `403`) against the origin's history
+  as the reader's credentials saw it: under `revalidate`, a state the
+  origin held between the request and the answer, and under `ttl`, one
+  it held from the TTL before the request. Random interleavings seldom
+  reach the two races the seeded bugs need, so a *stager* stages them on
+  keys of its own: a key cached on its primary, replaced at the origin,
+  and read through every node after the TTL; and a key both buckets
+  cached, denied to the guest, and read with both credentials through
+  one node. M4-06's finding about imports does not apply: a `read_only`
+  bucket has no import.
+- **Simulation cost.** `tests/simulation/origin.rs`, six scenarios:
+  revalidate, TTL, a replay of one seed, crashes and message loss, and
+  the two seeded bugs. The clean ones run at
+  `Runner::with_cost(2, COST)`, the replay and the seeded bugs at twice
+  the cost: CI runs seeds 0 to 7 of the clean ones and 0 to 3 of the
+  rest, 71 s for all six side by side at `SKYS3_SIM_SEEDS=256` in a debug
+  build (a run is about 2.5 s). Revalidate, TTL, and the fault scenario
+  each passed seeds 0 to 63 (`SKYS3_SIM_SEEDS=2048`, 296 s side by
+  side). Under `revalidate` no read was stale; under a TTL of 1 s, 14 to
+  30 reads per run served a version the origin had replaced within the
+  TTL, which the audit allows.
+- **Seeded bugs** (test-only switches on `OriginValidations`):
+  - `OriginValidations::skip_revalidation`, serving whatever version an
+    entry holds without asking the origin: caught at every one of seeds 0
+    to 63 (`SKYS3_SIM_SEEDS=4096`), first at **seed 0**, as a read
+    serving an ETag the origin had replaced before the read began.
+  - `OriginValidations::ignore_credentials`, validations keyed without
+    their credential scope: caught at every one of seeds 0 to 63, first
+    at **seed 0**, as a `full` read answered `403` from the guest's
+    answer, or a guest read served past its denial. Its first version
+    missed at **seed 6**: the stager read the denied key with each
+    credential through that bucket's primary, two different nodes, and
+    validations are each gateway's own. It now reads both through one
+    node.
+- **Left open.** Fills are not forwarded to a shard's primary, so only
+  the primary's node caches what its reads fetch. Validations are per
+  gateway and in memory, so a restart asks again. A key deleted at the
+  origin keeps its stub until a later version replaces it; nothing
+  removes stubs of keys the origin no longer has. There are no metrics
+  of revalidations or forwarded listings.
+
 ## M5 Local erasure coding
 
 ### M5-01 EcCodec
@@ -6496,8 +6627,8 @@ of this file. A task with nothing unexpected keeps "None."
   `fragments` (the per-shard index from node to fragments, keyed by
   shard, node, key, stripe, and index) and `attempts`, and its values
   from format 3 to 4 for the entry's coded layout (`ObjectVersion::coded`:
-  the `EC_PUBLISH` position, the attempt, the stripes). Both recorded in
-  §10.1 and §10.2.
+  the `EC_PUBLISH` position, the version its fragments were written for,
+  the attempt, the stripes). Both recorded in §10.1 and §10.2.
 - **What supersedes a publish.** Applying `EC_PUBLISH` codes the version
   only if the entry still has its position, ETag, and size and is not
   coded; otherwise it is rejected (`Rejection::Superseded`,
@@ -6505,6 +6636,19 @@ of this file. A task with nothing unexpected keeps "None."
   so tags changed during an attempt supersede it, which is conservative;
   `TAGS` after a publish keeps the layout. `PUT`, `DELETE`, `ADOPT`, and
   `MPU_COMPLETE` replace the layout and remove its `fragments` rows.
+- **A retagged layout records its fragments' version.** The layout first
+  held only the publish position, the attempt, and the stripes, so after
+  a `TAGS` record moved `Entry::version` nothing named the version the
+  fragment headers carry, and a read (M5-06) or repair (M5-08) checking a
+  fragment's identity against the entry's version refused every fragment
+  of a retagged coded object. `Coded::version` now records the position
+  the `EC_PUBLISH` named (set as it is applied, so a superseded publish
+  under `SeededBug::PublishSuperseded` records the version it named, not
+  the entry's), and a fragment's identity is `Coded::version` with the
+  object's ETag, which a retag does not change. It is encoded right after
+  the publish position and must precede it, as in the record. Index
+  format 9 and value format 4 are new in this PR, so the field went into
+  them rather than a new format.
 - **Members drop replicas through compaction, gated on the commit.** A
   coded version's payload is `Holder::Coded` in the index. Compaction
   treats it as unreferenced only once the replica's commit watermark
@@ -6563,7 +6707,7 @@ of this file. A task with nothing unexpected keeps "None."
   object is coded and its replicas dropped, every node loses power and
   is recovered outside the simulation, and each member's entry must read
   back the last bytes written, from its log or decoded from fragments
-  whose headers name that version, stripe, and index.
+  whose headers name the layout's version, the stripe, and the index.
 - **Crashes and seeded bugs.** The crash scenario covers, each seed,
   every step (a stripe's start, two fragments durable, a stripe's end,
   the last stripe's start, `EC_PUBLISH` sequenced, and committed) against
@@ -6757,9 +6901,23 @@ of this file. A task with nothing unexpected keeps "None."
 - **Reads name what they expect.** A fragment ID alone is not enough: a
   fragment reclaimed since the plan (M5-05) or an ID reused on a
   replaced disk would serve another fragment's bytes, which pass their
-  checksums. A `FragmentRead` names the shard, key, version, stripe,
-  geometry, codec, and index, and the node answers "not held" unless
-  the fragment's header matches. Recorded in §8.5.
+  checksums. A `FragmentRead` names the shard, key, version, ETag,
+  stripe, geometry, codec, and index, and the node answers "not held"
+  unless the fragment's header matches. Recorded in §8.5.
+- **Reads name the layout's version, not the entry's.** A `TAGS` record
+  after an `EC_PUBLISH` moves the entry's version but keeps the coded
+  layout, whose fragments' headers name the version the encoder read.
+  Reads first named the entry's version, so a retagged coded object
+  failed every identity check and its GETs, UploadPartCopy, and
+  CopyObject answered `503`. Once #83 recorded that version in the
+  layout (`Coded::version`), every read names it with the object's
+  ETag, which no retag changes; `FragmentIdentity` and `CodedRead`
+  gained the ETag and `FragmentRead` carries it (field 17). The read
+  plan, the hot cache, and a copy's source reference still name the
+  entry's version. The gateway test
+  `a_coded_object_retagged_after_its_publish_reads_its_bytes` (retag,
+  then GET whole and by range, HEAD, GetObjectTagging, and a degraded
+  copy) fails on the entry's version. Recorded in §8.5.
 - **Two message kinds, no format change.** `FragmentRead` (11) and
   `FragmentData` (12), replication class, request in the frame header
   (it is small), bytes in the payload with their CRC32C. The fragment
@@ -6827,15 +6985,19 @@ of this file. A task with nothing unexpected keeps "None."
   dropped, every node runs a gateway (an in-memory control store and
   shard map, routed shard client, hot cache) and three clients send 40
   requests each through drawn nodes, whole or ranged GETs and, one in
-  eight, a CopyObject to a new key whose copy is read back, while, for
-  four seconds,
+  eight each, a CopyObject to a new key whose copy is read back and a
+  PutObjectTagging followed by a whole GET, while, for four seconds,
   up to two *lossy* nodes of n1 to n5 (`m` is 2 on six nodes) crash,
   with or without power loss, lose their fragment disk for good, or
   corrupt the bytes they send. Every answer must be its version's bytes,
   by its ETag (a copy keeps its source's); `503` and broken-off bodies
   are allowed. The harness's fragment source counts parity reads, and
-  the scenario requires some, and some copies. The copies stay out of
-  the coding checks, though the encoder may code them during the reads.
+  the scenario requires some, and some copies and retags. The copies
+  stay out of the coding checks, though the encoder may code them during
+  the reads. Since a `503` is allowed under faults, each client GETs
+  every object it retagged again once the faults are over, up to 40
+  times 250 ms apart, and one never served fails the run: with the
+  gateway naming the entry's version, seed 0 fails so.
 - **Crashes do not replay within one process.** Two runs of a seed in
   one process differed after a crash. A crashed host's runtime drops its
   tasks in an order tokio shards by task ID, and task IDs are global to
@@ -6846,14 +7008,15 @@ of this file. A task with nothing unexpected keeps "None."
   (ECDSA signatures in the handshakes also vary in length, harmlessly:
   nothing depends on their size.)
 - **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
-  replay (cost 128) 2 seeds in 18 s; degraded reads (lossy 2 on
-  even seeds, else 1; cost 32) 8 seeds in 40 s; trusting bad CRCs
-  (corruption only) 4 seeds in 37 s; wrong indices (crashes and lost
-  disks) 4 seeds in 42 s. Both bugs are caught on every seed tried, with
-  "not those of version". At `SKYS3_SIM_SEEDS=2048` all passed, copies
-  included: 64 seeds of degraded reads, 32 of each bug, 16 of replay
-  (431 s, four at a time); before the copies, replay passed 32 seeds at
-  4096. The copies add about a third to each run. Adding them first
+  replay (cost 128) 2 seeds in 16 s; degraded reads (lossy 2 on
+  even seeds, else 1; cost 32) 8 seeds in 34 s; trusting bad CRCs
+  (corruption only) 4 seeds in 32 s; wrong indices (crashes and lost
+  disks) 4 seeds in 37 s, with copies and retags. Both bugs are caught
+  on every seed tried, with "not those of version". At
+  `SKYS3_SIM_SEEDS=2048` all passed, copies and retags included: 64
+  seeds of degraded reads, 32 of each bug, 16 of replay (273 s, four at
+  a time); before the copies, replay passed 32 seeds at 4096. The copies
+  added about a third to each run. Adding copies first
   found a harness bug: the harness's gateways used the default
   `inline_max_bytes`, above the shard log's 512 bytes, so the shard
   refused every copy's inline body until the gateways took the log's

@@ -5,7 +5,9 @@
 //! or send corrupted fragment bytes, and every byte a GET returns must be
 //! the version's that its ETag names. Some requests copy a coded object to
 //! a new key with CopyObject, which reads the source from its fragments,
-//! and read the copy back.
+//! and read the copy back; others retag a coded object, which moves its
+//! entry's version past the one its fragments were written for, and read
+//! it back.
 //!
 //! Each node runs a gateway whose shards route to the shard's primary
 //! ([`RoutedShards`], over the node's transport), whose bucket comes from
@@ -16,7 +18,7 @@
 //! or break off while plans or fragments are unavailable, but none may
 //! return other bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,6 +55,12 @@ const BUCKET: &str = "coded";
 /// How long a client waits for a GET's whole answer.
 const GET_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long after the read window's faults the nodes have restarted and
+/// serve again, and how many times a client then GETs an object it
+/// retagged, 250 ms apart, before it judges the object unreadable.
+const SETTLE_AFTER_FAULTS: Duration = Duration::from_secs(2);
+const READ_BACK_ATTEMPTS: usize = 40;
+
 /// The room of each gateway's hot cache: whole objects of up to an eighth
 /// of it are kept, so some reads fill it and later ones hit it.
 const HOT_CACHE_BYTES: u64 = 256 * 1024;
@@ -86,6 +94,9 @@ pub struct ReadReport {
     /// CopyObjects of a coded object answered `200`; each copy is then
     /// read back as a GET is.
     pub copied: u64,
+    /// PutObjectTaggings of a coded object answered `200`, each followed
+    /// by a GET of the whole object.
+    pub retagged: u64,
     /// Fragment reads of a parity fragment, which only degraded pieces
     /// make.
     pub parity_reads: u64,
@@ -452,10 +463,13 @@ impl Driver<'_> {
 
 /// One client's requests, each of a drawn object through a drawn node's
 /// gateway: GETs of the whole object or a drawn range, and, one request in
-/// eight, a CopyObject to a new key whose copy is then read back.
+/// eight each, a CopyObject to a new key whose copy is then read back, and
+/// a PutObjectTagging followed by a GET of the whole object.
 async fn reader(world: &World, n: usize) {
     let reads = world.reads.as_ref().expect("reads in this run");
+    let started = tokio::time::Instant::now();
     let mut rng = StdRng::seed_from_u64(world.seed ^ 0x5245_4144 ^ (n as u64) << 20);
+    let mut retagged = BTreeSet::new();
     let keys: Vec<(String, usize)> = lock(&world.expected)
         .iter()
         .map(|(key, data)| (key.clone(), data.len()))
@@ -474,14 +488,24 @@ async fn reader(world: &World, n: usize) {
                 // The copy keeps the source's ETag, so its bytes are
                 // checked against the source version's.
                 let target = format!("copy-{n}-{i}");
-                if reads.copied(&key, &host, copy(&host, &key, &target).await) {
+                let copied = copy(&host, &key, &target).await;
+                if reads.wrote(Write::Copy, &key, &host, copied) {
                     let outcome = get(&host, &target, None).await;
                     reads.count(&target, &host, None, outcome);
                 }
                 tokio::time::sleep(Duration::from_millis(rng.random_range(0..20))).await;
                 continue;
             }
-            1..=3 => None,
+            1 => {
+                // The retag moves the entry's version past its coded
+                // layout's; the GET after it must still read the fragments.
+                let tagged = retag(&host, &key, &format!("{n}-{i}")).await;
+                if reads.wrote(Write::Retag, &key, &host, tagged) {
+                    retagged.insert(key.clone());
+                }
+                None
+            }
+            2..=3 => None,
             _ => {
                 let (a, b) = (rng.random_range(0..size), rng.random_range(0..size));
                 Some((a.min(b), a.max(b)))
@@ -491,16 +515,48 @@ async fn reader(world: &World, n: usize) {
         reads.count(&key, &host, range, outcome);
         tokio::time::sleep(Duration::from_millis(rng.random_range(0..20))).await;
     }
+    // Once the faults are over, every object this client retagged must be
+    // served again: a GET may answer `503` under faults, but a read that
+    // named the entry's version rather than the fragments' would answer it
+    // for good.
+    tokio::time::sleep_until(started + READ_WINDOW + SETTLE_AFTER_FAULTS).await;
+    for key in retagged {
+        let mut served = false;
+        for _ in 0..READ_BACK_ATTEMPTS {
+            let outcome = get("n0", &key, None).await;
+            served = matches!(outcome, Got::Bytes { .. });
+            reads.count(&key, "n0", None, outcome);
+            if served {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        if !served {
+            lock(&reads.wrong).push(format!(
+                "{key}, retagged, was not served again once the faults were over"
+            ));
+        }
+    }
+}
+
+/// A write a client sends besides its GETs.
+#[derive(Debug, Clone, Copy)]
+enum Write {
+    Copy,
+    Retag,
 }
 
 impl Reads {
-    /// Counts what a copy of `key` through `host` got, and whether it
-    /// copied.
-    fn copied(&self, key: &str, host: &str, outcome: Result<bool, String>) -> bool {
+    /// Counts what `write` of `key` through `host` got, and whether it
+    /// was done.
+    fn wrote(&self, write: Write, key: &str, host: &str, outcome: Result<bool, String>) -> bool {
         let mut report = lock(&self.report);
         match outcome {
             Ok(true) => {
-                report.copied += 1;
+                match write {
+                    Write::Copy => report.copied += 1,
+                    Write::Retag => report.retagged += 1,
+                }
                 true
             }
             Ok(false) => {
@@ -508,7 +564,7 @@ impl Reads {
                 false
             }
             Err(what) => {
-                lock(&self.wrong).push(format!("a copy of {key} through {host}: {what}"));
+                lock(&self.wrong).push(format!("a {write:?} of {key} through {host}: {what}"));
                 false
             }
         }
@@ -558,6 +614,24 @@ async fn copy(host: &str, key: &str, target: &str) -> Result<bool, String> {
         .header("x-amz-copy-source", format!("{BUCKET}/{key}"))
         .body(Full::new(Bytes::new()))
         .map_err(|error| format!("a request that does not build: {error}"))?;
+    write(host, request).await
+}
+
+/// Sets `key`'s tags to one, `reader` = `value`, through `host`'s gateway:
+/// whether it was set, or what was wrong with the answer.
+async fn retag(host: &str, key: &str, value: &str) -> Result<bool, String> {
+    let body = format!(
+        "<Tagging><TagSet><Tag><Key>reader</Key><Value>{value}</Value></Tag></TagSet></Tagging>"
+    );
+    let request = Request::put(format!("/{BUCKET}/{key}?tagging"))
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|error| format!("a request that does not build: {error}"))?;
+    write(host, request).await
+}
+
+/// Sends `request`, a write, through `host`'s gateway: whether it was
+/// done, or what was wrong with the answer.
+async fn write(host: &str, request: Request<Full<Bytes>>) -> Result<bool, String> {
     let answer = match s3::connect(host, GET_TIMEOUT).await {
         Ok(connection) => connection.send(request, GET_TIMEOUT).await,
         Err(error) => Err(error),

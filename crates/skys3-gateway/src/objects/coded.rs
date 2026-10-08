@@ -9,6 +9,12 @@
 //! whole object fills the hot cache once every byte has streamed, as a
 //! read from another node's holder does.
 //!
+//! Fragments are read by the version they were written for: the coded
+//! layout's version and the object's ETag (§8.4). A `TAGS` record after
+//! the publish moves the entry's version, which the read plan, the hot
+//! cache, and a copy's source reference keep naming, but not the
+//! fragments' headers.
+//!
 //! CopyObject reads a coded source the same way, whole, from the layout of
 //! the source's entry ([`Objects::coded_source`]); UploadPartCopy reads
 //! its source as a GET does.
@@ -19,15 +25,15 @@ use s3s::dto::StreamingBlob;
 use s3s::{S3Error, S3Result, s3_error};
 use skys3_ec::{CodedBody, CodedRead, CodedReadError, read_coded};
 use skys3_index::ObjectVersion;
-use skys3_types::{BucketDocument, EpochSeq};
+use skys3_types::BucketDocument;
 use tokio::sync::mpsc;
 
 use super::{Found, Objects, download, empty_blob, hot_names};
 use crate::shard::{ShardRef, Shards};
 
 impl<H: Shards> Objects<H> {
-    /// The whole of `object`, the coded version at `version` of `key` in
-    /// `shard`, read from its fragments for a copy.
+    /// The whole of `object`, a coded version of `key` in `shard`, read
+    /// from its fragments for a copy.
     ///
     /// # Errors
     ///
@@ -37,7 +43,6 @@ impl<H: Shards> Objects<H> {
         &self,
         shard: &ShardRef,
         key: &str,
-        version: EpochSeq,
         object: &ObjectVersion,
     ) -> S3Result<CodedBody> {
         let (Some(source), Some(coded)) = (&self.fragments, &object.coded) else {
@@ -46,7 +51,8 @@ impl<H: Shards> Objects<H> {
         let read = CodedRead {
             shard: shard.into(),
             key: key.to_owned(),
-            version,
+            version: coded.version,
+            etag: object.local_etag.clone(),
             size: object.size,
             stripes: coded.stripes.clone(),
             range: 0..object.size,
@@ -78,7 +84,8 @@ impl<H: Shards> Objects<H> {
         let read = CodedRead {
             shard: (&found.shard).into(),
             key: key.to_owned(),
-            version: found.version,
+            version: coded.version,
+            etag: found.object.local_etag.clone(),
             size: found.object.size,
             stripes: coded.stripes.clone(),
             range: found.bytes.clone(),

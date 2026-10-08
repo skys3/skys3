@@ -611,7 +611,9 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     }
 
     /// What the header of fragment `index` of stripe `stripe` of `key`'s
-    /// version `entry` says, if the version is coded with such a stripe.
+    /// version `entry` says, if the version is coded with such a stripe:
+    /// the version the layout's fragments were written for, which a retag
+    /// leaves behind the entry's, and the object's ETag.
     fn identity(
         &self,
         key: &str,
@@ -619,12 +621,14 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         stripe: u32,
         index: u8,
     ) -> Option<FragmentIdentity> {
-        let coded = entry.object.as_ref()?.coded.as_ref()?;
+        let object = entry.object.as_ref()?;
+        let coded = object.coded.as_ref()?;
         let at = coded.stripes.get(usize::try_from(stripe).ok()?)?;
         Some(FragmentIdentity {
             shard: self.shard.shard().clone(),
             key: key.to_owned(),
-            version: entry.version,
+            version: coded.version,
+            etag: object.local_etag.clone(),
             stripe: stripe_info(at, coded.stripes.len()),
             index,
         })
