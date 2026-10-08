@@ -416,9 +416,15 @@ fn write_through_waits_follow_the_policy() {
             let store = store(seed, true);
             let flusher = node.flusher(&target(&store, protected(), policy));
             let seq = conflicting_put(&node, &store, "k").await;
+            // Asked at once, the wait may reach the flusher before, while,
+            // or after the flush meets the conflict.
             let mut wait = node.shard.await_flush("k", at(seq)).unwrap();
             assert_eq!(wait.answered().await, Some(answer), "{policy:?}");
             node.settle(&flusher).await;
+            // Asked once the flusher is done with the version: held, or
+            // flushed or dropped and no longer tracked.
+            let mut wait = node.shard.await_flush("k", at(seq)).unwrap();
+            assert_eq!(wait.answered().await, Some(answer), "{policy:?}, late");
         });
     }
 }
