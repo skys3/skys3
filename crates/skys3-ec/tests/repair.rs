@@ -449,7 +449,6 @@ fn a_silent_node_is_repaired_once_it_stays_silent() {
             }
         ));
 
-        // Nothing is left to repair.
         // Nothing is left to repair, and the silent node holds nothing.
         assert_eq!(
             repairer.pass().await,
@@ -458,6 +457,20 @@ fn a_silent_node_is_repaired_once_it_stays_silent() {
                 ..RepairReport::default()
             }
         );
+
+        // Holding nothing, the silent node is checked no more, but stays
+        // silent to the repairer: a later repair places nothing on it,
+        // which would wait for its writes to time out.
+        let before = f.steps().len();
+        let lost = f.on(2).await;
+        f.nodes.wipe(2);
+        let report = repairer.pass().await;
+        assert_eq!(report.repaired, lost, "{report:?}");
+        let placed_on_silent = f.steps()[before..].iter().any(|step| {
+            matches!(step, RepairStep::Placed { nodes } if nodes.iter().any(|(_, n)| *n == node(3)))
+        });
+        assert!(!placed_on_silent, "{:?}", &f.steps()[before..]);
+        f.check_whole().await;
     });
 }
 

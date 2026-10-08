@@ -583,6 +583,16 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                     .map(|fragment| (node.clone(), *fragment)),
             );
         }
+        // A node silent at its last check stays silent until it answers
+        // one, though it may hold nothing to check any more once its
+        // fragments are rebuilt elsewhere: no repair places a fragment on
+        // it, whose write would only wait to time out. It is checked again
+        // once it holds the shard's fragments, which encoding may place.
+        for (node, health) in &state.nodes {
+            if health.silent_since.is_some() {
+                silent.insert(node.clone());
+            }
+        }
         // Each fragment keeps the time it was first found lost, for the
         // repair time (§16.3); fragments no longer lost are forgotten.
         let known = std::mem::take(&mut state.lost);

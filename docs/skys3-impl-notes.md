@@ -7088,6 +7088,15 @@ of this file. A task with nothing unexpected keeps "None."
   (its latest committing record, a `TAGS` included) makes a retag since
   the read reject the relocation; the next pass rebuilds under the new
   tags (`a_relocation_names_the_entry_s_version_which_a_retag_moves`).
+- **A node lost for good kept receiving rebuilt fragments.** Once its
+  fragments were rebuilt elsewhere, a silent node held nothing, so no
+  check named it, it left the pass's silent set, and the planner, whose
+  topology still listed it, placed later rebuilt fragments on it; each
+  write waited 10 s to time out. Seed 5 of the two-holder scenario,
+  whose readers now retag objects and so supersede some repairs, took
+  17.7 s, past its 15 s bound. A node silent at its last check now stays
+  silent to the repairer until it answers one
+  (`a_silent_node_is_repaired_once_it_stays_silent`).
 - **Re-indexing had to accept a retag's write identity.** A retag makes
   the `TAGS` record the write identity and drops an inherited one and
   the identity metadata carried from another cluster, so a fragment
