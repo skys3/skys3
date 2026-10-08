@@ -33,9 +33,19 @@ impl LinkError {
 }
 
 /// The source's end of the peer protocol to one destination cluster.
+///
+/// One link serves every shard flusher of a target.
 pub trait PeerLink: Send + Sync + 'static {
     /// Opens a new stream to the destination, for one object or one batch.
     fn open(&self) -> BoxFuture<'_, Result<PeerStream, LinkError>>;
+
+    /// The number of the target's shard flushers on this node that use the
+    /// link changed to `shards`. The node's pool allows
+    /// `peer_connections_per_shard` connections to a destination for each
+    /// (§7.8); a link without such a budget ignores it.
+    fn set_shards(&self, shards: usize) {
+        let _ = shards;
+    }
 }
 
 /// The sending half of a stream.
@@ -87,6 +97,10 @@ impl PeerLink for ShardLease {
                 batches,
             })
         })
+    }
+
+    fn set_shards(&self, shards: usize) {
+        ShardLease::set_shards(self, u32::try_from(shards).unwrap_or(u32::MAX));
     }
 }
 

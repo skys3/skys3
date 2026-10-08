@@ -248,6 +248,9 @@ struct BucketFlusher<S> {
     may_discard: bool,
     /// Whether its target is a SkyS3 peer over the native protocol.
     native: bool,
+    /// The link of a target on the native protocol, which learns how many
+    /// shard flushers use it.
+    link: Option<Arc<dyn crate::peer::PeerLink>>,
     /// How long each shard flusher it starts waits before it sends
     /// anything: the quarantine of a SkyS3 peer reached over S3 REST
     /// (§7.8), during which a native `COMMIT` sent before the flusher
@@ -518,6 +521,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             conflict_policy: configured_policy,
             may_discard: may_discard(backup),
             native: false,
+            link: None,
             quarantine: Duration::ZERO,
             probe: Arc::new(Mutex::new(ProbeStatus::Running { error: None })),
             probe_task: tokio::spawn(async {}),
@@ -597,6 +601,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         flusher.conflict_policy = effective_policy(flusher.configured_policy, holds);
         flusher.may_discard = may_discard(holds);
         flusher.native = native;
+        flusher.link = match &choice {
+            Choice::Native(link) => Some(Arc::clone(link)),
+            _ => None,
+        };
         // Over S3 REST to what may be a peer that took native commits, each
         // shard flusher waits them out as it starts: here, and as it takes
         // a shard over later.
@@ -827,6 +835,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 let (ready, wall) = (Arc::clone(&flusher.target), Arc::clone(&self.wall));
                 ShardFlusher::start(shard, ready, wall, charge, flusher.quarantine)
             });
+        }
+        // The pool's connection budget to a peer counts each shard flusher.
+        if let Some(link) = &flusher.link {
+            link.set_shards(flusher.shards.len());
         }
     }
 

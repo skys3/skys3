@@ -9,7 +9,9 @@
 //!
 //! - **QUIC** when the handshake succeeds ([`Choice::Native`]). A flush
 //!   whose link fails tells the discovery ([`Discovery::link_failed`]),
-//!   which tries a fresh handshake at once and falls back if it fails.
+//!   which tries a fresh handshake at once and falls back if it fails. If
+//!   it succeeds, its new link is a new choice: the flushers restart on
+//!   it, without a quarantine, as after any restart on QUIC.
 //! - **S3 REST to the peer** when the descriptor verifies but the handshake
 //!   does not ([`Choice::PeerS3`]): every precondition is honored, as on
 //!   any SkyS3 gateway, so nothing is probed. Another handshake is tried
@@ -111,10 +113,15 @@ impl Choice {
         }
     }
 
-    /// Whether `other` is the same choice, a link aside: moving between
-    /// them needs no new target.
+    /// Whether `other` is the same choice: moving between them needs no
+    /// new target. A new link is a new choice, even to the same peer: the
+    /// handshake that made it found the old one broken, or the peer at
+    /// other addresses, so the flushers must move to it.
     fn same(&self, other: &Choice) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        match (self, other) {
+            (Choice::Native(link), Choice::Native(other)) => Arc::ptr_eq(link, other),
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
     }
 }
 
@@ -165,7 +172,8 @@ impl Shared {
             selection.status.reason = reason;
             return;
         }
-        if selection.choice.transport().is_some() {
+        let (from, to) = (selection.choice.transport(), choice.transport());
+        if from.is_some() && from != to {
             selection.status.switches += 1;
         }
         tracing::info!(from = ?selection.choice, to = ?choice, reason,
@@ -462,14 +470,52 @@ mod tests {
             (status.in_use, status.peer, status.switches),
             (Some(Transport::S3), true, 0)
         );
+        // Another choice on S3 REST is a new generation, not a switch.
         shared.choose(Choice::PlainS3 { found: true }, false, "refused".to_owned());
         assert_eq!(discovery.current().0, 2);
-        assert_eq!(discovery.status().switches, 1);
+        assert_eq!(discovery.status().switches, 0);
         shared.note("a later round failed".to_owned());
         assert_eq!(discovery.status().reason, "a later round failed");
         assert!(format!("{:?}", discovery.current().1).contains("PlainS3"));
         assert_eq!(Transport::Quic.as_str(), "quic");
         assert_eq!(Transport::S3.as_str(), "s3");
         discovery.alarm().link_failed();
+    }
+
+    use crate::peer::{BoxFuture, LinkError, PeerStream};
+
+    /// A link that opens nothing.
+    struct NoLink;
+
+    impl PeerLink for NoLink {
+        fn open(&self) -> BoxFuture<'_, Result<PeerStream, LinkError>> {
+            Box::pin(async { Err(LinkError::new("no link")) })
+        }
+    }
+
+    #[test]
+    fn a_new_link_is_a_new_generation() {
+        let discovery = Discovery::stuck(TargetTransport::Auto, "looking");
+        let shared = &discovery.shared;
+        let first: Arc<dyn PeerLink> = Arc::new(NoLink);
+        shared.choose(Choice::Native(Arc::clone(&first)), true, "at a".to_owned());
+        assert_eq!(discovery.current().0, 1);
+        // The same link again changes nothing.
+        shared.choose(Choice::Native(Arc::clone(&first)), true, "at a".to_owned());
+        assert_eq!(discovery.current().0, 1);
+        // A handshake after a link failed made a new link, here to another
+        // address: the flushers move to it, and the transport stays QUIC.
+        let second: Arc<dyn PeerLink> = Arc::new(NoLink);
+        shared.choose(Choice::Native(Arc::clone(&second)), true, "at b".to_owned());
+        let (generation, choice) = discovery.current();
+        assert_eq!(generation, 2);
+        assert!(matches!(choice, Choice::Native(link) if Arc::ptr_eq(&link, &second)));
+        let status = discovery.status();
+        assert_eq!(
+            (status.in_use, status.switches, status.reason.as_str()),
+            (Some(Transport::Quic), 0, "at b")
+        );
+        shared.choose(Choice::PeerS3, true, "UDP is blocked".to_owned());
+        assert_eq!(discovery.status().switches, 1);
     }
 }
