@@ -7221,3 +7221,95 @@ of this file. A task with nothing unexpected keeps "None."
   objects stay readable until the next pass, as S3 allows. There are no
   per-bucket lifecycle metrics, and bucket status does not report the
   last pass.
+
+### M5-11 Re-indexing and restore drills
+
+- **The operator command is a library call, wrapped later by an admin
+  endpoint.** `skys3_flush::snapshot::drill` takes the shard, its snapshot
+  target and durable home, every node, the lost nodes, and the loss time,
+  and lists headers through `skys3_ec::reindex::HeaderSource`. A
+  command-line tool was rejected: the drill needs the bucket's credentials
+  for the snapshot target and the home, fragment listing over the cluster
+  transport is for node certificates only (§8.5), and the result has to be
+  installed on a node. The node binary runs no fragment stores yet, so the
+  admin endpoint and a transport message that lists a node's headers are
+  left to the task that wires them in. `HeaderSource` is implemented for a
+  map of in-process `FragmentServer`s, which the tests and the simulation
+  use. Recorded in §8.9 ("Restore drills, as built").
+- **Pure rules in `skys3-ec`, the drill in `skys3-flush`.**
+  `skys3_ec::reindex::reindex` is a synchronous function of the snapshot's
+  entries and position and the headers found; the drill around it reads
+  the snapshot, asks the nodes, consults the home, and builds the report.
+  `skys3-flush` now depends on `skys3-ec`. M4-11's hook `Restored::rows`
+  stayed unused: the drill decodes `Restored::entries` instead.
+- **Combining a snapshot and headers.** A header version after the
+  snapshot's position supersedes the snapshot's entry, and the newest such
+  version is restored from headers alone, or reported unrecoverable;
+  never an older version in its place (`ReindexBug::FallsBack`). Header
+  versions at or before the position that the entry does not name are
+  orphans of an overwrite or delete and are never restored
+  (`ReindexBug::Resurrects`). Tags and the entry's version come from
+  whichever of the snapshot entry and the latest attempt's header names
+  the later position: a retag after coding moves the entry, a repair
+  after a retag writes headers whose write identity names it
+  (`ReindexBug::HeaderTags`, `ReindexBug::OlderAttempt`).
+- **Deletes and overwrites after the snapshot.** Their only trace is the
+  absence of a newer header, so without a durable home a coded object
+  deleted in the window comes back; the window covers it. With a home,
+  an object restored from headers is dropped if the home holds no object
+  at the key or a later write of the shard. The home is matched by write
+  identity, not ETag: a multipart flush's remote ETag differs from the
+  local one, so comparing ETags, as the first version did, left such an
+  entry dirty.
+- **Two copies of a fragment on one node.** Simulation seed 7 found a
+  stripe whose rebuilt fragment 4 went to a node that already held a stale
+  copy of fragment 0 from an older attempt, after the node came back.
+  Taking each index's latest copy put two fragments on one node, which
+  `CodedStripe::new` refuses. Locations are now a maximum bipartite
+  matching of indices to nodes over every copy found (latest attempts
+  tried first); the harness checks recoverability with the same
+  distinct-node rule.
+- **Replicated entries with coded headers.** Seed 6 had a replicated
+  snapshot entry whose version had been coded after the snapshot but too
+  few headers survived: it was reported lost with no reason. It is now
+  unrecoverable with the rebuild error, like a coded entry.
+- **Missing fragments get placeholders.** A slot no header fills keeps the
+  snapshot's location, or goes to a lost node, else any unused node, under
+  `UNKNOWN_FRAGMENT` (`u128::MAX`, which no store assigns): reads decode
+  around it and repair rebuilds it. A layout restored from headers alone
+  is published at the restored index's position, its `EC_PUBLISH` lost.
+- **The restored index is coded-only** and installs as a learner's
+  snapshot does (`begin_install`, `install_rows`, `finish_install`), at a
+  position after everything the snapshot and headers name; the shard must
+  start in an epoch after every attempt's. Installing it on a live shard is
+  not done here: the simulation installs it into a fresh index and reads
+  every object back through it.
+- **The simulation is its own harness** (`skys3_cluster_sim::drill`), not
+  the cluster: one single-member shard on n0 of eight nodes with fragment
+  stores, 3+2 coding, the real encoder, repairer, orphan reclamation, and
+  snapshot service, driven by a turmoil client for deterministic time. A
+  loss is modelled by forking the state at a random moment (the snapshot
+  target with `SimS3::fork`) and silencing n0 plus up to two random nodes;
+  before each loss the run retags and deletes before a snapshot, then
+  retags, damages, and repairs and overwrites a coded key after it, so
+  every drill has work after the snapshot. Expected tags are evidence
+  based: the latest retag that a snapshot or a surviving header records.
+- **Seeded bugs** (`skys3_ec::reindex::seeded::ReindexBug`, `test-util`):
+  `OlderAttempt`, `HeaderTags`, `PrefersSnapshot`, `Resurrects`,
+  `FallsBack`. Each test runs a seed without the bug, which must pass,
+  then with it, which must fail for the expected reason; every seed of
+  each test catches its bug (seeds 0 to 7 at CI's count, and seeds 0 to
+  255 at `SKYS3_SIM_SEEDS=8192`). `Resurrects` needs orphan reclamation off
+  (`orphan_after` 600 s), and `FallsBack` a loss that takes the latest
+  version's holders (`lose_latest`).
+- **Simulation cost.** One run is cost 16 (about 0.8 s in a debug build);
+  the main scenario runs 16 seeds and each bug test 8 (two runs each) at
+  CI's 256 seeds: 65 s for the six tests one at a time in a debug build,
+  33 s on four threads. At `SKYS3_SIM_SEEDS=8192` (512 seeds of the main
+  scenario, 256 of each bug) all passed in 733 s on four cores.
+- **Left open.** The admin endpoint and the transport message listing a
+  node's headers; installing the restored index on a shard that serves
+  again; copying a backup's replicated objects back; listing every header
+  of a shard at once holds them all in memory; nothing stops reclamation
+  on a node whose shard still has a live primary elsewhere (the drill
+  assumes none).
