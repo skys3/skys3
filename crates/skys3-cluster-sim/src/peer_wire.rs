@@ -159,6 +159,10 @@ impl PeerLink for NodeLink {
             })
         })
     }
+
+    fn set_shards(&self, shards: usize) {
+        PeerLink::set_shards(&self.lease, shards);
+    }
 }
 
 struct NodeSend {
