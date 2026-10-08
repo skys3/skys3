@@ -27,13 +27,14 @@ use yaml_rust2::{Yaml, YamlLoader};
 use super::NodeMetrics;
 use crate::admission::{DiskOf, DiskSpace, NodeAdmission};
 
-const REFERENCE: &str = include_str!("../../../../docs/skys3-metrics.md");
-const DESIGN: &str = include_str!("../../../../docs/skys3-design.md");
-const ALERTS: &str = include_str!("../../../../deploy/prometheus/skys3-alerts.yml");
+pub(super) const REFERENCE: &str = include_str!("../../../../docs/skys3-metrics.md");
+pub(super) const DESIGN: &str = include_str!("../../../../docs/skys3-design.md");
+pub(super) const ALERTS: &str = include_str!("../../../../deploy/prometheus/skys3-alerts.yml");
 const DASHBOARD: &str = include_str!("../../../../deploy/grafana/skys3-dashboard.json");
 
 /// Where every alert's runbook lives; each alert names a section of it.
-const RUNBOOKS: &str = "https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#";
+pub(super) const RUNBOOKS: &str =
+    "https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#";
 
 /// Series that alerts and the dashboard use but no SkyS3 node exports: the
 /// scrape health Prometheus records, and node_exporter's clock state.
@@ -155,7 +156,7 @@ fn section<'a>(document: &'a str, heading: &str) -> Vec<&'a str> {
 }
 
 /// The cells of a Markdown table row, trimmed.
-fn cells(line: &str) -> Vec<&str> {
+pub(super) fn cells(line: &str) -> Vec<&str> {
     let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
     inner.split('|').map(str::trim).collect()
 }
