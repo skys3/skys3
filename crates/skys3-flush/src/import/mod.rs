@@ -574,14 +574,16 @@ impl<'a> Retry<'a> {
 }
 
 /// The `IMPORT` record of a listed object, or `None` for a key outside the
-/// prefix, the empty key, a key too long, or one under the probe's scratch
-/// prefix or the index snapshots' directory (§8.9).
+/// prefix, the empty key, a key too long, one under the probe's scratch
+/// prefix or the index snapshots' directory (§8.9), or the peer
+/// descriptor's reserved key, which no SkyS3 gateway writes (§7.8).
 fn import_of(object: ListedObject, prefix: &str, wall: &dyn WallClock) -> Option<Import> {
     let key = object.key.strip_prefix(prefix)?;
     if key.is_empty()
         || key.len() > MAX_KEY_LEN
         || key.starts_with(ConditionalProbe::SCRATCH_DIR)
         || key.starts_with(crate::snapshot::SNAPSHOT_DIR)
+        || key == skys3_peer::DESCRIPTOR_KEY
     {
         return None;
     }
@@ -864,6 +866,25 @@ pub fn loaded_metadata(info: &ObjectInfo) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_keys_are_not_imported() {
+        let wall = skys3_io::ManualWallClock::new(std::time::Duration::from_secs(1));
+        let listed = |key: &str| ListedObject {
+            key: format!("team/{key}"),
+            etag: skys3_types::ETag::new("abc").unwrap(),
+            size: 1,
+            last_modified_ms: Some(1),
+            storage_class: None,
+        };
+        let imported = |key: &str| import_of(listed(key), "team/", &wall).map(|i| i.key);
+        assert_eq!(imported("photo.jpg").as_deref(), Some("photo.jpg"));
+        assert_eq!(imported(skys3_peer::DESCRIPTOR_KEY), None);
+        assert_eq!(imported(".skys3-snapshots/b/0/x"), None);
+        // Another key of the directory is an ordinary key.
+        let other = ".skys3/peer-descriptor.old";
+        assert_eq!(imported(other).as_deref(), Some(other));
+    }
 
     #[test]
     fn the_most_streams_configurable_is_the_most_ranges_stored() {

@@ -5447,6 +5447,14 @@ of this file. A task with nothing unexpected keeps "None."
   and a `ShardLease` can stand for that many shards
   (`ShardLease::set_shards`), at least one. A link per shard flusher
   would not fit: the batcher and the uploads share the target's link.
+- **The descriptor key is reserved (found in review).** Only `GET` and
+  `HEAD` knew the key. A client could write it in a source bucket, the
+  peer would store that version, and every read there would answer the
+  descriptor instead. Now every gateway refuses writes of the key in
+  every bucket with `400 InvalidArgument`, from clients and peers, over
+  S3 or in a `COMMIT` or `BATCH` item, and a multi-object delete refuses
+  that key alone. A namespace import skips a remote object at the key, so
+  it is never filled. Recorded in §7.2 and §7.8.
 - **The node binary peers.** `NodePeering` binds the QUIC endpoint when
   peers are configured. It serves `StagingService` with `PeerCommits`
   over the node's shards, adapts the pool every second, and signs the

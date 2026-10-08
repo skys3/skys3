@@ -159,6 +159,12 @@ impl<S: Shards> PeerCommits<S> {
         let Some(document) = (self.buckets)(&commit.bucket) else {
             return Err(refused(format!("there is no bucket {}", commit.bucket)));
         };
+        if commit.key == crate::peer_s3::DESCRIPTOR_KEY {
+            return Err(refused(format!(
+                "the key {} is reserved for the peer descriptor",
+                commit.key
+            )));
+        }
         let source = &commit.identity.cluster;
         if self.settings.get(&commit.bucket).peer_source.as_ref() != Some(source) {
             return Err(refused(format!(
@@ -1174,6 +1180,28 @@ mod tests {
             let written = log_bytes(&shards) - before;
             assert!(written <= cap, "{written} bytes of records");
         }
+    }
+
+    #[tokio::test]
+    async fn the_descriptor_key_is_never_written() {
+        let (shards, document) = opened().await;
+        let key = crate::peer_s3::DESCRIPTOR_KEY;
+        let staged = stage(&shards, &document, key, b"0123").await;
+        let commits = PeerCommits::new(shards.clone(), lookup(&document), &settings(Some(SOURCE)));
+        let outcome = commits
+            .apply(&put_commit(1, key, Expected::Absent, 4), Some(&staged))
+            .await;
+        assert_failed(&outcome, ApplyError::Refused);
+        let outcomes = commits
+            .apply_batch(&[
+                item(2, key, Expected::Absent, Some(b"a")),
+                item(3, key, Expected::Unconditional, None),
+                item(4, "other", Expected::Absent, Some(b"b")),
+            ])
+            .await;
+        assert_failed(&outcomes[0], ApplyError::Refused);
+        assert_failed(&outcomes[1], ApplyError::Refused);
+        assert!(matches!(outcomes[2], Outcome::Committed { .. }));
     }
 
     #[tokio::test]

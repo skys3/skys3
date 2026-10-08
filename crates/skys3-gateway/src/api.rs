@@ -57,7 +57,7 @@ use crate::features::{
 use crate::lifecycle;
 use crate::listing::Listings;
 use crate::objects::{Objects, copy_source};
-use crate::peer_s3::{DESCRIPTOR_KEY, PeerAccess, PeerDescriptors};
+use crate::peer_s3::{DESCRIPTOR_KEY, PeerAccess, PeerDescriptors, writable_key};
 use crate::shard::Shards;
 
 /// The content type of a peer descriptor: its protobuf encoding.
@@ -291,6 +291,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.put(&bucket, req).await?)
     }
 
@@ -338,6 +339,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.delete(&bucket, req).await?)
     }
 
@@ -354,6 +356,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         let (source, _) = copy_source(&req.input.copy_source)?;
         let source = self.bucket(source)?;
         if source.mode == BucketMode::ReadOnly {
@@ -387,6 +390,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.put_tagging(&bucket, req.input).await?)
     }
 
@@ -395,6 +399,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.delete_tagging(&bucket, req.input).await?)
     }
 
@@ -403,6 +408,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.create_upload(&bucket, req).await?)
     }
 
@@ -411,6 +417,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.upload_part(&bucket, req).await?)
     }
 
@@ -419,6 +426,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         let (source, _) = copy_source(&req.input.copy_source)?;
         let source = self.bucket(source)?;
         ok(self.objects.upload_part_copy(&bucket, &source, req).await?)
@@ -429,6 +437,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.complete_upload(&bucket, req).await?)
     }
 

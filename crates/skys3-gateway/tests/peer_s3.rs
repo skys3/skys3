@@ -266,3 +266,136 @@ fn between<'a>(xml: &'a str, open: &str, close: &str) -> &'a str {
     let end = start + xml[start..].find(close).unwrap();
     &xml[start..end]
 }
+
+#[tokio::test]
+async fn no_write_reaches_the_descriptor_key() {
+    let gateway = start(true).await;
+    let peer = [(KEY_HEADER, PEER_KEY)];
+    let with_identity = [(KEY_HEADER, PEER_KEY), ("x-amz-meta-skys3-wid", IDENTITY)];
+    // A client in an ordinary bucket, and the peer in the bucket that
+    // receives from it, both with an object to copy and an upload of
+    // another key whose parts could be copied.
+    for (bucket, headers) in [("photos", &[][..]), ("archive", &peer[..])] {
+        let reserved = format!("/{bucket}/{DESCRIPTOR_KEY}");
+        call(
+            &gateway,
+            Method::PUT,
+            &format!("/{bucket}/src"),
+            headers,
+            "body",
+        )
+        .await
+        .assert(200, None);
+        let copy_source = format!("/{bucket}/src");
+        let copy: Vec<(&str, &str)> = headers
+            .iter()
+            .copied()
+            .chain([("x-amz-copy-source", copy_source.as_str())])
+            .collect();
+        let refusals = [
+            (Method::PUT, reserved.clone(), headers, "body"),
+            (Method::PUT, reserved.clone(), &copy[..], ""),
+            (Method::POST, format!("{reserved}?uploads"), headers, ""),
+            (
+                Method::PUT,
+                format!("{reserved}?partNumber=1&uploadId=u"),
+                headers,
+                "part",
+            ),
+            (
+                Method::POST,
+                format!("{reserved}?uploadId=u"),
+                headers,
+                "<CompleteMultipartUpload/>",
+            ),
+            (
+                Method::PUT,
+                format!("{reserved}?partNumber=1&uploadId=u"),
+                &copy[..],
+                "",
+            ),
+            (
+                Method::PUT,
+                format!("{reserved}?tagging"),
+                headers,
+                "<Tagging><TagSet></TagSet></Tagging>",
+            ),
+            (Method::DELETE, format!("{reserved}?tagging"), headers, ""),
+            (Method::DELETE, reserved.clone(), headers, ""),
+        ];
+        for (method, uri, headers, body) in refusals {
+            let got = call(&gateway, method.clone(), &uri, headers, body).await;
+            assert_eq!(
+                (
+                    got.status.as_u16(),
+                    got.code(),
+                    got.body.contains("reserved")
+                ),
+                (400, Some("InvalidArgument"), true),
+                "{method} {uri}: {got:?}"
+            );
+        }
+        // A multi-object delete refuses that key alone.
+        let delete = format!(
+            "<Delete><Object><Key>{DESCRIPTOR_KEY}</Key></Object>\
+             <Object><Key>src</Key></Object></Delete>"
+        );
+        let digest = md5(&delete);
+        let headers: Vec<(&str, &str)> = headers
+            .iter()
+            .copied()
+            .chain([("content-md5", digest.as_str())])
+            .collect();
+        let got = call(
+            &gateway,
+            Method::POST,
+            &format!("/{bucket}?delete"),
+            &headers,
+            &delete,
+        )
+        .await;
+        assert_eq!(got.status.as_u16(), 200, "{got:?}");
+        assert!(
+            got.body.contains(&format!(
+                "<Error><Code>InvalidArgument</Code><Key>{DESCRIPTOR_KEY}</Key>"
+            )),
+            "{got:?}"
+        );
+        assert!(got.body.contains("<Deleted><Key>src</Key>"), "{got:?}");
+    }
+    // Nor with the peer's write identity.
+    call(
+        &gateway,
+        Method::PUT,
+        &format!("/archive/{DESCRIPTOR_KEY}"),
+        &with_identity,
+        "body",
+    )
+    .await
+    .assert(400, Some("InvalidArgument"));
+    // The descriptor still answers, and the ordinary bucket has nothing.
+    let got = call(
+        &gateway,
+        Method::GET,
+        &format!("/archive/{DESCRIPTOR_KEY}"),
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(got.body, "descriptor of archive");
+    call(
+        &gateway,
+        Method::GET,
+        &format!("/photos/{DESCRIPTOR_KEY}"),
+        &[],
+        "",
+    )
+    .await
+    .assert(404, Some("NoSuchKey"));
+}
+
+fn md5(body: &str) -> String {
+    use base64::Engine as _;
+    use md5::Digest as _;
+    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body.as_bytes()))
+}
