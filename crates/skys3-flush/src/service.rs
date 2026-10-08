@@ -217,7 +217,7 @@ struct BucketFlusher<S> {
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
     /// The target, once the probe is done.
-    target: Ready<S>,
+    target: Arc<Ready<S>>,
     shards: BTreeMap<ShardId, ShardFlusher>,
     /// What only the target of a `write_back` bucket, its system of
     /// record, has; `None` for a backup target.
@@ -472,21 +472,24 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         };
         let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
         let native = parts.native.is_some();
-        let (ready, target) = watch::channel(None);
-        let (probe, probe_task) = if native {
+        let (target, probe, probe_task) = if native {
             // The peer evaluates every precondition itself: nothing to
             // probe, and the target is ready before its flushers start.
-            ready.send_replace(Some(Arc::new(parts.build(native_writes()))));
+            // Nothing to sweep either: a native target opens no remote
+            // multipart upload, so none is ever left open (§7.8).
+            let target = Ready::new(Some(Arc::new(parts.build(native_writes()))));
             let done = ProbeStatus::Done {
                 unprotected: Vec::new(),
                 server_side_copy: false,
             };
-            (Arc::new(Mutex::new(done)), tokio::spawn(async {}))
+            (target, Arc::new(Mutex::new(done)), tokio::spawn(async {}))
         } else {
             let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
+            let target = Ready::new(None);
+            let ready = Arc::clone(&target);
             let nonces = self.probe_nonces.clone();
-            let task = tokio::spawn(run_probe(parts, nonces, Arc::clone(&probe), ready));
-            (probe, task)
+            let probe_task = tokio::spawn(run_probe(parts, nonces, Arc::clone(&probe), ready));
+            (target, probe, probe_task)
         };
         BucketFlusher {
             name,
@@ -657,7 +660,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let id = shard.shard().shard;
             flusher.shards.entry(id).or_insert_with(|| {
                 let charge = charged.then(|| self.budget.charge(bucket));
-                let (ready, wall) = (flusher.target.clone(), Arc::clone(&self.wall));
+                let (ready, wall) = (Arc::clone(&flusher.target), Arc::clone(&self.wall));
                 ShardFlusher::start(shard, ready, wall, charge)
             });
         }
@@ -680,14 +683,9 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .collect(),
             orphaned_uploads: flusher
                 .target
-                .borrow()
-                .as_ref()
+                .get()
                 .map_or(0, |target| target.orphaned_uploads() as u64),
-            concurrency: flusher
-                .target
-                .borrow()
-                .as_ref()
-                .map(|target| target.concurrency()),
+            concurrency: flusher.target.get().map(|target| target.concurrency()),
             dirty_budget: self
                 .budget
                 .usage(bucket)
@@ -859,16 +857,37 @@ fn native_writes() -> ConditionalWrites {
     }
 }
 
+/// Aborts the remote uploads that flushes left open on `target`
+/// ([`Target::orphaned_uploads`]) for as long as the target is used, after
+/// a backoff that grows while some stay open. Each multipart flush aborts
+/// some before it opens its own; this ends those that no later multipart
+/// flush here would reach, as when the key's next version is a single
+/// `PUT` or the node no longer leads the shard.
+async fn abort_orphans<S: ObjectStore>(target: &Target<S>) {
+    let mut left = 0;
+    loop {
+        tokio::time::sleep(target.settings.backoff(left + 1)).await;
+        target.abort_orphaned_uploads().await;
+        left = if target.orphaned_uploads() == 0 {
+            0
+        } else {
+            left + 1
+        };
+    }
+}
+
 /// Probes the target's writes until a run succeeds, backing off between
 /// runs, and then makes the target ready, without server-side copies.
 /// Then it probes copies alone the same way, and lets the target copy
 /// server-side once a run finds it supports them: a flaky store fails the
 /// copy steps' many requests more often, and flushing need not wait.
+/// Meanwhile, and for as long as the target is used, it aborts the uploads
+/// flushes leave open.
 async fn run_probe<S: ObjectStore>(
     parts: TargetParts<S>,
     nonces: Option<Arc<AtomicU64>>,
     status: Arc<Mutex<ProbeStatus>>,
-    ready: watch::Sender<Option<Arc<Target<S>>>>,
+    ready: Arc<Ready<S>>,
 ) {
     let prefix = parts.prefix.clone();
     let settings = parts.settings.clone();
@@ -898,7 +917,7 @@ async fn run_probe<S: ObjectStore>(
                     server_side_copy: false,
                 };
                 let target = Arc::new(parts.build(found));
-                ready.send_replace(Some(Arc::clone(&target)));
+                ready.set(Arc::clone(&target));
                 break target;
             }
             Err(error) => {
@@ -911,29 +930,32 @@ async fn run_probe<S: ObjectStore>(
             }
         }
     };
-    let mut failures = 0;
-    let support = loop {
-        match probe().run_copies(&*store).await {
-            Ok(support) => break support,
-            Err(error) => {
-                failures += 1;
-                tracing::warn!(%error, "the target's server-side copy probe failed");
-                tokio::time::sleep(settings.backoff(failures)).await;
+    let copies = async {
+        let mut failures = 0;
+        let support = loop {
+            match probe().run_copies(&*store).await {
+                Ok(support) => break support,
+                Err(error) => {
+                    failures += 1;
+                    tracing::warn!(%error, "the target's server-side copy probe failed");
+                    tokio::time::sleep(settings.backoff(failures)).await;
+                }
             }
+        };
+        target.set_copy_support(support);
+        let usable = support.is_usable();
+        if !usable {
+            tracing::info!(
+                copy = %support,
+                "the target cannot take server-side copies; copies are uploaded (§11)"
+            );
+        }
+        if let ProbeStatus::Done {
+            server_side_copy, ..
+        } = &mut *lock(&status)
+        {
+            *server_side_copy = usable;
         }
     };
-    target.set_copy_support(support);
-    let usable = support.is_usable();
-    if !usable {
-        tracing::info!(
-            copy = %support,
-            "the target cannot take server-side copies; copies are uploaded (§11)"
-        );
-    }
-    if let ProbeStatus::Done {
-        server_side_copy, ..
-    } = &mut *lock(&status)
-    {
-        *server_side_copy = usable;
-    }
+    tokio::join!(copies, abort_orphans(&target));
 }

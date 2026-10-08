@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rand::rngs::SmallRng;
@@ -37,6 +37,7 @@ use crate::conflicts::{self, ConflictAudit, Conflicts, Final};
 use crate::copies::{self, Copies, CopyAudit};
 use crate::creation;
 use crate::faults::{Endpoint, Fault, FaultPlan};
+use crate::large_objects::{self, LargeObjectAudit, LargeObjects, Versions};
 use crate::lifecycle::{self, Lifecycle, LifecycleAudit, ShardLogs};
 use crate::node::{
     self, BoxError, ControlHandle, INDEX_FILE, LocalServices, NodeServices, NodeSettings, NodeSlot,
@@ -47,7 +48,7 @@ use crate::peer::{self, Destination, Peer, PeerAudit};
 use crate::pki::Pki;
 use crate::replication::register;
 use crate::snapshots::{self, Drill, SnapshotAudit, Snapshots};
-use crate::workload::{Client, Routes, Timings, Workload, etag_of};
+use crate::workload::{Client, Routes, Timings, Workload, etag_of, single_put_etags};
 use crate::write_through::{self, RemoteAudit, WriteThrough, write_back_prefix};
 
 /// The shape of a simulated cluster.
@@ -157,6 +158,11 @@ pub struct ClusterConfig {
     /// with [`ClusterConfig::snapshots`], which may name the `write_back`
     /// buckets' tables too.
     pub conflicts: Option<Conflicts>,
+    /// The large-object mix in place of the clients' usual one, faults
+    /// aimed at each step of a multipart upload at the remote store, and
+    /// the audit that no partial remote object is ever visible and that
+    /// ETags match ([`LargeObjects`]). `None` by default.
+    pub large_objects: Option<LargeObjects>,
     /// A copier that copies clean objects of the `write_back` buckets,
     /// whose flushes go to the remote store as server-side copies, and the
     /// audit of what every copy's flush left there ([`Copies`]). `None` by
@@ -241,6 +247,7 @@ impl Default for ClusterConfig {
             snapshots: None,
             origin: None,
             conflicts: None,
+            large_objects: None,
             copies: None,
             peer: None,
         }
@@ -348,6 +355,9 @@ pub struct Report {
     /// What the audit of the conflict policy found
     /// ([`ClusterConfig::conflicts`]).
     pub conflicts: ConflictAudit,
+    /// What the audit of large objects found
+    /// ([`ClusterConfig::large_objects`]).
+    pub large_objects: LargeObjectAudit,
     /// What the copier did and the audit of its copies found
     /// ([`ClusterConfig::copies`]).
     pub copies: CopyAudit,
@@ -471,11 +481,23 @@ const FINAL_READ_ATTEMPTS: usize = 120;
 /// flushers to send what they hold (§8.9).
 const BACKUP_DRAIN_LIMIT: Duration = Duration::from_secs(60);
 
+/// The gateways' `max_body_duration` in a run with large objects: a body
+/// that never commits is given up twice as late (§7.3).
+const LARGE_BODY_DURATION: Duration = Duration::from_secs(3);
+
+/// How long the driver waits, once every fault healed, for the flushers
+/// of a run with large objects to send what they hold and end every remote
+/// upload they opened: long enough for a body that never committed to
+/// time out.
+const LARGE_DRAIN_LIMIT: Duration = Duration::from_secs(90);
+
 /// A change the driver makes when a fault heals.
 #[derive(Debug, Clone)]
 enum Heal {
     Repair(Endpoint, Endpoint),
     Release(Endpoint, Endpoint),
+    /// The end of a [`Fault::RemoteLink`] of the node at this position.
+    RemoteLink(usize),
     /// The end of a window of [`InForce`].
     End(Window),
     /// Not a heal: the power-loss restart a failed sync needs, for the
@@ -632,6 +654,12 @@ impl<S: NodeServices> Cluster<S> {
                 .conflicts
                 .map_or_else(Default::default, |c| c.bug),
         );
+        skys3_flush::test_hooks::seed_large_object_bug(
+            self.config
+                .large_objects
+                .as_ref()
+                .map_or_else(Default::default, |l| l.bug),
+        );
         skys3_flush::test_hooks::seed_copy_bug(
             self.config.copies.map_or_else(Default::default, |c| c.bug),
         );
@@ -709,6 +737,7 @@ impl<S: NodeServices> Cluster<S> {
             failure: None,
             audit: None,
             peer_down: None,
+            large: None,
             drill: self.config.snapshots.map(|config| {
                 let mut rng = SmallRng::seed_from_u64(context.fork_seed());
                 let span = config.latest.saturating_sub(config.earliest);
@@ -758,6 +787,24 @@ impl<S: NodeServices> Cluster<S> {
                 },
             )
         });
+        driver.large = self.config.large_objects.as_ref().map(|large| {
+            let hosts: Vec<String> = world.slots.iter().map(|slot| slot.host.clone()).collect();
+            let versions = Versions::new(
+                large,
+                world.shared.settings.cluster.clone(),
+                routes.keys(workload.keys),
+                |bucket| match bucket.mode {
+                    BucketMode::WriteBack => Some(remote_prefix(bucket).to_owned()),
+                    BucketMode::Local if backup.enabled() => backup::backup_prefix(bucket),
+                    _ => None,
+                },
+                &hosts,
+                history.clone(),
+                context.fork_seed(),
+            );
+            versions.watch_store(large, &world.remote);
+            versions
+        });
         let writes = Timings::default();
         for index in 0..workload.clients {
             let client = Client::new(
@@ -768,7 +815,8 @@ impl<S: NodeServices> Cluster<S> {
                 context.fork_seed(),
             )
             .with_timings(writes.clone())
-            .with_acks(driver.audit.as_ref().map(RemoteAudit::on_ack));
+            .with_acks(driver.audit.as_ref().map(RemoteAudit::on_ack))
+            .with_large_objects(driver.large.clone());
             sim.client(client_host(index), client.run());
         }
         if let Some(lifecycle) = &self.config.lifecycle {
@@ -862,7 +910,8 @@ impl<S: NodeServices> Cluster<S> {
             history.clone(),
             workload.clone(),
             context.fork_seed(),
-        );
+        )
+        .with_large_objects(driver.large.clone());
         sim.client("verifier", reader.read_all(FINAL_READ_ATTEMPTS));
         self.drive(&mut sim, &mut driver, &history, true)?;
         // Every committed change of a `local` bucket reaches its backup:
@@ -882,6 +931,29 @@ impl<S: NodeServices> Cluster<S> {
             sim.client("backup-drain", async move {
                 let drained = backup::drain(flushers, buckets, BACKUP_DRAIN_LIMIT).await;
                 done.store(drained, Ordering::SeqCst);
+                Ok(())
+            });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
+        // Every version reaches its target and every remote upload a
+        // flusher opened ends, once the faults healed.
+        let large_drained = Arc::new(Mutex::new(Ok(())));
+        if self.config.large_objects.is_some() {
+            let targets: Vec<BucketDocument> = routes
+                .buckets
+                .iter()
+                .filter(|bucket| match bucket.mode {
+                    BucketMode::WriteBack => true,
+                    BucketMode::Local => backup.enabled(),
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            let flushers = Arc::clone(&world.shared.flushers);
+            let done = Arc::clone(&large_drained);
+            sim.client("large-object-drain", async move {
+                let drained = large_objects::drain(flushers, targets, LARGE_DRAIN_LIMIT).await;
+                *done.lock().unwrap_or_else(PoisonError::into_inner) = drained;
                 Ok(())
             });
             self.drive(&mut sim, &mut driver, &history, true)?;
@@ -998,6 +1070,23 @@ impl<S: NodeServices> Cluster<S> {
         } else {
             0
         };
+        // No partial object was ever visible at the remote, and ETags match.
+        let large_objects = match &driver.large {
+            Some(versions) => {
+                let drained = large_drained
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                drained.map_err(|left| {
+                    RunError::Simulation(format!("the flushers did not drain: {left}"))
+                })?;
+                let logs = world.shard_logs(&routes)?;
+                versions
+                    .audit(&logs, &world.remote)
+                    .map_err(RunError::Check)?
+            }
+            None => LargeObjectAudit::default(),
+        };
         let conflicts = match self.config.conflicts {
             Some(conflicts) => conflicts::audit(
                 conflicts,
@@ -1042,6 +1131,7 @@ impl<S: NodeServices> Cluster<S> {
         Ok(Report {
             snapshots,
             conflicts,
+            large_objects,
             copies,
             peer: peer_audit,
             history: operations,
@@ -1566,12 +1656,15 @@ impl<S: NodeServices> World<S> {
 
 /// The value the write of a remote object holding `body` with `etag`
 /// wrote: its ETag, but the MD5 of its bytes for a streamed single `PUT`,
-/// which completes a multipart upload of two parts or more (§7.4). The
-/// workload's multipart uploads have one part.
+/// which completes a multipart upload of two parts or more of the
+/// flushers' 512 bytes (§7.4). The workload's multipart uploads have one
+/// part, or parts of another size.
 pub(crate) fn written(body: &[u8], etag: &ETag) -> String {
-    match etag.as_str().rsplit_once('-') {
-        Some((_, parts)) if parts.parse::<u32>().is_ok_and(|parts| parts >= 2) => etag_of(body),
-        _ => etag.to_string(),
+    let streamed = single_put_etags(body);
+    if streamed.len() > 1 && streamed[1] == etag.as_str() {
+        etag_of(body)
+    } else {
+        etag.to_string()
     }
 }
 
@@ -1798,10 +1891,15 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     gateway.extent_bytes = 512;
     gateway.streaming_flush_min_bytes = Some(1024);
     gateway.flush_part_bytes = 512;
+    // Uploads of several parts stay small, as the remote's do.
+    gateway.min_part_bytes = 1;
     // A body streams for at most half the TTL after which compaction drops
     // extents that nothing names, as the gateway's own configuration has it.
     if let Some(compaction) = shape.compaction {
         gateway.max_body_duration = compaction.unreferenced_ttl / 2;
+    } else if shape.large_objects.is_some() {
+        // Streams of bodies that never commit are aborted within a run.
+        gateway.max_body_duration = LARGE_BODY_DURATION;
     }
     let body_timeout = gateway.max_body_duration * 2;
     gateway.read_registration_renew_interval = shape.read_registration.renew_every;
@@ -1832,6 +1930,10 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
             max_concurrency: 2,
             min_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(1),
+            streaming: shape
+                .large_objects
+                .as_ref()
+                .is_none_or(|large| large.streaming),
             ..FlushSettings::default()
         },
         checkpoint_interval: Duration::from_secs(1),
@@ -2010,6 +2112,9 @@ struct Driver<'a, S> {
     audit: Option<RemoteAudit>,
     /// When the SkyS3 peer restarts, while it is down.
     peer_down: Option<Duration>,
+    /// The audit of large objects, which also aims crashes at the steps
+    /// of multipart uploads, once the clients run.
+    large: Option<Versions>,
     /// The restore drill, with index snapshots.
     drill: Option<Drill>,
 }
@@ -2020,6 +2125,9 @@ impl<S: NodeServices> Driver<'_, S> {
     /// when it was acknowledged.
     fn check(&mut self) -> Result<(), RunError> {
         if let Some(violation) = self.audit.as_ref().and_then(RemoteAudit::violation) {
+            return Err(RunError::Check(violation));
+        }
+        if let Some(violation) = self.large.as_ref().and_then(Versions::violation) {
             return Err(RunError::Check(violation));
         }
         let destination = self.world.destination.as_ref();
@@ -2057,6 +2165,12 @@ impl<S: NodeServices> Driver<'_, S> {
             self.plan.clear();
         }
         for fault in self.world.shared.services.triggered_faults() {
+            if !heal_all {
+                self.start(sim, now, fault);
+            }
+        }
+        let aimed = self.large.as_ref().map(Versions::take_crashes);
+        for fault in aimed.into_iter().flatten() {
             if !heal_all {
                 self.start(sim, now, fault);
             }
@@ -2189,6 +2303,11 @@ impl<S: NodeServices> Driver<'_, S> {
                     self.peer_down = Some(now + downtime);
                 }
             }
+            Fault::RemoteLink { node, .. } => {
+                let host = &self.world.slots[node].host;
+                self.world.remote.set_source_down(host, true);
+                self.heals.push((until, Heal::RemoteLink(node)));
+            }
             Fault::Join { node } => {
                 // It starts at the next advance, once.
                 if self.down[node] == Some(Duration::MAX) {
@@ -2230,6 +2349,10 @@ impl<S: NodeServices> Driver<'_, S> {
         match heal {
             Heal::Repair(a, b) => sim.repair(self.host(a).as_str(), self.host(b).as_str()),
             Heal::Release(a, b) => sim.release(self.host(a).as_str(), self.host(b).as_str()),
+            Heal::RemoteLink(node) => {
+                let host = &self.world.slots[node].host;
+                self.world.remote.set_source_down(host, false);
+            }
             Heal::End(window) => {
                 self.in_force.close(window);
                 self.apply_in_force(sim);

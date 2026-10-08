@@ -6199,8 +6199,8 @@ of this file. A task with nothing unexpected keeps "None."
   `CopyObject` (`Copies::stalls`), and after some it writes the source
   again (`Copies::rewrites`), so the source changes at the remote before
   the stalled copy's retry. After a final drain the audit reads every
-  copier key on every member and checks the members agree and the remote
-  holds their version: bytes by MD5, user metadata, content type, tags,
+  copier key on every member and checks the members agree on its version
+  and the remote holds that version: bytes by MD5, user metadata, content type, tags,
   and the write identity of the version's record; any key held in
   conflict fails it. The main scenario adds crashes with and without
   power loss, partitions, message loss, control-store faults, and 2% of
@@ -6763,6 +6763,112 @@ of this file. A task with nothing unexpected keeps "None."
   origin keeps its stub until a later version replaces it; nothing
   removes stubs of keys the origin no longer has. There are no metrics
   of revalidations or forwarded listings.
+
+### M4-13 Large-object fault injection
+
+- **The audit watches the store, not the clients.** `SimS3::observe`
+  calls an observer, outside the store's lock, with every request the
+  store applied and, for a write, the object it left at the key. The
+  observer checks each object as it appears: a version a client
+  registered before sending it (`x-amz-meta-op` names it), with every
+  byte, its shard's write identity that no other version has, and the
+  ETag it must have there (the MD5 of a PUT sent whole, the 512-byte
+  multipart ETag of one that streamed, the client's ETag of an upload).
+  A run's end checks the final logs: every identity the remote held is
+  committed with the client's ETag, every `FLUSHED` names an ETag the
+  remote held for its version, and every remote upload the final
+  primary's log opened ended unless its local upload is still open.
+  Uploads whose IDs were never committed are counted for the lifecycle
+  rule (§7.3), 3 to 15 a seed.
+- **New store hooks.** `SimS3::from_source` gives a node its own handle,
+  and `set_source_down` drops that handle's link: requests sent while it
+  is down are lost unapplied, and answers of requests in flight when it
+  drops are lost after they applied (`SimS3Stats::cut_off`).
+  `set_operation_faults` gives one operation fault rates of its own.
+  Default behaviour is unchanged. `Fault::RemoteLink` drives the link,
+  and the observer aims crashes (`Fault::Crash`, power loss on half)
+  right after a step applied, one step in 40, at most four a run.
+  `ListParts` is not aimed at: it changes nothing.
+- **Small parts.** S3 refuses parts but the last below 5 MiB, and ranged
+  UploadPartCopy from sources up to 5 MiB, so `GatewayConfig` gained
+  `min_part_bytes` (not a configuration key) and the client copies whole
+  sources, read first and copied under `x-amz-copy-source-if-match`.
+  Parts but the last are 520 to 900 bytes, never the 512 of a streamed
+  body, so a multipart ETag tells a client's upload from a streamed PUT.
+- **Remote copies (after merging M4-07).** Copies of clean sources now
+  flush as remote `CopyObject`s, so `CopyObject` is among the faulted
+  steps and the steps crashes are aimed after. The large-object mix
+  sends no client `CopyObject` (M4-07's `copies` scenario audits those
+  flushes under crashes and faults), so here only the capability
+  probe's copies meet these faults, which keeps the probe's copy run
+  honest under a flaky store; their keys are not audited. No
+  `UploadPartCopy` reaches the remote: `ObjectStore` has none, and a
+  copied part is flushed as an `UploadPart` from the local log, so the
+  audit of multipart objects is unchanged. The orphan sweep now runs
+  alongside the copy probe, once the target is ready.
+- **What the merge's seeds found.** M4-07's copy audit required the
+  members to agree on each key's state as well as its version, though
+  the final power loss may cut a lazy `FLUSHED` on some members and not
+  others: `the_audit_catches_copies_without_their_identity` seed 1 ended
+  with one member clean and two dirty at the same version. The audit now
+  compares versions and checks each member's entry against the remote
+  (a clean one must record the remote's ETag). The seeded bug of given-up
+  aborts fails half the aborts instead of a quarter: a seed ends a dozen
+  or so streamed uploads, and seed 0 after the merge failed none.
+- **A real bug: uploads left open with no later flush.** An upload whose
+  abort failed, or whose flush was cancelled, was aborted only before
+  the target's next multipart flush. When the key's next version was a
+  single PUT, or the node no longer led the shard, none came: write-back
+  seed 9 at `SKYS3_SIM_SEEDS=2048` ended with "bucket-0 has 1 uploads to
+  abort". The probe task now sweeps the target's orphans after a backoff
+  that grows while some stay open (`run_probe`, design §7.4). The service
+  test `uploads_left_open_are_aborted_without_another_multipart_flush`
+  fails without it.
+- **Seeds did not replay.** Tokio draws unbiased `select!` branches and
+  the slot a `watch` waiter parks in from an RNG it seeds only under
+  `cfg(tokio_unstable)`. The flusher loop, the log committer's lazy wait,
+  the replication beacon wait, and the coordinator's idle wait are
+  `biased` now, the flusher's own tasks before the shard's changes (a
+  busy shard sends changes without end) and released backoffs taken on
+  every turn. The target the shard flushers wait for became a mutex and
+  a `Notify`, and a stopping flusher ends its waiters in key order: the
+  fault-free mix had diverged at seed 7 of 16, and it and the mix with
+  step faults and dropped links now replay at 16 of 16. With crashes
+  and partitions most seeds still do not (1 of 12; 7 of 8 without the
+  mix), within one process or across processes. A `--cfg
+  tokio_unstable` build, in which turmoil seeds tokio's RNG, replayed a
+  diverging seed 10 times of 10, so what is left is tokio's own
+  randomness: other `watch` channels with several waiters, which
+  takeovers and restarts wake. `a_large_object_seed_replays_exactly`
+  covers what replays.
+- **The audit's first false alarms.** A primary that crashed before its
+  lazy *opened* `PART_FLUSHED` reached the others leaves the record only
+  in its own log tail (write-back seed 4): the uploads' state is now the
+  final primary's log. The client forgot uploads by ID alone, but each
+  shard numbers its own, so a completion on one key forgot another's
+  upload, and the drain never ended; it matches path and ID now.
+- **Heavy faults starve the probe.** Half of all Complete answers lost
+  kept one node's capability probe failing for 90 s (seed 1), so its
+  shards never flushed. The ETag bug scenario loses 40% of them.
+- **Results.** At `SKYS3_SIM_SEEDS=256`, eight seeds of each scenario,
+  with 4 to 11 faults a seed, every seed with four aimed crashes:
+  `write_back` 36 s (single PUTs 5 to 23, streamed 0 to 11 with a
+  quarter of seeds not streaming, uploads 6 to 14, aborts 40 to 86),
+  `write_through` 40 s (7 to 12, 6 to 14, 13 to 23, 49 to 67), backup
+  35 s (5 to 13, 0 to 15, 3 to 22, 48 to 79). The replay test takes
+  24 s. Costs are `Runner::with_cost(4, 32)`, `(2, 32)` for the bugs,
+  and `(1, 128)` for the replay.
+- **Seeded bugs** (`test_hooks::seed_large_object_bug`), each caught at
+  seeds 0 to 7: `CompletesWithoutLastPart` as the truncated object
+  appears (4 s for eight seeds); `RecordsLocalEtagAfterLostComplete`
+  at the final audit (54 s), and at 31 of seeds 0 to 31 (seed 26
+  streamed two objects); `GivesUpFailedAborts` with a quarter of aborts
+  failing (47 s).
+- **Left open.** Crash replay needs `tokio_unstable` in simulation
+  builds, a workspace-wide flag left for a decision. The lifecycle rule
+  that ends uncommitted uploads is counted, not simulated. Aimed crashes
+  stop a node right after a step applied; a crash between the client's
+  steps of one upload is left to the random plan.
 
 ## M5 Local erasure coding
 

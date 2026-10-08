@@ -268,7 +268,10 @@ impl<S: ControlStore, P: Placement, A: Announce> Coordinator<S, P, A> {
     /// whichever comes first.
     async fn idle(&self, until: MonoTime) {
         let deadline = self.clock.now().saturating_add(self.config.idle).min(until);
+        // A wake-up and a deadline ready at once are taken in this order,
+        // not at random, so a simulation seed replays exactly.
         tokio::select! {
+            biased;
             () = self.wake.notified() => {}
             () = self.clock.sleep_until(deadline) => {}
         }

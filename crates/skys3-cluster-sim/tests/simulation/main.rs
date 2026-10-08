@@ -97,6 +97,12 @@
 //!   payload, and with `backup_ack = "write_through"` losing every node
 //!   after an acknowledgement loses no write, under takeovers and remote
 //!   faults, with seeded bugs caught.
+//! - [`large_objects`]: the M4 exit criterion: streamed single `PUT`s and
+//!   multipart uploads to `write_back`, `write_through`, and backed-up
+//!   buckets under crashes aimed at each step, failovers, remote errors
+//!   and lost answers on every multipart step, and dropped links, with
+//!   every remote object audited as it appears: never partial, and with
+//!   the ETag its version must have; seeded bugs are caught.
 //! - [`peer`]: `write_back` buckets and backups flushed to a SkyS3 peer
 //!   over the native protocol, under cut and held links, takeovers, and
 //!   restarts of the peer: no key recorded flushed and no write-through
@@ -140,6 +146,7 @@ mod handoff;
 mod harness;
 mod heal;
 mod hot_cache;
+mod large_objects;
 mod learners;
 mod leases;
 mod lifecycle;
