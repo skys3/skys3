@@ -49,7 +49,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use skys3_index::{Coded, Entry, EntryState, ObjectPart, ObjectVersion, Payload};
 use skys3_log::record::ShardRef;
 use skys3_types::{
-    AttemptId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation, NodeId, Seq,
+    AttemptId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation, Geometry,
+    NodeId, Seq,
 };
 
 use crate::fragment::ObjectMeta;
@@ -233,6 +234,32 @@ pub fn reindex(
         }
     }
 
+    // Every copy of each version's fragments, latest attempt first: a
+    // layout may take an older copy where the latest shares a node.
+    let mut copies = BTreeMap::<(String, EpochSeq), Vec<Copy>>::new();
+    for fragment in &found {
+        let header = &fragment.header;
+        let stripe = &header.stripe;
+        copies
+            .entry((header.key.clone(), header.version))
+            .or_default()
+            .push(Copy {
+                shape: (
+                    stripe.number,
+                    stripe.offset,
+                    stripe.data_len,
+                    stripe.geometry,
+                    stripe.codec,
+                ),
+                index: header.index,
+                attempt: header.attempt,
+                location: fragment.location.clone(),
+            });
+    }
+    for of_version in copies.values_mut() {
+        of_version.sort_by(|a, b| (b.attempt, &a.location).cmp(&(a.attempt, &b.location)));
+    }
+
     let mut versions =
         BTreeMap::<String, BTreeMap<EpochSeq, Result<ObjectLayout, RebuildError>>>::new();
     for (version, layout) in rebuild_layouts(found) {
@@ -278,11 +305,12 @@ pub fn reindex(
                 snapshot: same,
                 after_snapshot,
             } => {
-                let attempt = written[&(key.to_owned(), version)].attempt;
+                let of_version = (key.to_owned(), version);
                 restore(
                     version,
-                    attempt,
+                    written[&of_version].attempt,
                     layout,
+                    &copies[&of_version],
                     same,
                     placement,
                     reindexed.applied(),
@@ -392,7 +420,9 @@ fn decide<'a>(
             snapshot: Some(entry),
             after_snapshot: object.coded.is_none(),
         },
-        Some(Err(error)) if object.coded.is_some() => Decision::Unrecoverable {
+        // Coded, or coded after the snapshot as its headers show: either
+        // way its replicas are lost, and its stripes cannot be rebuilt.
+        Some(Err(error)) => Decision::Unrecoverable {
             version: fragments_version,
             error: error.clone().into(),
         },
@@ -400,20 +430,34 @@ fn decide<'a>(
             version: fragments_version,
             error: ReindexError::NoFragments,
         },
-        // A replicated version whose encoding, if any, cannot be rebuilt:
-        // it is lost with the replicas, as the lost-key report says.
+        // A replicated version: it is lost with the replicas, as the
+        // lost-key report says.
         _ => Decision::Nothing,
     }
 }
 
-/// The entry of `key`'s `version`, coded as `layout` by attempts up to
-/// `attempt`, merged with `snapshot`, the snapshot's entry of that version,
-/// and the number of fragments no header was found for. A layout restored
-/// from headers alone is published at `applied`.
+/// The values that place a stripe in an object and fix its fragments.
+type Shape = (u32, u64, u64, Geometry, CodecId);
+
+/// A copy of a fragment found: its stripe's shape, its index, the attempt
+/// that wrote it, and where it is.
+struct Copy {
+    shape: Shape,
+    index: u8,
+    attempt: AttemptId,
+    location: FragmentLocation,
+}
+
+/// The entry of a key's `version`, coded as `layout` by attempts up to
+/// `attempt`, whose fragments' copies are `copies`, merged with
+/// `snapshot`, the snapshot's entry of that version; and the number of
+/// fragments no copy is located for. A layout restored from headers alone
+/// is published at `applied`.
 fn restore(
     version: EpochSeq,
     attempt: AttemptId,
     layout: &ObjectLayout,
+    copies: &[Copy],
     snapshot: Option<&Entry>,
     placement: Placement<'_>,
     applied: EpochSeq,
@@ -425,9 +469,10 @@ fn restore(
     let mut stripes = Vec::with_capacity(layout.stripes.len());
     let mut missing = 0;
     for stripe in &layout.stripes {
-        missing += stripe.fragments.len() - stripe.located();
         let known = known.and_then(|coded| coded.stripes.get(stripe.number as usize));
-        stripes.push(fill(stripe, known, placement)?);
+        let (stripe, unlocated) = fill(stripe, copies, known, placement)?;
+        missing += unlocated;
+        stripes.push(stripe);
     }
     let coded = Coded {
         publish: known.map_or(applied, |coded| coded.publish),
@@ -489,14 +534,38 @@ fn restore(
     Ok((entry, missing))
 }
 
-/// Locates every fragment of `stripe`: those found where they were found,
-/// and each other one where `known`, the snapshot's layout of the stripe,
-/// put it, or else on a node of `placement` the stripe does not use.
+/// Locates every fragment of `stripe` from `copies`, one fragment per
+/// node, and returns the stripe with the number of fragments no copy is
+/// located for. A fragment whose copies all share nodes with other
+/// fragments' goes where `known`, the snapshot's layout of the stripe, put
+/// it, or else on a node of `placement` the stripe does not use.
 fn fill(
     stripe: &StripeLayout,
+    copies: &[Copy],
     known: Option<&CodedStripe>,
     placement: Placement<'_>,
-) -> Result<CodedStripe, ReindexError> {
+) -> Result<(CodedStripe, usize), ReindexError> {
+    let shape = (
+        stripe.number,
+        stripe.offset,
+        stripe.data_len,
+        stripe.geometry,
+        stripe.codec,
+    );
+    let mut candidates: Vec<Vec<&FragmentLocation>> = vec![Vec::new(); stripe.fragments.len()];
+    for copy in copies.iter().filter(|copy| copy.shape == shape) {
+        if let Some(of_index) = candidates.get_mut(usize::from(copy.index)) {
+            of_index.push(&copy.location);
+        }
+    }
+    let matched = match_nodes(&candidates);
+    let located = matched.iter().flatten().count();
+    if located < stripe.geometry.data_fragments() {
+        return Err(ReindexError::Layout {
+            stripe: stripe.number,
+            reason: format!("only {located} of its fragments are on distinct nodes"),
+        });
+    }
     let known = known.filter(|known| {
         (
             known.number(),
@@ -504,24 +573,13 @@ fn fill(
             known.data_len(),
             known.geometry(),
             known.codec(),
-        ) == (
-            stripe.number,
-            stripe.offset,
-            stripe.data_len,
-            stripe.geometry,
-            stripe.codec,
-        )
+        ) == shape
     });
-    let mut used: BTreeSet<NodeId> = stripe
-        .fragments
-        .iter()
-        .flatten()
-        .map(|location| location.node.clone())
-        .collect();
-    let mut fragments = Vec::with_capacity(stripe.fragments.len());
-    for (index, slot) in stripe.fragments.iter().enumerate() {
+    let mut used: BTreeSet<NodeId> = matched.iter().flatten().map(|l| l.node.clone()).collect();
+    let mut fragments = Vec::with_capacity(matched.len());
+    for (index, slot) in matched.iter().enumerate() {
         let location = match slot {
-            Some(location) => location.clone(),
+            Some(location) => (*location).clone(),
             None => {
                 let location = known
                     .map(|known| &known.fragments()[index])
@@ -548,7 +606,7 @@ fn fill(
         };
         fragments.push(location);
     }
-    CodedStripe::new(
+    let coded = CodedStripe::new(
         stripe.number,
         stripe.offset,
         stripe.data_len,
@@ -559,7 +617,52 @@ fn fill(
     .map_err(|error| ReindexError::Layout {
         stripe: stripe.number,
         reason: error.to_string(),
-    })
+    })?;
+    Ok((coded, matched.len() - located))
+}
+
+/// Picks for each fragment index one of its `candidates`, in order of
+/// preference, so that no two share a node and as many as possible are
+/// picked: a maximum matching of indices to nodes, by augmenting paths.
+fn match_nodes<'a>(candidates: &[Vec<&'a FragmentLocation>]) -> Vec<Option<&'a FragmentLocation>> {
+    let mut matched = vec![None; candidates.len()];
+    let mut owners = BTreeMap::<&NodeId, usize>::new();
+    for index in 0..candidates.len() {
+        augment(
+            index,
+            candidates,
+            &mut matched,
+            &mut owners,
+            &mut BTreeSet::new(),
+        );
+    }
+    matched
+}
+
+/// Finds `index` a node, moving the index that holds it to another of its
+/// candidates if needed; `seen` holds the nodes tried on this path.
+fn augment<'a>(
+    index: usize,
+    candidates: &[Vec<&'a FragmentLocation>],
+    matched: &mut [Option<&'a FragmentLocation>],
+    owners: &mut BTreeMap<&'a NodeId, usize>,
+    seen: &mut BTreeSet<&'a NodeId>,
+) -> bool {
+    for &location in &candidates[index] {
+        if !seen.insert(&location.node) {
+            continue;
+        }
+        let free = match owners.get(&location.node) {
+            None => true,
+            Some(&other) => augment(other, candidates, matched, owners, seen),
+        };
+        if free {
+            owners.insert(&location.node, index);
+            matched[index] = Some(location);
+            return true;
+        }
+    }
+    false
 }
 
 /// The unrecoverable `version`, described by the headers' `object` or the

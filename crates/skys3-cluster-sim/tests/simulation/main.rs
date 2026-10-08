@@ -117,6 +117,7 @@ mod compaction;
 mod conflicts;
 mod coordinator;
 mod crash;
+mod drills;
 mod handoff;
 mod harness;
 mod heal;
