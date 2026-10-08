@@ -6040,6 +6040,13 @@ of this file. A task with nothing unexpected keeps "None."
 - **Write-through waits.** A dropped version cannot reach the remote, so
   `discard_local` answers waiters as for a held conflict, `409
   OperationAborted`; under `overwrite` they keep waiting for the flush.
+- **Fixed: a wait that arrives after the drop.** A flush could drop a
+  version and untrack its key before the version's write-through wait
+  reached the flusher, which then answered an untracked key `Flushed`
+  and the client `200`. The flusher now remembers the newest dropped
+  version of the last 4096 keys it discarded and answers such a wait
+  `Conflict`; reading the shard's entry instead could not tell an
+  adopted stub from a later version's.
 - **Admin API shape (decided, design §12).** `GET
   /v1/buckets/<name>/conflicts` and `POST
   /v1/buckets/<name>/conflicts/<policy>/<key>`, with the policy before the
