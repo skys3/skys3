@@ -59,7 +59,8 @@
 //!   `TAGS` is flushed like any other, the bytes uploaded again with the
 //!   new tags and the `TAGS` record's write identity.
 //! - [`Target`]: what the flushers of one target share: the store, the
-//!   probe's findings, the in-flight byte budget, the settings
+//!   probe's findings, the window of requests in flight and the in-flight
+//!   byte budget ([`Target::concurrency`]), the settings
 //!   ([`FlushSettings`]), and the remote uploads left to abort.
 //! - [`Filler`]: read-through fill (§9.2). It reads an evicted version from
 //!   the target with `If-Match` and `versionId`, commits it as extents that
