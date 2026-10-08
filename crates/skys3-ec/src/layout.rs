@@ -20,18 +20,9 @@
 use std::collections::BTreeMap;
 
 use skys3_log::record::ShardRef;
-use skys3_types::{CodecId, EpochSeq, FragmentId, Geometry, NodeId};
+use skys3_types::{CodecId, CodedStripe, EpochSeq, FragmentLocation, Geometry};
 
 use crate::fragment::{FragmentHeader, ObjectMeta};
-
-/// Where a fragment is: its node, and its ID on that node.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FragmentLocation {
-    /// The node that stores the fragment.
-    pub node: NodeId,
-    /// The fragment's ID in that node's store.
-    pub fragment: FragmentId,
-}
 
 /// A fragment header found on a node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +33,9 @@ pub struct FoundFragment {
     pub header: FragmentHeader,
 }
 
-/// One stripe's layout, as an `EC_PUBLISH` record holds it.
+/// One stripe's layout, as rebuilt from fragment headers: what an
+/// `EC_PUBLISH` record holds as a [`CodedStripe`], with a slot left empty
+/// for each fragment no header was found for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeLayout {
     /// The stripe's number within the object.
@@ -65,6 +58,20 @@ impl StripeLayout {
     #[must_use]
     pub fn located(&self) -> usize {
         self.fragments.iter().flatten().count()
+    }
+}
+
+impl From<CodedStripe> for StripeLayout {
+    /// The layout of a published stripe, every fragment located.
+    fn from(stripe: CodedStripe) -> Self {
+        Self {
+            number: stripe.number(),
+            offset: stripe.offset(),
+            data_len: stripe.data_len(),
+            geometry: stripe.geometry(),
+            codec: stripe.codec(),
+            fragments: stripe.fragments().iter().cloned().map(Some).collect(),
+        }
     }
 }
 
