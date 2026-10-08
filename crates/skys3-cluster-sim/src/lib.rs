@@ -101,6 +101,7 @@ mod learners;
 mod lifecycle;
 mod node;
 mod origin;
+mod peer;
 mod pki;
 mod replication;
 mod routing;
@@ -126,12 +127,15 @@ pub use learners::{DurabilityWindows, LearnerCounts};
 pub use lifecycle::{Lifecycle, LifecycleAudit, LifecycleObject, LifecycleStart, ORIGIN_DAY};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use origin::{FULL, GUEST, Origin, OriginAudit, OriginBug, OriginFreshness};
+pub use peer::{Peer, PeerAudit};
 pub use replication::{
     HandoffCounts, HandoffTime, IoCounts, LateWrites, LeaseCounts, ReplicaState,
     ReplicatedServices, ReplicatedShards,
 };
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
+/// The seeded bugs of [`Peer`].
+pub use skys3_flush::PeerBug;
 /// The seeded bugs of conflict handling ([`Conflicts::bug`]).
 pub use skys3_flush::test_hooks::ConflictBug;
 /// The seeded bugs of server-side copies ([`Copies::bug`]).

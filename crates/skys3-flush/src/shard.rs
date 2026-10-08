@@ -935,11 +935,18 @@ fn finish<S, D: Disk>(
                     remote_version_id: remote.version_id.clone(),
                 };
                 if target.native.is_some() {
+                    // A delete's `COMMIT` carries the identity of its
+                    // tombstone; a version's, the one its record names.
+                    let identity = remote
+                        .version_id
+                        .clone()
+                        .unwrap_or_else(|| target.identity(shard.shard(), version).to_string());
                     peer_hooks::flushed(&FlushedRecord {
                         shard: shard.shard().clone(),
                         key: key.clone(),
                         version,
-                        identity: remote.version_id.clone(),
+                        identity,
+                        delete: remote.version_id.is_none(),
                     });
                 }
                 state.recording.insert(key.clone(), remote);

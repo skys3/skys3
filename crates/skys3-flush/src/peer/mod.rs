@@ -196,9 +196,11 @@ pub struct FlushedRecord {
     pub key: String,
     /// The version recorded.
     pub version: skys3_types::EpochSeq,
-    /// The write identity the destination's version carries, `None` for a
-    /// delete.
-    pub identity: Option<String>,
+    /// The write identity of the `COMMIT` whose `APPLIED` the record
+    /// follows: the one the destination's version carries, or a delete's.
+    pub identity: String,
+    /// Whether the version is a delete.
+    pub delete: bool,
 }
 
 pub(crate) mod hooks {

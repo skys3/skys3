@@ -18,6 +18,9 @@ pub enum Endpoint {
     Node(usize),
     /// The client at this position, from 0.
     Client(usize),
+    /// The SkyS3 peer the buckets flush to
+    /// ([`ClusterConfig::peer`](crate::ClusterConfig::peer)).
+    Peer,
 }
 
 /// A fault the harness injects.
@@ -118,6 +121,15 @@ pub enum Fault {
         /// The node.
         node: usize,
     },
+    /// The SkyS3 peer ([`ClusterConfig::peer`](crate::ClusterConfig::peer))
+    /// stops, losing every unsynced write with `power_loss`, and restarts
+    /// after `downtime`.
+    PeerRestart {
+        /// Whether unsynced writes are lost.
+        power_loss: bool,
+        /// How long the peer stays down.
+        downtime: Duration,
+    },
 }
 
 impl Fault {
@@ -125,7 +137,7 @@ impl Fault {
     #[must_use]
     pub fn duration(&self) -> Option<Duration> {
         match self {
-            Fault::Crash { downtime, .. } => Some(*downtime),
+            Fault::Crash { downtime, .. } | Fault::PeerRestart { downtime, .. } => Some(*downtime),
             Fault::Partition { duration, .. }
             | Fault::Hold { duration, .. }
             | Fault::MessageLoss { duration, .. }
@@ -176,6 +188,9 @@ pub struct FaultProfile {
     pub control: usize,
     /// The longest duration of a fault.
     pub max_duration: Duration,
+    /// Faults of the SkyS3 peer: partitions and holds between it and a
+    /// node, and restarts. None by default.
+    pub peer: usize,
 }
 
 impl Default for FaultProfile {
@@ -190,6 +205,7 @@ impl Default for FaultProfile {
             sync_failures: 1,
             control: 3,
             max_duration: Duration::from_secs(2),
+            peer: 0,
         }
     }
 }
@@ -299,6 +315,29 @@ impl FaultPlan {
             };
             plan.push(at(rng), fault);
         }
+        // Drawn last, and only if asked for, so that what else a seed draws
+        // stays the same.
+        let peer = if profile.peer > 0 {
+            rng.random_range(0..=profile.peer)
+        } else {
+            0
+        };
+        for _ in 0..peer {
+            let (a, b, duration) = (
+                Endpoint::Node(rng.random_range(0..nodes)),
+                Endpoint::Peer,
+                lasting(rng),
+            );
+            let fault = match rng.random_range(0..3) {
+                0 => Fault::Partition { a, b, duration },
+                1 => Fault::Hold { a, b, duration },
+                _ => Fault::PeerRestart {
+                    power_loss: rng.random_bool(0.5),
+                    downtime: duration,
+                },
+            };
+            plan.push(at(rng), fault);
+        }
         plan
     }
 }
@@ -375,6 +414,7 @@ mod tests {
                         6
                     }
                     Fault::Join { .. }
+                    | Fault::PeerRestart { .. }
                     | Fault::LoseControlStore
                     | Fault::RebuildControlStore { .. } => {
                         panic!("a random plan joins no node and loses no store")
@@ -396,5 +436,51 @@ mod tests {
                 .iter()
                 .all(|f| !matches!(f.fault, Fault::Partition { .. } | Fault::Hold { .. }))
         );
+    }
+
+    #[test]
+    fn peer_faults_cut_a_node_off_the_peer_or_restart_it() {
+        let profile = FaultProfile {
+            peer: 6,
+            ..FaultProfile::default()
+        };
+        let mut kinds = [0; 2];
+        for seed in 0..32 {
+            let plain = FaultPlan::random(
+                &mut SmallRng::seed_from_u64(seed),
+                &FaultProfile::default(),
+                3,
+                2,
+                4,
+            );
+            let plan = FaultPlan::random(&mut SmallRng::seed_from_u64(seed), &profile, 3, 2, 4);
+            // The other faults are those of the same seed without the peer.
+            let others: Vec<_> = plan
+                .faults()
+                .iter()
+                .filter(|f| match &f.fault {
+                    Fault::Partition { b, .. } | Fault::Hold { b, .. } => *b != Endpoint::Peer,
+                    fault => !matches!(fault, Fault::PeerRestart { .. }),
+                })
+                .cloned()
+                .collect();
+            assert_eq!(others, plain.faults());
+            for scheduled in plan.faults() {
+                match &scheduled.fault {
+                    Fault::Partition { a, b, .. } | Fault::Hold { a, b, .. }
+                        if *b == Endpoint::Peer =>
+                    {
+                        assert!(matches!(a, Endpoint::Node(n) if *n < 3));
+                        kinds[0] += 1;
+                    }
+                    Fault::PeerRestart { downtime, .. } => {
+                        assert!(*downtime <= profile.max_duration);
+                        kinds[1] += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(kinds.iter().all(|&count| count > 0), "{kinds:?}");
     }
 }

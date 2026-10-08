@@ -58,6 +58,7 @@ use crate::cluster::HotCaches;
 use crate::faults::Fault;
 use crate::lifecycle::{self, Lifecycle};
 use crate::origin::{Origin, OriginBug};
+use crate::peer::Peer;
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -191,6 +192,9 @@ pub(crate) struct NodeSettings {
     /// The `read_only` buckets' origin, if the run has one (§9.5): the
     /// gateways then read origins as the node binary does.
     pub origin: Option<Origin>,
+    /// The SkyS3 peer the buckets flush to over the native protocol, if
+    /// any.
+    pub peer: Option<Peer>,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -525,7 +529,7 @@ fn flush_service(
     seed: u64,
 ) -> FlushService<SimS3, SimMount> {
     let (remote, origin) = (remote.clone(), remote.clone());
-    FlushService::new(
+    let service = FlushService::new(
         settings.cluster.clone(),
         settings.flush.clone(),
         Box::new(move |_| remote.clone()),
@@ -537,7 +541,11 @@ fn flush_service(
     }))
     .with_wall_clock(Arc::new(SimWallClock))
     .with_buckets(settings.buckets.clone())
-    .with_probe_nonces(seed)
+    .with_probe_nonces(seed);
+    match settings.peer {
+        Some(peer) => service.with_peer_transport(peer.transport()),
+        None => service,
+    }
 }
 
 /// Keeps a flusher on every shard open on the node of a `write_back`
