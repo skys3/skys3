@@ -19,15 +19,16 @@
 //!   round mean of the last [`BASE_ROUNDS`] rounds, a windowed minimum
 //!   filter: the latency of a round in which nothing queued.
 //! - **Additive increase.** A round whose mean stays within
-//!   [`LATENCY_TOLERANCE`] of the base round trip, and in which some
-//!   request waited for a slot, grows the window: it doubles in the slow
-//!   start, until the first decrease, and grows by one request after. By
-//!   Little's law throughput is the requests in flight divided by their
-//!   latency, so while the window is full and latency stays at the base,
-//!   throughput rises with every slot added; once it no longer does,
-//!   latency rises instead. A round in which no request waited, because
-//!   there was no more to send or the in-flight byte bound held requests
-//!   back before they asked for a slot, does not grow the window.
+//!   [`LATENCY_TOLERANCE`] of the base round trip, and at whose end
+//!   requests wait for a slot, grows the window: it doubles in the slow
+//!   start, until the first decrease, and grows by one request after, but
+//!   never past the requests in flight and waiting. By Little's law
+//!   throughput is the requests in flight divided by their latency, so
+//!   while the window is full and latency stays at the base, throughput
+//!   rises with every slot added; once it no longer does, latency rises
+//!   instead. A round that ends with no request waiting, because there is
+//!   no more to send or the in-flight byte bound holds requests back
+//!   before they ask for a slot, does not grow the window.
 //! - **Multiplicative decrease.** A round whose mean exceeds the
 //!   tolerance shrinks the window to [`LATENCY_TARGET`] of the size at
 //!   which its mean would have been the base round trip, at most halving
@@ -117,8 +118,6 @@ impl Signal {
 struct Round {
     samples: u32,
     total: Duration,
-    /// Whether a request waited for a slot.
-    waited: bool,
 }
 
 /// The additive-increase, multiplicative-decrease controller of one
@@ -188,16 +187,16 @@ impl Controller {
         self.limit = self.limit.clamp(self.floor, self.ceiling);
     }
 
-    /// Numbers a request being sent; `waited` if it found no free slot.
-    pub(crate) fn sent(&mut self, waited: bool) -> u64 {
-        self.round.waited |= waited;
+    /// Numbers a request being sent.
+    pub(crate) fn sent(&mut self) -> u64 {
         let number = self.next;
         self.next += 1;
         number
     }
 
-    /// Learns from the answer to request `number`.
-    pub(crate) fn answered(&mut self, number: u64, signal: Signal) {
+    /// Learns from the answer to request `number`, while `demand`
+    /// requests, this one included, are in flight or waiting for a slot.
+    pub(crate) fn answered(&mut self, number: u64, signal: Signal, demand: u32) {
         match signal {
             Signal::Failed => {}
             Signal::Throttled => {
@@ -209,13 +208,13 @@ impl Controller {
                 self.round.samples += 1;
                 self.round.total = self.round.total.saturating_add(latency);
                 if number >= self.round_start {
-                    self.end_round();
+                    self.end_round(demand);
                 }
             }
         }
     }
 
-    fn end_round(&mut self) {
+    fn end_round(&mut self, demand: u32) {
         let round = std::mem::take(&mut self.round);
         let mean = round.total / round.samples.max(1);
         self.rounds += 1;
@@ -237,13 +236,13 @@ impl Controller {
             let knee = base.as_secs_f64() / mean.as_secs_f64();
             self.decrease((LATENCY_TARGET * knee).max(LATENCY_MIN_FACTOR));
             return;
-        } else if round.waited {
+        } else if demand > self.limit {
             let grown = if self.slow_start {
                 self.limit.saturating_mul(2)
             } else {
                 self.limit.saturating_add(1)
             };
-            self.limit = grown.min(self.ceiling);
+            self.limit = grown.min(demand).min(self.ceiling);
         }
         self.round_start = self.next;
     }
@@ -281,6 +280,8 @@ struct WindowState {
     /// The flushers sending to the target.
     shards: u32,
     in_flight: u32,
+    /// Requests waiting for a slot.
+    waiting: u32,
     /// Slots to keep, rather than free, as requests end: the window shrank
     /// below the requests in flight. Free slots, plus requests in flight,
     /// are always the limit plus the debt.
@@ -328,6 +329,7 @@ impl Window {
                 per_shard: (least, most),
                 shards: 0,
                 in_flight: 0,
+                waiting: 0,
                 debt: 0,
             }),
             throttles: Mutex::new(Counter::default()),
@@ -365,14 +367,15 @@ impl Window {
 
     /// Sends `request` once it has a slot, and learns from its answer.
     pub(crate) async fn send<T>(&self, request: impl Future<Output = S3Result<T>>) -> S3Result<T> {
-        let waited = self.permits.available_permits() == 0;
+        let waiting = Waiting::new(self);
         // The semaphore is never closed.
         if let Ok(permit) = self.permits.acquire().await {
             permit.forget();
         }
+        drop(waiting);
         let number = self.update(|state| {
             state.in_flight += 1;
-            state.controller.sent(waited)
+            state.controller.sent()
         });
         let mut slot = Slot {
             window: self,
@@ -422,6 +425,22 @@ impl Window {
     }
 }
 
+/// A request waiting for a slot, counted until dropped.
+struct Waiting<'w>(&'w Window);
+
+impl<'w> Waiting<'w> {
+    fn new(window: &'w Window) -> Self {
+        window.lock().waiting += 1;
+        Self(window)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.lock().waiting -= 1;
+    }
+}
+
 /// A slot of the window, held by a request in flight. Dropping it, as when
 /// the flush is abandoned, frees it without a sample.
 struct Slot<'w> {
@@ -438,7 +457,8 @@ impl Slot<'_> {
         };
         self.window.update(|state| {
             if let Some(signal) = signal {
-                state.controller.answered(number, signal);
+                let demand = state.in_flight.saturating_add(state.waiting);
+                state.controller.answered(number, signal, demand);
             }
             state.in_flight -= 1;
             if state.debt > 0 {

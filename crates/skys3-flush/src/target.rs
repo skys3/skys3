@@ -198,6 +198,8 @@ impl<S> Target<S> {
             settings.min_concurrency,
             settings.max_concurrency,
         )));
+        let counters = Counters::default();
+        window.count_throttles(counters.throttles.clone());
         Self {
             store: Paced::new(store, Arc::clone(&window)),
             window,
@@ -207,7 +209,7 @@ impl<S> Target<S> {
             settings,
             import: Arc::new(ImportDone),
             wall: Arc::new(SystemWallClock),
-            counters: Counters::default(),
+            counters,
             conflict_policy: ConflictPolicy::Hold,
             inflight: Semaphore::new(inflight_kib as usize),
             inflight_kib,

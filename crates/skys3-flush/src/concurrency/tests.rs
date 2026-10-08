@@ -7,15 +7,16 @@ use super::*;
 
 const MS: Duration = Duration::from_millis(1);
 
-/// Sends `count` requests, `waited` if they found the window full.
-fn send(controller: &mut Controller, count: u32, waited: bool) -> Vec<u64> {
-    (0..count).map(|_| controller.sent(waited)).collect()
+/// Sends `count` requests.
+fn send(controller: &mut Controller, count: u32) -> Vec<u64> {
+    (0..count).map(|_| controller.sent()).collect()
 }
 
-/// Answers `requests` after `latency` each.
+/// Answers `requests` after `latency` each, with a backlog of requests
+/// waiting for a slot.
 fn answer(controller: &mut Controller, requests: &[u64], latency: Duration) {
     for &number in requests {
-        controller.answered(number, Signal::Answered(latency));
+        controller.answered(number, Signal::Answered(latency), u32::MAX);
     }
 }
 
@@ -38,7 +39,7 @@ impl Driver {
     /// Runs a round whose answers take `latency`, and returns the window.
     fn round(&mut self, latency: Duration) -> u32 {
         let limit = self.controller.limit();
-        let sent = send(&mut self.controller, limit, true);
+        let sent = send(&mut self.controller, limit);
         let previous = std::mem::take(&mut self.outstanding);
         answer(&mut self.controller, &previous, latency);
         answer(&mut self.controller, &sent[..1], latency);
@@ -59,16 +60,20 @@ fn slow_start_doubles_each_full_round_up_to_the_ceiling() {
 }
 
 #[test]
-fn a_round_in_which_nothing_waited_does_not_grow() {
+fn the_window_grows_only_while_requests_wait_and_up_to_them() {
     let mut controller = Controller::new(4, 100);
-    let requests = send(&mut controller, 2, false);
-    answer(&mut controller, &requests, 10 * MS);
+    let requests = send(&mut controller, 4);
+    // Nothing waits: four in flight.
+    controller.answered(requests[0], Signal::Answered(10 * MS), 4);
     assert_eq!(controller.limit(), 4);
-    // One request that waited is enough.
-    let mut requests = send(&mut controller, 3, false);
-    requests.extend(send(&mut controller, 1, true));
+    // Two wait as the next round ends: the slow start would double the
+    // window, but six are all it can use.
+    let requests = send(&mut controller, 4);
+    controller.answered(requests[0], Signal::Answered(10 * MS), 6);
+    assert_eq!(controller.limit(), 6);
+    let requests = send(&mut controller, 6);
     answer(&mut controller, &requests, 10 * MS);
-    assert_eq!(controller.limit(), 8);
+    assert_eq!(controller.limit(), 12);
 }
 
 #[test]
@@ -108,7 +113,7 @@ fn a_small_rise_aims_just_below_the_knee() {
 #[test]
 fn rounds_end_when_a_request_sent_after_their_start_is_answered() {
     let mut controller = Controller::new(4, 100);
-    let first = send(&mut controller, 4, true);
+    let first = send(&mut controller, 4);
     // Requests of the same round answered out of order end it at the first
     // answer: the round started before any of them.
     answer(&mut controller, &first[3..], 10 * MS);
@@ -117,7 +122,7 @@ fn rounds_end_when_a_request_sent_after_their_start_is_answered() {
     // sent after it started.
     answer(&mut controller, &first[..3], 10 * MS);
     assert_eq!(controller.limit(), 8);
-    let second = send(&mut controller, 1, true);
+    let second = send(&mut controller, 1);
     answer(&mut controller, &second, 10 * MS);
     assert_eq!(controller.limit(), 16);
 }
@@ -130,22 +135,22 @@ fn throttles_shrink_once_per_window() {
     }
     let controller = &mut driver.controller;
     assert_eq!(controller.limit(), 64);
-    let requests = send(controller, 64, true);
-    controller.answered(requests[0], Signal::Throttled);
+    let requests = send(controller, 64);
+    controller.answered(requests[0], Signal::Throttled, u32::MAX);
     assert_eq!(controller.limit(), 44);
     // Throttles of requests sent before the decrease count once.
     for &number in &requests[1..10] {
-        controller.answered(number, Signal::Throttled);
+        controller.answered(number, Signal::Throttled, u32::MAX);
     }
     assert_eq!(controller.limit(), 44);
     // A request sent after it is throttled too: the rate is still too high.
-    let later = controller.sent(true);
-    controller.answered(later, Signal::Throttled);
+    let later = controller.sent();
+    controller.answered(later, Signal::Throttled, u32::MAX);
     assert_eq!(controller.limit(), 30);
     // Throttles never take the window below its floor.
     for _ in 0..20 {
-        let number = controller.sent(true);
-        controller.answered(number, Signal::Throttled);
+        let number = controller.sent();
+        controller.answered(number, Signal::Throttled, u32::MAX);
     }
     assert_eq!(controller.limit(), 4);
     // Then it grows by one a round, after a round that only measures.
@@ -157,9 +162,9 @@ fn throttles_shrink_once_per_window() {
 #[test]
 fn failures_say_nothing() {
     let mut controller = Controller::new(4, 100);
-    let requests = send(&mut controller, 4, true);
+    let requests = send(&mut controller, 4);
     for &number in &requests {
-        controller.answered(number, Signal::Failed);
+        controller.answered(number, Signal::Failed, u32::MAX);
     }
     assert_eq!(controller.limit(), 4);
     assert_eq!(controller.base(), None);
@@ -235,7 +240,7 @@ fn steady_window(
     let (mut sum, mut samples) = (0.0, 0.0);
     while answered < requests {
         while in_flight < controller.limit() {
-            let number = controller.sent(true);
+            let number = controller.sent();
             let leaves = link_free.max(now) + transfer;
             link_free = leaves;
             due.push(Reverse((leaves + round_trip, number, now)));
@@ -246,7 +251,7 @@ fn steady_window(
         now = at;
         in_flight -= 1;
         answered += 1;
-        controller.answered(number, Signal::Answered(at - sent_at));
+        controller.answered(number, Signal::Answered(at - sent_at), u32::MAX);
         if answered > requests / 2 {
             sum += f64::from(controller.limit());
             samples += 1.0;

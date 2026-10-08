@@ -320,9 +320,15 @@ async fn write_back_buckets_get_flushers() {
     assert_eq!(status["unflushed"], 1);
     assert_eq!(status["flush"]["conflicts"], serde_json::json!([]));
     assert_eq!(status["flush"]["orphaned_uploads"], 0);
+    // No window before the probe is done (§7.7).
+    assert_eq!(status["flush"]["concurrency"], serde_json::Value::Null);
     let (_, metrics) = http_get(&admin, "/metrics").await.unwrap();
     assert!(
         metrics.contains("skys3_dirty_bytes{bucket=\"archive\"}"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("skys3_flush_concurrency{bucket=\"archive\"} 0"),
         "{metrics}"
     );
     // A bucket with unflushed writes cannot be detached.
