@@ -1,10 +1,11 @@
 //! The flusher of one shard (§7.1): which keys are dirty, which are being
 //! flushed, which are held in conflict, and the task that drives them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use skys3_config::ConflictPolicy;
 use skys3_index::{Entry, EntryState};
 use skys3_io::{Disk, WallClock};
 use skys3_log::record::Flushed;
@@ -12,12 +13,13 @@ use skys3_log::{RecordBody, ShardRef};
 use skys3_remote::ObjectStore;
 use skys3_shard::{Change, FlushState, FlushWaiter, Shard, ShardError};
 use skys3_types::{ETag, EpochSeq, Seq};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 use crate::attempt::{Attempt, Conflict, Outcome, Remote};
 use crate::budget::Charge;
+use crate::conflict::{ConflictBug, Unresolved, conflict_bug};
 use crate::stream::{Step, Streams};
 use crate::target::Target;
 
@@ -26,6 +28,10 @@ pub(crate) type Ready<S> = watch::Receiver<Option<Arc<Target<S>>>>;
 
 /// How many entries the startup scan reads per index transaction.
 const SCAN_PAGE: usize = 512;
+
+/// How many keys' dropped versions a flusher remembers for the
+/// write-through waits that reach it after the drop ([`State::awaited`]).
+const MAX_DISCARDS: usize = 4096;
 
 /// Where a dirty key is in its flush (§4.2). `Clean` has no phase: a clean
 /// key is not tracked.
@@ -67,6 +73,9 @@ struct Tracked {
     /// Write-through writes waiting for versions not yet at the remote
     /// (§7.5).
     waiters: Vec<FlushWaiter>,
+    /// How its conflict was resolved, until a flush of the key succeeds
+    /// (§7.2).
+    resolution: Option<ConflictPolicy>,
 }
 
 /// One held conflict, as the admin API lists it.
@@ -134,6 +143,12 @@ struct State {
     stopped: bool,
     /// The budget `dirty_bytes` counts against, until the flusher stops.
     charge: Option<Charge>,
+    /// The newest version `discard_local` dropped of each key, for the
+    /// write-through waits that reach the flusher only after the drop
+    /// untracked the key.
+    discards: HashMap<String, EpochSeq>,
+    /// The keys of `discards`, oldest first: at most [`MAX_DISCARDS`].
+    discard_order: VecDeque<String>,
 }
 
 impl State {
@@ -155,6 +170,7 @@ impl State {
                 newer_since: None,
                 remote: None,
                 waiters: Vec::new(),
+                resolution: None,
             };
             self.keys.insert(key.to_owned(), tracked);
             return;
@@ -194,14 +210,15 @@ impl State {
         }
     }
 
-    /// Takes the next dirty key for a flush, if any.
-    fn take_ready(&mut self) -> Option<(String, EpochSeq)> {
+    /// Takes the next dirty key for a flush, if any, with how its conflict
+    /// was resolved.
+    fn take_ready(&mut self) -> Option<(String, EpochSeq, Option<ConflictPolicy>)> {
         let (_, key) = self.ready.pop_first()?;
         let tracked = self.keys.get_mut(&key)?;
         tracked.phase = Phase::Flushing;
         tracked.newer_since = None;
         self.flushing += 1;
-        Some((key, tracked.latest))
+        Some((key, tracked.latest, tracked.resolution))
     }
 
     /// Moves keys whose backoff ended back in line.
@@ -233,6 +250,9 @@ impl State {
             return;
         };
         tracked.failures = 0;
+        // A resolution ends with the flush that carried it out: a newer
+        // version builds on what that flush left at the remote.
+        tracked.resolution = None;
         match tracked.newer_since.take() {
             Some(since) if tracked.latest > dispatched => {
                 self.pending.remove(&(tracked.since, key.to_owned()));
@@ -265,18 +285,96 @@ impl State {
         }
     }
 
-    /// Ends the flush of `key` in conflict: it is held, and no longer in
-    /// line.
-    fn conflicted(&mut self, key: &str, conflict: Conflict) {
+    /// Ends the flush of `key` in conflict, which `policy` decides (§7.2):
+    /// under `hold` the key is held, and no longer in line; under the
+    /// other policies the conflict is resolved at once, and the key is
+    /// dirty again.
+    fn conflicted(&mut self, key: &str, conflict: Conflict, policy: ConflictPolicy) {
         self.flushing -= 1;
         self.errors.remove(key);
-        if let Some(tracked) = self.keys.get_mut(key) {
+        let Some(tracked) = self.keys.get_mut(key) else {
+            return;
+        };
+        if policy == ConflictPolicy::Hold {
             self.pending.remove(&(tracked.since, key.to_owned()));
             tracked.phase = Phase::Conflict(conflict);
             for waiter in tracked.waiters.drain(..) {
                 waiter.answer(FlushState::Conflict);
             }
+            return;
         }
+        tracked.phase = Phase::Dirty;
+        self.ready.insert(tracked.order, key.to_owned());
+        Self::resolved(tracked, policy);
+    }
+
+    /// Resolves the conflict `key` is held in under `policy`, as an
+    /// operator asks: the key is dirty again, in line, and its next flush
+    /// carries out the resolution (§4.2 Conflict → Dirty).
+    fn resolve(&mut self, key: &str, policy: ConflictPolicy) -> Result<(), Unresolved> {
+        let tracked = self.keys.get_mut(key).ok_or(Unresolved::NotHeld)?;
+        if !matches!(tracked.phase, Phase::Conflict(_)) {
+            return Err(Unresolved::NotHeld);
+        }
+        tracked.phase = Phase::Dirty;
+        tracked.failures = 0;
+        self.pending.insert((tracked.since, key.to_owned()));
+        self.ready.insert(tracked.order, key.to_owned());
+        Self::resolved(tracked, policy);
+        Ok(())
+    }
+
+    /// Records that `tracked`'s conflict is resolved under `policy`. A
+    /// write-through write waiting for a version that `discard_local` will
+    /// drop learns of the conflict now; one that `overwrite` will flush
+    /// keeps waiting for it.
+    fn resolved(tracked: &mut Tracked, policy: ConflictPolicy) {
+        tracked.resolution = Some(policy);
+        if policy == ConflictPolicy::DiscardLocal {
+            for waiter in tracked.waiters.drain(..) {
+                waiter.answer(FlushState::Conflict);
+            }
+        }
+    }
+
+    /// Records that `discard_local` dropped `version` of `key` for the
+    /// remote's write: the writes waiting for it, or an older version,
+    /// learn of the conflict, now or when their wait arrives.
+    fn discarded(&mut self, key: &str, version: EpochSeq) {
+        match self.discards.get_mut(key) {
+            Some(dropped) => *dropped = (*dropped).max(version),
+            None => {
+                self.discards.insert(key.to_owned(), version);
+                self.discard_order.push_back(key.to_owned());
+                if self.discard_order.len() > MAX_DISCARDS
+                    && let Some(oldest) = self.discard_order.pop_front()
+                {
+                    self.discards.remove(&oldest);
+                }
+            }
+        }
+        if let Some(tracked) = self.keys.get_mut(key) {
+            tracked.waiters.retain(|waiter| {
+                let dropped = waiter.version() <= version;
+                if dropped {
+                    waiter.answer(FlushState::Conflict);
+                }
+                !dropped && waiter.is_waited()
+            });
+        }
+    }
+
+    /// Stops tracking the held `key` as if its version had been flushed,
+    /// and returns its `seq` and the conflict: the seeded bug
+    /// [`ConflictBug::ResolvesClean`].
+    fn resolve_clean(&mut self, key: &str) -> Result<(Seq, Conflict), Unresolved> {
+        let tracked = self.keys.get(key).ok_or(Unresolved::NotHeld)?;
+        let Phase::Conflict(conflict) = &tracked.phase else {
+            return Err(Unresolved::NotHeld);
+        };
+        let resolved = (tracked.latest.seq, conflict.clone());
+        self.untrack(key);
+        Ok(resolved)
     }
 
     /// Records that the remote holds `version` of `key`, or a later one,
@@ -297,8 +395,14 @@ impl State {
     /// Takes a write-through write's wait for its version (§7.5). The
     /// shard passes it after the change that stored the version, so an
     /// untracked key has had its latest version, at or after the one
-    /// waited for, flushed.
+    /// waited for, flushed, unless `discard_local` dropped it: the flush
+    /// may have dropped it, and untracked the key, before the wait
+    /// arrived, so the drop is remembered for it.
     fn awaited(&mut self, waiter: FlushWaiter) {
+        let dropped = self.discards.get(waiter.key());
+        if dropped.is_some_and(|dropped| waiter.version() <= *dropped) {
+            return waiter.answer(FlushState::Conflict);
+        }
         let Some(tracked) = self.keys.get_mut(waiter.key()) else {
             return waiter.answer(FlushState::Flushed);
         };
@@ -388,11 +492,18 @@ impl State {
 ///   next, conditioned on what the flush put at the remote.
 /// - **States** (§4.2). A dirty key is taken for a flush (Dirty →
 ///   Flushing). A retryable failure puts it back after a backoff (Flushing
-///   → Dirty), an out-of-band remote write holds it in conflict (Flushing
+///   → Dirty), an out-of-band remote write puts it in conflict (Flushing
 ///   → Conflict), and success makes it clean once its `FLUSHED` record is
 ///   applied. Flushing and conflict are the primary's view, kept in memory:
 ///   the index shows such entries as dirty, and a restarted flusher finds
 ///   a conflict again by flushing, which is conditional and so safe.
+/// - **Conflicts** (§7.2). The target's
+///   [`conflict_policy`](Target::conflict_policy) decides: `hold` keeps
+///   the key in conflict until [`ShardFlusher::resolve`], and `overwrite`
+///   and `discard_local` resolve it at once (Conflict → Dirty). The next
+///   flush of a resolved key sends it unconditionally under `overwrite`,
+///   or adopts the remote's write under `discard_local`, with an `ADOPT`
+///   that drops the local version (see the `conflict` module).
 /// - **Recording.** The remote's answer is recorded with a `FLUSHED`
 ///   record committed lazily, on the next group commit
 ///   ([`Shard::commit_lazy`]). The flush slot is free before it is.
@@ -403,7 +514,38 @@ pub struct ShardFlusher {
     shard: ShardRef,
     state: Arc<Mutex<State>>,
     streams: Arc<Streams>,
+    resolver: Resolver,
     task: JoinHandle<()>,
+}
+
+/// Sends operators' resolutions of held conflicts to a flusher's task.
+#[derive(Debug, Clone)]
+pub(crate) struct Resolver(mpsc::UnboundedSender<Resolve>);
+
+impl Resolver {
+    /// See [`ShardFlusher::resolve`].
+    pub(crate) async fn resolve(
+        &self,
+        key: &str,
+        policy: ConflictPolicy,
+    ) -> Result<(), Unresolved> {
+        let (reply, answer) = oneshot::channel();
+        let resolve = Resolve {
+            key: key.to_owned(),
+            policy,
+            reply,
+        };
+        self.0.send(resolve).map_err(|_| Unresolved::Stopped)?;
+        answer.await.unwrap_or(Err(Unresolved::Stopped))
+    }
+}
+
+/// An operator's resolution of a held conflict, and where its answer goes.
+#[derive(Debug)]
+struct Resolve {
+    key: String,
+    policy: ConflictPolicy,
+    reply: oneshot::Sender<Result<(), Unresolved>>,
 }
 
 impl ShardFlusher {
@@ -430,17 +572,20 @@ impl ShardFlusher {
         }));
         let shard_ref = shard.shard().clone();
         let streams = Arc::new(Streams::default());
+        let (commands, resolutions) = mpsc::unbounded_channel();
         let task = tokio::spawn(run(
             shard,
             ready,
             wall,
             Arc::clone(&state),
             Arc::clone(&streams),
+            resolutions,
         ));
         Self {
             shard: shard_ref,
             state,
             streams,
+            resolver: Resolver(commands),
             task,
         }
     }
@@ -467,6 +612,27 @@ impl ShardFlusher {
             .keys
             .get(key)
             .map(|tracked| tracked.phase.clone())
+    }
+
+    /// Resolves the conflict `key` is held in under `policy`, as an
+    /// operator asks (§7.2): the key returns to dirty, and its next flush
+    /// retries the conditional request (`hold`), sends the local version
+    /// unconditionally (`overwrite`), or adopts the remote's write and
+    /// drops the local version (`discard_local`). Whether the bucket may
+    /// discard is the caller's to check.
+    ///
+    /// # Errors
+    ///
+    /// [`Unresolved::NotHeld`] if the key is not held in conflict, and
+    /// [`Unresolved::Stopped`] if the flusher stopped.
+    pub async fn resolve(&self, key: &str, policy: ConflictPolicy) -> Result<(), Unresolved> {
+        self.resolver.resolve(key, policy).await
+    }
+
+    /// The handle [`ShardFlusher::resolve`] sends through, if the flusher
+    /// holds `key` in conflict.
+    pub(crate) fn resolver_of(&self, key: &str) -> Option<Resolver> {
+        matches!(self.phase(key), Some(Phase::Conflict(_))).then(|| self.resolver.clone())
     }
 
     /// Whether the flusher stopped.
@@ -500,8 +666,8 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 }
 
 /// What a finished flush task returns: the key, the newest version known
-/// when it started, and how it ended.
-type Done = (String, EpochSeq, Outcome);
+/// when it started, how its conflict was resolved, and how it ended.
+type Done = (String, EpochSeq, Option<ConflictPolicy>, Outcome);
 
 /// What a finished `FLUSHED` commit returns: the key, the version
 /// recorded, and whether the shard committed it.
@@ -515,6 +681,7 @@ async fn run<S: ObjectStore, D: Disk>(
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
     streams: Arc<Streams>,
+    mut resolutions: mpsc::UnboundedReceiver<Resolve>,
 ) {
     let mut changes = shard.subscribe();
     // The streams first: an upload that completes in between is then a
@@ -562,6 +729,9 @@ async fn run<S: ObjectStore, D: Disk>(
                 }
                 () = sleep_until(release), if release.is_some() => {
                     lock(&state).release_due(Instant::now());
+                }
+                Some(resolve) = resolutions.recv() => {
+                    resolved(&shard, &state, &mut records, resolve);
                 }
                 // The next pump gives up on the body whose `PUT` timed out.
                 () = sleep_until(timeout), if timeout.is_some() => {}
@@ -658,13 +828,13 @@ fn dispatch<S: ObjectStore, D: Disk>(
     flushes: &mut JoinSet<Done>,
 ) {
     while flushes.len() < target.settings.concurrency {
-        let (key, dispatched, pending) = {
+        let (key, dispatched, resolution, pending) = {
             let mut state = lock(state);
-            let Some((key, dispatched)) = state.take_ready() else {
+            let Some((key, dispatched, resolution)) = state.take_ready() else {
                 return;
             };
             let pending = state.recording.get(&key).cloned();
-            (key, dispatched, pending)
+            (key, dispatched, resolution, pending)
         };
         let (shard, target, streams) = (shard.clone(), Arc::clone(target), Arc::clone(streams));
         flushes.spawn(async move {
@@ -673,9 +843,10 @@ fn dispatch<S: ObjectStore, D: Disk>(
                 target: &target,
                 key: &key,
                 streams: &streams,
+                resolution,
             };
             let outcome = attempt.run(pending.as_ref()).await;
-            (key, dispatched, outcome)
+            (key, dispatched, resolution, outcome)
         });
     }
 }
@@ -687,7 +858,7 @@ fn finish<S, D: Disk>(
     state: &Mutex<State>,
     streams: &Streams,
     records: &mut JoinSet<Recorded>,
-    (key, dispatched, outcome): Done,
+    (key, dispatched, resolution, outcome): Done,
 ) {
     let mut state = lock(state);
     match outcome {
@@ -697,6 +868,11 @@ fn finish<S, D: Disk>(
             record,
         } => {
             target.counters.flushes.inc();
+            if resolution == Some(ConflictPolicy::Overwrite) {
+                target.counters.overwritten.inc();
+                tracing::warn!(shard = %shard.shard(), key, seq = %version.seq,
+                    "the local version overwrote an out-of-band write");
+            }
             state.reached(&key, version);
             if record {
                 let flushed = Flushed {
@@ -727,9 +903,17 @@ fn finish<S, D: Disk>(
         }
         Outcome::Conflict(conflict) => {
             target.counters.conflicts.inc();
-            tracing::warn!(shard = %shard.shard(), key, seq = %conflict.seq,
-                "the remote changed out of band; the key is held in conflict");
-            state.conflicted(&key, conflict);
+            let policy = target.conflict_policy;
+            tracing::warn!(shard = %shard.shard(), key, seq = %conflict.seq, ?policy,
+                "the remote changed out of band; the key is in conflict");
+            state.conflicted(&key, conflict, policy);
+        }
+        Outcome::Discarded { version } => {
+            target.counters.discarded.inc();
+            tracing::warn!(shard = %shard.shard(), key, seq = %version.seq,
+                "an acknowledged write was dropped for an out-of-band write");
+            state.discarded(&key, version);
+            state.finished(&key, dispatched);
         }
         Outcome::Retry(error) => {
             target.counters.retries.inc();
@@ -741,6 +925,44 @@ fn finish<S, D: Disk>(
     if !state.awaits_flush(&key) {
         streams.reap(&key);
     }
+}
+
+/// Carries out an operator's resolution of a held conflict (§7.2), and
+/// answers it.
+fn resolved<D: Disk>(
+    shard: &Shard<D>,
+    state: &Mutex<State>,
+    records: &mut JoinSet<Recorded>,
+    Resolve { key, policy, reply }: Resolve,
+) {
+    let mut state = lock(state);
+    let result = if conflict_bug() == ConflictBug::ResolvesClean {
+        state.resolve_clean(&key).map(|(seq, conflict)| {
+            // The seeded bug: records the local version as flushed, over
+            // the remote's write.
+            let shard = shard.clone();
+            let recorded = key.clone();
+            records.spawn(async move {
+                let entry = shard.entry(&recorded).await;
+                let tombstone = matches!(&entry, Ok(Some(entry)) if entry.object.is_none());
+                let flushed = Flushed {
+                    key: recorded.clone(),
+                    seq,
+                    remote_etag: conflict.remote_etag.filter(|_| !tombstone),
+                    remote_version_id: None,
+                };
+                let committed = shard.commit_lazy(RecordBody::Flushed(flushed)).await;
+                (recorded, seq, committed.map(drop))
+            });
+        })
+    } else {
+        state.resolve(&key, policy)
+    };
+    if result.is_ok() {
+        tracing::info!(shard = %shard.shard(), key, ?policy, "a held conflict was resolved");
+    }
+    // The operator may have stopped waiting.
+    let _ = reply.send(result);
 }
 
 /// Acts on a finished `FLUSHED` commit, and returns whether the flusher
@@ -757,4 +979,188 @@ fn recorded_flush(state: &Mutex<State>, (key, seq, result): Recorded) -> bool {
         state.record_error(&key, error.to_string());
     }
     result.is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_shard::FlushWait;
+    use skys3_types::Epoch;
+
+    use super::*;
+
+    fn position(seq: u64) -> EpochSeq {
+        EpochSeq::new(Epoch::new(1), Seq::new(seq))
+    }
+
+    fn conflict() -> Conflict {
+        Conflict {
+            seq: Seq::new(1),
+            remote_etag: Some(ETag::new("theirs").unwrap()),
+            remote_identity: None,
+        }
+    }
+
+    /// A state tracking `k`, dirty at seq 1, whose flush was just taken.
+    fn flushing() -> State {
+        let mut state = State::default();
+        state.changed("k", position(1), Some(10), Duration::from_secs(1));
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(1), None))
+        );
+        state
+    }
+
+    fn phase(state: &State) -> Phase {
+        state.keys["k"].phase.clone()
+    }
+
+    /// The answer `wait` has now, if any.
+    fn answer_now(wait: &mut FlushWait) -> Option<FlushState> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(1), wait.answered())
+                .await
+                .ok()
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn hold_keeps_the_key_until_it_is_resolved_back_to_dirty() {
+        let mut state = flushing();
+        state.conflicted("k", conflict(), ConflictPolicy::Hold);
+        assert_eq!(phase(&state), Phase::Conflict(conflict()));
+        assert!(state.ready.is_empty() && state.pending.is_empty());
+        assert_eq!(state.status().conflicts.len(), 1);
+        assert_eq!(
+            state.resolve("other", ConflictPolicy::Overwrite),
+            Err(Unresolved::NotHeld)
+        );
+
+        // Conflict → Dirty, in line again, with the resolution its next
+        // flush carries out.
+        state.resolve("k", ConflictPolicy::Overwrite).unwrap();
+        assert_eq!(phase(&state), Phase::Dirty);
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(1), Some(ConflictPolicy::Overwrite)))
+        );
+        // A failed attempt keeps the resolution; a flush ends it.
+        let now = Instant::now();
+        state.failed("k", "the remote failed".to_owned(), now);
+        state.release_due(now);
+        let (_, _, resolution) = state.take_ready().unwrap();
+        assert_eq!(resolution, Some(ConflictPolicy::Overwrite));
+        state.changed("k", position(2), Some(5), Duration::from_secs(2));
+        state.finished("k", position(1));
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(2), None))
+        );
+        assert_eq!(
+            state.resolve("k", ConflictPolicy::Hold),
+            Err(Unresolved::NotHeld),
+            "a key being flushed is not held"
+        );
+    }
+
+    #[test]
+    fn other_policies_resolve_at_once() {
+        for policy in [ConflictPolicy::Overwrite, ConflictPolicy::DiscardLocal] {
+            let mut state = flushing();
+            let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(1));
+            state.awaited(waiter);
+            state.conflicted("k", conflict(), policy);
+            assert_eq!(phase(&state), Phase::Dirty);
+            assert!(state.status().conflicts.is_empty());
+            assert_eq!(
+                state.take_ready(),
+                Some(("k".to_owned(), position(1), Some(policy)))
+            );
+            // A write waiting for the version learns of the conflict only
+            // if the version will be dropped.
+            let expected = (policy == ConflictPolicy::DiscardLocal).then_some(FlushState::Conflict);
+            assert_eq!(answer_now(&mut wait), expected, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn a_discard_answers_the_writes_waiting_for_what_it_dropped() {
+        let mut state = flushing();
+        state.changed("k", position(3), Some(5), Duration::from_secs(2));
+        let (dropped, mut dropped_wait) = FlushWaiter::new("k".to_owned(), position(1));
+        let (later, mut later_wait) = FlushWaiter::new("k".to_owned(), position(3));
+        state.awaited(dropped);
+        state.awaited(later);
+        state.discarded("k", position(1));
+        assert_eq!(answer_now(&mut dropped_wait), Some(FlushState::Conflict));
+        assert_eq!(answer_now(&mut later_wait), None);
+        assert_eq!(state.keys["k"].waiters.len(), 1);
+    }
+
+    /// The flusher may drop a version, and stop tracking its key, before
+    /// the write-through wait for it arrives through the subscription: the
+    /// wait still learns of the conflict, and only for what was dropped.
+    #[test]
+    fn a_wait_that_arrives_after_the_discard_learns_of_it() {
+        let mut state = flushing();
+        state.discarded("k", position(1));
+        state.finished("k", position(1));
+        assert!(state.keys.is_empty());
+        let (dropped, mut dropped_wait) = FlushWaiter::new("k".to_owned(), position(1));
+        state.awaited(dropped);
+        assert_eq!(answer_now(&mut dropped_wait), Some(FlushState::Conflict));
+
+        // A later version builds on the adopted write and is flushed; a
+        // wait for the dropped one, even while the later one is tracked,
+        // still learns of the conflict.
+        state.changed("k", position(2), Some(5), Duration::from_secs(2));
+        let (late, mut late_wait) = FlushWaiter::new("k".to_owned(), position(1));
+        state.awaited(late);
+        assert_eq!(answer_now(&mut late_wait), Some(FlushState::Conflict));
+        assert_eq!(
+            state.take_ready(),
+            Some(("k".to_owned(), position(2), None))
+        );
+        state.finished("k", position(2));
+        let (flushed, mut flushed_wait) = FlushWaiter::new("k".to_owned(), position(2));
+        state.awaited(flushed);
+        assert_eq!(answer_now(&mut flushed_wait), Some(FlushState::Flushed));
+
+        // A key flushed without a discard, as under `overwrite`, or never
+        // tracked, answers that the remote holds the version.
+        let mut state = flushing();
+        state.finished("k", position(1));
+        let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(1));
+        state.awaited(waiter);
+        assert_eq!(answer_now(&mut wait), Some(FlushState::Flushed));
+    }
+
+    #[test]
+    fn the_flusher_remembers_the_latest_drops() {
+        let mut state = State::default();
+        for n in 0..=MAX_DISCARDS {
+            state.discarded(&format!("k{n}"), position(1));
+        }
+        state.discarded("k1", position(2));
+        assert_eq!(state.discards.len(), MAX_DISCARDS);
+        assert_eq!(state.discard_order.len(), MAX_DISCARDS);
+        assert!(!state.discards.contains_key("k0"));
+        assert_eq!(state.discards["k1"], position(2));
+    }
+
+    #[test]
+    fn the_seeded_bug_untracks_a_held_key() {
+        let mut state = flushing();
+        assert_eq!(state.resolve_clean("k"), Err(Unresolved::NotHeld));
+        state.conflicted("k", conflict(), ConflictPolicy::Hold);
+        assert_eq!(state.resolve_clean("k"), Ok((Seq::new(1), conflict())));
+        assert!(state.keys.is_empty() && state.dirty_bytes == 0);
+    }
 }

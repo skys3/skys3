@@ -197,7 +197,7 @@ Keys allowed only in a `[buckets.<name>]` table:
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `ack_policy` | `"local"` or `"write_through"` | `flush.ack_policy` | §7.5. |
-| `flush_conflict_policy` | `"hold"`, `"overwrite"`, or `"discard_local"` | `flush.flush_conflict_policy` | §7.2. |
+| `flush_conflict_policy` | `"hold"`, `"overwrite"`, or `"discard_local"` | `flush.flush_conflict_policy` | §7.2. `"discard_local"` only for a `write_back` bucket: a `local` bucket's backup target holds or overwrites its conflicts, never discards them. |
 | `backup_target` | target URL | none | Only for `mode = "local"` (§8.9). Every node needs the same table: each follows the bucket's backup with what its own configuration says. |
 | `snapshot_target` | target URL | `backup_target` | Where index snapshots go, under `<prefix>.skys3-snapshots/` (§8.9). A bucket with neither key writes none; a `write_back` bucket's should lie outside its remote prefix. |
 | `peer_source` | cluster ID | none | The cluster this bucket receives native replication from (§7.8). A valid cluster ID other than this cluster's, with a `[peering.peers.<cluster-id>]` table. Not for a `read_only` bucket. A `COMMIT` applies only to a bucket whose `peer_source` is its source cluster, and the bucket is read-only to this cluster's own clients: their object writes get `403 AccessDenied`. |
