@@ -106,8 +106,12 @@ fn coded() -> impl Strategy<Value = (Coded, u64)> {
                 vec(any::<u128>(), k + m),
             )
         });
-    (position(), (any::<u64>(), any::<u64>()), vec(stripe, 1..4)).prop_map(
-        |(publish, (epoch, number), stripes)| {
+    // The version precedes the publish.
+    let positions = (position(), position())
+        .prop_filter("distinct positions", |(a, b)| a != b)
+        .prop_map(|(a, b)| (a.max(b), a.min(b)));
+    (positions, (any::<u64>(), any::<u64>()), vec(stripe, 1..4)).prop_map(
+        |((publish, version), (epoch, number), stripes)| {
             let mut offset = 0;
             let stripes = stripes
                 .into_iter()
@@ -136,6 +140,7 @@ fn coded() -> impl Strategy<Value = (Coded, u64)> {
                 .collect();
             let coded = Coded {
                 publish,
+                version,
                 attempt: AttemptId::new(Epoch::new(epoch), number),
                 stripes,
             };

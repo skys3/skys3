@@ -22,7 +22,7 @@ use skys3_ec::{
     FragmentLocation, FragmentReadError, FragmentRequest, FragmentSource, Geometry, current_codec,
     read_coded,
 };
-use skys3_types::NodeId;
+use skys3_types::{ETag, NodeId};
 use support::{position, runtime, sample, shard};
 
 /// How a fragment fails when it is read.
@@ -155,6 +155,7 @@ fn coded_on(
                 shard: shard(),
                 key: "k".to_owned(),
                 version: position(4, 18),
+                etag: etag(),
                 stripe: info,
                 index: index as u8,
             };
@@ -192,11 +193,17 @@ fn lose(stripes: &[CodedStripe], nodes: &mut Nodes, index: usize, loss: Loss) {
     }
 }
 
+/// The object's ETag.
+fn etag() -> ETag {
+    ETag::new("9b2cf535f27731c974343645a3985328").unwrap()
+}
+
 fn request(stripes: Vec<CodedStripe>, size: usize, range: Range<u64>) -> CodedRead {
     CodedRead {
         shard: shard(),
         key: "k".to_owned(),
         version: position(4, 18),
+        etag: etag(),
         size: size as u64,
         stripes,
         range,

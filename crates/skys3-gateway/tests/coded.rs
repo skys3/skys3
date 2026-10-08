@@ -2,7 +2,9 @@
 //! commits, the gateway reads its bytes from the fragments the entry's
 //! coded layout names, decoding a stripe that lost a fragment, and
 //! CopyObject copies a coded source from its fragments too, never from the
-//! replicas, which drop their copies once the object is coded.
+//! replicas, which drop their copies once the object is coded. A retag
+//! after the publish moves the entry's version but not the fragments':
+//! reads name the layout's version and the ETag, as the fragment headers do.
 
 mod common;
 
@@ -20,17 +22,23 @@ use skys3_ec::{
 use skys3_gateway::{GatewayConfig, Precondition, ShardRef, Shards};
 use skys3_log::RecordBody;
 use skys3_log::record::EcPublish;
-use skys3_types::{AttemptId, BucketDocument, NodeId};
+use skys3_types::{AttemptId, BucketDocument, ETag, EpochSeq, NodeId};
 
 /// The object's size, and its stripes' data length: three stripes, the
 /// last one shorter.
 const SIZE: usize = 5_000;
 const STRIPE_LEN: usize = 2_000;
 
-/// Fragments held in memory by node and ID, with every request recorded.
+/// What a fragment's header says, which a read must name: its key, the
+/// version and ETag it was written for, and its index.
+type Written = (String, EpochSeq, ETag, u8);
+
+/// Fragments held in memory by node and ID, served, as a node serves them,
+/// only to reads that name what their headers say, with every request
+/// recorded.
 #[derive(Debug, Default)]
 struct Fragments {
-    held: Mutex<BTreeMap<(NodeId, FragmentId), Bytes>>,
+    held: Mutex<BTreeMap<(NodeId, FragmentId), (Written, Bytes)>>,
     requests: Mutex<Vec<FragmentRequest>>,
 }
 
@@ -60,12 +68,27 @@ impl FragmentSource for Fragments {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(request.clone());
             let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-            let Some(fragment) = held.get(&(request.node.clone(), request.fragment)) else {
+            let Some((written, fragment)) = held.get(&(request.node.clone(), request.fragment))
+            else {
                 return Err(FragmentReadError::NotHeld {
                     node: request.node,
                     reason: "no such fragment".to_owned(),
                 });
             };
+            let named = &request.identity;
+            if *written
+                != (
+                    named.key.clone(),
+                    named.version,
+                    named.etag.clone(),
+                    named.index,
+                )
+            {
+                return Err(FragmentReadError::NotHeld {
+                    node: request.node,
+                    reason: format!("the fragment is {written:?}"),
+                });
+            }
             let data = fragment.slice(request.range.start as usize..request.range.end as usize);
             let crc32c = crc32c::crc32c(&data);
             Ok(FragmentBytes { data, crc32c })
@@ -125,7 +148,18 @@ impl Setup {
                     .held
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert((node.clone(), id), fragment.into());
+                    .insert(
+                        (node.clone(), id),
+                        (
+                            (
+                                key.to_owned(),
+                                entry.version,
+                                object.local_etag.clone(),
+                                index as u8,
+                            ),
+                            fragment.into(),
+                        ),
+                    );
                 locations.push(FragmentLocation { node, fragment: id });
             }
             let stripe = CodedStripe::new(
@@ -159,6 +193,19 @@ impl Setup {
         let coded = self.shards.entry(&shard, key).await.unwrap().unwrap();
         assert!(coded.object.unwrap().coded.is_some(), "the publish applied");
         publish
+    }
+
+    /// Sets `key`'s tags to `tags` with PutObjectTagging.
+    async fn retag(&self, bucket: &BucketDocument, key: &str, tags: &[(&str, &str)]) {
+        let tags: String = tags
+            .iter()
+            .map(|(key, value)| format!("<Tag><Key>{key}</Key><Value>{value}</Value></Tag>"))
+            .collect();
+        let body = format!("<Tagging><TagSet>{tags}</TagSet></Tagging>");
+        let uri = format!("/{}/{key}?tagging", bucket.name);
+        self.call(Method::PUT, &uri, &[], &body)
+            .await
+            .assert(200, None);
     }
 }
 
@@ -273,4 +320,77 @@ async fn a_coded_source_that_cannot_be_read_answers_503() {
     );
     let shard = ShardRef::for_key(&bucket, "copy");
     assert!(setup.shards.entry(&shard, "copy").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_coded_object_retagged_after_its_publish_reads_its_bytes() {
+    let fragments = Arc::new(Fragments::default());
+    let setup = gateway(Some(&fragments)).await;
+    let bucket = setup.create_local("coded").await;
+    let data = letters(SIZE);
+    setup
+        .put("/coded/src", data.clone())
+        .await
+        .assert(200, None);
+    let publish = setup.code(&bucket, "src", &data, &fragments).await;
+
+    // A retag moves the entry's version past the layout's, which keeps the
+    // version its fragments were written for.
+    setup.retag(&bucket, "src", &[("team", "red")]).await;
+    let shard = ShardRef::for_key(&bucket, "src");
+    let entry = setup.shards.entry(&shard, "src").await.unwrap().unwrap();
+    let coded = entry.object.as_ref().unwrap().coded.clone().unwrap();
+    assert_ne!(entry.version, publish.version, "the retag moved the entry");
+    assert_eq!(
+        coded.version, publish.version,
+        "the layout kept its version"
+    );
+
+    // A range, then the whole object, come from the fragments, which every
+    // read names by the layout's version and the ETag.
+    let got = setup
+        .call(
+            Method::GET,
+            "/coded/src",
+            &[("range", "bytes=1900-4199")],
+            "",
+        )
+        .await;
+    got.assert(206, None);
+    assert_eq!(got.body.as_bytes(), &data[1900..4200]);
+    let got = setup.call(Method::GET, "/coded/src", &[], "").await;
+    got.assert(200, None);
+    assert_eq!(got.body.as_bytes(), &data[..]);
+    assert_eq!(
+        got.headers.get("x-amz-tagging-count").unwrap(),
+        "1",
+        "{got:?}"
+    );
+    let head = setup.call(Method::HEAD, "/coded/src", &[], "").await;
+    head.assert(200, None);
+    assert_eq!(head.headers.get("x-amz-tagging-count").unwrap(), "1");
+    let tags = setup.call(Method::GET, "/coded/src?tagging", &[], "").await;
+    tags.assert(200, None);
+    assert!(
+        tags.body.contains("<Key>team</Key><Value>red</Value>"),
+        "{tags:?}"
+    );
+
+    // A copy, degraded, keeps the bytes and the new tags.
+    fragments.lose(&publish, 1);
+    let copied = setup.copy("/coded/copy", "coded/src").await;
+    copied.assert(200, None);
+    let got = setup.call(Method::GET, "/coded/copy", &[], "").await;
+    got.assert(200, None);
+    assert_eq!(got.body.as_bytes(), &data[..]);
+    assert_eq!(got.headers.get("x-amz-tagging-count").unwrap(), "1");
+
+    let requests = fragments.requests();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.identity.version == publish.version && r.identity.etag == publish.etag),
+        "every read named the layout's version and the ETag"
+    );
 }

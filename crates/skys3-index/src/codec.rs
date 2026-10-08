@@ -13,8 +13,10 @@
 //! [`RemoteUpload`] and [`RemotePart`] values came later, with index
 //! version 8, in format 3; they too exist only in format 3. Format 4 adds,
 //! after an [`Entry`]'s payload, its [`Coded`] layout as an option: the
-//! `EC_PUBLISH` position, the attempt (epoch and number, `u64` each), and
-//! the stripes as the `EC_PUBLISH` record encodes them (§10.1). The
+//! `EC_PUBLISH` position, the position of the version its fragments were
+//! written for (which precedes it), the attempt (epoch and number, `u64`
+//! each), and the stripes as the `EC_PUBLISH` record encodes them (§10.1).
+//! The
 //! fragment values of index version 9 exist only in format 4. Integers in
 //! values are little-endian. Keys use big-endian integers so that redb's
 //! byte order sorts them numerically:
@@ -1132,7 +1134,9 @@ fn write_object(w: &mut Writer, object: &ObjectVersion) -> Result<()> {
 }
 
 fn write_coded(w: &mut Writer, coded: &Coded, size: u64) -> Result<()> {
+    check_coded_version(coded.version, coded.publish)?;
     w.position(coded.publish);
+    w.position(coded.version);
     w.u64(coded.attempt.epoch.get());
     w.u64(coded.attempt.number);
     w.len32("object.coded", coded.stripes.len(), MAX_STRIPES)?;
@@ -1167,6 +1171,8 @@ fn write_coded(w: &mut Writer, coded: &Coded, size: u64) -> Result<()> {
 fn read_coded(r: &mut Reader<'_>, size: u64) -> Result<Coded> {
     let field = "object.coded";
     let publish = r.position(field)?;
+    let version = r.position(field)?;
+    check_coded_version(version, publish)?;
     let attempt = AttemptId::new(Epoch::new(r.u64(field)?), r.u64(field)?);
     let count = r.len32(field, MAX_STRIPES)?;
     // A stripe takes at least its length, geometry, codec, and two
@@ -1199,9 +1205,23 @@ fn read_coded(r: &mut Reader<'_>, size: u64) -> Result<Coded> {
     }
     Ok(Coded {
         publish,
+        version,
         attempt,
         stripes,
     })
+}
+
+/// Checks that a coded layout's version precedes its `EC_PUBLISH`, as the
+/// record's own encoding requires (§10.1).
+fn check_coded_version(version: EpochSeq, publish: EpochSeq) -> Result<()> {
+    if version < publish {
+        Ok(())
+    } else {
+        Err(CodecError::new(
+            "object.coded",
+            "the version does not precede the publish",
+        ))
+    }
 }
 
 /// Returns the fragments-table key of fragment `index` of stripe `stripe`
