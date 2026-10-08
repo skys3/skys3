@@ -101,7 +101,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 use crate::attempt::{Failure, content_md5, read_payload};
-use crate::multipart::create_request;
+use crate::multipart::{LargeObjectBug, create_request, large_object_bug};
 use crate::target::{FlushSettings, Target};
 
 /// How many open uploads the startup scan reads per index transaction.
@@ -1176,6 +1176,7 @@ impl<S: ObjectStore, D: Disk> Task<S, D> {
             {
                 Ok(()) => break,
                 Err(error) if error.kind() == S3ErrorKind::NoSuchUpload => break,
+                Err(_) if large_object_bug() == LargeObjectBug::GivesUpFailedAborts => break,
                 Err(error) => {
                     tracing::debug!(key = self.key, upload = %self.upload, %error,
                         "a remote upload was not aborted");

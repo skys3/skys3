@@ -15,7 +15,7 @@ use skys3_obs::MetricsRegistry;
 use skys3_remote::probe::ConditionalOperation;
 use skys3_remote::{ObjectStore, PutObject};
 use skys3_sim::SimS3;
-use skys3_sim::s3::{Conditionals, SimS3Config, SimS3Faults};
+use skys3_sim::s3::{Conditionals, Fault, Operation, SimS3Config, SimS3Faults};
 use skys3_types::{
     BucketDocument, BucketMode, BucketName, Epoch, ProposalId, RemoteTarget, ShardConfig,
     ShardCount,
@@ -302,6 +302,62 @@ fn other_buckets_and_closed_shards_are_not_flushed() {
         service.reconcile(&[bucket, other.clone()], &node.set).await;
         assert_eq!(budget.check(&other.bucket_id), Ok(()));
         assert!(format!("{service:?}").contains("FlushService"));
+    });
+}
+
+/// Waits up to a minute of real time until `done`, polling every 10 ms of
+/// simulated time.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let patience = Patience::new();
+    while !done() {
+        assert!(!patience.is_exhausted(), "never saw {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A remote upload that a failed flush left open, and whose abort failed,
+/// is aborted even though no later multipart flush comes to abort it
+/// first: the key's next version is a single `PUT`.
+#[test]
+fn uploads_left_open_are_aborted_without_another_multipart_flush() {
+    runtime().block_on(async {
+        let node = Node::open(25).await;
+        let store = support::remote(25, false);
+        let target_store = store.clone();
+        // A failed flush is retried a second later.
+        let settings = FlushSettings {
+            min_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(1),
+            ..settings()
+        };
+        let service = FlushService::new(
+            cluster(),
+            settings,
+            Box::new(move |_: &RemoteTarget| target_store.clone()),
+            FlushMetrics::register(&MetricsRegistry::new()),
+        );
+        let bucket = bucket(BucketMode::WriteBack);
+        reconcile_until_probed(&service, &node, &bucket).await;
+        let status = || service.status(&bucket.bucket_id).unwrap();
+
+        // The flush's part fails, and so does its abort; before the flush
+        // is retried, a single `PUT` replaces the version.
+        store.inject(Operation::UploadPart, Fault::InternalError);
+        store.inject(Operation::AbortMultipartUpload, Fault::SlowDown);
+        node.multipart("clip.mp4", &["ab", "cd"]).await;
+        wait_until("an orphaned upload", || status().orphaned_uploads == 1).await;
+        node.put("clip.mp4", "small").await;
+        wait_until("the single PUT flushed", || {
+            store
+                .object("team/clip.mp4")
+                .is_some_and(|object| &object.body[..] == b"small")
+        })
+        .await;
+
+        wait_until("no upload left", || {
+            status().orphaned_uploads == 0 && store.uploads().is_empty()
+        })
+        .await;
     });
 }
 

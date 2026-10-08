@@ -147,6 +147,7 @@ pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
 pub mod test_hooks {
     pub use crate::concurrency::{ConcurrencyBug, seed_concurrency_bug};
     pub use crate::conflict::{ConflictBug, seed_conflict_bug};
+    pub use crate::multipart::{LargeObjectBug, seed_large_object_bug};
     pub use crate::snapshot::hooks::{SnapshotBug, seed_snapshot_bug};
     pub use crate::stream::test_hooks::*;
 }

@@ -121,11 +121,17 @@ impl<D: Disk> Committer<D> {
                 Some(oldest) => {
                     let deadline = oldest.arrival.saturating_add(LAZY_MAX_DELAY);
                     let at = self.clock.runtime_deadline(deadline);
+                    // A wake and a request ready at once are taken in this
+                    // order, not at random, so a simulation seed replays
+                    // exactly; the request waits for the next turn. The
+                    // wake comes first so that a run of lazy records
+                    // cannot hold it back.
                     tokio::select! {
+                        biased;
+                        () = self.shared.lazy_now.notified() => None,
                         next = tokio::time::timeout_at(at, self.requests.recv()) => {
                             next.unwrap_or(None)
                         }
-                        () = self.shared.lazy_now.notified() => None,
                     }
                 }
             };

@@ -190,7 +190,7 @@ struct BucketFlusher<S> {
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
     /// The target, once the probe is done.
-    target: Ready<S>,
+    target: Arc<Ready<S>>,
     shards: BTreeMap<ShardId, ShardFlusher>,
     /// What only the target of a `write_back` bucket, its system of
     /// record, has; `None` for a backup target.
@@ -427,7 +427,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         };
         let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
-        let (ready, target) = watch::channel(None);
+        let target = Ready::new(None);
+        let ready = Arc::clone(&target);
         let nonces = self.probe_nonces.clone();
         let probe_task = tokio::spawn(run_probe(parts, nonces, Arc::clone(&probe), ready));
         BucketFlusher {
@@ -542,7 +543,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let id = shard.shard().shard;
             flusher.shards.entry(id).or_insert_with(|| {
                 let charge = charged.then(|| self.budget.charge(bucket));
-                let (ready, wall) = (flusher.target.clone(), Arc::clone(&self.wall));
+                let (ready, wall) = (Arc::clone(&flusher.target), Arc::clone(&self.wall));
                 ShardFlusher::start(shard, ready, wall, charge)
             });
         }
@@ -565,14 +566,9 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .collect(),
             orphaned_uploads: flusher
                 .target
-                .borrow()
-                .as_ref()
+                .get()
                 .map_or(0, |target| target.orphaned_uploads() as u64),
-            concurrency: flusher
-                .target
-                .borrow()
-                .as_ref()
-                .map(|target| target.concurrency()),
+            concurrency: flusher.target.get().map(|target| target.concurrency()),
             dirty_budget: self
                 .budget
                 .usage(bucket)
@@ -715,13 +711,32 @@ impl<S> TargetParts<S> {
     }
 }
 
-/// Probes the target until a run succeeds, backing off between runs, and
-/// then makes the target ready.
+/// Aborts the remote uploads that flushes left open on `target`
+/// ([`Target::orphaned_uploads`]) for as long as the target is used, after
+/// a backoff that grows while some stay open. Each multipart flush aborts
+/// some before it opens its own; this ends those that no later multipart
+/// flush here would reach, as when the key's next version is a single
+/// `PUT` or the node no longer leads the shard.
+async fn abort_orphans<S: ObjectStore>(target: &Target<S>) {
+    let mut left = 0;
+    loop {
+        tokio::time::sleep(target.settings.backoff(left + 1)).await;
+        target.abort_orphaned_uploads().await;
+        left = if target.orphaned_uploads() == 0 {
+            0
+        } else {
+            left + 1
+        };
+    }
+}
+
+/// Probes the target until a run succeeds, backing off between runs, then
+/// makes the target ready, and aborts the uploads flushes leave open.
 async fn run_probe<S: ObjectStore>(
     parts: TargetParts<S>,
     nonces: Option<Arc<AtomicU64>>,
     status: Arc<Mutex<ProbeStatus>>,
-    ready: watch::Sender<Option<Arc<Target<S>>>>,
+    ready: Arc<Ready<S>>,
 ) {
     let mut failures = 0;
     loop {
@@ -744,7 +759,9 @@ async fn run_probe<S: ObjectStore>(
                     );
                 }
                 *lock(&status) = ProbeStatus::Done { unprotected };
-                ready.send_replace(Some(Arc::new(parts.build(found))));
+                let target = Arc::new(parts.build(found));
+                ready.set(Arc::clone(&target));
+                abort_orphans(&target).await;
                 return;
             }
             Err(error) => {
