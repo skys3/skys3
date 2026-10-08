@@ -2318,11 +2318,13 @@ name = "skys3-coord"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "prometheus-client",
  "prost",
  "skys3-config",
  "skys3-control",
  "skys3-io",
  "skys3-net",
+ "skys3-obs",
  "skys3-types",
  "thiserror",
  "tokio",
