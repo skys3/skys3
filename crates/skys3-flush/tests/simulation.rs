@@ -112,7 +112,7 @@ fn flush_concurrency_approaches_the_bandwidth_delay_product() {
 
 #[test]
 fn flush_concurrency_backs_off_under_a_rate_limit_and_recovers() {
-    Runner::with_cost(2, 8).run(concurrency_simulation::backs_off_under_a_rate_limit);
+    Runner::with_cost(2, 16).run(concurrency_simulation::backs_off_under_a_rate_limit);
 }
 
 #[test]

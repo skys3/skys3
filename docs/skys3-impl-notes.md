@@ -6239,6 +6239,95 @@ of this file. A task with nothing unexpected keeps "None."
   Backup lag has no metric of its own: the flush metrics carry it under
   the bucket's name.
 
+### M4-10 Adaptive flush concurrency
+
+- **The concurrency was per shard; the window is per target.** M1-16 fixed
+  each shard at `flush_min_concurrency_per_shard` keys, and streamed parts
+  had a cap of their own. A link has one bandwidth-delay product however
+  many shards a node leads, so every request the flushers send to a target
+  (a key's flush, a streamed part, an abort) now takes a slot of one
+  window per target (`Target` wraps its store in `Paced`), shared first
+  come, first served. The per-shard keys scale its bounds by the shards
+  the node flushes there, and `flush_max_concurrency_per_shard` still caps
+  the keys and parts one shard has under way. `FlushSettings::concurrency`
+  became `min_concurrency` and `max_concurrency`; tests that relied on a
+  fixed concurrency set both. Nodes do not coordinate: competing AIMD
+  windows share a bottleneck fairly, and anything else would put the
+  coordinator on the flush path. Fills, origin reads (M4-12), imports,
+  and snapshots (M4-11) use the raw store and take no slot: they are not
+  flushes, and a slow flush backlog must not hold up a client's read.
+- **Decisions recorded in design §7.7.** Latency samples are successes and
+  non-throttle `4xx` answers, timed from the slot to the answer. A round
+  ends when a request sent after it began is answered. The base round trip
+  is a windowed minimum of round means over 1,024 rounds. A round within
+  25% of the base, ending with requests waiting, grows the window (double
+  in slow start, then +1); a mean above that shrinks it to 0.9 of the knee
+  the mean implies, at most halving it, so the sawtooth dips below the
+  knee and the min filter keeps seeing the real base (a decrease that
+  stayed above the knee let the base creep up in the model test). A
+  throttle shrinks it by 0.7 once per window. The round after a decrease
+  only measures. `S3Error::is_throttle` (any `503`, `429`, or a code in
+  `THROTTLE_CODES`, after the AWS SDKs' list) is new in `skys3-remote`.
+- **In-flight bytes are reserved before the slot.** A body is read into
+  memory, and counted, before its request asks for a slot, so requests
+  the byte bound holds back never wait at the window and cannot make it
+  grow. Multipart and streamed uploads count each part in flight, never
+  the whole object. `Target::reserve` returns a guard that keeps the byte
+  count for the new gauge.
+- **Growth first counted the wrong waits.** "Some request waited for a
+  slot this round" also counted requests released by the previous growth,
+  so a slow start doubled past what the byte bound allowed (seed 1: window
+  16 with a bound of 7 objects). Growth now needs requests waiting as the
+  round ends, and grows at most to the requests in flight and waiting
+  (seed 6 had doubled from 16 to 32 under a bound of 22).
+- **The paused clock rounds every sleep to a millisecond.** The first
+  1 ms scenario reached a window of 489 against a product of 108: Tokio's
+  timer wheel quantized sub-millisecond transfer times, so queueing was
+  invisible. The scenarios run their paths 100 times slower (the
+  controller only compares latencies and counts rounds, so its window is
+  scale-free) and report unscaled times; the controller's unit test drives
+  it with an exact event model instead.
+- **`SimS3` gained a network path** (`SimLink`, `SimS3::set_link`): a
+  round trip, a bandwidth that request and response bodies queue for, one
+  bottleneck queue each way, and a GCRA rate limit answering `503
+  SlowDown` unapplied. `SimS3Stats` gained `rate_limited` and the peak
+  requests and request-body bytes in progress. The default path is
+  instant and never yields, so earlier seeds replay unchanged.
+- **A rate limiter without burst rejects clumps.** A window's requests
+  leave together, so a limit with no burst refused most of each window
+  even with the window at its floor (seed 2: 34% slowed down at a window
+  of 4). Real stores allow bursts; the scenario draws a burst of 10 to 20
+  and counts slow-downs only in the second half of the limit, after the
+  window came down (the first collapse from 64 alone is about 120
+  slow-downs).
+- **Results.** The model test (exact times, 64 KiB requests, floor 1)
+  ends at 1.07 to 1.10 times the product for every round trip from 1 to
+  150 ms at 16 to 256 MiB/s, products 1.3 to 615. In the flusher
+  scenario, over 256 seeds (products 6 to 60, without a byte bound) the
+  mean window over the second half of the flush was 1.06 to 1.24 times
+  the product: 1.12 on average at 1 ms, 1.13 at 10 ms, 1.13 at 50 ms,
+  1.14 at 100 ms, 1.13 at 150 ms; with a byte bound, the window settles
+  at what it lets through. Under a rate limit the window held 0.9 to 1.3
+  times the limit's in-flight equivalent, 7.5% of requests were slowed
+  down on average once it had come down, and it grew back past the
+  product after the limit, with every object at the remote exactly once.
+- **Seeded bugs** (`test_hooks::seed_concurrency_bug`, a test in the
+  `simulation` target): `IgnoresThrottles` is caught at seed 0 in 1.7 s
+  (window 55 under a limit of 10 in flight); `IgnoresInflightBytes` at
+  seed 1 in 0.4 s (32 KiB in flight against a 7 KiB bound).
+- **Cost.** A seed costs about 0.8 s (product scenario) and 1.3 s (rate
+  limit) unoptimized, so they run `Runner::with_cost(5, 8)` and
+  `Runner::with_cost(2, 16)`: at `SKYS3_SIM_SEEDS=256`, 32 seeds in 25 s
+  and 16 in 21 s, plus 2.6 s for the seeded bugs. 256 seeds of each
+  passed too (6 minutes). The other flush scenarios pass all their CI
+  seeds unchanged, now that streamed parts and keys share one window.
+- **Left open.** Write-through waiters queue behind other flushes of their
+  bucket's target, first come, first served; a priority for them is left
+  until measurements ask for it. The base window is counted in rounds, so
+  a path whose round trip grows for good runs at a smaller window for up
+  to 1,024 rounds (2.5 minutes at 150 ms). The design's measurement
+  against real providers at 1 to 150 ms (§16.3) is M7-06's.
+
 ### M4-11 Index snapshots and lost-key report
 
 - **Configuration was already there.** `index_snapshot_interval_seconds`
