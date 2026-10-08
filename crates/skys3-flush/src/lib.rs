@@ -125,6 +125,7 @@ mod import;
 mod metrics;
 mod multipart;
 mod origin;
+mod peer;
 mod service;
 mod shard;
 mod single;
@@ -146,6 +147,10 @@ pub use import::{
 };
 pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use origin::{DEFAULT_CREDENTIALS, Origin, OriginConnect, profile_credentials};
+pub use peer::{
+    BoxFuture, DEFAULT_ANSWER_TIMEOUT, FlushedRecord, LinkError, PeerBug, PeerConnect, PeerLink,
+    PeerReceive, PeerSend, PeerStream, PeerTransport,
+};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
 pub use target::{CopySources, FlushSettings, ImportDone, ImportProgress, Target};
@@ -156,6 +161,7 @@ pub mod test_hooks {
     pub use crate::concurrency::{ConcurrencyBug, seed_concurrency_bug};
     pub use crate::conflict::{ConflictBug, seed_conflict_bug};
     pub use crate::copy::{CopyBug, seed_copy_bug};
+    pub use crate::peer::hooks::{observe_flushed, seed_peer_bug};
     pub use crate::snapshot::hooks::{SnapshotBug, seed_snapshot_bug};
     pub use crate::stream::test_hooks::*;
 }

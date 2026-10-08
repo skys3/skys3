@@ -51,7 +51,7 @@ use skys3_remote::{
     ByteRange, GetObject, GetOutput, HeadObject, ObjectStore, S3Error, S3ErrorKind, VersionId,
 };
 use skys3_shard::{Outcome, Shard};
-use skys3_types::EpochSeq;
+use skys3_types::{EpochSeq, WriteIdentity};
 use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::import::loaded_metadata;
@@ -330,7 +330,13 @@ impl<S: ObjectStore> Filler<S> {
             let len = (end - offset).min(chunk);
             let mut request =
                 GetObject::new(self.remote_key(key)).with_if_match(remote_etag.clone());
-            request.version_id = entry.remote_version_id.clone().map(VersionId);
+            // A version flushed to a SkyS3 peer records the write identity
+            // the peer's version carries there, not a version ID (§7.8).
+            request.version_id = entry
+                .remote_version_id
+                .clone()
+                .filter(|id| id.parse::<WriteIdentity>().is_err())
+                .map(VersionId);
             if len > 0
                 && let Some(range) = ByteRange::inclusive(offset, offset + len - 1)
             {

@@ -49,7 +49,7 @@ use crate::message::{
     Abort, AbortReason, Applied, ApplyError, Begin, Commit, Data, MAX_REASON_LEN, Message, Outcome,
 };
 use crate::staging::{Admitted, StagedObject, Staging};
-use crate::stream::{InboundSender, InboundStream, StreamError};
+use crate::stream::{Inbound, Outbound, StreamError};
 
 /// The most frames of one stream being staged at once. A stream whose
 /// frames are all in flight is not read until one finishes, so QUIC flow
@@ -234,7 +234,9 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     }
 
     /// Serves one stream until the source finishes it, then waits for its
-    /// frames in flight, reports them, and finishes the stream.
+    /// frames in flight, reports them, and finishes the stream. The stream
+    /// is an [`InboundStream`](crate::InboundStream) over QUIC, or another
+    /// [`Inbound`] transport of the same messages.
     ///
     /// - `BEGIN` opens or resumes the staging of its identity and is
     ///   answered with its `RESUME`, or with `ABORT` (`refused`) if the
@@ -259,13 +261,14 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     ///
     /// The stream's errors, other than refused messages, which
     /// [`InboundStream`] answers itself.
-    pub async fn serve(&self, mut stream: InboundStream) -> Result<(), StreamError> {
+    pub async fn serve<I: Inbound>(&self, mut stream: I) -> Result<(), StreamError> {
         let (events, received) = mpsc::unbounded_channel();
         let reports = Reports {
             events,
             refused: Arc::default(),
         };
-        let reporter = tokio::spawn(report(Arc::clone(&self.staging), stream.sender(), received));
+        let sender = stream.sender();
+        let reporter = tokio::spawn(report(Arc::clone(&self.staging), sender.clone(), received));
         let appends = Arc::new(Semaphore::new(MAX_APPENDS_PER_STREAM as usize));
         let mut current: Option<Begin> = None;
         loop {
@@ -280,12 +283,12 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     current = match self.staging.begin(&begin, Instant::now()) {
                         Ok(resume) => {
                             reports.refused().remove(&begin.identity);
-                            stream.send(&Message::Resume(resume)).await?;
+                            sender.send(&Message::Resume(resume)).await?;
                             Some(begin)
                         }
                         Err(reason) => {
                             let message = abort(&begin.identity, reason, discarded(reason));
-                            stream.send(&message).await?;
+                            sender.send(&message).await?;
                             None
                         }
                     };
@@ -315,7 +318,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                         }
                         Err(reason) => {
                             let message = abort(&begin.identity, reason, discarded(reason));
-                            stream.send(&message).await?;
+                            sender.send(&message).await?;
                             current = None;
                         }
                     }
@@ -344,7 +347,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     {
                         current = None;
                     }
-                    stream.send(&Message::Applied(applied)).await?;
+                    sender.send(&Message::Applied(applied)).await?;
                 }
                 Message::Batch(batch) => {
                     let outcomes = self.commits.apply_batch(&batch.items).await;
@@ -358,7 +361,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                             identity: item.identity,
                             outcome: bounded(outcome),
                         };
-                        stream.send(&Message::Applied(applied)).await?;
+                        sender.send(&Message::Applied(applied)).await?;
                     }
                 }
                 // The session refuses every other message from a source
@@ -373,7 +376,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
         drop(reports);
         // The reporter ends once every append has reported.
         let _ = reporter.await;
-        stream.finish().await
+        sender.finish().await
     }
 
     /// Applies `commit` to what is staged for its identity, and consumes the
@@ -458,9 +461,9 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
 /// everything that arrived while the last was sent, and an `ABORT` for
 /// staging the destination refused, until every append has reported.
 /// Once the stream fails, it keeps receiving without sending.
-async fn report(
+async fn report<O: Outbound>(
     staging: Arc<Staging>,
-    sender: InboundSender,
+    sender: O,
     mut received: mpsc::UnboundedReceiver<Event>,
 ) {
     let mut open = true;

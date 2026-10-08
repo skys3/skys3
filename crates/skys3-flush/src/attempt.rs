@@ -21,6 +21,7 @@ use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
 
 use crate::copy::Copied;
 use crate::import::loaded_metadata;
+use crate::peer::{Bodies, LinkError};
 use crate::stream::{Streams, test_hooks};
 use crate::target::Target;
 
@@ -117,6 +118,12 @@ pub(crate) struct Attempt<'a, S, D: Disk> {
     /// adopts the remote's write if it is still there, and `hold` flushes
     /// as usual.
     pub(crate) resolution: Option<ConflictPolicy>,
+    /// The streamed bodies of the shard, for a native target (§7.8).
+    pub(crate) bodies: &'a Bodies,
+    /// Called once a native target's `COMMIT` is sent: only the seeded bug
+    /// [`PeerBug::AnsweredOnCommit`](crate::PeerBug::AnsweredOnCommit)
+    /// sets it.
+    pub(crate) early: Option<&'a (dyn Fn() + Send + Sync)>,
 }
 
 impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
@@ -136,6 +143,21 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             || pending.is_some_and(|remote| remote.seq == entry.version.seq)
         {
             return Outcome::Settled;
+        }
+        if let Some(native) = &self.target.native {
+            // A streamed body's `PUT`: its flush stages what the body's
+            // own stream has not (§7.8).
+            if let Some(upload) = entry.object.as_ref().and_then(|o| o.write_identity) {
+                self.bodies.claim(upload);
+            }
+            let known = match pending {
+                Some(remote) => (remote.etag.clone(), remote.version_id.clone()),
+                None => (entry.remote_etag.clone(), entry.remote_version_id.clone()),
+            };
+            return self
+                .native(native, &entry, known, passed)
+                .await
+                .unwrap_or_else(|error| Outcome::Retry(error.to_string()));
         }
         if self.resolution == Some(ConflictPolicy::DiscardLocal) {
             match self.discard(&entry).await {
@@ -157,6 +179,14 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
 
     pub(crate) fn remote_key(&self) -> String {
         format!("{}{}", self.target.prefix, self.key)
+    }
+
+    /// Tells the seeded bug, if any, that a native target's `COMMIT` is
+    /// sent.
+    pub(crate) fn sent(&self) {
+        if let Some(early) = self.early {
+            early();
+        }
     }
 
     /// Whether `operation` is sent with its precondition: the target
@@ -436,16 +466,19 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// Whether the remote object is a write of this shard from before
     /// `version`: one SkyS3 flushed earlier, which the version supersedes.
     fn ours_before(&self, info: &ObjectInfo, version: EpochSeq) -> bool {
-        let shard = self.shard.shard();
         info.metadata
             .write_identity()
             .and_then(|value| value.parse::<WriteIdentity>().ok())
-            .is_some_and(|wid| {
-                wid.cluster == self.target.cluster
-                    && wid.bucket == shard.bucket
-                    && wid.shard == shard.shard
-                    && wid.position < version
-            })
+            .is_some_and(|wid| self.wrote_before(&wid, version))
+    }
+
+    /// Whether `wid` names a write of this shard from before `version`.
+    pub(crate) fn wrote_before(&self, wid: &WriteIdentity, version: EpochSeq) -> bool {
+        let shard = self.shard.shard();
+        wid.cluster == self.target.cluster
+            && wid.bucket == shard.bucket
+            && wid.shard == shard.shard
+            && wid.position < version
     }
 
     async fn head(&self) -> Result<Option<ObjectInfo>, Failure> {
@@ -504,6 +537,17 @@ pub(crate) enum Failure {
     Local(String),
     /// Failed preconditions kept finding a newer remote object.
     Changing,
+    /// The link to a native target failed, or no answer came in time.
+    Link(LinkError),
+    /// A native target did not apply the write (§7.8).
+    Peer(String),
+}
+
+impl Failure {
+    /// The failure of a link to a native target.
+    pub(crate) fn link(error: LinkError) -> Self {
+        Failure::Link(error)
+    }
 }
 
 impl fmt::Display for Failure {
@@ -512,6 +556,8 @@ impl fmt::Display for Failure {
             Failure::Remote(error) => write!(f, "the remote failed: {error}"),
             Failure::Local(reason) => f.write_str(reason),
             Failure::Changing => f.write_str("the remote object kept changing"),
+            Failure::Link(error) => write!(f, "the link to the peer failed: {error}"),
+            Failure::Peer(reason) => write!(f, "the peer did not apply the write: {reason}"),
         }
     }
 }

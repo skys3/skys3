@@ -1,6 +1,7 @@
 //! Messages on a QUIC stream, and the destination's authorization of what
 //! a source sends on one.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -58,6 +59,39 @@ pub enum StreamError {
     /// closed.
     #[error(transparent)]
     Unauthorized(#[from] Unauthorized),
+    /// Another transport than QUIC failed, such as the one a simulation
+    /// carries the protocol's frames over ([`Inbound`]).
+    #[error("transport error: {0}")]
+    Transport(String),
+}
+
+/// The destination's end of one stream, as
+/// [`StagingService::serve`](crate::StagingService::serve) reads it: the
+/// source's messages, each authorized before it is returned, and a sending
+/// half that tasks share. [`InboundStream`] carries them over QUIC; a
+/// simulation may carry the same frames over another transport.
+pub trait Inbound: Send {
+    /// The sending half.
+    type Sender: Outbound;
+
+    /// Receives the next authorized message, or `None` once the source
+    /// finished the stream; see [`InboundStream::recv`].
+    fn recv(&mut self) -> impl Future<Output = Result<Option<Message>, StreamError>> + Send;
+
+    /// Another handle to the sending half, for a task that answers while
+    /// the stream is read.
+    fn sender(&self) -> Self::Sender;
+}
+
+/// The sending half of an [`Inbound`] stream. Each message is written whole
+/// before the next one starts, whichever handle sends it.
+pub trait Outbound: Clone + Send + Sync + 'static {
+    /// Sends `message` to the source.
+    fn send(&self, message: &Message) -> impl Future<Output = Result<(), StreamError>> + Send;
+
+    /// Ends the stream in this direction once every message sent is
+    /// delivered.
+    fn finish(&self) -> impl Future<Output = Result<(), StreamError>> + Send;
 }
 
 /// Counts the open streams of a connection, so a pool can spread new
@@ -238,6 +272,13 @@ impl MessageStream {
         self.sender.finish()
     }
 
+    /// What the connection's `HELLO`s agreed on, such as whether the
+    /// destination accepts `BATCH`.
+    #[must_use]
+    pub fn session(&self) -> &Session {
+        &self.sender.session
+    }
+
     /// Splits the stream, so one task can send while another receives. A
     /// source streams `DATA` while `DURABLE`s arrive, and neither may wait
     /// on the other: QUIC flow control stalls a sender whose peer does not
@@ -287,6 +328,28 @@ impl InboundSender {
     /// As [`MessageSender::finish`].
     pub async fn finish(&self) -> Result<(), StreamError> {
         self.0.lock().await.finish()
+    }
+}
+
+impl Outbound for InboundSender {
+    async fn send(&self, message: &Message) -> Result<(), StreamError> {
+        InboundSender::send(self, message).await
+    }
+
+    async fn finish(&self) -> Result<(), StreamError> {
+        InboundSender::finish(self).await
+    }
+}
+
+impl Inbound for InboundStream {
+    type Sender = InboundSender;
+
+    async fn recv(&mut self) -> Result<Option<Message>, StreamError> {
+        InboundStream::recv(self).await
+    }
+
+    fn sender(&self) -> InboundSender {
+        InboundStream::sender(self)
     }
 }
 

@@ -26,6 +26,7 @@ skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
 skys3-obs.workspace = true
+skys3-peer.workspace = true
 skys3-remote.workspace = true
 skys3-shard.workspace = true
 skys3-types.workspace = true
@@ -44,6 +45,5 @@ skys3-control.workspace = true
 skys3-flush = { path = ".", features = ["test-util"] }
 skys3-gateway = { workspace = true, features = ["test-util"] }
 skys3-net.workspace = true
-skys3-peer.workspace = true
 skys3-sim.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
