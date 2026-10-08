@@ -26,6 +26,7 @@ exist.
   - [Held conflicts](#held-conflicts)
   - [Discarded conflicts](#discarded-conflicts)
   - [Peer link](#peer-link)
+  - [Peer transport fallback](#peer-transport-fallback)
 - [4. Replication and placement](#4-replication-and-placement)
   - [Under-replication](#under-replication)
   - [Network partition](#network-partition)
@@ -86,12 +87,13 @@ filter` sets. The runbooks quote the messages to search for.
 
 **What the node binary runs today.** Every node serves its buckets alone,
 over the file control store (`[control_store] backend = "file"`; the
-binary refuses `etcd` and `s3`). Replication, the coordinator, encoding and
-fragment repair, and the peer transport are built and run in the cluster
-simulation, but the binary does not run them yet. Their metrics are listed
-as defined in the metrics reference, and their alerts cannot fire. The
-runbooks for them describe what to do once the binary runs them, and say
-which of their steps cannot be taken yet.
+binary refuses `etcd` and `s3`). Replication, the coordinator, and
+encoding and fragment repair are built and run in the cluster simulation,
+but the binary does not run them yet. Their metrics are listed as defined
+in the metrics reference, and their alerts cannot fire. The runbooks for
+them describe what to do once the binary runs them, and say which of their
+steps cannot be taken yet. The peer transport (design section 7.8) runs in
+the binary on a node with `[peering.peers]` tables.
 
 ## 2. Index
 
@@ -110,7 +112,7 @@ Each row of design section 13, in its order, with the runbooks to follow.
 | Node fails while the control store is unreachable | [Control store unreachable](#control-store-unreachable), [Node down](#node-down) |
 | Remote target unreachable | [Flush stalled](#flush-stalled), [Dirty budget](#dirty-budget), [Dirty data age](#dirty-data-age) |
 | Link to a peer SkyS3 cluster drops or flaps | [Peer link](#peer-link) |
-| UDP blocked between peer clusters | [Peer link](#peer-link) |
+| UDP blocked between peer clusters | [Peer transport fallback](#peer-transport-fallback), [Peer link](#peer-link) |
 | Control store unreachable | [Control store unreachable](#control-store-unreachable), [Identity staleness](#identity-staleness) |
 | High-latency link to the control store | [Control store latency](#control-store-latency) |
 | Coordinator dies | [Coordinator](#coordinator) |
@@ -352,28 +354,142 @@ its log records are reclaimed by compaction, and no tool reads them.
 **Symptoms.** For a bucket whose target is a peer SkyS3 cluster (design
 section 7.8): `SkyS3DirtyDataOld` with a growing
 `skys3_oldest_dirty_age_seconds` and `skys3_flush_lag_seconds` while the
-link is down. A link that flaps and resumes shows nothing, by design.
-`skys3_flush_transport`, which shows a fallback from QUIC to S3 REST, is
-planned (plan M6-07).
+link is down. A link that flaps and resumes shows nothing, by design. A
+bucket whose `target_transport` is `auto` falls back to S3 REST when a
+fresh handshake fails, and `skys3_flush_transport` then shows `s3`
+([Peer transport fallback](#peer-transport-fallback)).
 
 **Impact.** Objects stay dirty at the source until the destination applies
-them (`APPLIED`), and transfers resume from the last durable range. With
-UDP blocked, `target_transport = "auto"` is meant to fall back to S3 REST.
+them (`APPLIED`), and transfers resume from the last durable range. When a
+flush finds its link broken, the target tries a fresh handshake at once.
+If it fails, an `auto` target falls back to S3 REST and flushing goes on
+there; a `native` target waits.
 
 **Diagnosis.** As in [Flush stalled](#flush-stalled): the bucket's
-`flush.errors` name the transport's errors. Check UDP reachability of the
-peer's `quic_listen` address, and the peer's trust bundle and bucket pairs
-(`[peering.peers.<cluster-id>]`).
+`flush.errors` name the transport's errors, and `flush.transport` the
+transport in use and why. Check UDP reachability of the addresses the peer
+advertises (its `quic_advertise`), and the peer's trust bundle and bucket
+pairs (`[peering.peers.<cluster-id>]`).
 
 **Remediation.** Restore the path between the clusters. The flushers resume
 by themselves.
 
 **Verification.** The dirty age at the source returns to seconds.
 
-**Do not.** Do not point a bucket at a SkyS3 cluster as a plain S3 target:
-a SkyS3 gateway refuses the write-identity metadata every S3 REST flush
-sends (`400 InvalidArgument`, section 8). The node binary does not run the
-peer transport yet.
+**Do not.** Do not point a bucket at a SkyS3 cluster that does not list
+this cluster as a peer: a SkyS3 gateway refuses the write-identity
+metadata every S3 REST flush sends (`400 InvalidArgument`), except from
+the access keys of a peer it lists in `s3_access_key_ids` (section 8).
+
+### Peer transport fallback
+
+**Symptoms.** `SkyS3PeerTransportFallback`: a bucket's
+`skys3_flush_transport{transport="s3"}` has been 1 for 30 minutes. Its
+flushers reach their peer SkyS3 cluster over S3 REST instead of QUIC. The
+flush metrics usually stay healthy, because flushing goes on. In
+`GET /v1/buckets/<bucket>`, `flush.transport` has `in_use` `s3`, `peer`
+true, and a `reason` such as `the QUIC handshake with cluster <id> did not
+finish within 3s`. The source node logs `the target's transport changes`
+at each switch, with `from`, `to`, and the reason.
+
+Three other states raise no alert:
+
+- **A descriptor that cannot be read.** `flush.transport.in_use` is `null`
+  and `reason` starts with `the peer descriptor could not be read`. The
+  target's S3 endpoint answered a `5xx`, or nothing. A target whose
+  discovery has not chosen yet waits, and nothing is flushed. A target
+  that had chosen keeps its transport. The bucket's dirty age grows
+  ([Dirty data age](#dirty-data-age)).
+- **A refused descriptor.** `peer` is false, `reason` starts with `the
+  peer descriptor is refused`, and the node logs `the target's peer
+  descriptor is refused`. The descriptor is forged, expired, not yet
+  valid, signed by a chain that does not lead to the named cluster's
+  trust bundle, or names another bucket or source cluster. An `auto`
+  target is flushed as a plain S3 store, and `skys3_flush_transport` has
+  no series for it. A `native` target waits.
+- **A `native` target that does not flush.** `configured` is `native`
+  and `in_use` is `null`. `native` never falls back to S3 REST: it waits
+  while QUIC cannot be used. On a node without `[peering.peers]` tables,
+  the node logs `a native target is not flushed`, with the reason `this
+  node has no peer transport`.
+
+**Impact.** Over S3 REST, every committed change still reaches the peer
+exactly once, as over QUIC (design section 7.8). The transfer is slower
+over a long link, and it uses the REST window (section 7.7). Each shard
+flusher that starts on S3 REST to a target that served a descriptor,
+verified or not, waits a quarantine before it sends anything. The
+quarantine is twice the peer answer timeout plus the QUIC idle timeout:
+90 seconds. This happens at each switch to S3 REST, and at each restart or
+takeover while the target stays on S3 REST, so the dirty age grows by up
+to that much each time. A target on S3 REST tries a handshake again after
+a backoff from 15 seconds, doubling, up to 5 minutes. It returns to QUIC
+within 5 minutes of UDP being allowed again, without the quarantine.
+
+**Diagnosis.**
+
+1. `GET /v1/buckets/<bucket>` on each source node that alerts. Read
+   `flush.transport`: `configured`, `in_use`, `peer`, `reason`, and
+   `switches`. A `switches` count that keeps growing means the path flaps.
+2. **Handshake failures** (`peer` true, `in_use` `s3`). The reason names
+   the cluster and the failure: a timeout means UDP is blocked or dropped
+   on the way, and an error names TLS or the protocol. Check UDP from the
+   source nodes to the addresses the destination advertises: its `[peering]
+   quic_advertise`, which its `quic_listen` must serve. Check firewalls and
+   NAT on both sides. A TLS error points at the `[transport]` certificates
+   or at the trust bundle in `[peering.peers.<cluster-id>]`. On the
+   destination, `a peer connection failed` logs each connection it could
+   not establish, with the source address.
+3. **A descriptor that cannot be read.** The target's S3 endpoint fails:
+   follow [Flush stalled](#flush-stalled) for the S3 path.
+4. **A refused descriptor.** The reason names the check that failed.
+   Compare the clocks of both clusters ([Clock drift](#clock-drift)): a
+   descriptor is valid from 5 minutes before it was issued. Check that
+   the source's `[peering.peers.<cluster-id>]` names the destination
+   cluster and its trust bundle, and that the destination bucket's
+   `peer_source` is the source cluster. On the destination, `the peer
+   descriptor cannot be signed` means its `[transport]` key cannot sign.
+5. **No descriptor.** `reason` is `the target serves no peer descriptor`,
+   or names a refused `GET` (another `4xx`). The target is treated as a
+   plain S3 store, and its discovery has stopped. The destination serves a
+   descriptor only for a bucket whose `peer_source` names the source, on
+   nodes whose `quic_advertise` is set.
+6. **S3 REST writes refused by the destination.** `flush.errors` show
+   `403 AccessDenied` (`receives native replication from cluster <id> and
+   is read-only to this cluster's clients`) or `400 InvalidArgument`
+   (`x-amz-meta-skys3-wid is reserved for SkyS3's write identity`). The
+   destination does not list the access keys of the source's flushers in
+   `[peering.peers.<source-id>] s3_access_key_ids`, or the bucket pair is
+   missing from that table's `buckets`. The flushers sign with the
+   credentials of the node's `aws-config` default chain.
+
+**Remediation.**
+
+- **UDP blocked:** allow UDP from the source nodes to the destination's
+  advertised addresses. The targets return to QUIC at their next
+  re-probe, within 5 minutes, with no action.
+- **Refused descriptor:** fix the clocks, the trust bundle, or the bucket
+  pair. The descriptor is read again at the next re-probe.
+- **No descriptor:** set `quic_advertise` on the destination's nodes, or
+  the bucket's `peer_source`, and restart them one at a time. Then
+  restart the source nodes one at a time, because a target found to serve
+  no descriptor is not looked at again until the node starts.
+- **Writes refused:** add the source flushers' access keys to the
+  destination's `s3_access_key_ids` for that peer, on every destination
+  node, and restart them one at a time. A key belongs to one peer only.
+- **A `native` target that must keep flushing** while QUIC is down: set
+  its `target_transport` to `auto` on every source node and restart them
+  one at a time.
+
+**Verification.** `flush.transport.in_use` is `quic` on every source node,
+`skys3_flush_transport{transport="quic"}` is 1, and the alert resolves.
+`switches` stops growing, and the dirty age returns to seconds.
+
+**Do not.** Do not set `target_transport = "s3"` to silence the alert
+while the link should carry QUIC: the targets then never look for QUIC
+again. Do not put the peer's flusher keys in a client's policy instead of
+`s3_access_key_ids`: the destination refuses their write identities.
+Escalate if a target stays on S3 REST while a handshake to the advertised
+addresses succeeds from the same node.
 
 ## 4. Replication and placement
 
@@ -1051,11 +1167,12 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | Runbook | Drill | What it showed | Found wrong |
 |---|---|---|---|
 | [Dirty data age](#dirty-data-age) | `runbooks::drill_remote_outage` (in process: flush service, metrics, admin API) | During a remote outage `skys3_oldest_dirty_age_seconds` and `skys3_flush_lag_seconds` grow and `skys3_flush_retries_total` counts retries; `flush.errors` names the key and the error; once the remote returns, everything drains with no action, and the gauges return to 0. Held keys age without flush lag (`runbooks::drill_out_of_band_writes`). | Nothing. |
-| [Flush stalled](#flush-stalled) | `runbooks::drill_remote_outage`; `runbooks::drill_dirty_budget` | As above. On the binary, a target unreachable from the start shows `probe` `running` with its `probe_error`. | A SkyS3 node cannot stand in for a remote target: its gateway refuses the write-identity metadata of every flush. The drills use a simulated remote; section 8. |
+| [Flush stalled](#flush-stalled) | `runbooks::drill_remote_outage`; `runbooks::drill_dirty_budget` | As above. On the binary, a target unreachable from the start shows `probe` `running` with its `probe_error`. | A SkyS3 node cannot stand in for a remote target unless it lists the source as a peer: its gateway refuses the write-identity metadata of every flush. The drills use a simulated remote; section 8. |
 | [Dirty budget](#dirty-budget) | `runbooks::drill_dirty_budget` | The share fills, a write gets `503 SlowDown`, `skys3_admission_refusals_total{reason="bucket_budget"}` counts it, and `GET /v1/buckets/<bucket>` shows `dirty_bytes` at `dirty_budget_bytes`. A larger `max_dirty_bytes` and a restart admit writes, and the dirty data stays dirty. | Nothing. |
 | [Held conflicts](#held-conflicts) | `runbooks::drill_out_of_band_writes` (in process); `conflicts::conflicts_are_listed_and_resolved_under_each_policy`; `simulation::conflicts::hold_keeps_conflicts_until_an_operator_resolves_them` | `skys3_conflicted_keys` and `skys3_flush_conflicts_total` count the held keys; the conflicts list shows each with `remote_identity` null for a writer outside SkyS3; `overwrite` puts the local version at the remote and counts it; `hold` after the other writer's object is removed flushes; a key not held answers `404`. | Nothing. |
 | [Discarded conflicts](#discarded-conflicts) | `runbooks::drill_out_of_band_writes` (in process) | A `discard_local` resolution adopts the remote's version and counts it in `skys3_flush_conflicts_discarded_total`, the series the alert reads. | The log lines the runbook quotes were not checked: the in-process drill has no log. |
-| [Peer link](#peer-link) | `simulation::peer::every_committed_change_reaches_the_peer_under_faults` | Under link faults, every committed change reaches the peer cluster, and stays dirty at the source until applied. | Not drilled on the binary, which does not run the peer transport. The fallback to S3 REST (UDP blocked) is not built yet (plan M6-07), and could not work against a SkyS3 gateway as it is (section 8). |
+| [Peer link](#peer-link) | `simulation::peer::every_committed_change_reaches_the_peer_under_faults` | Under link faults, every committed change reaches the peer cluster, and stays dirty at the source until applied. | Not drilled on the binary. |
+| [Peer transport fallback](#peer-transport-fallback) | `simulation::discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`; `simulation::discovery::forged_and_expired_descriptors_are_refused` | With UDP blocked, under crashes, takeovers, and peer restarts, the flushers fall back to S3 REST through the peer's own SkyS3 gateway, which takes their writes with their write identities from the keys in `s3_access_key_ids`, and return to QUIC once UDP is allowed again. Every committed change reaches the peer once; no `COMMIT` reaches it after an S3 write of its key acknowledged after the `COMMIT` was sent; `skys3_flush_transport` and `flush.transport` follow every switch. Forged and expired descriptors are refused, and those targets are flushed as plain S3 stores. | Not drilled on the binary; its handshake and descriptor are tested in process (`crates/skys3/src/peering.rs`). The simulation shortens the quarantine and the re-probe backoff, and does not evaluate the alert's rule. |
 | [Under-replication](#under-replication) | `simulation::backfill::a_lost_member_is_replaced_and_its_shards_regain_their_copies`; `simulation::replacement::after_a_node_loss_every_affected_shard_returns_to_replicas_members`; `simulation::takeover::a_single_survivor_takes_over` | A lost member is removed, replaced by a learner, backfilled, and promoted with no operator action; a single survivor takes over and serves what was committed. | Not drilled on the binary: it does not run replication, so its metrics and alerts and the `placement` report cannot be read yet. |
 | [Network partition](#network-partition) | `simulation::takeover::competing_candidates_across_a_partition` | Across a partition, one candidate's CAS wins and the shard serves on the majority side; no acknowledged write is lost. | Not drilled on the binary, as above. |
 | [Placement policy](#placement-policy) | `skys3_coord::policy::tests::losing_a_rack_leaves_buckets_unsatisfied_without_co_location`; `skys3_coord::metrics::tests::the_gauges_follow_tenures_and_reports`; `simulation::heal::a_lost_rack_is_replaced_across_the_remaining_racks` | The report names short and co-located shards and unlabeled nodes without co-locating; the gauges follow the coordinator's report; a lost rack heals across the others. | Not drilled on the binary, which does not run the coordinator, so `GET /v1/health` has no `placement` yet. |
@@ -1079,12 +1196,13 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 What the runbooks need that does not exist yet. Each is a gap an operator
 meets today, not a plan of this document.
 
-- **A SkyS3 cluster as an S3 REST target.** A gateway refuses
-  `x-amz-meta-skys3-wid` from clients (`400 InvalidArgument`), and every
-  flush over S3 REST sends it, so a `write_back` or backup target that is a
-  SkyS3 cluster reached over S3 REST fails every flush. The fallback of
-  `target_transport = "auto"` to S3 REST (design sections 7.8 and 13, plan
-  M6-07) needs a way through.
+- **A SkyS3 cluster as a plain S3 target.** A gateway refuses
+  `x-amz-meta-skys3-wid` (`400 InvalidArgument`), which every flush over S3
+  REST sends, except from the access keys of a peer it lists in
+  `s3_access_key_ids`, for that peer's bucket pairs (design sections 7.8
+  and 12). A SkyS3 cluster therefore takes S3 REST flushes only from a
+  cluster configured as its peer. One that is not, such as a single node
+  standing in for a remote target in a drill, fails every flush.
 - **The file control store after a failed write.** It refuses every request
   until it is opened again, and a running node reopens only a store it
   could not open, so the node needs a restart once the store is back.
