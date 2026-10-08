@@ -258,7 +258,7 @@ impl<H: Shards> Objects<H> {
         }
         let (data, digests) = self
             .copy_bytes(
-                (&source_shard, &source_key, version),
+                (&source_shard, &source_key),
                 &object,
                 &shard,
                 &input.key,
@@ -331,23 +331,21 @@ impl<H: Shards> Objects<H> {
         })
     }
 
-    /// Writes the bytes of `object`, the version at `version` of
+    /// Writes the bytes of `object`, the current version of
     /// `source_key` in `source`, into `shard` as the body of a `PUT` of
     /// `key`, and returns where they are and their digests in the `hashed`
     /// algorithms. A coded source is read from its fragments, since its
     /// replicas drop their copies once it is coded (§8.5).
     async fn copy_bytes(
         &self,
-        (source, source_key, version): (&ShardRef, &str, EpochSeq),
+        (source, source_key): (&ShardRef, &str),
         object: &ObjectVersion,
         shard: &ShardRef,
         key: &str,
         hashed: &[ChecksumAlgorithm],
     ) -> S3Result<(PutData, Digests)> {
         let (mut coded, positions) = if object.coded.is_some() {
-            let body = self
-                .coded_source(source, source_key, version, object)
-                .await?;
+            let body = self.coded_source(source, source_key, object).await?;
             (Some(body), Vec::new())
         } else {
             let positions = match &object.payload {

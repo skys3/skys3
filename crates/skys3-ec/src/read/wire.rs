@@ -29,7 +29,8 @@ use skys3_log::ShardRef;
 use skys3_log::record::MAX_KEY_LEN;
 use skys3_net::{Connection, Frame, Header, MessageKind, Network, Receiver, Sender, Transport};
 use skys3_types::{
-    BucketId, CodecId, Epoch, EpochSeq, FragmentId, Geometry, NodeAddress, NodeId, Seq, ShardId,
+    BucketId, CodecId, ETag, Epoch, EpochSeq, FragmentId, Geometry, NodeAddress, NodeId, Seq,
+    ShardId,
 };
 use tokio::time::Instant;
 
@@ -110,6 +111,9 @@ pub struct FragmentRead {
     /// The byte after the last one to read.
     #[prost(uint64, tag = "16")]
     pub end: u64,
+    /// The object's ETag, unquoted.
+    #[prost(string, tag = "17")]
+    pub etag: String,
 }
 
 /// The body of a `FragmentData` frame, whose payload holds the bytes read.
@@ -151,6 +155,7 @@ impl FragmentRead {
             index: u32::from(identity.index),
             start: request.range.start,
             end: request.range.end,
+            etag: identity.etag.as_str().to_owned(),
         }
     }
 
@@ -189,10 +194,12 @@ impl FragmentRead {
         if self.start >= self.end || self.end - self.start > MAX_READ_LEN {
             return Err(format!("bytes {}..{}", self.start, self.end));
         }
+        let etag = ETag::new(self.etag.clone()).map_err(|e| e.to_string())?;
         let identity = FragmentIdentity {
             shard: ShardRef::new(bucket, ShardId::new(shard)),
             key: self.key.clone(),
             version: EpochSeq::new(Epoch::new(self.version_epoch), Seq::new(self.version_seq)),
+            etag,
             stripe: StripeInfo {
                 number: self.stripe,
                 count: self.stripes,
@@ -462,8 +469,12 @@ impl<D: Disk> FragmentServer<D> {
             })?;
         if !identity.matches(&read.header) {
             return Err(NotServed::NotHeld(format!(
-                "fragment {id} is fragment {} of stripe {} of {} at {}",
-                read.header.index, read.header.stripe.number, read.header.key, read.header.version
+                "fragment {id} is fragment {} of stripe {} of {} at {} ({})",
+                read.header.index,
+                read.header.stripe.number,
+                read.header.key,
+                read.header.version,
+                read.header.object.etag.as_str()
             )));
         }
         Ok(FragmentBytes {
