@@ -486,10 +486,12 @@ impl State {
 /// each dirty key's latest committed version to the target:
 ///
 /// - **Order and coalescing.** Keys are flushed oldest first, at most
-///   [`FlushSettings::concurrency`](crate::FlushSettings::concurrency) at
-///   once, and each key has at most one flush in flight. A flush sends the
-///   key's latest version; versions committed during a flush are flushed
-///   next, conditioned on what the flush put at the remote.
+///   [`FlushSettings::max_concurrency`](crate::FlushSettings::max_concurrency)
+///   at once, and each key has at most one flush in flight. A flush sends
+///   the key's latest version; versions committed during a flush are
+///   flushed next, conditioned on what the flush put at the remote. Their
+///   requests share the target's adaptive window with the other shards
+///   flushing to it (§7.7).
 /// - **States** (§4.2). A dirty key is taken for a flush (Dirty →
 ///   Flushing). A retryable failure puts it back after a backoff (Flushing
 ///   → Dirty), an out-of-band remote write puts it in conflict (Flushing
@@ -693,9 +695,13 @@ async fn run<S: ObjectStore, D: Disk>(
         let mut streaming: JoinSet<Step> = JoinSet::new();
         // Whether a target may still arrive.
         let mut awaiting = true;
+        // The flusher's place among those sending to the target, which
+        // sizes the target's window (§7.7).
+        let mut membership = None;
         loop {
             let target = ready.borrow_and_update().clone();
             if let Some(target) = &target {
+                membership.get_or_insert_with(|| target.join());
                 dispatch(&shard, target, &state, &streams, &mut flushes);
                 streams.pump(&shard, target, &mut streaming);
             }
@@ -827,7 +833,7 @@ fn dispatch<S: ObjectStore, D: Disk>(
     streams: &Arc<Streams>,
     flushes: &mut JoinSet<Done>,
 ) {
-    while flushes.len() < target.settings.concurrency {
+    while flushes.len() < target.settings.max_concurrency as usize {
         let (key, dispatched, resolution, pending) = {
             let mut state = lock(state);
             let Some((key, dispatched, resolution)) = state.take_ready() else {

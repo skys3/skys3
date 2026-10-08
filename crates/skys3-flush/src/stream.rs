@@ -721,7 +721,8 @@ impl Streams {
     }
 
     /// Starts what the streams need: opens of new uploads, sends of queued
-    /// parts while fewer than `concurrency` are in flight, and aborts.
+    /// parts while fewer than `max_concurrency` are in flight, and aborts.
+    /// Their requests share the target's window with the keys' flushes.
     pub(crate) fn pump<S: ObjectStore, D: Disk>(
         self: &Arc<Self>,
         shard: &Shard<D>,
@@ -793,7 +794,7 @@ impl Streams {
                 .copied()
                 .collect();
             for number in ready {
-                if sending >= target.settings.concurrency {
+                if sending >= target.settings.max_concurrency as usize {
                     break;
                 }
                 let Some(position) = stream.waiting.remove(&number) else {

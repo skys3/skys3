@@ -107,6 +107,10 @@ they measure what the backup lacks.
 | `skys3_flush_conflicts_discarded_total` | counter | `bucket` | exported (M4-06) | Conflicts resolved by adopting the out-of-band write and dropping the local version, an acknowledged write: by the `discard_local` policy, or by an operator's `discard_local` resolution (design section 7.2). |
 | `skys3_flushes_total` | counter | `bucket` | exported (M1-16) | Versions flushed: the remote accepted them, or a retry found them there by their write identity. |
 | `skys3_flush_retries_total` | counter | `bucket` | exported (M1-16) | Flush attempts that failed (`5xx`, `503 SlowDown`, a lost response, another error) and are retried after a backoff. |
+| `skys3_flush_concurrency` | gauge | `bucket` | exported (M4-10) | The requests this node's flushers may have in flight to the bucket's target: the adaptive window of design section 7.7, between `flush_min_concurrency_per_shard` and `flush_max_concurrency_per_shard` times the bucket's shards flushed here. It approaches the bandwidth-delay product of the link in requests, and drops on throttles and rising latency. Set once the target's capability probe is done. |
+| `skys3_flush_inflight_bytes` | gauge | `bucket` | exported (M4-10) | Bytes this node's flushers hold in memory for requests to the bucket's target, bounded by `flush_max_inflight_bytes_per_target`: single PUT bodies and multipart or streamed parts, from reading them until their answer. |
+| `skys3_flush_base_round_trip_seconds` | gauge | `bucket` | exported (M4-10) | The target's base round trip, which the window compares latency with: the smallest mean latency of a round of requests among the last 1,024 rounds. 0 until a round has ended. |
+| `skys3_flush_throttles_total` | counter | `bucket` | exported (M4-10) | Flush requests the target answered with a throttle (any `503`, `429`, or a throttling error code), each of which may shrink `skys3_flush_concurrency`. Their keys are retried and also counted in `skys3_flush_retries_total`. |
 
 The `bucket` label is the bucket's name. A node exports the gauges and the
 counters for every `write_back` bucket it knows, counting the shards open on
