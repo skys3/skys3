@@ -5360,9 +5360,18 @@ of this file. A task with nothing unexpected keeps "None."
   testing).** A replay test of the peer scenario failed with no peer
   configured. The same test on the base branch failed the same way: its
   backup scenario, with replicated shards, takeovers, and write-through
-  acknowledgements, also differs between two runs of one seed. The cause
-  was not traced; it is left open. The peer's replay test therefore runs
-  with one member per shard, and replays exactly at 16 seeds.
+  acknowledgements, also differs between two runs of one seed. M4-13
+  traced this to tokio's own randomness, which takeovers and restarts
+  wake. The peer's replay test therefore runs with one member per shard,
+  and replays exactly at 16 seeds.
+- **Merging M4-13.** Native targets skip the orphan sweep that now runs
+  beside the copy probe: they open no remote multipart upload, so none
+  is ever left open, and they still skip the probe, becoming ready
+  through `Ready::new` before their flushers start. In the flusher's
+  `biased` `select!`, finished body stagings come with the flusher's
+  other tasks, before the shard's changes, so a busy shard cannot starve
+  them. At 256 seeds the peer scenarios took 58.4 s in all after the
+  merge.
 - **Run times at 256 seeds.** `peer::every_committed_change_reaches_the_peer_under_faults`
   takes 23.1 s, `peer::write_through_writes_are_acknowledged_once_the_peer_applied_them`
   28.8 s, `peer::a_seed_with_a_peer_replays_exactly` 4.6 s, and the two
