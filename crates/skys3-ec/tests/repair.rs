@@ -1074,12 +1074,12 @@ fn a_move_that_fails_is_abandoned_and_retried() {
         assert_eq!(f.layouts().await, before);
         assert!(f.attempts.in_progress().is_empty());
 
-        // The first write fails: that move waits for the next pass, the
-        // others go on.
+        // The first write fails: that move, and the pass's others to its
+        // node, wait for the next pass; the others go on.
         f.nodes.unreadable.lock().unwrap().clear();
         *f.nodes.failures.lock().unwrap() = 1;
         let report = repairer.pass().await;
-        assert_eq!(report.unmoved, 1, "{report:?}");
+        assert!(report.unmoved >= 1, "{report:?}");
         assert!(report.moved > 0, "{report:?}");
         f.settle(&repairer).await;
         f.check_whole().await;

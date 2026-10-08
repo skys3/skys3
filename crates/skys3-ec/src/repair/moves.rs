@@ -60,9 +60,16 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             avoid: &avoid,
             limit: self.settings.moves_per_pass,
         });
+        // Nodes a move of this pass failed to read from or write to: the
+        // rest of the pass leaves them be rather than wait on them again.
+        let mut failing: BTreeSet<NodeId> = BTreeSet::new();
         for planned in planned {
             if !leads(&self.shard) {
                 break;
+            }
+            if failing.contains(&planned.from.node) || failing.contains(&planned.to) {
+                report.unmoved += 1;
+                continue;
             }
             // The entry as it is now, not as the pass found it: a write or
             // a retag since would reject the move's record.
@@ -89,6 +96,15 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                 Ok(false) => report.unmoved += 1,
                 Err(error) => {
                     report.unmoved += 1;
+                    match &error {
+                        RepairError::Source(_) => {
+                            failing.insert(planned.from.node.clone());
+                        }
+                        RepairError::Fragments(_) => {
+                            failing.insert(planned.to.clone());
+                        }
+                        _ => {}
+                    }
                     tracing::info!(
                         shard = %self.shard.shard(),
                         key = planned.key,

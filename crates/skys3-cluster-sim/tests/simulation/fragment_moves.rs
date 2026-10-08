@@ -29,7 +29,11 @@ use skys3_sim::{Runner, SimContext};
 use super::coding::caught;
 
 /// What one run costs, in seeds of a typical scenario: the encoding of the
-/// coding scenarios, then a few seconds of repairs and moves.
+/// coding scenarios, then a few seconds of repairs and moves, about two
+/// seconds in a debug build. Runs with reads take about five, and a
+/// scenario that runs its seed with and without a bug runs twice or more,
+/// so those declare more; the joins and drains with reads declare more
+/// still, to keep CI's seed set to a few runs of each.
 const RUN_COST: u64 = 16;
 
 /// A run in which `rebalance` joins and drains nodes as the holders in
@@ -74,7 +78,7 @@ fn moved(report: &CodingReport) -> Result<&MoveOutcome, String> {
 
 #[test]
 fn joined_nodes_receive_fragments_while_reads_and_losses_go_on() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
         let losses = drawn_losses(context);
         let rebalance = RebalanceConfig {
             joins: 2,
@@ -99,7 +103,7 @@ fn joined_nodes_receive_fragments_while_reads_and_losses_go_on() {
 /// a 3+2 stripe.
 #[test]
 fn a_drained_node_is_emptied_while_reads_and_losses_go_on() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
         let losses = drawn_losses(context);
         let rebalance = RebalanceConfig {
             joins: 1,
@@ -120,7 +124,7 @@ fn a_drained_node_is_emptied_while_reads_and_losses_go_on() {
 /// rack; one node joins the first rack and another a new one.
 #[test]
 fn moves_keep_each_rack_within_its_cap() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         let losses = if context.rng().random_bool(0.5) {
             vec![Loss::Disk]
         } else {
@@ -200,7 +204,7 @@ fn outlasting(bug: Option<RepairBug>) -> CodingConfig {
 
 #[test]
 fn moves_outlasting_orphan_after_keep_their_fragments() {
-    Runner::with_cost(4, RUN_COST).run(|context| {
+    Runner::with_cost(4, 2 * RUN_COST).run(|context| {
         let report = coding::run(context, &outlasting(None))?;
         moved(&report)?;
         Ok(())
@@ -209,7 +213,7 @@ fn moves_outlasting_orphan_after_keep_their_fragments() {
 
 #[test]
 fn a_move_unknown_to_the_orphan_fence_is_caught() {
-    Runner::with_cost(2, 2 * RUN_COST).run(|context| {
+    Runner::with_cost(2, 4 * RUN_COST).run(|context| {
         caught(
             context,
             &outlasting(None),
@@ -221,7 +225,7 @@ fn a_move_unknown_to_the_orphan_fence_is_caught() {
 
 #[test]
 fn retiring_a_fragment_before_its_move_commits_is_caught() {
-    Runner::with_cost(2, 2 * RUN_COST).run(|context| {
+    Runner::with_cost(2, 4 * RUN_COST).run(|context| {
         // The primary dies once a copy is placed: that move never commits.
         let rebalance = RebalanceConfig {
             joins: 2,
@@ -249,7 +253,7 @@ fn retiring_a_fragment_before_its_move_commits_is_caught() {
 
 #[test]
 fn relocating_a_copy_before_it_is_durable_is_caught() {
-    Runner::with_cost(2, 2 * RUN_COST).run(|context| {
+    Runner::with_cost(2, 4 * RUN_COST).run(|context| {
         // The first copy's new holder loses power at its next sync: the
         // one that would make the copy durable.
         let rebalance = RebalanceConfig {
@@ -274,7 +278,7 @@ fn relocating_a_copy_before_it_is_durable_is_caught() {
 
 #[test]
 fn moves_ahead_of_repairs_or_across_racks_are_caught() {
-    Runner::with_cost(2, 4 * RUN_COST).run(|context| {
+    Runner::with_cost(2, 8 * RUN_COST).run(|context| {
         // A disk is lost as two nodes join: the passes that find its
         // fragments lost must repair them before any move.
         let rebalance = RebalanceConfig {
