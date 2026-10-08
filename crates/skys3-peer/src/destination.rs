@@ -260,7 +260,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     /// # Errors
     ///
     /// The stream's errors, other than refused messages, which
-    /// [`InboundStream`] answers itself.
+    /// [`InboundStream`](crate::InboundStream) answers itself.
     pub async fn serve<I: Inbound>(&self, mut stream: I) -> Result<(), StreamError> {
         let (events, received) = mpsc::unbounded_channel();
         let reports = Reports {

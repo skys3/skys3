@@ -314,9 +314,7 @@ impl Destination {
     /// and returns what it holds, by key, with what the run found: the
     /// `PUT` records in its log, each of a write identity of its own, or
     /// the violation if one repeats.
-    pub(crate) fn finish(
-        &self,
-    ) -> Result<Result<Finished, Violation>, BoxError> {
+    pub(crate) fn finish(&self) -> Result<Result<Finished, Violation>, BoxError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
