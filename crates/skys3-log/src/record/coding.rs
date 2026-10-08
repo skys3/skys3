@@ -155,8 +155,12 @@ pub struct FragmentMove {
 pub struct EcRelocate {
     /// The object key.
     pub key: String,
-    /// The position of the record that committed the version, which
-    /// precedes this record.
+    /// The entry's version when the attempt read it: the position of the
+    /// key's latest committing record, a `TAGS` included, which precedes
+    /// this record. It is not the coded layout's version, which a retag
+    /// leaves behind: naming the entry's makes a retag since the attempt
+    /// read the object reject the record, so a new fragment's header never
+    /// holds older tags than the entry.
     pub version: EpochSeq,
     /// The version's ETag.
     pub etag: ETag,

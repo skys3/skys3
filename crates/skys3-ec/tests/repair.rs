@@ -15,9 +15,10 @@ use skys3_ec::fragment::FragmentHeader;
 use skys3_ec::read::ReadFuture;
 use skys3_ec::repair::RepairBug;
 use skys3_ec::{
-    Attempts, Encoded, Encoder, EncoderSettings, FragmentBytes, FragmentId, FragmentReadError,
-    FragmentRequest, FragmentSource, FragmentWriter, PlannerSource, RepairEvent, RepairMetrics,
-    RepairReport, RepairSettings, RepairStep, Repairer, TransferError, codec,
+    Attempts, CodedRead, Encoded, Encoder, EncoderSettings, FoundFragment, FragmentBytes,
+    FragmentId, FragmentLocation, FragmentReadError, FragmentRequest, FragmentSource,
+    FragmentWriter, PlannerSource, RepairEvent, RepairMetrics, RepairReport, RepairSettings,
+    RepairStep, Repairer, TransferError, codec, read_coded, rebuild_layouts,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{BlockingPool, ManualWallClock, MonotonicClock, SimDisk, SimMount};
@@ -334,10 +335,14 @@ impl Fixture {
     }
 
     /// Checks that every fragment each layout names is held by its node,
-    /// with a header of its stripe and index, and decodes to the object.
+    /// with a header of its version, stripe, and index, and decodes to the
+    /// object, and that a coded read of the whole object reads it back.
     async fn check_whole(&self) {
         for (key, stripes) in self.layouts().await {
             let data = &self.objects[&key];
+            let entry = self.shard.entry(&key).await.unwrap().unwrap();
+            let object = entry.object.unwrap();
+            let coded = object.coded.unwrap();
             for stripe in stripes {
                 let mut slots = Vec::new();
                 for (index, location) in stripe.fragments().iter().enumerate() {
@@ -346,6 +351,8 @@ impl Fixture {
                         .get(&location.node, location.fragment)
                         .unwrap_or_else(|| panic!("{key}: {location:?} is not held"));
                     assert_eq!(header.key, key);
+                    assert_eq!(header.version, coded.version);
+                    assert_eq!(header.object.etag, object.local_etag);
                     assert_eq!(usize::from(header.index), index);
                     assert_eq!(header.stripe.number, stripe.number());
                     slots.push(Some(bytes));
@@ -362,6 +369,22 @@ impl Fixture {
                     data[stripe.offset() as usize..stripe.end() as usize]
                 );
             }
+            let read = CodedRead {
+                shard: self.shard.shard().clone(),
+                key: key.clone(),
+                version: coded.version,
+                etag: object.local_etag.clone(),
+                size: object.size,
+                stripes: coded.stripes.clone(),
+                range: 0..object.size,
+            };
+            let source = Arc::clone(&self.nodes) as Arc<dyn FragmentSource>;
+            let mut body = read_coded(source, read).await.unwrap();
+            let mut read_back = Vec::new();
+            while let Some(piece) = body.recv().await {
+                read_back.extend_from_slice(&piece.unwrap());
+            }
+            assert!(read_back == *data, "{key} does not read back");
         }
     }
 
@@ -456,27 +479,65 @@ fn a_node_that_lost_its_disk_is_repaired_at_once() {
 }
 
 #[test]
-fn a_version_retagged_after_coding_is_left_be() {
+fn a_version_retagged_after_coding_is_repaired_and_reads_back() {
     runtime().block_on(async {
         let f = Fixture::coded(2, 6, EcConfig::default()).await;
-        let before = f.layouts().await;
-        // Tags change object-0's version after its EC_PUBLISH: its
-        // fragments' headers name the version before, which no check
-        // matches.
+        // Tags move object-0's entry past its coded version: its
+        // fragments' headers keep naming the version they were written
+        // for, which checks, reads, and rebuilt fragments must name too.
         let tags = Tags {
             key: "object-0".to_owned(),
             tags: BTreeMap::from([("k".to_owned(), "v".to_owned())]),
         };
         f.shard.commit(RecordBody::Tags(tags)).await.unwrap();
+        let entry = f.shard.entry("object-0").await.unwrap().unwrap();
+        let coded = entry.object.as_ref().unwrap().coded.as_ref().unwrap();
+        assert!(entry.version > coded.publish, "the retag moved the version");
+        let healthy = f.repairer(planner(6, EcConfig::default(), Vec::new()), SETTINGS);
+        let report = healthy.pass().await;
+        assert_eq!((report.lost, report.unrecoverable), (0, 0), "{report:?}");
+
         let lost = f.on(2).await;
         f.nodes.wipe(2);
         let repairer = f.repairer(planner(6, EcConfig::default(), Vec::new()), SETTINGS);
         let report = repairer.pass().await;
+        assert_eq!((report.lost, report.repaired), (lost, lost), "{report:?}");
         assert_eq!(report.unrecoverable, 0, "{report:?}");
-        assert!(report.repaired > 0 && report.repaired < lost, "{report:?}");
-        let after = f.layouts().await;
-        assert_eq!(after["object-0"], before["object-0"]);
-        assert_ne!(after["object-1"], before["object-1"]);
+        f.check_whole().await;
+        // A rebuilt fragment holds the tags the attempt read.
+        let layout = &f.layouts().await["object-0"];
+        let rebuilt = layout
+            .iter()
+            .flat_map(CodedStripe::fragments)
+            .filter_map(|location| f.nodes.get(&location.node, location.fragment))
+            .find(|(header, _)| header.attempt != coded.attempt)
+            .expect("a fragment of object-0 was rebuilt");
+        assert_eq!(rebuilt.0.object.tags["k"], "v");
+
+        // The headers alone still rebuild object-0, with the retag's tags
+        // and write identity from the repair, the latest attempt.
+        let found: Vec<FoundFragment> = f
+            .nodes
+            .fragments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|((node, fragment), (header, _))| FoundFragment {
+                location: FragmentLocation {
+                    node: node.clone(),
+                    fragment: *fragment,
+                },
+                header: header.clone(),
+            })
+            .collect();
+        let rebuilt = rebuild_layouts(found)
+            .into_iter()
+            .find(|(version, _)| version.key == "object-0")
+            .map(|(_, layout)| layout.unwrap())
+            .unwrap();
+        assert_eq!(rebuilt.version.version, coded.version);
+        assert_eq!(rebuilt.object.tags["k"], "v");
+        assert_eq!(rebuilt.object.identity, entry.version);
     });
 }
 

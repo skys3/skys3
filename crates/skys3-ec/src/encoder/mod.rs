@@ -668,7 +668,16 @@ impl Attempt<'_> {
     ) -> FragmentHeader {
         // A geometry has at most 255 fragments.
         let index = index as u8;
-        fragment_header(shard, self.key, self.entry, self.attempt, stripe, index)
+        let version = self.entry.version;
+        fragment_header(
+            shard,
+            self.key,
+            self.entry,
+            version,
+            self.attempt,
+            stripe,
+            index,
+        )
     }
 }
 
@@ -679,7 +688,11 @@ pub(crate) fn leads<D: Disk>(shard: &Shard<D>) -> bool {
 }
 
 /// The header of fragment `index` of stripe `stripe` of `key`'s version
-/// `entry`, written by `attempt` (§8.4).
+/// `entry`, written by `attempt` (§8.4). `version` is the position the
+/// header names: the entry's when it is encoded, and the coded layout's
+/// when a repair rebuilds a fragment, which a retag leaves behind the
+/// entry's. The rest is the object as `entry` holds it now, its tags and
+/// write identity included.
 ///
 /// # Panics
 ///
@@ -688,6 +701,7 @@ pub(crate) fn fragment_header(
     shard: &skys3_log::ShardRef,
     key: &str,
     entry: &Entry,
+    version: EpochSeq,
     attempt: AttemptId,
     stripe: StripeInfo,
     index: u8,
@@ -706,7 +720,7 @@ pub(crate) fn fragment_header(
     FragmentHeader {
         shard: shard.clone(),
         key: key.to_owned(),
-        version: entry.version,
+        version,
         attempt,
         stripe,
         index,

@@ -15,9 +15,10 @@
 //!    fragment the node answers it does not hold, or holds damaged, is
 //!    lost, and the node's other fragments are then all checked, as after
 //!    a lost disk. A node that has answered none of the checks for
-//!    `fragment_repair_after_seconds` has lost them all. A version
-//!    retagged after it was coded is left alone: its fragments' headers
-//!    name the version before the tags, which no check matches.
+//!    `fragment_repair_after_seconds` has lost them all. Checks, reads,
+//!    and rebuilt fragments name the version the layout's fragments were
+//!    written for (`Coded::version`) and the object's ETag, not the
+//!    entry's version, which a retag moves past it.
 //! 2. **Orders the stripes.** Stripes with more fragments lost go first,
 //!    then key and stripe order. A stripe that lost more than `m` cannot be
 //!    rebuilt and is reported.
@@ -487,7 +488,6 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                         };
                         let named = entries
                             .get(&row.key)
-                            .filter(|entry| !retagged(entry))
                             .and_then(|entry| coded_stripe(entry, row.stripe))
                             .and_then(|stripe| stripe.fragments().get(usize::from(row.index)))
                             == Some(&location);
@@ -706,6 +706,9 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         if unfenced {
             self.attempts.begin(attempt);
         }
+        // The entry's version, not the layout's: a retag since this attempt
+        // read the entry rejects the record, and the next pass rebuilds the
+        // fragments with the new tags.
         let body = skys3_log::RecordBody::EcRelocate(EcRelocate {
             key: key.to_owned(),
             version: entry.version,
@@ -765,6 +768,9 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         let key = damaged.key.as_str();
         let stripe = coded_stripe(entry, damaged.stripe)
             .ok_or(RepairError::Unreadable { read: 0, needed: 1 })?;
+        // The rebuilt fragments name the version the others were written
+        // for, which a retag leaves behind the entry's.
+        let version = coded_version(entry).ok_or(RepairError::Unreadable { read: 0, needed: 1 })?;
         let geometry = stripe.geometry();
         let codec = codec(stripe.codec())?;
         let len = codec.fragment_len(geometry, stripe.data_len())?;
@@ -853,7 +859,15 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             );
             let mut writes = JoinSet::new();
             for (index, node) in placed {
-                let header = fragment_header(self.shard.shard(), key, entry, attempt, info, index);
+                let header = fragment_header(
+                    self.shard.shard(),
+                    key,
+                    entry,
+                    version,
+                    attempt,
+                    info,
+                    index,
+                );
                 let data = Bytes::from(std::mem::take(&mut fragments[usize::from(index)]));
                 let writer = Arc::clone(&self.writer);
                 let bandwidth = self.throttle().cloned();
@@ -1031,17 +1045,11 @@ async fn check_node(
     outcome
 }
 
-/// Whether `entry`'s version was retagged after it was coded: a `TAGS`
-/// record moves the entry's version and keeps the layout, while the
-/// fragments' headers name the version they were written for, which the
-/// entry no longer records. No check or read can match them, so repair
-/// leaves them be rather than count every one lost (§8.6).
-fn retagged(entry: &Entry) -> bool {
-    entry
-        .object
-        .as_ref()
-        .and_then(|object| object.coded.as_ref())
-        .is_some_and(|coded| entry.version > coded.publish)
+/// The version `entry`'s coded layout's fragments were written for, if it
+/// has a coded layout.
+fn coded_version(entry: &Entry) -> Option<EpochSeq> {
+    let coded = entry.object.as_ref()?.coded.as_ref()?;
+    Some(coded.version)
 }
 
 /// Stripe `stripe` of `entry`'s coded layout, if it has one.

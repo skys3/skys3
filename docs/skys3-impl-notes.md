@@ -7069,15 +7069,33 @@ of this file. A task with nothing unexpected keeps "None."
   ones toward each failure domain's cap and avoiding their nodes, so a
   repaired stripe obeys the same rules as a new one (a proptest over
   random topologies checks both rules).
-- **A retagged coded version cannot be checked.** `TAGS` moves the
-  entry's version and keeps the layout, but fragment headers name the
-  version they were written for. Every check of such a version's
-  fragments reads as missing, so the repairer would count them all lost
-  and report the stripes unrecoverable at every pass. It now skips a
-  version whose position is after its `EC_PUBLISH`
-  (`a_version_retagged_after_coding_is_left_be`). Coded reads (M5-06)
-  have the same gap, which needs the layout to record the coded
-  version: an index format change, left open in §8.6.
+- **Retagged coded versions.** `TAGS` moves the entry's version and
+  keeps the layout, while fragment headers keep the version they were
+  written for, so checks named by the entry's version read every fragment
+  as missing. The first version skipped such versions; once #83 recorded
+  `Coded::version` and #87 read fragments by it and the ETag, repair
+  does the same: checks, the reads that rebuild a stripe, and the
+  rebuilt headers (`fragment_header` now takes the version) name the
+  layout's version and the ETag. The test
+  `a_version_retagged_after_coding_is_repaired_and_reads_back` and the
+  scenario `a_lost_holder_is_repaired_while_reads_go_on`, which retags
+  three of four objects before the loss, fail if any of the three names
+  the entry's version, or if the skip comes back.
+- **`EC_RELOCATE` keeps naming the entry's version.** The record could
+  have named the layout's version, which no retag changes, but then a
+  relocation would commit across a retag, with rebuilt headers holding
+  the tags and write identity from before it. Naming the entry's version
+  (its latest committing record, a `TAGS` included) makes a retag since
+  the read reject the relocation; the next pass rebuilds under the new
+  tags (`a_relocation_names_the_entry_s_version_which_a_retag_moves`).
+- **Re-indexing had to accept a retag's write identity.** A retag makes
+  the `TAGS` record the write identity and drops an inherited one and
+  the identity metadata carried from another cluster, so a fragment
+  rebuilt after a retag disagreed with the others on the version's
+  fixed metadata, and `rebuild_layouts` refused the whole object.
+  Like the tags, the write identity and that metadata entry now come
+  from the latest attempt (`later_attempts_win_where_copies_overlap`;
+  the repair test rebuilds the retagged object from its headers).
 - **A new disk repeats fragment IDs.** IDs are disk, segment, and
   offset, so a node restarting on an empty disk hands out IDs its old
   disk used. At 256 seeds the harness reported layouts naming fragments

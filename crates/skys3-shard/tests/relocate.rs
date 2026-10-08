@@ -253,3 +253,27 @@ fn fragments_of_a_stripe_may_trade_nodes() {
     assert_eq!(stripe.fragments()[1], location(1, 201));
     assert_eq!(on(&index, 1), [("k".into(), 0, 1, 201)]);
 }
+
+#[test]
+fn a_relocation_names_the_entry_s_version_which_a_retag_moves() {
+    let (_, index) = new_index();
+    step(&index, 1, put("k", 20, 1));
+    step(&index, 2, publish("k", 1));
+    step(&index, 3, tags("k", "v"));
+    let one = || vec![moved(0, 0, location(1, 0), location(9, 9))];
+    // The coded version's position no longer names the entry: a repair
+    // that read the entry before the retag is fenced out.
+    assert_eq!(
+        step(&index, 4, relocate("k", 1, one())),
+        Outcome::Rejected(Rejection::Superseded)
+    );
+    // The retag's position, with the version's ETag, does.
+    let RecordBody::EcRelocate(mut retagged) = relocate("k", 3, one()) else {
+        unreachable!()
+    };
+    retagged.etag = etag(1);
+    assert_eq!(step(&index, 5, RecordBody::EcRelocate(retagged)), RELOCATED);
+    let coded = entry(&index, "k").unwrap().object.unwrap().coded.unwrap();
+    assert_eq!((coded.version, coded.publish), (at(1), at(2)));
+    assert_eq!(coded.stripes[0].fragments()[0], location(9, 9));
+}
