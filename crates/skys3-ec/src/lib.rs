@@ -50,7 +50,7 @@
 //!   `k` fragments of a stripe that lost one, missing or corrupt, through
 //!   a [`FragmentSource`] ([`FragmentReadClient`] over the cluster
 //!   transport, served by [`FragmentServer::serve_reads`]).
-//! - **Re-indexing** ([`reindex`]): a lost shard's coded objects
+//! - **Re-indexing** ([`mod@reindex`]): a lost shard's coded objects
 //!   restored from its latest index snapshot and the fragment headers its
 //!   surviving nodes hold ([`HeaderSource`]), the restore drill's core
 //!   (§6.9, §8.9).
