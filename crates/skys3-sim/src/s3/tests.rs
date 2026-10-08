@@ -1872,3 +1872,107 @@ async fn requests_beyond_the_rate_limit_slow_down_and_are_not_applied() {
             .unwrap();
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_link_loses_its_sources_requests_and_answers() {
+    let store = store();
+    store.set_faults(SimS3Faults {
+        min_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        ..SimS3Faults::NONE
+    });
+    let node = store.from_source("node-1");
+    let other = store.from_source("node-2");
+    store.set_source_down("node-1", true);
+    let lost = node.put_object(PutObject::new("a", "1")).await;
+    assert_eq!(kind(lost), S3ErrorKind::Timeout);
+    assert_eq!(body(&store, "a"), None, "a request sent while down is lost");
+    // Another source, and a handle without one, still reach the store.
+    other.put_object(PutObject::new("b", "1")).await.unwrap();
+    store.put_object(PutObject::new("c", "1")).await.unwrap();
+
+    // A link that drops while a request is in progress loses its answer,
+    // though the store applied it: the store applies the request at 10 ms,
+    // and the link drops and comes back before the answer at 20 ms.
+    store.set_source_down("node-1", false);
+    let flap = async {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        store.set_source_down("node-1", true);
+        store.set_source_down("node-1", false);
+    };
+    let (written, ()) = tokio::join!(node.put_object(PutObject::new("a", "2")), flap);
+    assert_eq!(kind(written), S3ErrorKind::Timeout);
+    assert_eq!(body(&store, "a").as_deref(), Some(&b"2"[..]));
+    assert_eq!(store.unanswered(Operation::PutObject), 1);
+    assert_eq!(store.stats().cut_off, 2);
+    node.put_object(PutObject::new("a", "3")).await.unwrap();
+
+    // Credentials and sources combine, whichever comes first.
+    store.deny("reader", "a", true);
+    let reader = node.with_credentials("reader");
+    let denied = reader.get_object(GetObject::new("a")).await;
+    assert_eq!(denied.unwrap_err().status(), Some(403));
+    store.set_source_down("node-1", true);
+    let reader = store.with_credentials("reader").from_source("node-1");
+    assert_eq!(
+        kind(reader.get_object(GetObject::new("b")).await),
+        S3ErrorKind::Timeout
+    );
+}
+
+#[tokio::test]
+async fn observers_see_every_request_applied_and_the_key_it_left() {
+    let store = store();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    store.observe(Some(Arc::new(move |applied: &Applied<'_>| {
+        let current = applied
+            .current
+            .map(|object| String::from_utf8_lossy(&object.body).into_owned());
+        log.lock().unwrap().push(format!(
+            "{:?} {:?} {:?} {current:?}",
+            applied.operation, applied.source, applied.key
+        ));
+    })));
+    let node = store.from_source("node-1");
+    node.put_object(PutObject::new("a", "one")).await.unwrap();
+    let id = node
+        .create_multipart_upload(CreateMultipartUpload::new("b"))
+        .await
+        .unwrap();
+    let part = node
+        .upload_part(UploadPart::new("b", id.clone(), 1, "part"))
+        .await
+        .unwrap();
+    // A refused request is not seen.
+    let refused = PutObject::new("a", "two").with_precondition(WritePrecondition::IfAbsent);
+    assert_eq!(
+        kind(node.put_object(refused).await),
+        S3ErrorKind::PreconditionFailed
+    );
+    // One whose answer is lost is.
+    store.inject(Operation::CompleteMultipartUpload, Fault::LostResponse);
+    let complete = CompleteMultipartUpload {
+        key: "b".to_owned(),
+        upload_id: id,
+        parts: vec![CompletedPart {
+            part_number: 1,
+            etag: part,
+        }],
+        precondition: WritePrecondition::None,
+    };
+    assert!(store.complete_multipart_upload(complete).await.is_err());
+    store.delete_object(DeleteObject::new("a")).await.unwrap();
+    store.observe(None);
+    store.put_object(PutObject::new("c", "unseen")).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            "PutObject Some(\"node-1\") Some(\"a\") Some(\"one\")",
+            "CreateMultipartUpload Some(\"node-1\") None None",
+            "UploadPart Some(\"node-1\") None None",
+            "CompleteMultipartUpload None Some(\"b\") Some(\"part\")",
+            "DeleteObject None Some(\"a\") None",
+        ]
+    );
+}
