@@ -522,20 +522,37 @@ remote. Coded objects survive in their fragments (design section 6.9).
 
 1. Confirm the loss: the members' disks cannot be brought back. A node
    whose disks return is not lost; start it.
-2. What was lost: the latest index snapshot of the shard, under
-   `<prefix>.skys3-snapshots/` in the bucket's snapshot target, gives the
-   keys whose data only the members held, and the window after it in which
-   other keys may have been lost (design section 8.9). The lost-key report
-   and the restore drill that build this exist as library functions
+2. Whether the bucket has snapshots: only a bucket with a snapshot target
+   writes them. That is its `[buckets.<name>] snapshot_target`, or, for a
+   `local` bucket, its `backup_target` by default. A `write_back` bucket
+   whose table names no `snapshot_target`, and a `local` bucket with
+   neither key, write none (design section 8.9).
+3. With a snapshot: the latest index snapshot of the shard, under
+   `<prefix>.skys3-snapshots/<bucket ID>/<shard>/` in the snapshot target,
+   gives the keys whose data only the members held, and the window after it
+   in which other keys may have been lost. The lost-key report and the
+   restore drill that build this exist as library functions
    (`skys3_flush::snapshot::{latest, lost_keys, drill}`) without a command
    (section 8). Listing the snapshot prefix with the target's own tools
    shows the snapshot's time, which starts the window.
+4. Without a snapshot there is no list of keys and no start of the window
+   from SkyS3:
+   - a `write_back` bucket lost what was dirty. The last scraped
+     `skys3_oldest_dirty_age_seconds` and `skys3_dirty_bytes` of the
+     shard's primary before the loss bound it: keys written in that window
+     before the loss. Comparing a listing of the remote target with the
+     writers' own records of that window finds the keys;
+   - a `local` bucket without a backup lost every replicated object of the
+     shard, whenever written. Only the writers' records name them. Its
+     coded objects' fragments survive, and re-indexing them is the restore
+     drill.
 
 **Remediation.** Tell the bucket's owners which keys, or which window, were
 lost. For a `write_back` bucket, the cluster serves what the remote holds
 once the shard has members again. For a `local` bucket, the restore drill
 re-indexes coded objects from their fragment headers; it has no command
-yet.
+yet. Give the bucket a `snapshot_target` (and a `local` bucket a
+`backup_target`) so that a later loss can be reported.
 
 **Verification.** The shard serves again, and the lost keys are accounted
 for.
@@ -930,23 +947,51 @@ metrics and `etcdctl endpoint status` show fewer than a majority of voters.
 majority is lost. etcd cannot recover a lost majority by itself.
 
 **Diagnosis.** With etcd's tools: which members are lost for good, and
-whether a member with the latest data survives.
+whether the members that are lost come back with their data intact.
 
-**Remediation.** Recover etcd with its own disaster recovery: restore a
-snapshot, or force a new cluster from a surviving member, following the
-etcd documentation for its version. Then check the result before the nodes
-use it: `cluster.json` under the cluster's prefix must hold a generation at
-least the nodes' copies' (`GET /v1/health` `control_store.generation`). A
-store behind the copies is refused by the nodes as reset: rebuild it from
-the nodes' copies instead ([Control store loss](#control-store-loss)),
-into an empty prefix.
+**Remediation.** It depends on whether etcd can come back without losing a
+write.
 
-**Verification.** As for [Control store unreachable](#control-store-unreachable).
+- **Every write kept.** The lost members return with their data (an outage,
+  not a loss), and etcd regains its majority. Nothing more: the nodes
+  follow the store again as after any
+  [unreachable control store](#control-store-unreachable).
+- **Any write possibly lost.** Recovering etcd from a snapshot, or forcing
+  a new cluster from a surviving member, can lose writes the lost majority
+  held. Treat that as a [control store loss](#control-store-loss), and
+  rebuild from the nodes' exports:
+  1. Stop every node before the recovered etcd answers them. A node that
+     runs from its copy retries the store every
+     `config_poll_interval_seconds`, and follows any store whose generation
+     is not below its copy's.
+  2. Recover etcd with its own disaster recovery, following the etcd
+     documentation for its version.
+  3. Rebuild into an empty prefix: export every node, and plan and write
+     the rebuild as in [Control store loss](#control-store-loss), with the
+     cluster's prefix cleared of what the recovery restored (the rebuild
+     refuses a store that holds registers). This build's `skys3 control
+     rebuild` plans for any backend but writes only the file control store
+     (section 8).
+  4. Start the nodes.
 
-**Do not.** Do not restore an etcd snapshot older than the nodes' copies
-and point the nodes at it: they refuse it, and a shard register older than
-a configuration a node acted on must never be followed. The node binary
-does not run the etcd backend yet.
+  Do not decide by comparing generations. A restored `cluster.json` at the
+  same generation as the nodes' copies (`GET /v1/health`
+  `control_store.generation`) does not prove that nothing was lost: a
+  bucket or identity register is written before the increment that
+  announces it, and nodes also sync on a timer, so a copy can hold a write
+  that a snapshot taken at the same generation lacks. A node refuses only a
+  store whose generation is below its copy's; at an equal generation it
+  takes the restored registers, dropping the newer bucket and identity
+  registers it held, and a shard register older than a configuration a
+  replica acted on would let membership changes reuse that epoch (section
+  8).
+
+**Verification.** As for [Control store unreachable](#control-store-unreachable),
+or for [Control store loss](#control-store-loss) after a rebuild.
+
+**Do not.** Do not let the nodes reach a restored etcd before deciding.
+Do not trust a restored store because its generation matches the nodes'.
+The node binary does not run the etcd backend yet.
 
 ## 7. Drills
 
@@ -1012,5 +1057,18 @@ meets today, not a plan of this document.
   the S3 or etcd backend in the binary adds one.
 - **Gateway request metrics.** Failover and refused writes show to clients
   as `503` answers that no metric counts.
+- **A control store rolled back to the same generation.** A node detects a
+  store rolled back only by a generation below its copy's
+  (`ControlCopy::fetch_since` in `crates/skys3/src/control.rs`, design
+  section 6.2). A store restored to a state at the copy's generation, but
+  lacking writes the copy listed, is followed: the node replaces its copy
+  with the restored registers, losing newer buckets and roles, or bringing
+  back deleted ones. A shard register older than the newest configuration
+  a replica acted on is not followed by that replica, but a membership
+  change written over it could take an epoch the replica already used.
+  Register versions could tell (etcd's are ordered), but versions of other
+  backends are not ordered, and nothing compares them now. Until then the
+  [etcd majority loss](#etcd-majority-loss) runbook rebuilds after any
+  recovery that may have lost a write.
 - **etcd in the binary**, and a multi-member etcd harness to drill majority
   loss.
