@@ -7,6 +7,8 @@
 
 mod support;
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -25,6 +27,7 @@ use skys3_sim::SimS3;
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
 use skys3_types::RemoteTarget;
 use support::{Patience, cluster, settings};
+use tokio::sync::oneshot;
 
 /// The remote prefix of the bucket `photos`.
 const PREFIX: &str = "team/";
@@ -123,7 +126,41 @@ impl World {
         headers: &[(&str, &str)],
         body: impl Into<Bytes>,
     ) -> (u16, String) {
-        call(&self.gateway, method, uri, headers, body.into()).await
+        let body = s3s::Body::from(body.into());
+        call(&self.gateway, method, uri, headers, body).await
+    }
+
+    /// PUTs `body` at `key` of `photos` as a client that sends its first
+    /// `first` bytes, then waits until the remote's multipart upload of the
+    /// key is open before it sends the rest, so that the body streams.
+    ///
+    /// Otherwise the `PUT` may commit before the flusher's open of the
+    /// remote upload starts, as on a busy runner, and the body is then
+    /// rightly sent as one `PutObject` under the same write identity.
+    async fn put_streamed(&self, key: &str, body: &str, first: usize) -> (u16, String) {
+        let (gate, opened) = oneshot::channel();
+        let gated = Gated {
+            first: Some(Bytes::copy_from_slice(&body.as_bytes()[..first])),
+            opened: Some(opened),
+            rest: Some(Bytes::copy_from_slice(&body.as_bytes()[first..])),
+        };
+        let uri = format!("/photos/{key}");
+        let put = call(
+            &self.gateway,
+            Method::PUT,
+            &uri,
+            &[],
+            s3s::Body::http_body(gated),
+        );
+        let remote = format!("{PREFIX}{key}");
+        let open = async {
+            self.until("the remote upload of the body is open", |w| {
+                w.store.uploads().iter().any(|(_, key)| *key == remote)
+            })
+            .await;
+            let _ = gate.send(());
+        };
+        tokio::join!(put, open).0
     }
 
     /// The bytes the remote holds at `key`.
@@ -155,18 +192,51 @@ async fn call(
     method: Method,
     uri: &str,
     headers: &[(&str, &str)],
-    body: Bytes,
+    body: s3s::Body,
 ) -> (u16, String) {
     let mut request = Request::builder().method(method).uri(uri);
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    let request = request.body(s3s::Body::from(body)).unwrap();
+    let request = request.body(body).unwrap();
     let response = gateway.handle(request).await;
     let status = response.status().as_u16();
     let mut body = response.into_body();
     let body = body.store_all_limited(64 << 20).await.unwrap();
     (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A request body that sends `first`, then waits until `opened` fires or
+/// is dropped before it sends `rest`.
+struct Gated {
+    first: Option<Bytes>,
+    opened: Option<oneshot::Receiver<()>>,
+    rest: Option<Bytes>,
+}
+
+impl http_body::Body for Gated {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, std::io::Error>>> {
+        if let Some(first) = self.first.take() {
+            return Poll::Ready(Some(Ok(http_body::Frame::data(first))));
+        }
+        if let Some(opened) = &mut self.opened {
+            if Pin::new(opened).poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.opened = None;
+        }
+        Poll::Ready(
+            self.rest
+                .take()
+                .map(|rest| Ok(http_body::Frame::data(rest))),
+        )
+    }
 }
 
 /// A store like AWS S3 whose every request takes 5 to 20 ms each way, so
@@ -227,9 +297,7 @@ fn every_write_is_answered_once_the_remote_holds_it() {
         let large: String = (0..3000)
             .map(|i| char::from(b'a' + (i % 26) as u8))
             .collect();
-        let (status, _) = world
-            .call(Method::PUT, "/photos/large", &[], large.clone())
-            .await;
+        let (status, _) = world.put_streamed("large", &large, 1536).await;
         assert_eq!(status, 200);
         assert_eq!(world.remote("large").as_deref(), Some(large.as_bytes()));
         // Streamed in 512-byte parts: a multipart ETag at the remote.
@@ -368,7 +436,14 @@ fn a_write_waits_through_a_flusher_restart() {
         world.store.set_faults(SimS3Faults::OUTAGE);
         let gateway = world.gateway.clone();
         let put = tokio::spawn(async move {
-            call(&gateway, Method::PUT, "/photos/k", &[], Bytes::from("v1")).await
+            call(
+                &gateway,
+                Method::PUT,
+                "/photos/k",
+                &[],
+                s3s::Body::from(Bytes::from("v1")),
+            )
+            .await
         });
         // The write is committed, and waits for the remote.
         world
