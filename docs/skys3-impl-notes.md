@@ -5298,6 +5298,81 @@ of this file. A task with nothing unexpected keeps "None."
   group commit per cap. A destination configured with a smaller cap
   splits default-size batches.
 
+### M6-06 Source-side flusher integration
+
+- **The transport sits behind a link trait.** `skys3-flush` gains
+  `PeerLink`, which opens a stream of messages, and `PeerTransport`,
+  which `FlushService::with_peer_transport` takes. `ShardLease` (M6-02)
+  implements `PeerLink`; the tests use channels, and the cluster
+  simulation uses TCP over turmoil, since Quinn under turmoil waits for
+  M6-08. `skys3-peer` gains `Inbound` and `Outbound`, so that
+  `StagingService::serve` runs over any stream, and
+  `StreamError::Transport` for those streams' errors. The node binary
+  passes no transport yet, and the destination side is not wired in
+  either, so a `native` target falls back to S3 REST with a warning
+  until M6-07. Recorded in §7.8 ("Source side, as built").
+- **Nothing new is persisted.** M4-04 persists `MPU_FLUSH_OPEN` so that a
+  new primary finds the remote upload. A peer upload needs nothing like
+  it: staging is keyed by the write identity, which the log holds, and
+  the bytes of an identity never change, so every version is staged as
+  piece 0. A flusher after a restart or a takeover sends `BEGIN` and
+  resumes from the `RESUME`. What is never committed expires after
+  `peer_staging_ttl_seconds`.
+- **`FLUSHED` keeps the destination's identity as the remote version ID.**
+  The next version of the key is conditioned on it. An S3 fill would
+  send it as a `versionId`, so `fill.rs` now ignores a remote version ID
+  that parses as a write identity. A key whose identity the entry does
+  not know, such as an imported one, is committed on absence first, and
+  its identity is learned from the failed precondition.
+- **Multipart objects go as one piece.** The destination answers a
+  multipart `COMMIT` `unavailable` (M6-04), so the flusher stages a
+  multipart object at flush time as one piece that keeps its multipart
+  ETag. Part boundaries are lost, and objects over 5 GiB
+  (`MAX_PIECE_BYTES`) cannot be sent. That stays open until the
+  destination publishes multipart commits.
+- **Batches fill only under load (found in testing).** The first
+  in-memory test expected six small objects to share batches. With 4
+  batches in flight and a flush concurrency of 4, each object went in a
+  batch of its own. That is the intended behavior: an item waits only
+  while 4 batches are unanswered, so an idle target adds no delay. The
+  test now checks that small objects never open a staging stream.
+- **The cluster simulation has a peer.** `ClusterConfig::peer` adds a
+  destination cluster of one node. It recovers its shards from a
+  simulated disk in each life, and serves the real `StagingService` and
+  `PeerCommits` over TCP, one connection per stream, 20 ms from every
+  node. The `write_back` buckets and the backups flush to it.
+  `Endpoint::Peer` and `Fault::PeerRestart` cut, hold, and restart it,
+  on top of the usual crashes and takeovers. The audits:
+  - every `FLUSHED` a flusher decides on, which a new test hook
+    (`observe_flushed`) reports before it commits, names an identity the
+    peer answered `committed` or named as current;
+  - each write-through acknowledgement finds the write in the peer's
+    index, or in what the peer last held while it is down;
+  - at the end, after a power loss of the peer too, it holds what every
+    member holds, and no write identity is in two of its `PUT` records.
+- **The seeded bugs need distance (found in testing).**
+  `PeerBug::FlushedOnCommit` records `FLUSHED` once the `COMMIT` is sent,
+  and `PeerBug::AnsweredOnCommit` answers write-through waits then. The
+  second bug is caught only if the client's answer arrives before the
+  `COMMIT` is applied. The peer's 20 ms link guarantees that. Both bugs
+  were caught at every one of 32 seeds.
+- **The replicated backup scenarios do not replay exactly (found in
+  testing).** A replay test of the peer scenario failed with no peer
+  configured. The same test on the base branch failed the same way: its
+  backup scenario, with replicated shards, takeovers, and write-through
+  acknowledgements, also differs between two runs of one seed. The cause
+  was not traced; it is left open. The peer's replay test therefore runs
+  with one member per shard, and replays exactly at 16 seeds.
+- **Run times at 256 seeds.** `peer::every_committed_change_reaches_the_peer_under_faults`
+  takes 23.1 s, `peer::write_through_writes_are_acknowledged_once_the_peer_applied_them`
+  28.8 s, `peer::a_seed_with_a_peer_replays_exactly` 4.6 s, and the two
+  seeded-bug scenarios about 2 s each, which is about 61 s in all. All
+  but the replay test use `Runner::with_cost(_, COST)`; the replay test,
+  which runs each seed twice, uses twice the cost.
+- **No new fuzz target.** The simulation's TCP framing reads frames with
+  `parse_prefix` and `Message::decode_parts`, which M6-01's
+  `peer_messages` target already fuzzes.
+
 ## M4 Large objects
 
 ### M4-01 Write identity for streamed single PUTs
