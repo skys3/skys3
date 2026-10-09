@@ -5,7 +5,7 @@
 //!
 //! Each scenario runs three replicated nodes with takeovers, clients that
 //! send each request to any node, and a destination of one node that the
-//! nodes reach over TCP, one connection per stream. Faults cut the links
+//! nodes reach over QUIC on the simulated network. Faults cut the links
 //! between the nodes and the destination, hold them, lose messages, crash
 //! source nodes so that new primaries take over their flushes, and
 //! restart the destination, with and without power loss. The audits
