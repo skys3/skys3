@@ -5672,14 +5672,15 @@ of this file. A task with nothing unexpected keeps "None."
   sources did, so that each scenario can show its faults happened.
 - **Scenarios.** `peer_protocol` runs three replicated nodes with
   takeovers, under the M6-06 cluster faults plus:
-  - `lost_messages_are_retried_and_each_write_applies_once`: loses 4 %
-    of messages either way, for staged objects and batches.
+  - `lost_messages_are_retried_and_each_write_applies_once`: loses 5 %
+    of messages either way, for staged objects and batches, over 20
+    keys.
   - `reconnects_mid_transfer_resend_only_what_is_not_durable`: drops 6 %
-    of connections mid-transfer, and checks that `RESUME`s reported
-    durable bytes that were not resent.
+    of connections mid-transfer, with 128-byte frames, and checks that
+    `RESUME`s reported durable bytes that were not resent.
   - `duplicate_commits_apply_once_and_are_answered_alike`: replays after
-    lost `APPLIED`s, and deposes a `COMMIT`'s sender while the `COMMIT`
-    waits, so that its successor sends it too.
+    lost `APPLIED`s (4 % loss), and deposes a `COMMIT`'s sender while
+    the `COMMIT` waits, so that its successor sends it too.
   - `staging_that_expires_before_its_commit_is_staged_again`: a 400 ms
     TTL, late `COMMIT`s, and held senders.
   - `commits_that_arrive_past_their_window_are_refused`: a 1.5 s commit
@@ -5740,31 +5741,54 @@ of this file. A task with nothing unexpected keeps "None."
   `PeerCommits` checks the apply-by time before it looks for the stored
   result, and §7.8 makes every such refusal `unavailable` for the source
   to retry. That is correct, so the audit now accepts `unavailable` too.
+- **Merging M6-07's QUIC start wait.** M6-07 then required an apply-by
+  time on every `COMMIT`, and made each shard flusher that starts on
+  QUIC wait the quarantine before its first `COMMIT`.
+  - `PeerBug::NoApplyBy` became `PeerBug::NoCommitWindow`.
+  - With the default 8 s commit window and 2 s answer timeout, the wait
+    is 12 s. The peer protocol scenarios then flushed only about a dozen
+    `COMMIT`s per run, mostly after the cluster faults, and on some seeds
+    no protocol fault struck. Their peer now has a 3 s commit window and
+    a 1 s answer timeout, so the wait is 5 s. The duplicate scenario
+    keeps 8 s, because its `COMMIT` held for 6 s must still apply. The
+    loss and drop rates grew, and so did the traffic: 20 keys for lost
+    messages, and 128-byte frames for reconnects and for
+    `PeerBug::ResendDurable`.
+  - The main discovery scenario failed on seed 2: it wrote nothing over
+    S3. Over QUIC, a held connection fails only at its idle timeout, and
+    a flusher then waits the quarantine on S3 REST. Its UDP blocks now
+    last 11 to 14 s instead of 8 to 12 s, and it passes seeds 0 to 15.
+    Both of M6-07's quarantine bugs are still caught on seeds 0 to 11.
 - **Seeds and run times at 256 seeds.** Every new scenario uses
   `Runner::with_cost`. With `SKYS3_SIM_SEEDS=256`, one at `COST` runs
-  seeds 0 to 7, and the replay test, at twice that, runs seeds 0 to 3,
-  each twice. On toolchain 1.98.1, after the apply-by merge:
-  - `lost_messages_are_retried_and_each_write_applies_once` 29.6 s,
-    `reconnects_mid_transfer_resend_only_what_is_not_durable` 30.2 s,
-    `duplicate_commits_apply_once_and_are_answered_alike` 30.8 s,
-    `staging_that_expires_before_its_commit_is_staged_again` 31.0 s, and
-    `commits_that_arrive_past_their_window_are_refused` 27.3 s.
-  - `a_seed_with_protocol_faults_replays_exactly` 7.0 s.
-  - The seeded-bug scenarios: `the_audit_catches_durable_ranges_sent_again`
-    6.6 s, `the_audit_catches_expired_staging_taken_for_a_commit` 9.2 s,
-    and `the_audit_catches_commits_applied_past_their_window` 13.4 s.
-  - That is 185.1 s for M6-08, a little over the 3 minutes planned.
-  - Over QUIC, the M6-06 scenarios take 72.6 s (28.5, 32.4, 6.3, 2.5,
-    and 2.9 s), against 62.1 s over TCP. The M6-07 scenarios take
-    113.2 s (49.4, 20.1, 28.8, 2.4, and 12.5 s), against 123.4 s.
-  - Beyond CI's seeds, every scenario and seeded bug passed seeds 100 to
-    115, and the overdue scenario and its bug passed seeds 0 to 15 too.
-    `PeerBug::NoQuarantine` was caught on seeds 0 to 11 after the merge.
-    With the bug taken out, its scenario and `PeerBug::NoCommitWindow`'s
-    passed seeds 0 to 7, so the correct cluster passes the same faults.
-  - Typical counts at a seed: 3 to 18 connections dropped, with 2 to 11
-    `RESUME`s that reported up to about 10 KB durable; 15 to 30
-    messages lost, with 3 to 11 `COMMIT`s answered `incomplete`.
+  seeds 0 to 7, and one at twice that runs seeds 0 to 3; the replay
+  test runs each of its seeds twice. On toolchain 1.98.1, after the
+  start-wait merge:
+  - At `COST`: `lost_messages_are_retried_and_each_write_applies_once`
+    31.5 s, `reconnects_mid_transfer_resend_only_what_is_not_durable`
+    26.0 s, `duplicate_commits_apply_once_and_are_answered_alike`
+    42.9 s, `staging_that_expires_before_its_commit_is_staged_again`
+    30.1 s, and `commits_that_arrive_past_their_window_are_refused`
+    31.9 s.
+  - At twice `COST`: `a_seed_with_protocol_faults_replays_exactly`
+    9.3 s, and the seeded-bug scenarios
+    `the_audit_catches_durable_ranges_sent_again` 10.2 s,
+    `the_audit_catches_expired_staging_taken_for_a_commit` 11.9 s, and
+    `the_audit_catches_commits_applied_past_their_window` 11.5 s. The
+    start wait delays each bug's first chance to show, so these went to
+    twice `COST`, as M6-07's bug scenarios are.
+  - That is 205.3 s for M6-08, over the 3 minutes planned. Before the
+    start wait it was 185.1 s.
+  - The M6-06 scenarios now take 122.1 s (29.0, 12.1, 35.2, 22.7, and
+    23.1 s): the start wait slows their seeded bugs too. Over TCP before
+    the wait they took 62.1 s. The M6-07 scenarios take 178.6 s (44.9,
+    19.4, 30.0, 14.4, 33.4, and 36.5 s).
+  - Beyond CI's seeds, after the start-wait merge, every M6-08 scenario
+    and seeded bug passed seeds 0 to 15 and 100 to 115. Before it, with
+    each bug taken out, the scenarios of `PeerBug::NoQuarantine` and
+    `PeerBug::NoCommitWindow` passed seeds 0 to 7, so the correct cluster
+    passes the same faults.
+  - The 256-seed `harness` run passes too.
 - **No new fuzz target.** The simulation adds no parser. Frames travel
   through `skys3-peer`'s own wire code, which `peer_messages` already
   fuzzes.

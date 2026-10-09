@@ -372,7 +372,7 @@ fn a_seed_with_protocol_faults_replays_exactly() {
 /// a streamed body or a dropped connection left some.
 #[test]
 fn the_audit_catches_durable_ranges_sent_again() {
-    Runner::with_cost(2, COST).run(|context| {
+    Runner::with_cost(2, 2 * COST).run(|context| {
         let faults = ProtocolFaults {
             drop_per_mille: 100,
             ..ProtocolFaults::default()
@@ -402,7 +402,7 @@ fn the_audit_catches_durable_ranges_sent_again() {
 /// audit of each `FLUSHED` finds the destination never applied.
 #[test]
 fn the_audit_catches_expired_staging_taken_for_a_commit() {
-    Runner::with_cost(2, COST).run(|context| {
+    Runner::with_cost(2, 2 * COST).run(|context| {
         let config = config(expiring(PeerBug::ExpiredAsCommitted));
         let workload = workload(context, 30);
         let run =
@@ -425,7 +425,7 @@ fn the_audit_catches_expired_staging_taken_for_a_commit() {
 /// answered `committed`.
 #[test]
 fn the_audit_catches_commits_applied_past_their_window() {
-    Runner::with_cost(2, COST).run(|context| {
+    Runner::with_cost(2, 2 * COST).run(|context| {
         let config = config(overdue(PeerBug::NoCommitWindow));
         let workload = workload(context, 20);
         let run =
