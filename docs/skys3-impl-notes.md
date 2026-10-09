@@ -8389,3 +8389,64 @@ of this file. A task with nothing unexpected keeps "None."
   in order, that every runbook has its parts and a drill row, that every
   drill names a test function that exists, and that every metric the
   runbooks name is in the metrics reference.
+
+### M7-08 Security review
+
+- **The review is a document.** `docs/skys3-security-review.md` has one
+  row per claim of design section 12 and per item of the plan entry, the
+  internal paths with how each authenticates, 0-RTT on every QUIC and TLS
+  endpoint, secrets, input bounds, the dependency audit, and the tracked
+  findings, written for the issues the orchestrator opens.
+- **Most internal paths are not in the binary yet.** Replication,
+  routing, the coordinator, and fragment transfer run over `skys3-net`'s
+  mutual TLS in the libraries and the simulation, but the node binary
+  binds no intra-cluster listener, and it refuses the S3 and etcd control
+  stores. Those rows are "not applicable yet", judged on the library code
+  and its tests. Only the peer QUIC endpoint, the peer S3 fallback, the
+  file control store, the gateway, and the admin listener run in the
+  binary.
+- **The admin token's equality was not constant-time.** `AdminToken`
+  derived `PartialEq`, so `==` compared the token byte by byte, and its
+  own `matches` was a hand-written fold that the optimizer may shorten.
+  Both now call `aws-lc-rs`'s `verify_slices_are_equal`, as SigV4 and STS
+  do, so `skys3-obs` gains `aws-lc-rs` (already in every node build) and
+  `zeroize`, and the token and its file buffer are zeroed on drop.
+- **The control-prefix overlap check missed other AWS regions.** It ran
+  only when the target's failure scope equalled the control store's, but
+  AWS bucket names are global: the control bucket named through another
+  region's endpoint, or the global one, passed, and that target's
+  credential would reach the registers. The overlap check now treats every
+  AWS endpoint as one bucket namespace (`bucket_namespace`), while the
+  correlation check still compares regions. Recorded in design §6.1.
+- **"Reads at most 64 KiB" was not enforced.** The descriptor fetch asks
+  for a range, but `AwsS3::get_object` buffered whatever body came back,
+  so a store that ignores `Range` could make a source buffer any size.
+  A ranged read now refuses a `Content-Length` longer than its range can
+  select before reading the body (`ByteRange::max_len`). Recorded in
+  §7.8. Unranged reads (snapshots, S3 control registers) stay unbounded,
+  tracked as T4 and T5.
+- **Intra-cluster TLS had no test of its "no resumption" claim.** The
+  peer transport tests 0-RTT directly; `skys3-net` only set the options.
+  A raw client with a ticket store now reads a frame after its handshake
+  with a node and must have received no ticket; with the server's ticket
+  settings removed it receives two. Early data is now refused explicitly
+  too. §12 now says that a node issues no tickets.
+- **§12 promised versioning without saying who checks it.** Nothing in
+  the code reads the control bucket's versioning, and the least-privilege
+  credential of §6.1 could not (`s3:GetBucketVersioning`). §12 now says
+  what SkyS3 enforces (prefix-only keys, no overlapping target) and that
+  credential scope and versioning are the operator's. A startup check is
+  tracked (T8).
+- **The four known items still hold.** The file control store is not
+  reopened after a failed write, bucket changes answer `500` when it
+  fails, a rollback is detected by generation alone, and the gateway
+  exports no request metrics: each verified against the code and tracked
+  (K1 to K4).
+- **No `cargo audit`.** It is not installed; `cargo deny check
+  advisories` reads the same RustSec database and passes with no ignored
+  advisory.
+- **No new fuzz target or simulation scenario.** The fixes add no parser
+  (the ranged-read check compares a header the SDK already parsed), and
+  change no behavior the simulation exercises (it uses no `AwsS3`, and
+  the TLS options made explicit were the defaults), so the 256-seed
+  `harness` run is the only simulation run.
