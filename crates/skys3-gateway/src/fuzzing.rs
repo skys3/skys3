@@ -646,6 +646,28 @@ mod tests {
         assert_eq!(harness.request(b"\x88<Delete><Object>").unwrap().0, 400);
     }
 
+    /// The M7-03 campaign found `GET /?prefix=%1F` answered 500: `s3s`
+    /// refuses to send XML holding a control character, and ListBuckets
+    /// echoed the prefix. Nothing a client sends reaches an XML answer
+    /// with one.
+    #[test]
+    fn control_characters_never_reach_an_xml_answer() {
+        let harness = Harness::default();
+        for input in [
+            &b"\x00/?prefix=%1F"[..],
+            b"\x00/fuzz?list-type=2&start-after=%01",
+            b"\x00/fuzz?prefix=a%00&delimiter=/",
+            b"\x01/fuzz/bell%07\ncontent-length: 0\n\n",
+            b"\x02/fuzz/bell%07?uploads",
+            b"\x01/fuzz/copy%08\nx-amz-copy-source: /fuzz/a\ncontent-length: 0\n\n",
+        ] {
+            let status = harness.request(input).unwrap().0;
+            assert_eq!(status, 400, "{}", String::from_utf8_lossy(input));
+        }
+        let tab = b"\x01/fuzz/tab%09ok\ncontent-length: 0\n\n";
+        assert_eq!(harness.request(tab).unwrap().0, 200);
+    }
+
     #[test]
     fn sigv4_inputs_are_signed_and_verified() {
         let harness = Harness::default();

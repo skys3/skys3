@@ -104,6 +104,35 @@ async fn keys_are_deleted_and_reported() {
     assert!(gone, "the tombstone of a was removed");
 }
 
+/// The answer echoes keys and version IDs in XML, which cannot carry
+/// control characters: such a request deletes nothing (M7-03).
+#[tokio::test]
+async fn keys_with_control_characters_are_refused_before_any_delete() {
+    let (setup, _) = local().await;
+    setup.put("a").await.assert(200, None);
+    for (odd, code) in [
+        (key("bell\u{7}"), "InvalidArgument"),
+        (
+            format!("{}<VersionId>\u{1}</VersionId>", key("b")),
+            "InvalidArgument",
+        ),
+        // The XML parser refuses a reference to a control character.
+        (key("bell&#x7;"), "MalformedXML"),
+    ] {
+        let body = delete_xml(false, &[key("a"), odd.clone()]);
+        let answer = setup.delete_objects(&body).await;
+        assert_eq!(
+            (answer.status.as_u16(), answer.code()),
+            (400, Some(code)),
+            "{odd}"
+        );
+        assert!(setup.exists("a").await, "{odd}");
+    }
+    let whitespace = delete_xml(false, &[key("a"), key("tab\there")]);
+    setup.delete_objects(&whitespace).await.assert(200, None);
+    assert!(!setup.exists("a").await);
+}
+
 #[tokio::test]
 async fn quiet_mode_lists_only_errors() {
     let (setup, _) = local().await;

@@ -1,5 +1,6 @@
 //! Request limits (design §12): header sizes, URI and key lengths, part
-//! numbers, ranges, and the size and nesting depth of XML bodies.
+//! numbers, ranges, query values XML can carry, and the size and nesting
+//! depth of XML bodies.
 //!
 //! The gateway checks every request against [`RequestLimits`] before
 //! authentication and routing, so an oversized request costs a bounded
@@ -24,7 +25,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use s3s::config::{S3Config, StaticConfigProvider};
 use s3s::{S3Error, s3_error};
-use skys3_types::limits::MAX_SINGLE_PUT_BYTES;
+use skys3_types::limits::{MAX_SINGLE_PUT_BYTES, is_xml_text};
 
 /// The longest object key, in bytes of UTF-8 (the S3 limit).
 pub const MAX_KEY_BYTES: usize = 1024;
@@ -130,7 +131,8 @@ impl RequestLimits {
     /// The S3 error for the first limit the request breaks:
     /// `RequestHeaderSectionTooLarge`, `InvalidURI` (also for a path or
     /// query that does not decode), `KeyTooLongError`,
-    /// `InvalidArgument` (part number or range), or
+    /// `InvalidArgument` (part number, range, or a query value holding a
+    /// control character), or
     /// `MaxMessageLengthExceeded` for an XML body that declares a length
     /// above the limit.
     pub(crate) fn check_head(&self, parts: &Parts) -> Result<RequestShape, S3Error> {
@@ -174,6 +176,14 @@ impl RequestLimits {
                 return Err(s3_error!(
                     InvalidArgument,
                     "Part number must be an integer between 1 and {MAX_PART_NUMBER}, inclusive"
+                ));
+            }
+            // Responses echo prefixes, delimiters, and markers in XML, which
+            // cannot carry control characters (`s3s` would answer 500).
+            if !is_xml_text(value) {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "The query parameter {name:?} holds a control character"
                 ));
             }
         }
@@ -294,6 +304,33 @@ impl RequestLimits {
         config.form_max_parts = 100;
         Arc::new(StaticConfigProvider::new(Arc::new(config)))
     }
+}
+
+/// Refuses `key` as the key of a new object if it holds a control character
+/// other than tab, line feed, and carriage return. S3 responses echo keys in
+/// XML (CreateMultipartUpload, listings, DeleteObjects), which cannot carry
+/// those, so such a key could be written but never listed (design §12).
+/// Keys that already exist, such as one an import found at the remote, can
+/// still be read and deleted.
+///
+/// # Errors
+///
+/// `InvalidArgument`.
+pub(crate) fn check_new_key(key: &str) -> Result<(), S3Error> {
+    if is_xml_text(key) {
+        Ok(())
+    } else {
+        Err(control_character_key())
+    }
+}
+
+/// The refusal of a key that holds a control character.
+pub(crate) fn control_character_key() -> S3Error {
+    s3_error!(
+        InvalidArgument,
+        "Object keys cannot hold control characters other than tab, line feed, and carriage \
+         return, which XML responses cannot carry"
+    )
 }
 
 /// Whether the request body is an HTML form (POST Object).
@@ -531,6 +568,29 @@ mod tests {
             code(shape(Method::GET, "/b/k", &[("range", &long)])),
             S3ErrorCode::InvalidArgument
         );
+    }
+
+    /// Found by fuzzing (M7-03): `GET /?prefix=%1F` made ListBuckets echo
+    /// a control character, and `s3s` answered 500.
+    #[test]
+    fn query_values_with_control_characters_are_refused() {
+        for uri in [
+            "/?prefix=%1F",
+            "/b?list-type=2&prefix=a%1F",
+            "/b?delimiter=%00",
+            "/b?marker=%08&prefix=a",
+            "/b/k?uploadId=%0B",
+        ] {
+            assert_eq!(
+                code(shape(Method::GET, uri, &[])),
+                S3ErrorCode::InvalidArgument,
+                "{uri}"
+            );
+        }
+        // Whitespace is XML text, and a value holding it is accepted.
+        shape(Method::GET, "/b?prefix=a%09b%0Ac%0Dd&delimiter=%7F", &[]).unwrap();
+        // Names are not echoed, and keys are checked where they are written.
+        shape(Method::GET, "/b/%01?%1F", &[]).unwrap();
     }
 
     #[test]

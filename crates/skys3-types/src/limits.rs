@@ -33,3 +33,32 @@ pub const MAX_EXTENTS_PER_PUT: usize = (MAX_SINGLE_PUT_BYTES / MIN_EXTENT_LEN as
 
 const _: () = assert!(MAX_EXTENTS_PER_PUT == 81_920);
 const _: () = assert!(MIN_EXTENT_LEN <= MAX_RECORD_PAYLOAD_LEN);
+
+/// Whether an XML 1.0 document can carry `text`: it holds no control
+/// character below U+0020 other than tab, line feed, and carriage return.
+///
+/// S3 answers in XML and echoes keys, prefixes, markers, and rule IDs, and
+/// `s3s` refuses to send a response that holds such a character, so the
+/// gateway refuses them where a client brings them in (design §12).
+#[must_use]
+pub fn is_xml_text(text: &str) -> bool {
+    !text
+        .bytes()
+        .any(|b| b < b' ' && !matches!(b, b'\t' | b'\n' | b'\r'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_text_has_no_control_characters_but_whitespace() {
+        assert!(is_xml_text(""));
+        assert!(is_xml_text("photos/2024/cat.jpg"));
+        assert!(is_xml_text("tab\tnew line\ncarriage return\r\u{7f}\u{e9}"));
+        for b in (0_u8..0x20).filter(|b| !matches!(b, b'\t' | b'\n' | b'\r')) {
+            let text = format!("a{}b", char::from(b));
+            assert!(!is_xml_text(&text), "{text:?}");
+        }
+    }
+}

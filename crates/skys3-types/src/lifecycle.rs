@@ -44,6 +44,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::limits::is_xml_text;
+
 /// A day, in milliseconds.
 pub const DAY_MS: u64 = 86_400_000;
 
@@ -197,6 +199,11 @@ pub enum LifecycleError {
     /// not have.
     #[error("rule {0:?}: AbortIncompleteMultipartUpload cannot be used with a tag or size filter")]
     UploadFilter(String),
+    /// A rule's ID, prefix, or a tag of its filter holds a control
+    /// character, which the XML of GetBucketLifecycleConfiguration cannot
+    /// carry ([`is_xml_text`]).
+    #[error("rule {0:?}: the ID, prefix, and tags cannot hold control characters")]
+    ControlCharacter(String),
     /// The configuration is larger than [`MAX_JSON_BYTES`] stored.
     #[error(
         "the lifecycle configuration takes {0} bytes stored; at most {MAX_JSON_BYTES} are allowed"
@@ -309,6 +316,14 @@ impl LifecycleRule {
         }
         if filter.tags.len() > MAX_FILTER_TAGS || filter.tags.contains_key("") {
             return Err(LifecycleError::InvalidTags(id()));
+        }
+        let texts = [self.id.as_str(), filter.prefix.as_str()].into_iter();
+        let tags = filter
+            .tags
+            .iter()
+            .flat_map(|(k, v)| [k.as_str(), v.as_str()]);
+        if !texts.chain(tags).all(is_xml_text) {
+            return Err(LifecycleError::ControlCharacter(id()));
         }
         if let (Some(greater), Some(less)) = (filter.size_greater_than, filter.size_less_than)
             && less <= greater
@@ -466,6 +481,20 @@ mod tests {
             with(&|rule| rule.filter.tags = tags(&[("", "v")])),
             Err(LifecycleError::InvalidTags(r()))
         );
+        // GetBucketLifecycleConfiguration echoes these in XML (M7-03).
+        assert_eq!(
+            check(vec![rule("a\u{1}")]),
+            LifecycleError::ControlCharacter("a\u{1}".into())
+        );
+        let control: [&dyn Fn(&mut LifecycleRule); 3] = [
+            &|rule| rule.filter.prefix = "logs/\u{1f}".into(),
+            &|rule| rule.filter.tags = tags(&[("k\u{0}", "v")]),
+            &|rule| rule.filter.tags = tags(&[("k", "\u{8}")]),
+        ];
+        for change in control {
+            assert_eq!(with(change), Err(LifecycleError::ControlCharacter(r())));
+        }
+        assert!(with(&|rule| rule.filter.prefix = "tab\tline\n".into()).is_ok());
         assert_eq!(
             with(&|rule| {
                 rule.filter.size_greater_than = Some(5);

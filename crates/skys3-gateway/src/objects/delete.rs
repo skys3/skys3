@@ -18,6 +18,10 @@
 //!   (`400 InvalidRequest` without one);
 //! - an empty list, or more than 1,000 keys, is `400 MalformedXML`, and an
 //!   empty key `400 UserKeyMustBeSpecified`;
+//! - a key or version ID holding a control character, which the XML answer
+//!   could not echo, refuses the whole request with `400 InvalidArgument`
+//!   before anything is deleted (design §12); DeleteObject still deletes
+//!   such a key;
 //! - each key is authorized on its own ([`KeyDecisions`]): one the caller
 //!   may not delete gets `AccessDenied`, and the others are deleted;
 //! - a key's `ETag` makes its delete conditional, like `If-Match` on
@@ -38,6 +42,7 @@ use s3s::dto::{
 use s3s::{S3Error, S3Request, S3Result, s3_error};
 use skys3_log::RecordBody;
 use skys3_log::record::{Delete, Flushed};
+use skys3_types::limits::is_xml_text;
 use skys3_types::{BucketDocument, BucketMode, EpochSeq};
 use tokio::task::JoinSet;
 
@@ -47,7 +52,7 @@ use crate::authz::{KeyDecisions, access_denied};
 use crate::buckets::shard_error;
 use crate::checksum::ExpectedChecksums;
 use crate::conditions::Precondition;
-use crate::limits::MAX_KEY_BYTES;
+use crate::limits::{MAX_KEY_BYTES, control_character_key};
 use crate::peer_s3::ApplyBy;
 use crate::shard::{ShardRef, Shards};
 
@@ -110,6 +115,13 @@ impl<H: Shards> Objects<H> {
                 UserKeyMustBeSpecified,
                 "Each Object must specify a Key"
             ));
+        }
+        // The answer echoes every key and version ID in XML, which cannot
+        // carry control characters: refuse before deleting anything.
+        if objects.iter().any(|object| {
+            !is_xml_text(&object.key) || !object.version_id.as_deref().is_none_or(is_xml_text)
+        }) {
+            return Err(control_character_key());
         }
         let decisions = extensions
             .get::<KeyDecisions>()

@@ -19,6 +19,9 @@
 //!
 //! With `encoding-type=url`, keys, common prefixes, and the echoed prefix,
 //! delimiter, `start-after`, and markers are URL-encoded ([`url_encode`]).
+//! Without it, a page holding a key with a control character, which XML
+//! cannot carry, answers `400 InvalidArgument` (design §12); clients cannot
+//! write such keys, but an import can find them at the remote.
 //!
 //! While a `write_back` bucket's namespace import runs, the page also
 //! merges the remote's listing of the keys the import has not reached
@@ -42,6 +45,7 @@ use std::sync::Arc;
 use s3s::{S3Error, S3Result, s3_error};
 use skys3_index::{ImportCheckpoint, ListItem, ListQuery, ObjectVersion};
 use skys3_types::checksum::ChecksumAlgorithm;
+use skys3_types::limits::is_xml_text;
 use skys3_types::{BucketDocument, BucketMode};
 
 use crate::buckets::{GatewayConfig, shard_error};
@@ -232,6 +236,15 @@ impl<H: Shards> Listings<H> {
         } else {
             self.merge(bucket, &query).await?
         };
+        // Clients cannot write such keys (`check_new_key`), but an import
+        // can find them at the remote.
+        if !request.url && !merged.items.iter().all(|item| is_xml_text(item.name())) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "The listing holds a key with a control character, which XML cannot carry; \
+                 list with encoding-type=url"
+            ));
+        }
         let last = merged.items.last().map(|item| item.name().to_owned());
         let mut page = Page {
             contents: Vec::new(),
