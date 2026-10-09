@@ -5613,6 +5613,209 @@ of this file. A task with nothing unexpected keeps "None."
   descriptor and checks the decoder's invariants. A verifier that trusts
   nobody refuses every input.
 
+### M6-08 Peer protocol simulation
+
+- **The simulation runs real QUIC.** M6-06 put a TCP stream model under
+  the peer scenarios. It is gone: the nodes and the destination now run
+  Quinn over turmoil's UDP. `skys3-cluster-sim`'s `quic` module adapts a
+  turmoil `UdpSocket` to Quinn's `AsyncUdpSocket`. It reports that it
+  may fragment, so Quinn skips MTU discovery. The nodes use the node
+  binary's `PeerEndpoint`, handshake, and `ConnectionPool`, and the
+  destination runs the real `StagingService` and `PeerCommits`. Holds,
+  partitions, message loss, and peer restarts now lose datagrams and
+  stall connections until their idle timeout (`Peer::idle`), as on a
+  real network. Recorded in §16.1.
+- **Seeded endpoints make QUIC replay.** `PeerEndpoint::with_socket`
+  takes any socket and an optional seed. With a seed, Quinn's
+  `rng_seed`, the connection IDs, the initial destination IDs, and the
+  keys of stateless resets and tokens all come from it (SplitMix64 and
+  `aws-lc-rs` keys from fixed bytes). TLS still draws its own key shares
+  and randoms. That changes bytes on the wire but not their sizes, and
+  the simulation's PKI is Ed25519 for that reason, so a seed replays.
+  Quinn uses the Tokio runtime's clock, which is the simulation's paused
+  clock. `EndpointSettings` gains `idle_timeout`, with keep-alives at a
+  sixth of it. The node binary passes neither a seed nor a socket and
+  is unchanged.
+- **Determinism findings.** The QUIC adapter test, the new
+  `peer_protocol::a_seed_with_protocol_faults_replays_exactly`,
+  `peer::a_seed_with_a_peer_replays_exactly`, and
+  `discovery::a_seed_with_udp_blocked_replays_exactly` all replay
+  exactly. As in M6-06, the replay tests use one member per shard,
+  because tokio's own unseeded randomness makes replicated takeovers
+  differ between runs. CI's flags are unchanged. The destination's
+  fault draws come from a `SmallRng` forked from the run's seed, and
+  every map it keeps is a `BTreeMap`.
+- **Protocol faults at the destination.** `Peer::faults`
+  (`ProtocolFaults`) wraps each stream the destination serves in a tap.
+  The tap can:
+  - lose `BEGIN`, `DATA`, `COMMIT`, and `BATCH` frames, or `RESUME`,
+    `DURABLE`, and `APPLIED` answers;
+  - close the connection as a `DATA` frame arrives, after a `DURABLE`,
+    or with an `APPLIED` in flight;
+  - make a `COMMIT` arrive late.
+  Aimed faults (`AimedBlocks::scope`) hold a `COMMIT`'s UDP path, hold
+  its sender's link, or depose its sender by holding its link and
+  crashing it.
+- **Audits added.** Each tap checks its stream:
+  - no `DATA` resends bytes the stream's `RESUME` reported durable;
+  - every `APPLIED` for the identity the key's current version carries
+    says `committed` with that version's ETag, for replays and for a
+    deposed primary's copy alike, or `unavailable`, which claims nothing;
+  - a `COMMIT` that arrived while its staging covered the whole object is
+    never answered `incomplete`, unless its source aborted it;
+  - a `COMMIT` that arrived past the commit window of its identity's
+    latest send is never answered `committed`. Its apply-by time passed,
+    whichever send it is, and `PeerCommits` checks that before it looks
+    for a stored result.
+  At the end, the staging left over must expire and give back its whole
+  quota charge. `PeerAudit` counts the faults that struck and what the
+  sources did, so that each scenario can show its faults happened.
+- **Scenarios.** `peer_protocol` runs three replicated nodes with
+  takeovers, under the M6-06 cluster faults plus:
+  - `lost_messages_are_retried_and_each_write_applies_once`: loses 5 %
+    of messages either way, for staged objects and batches, over 20
+    keys.
+  - `reconnects_mid_transfer_resend_only_what_is_not_durable`: drops 6 %
+    of connections mid-transfer, with 128-byte frames, and checks that
+    `RESUME`s reported durable bytes that were not resent.
+  - `duplicate_commits_apply_once_and_are_answered_alike`: replays after
+    lost `APPLIED`s (4 % loss), and deposes a `COMMIT`'s sender once the
+    `COMMIT` reached the destination, so that its successor sends it
+    too. At least one seed of each run must have a `COMMIT` from two
+    nodes.
+  - `staging_that_expires_before_its_commit_is_staged_again`: a 400 ms
+    TTL, late `COMMIT`s, and held senders.
+  - `commits_that_arrive_past_their_window_are_refused`: a 1.5 s commit
+    window, with one `COMMIT` in two arriving 2.5 s late. At one in
+    three, seed 109 saw no overdue `COMMIT`: a peer restart killed all
+    five late ones, and every later write went in a batch.
+  - `a_seed_with_protocol_faults_replays_exactly`.
+- **Seeded bugs.** All three were added in `skys3-flush`, and each one is
+  caught on every seed tried:
+  - `PeerBug::ResendDurable` ignores the `RESUME`.
+  - `PeerBug::ExpiredAsCommitted` takes an `incomplete` answer or expired
+    staging for a commit. The `FLUSHED` audit catches it.
+  - `PeerBug::NoCommitWindow` stamps each `COMMIT`'s apply-by time a day
+    past the commit window. It was added after M6-07's apply-by merge.
+    It first sent no apply-by time at all, which M6-07's protocol
+    version 2 now refuses on send.
+- **Product change: staging stays while its `COMMIT` applies.**
+  `Staging::pin` and `Staging::unpin` keep staging that was live when its
+  `COMMIT` arrived from expiring while the `COMMIT` waits for the
+  stream's frames in flight and applies. `Staging::expire` skips pinned
+  staging. The destination holds the pin in a guard, so a stream task
+  aborted when its connection closes releases it. Before this, an append
+  that outlived the TTL could expire the staging under its own `COMMIT`.
+  No simulation run hit that; the race was found by reading the code
+  while writing the expiry audit. A unit test covers it. Recorded in
+  §7.8 ("Expiry"). No other product bug turned up.
+- **A closed connection takes held COMMITs with it (found in testing).**
+  Under QUIC, `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`
+  let `PeerBug::NoQuarantine` through on 3 of 12 seeds. The fault held
+  the link only once the `COMMIT` reached the destination's side.
+  Falling back, the source closed its connection, and the held `COMMIT`
+  died with it. Aimed faults now hold the sender's link as the `COMMIT`
+  is sent. The bug scenario uses `AimedBlocks::late`: the destination
+  takes the `COMMIT` and applies it after four fifths of the hold, while
+  the links are held and before it can hear the close. With that, the
+  bug is caught on seeds 0 to 11, and the correct cluster passes the
+  same faults.
+- **Deposing by partition never duplicated a COMMIT (found in
+  testing).** A partitioned primary was re-elected and its keys were
+  rewritten, so no `COMMIT` came from two nodes. `AimScope::Deposed`
+  crashes the sender while its link is held, and the scenario writes 40
+  keys, so that the successor flushes the same write.
+- **The expiry scenario needed a sweeper and late COMMITs (found in
+  testing).** Staging expires lazily, so on some seeds nothing expired.
+  The simulated destination now sweeps every TTL, and one `COMMIT` in
+  two arrives a second late. The first version of the covered-stream
+  audit also flagged staging that had expired before its `COMMIT`
+  arrived; it now counts only staging that is still there on arrival.
+- **Merging M6-07's apply-by time.** The simulated destination records
+  each `COMMIT` with its apply-by time, so the quarantine audit ignores
+  `COMMIT`s that arrive too late to apply. The nodes' transports take
+  the commit window. The tapped accept loop keeps each connection's
+  streams in a `JoinSet`, as `serve_connection` now does.
+- **A late replay is answered `unavailable` (found in testing).** The
+  first run of the overdue scenario at 256 seeds failed on seed 5. A
+  replay of an applied write arrived past its apply-by time and was
+  answered `unavailable`, and the consistency audit wanted `committed`.
+  `PeerCommits` checks the apply-by time before it looks for the stored
+  result, and §7.8 makes every such refusal `unavailable` for the source
+  to retry. That is correct, so the audit now accepts `unavailable` too.
+- **Merging M6-07's QUIC start wait.** M6-07 then required an apply-by
+  time on every `COMMIT`, and made each shard flusher that starts on
+  QUIC wait the quarantine before its first `COMMIT`.
+  - `PeerBug::NoApplyBy` became `PeerBug::NoCommitWindow`.
+  - With the default 8 s commit window and 2 s answer timeout, the wait
+    is 12 s. The peer protocol scenarios then flushed only about a dozen
+    `COMMIT`s per run, mostly after the cluster faults, and on some seeds
+    no protocol fault struck. Their peer now has a 3 s commit window and
+    a 1 s answer timeout, so the wait is 5 s. The loss and drop rates
+    grew, and so did the traffic: 20 keys for lost
+    messages, and 128-byte frames for reconnects and for
+    `PeerBug::ResendDurable`.
+  - The main discovery scenario failed on seed 2: it wrote nothing over
+    S3. Over QUIC, a held connection fails only at its idle timeout, and
+    a flusher then waits the quarantine on S3 REST. Its UDP blocks now
+    last 11 to 14 s instead of 8 to 12 s, and it passes seeds 0 to 15.
+    Both of M6-07's quarantine bugs are still caught on seeds 0 to 11.
+- **The duplicate scenario now asserts a COMMIT from two nodes (found
+  in review).** It asserted only `replayed > 0`, which same-node
+  retries after lost answers satisfy. `from_two_nodes` was 0 on every
+  seed after the start-wait merge, for two reasons:
+  - Aimed faults start only while the clients write. The clients
+    finished at about 5 s, before the 12 s start wait let any `COMMIT`
+    out, so every aim was released.
+  - A sender deposed for 3 s regained its shard before its successor's
+    start wait ended, and sent the `COMMIT` again itself.
+  The scenario now aims in late mode: the fault starts once the `COMMIT`
+  reaches the destination, which applies it 1.2 s later. Its peer has a
+  2 s commit window and a 0.5 s answer timeout, so the start wait is
+  3 s. The clients pause up to 300 ms between requests and still write
+  when the aims fall due. A deposed sender stays down for 6 s.
+  - Some seeds still get no `COMMIT` from two nodes: no other node takes
+    the deposed shard over while its sender is down. So each seed must
+    replay a `COMMIT`, and at least one seed of each run must have one
+    from two nodes. The test prints the counts by seed.
+  - At 256 seeds (seeds 0 to 7) the counts are 4, 0, 2, 3, 2, 3, 0 and
+    3. Seeds 100 to 115 had one on all but 100 and 111.
+  - A dedicated scenario would have cost a full run more; this one cost
+    no more than before. The seeded bugs do not use this path.
+- **Seeds and run times at 256 seeds.** Every new scenario uses
+  `Runner::with_cost`. With `SKYS3_SIM_SEEDS=256`, one at `COST` runs
+  seeds 0 to 7, and one at twice that runs seeds 0 to 3; the replay
+  test runs each of its seeds twice. On toolchain 1.98.1, after the
+  start-wait merge:
+  - At `COST`: `lost_messages_are_retried_and_each_write_applies_once`
+    29.9 s, `reconnects_mid_transfer_resend_only_what_is_not_durable`
+    27.2 s, `duplicate_commits_apply_once_and_are_answered_alike`
+    40.7 s, `staging_that_expires_before_its_commit_is_staged_again`
+    29.2 s, and `commits_that_arrive_past_their_window_are_refused`
+    32.4 s.
+  - At twice `COST`: `a_seed_with_protocol_faults_replays_exactly`
+    8.7 s, and the seeded-bug scenarios
+    `the_audit_catches_durable_ranges_sent_again` 10.2 s,
+    `the_audit_catches_expired_staging_taken_for_a_commit` 11.9 s, and
+    `the_audit_catches_commits_applied_past_their_window` 11.1 s. The
+    start wait delays each bug's first chance to show, so these went to
+    twice `COST`, as M6-07's bug scenarios are.
+  - That is 201.3 s for M6-08, over the 3 minutes planned. Before the
+    start wait it was 185.1 s.
+  - The M6-06 scenarios now take 122.1 s (29.0, 12.1, 35.2, 22.7, and
+    23.1 s): the start wait slows their seeded bugs too. Over TCP before
+    the wait they took 62.1 s. The M6-07 scenarios take 178.6 s (44.9,
+    19.4, 30.0, 14.4, 33.4, and 36.5 s).
+  - Beyond CI's seeds, after the start-wait merge, every M6-08 scenario
+    and seeded bug passed seeds 0 to 15 and 100 to 115. Before it, with
+    each bug taken out, the scenarios of `PeerBug::NoQuarantine` and
+    `PeerBug::NoCommitWindow` passed seeds 0 to 7, so the correct cluster
+    passes the same faults.
+  - The 256-seed `harness` run passes too.
+- **No new fuzz target.** The simulation adds no parser. Frames travel
+  through `skys3-peer`'s own wire code, which `peer_messages` already
+  fuzzes.
+
 ## M4 Large objects
 
 ### M4-01 Write identity for streamed single PUTs

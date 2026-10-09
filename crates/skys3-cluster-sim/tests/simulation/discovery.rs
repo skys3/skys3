@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use rand::Rng;
 use skys3_cluster_sim::{
-    AimedBlocks, Backup, Cluster, ClusterConfig, DescriptorKind, Fault, FaultPlan, FaultProfile,
-    Peer, PeerBug, ReplicatedServices, Report, RoutedServices, RunError, Workload,
+    AimScope, AimedBlocks, Backup, Cluster, ClusterConfig, DescriptorKind, Fault, FaultPlan,
+    FaultProfile, Peer, PeerBug, ReplicatedServices, Report, RoutedServices, RunError, Workload,
 };
 use skys3_config::TargetTransport;
 use skys3_gateway::routing::RoutingConfig;
@@ -143,8 +143,11 @@ fn faults(context: &mut SimContext, config: &ClusterConfig, workload: &Workload)
         workload.clients,
     );
     // The blocks start early enough to heal well before the clients stop
-    // writing, so that the flushers carry writes over QUIC again.
-    let blocked = (Duration::from_secs(8), Duration::from_secs(12));
+    // writing, so that the flushers carry writes over QUIC again. A held
+    // QUIC connection fails only at its idle timeout, and the flushers
+    // then wait the quarantine on S3 REST, so each block lasts long enough
+    // for writes over S3 after both.
+    let blocked = (Duration::from_secs(11), Duration::from_secs(14));
     block_udp(context, &mut plan, 2, end / 2, blocked);
     plan
 }
@@ -180,6 +183,8 @@ fn with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic() {
                 count: 2,
                 hold,
                 every: Duration::from_secs(8),
+                scope: AimScope::Udp,
+                late: false,
             },
             ..peer(DescriptorKind::Signed, PeerBug::None)
         });
@@ -285,14 +290,20 @@ fn the_audit_catches_an_unverified_descriptor() {
 #[test]
 fn the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding() {
     Runner::with_cost(2, 2 * COST).run(|context| {
-        // UDP blocked as `COMMIT`s are on their way, for longer than it
-        // takes to fall back but not than the peer's idle timeout.
+        // UDP blocked as `COMMIT`s reach the peer, for longer than it
+        // takes to fall back but not than the peer's idle timeout. The
+        // peer applies each one late, within its apply-by time, after its
+        // node fell back but before the peer can hear that the node
+        // closed the connection: over QUIC, a `COMMIT` held on its way
+        // would die with that connection.
         let peer = Peer {
             idle: Duration::from_secs(8),
             aimed: AimedBlocks {
                 count: 3,
                 hold: Duration::from_secs(5),
                 every: Duration::from_secs(10),
+                scope: AimScope::Udp,
+                late: true,
             },
             ..peer(DescriptorKind::Signed, PeerBug::NoQuarantine)
         };

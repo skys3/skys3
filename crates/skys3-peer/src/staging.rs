@@ -23,7 +23,8 @@
 //!   carries from [`Staging::admit`] to [`Staging::settle`], so an append
 //!   that outlives its staging never changes one that replaced it.
 //! - **Expiry.** Staging that sees no `BEGIN` or `DATA` for
-//!   `peer_staging_ttl_seconds` is discarded.
+//!   `peer_staging_ttl_seconds` is discarded, unless a `COMMIT` that
+//!   arrived for it is still being applied ([`Staging::pin`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -101,6 +102,9 @@ struct Entry {
     generation: u64,
     /// The last `BEGIN` or `DATA`.
     touched: Instant,
+    /// The `COMMIT`s that arrived for it and are being applied, which
+    /// keep it from expiring.
+    pins: u32,
 }
 
 /// The staging of one piece.
@@ -250,6 +254,7 @@ impl Staging {
                 bytes: MIN_STAGING_CHARGE,
                 generation: *next_generation,
                 touched: now,
+                pins: 0,
             };
             stagings.insert(begin.identity.clone(), entry);
         }
@@ -377,8 +382,34 @@ impl Staging {
         self.table().remove(identity)
     }
 
+    /// Keeps the staging of `identity`, if any, from expiring while a
+    /// `COMMIT` that arrived for it waits for its stream's frames in
+    /// flight and is applied: staging that was live when its `COMMIT`
+    /// arrived is still there when the `COMMIT` needs it. Returns the
+    /// staging's generation, which [`Staging::unpin`] takes, or `None` if
+    /// there is none.
+    pub fn pin(&self, identity: &WriteIdentity) -> Option<u64> {
+        let mut table = self.table();
+        let entry = table.stagings.get_mut(identity)?;
+        entry.pins += 1;
+        Some(entry.generation)
+    }
+
+    /// Releases a [`Staging::pin`] of `identity`'s staging of
+    /// `generation`. Staging discarded or replaced since is left alone.
+    pub fn unpin(&self, identity: &WriteIdentity, generation: u64) {
+        let mut table = self.table();
+        if let Some(entry) = table
+            .stagings
+            .get_mut(identity)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.pins = entry.pins.saturating_sub(1);
+        }
+    }
+
     /// Discards every staging that saw no `BEGIN` or `DATA` within the
-    /// TTL before `now`, and returns their identities.
+    /// TTL before `now` and is not pinned, and returns their identities.
     pub fn expire(&self, now: Instant) -> Vec<WriteIdentity> {
         self.table().expire(now, self.limits.ttl)
     }
@@ -440,7 +471,9 @@ impl Table {
         let expired: Vec<_> = self
             .stagings
             .iter()
-            .filter(|(_, entry)| now.saturating_duration_since(entry.touched) >= ttl)
+            .filter(|(_, entry)| {
+                entry.pins == 0 && now.saturating_duration_since(entry.touched) >= ttl
+            })
             .map(|(identity, _)| identity.clone())
             .collect();
         for identity in &expired {
@@ -813,6 +846,38 @@ mod tests {
                 ttl: Duration::from_secs(86_400),
             }
         );
+    }
+
+    #[test]
+    fn a_commit_keeps_its_staging_from_expiring() {
+        let staging = Staging::new(LIMITS);
+        let id = identity("us", 1);
+        let start = Instant::now();
+        staging.begin(&begin(&id, "k"), start).unwrap();
+        stage(&staging, &id, 1, 0..10, start);
+        // A COMMIT arrives just before the TTL, and waits while the TTL
+        // passes and other streams sweep.
+        let generation = staging.pin(&id).unwrap();
+        let late = start + LIMITS.ttl + SWEEP_INTERVAL;
+        assert_eq!(staging.expire(late), []);
+        let other = identity("us", 2);
+        staging.begin(&begin(&other, "k"), late).unwrap();
+        assert!(staging.staged(&id).is_some());
+        // Once applied, it no longer holds the staging.
+        staging.unpin(&id, generation);
+        assert_eq!(staging.expire(late), std::slice::from_ref(&id));
+        // A pin of gone staging pins nothing, and an old generation's
+        // unpin leaves a replacement alone.
+        assert_eq!(staging.pin(&id), None);
+        staging.begin(&begin(&id, "k"), late).unwrap();
+        let replacement = staging.pin(&id).unwrap();
+        assert_ne!(replacement, generation);
+        staging.unpin(&id, generation);
+        let later = late + LIMITS.ttl;
+        assert_eq!(staging.expire(later), std::slice::from_ref(&other));
+        staging.unpin(&id, replacement);
+        assert_eq!(staging.expire(later), std::slice::from_ref(&id));
+        assert_eq!(staging.used(&id.cluster), 0);
     }
 
     #[test]
