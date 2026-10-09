@@ -225,9 +225,11 @@ impl Credentials {
         config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
         // No resumption: every connection presents and verifies a full
         // certificate chain, so an expired or replaced certificate is never
-        // accepted from a ticket.
+        // accepted from a ticket. No early data either, so no message is
+        // ever replayed from 0-RTT.
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
+        config.max_early_data_size = 0;
         Some(Arc::new(config))
     }
 
@@ -241,6 +243,7 @@ impl Credentials {
             .with_client_cert_resolver(Arc::new(SingleCertAndKey::from(self.certified.clone())));
         config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
         config.resumption = rustls::client::Resumption::disabled();
+        config.enable_early_data = false;
         // Peers are named by the SPIFFE ID in their certificates, not by a
         // host name, so no name is sent.
         config.enable_sni = false;
