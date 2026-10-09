@@ -8439,8 +8439,20 @@ of this file. A task with nothing unexpected keeps "None."
   AWS bucket names are global: the control bucket named through another
   region's endpoint, or the global one, passed, and that target's
   credential would reach the registers. The overlap check now treats every
-  AWS endpoint as one bucket namespace (`bucket_namespace`), while the
-  correlation check still compares regions. Recorded in design §6.1.
+  AWS endpoint of one partition as one bucket namespace
+  (`bucket_namespace`), while the correlation check still compares
+  regions. Recorded in design §6.1.
+- **AWS bucket names are global only within a partition (review).** The
+  first fix folded every `amazonaws.com` endpoint into one namespace, but
+  did not recognize `amazonaws.com.cn`, which the remote client treats as
+  AWS: two China regions got unrelated `dns:` scopes, and the overlap
+  check was skipped for the same bucket. Bucket names are unique per
+  partition (`aws`, `aws-cn`, `aws-us-gov`), so a failure scope is now
+  `<partition>:<region>`, and GovCloud, whose host names end in
+  `amazonaws.com`, is its own partition, told apart by its `us-gov-`
+  regions. `skys3_types::aws` holds the one definition of AWS host names
+  and their partition and region, used by the configuration checks and by
+  `AwsS3`'s addressing; both crates already depend on `skys3-types`.
 - **"Reads at most 64 KiB" was not enforced.** The descriptor fetch asks
   for a range, but `AwsS3::get_object` buffered whatever body came back,
   so a store that ignores `Range` could make a source buffer any size.

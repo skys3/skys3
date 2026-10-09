@@ -123,8 +123,9 @@ impl ControlStoreConfig {
     /// - The target must not hold keys under the control prefix, nor the
     ///   control prefix keys of the target: in one bucket, one prefix must
     ///   not start with the other. Endpoints of one host or address reach
-    ///   the same buckets, and so do AWS S3 endpoints of every region,
-    ///   since AWS bucket names are global. Otherwise a credential for the target
+    ///   the same buckets, and so do AWS S3 endpoints of every region of
+    ///   one partition, since AWS bucket names are unique per partition
+    ///   (`aws`, `aws-cn`, `aws-us-gov`). Otherwise a credential for the target
     ///   would also reach the registers. This holds even with
     ///   `allow_correlated_control_store`.
     /// - The target must not share the control store's failure scope: the
@@ -145,9 +146,10 @@ impl ControlStoreConfig {
         };
         let target_scope = target::failure_scope(&target.endpoint);
         let target_prefix = target.prefix.as_deref().unwrap_or_default();
-        // AWS bucket names are global: an endpoint of any region reaches
-        // the same bucket, so a control bucket named through another
-        // region's endpoint is still the control bucket.
+        // AWS bucket names are unique per partition: an endpoint of any
+        // region of the partition reaches the same bucket, so a control
+        // bucket named through another region's endpoint is still the
+        // control bucket.
         let same_buckets = target_scope.as_deref().is_some_and(|other| {
             target::bucket_namespace(other) == target::bucket_namespace(&scope)
         });
