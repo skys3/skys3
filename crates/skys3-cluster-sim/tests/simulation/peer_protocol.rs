@@ -26,7 +26,7 @@
 //! latest send is answered `committed`, and that all staging left at the
 //! end expires with its whole quota. Seeded bugs of the source show that
 //! the new audits catch durable ranges sent again, expired staging taken
-//! for a commit, and `COMMIT`s sent without an apply-by time.
+//! for a commit, and apply-by times that ignore the commit window.
 
 use std::time::Duration;
 
@@ -55,9 +55,15 @@ fn config(peer: Peer) -> ClusterConfig {
     }
 }
 
-/// The peer with `faults`, and `bug` seeded into the flushers.
+/// The peer with `faults`, and `bug` seeded into the flushers. Its
+/// streams time out after a second and its connections after 3 s of
+/// silence, its commit window, so that the 5 s a shard flusher waits
+/// before its first `COMMIT` (twice the one and the other) leaves most of
+/// a run to flush in, under the cluster's faults.
 fn peer(faults: ProtocolFaults, bug: PeerBug) -> Peer {
     Peer {
+        timeout: Duration::from_secs(1),
+        idle: Duration::from_secs(3),
         faults,
         bug,
         ..Peer::default()
@@ -164,10 +170,15 @@ fn run_with(context: &mut SimContext, config: ClusterConfig, workload: &Workload
 fn lost_messages_are_retried_and_each_write_applies_once() {
     Runner::with_cost(4, COST).run(|context| {
         let faults = ProtocolFaults {
-            loss_per_mille: 40,
+            loss_per_mille: 50,
             ..ProtocolFaults::default()
         };
-        let report = run(context, config(peer(faults, PeerBug::None)), 40);
+        // Twenty keys, so that fewer writes of a key share a flush.
+        let workload = Workload {
+            keys: 20,
+            ..workload(context, 40)
+        };
+        let report = run_with(context, config(peer(faults, PeerBug::None)), &workload);
         let audit = &report.peer;
         assert!(audit.lost > 0, "{audit:?}");
         assert!(audit.replayed > 0, "{audit:?}");
@@ -178,14 +189,20 @@ fn lost_messages_are_retried_and_each_write_applies_once() {
 /// Connections dropped as `DATA` arrives, between a `DURABLE` and the
 /// `COMMIT`, and with an `APPLIED` in flight: each source reconnects,
 /// resumes from the `RESUME`, and sends no byte it reported durable.
+/// Frames of 128 bytes split a body into up to 16, so that many
+/// connections drop with part of a body durable.
 #[test]
 fn reconnects_mid_transfer_resend_only_what_is_not_durable() {
     Runner::with_cost(4, COST).run(|context| {
         let faults = ProtocolFaults {
-            drop_per_mille: 30,
+            drop_per_mille: 60,
             ..ProtocolFaults::default()
         };
-        let report = run(context, config(peer(faults, PeerBug::None)), 40);
+        let peer = Peer {
+            frame_bytes: 128,
+            ..peer(faults, PeerBug::None)
+        };
+        let report = run(context, config(peer), 40);
         let audit = &report.peer;
         assert!(audit.dropped > 0, "{audit:?}");
         assert!(audit.resumes > 0 && audit.resumed_bytes > 0, "{audit:?}");
@@ -199,7 +216,11 @@ fn reconnects_mid_transfer_resend_only_what_is_not_durable() {
 #[test]
 fn duplicate_commits_apply_once_and_are_answered_alike() {
     Runner::with_cost(4, COST).run(|context| {
+        // A commit window of 8 s, so that a `COMMIT` held for 6 s on its
+        // deposed sender's link can still apply.
         let peer = Peer {
+            timeout: Duration::from_secs(2),
+            idle: Duration::from_secs(8),
             aimed: AimedBlocks {
                 count: 3,
                 hold: Duration::from_secs(6),
@@ -211,7 +232,7 @@ fn duplicate_commits_apply_once_and_are_answered_alike() {
             },
             ..peer(
                 ProtocolFaults {
-                    loss_per_mille: 20,
+                    loss_per_mille: 40,
                     ..ProtocolFaults::default()
                 },
                 PeerBug::None,
@@ -353,11 +374,14 @@ fn a_seed_with_protocol_faults_replays_exactly() {
 fn the_audit_catches_durable_ranges_sent_again() {
     Runner::with_cost(2, COST).run(|context| {
         let faults = ProtocolFaults {
-            drop_per_mille: 30,
+            drop_per_mille: 100,
             ..ProtocolFaults::default()
         };
-        let config = config(peer(faults, PeerBug::ResendDurable));
-        let workload = workload(context, 20);
+        let config = config(Peer {
+            frame_bytes: 128,
+            ..peer(faults, PeerBug::ResendDurable)
+        });
+        let workload = workload(context, 40);
         let run =
             Cluster::with_services(config, services()).run(context, &workload, &FaultPlan::none());
         match run {
@@ -396,13 +420,13 @@ fn the_audit_catches_expired_staging_taken_for_a_commit() {
     });
 }
 
-/// The seeded bug of `COMMIT`s sent without an apply-by time: one that
-/// arrives past its commit window still applies, and is answered
-/// `committed`.
+/// The seeded bug of apply-by times a day past the commit window: a
+/// `COMMIT` that arrives past its commit window still applies, and is
+/// answered `committed`.
 #[test]
 fn the_audit_catches_commits_applied_past_their_window() {
     Runner::with_cost(2, COST).run(|context| {
-        let config = config(overdue(PeerBug::NoApplyBy));
+        let config = config(overdue(PeerBug::NoCommitWindow));
         let workload = workload(context, 20);
         let run =
             Cluster::with_services(config, services()).run(context, &workload, &FaultPlan::none());

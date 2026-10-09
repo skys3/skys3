@@ -211,10 +211,14 @@ fn descriptors_are_valid_only_for_their_time_bucket_and_source() {
         ),
         Err(DescriptorError::Source { .. })
     ));
-    // No common protocol version.
+    // No common protocol version: one only newer, or only older, as a
+    // peer whose commits carry no apply-by time.
     let mut newer = descriptor(NOW);
-    newer.versions = VersionRange::new(2, 9).unwrap();
+    newer.versions = VersionRange::new(3, 9).unwrap();
     assert_eq!(verify(&newer, NOW), Err(DescriptorError::Versions));
+    let mut older = descriptor(NOW);
+    older.versions = VersionRange::new(1, 1).unwrap();
+    assert_eq!(verify(&older, NOW), Err(DescriptorError::Versions));
 }
 
 proptest! {

@@ -292,7 +292,8 @@ pub struct Condition {
     /// The cluster of a peer write's destination: this cluster.
     #[prost(string, tag = "5")]
     pub cluster: String,
-    /// A peer write's apply-by time, in milliseconds since the Unix epoch.
+    /// A peer cluster's write's apply-by time, in milliseconds since the
+    /// Unix epoch, with any kind (design §7.8).
     #[prost(uint64, optional, tag = "6")]
     pub apply_by_ms: Option<u64>,
 }
@@ -629,13 +630,7 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
         }),
         Request::Write { body, condition } => {
             payload = record(body.clone())?;
-            Op::Write(match condition {
-                Precondition::None => condition_of(0, ""),
-                Precondition::Absent => condition_of(1, ""),
-                Precondition::Exists => condition_of(2, ""),
-                Precondition::Matches(etag) => condition_of(3, etag),
-                Precondition::Peer(peer) => peer_condition(peer),
-            })
+            Op::Write(encode_condition(condition))
         }
         Request::Seal => Op::Seal(true),
         Request::Unseal => Op::Unseal(true),
@@ -650,6 +645,24 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
         Header::new(MessageKind::Forward).with_body(forward.encode_to_vec()),
         payload,
     ))
+}
+
+/// The wire form of a write's precondition.
+fn encode_condition(condition: &Precondition) -> Condition {
+    match condition {
+        Precondition::None => condition_of(0, ""),
+        Precondition::Absent => condition_of(1, ""),
+        Precondition::Exists => condition_of(2, ""),
+        Precondition::Matches(etag) => condition_of(3, etag),
+        Precondition::Peer(peer) => peer_condition(peer),
+        Precondition::ApplyBy {
+            condition,
+            apply_by_ms,
+        } => Condition {
+            apply_by_ms: Some(*apply_by_ms),
+            ..encode_condition(condition)
+        },
+    }
 }
 
 fn condition_of(kind: u32, etag: &str) -> Condition {
@@ -672,7 +685,7 @@ fn peer_condition(peer: &PeerCondition) -> Condition {
         identity: peer.identity.to_string(),
         expected,
         cluster: peer.cluster.to_string(),
-        apply_by_ms: peer.apply_by_ms,
+        apply_by_ms: None,
     }
 }
 
@@ -686,18 +699,16 @@ fn decode_condition(condition: Condition, shard: &ShardRef) -> Decoded<Precondit
         cluster,
         apply_by_ms,
     } = condition;
-    let plain =
-        identity.is_empty() && expected.is_empty() && cluster.is_empty() && apply_by_ms.is_none();
+    let plain = identity.is_empty() && expected.is_empty() && cluster.is_empty();
     let peer = |expected| -> Decoded<Precondition> {
         Ok(Precondition::Peer(PeerCondition {
             identity: identity.parse().map_err(|error| format!("{error}"))?,
             expected,
             cluster: ClusterId::new(cluster).map_err(|error| error.to_string())?,
             shard: shard.clone(),
-            apply_by_ms,
         }))
     };
-    match (kind, etag.is_empty(), plain) {
+    let condition = match (kind, etag.is_empty(), plain) {
         (0, true, true) => Ok(Precondition::None),
         (1, true, true) => Ok(Precondition::Absent),
         (2, true, true) => Ok(Precondition::Exists),
@@ -708,7 +719,8 @@ fn decode_condition(condition: Condition, shard: &ShardRef) -> Decoded<Precondit
         )),
         (6, true, _) if expected.is_empty() => peer(skys3_peer::Precondition::Unconditional),
         _ => Err(format!("condition {kind}")),
-    }
+    }?;
+    Ok(condition.apply_by(apply_by_ms))
 }
 
 /// Decodes a forwarded request: its shard, the gateway's epoch, and the

@@ -155,8 +155,8 @@ pub use message::{
     Message, Outcome, Precondition, Put, PutData, StagedPart, StagedRanges, Write,
 };
 pub use negotiation::{
-    Capabilities, NegotiationError, PROTOCOL_VERSION, ProtocolError, SUPPORTED_VERSIONS, Session,
-    Side, VersionRange, negotiate,
+    APPLY_BY_VERSION, Capabilities, NegotiationError, PROTOCOL_VERSION, ProtocolError,
+    SUPPORTED_VERSIONS, Session, Side, VersionRange, negotiate,
 };
 pub use pool::{
     AdaptiveLimit, ConnectionPool, GROWTH_THRESHOLD, LATENCY_SLACK, LATENCY_TOLERANCE, Measurement,

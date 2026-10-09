@@ -33,7 +33,7 @@ use skys3_remote::{
     UserMetadata, VersionId, WriteOutput, WritePrecondition,
 };
 use skys3_sim::SimS3;
-use skys3_types::ETag;
+use skys3_types::{ETag, WriteIdentity};
 
 use crate::peer::PeerLog;
 use crate::s3::{self, S3_PORT};
@@ -198,6 +198,21 @@ impl PeerS3 {
     fn acknowledged(&self, key: &str) {
         self.log.s3_write(key);
     }
+
+    /// Sends the apply-by time of a write of `key`, if it has one, and
+    /// records that the write was sent (design §7.8).
+    fn bounded(
+        &self,
+        builder: http::request::Builder,
+        key: &str,
+        apply_by_ms: Option<u64>,
+    ) -> http::request::Builder {
+        self.log.s3_sent(key, apply_by_ms);
+        match apply_by_ms {
+            Some(apply_by) => builder.header(WriteIdentity::APPLY_BY_HEADER, apply_by),
+            None => builder,
+        }
+    }
 }
 
 impl ObjectStore for PeerS3 {
@@ -216,6 +231,7 @@ impl ObjectStore for PeerS3 {
             builder = builder.header("content-md5", md5.as_str());
         }
         builder = with_precondition(builder, &request.precondition);
+        builder = self.bounded(builder, &request.key, request.apply_by_ms);
         let response = self.send(builder, request.body).await?;
         self.acknowledged(&request.key);
         write_output(response.headers(), None)
@@ -281,6 +297,7 @@ impl ObjectStore for PeerS3 {
         if let Some(etag) = &request.if_match {
             builder = builder.header("if-match", etag.to_quoted());
         }
+        builder = self.bounded(builder, &request.key, request.apply_by_ms);
         let response = self.send(builder, Bytes::new()).await?;
         self.acknowledged(&request.key);
         Ok(DeleteOutput {
@@ -366,6 +383,7 @@ impl ObjectStore for PeerS3 {
             }
         }
         builder = with_precondition(builder, &request.precondition);
+        builder = self.bounded(builder, &request.key, request.apply_by_ms);
         let response = self.send(builder, Bytes::new()).await?;
         self.acknowledged(&request.key);
         let xml = String::from_utf8_lossy(response.body()).into_owned();
@@ -411,6 +429,7 @@ impl ObjectStore for PeerS3 {
         let query = [("uploadId", request.upload_id.0.clone())];
         let mut builder = self.request(Method::POST, &self.path(&request.key, &query));
         builder = with_precondition(builder, &request.precondition);
+        builder = self.bounded(builder, &request.key, request.apply_by_ms);
         let mut xml = String::from("<CompleteMultipartUpload>");
         for part in &request.parts {
             xml.push_str(&format!(

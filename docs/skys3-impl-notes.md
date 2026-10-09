@@ -5335,7 +5335,9 @@ of this file. A task with nothing unexpected keeps "None."
   batches in flight and a flush concurrency of 4, each object went in a
   batch of its own. That is the intended behavior: an item waits only
   while 4 batches are unanswered, so an idle target adds no delay. The
-  test now checks that small objects never open a staging stream.
+  test now checks that small objects never open a staging stream. Since
+  the S3 fence (below), a batch holds at most 1 MiB of records and 16
+  are in flight.
 - **The cluster simulation has a peer.** `ClusterConfig::peer` adds a
   destination cluster of one node. It recovers its shards from a
   simulated disk in each life, and serves the real `StagingService` and
@@ -5467,11 +5469,53 @@ of this file. A task with nothing unexpected keeps "None."
   it is not applied; the simulation's audit now ignores a `COMMIT` that
   arrives after its apply-by time, and its commit window is the
   destination's idle timeout, so the seeded bug of no quarantine is still
-  caught. Still open: the reverse switch. An S3 REST write to a SkyS3
-  peer carries no apply-by time, so one routed to a remote primary and
-  held there can still be sequenced after its target is back on QUIC.
-  A node that does not know `apply_by_ms` ignores it, so every node of
-  both clusters needs this version for the bound to hold.
+  caught.
+- **The apply-by time is negotiated (found in review).** A node that did
+  not know `apply_by_ms` ignored it, and a `COMMIT` without one was
+  unbounded, yet both spoke protocol version 1, so the shorter
+  quarantine relied on a field neither end had to send or check. The
+  protocol is now version 2 only (`PROTOCOL_VERSION`,
+  `APPLY_BY_VERSION`): version 1 was never released, so no node keeps
+  it. `Session::check` refuses a `COMMIT` or `BATCH` item without an
+  apply-by time, on send and on receipt (`ProtocolError::NoApplyBy`), so
+  every `COMMIT` of a session is bounded, and the field became required
+  for every sender (`Native` always stamps). The routing wire's condition
+  carries the time for any kind of condition (tag 6), as the destination
+  checks it on whichever node sequences the write. Recorded in §7.8.
+- **S3 writes to a peer are fenced too (found in review).** The reverse
+  switch had no fence: an S3 REST write to a SkyS3 peer carried no
+  apply-by time, so one held in the destination's routing could be
+  sequenced over a `COMMIT` sent after the target returned to QUIC.
+  Now each S3 write that publishes or deletes a version, to a target that
+  served a descriptor, carries `x-skys3-apply-by`
+  (`WriteIdentity::APPLY_BY_HEADER`), signed with the request. The
+  `Stamping` store adds it as the REST window admits the request, and
+  `Target::with_apply_by` turns it on, probes included. The gateway
+  reads it only from the peer's keys (`ApplyBy`) and checks it with the
+  precondition (`Precondition::ApplyBy`), as it checks a `COMMIT`'s; it
+  requires it where that peer reaches the bucket over QUIC too, the
+  bucket's `peer_source` on a node serving the descriptor. A multipart
+  upload's completion carries it, its parts and creation do not. Each
+  shard flusher that starts on QUIC waits the quarantine from the later
+  of its tenure's start (the shard's sequencing epoch, as this node
+  first saw it) and the node's last S3 flush of the target, so a node's
+  start, a takeover, and a `native` target wait as well: 90 s by default
+  before a new flusher's first `COMMIT`. A deadline covers the
+  destination's work, not a body's transfer, so the bytes it covers stay
+  at 1 MiB (`MAX_BOUNDED_BYTES`): a `BATCH` holds at most 1 MiB of
+  records and objects of at most 1 MiB, with 16 batches in flight
+  instead of 4 to keep the throughput; over S3 to a peer, a `PUT` over
+  1 MiB becomes a multipart upload (`put_body_parts`), so its remote
+  ETag is a multipart one, and a copy is sent as an object. The
+  simulation's audit now records each S3 write's apply-by time and
+  fails a `COMMIT` sent while one of its key could still apply; the
+  seeded bug `PeerBug::NoReturnQuarantine` is caught. The replay
+  scenario's UDP block is longer, since the first QUIC flushes now wait
+  out the quarantine.
+- **A stalled-commit test was flaky.** The gate of
+  `a_commit_that_stalls_past_its_apply_by_time_never_applies` released
+  its permits back, so a later poll could pass early. It now forgets
+  them.
 - **The descriptor key is reserved (found in review).** Only `GET` and
   `HEAD` knew the key. A client could write it in a source bucket, the
   peer would store that version, and every read there would answer the
@@ -5480,6 +5524,12 @@ of this file. A task with nothing unexpected keeps "None."
   S3 or in a `COMMIT` or `BATCH` item, and a multi-object delete refuses
   that key alone. A namespace import skips a remote object at the key, so
   it is never filled. Recorded in §7.2 and §7.8.
+- **A peer's copy carries its identity (found in review).** CopyObject
+  checked `REPLACE` metadata as a client's, so a peer's server-side copy
+  with its `x-amz-meta-skys3-wid` was refused with `400
+  InvalidArgument`, and the flusher fell back to uploading the bytes.
+  The copy now takes its carrier from the request, as PUT and multipart
+  uploads do.
 - **The node binary peers.** `NodePeering` binds the QUIC endpoint when
   peers are configured. It serves `StagingService` with `PeerCommits`
   over the node's shards, adapts the pool every second, and signs the
@@ -5624,7 +5674,7 @@ of this file. A task with nothing unexpected keeps "None."
   takeovers, under the M6-06 cluster faults plus:
   - `lost_messages_are_retried_and_each_write_applies_once`: loses 4 %
     of messages either way, for staged objects and batches.
-  - `reconnects_mid_transfer_resend_only_what_is_not_durable`: drops 3 %
+  - `reconnects_mid_transfer_resend_only_what_is_not_durable`: drops 6 %
     of connections mid-transfer, and checks that `RESUME`s reported
     durable bytes that were not resent.
   - `duplicate_commits_apply_once_and_are_answered_alike`: replays after
@@ -5642,8 +5692,10 @@ of this file. A task with nothing unexpected keeps "None."
   - `PeerBug::ResendDurable` ignores the `RESUME`.
   - `PeerBug::ExpiredAsCommitted` takes an `incomplete` answer or expired
     staging for a commit. The `FLUSHED` audit catches it.
-  - `PeerBug::NoApplyBy` sends `COMMIT`s without an apply-by time. It was
-    added after M6-07's apply-by merge.
+  - `PeerBug::NoCommitWindow` stamps each `COMMIT`'s apply-by time a day
+    past the commit window. It was added after M6-07's apply-by merge.
+    It first sent no apply-by time at all, which M6-07's protocol
+    version 2 now refuses on send.
 - **Product change: staging stays while its `COMMIT` applies.**
   `Staging::pin` and `Staging::unpin` keep staging that was live when its
   `COMMIT` arrived from expiring while the `COMMIT` waits for the
@@ -5708,7 +5760,7 @@ of this file. A task with nothing unexpected keeps "None."
   - Beyond CI's seeds, every scenario and seeded bug passed seeds 100 to
     115, and the overdue scenario and its bug passed seeds 0 to 15 too.
     `PeerBug::NoQuarantine` was caught on seeds 0 to 11 after the merge.
-    With the bug taken out, its scenario and `PeerBug::NoApplyBy`'s
+    With the bug taken out, its scenario and `PeerBug::NoCommitWindow`'s
     passed seeds 0 to 7, so the correct cluster passes the same faults.
   - Typical counts at a seed: 3 to 18 connections dropped, with 2 to 11
     `RESUME`s that reported up to about 10 KB durable; 15 to 30

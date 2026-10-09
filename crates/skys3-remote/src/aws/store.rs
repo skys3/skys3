@@ -4,10 +4,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
+use aws_sdk_s3::config::http::HttpRequest;
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{self as sdk, CompletedMultipartUpload};
 use bytes::Bytes;
-use skys3_types::ETag;
+use skys3_types::{ETag, WriteIdentity};
 
 use super::AwsS3;
 use super::error::{malformed, map_sdk_error};
@@ -144,6 +145,18 @@ fn encode_copy_source(key: &str) -> String {
     encoded
 }
 
+/// Sets a write's `x-skys3-apply-by` header, before the request is signed,
+/// if the write has an apply-by time (design §7.8).
+fn apply_by(apply_by_ms: Option<u64>) -> impl Fn(&mut HttpRequest) + Send + Sync + 'static {
+    move |request: &mut HttpRequest| {
+        if let Some(apply_by_ms) = apply_by_ms {
+            request
+                .headers_mut()
+                .insert(WriteIdentity::APPLY_BY_HEADER, apply_by_ms.to_string());
+        }
+    }
+}
+
 impl ObjectStore for AwsS3 {
     async fn put_object(&self, request: PutObject) -> S3Result<WriteOutput> {
         const OP: &str = "PutObject";
@@ -166,6 +179,8 @@ impl ObjectStore for AwsS3 {
             .set_content_md5(request.content_md5)
             .set_if_none_match(if_none_match)
             .set_if_match(if_match)
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;
@@ -256,6 +271,8 @@ impl ObjectStore for AwsS3 {
             .key(request.key)
             .set_version_id(request.version_id.map(|v| v.0))
             .set_if_match(request.if_match.map(|etag| etag.to_quoted()))
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error("DeleteObject", error))?;
@@ -362,6 +379,8 @@ impl ObjectStore for AwsS3 {
                 .set_tagging((!tags.is_empty()).then(|| tagging(&tags))),
         };
         let output = builder
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;
@@ -445,6 +464,8 @@ impl ObjectStore for AwsS3 {
             )
             .set_if_none_match(if_none_match)
             .set_if_match(if_match)
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;

@@ -190,7 +190,7 @@ fn commit(n: u64) -> Commit {
             checksums: BTreeMap::new(),
             data: PutData::Inline(Bytes::from(body)),
         }),
-        apply_by_ms: None,
+        apply_by_ms: Some(u64::MAX),
     }
 }
 

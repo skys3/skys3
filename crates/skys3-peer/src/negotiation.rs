@@ -14,11 +14,18 @@ use skys3_types::ClusterId;
 use crate::message::{Hello, Message};
 
 /// The protocol version this implementation speaks best.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// The protocol versions this implementation speaks.
+/// The first protocol version whose `COMMIT`s and `BATCH` items must
+/// carry an apply-by time ([`Commit::apply_by_ms`](crate::Commit), §7.8).
+/// A source that falls back to S3 REST relies on it to bound when a
+/// `COMMIT` it sent can still apply, so no session is older.
+pub const APPLY_BY_VERSION: u16 = 2;
+
+/// The protocol versions this implementation speaks: only those whose
+/// commits carry an apply-by time. Version 1 was never released.
 pub const SUPPORTED_VERSIONS: VersionRange = VersionRange {
-    min: 1,
+    min: APPLY_BY_VERSION,
     max: PROTOCOL_VERSION,
 };
 
@@ -212,6 +219,13 @@ pub enum ProtocolError {
         /// The message's name.
         message: &'static str,
     },
+    /// A `COMMIT` or `BATCH` item without the apply-by time its session's
+    /// version requires (§7.8).
+    #[error("{message} carries no apply-by time")]
+    NoApplyBy {
+        /// The message's name.
+        message: &'static str,
+    },
 }
 
 impl Session {
@@ -220,7 +234,9 @@ impl Session {
     /// # Errors
     ///
     /// [`ProtocolError`] for a second `HELLO`, a message from the wrong
-    /// side, or a `BATCH` without [`Capabilities::BATCH`].
+    /// side, a `BATCH` without [`Capabilities::BATCH`], or, from
+    /// [`APPLY_BY_VERSION`] on, a `COMMIT` or `BATCH` item without an
+    /// apply-by time.
     pub fn check(&self, message: &Message, sender: Side) -> Result<(), ProtocolError> {
         let name = message.name();
         let from = match message {
@@ -240,6 +256,14 @@ impl Session {
         if matches!(message, Message::Batch(_)) && !self.capabilities.contains(Capabilities::BATCH)
         {
             return Err(ProtocolError::NotNegotiated { message: name });
+        }
+        let unbounded = match message {
+            Message::Commit(commit) => commit.apply_by_ms.is_none(),
+            Message::Batch(batch) => batch.items.iter().any(|item| item.apply_by_ms.is_none()),
+            _ => false,
+        };
+        if unbounded && self.version >= APPLY_BY_VERSION {
+            return Err(ProtocolError::NoApplyBy { message: name });
         }
         Ok(())
     }

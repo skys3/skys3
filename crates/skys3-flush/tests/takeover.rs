@@ -220,6 +220,7 @@ fn a_complete_the_old_primary_sent_is_recognized_by_its_identity() {
                 etag: md5_etag(b"only part"),
             }],
             precondition: WritePrecondition::None,
+            apply_by_ms: None,
         };
         store.complete_multipart_upload(complete).await.unwrap();
         let node = node.crash().await;

@@ -1182,8 +1182,25 @@ fn peer_conditions_round_trip() {
                 expected,
                 cluster: ClusterId::new("prod-eu").unwrap(),
                 shard: shard.clone(),
-                apply_by_ms: Some(1_800_000_000_000),
-            }),
+            })
+            .apply_by(Some(1_800_000_000_000)),
+        };
+        let frame = wire::request_frame(&shard, Epoch::new(1), &write).unwrap();
+        assert_eq!(
+            wire::decode_request(&frame),
+            Ok((shard.clone(), Epoch::new(1), write))
+        );
+    }
+    // A peer's S3 write: a plain condition with an apply-by time.
+    for condition in [
+        Precondition::None,
+        Precondition::Absent,
+        Precondition::Exists,
+        Precondition::Matches("0123".into()),
+    ] {
+        let write = Request::Write {
+            body: delete.clone(),
+            condition: condition.apply_by(Some(1_800_000_000_000)),
         };
         let frame = wire::request_frame(&shard, Epoch::new(1), &write).unwrap();
         assert_eq!(
@@ -1306,8 +1323,8 @@ proptest! {
                     },
                     cluster: ClusterId::new("prod-eu").unwrap(),
                     shard: shard(3),
-                    apply_by_ms: (limit % 2 == 0).then_some(limit as u64),
-                }),
+                })
+                .apply_by((limit % 2 == 0).then_some(limit as u64)),
             },
             Request::Flushed {
                 key: format!("k{key}"),

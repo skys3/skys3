@@ -82,11 +82,22 @@ pub const DEFAULT_REPROBE_MAX: Duration = Duration::from_secs(300);
 
 /// How far the wall clock of any node of two peered clusters may be from
 /// true time, which the quarantine allows for twice: once on the source
-/// that stamps a `COMMIT`'s apply-by time, once on the destination that
+/// that stamps a write's apply-by time, once on the destination that
 /// checks it (§7.8).
 pub const CLOCK_TOLERANCE: Duration = Duration::from_secs(30);
 
-/// How a target's `COMMIT`s are stamped with their apply-by time: the
+/// The most bytes a peer write whose apply-by time bounds it carries,
+/// inline in a `BATCH` or as an S3 `PutObject`'s body: the commit window
+/// must cover sending them (§7.8). Larger objects are staged, or uploaded
+/// in parts, and the small `COMMIT` or `CompleteMultipartUpload` that
+/// publishes them carries the apply-by time.
+pub const MAX_BOUNDED_BYTES: u64 = 1 << 20;
+
+/// How far past the commit window [`PeerBug::NoCommitWindow`] stamps a
+/// `COMMIT`'s apply-by time: a day.
+const BUGGY_EXTRA_WINDOW_MS: u64 = 24 * 3600 * 1000;
+
+/// How a target's peer writes are stamped with their apply-by time: the
 /// source's wall clock as each is sent, plus the commit window (§7.8).
 #[derive(Clone)]
 pub(crate) struct Stamp {
@@ -94,25 +105,35 @@ pub(crate) struct Stamp {
     window: Duration,
 }
 
+impl std::fmt::Debug for Stamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stamp")
+            .field("window", &self.window)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Stamp {
     pub(crate) fn new(wall: Arc<dyn WallClock>, window: Duration) -> Self {
         Self { wall, window }
     }
 
-    /// The apply-by time of a `COMMIT` sent now.
-    fn apply_by_ms(&self) -> u64 {
+    /// The apply-by time of a write sent now.
+    pub(crate) fn apply_by_ms(&self) -> u64 {
         u64::try_from((self.wall.now() + self.window).as_millis()).unwrap_or(u64::MAX)
     }
-}
 
-/// `commit` as it is sent now, with its apply-by time if `stamp` gives
-/// one.
-pub(crate) fn stamped(stamp: Option<&Stamp>, commit: &Commit) -> Commit {
-    let mut commit = commit.clone();
-    if let Some(stamp) = stamp.filter(|_| hooks::peer_bug() != PeerBug::NoApplyBy) {
-        commit.apply_by_ms = Some(stamp.apply_by_ms());
+    /// `commit` as it is sent now, with its apply-by time.
+    pub(crate) fn commit(&self, commit: &Commit) -> Commit {
+        let mut apply_by_ms = self.apply_by_ms();
+        if hooks::peer_bug() == PeerBug::NoCommitWindow {
+            apply_by_ms = apply_by_ms.saturating_add(BUGGY_EXTRA_WINDOW_MS);
+        }
+        Commit {
+            apply_by_ms: Some(apply_by_ms),
+            ..commit.clone()
+        }
     }
-    commit
 }
 
 /// Makes a link to the destination a verified descriptor names, once a
@@ -255,9 +276,8 @@ pub(crate) struct Native {
     pub(crate) batcher: Batcher,
     /// Tells the target's discovery when a link fails, if it has one.
     alarm: Option<LinkAlarm>,
-    /// How its `COMMIT`s are stamped with their apply-by time, if they
-    /// are.
-    stamp: Option<Stamp>,
+    /// How its `COMMIT`s are stamped with their apply-by time.
+    stamp: Stamp,
 }
 
 impl Native {
@@ -269,7 +289,7 @@ impl Native {
         bucket: BucketName,
         frame_bytes: u64,
         timeout: Duration,
-        stamp: Option<Stamp>,
+        stamp: Stamp,
     ) -> Self {
         let batcher = Batcher::spawn(Arc::clone(&link), timeout, stamp.clone());
         Self {
@@ -285,7 +305,7 @@ impl Native {
 
     /// `commit` as it is sent now, with its apply-by time.
     pub(crate) fn stamped(&self, commit: &Commit) -> Commit {
-        stamped(self.stamp.as_ref(), commit)
+        self.stamp.commit(commit)
     }
 
     /// Tells `alarm` of every link that fails.
@@ -334,6 +354,9 @@ pub enum PeerBug {
     /// A shard flusher that starts on S3 REST to a peer flushes at once,
     /// while `COMMIT`s sent over QUIC may still apply.
     NoQuarantine,
+    /// A shard flusher that starts on QUIC commits at once, while S3
+    /// writes sent to the peer before it started may still apply.
+    NoReturnQuarantine,
     /// Staging ignores the `RESUME`: every byte of the object is sent
     /// again, durable ranges included.
     ResendDurable,
@@ -341,10 +364,10 @@ pub enum PeerBug {
     /// reports expired, counts as committed: the key is recorded flushed
     /// although the destination never applied it.
     ExpiredAsCommitted,
-    /// A `COMMIT` carries no apply-by time: one delayed past its commit
-    /// window still applies, after its source may have given it up and
-    /// flushed the key over S3.
-    NoApplyBy,
+    /// A `COMMIT`'s apply-by time ignores the commit window, a day past
+    /// it: one delayed past its window still applies, after its source
+    /// may have given it up and flushed the key over S3.
+    NoCommitWindow,
 }
 
 /// What a flusher records as flushed to a native target, as the
@@ -456,9 +479,17 @@ mod tests {
             write: Write::Delete,
             apply_by_ms: None,
         };
-        assert_eq!(stamped(None, &commit), commit);
-        assert_eq!(stamped(Some(&stamp), &commit).apply_by_ms, Some(1_030_000));
+        let stamped = stamp.commit(&commit);
+        assert_eq!(stamped.apply_by_ms, Some(1_030_000));
+        assert_eq!(
+            Commit {
+                apply_by_ms: None,
+                ..stamped
+            },
+            commit
+        );
         wall.advance(Duration::from_secs(5));
-        assert_eq!(stamped(Some(&stamp), &commit).apply_by_ms, Some(1_035_000));
+        assert_eq!(stamp.commit(&commit).apply_by_ms, Some(1_035_000));
+        assert_eq!(stamp.apply_by_ms(), 1_035_000);
     }
 }

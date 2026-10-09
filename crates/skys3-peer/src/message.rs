@@ -146,7 +146,10 @@ pub struct Commit {
     /// sequence it later, by its own wall clock, and answers `unavailable`
     /// (§7.8). A source sets it as it sends the message, so a `COMMIT` held
     /// in a queue or on the way cannot apply after the source moved on to
-    /// S3 REST. `None`: no limit.
+    /// S3 REST. Every session of [`APPLY_BY_VERSION`](crate::APPLY_BY_VERSION)
+    /// or later refuses a `COMMIT` or `BATCH` item without one
+    /// ([`Session::check`](crate::Session::check)); `None` is only a commit
+    /// not yet sent.
     pub apply_by_ms: Option<u64>,
 }
 

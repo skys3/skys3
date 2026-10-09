@@ -88,7 +88,9 @@ fn commit(seq: u64, key: &str, precondition: Precondition, body: &[u8]) -> Commi
             checksums: BTreeMap::new(),
             data: PutData::Staged { piece: 1 },
         }),
-        apply_by_ms: None,
+        // Protocol version 2 refuses a COMMIT without one; these never
+        // expire.
+        apply_by_ms: Some(u64::MAX),
     }
 }
 
