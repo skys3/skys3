@@ -109,7 +109,7 @@ impl Stamp {
 /// one.
 pub(crate) fn stamped(stamp: Option<&Stamp>, commit: &Commit) -> Commit {
     let mut commit = commit.clone();
-    if let Some(stamp) = stamp {
+    if let Some(stamp) = stamp.filter(|_| hooks::peer_bug() != PeerBug::NoApplyBy) {
         commit.apply_by_ms = Some(stamp.apply_by_ms());
     }
     commit
@@ -341,6 +341,10 @@ pub enum PeerBug {
     /// reports expired, counts as committed: the key is recorded flushed
     /// although the destination never applied it.
     ExpiredAsCommitted,
+    /// A `COMMIT` carries no apply-by time: one delayed past its commit
+    /// window still applies, after its source may have given it up and
+    /// flushed the key over S3.
+    NoApplyBy,
 }
 
 /// What a flusher records as flushed to a native target, as the

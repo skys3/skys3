@@ -397,6 +397,8 @@ struct TapState {
     keys: BTreeMap<WriteIdentity, String>,
     /// Identities whose `COMMIT` arrived with its whole object covered.
     whole: BTreeSet<WriteIdentity>,
+    /// Identities whose `COMMIT` arrived overdue.
+    overdue: BTreeSet<WriteIdentity>,
 }
 
 impl Tap {
@@ -449,7 +451,9 @@ impl Tap {
                 }
             }
             Message::Commit(commit) => {
-                destination.commit_arrived(commit, &self.node);
+                if destination.commit_arrived(commit, &self.node) {
+                    state.overdue.insert(commit.identity.clone());
+                }
                 state
                     .keys
                     .insert(commit.identity.clone(), commit.key.clone());
@@ -464,7 +468,9 @@ impl Tap {
             }
             Message::Batch(batch) => {
                 for item in &batch.items {
-                    destination.commit_arrived(item, &self.node);
+                    if destination.commit_arrived(item, &self.node) {
+                        state.overdue.insert(item.identity.clone());
+                    }
                     state.keys.insert(item.identity.clone(), item.key.clone());
                 }
             }
@@ -483,6 +489,19 @@ impl Tap {
             Message::Applied(applied) => {
                 let key = state.keys.get(&applied.identity).cloned();
                 destination.answered(applied, key.as_deref());
+                if matches!(applied.outcome, Outcome::Committed { .. })
+                    && state.overdue.contains(&applied.identity)
+                {
+                    destination.violate(
+                        applied.identity.to_string(),
+                        format!(
+                            "the COMMIT of {} arrived past the commit window of its latest \
+                             send, yet it was answered committed: it applied after its \
+                             source may have flushed the key over S3",
+                            applied.identity
+                        ),
+                    );
+                }
                 if matches!(
                     applied.outcome,
                     Outcome::Failed {

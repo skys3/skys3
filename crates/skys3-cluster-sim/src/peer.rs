@@ -57,10 +57,12 @@
 //!   resends a byte its stream's `RESUME` reported durable
 //!   (`PeerBug::ResendDurable` breaks this); every `APPLIED` for the
 //!   identity the key's current version carries says `committed` with its
-//!   ETag, however many copies of the `COMMIT` arrive and from whichever
-//!   node; and a `COMMIT` whose stream covered its whole object is never
-//!   answered `incomplete`. Once the run is over, the staging that is
-//!   left expires and gives back its whole quota charge.
+//!   ETag, or `unavailable` for it to be sent again, however many copies
+//!   of the `COMMIT` arrive and from whichever node; a `COMMIT` whose stream covered its whole object is never
+//!   answered `incomplete`; and a `COMMIT` that arrives past the commit
+//!   window of its latest send is never answered `committed`
+//!   (`PeerBug::NoApplyBy` breaks this). Once the run is over, the staging
+//!   that is left expires and gives back its whole quota charge.
 //!
 //! [`Fault::PeerRestart`]: crate::Fault::PeerRestart
 
@@ -90,7 +92,7 @@ use skys3_io::{BlockingPool, Drift, MonoTime, SimDisk, SimMount, WallClock};
 use skys3_log::record::IDENTITY_METADATA;
 use skys3_log::{LogConfig, RecordBody};
 use skys3_peer::{
-    Applied, Commit, DescriptorSigner, DescriptorVerifier, EndpointSettings, Outcome,
+    Applied, ApplyError, Commit, DescriptorSigner, DescriptorVerifier, EndpointSettings, Outcome,
     PeerDescriptor, PeerTls, PeerTrust, Staging, StagingLimits, StagingService,
 };
 use skys3_sim::NodeClock;
@@ -127,6 +129,10 @@ const EXPIRED_BY: Duration = Duration::from_secs(2 * 3600);
 /// How often the driver samples the transport of the live nodes' peer
 /// targets.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+/// How far past the commit window of its latest send a `COMMIT` arrives
+/// before the audit calls it overdue: past its apply-by time, which counts
+/// whole milliseconds.
+const OVERDUE_MARGIN: Duration = Duration::from_millis(10);
 
 /// A SkyS3 peer that the buckets flush to over the native protocol, and
 /// the seeded bug the flushers run, if any.
@@ -377,6 +383,11 @@ impl PeerLog {
         aim
     }
 
+    /// When the latest `COMMIT` of `identity` was sent.
+    fn last_sent(&self, identity: &str) -> Option<Duration> {
+        lock(&self.commits).get(identity).map(|(_, sent)| *sent)
+    }
+
     /// How late the destination applies the `COMMIT` of `identity`, which
     /// just arrived, if a fault aimed at it is to apply it late: the fault
     /// starts now, and the `COMMIT` applies once four fifths of its hold
@@ -615,6 +626,9 @@ pub struct PeerAudit {
     pub late: u64,
     /// `ABORT`s that told a source its staging had expired.
     pub expired: u64,
+    /// `COMMIT`s that arrived past the commit window of their latest send,
+    /// which the destination must not answer `committed`.
+    pub overdue: u64,
     /// Write identities whose `COMMIT` arrived more than once.
     pub replayed: u64,
     /// Write identities whose `COMMIT` arrived from more than one node: a
@@ -633,6 +647,7 @@ pub(crate) struct ProtocolCounts {
     incomplete: AtomicU64,
     late: AtomicU64,
     expired: AtomicU64,
+    overdue: AtomicU64,
 }
 
 impl ProtocolCounts {
@@ -667,6 +682,10 @@ impl ProtocolCounts {
         self.expired.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn overdue(&self) {
+        self.overdue.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// `audit`, with the counts.
     fn add_to(&self, audit: PeerAudit) -> PeerAudit {
         let load = |count: &AtomicU64| count.load(Ordering::Relaxed);
@@ -679,6 +698,7 @@ impl ProtocolCounts {
             incomplete: load(&self.incomplete),
             late: load(&self.late),
             expired: load(&self.expired),
+            overdue: load(&self.overdue),
             ..audit
         }
     }
@@ -744,6 +764,8 @@ pub(crate) struct Destination {
     aborted: Mutex<BTreeSet<WriteIdentity>>,
     /// The staging of its latest life.
     staging: Mutex<Option<Arc<Staging>>>,
+    /// How long after it is sent a `COMMIT` may still apply.
+    window: Duration,
 }
 
 impl Destination {
@@ -860,6 +882,7 @@ impl Destination {
             arrivals: Mutex::default(),
             aborted: Mutex::default(),
             staging: Mutex::default(),
+            window: peer.commit_window(),
         })
     }
 
@@ -935,15 +958,28 @@ impl Destination {
         });
     }
 
-    /// `commit` arrived from `node`, alone or in a batch.
-    pub(crate) fn commit_arrived(&self, commit: &Commit, node: &str) {
+    /// `commit` arrived from `node`, alone or in a batch. Whether it is
+    /// overdue: it arrived past the commit window of its identity's latest
+    /// send, so its apply-by time passed, whichever send it is, and the
+    /// destination must not answer it `committed`, not even from the
+    /// stored result.
+    pub(crate) fn commit_arrived(&self, commit: &Commit, node: &str) -> bool {
         let identity = commit.identity.to_string();
         self.record
             .commit_received(&identity, &commit.key, commit.apply_by_ms);
+        // The margin covers the apply-by time's whole milliseconds.
+        let overdue = self
+            .record
+            .last_sent(&identity)
+            .is_some_and(|sent| now() > sent + self.window + OVERDUE_MARGIN);
+        if overdue {
+            self.counts.overdue();
+        }
         let mut arrivals = lock(&self.arrivals);
         let (count, nodes) = arrivals.entry(identity).or_default();
         *count += 1;
         nodes.insert(node.to_owned());
+        overdue
     }
 
     /// Whether the destination holds staging of `identity` now.
@@ -967,7 +1003,8 @@ impl Destination {
     /// `key`, if the tap knows its key: what it answered `committed`, or
     /// named as the key's current identity, is applied; and an identity
     /// the key's current version carries is answered `committed` with
-    /// that version's ETag, as often as its `COMMIT` arrives.
+    /// that version's ETag, or `unavailable`, as often as its `COMMIT`
+    /// arrives.
     pub(crate) fn answered(&self, applied: &Applied, key: Option<&str>) {
         {
             let mut known = lock(&self.applied);
@@ -992,15 +1029,25 @@ impl Destination {
         if carried != identity {
             return;
         }
-        let consistent = matches!(
-            &applied.outcome,
-            Outcome::Committed { etag: Some(answered) } if answered.as_str() == etag
-        );
+        // `unavailable` claims nothing: the source sends the COMMIT again,
+        // as it does after one arrived past its apply-by time, which is
+        // refused before the stored result is looked for.
+        let consistent = match &applied.outcome {
+            Outcome::Committed {
+                etag: Some(answered),
+            } => answered.as_str() == etag,
+            Outcome::Failed {
+                error: ApplyError::Unavailable,
+                ..
+            } => true,
+            _ => false,
+        };
         if !consistent {
             self.violate(
                 key.to_owned(),
                 format!(
-                    "the peer's current version of {key} carries {identity}, with ETag {etag},                      yet a COMMIT of it was answered {:?}",
+                    "the peer's current version of {key} carries {identity}, with ETag {etag}, \
+                     yet a COMMIT of it was answered {:?}",
                     applied.outcome
                 ),
             );

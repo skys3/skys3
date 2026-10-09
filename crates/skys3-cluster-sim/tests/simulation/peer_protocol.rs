@@ -1,7 +1,8 @@
 //! The native peer protocol under its own faults (plan M6-08, design
 //! §16.1): lost `DURABLE` and `APPLIED` messages and lost source messages,
-//! reconnects in the middle of a transfer, duplicate `COMMIT`s, and
-//! staging that expires before its `COMMIT` arrives.
+//! reconnects in the middle of a transfer, duplicate `COMMIT`s, staging
+//! that expires before its `COMMIT` arrives, and `COMMIT`s that arrive
+//! past their commit window.
 //!
 //! Each scenario runs three replicated nodes with takeovers, flushing a
 //! `write_back` bucket and a `local` bucket's backups to a destination of
@@ -18,11 +19,14 @@
 //! before the destination applied it, every committed change applied there
 //! once), the destination's taps check that no `DATA` resends what its
 //! stream's `RESUME` reported durable, that every copy of a `COMMIT` whose
-//! write the key holds is answered `committed` with its ETag, that a
+//! write the key holds is answered `committed` with its ETag, or
+//! `unavailable` for it to be sent again, that a
 //! `COMMIT` whose stream covered its object is never answered
-//! `incomplete`, and that all staging left at the end expires with its
-//! whole quota. Seeded bugs of the source show that the new audits catch
-//! durable ranges sent again and expired staging taken for a commit.
+//! `incomplete`, that no `COMMIT` arriving past the commit window of its
+//! latest send is answered `committed`, and that all staging left at the
+//! end expires with its whole quota. Seeded bugs of the source show that
+//! the new audits catch durable ranges sent again, expired staging taken
+//! for a commit, and `COMMIT`s sent without an apply-by time.
 
 use std::time::Duration;
 
@@ -269,6 +273,36 @@ fn expiring(bug: PeerBug) -> Peer {
     }
 }
 
+/// `COMMIT`s that arrive past their commit window, before their source
+/// gave up on them: the destination refuses each one, however its write
+/// went, and the source sends it again with a new apply-by time.
+#[test]
+fn commits_that_arrive_past_their_window_are_refused() {
+    Runner::with_cost(2, COST).run(|context| {
+        let report = run(context, config(overdue(PeerBug::None)), 30);
+        assert!(report.peer.overdue > 0, "{:?}", report.peer);
+        Ok(())
+    });
+}
+
+/// A peer whose commit window, its idle timeout, is 1.5 s: one `COMMIT`
+/// in three arrives 2.5 s late, within the 4 s a source waits for an
+/// answer.
+fn overdue(bug: PeerBug) -> Peer {
+    Peer {
+        idle: Duration::from_millis(1500),
+        timeout: Duration::from_secs(4),
+        ..peer(
+            ProtocolFaults {
+                late_per_mille: 300,
+                late_by: Duration::from_millis(2500),
+                ..ProtocolFaults::default()
+            },
+            bug,
+        )
+    }
+}
+
 /// A seed with the protocol's faults, QUIC included, replays exactly, on a
 /// cluster whose shards have one member: QUIC's draws come from the seed,
 /// and TLS's own change bytes but not sizes. A seed runs twice.
@@ -353,6 +387,29 @@ fn the_audit_catches_expired_staging_taken_for_a_commit() {
             Err(RunError::Check(violation)) => {
                 assert!(
                     violation.reason.contains("the peer never applied"),
+                    "{violation}"
+                );
+                Ok(())
+            }
+            other => Err(format!("the bug went unnoticed: {other:?}").into()),
+        }
+    });
+}
+
+/// The seeded bug of `COMMIT`s sent without an apply-by time: one that
+/// arrives past its commit window still applies, and is answered
+/// `committed`.
+#[test]
+fn the_audit_catches_commits_applied_past_their_window() {
+    Runner::with_cost(2, COST).run(|context| {
+        let config = config(overdue(PeerBug::NoApplyBy));
+        let workload = workload(context, 20);
+        let run =
+            Cluster::with_services(config, services()).run(context, &workload, &FaultPlan::none());
+        match run {
+            Err(RunError::Check(violation)) => {
+                assert!(
+                    violation.reason.contains("past the commit window"),
                     "{violation}"
                 );
                 Ok(())
