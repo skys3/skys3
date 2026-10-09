@@ -133,12 +133,19 @@ fn check(report: &Report) {
     assert!(report.peer.objects > 0 || !present, "{report:?}");
 }
 
-/// Runs `config` under the peer scenarios' faults and checks the run.
+/// Runs `config` with the clients of `workload` under the peer scenarios'
+/// faults, and checks the run.
 fn run(context: &mut SimContext, config: ClusterConfig, operations: usize) -> Report {
     let workload = workload(context, operations);
-    let plan = faults(context, &config, &workload);
+    run_with(context, config, &workload)
+}
+
+/// Runs `config` with `workload` under the peer scenarios' faults, and
+/// checks the run.
+fn run_with(context: &mut SimContext, config: ClusterConfig, workload: &Workload) -> Report {
+    let plan = faults(context, &config, workload);
     let report = Cluster::with_services(config, services())
-        .run(context, &workload, &plan)
+        .run(context, workload, &plan)
         .unwrap_or_else(|error| panic!("{error}"));
     check(&report);
     report
@@ -191,10 +198,10 @@ fn duplicate_commits_apply_once_and_are_answered_alike() {
         let peer = Peer {
             aimed: AimedBlocks {
                 count: 3,
-                hold: Duration::from_millis(2500),
-                every: Duration::from_secs(6),
+                hold: Duration::from_secs(6),
+                every: Duration::from_secs(8),
                 scope: AimScope::Deposed {
-                    isolated: Duration::from_secs(3),
+                    downtime: Duration::from_secs(3),
                 },
                 late: false,
             },
@@ -206,7 +213,13 @@ fn duplicate_commits_apply_once_and_are_answered_alike() {
                 PeerBug::None,
             )
         };
-        let report = run(context, config(peer), 40);
+        // Many keys, so that a key is seldom written again before the
+        // successor flushes the deposed primary's write.
+        let workload = Workload {
+            keys: 40,
+            ..workload(context, 40)
+        };
+        let report = run_with(context, config(peer), &workload);
         assert!(report.peer.replayed > 0, "{:?}", report.peer);
         Ok(())
     });

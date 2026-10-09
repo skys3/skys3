@@ -196,13 +196,14 @@ pub enum AimScope {
     /// The link between the node that sent the `COMMIT` and the peer: its
     /// `COMMIT` arrives late, while the other nodes' streams go on.
     Sender,
-    /// The sender deposed: it is cut off from the other nodes for
-    /// `isolated`, long enough for a member to take its shards over and
-    /// flush the same write again, while its link to the peer is held, so
-    /// that its own `COMMIT` arrives too, after its successor's or before.
+    /// The sender deposed: its process dies while its `COMMIT` waits on
+    /// its held link, and a member takes its shards over and flushes the
+    /// same write again. A dead process closes no connection, so its own
+    /// `COMMIT` arrives too once the hold ends within the idle timeout,
+    /// after its successor's or before.
     Deposed {
-        /// How long the sender is cut off from the other nodes.
-        isolated: Duration,
+        /// How long the sender stays down.
+        downtime: Duration,
     },
 }
 

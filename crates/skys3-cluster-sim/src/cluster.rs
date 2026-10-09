@@ -2498,9 +2498,9 @@ impl<S: NodeServices> Driver<'_, S> {
     }
 
     /// Starts a fault aimed at a `COMMIT` that the node `aim.node` sent:
-    /// UDP blocked between every node and the peer, its own link to the
-    /// peer held, or both and the node cut off from the others, so that a
-    /// member deposes it while its `COMMIT` waits.
+    /// UDP blocked between every node and the peer, or its own link to the
+    /// peer held, and the node crashed with it, so that a member deposes it
+    /// while its `COMMIT` waits.
     fn aim(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, aim: Aim) {
         let (node, peer) = (Endpoint::Node(aim.node), Endpoint::Peer);
         let hold = Fault::Hold {
@@ -2518,16 +2518,14 @@ impl<S: NodeServices> Driver<'_, S> {
             }
             AimScope::Udp => {}
             AimScope::Sender => self.start(sim, now, hold),
-            AimScope::Deposed { isolated } => {
-                for other in (0..self.world.slots.len()).filter(|other| *other != aim.node) {
-                    let cut = Fault::Partition {
-                        a: node,
-                        b: Endpoint::Node(other),
-                        duration: isolated,
-                    };
-                    self.start(sim, now, cut);
-                }
+            AimScope::Deposed { downtime } => {
                 self.start(sim, now, hold);
+                let crash = Fault::Crash {
+                    node: aim.node,
+                    power_loss: false,
+                    downtime,
+                };
+                self.start(sim, now, crash);
             }
         }
     }
