@@ -211,24 +211,39 @@ fn reconnects_mid_transfer_resend_only_what_is_not_durable() {
 }
 
 /// `COMMIT`s replayed after their `APPLIED` was lost, and the same
-/// `COMMIT` sent by a deposed primary, held on its way, and by its
-/// successor: each applies once and every copy is answered alike.
+/// `COMMIT` sent by a deposed primary and by its successor: each applies
+/// once and every copy is answered alike.
+///
+/// Each aimed fault starts as a `COMMIT` reaches the destination, which
+/// applies it late. Meanwhile its sender's link is held and the sender
+/// crashes before it can hear the `APPLIED`, so the shard's next primary
+/// sends the same `COMMIT` again from another node. Faults are aimed only
+/// while the clients write, and a successor sends nothing for the 3 s
+/// start wait (twice the 0.5 s answer timeout and the 2 s commit window),
+/// so the clients pause up to 300 ms between requests, and a deposed
+/// sender stays down for 6 s, long enough for its successor to flush.
+///
+/// On some seeds no other node takes the deposed shard over while its
+/// sender is down, and no `COMMIT` comes from two nodes. So every seed
+/// replays a `COMMIT`, and at least one seed of each run has one from two
+/// nodes; the counts by seed are printed.
 #[test]
 fn duplicate_commits_apply_once_and_are_answered_alike() {
+    let mut from_two_nodes = Vec::new();
     Runner::with_cost(4, COST).run(|context| {
-        // A commit window of 8 s, so that a `COMMIT` held for 6 s on its
-        // deposed sender's link can still apply.
+        // Applied 1.2 s late, four fifths of the 1.5 s hold, a `COMMIT` is
+        // within the commit window.
         let peer = Peer {
-            timeout: Duration::from_secs(2),
-            idle: Duration::from_secs(8),
+            timeout: Duration::from_millis(500),
+            idle: Duration::from_secs(2),
             aimed: AimedBlocks {
-                count: 3,
-                hold: Duration::from_secs(6),
-                every: Duration::from_secs(8),
+                count: 4,
+                hold: Duration::from_millis(1500),
+                every: Duration::from_secs(3),
                 scope: AimScope::Deposed {
-                    downtime: Duration::from_secs(3),
+                    downtime: Duration::from_secs(6),
                 },
-                late: false,
+                late: true,
             },
             ..peer(
                 ProtocolFaults {
@@ -242,12 +257,20 @@ fn duplicate_commits_apply_once_and_are_answered_alike() {
         // successor flushes the deposed primary's write.
         let workload = Workload {
             keys: 40,
+            think_time: Duration::from_millis(300),
             ..workload(context, 40)
         };
         let report = run_with(context, config(peer), &workload);
         assert!(report.peer.replayed > 0, "{:?}", report.peer);
+        from_two_nodes.push((context.seed(), report.peer.from_two_nodes));
         Ok(())
     });
+    // Write identities whose `COMMIT` came from two nodes, by seed.
+    eprintln!("COMMITs from two nodes, by seed: {from_two_nodes:?}");
+    assert!(
+        from_two_nodes.iter().any(|&(_, count)| count > 0),
+        "no seed had a COMMIT from two nodes: {from_two_nodes:?}"
+    );
 }
 
 /// Staging with a short TTL, and `COMMIT`s held on their way past it:

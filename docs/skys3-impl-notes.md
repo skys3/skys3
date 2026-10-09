@@ -5679,8 +5679,10 @@ of this file. A task with nothing unexpected keeps "None."
     of connections mid-transfer, with 128-byte frames, and checks that
     `RESUME`s reported durable bytes that were not resent.
   - `duplicate_commits_apply_once_and_are_answered_alike`: replays after
-    lost `APPLIED`s (4 % loss), and deposes a `COMMIT`'s sender while
-    the `COMMIT` waits, so that its successor sends it too.
+    lost `APPLIED`s (4 % loss), and deposes a `COMMIT`'s sender once the
+    `COMMIT` reached the destination, so that its successor sends it
+    too. At least one seed of each run must have a `COMMIT` from two
+    nodes.
   - `staging_that_expires_before_its_commit_is_staged_again`: a 400 ms
     TTL, late `COMMIT`s, and held senders.
   - `commits_that_arrive_past_their_window_are_refused`: a 1.5 s commit
@@ -5749,9 +5751,8 @@ of this file. A task with nothing unexpected keeps "None."
     is 12 s. The peer protocol scenarios then flushed only about a dozen
     `COMMIT`s per run, mostly after the cluster faults, and on some seeds
     no protocol fault struck. Their peer now has a 3 s commit window and
-    a 1 s answer timeout, so the wait is 5 s. The duplicate scenario
-    keeps 8 s, because its `COMMIT` held for 6 s must still apply. The
-    loss and drop rates grew, and so did the traffic: 20 keys for lost
+    a 1 s answer timeout, so the wait is 5 s. The loss and drop rates
+    grew, and so did the traffic: 20 keys for lost
     messages, and 128-byte frames for reconnects and for
     `PeerBug::ResendDurable`.
   - The main discovery scenario failed on seed 2: it wrote nothing over
@@ -5759,25 +5760,47 @@ of this file. A task with nothing unexpected keeps "None."
     a flusher then waits the quarantine on S3 REST. Its UDP blocks now
     last 11 to 14 s instead of 8 to 12 s, and it passes seeds 0 to 15.
     Both of M6-07's quarantine bugs are still caught on seeds 0 to 11.
+- **The duplicate scenario now asserts a COMMIT from two nodes (found
+  in review).** It asserted only `replayed > 0`, which same-node
+  retries after lost answers satisfy. `from_two_nodes` was 0 on every
+  seed after the start-wait merge, for two reasons:
+  - Aimed faults start only while the clients write. The clients
+    finished at about 5 s, before the 12 s start wait let any `COMMIT`
+    out, so every aim was released.
+  - A sender deposed for 3 s regained its shard before its successor's
+    start wait ended, and sent the `COMMIT` again itself.
+  The scenario now aims in late mode: the fault starts once the `COMMIT`
+  reaches the destination, which applies it 1.2 s later. Its peer has a
+  2 s commit window and a 0.5 s answer timeout, so the start wait is
+  3 s. The clients pause up to 300 ms between requests and still write
+  when the aims fall due. A deposed sender stays down for 6 s.
+  - Some seeds still get no `COMMIT` from two nodes: no other node takes
+    the deposed shard over while its sender is down. So each seed must
+    replay a `COMMIT`, and at least one seed of each run must have one
+    from two nodes. The test prints the counts by seed.
+  - At 256 seeds (seeds 0 to 7) the counts are 4, 0, 2, 3, 2, 3, 0 and
+    3. Seeds 100 to 115 had one on all but 100 and 111.
+  - A dedicated scenario would have cost a full run more; this one cost
+    no more than before. The seeded bugs do not use this path.
 - **Seeds and run times at 256 seeds.** Every new scenario uses
   `Runner::with_cost`. With `SKYS3_SIM_SEEDS=256`, one at `COST` runs
   seeds 0 to 7, and one at twice that runs seeds 0 to 3; the replay
   test runs each of its seeds twice. On toolchain 1.98.1, after the
   start-wait merge:
   - At `COST`: `lost_messages_are_retried_and_each_write_applies_once`
-    31.5 s, `reconnects_mid_transfer_resend_only_what_is_not_durable`
-    26.0 s, `duplicate_commits_apply_once_and_are_answered_alike`
-    42.9 s, `staging_that_expires_before_its_commit_is_staged_again`
-    30.1 s, and `commits_that_arrive_past_their_window_are_refused`
-    31.9 s.
+    29.9 s, `reconnects_mid_transfer_resend_only_what_is_not_durable`
+    27.2 s, `duplicate_commits_apply_once_and_are_answered_alike`
+    40.7 s, `staging_that_expires_before_its_commit_is_staged_again`
+    29.2 s, and `commits_that_arrive_past_their_window_are_refused`
+    32.4 s.
   - At twice `COST`: `a_seed_with_protocol_faults_replays_exactly`
-    9.3 s, and the seeded-bug scenarios
+    8.7 s, and the seeded-bug scenarios
     `the_audit_catches_durable_ranges_sent_again` 10.2 s,
     `the_audit_catches_expired_staging_taken_for_a_commit` 11.9 s, and
-    `the_audit_catches_commits_applied_past_their_window` 11.5 s. The
+    `the_audit_catches_commits_applied_past_their_window` 11.1 s. The
     start wait delays each bug's first chance to show, so these went to
     twice `COST`, as M6-07's bug scenarios are.
-  - That is 205.3 s for M6-08, over the 3 minutes planned. Before the
+  - That is 201.3 s for M6-08, over the 3 minutes planned. Before the
     start wait it was 185.1 s.
   - The M6-06 scenarios now take 122.1 s (29.0, 12.1, 35.2, 22.7, and
     23.1 s): the start wait slows their seeded bugs too. Over TCP before
