@@ -115,6 +115,7 @@ pub enum Refusal {
 ///             checksums: BTreeMap::new(),
 ///             data: PutData::Inline(body),
 ///         }),
+///         apply_by_ms: None,
 ///     };
 ///     builder.push(&commit)?;
 /// }
@@ -319,6 +320,7 @@ mod tests {
                 checksums: BTreeMap::new(),
                 data: PutData::Inline(body),
             }),
+            apply_by_ms: None,
         }
     }
 

@@ -289,7 +289,8 @@ impl<S> Target<S> {
         frame_bytes: u64,
         timeout: Duration,
     ) -> Self {
-        self.native = Some(Native::new(link, bucket, frame_bytes, timeout));
+        let stamp = crate::peer::Stamp::new(Arc::clone(&self.wall), timeout);
+        self.native = Some(Native::new(link, bucket, frame_bytes, timeout, stamp));
         self
     }
 
@@ -301,6 +302,23 @@ impl<S> Target<S> {
     pub(crate) fn with_native(mut self, native: Option<Native>) -> Self {
         self.native = native;
         self
+    }
+
+    /// Stamps every S3 write that publishes or deletes a version with its
+    /// apply-by time, as the S3 writes to a target that may be a SkyS3
+    /// peer must carry it (§7.8). Such a target then gets no `PutObject`
+    /// body over [`MAX_BOUNDED_BYTES`](crate::MAX_BOUNDED_BYTES), which a
+    /// remote multipart upload sends instead, and no server-side copy.
+    #[must_use]
+    pub fn with_apply_by(mut self, window: Duration) -> Self {
+        let stamp = crate::peer::Stamp::new(Arc::clone(&self.wall), window);
+        self.store.stamp_with(stamp);
+        self
+    }
+
+    /// Whether S3 writes carry apply-by times ([`Target::with_apply_by`]).
+    pub(crate) fn stamped(&self) -> bool {
+        self.store.stamped()
     }
 
     /// Sets how far the bucket's import has got.

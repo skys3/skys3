@@ -5335,7 +5335,9 @@ of this file. A task with nothing unexpected keeps "None."
   batches in flight and a flush concurrency of 4, each object went in a
   batch of its own. That is the intended behavior: an item waits only
   while 4 batches are unanswered, so an idle target adds no delay. The
-  test now checks that small objects never open a staging stream.
+  test now checks that small objects never open a staging stream. Since
+  the S3 fence (below), a batch holds at most 1 MiB of records and 16
+  are in flight.
 - **The cluster simulation has a peer.** `ClusterConfig::peer` adds a
   destination cluster of one node. It recovers its shards from a
   simulated disk in each life, and serves the real `StagingService` and
@@ -5381,6 +5383,235 @@ of this file. A task with nothing unexpected keeps "None."
 - **No new fuzz target.** The simulation's TCP framing reads frames with
   `parse_prefix` and `Message::decode_parts`, which M6-01's
   `peer_messages` target already fuzzes.
+
+### M6-07 Discovery and fallback
+
+- **The descriptor lives in the receiving bucket.** A destination serves
+  it at the reserved key `.skys3/peer-descriptor` of each bucket that
+  has a `peer_source`, on nodes that set `[peering] quic_advertise`. The
+  source reads it through the target's own S3 store, with a ranged `GET`
+  of at most 64 KiB. This needs no new port, DNS name, or credential,
+  and it reaches the source wherever its flushes do. The gateway answers
+  `GET` and `HEAD` itself, without the shards, and only for the bucket's
+  own `peer_source`; in any other bucket the key is an ordinary key.
+  Recorded in §7.8 and in the plan's §14 table.
+- **It is signed with the node's transport key.** `skys3-peer` gains
+  `PeerDescriptor`, `DescriptorSigner`, and `DescriptorVerifier`. The
+  envelope is protobuf: the body, a TLS 1.3 signature scheme, the
+  signature over `skys3 peer descriptor\0` and the body, and the chain.
+  The verifier reuses `PeerVerifier` for the chain, so the trust domain,
+  the role, and the bundle checks are those of the handshake. It then
+  checks the signature with webpki, the times (5 minutes of skew, at most
+  24 hours of life), the bucket and the source, and the versions. A
+  descriptor lasts an hour, and the node signs a new one after half of
+  that.
+- **A SkyS3 destination refused the fallback's writes (found in M7-05).**
+  A SkyS3 gateway refuses `x-amz-meta-skys3-wid` from clients, so a
+  source that fell back to S3 REST could not flush to it. The decision:
+  `[peering.peers.<id>] s3_access_key_ids` lists the peer's flusher
+  keys. A request signed with one of them may write the buckets that
+  receive from that peer, and may carry an identity that names the peer
+  and one of its bucket pairs. The gateway stores it as `COMMIT` does,
+  so either transport finds an earlier copy of a write. `HEAD` and `GET`
+  show it only to the peer's keys, and every other carrier still gets
+  `400 InvalidArgument`. A key belongs to one peer. Recorded in §7.8,
+  §12, and the plan's §14 table.
+- **Discovery is one task per target.** It is `Waiting`, `Native`
+  (with a link), `PeerS3`, or `PlainS3`. Each change of choice is a
+  generation. `FlushService::reconcile` rebuilds the target and drops its
+  shard flushers, as a restart does. Re-probes back off from 15 s,
+  doubling, to 5 minutes (`DEFAULT_REPROBE_MIN` and `_MAX`). A native
+  flush whose link fails wakes the task, which tries a fresh handshake at
+  once. `native` never falls back any more: M6-06's fallback with a
+  warning is gone, and a node without peers does not flush a `native`
+  target.
+- **The quarantine moved to the shard flushers (found in review).** It
+  first delayed only the target's readiness when it fell back. A takeover
+  on a target that had fallen back long before skipped it, and a
+  `COMMIT` that a deposed primary sent could still be on its way. Each
+  shard flusher on S3 REST to a target that served a descriptor now
+  waits the quarantine (90 s) from its own start. That covers
+  fallbacks, restarts, and takeovers alike. The exactly-once argument is
+  in §7.8.
+- **A new link is a new choice (found in review).** A choice was the
+  same as the last when its kind was, so the link of a handshake that
+  followed a broken one was dropped. The target stayed on QUIC with the
+  dead link, its flushes failing, until a handshake failed and it fell
+  back. Now each new link is a new generation, and the shard flushers
+  restart on it without a quarantine, since every `COMMIT` stays on QUIC
+  as after any native restart. Only a change between QUIC and S3 REST
+  counts as a switch.
+- **The pool counts the shard flushers (found in review).** The node's
+  handshake attached one lease of the pool for a target, which all its
+  shard flushers shared, so a bucket got one shard's connection budget
+  however many shards this node flushed. `PeerLink::set_shards` now
+  tells the link how many shard flushers use it, after each reconcile,
+  and a `ShardLease` can stand for that many shards
+  (`ShardLease::set_shards`), at least one. A link per shard flusher
+  would not fit: the batcher and the uploads share the target's link.
+- **COMMITs carry an apply-by time (found in review).** The quarantine
+  assumed that the destination applies a `COMMIT` only while its
+  connection is open. It did not: each stream ran on a detached task, and
+  a `COMMIT` already read waited in `CommitSink::apply` for its shard as
+  long as that took, after the connection idled out. A write routed to a
+  primary on another node can wait longer still, so no timer on the
+  destination's gateway bounds when a write is sequenced. Now each
+  `COMMIT` and `BATCH` item carries `apply_by_ms`: the source's wall clock
+  as it sends it, plus the commit window (the answer timeout). The shard
+  checks it as it sequences the write, in `LocalShards`' precondition
+  check, on its node's wall clock (`ConditionFailed::Expired`), and the
+  gateway refuses a late arrival at once; both answer `unavailable`. The
+  quarantine is the commit window plus twice a clock tolerance of 30 s
+  (`CLOCK_TOLERANCE`): still 90 s by default. This adds the design's one
+  wall-clock assumption, recorded in §2.3 and §7.8. The destination also
+  aborts a connection's stream tasks when it closes. A unit test stalls a
+  `COMMIT` in front of its shard past its apply-by time and checks that
+  it is not applied; the simulation's audit now ignores a `COMMIT` that
+  arrives after its apply-by time, and its commit window is the
+  destination's idle timeout, so the seeded bug of no quarantine is still
+  caught.
+- **The apply-by time is negotiated (found in review).** A node that did
+  not know `apply_by_ms` ignored it, and a `COMMIT` without one was
+  unbounded, yet both spoke protocol version 1, so the shorter
+  quarantine relied on a field neither end had to send or check. The
+  protocol is now version 2 only (`PROTOCOL_VERSION`,
+  `APPLY_BY_VERSION`): version 1 was never released, so no node keeps
+  it. `Session::check` refuses a `COMMIT` or `BATCH` item without an
+  apply-by time, on send and on receipt (`ProtocolError::NoApplyBy`), so
+  every `COMMIT` of a session is bounded, and the field became required
+  for every sender (`Native` always stamps). The routing wire's condition
+  carries the time for any kind of condition (tag 6), as the destination
+  checks it on whichever node sequences the write. Recorded in §7.8.
+- **S3 writes to a peer are fenced too (found in review).** The reverse
+  switch had no fence: an S3 REST write to a SkyS3 peer carried no
+  apply-by time, so one held in the destination's routing could be
+  sequenced over a `COMMIT` sent after the target returned to QUIC.
+  Now each S3 write that publishes or deletes a version, to a target that
+  served a descriptor, carries `x-skys3-apply-by`
+  (`WriteIdentity::APPLY_BY_HEADER`), signed with the request. The
+  `Stamping` store adds it as the REST window admits the request, and
+  `Target::with_apply_by` turns it on, probes included. The gateway
+  reads it only from the peer's keys (`ApplyBy`) and checks it with the
+  precondition (`Precondition::ApplyBy`), as it checks a `COMMIT`'s; it
+  requires it where that peer reaches the bucket over QUIC too, the
+  bucket's `peer_source` on a node serving the descriptor. A multipart
+  upload's completion carries it, its parts and creation do not. Each
+  shard flusher that starts on QUIC waits the quarantine from the later
+  of its tenure's start (the shard's sequencing epoch, as this node
+  first saw it) and the node's last S3 flush of the target, so a node's
+  start, a takeover, and a `native` target wait as well: 90 s by default
+  before a new flusher's first `COMMIT`. A deadline covers the
+  destination's work, not a body's transfer, so the bytes it covers stay
+  at 1 MiB (`MAX_BOUNDED_BYTES`): a `BATCH` holds at most 1 MiB of
+  records and objects of at most 1 MiB, with 16 batches in flight
+  instead of 4 to keep the throughput; over S3 to a peer, a `PUT` over
+  1 MiB becomes a multipart upload (`put_body_parts`), so its remote
+  ETag is a multipart one, and a copy is sent as an object. The
+  simulation's audit now records each S3 write's apply-by time and
+  fails a `COMMIT` sent while one of its key could still apply; the
+  seeded bug `PeerBug::NoReturnQuarantine` is caught. The replay
+  scenario's UDP block is longer, since the first QUIC flushes now wait
+  out the quarantine.
+- **A stalled-commit test was flaky.** The gate of
+  `a_commit_that_stalls_past_its_apply_by_time_never_applies` released
+  its permits back, so a later poll could pass early. It now forgets
+  them.
+- **The descriptor key is reserved (found in review).** Only `GET` and
+  `HEAD` knew the key. A client could write it in a source bucket, the
+  peer would store that version, and every read there would answer the
+  descriptor instead. Now every gateway refuses writes of the key in
+  every bucket with `400 InvalidArgument`, from clients and peers, over
+  S3 or in a `COMMIT` or `BATCH` item, and a multi-object delete refuses
+  that key alone. A namespace import skips a remote object at the key, so
+  it is never filled. Recorded in §7.2 and §7.8.
+- **A peer's copy carries its identity (found in review).** CopyObject
+  checked `REPLACE` metadata as a client's, so a peer's server-side copy
+  with its `x-amz-meta-skys3-wid` was refused with `400
+  InvalidArgument`, and the flusher fell back to uploading the bytes.
+  The copy now takes its carrier from the request, as PUT and multipart
+  uploads do.
+- **The node binary peers.** `NodePeering` binds the QUIC endpoint when
+  peers are configured. It serves `StagingService` with `PeerCommits`
+  over the node's shards, adapts the pool every second, and signs the
+  descriptors. Its handshake opens a fresh connection with `HELLO`s to
+  each resolved address, closes it, and hands the flushers a pool link.
+  The admin bucket status gains `flush.transport`. The gauge
+  `skys3_flush_transport{bucket, transport}` exists for verified peers
+  and `native` targets. The alert `SkyS3PeerTransportFallback` fires
+  after 30 minutes on S3, and the dashboard has a panel for it.
+- **The simulation falls back to the peer's real gateway.** The
+  destination now runs `Gateway` over a `MemoryControlStore` beside its
+  native service. Its authenticator takes the access key from a header,
+  and its descriptors are signed in the simulation on simulated wall
+  time. The nodes reach the gateway through a relay host, so faults on
+  the node-to-peer links block only the native path. `PeerS3` is a small
+  HTTP S3 client over turmoil, and `SimStore` lets one flush service mix
+  it with `SimS3`. The destination's PKI is Ed25519 with fixed serials,
+  so descriptors and chains have the same size in every run. The
+  existing M6-06 scenarios also read their descriptor through the
+  gateway now.
+- **The destination idles streams out.** A sim stream that sends nothing
+  for `Peer::idle` ends, as a QUIC connection does after its idle
+  timeout. Without this, a held `COMMIT` could arrive any time later, and
+  no quarantine would bound it.
+- **UDP blocks are a fault of their own (found in testing).** Blocks
+  built from per-node partitions ended early when an overlapping
+  partition healed the same link. `Fault::UdpBlock` cuts or holds every
+  node-to-peer link, and blocks the link again whenever another heal
+  repairs it. Overlapping blocks extend each other.
+- **Random holds rarely caught a `COMMIT` (found in testing).** Each sim
+  stream has its own TCP connection, so a hold that starts before the
+  connect holds the SYN, and no `COMMIT` is ever sent. The missing
+  quarantine went unnoticed on 3 of 4 seeds. `Peer::aimed` starts a held
+  block as a node sends a `COMMIT`, which catches it on the wire. The
+  main scenario aims two such blocks, ending before or after the idle
+  timeout, besides two drawn blocks of 8 to 12 s.
+- **The clients must outlast the blocks (found in testing).** On one
+  seed in 32 extra ones, the drawn blocks ended late and an aimed hold
+  began as the first `COMMIT` after them was sent. The clients stopped
+  writing before the nodes were back on QUIC, so no `COMMIT` reached the
+  peer. The drawn blocks now start within the first 3 s, and the clients
+  send 200 operations each, which keeps them writing for about 25 s.
+- **Multipart flushes over S3 (found in testing).** The flushers' 512-byte
+  parts got `EntityTooSmall`, so the destination's gateway takes parts of
+  any size, as the nodes' do. The peer's ETag of a streamed `PUT` sent
+  as a multipart upload is not the client's. The final audit reads such
+  objects back through a gateway and compares their MD5, as it does for
+  the remote store. The descriptor also lacked an ETag, which S3 clients
+  require, so the gateway now answers it with the MD5 of its bytes.
+- **The audits.**
+  - Exactly once: the M6-06 final audit, now over both transports.
+  - No `COMMIT` reaches the peer after an S3 write of its key that was
+    acknowledged after the `COMMIT` was sent.
+  - No `COMMIT` reaches a peer whose descriptor is forged or expired.
+  - Sampled every 250 ms, each live node's metric matches its status,
+    and every change of transport increments `switches`.
+  - After healing, every peer target is back on QUIC within 30 s.
+- **Seeded bugs.** `PeerBug::UnverifiedDescriptor` decodes the
+  descriptor without checking it, and `PeerBug::NoQuarantine` flushes over
+  S3 at once.
+- **Seeds and run times at 256 seeds.** With `SKYS3_SIM_SEEDS=256`, a
+  scenario at `COST` runs seeds 0 to 7 and one at twice that seeds 0 to
+  3. On toolchain 1.98.1:
+  - `discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`,
+    2 × `COST`, seeds 0 to 3: 46.8 s.
+  - `discovery::a_seed_with_udp_blocked_replays_exactly`, 2 × `COST`,
+    seeds 0 to 3, each run twice: 20.5 s.
+  - `discovery::forged_and_expired_descriptors_are_refused`, `COST`,
+    seeds 0 to 7: 32.2 s.
+  - `discovery::the_audit_catches_an_unverified_descriptor`, `COST`,
+    seeds 0 to 7: 2.4 s.
+  - `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`,
+    2 × `COST`, seeds 0 to 3: 21.6 s.
+  - That is 123.4 s for M6-07. The M6-06 scenarios now take 62.1 s in
+    all (23.1, 29.7, 5.1, 2.0, and 2.2 s), about as before.
+  - Beyond CI's seeds, the main scenario passed 64 more (100 to 131 and
+    300 to 331). Forged and expired descriptors were refused on seeds
+    100 to 131. Both seeded bugs were caught on all of seeds 100 to 131.
+  - The 256-seed `harness` run passes too.
+- **Fuzz target.** `peer_descriptor` decodes arbitrary bytes as a
+  descriptor and checks the decoder's invariants. A verifier that trusts
+  nobody refuses every input.
 
 ## M4 Large objects
 

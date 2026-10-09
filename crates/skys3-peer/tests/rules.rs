@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use skys3_log::record::{IDENTITY_METADATA, IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN};
 use skys3_peer::{
-    Abort, AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges, Capabilities, Commit, Data,
-    Hello, MAX_BATCH_ITEMS, MAX_HEADER_LEN, MAX_OBJECT_BYTES, MAX_PAYLOAD_LEN, MAX_PIECE_BYTES,
-    MAX_REASON_LEN, MAX_REPORTED_PIECES, MAX_REPORTED_RANGES, Message, MessageError, Outcome,
-    PROTOCOL_VERSION, Precondition, ProtocolError, Put, PutData, SUPPORTED_VERSIONS, Side,
-    StagedPart, StagedRanges, VersionRange, Write, negotiate,
+    APPLY_BY_VERSION, Abort, AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges,
+    Capabilities, Commit, Data, Hello, MAX_BATCH_ITEMS, MAX_HEADER_LEN, MAX_OBJECT_BYTES,
+    MAX_PAYLOAD_LEN, MAX_PIECE_BYTES, MAX_REASON_LEN, MAX_REPORTED_PIECES, MAX_REPORTED_RANGES,
+    Message, MessageError, Outcome, PROTOCOL_VERSION, Precondition, ProtocolError, Put, PutData,
+    SUPPORTED_VERSIONS, Side, StagedPart, StagedRanges, VersionRange, Write, negotiate,
 };
 use skys3_types::checksum::{Checksum, ChecksumAlgorithm};
 use skys3_types::{BucketName, ClusterId, ETag, WriteIdentity};
@@ -45,6 +45,7 @@ fn commit(key: &str, write: Write) -> Commit {
         key: key.to_owned(),
         precondition: Precondition::Absent,
         write,
+        apply_by_ms: Some(1_800_000_000_000),
     }
 }
 
@@ -425,13 +426,13 @@ fn negotiation_fails_without_a_common_version() {
 #[test]
 fn sessions_allow_each_side_its_own_messages() {
     let with_batch = negotiate(
-        &hello("a", 1, 1, Capabilities::BATCH),
-        &hello("b", 1, 1, Capabilities::BATCH),
+        &hello("a", 2, 2, Capabilities::BATCH),
+        &hello("b", 2, 2, Capabilities::BATCH),
     )
     .unwrap();
     let without_batch = negotiate(
-        &hello("a", 1, 1, Capabilities::BATCH),
-        &hello("b", 1, 1, Capabilities::NONE),
+        &hello("a", 2, 2, Capabilities::BATCH),
+        &hello("b", 2, 2, Capabilities::NONE),
     )
     .unwrap();
     let data = Message::Data(Data {
@@ -479,6 +480,34 @@ fn sessions_allow_each_side_its_own_messages() {
     let error = without_batch.check(&batch, Side::Source).unwrap_err();
     assert_eq!(error, ProtocolError::NotNegotiated { message: "BATCH" });
     assert!(error.to_string().contains("BATCH"));
+
+    // From version 2, every COMMIT and BATCH item carries an apply-by
+    // time (§7.8), sent or received.
+    assert_eq!(APPLY_BY_VERSION, 2);
+    let mut unbounded = commit("k", Write::Delete);
+    unbounded.apply_by_ms = None;
+    let lone = Message::Commit(unbounded.clone());
+    assert_eq!(
+        with_batch.check(&Message::Commit(commit("k", Write::Delete)), Side::Source),
+        Ok(())
+    );
+    for side in [Side::Source, Side::Destination] {
+        let error = with_batch.check(&lone, side);
+        let expected = match side {
+            Side::Source => Err(ProtocolError::NoApplyBy { message: "COMMIT" }),
+            Side::Destination => Err(ProtocolError::WrongSide {
+                side,
+                message: "COMMIT",
+            }),
+        };
+        assert_eq!(error, expected);
+    }
+    let mixed = Message::Batch(Batch {
+        items: vec![commit("a", Write::Delete), unbounded],
+    });
+    let error = with_batch.check(&mixed, Side::Source).unwrap_err();
+    assert_eq!(error, ProtocolError::NoApplyBy { message: "BATCH" });
+    assert_eq!(error.to_string(), "BATCH carries no apply-by time");
 }
 
 #[test]

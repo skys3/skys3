@@ -76,7 +76,12 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     pub(crate) fn copy_source(&self, object: &ObjectVersion) -> Option<Source> {
         let source = object.copy_source.as_ref()?;
         let etag = source.remote_etag.clone()?;
-        if !self.target.copy_support().is_usable() || object.size > MAX_COPY_BYTES {
+        // A SkyS3 peer's apply-by time would bound the copy's work at the
+        // destination too (§7.8): its copies are sent as objects.
+        if !self.target.copy_support().is_usable()
+            || object.size > MAX_COPY_BYTES
+            || self.target.stamped()
+        {
             return None;
         }
         let prefix = self.target.copy_sources.prefix(&source.bucket)?;

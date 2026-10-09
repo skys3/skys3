@@ -195,9 +195,10 @@ impl<H: Shards> Objects<H> {
         &self,
         bucket: &BucketDocument,
         input: PutObjectTaggingInput,
+        apply_by: Option<u64>,
     ) -> S3Result<PutObjectTaggingOutput> {
         let tags = tags_from_xml(input.tagging.tag_set)?;
-        self.set_tags(bucket, input.key, tags).await?;
+        self.set_tags(bucket, input.key, tags, apply_by).await?;
         Ok(PutObjectTaggingOutput::default())
     }
 
@@ -205,14 +206,23 @@ impl<H: Shards> Objects<H> {
         &self,
         bucket: &BucketDocument,
         input: DeleteObjectTaggingInput,
+        apply_by: Option<u64>,
     ) -> S3Result<DeleteObjectTaggingOutput> {
-        self.set_tags(bucket, input.key, TagSet::new()).await?;
+        self.set_tags(bucket, input.key, TagSet::new(), apply_by)
+            .await?;
         Ok(DeleteObjectTaggingOutput::default())
     }
 
     /// Commits a `TAGS` record that replaces the tags of `key`, if it has
-    /// an object when the record is sequenced.
-    async fn set_tags(&self, bucket: &BucketDocument, key: String, tags: TagSet) -> S3Result<()> {
+    /// an object when the record is sequenced, by `apply_by` for a peer's
+    /// write (§7.8).
+    async fn set_tags(
+        &self,
+        bucket: &BucketDocument,
+        key: String,
+        tags: TagSet,
+        apply_by: Option<u64>,
+    ) -> S3Result<()> {
         let shard = ShardRef::for_key(bucket, &key);
         self.admit(bucket, &shard)?;
         let record = RecordBody::Tags(Tags {
@@ -221,7 +231,7 @@ impl<H: Shards> Objects<H> {
         });
         let version = self
             .shards
-            .write(&shard, record, Precondition::Exists)
+            .write(&shard, record, Precondition::Exists.apply_by(apply_by))
             .await
             .map_err(shard_error)??;
         self.acknowledge(bucket, &shard, &key, version).await

@@ -48,6 +48,7 @@ use crate::buckets::shard_error;
 use crate::checksum::ExpectedChecksums;
 use crate::conditions::Precondition;
 use crate::limits::MAX_KEY_BYTES;
+use crate::peer_s3::ApplyBy;
 use crate::shard::{ShardRef, Shards};
 
 /// The most keys one DeleteObjects request deletes (the S3 limit).
@@ -62,6 +63,7 @@ impl<H: Shards> Objects<H> {
         bucket: &BucketDocument,
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<DeleteObjectOutput> {
+        let apply_by = ApplyBy::of(&req.extensions);
         let input = req.input;
         if input.if_match_last_modified_time.is_some() || input.if_match_size.is_some() {
             return Err(s3_error!(
@@ -69,7 +71,7 @@ impl<H: Shards> Objects<H> {
                 "x-amz-if-match-last-modified-time and x-amz-if-match-size are not supported"
             ));
         }
-        let condition = Precondition::of_write(input.if_match.as_ref(), None)?;
+        let condition = Precondition::of_write(input.if_match.as_ref(), None)?.apply_by(apply_by);
         let shard = ShardRef::for_key(bucket, &input.key);
         let delete = self.removal(bucket);
         delete
@@ -114,6 +116,7 @@ impl<H: Shards> Objects<H> {
             .cloned()
             .unwrap_or_default();
         let removal = self.removal(bucket);
+        let apply_by = ApplyBy::of(&extensions);
         let mut outcomes: Vec<Option<S3Result<()>>> = objects.iter().map(|_| None).collect();
         let mut pending = JoinSet::new();
         let mut work = objects.iter().enumerate();
@@ -123,7 +126,11 @@ impl<H: Shards> Objects<H> {
                     break;
                 };
                 let condition = match key_condition(object) {
-                    Ok(condition) if decisions.allows(index) => condition,
+                    Ok(_) if object.key == crate::peer_s3::DESCRIPTOR_KEY => {
+                        outcomes[index] = Some(Err(crate::peer_s3::reserved_key()));
+                        continue;
+                    }
+                    Ok(condition) if decisions.allows(index) => condition.apply_by(apply_by),
                     Ok(_) => {
                         outcomes[index] = Some(Err(access_denied()));
                         continue;

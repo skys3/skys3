@@ -325,6 +325,71 @@ async fn writes_carry_if_match() {
 }
 
 #[tokio::test]
+async fn writes_to_a_peer_carry_their_signed_apply_by_time() {
+    let mock = Mock::start().await;
+    let store = mock.client();
+    let by = Some(1_800_000_000_000);
+    let signed = |request: &Received| {
+        assert_eq!(request.header("x-skys3-apply-by"), Some("1800000000000"));
+        let authorization = request.header("authorization").unwrap();
+        assert!(
+            authorization.contains("x-skys3-apply-by"),
+            "{authorization}"
+        );
+    };
+
+    mock.reply(ok(&[("etag", "\"e1\"")], ""));
+    let put = PutObject {
+        apply_by_ms: by,
+        ..PutObject::new("k", "x")
+    };
+    store.put_object(put).await.unwrap();
+    signed(&mock.only_request());
+
+    mock.reply(status(204, &[], ""));
+    let delete = DeleteObject {
+        apply_by_ms: by,
+        ..DeleteObject::new("k")
+    };
+    store.delete_object(delete).await.unwrap();
+    signed(&mock.only_request());
+
+    mock.reply(ok(
+        &[],
+        "<CopyObjectResult><ETag>\"c1\"</ETag></CopyObjectResult>",
+    ));
+    let copy = CopyObject {
+        apply_by_ms: by,
+        ..CopyObject::new("src", "dst")
+    };
+    store.copy_object(copy).await.unwrap();
+    signed(&mock.only_request());
+
+    mock.reply(ok(
+        &[],
+        "<CompleteMultipartUploadResult><ETag>\"abc-1\"</ETag>\
+         </CompleteMultipartUploadResult>",
+    ));
+    let complete = CompleteMultipartUpload {
+        key: "k".to_owned(),
+        upload_id: UploadId("u".to_owned()),
+        parts: vec![CompletedPart {
+            part_number: 1,
+            etag: etag("p1"),
+        }],
+        precondition: WritePrecondition::None,
+        apply_by_ms: by,
+    };
+    store.complete_multipart_upload(complete).await.unwrap();
+    signed(&mock.only_request());
+
+    // Without one, nothing is sent.
+    mock.reply(ok(&[("etag", "\"e2\"")], ""));
+    store.put_object(PutObject::new("k", "y")).await.unwrap();
+    assert_eq!(mock.only_request().header("x-skys3-apply-by"), None);
+}
+
+#[tokio::test]
 async fn copies_replace_metadata_and_check_the_source() {
     let mock = Mock::start().await;
     let store = mock.client();
@@ -593,6 +658,7 @@ async fn multipart_uploads_round_trip() {
             },
         ],
         precondition: WritePrecondition::IfMatch(etag("old")),
+        apply_by_ms: None,
     };
     let output = store.complete_multipart_upload(complete).await.unwrap();
     assert_eq!(output.etag, etag("abc-2"));

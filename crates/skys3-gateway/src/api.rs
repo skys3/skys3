@@ -10,7 +10,9 @@
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use http::HeaderMap;
+use bytes::Bytes;
+use http::{Extensions, HeaderMap};
+use s3s::dto::StreamingBlob;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput,
     CompleteMultipartUploadOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
@@ -55,7 +57,13 @@ use crate::features::{
 use crate::lifecycle;
 use crate::listing::Listings;
 use crate::objects::{Objects, copy_source};
+use crate::peer_s3::{
+    ApplyBy, DESCRIPTOR_KEY, PeerAccess, PeerCaller, PeerDescriptors, writable_key,
+};
 use crate::shard::Shards;
+
+/// The content type of a peer descriptor: its protobuf encoding.
+const DESCRIPTOR_CONTENT_TYPE: &str = "application/x-protobuf";
 
 /// The most buckets one ListBuckets page returns (the S3 limit).
 const MAX_BUCKETS_PER_PAGE: usize = 10_000;
@@ -65,6 +73,11 @@ pub(crate) struct Api<C, H> {
     buckets: Arc<Buckets<C, H>>,
     objects: Objects<H>,
     listings: Listings<H>,
+    /// Which access keys are peer clusters' flushers (§7.8).
+    peers: PeerAccess,
+    /// The peer descriptors of the receiving buckets, if the node signs
+    /// any (§7.8).
+    descriptors: Option<Arc<dyn PeerDescriptors>>,
 }
 
 impl<C, H> Api<C, H> {
@@ -72,11 +85,14 @@ impl<C, H> Api<C, H> {
         buckets: Arc<Buckets<C, H>>,
         objects: Objects<H>,
         listings: Listings<H>,
+        (peers, descriptors): (PeerAccess, Option<Arc<dyn PeerDescriptors>>),
     ) -> Self {
         Self {
             buckets,
             objects,
             listings,
+            peers,
+            descriptors,
         }
     }
 }
@@ -88,10 +104,50 @@ impl<C: ControlStore, H: Shards> Api<C, H> {
     }
 
     /// The bucket an object write names, which must exist and take writes
-    /// from this cluster's clients.
-    fn writable(&self, name: &str) -> S3Result<BucketDocument> {
-        self.buckets.require_writable(&bucket_name(name)?)
+    /// from the request's sender: this cluster's clients, or a peer
+    /// cluster's flusher, which the request's `extensions` then record.
+    fn writable(&self, name: &str, extensions: &mut Extensions) -> S3Result<BucketDocument> {
+        let peer = self.peers.caller(extensions);
+        self.buckets
+            .require_writable(&bucket_name(name)?, peer.as_ref())
     }
+
+    /// The bucket a write that publishes or deletes a version names, as
+    /// [`Api::writable`], with the apply-by time a peer's flusher sent
+    /// recorded in `extensions` (§7.8). It is required where the peer's
+    /// native `COMMIT`s land: a bucket that receives from it, on a node
+    /// that serves its descriptor.
+    fn bounded(
+        &self,
+        name: &str,
+        headers: &HeaderMap,
+        extensions: &mut Extensions,
+    ) -> S3Result<BucketDocument> {
+        let bucket = self.writable(name, extensions)?;
+        let source = self.buckets.settings(&bucket.name).peer_source.as_ref();
+        let required = extensions
+            .get::<PeerCaller>()
+            .is_some_and(|PeerCaller(peer)| Some(peer) == source)
+            && self.descriptor(&bucket).is_some();
+        ApplyBy::of_request(headers, extensions, required)?;
+        Ok(bucket)
+    }
+
+    /// The peer descriptor of `bucket`, if it receives native replication
+    /// and the node signs one (§7.8).
+    fn descriptor(&self, bucket: &BucketDocument) -> Option<Bytes> {
+        let settings = self.buckets.settings(&bucket.name);
+        let source = settings.peer_source.as_ref()?;
+        self.descriptors.as_ref()?.descriptor(&bucket.name, source)
+    }
+}
+
+/// A descriptor's ETag, as of an object of its bytes: the MD5 of its
+/// encoding, which changes whenever it is signed again.
+fn descriptor_etag(descriptor: &[u8]) -> s3s::dto::ETag {
+    use md5::Digest as _;
+    let md5: [u8; 16] = md5::Md5::digest(descriptor).into();
+    s3s::dto::ETag::Strong(skys3_types::ETag::from_md5(&md5).as_str().to_owned())
 }
 
 fn bucket_name(name: &str) -> S3Result<BucketName> {
@@ -255,49 +311,75 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
 
     async fn put_object(
         &self,
-        req: S3Request<PutObjectInput>,
+        mut req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.put(&bucket, req).await?)
     }
 
     async fn get_object(
         &self,
-        req: S3Request<GetObjectInput>,
+        mut req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let bucket = self.bucket(&req.input.bucket)?;
+        if req.input.key == DESCRIPTOR_KEY
+            && let Some(descriptor) = self.descriptor(&bucket)
+        {
+            return ok(GetObjectOutput {
+                content_length: i64::try_from(descriptor.len()).ok(),
+                content_type: Some(DESCRIPTOR_CONTENT_TYPE.to_owned()),
+                e_tag: Some(descriptor_etag(&descriptor)),
+                body: Some(StreamingBlob::from_bytes(descriptor)),
+                ..GetObjectOutput::default()
+            });
+        }
+        self.peers.caller(&mut req.extensions);
         ok(self.objects.get(&bucket, req).await?)
     }
 
     async fn head_object(
         &self,
-        req: S3Request<HeadObjectInput>,
+        mut req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let bucket = self.bucket(&req.input.bucket)?;
+        if req.input.key == DESCRIPTOR_KEY
+            && let Some(descriptor) = self.descriptor(&bucket)
+        {
+            return ok(HeadObjectOutput {
+                content_length: i64::try_from(descriptor.len()).ok(),
+                content_type: Some(DESCRIPTOR_CONTENT_TYPE.to_owned()),
+                e_tag: Some(descriptor_etag(&descriptor)),
+                ..HeadObjectOutput::default()
+            });
+        }
+        self.peers.caller(&mut req.extensions);
         ok(self.objects.head(&bucket, req).await?)
     }
 
     async fn delete_object(
         &self,
-        req: S3Request<DeleteObjectInput>,
+        mut req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.delete(&bucket, req).await?)
     }
 
     async fn delete_objects(
         &self,
-        req: S3Request<DeleteObjectsInput>,
+        mut req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
         ok(self.objects.delete_objects(&bucket, req).await?)
     }
 
     async fn copy_object(
         &self,
-        req: S3Request<CopyObjectInput>,
+        mut req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         let (source, _) = copy_source(&req.input.copy_source)?;
         let source = self.bucket(source)?;
         if source.mode == BucketMode::ReadOnly {
@@ -328,41 +410,54 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
 
     async fn put_object_tagging(
         &self,
-        req: S3Request<PutObjectTaggingInput>,
+        mut req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
-        ok(self.objects.put_tagging(&bucket, req.input).await?)
+        let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
+        let apply_by = ApplyBy::of(&req.extensions);
+        ok(self
+            .objects
+            .put_tagging(&bucket, req.input, apply_by)
+            .await?)
     }
 
     async fn delete_object_tagging(
         &self,
-        req: S3Request<DeleteObjectTaggingInput>,
+        mut req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
-        ok(self.objects.delete_tagging(&bucket, req.input).await?)
+        let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
+        let apply_by = ApplyBy::of(&req.extensions);
+        ok(self
+            .objects
+            .delete_tagging(&bucket, req.input, apply_by)
+            .await?)
     }
 
     async fn create_multipart_upload(
         &self,
-        req: S3Request<CreateMultipartUploadInput>,
+        mut req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.create_upload(&bucket, req).await?)
     }
 
     async fn upload_part(
         &self,
-        req: S3Request<UploadPartInput>,
+        mut req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.upload_part(&bucket, req).await?)
     }
 
     async fn upload_part_copy(
         &self,
-        req: S3Request<UploadPartCopyInput>,
+        mut req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         let (source, _) = copy_source(&req.input.copy_source)?;
         let source = self.bucket(source)?;
         ok(self.objects.upload_part_copy(&bucket, &source, req).await?)
@@ -370,17 +465,18 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
 
     async fn complete_multipart_upload(
         &self,
-        req: S3Request<CompleteMultipartUploadInput>,
+        mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
+        writable_key(&req.input.key)?;
         ok(self.objects.complete_upload(&bucket, req).await?)
     }
 
     async fn abort_multipart_upload(
         &self,
-        req: S3Request<AbortMultipartUploadInput>,
+        mut req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
-        let bucket = self.writable(&req.input.bucket)?;
+        let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
         ok(self.objects.abort_upload(&bucket, req).await?)
     }
 

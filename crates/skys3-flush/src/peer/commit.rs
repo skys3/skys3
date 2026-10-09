@@ -15,7 +15,7 @@ use skys3_types::{ETag, EpochSeq, WriteIdentity};
 use super::batch::Unbatched;
 use super::hooks::peer_bug;
 use super::upload::{Layout, Staged};
-use super::{Native, PIECE, PeerBug};
+use super::{MAX_BOUNDED_BYTES, Native, PIECE, PeerBug};
 use crate::attempt::{Attempt, Conflict, Failure, MAX_ROUNDS, Outcome, Remote, read_payload};
 
 /// What a flush sends: a delete, or a version and where its bytes are.
@@ -66,6 +66,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 key: self.remote_key(),
                 precondition: precondition.clone(),
                 write: Write::Delete,
+                apply_by_ms: None,
             };
             let applied = match &sending {
                 Sending::Delete => self.commit_small(native, commit).await?,
@@ -165,7 +166,8 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             checksums: object.checksums.clone(),
             data: PutData::Staged { piece: PIECE },
         };
-        let small = skips_staging(object.size, native.frame_bytes)
+        // A batch's bytes are bounded by its apply-by time (§7.8).
+        let small = skips_staging(object.size, native.frame_bytes.min(MAX_BOUNDED_BYTES))
             && !matches!(object.payload, Payload::Parts { .. });
         if small && native.batcher.supported() {
             let _reserved = self.target.reserve(object.size).await;
@@ -207,7 +209,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             .await
             .map_err(Failure::link)?;
         stream
-            .send(&skys3_peer::Message::Commit(commit.clone()))
+            .send(&skys3_peer::Message::Commit(native.stamped(&commit)))
             .await
             .map_err(Failure::link)?;
         stream.finish().map_err(Failure::link)?;

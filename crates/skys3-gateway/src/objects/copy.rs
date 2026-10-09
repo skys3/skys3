@@ -23,7 +23,8 @@
 //! - **Metadata** (`x-amz-metadata-directive`): `COPY`, the default, keeps
 //!   the source's stored headers and user metadata and ignores the
 //!   request's; `REPLACE` takes them from the request, with PutObject's
-//!   limits. A write identity the source carries is never copied (§7.2).
+//!   limits. A write identity the source carries is never copied (§7.2);
+//!   a peer cluster's flusher may set its own, as on PutObject (§7.8).
 //! - **Tags** (`x-amz-tagging-directive`): `COPY`, the default, keeps the
 //!   source's tags; `REPLACE` takes `x-amz-tagging`, or none. Copying a
 //!   tagged source's tags needs `s3:GetObjectTagging` on the source and
@@ -64,6 +65,7 @@ use crate::checksum::{DEFAULT_ALGORITHM, Digests, PooledHasher, parse_algorithm}
 use crate::conditions::{
     Precondition, ReadConditions, last_modified, no_such_key, precondition_failed, s3_etag,
 };
+use crate::peer_s3::ApplyBy;
 use crate::shard::{ShardRef, Shards};
 
 /// What a copy does with the source's metadata or tags.
@@ -125,7 +127,7 @@ impl<H: Shards> Objects<H> {
             .extensions
             .get::<CopiedTags>()
             .is_some_and(|copied| copied.allowed());
-        let input = req.input;
+        let (input, extensions) = (req.input, req.extensions);
         let (_, source_key) = copy_source(&input.copy_source)?;
         let source_key = source_key.to_owned();
         let metadata_directive = Directive::parse(
@@ -152,6 +154,8 @@ impl<H: Shards> Objects<H> {
             Directive::Replace => Some(metadata_of(
                 standard_headers!(input),
                 input.metadata.as_ref(),
+                // A peer's flusher may carry its write identity (§7.8).
+                self.carrier(bucket, &extensions),
             )?),
         };
         let replaced_tags = match tagging_directive {
@@ -171,7 +175,8 @@ impl<H: Shards> Objects<H> {
             .map(|algorithm| parse_algorithm(algorithm.as_str()))
             .transpose()?;
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(ApplyBy::of(&extensions));
 
         let source_shard = ShardRef::for_key(source_bucket, &source_key);
         let entry = self
