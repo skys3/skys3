@@ -1,0 +1,153 @@
+name: Fuzz nightly
+
+# Long runs of every cargo-fuzz target (plan M7-03). The pull-request smoke
+# job (ci.yml, "Fuzz smoke runs") gives each target 30 seconds; this
+# workflow gives each one a core for FUZZ_MINUTES every night, under the
+# same bounds (fuzz/run.sh). It runs on a schedule or by hand, never on
+# pull requests, so it is not part of `ci-passed`, and it needs no secrets.
+#
+# Every target starts from its committed corpus (fuzz/corpus) and from what
+# earlier nights grew, which an Actions cache carries from night to night,
+# so the nights add up. A crash, timeout, or out-of-memory input fails the
+# job and is uploaded with the run's logs. Fixing one means minimizing it
+# (`cargo fuzz tmin`), fixing the code with a regression test, and adding
+# the input to the target's corpus.
+on:
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes of fuzzing per target
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Targets that run side by side on one runner, one per core.
+  PER_RUNNER: 4
+
+jobs:
+  # Splits the targets into groups of PER_RUNNER, one runner each, so each
+  # target has a core for the whole budget however many targets there are.
+  plan:
+    name: Plan the fuzz runs
+    runs-on: ubuntu-24.04
+    outputs:
+      runners: ${{ steps.plan.outputs.runners }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Count the targets
+        id: plan
+        run: |
+          count=$(find fuzz/fuzz_targets -name '*.rs' | wc -l)
+          runners=$(( (count + PER_RUNNER - 1) / PER_RUNNER ))
+          echo "$count targets on $runners runners"
+          echo "runners=$runners" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 0 $((runners - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: Fuzz (runner ${{ matrix.shard }})
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      FUZZ_MINUTES: ${{ inputs.minutes || '30' }}
+      SHARD: ${{ matrix.shard }}
+      RUNNERS: ${{ needs.plan.outputs.runners }}
+      # The prebuilt cargo-fuzz is a musl binary and defaults `--target`
+      # to its own triple, which has no sanitizer support; name the host.
+      FUZZ_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Cache the fuzz build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      # What this runner's targets grew on earlier nights: the newest of
+      # the caches saved after each night's run.
+      - name: Restore the grown corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/grown
+          key: fuzz-corpus-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.shard }}-
+
+      - name: Pick this runner's targets
+        run: |
+          cargo +nightly fuzz list | awk -v s="$SHARD" -v n="$RUNNERS" '(NR - 1) % n == s' > targets.txt
+          cat targets.txt
+
+      - name: Build the targets
+        run: |
+          while read -r target; do
+            cargo +nightly fuzz build --target "$FUZZ_TARGET" "$target"
+          done < targets.txt
+
+      - name: Fuzz each target on its own core
+        run: |
+          while read -r target; do
+            if [ -d "fuzz/grown/$target" ]; then
+              mkdir -p "fuzz/corpus/$target"
+              cp -n "fuzz/grown/$target"/* "fuzz/corpus/$target"/ 2>/dev/null || true
+            fi
+          done < targets.txt
+          mkdir -p logs
+          status=0
+          xargs -P "$PER_RUNNER" -I '{}' sh -c 'fuzz/run.sh "$1" "$2" > "logs/$1.log" 2>&1' \
+            sh '{}' "$((FUZZ_MINUTES * 60))" < targets.txt || status=$?
+          while read -r target; do
+            echo "::group::$target"
+            tail -n 30 "logs/$target.log"
+            echo "::endgroup::"
+          done < targets.txt
+          exit "$status"
+
+      # Each target's corpus, minimized, for the next night.
+      - name: Minimize the corpus
+        run: |
+          rm -rf fuzz/grown
+          while read -r target; do
+            fuzz/run.sh --cmin "$target" > "logs/$target-cmin.log" 2>&1
+            mkdir -p "fuzz/grown/$target"
+            cp "fuzz/corpus/$target"/* "fuzz/grown/$target"/
+          done < targets.txt
+          du -sh fuzz/grown
+
+      - name: Save the grown corpus
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/grown
+          key: fuzz-corpus-${{ matrix.shard }}-${{ github.run_id }}
+
+      - name: Upload crashing inputs and logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-findings-${{ matrix.shard }}
+          path: |
+            fuzz/artifacts/
+            logs/
+          if-no-files-found: ignore
