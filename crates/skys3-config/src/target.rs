@@ -15,6 +15,7 @@
 
 use std::net::IpAddr;
 
+use skys3_types::aws::{self, AwsPartition};
 use skys3_types::{AddressError, Host, NodeAddress, RemoteTarget};
 
 /// A URL's scheme, host, and the port it names explicitly, if any.
@@ -140,8 +141,8 @@ pub fn parse_target(url: &str) -> Result<RemoteTarget, String> {
     })
 }
 
-/// The failure scope an endpoint can be identified with: the AWS region for
-/// an AWS S3 endpoint, the IP address for an IP literal, otherwise the host
+/// The failure scope an endpoint can be identified with: the AWS partition
+/// and region for an AWS S3 endpoint, the IP address for an IP literal, otherwise the host
 /// name. Ports are ignored.
 ///
 /// IP addresses are compared as addresses, so every spelling of one IPv6
@@ -161,19 +162,24 @@ pub(crate) fn failure_scope(endpoint: &str) -> Option<String> {
     Some(format!("ip:{ip}"))
 }
 
-/// The scope of a lowercase DNS name.
-fn dns_scope(host: &str) -> String {
-    if let Some(service) = host.strip_suffix(".amazonaws.com") {
-        // s3.us-west-2, bucket.s3.us-west-2, s3.dualstack.us-west-2,
-        // s3-us-west-2, or the global s3 endpoint (us-east-1).
-        let last = service.rsplit('.').next().unwrap_or(service);
-        let region = match last {
-            "s3" => "us-east-1",
-            _ => last.strip_prefix("s3-").unwrap_or(last),
-        };
-        return format!("aws:{region}");
+/// The namespace of the bucket names behind endpoints of failure `scope`.
+/// AWS bucket names are unique per partition, so every AWS S3 endpoint of
+/// one partition shares one, named after the partition; any other endpoint
+/// has its own, the scope itself.
+pub(crate) fn bucket_namespace(scope: &str) -> &str {
+    match scope.split_once(':') {
+        Some((partition, _)) if AwsPartition::from_name(partition).is_some() => partition,
+        _ => scope,
     }
-    format!("dns:{host}")
+}
+
+/// The scope of a lowercase DNS name: `<partition>:<region>` for an AWS S3
+/// endpoint, such as `aws:us-west-2` or `aws-cn:cn-north-1`.
+fn dns_scope(host: &str) -> String {
+    match aws::s3_endpoint(host) {
+        Some(endpoint) => format!("{}:{}", endpoint.partition, endpoint.region),
+        None => format!("dns:{host}"),
+    }
 }
 
 #[cfg(test)]
@@ -271,8 +277,36 @@ mod tests {
         );
         assert_eq!(scope("https://s3-eu-west-1.amazonaws.com"), "aws:eu-west-1");
         assert_eq!(scope("https://s3.amazonaws.com"), "aws:us-east-1");
+        assert_eq!(
+            scope("https://s3.cn-north-1.amazonaws.com.cn"),
+            "aws-cn:cn-north-1"
+        );
+        assert_eq!(
+            scope("https://s3.us-gov-west-1.amazonaws.com"),
+            "aws-us-gov:us-gov-west-1"
+        );
         assert_eq!(scope("https://MinIO.example:9000"), "dns:minio.example");
         assert_eq!(failure_scope("ftp://x"), None);
+    }
+
+    #[test]
+    fn aws_endpoints_share_a_bucket_namespace_per_partition() {
+        let namespace = |url| {
+            let scope = failure_scope(url).unwrap();
+            bucket_namespace(&scope).to_owned()
+        };
+        assert_eq!(namespace("https://s3.us-west-2.amazonaws.com"), "aws");
+        assert_eq!(namespace("https://s3.amazonaws.com"), "aws");
+        assert_eq!(
+            namespace("https://s3.cn-northwest-1.amazonaws.com.cn"),
+            "aws-cn"
+        );
+        assert_eq!(
+            namespace("https://s3.us-gov-east-1.amazonaws.com"),
+            "aws-us-gov"
+        );
+        assert_eq!(namespace("https://minio.example"), "dns:minio.example");
+        assert_eq!(namespace("http://10.0.0.5"), "ip:10.0.0.5");
     }
 
     #[test]
