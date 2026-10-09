@@ -179,6 +179,12 @@ pub struct AimedBlocks {
     pub every: Duration,
     /// Which links.
     pub scope: AimScope,
+    /// Whether the links are held once the `COMMIT` reaches the
+    /// destination, which takes as long as the hold to apply it, as a slow
+    /// one may: it is still outstanding when the links come back, though
+    /// its sender may have closed its connection meanwhile. Without, the
+    /// sender holds its link before the `COMMIT` leaves.
+    pub late: bool,
 }
 
 /// Which links a fault aimed at a `COMMIT` holds.
@@ -298,6 +304,9 @@ pub(crate) struct PeerLog {
     aimed: Mutex<(AimedBlocks, Option<Duration>)>,
     /// The aimed faults due.
     aims: Mutex<Vec<Aim>>,
+    /// The aimed `COMMIT`s the destination is to apply late, and the
+    /// faults to start once they arrive.
+    late: Mutex<BTreeMap<String, Aim>>,
 }
 
 impl PeerLog {
@@ -317,8 +326,12 @@ impl PeerLog {
     }
 
     /// The node at `node` sent the `COMMIT` of `identity`, a write of
-    /// `key`.
-    pub(crate) fn commit_sent(&self, identity: String, key: String, node: usize) {
+    /// `key`. Returns whether its sender is to hold its link to the peer at
+    /// once, before the `COMMIT` leaves: a fault is aimed at it, which the
+    /// driver starts at its next step. A fault aimed at a `COMMIT` to apply
+    /// late ([`AimedBlocks::late`]) starts once the `COMMIT` arrives.
+    pub(crate) fn commit_sent(&self, identity: String, key: String, node: usize) -> bool {
+        let mut aim = false;
         {
             let mut aimed = lock(&self.aimed);
             let now = now();
@@ -326,14 +339,30 @@ impl PeerLog {
             if blocks.count > 0 && last.is_none_or(|last| now >= last + blocks.every) {
                 blocks.count -= 1;
                 *last = Some(now);
-                lock(&self.aims).push(Aim {
+                let fault = Aim {
                     node,
                     hold: blocks.hold,
                     scope: blocks.scope,
-                });
+                };
+                if blocks.late {
+                    lock(&self.late).insert(identity.clone(), fault);
+                } else {
+                    lock(&self.aims).push(fault);
+                    aim = true;
+                }
             }
         }
         lock(&self.commits).insert(identity, (key, now()));
+        aim
+    }
+
+    /// How late the destination applies the `COMMIT` of `identity`, which
+    /// just arrived, if a fault aimed at it is to apply it late: the fault
+    /// starts now. Once.
+    pub(crate) fn take_late(&self, identity: &str) -> Option<Duration> {
+        let fault = lock(&self.late).remove(identity)?;
+        lock(&self.aims).push(fault);
+        Some(fault.hold)
     }
 
     /// An S3 write of `key` was acknowledged.
@@ -839,6 +868,17 @@ impl Destination {
     /// What its endpoints draw from.
     pub(crate) fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// How late it applies the `COMMIT` of `identity`, if at all.
+    pub(crate) fn late(&self, identity: &WriteIdentity) -> Option<Duration> {
+        let aimed = self.record.take_late(&identity.to_string());
+        aimed.or_else(|| {
+            self.draw(self.faults.late_per_mille).then(|| {
+                self.counts.late();
+                self.faults.late_by
+            })
+        })
     }
 
     /// The faults it injects into the protocol.

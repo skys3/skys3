@@ -196,6 +196,7 @@ fn duplicate_commits_apply_once_and_are_answered_alike() {
                 scope: AimScope::Deposed {
                     isolated: Duration::from_secs(3),
                 },
+                late: false,
             },
             ..peer(
                 ProtocolFaults {
@@ -242,6 +243,7 @@ fn expiring(bug: PeerBug) -> Peer {
             hold: Duration::from_millis(1200),
             every: Duration::from_secs(2),
             scope: AimScope::Sender,
+            late: false,
         },
         ..peer(
             ProtocolFaults {

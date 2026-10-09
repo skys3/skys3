@@ -392,7 +392,9 @@ pub(crate) async fn run<S: NodeServices>(
         settings,
         &remote,
         seed.rotate_left(29),
-        peering.as_ref().map(|peering| (peering, slot.position)),
+        peering
+            .as_ref()
+            .map(|peering| (peering, slot.position, slot.host.as_str())),
     ));
     shared
         .flushers
@@ -541,7 +543,7 @@ fn flush_service(
     settings: &NodeSettings,
     remote: &SimS3,
     seed: u64,
-    peering: Option<(&NodePeering, usize)>,
+    peering: Option<(&NodePeering, usize, &str)>,
 ) -> FlushService<SimStore, SimMount> {
     let (remote, origin) = (remote.clone(), remote.clone());
     let at_peer = settings
@@ -567,8 +569,8 @@ fn flush_service(
     .with_buckets(settings.buckets.clone())
     .with_probe_nonces(seed);
     match (settings.peer, &settings.peer_side, peering) {
-        (Some(peer), Some(side), Some((peering, node))) => {
-            service.with_peer_transport(peering.transport(peer, side, node))
+        (Some(peer), Some(side), Some((peering, node, host))) => {
+            service.with_peer_transport(peering.transport(peer, side, node, host))
         }
         _ => service,
     }

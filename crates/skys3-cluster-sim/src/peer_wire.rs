@@ -89,9 +89,16 @@ impl NodePeering {
     /// How the flush service of the node at `node` reaches the peer: as
     /// the node binary's, a verified descriptor's first address must
     /// complete a fresh handshake, `HELLO`s included, before the target
-    /// uses QUIC through the pool. The node's `COMMIT`s are recorded in
-    /// `side`'s log.
-    pub(crate) fn transport(&self, peer: Peer, side: &PeerSide, node: usize) -> PeerTransport {
+    /// uses QUIC through the pool. The `COMMIT`s of the node, at `node` on
+    /// `host`, are recorded in `side`'s log.
+    pub(crate) fn transport(
+        &self,
+        peer: Peer,
+        side: &PeerSide,
+        node: usize,
+        host: &str,
+    ) -> PeerTransport {
+        let host = host.to_owned();
         let (endpoint, pool, log) = (
             self.endpoint.clone(),
             self.pool.clone(),
@@ -100,6 +107,7 @@ impl NodePeering {
         PeerTransport::new(
             Box::new(move |descriptor: &PeerDescriptor| {
                 let (endpoint, pool, log) = (endpoint.clone(), pool.clone(), Arc::clone(&log));
+                let host = host.clone();
                 let cluster = descriptor.cluster.clone();
                 let address = descriptor.addresses.first().cloned();
                 Box::pin(async move {
@@ -117,6 +125,7 @@ impl NodePeering {
                         lease: pool.attach(destination),
                         log,
                         node,
+                        host,
                     }) as Arc<dyn PeerLink>)
                 })
             }),
@@ -145,6 +154,7 @@ struct NodeLink {
     lease: ShardLease,
     log: Arc<PeerLog>,
     node: usize,
+    host: String,
 }
 
 impl PeerLink for NodeLink {
@@ -156,6 +166,7 @@ impl PeerLink for NodeLink {
                     inner: stream.sender,
                     log: Arc::clone(&self.log),
                     node: self.node,
+                    host: self.host.clone(),
                 }),
                 ..stream
             })
@@ -171,13 +182,19 @@ struct NodeSend {
     inner: Box<dyn PeerSend>,
     log: Arc<PeerLog>,
     node: usize,
+    host: String,
 }
 
 impl PeerSend for NodeSend {
     fn send<'a>(&'a mut self, message: &'a Message) -> BoxFuture<'a, Result<(), LinkError>> {
-        if let Message::Commit(commit) = message {
-            self.log
-                .commit_sent(commit.identity.to_string(), commit.key.clone(), self.node);
+        if let Message::Commit(commit) = message
+            && self
+                .log
+                .commit_sent(commit.identity.to_string(), commit.key.clone(), self.node)
+        {
+            // Caught on its way: held before it leaves, until the driver's
+            // aimed fault heals.
+            turmoil::hold(self.host.as_str(), crate::peer::HOST);
         }
         self.inner.send(message)
     }
@@ -301,13 +318,10 @@ impl Inbound for Tapped {
             let Some(message) = self.stream.recv().await? else {
                 return Ok(None);
             };
-            let tap = &self.sender.tap;
-            let faults = tap.destination.faults();
-            if let Message::Commit(_) = message
-                && tap.destination.draw(faults.late_per_mille)
+            if let Message::Commit(commit) = &message
+                && let Some(late) = self.sender.tap.destination.late(&commit.identity)
             {
-                tap.destination.counts().late();
-                tokio::time::sleep(faults.late_by).await;
+                tokio::time::sleep(late).await;
             }
             match self.sender.tap.arrived(&message) {
                 Verdict::Pass => return Ok(Some(message)),

@@ -2246,7 +2246,11 @@ impl<S: NodeServices> Driver<'_, S> {
         }
         // Faults aimed at a `COMMIT` on its way.
         while let Some(aim) = self.world.destination.as_ref().and_then(|d| d.take_aim()) {
-            if !heal_all {
+            if heal_all {
+                // The sender held its link as it sent the `COMMIT`.
+                let host = self.host(Endpoint::Node(aim.node));
+                sim.release(host.as_str(), peer::HOST);
+            } else {
                 self.aim(sim, now, aim);
             }
         }

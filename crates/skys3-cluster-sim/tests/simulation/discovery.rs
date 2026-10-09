@@ -179,6 +179,7 @@ fn with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic() {
                 hold,
                 every: Duration::from_secs(8),
                 scope: AimScope::Udp,
+                late: false,
             },
             ..peer(DescriptorKind::Signed, PeerBug::None)
         });
@@ -283,7 +284,10 @@ fn the_audit_catches_an_unverified_descriptor() {
 fn the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding() {
     Runner::with_cost(2, 2 * COST).run(|context| {
         // UDP blocked as `COMMIT`s are on their way, for longer than it
-        // takes to fall back but not than the peer's idle timeout.
+        // takes to fall back but not than the peer's idle timeout. Each
+        // `COMMIT` reached the peer, which applies it once the block
+        // ends: over QUIC, a held `COMMIT` dies with the connection its
+        // node closes as it falls back, unless another target keeps it.
         let peer = Peer {
             idle: Duration::from_secs(8),
             aimed: AimedBlocks {
@@ -291,6 +295,7 @@ fn the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding() {
                 hold: Duration::from_secs(5),
                 every: Duration::from_secs(10),
                 scope: AimScope::Udp,
+                late: true,
             },
             ..peer(DescriptorKind::Signed, PeerBug::NoQuarantine)
         };
