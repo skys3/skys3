@@ -82,6 +82,8 @@ impl WritePrecondition {
 /// assert_eq!(ByteRange::suffix(10).resolve(50), Some(40..50));
 /// assert_eq!(ByteRange::from_offset(50).resolve(50), None);
 /// assert_eq!(ByteRange::suffix(10).to_string(), "bytes=-10");
+/// assert_eq!(ByteRange::inclusive(0, 99).unwrap().max_len(), Some(100));
+/// assert_eq!(ByteRange::from_offset(50).max_len(), None);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ByteRange(RangeSpec);
@@ -107,6 +109,16 @@ impl ByteRange {
     /// `bytes=-<len>`: the last `len` bytes.
     pub fn suffix(len: u64) -> Self {
         ByteRange(RangeSpec::Suffix(len))
+    }
+
+    /// The most bytes this range can select from an object of any size, or
+    /// `None` for a range open at its end.
+    pub fn max_len(self) -> Option<u64> {
+        match self.0 {
+            RangeSpec::From(_) => None,
+            RangeSpec::Inclusive(first, last) => Some((last - first).saturating_add(1)),
+            RangeSpec::Suffix(len) => Some(len),
+        }
     }
 
     /// Returns the bytes this range selects from an object of `size` bytes,

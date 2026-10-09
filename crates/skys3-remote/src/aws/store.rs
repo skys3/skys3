@@ -13,11 +13,11 @@ use skys3_types::{ETag, WriteIdentity};
 use super::AwsS3;
 use super::error::{malformed, map_sdk_error};
 use crate::model::{
-    AbortMultipartUpload, CompleteMultipartUpload, CopyObject, CreateMultipartUpload, DeleteObject,
-    DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
-    ListPartsOutput, ListedObject, ListedPart, MAX_LIST_KEYS, MAX_LIST_PARTS, MetadataDirective,
-    ObjectInfo, PutObject, TaggingDirective, UploadId, UploadPart, VersionId, WriteOutput,
-    WritePrecondition,
+    AbortMultipartUpload, ByteRange, CompleteMultipartUpload, CopyObject, CreateMultipartUpload,
+    DeleteObject, DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2,
+    ListObjectsV2Output, ListParts, ListPartsOutput, ListedObject, ListedPart, MAX_LIST_KEYS,
+    MAX_LIST_PARTS, MetadataDirective, ObjectInfo, PutObject, TaggingDirective, UploadId,
+    UploadPart, VersionId, WriteOutput, WritePrecondition,
 };
 use crate::{ObjectStore, S3Error, S3ErrorKind, S3Result, UserMetadata};
 
@@ -192,6 +192,7 @@ impl ObjectStore for AwsS3 {
 
     async fn get_object(&self, request: GetObject) -> S3Result<GetOutput> {
         const OP: &str = "GetObject";
+        let most = request.range.and_then(ByteRange::max_len);
         let output = self
             .client
             .get_object()
@@ -206,6 +207,18 @@ impl ObjectStore for AwsS3 {
             .map_err(|error| map_sdk_error(OP, error))?;
         let etag = parse_etag(OP, output.e_tag())?;
         let length = size(OP, output.content_length())?;
+        // The body is buffered whole, so a store that ignores the range, or
+        // answers more than it asked for, is refused before it is read: a
+        // ranged read bounds the memory it costs (the peer descriptor's
+        // 64 KiB, §7.8).
+        if let Some(most) = most
+            && length > most
+        {
+            return Err(malformed(
+                OP,
+                format!("{length} body bytes for a range of at most {most}"),
+            ));
+        }
         let (range, size) = match output.content_range() {
             Some(value) => {
                 let (range, size) = content_range(value)

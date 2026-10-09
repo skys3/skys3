@@ -161,6 +161,20 @@ pub(crate) fn failure_scope(endpoint: &str) -> Option<String> {
     Some(format!("ip:{ip}"))
 }
 
+/// The prefix of the failure scope of an AWS S3 endpoint.
+const AWS_SCOPE: &str = "aws:";
+
+/// The namespace of the bucket names behind endpoints of failure `scope`.
+/// AWS bucket names are global, so every AWS S3 endpoint shares one; any
+/// other endpoint has its own, the scope itself.
+pub(crate) fn bucket_namespace(scope: &str) -> &str {
+    if scope.starts_with(AWS_SCOPE) {
+        AWS_SCOPE
+    } else {
+        scope
+    }
+}
+
 /// The scope of a lowercase DNS name.
 fn dns_scope(host: &str) -> String {
     if let Some(service) = host.strip_suffix(".amazonaws.com") {
@@ -171,7 +185,7 @@ fn dns_scope(host: &str) -> String {
             "s3" => "us-east-1",
             _ => last.strip_prefix("s3-").unwrap_or(last),
         };
-        return format!("aws:{region}");
+        return format!("{AWS_SCOPE}{region}");
     }
     format!("dns:{host}")
 }

@@ -1345,6 +1345,22 @@ fn attached_targets_must_not_share_the_control_stores_scope() {
     let control = skys3_config::parse_target("https://s3.us-west-2.amazonaws.com/ctl").unwrap();
     let error = s3(true).check_target_independence(&control).unwrap_err();
     assert!(error.contains("overlap"), "{error}");
+    // AWS bucket names are global, so the control bucket reached through
+    // another region's endpoint, or the global one, is still refused.
+    for other in [
+        "https://s3.eu-west-1.amazonaws.com/ctl",
+        "https://s3.amazonaws.com/ctl/",
+        "https://s3.dualstack.ap-south-1.amazonaws.com/ctl",
+    ] {
+        let target = skys3_config::parse_target(other).unwrap();
+        for allow in [false, true] {
+            let error = s3(allow).check_target_independence(&target).unwrap_err();
+            assert!(error.contains("overlap"), "{other}: {error}");
+        }
+    }
+    // A bucket of the same name on another provider is another bucket.
+    let minio = skys3_config::parse_target("https://minio.example/ctl").unwrap();
+    s3(false).check_target_independence(&minio).unwrap();
 }
 
 #[test]
