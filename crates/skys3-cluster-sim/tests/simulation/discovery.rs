@@ -283,11 +283,12 @@ fn the_audit_catches_an_unverified_descriptor() {
 #[test]
 fn the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding() {
     Runner::with_cost(2, 2 * COST).run(|context| {
-        // UDP blocked as `COMMIT`s are on their way, for longer than it
-        // takes to fall back but not than the peer's idle timeout. Each
-        // `COMMIT` reached the peer, which applies it once the block
-        // ends: over QUIC, a held `COMMIT` dies with the connection its
-        // node closes as it falls back, unless another target keeps it.
+        // UDP blocked as `COMMIT`s reach the peer, for longer than it
+        // takes to fall back but not than the peer's idle timeout. The
+        // peer applies each one late, within its apply-by time, after its
+        // node fell back but before the peer can hear that the node
+        // closed the connection: over QUIC, a `COMMIT` held on its way
+        // would die with that connection.
         let peer = Peer {
             idle: Duration::from_secs(8),
             aimed: AimedBlocks {

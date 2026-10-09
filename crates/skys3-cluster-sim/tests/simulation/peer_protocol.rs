@@ -286,7 +286,7 @@ fn commits_that_arrive_past_their_window_are_refused() {
 }
 
 /// A peer whose commit window, its idle timeout, is 1.5 s: one `COMMIT`
-/// in three arrives 2.5 s late, within the 4 s a source waits for an
+/// in two arrives 2.5 s late, within the 4 s a source waits for an
 /// answer.
 fn overdue(bug: PeerBug) -> Peer {
     Peer {
@@ -294,7 +294,7 @@ fn overdue(bug: PeerBug) -> Peer {
         timeout: Duration::from_secs(4),
         ..peer(
             ProtocolFaults {
-                late_per_mille: 300,
+                late_per_mille: 500,
                 late_by: Duration::from_millis(2500),
                 ..ProtocolFaults::default()
             },
