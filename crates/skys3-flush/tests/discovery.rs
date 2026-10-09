@@ -17,8 +17,8 @@ use rcgen::{
 };
 use skys3_config::{BucketsConfig, Config};
 use skys3_flush::{
-    BoxFuture, FlushMetrics, FlushService, LinkError, PeerBug, PeerConnect, PeerLink, PeerStream,
-    PeerTransport, Transport, TransportStatus, test_hooks,
+    BoxFuture, FlushMetrics, FlushService, LinkError, MAX_BOUNDED_BYTES, PeerBug, PeerConnect,
+    PeerLink, PeerStream, PeerTransport, Transport, TransportStatus, test_hooks,
 };
 use skys3_io::{ManualWallClock, SimMount};
 use skys3_net::{CertificateDer, Credentials, PrivateKeyDer};
@@ -28,6 +28,7 @@ use skys3_peer::{
 };
 use skys3_remote::{ObjectStore, PutObject};
 use skys3_sim::SimS3;
+use skys3_sim::s3::Operation;
 use skys3_sim::s3::SimS3Config;
 use skys3_types::{
     BucketDocument, BucketMode, BucketName, ClusterId, ProposalId, RemoteTarget, ShardCount,
@@ -248,12 +249,16 @@ fn flushing_falls_back_to_s3_while_quic_fails_and_returns() {
             .serve_descriptor(descriptor(&world.pki, DESTINATION, NOW))
             .await;
         world.node.put("a", "over quic").await;
+        let started = Instant::now();
         world
             .until("flushed over QUIC", |_, t| {
                 t.in_use == Some(Transport::Quic)
             })
             .await;
         world.until_at_destination("a").await;
+        // A shard's first flusher on QUIC waits out the S3 writes an
+        // earlier primary may have sent (§7.8).
+        assert!(started.elapsed() >= QUARANTINE - Duration::from_millis(100));
         // Every COMMIT carries its apply-by time: the source's wall clock
         // as it was sent, plus the commit window (the answer timeout).
         let apply_by = u64::try_from((NOW + Duration::from_secs(1)).as_millis()).unwrap();
@@ -303,14 +308,43 @@ fn flushing_falls_back_to_s3_while_quic_fails_and_returns() {
             .await;
         assert!(fell_back.elapsed() >= QUARANTINE - Duration::from_millis(100));
         assert!(!world.at_destination("b").await);
+        // An S3 write to the peer carries its apply-by time too, and a body
+        // larger than an apply-by time covers goes in parts, which only
+        // the completion publishes.
+        let big = "x".repeat(usize::try_from(MAX_BOUNDED_BYTES).unwrap() + 1);
+        let begun = world.node.begin("big").await;
+        let extents = world.node.extents("big", &big, 256 << 10).await;
+        world
+            .node
+            .complete_extents("big", &big, begun, &extents)
+            .await;
+        world
+            .until("flushed in parts", |world, _| world.at_store("big"))
+            .await;
+        let writes = world.store.apply_by_times();
+        let of = |key: &str| -> Vec<_> {
+            writes
+                .iter()
+                .filter(|(_, written, _)| written == &format!("team/{key}"))
+                .map(|(operation, _, apply_by)| (*operation, *apply_by))
+                .collect()
+        };
+        assert_eq!(of("b"), [(Operation::PutObject, Some(apply_by))]);
+        assert_eq!(
+            of("big"),
+            [(Operation::CompleteMultipartUpload, Some(apply_by))]
+        );
 
-        // UDP is allowed again: a re-probe finds QUIC, and flushes use it.
+        // UDP is allowed again: a re-probe finds QUIC, and flushes use it,
+        // once no S3 write sent before can still apply.
         world.destination.faults().down = false;
         world
             .until("returned to QUIC", |_, t| t.in_use == Some(Transport::Quic))
             .await;
+        let returned = Instant::now();
         world.node.put("c", "over quic again").await;
         world.until_at_destination("c").await;
+        assert!(returned.elapsed() >= QUARANTINE - Duration::from_millis(100));
         let transport = world
             .service
             .status(&bucket().bucket_id)

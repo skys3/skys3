@@ -421,11 +421,21 @@ verified or not, waits a quarantine before it sends anything. The
 quarantine is the commit window, the peer answer timeout, plus twice a
 clock tolerance of 30 seconds: 90 seconds. The wait happens at each switch
 to S3 REST, and at each restart or takeover while the target stays on S3
-REST, so the dirty age grows by up to that much each time. It is enough
+REST, so the dirty age grows by up to that much each time. A shard
+flusher that starts on QUIC waits the same quarantine from the later of
+its node's tenure of the shard and the node's last S3 flush of the
+target, so that no S3 write sent before can still apply: at a switch back
+to QUIC, and at a node's start or a takeover, for a `native` target too. It is enough
 only while every node's wall clock in both clusters is within 30 seconds
 of true time ([Clock drift](#clock-drift)). A target on S3 REST tries a handshake again after
 a backoff from 15 seconds, doubling, up to 5 minutes. It returns to QUIC
-within 5 minutes of UDP being allowed again, without the quarantine.
+within 5 minutes of UDP being allowed again, and flushes over it once the
+quarantine has passed. Over S3 REST to a peer, each write that publishes
+or deletes a version carries `x-skys3-apply-by`, and a `PUT` body over
+1 MiB goes as a multipart upload. A destination that answers a peer's
+write `400 InvalidArgument` naming that header was sent a write without
+it, from a source older than the destination; one that answers `503`
+received it after its apply-by time, and the source sends it again.
 
 **Diagnosis.**
 

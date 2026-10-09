@@ -40,6 +40,10 @@
 //! - **No `COMMIT` outlives the quarantine.** No `COMMIT` reaches the
 //!   destination after an S3 write of its key that was acknowledged after
 //!   the `COMMIT` was sent (`PeerBug::NoQuarantine` breaks this).
+//! - **No S3 write outlives the quarantine either.** No `COMMIT` of a key
+//!   is sent while an S3 write of it, sent before, could still apply by
+//!   its apply-by time, answered or not (`PeerBug::NoReturnQuarantine`
+//!   breaks this).
 //! - **No QUIC to an unverified peer.** While the destination serves a
 //!   descriptor that does not verify ([`DescriptorKind`]), no `COMMIT`
 //!   reaches it (`PeerBug::UnverifiedDescriptor` breaks this).
@@ -276,6 +280,10 @@ pub(crate) struct PeerSide {
 }
 
 /// What the run saw of the two transports, which the audits check.
+/// An S3 write a node sent: when, and its apply-by time on the simulated
+/// wall clock, if any.
+type SentS3 = (Duration, Option<u64>);
+
 #[derive(Debug, Default)]
 pub(crate) struct PeerLog {
     /// The descriptor the destination serves.
@@ -285,6 +293,9 @@ pub(crate) struct PeerLog {
     commits: Mutex<BTreeMap<String, (String, Duration)>>,
     /// When each key's S3 writes were acknowledged.
     s3_writes: Mutex<BTreeMap<String, Vec<Duration>>>,
+    /// The S3 writes of each key that may still apply: when each was
+    /// sent, and its apply-by time on the simulated wall clock, if any.
+    s3_sent: Mutex<BTreeMap<String, Vec<SentS3>>>,
     /// `COMMIT`s the destination received.
     received: AtomicU64,
     /// S3 writes the destination acknowledged.
@@ -313,8 +324,26 @@ impl PeerLog {
             .then(|| lock(&self.aimed).0.hold)
     }
 
-    /// A node sent the `COMMIT` of `identity`, a write of `key`.
+    /// A node sent the `COMMIT` of `identity`, a write of `key`: no S3
+    /// write of the key, answered or not, may still apply.
     fn commit_sent(&self, identity: String, key: String) {
+        let wall = wall_ms();
+        let outstanding = lock(&self.s3_sent).get_mut(&key).and_then(|sent| {
+            sent.retain(|(_, apply_by)| apply_by.is_none_or(|by| by >= wall));
+            sent.first().copied()
+        });
+        if let Some((sent, apply_by)) = outstanding {
+            self.violate(Violation {
+                key: key.clone(),
+                reason: format!(
+                    "the COMMIT of {identity} was sent at {:?} while an S3 write of the key, \
+                     sent at {sent:?}, could still apply until {apply_by:?}: a key was \
+                     committed over QUIC while an S3 write of it could still apply",
+                    now()
+                ),
+                operations: Vec::new(),
+            });
+        }
         {
             let mut aimed = lock(&self.aimed);
             let now = now();
@@ -326,6 +355,15 @@ impl PeerLog {
             }
         }
         lock(&self.commits).insert(identity, (key, now()));
+    }
+
+    /// A node sent an S3 write of `key` that may apply until `apply_by_ms`
+    /// on the simulated wall clock.
+    pub(crate) fn s3_sent(&self, key: &str, apply_by_ms: Option<u64>) {
+        lock(&self.s3_sent)
+            .entry(key.to_owned())
+            .or_default()
+            .push((now(), apply_by_ms));
     }
 
     /// An S3 write of `key` was acknowledged.
@@ -356,8 +394,7 @@ impl PeerLog {
             return;
         };
         // One that arrives after its apply-by time is never applied.
-        let wall = u64::try_from(SimWall.now().as_millis()).unwrap_or(u64::MAX);
-        if apply_by_ms.is_some_and(|by| wall > by) {
+        if apply_by_ms.is_some_and(|by| wall_ms() > by) {
             return;
         }
         let received = now();
@@ -387,6 +424,11 @@ impl PeerLog {
 /// The simulated time since the run began.
 fn now() -> Duration {
     turmoil::sim_elapsed().unwrap_or_default()
+}
+
+/// The simulated wall clock, in milliseconds since the Unix epoch.
+fn wall_ms() -> u64 {
+    u64::try_from(SimWall.now().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Samples the transport each live node's peer targets use, and checks
@@ -939,7 +981,9 @@ pub(crate) async fn run(destination: Arc<Destination>) -> Result<(), BoxError> {
     let s3 = Gateway::new(
         gateway,
         destination.control.clone(),
-        storage.shards.clone(),
+        // It checks the apply-by times of the S3 writes on the simulated
+        // wall clock, as the commits do.
+        storage.shards.clone().with_wall_clock(Arc::new(SimWall)),
         IdSource::seeded(life),
         PeerKeys,
     )

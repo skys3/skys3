@@ -18,13 +18,14 @@ use skys3_remote::probe::{
 };
 use skys3_shard::{Shard, ShardSet};
 use skys3_types::{
-    BucketDocument, BucketId, BucketMode, BucketName, ClusterId, RemoteTarget, ShardId,
+    BucketDocument, BucketId, BucketMode, BucketName, ClusterId, Epoch, RemoteTarget, ShardId,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::budget::DirtyBudget;
-use crate::concurrency::ConcurrencyStatus;
+use crate::concurrency::{ConcurrencyStatus, Stamping};
 use crate::conflict::{Unresolved, effective_policy, may_discard};
 use crate::fill::Filler;
 use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
@@ -188,6 +189,14 @@ impl BucketStatus {
 ///   started, here or on an earlier primary, can then still apply once a
 ///   key is flushed over S3. So does one on a target whose descriptor was
 ///   refused.
+/// - **S3 writes to what may be a peer** (over S3 REST to a peer, or to a
+///   target whose descriptor was refused) carry an apply-by time
+///   ([`Target::with_apply_by`]), as `COMMIT`s do: the peer refuses to
+///   sequence them later. Each shard flusher that starts on QUIC sends
+///   nothing until the same quarantine has passed since the later of its
+///   tenure's start, as this node knows it from the shard's epoch, and the
+///   node's last S3 flush of the target: no S3 write sent before, here or
+///   by an earlier primary, can then still apply over a `COMMIT`.
 /// - **A change of transport** builds the target anew and restarts the
 ///   bucket's shard flushers on it, as a restart or a takeover does: keys
 ///   in flight stay dirty, and the new flushers send them again with the
@@ -256,6 +265,17 @@ struct BucketFlusher<S> {
     /// (§7.8), during which a native `COMMIT` sent before the flusher
     /// started may still apply; zero for any other target.
     quarantine: Duration,
+    /// On QUIC, the quarantine each shard flusher waits out from the later
+    /// of its tenure's start and `s3_until`, during which an S3 write sent
+    /// before may still apply (§7.8).
+    native_quarantine: Option<Duration>,
+    /// When this node last stopped flushing the target over S3 REST to
+    /// what may be a SkyS3 peer, if it did; and whether it does now.
+    s3_until: Option<Instant>,
+    on_s3: bool,
+    /// The epoch of each open shard's sequencing and when this node first
+    /// saw it: the start of its tenure, as far as this node knows.
+    tenures: BTreeMap<ShardId, (Epoch, Instant)>,
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
     /// The target, once the probe is done.
@@ -510,6 +530,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             conflict_policy: configured_policy,
             copy_sources: self.copy_sources_of(target),
             bucket: target.bucket.parse().ok(),
+            apply_by: None,
         };
         let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
         let discovery = self.discovery(&name, target, transport, &parts);
@@ -523,6 +544,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             native: false,
             link: None,
             quarantine: Duration::ZERO,
+            native_quarantine: None,
+            s3_until: None,
+            on_s3: false,
+            tenures: BTreeMap::new(),
             probe: Arc::new(Mutex::new(ProbeStatus::Running { error: None })),
             probe_task: tokio::spawn(async {}),
             target: Ready::new(None),
@@ -592,9 +617,20 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// shard flushers on it.
     fn install(&self, flusher: &mut BucketFlusher<S>, choice: Choice) {
         flusher.probe_task.abort();
+        // A shard whose flusher stopped may be in a new tenure.
+        let shards = &flusher.shards;
+        flusher
+            .tenures
+            .retain(|id, _| shards.get(id).is_some_and(|shard| !shard.is_stopped()));
         // The flushers of the old target stop, as on a restart; their keys
         // stay dirty, and the new flushers send them again.
         flusher.shards.clear();
+        // Its S3 writes may apply until the quarantine passes (§7.8).
+        let on_s3 = matches!(choice, Choice::PeerS3 | Choice::PlainS3 { found: true });
+        if flusher.on_s3 {
+            flusher.s3_until = Some(Instant::now());
+        }
+        flusher.on_s3 = on_s3;
         let native = matches!(choice, Choice::Native(_));
         // Adopting the peer's write would read it over S3 (§7.8).
         let holds = flusher.backup || native;
@@ -612,6 +648,13 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             Choice::PeerS3 | Choice::PlainS3 { found: true } => self.quarantine(),
             _ => Duration::ZERO,
         };
+        // Over QUIC, each waits out the S3 writes sent before it started.
+        flusher.native_quarantine = native.then(|| self.native_quarantine());
+        // S3 writes to what may be a peer carry apply-by times.
+        let mut parts = flusher.parts.clone();
+        parts.apply_by = on_s3
+            .then(|| self.peers.as_ref().map(|peers| peers.commit_window()))
+            .flatten();
         if holds && flusher.configured_policy == ConflictPolicy::DiscardLocal {
             tracing::warn!(
                 bucket = flusher.name,
@@ -619,7 +662,6 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 its conflicts are held"
             );
         }
-        let mut parts = flusher.parts.clone();
         parts.conflict_policy = flusher.conflict_policy;
         let (target, probe, probe_task) = match choice {
             // Nothing is flushed until the discovery chooses.
@@ -677,11 +719,23 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         let peers = self.peers.as_ref()?;
         let bucket = parts.bucket.clone()?;
         let stamp = crate::peer::Stamp::new(Arc::clone(&self.wall), peers.commit_window());
-        let native = Native::new(link, bucket, peers.frame_bytes, peers.timeout, Some(stamp));
+        let native = Native::new(link, bucket, peers.frame_bytes, peers.timeout, stamp);
         Some(match discovery {
             Some((discovery, _)) => native.with_alarm(discovery.alarm()),
             None => native,
         })
+    }
+
+    /// How long a peer target's native flushes wait after their tenure
+    /// starts, or the node's last S3 flush of the target, whichever is
+    /// later ([`PeerTransport::quarantine`]).
+    fn native_quarantine(&self) -> Duration {
+        if peer_hooks::peer_bug() == PeerBug::NoReturnQuarantine {
+            return Duration::ZERO;
+        }
+        self.peers
+            .as_ref()
+            .map_or(Duration::ZERO, |peers| peers.quarantine())
     }
 
     /// How long a peer target's S3 REST flushes wait after their flushers
@@ -829,12 +883,24 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         flusher
             .shards
             .retain(|id, shard| open.contains(id) && !shard.is_stopped());
+        let now = Instant::now();
+        flusher.tenures.retain(|id, _| open.contains(id));
         for shard in shards {
             let id = shard.shard().shard;
+            let epoch = shard.sequencing();
+            let tenure = flusher.tenures.entry(id).or_insert((epoch, now));
+            if tenure.0 != epoch {
+                *tenure = (epoch, now);
+            }
+            let since = flusher.s3_until.map_or(tenure.1, |s3| s3.max(tenure.1));
+            let quarantine = match flusher.native_quarantine {
+                Some(quarantine) => (since + quarantine).saturating_duration_since(now),
+                None => flusher.quarantine,
+            };
             flusher.shards.entry(id).or_insert_with(|| {
                 let charge = charged.then(|| self.budget.charge(bucket));
                 let (ready, wall) = (Arc::clone(&flusher.target), Arc::clone(&self.wall));
-                ShardFlusher::start(shard, ready, wall, charge, flusher.quarantine)
+                ShardFlusher::start(shard, ready, wall, charge, quarantine)
             });
         }
         // The pool's connection budget to a peer counts each shard flusher.
@@ -1014,6 +1080,9 @@ struct TargetParts<S> {
     copy_sources: CopySources,
     /// The destination bucket, if the target's bucket is a bucket name.
     bucket: Option<BucketName>,
+    /// For S3 REST to what may be a SkyS3 peer, the commit window of its
+    /// writes' apply-by times (§7.8).
+    apply_by: Option<Duration>,
 }
 
 impl<S> Clone for TargetParts<S> {
@@ -1029,6 +1098,7 @@ impl<S> Clone for TargetParts<S> {
             conflict_policy: self.conflict_policy,
             copy_sources: self.copy_sources.clone(),
             bucket: self.bucket.clone(),
+            apply_by: self.apply_by,
         }
     }
 }
@@ -1037,12 +1107,15 @@ impl<S> TargetParts<S> {
     /// The target, honoring `writes`, over the native protocol if `native`
     /// is given.
     fn build(self, writes: ConditionalWrites, native: Option<Native>) -> Target<S> {
-        let target = Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
+        let mut target = Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
             .with_wall_clock(self.wall)
             .with_counters(self.counters)
             .with_conflict_policy(self.conflict_policy)
             .with_copy_sources(self.copy_sources)
             .with_native(native);
+        if let Some(window) = self.apply_by {
+            target = target.with_apply_by(window);
+        }
         match self.import {
             Some(import) => target.with_import(import),
             None => target,
@@ -1116,8 +1189,12 @@ async fn run_probe<S: ObjectStore>(
     let prefix = parts.prefix.clone();
     let settings = parts.settings.clone();
     // Probes are not flushes: they go to the store directly, outside the
-    // target's window (§7.7).
-    let store = Arc::clone(&parts.store);
+    // target's window (§7.7), with apply-by times to what may be a SkyS3
+    // peer (§7.8).
+    let stamp = parts
+        .apply_by
+        .map(|window| crate::peer::Stamp::new(Arc::clone(&parts.wall), window));
+    let store = Stamping::new(Arc::clone(&parts.store), stamp);
     // A fresh nonce per run: a failed run may leave scratch keys behind,
     // which would fail the next run's `If-None-Match: *` that must hold.
     let probe = || match &nonces {
@@ -1126,7 +1203,7 @@ async fn run_probe<S: ObjectStore>(
     };
     let mut failures = 0;
     let target = loop {
-        match probe().run_writes(&*parts.store).await {
+        match probe().run_writes(&store).await {
             Ok(found) => {
                 let unprotected = found.unprotected();
                 if !unprotected.is_empty() {
@@ -1157,7 +1234,7 @@ async fn run_probe<S: ObjectStore>(
     let copies = async {
         let mut failures = 0;
         let support = loop {
-            match probe().run_copies(&*store).await {
+            match probe().run_copies(&store).await {
                 Ok(support) => break support,
                 Err(error) => {
                     failures += 1;

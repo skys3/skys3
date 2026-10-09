@@ -411,7 +411,7 @@ async fn staging_that_cannot_continue_is_aborted() {
         key: "k".into(),
         precondition: Precondition::Absent,
         write: Write::Delete,
-        apply_by_ms: None,
+        apply_by_ms: Some(1_800_000_000_000),
     };
     stream
         .send(&Message::Commit(commit.clone()))
@@ -541,7 +541,7 @@ fn batch_item(identity: &WriteIdentity, key: &str, body: Option<&'static [u8]>) 
         key: key.to_owned(),
         precondition: Precondition::Absent,
         write,
-        apply_by_ms: None,
+        apply_by_ms: Some(1_800_000_000_000),
     }
 }
 
@@ -629,7 +629,7 @@ fn staged_commit(identity: &WriteIdentity, key: &str, size: u64) -> Message {
             checksums: BTreeMap::new(),
             data: PutData::Staged { piece: 1 },
         }),
-        apply_by_ms: None,
+        apply_by_ms: Some(1_800_000_000_000),
     })
 }
 

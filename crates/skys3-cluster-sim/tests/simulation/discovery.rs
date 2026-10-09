@@ -12,11 +12,13 @@
 //! restarts. The audits (`ClusterConfig::peer`): every committed change
 //! reaches the peer exactly once, over either transport, after a power
 //! loss of the peer too; no native `COMMIT` reaches the peer after an S3
-//! write of its key that was acknowledged after it was sent; the transport
-//! metric and status of every live node follow each switch; every target
-//! is back on QUIC once the faults healed; and no `COMMIT` reaches a peer
-//! whose descriptor is forged or expired. Seeded bugs (an unverified
-//! descriptor used, flushes over S3 without the quarantine) are caught.
+//! write of its key that was acknowledged after it was sent; no `COMMIT`
+//! is sent while an S3 write of its key could still apply by its apply-by
+//! time; the transport metric and status of every live node follow each
+//! switch; every target is back on QUIC once the faults healed; and no
+//! `COMMIT` reaches a peer whose descriptor is forged or expired. Seeded
+//! bugs (an unverified descriptor used, flushes over S3 or back over QUIC
+//! without the quarantine) are caught.
 
 use std::time::Duration;
 
@@ -217,8 +219,10 @@ fn a_seed_with_udp_blocked_replays_exactly() {
             think_time: Duration::from_millis(200),
             ..Workload::default()
         };
+        // Long enough to outlast the quarantine at the first QUIC flush,
+        // the fallback, and the quarantine over S3.
         let mut plan = FaultPlan::none();
-        let blocked = (Duration::from_secs(8), Duration::from_secs(10));
+        let blocked = (Duration::from_secs(14), Duration::from_secs(16));
         block_udp(&mut context, &mut plan, 1, Duration::from_secs(2), blocked);
         Cluster::new(config)
             .run(&mut context, &workload, &plan)
@@ -302,6 +306,34 @@ fn the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding() {
                     violation
                         .reason
                         .contains("while its COMMIT was outstanding"),
+                    "{violation}"
+                );
+                Ok(())
+            }
+            other => Err(format!("the bug went unnoticed: {other:?}").into()),
+        }
+    });
+}
+
+/// The seeded bug of flushing over QUIC at once on the return from S3
+/// REST, without the quarantine: a `COMMIT` is sent while an S3 write of
+/// its key, sent before UDP was allowed again, could still apply by its
+/// apply-by time.
+#[test]
+fn the_audit_catches_a_commit_sent_while_an_s3_write_of_its_key_may_apply() {
+    Runner::with_cost(2, 2 * COST).run(|context| {
+        let config = config(peer(DescriptorKind::Signed, PeerBug::NoReturnQuarantine));
+        let workload = workload(context, 240);
+        // One block, early and long enough for the flushers to fall back
+        // and flush over S3 before they return.
+        let mut plan = FaultPlan::none();
+        let blocked = (Duration::from_secs(10), Duration::from_secs(12));
+        block_udp(context, &mut plan, 1, Duration::from_secs(2), blocked);
+        let run = Cluster::with_services(config, services()).run(context, &workload, &plan);
+        match run {
+            Err(RunError::Check(violation)) => {
+                assert!(
+                    violation.reason.contains("could still apply"),
                     "{violation}"
                 );
                 Ok(())

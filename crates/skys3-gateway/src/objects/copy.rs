@@ -65,6 +65,7 @@ use crate::checksum::{DEFAULT_ALGORITHM, Digests, PooledHasher, parse_algorithm}
 use crate::conditions::{
     Precondition, ReadConditions, last_modified, no_such_key, precondition_failed, s3_etag,
 };
+use crate::peer_s3::ApplyBy;
 use crate::shard::{ShardRef, Shards};
 
 /// What a copy does with the source's metadata or tags.
@@ -174,7 +175,8 @@ impl<H: Shards> Objects<H> {
             .map(|algorithm| parse_algorithm(algorithm.as_str()))
             .transpose()?;
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(ApplyBy::of(&extensions));
 
         let source_shard = ShardRef::for_key(source_bucket, &source_key);
         let entry = self

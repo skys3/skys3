@@ -22,12 +22,23 @@
 //!   then carries it as a `COMMIT`'s does, so a later `COMMIT` of the
 //!   other transport sees the same current identity. Its reads see the
 //!   identity, as the flusher's 412 recovery needs (§7.2).
+//! - **Apply-by times.** A peer's write that publishes or deletes a
+//!   version (`PUT`, copy, multipart completion, delete, multi-object
+//!   delete, and tagging) may carry an apply-by time in
+//!   [`WriteIdentity::APPLY_BY_HEADER`], milliseconds since the Unix
+//!   epoch, as its `COMMIT`s do: the key's shard refuses to sequence it
+//!   later ([`Precondition::ApplyBy`](crate::Precondition::ApplyBy)), with
+//!   `503 ServiceUnavailable`, so a write held on the way cannot apply
+//!   after the peer moved back to QUIC. Where native `COMMIT`s can land,
+//!   to a bucket that receives from the peer on a node that serves its
+//!   descriptor, the header is required ([`ApplyBy::of_request`]). The
+//!   gateway reads it only from a peer's keys.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::Extensions;
+use http::{Extensions, HeaderMap};
 use skys3_config::PeeringConfig;
 use skys3_types::{BucketId, BucketName, ClusterId, WriteIdentity};
 
@@ -166,6 +177,63 @@ impl<'a> Carrier<'a> {
                 bucket,
             } => access.may_carry(caller, bucket, value),
         }
+    }
+}
+
+/// The apply-by time of a peer's write, in milliseconds since the Unix
+/// epoch, which the gateway records in the request's extensions (§7.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApplyBy(pub(crate) u64);
+
+impl ApplyBy {
+    /// Reads the apply-by time of a write to `bucket` from `headers` into
+    /// `extensions`, if a peer's flusher sent it ([`PeerCaller`]); a
+    /// client's is ignored. `required`: the bucket receives from that peer
+    /// on a node that serves its descriptor, where native `COMMIT`s land,
+    /// so its S3 writes must be bounded too.
+    ///
+    /// # Errors
+    ///
+    /// `400 InvalidArgument` for a malformed header, or none where it is
+    /// required.
+    pub(crate) fn of_request(
+        headers: &HeaderMap,
+        extensions: &mut Extensions,
+        required: bool,
+    ) -> S3Result<()> {
+        if extensions.get::<PeerCaller>().is_none() {
+            return Ok(());
+        }
+        let name = WriteIdentity::APPLY_BY_HEADER;
+        let Some(value) = headers.get(name) else {
+            if required {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "A peer cluster's write to a bucket that receives native replication from \
+                     it must carry {name} (design 7.8)"
+                ));
+            }
+            return Ok(());
+        };
+        let apply_by = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| {
+                s3_error!(
+                    InvalidArgument,
+                    "{name} must be milliseconds since the Unix epoch"
+                )
+            })?;
+        extensions.insert(ApplyBy(apply_by));
+        Ok(())
+    }
+
+    /// The apply-by time the request with `extensions` carries, if any.
+    pub(crate) fn of(extensions: &Extensions) -> Option<u64> {
+        extensions
+            .get::<ApplyBy>()
+            .map(|ApplyBy(apply_by)| *apply_by)
     }
 }
 

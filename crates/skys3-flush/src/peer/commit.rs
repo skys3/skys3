@@ -15,7 +15,7 @@ use skys3_types::{ETag, EpochSeq, WriteIdentity};
 use super::batch::Unbatched;
 use super::hooks::peer_bug;
 use super::upload::{Layout, Staged};
-use super::{Native, PIECE, PeerBug};
+use super::{MAX_BOUNDED_BYTES, Native, PIECE, PeerBug};
 use crate::attempt::{Attempt, Conflict, Failure, MAX_ROUNDS, Outcome, Remote, read_payload};
 
 /// What a flush sends: a delete, or a version and where its bytes are.
@@ -166,7 +166,8 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             checksums: object.checksums.clone(),
             data: PutData::Staged { piece: PIECE },
         };
-        let small = skips_staging(object.size, native.frame_bytes)
+        // A batch's bytes are bounded by its apply-by time (§7.8).
+        let small = skips_staging(object.size, native.frame_bytes.min(MAX_BOUNDED_BYTES))
             && !matches!(object.payload, Payload::Parts { .. });
         if small && native.batcher.supported() {
             let _reserved = self.target.reserve(object.size).await;

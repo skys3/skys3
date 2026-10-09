@@ -105,7 +105,7 @@ use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
 use crate::fill::{FillError, Fills};
 use crate::hot_cache::{HotCache, ObjectName, VersionName};
 use crate::origin::OriginValidations;
-use crate::peer_s3::{Carrier, PeerAccess, reveals_identity};
+use crate::peer_s3::{ApplyBy, Carrier, PeerAccess, reveals_identity};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
@@ -394,7 +394,8 @@ impl<H: Shards> Objects<H> {
             .transpose()?
             .unwrap_or_default();
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(ApplyBy::of(&extensions));
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
         if condition != Precondition::None {

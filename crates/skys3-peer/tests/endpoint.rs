@@ -11,8 +11,8 @@ use bytes::Bytes;
 use common::*;
 use skys3_peer::{
     Abort, AbortReason, Applied, ApplyError, Batch, Begin, Capabilities, Commit, ConnectError,
-    Data, Hello, Message, Outcome, PeerConnection, PeerTrust, Precondition, Put, PutData,
-    StagedRanges, StreamError, Unauthorized, VersionRange, WINDOW_INTERVAL, Write,
+    Data, Hello, Message, Outcome, PROTOCOL_VERSION, PeerConnection, PeerTrust, Precondition, Put,
+    PutData, StagedRanges, StreamError, Unauthorized, VersionRange, WINDOW_INTERVAL, Write,
 };
 use skys3_types::{BucketName, ETag, WriteIdentity};
 
@@ -55,7 +55,7 @@ fn commit(identity: WriteIdentity, destination: &str, data: PutData, size: u64) 
             checksums: BTreeMap::new(),
             data,
         }),
-        apply_by_ms: None,
+        apply_by_ms: Some(1_800_000_000_000),
     }
 }
 
@@ -128,7 +128,7 @@ async fn trusted_peers_negotiate_and_exchange_messages() {
     assert_eq!(destination.peer_node().as_str(), "us-1");
     assert_eq!(destination.side(), skys3_peer::Side::Destination);
     for end in [&source, &destination] {
-        assert_eq!(end.session().version, 1);
+        assert_eq!(end.session().version, PROTOCOL_VERSION);
         assert_eq!(end.session().capabilities, Capabilities::BATCH);
         assert!(end.close_reason().is_none());
     }
@@ -355,8 +355,19 @@ async fn hellos_must_match_the_certificate_and_share_a_version() {
         matches!(error, ConnectError::WrongCluster { .. }),
         "{error}"
     );
+    // A peer that speaks only newer versions, or only version 1, whose
+    // commits carry no apply-by time.
     let error = attempt(Some(Message::Hello(Hello {
-        versions: VersionRange::new(2, 3).unwrap(),
+        versions: VersionRange::new(3, 4).unwrap(),
+        ..match hello(US) {
+            Message::Hello(hello) => hello,
+            _ => unreachable!(),
+        }
+    })))
+    .await;
+    assert!(matches!(error, ConnectError::Negotiation(_)), "{error}");
+    let error = attempt(Some(Message::Hello(Hello {
+        versions: VersionRange::new(1, 1).unwrap(),
         ..match hello(US) {
             Message::Hello(hello) => hello,
             _ => unreachable!(),

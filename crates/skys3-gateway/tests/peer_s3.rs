@@ -15,7 +15,7 @@ use skys3_gateway::{
     Authenticator, DESCRIPTOR_KEY, Gateway, GatewayConfig, MODE_HEADER, PeerDescriptors,
     Permissions, Principal,
 };
-use skys3_types::{BucketName, ClusterId};
+use skys3_types::{BucketName, ClusterId, WriteIdentity};
 
 /// The header the test authenticator reads the access key from.
 const KEY_HEADER: &str = "x-test-access-key";
@@ -23,6 +23,11 @@ const KEY_HEADER: &str = "x-test-access-key";
 const PEER_KEY: &str = "AKIAPRODUS";
 /// An identity `prod-us` may carry into `archive`.
 const IDENTITY: &str = "prod-us/b-src/3/2.17";
+/// An apply-by time long past, and one far ahead (§7.8).
+const PAST: &str = "1000";
+const FUTURE: &str = "99999999999999";
+/// The header that carries a peer write's apply-by time.
+const APPLY_BY: &str = WriteIdentity::APPLY_BY_HEADER;
 
 /// Takes every request as signed by whatever access key its test header
 /// names, with every permission.
@@ -267,6 +272,155 @@ async fn a_peer_copy_keeps_its_write_identity() {
 }
 
 #[tokio::test]
+async fn where_commits_land_a_peer_write_must_be_sequenced_by_its_apply_by_time() {
+    // The node serves the descriptor of `archive`, so the peer's native
+    // commits may land there.
+    let gateway = start(true).await;
+    let bounded = |by| [(KEY_HEADER, PEER_KEY), (APPLY_BY, by)];
+    call(&gateway, Method::PUT, "/archive/k", &bounded(FUTURE), "v1")
+        .await
+        .assert(200, None);
+    // Without the header, or with a malformed one, a write is refused.
+    for headers in [
+        &[(KEY_HEADER, PEER_KEY)][..],
+        &[(KEY_HEADER, PEER_KEY), (APPLY_BY, "soon")][..],
+    ] {
+        call(&gateway, Method::PUT, "/archive/k", headers, "v2")
+            .await
+            .assert(400, Some("InvalidArgument"));
+    }
+    // A write that reaches its shard after its apply-by time is not
+    // sequenced: the peer sends it again with a new one.
+    let late = bounded(PAST);
+    let copy_late = [
+        (KEY_HEADER, PEER_KEY),
+        (APPLY_BY, PAST),
+        ("x-amz-copy-source", "/archive/k"),
+    ];
+    let writes = [
+        (Method::PUT, "/archive/k".to_owned(), &late[..], "late"),
+        (Method::PUT, "/archive/c".to_owned(), &copy_late[..], ""),
+        (Method::DELETE, "/archive/k".to_owned(), &late[..], ""),
+        (
+            Method::PUT,
+            "/archive/k?tagging".to_owned(),
+            &late[..],
+            "<Tagging><TagSet></TagSet></Tagging>",
+        ),
+        (
+            Method::DELETE,
+            "/archive/k?tagging".to_owned(),
+            &late[..],
+            "",
+        ),
+    ];
+    for (method, uri, headers, body) in writes {
+        let got = call(&gateway, method.clone(), &uri, headers, body).await;
+        assert_eq!(
+            (got.status.as_u16(), got.code()),
+            (503, Some("ServiceUnavailable")),
+            "{method} {uri}: {got:?}"
+        );
+    }
+    let delete = "<Delete><Object><Key>k</Key></Object></Delete>";
+    let digest = md5(delete);
+    let got = call(
+        &gateway,
+        Method::POST,
+        "/archive?delete",
+        &[
+            (KEY_HEADER, PEER_KEY),
+            (APPLY_BY, PAST),
+            ("content-md5", digest.as_str()),
+        ],
+        delete,
+    )
+    .await;
+    assert!(
+        got.body.contains("<Code>ServiceUnavailable</Code>"),
+        "{got:?}"
+    );
+    // A multipart upload's parts change no key; its completion carries
+    // the apply-by time.
+    let create = call(
+        &gateway,
+        Method::POST,
+        "/archive/m?uploads",
+        &[(KEY_HEADER, PEER_KEY)],
+        "",
+    )
+    .await;
+    create.assert(200, None);
+    let upload = between(&create.body, "<UploadId>", "</UploadId>");
+    let part = call(
+        &gateway,
+        Method::PUT,
+        &format!("/archive/m?partNumber=1&uploadId={upload}"),
+        &[(KEY_HEADER, PEER_KEY)],
+        "part",
+    )
+    .await;
+    part.assert(200, None);
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         </CompleteMultipartUpload>",
+        part.headers["etag"].to_str().unwrap()
+    );
+    let uri = format!("/archive/m?uploadId={upload}");
+    call(&gateway, Method::POST, &uri, &late, &complete)
+        .await
+        .assert(503, Some("ServiceUnavailable"));
+    // Refused, it left the upload open, and a new apply-by time completes
+    // it.
+    call(&gateway, Method::POST, &uri, &bounded(FUTURE), &complete)
+        .await
+        .assert(200, None);
+    // Nothing late applied: the key still holds its first version.
+    let got = call(
+        &gateway,
+        Method::GET,
+        "/archive/k",
+        &[(KEY_HEADER, PEER_KEY)],
+        "",
+    )
+    .await;
+    assert_eq!(got.body, "v1");
+    call(&gateway, Method::GET, "/archive/c", &[], "")
+        .await
+        .assert(404, Some("NoSuchKey"));
+    // A client's apply-by time is ignored.
+    call(
+        &gateway,
+        Method::PUT,
+        "/photos/k",
+        &[(APPLY_BY, PAST)],
+        "client",
+    )
+    .await
+    .assert(200, None);
+}
+
+#[tokio::test]
+async fn where_no_commit_lands_the_apply_by_time_is_optional() {
+    // The node serves no descriptor: no native commit lands here.
+    let gateway = start(false).await;
+    let peer = [(KEY_HEADER, PEER_KEY)];
+    call(&gateway, Method::PUT, "/archive/k", &peer, "unbounded")
+        .await
+        .assert(200, None);
+    // One the peer sends still holds.
+    call(
+        &gateway,
+        Method::PUT,
+        "/archive/k",
+        &[(KEY_HEADER, PEER_KEY), (APPLY_BY, PAST)],
+        "late",
+    )
+    .await
+    .assert(503, Some("ServiceUnavailable"));
+}
+
+#[tokio::test]
 async fn only_the_peer_writes_and_only_its_own_identities() {
     let gateway = start(false).await;
     // The bucket stays read-only to this cluster's clients.
@@ -322,8 +476,12 @@ fn between<'a>(xml: &'a str, open: &str, close: &str) -> &'a str {
 #[tokio::test]
 async fn no_write_reaches_the_descriptor_key() {
     let gateway = start(true).await;
-    let peer = [(KEY_HEADER, PEER_KEY)];
-    let with_identity = [(KEY_HEADER, PEER_KEY), ("x-amz-meta-skys3-wid", IDENTITY)];
+    let peer = [(KEY_HEADER, PEER_KEY), (APPLY_BY, FUTURE)];
+    let with_identity = [
+        (KEY_HEADER, PEER_KEY),
+        (APPLY_BY, FUTURE),
+        ("x-amz-meta-skys3-wid", IDENTITY),
+    ];
     // A client in an ordinary bucket, and the peer in the bucket that
     // receives from it, both with an object to copy and an upload of
     // another key whose parts could be copied.

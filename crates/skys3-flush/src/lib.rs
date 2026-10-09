@@ -149,8 +149,8 @@ pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use origin::{DEFAULT_CREDENTIALS, Origin, OriginConnect, profile_credentials};
 pub use peer::{
     BoxFuture, CLOCK_TOLERANCE, DEFAULT_ANSWER_TIMEOUT, DEFAULT_REPROBE_MAX, DEFAULT_REPROBE_MIN,
-    FlushedRecord, LinkError, PeerBug, PeerConnect, PeerLink, PeerReceive, PeerSend, PeerStream,
-    PeerTransport, Transport, TransportStatus,
+    FlushedRecord, LinkError, MAX_BOUNDED_BYTES, PeerBug, PeerConnect, PeerLink, PeerReceive,
+    PeerSend, PeerStream, PeerTransport, Transport, TransportStatus,
 };
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};

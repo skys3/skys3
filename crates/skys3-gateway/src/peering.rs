@@ -194,7 +194,6 @@ impl<S: Shards> PeerCommits<S> {
             expected: commit.precondition.clone(),
             cluster: self.cluster.clone(),
             shard: ShardRef::for_key(&document, &commit.key),
-            apply_by_ms: commit.apply_by_ms,
         })
     }
 
@@ -224,9 +223,8 @@ impl<S: Shards> PeerCommits<S> {
                 Some(put.etag.clone()),
             ),
         };
-        let written = self
-            .shards
-            .write(&shard, body, Precondition::Peer(condition.clone()));
+        let condition_at_shard = Precondition::Peer(condition.clone()).apply_by(commit.apply_by_ms);
+        let written = self.shards.write(&shard, body, condition_at_shard);
         match written.await.map_err(failed)? {
             Ok(_) => return Ok(Outcome::Committed { etag }),
             // Not sequenced: it would have been too late.
@@ -339,7 +337,8 @@ impl<S: Shards> PeerCommits<S> {
         let (items, writes): (Vec<_>, Vec<_>) = sequenced
             .into_iter()
             .map(|(item, body)| {
-                let condition = Precondition::Peer(item.condition.clone());
+                let condition =
+                    Precondition::Peer(item.condition.clone()).apply_by(item.commit.apply_by_ms);
                 (item, (body, condition))
             })
             .unzip();
@@ -1415,8 +1414,10 @@ mod tests {
             b: RecordBody,
             c: Precondition,
         ) -> Result<Result<EpochSeq, crate::ConditionFailed>, ShardError> {
+            // Each write takes a permit of its own, so that every one
+            // waits for the test to let it through.
             if let Some(gate) = &self.1 {
-                drop(gate.acquire().await.unwrap());
+                gate.acquire().await.unwrap().forget();
             }
             self.0.write(s, b, c).await
         }

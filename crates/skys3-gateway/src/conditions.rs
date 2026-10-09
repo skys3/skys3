@@ -21,7 +21,9 @@
 //! DeleteObject, which the shard checks when it sequences the write
 //! ([`Shards::write`](crate::Shards::write)). A peer cluster's `COMMIT`
 //! takes a [`PeerCondition`] instead, on the write identity of the key's
-//! current version (design §7.8).
+//! current version (design §7.8). A peer cluster's write, over either
+//! transport, also has an apply-by time ([`Precondition::ApplyBy`]): the
+//! shard refuses to sequence it later.
 
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -52,6 +54,17 @@ pub enum Precondition {
     /// A peer cluster's write: the key's current write identity is the
     /// one its `COMMIT` expects (design §7.8).
     Peer(PeerCondition),
+    /// A peer cluster's write, a `COMMIT` or an S3 write signed with the
+    /// peer's key, that must be sequenced by its apply-by time (§7.8):
+    /// `condition`, checked only until `apply_by_ms`, in milliseconds since
+    /// the Unix epoch, on the wall clock of the node that sequences it
+    /// ([`Precondition::check_at`]).
+    ApplyBy {
+        /// The write's own precondition.
+        condition: Box<Precondition>,
+        /// When the write may last be sequenced.
+        apply_by_ms: u64,
+    },
 }
 
 /// What a peer cluster's `COMMIT` requires of its key (design §7.8),
@@ -69,19 +82,9 @@ pub struct PeerCondition {
     pub cluster: ClusterId,
     /// The key's shard.
     pub shard: ShardRef,
-    /// When the write may last be sequenced, in milliseconds since the Unix
-    /// epoch (the `COMMIT`'s apply-by time, §7.8): the shard refuses it
-    /// later by its node's wall clock ([`Precondition::check_at`]).
-    pub apply_by_ms: Option<u64>,
 }
 
 impl PeerCondition {
-    /// Whether the write's apply-by time passed at `now_ms`.
-    #[must_use]
-    pub fn expired(&self, now_ms: u64) -> bool {
-        self.apply_by_ms.is_some_and(|by| now_ms > by)
-    }
-
     /// Whether the condition holds of `entry`, the key's entry.
     ///
     /// # Errors
@@ -152,7 +155,8 @@ pub enum ConditionFailed {
     #[error("a part is not the one the completion names")]
     InvalidPart,
     /// A peer cluster's write reached its shard after its apply-by time
-    /// (§7.8), and was not sequenced.
+    /// (§7.8), and was not sequenced (`503 ServiceUnavailable`: the peer
+    /// sends it again with a new one).
     #[error("the write's apply-by time passed")]
     Expired,
 }
@@ -197,23 +201,51 @@ impl Precondition {
         self.check_at(entry, 0)
     }
 
+    /// The precondition of a peer cluster's write that must be sequenced
+    /// by `apply_by_ms`, if it has one: this one, checked only until then.
+    /// Of two apply-by times, the earlier holds.
+    #[must_use]
+    pub fn apply_by(self, apply_by_ms: Option<u64>) -> Self {
+        let Some(by) = apply_by_ms else {
+            return self;
+        };
+        match self {
+            Self::ApplyBy {
+                condition,
+                apply_by_ms,
+            } => Self::ApplyBy {
+                condition,
+                apply_by_ms: apply_by_ms.min(by),
+            },
+            condition => Self::ApplyBy {
+                condition: Box::new(condition),
+                apply_by_ms: by,
+            },
+        }
+    }
+
+    /// Whether the write's apply-by time, if it has one, passed at
+    /// `now_ms`.
+    #[must_use]
+    pub fn expired(&self, now_ms: u64) -> bool {
+        matches!(self, Self::ApplyBy { apply_by_ms, .. } if now_ms > *apply_by_ms)
+    }
+
     /// [`Precondition::check`] at `now_ms`, milliseconds since the Unix
     /// epoch on this node's wall clock: a peer write whose apply-by time
     /// passed fails with [`ConditionFailed::Expired`]. A shard calls it as
     /// it sequences the write, so a write is sequenced by its apply-by
-    /// time or never (§7.8).
+    /// time or never (§7.8). [`Precondition::check`] ignores apply-by
+    /// times.
     ///
     /// # Errors
     ///
     /// Why the precondition does not hold.
     pub fn check_at(&self, entry: Option<&Entry>, now_ms: u64) -> Result<(), ConditionFailed> {
-        if let Self::Peer(peer) = self
-            && peer.expired(now_ms)
-        {
-            return Err(ConditionFailed::Expired);
-        }
         let object = entry.and_then(|entry| entry.object.as_ref());
         match (self, object) {
+            (Self::ApplyBy { .. }, _) if self.expired(now_ms) => Err(ConditionFailed::Expired),
+            (Self::ApplyBy { condition, .. }, _) => condition.check_at(entry, now_ms),
             (Self::Peer(peer), _) => peer.check(entry),
             (Self::None, _) | (Self::Absent, None) | (Self::Exists, Some(_)) => Ok(()),
             (Self::Absent, Some(_)) => Err(ConditionFailed::PreconditionFailed),
@@ -349,4 +381,24 @@ fn not_modified(object: &ObjectVersion) -> S3Error {
     }
     error.set_headers(headers);
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_apply_by_time_bounds_when_a_write_is_sequenced() {
+        let bounded = Precondition::Absent.apply_by(Some(1_000));
+        assert_eq!(bounded.check_at(None, 1_000), Ok(()));
+        assert_eq!(bounded.check_at(None, 1_001), Err(ConditionFailed::Expired));
+        // Without a clock, only the write's own precondition is checked.
+        assert_eq!(bounded.check(None), Ok(()));
+        // Of two apply-by times, the earlier holds.
+        assert_eq!(bounded.clone().apply_by(Some(2_000)), bounded);
+        let earlier = bounded.clone().apply_by(Some(500));
+        assert_eq!(earlier.check_at(None, 600), Err(ConditionFailed::Expired));
+        assert_eq!(Precondition::Absent.apply_by(None), Precondition::Absent);
+        assert!(!Precondition::None.expired(u64::MAX));
+    }
 }
