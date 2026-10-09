@@ -1182,6 +1182,7 @@ fn peer_conditions_round_trip() {
                 expected,
                 cluster: ClusterId::new("prod-eu").unwrap(),
                 shard: shard.clone(),
+                apply_by_ms: Some(1_800_000_000_000),
             }),
         };
         let frame = wire::request_frame(&shard, Epoch::new(1), &write).unwrap();
@@ -1305,6 +1306,7 @@ proptest! {
                     },
                     cluster: ClusterId::new("prod-eu").unwrap(),
                     shard: shard(3),
+                    apply_by_ms: (limit % 2 == 0).then_some(limit as u64),
                 }),
             },
             Request::Flushed {

@@ -55,6 +55,7 @@ fn commit(identity: WriteIdentity, destination: &str, data: PutData, size: u64) 
             checksums: BTreeMap::new(),
             data,
         }),
+        apply_by_ms: None,
     }
 }
 

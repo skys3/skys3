@@ -53,7 +53,8 @@ mod upload;
 use std::sync::Arc;
 use std::time::Duration;
 
-use skys3_peer::{DescriptorVerifier, IDLE_TIMEOUT, PeerDescriptor};
+use skys3_io::WallClock;
+use skys3_peer::{Commit, DescriptorVerifier, PeerDescriptor};
 use skys3_types::BucketName;
 
 pub(crate) use bodies::{Bodies, BodyStep};
@@ -79,6 +80,41 @@ pub const DEFAULT_REPROBE_MIN: Duration = Duration::from_secs(15);
 /// The most time between two handshakes a target on S3 REST tries.
 pub const DEFAULT_REPROBE_MAX: Duration = Duration::from_secs(300);
 
+/// How far the wall clock of any node of two peered clusters may be from
+/// true time, which the quarantine allows for twice: once on the source
+/// that stamps a `COMMIT`'s apply-by time, once on the destination that
+/// checks it (§7.8).
+pub const CLOCK_TOLERANCE: Duration = Duration::from_secs(30);
+
+/// How a target's `COMMIT`s are stamped with their apply-by time: the
+/// source's wall clock as each is sent, plus the commit window (§7.8).
+#[derive(Clone)]
+pub(crate) struct Stamp {
+    wall: Arc<dyn WallClock>,
+    window: Duration,
+}
+
+impl Stamp {
+    pub(crate) fn new(wall: Arc<dyn WallClock>, window: Duration) -> Self {
+        Self { wall, window }
+    }
+
+    /// The apply-by time of a `COMMIT` sent now.
+    fn apply_by_ms(&self) -> u64 {
+        u64::try_from((self.wall.now() + self.window).as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// `commit` as it is sent now, with its apply-by time if `stamp` gives
+/// one.
+pub(crate) fn stamped(stamp: Option<&Stamp>, commit: &Commit) -> Commit {
+    let mut commit = commit.clone();
+    if let Some(stamp) = stamp {
+        commit.apply_by_ms = Some(stamp.apply_by_ms());
+    }
+    commit
+}
+
 /// Makes a link to the destination a verified descriptor names, once a
 /// fresh QUIC handshake with it, `HELLO`s included, succeeded: the probe
 /// that decides whether a target uses QUIC (§7.8). An error says why the
@@ -99,6 +135,7 @@ pub struct PeerTransport {
     pub(crate) connect_timeout: Duration,
     pub(crate) reprobe: (Duration, Duration),
     pub(crate) quarantine: Option<Duration>,
+    pub(crate) commit_window: Option<Duration>,
 }
 
 impl std::fmt::Debug for PeerTransport {
@@ -108,6 +145,7 @@ impl std::fmt::Debug for PeerTransport {
             .field("timeout", &self.timeout)
             .field("connect_timeout", &self.connect_timeout)
             .field("reprobe", &self.reprobe)
+            .field("commit_window", &self.commit_window())
             .field("quarantine", &self.quarantine())
             .finish_non_exhaustive()
     }
@@ -129,6 +167,7 @@ impl PeerTransport {
             connect_timeout: Duration::from_secs(3),
             reprobe: (DEFAULT_REPROBE_MIN, DEFAULT_REPROBE_MAX),
             quarantine: None,
+            commit_window: None,
         }
     }
 
@@ -165,18 +204,35 @@ impl PeerTransport {
         self
     }
 
+    /// Sets how long after it is sent a `COMMIT` may still be applied:
+    /// its apply-by time is the source's wall clock as it is sent plus
+    /// this window (the answer timeout by default).
+    #[must_use]
+    pub fn with_commit_window(mut self, window: Duration) -> Self {
+        self.commit_window = Some(window);
+        self
+    }
+
+    /// How long after it is sent a `COMMIT` may still be applied
+    /// ([`PeerTransport::with_commit_window`]).
+    #[must_use]
+    pub fn commit_window(&self) -> Duration {
+        self.commit_window.unwrap_or(self.timeout)
+    }
+
     /// How long each shard flusher that starts on S3 REST to a peer, after
     /// a fallback, a restart, or a takeover, waits before its first S3
     /// flush: until no `COMMIT` sent over QUIC before it started, on this
-    /// node or by an earlier primary, can still apply (§7.8). A `COMMIT`
-    /// reaches the destination only on a live connection, a connection its
-    /// source stopped using dies within the QUIC idle timeout, and the
-    /// destination applies what it read within an answer timeout. By
-    /// default twice the answer timeout plus the idle timeout: 90 s.
+    /// node or by an earlier primary, can still apply (§7.8). Each
+    /// `COMMIT` carries an apply-by time, its sender's wall clock plus the
+    /// commit window, and the destination's shard sequences it by then on
+    /// its own wall clock, or never. With every clock within
+    /// [`CLOCK_TOLERANCE`] of true time, the wait is the commit window
+    /// plus twice that: 90 s by default.
     #[must_use]
     pub fn quarantine(&self) -> Duration {
         self.quarantine
-            .unwrap_or(self.timeout.saturating_mul(2) + IDLE_TIMEOUT)
+            .unwrap_or(self.commit_window() + CLOCK_TOLERANCE.saturating_mul(2))
     }
 
     /// The wait before the next handshake after `failures` failed rounds.
@@ -199,18 +255,23 @@ pub(crate) struct Native {
     pub(crate) batcher: Batcher,
     /// Tells the target's discovery when a link fails, if it has one.
     alarm: Option<LinkAlarm>,
+    /// How its `COMMIT`s are stamped with their apply-by time, if they
+    /// are.
+    stamp: Option<Stamp>,
 }
 
 impl Native {
-    /// A transport over `link` to `bucket`. Starts the target's batcher on
-    /// the current Tokio runtime.
+    /// A transport over `link` to `bucket`, whose `COMMIT`s `stamp` gives
+    /// an apply-by time. Starts the target's batcher on the current Tokio
+    /// runtime.
     pub(crate) fn new(
         link: Arc<dyn PeerLink>,
         bucket: BucketName,
         frame_bytes: u64,
         timeout: Duration,
+        stamp: Option<Stamp>,
     ) -> Self {
-        let batcher = Batcher::spawn(Arc::clone(&link), timeout);
+        let batcher = Batcher::spawn(Arc::clone(&link), timeout, stamp.clone());
         Self {
             link,
             bucket,
@@ -218,7 +279,13 @@ impl Native {
             timeout,
             batcher,
             alarm: None,
+            stamp,
         }
+    }
+
+    /// `commit` as it is sent now, with its apply-by time.
+    pub(crate) fn stamped(&self, commit: &Commit) -> Commit {
+        stamped(self.stamp.as_ref(), commit)
     }
 
     /// Tells `alarm` of every link that fails.
@@ -341,5 +408,53 @@ pub(crate) mod hooks {
         if let Some(observer) = observer {
             observer(record);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_io::ManualWallClock;
+    use skys3_peer::{PeerTrust, Precondition, Write};
+
+    use super::*;
+
+    fn transport() -> PeerTransport {
+        PeerTransport::new(
+            Box::new(|_: &PeerDescriptor| Box::pin(async { Err(LinkError::new("no peers here")) })),
+            DescriptorVerifier::new(Arc::new(PeerTrust::new())),
+            1024,
+        )
+    }
+
+    #[test]
+    fn the_quarantine_outlasts_every_commit_window_and_clock_error() {
+        let peers = transport();
+        assert_eq!(peers.commit_window(), DEFAULT_ANSWER_TIMEOUT);
+        assert_eq!(peers.quarantine(), Duration::from_secs(90));
+        let peers = transport()
+            .with_timeout(Duration::from_secs(5))
+            .with_commit_window(Duration::from_secs(8));
+        assert_eq!(peers.commit_window(), Duration::from_secs(8));
+        assert_eq!(peers.quarantine(), Duration::from_secs(68));
+        let peers = peers.with_quarantine(Duration::from_secs(3));
+        assert_eq!(peers.quarantine(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn commits_are_stamped_as_they_are_sent() {
+        let wall = Arc::new(ManualWallClock::new(Duration::from_secs(1_000)));
+        let stamp = Stamp::new(wall.clone(), Duration::from_secs(30));
+        let commit = Commit {
+            identity: "prod-us/b-src/3/2.17".parse().unwrap(),
+            bucket: "archive".parse().unwrap(),
+            key: "k".to_owned(),
+            precondition: Precondition::Absent,
+            write: Write::Delete,
+            apply_by_ms: None,
+        };
+        assert_eq!(stamped(None, &commit), commit);
+        assert_eq!(stamped(Some(&stamp), &commit).apply_by_ms, Some(1_030_000));
+        wall.advance(Duration::from_secs(5));
+        assert_eq!(stamped(Some(&stamp), &commit).apply_by_ms, Some(1_035_000));
     }
 }

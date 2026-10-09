@@ -676,7 +676,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     ) -> Option<Native> {
         let peers = self.peers.as_ref()?;
         let bucket = parts.bucket.clone()?;
-        let native = Native::new(link, bucket, peers.frame_bytes, peers.timeout);
+        let stamp = crate::peer::Stamp::new(Arc::clone(&self.wall), peers.commit_window());
+        let native = Native::new(link, bucket, peers.frame_bytes, peers.timeout, Some(stamp));
         Some(match discovery {
             Some((discovery, _)) => native.with_alarm(discovery.alarm()),
             None => native,

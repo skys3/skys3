@@ -98,7 +98,10 @@ pub trait CommitSink: Clone + Send + Sync + 'static {
     ///
     /// A commit is applied at most once: a sink that finds the commit's
     /// write already applied, as after a lost `APPLIED`, answers with the
-    /// result it had.
+    /// result it had. A commit with an apply-by time
+    /// ([`Commit::apply_by_ms`]) is sequenced by then, on the wall clock of
+    /// the node that sequences it, or never, and answered `unavailable`
+    /// otherwise (§7.8).
     fn apply(
         &self,
         commit: &Commit,
@@ -215,19 +218,29 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     }
 
     /// Serves every stream a source opens on `connection`, each on its own
-    /// task, until the connection closes.
+    /// task, until the connection closes. The streams' tasks end with it:
+    /// nothing is read from a source, or applied for it, after its
+    /// connection is gone. A write already handed to its shard may still
+    /// be sequenced, which the `COMMIT`'s apply-by time bounds (§7.8).
     pub async fn serve_connection(&self, connection: PeerConnection) {
+        let mut streams = tokio::task::JoinSet::new();
         loop {
-            match connection.accept_stream().await {
+            let accepted = tokio::select! {
+                accepted = connection.accept_stream() => accepted,
+                // Reap the streams that ended, so the set stays small.
+                Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+            };
+            match accepted {
                 Ok(stream) => {
                     let service = self.clone();
-                    tokio::spawn(async move {
+                    streams.spawn(async move {
                         if let Err(error) = service.serve(stream).await {
                             tracing::debug!(%error, "a peer stream ended with an error");
                         }
                     });
                 }
                 Err(StreamError::ZeroRtt) => {}
+                // Dropping the set aborts the streams still being served.
                 Err(_) => return,
             }
         }
@@ -335,9 +348,9 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                 }
                 Message::Commit(commit) => {
                     // Staging live as the COMMIT arrives stays until it is
-                    // applied, however long its frames in flight take.
-                    let identity = commit.identity.clone();
-                    let pinned = self.staging.pin(&identity);
+                    // applied, however long its frames in flight take, or
+                    // until the stream's task is aborted.
+                    let pinned = Pinned::new(&self.staging, &commit.identity);
                     drop(
                         appends
                             .acquire_many(MAX_APPENDS_PER_STREAM)
@@ -345,9 +358,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                             .expect("the semaphore is never closed"),
                     );
                     let applied = self.commit(commit).await;
-                    if let Some(generation) = pinned {
-                        self.staging.unpin(&identity, generation);
-                    }
+                    drop(pinned);
                     if matches!(applied.outcome, Outcome::Committed { .. })
                         && current
                             .as_ref()
@@ -461,6 +472,32 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// A [`Staging::pin`] of one identity's staging, released when dropped,
+/// as when a stream's task is aborted while its `COMMIT` is applied.
+struct Pinned {
+    staging: Arc<Staging>,
+    identity: WriteIdentity,
+    generation: Option<u64>,
+}
+
+impl Pinned {
+    fn new(staging: &Arc<Staging>, identity: &WriteIdentity) -> Self {
+        Self {
+            staging: Arc::clone(staging),
+            identity: identity.clone(),
+            generation: staging.pin(identity),
+        }
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            self.staging.unpin(&self.identity, generation);
         }
     }
 }

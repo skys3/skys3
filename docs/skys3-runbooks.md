@@ -418,10 +418,12 @@ exactly once, as over QUIC (design section 7.8). The transfer is slower
 over a long link, and it uses the REST window (section 7.7). Each shard
 flusher that starts on S3 REST to a target that served a descriptor,
 verified or not, waits a quarantine before it sends anything. The
-quarantine is twice the peer answer timeout plus the QUIC idle timeout:
-90 seconds. This happens at each switch to S3 REST, and at each restart or
-takeover while the target stays on S3 REST, so the dirty age grows by up
-to that much each time. A target on S3 REST tries a handshake again after
+quarantine is the commit window, the peer answer timeout, plus twice a
+clock tolerance of 30 seconds: 90 seconds. The wait happens at each switch
+to S3 REST, and at each restart or takeover while the target stays on S3
+REST, so the dirty age grows by up to that much each time. It is enough
+only while every node's wall clock in both clusters is within 30 seconds
+of true time ([Clock drift](#clock-drift)). A target on S3 REST tries a handshake again after
 a backoff from 15 seconds, doubling, up to 5 minutes. It returns to QUIC
 within 5 minutes of UDP being allowed again, without the quarantine.
 
@@ -888,7 +890,11 @@ disk takes itself out of service. Do not delete segment files or the index.
 **Impact.** A clock that is not synchronized may drift faster than
 `assumed_clock_drift` (`ρ`), which the leases assume. Read linearizability
 is then at risk: a primary could serve a read after another member took
-over. Write safety does not depend on clocks (design sections 5.4 and 13).
+over. Write safety does not depend on clocks (design sections 5.4 and 13),
+except across a peer target's fallback to S3 REST: a wall clock more than
+30 seconds off, on a node of either cluster, can let a late `COMMIT` apply
+over a newer S3 write of its key ([Peer transport
+fallback](#peer-transport-fallback), design section 7.8).
 
 **Diagnosis.** The host's time synchronization service (for example
 `chronyc tracking` or `timedatectl`): its sources, and the measured

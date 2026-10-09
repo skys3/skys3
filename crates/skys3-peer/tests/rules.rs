@@ -45,6 +45,7 @@ fn commit(key: &str, write: Write) -> Commit {
         key: key.to_owned(),
         precondition: Precondition::Absent,
         write,
+        apply_by_ms: None,
     }
 }
 

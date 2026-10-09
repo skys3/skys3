@@ -135,6 +135,7 @@ impl NodePeering {
         .with_timeout(peer.timeout)
         .with_connect_timeout(peer.connect_timeout)
         .with_reprobe(peer.reprobe.0, peer.reprobe.1)
+        .with_commit_window(peer.commit_window())
         .with_quarantine(peer.quarantine())
     }
 }
@@ -264,12 +265,19 @@ pub(crate) async fn serve<S: ExtentSink, C: CommitSink>(
                     return;
                 }
             };
+            // As the staging service's own loop: the streams of a closed
+            // connection are aborted with it.
+            let mut streams = tokio::task::JoinSet::new();
             loop {
-                match connection.accept_stream().await {
+                let accepted = tokio::select! {
+                    accepted = connection.accept_stream() => accepted,
+                    Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+                };
+                match accepted {
                     Ok(stream) => {
                         let tapped = Tapped::new(stream, connection.clone(), &destination);
                         let service = service.clone();
-                        tokio::spawn(async move {
+                        streams.spawn(async move {
                             if let Err(error) = service.serve(tapped).await {
                                 tracing::debug!(%error, "a peer stream failed");
                             }
@@ -441,7 +449,7 @@ impl Tap {
                 }
             }
             Message::Commit(commit) => {
-                destination.commit_arrived(&commit.identity, &commit.key, &self.node);
+                destination.commit_arrived(commit, &self.node);
                 state
                     .keys
                     .insert(commit.identity.clone(), commit.key.clone());
@@ -456,7 +464,7 @@ impl Tap {
             }
             Message::Batch(batch) => {
                 for item in &batch.items {
-                    destination.commit_arrived(&item.identity, &item.key, &self.node);
+                    destination.commit_arrived(item, &self.node);
                     state.keys.insert(item.identity.clone(), item.key.clone());
                 }
             }

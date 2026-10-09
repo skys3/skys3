@@ -263,7 +263,7 @@ impl<S, D: Disk> Staged<'_, S, D> {
             };
             self.send(&mut stream, layout, &durable).await?;
             stream
-                .send(&Message::Commit(commit.clone()))
+                .send(&Message::Commit(self.native.stamped(commit)))
                 .await
                 .map_err(Failure::link)?;
             stream.finish().map_err(Failure::link)?;

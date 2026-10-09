@@ -123,6 +123,10 @@ impl<H: Shards> Objects<H> {
                     break;
                 };
                 let condition = match key_condition(object) {
+                    Ok(_) if object.key == crate::peer_s3::DESCRIPTOR_KEY => {
+                        outcomes[index] = Some(Err(crate::peer_s3::reserved_key()));
+                        continue;
+                    }
                     Ok(condition) if decisions.allows(index) => condition,
                     Ok(_) => {
                         outcomes[index] = Some(Err(access_denied()));

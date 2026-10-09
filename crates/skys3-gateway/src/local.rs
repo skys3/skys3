@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
-use skys3_io::Disk;
+use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_shard::{
@@ -29,6 +29,8 @@ use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts, Writ
 pub struct LocalShards<D: Disk> {
     set: Arc<ShardSet<D>>,
     node: NodeId,
+    /// The clock a peer write's apply-by time is checked on.
+    wall: Arc<dyn WallClock>,
 }
 
 impl<D: Disk> Clone for LocalShards<D> {
@@ -36,6 +38,7 @@ impl<D: Disk> Clone for LocalShards<D> {
         Self {
             set: Arc::clone(&self.set),
             node: self.node.clone(),
+            wall: Arc::clone(&self.wall),
         }
     }
 }
@@ -55,7 +58,21 @@ impl<D: Disk> LocalShards<D> {
         Self {
             set: Arc::new(set),
             node,
+            wall: Arc::new(SystemWallClock),
         }
+    }
+
+    /// The shards, checking peer writes' apply-by times on `wall` (the
+    /// system clock by default).
+    #[must_use]
+    pub fn with_wall_clock(mut self, wall: Arc<dyn WallClock>) -> Self {
+        self.wall = wall;
+        self
+    }
+
+    /// Now on the wall clock, in milliseconds since the Unix epoch.
+    fn now_ms(wall: &dyn WallClock) -> u64 {
+        u64::try_from(wall.now().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// The node's shard set.
@@ -362,7 +379,11 @@ impl<D: Disk> Shards for LocalShards<D> {
         let committed = if condition == Precondition::None {
             local.commit(body).await.map(Ok)
         } else {
-            local.commit_if(body, |entry| condition.check(entry)).await
+            // The clock is read as the write is sequenced.
+            let wall = &*self.wall;
+            local
+                .commit_if(body, |entry| condition.check_at(entry, Self::now_ms(wall)))
+                .await
         };
         let committed = committed.map_err(|error| convert(shard, error))?;
         Ok(committed.and_then(written))
@@ -381,7 +402,9 @@ impl<D: Disk> Shards for LocalShards<D> {
         };
         let (bodies, conditions): (Vec<_>, Vec<_>) = writes.into_iter().unzip();
         local
-            .commit_all_if(bodies, |at, entry| conditions[at].check(entry))
+            .commit_all_if(bodies, |at, entry| {
+                conditions[at].check_at(entry, Self::now_ms(&*self.wall))
+            })
             .await
             .into_iter()
             .map(|committed| match committed {

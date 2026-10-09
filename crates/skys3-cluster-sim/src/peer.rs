@@ -86,12 +86,12 @@ use skys3_gateway::{
     PeerExtents, Permissions, Principal, ShardRef, Shards,
 };
 use skys3_index::{Index, IndexConfig, ListItem, ListQuery};
-use skys3_io::{BlockingPool, Drift, MonoTime, SimDisk, SimMount};
+use skys3_io::{BlockingPool, Drift, MonoTime, SimDisk, SimMount, WallClock};
 use skys3_log::record::IDENTITY_METADATA;
 use skys3_log::{LogConfig, RecordBody};
 use skys3_peer::{
-    Applied, DescriptorSigner, DescriptorVerifier, EndpointSettings, Outcome, PeerDescriptor,
-    PeerTls, PeerTrust, Staging, StagingLimits, StagingService,
+    Applied, Commit, DescriptorSigner, DescriptorVerifier, EndpointSettings, Outcome,
+    PeerDescriptor, PeerTls, PeerTrust, Staging, StagingLimits, StagingService,
 };
 use skys3_sim::NodeClock;
 use skys3_sim::check::Violation;
@@ -180,10 +180,11 @@ pub struct AimedBlocks {
     /// Which links.
     pub scope: AimScope,
     /// Whether the links are held once the `COMMIT` reaches the
-    /// destination, which takes as long as the hold to apply it, as a slow
-    /// one may: it is still outstanding when the links come back, though
-    /// its sender may have closed its connection meanwhile. Without, the
-    /// sender holds its link before the `COMMIT` leaves.
+    /// destination, which takes most of the hold to apply it, as a slow
+    /// one may: it applies while the links are held, after its sender may
+    /// have given up on it and closed its connection, which the
+    /// destination cannot hear yet. Without, the sender holds its link
+    /// before the `COMMIT` leaves.
     pub late: bool,
 }
 
@@ -256,9 +257,17 @@ impl Default for Peer {
 }
 
 impl Peer {
+    /// How long after it is sent a `COMMIT` may still apply: the
+    /// destination's idle timeout, so that a `COMMIT` held on the way for
+    /// less than that still can, as the seeded bug of no quarantine needs.
+    #[must_use]
+    pub fn commit_window(self) -> Duration {
+        self.idle
+    }
+
     /// How long a node's flushers wait before they flush a shard over S3
-    /// REST to the peer: as the node binary's, twice the timeout of a
-    /// stream and the destination's idle timeout.
+    /// REST to the peer: more than the commit window, which is all the
+    /// node binary's rule needs with the simulation's exact clocks.
     #[must_use]
     pub fn quarantine(self) -> Duration {
         2 * self.timeout + self.idle
@@ -272,6 +281,17 @@ impl Peer {
             idle_timeout: self.idle,
             ..EndpointSettings::from_config(&PeeringConfig::default())
         }
+    }
+}
+
+/// The simulated wall clock, which the destination checks apply-by times
+/// on.
+#[derive(Debug, Clone, Copy)]
+struct SimWall;
+
+impl WallClock for SimWall {
+    fn now(&self) -> Duration {
+        turmoil::since_epoch().unwrap_or_default()
     }
 }
 
@@ -359,11 +379,13 @@ impl PeerLog {
 
     /// How late the destination applies the `COMMIT` of `identity`, which
     /// just arrived, if a fault aimed at it is to apply it late: the fault
-    /// starts now. Once.
+    /// starts now, and the `COMMIT` applies once four fifths of its hold
+    /// passed, before the destination can hear that its sender closed the
+    /// connection meanwhile. Once.
     pub(crate) fn take_late(&self, identity: &str) -> Option<Duration> {
         let fault = lock(&self.late).remove(identity)?;
         lock(&self.aims).push(fault);
-        Some(fault.hold)
+        Some(fault.hold * 4 / 5)
     }
 
     /// An S3 write of `key` was acknowledged.
@@ -375,8 +397,9 @@ impl PeerLog {
             .push(now());
     }
 
-    /// The destination received the `COMMIT` of `identity`, of `key`.
-    fn commit_received(&self, identity: &str, key: &str) {
+    /// The destination received the `COMMIT` of `identity`, of `key`, which
+    /// may apply until `apply_by_ms` on the simulated wall clock.
+    fn commit_received(&self, identity: &str, key: &str, apply_by_ms: Option<u64>) {
         self.received.fetch_add(1, Ordering::Relaxed);
         if self.descriptor != DescriptorKind::Signed {
             self.violate(Violation {
@@ -392,6 +415,11 @@ impl PeerLog {
         let Some(sent) = lock(&self.commits).get(identity).map(|(_, sent)| *sent) else {
             return;
         };
+        // One that arrives after its apply-by time is never applied.
+        let wall = u64::try_from(SimWall.now().as_millis()).unwrap_or(u64::MAX);
+        if apply_by_ms.is_some_and(|by| wall > by) {
+            return;
+        }
         let received = now();
         let crossed = lock(&self.s3_writes).get(key).and_then(|acks| {
             acks.iter()
@@ -907,11 +935,11 @@ impl Destination {
         });
     }
 
-    /// The `COMMIT` of `identity`, a write of `key`, arrived from `node`,
-    /// alone or in a batch.
-    pub(crate) fn commit_arrived(&self, identity: &WriteIdentity, key: &str, node: &str) {
-        let identity = identity.to_string();
-        self.record.commit_received(&identity, key);
+    /// `commit` arrived from `node`, alone or in a batch.
+    pub(crate) fn commit_arrived(&self, commit: &Commit, node: &str) {
+        let identity = commit.identity.to_string();
+        self.record
+            .commit_received(&identity, &commit.key, commit.apply_by_ms);
         let mut arrivals = lock(&self.arrivals);
         let (count, nodes) = arrivals.entry(identity).or_default();
         *count += 1;
@@ -1284,7 +1312,14 @@ pub(crate) async fn run(destination: Arc<Destination>) -> Result<(), BoxError> {
         staging,
         PeerExtents::new(storage.shards.clone(), Arc::clone(&lookup)),
     )
-    .with_commits(PeerCommits::new(storage.shards.clone(), lookup, &gateway));
+    .with_commits(
+        PeerCommits::new(
+            storage.shards.clone().with_wall_clock(Arc::new(SimWall)),
+            lookup,
+            &gateway,
+        )
+        .with_wall_clock(Arc::new(SimWall)),
+    );
     // The gateway, which serves the descriptor and takes S3 flushes.
     let life = destination.lives.load(Ordering::Relaxed);
     let s3 = Gateway::new(

@@ -254,6 +254,27 @@ fn flushing_falls_back_to_s3_while_quic_fails_and_returns() {
             })
             .await;
         world.until_at_destination("a").await;
+        // Every COMMIT carries its apply-by time: the source's wall clock
+        // as it was sent, plus the commit window (the answer timeout).
+        let apply_by = u64::try_from((NOW + Duration::from_secs(1)).as_millis()).unwrap();
+        let stamps: Vec<_> = world
+            .destination
+            .seen()
+            .received
+            .iter()
+            .flat_map(|message| match message {
+                skys3_peer::Message::Commit(commit) => vec![commit.apply_by_ms],
+                skys3_peer::Message::Batch(batch) => {
+                    batch.items.iter().map(|item| item.apply_by_ms).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(!stamps.is_empty());
+        assert!(
+            stamps.iter().all(|stamp| *stamp == Some(apply_by)),
+            "{stamps:?}"
+        );
         let status = world.service.status(&bucket().bucket_id).unwrap();
         let transport = status.transport.unwrap();
         assert!(status.native && transport.peer, "{transport:?}");

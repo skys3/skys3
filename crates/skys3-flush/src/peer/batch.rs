@@ -19,9 +19,9 @@ use skys3_peer::{Applied, Batch, BatchBuilder, Commit, Message, Outcome, Refusal
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use super::PeerBug;
 use super::hooks::peer_bug;
 use super::link::{LinkError, PeerLink, Stream};
+use super::{PeerBug, Stamp, stamped};
 
 /// The most batches of a target sent and not yet answered.
 pub(crate) const BATCHES_IN_FLIGHT: usize = 4;
@@ -54,9 +54,10 @@ impl Batcher {
     /// Starts the batches of a target reached through `link`, each stream
     /// bounded by `timeout`, on the current Tokio runtime. The task ends
     /// once every handle is dropped and every batch is answered.
-    pub(crate) fn spawn(link: Arc<dyn PeerLink>, timeout: Duration) -> Self {
+    pub(crate) fn spawn(link: Arc<dyn PeerLink>, timeout: Duration, stamp: Option<Stamp>) -> Self {
         let (items, received) = mpsc::unbounded_channel();
         let unsupported = Arc::new(AtomicBool::new(false));
+        let link = (link, stamp);
         tokio::spawn(run(link, timeout, received, Arc::clone(&unsupported)));
         Self { items, unsupported }
     }
@@ -97,7 +98,7 @@ fn stopped() -> Unbatched {
 
 /// Gathers items and sends them in batches until every handle is dropped.
 async fn run(
-    link: Arc<dyn PeerLink>,
+    link: (Arc<dyn PeerLink>, Option<Stamp>),
     timeout: Duration,
     mut received: mpsc::UnboundedReceiver<Item>,
     unsupported: Arc<AtomicBool>,
@@ -109,7 +110,7 @@ async fn run(
         while sending.len() < BATCHES_IN_FLIGHT && !pending.is_empty() {
             let items = pack(&mut pending);
             if !items.is_empty() {
-                let (link, unsupported) = (Arc::clone(&link), Arc::clone(&unsupported));
+                let (link, unsupported) = (link.clone(), Arc::clone(&unsupported));
                 sending.spawn(send(link, timeout, items, unsupported));
             }
         }
@@ -155,16 +156,25 @@ fn pack(pending: &mut VecDeque<Item>) -> Vec<Item> {
 /// Sends `items` as one `BATCH` on a stream of its own and answers each
 /// with its `APPLIED`; an item without one gets the stream's failure.
 async fn send(
-    link: Arc<dyn PeerLink>,
+    (link, stamp): (Arc<dyn PeerLink>, Option<Stamp>),
     timeout: Duration,
     items: Vec<Item>,
     unsupported: Arc<AtomicBool>,
 ) {
-    let batch = Batch {
-        items: items.iter().map(|item| item.commit.clone()).collect(),
-    };
-    let mut replies: Vec<_> = items.into_iter().map(|item| Some(item.reply)).collect();
-    let result = exchange(&*link, timeout, &batch, &mut replies, &unsupported).await;
+    let mut replies: Vec<_> = items.iter().map(|_| None).collect();
+    let mut commits = Vec::new();
+    for (item, reply) in items.into_iter().zip(&mut replies) {
+        *reply = Some(item.reply);
+        commits.push(item.commit);
+    }
+    let result = exchange(
+        (&*link, stamp.as_ref()),
+        timeout,
+        &commits,
+        &mut replies,
+        &unsupported,
+    )
+    .await;
     let failure = match result {
         Ok(()) => Unbatched::Lost(LinkError::new("the batch ended without an APPLIED for it")),
         Err(failure) => failure,
@@ -177,9 +187,9 @@ async fn send(
 /// Sends `batch` and answers each item's reply in `replies` as its
 /// `APPLIED` arrives.
 async fn exchange(
-    link: &dyn PeerLink,
+    (link, stamp): (&dyn PeerLink, Option<&Stamp>),
     timeout: Duration,
-    batch: &Batch,
+    commits: &[Commit],
     replies: &mut [Option<oneshot::Sender<Result<Outcome, Unbatched>>>],
     unsupported: &AtomicBool,
 ) -> Result<(), Unbatched> {
@@ -188,6 +198,13 @@ async fn exchange(
         unsupported.store(true, Ordering::Relaxed);
         return Err(Unbatched::NotSupported);
     }
+    // Stamped as the batch is sent.
+    let batch = &Batch {
+        items: commits
+            .iter()
+            .map(|commit| stamped(stamp, commit))
+            .collect(),
+    };
     stream
         .send(&Message::Batch(batch.clone()))
         .await

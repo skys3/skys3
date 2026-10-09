@@ -7,6 +7,11 @@
 //!   [`PeerDescriptors`] signs, after the usual authentication and
 //!   authorization of a GetObject of that key. Without a descriptor, the
 //!   key is read as any other, and a source finds no peer.
+//! - **The key is reserved.** No write reaches it in any bucket, from a
+//!   client or a peer, over S3 or in a `COMMIT`: PUT, copies to it,
+//!   multipart uploads, tagging, and deletes answer `400 InvalidArgument`
+//!   ([`writable_key`]), so no version of it is ever replicated, and a
+//!   receiving bucket's descriptor never hides one.
 //! - **Peer callers.** A request signed with one of the access keys a
 //!   `[peering.peers.<cluster-id>]` table lists (`s3_access_key_ids`) is
 //!   that peer's flusher ([`PeerCaller`]). It may write the buckets whose
@@ -26,9 +31,31 @@ use http::Extensions;
 use skys3_config::PeeringConfig;
 use skys3_types::{BucketId, BucketName, ClusterId, WriteIdentity};
 
+use s3s::{S3Error, S3Result, s3_error};
 pub use skys3_peer::DESCRIPTOR_KEY;
 
 use crate::sigv4::Authenticated;
+
+/// Refuses a write of `key` if it is [`DESCRIPTOR_KEY`], which only the
+/// peer descriptor may answer (§7.8).
+///
+/// # Errors
+///
+/// `400 InvalidArgument` for the reserved key.
+pub(crate) fn writable_key(key: &str) -> S3Result<()> {
+    if key == DESCRIPTOR_KEY {
+        return Err(reserved_key());
+    }
+    Ok(())
+}
+
+/// The refusal of a write of [`DESCRIPTOR_KEY`].
+pub(crate) fn reserved_key() -> S3Error {
+    s3_error!(
+        InvalidArgument,
+        "The key {DESCRIPTOR_KEY} is reserved for SkyS3's peer descriptor"
+    )
+}
 
 /// Serves the signed peer descriptors of a node's receiving buckets.
 pub trait PeerDescriptors: Send + Sync + std::fmt::Debug + 'static {

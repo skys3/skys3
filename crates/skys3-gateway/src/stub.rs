@@ -241,6 +241,14 @@ impl MemoryShards {
         Some(local.is_sealed())
     }
 
+    /// The shards, checking peer writes' apply-by times on `wall`
+    /// ([`LocalShards::with_wall_clock`]).
+    #[must_use]
+    pub fn with_wall_clock(mut self, wall: Arc<dyn skys3_io::WallClock>) -> Self {
+        self.local = self.local.with_wall_clock(wall);
+        self
+    }
+
     /// Makes every later request fail with [`ShardError::Unavailable`], or
     /// succeed again.
     pub fn set_unavailable(&self, unavailable: bool) {
