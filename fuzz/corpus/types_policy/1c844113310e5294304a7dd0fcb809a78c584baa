@@ -1,0 +1,2 @@
+buccet/key
+{"Version": "2011-10l-17", "Id": "p", "Statement": [{"Sid": "read", "NotResource": ["etarn:aons5:Ge"]}, {"Effect": "Dany", "NorAction": "s0:/sec=et/*"}]}

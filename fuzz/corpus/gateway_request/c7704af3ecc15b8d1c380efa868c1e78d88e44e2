@@ -1,0 +1,6 @@
+/fuzz/d
+x-amz-copy-source: /fuzz/k
+x-amz-metadata-directive:uploadsA
+x-amz-copy-source-if-match: "abc"
+si:type="CanonicalUser": COPY
+

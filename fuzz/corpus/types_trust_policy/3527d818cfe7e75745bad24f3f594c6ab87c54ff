@@ -1,0 +1,2 @@
+e/a
+{"Version": "2012-10-17", "Statement": {"Effect":" Allow", "Principal": {"Federated": "a:nraws:iam::061744506:oidc-proctm"}, "Action": "sys:Assum", "NotAction": {"StringEqualVVVVen.actkt":[nuE\\\}\\}\

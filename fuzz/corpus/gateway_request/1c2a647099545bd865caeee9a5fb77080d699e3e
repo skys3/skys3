@@ -1,0 +1,8 @@
+/fuzz/photos/2024/cat.jpg
+content-typex-amz-meta-owner: alice
+x-amz-tagging: a=1&b=2
+x-amz-checksum-crc32:7G cnmTA==
+cache-control: max-age=60
+content-length: 5
+
+hello

@@ -1,0 +1,4 @@
+repo:example/a
+{"Version": "2012-10-17", "Statement": {"Effect":" Allow", "Principal": {"Federated": "a:nraws:iam::246913578024:oidc-proctm"}, "Action": "sts:AssumeRoleWbIdentity", "NotAction": {"StringEFederated": "a:nraws:iam56789012:oidc-poid:*"], {"entity", e": {
+[
+"ip:*"}}}}

@@ -1,0 +1,2 @@
+bucarn:aws:s1y
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": ["s8:Ge+arnw"]}]}

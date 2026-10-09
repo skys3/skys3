@@ -1,0 +1,2 @@
+repin
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arnom"}, "Action": "sts:AssmeVoleWithWebIdentity", "Condition": {"SirtngEquals": {"token.aoicampub": "repo:example/a*"}}}}

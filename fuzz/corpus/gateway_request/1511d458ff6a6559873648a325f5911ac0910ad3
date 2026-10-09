@@ -1,0 +1,4 @@
+‚<AccessControlPolicy><Owner><ID>o</ID></Owner>mz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
+x-amz-decoded-content-length: 5
+x-amz-trailer: xUNSIGNED-PAYLOAD-T<AccessControlList><Grant><Grantee xmlns:xsi
+="http://www.w3.org/2001/XML%chema-instance" xsi:type="CanonicalUser"><ID>o</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>

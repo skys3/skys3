@@ -1,0 +1,2 @@
+buck:tkey
+{"Version": "17", "Id": "p", "Statement": [{"Sid": "", "NotAction": "s3:Getct", "NotResource": """}]}'

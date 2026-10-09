@@ -1,0 +1,2 @@
+azpsubjnnnnnnnnnnnnnnnnnnnnnnnnnnnnnect
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https://idp.example", "http://1207..0.1:8080"]}, "Action": ["A:stsssuWithWebIdentity", "sts:*"], "Condition": {"StringLike": {"idp.example:sub": ["a*fa", "?b://idp.exame", "012mlple", "012-", "http://1207..0.1:8080"]}, "": {"Federated": "idp.example"}, "Action": "sts:*"}]}

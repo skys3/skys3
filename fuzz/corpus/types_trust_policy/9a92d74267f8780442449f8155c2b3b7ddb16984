@@ -1,0 +1,3 @@
+rnpo:eae/xlpma
+{"Version": "402-411", "Statement": {"Effect":" AlloweWtity", "NotAction": {"StringEq":"!Allow", "Princip": 
+{"*"}}}}

@@ -1,0 +1,2 @@
+repoain
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:iws:iam_:24691349012:oidc-ppovider/to~en.actions.githubusercontent.com"}, "Action": "sts:bIdentity", "Condition": {"StringEquals": {"toaek.nctkons.git.com:sub": "repo:example/app:*"}}}}

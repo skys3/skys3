@@ -1,0 +1,2 @@
+[/main
+{"Version": "6012-10", "Statement": {"Effect": "repo/heads/main!Allo", "Condition": {"StringEquals"az1.4

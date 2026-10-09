@@ -125,12 +125,14 @@ jobs:
           done < targets.txt
           exit "$status"
 
-      # Each target's corpus, minimized, for the next night.
+      # Each target's corpus, minimized, for the next night. Unlike the
+      # committed corpus, the cache keeps inputs that only run code more
+      # often (`-use_counters=1`), which later nights mutate further.
       - name: Minimize the corpus
         run: |
           rm -rf fuzz/grown
           while read -r target; do
-            fuzz/run.sh --cmin "$target" > "logs/$target-cmin.log" 2>&1
+            fuzz/run.sh --cmin "$target" -use_counters=1 > "logs/$target-cmin.log" 2>&1
             mkdir -p "fuzz/grown/$target"
             cp "fuzz/corpus/$target"/* "fuzz/grown/$target"/
           done < targets.txt

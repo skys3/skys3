@@ -1,0 +1,5 @@
+/fuzz/d
+x-amz-copy-source: /fuzz/k
+y-source-if-match: "abc"
+si:type="CanonicalUser": COPY
+

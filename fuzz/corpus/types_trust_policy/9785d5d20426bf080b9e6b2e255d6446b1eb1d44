@@ -1,0 +1,2 @@
+repo:example/app:re:fe//main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "a.om"}, "Action": "st~s:Assum-RoleWithbYdentity", "Condition": {"StringEquals": {"tokenhubusercntent.cb": "/app:*"}}}}

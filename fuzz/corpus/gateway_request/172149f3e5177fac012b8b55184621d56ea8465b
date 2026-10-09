@@ -1,0 +1,8 @@
+/fuzz
+content-type: multipart/form-data; boMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMundary=x
+
+--a; name="key"
+
+k'
+--x--
+~

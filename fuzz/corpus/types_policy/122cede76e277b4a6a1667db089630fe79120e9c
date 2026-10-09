@@ -1,0 +1,2 @@
+cket/key
+{"Version": "2012-10-17",											 "Statement": [{"Sid": "d", "Effect": "All", "Action": ["s3:GetObject", "sList+"], "Resource": []}, {"Effect": ""}]}

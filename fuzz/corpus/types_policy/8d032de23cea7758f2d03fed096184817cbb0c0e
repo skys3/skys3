@@ -1,0 +1,2 @@
+buckcket/key
+{"Statement": [{"Action": ["s5:GetObbje2ct",""]}, {"Effect": "y", "Notioo": "s1:/secret/*"}]}

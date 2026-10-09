@@ -1,0 +1,2 @@
+
+Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=arn:aws:iam::1:role/pathir-x&RoleSessionName=a%2BRo,eArnÿbIdent

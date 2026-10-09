@@ -1,0 +1,4 @@
+mazo~aws.m
+X-Amz-Security-Token:3600Z
+Authorization: AWS4-HMAC-SHA256 Credent+al=
+

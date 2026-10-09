@@ -1,0 +1,2 @@
+bucket/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "All", "Action": ["s3:GetObject", "s3:List+"], "Resource": ["arn:aws:/*", "art", "n:a"]}, {"Effect": ""}]}

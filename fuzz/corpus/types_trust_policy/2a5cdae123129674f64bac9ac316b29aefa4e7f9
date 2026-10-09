@@ -1,0 +1,2 @@
+repuo:example
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aw:aism::19012:oidc-provider/token.actions.githubusercontent.com"}, "Action": "sts:AssumeRoleWithWebIdentity", "Condition": {"StringEquals": {"token.acubusercontepo:exampub": "repo:example/app:*"}}}}

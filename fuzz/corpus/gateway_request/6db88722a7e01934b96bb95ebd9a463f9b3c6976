@@ -1,0 +1,6 @@
+/fuzz/dst
+x-amz-copy-source: /fuz/z
+a-xkmz-metadata-directive: REPLACE
+x-amz-copy-source-if-match: "abc"
+x-amz-tagging-directive: C—PY
+

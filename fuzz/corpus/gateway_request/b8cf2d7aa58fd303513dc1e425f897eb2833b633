@@ -1,0 +1,16 @@
+/fuzz/c
+content-encoding: aws-chunked
+x-length: 5
+x-amz-trailer: x-amz-checksum-crc32
+
+5
+hello
+0
+x-amz-check32
+
+5
+hello
+0
+x-amgth: 5
+x-a2:NhCmhg==
+

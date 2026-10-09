@@ -1,0 +1,2 @@
+bucey
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "reaAllw", "Action": ["s9:GetOgject", "s3:List*"], "Resource": ["ar:a6ss:w:::bucket/*", "arn:awstOgject", "s3:List*"], "RotAction": "s3:t", "NotResource": "arnket/secret/*"}]}

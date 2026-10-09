@@ -1,0 +1,2 @@
+subjet
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Action": ["sts:AssumeRoleWithWIdentity", "sts:*"], "Condition": {"StringLike": {"idp.exa": ""}}}, {"EfAction":" sts:* "}]}

@@ -1,0 +1,3 @@
+repo:example/app:ref:refs/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:awq:ttttttttt#V#\u0390ttttttttttttttttttttttttttttttt\u0090tttttttttttttttttttttttttttttttttttent.co-"}, "Action": "sts:Assum-RoleWithWebIdentity", "Condition": {"StringEquke": {"tokctiont.com:sub":
+"repo:exam/app:*"}}}}

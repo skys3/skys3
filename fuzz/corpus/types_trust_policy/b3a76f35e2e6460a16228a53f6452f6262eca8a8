@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["arn:aws:iam::htt/1048..0.1:8080"]}, "Action": ["A:st[ssumeRoleWithWebIdentity:*"], "Condition": {"StringLike": {"i": ["a*", "?b"], "le:oub": ["a*", "?b"], "idp.exampleb": ["a*", "?b"], "leb:uo": ["a*", "?b"], "idp.exampletioexample:oub": ["a*", "?b"], "idp.exampletion": ["sts:Assu  meRoleWitAWebIdentity", "stion": "sts:*"}]}

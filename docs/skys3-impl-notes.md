@@ -8292,6 +8292,84 @@ of this file. A task with nothing unexpected keeps "None."
 
 ## M7 Hardening
 
+### M7-03 Fuzzing campaign
+
+- **The agreed time.** Every one of the 35 targets ran 10 CPU-minutes
+  (`-max_total_time=600`, three at a time on four cores) from its seeds
+  and a 15-second smoke run, and the plan entry records the bar: that
+  before the PR, then 30 minutes a night on a core of its own. The
+  request pipeline, SigV4, and forwarding targets, still finding coverage
+  at the end, got 20 to 30 more minutes on the spare core. About half the
+  targets (the small text parsers and the frame-level decoders) found no
+  new coverage in the second half of their run; the larger ones (the
+  request pipeline, SigV4, forwarding, policies, tokens and key sets, peer
+  and replication messages, log records, the index codec, and rebuild
+  exports) still did in their last minutes. That is what the nightly runs
+  are for, and why they carry the corpus from night to night in an
+  Actions cache instead of starting from the committed one each time.
+- **One finding: control characters in XML answers.** The request
+  pipeline target found that `GET /?prefix=%1F` answered `500`: `s3s`
+  refuses to send an XML response holding a control character below
+  U+0020 other than tab, line feed, and carriage return, and ListBuckets
+  echoed the prefix (minimized with `-minimize_crash` from a 67-byte
+  ListObjectsV2 request). The same held for every query value an answer
+  echoes, for keys echoed by CreateMultipartUpload, listings, and
+  DeleteObjects (which answered `500` after deleting), and for lifecycle
+  rule IDs, prefixes, and tags, which made every later
+  GetBucketLifecycleConfiguration of the bucket answer `500`. The
+  gateway now refuses those with `400 InvalidArgument` (design §12,
+  `skys3_types::limits::is_xml_text`); a key with one that an import
+  finds at the remote still reads and deletes and lists URL-encoded.
+  Regression tests: `control_characters_never_reach_an_xml_answer` (the
+  harness), `query_values_with_control_characters_are_refused`,
+  `keys_with_control_characters_are_refused_before_any_delete`,
+  `an_imported_key_with_a_control_character_lists_url_encoded`, the
+  lifecycle validation test, and the minimized input in the request
+  pipeline's corpus (`regression-list-buckets-prefix-control-character`). No other crash, timeout, or out-of-memory
+  report came up: every target's slowest input took under a second and
+  its peak RSS stayed under 600 MiB.
+- **Stricter lifecycle validation applies to stored registers too.**
+  `LifecycleConfiguration::validate` runs when a bucket register is read,
+  so a register stored with a control character in a rule would now fail
+  to load. No release has shipped, so there is nothing to migrate.
+- **`cargo fuzz build -O` turns debug assertions off.** By default
+  cargo-fuzz builds with optimizations *and* debug assertions and
+  overflow checks; `-O` (`--release`) drops the assertions. Every run here
+  and in CI uses the default, so overflow checks stay on.
+- **`max_len` is not reached in short runs.** libFuzzer grows inputs
+  gradually (`-len_control`): after 30 minutes the request pipeline's
+  inputs were still under 700 bytes, far from the 16 KiB head limits.
+  Seeds at the limits keep those refusals covered: a 16 KiB request
+  target, 101 header fields, a 16 KiB header value, a 1,025-byte key, XML
+  nested 33 deep, and an `aws-chunked` body with a 5,000-byte trailer,
+  nine trailers, and a 200-byte chunk line.
+- **Bounds per target.** `fuzz/run.sh` sets `max_len`, `malloc_limit_mb`,
+  `rss_limit_mb`, and `timeout` per target from its parser's limits; the
+  smoke job, the nightly job, and local runs all go through it.
+  AddressSanitizer's quarantine alone holds 256 MiB, so peak RSS sat at
+  450 to 580 MiB for every target, and the RSS limit is 1 GiB (2 GiB for
+  the gateway harness, which keeps simulated shards for 256 inputs). The
+  malloc limit (64 MiB, 128 MiB for the gateway) is the one that would
+  catch an allocation sized from a declared length.
+- **`cargo fuzz cmin` keeps too much by default.** After the runs the
+  corpora held 114,093 inputs (31.5 MB). The default merge keeps an input
+  for every new feature, hit-count buckets included, and still left
+  36,712 inputs (13.0 MB), 3.5 MB of them rebuild exports. Merging on
+  edges alone (`-use_counters=0`, now what `fuzz/run.sh --cmin` does)
+  left 11,193 inputs and 1.1 MB, the largest target's 340 KB, with the
+  same edge coverage. The nightly cache keeps the hit-count features
+  (`-use_counters=1`), which the next night's mutations build on.
+- **Seeds.** The SigV4 test suite's signed requests, S3 requests and XML
+  bodies for every operation the harness routes, tokens and key sets
+  (real RSA, P-256, P-384, and Ed25519 keys), policies, small text
+  parsers' examples, the log record golden vectors, and rebuild exports
+  taken from the rebuild tests' scenarios (by a test that was not kept).
+  `cargo fuzz cmin` keeps only those that add coverage.
+- **`cargo fuzz run` rebuilds when sources change.** The fix landed while
+  the campaign ran, so the targets started after it, among them every
+  gateway target whose code it touches, were rebuilt and fuzzed the fixed
+  code; the extra 30 minutes of the request pipeline also ran on it.
+
 ### M7-04 Metrics, alerts, and dashboards
 
 - **A labeled family is invisible until it has a series.** `prometheus-client`

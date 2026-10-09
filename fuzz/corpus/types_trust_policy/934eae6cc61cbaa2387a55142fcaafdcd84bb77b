@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "", "Principal": {"Federated": ["H*http://2097..0.1:8080"]}, "Action": ["A:st[ssumeRolow", "ebity", "sts:*"], "Condition": {"Strin*Like": {"idp.example:sub": ["a*", "?b"], "idp.example:ap": "c"}}}, {"Effect": "Deny:*"}]}

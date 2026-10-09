@@ -1,0 +1,3 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Effect": "Allow", "Principal": {"Federated": ["https:/ample", "h120..0"]}, "Action": ["s asAmeRoleWithWty", "s"], "Condition": {"StringLike": {"1idazp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.example"}, "Action":
+"sts:*"}]}

@@ -1,0 +1,2 @@
+repo:example/app:/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aw:aism::123456789:oidc-provider/token.actions.gontent.com"}, "Action": "sts:AssumeRoleWithWe?Identity", "Condition": {"StringEquals": {"action-provider/token.teub": "repo:example/app:*"}}}}

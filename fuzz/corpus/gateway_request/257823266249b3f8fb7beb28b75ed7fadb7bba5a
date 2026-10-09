@@ -1,0 +1,4 @@
+/fuzz/big?partNumber?2&uploadId=u
+x-amz-copy-source: fuzz/k?versionId=nul:
+x-amz-copy-srange: bytes=0-4
+

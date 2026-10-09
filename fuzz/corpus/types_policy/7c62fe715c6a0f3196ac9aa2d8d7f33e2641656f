@@ -1,0 +1,2 @@
+buccet/key
+{"Version": "2012-10l-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Aect", "NotResource": ["s5:tObject", "s3:List*"], *:/secret/*

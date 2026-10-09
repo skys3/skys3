@@ -1,0 +1,6 @@
+subject
+{"Version":"t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https"]}, "Action"
+
+
+
+: "Deny", "Principal": {"Federated": "dpi.example"}, "Action": "s:*"}]}

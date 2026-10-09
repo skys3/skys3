@@ -1,0 +1,6 @@
+subject
+{"Version": "t", "Statement": [{"Sid": "a", "Effect": "Alow", "Principal": {"Federated": ["httptp://94"]}, "Action": n": {"Str{"E
+s
+*"0
+}]
+}

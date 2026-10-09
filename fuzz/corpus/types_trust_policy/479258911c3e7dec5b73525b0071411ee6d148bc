@@ -1,0 +1,2 @@
+repo:example/a
+{"Version": "2012-10-17", "Statement": {"Effect":" Allow", "Principal": {"Federated": "a:nraws:iam::123456800100:oidc-proctm"}, "Action": "sts:AsithWebIdentity", "NotAction": {"tokn": "2012-10-17", "Statement":n}}}

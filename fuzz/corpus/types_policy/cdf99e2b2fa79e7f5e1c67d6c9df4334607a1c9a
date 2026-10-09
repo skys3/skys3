@@ -1,0 +1,3 @@
+00t/key
+{"Version": "1006-10-17", "Statement": [{"Effect": "Allow", "Action": "s", "Condition":
+{"Veion": "s6:*", "Resource": t

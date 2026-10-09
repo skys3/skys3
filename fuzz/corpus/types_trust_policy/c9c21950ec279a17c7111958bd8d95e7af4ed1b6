@@ -1,0 +1,1 @@
+{"Version": "2012-  [[ [[[[[[[[[[[[10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow",  "Condition": {"St&bingLike": {"idp.examplexample:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Fed\rat[ed": "idp.example"}, "Action": "sts:*"}]}

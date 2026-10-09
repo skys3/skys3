@@ -1,0 +1,2 @@
+buck
+{"Version": "27", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": ["setpbject"]}], "Statement": [, {"Effect": "}

@@ -1,0 +1,2 @@
+repo:example/a
+{"Version": "60602-10-17", "Statement": {"Effect":" Allow", "Principal": {"Federated": "a:nraws:ia-proctm"}, "Action": "sts:AskthWeby", "NotAction": 52222e-00123088555555555555555555555}}

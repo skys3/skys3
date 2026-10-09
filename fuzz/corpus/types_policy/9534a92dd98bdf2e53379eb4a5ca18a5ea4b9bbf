@@ -1,0 +1,2 @@
+buck:t/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{ "Effect": "Allow", "Action": ["s:List*"], "Resource": ["arn:aws:s3:::bucket"]}, {"Effect": "Deny", "NotAction": "s3:Get?bject", "NotResource": "arn:aws:s3:::bucket/secre"}]}

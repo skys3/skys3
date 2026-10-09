@@ -1,0 +1,2 @@
+bucket/key
+{"Version": "", "Statement": {"Effect": "3*c*d*e*f*", "Condition": {"StringLikgLike": {"srefix": ["home/*"]}

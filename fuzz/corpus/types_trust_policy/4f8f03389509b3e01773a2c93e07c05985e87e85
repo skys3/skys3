@@ -1,0 +1,2 @@
+rain
+{"Version": "", "Statement": {"Effect": "Allow", "Principal": {"Federated": {     }}}

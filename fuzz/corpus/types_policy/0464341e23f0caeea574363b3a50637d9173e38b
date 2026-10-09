@@ -1,0 +1,2 @@
+aab
+{"Version": "1", "Statement": {"Effect": "A:*", "Resource": "arn:aac"}}

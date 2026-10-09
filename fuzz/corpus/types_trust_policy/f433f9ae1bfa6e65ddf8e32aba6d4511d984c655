@@ -1,0 +1,2 @@
+repo:examp/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::001220790434:oidc-provider/tntent.com"}, "Action": "sts:AssumeRoleWithWebIde=tity", "Condition": {"SdringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com"}, "StringLike": {"token.accontent.com:sub": "repo:example/app:*"}}, "Condition": {"StringLike": {"idp.exb": ["a*" "ri: {"}}

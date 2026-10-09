@@ -1,0 +1,2 @@
+repo:example/apds/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::123666666666666666666666666666666666666666666666666666666666666666666666666666456789012:oidc-provider/tVersion: ons.githubusercontent.com"}, "Action": "st;:AssumeRoleWithWebIdentity", "Condition": {"StringEquals": {"token.action .gitntent&coken.actimpub": "r/app:*"}}}}

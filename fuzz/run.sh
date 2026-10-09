@@ -5,13 +5,13 @@
 # target runs under the same bounds everywhere.
 #
 #   fuzz/run.sh <target> <seconds> [extra libFuzzer flags...]
-#   fuzz/run.sh --cmin <target>
+#   fuzz/run.sh --cmin <target> [extra libFuzzer flags...]
 #
 # The first form fuzzes for <seconds>: inputs the run finds are added to
 # fuzz/corpus/<target>, and crashes, timeouts, and out-of-memory inputs go to
 # fuzz/artifacts/<target>. The second minimizes the corpus in place with
 # `cargo fuzz cmin`, under the same bounds, so no input longer than the
-# target's `max_len` is kept. Set FUZZ_TARGET to
+# target's `max_len` is kept. Run it before committing a corpus. Set FUZZ_TARGET to
 # a target triple to pass `--target` to cargo-fuzz (CI names the host,
 # because the prebuilt cargo-fuzz defaults to its own musl triple).
 #
@@ -34,11 +34,11 @@ set -euo pipefail
 
 usage() {
   echo "usage: $0 <target> <seconds> [libFuzzer flags...]" >&2
-  echo "       $0 --cmin <target>" >&2
+  echo "       $0 --cmin <target> [libFuzzer flags...]" >&2
   exit 2
 }
 if [ "${1:-}" = "--cmin" ]; then
-  [ "$#" -eq 2 ] || usage
+  [ "$#" -ge 2 ] || usage
   mode=cmin target="$2"
   shift 2
 else
@@ -98,7 +98,11 @@ bounds=(
   -timeout="$timeout"
 )
 if [ "$mode" = cmin ]; then
-  exec cargo +nightly fuzz cmin "${triple[@]}" "$target" "$corpus" -- "${bounds[@]}"
+  # Edges only (`-use_counters=0`): an input stays if it reaches code no
+  # smaller input reaches, which keeps the committed corpus small. Pass
+  # `-use_counters=1` to also keep inputs that only run code more often.
+  exec cargo +nightly fuzz cmin "${triple[@]}" "$target" "$corpus" -- \
+    "${bounds[@]}" -use_counters=0 "$@"
 fi
 exec cargo +nightly fuzz run "${triple[@]}" "$target" "$corpus" -- \
   -max_total_time="$seconds" "${bounds[@]}" "$@"

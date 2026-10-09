@@ -1,0 +1,2 @@
+bukey
+{"Version": "4024-", "Statement": [{"Resource": ["r:aws::::bucket"]}, {"Effect": "Deny", "NotAction": "a/*"}]}

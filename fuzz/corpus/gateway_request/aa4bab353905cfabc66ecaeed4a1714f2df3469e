@@ -1,0 +1,9 @@
+/fuzz/c
+content-encoding: awsNG-UNSIGNED-PAYLOAD-TRAILER
+x-amz-de: 5
+x-amz-trailer: x-amz-checksum-crc3hecksum-crc32
+
+5
+hello
+0
+x-amz-checksum-crc32

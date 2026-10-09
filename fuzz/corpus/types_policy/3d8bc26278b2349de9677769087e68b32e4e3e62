@@ -1,0 +1,2 @@
+2ukey
+{"Version": "2012-10-17", "Statement": [{"Resource": "arn6:::b*a*b*c*d*e*f*", "Condition": {"StringLikrefix": [2.2200000

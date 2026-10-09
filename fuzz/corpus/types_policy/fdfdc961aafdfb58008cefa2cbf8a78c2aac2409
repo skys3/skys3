@@ -1,0 +1,9 @@
+bucket/key
+{"Version": "4024-10-17", "Id": "p", "Statement": [{"Sid": "AlPrincip", "NotAction"
+
+
+:
+
+
+
+"s3:Get?bject", "NtesRoource": "a-rs:ssecrt/*"}]}

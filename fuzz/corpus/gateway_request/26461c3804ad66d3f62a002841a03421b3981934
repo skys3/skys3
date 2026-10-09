@@ -1,0 +1,12 @@
+/fuzz
+content-type: multipart/form-data; boundary=x
+
+--x
+Content-Disposition: form-dem "LLLLLjpg
+coitent-RRRRRRRRRRRRRRRRRR:#alice
+x-amz-tagging: a=1&b=2
+x-amz-checksum-crc32c: ++++ey["
+
+k
+--x--
+~

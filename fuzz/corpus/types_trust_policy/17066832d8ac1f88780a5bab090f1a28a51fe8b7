@@ -1,0 +1,2 @@
+repo:example/app:refs/heads/main
+{"Version": "27", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::123457ns.sercontent.com"}, "Action": "stsumeRoleWithWebIdentity", "Condition": {"StringEquals": {"": "repo:example/app:*"}}e}

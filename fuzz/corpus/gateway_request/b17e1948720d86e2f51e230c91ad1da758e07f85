@@ -1,0 +1,7 @@
+/fuzz/photos/2024/cat.jpg
+contt-md5:=1&b=2
+x-amz-checksum-crc32c: +++++++++++mnG7TA==
+cache-control: max-age=60
+content-length: 5
+
+hello

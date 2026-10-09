@@ -1,0 +1,4 @@
+/fuzz/dst
+x-amz-copy-source: /fuzz/k
+x-amz-metadata-directive: R-tagging-directive: COPY
+

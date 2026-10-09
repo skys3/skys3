@@ -1,0 +1,2 @@
+repo:example/app:efs/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"}, "Action": "sithWe:Identity", "Condition": {"StringEquals": {"token.actkonsom:sub": "repo:example/aple/app:*"}}}}

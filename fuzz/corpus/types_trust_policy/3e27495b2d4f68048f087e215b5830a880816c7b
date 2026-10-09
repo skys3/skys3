@@ -1,0 +1,2 @@
+repo:example/app:ref:refs/heads/m
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::12345-provider/token.a523773:oidc-provider/token.accom"}, "Action": "sts:AssumeRole&ientity", "Condition": {"StringEquals": {"tokeaud": "sts.ama*"}}}}
