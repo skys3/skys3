@@ -215,6 +215,58 @@ async fn a_peer_flushes_over_s3_with_its_write_identity() {
 }
 
 #[tokio::test]
+async fn a_peer_copy_keeps_its_write_identity() {
+    let gateway = start(false).await;
+    let peer = [(KEY_HEADER, PEER_KEY), ("x-amz-meta-skys3-wid", IDENTITY)];
+    call(&gateway, Method::PUT, "/archive/src", &peer, "copied")
+        .await
+        .assert(200, None);
+    // A server-side copy replaces the metadata with the copy's own
+    // identity, as the flusher sends it.
+    let copy = [
+        (KEY_HEADER, PEER_KEY),
+        ("x-amz-copy-source", "/archive/src"),
+        ("x-amz-metadata-directive", "REPLACE"),
+        ("x-amz-meta-skys3-wid", "prod-us/b-src/3/2.19"),
+    ];
+    call(&gateway, Method::PUT, "/archive/dst", &copy, "")
+        .await
+        .assert(200, None);
+    let head = call(
+        &gateway,
+        Method::HEAD,
+        "/archive/dst",
+        &[(KEY_HEADER, PEER_KEY)],
+        "",
+    )
+    .await;
+    head.assert(200, None);
+    assert_eq!(head.headers["x-amz-meta-skys3-wid"], "prod-us/b-src/3/2.19");
+    // A client's copy with an identity is still refused, as is the
+    // peer's with another cluster's.
+    call(&gateway, Method::PUT, "/photos/src", &[], "client")
+        .await
+        .assert(200, None);
+    let client = [
+        ("x-amz-copy-source", "/photos/src"),
+        ("x-amz-metadata-directive", "REPLACE"),
+        ("x-amz-meta-skys3-wid", IDENTITY),
+    ];
+    call(&gateway, Method::PUT, "/photos/dst", &client, "")
+        .await
+        .assert(400, Some("InvalidArgument"));
+    let foreign = [
+        (KEY_HEADER, PEER_KEY),
+        ("x-amz-copy-source", "/archive/src"),
+        ("x-amz-metadata-directive", "REPLACE"),
+        ("x-amz-meta-skys3-wid", "prod-ap/b-src/3/2.19"),
+    ];
+    call(&gateway, Method::PUT, "/archive/dst", &foreign, "")
+        .await
+        .assert(400, Some("InvalidArgument"));
+}
+
+#[tokio::test]
 async fn only_the_peer_writes_and_only_its_own_identities() {
     let gateway = start(false).await;
     // The bucket stays read-only to this cluster's clients.

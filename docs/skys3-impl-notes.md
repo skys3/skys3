@@ -5480,6 +5480,12 @@ of this file. A task with nothing unexpected keeps "None."
   S3 or in a `COMMIT` or `BATCH` item, and a multi-object delete refuses
   that key alone. A namespace import skips a remote object at the key, so
   it is never filled. Recorded in §7.2 and §7.8.
+- **A peer's copy carries its identity (found in review).** CopyObject
+  checked `REPLACE` metadata as a client's, so a peer's server-side copy
+  with its `x-amz-meta-skys3-wid` was refused with `400
+  InvalidArgument`, and the flusher fell back to uploading the bytes.
+  The copy now takes its carrier from the request, as PUT and multipart
+  uploads do.
 - **The node binary peers.** `NodePeering` binds the QUIC endpoint when
   peers are configured. It serves `StagingService` with `PeerCommits`
   over the node's shards, adapts the pool every second, and signs the
