@@ -5428,9 +5428,9 @@ of this file. A task with nothing unexpected keeps "None."
   on a target that had fallen back long before skipped it, and a
   `COMMIT` that a deposed primary sent could still be on its way. Each
   shard flusher on S3 REST to a target that served a descriptor now
-  waits 2 × the answer timeout + the QUIC idle timeout (90 s) from its
-  own start. That covers fallbacks, restarts, and takeovers alike. The
-  exactly-once argument is in §7.8.
+  waits the quarantine (90 s) from its own start. That covers
+  fallbacks, restarts, and takeovers alike. The exactly-once argument is
+  in §7.8.
 - **A new link is a new choice (found in review).** A choice was the
   same as the last when its kind was, so the link of a handshake that
   followed a broken one was dropped. The target stayed on QUIC with the
@@ -5447,6 +5447,31 @@ of this file. A task with nothing unexpected keeps "None."
   and a `ShardLease` can stand for that many shards
   (`ShardLease::set_shards`), at least one. A link per shard flusher
   would not fit: the batcher and the uploads share the target's link.
+- **COMMITs carry an apply-by time (found in review).** The quarantine
+  assumed that the destination applies a `COMMIT` only while its
+  connection is open. It did not: each stream ran on a detached task, and
+  a `COMMIT` already read waited in `CommitSink::apply` for its shard as
+  long as that took, after the connection idled out. A write routed to a
+  primary on another node can wait longer still, so no timer on the
+  destination's gateway bounds when a write is sequenced. Now each
+  `COMMIT` and `BATCH` item carries `apply_by_ms`: the source's wall clock
+  as it sends it, plus the commit window (the answer timeout). The shard
+  checks it as it sequences the write, in `LocalShards`' precondition
+  check, on its node's wall clock (`ConditionFailed::Expired`), and the
+  gateway refuses a late arrival at once; both answer `unavailable`. The
+  quarantine is the commit window plus twice a clock tolerance of 30 s
+  (`CLOCK_TOLERANCE`): still 90 s by default. This adds the design's one
+  wall-clock assumption, recorded in §2.3 and §7.8. The destination also
+  aborts a connection's stream tasks when it closes. A unit test stalls a
+  `COMMIT` in front of its shard past its apply-by time and checks that
+  it is not applied; the simulation's audit now ignores a `COMMIT` that
+  arrives after its apply-by time, and its commit window is the
+  destination's idle timeout, so the seeded bug of no quarantine is still
+  caught. Still open: the reverse switch. An S3 REST write to a SkyS3
+  peer carries no apply-by time, so one routed to a remote primary and
+  held there can still be sequenced after its target is back on QUIC.
+  A node that does not know `apply_by_ms` ignores it, so every node of
+  both clusters needs this version for the bound to hold.
 - **The descriptor key is reserved (found in review).** Only `GET` and
   `HEAD` knew the key. A client could write it in a source bucket, the
   peer would store that version, and every read there would answer the

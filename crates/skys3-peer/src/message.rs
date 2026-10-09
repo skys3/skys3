@@ -45,6 +45,10 @@ pub const MAX_REASON_LEN: usize = 1024;
 
 /// One message of the peer protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value per frame, encoded or applied at once; boxing would allocate for each"
+)]
 pub enum Message {
     /// Both ends, once per connection: who they are and what they speak.
     Hello(Hello),
@@ -137,6 +141,13 @@ pub struct Commit {
     pub precondition: Precondition,
     /// The write.
     pub write: Write,
+    /// When the write may last be applied, in milliseconds since the Unix
+    /// epoch on the source's wall clock: the destination refuses to
+    /// sequence it later, by its own wall clock, and answers `unavailable`
+    /// (§7.8). A source sets it as it sends the message, so a `COMMIT` held
+    /// in a queue or on the way cannot apply after the source moved on to
+    /// S3 REST. `None`: no limit.
+    pub apply_by_ms: Option<u64>,
 }
 
 /// A `COMMIT`'s precondition, which the destination evaluates in its own

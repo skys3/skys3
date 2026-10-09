@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use skys3_config::BucketsConfig;
 use skys3_index::Entry;
+use skys3_io::{SystemWallClock, WallClock};
 use skys3_log::RecordBody;
 use skys3_log::record::{self, Delete, Extent, ExtentRef, IDENTITY_METADATA, MAX_METADATA_LEN};
 use skys3_peer::{
@@ -20,7 +21,7 @@ use skys3_peer::{
 use skys3_types::{BucketDocument, BucketName, ClusterId};
 
 use crate::buckets::GatewayConfig;
-use crate::conditions::{PeerCondition, Precondition, current_identity};
+use crate::conditions::{ConditionFailed, PeerCondition, Precondition, current_identity};
 use crate::shard::{ShardError, ShardRef, Shards};
 
 /// Looks up a bucket by name, as the gateway's local copy of the bucket
@@ -125,6 +126,8 @@ pub struct PeerCommits<S> {
     cluster: ClusterId,
     inline_max_bytes: usize,
     extent_bytes: usize,
+    /// The clock apply-by times are checked on.
+    wall: Arc<dyn WallClock>,
 }
 
 impl<S: fmt::Debug> fmt::Debug for PeerCommits<S> {
@@ -150,7 +153,17 @@ impl<S: Shards> PeerCommits<S> {
             extent_bytes: usize::try_from(config.extent_bytes)
                 .unwrap_or(usize::MAX)
                 .max(1),
+            wall: Arc::new(SystemWallClock),
         }
+    }
+
+    /// The commits, checking apply-by times on `wall` (the system clock by
+    /// default). The shards check them again as they sequence each write,
+    /// on their own clock.
+    #[must_use]
+    pub fn with_wall_clock(mut self, wall: Arc<dyn WallClock>) -> Self {
+        self.wall = wall;
+        self
     }
 
     /// The condition `commit` writes under in the shard of its key, if its
@@ -159,6 +172,10 @@ impl<S: Shards> PeerCommits<S> {
         let Some(document) = (self.buckets)(&commit.bucket) else {
             return Err(refused(format!("there is no bucket {}", commit.bucket)));
         };
+        let now = u64::try_from(self.wall.now().as_millis()).unwrap_or(u64::MAX);
+        if commit.apply_by_ms.is_some_and(|by| now > by) {
+            return Err(expired());
+        }
         if commit.key == crate::peer_s3::DESCRIPTOR_KEY {
             return Err(refused(format!(
                 "the key {} is reserved for the peer descriptor",
@@ -177,6 +194,7 @@ impl<S: Shards> PeerCommits<S> {
             expected: commit.precondition.clone(),
             cluster: self.cluster.clone(),
             shard: ShardRef::for_key(&document, &commit.key),
+            apply_by_ms: commit.apply_by_ms,
         })
     }
 
@@ -209,8 +227,11 @@ impl<S: Shards> PeerCommits<S> {
         let written = self
             .shards
             .write(&shard, body, Precondition::Peer(condition.clone()));
-        if written.await.map_err(failed)?.is_ok() {
-            return Ok(Outcome::Committed { etag });
+        match written.await.map_err(failed)? {
+            Ok(_) => return Ok(Outcome::Committed { etag }),
+            // Not sequenced: it would have been too late.
+            Err(ConditionFailed::Expired) => return Ok(expired()),
+            Err(_) => {}
         }
         // The condition failed when the shard sequenced the write: another
         // copy of the commit applied it, or the key changed since it was
@@ -333,6 +354,7 @@ impl<S: Shards> PeerCommits<S> {
                     };
                     answered.push((item.at, Outcome::Committed { etag }));
                 }
+                Ok(Err(ConditionFailed::Expired)) => answered.push((item.at, expired())),
                 Ok(Err(_)) => unmet.push(item),
                 Err(error) => answered.push((item.at, failed(error))),
             }
@@ -538,6 +560,15 @@ fn version(commit: &Commit, put: &Put, data: record::PutData) -> Result<record::
     })
 }
 
+/// The answer to a write that reached its shard after its apply-by time:
+/// the source may send it again with a new one.
+fn expired() -> Outcome {
+    Outcome::Failed {
+        error: ApplyError::Unavailable,
+        reason: "the COMMIT's apply-by time passed".to_owned(),
+    }
+}
+
 fn refused(reason: impl Into<String>) -> Outcome {
     Outcome::Failed {
         error: ApplyError::Refused,
@@ -570,6 +601,10 @@ mod tests {
     use skys3_types::{
         BucketId, BucketMode, ETag, EpochSeq, ProposalId, ShardCount, WriteIdentity,
     };
+
+    use std::time::Duration;
+
+    use skys3_io::ManualWallClock;
 
     use super::*;
     use crate::stub::MemoryShards;
@@ -648,6 +683,7 @@ mod tests {
                 checksums: BTreeMap::new(),
                 data: PutData::Staged { piece: 7 },
             }),
+            apply_by_ms: None,
         }
     }
 
@@ -1256,143 +1292,214 @@ mod tests {
         assert_failed(&commits.apply_batch(&[full]).await[0], ApplyError::Refused);
     }
 
+    /// Shards that take the default [`Shards::write_all`], and whose writes
+    /// wait for a permit of the gate, if there is one, before they reach
+    /// the shard.
+    #[derive(Debug, Clone)]
+    struct OneByOne(MemoryShards, Option<Arc<tokio::sync::Semaphore>>);
+
+    impl Shards for OneByOne {
+        async fn open(&self, s: &ShardRef, b: &BucketDocument) -> Result<(), ShardError> {
+            self.0.open(s, b).await
+        }
+        async fn seal(&self, s: &ShardRef) -> Result<crate::ShardSummary, ShardError> {
+            self.0.seal(s).await
+        }
+        async fn unseal(&self, s: &ShardRef) -> Result<(), ShardError> {
+            self.0.unseal(s).await
+        }
+        async fn remove(&self, s: &ShardRef) -> Result<(), ShardError> {
+            self.0.remove(s).await
+        }
+        async fn entry(&self, s: &ShardRef, k: &str) -> Result<Option<Entry>, ShardError> {
+            self.0.entry(s, k).await
+        }
+        async fn list(
+            &self,
+            s: &ShardRef,
+            q: &skys3_index::ListQuery,
+        ) -> Result<skys3_index::ListPage, ShardError> {
+            self.0.list(s, q).await
+        }
+        async fn upload(
+            &self,
+            s: &ShardRef,
+            k: &str,
+            u: EpochSeq,
+            a: u16,
+            l: usize,
+        ) -> Result<Option<crate::UploadParts>, ShardError> {
+            self.0.upload(s, k, u, a, l).await
+        }
+        async fn uploads(
+            &self,
+            s: &ShardRef,
+            p: &str,
+            a: Option<(String, Option<EpochSeq>)>,
+            l: usize,
+        ) -> Result<Vec<(String, EpochSeq, skys3_index::Upload)>, ShardError> {
+            self.0.uploads(s, p, a, l).await
+        }
+        async fn parts(
+            &self,
+            s: &ShardRef,
+            u: EpochSeq,
+            a: u16,
+            l: usize,
+        ) -> Result<Vec<(u16, skys3_index::Part)>, ShardError> {
+            self.0.parts(s, u, a, l).await
+        }
+        async fn payload(&self, s: &ShardRef, p: EpochSeq) -> Result<Bytes, ShardError> {
+            self.0.payload(s, p).await
+        }
+        async fn plan(&self, s: &ShardRef, k: &str) -> Result<skys3_shard::ReadPlan, ShardError> {
+            self.0.plan(s, k).await
+        }
+        async fn register(
+            &self,
+            s: &ShardRef,
+            h: &skys3_types::NodeId,
+            k: &str,
+            v: EpochSeq,
+            l: Vec<ExtentRef>,
+        ) -> Result<Option<skys3_shard::Registered>, ShardError> {
+            self.0.register(s, h, k, v, l).await
+        }
+        async fn renew(
+            &self,
+            s: &ShardRef,
+            h: &skys3_types::NodeId,
+            r: u64,
+        ) -> Result<bool, ShardError> {
+            self.0.renew(s, h, r).await
+        }
+        async fn release(
+            &self,
+            s: &ShardRef,
+            h: &skys3_types::NodeId,
+            r: u64,
+        ) -> Result<(), ShardError> {
+            self.0.release(s, h, r).await
+        }
+        async fn fetch(
+            &self,
+            s: &ShardRef,
+            h: &skys3_types::NodeId,
+            r: u64,
+            p: EpochSeq,
+        ) -> Result<Bytes, ShardError> {
+            self.0.fetch(s, h, r, p).await
+        }
+        async fn append_extent(&self, s: &ShardRef, e: Extent) -> Result<ExtentRef, ShardError> {
+            self.0.append_extent(s, e).await
+        }
+        async fn announce(
+            &self,
+            s: &ShardRef,
+            b: skys3_shard::StreamedBody,
+        ) -> Result<(), ShardError> {
+            self.0.announce(s, b).await
+        }
+        async fn flushed(
+            &self,
+            s: &ShardRef,
+            k: &str,
+            v: EpochSeq,
+            w: std::time::Duration,
+        ) -> Result<skys3_shard::FlushState, ShardError> {
+            self.0.flushed(s, k, v, w).await
+        }
+        async fn write(
+            &self,
+            s: &ShardRef,
+            b: RecordBody,
+            c: Precondition,
+        ) -> Result<Result<EpochSeq, crate::ConditionFailed>, ShardError> {
+            if let Some(gate) = &self.1 {
+                drop(gate.acquire().await.unwrap());
+            }
+            self.0.write(s, b, c).await
+        }
+    }
+
+    /// What the destination holds now, and the time on its clocks.
+    const NOW: Duration = Duration::from_secs(1_800_000_000);
+
+    #[tokio::test]
+    async fn a_commit_that_stalls_past_its_apply_by_time_never_applies() {
+        let (shards, document) = opened().await;
+        let wall = Arc::new(ManualWallClock::new(NOW));
+        let shards = shards.with_wall_clock(wall.clone());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let stalled = OneByOne(shards.clone(), Some(Arc::clone(&gate)));
+        let commits = PeerCommits::new(stalled, lookup(&document), &settings(Some(SOURCE)))
+            .with_wall_clock(wall.clone());
+        let apply_by = |by: Duration| u64::try_from((NOW + by).as_millis()).unwrap();
+        let staged = stage(&shards, &document, "k", b"0123").await;
+        let mut commit = put_commit(1, "k", Expected::Absent, 4);
+        commit.apply_by_ms = Some(apply_by(Duration::from_secs(30)));
+
+        // The shard stalls past the connection's idle timeout and the
+        // commit window: the write reaches it too late, and is refused
+        // where it would have been sequenced.
+        let applying = tokio::spawn({
+            let (commits, commit, staged) = (commits.clone(), commit.clone(), staged.clone());
+            async move { commits.apply(&commit, Some(&staged)).await }
+        });
+        tokio::task::yield_now().await;
+        wall.advance(Duration::from_secs(60));
+        gate.add_permits(1);
+        let outcome = applying.await.unwrap();
+        assert_failed(&outcome, ApplyError::Unavailable);
+        assert!(
+            shards
+                .entry(&shard_of(&document, "k"), "k")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A COMMIT that arrives after its apply-by time is refused at once.
+        assert_failed(
+            &commits.apply(&commit, Some(&staged)).await,
+            ApplyError::Unavailable,
+        );
+
+        // Sent again with a later apply-by time, it applies in time.
+        commit.apply_by_ms = Some(apply_by(Duration::from_secs(90)));
+        gate.add_permits(1);
+        let outcome = commits.apply(&commit, Some(&staged)).await;
+        assert!(matches!(outcome, Outcome::Committed { .. }), "{outcome:?}");
+
+        // Batch items too.
+        let mut late = item(2, "b", Expected::Absent, Some(b"b"));
+        late.apply_by_ms = Some(apply_by(Duration::from_secs(70)));
+        let batching = tokio::spawn({
+            let (commits, late) = (commits.clone(), late.clone());
+            async move { commits.apply_batch(&[late]).await }
+        });
+        tokio::task::yield_now().await;
+        wall.advance(Duration::from_secs(20));
+        gate.add_permits(1);
+        let outcomes = batching.await.unwrap();
+        assert_failed(&outcomes[0], ApplyError::Unavailable);
+        assert!(
+            shards
+                .entry(&shard_of(&document, "b"), "b")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn shard_of(document: &BucketDocument, key: &str) -> ShardRef {
+        ShardRef::for_key(document, key)
+    }
+
     #[tokio::test]
     async fn a_shard_that_does_not_batch_writes_each_item_on_its_own() {
-        /// Shards that take the default [`Shards::write_all`].
-        #[derive(Debug, Clone)]
-        struct OneByOne(MemoryShards);
-
-        impl Shards for OneByOne {
-            async fn open(&self, s: &ShardRef, b: &BucketDocument) -> Result<(), ShardError> {
-                self.0.open(s, b).await
-            }
-            async fn seal(&self, s: &ShardRef) -> Result<crate::ShardSummary, ShardError> {
-                self.0.seal(s).await
-            }
-            async fn unseal(&self, s: &ShardRef) -> Result<(), ShardError> {
-                self.0.unseal(s).await
-            }
-            async fn remove(&self, s: &ShardRef) -> Result<(), ShardError> {
-                self.0.remove(s).await
-            }
-            async fn entry(&self, s: &ShardRef, k: &str) -> Result<Option<Entry>, ShardError> {
-                self.0.entry(s, k).await
-            }
-            async fn list(
-                &self,
-                s: &ShardRef,
-                q: &skys3_index::ListQuery,
-            ) -> Result<skys3_index::ListPage, ShardError> {
-                self.0.list(s, q).await
-            }
-            async fn upload(
-                &self,
-                s: &ShardRef,
-                k: &str,
-                u: EpochSeq,
-                a: u16,
-                l: usize,
-            ) -> Result<Option<crate::UploadParts>, ShardError> {
-                self.0.upload(s, k, u, a, l).await
-            }
-            async fn uploads(
-                &self,
-                s: &ShardRef,
-                p: &str,
-                a: Option<(String, Option<EpochSeq>)>,
-                l: usize,
-            ) -> Result<Vec<(String, EpochSeq, skys3_index::Upload)>, ShardError> {
-                self.0.uploads(s, p, a, l).await
-            }
-            async fn parts(
-                &self,
-                s: &ShardRef,
-                u: EpochSeq,
-                a: u16,
-                l: usize,
-            ) -> Result<Vec<(u16, skys3_index::Part)>, ShardError> {
-                self.0.parts(s, u, a, l).await
-            }
-            async fn payload(&self, s: &ShardRef, p: EpochSeq) -> Result<Bytes, ShardError> {
-                self.0.payload(s, p).await
-            }
-            async fn plan(
-                &self,
-                s: &ShardRef,
-                k: &str,
-            ) -> Result<skys3_shard::ReadPlan, ShardError> {
-                self.0.plan(s, k).await
-            }
-            async fn register(
-                &self,
-                s: &ShardRef,
-                h: &skys3_types::NodeId,
-                k: &str,
-                v: EpochSeq,
-                l: Vec<ExtentRef>,
-            ) -> Result<Option<skys3_shard::Registered>, ShardError> {
-                self.0.register(s, h, k, v, l).await
-            }
-            async fn renew(
-                &self,
-                s: &ShardRef,
-                h: &skys3_types::NodeId,
-                r: u64,
-            ) -> Result<bool, ShardError> {
-                self.0.renew(s, h, r).await
-            }
-            async fn release(
-                &self,
-                s: &ShardRef,
-                h: &skys3_types::NodeId,
-                r: u64,
-            ) -> Result<(), ShardError> {
-                self.0.release(s, h, r).await
-            }
-            async fn fetch(
-                &self,
-                s: &ShardRef,
-                h: &skys3_types::NodeId,
-                r: u64,
-                p: EpochSeq,
-            ) -> Result<Bytes, ShardError> {
-                self.0.fetch(s, h, r, p).await
-            }
-            async fn append_extent(
-                &self,
-                s: &ShardRef,
-                e: Extent,
-            ) -> Result<ExtentRef, ShardError> {
-                self.0.append_extent(s, e).await
-            }
-            async fn announce(
-                &self,
-                s: &ShardRef,
-                b: skys3_shard::StreamedBody,
-            ) -> Result<(), ShardError> {
-                self.0.announce(s, b).await
-            }
-            async fn flushed(
-                &self,
-                s: &ShardRef,
-                k: &str,
-                v: EpochSeq,
-                w: std::time::Duration,
-            ) -> Result<skys3_shard::FlushState, ShardError> {
-                self.0.flushed(s, k, v, w).await
-            }
-            async fn write(
-                &self,
-                s: &ShardRef,
-                b: RecordBody,
-                c: Precondition,
-            ) -> Result<Result<EpochSeq, crate::ConditionFailed>, ShardError> {
-                self.0.write(s, b, c).await
-            }
-        }
-
         let (shards, document) = opened().await;
-        let one_by_one = OneByOne(shards.clone());
+        let one_by_one = OneByOne(shards.clone(), None);
         let commits = PeerCommits::new(one_by_one, lookup(&document), &settings(Some(SOURCE)));
         let items: Vec<_> = (1..=8)
             .map(|seq| item(seq, &format!("k{seq}"), Expected::Absent, Some(b"x")))

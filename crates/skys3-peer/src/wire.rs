@@ -108,6 +108,8 @@ struct WireCommit {
     precondition: Option<WirePrecondition>,
     #[prost(oneof = "WireWrite", tags = "7, 8")]
     write: Option<WireWrite>,
+    #[prost(uint64, optional, tag = "9")]
+    apply_by_ms: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Oneof)]
@@ -501,6 +503,7 @@ fn encode_commit(commit: &Commit, payload: &mut Vec<Bytes>) -> WireCommit {
         key: commit.key.clone(),
         precondition: Some(precondition),
         write: Some(write),
+        apply_by_ms: commit.apply_by_ms,
     }
 }
 
@@ -572,6 +575,7 @@ fn decode_commit(wire: WireCommit, payload: &mut Bytes) -> Result<Commit, Messag
         key: wire.key,
         precondition,
         write,
+        apply_by_ms: wire.apply_by_ms,
     })
 }
 
@@ -759,6 +763,7 @@ mod tests {
             key: "k".to_owned(),
             precondition,
             write,
+            apply_by_ms: None,
         }
     }
 

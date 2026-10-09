@@ -75,7 +75,7 @@ use skys3_gateway::{
     PeerExtents, Permissions, Principal, ShardRef, Shards,
 };
 use skys3_index::{Index, IndexConfig, ListItem, ListQuery};
-use skys3_io::{BlockingPool, Drift, MonoTime, SimDisk, SimMount};
+use skys3_io::{BlockingPool, Drift, MonoTime, SimDisk, SimMount, WallClock};
 use skys3_log::record::IDENTITY_METADATA;
 use skys3_log::{LogConfig, RecordBody};
 use skys3_peer::{
@@ -235,15 +235,35 @@ impl Peer {
         .with_timeout(self.timeout)
         .with_connect_timeout(self.connect_timeout)
         .with_reprobe(self.reprobe.0, self.reprobe.1)
+        .with_commit_window(self.commit_window())
         .with_quarantine(self.quarantine())
     }
 
+    /// How long after it is sent a `COMMIT` may still apply: the
+    /// destination's idle timeout, so that a `COMMIT` held on the way for
+    /// less than that still can, as the seeded bug of no quarantine needs.
+    #[must_use]
+    pub fn commit_window(self) -> Duration {
+        self.idle
+    }
+
     /// How long a node's flushers wait before they flush a shard over S3
-    /// REST to the peer: as the node binary's, twice the timeout of a
-    /// stream and the destination's idle timeout.
+    /// REST to the peer: more than the commit window, which is all the
+    /// node binary's rule needs with the simulation's exact clocks.
     #[must_use]
     pub fn quarantine(self) -> Duration {
         2 * self.timeout + self.idle
+    }
+}
+
+/// The simulated wall clock, which the destination checks apply-by times
+/// on.
+#[derive(Debug, Clone, Copy)]
+struct SimWall;
+
+impl WallClock for SimWall {
+    fn now(&self) -> Duration {
+        turmoil::since_epoch().unwrap_or_default()
     }
 }
 
@@ -317,8 +337,9 @@ impl PeerLog {
             .push(now());
     }
 
-    /// The destination received the `COMMIT` of `identity`, of `key`.
-    fn commit_received(&self, identity: &str, key: &str) {
+    /// The destination received the `COMMIT` of `identity`, of `key`, which
+    /// may apply until `apply_by_ms` on the simulated wall clock.
+    fn commit_received(&self, identity: &str, key: &str, apply_by_ms: Option<u64>) {
         self.received.fetch_add(1, Ordering::Relaxed);
         if self.descriptor != DescriptorKind::Signed {
             self.violate(Violation {
@@ -334,6 +355,11 @@ impl PeerLog {
         let Some(sent) = lock(&self.commits).get(identity).map(|(_, sent)| *sent) else {
             return;
         };
+        // One that arrives after its apply-by time is never applied.
+        let wall = u64::try_from(SimWall.now().as_millis()).unwrap_or(u64::MAX);
+        if apply_by_ms.is_some_and(|by| wall > by) {
+            return;
+        }
         let received = now();
         let crossed = lock(&self.s3_writes).get(key).and_then(|acks| {
             acks.iter()
@@ -900,7 +926,14 @@ pub(crate) async fn run(destination: Arc<Destination>) -> Result<(), BoxError> {
         Arc::new(Staging::new(destination.limits)),
         PeerExtents::new(storage.shards.clone(), Arc::clone(&lookup)),
     )
-    .with_commits(PeerCommits::new(storage.shards.clone(), lookup, &gateway));
+    .with_commits(
+        PeerCommits::new(
+            storage.shards.clone().with_wall_clock(Arc::new(SimWall)),
+            lookup,
+            &gateway,
+        )
+        .with_wall_clock(Arc::new(SimWall)),
+    );
     // The gateway, which serves the descriptor and takes S3 flushes.
     let life = destination.lives.load(Ordering::Relaxed);
     let s3 = Gateway::new(
@@ -1051,8 +1084,11 @@ impl Inbound for TcpInbound {
             .map_err(|_| StreamError::Transport("the stream idled out".to_owned()))?
             .map_err(|error| StreamError::Transport(error.to_string()))?;
         if let Some(Message::Commit(commit)) = &message {
-            self.log
-                .commit_received(&commit.identity.to_string(), &commit.key);
+            self.log.commit_received(
+                &commit.identity.to_string(),
+                &commit.key,
+                commit.apply_by_ms,
+            );
         }
         Ok(message)
     }

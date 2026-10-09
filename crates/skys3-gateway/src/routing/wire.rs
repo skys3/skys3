@@ -292,6 +292,9 @@ pub struct Condition {
     /// The cluster of a peer write's destination: this cluster.
     #[prost(string, tag = "5")]
     pub cluster: String,
+    /// A peer write's apply-by time, in milliseconds since the Unix epoch.
+    #[prost(uint64, optional, tag = "6")]
+    pub apply_by_ms: Option<u64>,
 }
 
 /// Replica to gateway: whether the replica served a [`Forward`].
@@ -669,6 +672,7 @@ fn peer_condition(peer: &PeerCondition) -> Condition {
         identity: peer.identity.to_string(),
         expected,
         cluster: peer.cluster.to_string(),
+        apply_by_ms: peer.apply_by_ms,
     }
 }
 
@@ -680,14 +684,17 @@ fn decode_condition(condition: Condition, shard: &ShardRef) -> Decoded<Precondit
         identity,
         expected,
         cluster,
+        apply_by_ms,
     } = condition;
-    let plain = identity.is_empty() && expected.is_empty() && cluster.is_empty();
+    let plain =
+        identity.is_empty() && expected.is_empty() && cluster.is_empty() && apply_by_ms.is_none();
     let peer = |expected| -> Decoded<Precondition> {
         Ok(Precondition::Peer(PeerCondition {
             identity: identity.parse().map_err(|error| format!("{error}"))?,
             expected,
             cluster: ClusterId::new(cluster).map_err(|error| error.to_string())?,
             shard: shard.clone(),
+            apply_by_ms,
         }))
     };
     match (kind, etag.is_empty(), plain) {
@@ -989,6 +996,7 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
                     ConditionFailed::PreconditionFailed => 2,
                     ConditionFailed::NoSuchUpload => 3,
                     ConditionFailed::InvalidPart => 4,
+                    ConditionFailed::Expired => 5,
                 },
             },
         }),
@@ -1147,6 +1155,7 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
             (None, 2) => Err(ConditionFailed::PreconditionFailed),
             (None, 3) => Err(ConditionFailed::NoSuchUpload),
             (None, 4) => Err(ConditionFailed::InvalidPart),
+            (None, 5) => Err(ConditionFailed::Expired),
             (_, failed) => return Err(format!("write outcome {failed}")),
         }),
         Result::Sealed(summary) => Response::Sealed(ShardSummary {

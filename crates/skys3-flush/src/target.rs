@@ -289,7 +289,7 @@ impl<S> Target<S> {
         frame_bytes: u64,
         timeout: Duration,
     ) -> Self {
-        self.native = Some(Native::new(link, bucket, frame_bytes, timeout));
+        self.native = Some(Native::new(link, bucket, frame_bytes, timeout, None));
         self
     }
 

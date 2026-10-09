@@ -69,9 +69,19 @@ pub struct PeerCondition {
     pub cluster: ClusterId,
     /// The key's shard.
     pub shard: ShardRef,
+    /// When the write may last be sequenced, in milliseconds since the Unix
+    /// epoch (the `COMMIT`'s apply-by time, §7.8): the shard refuses it
+    /// later by its node's wall clock ([`Precondition::check_at`]).
+    pub apply_by_ms: Option<u64>,
 }
 
 impl PeerCondition {
+    /// Whether the write's apply-by time passed at `now_ms`.
+    #[must_use]
+    pub fn expired(&self, now_ms: u64) -> bool {
+        self.apply_by_ms.is_some_and(|by| now_ms > by)
+    }
+
     /// Whether the condition holds of `entry`, the key's entry.
     ///
     /// # Errors
@@ -141,6 +151,10 @@ pub enum ConditionFailed {
     /// completion was prepared (`400 InvalidPart`).
     #[error("a part is not the one the completion names")]
     InvalidPart,
+    /// A peer cluster's write reached its shard after its apply-by time
+    /// (§7.8), and was not sequenced.
+    #[error("the write's apply-by time passed")]
+    Expired,
 }
 
 impl Precondition {
@@ -180,6 +194,24 @@ impl Precondition {
     ///
     /// Why it does not.
     pub fn check(&self, entry: Option<&Entry>) -> Result<(), ConditionFailed> {
+        self.check_at(entry, 0)
+    }
+
+    /// [`Precondition::check`] at `now_ms`, milliseconds since the Unix
+    /// epoch on this node's wall clock: a peer write whose apply-by time
+    /// passed fails with [`ConditionFailed::Expired`]. A shard calls it as
+    /// it sequences the write, so a write is sequenced by its apply-by
+    /// time or never (§7.8).
+    ///
+    /// # Errors
+    ///
+    /// Why the precondition does not hold.
+    pub fn check_at(&self, entry: Option<&Entry>, now_ms: u64) -> Result<(), ConditionFailed> {
+        if let Self::Peer(peer) = self
+            && peer.expired(now_ms)
+        {
+            return Err(ConditionFailed::Expired);
+        }
         let object = entry.and_then(|entry| entry.object.as_ref());
         match (self, object) {
             (Self::Peer(peer), _) => peer.check(entry),
@@ -199,6 +231,10 @@ impl From<ConditionFailed> for S3Error {
             ConditionFailed::PreconditionFailed => precondition_failed(),
             ConditionFailed::NoSuchUpload => no_such_upload(),
             ConditionFailed::InvalidPart => invalid_part(),
+            ConditionFailed::Expired => s3_error!(
+                ServiceUnavailable,
+                "The write reached its shard after its apply-by time"
+            ),
         }
     }
 }
