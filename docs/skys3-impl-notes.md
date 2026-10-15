@@ -5512,6 +5512,26 @@ of this file. A task with nothing unexpected keeps "None."
   seeded bug `PeerBug::NoReturnQuarantine` is caught. The replay
   scenario's UDP block is longer, since the first QUIC flushes now wait
   out the quarantine.
+- **A refused descriptor that disappears (found in review).** Discovery
+  compared choices other than QUIC by kind only, so a target whose refused
+  descriptor was later removed stayed `PlainS3 { found: true }`: stamped
+  with `x-skys3-apply-by`, its large PUTs sent as multipart uploads, and
+  no server-side copies, after its discovery had ended. A change of
+  `found` is now a new choice, and the target is rebuilt as a plain
+  store. Since that rebuild, and a peer whose descriptor disappears
+  while on QUIC, lead to a plain store without the quarantine, the
+  service records when this node last stopped flushing the target over
+  QUIC (`native_until`), and a shard flusher that starts on S3 REST waits
+  out what is left of the quarantine since then.
+- **A peer writes only the buckets that receive from it (found in
+  review).** The gateway's guard let a peer's key write any bucket with
+  no `peer_source`, and any bucket with `peer_local_writes`, whichever
+  cluster it receives from, as far as the key's permissions allowed. A
+  peer's request now writes objects only in the buckets whose
+  `peer_source` is that peer (`403 AccessDenied` elsewhere);
+  `peer_local_writes` opens a bucket to this cluster's clients only. The
+  design was silent on buckets that receive from no peer; the stricter
+  rule was chosen. Recorded in §7.8 and §12.
 - **A stalled-commit test was flaky.** The gate of
   `a_commit_that_stalls_past_its_apply_by_time_never_applies` released
   its permits back, so a later poll could pass early. It now forgets
