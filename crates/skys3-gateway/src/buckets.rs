@@ -394,8 +394,9 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     /// replication from a peer cluster (`peer_source`) is read-only to them,
     /// so each key has a single writer, unless `peer_local_writes` is set
     /// (design §7.8), and a `read_only` bucket takes none (§9.5). A write
-    /// from the flusher of `peer`, over S3 REST, may write the buckets that
-    /// receive from that peer.
+    /// from the flusher of `peer`, over S3 REST, may write only the buckets
+    /// that receive from that peer, whether or not `peer_local_writes` is
+    /// set.
     pub(crate) fn require_writable(
         &self,
         name: &BucketName,
@@ -410,8 +411,16 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             ));
         }
         let settings = self.config.buckets.get(name);
-        match &settings.peer_source {
-            Some(source) if !settings.peer_local_writes && peer != Some(source) => Err(s3_error!(
+        match (peer, &settings.peer_source) {
+            // A peer's flusher writes only the buckets that receive from
+            // it, whatever `peer_local_writes` lets this cluster's clients
+            // do: its key is the peer's, not a local client's.
+            (Some(peer), source) if source.as_ref() != Some(peer) => Err(s3_error!(
+                AccessDenied,
+                "The request is cluster {peer}'s, and bucket {name} does not receive \
+                 replication from it"
+            )),
+            (None, Some(source)) if !settings.peer_local_writes => Err(s3_error!(
                 AccessDenied,
                 "Bucket {name} receives native replication from cluster {source} and is \
                  read-only to this cluster's clients"

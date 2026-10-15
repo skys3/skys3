@@ -233,7 +233,7 @@ A peer cluster this node trusts, keyed by its cluster ID (§12). Peer connection
 |---|---|---|---|
 | `ca_file` | path | required | Not empty. The peer's CA bundle in PEM; the peer's node certificates must lead to it and name the peer's cluster in their SPIFFE ID. |
 | `buckets` | array of `{ source, destination }` tables | `[]` | The bucket pairs the peer may write as a source: `source` is the peer's bucket ID, which its write identities carry, and `destination` is this cluster's bucket name. No pair appears twice. Empty for a peer this node only sends to. |
-| `s3_access_key_ids` | array of strings | `[]` | ASCII letters and digits, each listed for one peer only. The access keys the peer's flushers sign S3 requests with when they fall back to S3 REST (§7.8, §12): requests signed with one may write the buckets whose `peer_source` is the peer, with the peer's write identities (`x-amz-meta-skys3-wid`) for its bucket pairs. The keys themselves are this cluster's identities, as any client's. |
+| `s3_access_key_ids` | array of strings | `[]` | ASCII letters and digits, each listed for one peer only. The access keys the peer's flushers sign S3 requests with when they fall back to S3 REST (§7.8, §12): requests signed with one may write objects only in the buckets whose `peer_source` is the peer, whatever `peer_local_writes` allows, with the peer's write identities (`x-amz-meta-skys3-wid`) for its bucket pairs. The keys themselves are this cluster's identities, as any client's. |
 
 ## `[identity]`
 
