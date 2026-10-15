@@ -432,7 +432,6 @@ async fn only_the_peer_writes_and_only_its_own_identities() {
     for (uri, identity) in [
         ("/archive/k", "prod-ap/b-src/3/2.17"),
         ("/archive/k", "prod-us/b-other/3/2.17"),
-        ("/photos/k", IDENTITY),
     ] {
         call(
             &gateway,
@@ -453,17 +452,66 @@ async fn only_the_peer_writes_and_only_its_own_identities() {
     )
     .await
     .assert(400, Some("InvalidArgument"));
-    // The peer may write other buckets as any client, without an
-    // identity.
-    call(
-        &gateway,
-        Method::PUT,
-        "/photos/k",
-        &[(KEY_HEADER, PEER_KEY)],
-        "body",
-    )
-    .await
-    .assert(200, None);
+    // The peer writes no other bucket, with an identity or without.
+    for identity in [&[("x-amz-meta-skys3-wid", IDENTITY)][..], &[][..]] {
+        let mut headers = vec![(KEY_HEADER, PEER_KEY)];
+        headers.extend_from_slice(identity);
+        call(&gateway, Method::PUT, "/photos/k", &headers, "body")
+            .await
+            .assert(403, Some("AccessDenied"));
+    }
+}
+
+#[tokio::test]
+async fn a_peer_writes_only_the_buckets_that_receive_from_it() {
+    // Both receiving buckets take local writes; `ledger` receives from
+    // another peer, and `photos` from none.
+    let config = config(&format!(
+        "[transport]\ntls_cert_file = \"/n.crt\"\ntls_key_file = \"/n.key\"\n\
+         tls_ca_file = \"/ca.crt\"\n\
+         [buckets.archive]\nmode = \"local\"\npeer_source = \"prod-us\"\n\
+         peer_local_writes = true\n\
+         [buckets.ledger]\nmode = \"local\"\npeer_source = \"prod-ap\"\n\
+         peer_local_writes = true\n\
+         [peering.peers.prod-us]\nca_file = \"/us.crt\"\n\
+         buckets = [{{ source = \"b-src\", destination = \"archive\" }}]\n\
+         s3_access_key_ids = [\"{PEER_KEY}\"]\n\
+         [peering.peers.prod-ap]\nca_file = \"/ap.crt\"\n\
+         buckets = [{{ source = \"b-src\", destination = \"ledger\" }}]\n\
+         s3_access_key_ids = [\"AKIAPRODAP\"]\n"
+    ));
+    let gateway = gateway_with(config, ByKey).await;
+    for name in ["archive", "ledger", "photos"] {
+        call(
+            &gateway,
+            Method::PUT,
+            &format!("/{name}"),
+            &[(MODE_HEADER, "local")],
+            "",
+        )
+        .await
+        .assert(200, None);
+    }
+    let peer = [(KEY_HEADER, PEER_KEY)];
+    call(&gateway, Method::PUT, "/archive/k", &peer, "replicated")
+        .await
+        .assert(200, None);
+    // `peer_local_writes` opens the buckets to this cluster's clients, not
+    // to another peer's flushers.
+    for uri in ["/ledger/k", "/photos/k"] {
+        call(&gateway, Method::PUT, uri, &[], "local")
+            .await
+            .assert(200, None);
+        call(&gateway, Method::PUT, uri, &peer, "stray")
+            .await
+            .assert(403, Some("AccessDenied"));
+        call(&gateway, Method::DELETE, uri, &peer, "")
+            .await
+            .assert(403, Some("AccessDenied"));
+        call(&gateway, Method::POST, &format!("{uri}?uploads"), &peer, "")
+            .await
+            .assert(403, Some("AccessDenied"));
+    }
 }
 
 /// The text between `open` and `close` in `xml`.

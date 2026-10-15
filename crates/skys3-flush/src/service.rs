@@ -273,6 +273,11 @@ struct BucketFlusher<S> {
     /// what may be a SkyS3 peer, if it did; and whether it does now.
     s3_until: Option<Instant>,
     on_s3: bool,
+    /// When this node last stopped flushing the target over QUIC, if it
+    /// did: a shard flusher that starts on S3 REST waits out the
+    /// `COMMIT`s sent before, even to a store that no longer serves a
+    /// descriptor.
+    native_until: Option<Instant>,
     /// The epoch of each open shard's sequencing and when this node first
     /// saw it: the start of its tenure, as far as this node knows.
     tenures: BTreeMap<ShardId, (Epoch, Instant)>,
@@ -547,6 +552,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             native_quarantine: None,
             s3_until: None,
             on_s3: false,
+            native_until: None,
             tenures: BTreeMap::new(),
             probe: Arc::new(Mutex::new(ProbeStatus::Running { error: None })),
             probe_task: tokio::spawn(async {}),
@@ -632,6 +638,9 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         }
         flusher.on_s3 = on_s3;
         let native = matches!(choice, Choice::Native(_));
+        if flusher.native {
+            flusher.native_until = Some(Instant::now());
+        }
         // Adopting the peer's write would read it over S3 (§7.8).
         let holds = flusher.backup || native;
         flusher.conflict_policy = effective_policy(flusher.configured_policy, holds);
@@ -895,7 +904,12 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let since = flusher.s3_until.map_or(tenure.1, |s3| s3.max(tenure.1));
             let quarantine = match flusher.native_quarantine {
                 Some(quarantine) => (since + quarantine).saturating_duration_since(now),
-                None => flusher.quarantine,
+                // On S3 REST, the `COMMIT`s this node sent before may still
+                // apply until the quarantine passed since it stopped.
+                None => flusher.native_until.map_or(flusher.quarantine, |until| {
+                    let left = (until + self.quarantine()).saturating_duration_since(now);
+                    flusher.quarantine.max(left)
+                }),
             };
             flusher.shards.entry(id).or_insert_with(|| {
                 let charge = charged.then(|| self.budget.charge(bucket));
