@@ -108,7 +108,7 @@ fn is_aws_endpoint(endpoint: &str) -> bool {
         _ => authority,
     };
     let host = host.to_ascii_lowercase();
-    host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn")
+    skys3_types::aws::is_aws_host(&host)
 }
 
 /// Whether `bucket` can be a host label under TLS: no dots, which a

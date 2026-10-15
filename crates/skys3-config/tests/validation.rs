@@ -1364,6 +1364,66 @@ fn attached_targets_must_not_share_the_control_stores_scope() {
 }
 
 #[test]
+fn aws_bucket_names_are_compared_within_their_partition() {
+    let store = |endpoint: &str| {
+        control_store(&format!(
+            "backend = \"s3\"\nendpoint = \"{endpoint}\"\nbucket = \"ctl\"\n\
+             allow_correlated_control_store = true"
+        ))
+        .parse::<Config>()
+        .unwrap()
+        .control_store()
+        .clone()
+    };
+    let target = |url: &str| skys3_config::parse_target(url).unwrap();
+    let overlaps = |store: &skys3_config::ControlStoreConfig, url: &str| {
+        store
+            .check_target_independence(&target(url))
+            .is_err_and(|error| error.contains("overlap"))
+    };
+
+    // China: one namespace across its regions, apart from the others.
+    let china = store("https://s3.cn-north-1.amazonaws.com.cn");
+    assert!(overlaps(
+        &china,
+        "https://s3.cn-northwest-1.amazonaws.com.cn/ctl"
+    ));
+    assert!(overlaps(
+        &china,
+        "https://ctl.s3.cn-north-1.amazonaws.com.cn/ctl"
+    ));
+    for other in [
+        "https://s3.amazonaws.com/ctl",
+        "https://s3.us-west-2.amazonaws.com/ctl",
+        "https://s3.us-gov-west-1.amazonaws.com/ctl",
+    ] {
+        china.check_target_independence(&target(other)).unwrap();
+    }
+
+    // GovCloud: its own partition, though its host names end in
+    // amazonaws.com.
+    let gov = store("https://s3.us-gov-west-1.amazonaws.com");
+    assert!(overlaps(
+        &gov,
+        "https://s3-fips.us-gov-east-1.amazonaws.com/ctl"
+    ));
+    for other in [
+        "https://s3.amazonaws.com/ctl",
+        "https://s3.us-east-1.amazonaws.com/ctl",
+        "https://s3.cn-north-1.amazonaws.com.cn/ctl",
+    ] {
+        gov.check_target_independence(&target(other)).unwrap();
+    }
+
+    // The commercial partition does not reach GovCloud's or China's buckets.
+    let commercial = store("https://s3.eu-west-1.amazonaws.com");
+    assert!(overlaps(&commercial, "https://s3.amazonaws.com/ctl"));
+    commercial
+        .check_target_independence(&target("https://s3.us-gov-east-1.amazonaws.com/ctl"))
+        .unwrap();
+}
+
+#[test]
 fn target_regions_are_names() {
     for bad in ["", "us east", "us-east-1/x"] {
         let violations = violations_of(&format!("{BASE}\n[flush]\ntarget_region = {bad:?}"));
