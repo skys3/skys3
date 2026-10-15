@@ -62,7 +62,9 @@ impl From<PeerCertError> for rustls::Error {
 }
 
 /// A node's TLS identity for peer connections: its own certificate from
-/// its cluster's PKI, and the peer clusters it trusts.
+/// its cluster's PKI, and the peer clusters it trusts. Cloning it gives
+/// another handle to the same identity.
+#[derive(Clone)]
 pub struct PeerTls {
     cluster: ClusterId,
     certified: Arc<CertifiedKey>,
