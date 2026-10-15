@@ -1,0 +1,9 @@
+/t.jpg
+content-type: image/jpeg
+content-md5: XUFAKrxLKna5cZ2REBfFa-owe: image/jpeg
+content-md5: XUFAKrxLKna5cZ2REBfFa-owner:kg==
+x-amz-meta-owner: alice
+x-amz-tagging: a=1&b=2
+x-amz-cz-tagging: a=1&b=2
+x-amz-checksumshards-crc32c: 2REBfFa-owner:kg==
+x-amz-meta-owner: alicefuzz/bi:?partNumber=1&uploadllo

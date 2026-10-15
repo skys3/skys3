@@ -1,0 +1,2 @@
+bet/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow",  "Resource": ["arn:aws:cket"]}, {"Effect": "Deny", "NotAction": "arn:a3:::t/t/*"}]}

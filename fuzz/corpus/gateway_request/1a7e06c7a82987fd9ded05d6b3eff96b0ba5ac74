@@ -1,0 +1,4 @@
+/fuzz/big?parg?partNumber=2&uploadI
+x-amz-copy-source: fuzz/k?vers-owner: alice
+x-amz-tagging: a bytes=0-4
+

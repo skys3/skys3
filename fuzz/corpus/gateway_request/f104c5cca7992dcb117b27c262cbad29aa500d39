@@ -1,0 +1,12 @@
+/fuzz/c
+content-eamz-decoded-content-length: 5
+x-amz-trailer: x-amz-checksum-crc3hecksum-crc32
+ncoding: aws-chunked
+x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
+x-amz-decoded-content-length: 5
+x-amz-trailer: x-amz-checksum-crc3hecksum-crc32
+
+5
+hello
+0
+x-amz-checksum-crc32

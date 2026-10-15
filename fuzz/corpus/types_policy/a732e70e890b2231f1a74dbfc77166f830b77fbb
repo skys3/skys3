@@ -1,0 +1,2 @@
+bucket/key
+{"Version": "4024-117", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": n:aa

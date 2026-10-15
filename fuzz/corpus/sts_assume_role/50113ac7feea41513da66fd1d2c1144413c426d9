@@ -1,0 +1,1 @@
+Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=arn%3Aaws%3Aiam%3A%3A1234562%3Arole%2Fci&RoleSessionName=bu42&WebIdentityToken=eyJhbonconds=196

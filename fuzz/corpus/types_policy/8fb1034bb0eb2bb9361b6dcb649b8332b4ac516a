@@ -1,0 +1,6 @@
+bukey
+{"Version": "2012-10-ffect7", "Statement": [{"Resource": "arn", "Condition": {"SLike": {"s3:pefix"
+
+
+
+:[8.88888		]}}}]}

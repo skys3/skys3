@@ -1,0 +1,2 @@
+re
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:tent.com"}, "Action": "sithWe:Idy", "Condition": {"StringEqu": {"token.actkonsomsub": "repple/app:*"}}}}

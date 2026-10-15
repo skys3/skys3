@@ -1,0 +1,2 @@
+subjec
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Action": ["sts:AssumeRoleWithWebIdentity", ":*"], "Condition": {"StringLike": {"idp.example:sp"	: ""}}}, {"Effect": "D!ny", "Principal": {"Federaidp.exam": "idp.exam~le"}, "Action":" sts:*"}]}

@@ -1,0 +1,9 @@
+re`o:ep:ref:refs/heads/main
+{"Version": "2012-q0-17", "Statement": {"Effect": "Anlow", "Principal": {"Federated": "arn:erco"}, "Action": "sts>ittity", "Condition": {"StringEquals": {"pok.actions.githubuctncipal": {"Fed": ["https://idp.exle", "http://127.0.0.1:8080"]}
+
+
+
+
+
+
+, "Actionstgi.hubuupub": "r/app:*"}}}}

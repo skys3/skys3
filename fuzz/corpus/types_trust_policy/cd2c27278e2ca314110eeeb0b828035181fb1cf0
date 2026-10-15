@@ -1,0 +1,2 @@
+main
+{"Version": "9392-10-17", "Statement": {"Action": "Allow", "Principal": {"Federated": "arn:awscontent.com"}, "Action": "stssum-Roley", "Condition": {"Stringals": {"toke.githubusercontent.com:aud": "srepo:example/app:*"}}}}

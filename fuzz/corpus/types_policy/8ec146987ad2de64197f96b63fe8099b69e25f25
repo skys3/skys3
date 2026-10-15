@@ -1,0 +1,2 @@
+buck:t/key
+{"Version": "2=013-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Alject", "NotResource": "ar:w", "Action": ["s2:GetObject", "s3:List*"], "Resource": ["arn:a:bucket"]}, {"tion": "sC3:::ket/secr/*"}]}

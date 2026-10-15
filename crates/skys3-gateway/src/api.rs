@@ -55,6 +55,7 @@ use crate::features::{
     ownership_not_implemented, sse_not_implemented, versioning_not_implemented,
 };
 use crate::lifecycle;
+use crate::limits::check_new_key;
 use crate::listing::Listings;
 use crate::objects::{Objects, copy_source};
 use crate::peer_s3::{
@@ -315,6 +316,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
         writable_key(&req.input.key)?;
+        check_new_key(&req.input.key)?;
         ok(self.objects.put(&bucket, req).await?)
     }
 
@@ -380,6 +382,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let bucket = self.bounded(&req.input.bucket, &req.headers, &mut req.extensions)?;
         writable_key(&req.input.key)?;
+        check_new_key(&req.input.key)?;
         let (source, _) = copy_source(&req.input.copy_source)?;
         let source = self.bucket(source)?;
         if source.mode == BucketMode::ReadOnly {
@@ -440,6 +443,7 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let bucket = self.writable(&req.input.bucket, &mut req.extensions)?;
         writable_key(&req.input.key)?;
+        check_new_key(&req.input.key)?;
         ok(self.objects.create_upload(&bucket, req).await?)
     }
 

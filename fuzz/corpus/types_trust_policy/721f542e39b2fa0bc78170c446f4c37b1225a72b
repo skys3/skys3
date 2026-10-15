@@ -1,0 +1,2 @@
+rep4444444444444main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmaws:iam::123456789012:oidc%provider/tws:iam::12345ken.actkons.gitrAepo:example/app: {"}}}

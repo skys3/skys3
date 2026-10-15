@@ -1,0 +1,2 @@
+ey
+{"Version": "4024-10-17", "Id": "p", "Statement": [{"Sid": "read", "Action": ["s3:Getpbjt"]}, {"Efce": ":s3:!"}]}

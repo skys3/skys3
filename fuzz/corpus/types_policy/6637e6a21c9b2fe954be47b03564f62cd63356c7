@@ -1,0 +1,2 @@
+buck
+{"Version": "2012-10-17", "Id": "Nop", "Statement": [{"Sid": "re", "Effect": "Allow", "Action": ["s4:bj::bucet"]}, {"Effect":""}]}

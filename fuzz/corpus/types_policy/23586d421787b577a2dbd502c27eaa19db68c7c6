@@ -1,0 +1,6 @@
+buct/key
+{"Version": "-17", "Statement": [{"Resource": "arf*", "Condition": {"SLike": {"s3:prefix"
+
+
+
+:[888888881e-21]}}}]}

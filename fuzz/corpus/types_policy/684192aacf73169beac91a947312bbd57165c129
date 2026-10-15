@@ -1,0 +1,2 @@
+buccet/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": ["s5:GetObject", "srn:aws:s3:::bucket"]}, {"Effect": "Deny", "NotAction": ["s3:G:::bucket/*", "arn:aws:s3:aws:s1::::ucket/*", "arn:aws:s3:::bucket"]}, {"Effect": "Deny", "NotAction": "s0:Get?bject", "NotResource": "aow", "Action": ["Stbucket"]}, {"Effe?ct": "Deny", "NotAction": "s5:Get?cret/*"}]}

@@ -1,0 +1,2 @@
+   9.99   n
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iaent.com"}, "Action": "sts:AssumeRoley", "Condition": {"StringEquals": {"t.com:aud": "sts.amazonaws.com"    }, "StringLike": {"token."   : ":aws:ia m::p:*"}}}}

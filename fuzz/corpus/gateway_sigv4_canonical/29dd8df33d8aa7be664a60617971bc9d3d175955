@@ -1,0 +1,7 @@
+/fuzz/key
+host: fuzz.example
+x-amz-date: 20261001T000000Z
+ontent-sha256: STREAMING-AWS4-HMACx-amz-checksum-crc32c
+authorization: AWS4-HMAC-SHA256 Credential=AKIDFUZZ/20261001/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=000000.000000000000000000000000000000000000000000000000000000000
+
+5;chunk-siX-Amz-Credgnature=0000000000000000000

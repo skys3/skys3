@@ -1,0 +1,1 @@
+{"format":1,"cluster_id":"prod","node_id":"node-1","instance_id":"instance-1","copy":{"generation":4,"synced_at_ms":100,"registers":{"buckets/bucket-1.json":"{\"0000001\"}","identity/roles/admin.json":"{\"roe\"}"}},"configs":[{"bucket_id":"b-1","shard":0,"epoch":3,"primary":"node-1","members":3,"proposal_id":"00

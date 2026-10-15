@@ -1,0 +1,2 @@
+{} ?subject
+{"Version": "2012-10-17", "Id": "", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": nulu{"Fed""sts:*"}]}

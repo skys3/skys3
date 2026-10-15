@@ -1,0 +1,22 @@
+/fuzz/photos/2024/cat.jpg
+content-typ: a=1&b=2
+x-amz-checksum-crc32c: mnG7TA==
+cache-control: mAx-age=60
+content-length: 5
+
+e: image¯jpeg
+content-md5: XUol: mAx-age=60
+content-length: 5
+
+e: image¯jpeg
+content-md5: XUFAKrxLKna5cZ2REBfFkg==ö‡Ò¢mz-meta-owner: alice
+x-amz-tagging: a=1&b=2
+x-amz-checksum-crc32c: mnG7TA==
+cache-control: max-age=60
+content-˜engFAKrxLKna5cZ2REBfFkg==ö‡Ò¢mz-meta-owner: alice
+x-amz-tagging: a=1&b=2
+x-amz-checksum-crc32c: mnG7TA==
+cache-control: max-age=60
+content-˜ength: 5
+
+hello
