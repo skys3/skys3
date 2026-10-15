@@ -2386,6 +2386,7 @@ dependencies = [
  "libfuzzer-sys",
  "prost",
  "serde_json",
+ "skys3-config",
  "skys3-control",
  "skys3-coord",
  "skys3-ec",

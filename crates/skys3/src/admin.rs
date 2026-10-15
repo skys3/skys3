@@ -49,7 +49,13 @@
 //!   `after`, the last key it has imported without a gap while it runs,
 //!   `ranges` and `ranges_done`, the key ranges it lists in parallel and
 //!   those done, `imported`, the `IMPORT` records committed since the node
-//!   started, and `error`, its last error until it gets past it.
+//!   started, and `error`, its last error until it gets past it;
+//! - `transport`: for a target that may be a SkyS3 peer (§7.8), what its
+//!   discovery found, `null` for one flushed over S3 REST only:
+//!   `configured`, the bucket's `target_transport`; `in_use`, `quic`, `s3`,
+//!   or `null` while flushing waits for a transport; `peer`, whether the
+//!   target served a peer descriptor that verified; `reason`, why, in
+//!   words; and `switches`, how often the transport changed.
 //!
 //! Once the node runs the coordinator, `health` gains a `placement` object
 //! from `skys3_coord::PlacementHealth` (design §12), and bucket status the
@@ -89,8 +95,8 @@ use bytes::Bytes;
 use http::{Method, Response, StatusCode, header};
 use http_body_util::Full;
 use serde_json::{Value, json};
-use skys3_config::ConflictPolicy;
-use skys3_flush::{BucketStatus, FlushService, ProbeStatus, Unresolved};
+use skys3_config::{ConflictPolicy, TargetTransport};
+use skys3_flush::{BucketStatus, FlushService, ProbeStatus, Transport, Unresolved};
 use skys3_gateway::{LocalShards, ShardRef};
 use skys3_index::ImportCheckpoint;
 use skys3_io::{Disk, SystemWallClock, WallClock};
@@ -505,6 +511,17 @@ fn flush_status(status: &BucketStatus) -> Value {
             "ranges_done": import.ranges.done(),
             "imported": import.imported,
             "error": import.error,
+        })),
+        "transport": status.transport.as_ref().map(|transport| json!({
+            "configured": match transport.configured {
+                TargetTransport::Auto => "auto",
+                TargetTransport::Native => "native",
+                TargetTransport::S3 => "s3",
+            },
+            "in_use": transport.in_use.map(Transport::as_str),
+            "peer": transport.peer,
+            "reason": transport.reason,
+            "switches": transport.switches,
         })),
     })
 }

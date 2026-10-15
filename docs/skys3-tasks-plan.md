@@ -1045,7 +1045,8 @@ The design leaves these points open. Each named PR decides the point and records
 | TLS for the admin HTTP listener, and `admin` certificates of the node PKI as an alternative to its bearer token (§12). M2-02 defines the PKI and the `admin` role. | M3-02 |
 | The fragment header fields needed to re-index coded objects: §8.4 omits the fragment index, geometry, codec ID, and stripe length | M5-02 |
 | Fencing orphan-fragment reclamation against fragment-writing attempts still in progress (encoding, repair, and moves), which §8.4 does not specify | M5-04, M5-05, M5-08, M5-09 |
-| The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07 |
+| The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07: the reserved key `.skys3/peer-descriptor` of the receiving bucket, through the target's own S3 endpoint; signed by the destination node's `[transport]` key, with its chain, for an hour; verified against the named peer's trust bundle |
+| How a destination accepts a peer's write identity over S3 REST, which a SkyS3 gateway refuses from clients (§7.2, §7.8) | M6-07: requests signed with an access key listed in the peer's `s3_access_key_ids` may carry identities of that peer's bucket pairs |
 | Upgrade rules for on-disk and wire format versions | M7-09, with version fields present from M1-01 |
 
 ## 15. Open questions from design section 19

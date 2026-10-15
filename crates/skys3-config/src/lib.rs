@@ -88,7 +88,10 @@ pub use error::{ConfigError, Violation, Violations};
 pub use flush::{AckPolicy, ConflictPolicy, FlushConfig};
 pub use identity::{IdentityConfig, StaticCredentialConfig};
 pub use node::{GatewayListenConfig, NodeConfig};
-pub use peering::{BucketPair, CongestionControl, PeerConfig, PeeringConfig};
+pub use peering::{
+    BucketPair, CongestionControl, MAX_ADVERTISED_ADDRESS_LEN, MAX_ADVERTISED_ADDRESSES,
+    PeerConfig, PeeringConfig, advertisable,
+};
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};
 pub use target::parse_target;

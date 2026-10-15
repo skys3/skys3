@@ -108,6 +108,13 @@
 //!   restarts of the peer: no key recorded flushed and no write-through
 //!   write acknowledged before the peer applied it, and every committed
 //!   change applied there once, with seeded bugs caught.
+//! - [`discovery`]: the same peer reached with `target_transport =
+//!   "auto"`, with UDP blocked between every node and the peer mid-run:
+//!   flushing falls back to S3 REST through the peer's gateway and returns
+//!   to QUIC, every committed change applied there once, no native commit
+//!   outliving the quarantine, the transport metric and status following
+//!   each switch, forged and expired descriptors refused, and seeded bugs
+//!   caught.
 //! - [`origin`]: `read_only` buckets over an origin that an out-of-band
 //!   writer changes while clients read through every node: every answer is
 //!   one the origin gave, as the reader's credentials see it, within the
@@ -140,6 +147,7 @@ mod conflicts;
 mod coordinator;
 mod copies;
 mod crash;
+mod discovery;
 mod drills;
 mod fragment_moves;
 mod handoff;
