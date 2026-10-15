@@ -179,11 +179,12 @@ impl RequestLimits {
                 ));
             }
             // Responses echo prefixes, delimiters, and markers in XML, which
-            // cannot carry control characters (`s3s` would answer 500).
+            // cannot carry control characters (`s3s` would answer 500) or
+            // U+FFFE and U+FFFF (strict parsers would refuse the answer).
             if !is_xml_text(value) {
                 return Err(s3_error!(
                     InvalidArgument,
-                    "The query parameter {name:?} holds a control character"
+                    "The query parameter {name:?} holds a character XML 1.0 cannot carry"
                 ));
             }
         }
@@ -306,8 +307,9 @@ impl RequestLimits {
     }
 }
 
-/// Refuses `key` as the key of a new object if it holds a control character
-/// other than tab, line feed, and carriage return. S3 responses echo keys in
+/// Refuses `key` as the key of a new object if it holds a character XML 1.0
+/// cannot carry ([`is_xml_text`]): a control character other than tab, line
+/// feed, and carriage return, or U+FFFE or U+FFFF. S3 responses echo keys in
 /// XML (CreateMultipartUpload, listings, DeleteObjects), which cannot carry
 /// those, so such a key could be written but never listed (design §12).
 /// Keys that already exist, such as one an import found at the remote, can
@@ -324,12 +326,12 @@ pub(crate) fn check_new_key(key: &str) -> Result<(), S3Error> {
     }
 }
 
-/// The refusal of a key that holds a control character.
+/// The refusal of a key that holds a character XML 1.0 cannot carry.
 pub(crate) fn control_character_key() -> S3Error {
     s3_error!(
         InvalidArgument,
         "Object keys cannot hold control characters other than tab, line feed, and carriage \
-         return, which XML responses cannot carry"
+         return, or U+FFFE or U+FFFF, which XML responses cannot carry"
     )
 }
 
@@ -580,6 +582,9 @@ mod tests {
             "/b?delimiter=%00",
             "/b?marker=%08&prefix=a",
             "/b/k?uploadId=%0B",
+            // U+FFFE and U+FFFF are outside XML 1.0's Char production too.
+            "/b?prefix=a%EF%BF%BE",
+            "/b?start-after=%EF%BF%BF",
         ] {
             assert_eq!(
                 code(shape(Method::GET, uri, &[])),

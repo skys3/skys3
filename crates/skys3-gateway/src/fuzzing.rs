@@ -659,6 +659,7 @@ mod tests {
             b"\x00/fuzz?prefix=a%00&delimiter=/",
             b"\x01/fuzz/bell%07\ncontent-length: 0\n\n",
             b"\x02/fuzz/bell%07?uploads",
+            b"\x01/fuzz/nonchar%EF%BF%BF\ncontent-length: 0\n\n",
             b"\x01/fuzz/copy%08\nx-amz-copy-source: /fuzz/a\ncontent-length: 0\n\n",
         ] {
             let status = harness.request(input).unwrap().0;

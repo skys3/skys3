@@ -8328,6 +8328,20 @@ of this file. A task with nothing unexpected keeps "None."
   pipeline's corpus (`regression-list-buckets-prefix-control-character`). No other crash, timeout, or out-of-memory
   report came up: every target's slowest input took under a second and
   its peak RSS stayed under 600 MiB.
+- **U+FFFE and U+FFFF too (review).** XML 1.0's `Char` production also
+  leaves out U+FFFE and U+FFFF. `s3s` checks only bytes below 0x20, so it
+  sent those two as they are, in answers strict XML parsers refuse.
+  `is_xml_text` now follows the production exactly; its last gap, the
+  surrogates, cannot occur in a Rust `str`.
+- **One nightly cache for all targets (review).** The first version kept
+  a cache per runner, keyed by its number, so adding a target, which
+  moves most targets to another runner, would have restarted them from
+  the committed corpus. Now every runner restores one cache holding a
+  directory per target, hands what it grew to a final `save` job as an
+  artifact, and that job overlays it, a target at a time, on the
+  previous cache and saves the result. A target whose runner failed
+  keeps its previous corpus. Minimized with hit counts, this campaign's
+  corpora took 13 MB, far below the 10 GB a repository's caches may hold.
 - **Stricter lifecycle validation applies to stored registers too.**
   `LifecycleConfiguration::validate` runs when a bucket register is read,
   so a register stored with a control character in a rule would now fail

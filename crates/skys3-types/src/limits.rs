@@ -34,17 +34,23 @@ pub const MAX_EXTENTS_PER_PUT: usize = (MAX_SINGLE_PUT_BYTES / MIN_EXTENT_LEN as
 const _: () = assert!(MAX_EXTENTS_PER_PUT == 81_920);
 const _: () = assert!(MIN_EXTENT_LEN <= MAX_RECORD_PAYLOAD_LEN);
 
-/// Whether an XML 1.0 document can carry `text`: it holds no control
-/// character below U+0020 other than tab, line feed, and carriage return.
+/// Whether an XML 1.0 document can carry `text`: every character is in the
+/// `Char` production, so none is a control character below U+0020 other
+/// than tab, line feed, and carriage return, or U+FFFE or U+FFFF. The
+/// production's other gap, the surrogates, cannot occur in a `str`.
 ///
-/// S3 answers in XML and echoes keys, prefixes, markers, and rule IDs, and
-/// `s3s` refuses to send a response that holds such a character, so the
-/// gateway refuses them where a client brings them in (design §12).
+/// S3 answers in XML and echoes keys, prefixes, markers, and rule IDs.
+/// `s3s` refuses to send a response holding a control character, and sends
+/// U+FFFE and U+FFFF as they are, which strict XML parsers refuse, so the
+/// gateway refuses all of them where a client brings them in (design §12).
 #[must_use]
 pub fn is_xml_text(text: &str) -> bool {
-    !text
-        .bytes()
-        .any(|b| b < b' ' && !matches!(b, b'\t' | b'\n' | b'\r'))
+    !text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{0}'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}'
+        )
+    })
 }
 
 #[cfg(test)]
@@ -60,5 +66,10 @@ mod tests {
             let text = format!("a{}b", char::from(b));
             assert!(!is_xml_text(&text), "{text:?}");
         }
+        // The Char production also leaves out U+FFFE and U+FFFF, but not
+        // their neighbours or the supplementary planes.
+        assert!(!is_xml_text("a\u{fffe}"));
+        assert!(!is_xml_text("\u{ffff}b"));
+        assert!(is_xml_text("\u{d7ff}\u{e000}\u{fffd}\u{10000}\u{10ffff}"));
     }
 }

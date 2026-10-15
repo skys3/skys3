@@ -202,7 +202,9 @@ pub enum LifecycleError {
     /// A rule's ID, prefix, or a tag of its filter holds a control
     /// character, which the XML of GetBucketLifecycleConfiguration cannot
     /// carry ([`is_xml_text`]).
-    #[error("rule {0:?}: the ID, prefix, and tags cannot hold control characters")]
+    #[error(
+        "rule {0:?}: the ID, prefix, and tags cannot hold control characters, U+FFFE, or U+FFFF"
+    )]
     ControlCharacter(String),
     /// The configuration is larger than [`MAX_JSON_BYTES`] stored.
     #[error(
@@ -486,10 +488,11 @@ mod tests {
             check(vec![rule("a\u{1}")]),
             LifecycleError::ControlCharacter("a\u{1}".into())
         );
-        let control: [&dyn Fn(&mut LifecycleRule); 3] = [
+        let control: [&dyn Fn(&mut LifecycleRule); 4] = [
             &|rule| rule.filter.prefix = "logs/\u{1f}".into(),
             &|rule| rule.filter.tags = tags(&[("k\u{0}", "v")]),
             &|rule| rule.filter.tags = tags(&[("k", "\u{8}")]),
+            &|rule| rule.filter.prefix = "logs/\u{fffe}".into(),
         ];
         for change in control {
             assert_eq!(with(change), Err(LifecycleError::ControlCharacter(r())));

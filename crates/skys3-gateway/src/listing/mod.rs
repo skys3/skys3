@@ -241,7 +241,7 @@ impl<H: Shards> Listings<H> {
         if !request.url && !merged.items.iter().all(|item| is_xml_text(item.name())) {
             return Err(s3_error!(
                 InvalidArgument,
-                "The listing holds a key with a control character, which XML cannot carry; \
+                "The listing holds a key with a character XML 1.0 cannot carry; \
                  list with encoding-type=url"
             ));
         }
