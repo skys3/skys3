@@ -116,10 +116,13 @@ impl Choice {
     /// Whether `other` is the same choice: moving between them needs no
     /// new target. A new link is a new choice, even to the same peer: the
     /// handshake that made it found the old one broken, or the peer at
-    /// other addresses, so the flushers must move to it.
+    /// other addresses, so the flushers must move to it. Whether a plain
+    /// store served a descriptor changes its target too: one that did is
+    /// stamped and waited out, one that does not is a plain S3 store.
     fn same(&self, other: &Choice) -> bool {
         match (self, other) {
             (Choice::Native(link), Choice::Native(other)) => Arc::ptr_eq(link, other),
+            (Choice::PlainS3 { found }, Choice::PlainS3 { found: other }) => found == other,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
@@ -473,6 +476,15 @@ mod tests {
         // Another choice on S3 REST is a new generation, not a switch.
         shared.choose(Choice::PlainS3 { found: true }, false, "refused".to_owned());
         assert_eq!(discovery.current().0, 2);
+        assert_eq!(discovery.status().switches, 0);
+        // A refused descriptor that disappears leaves a plain store: a new
+        // target, which is neither stamped nor waited out.
+        shared.choose(Choice::PlainS3 { found: false }, false, "gone".to_owned());
+        assert_eq!(discovery.current().0, 3);
+        assert!(matches!(
+            discovery.current().1,
+            Choice::PlainS3 { found: false }
+        ));
         assert_eq!(discovery.status().switches, 0);
         shared.note("a later round failed".to_owned());
         assert_eq!(discovery.status().reason, "a later round failed");

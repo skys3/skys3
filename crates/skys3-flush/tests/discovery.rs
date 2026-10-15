@@ -26,7 +26,7 @@ use skys3_obs::MetricsRegistry;
 use skys3_peer::{
     DESCRIPTOR_KEY, DescriptorSigner, DescriptorVerifier, PeerDescriptor, PeerTls, PeerTrust,
 };
-use skys3_remote::{ObjectStore, PutObject};
+use skys3_remote::{DeleteObject, ObjectStore, PutObject};
 use skys3_sim::SimS3;
 use skys3_sim::s3::Operation;
 use skys3_sim::s3::SimS3Config;
@@ -420,6 +420,87 @@ fn targets_without_a_valid_descriptor_are_plain_s3() {
                 .await;
             assert!(!world.at_destination("a").await);
         }
+    });
+}
+
+#[test]
+fn a_refused_descriptor_that_disappears_leaves_a_plain_store() {
+    runtime().block_on(async {
+        // A forged descriptor: plain S3, stamped, since the store may be a
+        // peer that took native commits.
+        let world = world("auto").await;
+        let forged = descriptor(&pki(DESTINATION), DESTINATION, NOW);
+        world.serve_descriptor(forged).await;
+        world.node.put("a", "refused").await;
+        world
+            .until("refused the descriptor", |_, t| {
+                t.reason.contains("not trusted")
+            })
+            .await;
+        world
+            .until("flushed over S3", |world, _| world.at_store("a"))
+            .await;
+        let stamp = |key: &str| -> Vec<Option<u64>> {
+            world
+                .store
+                .apply_by_times()
+                .iter()
+                .filter(|(_, written, _)| written == &format!("team/{key}"))
+                .map(|(_, _, apply_by)| *apply_by)
+                .collect()
+        };
+        assert!(stamp("a").iter().all(Option::is_some), "{:?}", stamp("a"));
+
+        // The stray descriptor is removed: the target is rebuilt as a plain
+        // store, whose writes carry no apply-by time.
+        world
+            .store
+            .delete_object(DeleteObject::new(DESCRIPTOR_KEY))
+            .await
+            .unwrap();
+        world
+            .until("found no descriptor", |_, t| {
+                t.reason.contains("no peer descriptor")
+            })
+            .await;
+        world.node.put("b", "plain").await;
+        world
+            .until("flushed over S3", |world, _| world.at_store("b"))
+            .await;
+        let b = stamp("b");
+        assert!(!b.is_empty() && b.iter().all(Option::is_none), "{b:?}");
+    });
+}
+
+#[test]
+fn a_peer_whose_descriptor_disappears_is_left_after_the_quarantine() {
+    runtime().block_on(async {
+        let world = world("auto").await;
+        world
+            .serve_descriptor(descriptor(&world.pki, DESTINATION, NOW))
+            .await;
+        world.node.put("a", "native").await;
+        world.until_at_destination("a").await;
+
+        // The descriptor goes, and the link fails: plain S3 REST, but only
+        // once no COMMIT sent over QUIC can still apply (§7.8).
+        world
+            .store
+            .delete_object(DeleteObject::new(DESCRIPTOR_KEY))
+            .await
+            .unwrap();
+        world.destination.faults().down = true;
+        world.node.put("b", "plain").await;
+        world
+            .until("found no descriptor", |_, t| {
+                t.reason.contains("no peer descriptor")
+            })
+            .await;
+        let left = Instant::now();
+        world
+            .until("flushed over S3", |world, _| world.at_store("b"))
+            .await;
+        assert!(left.elapsed() >= QUARANTINE - Duration::from_millis(100));
     });
 }
 
