@@ -277,13 +277,10 @@ async fn identity(config: &Config, request: Request) -> ExitCode {
             for (key, change) in &applied.changes {
                 println!("{}: {key}", change.as_str());
             }
-            match applied.generation {
-                Some(generation) => println!(
-                    "announced at generation {}; nodes follow it on their next sync",
-                    generation.get()
-                ),
-                None => println!("nothing changed"),
-            }
+            println!(
+                "announced at generation {}; nodes follow it on their next sync",
+                applied.generation.get()
+            );
             ExitCode::SUCCESS
         }
         Err(error @ IdentityError::Invalid { .. }) => {
