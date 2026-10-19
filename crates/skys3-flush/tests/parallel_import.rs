@@ -45,6 +45,7 @@ fn bucket() -> BucketDocument {
             prefix: Some(PREFIX.to_owned()),
         }),
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new("p-1").unwrap(),
     }
 }
@@ -91,7 +92,7 @@ async fn remote(seed: u64, keys: &[String]) -> SimS3 {
 
 /// The bucket's import status.
 fn status(service: &FlushService<SimS3, SimMount>) -> ImportStatus {
-    service.status(&bucket().bucket_id).unwrap().import
+    service.status(&bucket().bucket_id).unwrap().import.unwrap()
 }
 
 /// Follows the bucket until its import is done, and returns its status.
@@ -284,7 +285,12 @@ fn shutdown_waits_for_a_checkpoint_write_in_flight() {
         let store = remote(95, &keys).await;
         let bucket = bucket();
         let checkpoint = |service: &FlushService<SimS3, SimMount>| {
-            service.status(&bucket.bucket_id).unwrap().import.checkpoint
+            service
+                .status(&bucket.bucket_id)
+                .unwrap()
+                .import
+                .unwrap()
+                .checkpoint
         };
         // About a page of ten keys a second, on the paused clock.
         let service = service(&store, 10, 10, 1);

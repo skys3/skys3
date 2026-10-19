@@ -157,6 +157,36 @@ fn a_write_that_times_out_still_commits_in_order() {
     });
 }
 
+/// A batch that times out fails each record not yet acknowledged, naming
+/// the position it took, and the records still commit once the members
+/// catch up.
+#[test]
+fn a_batch_that_times_out_names_each_records_position() {
+    runtime().block_on(async {
+        let replica = Replica::new().await;
+        let (primary, leader) = replica.primary(AckTimeout::wait_through(TIMEOUT)).await;
+        // The members' leases let the primary read the keys' entries.
+        let clock: Arc<dyn skys3_io::Clock> = Arc::new(skys3_io::MonotonicClock::new());
+        leader.start_leases(clock, Duration::from_secs(60));
+        let stamp = leader.lease_stamp().unwrap();
+        leader.granted(&node(2), stamp);
+        leader.granted(&node(3), stamp);
+        let bodies = vec![put("a", 10, 1), put("b", 10, 2)];
+        let results = primary.commit_all_if(bodies, |_, _| Ok::<(), ()>(())).await;
+        for (result, seq) in results.into_iter().zip(1..) {
+            match result {
+                Err(ShardError::NotAcknowledged { position, .. }) => {
+                    assert_eq!(position, Some(at(seq)));
+                }
+                other => panic!("expected the write not to be acknowledged, got {other:?}"),
+            }
+        }
+        acknowledge(&leader, 2);
+        until(|| primary.applied() == at(2)).await;
+        assert!(entry(&replica.index, "b").unwrap().object.is_some());
+    });
+}
+
 /// Fail-fast: once a write timed out, new writes are refused at once,
 /// without a position, until the late record is applied.
 #[test]

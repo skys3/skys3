@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "g", "Effect": "Allow", "Principal": {"Federated": ["https:/**1***********************************************************"], "idp.exampleke": {"idp.example:sub": ["********************1*********?b"], "idp.example:azp": "c"}}}, {"Effect": "De:*"}]}

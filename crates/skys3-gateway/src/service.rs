@@ -174,8 +174,10 @@ impl<A: Authenticator> Gateway<A> {
         let hashing_pool = config.hashing_pool.clone();
         let objects = Objects::new(shards.clone(), &config);
         let listings = Listings::new(shards.clone(), &config);
+        let peers = (config.peer_access.clone(), config.descriptors.clone());
         let buckets = Arc::new(Buckets::load(store, shards, config, ids).await?);
-        let mut builder = S3ServiceBuilder::new(Api::new(Arc::clone(&buckets), objects, listings));
+        let api = Api::new(Arc::clone(&buckets), objects, listings, peers);
+        let mut builder = S3ServiceBuilder::new(api);
         builder.set_config(limits.s3s_config());
         builder.set_auth(NoSignatures);
         builder.set_access(Access::new(anonymous.clone()));

@@ -58,7 +58,9 @@ struct Active<F> {
 ///
 /// A lazy record does not start a group: it waits, in queue order, until
 /// another record starts one and joins it, or until it has waited
-/// [`LAZY_MAX_DELAY`], and then commits with the lazy records queued so far.
+/// [`LAZY_MAX_DELAY`] or an appender asks for it
+/// ([`SegmentLog::commit_lazy_now`](crate::SegmentLog::commit_lazy_now)),
+/// and then commits with the lazy records queued so far.
 ///
 /// The first I/O error ends the write path for good: the committer fails
 /// the group it was committing and every record queued after it, and the
@@ -66,7 +68,7 @@ struct Active<F> {
 /// failed sync covered is acknowledged later.
 #[derive(Debug)]
 pub(crate) struct Committer<D: Disk> {
-    disk: D,
+    disk: Arc<D>,
     shared: Arc<Shared<D::File>>,
     requests: mpsc::Receiver<Request>,
     clock: Arc<dyn Clock>,
@@ -81,7 +83,7 @@ pub(crate) struct Committer<D: Disk> {
 
 impl<D: Disk> Committer<D> {
     pub(crate) fn new(
-        disk: D,
+        disk: Arc<D>,
         shared: Arc<Shared<D::File>>,
         requests: mpsc::Receiver<Request>,
         clock: Arc<dyn Clock>,
@@ -119,9 +121,18 @@ impl<D: Disk> Committer<D> {
                 Some(oldest) => {
                     let deadline = oldest.arrival.saturating_add(LAZY_MAX_DELAY);
                     let at = self.clock.runtime_deadline(deadline);
-                    tokio::time::timeout_at(at, self.requests.recv())
-                        .await
-                        .unwrap_or(None)
+                    // A wake and a request ready at once are taken in this
+                    // order, not at random, so a simulation seed replays
+                    // exactly; the request waits for the next turn. The
+                    // wake comes first so that a run of lazy records
+                    // cannot hold it back.
+                    tokio::select! {
+                        biased;
+                        () = self.shared.lazy_now.notified() => None,
+                        next = tokio::time::timeout_at(at, self.requests.recv()) => {
+                            next.unwrap_or(None)
+                        }
+                    }
                 }
             };
             match next {
@@ -133,7 +144,8 @@ impl<D: Disk> Committer<D> {
                     group.append(&mut waiting);
                     self.gather(first, &mut group).await;
                 }
-                // Lazy records waited long enough, or every handle is gone.
+                // Lazy records waited long enough or were asked for, or
+                // every handle is gone.
                 None if !waiting.is_empty() => group.append(&mut waiting),
                 None => return,
             }
@@ -254,7 +266,7 @@ impl<D: Disk> Committer<D> {
         let [hot, bulk] = buffers;
         let [hot_segment, bulk_segment] = self.active.each_ref();
         let dir_dirty = self.dir_dirty;
-        let disk = &self.disk;
+        let disk = &*self.disk;
         let (hot, bulk, dir) = tokio::join!(
             write_and_sync(hot_segment.as_ref(), hot),
             write_and_sync(bulk_segment.as_ref(), bulk),
@@ -300,6 +312,9 @@ impl<D: Disk> Committer<D> {
         let file = Arc::new(self.disk.create(&file_name(class, id)).await?);
         self.next_id = id.next();
         self.dir_dirty = true;
+        if let Some(previous) = &self.active[index] {
+            self.shared.seal(previous.id, self.clock.now());
+        }
         self.shared.add_segment(id, class, Arc::clone(&file));
         self.active[index] = Some(Active { id, file, len: 0 });
         Ok(())

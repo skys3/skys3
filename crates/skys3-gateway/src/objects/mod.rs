@@ -11,7 +11,16 @@
 //! the request is answered only once the record is durable and applied.
 //! `If-None-Match: *` and `If-Match` are checked by the shard when it
 //! sequences the `PUT` ([`Precondition`]), and once before the body is read,
-//! so a write bound to fail does not upload its body first.
+//! so a write bound to fail does not upload its body first. A body of a
+//! `write_back` bucket, or of a `local` one with a backup target, that
+//! reaches `streaming_flush_min_bytes` commits an `UPLOAD_BEGIN` while it
+//! streams, and its `PUT` inherits that record's write identity (§7.2); a
+//! body that fails leaves the record naming no write.
+//!
+//! **Write-through.** In a `write_back` bucket whose `ack_policy` is
+//! `write_through`, and a `local` one whose `backup_ack` is, every write
+//! that makes a version of a key is answered only once the remote target or
+//! the backup target holds it (§7.5, §8.9, `write_through`).
 //!
 //! **Metadata.** The record keeps the standard headers S3 stores
 //! (`Cache-Control`, `Content-Disposition`, `Content-Encoding`,
@@ -35,17 +44,40 @@
 //! and so does SkyS3. `partNumber=N` serves the `N`th part of a multipart
 //! object, with `206` and `x-amz-mp-parts-count`, and `partNumber=1` the
 //! whole of any other. An object with tags reports their number in
-//! `x-amz-tagging-count`.
+//! `x-amz-tagging-count`. A GET reads its bytes from a holder its shard's
+//! primary names in the read plan (§9.2), the gateway's own node first,
+//! under a registration that keeps them on the holder while they stream
+//! (`holders`); when no holder still has the version, the read resolves
+//! the key again. Before it asks a holder, a GET looks the version up in
+//! the node's [`HotCache`], and a whole object read from another node's
+//! holder fills it. A GET of a coded version reads it from the fragments
+//! its layout names, decoding a stripe that lost some (§8.5, `coded`);
+//! when too few of a stripe's fragments can be read, the read resolves
+//! the key again. A GET of an evicted version of a `write_back`
+//! bucket reads it through a fill from the remote ([`Fills`]); when the fill
+//! finds the remote changed and adopts its version, the read resolves the
+//! key again, at most [`MAX_FILL_ROUNDS`] times.
+//!
+//! **`read_only` buckets** (§9.5, `origin`) reject writes, and check every
+//! GET and HEAD against the bucket's origin, by a HEAD or, under a TTL, by
+//! what one saw recently, before they serve the cached version the origin
+//! holds; a gateway that cannot fill an evicted version reads it straight
+//! from the origin.
 //!
 //! DeleteObject and DeleteObjects are in `delete`, CopyObject in `copy`,
 //! GetObjectTagging, PutObjectTagging, and DeleteObjectTagging in `tagging`,
-//! and multipart uploads in `multipart`.
+//! multipart uploads in `multipart`, and UploadPartCopy, which reads its
+//! source as a GET does, in `part_copy`.
 
+mod coded;
 mod download;
+mod holders;
+mod origin;
 mod upload;
+mod write_through;
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::request::Parts;
 use http_body_util::BodyExt;
@@ -54,26 +86,45 @@ use s3s::dto::{
     PutObjectOutput, Range, StreamingBlob,
 };
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
+use skys3_config::BucketsConfig;
+use skys3_ec::FragmentSource;
 use skys3_index::{ObjectVersion, Payload};
 use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
-use skys3_log::record::{IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put, PutData};
+use skys3_log::record::{
+    ExtentRef, IDENTITY_METADATA, IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put,
+    PutData,
+};
 use skys3_types::checksum::ChecksumAlgorithm;
-use skys3_types::{BucketDocument, WriteIdentity};
+use skys3_types::{BucketDocument, BucketMode, EpochSeq, NodeId, WriteIdentity};
 
 use crate::admission::Admission;
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
+use crate::fill::{FillError, Fills};
+use crate::hot_cache::{HotCache, ObjectName, VersionName};
+use crate::origin::OriginValidations;
+use crate::peer_s3::{ApplyBy, Carrier, PeerAccess, reveals_identity};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
 pub(crate) use copy::copy_source;
 pub use delete::MAX_DELETE_KEYS;
+use holders::{HolderReads, Keep};
+pub(crate) use tagging::tags_from_xml;
 pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
-pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};
-use upload::Upload;
+pub(crate) use tagging::{parse_tagging_header, tagging_header};
+use upload::{Streaming, Upload};
+use write_through::WriteThrough;
+pub(crate) use write_through::backed_up;
+
+/// How many times a GET resolves its key again after a read-through fill
+/// found the key changed, such as after the fill adopted the remote's
+/// version, or after no holder still had the version its plan named
+/// (§9.2), before it answers `503`.
+const MAX_FILL_ROUNDS: usize = 3;
 
 /// The largest object a single PUT stores: 5 GiB, S3's limit.
 pub const MAX_OBJECT_BYTES: u64 = 5 << 30;
@@ -159,7 +210,7 @@ macro_rules! overrides {
 /// Fills a GetObject or HeadObject output from a resolved read, then
 /// replaces the headers the request overrides.
 macro_rules! describe {
-    ($output:expr, $found:expr, $checksum_mode:expr, $overrides:expr) => {{
+    ($output:expr, $found:expr, $checksum_mode:expr, $overrides:expr, $reveal:expr) => {{
         let found: &Found = &$found;
         let object = &found.object;
         let header = |name: &str| object.metadata.get(name).cloned();
@@ -177,7 +228,7 @@ macro_rules! describe {
         $output.e_tag = Some(s3_etag(object));
         $output.last_modified = Some(last_modified(object));
         $output.storage_class = storage_class(object);
-        let metadata: s3s::dto::Metadata = user_metadata(&object.metadata).collect();
+        let metadata: s3s::dto::Metadata = user_metadata(&object.metadata, $reveal).collect();
         $output.metadata = (!metadata.is_empty()).then_some(metadata);
         $output.tag_count = i32::try_from(object.tags.len())
             .ok()
@@ -211,7 +262,11 @@ mod copy;
 mod delete;
 mod multipart;
 mod namespace;
+mod part_copy;
 mod tagging;
+
+#[cfg(feature = "test-util")]
+pub(crate) use part_copy::CopyRange;
 
 pub use multipart::{MAX_MULTIPART_OBJECT_BYTES, MIN_PART_BYTES, parse_upload_id, upload_id};
 
@@ -220,9 +275,25 @@ pub(crate) struct Objects<H> {
     shards: H,
     inline_max_bytes: usize,
     extent_bytes: usize,
+    streaming_flush_min_bytes: Option<u64>,
+    flush_part_bytes: u64,
+    min_part_bytes: u64,
+    max_body_duration: Duration,
     pool: Option<BlockingPool>,
+    fills: Option<Arc<dyn Fills>>,
     admission: Arc<dyn Admission>,
     remote: Option<Arc<dyn RemoteReads>>,
+    holders: HolderReads,
+    hot_cache: HotCache,
+    fragments: Option<Arc<dyn FragmentSource>>,
+    write_through: WriteThrough,
+    /// Each bucket's settings: a `read_only` bucket's freshness (§9.5).
+    buckets: BucketsConfig,
+    /// What the origins of `read_only` buckets were seen to hold (§9.5).
+    validations: OriginValidations,
+    /// Which access keys are peer clusters' flushers, which may store their
+    /// write identity with what they write (§7.8).
+    peer_access: PeerAccess,
 }
 
 impl<H: Shards> Objects<H> {
@@ -231,9 +302,55 @@ impl<H: Shards> Objects<H> {
             shards,
             inline_max_bytes: usize::try_from(config.inline_max_bytes).unwrap_or(usize::MAX),
             extent_bytes: usize::try_from(config.extent_bytes).unwrap_or(usize::MAX),
+            streaming_flush_min_bytes: config.streaming_flush_min_bytes,
+            flush_part_bytes: config.flush_part_bytes,
+            min_part_bytes: config.min_part_bytes,
+            max_body_duration: config.max_body_duration,
             pool: config.hashing_pool.clone(),
+            fills: config.fills.clone(),
             admission: Arc::clone(&config.admission),
             remote: config.remote.clone(),
+            holders: HolderReads::new(config.read_registration_renew_interval),
+            hot_cache: config.hot_cache.clone(),
+            fragments: config.fragments.clone(),
+            write_through: WriteThrough::new(config.buckets.clone(), config.write_through_timeout),
+            buckets: config.buckets.clone(),
+            validations: config.origin_validations.clone(),
+            peer_access: config.peer_access.clone(),
+        }
+    }
+
+    /// Who may set the write identity on a write to `bucket` by the
+    /// request with `extensions`.
+    pub(crate) fn carrier<'a>(
+        &'a self,
+        bucket: &'a BucketDocument,
+        extensions: &'a http::Extensions,
+    ) -> Carrier<'a> {
+        Carrier::of(&self.peer_access, extensions, &bucket.name)
+    }
+
+    /// Answers a write to `bucket` that committed `version` of `key` in
+    /// `shard`: at once, or for a `write_through` bucket once the remote
+    /// target holds the version (§7.5).
+    ///
+    /// # Errors
+    ///
+    /// For a `write_through` bucket, `503 SlowDown` if the version does not
+    /// reach the remote in time, and `409 OperationAborted` if its key is
+    /// held in conflict; the write stays committed either way.
+    async fn acknowledge(
+        &self,
+        bucket: &BucketDocument,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+    ) -> S3Result<()> {
+        match self.write_through.wait_of(bucket) {
+            Some(timeout) => {
+                write_through::reach_remote(&self.shards, shard, key, version, timeout).await
+            }
+            None => Ok(()),
         }
     }
 
@@ -269,7 +386,7 @@ impl<H: Shards> Objects<H> {
         {
             return Err(entity_too_large());
         }
-        let metadata = stored_metadata(&input)?;
+        let metadata = stored_metadata(&input, self.carrier(bucket, &extensions))?;
         let tags = input
             .tagging
             .as_deref()
@@ -277,7 +394,8 @@ impl<H: Shards> Objects<H> {
             .transpose()?
             .unwrap_or_default();
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(ApplyBy::of(&extensions));
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
         if condition != Precondition::None {
@@ -288,8 +406,22 @@ impl<H: Shards> Objects<H> {
         let expected = ExpectedChecksums::from_headers(&headers)?;
         let trailers = extensions.get::<Trailers>().cloned();
         let validator = ChecksumValidator::on(expected, trailers, self.pool.clone())?;
-        let (verified, data) = self
-            .receive(&shard, &input.key, input.body.take(), validator)
+        // Only a bucket with a remote target streams a PUT to it (§7.3): a
+        // `write_back` bucket, or a `local` one with a backup target
+        // (§8.9).
+        let stream = self
+            .streaming_flush_min_bytes
+            .filter(|_| {
+                bucket.mode == BucketMode::WriteBack || self.write_through.backed_up(bucket)
+            })
+            .map(|min_bytes| Streaming {
+                min_bytes,
+                part_bytes: self.flush_part_bytes,
+                metadata: metadata.clone(),
+                tags: tags.clone(),
+            });
+        let (verified, data, inherited_identity) = self
+            .receive(&shard, &input.key, input.body.take(), validator, stream)
             .await?;
 
         let put = Put {
@@ -297,7 +429,7 @@ impl<H: Shards> Objects<H> {
             size: verified.length,
             last_modified_ms: now_ms(),
             etag: verified.etag.clone(),
-            inherited_identity: None,
+            inherited_identity,
             metadata,
             tags,
             checksums: verified.checksums,
@@ -305,10 +437,13 @@ impl<H: Shards> Objects<H> {
             data,
         };
         let checksums = put.checksums.clone();
-        self.shards
+        let key = put.key.clone();
+        let version = self
+            .shards
             .write(&shard, RecordBody::Put(put), condition)
             .await
             .map_err(shard_error)??;
+        self.acknowledge(bucket, &shard, &key, version).await?;
         let mut output = PutObjectOutput {
             e_tag: Some(s3s::dto::ETag::Strong(verified.etag.as_str().to_owned())),
             ..PutObjectOutput::default()
@@ -320,29 +455,37 @@ impl<H: Shards> Objects<H> {
     /// Streams a request body of `key` into `shard` through `validator`:
     /// inline, or as `EXTENT` records while it arrives ([`Upload`]). It
     /// returns once the body has been read to its end and passed its
-    /// checks, and its extents are applied.
+    /// checks, and its extents are applied, with the position of the
+    /// `UPLOAD_BEGIN` it committed once it reached `stream`'s threshold,
+    /// whose write identity its `PUT` inherits (§7.2), and announced to the
+    /// shard's primary (§7.3).
     ///
     /// # Errors
     ///
     /// `400 EntityTooLarge` past [`MAX_OBJECT_BYTES`], which is also the
-    /// largest part; the body's and the validator's errors.
+    /// largest part; `400 RequestTimeout` once a body streamed as extents
+    /// has taken longer than `max_body_duration`, waiting for the client's
+    /// next bytes included; the body's and the validator's errors.
     async fn receive(
         &self,
         shard: &ShardRef,
         key: &str,
         body: Option<StreamingBlob>,
         mut validator: ChecksumValidator,
-    ) -> S3Result<(VerifiedBody, PutData)> {
+        stream: Option<Streaming>,
+    ) -> S3Result<(VerifiedBody, PutData, Option<EpochSeq>)> {
         let mut upload = Upload::new(
             self.shards.clone(),
             shard.clone(),
             key.to_owned(),
             self.inline_max_bytes,
             self.extent_bytes,
-        );
+            self.max_body_duration,
+        )
+        .streamed(stream);
         let mut body = s3s::Body::from(body.unwrap_or_else(empty_blob));
         let mut length = 0u64;
-        while let Some(frame) = body.frame().await {
+        while let Some(frame) = upload.before_deadline(body.frame()).await? {
             let Ok(data) = frame.map_err(|error| body_error(&*error))?.into_data() else {
                 continue;
             };
@@ -354,8 +497,9 @@ impl<H: Shards> Objects<H> {
             validator.update(data).await?;
         }
         let verified = validator.finish().await?;
+        let identity = upload.identity();
         let data = upload.finish().await?;
-        Ok((verified, data))
+        Ok((verified, data, identity))
     }
 
     pub(crate) async fn get(
@@ -371,32 +515,126 @@ impl<H: Shards> Objects<H> {
             if_modified_since: input.if_modified_since.as_ref(),
             if_unmodified_since: input.if_unmodified_since.as_ref(),
         };
-        let found = self
-            .resolve(
-                bucket,
-                &input.key,
-                conditions,
-                input.range,
-                input.part_number,
-            )
+        let (range, part_number) = (input.range, input.part_number);
+        let (found, body) = self
+            .open(bucket, &input.key, conditions, |shard, version, object| {
+                select(shard, version, object, range, part_number)
+            })
             .await?;
-        let body = if found.remote {
-            self.read_remote(bucket, &input.key, &found).await?
-        } else {
-            download::read(
-                &self.shards,
-                &found.shard,
-                &found.object.payload,
-                found.bytes.clone(),
-            )
-            .await?
-        };
         let mut output = GetObjectOutput {
             body: Some(body),
             ..GetObjectOutput::default()
         };
-        describe!(output, found, input.checksum_mode, overrides);
+        describe!(
+            output,
+            found,
+            input.checksum_mode,
+            overrides,
+            reveals_identity(&req.extensions)
+        );
         Ok(output)
+    }
+
+    /// Resolves a read of `key` whose bytes `selector` chooses, and opens
+    /// them: at the remote for a key only there (§9.1), from the hot cache,
+    /// from a holder the read plan names, or through a fill for an evicted
+    /// version (§9.2). A GET reads this way, and so does UploadPartCopy its
+    /// source. When no holder still has the planned version, or a fill finds
+    /// the key changed, the key is resolved again, at most
+    /// [`MAX_FILL_ROUNDS`] times.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Objects::resolve`], and `503 ServiceUnavailable`
+    /// when the bytes cannot be read.
+    async fn open(
+        &self,
+        bucket: &BucketDocument,
+        key: &str,
+        conditions: ReadConditions<'_>,
+        selector: impl Fn(ShardRef, EpochSeq, ObjectVersion) -> S3Result<Found>,
+    ) -> S3Result<(Found, StreamingBlob)> {
+        let mut rounds = 0;
+        loop {
+            let found = self
+                .resolve(bucket, key, conditions, &selector, true)
+                .await?;
+            if found.remote {
+                let body = self.read_remote(bucket, key, &found).await?;
+                return Ok((found, body));
+            }
+            if let Some(body) = self.read_hot(bucket, key, &found) {
+                return Ok((found, body));
+            }
+            if found.object.coded.is_some() {
+                match self.read_coded(bucket, key, &found).await? {
+                    Ok(body) => return Ok((found, body)),
+                    // Too few fragments of a stripe: the version may have
+                    // been replaced and its fragments reclaimed since the
+                    // plan, so the key is resolved again.
+                    Err(error) if rounds + 1 < MAX_FILL_ROUNDS => {
+                        tracing::debug!(shard = %found.shard, key, %error,
+                            "a coded read did not start");
+                        rounds += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(s3_error!(
+                            ServiceUnavailable,
+                            "The object's fragments could not be read: {error}"
+                        ));
+                    }
+                }
+            }
+            if !found.evicted {
+                if found.holders.is_empty() {
+                    // A version whose bytes no replica holds, as a copy
+                    // of an evicted object.
+                    return Err(download::not_cached());
+                }
+                match self.read_held(bucket, key, &found).await {
+                    Some(body) => return Ok((found, body)),
+                    // No holder still has the version: it was replaced or
+                    // evicted since the plan, so the key is resolved again.
+                    None if rounds + 1 < MAX_FILL_ROUNDS => {
+                        rounds += 1;
+                        continue;
+                    }
+                    None => {
+                        return Err(s3_error!(
+                            ServiceUnavailable,
+                            "The object changed while it was read; please retry"
+                        ));
+                    }
+                }
+            }
+            match self.fill(bucket, key, &found).await? {
+                Ok(body) => return Ok((found, body)),
+                Err(FillError::Changed) if rounds + 1 < MAX_FILL_ROUNDS => rounds += 1,
+                // Only the shard's primary fills: elsewhere, a version of
+                // an origin is read straight from it (§9.5).
+                Err(FillError::Unavailable(reason)) if bucket.mode == BucketMode::ReadOnly => {
+                    tracing::debug!(shard = %found.shard, key, %reason,
+                        "no fill; reading the origin");
+                    match self.read_origin(bucket, key, &found).await? {
+                        Some(body) => return Ok((found, body)),
+                        None if rounds + 1 < MAX_FILL_ROUNDS => rounds += 1,
+                        None => {
+                            return Err(s3_error!(
+                                ServiceUnavailable,
+                                "The object changed while it was read; please retry"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(s3_error!(
+                        ServiceUnavailable,
+                        "The object's bytes could not be read from the bucket's target: {error}"
+                    ));
+                }
+            }
+        }
     }
 
     pub(crate) async fn head(
@@ -412,43 +650,158 @@ impl<H: Shards> Objects<H> {
             if_modified_since: input.if_modified_since.as_ref(),
             if_unmodified_since: input.if_unmodified_since.as_ref(),
         };
+        let (range, part_number) = (input.range, input.part_number);
+        let selector = |shard, version, object| select(shard, version, object, range, part_number);
         let found = self
-            .resolve(
-                bucket,
-                &input.key,
-                conditions,
-                input.range,
-                input.part_number,
-            )
+            .resolve(bucket, &input.key, conditions, selector, false)
             .await?;
         let mut output = HeadObjectOutput::default();
-        describe!(output, found, input.checksum_mode, overrides);
+        describe!(
+            output,
+            found,
+            input.checksum_mode,
+            overrides,
+            reveals_identity(&req.extensions)
+        );
         Ok(output)
     }
 
+    /// The bytes of `found`, a version of `key`, from the hot cache, if it
+    /// holds that version (§9.2).
+    fn read_hot(&self, bucket: &BucketDocument, key: &str, found: &Found) -> Option<StreamingBlob> {
+        if found.bytes.is_empty() {
+            return None;
+        }
+        let (object, version) = hot_names(bucket, key, found);
+        let data = self.hot_cache.get(&object, &version, found.bytes.clone())?;
+        Some(StreamingBlob::from_bytes(data))
+    }
+
+    /// The bytes of `found`, a version of `key`, from the first of the
+    /// plan's holders that still holds it (§9.2), or `None` if none does.
+    /// A read of the whole object from another node's holder fills the hot
+    /// cache, if it admits the object.
+    async fn read_held(
+        &self,
+        bucket: &BucketDocument,
+        key: &str,
+        found: &Found,
+    ) -> Option<StreamingBlob> {
+        if found.bytes.is_empty() {
+            return Some(empty_blob());
+        }
+        let local = self.shards.node();
+        let whole = found.bytes == (0..found.object.size);
+        for holder in self.holders.order(&found.holders, local.as_ref()) {
+            let keep = (whole
+                && Some(&holder) != local.as_ref()
+                && self.hot_cache.admits(found.object.size))
+            .then(|| {
+                let (object, version) = hot_names(bucket, key, found);
+                Keep {
+                    cache: self.hot_cache.clone(),
+                    object,
+                    version,
+                    size: found.object.size,
+                }
+            });
+            let opened = self
+                .holders
+                .open(
+                    &self.shards,
+                    (&found.shard, &holder),
+                    key,
+                    found.version,
+                    found.layout.clone(),
+                    found.bytes.clone(),
+                    keep,
+                )
+                .await;
+            match opened {
+                Ok(Some(body)) => return Some(body),
+                Ok(None) => {
+                    tracing::debug!(shard = %found.shard, %holder, key,
+                        "a holder no longer has the version");
+                }
+                Err(error) => {
+                    tracing::debug!(shard = %found.shard, %holder, key, %error,
+                        "a holder did not serve the version");
+                }
+            }
+        }
+        None
+    }
+
+    /// Reads the bytes of `found`, an evicted version of `key`, through a
+    /// read-through fill (§9.2).
+    ///
+    /// # Errors
+    ///
+    /// `503 ServiceUnavailable` for a bucket that is neither `write_back`
+    /// nor `read_only`, or a gateway without [`Fills`] for a `write_back`
+    /// one; the fill's errors.
+    async fn fill(
+        &self,
+        bucket: &BucketDocument,
+        key: &str,
+        found: &Found,
+    ) -> S3Result<Result<StreamingBlob, FillError>> {
+        let fills = self.fills.as_ref();
+        let Some(fills) = fills.filter(|_| bucket.mode.has_target()) else {
+            if bucket.mode == BucketMode::ReadOnly {
+                let none = "this node does not fill".to_owned();
+                return Ok(Err(FillError::Unavailable(none)));
+            }
+            return Err(download::not_cached());
+        };
+        let read = fills
+            .read(&found.shard, key, found.version, found.bytes.clone())
+            .await;
+        Ok(read.map(|body| download::filled(body, found.bytes.end - found.bytes.start)))
+    }
+
     /// Resolves a read: the key's object, the conditions checked, and the
-    /// bytes to serve.
+    /// bytes `selector` chooses to serve, with where to read them if
+    /// `planned`.
     async fn resolve(
         &self,
         bucket: &BucketDocument,
         key: &str,
         conditions: ReadConditions<'_>,
-        range: Option<Range>,
-        part_number: Option<i32>,
+        selector: impl Fn(ShardRef, EpochSeq, ObjectVersion) -> S3Result<Found>,
+        planned: bool,
     ) -> S3Result<Found> {
         let shard = ShardRef::for_key(bucket, key);
-        let found = self.lookup(bucket, &shard, key).await?;
+        let found = self.lookup(bucket, &shard, key, planned).await?;
         conditions.check(&found.object)?;
-        let mut selected = select(shard, found.object, range, part_number)?;
+        let mut selected = selector(shard, found.version, found.object)?;
         selected.remote = found.remote;
+        selected.evicted = found.evicted;
+        selected.layout = found.layout;
+        selected.holders = found.holders;
         Ok(selected)
     }
+}
+
+/// The names the hot cache keeps `found`, a version of `key` in `bucket`,
+/// under: the bucket and key, and the version's position and ETag.
+fn hot_names(bucket: &BucketDocument, key: &str, found: &Found) -> (ObjectName, VersionName) {
+    let object = ObjectName {
+        bucket: bucket.bucket_id.clone(),
+        key: key.to_owned(),
+    };
+    let version = VersionName {
+        position: found.version,
+        etag: found.object.local_etag.clone(),
+    };
+    (object, version)
 }
 
 /// Selects the bytes of `object` a read serves: a `Range`, a part, or the
 /// whole object.
 fn select(
     shard: ShardRef,
+    version: EpochSeq,
     object: ObjectVersion,
     range: Option<Range>,
     part_number: Option<i32>,
@@ -464,7 +817,7 @@ fn select(
             let bytes = range
                 .check(object.size)
                 .map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
-            return Ok(Found::range(shard, object, bytes, None));
+            return Ok(Found::range(shard, version, object, bytes, None));
         }
         (None, Some(number)) => {
             if let Payload::Parts { parts, .. } = &object.payload {
@@ -478,7 +831,7 @@ fn select(
                 let start: u64 = parts[..index].iter().map(|part| part.size).sum();
                 let bytes = start..start + parts[index].size;
                 let count = i32::try_from(parts.len()).ok();
-                return Ok(Found::range(shard, object, bytes, count));
+                return Ok(Found::range(shard, version, object, bytes, count));
             }
             // An object stored by a single PUT has one part.
             if number != 1 {
@@ -490,17 +843,23 @@ fn select(
     };
     Ok(Found {
         shard,
+        version,
         object,
         bytes,
         content_range: None,
         parts_count: None,
         remote: false,
+        evicted: false,
+        layout: Vec::new(),
+        holders: Vec::new(),
     })
 }
 
 /// A resolved read.
 struct Found {
     shard: ShardRef,
+    /// The version's position, which names it (§9.2).
+    version: EpochSeq,
     object: ObjectVersion,
     /// The bytes to serve.
     bytes: std::ops::Range<u64>,
@@ -512,6 +871,12 @@ struct Found {
     /// Whether the object is only at the remote, which serves its bytes
     /// (§9.1).
     remote: bool,
+    /// Whether the entry is evicted, so a fill serves its bytes (§9.2).
+    evicted: bool,
+    /// The version's bytes as log positions, from the read plan.
+    layout: Vec<ExtentRef>,
+    /// The nodes the read plan names as holders of the bytes.
+    holders: Vec<NodeId>,
 }
 
 impl Found {
@@ -519,6 +884,7 @@ impl Found {
     /// they are empty.
     fn range(
         shard: ShardRef,
+        version: EpochSeq,
         object: ObjectVersion,
         bytes: std::ops::Range<u64>,
         parts_count: Option<i32>,
@@ -527,11 +893,15 @@ impl Found {
             .then(|| format!("bytes {}-{}/{}", bytes.start, bytes.end - 1, object.size));
         Self {
             shard,
+            version,
             object,
             bytes,
             content_range,
             parts_count,
             remote: false,
+            evicted: false,
+            layout: Vec::new(),
+            holders: Vec::new(),
         }
     }
 }
@@ -632,24 +1002,32 @@ fn storage_class(object: &ObjectVersion) -> Option<s3s::dto::StorageClass> {
 /// `400 InvalidArgument` for the write identity's reserved name, and
 /// `400 MetadataTooLarge` for user metadata over
 /// [`MAX_USER_METADATA_BYTES`] or metadata over what a record holds.
-fn stored_metadata(input: &PutObjectInput) -> S3Result<Metadata> {
-    metadata_of(standard_headers!(input), input.metadata.as_ref())
+fn stored_metadata(input: &PutObjectInput, carrier: Carrier<'_>) -> S3Result<Metadata> {
+    metadata_of(standard_headers!(input), input.metadata.as_ref(), carrier)
 }
 
 /// [`stored_metadata`] from the standard headers, as [`standard_headers!`]
 /// lists them, and the user metadata of a PutObject, a CopyObject, or a
-/// CreateMultipartUpload.
+/// CreateMultipartUpload. The write identity is kept only from a peer's
+/// flusher that may carry it (`carrier`, §7.8), outside the user
+/// metadata's limit, in the room reserved for it.
 fn metadata_of(
     standard: [(&str, &Option<String>); 6],
     user: Option<&s3s::dto::Metadata>,
+    carrier: Carrier<'_>,
 ) -> S3Result<Metadata> {
     let mut metadata: Metadata = standard
         .into_iter()
         .filter_map(|(name, value)| Some((name.to_owned(), value.clone()?)))
         .collect();
     let mut user_bytes = 0;
+    let mut identity = None;
     for (name, value) in user.into_iter().flatten() {
         let name = name.to_ascii_lowercase();
+        if name == WriteIdentity::METADATA_KEY && carrier.accepts(value) {
+            identity = Some(value.clone());
+            continue;
+        }
         if name == WriteIdentity::METADATA_KEY {
             return Err(s3_error!(
                 InvalidArgument,
@@ -670,16 +1048,20 @@ fn metadata_of(
              {MAX_USER_METADATA_BYTES} bytes of user metadata"
         ));
     }
+    if let Some(identity) = identity {
+        metadata.insert(IDENTITY_METADATA.to_owned(), identity);
+    }
     Ok(metadata)
 }
 
-/// The user metadata clients see: names without their prefix, and never
-/// the write identity, which an object imported or adopted from the remote
-/// can carry (§7.2).
-fn user_metadata(metadata: &Metadata) -> impl Iterator<Item = (String, String)> + '_ {
-    metadata.iter().filter_map(|(name, value)| {
+/// The user metadata clients see: names without their prefix, and the
+/// write identity, which an object imported or adopted from the remote, or
+/// written by a peer, can carry (§7.2), only if `reveal`: for a peer's
+/// flusher (§7.8).
+fn user_metadata(metadata: &Metadata, reveal: bool) -> impl Iterator<Item = (String, String)> + '_ {
+    metadata.iter().filter_map(move |(name, value)| {
         let name = name.strip_prefix(USER_METADATA_PREFIX)?;
-        (name != WriteIdentity::METADATA_KEY).then(|| (name.to_owned(), value.clone()))
+        (reveal || name != WriteIdentity::METADATA_KEY).then(|| (name.to_owned(), value.clone()))
     })
 }
 

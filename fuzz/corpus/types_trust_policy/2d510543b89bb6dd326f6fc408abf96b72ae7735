@@ -1,0 +1,2 @@
+9  (fsubject
+{"Version": "1006-1", "Statement": [{"Sid": "a", "Effect": "Allw", "Principal": {"Federated": ["https://idp.example", "http:"]}, "Action": ["sts:Adentity", "sts:*"], "Condition": {"StringLike": {"idp.example:sub": ["a*", "?b"], "idp.example:azp": "a"}}}, {"Effect"

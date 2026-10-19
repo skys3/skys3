@@ -11,12 +11,13 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+use aws_lc_rs::{hkdf, hmac};
 use quinn::congestion::{BbrConfig, CubicConfig, NewRenoConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{IdleTimeout, TransportConfig, VarInt};
+use quinn::{AsyncUdpSocket, ConnectionIdGenerator, IdleTimeout, TransportConfig, VarInt};
 use rustls::pki_types::CertificateDer;
 use skys3_config::{CongestionControl, PeeringConfig};
 use skys3_types::{ClusterId, NodeId};
@@ -36,6 +37,9 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often an otherwise quiet connection sends a packet, so that it
 /// outlives [`IDLE_TIMEOUT`] and NAT bindings.
 pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many keep-alives a quiet connection sends per idle timeout.
+const KEEP_ALIVES_PER_IDLE_TIMEOUT: u32 = 6;
 
 /// The most streams a source may have open on one connection: one per
 /// object or batch in flight.
@@ -69,6 +73,11 @@ pub struct EndpointSettings {
     pub max_inflight_bytes: u64,
     /// The capabilities this end announces in its `HELLO`.
     pub capabilities: Capabilities,
+    /// How long a connection may go without any packet before it is lost:
+    /// [`IDLE_TIMEOUT`], which a simulation may shorten. Quiet connections
+    /// send a keep-alive every sixth of it, every [`KEEP_ALIVE_INTERVAL`]
+    /// by default.
+    pub idle_timeout: Duration,
 }
 
 impl EndpointSettings {
@@ -81,6 +90,7 @@ impl EndpointSettings {
             connect_timeout: config.peer_connect_timeout(),
             max_inflight_bytes: config.peer_max_inflight_bytes,
             capabilities: Capabilities::KNOWN,
+            idle_timeout: IDLE_TIMEOUT,
         }
     }
 
@@ -89,11 +99,10 @@ impl EndpointSettings {
         let cap = self.max_inflight_bytes;
         let initial = cap.min(INITIAL_WINDOW);
         let mut transport = TransportConfig::default();
+        let idle = IdleTimeout::try_from(self.idle_timeout).unwrap_or(VarInt::MAX.into());
         transport
-            .max_idle_timeout(Some(
-                IdleTimeout::try_from(IDLE_TIMEOUT).expect("the idle timeout fits a VarInt"),
-            ))
-            .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
+            .max_idle_timeout(Some(idle))
+            .keep_alive_interval(Some(self.idle_timeout / KEEP_ALIVES_PER_IDLE_TIMEOUT))
             .max_concurrent_bidi_streams(MAX_STREAMS_PER_CONNECTION.into())
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .datagram_receive_buffer_size(None)
@@ -120,6 +129,62 @@ impl EndpointSettings {
 /// `value` as a QUIC variable-length integer, saturating.
 fn varint(value: u64) -> VarInt {
     VarInt::from_u64(value).unwrap_or(VarInt::MAX)
+}
+
+/// What the seed of [`PeerEndpoint::with_socket`] is mixed with for the
+/// address-validation token key, and for the client's initial connection
+/// IDs, so that they differ from the endpoint's other draws.
+const TOKEN_KEY_SEED: u64 = 0x746f_6b65_6e5f_6b65;
+const INITIAL_CID_SEED: u64 = 0x696e_6974_5f63_6964;
+
+/// The length of a seeded endpoint's connection IDs, and of its initial
+/// destination connection IDs: the 8 bytes RFC 9000 requires of the
+/// latter.
+const CID_LEN: usize = 8;
+
+/// Bytes drawn from a seed, with SplitMix64: not a cryptographic
+/// generator, which a deterministic simulation does not need.
+#[derive(Debug, Clone)]
+struct Seeded(u64);
+
+impl Seeded {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn array<const N: usize>(&mut self) -> [u8; N] {
+        let mut bytes = [0; N];
+        for chunk in bytes.chunks_mut(8) {
+            let next = self.next().to_le_bytes();
+            chunk.copy_from_slice(&next[..chunk.len()]);
+        }
+        bytes
+    }
+}
+
+/// The connection IDs of a seeded endpoint, drawn from its seed.
+struct SeededCids(Seeded);
+
+impl ConnectionIdGenerator for SeededCids {
+    fn generate_cid(&mut self) -> quinn::ConnectionId {
+        quinn::ConnectionId::new(&self.0.array::<CID_LEN>())
+    }
+
+    fn cid_len(&self) -> usize {
+        CID_LEN
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// The flow-control window of a connection: twice its bandwidth-delay
@@ -215,22 +280,97 @@ impl PeerEndpoint {
         tls: &PeerTls,
         settings: EndpointSettings,
     ) -> io::Result<Self> {
+        let (server, client) = Self::configs(tls, &settings, None);
+        let endpoint = quinn::Endpoint::server(server, address)?;
+        Ok(Self::with_endpoint(endpoint, client, tls, settings))
+    }
+
+    /// An endpoint over `socket`, any [`AsyncUdpSocket`] such as a
+    /// simulated network's, on the current Tokio runtime. With a `seed`,
+    /// everything the endpoint draws at random comes from it instead of
+    /// the operating system: QUIC's own generator, connection IDs, and the
+    /// keys of stateless resets and address-validation tokens. Only TLS
+    /// draws its own (its key shares and randoms), which changes bytes on
+    /// the wire but not their sizes. A deterministic simulation passes
+    /// one; a node never does.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of reading the socket's address.
+    pub fn with_socket(
+        socket: Arc<dyn AsyncUdpSocket>,
+        tls: &PeerTls,
+        settings: EndpointSettings,
+        seed: Option<u64>,
+    ) -> io::Result<Self> {
+        let (server, client) = Self::configs(tls, &settings, seed);
+        let mut config = quinn::EndpointConfig::default();
+        if let Some(seed) = seed {
+            let mut bytes = Seeded::new(seed);
+            config = quinn::EndpointConfig::new(Arc::new(hmac::Key::new(
+                hmac::HMAC_SHA256,
+                &bytes.array::<64>(),
+            )));
+            config.rng_seed(Some(bytes.array()));
+            let cids = bytes.next();
+            config.cid_generator(move || Box::new(SeededCids(Seeded::new(cids))));
+        }
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            config,
+            Some(server),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        Ok(Self::with_endpoint(endpoint, client, tls, settings))
+    }
+
+    /// The server and client configurations of an endpoint, seeded from
+    /// `seed` if there is one.
+    fn configs(
+        tls: &PeerTls,
+        settings: &EndpointSettings,
+        seed: Option<u64>,
+    ) -> (quinn::ServerConfig, quinn::ClientConfig) {
         let transport = Arc::new(settings.transport());
-        let server_tls = QuicServerConfig::try_from(tls.server_config())
-            .expect("the aws-lc-rs provider has QUIC's initial cipher suite");
-        let mut server = quinn::ServerConfig::with_crypto(Arc::new(server_tls));
+        let server_tls = Arc::new(
+            QuicServerConfig::try_from(tls.server_config())
+                .expect("the aws-lc-rs provider has QUIC's initial cipher suite"),
+        );
+        let mut server = match seed {
+            Some(seed) => {
+                let key = Seeded::new(seed ^ TOKEN_KEY_SEED).array::<64>();
+                let key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&key);
+                quinn::ServerConfig::new(server_tls, Arc::new(key))
+            }
+            None => quinn::ServerConfig::with_crypto(server_tls),
+        };
         server.transport_config(transport.clone());
         let client_tls = QuicClientConfig::try_from(tls.client_config())
             .expect("the aws-lc-rs provider has QUIC's initial cipher suite");
         let mut client = quinn::ClientConfig::new(Arc::new(client_tls));
         client.transport_config(transport);
-        let endpoint = quinn::Endpoint::server(server, address)?;
+        if let Some(seed) = seed {
+            let initial = Mutex::new(Seeded::new(seed ^ INITIAL_CID_SEED));
+            client.initial_dst_cid_provider(Arc::new(move || {
+                let mut bytes = initial.lock().unwrap_or_else(PoisonError::into_inner);
+                quinn::ConnectionId::new(&bytes.array::<CID_LEN>())
+            }));
+        }
+        (server, client)
+    }
+
+    fn with_endpoint(
+        endpoint: quinn::Endpoint,
+        client: quinn::ClientConfig,
+        tls: &PeerTls,
+        settings: EndpointSettings,
+    ) -> Self {
         let hello = Hello {
             cluster: tls.cluster().clone(),
             versions: SUPPORTED_VERSIONS,
             capabilities: settings.capabilities,
         };
-        Ok(Self {
+        Self {
             inner: Arc::new(EndpointInner {
                 endpoint,
                 client,
@@ -238,7 +378,7 @@ impl PeerEndpoint {
                 trust: tls.trust().clone(),
                 settings,
             }),
-        })
+        }
     }
 
     /// The address the endpoint is bound to.

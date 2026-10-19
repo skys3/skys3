@@ -27,6 +27,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -619,7 +625,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.3.1",
  "rand_core 0.10.1",
 ]
 
@@ -668,6 +674,15 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "cpufeatures"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -870,6 +885,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1035,6 +1056,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "foldhash",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
+dependencies = [
+ "hashbrown",
 ]
 
 [[package]]
@@ -1943,6 +1973,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "readme-rustdocifier"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
+
+[[package]]
 name = "redb"
 version = "4.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1958,6 +1994,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "reed-solomon-simd"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffef0520d30fbd4151fb20e262947ae47fb0ab276a744a19b6398438105a072"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "fixedbitset",
+ "once_cell",
+ "readme-rustdocifier",
 ]
 
 [[package]]
@@ -2048,9 +2096,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -2353,7 +2401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.3.1",
  "digest 0.11.3",
 ]
 
@@ -2364,7 +2412,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.3.1",
  "digest 0.11.3",
 ]
 
@@ -2409,25 +2457,34 @@ checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 name = "skys3"
 version = "0.1.0"
 dependencies = [
+ "aws-config",
+ "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-http-client",
+ "aws-types",
+ "base64",
  "bytes",
  "http",
  "http-body-util",
  "md-5",
  "prometheus-client",
  "rand 0.9.5",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "skys3-config",
  "skys3-control",
+ "skys3-coord",
+ "skys3-ec",
  "skys3-flush",
  "skys3-gateway",
  "skys3-index",
  "skys3-io",
  "skys3-log",
+ "skys3-net",
  "skys3-obs",
+ "skys3-peer",
  "skys3-remote",
  "skys3-shard",
  "skys3-sim",
@@ -2436,19 +2493,23 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "yaml-rust2",
 ]
 
 [[package]]
 name = "skys3-cluster-sim"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
  "md-5",
+ "quinn",
  "rand 0.9.5",
  "rcgen",
  "s3s",
@@ -2456,6 +2517,7 @@ dependencies = [
  "skys3-config",
  "skys3-control",
  "skys3-coord",
+ "skys3-ec",
  "skys3-flush",
  "skys3-gateway",
  "skys3-index",
@@ -2463,6 +2525,7 @@ dependencies = [
  "skys3-log",
  "skys3-net",
  "skys3-obs",
+ "skys3-peer",
  "skys3-remote",
  "skys3-shard",
  "skys3-sim",
@@ -2518,6 +2581,7 @@ name = "skys3-coord"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "prometheus-client",
  "proptest",
  "prost",
  "rcgen",
@@ -2525,6 +2589,35 @@ dependencies = [
  "skys3-control",
  "skys3-io",
  "skys3-net",
+ "skys3-obs",
+ "skys3-types",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "skys3-ec"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "prometheus-client",
+ "proptest",
+ "prost",
+ "rand 0.9.5",
+ "rcgen",
+ "reed-solomon-simd",
+ "skys3-config",
+ "skys3-coord",
+ "skys3-ec",
+ "skys3-index",
+ "skys3-io",
+ "skys3-log",
+ "skys3-net",
+ "skys3-obs",
+ "skys3-shard",
+ "skys3-sim",
  "skys3-types",
  "thiserror",
  "tokio",
@@ -2538,21 +2631,29 @@ dependencies = [
  "base64",
  "bytes",
  "http",
+ "http-body",
  "md-5",
  "prometheus-client",
+ "proptest",
  "rand 0.9.5",
+ "rcgen",
  "s3s",
  "skys3-config",
  "skys3-control",
+ "skys3-ec",
+ "skys3-flush",
  "skys3-gateway",
  "skys3-index",
  "skys3-io",
  "skys3-log",
+ "skys3-net",
  "skys3-obs",
+ "skys3-peer",
  "skys3-remote",
  "skys3-shard",
  "skys3-sim",
  "skys3-types",
+ "thiserror",
  "tokio",
  "tracing",
 ]
@@ -2570,12 +2671,14 @@ dependencies = [
  "base64",
  "bytes",
  "crc-fast",
+ "crc32c",
  "http",
  "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
  "md-5",
+ "prometheus-client",
  "proptest",
  "prost",
  "quick-xml",
@@ -2589,16 +2692,19 @@ dependencies = [
  "skys3-config",
  "skys3-control",
  "skys3-coord",
+ "skys3-ec",
  "skys3-gateway",
  "skys3-index",
  "skys3-io",
  "skys3-log",
  "skys3-net",
+ "skys3-obs",
  "skys3-peer",
  "skys3-shard",
  "skys3-types",
  "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -2680,6 +2786,7 @@ dependencies = [
 name = "skys3-obs"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "http",
  "http-body-util",
@@ -2690,12 +2797,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
 name = "skys3-peer"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "bytes",
  "crc32c",
@@ -2751,6 +2860,7 @@ dependencies = [
  "skys3-log",
  "skys3-net",
  "skys3-obs",
+ "skys3-shard",
  "skys3-sim",
  "skys3-types",
  "thiserror",
@@ -3523,6 +3633,16 @@ name = "xxhash-rust"
 version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
+name = "yaml-rust2"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57e5b818a27a4cd30884ea380857a5e56f7ec3ba24a3990a3cc0b95af3238e18"
+dependencies = [
+ "arraydeque",
+ "hashlink",
+]
 
 [[package]]
 name = "yasna"

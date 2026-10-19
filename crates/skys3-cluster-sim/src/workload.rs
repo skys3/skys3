@@ -19,7 +19,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use ::http::{Method, Request, Response, StatusCode};
@@ -32,7 +33,13 @@ use skys3_gateway::ShardRef;
 use skys3_sim::history::{Call, Condition, History, Outcome, Pending};
 use skys3_types::{BucketDocument, NodeId, ShardConfig};
 
+use crate::cluster::WriteTiming;
+use crate::large_objects::Versions;
 use crate::s3::{self, NoAnswer};
+
+mod large;
+
+pub(crate) use large::single_put_etags;
 
 /// The shape of the client workload.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,12 +57,21 @@ pub struct Workload {
     pub think_time: Duration,
     /// How long a client waits for an answer.
     pub timeout: Duration,
+    /// How long a client waits for a connection, if not `timeout`: a
+    /// short one lets clients that send to any node, as through a load
+    /// balancer, move on from a node that is down instead of waiting out
+    /// `timeout` each time they draw it.
+    pub connect_timeout: Option<Duration>,
     /// Whether clients send each request to a node drawn at random, whose
     /// gateway routes it to the primary, rather than to the primary
     /// itself. A forwarded write may still apply after the gateway gave up
     /// on it or crashed, so writes that fail or reach a node that crashes
     /// are recorded as unknown.
     pub any_gateway: bool,
+    /// The share of operations, in percent, that are `GET`s drawn ahead
+    /// of the usual mix, which has 30% of them; 0, the default, draws
+    /// nothing ahead of it.
+    pub get_percent: u8,
 }
 
 impl Default for Workload {
@@ -67,17 +83,29 @@ impl Default for Workload {
             max_body: 2048,
             think_time: Duration::from_millis(200),
             timeout: Duration::from_secs(2),
+            connect_timeout: None,
             any_gateway: false,
+            get_percent: 0,
         }
     }
 }
 
+impl Workload {
+    /// How long a client waits for a connection.
+    fn connecting(&self) -> Duration {
+        self.connect_timeout.unwrap_or(self.timeout)
+    }
+}
+
 /// Where the workload sends each key: the bucket documents, each shard's
-/// configuration, whose primary serves it, and every node.
+/// configuration, whose primary serves it, and the nodes clients know.
 #[derive(Clone, Debug)]
 pub(crate) struct Routes {
     pub buckets: Vec<BucketDocument>,
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
+    /// The nodes in the cluster from the start, which any-gateway clients
+    /// draw from: not those that join later
+    /// ([`ClusterConfig::joining`](crate::ClusterConfig::joining)).
     pub nodes: Vec<NodeId>,
 }
 
@@ -118,11 +146,21 @@ pub(crate) fn etag_of(body: &[u8]) -> String {
 /// The ETag S3 gives a multipart object of the single part `body`: the
 /// MD5 of the part's MD5, in hex, and the part count.
 pub(crate) fn multipart_etag_of(body: &[u8]) -> String {
-    let mut hex = String::with_capacity(34);
-    for byte in Md5::digest(Md5::digest(body)) {
+    multipart_etag(&[body])
+}
+
+/// The ETag S3 gives a multipart object of `parts`: the MD5 of the parts'
+/// MD5s, in hex, and the part count (§7.4).
+pub(crate) fn multipart_etag(parts: &[&[u8]]) -> String {
+    let mut digests = Md5::new();
+    for part in parts {
+        digests.update(Md5::digest(part));
+    }
+    let mut hex = String::with_capacity(36);
+    for byte in digests.finalize() {
         let _ = write!(hex, "{byte:02x}");
     }
-    hex.push_str("-1");
+    let _ = write!(hex, "-{}", parts.len());
     hex
 }
 
@@ -170,6 +208,13 @@ fn multipart_etags_digest_the_part_digests() {
     assert_eq!(element(xml, "Key"), None);
 }
 
+/// Whether `response` refused a body that took longer to stream than the
+/// gateway allows (§10.3), as one a fault held up may.
+fn timed_out(response: &Response<Bytes>) -> bool {
+    response.status() == StatusCode::BAD_REQUEST
+        && element(&String::from_utf8_lossy(response.body()), "Code") == Some("RequestTimeout")
+}
+
 /// An answer the workload does not expect, which fails the simulation.
 fn unexpected(what: &str, response: &Response<Bytes>) -> Box<dyn std::error::Error> {
     format!(
@@ -178,6 +223,42 @@ fn unexpected(what: &str, response: &Response<Bytes>) -> Box<dyn std::error::Err
         String::from_utf8_lossy(response.body())
     )
     .into()
+}
+
+/// Where clients record how long their writes took, and how many of
+/// their `GET`s broke off mid-body. Clones share the record.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Timings {
+    writes: Arc<Mutex<Vec<WriteTiming>>>,
+    broken: Arc<AtomicUsize>,
+}
+
+impl Timings {
+    fn push(&self, timing: WriteTiming) {
+        self.writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(timing);
+    }
+
+    /// Every write recorded so far, leaving none.
+    pub(crate) fn take(&self) -> Vec<WriteTiming> {
+        std::mem::take(&mut *self.writes.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// How many `GET`s were answered and then broke off mid-body.
+    pub(crate) fn broken(&self) -> usize {
+        self.broken.load(Ordering::Relaxed)
+    }
+}
+
+/// What a client calls with the history's name of a key each time a write
+/// of it is acknowledged, right after the history records it.
+pub(crate) type OnAck = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// The simulated time since the run began.
+fn elapsed() -> Duration {
+    turmoil::sim_elapsed().unwrap_or_default()
 }
 
 /// One client of the workload.
@@ -189,6 +270,18 @@ pub(crate) struct Client {
     pub rng: SmallRng,
     /// The last value this client saw for each key, for `If-Match`.
     seen: BTreeMap<String, String>,
+    /// Where the client records its writes' times, if anywhere.
+    timings: Option<Timings>,
+    /// What the client tells of each acknowledged write, if anything.
+    on_ack: Option<OnAck>,
+    /// With the large-object mix, where the client registers each version
+    /// it may make before it sends it ([`ClusterConfig::large_objects`]).
+    ///
+    /// [`ClusterConfig::large_objects`]: crate::ClusterConfig::large_objects
+    large: Option<Versions>,
+    /// The multipart uploads of the large-object mix not known to be
+    /// completed or aborted, which the client aborts once it is done.
+    uploads: Vec<large::OpenUpload>,
 }
 
 impl Client {
@@ -206,6 +299,53 @@ impl Client {
             workload,
             rng: SmallRng::seed_from_u64(seed),
             seen: BTreeMap::new(),
+            timings: None,
+            on_ack: None,
+            large: None,
+            uploads: Vec::new(),
+        }
+    }
+
+    /// The same client, telling `on_ack` of each acknowledged write.
+    pub(crate) fn with_acks(mut self, on_ack: Option<OnAck>) -> Self {
+        self.on_ack = on_ack;
+        self
+    }
+
+    /// The same client, sending the large-object mix and registering each
+    /// version it may make in `versions`, if given.
+    pub(crate) fn with_large_objects(mut self, versions: Option<Versions>) -> Self {
+        self.large = versions;
+        self
+    }
+
+    /// Records the answer of a write of the key the history names `name`.
+    fn answer_write(&self, pending: Pending, outcome: Outcome, name: &str) {
+        let acknowledged = outcome == Outcome::Done;
+        self.history.answer(pending, outcome);
+        if acknowledged && let Some(on_ack) = &self.on_ack {
+            on_ack(name);
+        }
+    }
+
+    /// The same client, recording how long each write takes in `timings`.
+    pub(crate) fn with_timings(mut self, timings: Timings) -> Self {
+        self.timings = Some(timings);
+        self
+    }
+
+    /// Records a write to `key` in `bucket` sent at `sent` that ended with
+    /// `outcome` now. A write that never connected is recorded too, as
+    /// unanswered: the history leaves it out, since it reached no node, but
+    /// the client waited for it all the same.
+    fn time(&self, bucket: &BucketDocument, key: &str, sent: Duration, outcome: &Outcome) {
+        if let Some(timings) = &self.timings {
+            timings.push(WriteTiming {
+                shard: ShardRef::for_key(bucket, key),
+                sent,
+                took: elapsed().saturating_sub(sent),
+                answered: matches!(outcome, Outcome::Done | Outcome::ConditionFailed),
+            });
         }
     }
 
@@ -219,6 +359,16 @@ impl Client {
             let bucket = self.rng.random_range(0..self.routes.buckets.len());
             let bucket = self.routes.buckets[bucket].clone();
             let key = format!("key-{}", self.rng.random_range(0..self.workload.keys));
+            if let Some(versions) = self.large.clone() {
+                self.large_operation(&versions, &bucket, &key, n).await?;
+                continue;
+            }
+            if self.workload.get_percent > 0
+                && self.rng.random_range(0..100) < self.workload.get_percent
+            {
+                self.read(&bucket, &key, Method::GET).await?;
+                continue;
+            }
             match self.rng.random_range(0..100) {
                 0..24 => self.put(&bucket, &key, n, Condition::None).await?,
                 24..27 => self.multipart(&bucket, &key, n, Condition::None).await?,
@@ -242,7 +392,9 @@ impl Client {
                 _ => self.delete(&bucket, &key).await?,
             }
         }
-        Ok(())
+        // Uploads the client left open are aborted, as a transfer manager
+        // aborts the uploads it gives up on.
+        self.abort_open_uploads().await
     }
 
     /// The node to send a request on `key` in `bucket` to: its primary,
@@ -273,7 +425,7 @@ impl Client {
         request: Request<Full<Bytes>>,
     ) -> Result<Response<Bytes>, NoAnswer> {
         let timeout = self.workload.timeout;
-        let answer = match s3::connect(host, timeout).await {
+        let answer = match s3::connect(host, self.workload.connecting()).await {
             Ok(connection) => connection.send(request, timeout).await,
             Err(error) => Err(error),
         };
@@ -294,7 +446,7 @@ impl Client {
         request: Request<Full<Bytes>>,
     ) -> Option<(Pending, Result<Response<Bytes>, NoAnswer>)> {
         let timeout = self.workload.timeout;
-        let connection = match s3::connect(host, timeout).await {
+        let connection = match s3::connect(host, self.workload.connecting()).await {
             Ok(connection) => connection,
             Err(error) => {
                 tracing::debug!(process = %self.process, %host, %error, "no connection");
@@ -334,8 +486,24 @@ impl Client {
         condition: Condition,
     ) -> turmoil::Result {
         let body = self.body(n);
+        self.put_body(bucket, key, body, condition, &[]).await
+    }
+
+    /// Sends a `PUT` of `body` to `key` in `bucket` with `condition` and
+    /// the `headers` given, and records it.
+    async fn put_body(
+        &mut self,
+        bucket: &BucketDocument,
+        key: &str,
+        body: Bytes,
+        condition: Condition,
+        headers: &[(&str, &str)],
+    ) -> turmoil::Result {
         let value = etag_of(&body);
         let mut request = Request::put(format!("/{}/{key}", bucket.name));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         match &condition {
             Condition::None => {}
             Condition::IfAbsent => request = request.header("if-none-match", "*"),
@@ -350,13 +518,15 @@ impl Client {
             condition: condition.clone(),
         };
         let host = self.host(bucket, key);
+        let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK => {
-                    self.seen.insert(name, value);
+                    self.seen.insert(name.clone(), value);
                     Outcome::Done
                 }
                 StatusCode::PRECONDITION_FAILED if condition != Condition::None => {
@@ -367,11 +537,13 @@ impl Client {
                     Outcome::ConditionFailed
                 }
                 status if status.is_server_error() => self.write_failed(),
+                _ if timed_out(&response) => self.write_failed(),
                 _ => return Err(unexpected("a PUT", &response)),
             },
             Err(_) => Outcome::Unknown,
         };
-        self.history.answer(pending, outcome);
+        self.time(bucket, key, sent, &outcome);
+        self.answer_write(pending, outcome, &name);
         Ok(())
     }
 
@@ -409,7 +581,9 @@ impl Client {
         let request =
             Request::put(format!("{path}?partNumber=1&uploadId={id}")).body(Full::new(part))?;
         match self.send(&host, request).await {
-            Ok(response) if response.status().is_server_error() => return Ok(()),
+            Ok(response) if response.status().is_server_error() || timed_out(&response) => {
+                return Ok(());
+            }
             Ok(response) if response.status() == StatusCode::OK => {}
             Ok(response) => return Err(unexpected("an UploadPart", &response)),
             Err(_) => return Ok(()),
@@ -429,13 +603,15 @@ impl Client {
             value: value.clone(),
             condition: condition.clone(),
         };
+        let sent = elapsed();
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK if String::from_utf8_lossy(response.body()).contains(&value) => {
-                    self.seen.insert(name, value);
+                    self.seen.insert(name.clone(), value);
                     Outcome::Done
                 }
                 StatusCode::PRECONDITION_FAILED if condition != Condition::None => {
@@ -446,7 +622,8 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
-        self.history.answer(pending, outcome);
+        self.time(bucket, key, sent, &outcome);
+        self.answer_write(pending, outcome, &name);
         Ok(())
     }
 
@@ -477,7 +654,7 @@ impl Client {
                         .and_then(|etag| etag.to_str().ok())
                         .map(|etag| unquote(etag).to_owned())
                         .ok_or_else(|| unexpected("a read without an ETag", &response))?;
-                    if method == Method::GET && !body_matches(response.body(), &etag) {
+                    if method == Method::GET && !self.read_matches(&response, &etag) {
                         return Err(unexpected("a GET whose body does not match", &response));
                     }
                     self.seen.insert(name, etag.clone());
@@ -487,6 +664,12 @@ impl Client {
                 status if status.is_server_error() => Outcome::Failed,
                 _ => return Err(unexpected("a read", &response)),
             },
+            Err(NoAnswer::Broken(_)) => {
+                if let Some(timings) = &self.timings {
+                    timings.broken.fetch_add(1, Ordering::Relaxed);
+                }
+                Outcome::Unknown
+            }
             Err(_) => Outcome::Unknown,
         };
         let definite = matches!(outcome, Outcome::Read(_));
@@ -494,14 +677,35 @@ impl Client {
         Ok(definite)
     }
 
+    /// Whether the body of `response`, a `GET`, is the object its `etag`
+    /// names: by the ETag's own rule for a single part, and for more parts
+    /// by the version of the large-object mix its metadata names.
+    fn read_matches(&self, response: &Response<Bytes>, etag: &str) -> bool {
+        let several = etag
+            .rsplit_once('-')
+            .is_some_and(|(_, parts)| parts.parse::<u32>().is_ok_and(|parts| parts >= 2));
+        match &self.large {
+            Some(versions) if several => {
+                let op = response
+                    .headers()
+                    .get(large::OP_HEADER)
+                    .and_then(|op| op.to_str().ok());
+                op.is_some_and(|op| versions.matches(op, response.body(), etag))
+            }
+            _ => body_matches(response.body(), etag),
+        }
+    }
+
     async fn delete(&mut self, bucket: &BucketDocument, key: &str) -> turmoil::Result {
         let request = Request::delete(format!("/{}/{key}", bucket.name)).body(Full::default())?;
         let name = history_key(bucket, key);
         let host = self.host(bucket, key);
+        let sent = elapsed();
         let Some((pending, answer)) = self
             .send_recorded(&host, &name, Call::Delete, request)
             .await
         else {
+            self.time(bucket, key, sent, &Outcome::Unknown);
             return Ok(());
         };
         let outcome = match answer {
@@ -512,8 +716,37 @@ impl Client {
             },
             Err(_) => Outcome::Unknown,
         };
-        self.history.answer(pending, outcome);
+        self.time(bucket, key, sent, &outcome);
+        self.answer_write(pending, outcome, &name);
         Ok(())
+    }
+
+    /// Writes a new value to each of `keys`, as [`Routes::keys`] lists
+    /// them, once the faults have healed, retrying a key until a write of
+    /// it is acknowledged, and returns the value each key was acknowledged
+    /// with.
+    pub(crate) async fn write_each(
+        &mut self,
+        keys: &[(String, BucketDocument, String)],
+        attempts: usize,
+    ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        let mut acknowledged = BTreeMap::new();
+        for (n, (name, bucket, key)) in keys.iter().enumerate() {
+            for attempt in 0..attempts {
+                self.seen.remove(name);
+                self.put(bucket, key, n * attempts + attempt, Condition::None)
+                    .await?;
+                if let Some(value) = self.seen.get(name) {
+                    acknowledged.insert(name.clone(), value.clone());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if !acknowledged.contains_key(name) {
+                return Err(format!("no write of {name} was acknowledged").into());
+            }
+        }
+        Ok(acknowledged)
     }
 
     /// Reads every key from its primary until each gives a definite
@@ -532,6 +765,79 @@ impl Client {
             if !answered {
                 return Err(format!("the primary of {}/{key} never answered", bucket.name).into());
             }
+        }
+        if self.large.is_some() {
+            self.abort_listed_uploads(attempts).await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_control::ProposalIds;
+    use skys3_types::{BucketId, BucketMode, BucketName, ShardCount};
+
+    use super::*;
+
+    /// A write whose connection never opens still counts against the
+    /// client's latency: it is timed, as unanswered, for the whole time
+    /// the client spent trying.
+    #[test]
+    fn writes_that_never_connect_are_timed_as_unanswered() -> turmoil::Result {
+        const TIMEOUT: Duration = Duration::from_secs(2);
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(Duration::from_secs(60))
+            .build();
+        // A node whose messages from the client are held, never delivered.
+        sim.host("node-0", || async {
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        let timings = Timings::default();
+        let recorded = timings.clone();
+        sim.client("client", async move {
+            let bucket = BucketDocument {
+                bucket_id: BucketId::new("b-test")?,
+                name: BucketName::new("bucket-test")?,
+                mode: BucketMode::Local,
+                shards: ShardCount::new(1)?,
+                replicas: 1,
+                min_write_replicas: 1,
+                clean_copies: 1,
+                target: None,
+                created_unix_ms: 0,
+                lifecycle: None,
+                proposal_id: ProposalIds::seeded(1).next_id(),
+            };
+            let routes = Routes {
+                buckets: vec![bucket.clone()],
+                placement: Arc::new(BTreeMap::new()),
+                nodes: vec![NodeId::new("node-0")?],
+            };
+            let workload = Workload {
+                timeout: TIMEOUT,
+                any_gateway: true,
+                ..Workload::default()
+            };
+            let mut client = Client::new("client".to_owned(), routes, History::new(), workload, 1)
+                .with_timings(timings);
+            turmoil::hold("client", "node-0");
+            client.put(&bucket, "key-0", 0, Condition::None).await?;
+            client
+                .multipart(&bucket, "key-0", 1, Condition::None)
+                .await?;
+            client.delete(&bucket, "key-0").await?;
+            Ok(())
+        });
+        sim.run()?;
+        let writes = recorded.take();
+        // The multipart upload never got as far as its completion, the
+        // only part of it that is a write.
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        for write in &writes {
+            assert!(!write.answered, "{write:?}");
+            assert!(write.took >= TIMEOUT, "{write:?}");
         }
         Ok(())
     }

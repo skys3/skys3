@@ -1,0 +1,2 @@
+repo:rA.5p actioneV
+{"Version": "201-17","Statement": {"Effect": "'Allow", "Principal": {"Federated": "\rn:aws:"}, "Action": "iity", "NotAction": {"StringEquNVV": {"toke0ipal": {"Federated": ["https://idp.ex"]}, "Action": ["sts:As"]

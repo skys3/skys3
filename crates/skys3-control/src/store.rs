@@ -257,6 +257,19 @@ pub enum ControlError {
     /// `cluster.json` does not exist.
     #[error("the control store has no cluster.json; the cluster is not bootstrapped")]
     NotBootstrapped,
+    /// `cluster.json` holds an older generation than a copy already read
+    /// from the store: the store was reset, or rebuilt from older copies,
+    /// and a node does not follow a store backwards (design §6.2).
+    #[error(
+        "the control store is at generation {found}, older than generation {kept} of the local \
+         copy: it was reset or rebuilt from older state"
+    )]
+    GenerationBehind {
+        /// The generation of the local copy.
+        kept: Generation,
+        /// The generation `cluster.json` holds.
+        found: Generation,
+    },
     /// `cluster.json` names another cluster.
     #[error("the control store belongs to cluster {found}, not {expected}")]
     ClusterMismatch {

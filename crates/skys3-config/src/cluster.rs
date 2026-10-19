@@ -122,7 +122,10 @@ impl ControlStoreConfig {
     ///
     /// - The target must not hold keys under the control prefix, nor the
     ///   control prefix keys of the target: in one bucket, one prefix must
-    ///   not start with the other. Otherwise a credential for the target
+    ///   not start with the other. Endpoints of one host or address reach
+    ///   the same buckets, and so do AWS S3 endpoints of every region of
+    ///   one partition, since AWS bucket names are unique per partition
+    ///   (`aws`, `aws-cn`, `aws-us-gov`). Otherwise a credential for the target
     ///   would also reach the registers. This holds even with
     ///   `allow_correlated_control_store`.
     /// - The target must not share the control store's failure scope: the
@@ -141,11 +144,17 @@ impl ControlStoreConfig {
         let Some(scope) = target::failure_scope(endpoint) else {
             return Ok(());
         };
-        if target::failure_scope(&target.endpoint).as_ref() != Some(&scope) {
-            return Ok(());
-        }
+        let target_scope = target::failure_scope(&target.endpoint);
         let target_prefix = target.prefix.as_deref().unwrap_or_default();
-        if target.bucket == *bucket
+        // AWS bucket names are unique per partition: an endpoint of any
+        // region of the partition reaches the same bucket, so a control
+        // bucket named through another region's endpoint is still the
+        // control bucket.
+        let same_buckets = target_scope.as_deref().is_some_and(|other| {
+            target::bucket_namespace(other) == target::bucket_namespace(&scope)
+        });
+        if same_buckets
+            && target.bucket == *bucket
             && (self.prefix.starts_with(target_prefix) || target_prefix.starts_with(&self.prefix))
         {
             return Err(format!(
@@ -155,7 +164,7 @@ impl ControlStoreConfig {
                 self.prefix
             ));
         }
-        if self.allow_correlated_control_store {
+        if target_scope.as_ref() != Some(&scope) || self.allow_correlated_control_store {
             return Ok(());
         }
         Err(format!(

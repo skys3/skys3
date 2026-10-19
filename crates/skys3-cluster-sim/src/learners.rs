@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use skys3_control::ProposalIds;
-use skys3_control::{ControlError, S3ControlStore};
+use skys3_control::{ControlError, RegisterKey, RegisterKind, S3ControlStore};
 use skys3_gateway::ShardRef;
 use skys3_shard::replication::{BoxFuture, ControlRegisters, Replaced, ShardRegisters};
 use skys3_sim::SimS3;
@@ -378,7 +378,7 @@ impl ReplicatedServices {
 /// whose register in `registers` names their node.
 async fn follow(shards: &ReplicatedShards, registers: &S3ControlStore<SimS3>) {
     let node = &shards.node;
-    for shard in shards.placement.keys() {
+    for shard in &followed(shards, registers) {
         let Some(config) = register(registers, shard) else {
             continue;
         };
@@ -398,6 +398,22 @@ async fn follow(shards: &ReplicatedShards, registers: &S3ControlStore<SimS3>) {
             tracing::debug!(%shard, %error, "following the shard's register failed");
         }
     }
+}
+
+/// The shards whose registers a node follows: those of the static
+/// placement, and those whose registers exist, which includes the shards
+/// of buckets the gateways created (plan M3-04), unknown to the static
+/// placement.
+fn followed(shards: &ReplicatedShards, registers: &S3ControlStore<SimS3>) -> BTreeSet<ShardRef> {
+    let prefix = registers.config().prefix.as_str();
+    let created = registers.objects().keys().into_iter().filter_map(|key| {
+        let key = RegisterKey::new(key.strip_prefix(prefix)?).ok()?;
+        match key.kind() {
+            RegisterKind::Shard(bucket, shard) => Some(ShardRef { bucket, shard }),
+            _ => None,
+        }
+    });
+    shards.placement.keys().cloned().chain(created).collect()
 }
 
 /// One life of a node following the shard registers that name it, and

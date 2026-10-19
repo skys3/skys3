@@ -54,6 +54,8 @@ pub(crate) async fn serve<A: Authenticator>(
 pub(crate) enum NoAnswer {
     /// The connection failed or broke.
     Io(String),
+    /// The answer began, and its body broke off.
+    Broken(String),
     /// The answer did not arrive in time.
     Timeout,
 }
@@ -62,6 +64,7 @@ impl std::fmt::Display for NoAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NoAnswer::Io(error) => write!(f, "the connection failed: {error}"),
+            NoAnswer::Broken(error) => write!(f, "the answer broke off: {error}"),
             NoAnswer::Timeout => f.write_str("no answer in time"),
         }
     }
@@ -106,7 +109,11 @@ impl Connection {
                 .await
                 .map_err(|e| io(&e))?;
             let (parts, body) = response.into_parts();
-            let body = body.collect().await.map_err(|e| io(&e))?.to_bytes();
+            let body = body
+                .collect()
+                .await
+                .map_err(|e| NoAnswer::Broken(e.to_string()))?
+                .to_bytes();
             Ok(Response::from_parts(parts, body))
         };
         tokio::time::timeout(timeout, exchange)

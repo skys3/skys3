@@ -131,14 +131,15 @@ The node storage engine (§10) and read registrations (§8.7).
 | `read_registration_ttl_seconds` | integer | `30` | Positive. |
 | `read_registration_renew_interval_seconds` | integer | `10` | Positive, and less than `read_registration_ttl_seconds`. |
 | `disk_min_free_bytes` | integer | `1073741824` (1 GiB) | May be 0, which turns the check off. Admission control (§13): while a log disk has less free space than this, writes that add data to the shards on it get `503 SlowDown`, and while the data directory's file system has less, every such write does. Deletes are still admitted. The margin keeps the disk from filling, since the first write error takes a disk out of service (§10.4). |
+| `lifecycle_interval_seconds` | integer | `3600` | Positive. How often each shard primary evaluates its bucket's lifecycle rules over its index, expiring objects and aborting abandoned multipart uploads (§8.7). An object is expired within this long after its expiry time. |
 
 ## `[cache]`
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `hot_cache_bytes_per_node` | integer | `68719476736` (64 GiB) | The node-local hot cache (§9.2). May be 0. |
-| `cache_max_bytes_per_node` | integer | `1099511627776` (1 TiB) | The bound on clean cache per node (§9.3). May be 0. |
-| `reserve_fraction` | float | `0.10` | At least 0 and less than 1. The share of each disk held back from caching, for learner catch-up and filesystem overhead (§9.3). |
+| `hot_cache_bytes_per_node` | integer | `1073741824` (1 GiB) | The node-local hot cache (§9.2), held in memory: whole objects of up to an eighth of it each that the node's gateway read from other nodes. It bounds the objects held and the fills in progress together. May be 0, which keeps none. |
+| `cache_max_bytes_per_node` | integer | `1099511627776` (1 TiB) | The bound on clean cache per node (§9.3): above it, clean payload is evicted least recently used first. May be 0, which keeps no clean payload once it is flushed. |
+| `reserve_fraction` | float | `0.10` | At least 0 and less than 1. The share of each disk held back from caching, for learner catch-up and filesystem overhead (§9.3): clean payload on a disk is evicted while the disk has less free than this share of its size, counting the payload already evicted as free. |
 
 ## `[flush]`
 
@@ -147,15 +148,16 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `ack_policy` | `"local"` or `"write_through"` | `"local"` | §7.5. |
-| `flush_min_concurrency_per_shard` | integer | `4` | Positive. |
-| `flush_max_concurrency_per_shard` | integer | `64` | At least `flush_min_concurrency_per_shard`. |
-| `flush_max_inflight_bytes_per_target` | integer | `1073741824` (1 GiB) | Positive. |
-| `streaming_flush_min_bytes` | integer | `67108864` (64 MiB) | Positive. |
-| `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. |
+| `write_through_timeout_seconds` | integer | `30` | Positive. How long a write to a `write_through` bucket waits for the remote flush before it is answered `503 SlowDown`; the write stays committed locally and is flushed later (§7.5). |
+| `flush_min_concurrency_per_shard` | integer | `4` | Positive. The floor of adaptive flush concurrency (§7.7): a node keeps at least this many requests in flight to a target for each of the target's shards it flushes, whatever the latency or throttling. |
+| `flush_max_concurrency_per_shard` | integer | `64` | At least `flush_min_concurrency_per_shard`. The ceiling: at most this many requests in flight to a target per shard the node flushes, and at most this many keys flushed at once by one shard. Equal bounds fix the concurrency. |
+| `flush_max_inflight_bytes_per_target` | integer | `1073741824` (1 GiB) | Positive. The bytes a node's flushers hold in memory for requests to one target: a single PUT's body, or one part of a multipart or streamed upload, from reading it until its answer. A larger body waits for the whole bound. |
+| `streaming_flush_min_bytes` | integer | `67108864` (64 MiB) | Positive. A single PUT to a `write_back` bucket whose body reaches it commits an `UPLOAD_BEGIN` while it streams, and takes that record's write identity (§7.2). |
+| `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. The part size of the remote multipart upload that such a PUT streams to (§7.3); a body of more than 10,000 parts is sent as one `PutObject` after it commits. |
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
 | `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
 | `import_max_keys_per_second` | integer | `100000` | Positive. The most remote keys the namespace import of one bucket lists a second (§9.1), so an attach does not crowd out client writes on the shards' logs or exceed the target's request rate. |
-| `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain. |
+| `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets and `read_only` origins for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain, or an origin's `origin_profile`. |
 
 ## `[ec]`
 
@@ -164,10 +166,11 @@ Erasure coding of `local` buckets (§8).
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `parity_fragments` | integer | `2` | Positive. `m` in every geometry. |
-| `max_data_fragments` | integer | `8` | Positive. The widest `k`. |
+| `max_data_fragments` | integer | `8` | Positive, and at most 255 with `parity_fragments`, since a stripe has at most 255 fragments (§8.4). The widest `k`. |
 | `min_eligible_nodes` | integer | `5` | Greater than `parity_fragments`, since a stripe puts at most one fragment on a node. |
-| `fragment_release_delay_seconds` | integer | `60` | May be 0 (§8.7). |
+| `fragment_release_delay_seconds` | integer | `60` | May be 0 (§8.7). Also how long compaction keeps payload no entry names before it drops it (§10.3). |
 | `fragment_orphan_after_seconds` | integer | `3600` | Positive (§8.4). |
+| `fragment_repair_after_seconds` | integer | `600` | Positive (§8.6). How long a node may leave a shard primary's fragment checks unanswered before the primary rebuilds the node's fragments elsewhere. A node that answers but no longer holds a fragment has it rebuilt at once. |
 | `repair_bytes_per_second_per_node` | integer | `104857600` (100 MiB/s) | Positive (§8.6). |
 
 ## `[buckets.defaults]` and `[buckets.<name>]` {#buckets}
@@ -183,21 +186,24 @@ Erasure coding of `local` buckets (§8).
 | `clean_copies` | integer | `1` | From 0 to `replicas` (§9.3). |
 | `import_parallel_streams` | integer | `32` | From 1 to 256. Key ranges a new namespace import lists in parallel, each with its own checkpoint; one rate limit, `import_max_keys_per_second`, covers them all (§9.1). |
 | `ec_min_object_bytes` | integer | `4194304` (4 MiB) | Positive (§8.2). |
-| `ec_stripe_data_bytes` | integer | `67108864` (64 MiB) | Positive. |
+| `ec_stripe_data_bytes` | integer | `67108864` (64 MiB) | Positive. Each fragment of a stripe in the narrowest geometry (`k = min_eligible_nodes − parity_fragments`, from 1 to `max_data_fragments`), `⌈ec_stripe_data_bytes / k⌉` rounded up to 64 bytes, is at most 256 MiB, the fragment store's limit: 768 MiB with the defaults. |
 | `ec_after_seconds` | integer | `600` | May be 0. |
-| `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). |
+| `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). `"write_through"` answers a write once the backup holds it, with `flush.write_through_timeout_seconds` as for `ack_policy` (§7.5). |
 | `index_snapshot_interval_seconds` | integer | `3600` | Positive (§8.9). |
-| `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. |
-| `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets have dirty data. |
+| `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. On a node with `[peering.peers]` tables, `auto` uses QUIC when the target serves a peer descriptor that verifies and a handshake succeeds, and S3 REST otherwise; `native` uses QUIC only, and waits while it cannot; `s3` never looks for a peer. Without peers, `auto` is S3 REST and a `native` target is not flushed. |
+| `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets take one: what a `local` bucket's backup lacks is not charged (§8.9). |
+| `freshness` | `"revalidate"` or `"ttl"` | `"revalidate"` | Only `read_only` buckets use it (§9.5). `"revalidate"` asks the origin on every GET and HEAD; `"ttl"` lets a read use what a HEAD sent up to `freshness_ttl_seconds` earlier saw. |
+| `freshness_ttl_seconds` | integer | `60` | From 1 to 86400. How stale a read of a `read_only` bucket with `freshness = "ttl"` may be (§9.5). |
+| `origin_profile` | string | none | 1 to 128 visible ASCII characters other than `[` and `]`. The profile of the shared AWS configuration whose credentials a `read_only` bucket's origin is read with; without it, the default credential chain's, as for `write_back` targets. It names the credential scope that what gateways learn of the origin is keyed by (§9.5). Every node needs the same value. |
 
 Keys allowed only in a `[buckets.<name>]` table:
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `ack_policy` | `"local"` or `"write_through"` | `flush.ack_policy` | §7.5. |
-| `flush_conflict_policy` | `"hold"`, `"overwrite"`, or `"discard_local"` | `flush.flush_conflict_policy` | §7.2. |
-| `backup_target` | target URL | none | Only for `mode = "local"` (§8.9). |
-| `snapshot_target` | target URL | `backup_target` | Where index snapshots go (§8.9). |
+| `flush_conflict_policy` | `"hold"`, `"overwrite"`, or `"discard_local"` | `flush.flush_conflict_policy` | §7.2. `"discard_local"` only for a `write_back` bucket: a `local` bucket's backup target holds or overwrites its conflicts, never discards them. |
+| `backup_target` | target URL | none | Only for `mode = "local"` (§8.9). Every node needs the same table: each follows the bucket's backup with what its own configuration says. |
+| `snapshot_target` | target URL | `backup_target` | Where index snapshots go, under `<prefix>.skys3-snapshots/` (§8.9). A bucket with neither key writes none; a `write_back` bucket's should lie outside its remote prefix. |
 | `peer_source` | cluster ID | none | The cluster this bucket receives native replication from (§7.8). A valid cluster ID other than this cluster's, with a `[peering.peers.<cluster-id>]` table. Not for a `read_only` bucket. A `COMMIT` applies only to a bucket whose `peer_source` is its source cluster, and the bucket is read-only to this cluster's own clients: their object writes get `403 AccessDenied`. |
 | `peer_local_writes` | boolean | `false` | Only with `peer_source`. `true` lets this cluster's own clients write the bucket too. Their versions carry this cluster's write identity, so a source `COMMIT` that expects its own fails its precondition (§7.8). |
 
@@ -210,13 +216,14 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `quic_listen` | socket address | `"0.0.0.0:7443"` | |
+| `quic_advertise` | array of strings | `[]` | At most 16 addresses, each `host:port` in at most 255 bytes: a host of ASCII letters, digits, `.`, and `-`, or a bracketed IPv6 address, and a port from 1 to 65535. The addresses of this node's QUIC endpoint as peers reach it, which the peer descriptors of its receiving buckets name and its `[transport]` key signs (§7.8). Empty: the node serves no descriptor, and sources reach its buckets over S3 REST only. |
 | `congestion_control` | `"cubic"`, `"new_reno"`, or `"bbr"` | `"cubic"` | BBR is experimental in Quinn. |
-| `peer_frame_bytes` | integer | `262144` (256 KiB) | From 1 to 16777216 (16 MiB). The size of a `DATA` frame and the largest object in a `BATCH`; a destination stages each frame as one log record. |
-| `peer_connect_timeout_ms` | integer | `3000` | Positive. |
+| `peer_frame_bytes` | integer | `262144` (256 KiB) | From 1 to 16777216 (16 MiB). The size of a `DATA` frame and the largest object in a `BATCH`, which also holds none over 1 MiB (design §7.8); a destination stages each frame as one log record. |
+| `peer_connect_timeout_ms` | integer | `3000` | Positive. How long a source's handshake with a peer, `HELLO`s included, may take before the target falls back to S3 REST (§7.8). |
 | `peer_connections_per_shard` | integer | `64` | Positive. |
 | `peer_max_inflight_bytes` | integer | `268435456` (256 MiB) | At least `peer_frame_bytes`. |
 | `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least 64 KiB plus the larger of `peer_frame_bytes` and 64 KiB: one staging and one frame, each charged at least 64 KiB (design §7.8). |
-| `peer_staging_ttl_seconds` | integer | `86400` | Positive. |
+| `peer_staging_ttl_seconds` | integer | `86400` | Positive. Also how long compaction keeps `EXTENT` records that nothing names (§10.3), so a client's request body must arrive within half of it, or it is refused with `400 RequestTimeout`. |
 
 ### `[peering.peers.<cluster-id>]`
 
@@ -226,6 +233,7 @@ A peer cluster this node trusts, keyed by its cluster ID (§12). Peer connection
 |---|---|---|---|
 | `ca_file` | path | required | Not empty. The peer's CA bundle in PEM; the peer's node certificates must lead to it and name the peer's cluster in their SPIFFE ID. |
 | `buckets` | array of `{ source, destination }` tables | `[]` | The bucket pairs the peer may write as a source: `source` is the peer's bucket ID, which its write identities carry, and `destination` is this cluster's bucket name. No pair appears twice. Empty for a peer this node only sends to. |
+| `s3_access_key_ids` | array of strings | `[]` | ASCII letters and digits, each listed for one peer only. The access keys the peer's flushers sign S3 requests with when they fall back to S3 REST (§7.8, §12): requests signed with one may write objects only in the buckets whose `peer_source` is the peer, whatever `peer_local_writes` allows, with the peer's write identities (`x-amz-meta-skys3-wid`) for its bucket pairs. The keys themselves are this cluster's identities, as any client's. |
 
 ## `[identity]`
 

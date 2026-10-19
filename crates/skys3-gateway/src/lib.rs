@@ -25,7 +25,11 @@
 //!   ([`Precondition`]) checked when the shard sequences the write. A body
 //!   up to `inline_max_bytes` is stored inline in its `PUT` record, a
 //!   larger one as `EXTENT` records while it arrives, and a PUT is answered
-//!   only once its record is durable and applied. User metadata is limited
+//!   only once its record is durable and applied. A GET of an evicted
+//!   version of a `write_back` bucket reads it through a read-through fill
+//!   from the bucket's remote target ([`Fills`]). Objects read from other
+//!   nodes stay in the node's [`HotCache`], which serves later GETs of the
+//!   same version. User metadata is limited
 //!   to [`MAX_USER_METADATA_BYTES`]. DeleteObjects deletes up to
 //!   [`MAX_DELETE_KEYS`] keys, each authorized on its own. CopyObject copies
 //!   the source's bytes into the destination's shard and commits a `PUT`
@@ -37,6 +41,9 @@
 //!   upload's ID ([`upload_id`]) is the position of its `MPU_CREATE`, the
 //!   write identity of the object it completes, which keeps its parts'
 //!   boundaries for GetObject's `partNumber` and the multipart ETag.
+//!   UploadPartCopy reads its source, or a byte range of it, as a GET
+//!   reads it, from any bucket of the cluster, and stores the bytes as a
+//!   part whose ETag is their MD5, as S3 does.
 //! - [`Admission`] control (§7.6, §13): before a write that adds data,
 //!   the gateway asks whether it may proceed, and answers `503 SlowDown`
 //!   with the [`Refusal`] if not, such as when the bucket's dirty-data
@@ -127,14 +134,19 @@ pub mod checksum;
 mod conditions;
 mod credentials;
 mod features;
+mod fill;
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod hot_cache;
+mod lifecycle;
 mod limits;
 mod listener;
 mod listing;
 mod local;
 mod objects;
+mod origin;
+mod peer_s3;
 mod peering;
 mod remote;
 pub mod routing;
@@ -149,6 +161,8 @@ pub use authz::{Permissions, Principal};
 pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, ShardPlacement, TARGET_HEADER};
 pub use conditions::{ConditionFailed, PeerCondition, Precondition, current_identity};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
+pub use fill::{FillBody, FillError, Fills};
+pub use hot_cache::{HotCache, HotCacheMetrics, HotCacheUsage};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
 pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};
@@ -158,13 +172,16 @@ pub use objects::{
     MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
     parse_upload_id, upload_id,
 };
+pub use origin::{MAX_ORIGIN_VALIDATIONS, OriginHead, OriginScope, OriginValidations};
+pub use peer_s3::{DESCRIPTOR_KEY, PeerAccess, PeerDescriptors};
 pub use peering::{BucketLookup, PeerCommits, PeerExtents};
 pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};
-pub use shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
+pub use shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome};
 pub use sigv4::{
     Authenticated, BodyError, CredentialLookup, LookupError, SecretAccessKey, SigV4Authenticator,
     SigningCredential, Trailers,
 };
+pub use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, StreamedBody};

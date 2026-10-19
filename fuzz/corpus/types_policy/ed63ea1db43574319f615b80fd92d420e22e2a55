@@ -1,0 +1,2 @@
+bu/key
+{"Version": "0212-10", "Statement": [{"Sid": "read", "Effect": "Allow","Resource": ["arn:aws:ucws:s3"]}, {"Effect": "Deny", "NotActitionurce": "arnet/*"}]}

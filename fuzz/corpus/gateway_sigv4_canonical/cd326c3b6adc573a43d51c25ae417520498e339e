@@ -1,0 +1,11 @@
+/fuzz/c
+conten.-encoding: awj-chunket
+x-amz-content-sha256: 'TREAMING-UNSIGNED-PAYLOAD-TRAILER
+x-amz-decoded-content-length: 5
+xer: x-Àmz-checksum--checksum-crc32
+
+5
+hello
+0
+xcrcamz-
+r

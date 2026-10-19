@@ -16,18 +16,22 @@
 //! which nothing can reach (see the `multipart` module).
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use skys3_index::{
-    Applier, Entry, EntryState, ImportRanges, IndexError, IndexWriter, ObjectVersion, Payload,
+    Applier, Coded, Entry, EntryState, ImportRanges, IndexError, IndexWriter, ObjectVersion,
+    Payload,
 };
 use skys3_log::record::{
-    Adopt, Delete, Flushed, IDENTITY_METADATA, Import, ImportProgress, Put, PutData, Tags,
+    Adopt, Delete, EcPublish, EcRelocate, Flushed, IDENTITY_METADATA, Import, ImportProgress, Put,
+    PutData, Tags,
 };
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
-use skys3_types::{EpochSeq, Seq};
+use skys3_types::{CodedStripe, EpochSeq, FragmentLocation, Seq};
 
 use crate::multipart;
+use crate::seeded::{SeededBug, is_seeded};
 
 /// The shard state machine. It holds no state of its own: everything it
 /// decides comes from the record and the index.
@@ -80,7 +84,9 @@ pub enum Effect {
     Imported,
     /// An `IMPORT_PROGRESS` became the shard's import progress.
     Progressed,
-    /// An `ADOPT` replaced a clean version with the remote's.
+    /// An `ADOPT` replaced the version it named with the remote's: a
+    /// clean one after a fill, or a dirty one that a conflict policy
+    /// discarded (§7.2).
     Adopted,
     /// An `EXTENT` was entered into the location map.
     Located,
@@ -94,6 +100,18 @@ pub enum Effect {
         /// How many parts the upload had.
         parts: usize,
     },
+    /// A `PART_FLUSHED` recorded a step of a streamed upload's remote
+    /// counterpart (§7.3): it was opened, took a part, or ended.
+    RemoteUploadMoved,
+    /// An `UPLOAD_BEGIN` fixed the write identity of a streamed PUT
+    /// (§7.2). It changes no entry: only the `PUT` that inherits the
+    /// identity does.
+    UploadBegun,
+    /// An `EC_PUBLISH` marked the key's current version coded (§8.4).
+    Published,
+    /// An `EC_RELOCATE` moved fragments of the current version's layout to
+    /// new locations (§8.6).
+    Relocated,
     /// A `CONFIG` or `TRUNCATE`, which change no entry.
     Unchanged,
 }
@@ -113,8 +131,9 @@ pub enum Rejection {
     /// is known.
     #[error("the key already has an entry")]
     HasEntry,
-    /// An `ADOPT` found the entry no longer clean: a local write committed
-    /// after the read plan.
+    /// An `ADOPT` found the entry at another version than it named, and
+    /// not clean: a local write committed after the read plan or the
+    /// conflict it resolves.
     #[error("the entry is {0:?}, not clean")]
     NotClean(EntryState),
     /// An `ADOPT` found the entry clean at another version than the read
@@ -171,6 +190,36 @@ pub enum Rejection {
     /// An `IMPORT_PROGRESS` whose ranges are out of order.
     #[error("the import ranges are out of order")]
     InvalidProgress,
+    /// A `PART_FLUSHED` names a remote upload this replica does not hold
+    /// for the local upload: never opened, ended already, or replaced by
+    /// another.
+    #[error("the remote upload is not recorded")]
+    NoRemoteUpload,
+    /// An `EC_PUBLISH` names a version that is no longer the key's
+    /// current one: an overwrite, a delete, or a tag change committed
+    /// after the encoder read it (§8.4). Its fragments become orphans.
+    #[error("the published version is superseded")]
+    Superseded,
+    /// An `EC_PUBLISH` names a version that another `EC_PUBLISH` coded
+    /// already: an attempt that outlived its primary's life.
+    #[error("the version is coded already")]
+    AlreadyCoded,
+    /// An `EC_RELOCATE` names a version that is not coded.
+    #[error("the version is not coded")]
+    NotCoded,
+    /// An `EC_RELOCATE` moves a fragment that the layout no longer locates
+    /// where the record says it was, such as one another repair or move
+    /// relocated first, or would put two fragments of a stripe on one node.
+    /// Its new fragments become orphans.
+    #[error(
+        "the layout no longer locates fragment {index} of stripe {stripe} where the record moves it from"
+    )]
+    Moved {
+        /// The stripe's number.
+        stripe: u32,
+        /// The fragment's index.
+        index: u8,
+    },
     /// A record kind this state machine does not apply.
     #[error("{0:?} records are not applied by this build")]
     Unsupported(RecordKind),
@@ -223,11 +272,17 @@ impl StateMachine {
                 multipart::complete(index, shard, position, complete)?
             }
             RecordBody::MpuAbort(abort) => multipart::abort(index, shard, abort)?,
+            // Its position is the identity; the `PUT` that completes the
+            // upload records it (`put_object`).
+            RecordBody::UploadBegin(_) => Ok(Effect::UploadBegun),
             RecordBody::Tags(tags) => set_tags(index, shard, position, tags)?,
             RecordBody::Flushed(flushed) => flush(index, shard, flushed)?,
+            RecordBody::PartFlushed(flushed) => multipart::part_flushed(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
             RecordBody::ImportProgress(progress) => import_progress(index, shard, progress)?,
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
+            RecordBody::EcPublish(publish) => publish_coded(index, shard, position, publish)?,
+            RecordBody::EcRelocate(relocate) => relocate_coded(index, shard, relocate)?,
             // A replica's own bookkeeping: the configuration it adopted,
             // which the index keeps as the replica's local copy of it
             // (§6.2), or where reconciliation cut its log (§6.6).
@@ -324,6 +379,7 @@ fn put_object(
         storage_class: None,
         copy_source: put.copy_source.clone(),
         payload,
+        coded: None,
     };
     store(index, shard, &put.key, position, state, Some(object), prior)?;
     Ok(Ok(Effect::Stored { state }))
@@ -355,6 +411,7 @@ pub(crate) fn store(
     prior: Option<Entry>,
 ) -> Result<(), IndexError> {
     multipart::drop_parts(index, shard, prior.as_ref())?;
+    release_coded(index, shard, key, prior.as_ref())?;
     let (remote_etag, remote_version_id) = prior.map_or((None, None), |prior| {
         (prior.remote_etag, prior.remote_version_id)
     });
@@ -370,9 +427,10 @@ pub(crate) fn store(
 
 /// `TAGS`: replaces a live object's tags as a new version, which the
 /// flusher must send to the remote. The new version keeps the object's
-/// bytes and `Last-Modified`, and its write identity names the `TAGS`
-/// record: an identity the object carried from another cluster (§7.8) is
-/// dropped with its metadata entry.
+/// bytes, `Last-Modified`, and coded layout (§8.4), whose fragments still
+/// name the version they were written for, and its write identity names
+/// the `TAGS` record: an identity the object carried from another cluster
+/// (§7.8) is dropped with its metadata entry.
 fn set_tags(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -496,6 +554,7 @@ fn import_stub(
             storage_class: import.storage_class.clone(),
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         }),
         remote_etag: Some(import.etag.clone()),
         remote_version_id: None,
@@ -527,11 +586,17 @@ fn import_progress(
     Ok(Ok(Effect::Progressed))
 }
 
-/// `ADOPT`: the remote changed out of band, and the entry is still clean at
-/// the version the read plan named (§9.2). The remote version replaces it
-/// as a stub, at the `ADOPT` record's position, so no cache serves the old
-/// version's bytes under the new identity. Its tags are unknown and left
-/// empty.
+/// `ADOPT`: the remote changed out of band, and the entry is still at the
+/// version the record names. The remote version replaces it as a stub, at
+/// the `ADOPT` record's position, so no cache serves the old version's
+/// bytes under the new identity. Its tags are unknown and left empty.
+///
+/// A fill names a clean version, the one its read plan named (§9.2). The
+/// `discard_local` conflict policy names a dirty one, a version or a
+/// tombstone, whose flush found an out-of-band write: the local version is
+/// dropped (§7.2). A clean version never becomes dirty again at its `seq`,
+/// so a fill's `ADOPT` still applies only while its version is clean, and
+/// any write committed after the version named rejects either.
 fn adopt_remote(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -541,10 +606,10 @@ fn adopt_remote(
     let Some(entry) = index.entry(shard, &adopt.key)? else {
         return Ok(Err(Rejection::NoEntry));
     };
-    if !matches!(entry.state, EntryState::Clean | EntryState::Evicted) {
-        return Ok(Err(Rejection::NotClean(entry.state)));
-    }
     if entry.version.seq != adopt.expected_seq {
+        if !matches!(entry.state, EntryState::Clean | EntryState::Evicted) {
+            return Ok(Err(Rejection::NotClean(entry.state)));
+        }
         return Ok(Err(Rejection::VersionChanged {
             expected: adopt.expected_seq,
             current: entry.version.seq,
@@ -564,11 +629,155 @@ fn adopt_remote(
             storage_class: None,
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         }),
         remote_etag: Some(adopt.remote_etag.clone()),
         remote_version_id: adopt.remote_version_id.clone(),
     };
     multipart::drop_parts(index, shard, Some(&entry))?;
+    release_coded(index, shard, &adopt.key, Some(&entry))?;
     index.put_entry(shard, &adopt.key, &adopted)?;
     Ok(Ok(Effect::Adopted))
+}
+
+/// `EC_PUBLISH`: the version the record names is coded, if it is still the
+/// key's current version and not coded yet (§8.4). Its stripes become the
+/// version's layout, which records that version as the one its fragments
+/// were written for, and their fragments enter the shard's index from node
+/// to fragments. The entry keeps its version, state, and payload: the
+/// replicas drop the replicated bytes only once they know the record
+/// committed (see [`Holder::Coded`](skys3_index::Holder::Coded)).
+fn publish_coded(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    position: EpochSeq,
+    publish: &EcPublish,
+) -> Result<Rule, IndexError> {
+    let Some(mut entry) = index.entry(shard, &publish.key)? else {
+        return Ok(Err(Rejection::NoEntry));
+    };
+    let Some(object) = &mut entry.object else {
+        return Ok(Err(Rejection::Deleted));
+    };
+    let current = entry.version == publish.version
+        && object.local_etag == publish.etag
+        && object.size == publish.size;
+    if !current && !(is_seeded(SeededBug::PublishSuperseded) && object.size == publish.size) {
+        return Ok(Err(Rejection::Superseded));
+    }
+    if object.coded.is_some() {
+        return Ok(Err(Rejection::AlreadyCoded));
+    }
+    let coded = Coded {
+        publish: position,
+        version: publish.version,
+        attempt: publish.attempt,
+        stripes: publish.stripes.clone(),
+    };
+    index.put_fragments(shard, &publish.key, &coded)?;
+    object.coded = Some(coded);
+    index.put_entry(shard, &publish.key, &entry)?;
+    Ok(Ok(Effect::Published))
+}
+
+/// `EC_RELOCATE`: the fragments the record moves get their new locations
+/// in the layout of the version it names, if that is still the key's
+/// current version, coded, and the layout still locates each fragment where
+/// the record moves it from (§8.6). The shard's index from node to
+/// fragments follows. Otherwise nothing changes, and the new fragments are
+/// orphans. The entry keeps everything else, its `EC_PUBLISH` position
+/// included, which is what replicas drop their copies by.
+fn relocate_coded(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    relocate: &EcRelocate,
+) -> Result<Rule, IndexError> {
+    let Some(mut entry) = index.entry(shard, &relocate.key)? else {
+        return Ok(Err(Rejection::NoEntry));
+    };
+    let Some(object) = &mut entry.object else {
+        return Ok(Err(Rejection::Deleted));
+    };
+    if entry.version != relocate.version || object.local_etag != relocate.etag {
+        return Ok(Err(Rejection::Superseded));
+    }
+    let Some(coded) = &mut object.coded else {
+        return Ok(Err(Rejection::NotCoded));
+    };
+    // Every move of a stripe lands before the stripe is checked, so two
+    // fragments may trade nodes.
+    let mut moved_stripes: BTreeMap<usize, Vec<FragmentLocation>> = BTreeMap::new();
+    for moved in &relocate.moves {
+        let rejected = Rejection::Moved {
+            stripe: moved.stripe,
+            index: moved.index,
+        };
+        let Some(number) = usize::try_from(moved.stripe)
+            .ok()
+            .filter(|number| *number < coded.stripes.len())
+        else {
+            return Ok(Err(rejected));
+        };
+        let fragments = moved_stripes
+            .entry(number)
+            .or_insert_with(|| coded.stripes[number].fragments().to_vec());
+        match fragments.get_mut(usize::from(moved.index)) {
+            Some(location) if *location == moved.from => *location = moved.to.clone(),
+            _ => return Ok(Err(rejected)),
+        }
+    }
+    let mut stripes = coded.stripes.clone();
+    for (number, fragments) in moved_stripes {
+        let stripe = &stripes[number];
+        let Ok(relocated) = CodedStripe::new(
+            stripe.number(),
+            stripe.offset(),
+            stripe.data_len(),
+            stripe.geometry(),
+            stripe.codec(),
+            fragments,
+        ) else {
+            let index = relocate
+                .moves
+                .iter()
+                .find(|moved| moved.stripe == stripe.number())
+                .map_or(0, |moved| moved.index);
+            return Ok(Err(Rejection::Moved {
+                stripe: stripe.number(),
+                index,
+            }));
+        };
+        stripes[number] = relocated;
+    }
+    for moved in &relocate.moves {
+        index.move_fragment(
+            shard,
+            &relocate.key,
+            (moved.stripe, moved.index),
+            &moved.from,
+            &moved.to,
+        )?;
+    }
+    coded.stripes = stripes;
+    index.put_entry(shard, &relocate.key, &entry)?;
+    Ok(Ok(Effect::Relocated))
+}
+
+/// Removes the fragments of `prior`'s coded layout, if it has one, from the
+/// shard's index from node to fragments, as a write replaces the version.
+/// The fragments themselves stay until the version is released (plan
+/// M5-07).
+fn release_coded(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    key: &str,
+    prior: Option<&Entry>,
+) -> Result<(), IndexError> {
+    if let Some(coded) = prior
+        .and_then(|prior| prior.object.as_ref())
+        .and_then(|object| object.coded.as_ref())
+    {
+        index.remove_fragments(shard, key, coded)?;
+    }
+    Ok(())
 }

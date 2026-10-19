@@ -4,17 +4,21 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
-use skys3_io::Disk;
+use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{Outcome, Rejection, Shard, ShardSet};
+use skys3_shard::{
+    Committed, FlushState, Outcome, ReadId, ReadPlan, Registered, Rejection, Shard, ShardSet,
+    StreamedBody,
+};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
 
 use crate::conditions::{ConditionFailed, Precondition};
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
+use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome};
 
 /// The node's shard replicas, as the gateway calls them.
 ///
@@ -25,6 +29,8 @@ use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
 pub struct LocalShards<D: Disk> {
     set: Arc<ShardSet<D>>,
     node: NodeId,
+    /// The clock a peer write's apply-by time is checked on.
+    wall: Arc<dyn WallClock>,
 }
 
 impl<D: Disk> Clone for LocalShards<D> {
@@ -32,6 +38,7 @@ impl<D: Disk> Clone for LocalShards<D> {
         Self {
             set: Arc::clone(&self.set),
             node: self.node.clone(),
+            wall: Arc::clone(&self.wall),
         }
     }
 }
@@ -51,7 +58,21 @@ impl<D: Disk> LocalShards<D> {
         Self {
             set: Arc::new(set),
             node,
+            wall: Arc::new(SystemWallClock),
         }
+    }
+
+    /// The shards, checking peer writes' apply-by times on `wall` (the
+    /// system clock by default).
+    #[must_use]
+    pub fn with_wall_clock(mut self, wall: Arc<dyn WallClock>) -> Self {
+        self.wall = wall;
+        self
+    }
+
+    /// Now on the wall clock, in milliseconds since the Unix epoch.
+    fn now_ms(wall: &dyn WallClock) -> u64 {
+        u64::try_from(wall.now().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// The node's shard set.
@@ -92,6 +113,24 @@ impl<D: Disk> LocalShards<D> {
             .check_readable()
             .map_err(|error| convert(shard, error))?;
         Ok(local)
+    }
+
+    /// The replica of `shard` on `holder`, which must be this node, as a
+    /// holder of read payload (§8.7): any replica that runs serves what it
+    /// holds, whatever its role.
+    async fn holding(&self, shard: &ShardRef, holder: &NodeId) -> Result<Shard<D>, ShardError> {
+        self.check_holder(shard, holder)?;
+        self.find(shard).await
+    }
+
+    /// Checks that `holder` is this node. Registrations are the node's and
+    /// outlive its replicas, so renewing and releasing one needs none.
+    fn check_holder(&self, shard: &ShardRef, holder: &NodeId) -> Result<(), ShardError> {
+        if *holder == self.node {
+            Ok(())
+        } else {
+            Err(ShardError::NotFound(shard.clone()))
+        }
     }
 }
 
@@ -232,6 +271,65 @@ impl<D: Disk> Shards for LocalShards<D> {
             .map_err(|error| convert(shard, error))
     }
 
+    fn node(&self) -> Option<NodeId> {
+        Some(self.node.clone())
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        let local = self.find(shard).await?;
+        local.plan(key).await.map_err(|error| convert(shard, error))
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        let local = self.holding(shard, holder).await?;
+        local
+            .register_read(self.set.reads(), key, version, layout)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        self.check_holder(shard, holder)?;
+        Ok(self.set.reads().renew(read))
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        self.check_holder(shard, holder)?;
+        self.set.reads().release(read);
+        Ok(())
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        let local = self.holding(shard, holder).await?;
+        local
+            .read_registered(self.set.reads(), read, position)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
     async fn append_extent(
         &self,
         shard: &ShardRef,
@@ -244,6 +342,33 @@ impl<D: Disk> Shards for LocalShards<D> {
             .map_err(|error| convert(shard, error))
     }
 
+    async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
+        let local = self.find(shard).await?;
+        local.announce(body).map_err(|error| convert(shard, error))
+    }
+
+    async fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> Result<FlushState, ShardError> {
+        let mut flush = self
+            .serving(shard)
+            .await?
+            .await_flush(key, version)
+            .map_err(|error| convert(shard, error))?;
+        match tokio::time::timeout(wait, flush.answered()).await {
+            Ok(Some(state)) => Ok(state),
+            Ok(None) => Err(ShardError::Unavailable {
+                shard: shard.clone(),
+                reason: "the shard's flusher stopped".to_owned(),
+            }),
+            Err(_) => Ok(FlushState::Pending),
+        }
+    }
+
     async fn write(
         &self,
         shard: &ShardRef,
@@ -254,16 +379,50 @@ impl<D: Disk> Shards for LocalShards<D> {
         let committed = if condition == Precondition::None {
             local.commit(body).await.map(Ok)
         } else {
-            local.commit_if(body, |entry| condition.check(entry)).await
+            // The clock is read as the write is sequenced.
+            let wall = &*self.wall;
+            local
+                .commit_if(body, |entry| condition.check_at(entry, Self::now_ms(wall)))
+                .await
         };
         let committed = committed.map_err(|error| convert(shard, error))?;
-        Ok(committed.and_then(|committed| match committed.outcome {
-            Outcome::Rejected(Rejection::NoSuchUpload) => Err(ConditionFailed::NoSuchUpload),
-            Outcome::Rejected(Rejection::PartChanged { .. }) => Err(ConditionFailed::InvalidPart),
-            // Other rejections are of records only the node writes, such as
-            // a `FLUSHED` that lost a race, which their writer expects.
-            _ => Ok(committed.position),
-        }))
+        Ok(committed.and_then(written))
+    }
+
+    /// Sequences the writes together, in one pass of the shard's sequencer
+    /// ([`Shard::commit_all_if`]), so that they share a group commit.
+    async fn write_all(
+        &self,
+        shard: &ShardRef,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> Vec<WriteOutcome> {
+        let local = match self.find(shard).await {
+            Ok(local) => local,
+            Err(error) => return writes.iter().map(|_| Err(error.clone())).collect(),
+        };
+        let (bodies, conditions): (Vec<_>, Vec<_>) = writes.into_iter().unzip();
+        local
+            .commit_all_if(bodies, |at, entry| {
+                conditions[at].check_at(entry, Self::now_ms(&*self.wall))
+            })
+            .await
+            .into_iter()
+            .map(|committed| match committed {
+                Ok(committed) => Ok(committed.and_then(written)),
+                Err(error) => Err(convert(shard, error)),
+            })
+            .collect()
+    }
+}
+
+/// What a committed write did, as [`Shards::write`] reports it.
+fn written(committed: Committed) -> Result<EpochSeq, ConditionFailed> {
+    match committed.outcome {
+        Outcome::Rejected(Rejection::NoSuchUpload) => Err(ConditionFailed::NoSuchUpload),
+        Outcome::Rejected(Rejection::PartChanged { .. }) => Err(ConditionFailed::InvalidPart),
+        // Other rejections are of records only the node writes, such as a
+        // `FLUSHED` that lost a race, which their writer expects.
+        _ => Ok(committed.position),
     }
 }
 

@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use skys3_config::{
-    AckPolicy, AckTimeoutMode, Config, ControlStoreBackend, FailureDomain, LogFormat,
+    AckPolicy, AckTimeoutMode, Config, ControlStoreBackend, FailureDomain, Freshness, LogFormat,
     TargetTransport,
 };
 use skys3_types::{BucketMode, BucketName, ShardCount};
@@ -131,6 +131,9 @@ fn the_defaults_are_the_design_example_values() {
     // The example's peer cluster has no default.
     assert_eq!(peering.peers.len(), 1);
     peering.peers.clear();
+    // Nor do the addresses it advertises.
+    assert_eq!(peering.quic_advertise.len(), 1);
+    peering.quic_advertise.clear();
     assert_eq!(minimal.peering(), &peering);
     let mut identity = example.identity().clone();
     // The example's static credential has no default.
@@ -209,6 +212,7 @@ compaction_live_threshold = 0.4
 read_registration_ttl_seconds = 60
 read_registration_renew_interval_seconds = 20
 disk_min_free_bytes = 0
+lifecycle_interval_seconds = 600
 
 [cache]
 hot_cache_bytes_per_node = 1073741824
@@ -217,6 +221,7 @@ reserve_fraction = 0.2
 
 [flush]
 ack_policy = "write_through"
+write_through_timeout_seconds = 12
 flush_min_concurrency_per_shard = 2
 flush_max_concurrency_per_shard = 32
 flush_max_inflight_bytes_per_target = 536870912
@@ -233,6 +238,7 @@ max_data_fragments = 6
 min_eligible_nodes = 7
 fragment_release_delay_seconds = 30
 fragment_orphan_after_seconds = 7200
+fragment_repair_after_seconds = 900
 repair_bytes_per_second_per_node = 52428800
 
 [buckets.defaults]
@@ -249,6 +255,13 @@ backup_ack = "write_through"
 index_snapshot_interval_seconds = 600
 target_transport = "s3"
 max_dirty_bytes = 107374182400
+freshness = "ttl"
+freshness_ttl_seconds = 30
+
+[buckets.datasets]
+mode = "read_only"
+freshness = "revalidate"
+origin_profile = "datasets-reader"
 
 [buckets."logs.example"]
 mode = "write_back"
@@ -275,6 +288,7 @@ peer_local_writes = true
 
 [peering]
 quic_listen = "[::]:8443"
+quic_advertise = ["gw.c1.example.com:8443"]
 congestion_control = "bbr"
 peer_frame_bytes = 131072
 peer_connect_timeout_ms = 1000
@@ -286,6 +300,7 @@ peer_staging_ttl_seconds = 3600
 [peering.peers.c2]
 ca_file = "/etc/skys3/peers/c2.crt"
 buckets = [{ source = "b-91c2", destination = "mirror" }]
+s3_access_key_ids = ["AKIAPEERC2"]
 
 [identity]
 anonymous_access = true
@@ -327,6 +342,7 @@ fn every_key_parses_and_is_resolved() {
     let tls = config.transport().tls_files().expect("all three files");
     assert_eq!(tls.ca, std::path::Path::new("/etc/skys3/ca.crt"));
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
+    assert_eq!(config.ec().fragment_repair_after().as_secs(), 900);
     let node = config.node();
     assert_eq!(node.node_id.as_ref().unwrap().as_str(), "node-7");
     assert_eq!(node.data_dir, std::path::Path::new("/data/skys3"));
@@ -341,10 +357,12 @@ fn every_key_parses_and_is_resolved() {
     let defaults = &config.buckets().defaults;
     assert_eq!(defaults.mode, BucketMode::Local);
     assert_eq!(defaults.ack_policy, AckPolicy::WriteThrough, "from [flush]");
+    assert_eq!(config.flush().write_through_timeout().as_secs(), 12);
     assert_eq!(defaults.ec_after().as_secs(), 300);
     assert_eq!(defaults.index_snapshot_interval().as_secs(), 600);
     assert_eq!(defaults.max_dirty_bytes, 100 << 30);
     assert_eq!(config.storage().disk_min_free_bytes, 0);
+    assert_eq!(config.storage().lifecycle_interval().as_secs(), 600);
 
     let logs = config
         .buckets()
@@ -369,6 +387,14 @@ fn every_key_parses_and_is_resolved() {
     );
     assert_eq!(mirror.peer_source.as_ref().unwrap().as_str(), "c2");
     assert!(mirror.peer_local_writes);
+
+    assert_eq!(defaults.freshness, Freshness::Ttl);
+    assert_eq!(defaults.freshness_ttl().as_secs(), 30);
+    let datasets = config.buckets().get(&BucketName::new("datasets").unwrap());
+    assert_eq!(datasets.mode, BucketMode::ReadOnly);
+    assert_eq!(datasets.freshness, Freshness::Revalidate);
+    assert_eq!(datasets.freshness_ttl_seconds, 30, "inherited");
+    assert_eq!(datasets.origin_profile.as_deref(), Some("datasets-reader"));
 
     let unnamed = config.buckets().get(&BucketName::new("other").unwrap());
     assert_eq!(unnamed, defaults);

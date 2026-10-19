@@ -4,18 +4,20 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
+use aws_sdk_s3::config::http::HttpRequest;
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{self as sdk, CompletedMultipartUpload};
 use bytes::Bytes;
-use skys3_types::ETag;
+use skys3_types::{ETag, WriteIdentity};
 
 use super::AwsS3;
 use super::error::{malformed, map_sdk_error};
 use crate::model::{
-    AbortMultipartUpload, CompleteMultipartUpload, CopyObject, CreateMultipartUpload, DeleteObject,
-    DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
-    ListPartsOutput, ListedObject, ListedPart, MAX_LIST_KEYS, MAX_LIST_PARTS, MetadataDirective,
-    ObjectInfo, PutObject, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
+    AbortMultipartUpload, ByteRange, CompleteMultipartUpload, CopyObject, CreateMultipartUpload,
+    DeleteObject, DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2,
+    ListObjectsV2Output, ListParts, ListPartsOutput, ListedObject, ListedPart, MAX_LIST_KEYS,
+    MAX_LIST_PARTS, MetadataDirective, ObjectInfo, PutObject, TaggingDirective, UploadId,
+    UploadPart, VersionId, WriteOutput, WritePrecondition,
 };
 use crate::{ObjectStore, S3Error, S3ErrorKind, S3Result, UserMetadata};
 
@@ -86,6 +88,11 @@ fn size(operation: &str, value: Option<i64>) -> S3Result<u64> {
     u64::try_from(value).map_err(|_| malformed(operation, format!("negative size {value}")))
 }
 
+/// `x-amz-tagging-count`, which S3 leaves out for an object without tags.
+fn tag_count(value: Option<i32>) -> u32 {
+    value.map_or(0, |count| u32::try_from(count).unwrap_or(0))
+}
+
 /// Converts a model count to the SDK's `i32`, saturating.
 fn count(value: u32) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
@@ -138,6 +145,18 @@ fn encode_copy_source(key: &str) -> String {
     encoded
 }
 
+/// Sets a write's `x-skys3-apply-by` header, before the request is signed,
+/// if the write has an apply-by time (design §7.8).
+fn apply_by(apply_by_ms: Option<u64>) -> impl Fn(&mut HttpRequest) + Send + Sync + 'static {
+    move |request: &mut HttpRequest| {
+        if let Some(apply_by_ms) = apply_by_ms {
+            request
+                .headers_mut()
+                .insert(WriteIdentity::APPLY_BY_HEADER, apply_by_ms.to_string());
+        }
+    }
+}
+
 impl ObjectStore for AwsS3 {
     async fn put_object(&self, request: PutObject) -> S3Result<WriteOutput> {
         const OP: &str = "PutObject";
@@ -160,6 +179,8 @@ impl ObjectStore for AwsS3 {
             .set_content_md5(request.content_md5)
             .set_if_none_match(if_none_match)
             .set_if_match(if_match)
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;
@@ -171,6 +192,7 @@ impl ObjectStore for AwsS3 {
 
     async fn get_object(&self, request: GetObject) -> S3Result<GetOutput> {
         const OP: &str = "GetObject";
+        let most = request.range.and_then(ByteRange::max_len);
         let output = self
             .client
             .get_object()
@@ -185,6 +207,18 @@ impl ObjectStore for AwsS3 {
             .map_err(|error| map_sdk_error(OP, error))?;
         let etag = parse_etag(OP, output.e_tag())?;
         let length = size(OP, output.content_length())?;
+        // The body is buffered whole, so a store that ignores the range, or
+        // answers more than it asked for, is refused before it is read: a
+        // ranged read bounds the memory it costs (the peer descriptor's
+        // 64 KiB, §7.8).
+        if let Some(most) = most
+            && length > most
+        {
+            return Err(malformed(
+                OP,
+                format!("{length} body bytes for a range of at most {most}"),
+            ));
+        }
         let (range, size) = match output.content_range() {
             Some(value) => {
                 let (range, size) = content_range(value)
@@ -200,6 +234,7 @@ impl ObjectStore for AwsS3 {
             metadata: user_metadata(output.metadata()),
             content_type: output.content_type().map(str::to_owned),
             last_modified_ms: last_modified(output.last_modified()),
+            tag_count: tag_count(output.tag_count()),
         };
         let body = output.body.collect().await.map_err(|error| {
             S3Error::new(
@@ -237,6 +272,7 @@ impl ObjectStore for AwsS3 {
             metadata: user_metadata(output.metadata()),
             content_type: output.content_type().map(str::to_owned),
             last_modified_ms: last_modified(output.last_modified()),
+            tag_count: tag_count(output.tag_count()),
         })
     }
 
@@ -248,6 +284,8 @@ impl ObjectStore for AwsS3 {
             .key(request.key)
             .set_version_id(request.version_id.map(|v| v.0))
             .set_if_match(request.if_match.map(|etag| etag.to_quoted()))
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error("DeleteObject", error))?;
@@ -336,12 +374,26 @@ impl ObjectStore for AwsS3 {
             MetadataDirective::Replace {
                 metadata,
                 content_type,
+                headers,
             } => builder
                 .metadata_directive(sdk::MetadataDirective::Replace)
                 .set_metadata(metadata_map(&metadata))
-                .set_content_type(content_type),
+                .set_content_type(content_type)
+                .set_cache_control(headers.get("cache-control").cloned())
+                .set_content_disposition(headers.get("content-disposition").cloned())
+                .set_content_encoding(headers.get("content-encoding").cloned())
+                .set_content_language(headers.get("content-language").cloned())
+                .set_expires(expires(&headers)),
+        };
+        builder = match request.tagging_directive {
+            TaggingDirective::Copy => builder.tagging_directive(sdk::TaggingDirective::Copy),
+            TaggingDirective::Replace(tags) => builder
+                .tagging_directive(sdk::TaggingDirective::Replace)
+                .set_tagging((!tags.is_empty()).then(|| tagging(&tags))),
         };
         let output = builder
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;
@@ -425,6 +477,8 @@ impl ObjectStore for AwsS3 {
             )
             .set_if_none_match(if_none_match)
             .set_if_match(if_match)
+            .customize()
+            .mutate_request(apply_by(request.apply_by_ms))
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;

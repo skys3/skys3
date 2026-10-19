@@ -1,0 +1,2 @@
+repo:example/app:r:refs/heads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "ions.gitcsuubrheon*om"}, "Action": "sithWebIdentity", "Condition": {"StringEquals": {"token.actons.0itontent.com:sub": "repo:example/app:*"}}}}

@@ -9,8 +9,9 @@
 //! [`Harness::sigv4`] drives requests through SigV4 canonicalization and
 //! verification, and [`aws_chunked`] drives bodies through the chunk
 //! decoder. [`checksums`] reads checksum headers and values, and
-//! [`list_token`] opens continuation tokens, and [`tagging`] parses
-//! `x-amz-tagging` headers.
+//! [`list_token`] opens continuation tokens, [`tagging`] parses
+//! `x-amz-tagging` headers, and [`copy_source_range`] parses
+//! `x-amz-copy-source-range` headers.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -31,8 +32,8 @@ use crate::checksum::{ExpectedChecksum, ExpectedChecksums};
 use crate::limits::MAX_KEY_BYTES;
 use crate::listing::{ListTokenKeys, TokenScope};
 use crate::objects::{
-    MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, parse_tagging_header, tagging_header,
-    tags_from_xml,
+    CopyRange, MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, parse_tagging_header,
+    tagging_header, tags_from_xml,
 };
 use crate::service::{Authenticator, Gateway, TrustAll};
 use crate::sigv4::body::BodyError;
@@ -473,6 +474,35 @@ pub fn tagging(data: &[u8]) -> bool {
     true
 }
 
+/// Parses `data` as an `x-amz-copy-source-range` value, which UploadPartCopy
+/// takes from clients, and returns whether it is one.
+///
+/// # Panics
+///
+/// If a property fails: an accepted range does not start at or before its
+/// end, does not survive being written again, or selects other bytes of a
+/// source than it names.
+#[must_use]
+pub fn copy_source_range(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    let Ok(range) = CopyRange::parse(&text) else {
+        return false;
+    };
+    assert!(range.first <= range.last);
+    let again = format!("bytes={}-{}", range.first, range.last);
+    assert_eq!(CopyRange::parse(&again).ok(), Some(range));
+    for size in [range.last, range.last.saturating_add(1), u64::MAX] {
+        match range.within(size) {
+            Ok(bytes) => {
+                assert!(range.last < size);
+                assert_eq!(bytes, range.first..range.last + 1);
+            }
+            Err(_) => assert!(range.last >= size),
+        }
+    }
+    true
+}
+
 /// Opens `data` as a ListObjectsV2 continuation token, and seals it as the
 /// last item of a page and opens the token again. Returns whether `data`
 /// opened as a token, which only a forgery would.
@@ -614,6 +644,29 @@ mod tests {
             b"\x81<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
         assert_eq!(harness.request(enable).unwrap().0, 501);
         assert_eq!(harness.request(b"\x88<Delete><Object>").unwrap().0, 400);
+    }
+
+    /// The M7-03 campaign found `GET /?prefix=%1F` answered 500: `s3s`
+    /// refuses to send XML holding a control character, and ListBuckets
+    /// echoed the prefix. Nothing a client sends reaches an XML answer
+    /// with one.
+    #[test]
+    fn control_characters_never_reach_an_xml_answer() {
+        let harness = Harness::default();
+        for input in [
+            &b"\x00/?prefix=%1F"[..],
+            b"\x00/fuzz?list-type=2&start-after=%01",
+            b"\x00/fuzz?prefix=a%00&delimiter=/",
+            b"\x01/fuzz/bell%07\ncontent-length: 0\n\n",
+            b"\x02/fuzz/bell%07?uploads",
+            b"\x01/fuzz/nonchar%EF%BF%BF\ncontent-length: 0\n\n",
+            b"\x01/fuzz/copy%08\nx-amz-copy-source: /fuzz/a\ncontent-length: 0\n\n",
+        ] {
+            let status = harness.request(input).unwrap().0;
+            assert_eq!(status, 400, "{}", String::from_utf8_lossy(input));
+        }
+        let tab = b"\x01/fuzz/tab%09ok\ncontent-length: 0\n\n";
+        assert_eq!(harness.request(tab).unwrap().0, 200);
     }
 
     #[test]

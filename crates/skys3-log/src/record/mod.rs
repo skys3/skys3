@@ -61,10 +61,11 @@
 //!
 //! Each defined kind's fields are encoded in the declaration order of its
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
-//! [`MpuComplete`], [`MpuAbort`], [`Tags`], [`Flushed`], [`Import`],
-//! [`Adopt`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
-//! without the bucket, shard, and epoch the fixed header holds, `TRUNCATE`,
-//! which has no fields, and [`ImportProgress`]):
+//! [`MpuComplete`], [`MpuAbort`], [`UploadBegin`], [`Tags`], [`Flushed`],
+//! [`PartFlushed`], [`Import`], [`Adopt`], [`EcPublish`], [`EcRelocate`],
+//! `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig) without the
+//! bucket, shard, and epoch the fixed header holds, `TRUNCATE`, which has
+//! no fields, and [`ImportProgress`]):
 //!
 //! - integers as fixed-width little-endian values; positions as epoch then
 //!   sequence number; timestamps as milliseconds since the Unix epoch,
@@ -83,6 +84,13 @@
 //!   and the type (`u8`: 0 for `FULL_OBJECT`, 1 for `COMPOSITE`), and an
 //!   `MPU_COMPLETE`'s parts as a `u16` count followed by each part's
 //!   number (`u16`) and position, in increasing part number,
+//! - a `PART_FLUSHED`'s step as a tag byte: 0 for `Opened`, 2 for `Ended`,
+//!   or 1 for a part, followed by its number (`u16`), its `MPU_PART`
+//!   position, and the remote ETag,
+//! - an `EC_PUBLISH`'s stripes as a `u32` count and, per stripe, its data
+//!   length, `k` and `m` (`u8` each), codec ID (`u16`), and each fragment's
+//!   node ID (`u8` length) and fragment ID (`u128`); a stripe's number and
+//!   offset follow from its place in the list,
 //! - an `IMPORT_PROGRESS`'s ranges as a `u16` count from 1 to
 //!   [`MAX_IMPORT_RANGES`] followed by each range's optional end and its
 //!   checkpoint: a tag byte, 0 for a running range followed by its optional
@@ -102,6 +110,7 @@
 //! bytes. A record of an older version re-encodes in the current one.
 
 mod body;
+mod coding;
 mod error;
 mod header;
 mod multipart;
@@ -115,11 +124,15 @@ pub use body::{
     IDENTITY_METADATA_RESERVED, Import, ImportCheckpoint, ImportProgress, ImportRange, MAX_EXTENTS,
     MAX_IMPORT_RANGES, MAX_KEY_LEN, MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
     MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet,
-    Tags,
+    Tags, UploadBegin,
 };
+pub use coding::{EcPublish, EcRelocate, FragmentMove, MAX_MOVES, MAX_STRIPES};
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
-pub use multipart::{CompletedPart, MpuAbort, MpuComplete, MpuCreate, MpuPart, UploadChecksum};
+pub use multipart::{
+    CompletedPart, MAX_UPLOAD_ID_LEN, MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed,
+    RemoteStep, UploadChecksum,
+};
 pub use skys3_types::checksum::{Checksum, ChecksumAlgorithm, ChecksumType, Checksums};
 
 use wire::Writer;

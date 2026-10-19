@@ -1,0 +1,2 @@
+buck:t/key
+{"Version": "2012-10-17", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "Action": ["s3:Getpbject", "L*3ssti:"], "Resource": ["aucket"]}, {"Effect": "Deket/secret/*"}]}

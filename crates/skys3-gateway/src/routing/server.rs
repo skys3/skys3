@@ -13,7 +13,10 @@ use skys3_types::{Epoch, NodeId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{Reply, Request, Response, wire};
-use crate::shard::{ShardError, ShardRef, Shards};
+use skys3_log::RecordBody;
+
+use crate::conditions::Precondition;
+use crate::shard::{ShardError, ShardRef, Shards, WriteOutcome};
 
 /// How long an accepted connection may take to send its first frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -105,6 +108,18 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
     /// Answers `request` to `shard` from a gateway that knows its
     /// configuration in `epoch`.
     pub async fn handle(&self, shard: &ShardRef, epoch: Epoch, request: Request) -> Reply {
+        if request.is_holder() {
+            // Any replica holds the payload it has, whatever its role and
+            // epoch, and the routing audit is of primaries only.
+            return match self.execute(shard, request).await {
+                Ok(response) => Reply::Served {
+                    response,
+                    epoch,
+                    hint: None,
+                },
+                Err(error) => Reply::Refused(error),
+            };
+        }
         let Some(replica) = self.inner.set.get(&shard.into()).await else {
             return Reply::Refused(ShardError::NotFound(shard.clone()));
         };
@@ -132,8 +147,36 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
         }
     }
 
+    /// Commits `writes` on this node's replica of `shard` together, as
+    /// [`Shards::write_all`] does, for a gateway of this node that knows the
+    /// shard's configuration in `epoch`. `None`, with nothing written, if
+    /// the replica does not serve as the primary of that configuration or a
+    /// newer one; a write the replica refuses as it steps down meanwhile
+    /// fails with [`ShardError::NotPrimary`].
+    pub async fn write_all(
+        &self,
+        shard: &ShardRef,
+        epoch: Epoch,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> Option<Vec<WriteOutcome>> {
+        let replica = self.inner.set.get(&shard.into()).await?;
+        let config = replica.config();
+        if config.epoch < epoch || replica.check_readable().is_err() {
+            return None;
+        }
+        let written = self.inner.shards.write_all(shard, writes).await;
+        if let Some(observer) = self.inner.observer.get() {
+            observer(&Served {
+                shard: shard.clone(),
+                node: self.inner.node.clone(),
+                epoch: config.epoch,
+            });
+        }
+        Some(written)
+    }
+
     async fn execute(&self, shard: &ShardRef, request: Request) -> Result<Response, ShardError> {
-        let shards = &self.inner.shards;
+        let (shards, node) = (&self.inner.shards, &self.inner.node);
         Ok(match request {
             Request::Entry { key } => Response::Entry(shards.entry(shard, &key).await?),
             Request::List(query) => Response::List(shards.list(shard, &query).await?),
@@ -154,8 +197,29 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
                 limit,
             } => Response::Parts(shards.parts(shard, upload, after, limit).await?),
             Request::Payload(position) => Response::Payload(shards.payload(shard, position).await?),
+            Request::Plan { key } => Response::Plan(shards.plan(shard, &key).await?),
+            Request::Register {
+                key,
+                version,
+                layout,
+            } => Response::Registered(shards.register(shard, node, &key, version, layout).await?),
+            Request::Renew(read) => Response::Renewed(shards.renew(shard, node, read).await?),
+            Request::Release(read) => {
+                shards.release(shard, node, read).await?;
+                Response::Released
+            }
+            Request::Fetch { read, position } => {
+                Response::Payload(shards.fetch(shard, node, read, position).await?)
+            }
             Request::AppendExtent(extent) => {
                 Response::Extent(shards.append_extent(shard, extent).await?)
+            }
+            Request::Announce(body) => {
+                shards.announce(shard, body).await?;
+                Response::Announced
+            }
+            Request::Flushed { key, version, wait } => {
+                Response::Flushed(shards.flushed(shard, &key, version, wait).await?)
             }
             Request::Write { body, condition } => {
                 Response::Written(shards.write(shard, body, condition).await?)

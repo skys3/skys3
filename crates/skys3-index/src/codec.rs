@@ -2,14 +2,22 @@
 //!
 //! redb stores raw bytes; this module defines what they mean. Every value
 //! starts with a format byte ([`VALUE_FORMAT`]) so a later build can change
-//! a layout without guessing. This build writes format 3 and reads formats
-//! 1 to 3 ([`MIN_VALUE_FORMAT`]); any other format byte is rejected. Format
+//! a layout without guessing. This build writes format 4 and reads formats
+//! 1 to 4 ([`MIN_VALUE_FORMAT`]); any other format byte is rejected. Format
 //! 2 adds a `u16` part count after each checksum digest of an [`Entry`],
 //! zero for a `FULL_OBJECT` checksum; a format 1 checksum has none and is
 //! `FULL_OBJECT`. Format 3 adds the payload of a multipart object (tag 3:
 //! the upload's position, a `u16` part count, and each part's number
 //! (`u16`) and size (`u64`)), and the [`Upload`] and [`Part`] values, which
-//! only it has. Every other value is the same in all three. Integers in
+//! only it has. Every other value is the same in all three. The
+//! [`RemoteUpload`] and [`RemotePart`] values came later, with index
+//! version 8, in format 3; they too exist only in format 3. Format 4 adds,
+//! after an [`Entry`]'s payload, its [`Coded`] layout as an option: the
+//! `EC_PUBLISH` position, the position of the version its fragments were
+//! written for (which precedes it), the attempt (epoch and number, `u64`
+//! each), and the stripes as the `EC_PUBLISH` record encodes them (§10.1).
+//! The
+//! fragment values of index version 9 exist only in format 4. Integers in
 //! values are little-endian. Keys use big-endian integers so that redb's
 //! byte order sorts them numerically:
 //!
@@ -22,9 +30,13 @@
 //! | control | register key (UTF-8) | [`ControlEntry`] |
 //! | uploads | shard, the object key's bytes, a zero byte, then the upload's epoch and seq | [`Upload`] |
 //! | parts | shard, the upload's epoch and seq, part number (`u16`) | [`Part`] |
+//! | remote_uploads | shard, the upload's epoch and seq | [`RemoteUpload`]: the object key and the remote upload ID (`u16` lengths) |
+//! | remote_parts | shard, the upload's epoch and seq, part number (`u16`) | [`RemotePart`]: the `MPU_PART` position and the remote ETag |
 //! | shard_map | shard | the gateway's [`ShardConfig`], as its register's JSON |
 //! | configs | shard | the [`ShardConfig`] of the shard's latest applied `CONFIG` record, as its register's JSON |
 //! | takeovers | shard | the [`ShardConfig`] a member proposed to take over in, as its register's JSON |
+//! | fragments | shard, node ID (`u8` length and bytes), the object key's bytes, stripe number (`u32`), fragment index (`u8`) | the [`FragmentId`] of a coded version's fragment on that node |
+//! | attempts | shard | the next attempt number this node's primary may use (`u64`, not a value of this module) |
 //! | imports | bucket ID (UTF-8) | [`ImportRanges`]: one range as its [`ImportCheckpoint`] alone, a tag (0 running, 1 done) and for a running import the last key imported, as an option; or several as tag 2, a `u16` count of at least two, and each range's end, as an option present on all but the last, followed by its checkpoint |
 //! | import_progress | shard | the latest `IMPORT_PROGRESS` the shard applied: its number (`u64`), then its [`ImportRanges`] as in imports |
 //!
@@ -48,24 +60,27 @@ use std::fmt;
 
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, MAX_EXTENTS,
-    MAX_KEY_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
-    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, ShardRef, TagSet, UploadChecksum,
+    MAX_KEY_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_STRIPES,
+    MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_UPLOAD_ID_LEN, MAX_VERSION_ID_LEN, Metadata,
+    ShardRef, TagSet, UploadChecksum,
 };
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::limits::MAX_PARTS;
 use skys3_types::{
-    BucketId, ETag, Epoch, EpochSeq, Generation, Label, RegisterDocument, Seq, ShardConfig,
-    ShardId, VersionIdentity,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Generation, Geometry, Label, NodeId, RegisterDocument, Seq, ShardConfig, ShardId,
+    VersionIdentity,
 };
 
 use crate::entry::{
-    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
+    Coded, ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, RemotePart,
+    RemoteUpload, Upload,
 };
 use crate::import::{ImportCheckpoint, ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 
 /// The format byte every value this build writes starts with, and the
 /// newest format it reads.
-pub const VALUE_FORMAT: u8 = 3;
+pub const VALUE_FORMAT: u8 = 4;
 
 /// The oldest value format this build reads.
 pub const MIN_VALUE_FORMAT: u8 = 1;
@@ -75,6 +90,13 @@ const PART_COUNTS_SINCE: u8 = 2;
 
 /// The first value format with multipart uploads.
 const UPLOADS_SINCE: u8 = 3;
+
+/// The first value format with coded layouts and fragment rows.
+const CODED_SINCE: u8 = 4;
+
+/// The bytes after a fragment key's object key: the stripe number and the
+/// fragment index.
+const FRAGMENT_KEY_SUFFIX_LEN: usize = 4 + 1;
 
 /// The longest control-state value kept locally, in bytes.
 pub const MAX_CONTROL_VALUE_LEN: usize = 1 << 20;
@@ -114,6 +136,11 @@ impl CodecError {
     #[must_use]
     pub fn field(&self) -> &'static str {
         self.field
+    }
+
+    /// A counter `field` that reached its largest value.
+    pub(crate) fn exhausted(field: &'static str) -> Self {
+        Self::new(field, "exhausted")
     }
 }
 
@@ -945,15 +972,10 @@ pub fn decode_upload(bytes: &[u8]) -> Result<Upload> {
 ///
 /// # Errors
 ///
-/// Returns a [`CodecError`] if a field is out of bounds, or the payload is
-/// neither inline nor in extents.
+/// Returns a [`CodecError`] if a field is out of bounds, or the payload
+/// names parts.
 pub fn encode_part(part: &Part) -> Result<Vec<u8>> {
-    if !matches!(part.payload, Payload::Inline(_) | Payload::Extents(_)) {
-        return Err(CodecError::new(
-            "part.payload",
-            "a part's bytes are inline or in extents",
-        ));
-    }
+    check_part_payload(&part.payload)?;
     let mut w = Writer::value();
     w.position(part.position);
     w.u64(part.size);
@@ -981,14 +1003,114 @@ pub fn decode_part(bytes: &[u8]) -> Result<Part> {
         checksums: read_checksums(&mut r)?,
         payload: read_payload(&mut r)?,
     };
-    if !matches!(part.payload, Payload::Inline(_) | Payload::Extents(_)) {
-        return Err(CodecError::new(
-            "part.payload",
-            "a part's bytes are inline or in extents",
-        ));
-    }
+    check_part_payload(&part.payload)?;
     r.finish("part")?;
     Ok(part)
+}
+
+/// Returns the remote-uploads key of the remote upload of the local
+/// upload opened at `upload` in `shard`: the same bytes as the prefix of
+/// that upload's parts ([`upload_parts_prefix`]).
+#[must_use]
+pub fn remote_upload_key(shard: &ShardRef, upload: EpochSeq) -> Vec<u8> {
+    upload_parts_prefix(shard, upload)
+}
+
+/// Decodes a remote-uploads key into its shard and upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not a shard and a position.
+pub fn decode_remote_upload_key(bytes: &[u8]) -> Result<(ShardRef, EpochSeq)> {
+    let field = "remote upload key";
+    let mut r = Reader(bytes, VALUE_FORMAT);
+    let shard = r.shard(field)?;
+    let upload = read_key_position(&mut r, field)?;
+    r.finish(field)?;
+    Ok((shard, upload))
+}
+
+/// Encodes a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the key or the ID is empty or too long.
+pub fn encode_remote_upload(upload: &RemoteUpload) -> Result<Vec<u8>> {
+    let mut w = Writer::value();
+    write_nonempty(&mut w, "remote_upload.key", &upload.key, MAX_KEY_LEN)?;
+    write_nonempty(&mut w, "remote_upload.id", &upload.id, MAX_UPLOAD_ID_LEN)?;
+    Ok(w.0)
+}
+
+/// Decodes a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded remote upload.
+pub fn decode_remote_upload(bytes: &[u8]) -> Result<RemoteUpload> {
+    let mut r = Reader::value(bytes, "remote_upload")?;
+    check_has_uploads(&r, "remote_upload")?;
+    let upload = RemoteUpload {
+        key: read_nonempty(&mut r, "remote_upload.key", MAX_KEY_LEN)?,
+        id: read_nonempty(&mut r, "remote_upload.id", MAX_UPLOAD_ID_LEN)?,
+    };
+    r.finish("remote_upload")?;
+    Ok(upload)
+}
+
+/// Encodes a part of a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the ETag is too long.
+pub fn encode_remote_part(part: &RemotePart) -> Result<Vec<u8>> {
+    let mut w = Writer::value();
+    w.position(part.position);
+    write_etag(&mut w, "remote_part.etag", &part.etag)?;
+    Ok(w.0)
+}
+
+/// Decodes a part of a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded remote part.
+pub fn decode_remote_part(bytes: &[u8]) -> Result<RemotePart> {
+    let mut r = Reader::value(bytes, "remote_part")?;
+    check_has_uploads(&r, "remote_part")?;
+    let part = RemotePart {
+        position: r.position("remote_part.position")?,
+        etag: r.etag("remote_part.etag")?,
+    };
+    r.finish("remote_part")?;
+    Ok(part)
+}
+
+fn write_nonempty(w: &mut Writer, field: &'static str, text: &str, max: usize) -> Result<()> {
+    if text.is_empty() {
+        return Err(CodecError::new(field, "empty"));
+    }
+    w.str16(field, text, max)
+}
+
+fn read_nonempty(r: &mut Reader<'_>, field: &'static str, max: usize) -> Result<String> {
+    let text = r.str16(field, max)?;
+    if text.is_empty() {
+        return Err(CodecError::new(field, "empty"));
+    }
+    Ok(text)
+}
+
+/// Checks that a part's bytes are inline or in extents, or that the part
+/// has none: a part of an evicted multipart object (§9.3).
+fn check_part_payload(payload: &Payload) -> Result<()> {
+    if matches!(payload, Payload::Parts { .. }) {
+        return Err(CodecError::new(
+            "part.payload",
+            "a part's bytes are inline, in extents, or evicted",
+        ));
+    }
+    Ok(())
 }
 
 fn check_has_uploads(r: &Reader<'_>, field: &'static str) -> Result<()> {
@@ -1040,7 +1162,199 @@ fn write_object(w: &mut Writer, object: &ObjectVersion) -> Result<()> {
             source.remote_etag.as_ref(),
         )?;
     }
-    write_payload(w, &object.payload)
+    write_payload(w, &object.payload)?;
+    w.present(object.coded.is_some());
+    if let Some(coded) = &object.coded {
+        write_coded(w, coded, object.size)?;
+    }
+    Ok(())
+}
+
+fn write_coded(w: &mut Writer, coded: &Coded, size: u64) -> Result<()> {
+    check_coded_version(coded.version, coded.publish)?;
+    w.position(coded.publish);
+    w.position(coded.version);
+    w.u64(coded.attempt.epoch.get());
+    w.u64(coded.attempt.number);
+    w.len32("object.coded", coded.stripes.len(), MAX_STRIPES)?;
+    let mut offset = 0;
+    for (number, stripe) in coded.stripes.iter().enumerate() {
+        if stripe.number() as usize != number || stripe.offset() != offset {
+            return Err(CodecError::new("object.coded", "stripes out of order"));
+        }
+        offset = stripe.end();
+        w.u64(stripe.data_len());
+        let geometry = stripe.geometry();
+        // A geometry has at most 255 fragments, so each count fits a byte.
+        w.u8(geometry.data_fragments() as u8);
+        w.u8(geometry.parity_fragments() as u8);
+        w.u16(stripe.codec().get());
+        for location in stripe.fragments() {
+            let node = location.node.as_str();
+            w.len8("object.coded", node.len(), NodeId::MAX_LEN)?;
+            w.0.extend_from_slice(node.as_bytes());
+            w.0.extend_from_slice(&location.fragment.get().to_le_bytes());
+        }
+    }
+    if offset != size {
+        return Err(CodecError::new(
+            "object.coded",
+            "stripes do not cover the object",
+        ));
+    }
+    Ok(())
+}
+
+fn read_coded(r: &mut Reader<'_>, size: u64) -> Result<Coded> {
+    let field = "object.coded";
+    let publish = r.position(field)?;
+    let version = r.position(field)?;
+    check_coded_version(version, publish)?;
+    let attempt = AttemptId::new(Epoch::new(r.u64(field)?), r.u64(field)?);
+    let count = r.len32(field, MAX_STRIPES)?;
+    // A stripe takes at least its length, geometry, codec, and two
+    // fragments.
+    r.check_count(field, count, 12 + 2 * 18)?;
+    let mut stripes = Vec::with_capacity(count);
+    let mut offset = 0u64;
+    for number in 0..count {
+        let data_len = r.u64(field)?;
+        let geometry = Geometry::new(r.u8(field)?.into(), r.u8(field)?.into())
+            .map_err(|e| CodecError::new(field, e))?;
+        let codec = CodecId::new(r.u16(field)?);
+        r.check_count(field, geometry.total_fragments(), 18)?;
+        let mut fragments = Vec::with_capacity(geometry.total_fragments());
+        for _ in 0..geometry.total_fragments() {
+            let len = r.len8(field, NodeId::MAX_LEN)?;
+            let node = NodeId::new(Reader::text(field, r.take(field, len)?)?)
+                .map_err(|e| CodecError::new(field, e))?;
+            let fragment = FragmentId::new(u128::from_le_bytes(r.array(field)?));
+            fragments.push(FragmentLocation { node, fragment });
+        }
+        // `count` is at most `MAX_STRIPES`, which fits a u32.
+        let stripe = CodedStripe::new(number as u32, offset, data_len, geometry, codec, fragments)
+            .map_err(|e| CodecError::new(field, e))?;
+        offset = stripe.end();
+        stripes.push(stripe);
+    }
+    if offset != size {
+        return Err(CodecError::new(field, "stripes do not cover the object"));
+    }
+    Ok(Coded {
+        publish,
+        version,
+        attempt,
+        stripes,
+    })
+}
+
+/// Checks that a coded layout's version precedes its `EC_PUBLISH`, as the
+/// record's own encoding requires (§10.1).
+fn check_coded_version(version: EpochSeq, publish: EpochSeq) -> Result<()> {
+    if version < publish {
+        Ok(())
+    } else {
+        Err(CodecError::new(
+            "object.coded",
+            "the version does not precede the publish",
+        ))
+    }
+}
+
+/// Returns the fragments-table key of fragment `index` of stripe `stripe`
+/// of `key`'s coded version, held by `node`.
+#[must_use]
+pub fn fragment_key(shard: &ShardRef, node: &NodeId, key: &str, stripe: u32, index: u8) -> Vec<u8> {
+    let mut bytes = fragment_node_prefix(shard, node);
+    bytes.extend_from_slice(key.as_bytes());
+    bytes.extend_from_slice(&stripe.to_be_bytes());
+    bytes.push(index);
+    bytes
+}
+
+/// Returns the prefix of every fragments-table key of `node` in `shard`.
+#[must_use]
+pub fn fragment_node_prefix(shard: &ShardRef, node: &NodeId) -> Vec<u8> {
+    let mut bytes = shard_key(shard);
+    // A node ID is at most `NodeId::MAX_LEN` bytes.
+    bytes.push(node.as_str().len() as u8);
+    bytes.extend_from_slice(node.as_str().as_bytes());
+    bytes
+}
+
+/// A fragments-table key, decoded: whose fragment it names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FragmentKey {
+    /// The shard.
+    pub shard: ShardRef,
+    /// The node holding the fragment.
+    pub node: NodeId,
+    /// The object key.
+    pub key: String,
+    /// The stripe's number.
+    pub stripe: u32,
+    /// The fragment's index within the stripe.
+    pub index: u8,
+}
+
+/// Decodes a fragments-table key.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the shard or node is malformed, or the
+/// object key is empty, too long, or not UTF-8.
+pub fn decode_fragment_key(bytes: &[u8]) -> Result<FragmentKey> {
+    let field = "fragment key";
+    let mut r = Reader(bytes, VALUE_FORMAT);
+    let shard = r.shard(field)?;
+    let len = r.len8(field, NodeId::MAX_LEN)?;
+    let node = NodeId::new(Reader::text(field, r.take(field, len)?)?)
+        .map_err(|e| CodecError::new(field, e))?;
+    let Some(key_len) = r.0.len().checked_sub(FRAGMENT_KEY_SUFFIX_LEN) else {
+        return Err(CodecError::new(field, "truncated"));
+    };
+    if key_len == 0 {
+        return Err(CodecError::new(field, "empty"));
+    }
+    Reader::check(field, key_len, MAX_KEY_LEN)?;
+    let key = Reader::text(field, r.take(field, key_len)?)?;
+    let stripe = u32::from_be_bytes(r.array(field)?);
+    let index = r.u8(field)?;
+    r.finish(field)?;
+    Ok(FragmentKey {
+        shard,
+        node,
+        key,
+        stripe,
+        index,
+    })
+}
+
+/// Encodes the fragment ID of a fragments-table row.
+#[must_use]
+pub fn encode_fragment(fragment: FragmentId) -> Vec<u8> {
+    let mut w = Writer::value();
+    w.0.extend_from_slice(&fragment.get().to_le_bytes());
+    w.0
+}
+
+/// Decodes the fragment ID of a fragments-table row.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded fragment ID of a
+/// format that has them.
+pub fn decode_fragment(bytes: &[u8]) -> Result<FragmentId> {
+    let mut r = Reader::value(bytes, "fragment")?;
+    if r.1 < CODED_SINCE {
+        return Err(CodecError::new(
+            "fragment",
+            format_args!("format {} has no fragments", r.1),
+        ));
+    }
+    let fragment = FragmentId::new(u128::from_le_bytes(r.array("fragment")?));
+    r.finish("fragment")?;
+    Ok(fragment)
 }
 
 fn write_payload(w: &mut Writer, payload: &Payload) -> Result<()> {
@@ -1164,6 +1478,11 @@ fn read_object(r: &mut Reader<'_>) -> Result<ObjectVersion> {
         None
     };
     let payload = read_payload(r)?;
+    let coded = if r.1 >= CODED_SINCE && r.present("object.coded")? {
+        Some(read_coded(r, size)?)
+    } else {
+        None
+    };
     Ok(ObjectVersion {
         size,
         last_modified_ms,
@@ -1175,6 +1494,7 @@ fn read_object(r: &mut Reader<'_>) -> Result<ObjectVersion> {
         storage_class,
         copy_source,
         payload,
+        coded,
     })
 }
 

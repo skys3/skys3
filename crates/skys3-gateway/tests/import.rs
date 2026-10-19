@@ -68,6 +68,7 @@ impl Remote {
             storage_class: None,
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         };
         let remote = RemoteObject {
             object,
@@ -279,6 +280,53 @@ async fn a_miss_falls_through_to_the_remote_until_the_import_passes_the_key() {
     remote.set_import(None);
     let unknown = setup.call(Method::GET, "/photos/b.txt", &[], "").await;
     unknown.assert(404, Some("NoSuchKey"));
+}
+
+/// A key with a control character can come from the remote, though no
+/// client can write one: it reads and deletes, and lists only URL-encoded,
+/// since XML cannot carry it (design §12, found by fuzzing in M7-03).
+#[tokio::test]
+async fn an_imported_key_with_a_control_character_lists_url_encoded() {
+    let remote = Arc::new(Remote::default());
+    let (setup, _) = setup(&remote).await;
+    remote.running(None);
+    remote.put("bell\u{7}.txt", "ding");
+
+    setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await
+        .assert(400, Some("InvalidArgument"));
+    let encoded = setup
+        .call(
+            Method::GET,
+            "/photos?list-type=2&encoding-type=url",
+            &[],
+            "",
+        )
+        .await;
+    encoded.assert(200, None);
+    assert!(
+        encoded.body.contains("<Key>bell%07.txt</Key>"),
+        "{}",
+        encoded.body
+    );
+    let get = setup
+        .call(Method::GET, "/photos/bell%07.txt", &[], "")
+        .await;
+    get.assert(200, None);
+    assert_eq!(get.body, "ding");
+    setup
+        .call(Method::PUT, "/photos/bell%07.txt", &[], "dong")
+        .await
+        .assert(400, Some("InvalidArgument"));
+    setup
+        .call(Method::DELETE, "/photos/bell%07.txt", &[], "")
+        .await
+        .assert(204, None);
+    setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await
+        .assert(200, None);
 }
 
 #[tokio::test]

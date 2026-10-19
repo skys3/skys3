@@ -1,6 +1,6 @@
 [package]
 name = "skys3-flush"
-description = "SkyS3 write-back flush: per-shard flushers that send committed writes to a bucket's remote target with conditional requests."
+description = "SkyS3 write-back flush: per-shard flushers that send committed writes to a bucket's remote target with conditional requests, and read-through fill of evicted versions."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,27 +11,39 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Failpoints for tests.
+test-util = []
+
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+md-5.workspace = true
 prometheus-client.workspace = true
 skys3-config.workspace = true
+skys3-ec.workspace = true
 skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
 skys3-obs.workspace = true
+skys3-peer.workspace = true
 skys3-remote.workspace = true
 skys3-shard.workspace = true
 skys3-types.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
 http.workspace = true
-md-5.workspace = true
+http-body.workspace = true
+proptest.workspace = true
 rand.workspace = true
+rcgen.workspace = true
 s3s.workspace = true
 skys3-control.workspace = true
+skys3-flush = { path = ".", features = ["test-util"] }
 skys3-gateway = { workspace = true, features = ["test-util"] }
+skys3-net.workspace = true
 skys3-sim.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }

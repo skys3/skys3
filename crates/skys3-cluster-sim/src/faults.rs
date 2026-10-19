@@ -18,6 +18,9 @@ pub enum Endpoint {
     Node(usize),
     /// The client at this position, from 0.
     Client(usize),
+    /// The SkyS3 peer the buckets flush to
+    /// ([`ClusterConfig::peer`](crate::ClusterConfig::peer)).
+    Peer,
 }
 
 /// A fault the harness injects.
@@ -93,6 +96,63 @@ pub enum Fault {
         /// How long the losses go on.
         duration: Duration,
     },
+    /// Every register of the control store is deleted, `cluster.json`
+    /// included, as when its bucket is lost (§6.9). Nodes run on from
+    /// their local copies (§6.2) until a [`Fault::RebuildControlStore`].
+    LoseControlStore,
+    /// Not a fault: an operator rebuilds the control store (plan M3-07,
+    /// §6.9). Every node stops, losing power with `power_loss`, as the
+    /// procedure asks; each node's export is taken from its disks
+    /// ([`skys3::rebuild::export`]); the store is rebuilt from the exports
+    /// ([`skys3_control::RebuildPlan`]), through lost answers and
+    /// conflicts; and the nodes start again after `downtime`. The rebuild
+    /// is in [`Report::rebuilds`](crate::Report::rebuilds).
+    RebuildControlStore {
+        /// Whether the nodes lose power as they stop.
+        power_loss: bool,
+        /// How long the nodes stay down.
+        downtime: Duration,
+    },
+    /// The node's link to the remote store drops: its requests there are
+    /// lost, and so are the answers of those in progress, while the rest
+    /// of the cluster reaches the store.
+    RemoteLink {
+        /// The node.
+        node: usize,
+        /// How long the link stays down.
+        duration: Duration,
+    },
+    /// Not a fault: a node held back from the start
+    /// ([`ClusterConfig::joining`](crate::ClusterConfig::joining)) starts
+    /// for the first time, as a newly provisioned node with valid
+    /// credentials and empty disks does.
+    Join {
+        /// The node.
+        node: usize,
+    },
+    /// The SkyS3 peer ([`ClusterConfig::peer`](crate::ClusterConfig::peer))
+    /// stops, losing every unsynced write with `power_loss`, and restarts
+    /// after `downtime`.
+    PeerRestart {
+        /// Whether unsynced writes are lost.
+        power_loss: bool,
+        /// How long the peer stays down.
+        downtime: Duration,
+    },
+    /// UDP blocked between every node and the SkyS3 peer
+    /// ([`ClusterConfig::peer`](crate::ClusterConfig::peer)), as a
+    /// firewall that blocks it would: the native transport's links are
+    /// cut, or held with `hold`, and the peer's S3 endpoint stays
+    /// reachable. A block holds for `duration` whatever else heals in
+    /// between: a cut or held link between a node and the peer that heals
+    /// within it is blocked again. Blocks that overlap extend each other.
+    UdpBlock {
+        /// Whether the links are held, so that what was on its way arrives
+        /// once the block ends, rather than cut.
+        hold: bool,
+        /// How long UDP stays blocked.
+        duration: Duration,
+    },
 }
 
 impl Fault {
@@ -100,14 +160,17 @@ impl Fault {
     #[must_use]
     pub fn duration(&self) -> Option<Duration> {
         match self {
-            Fault::Crash { downtime, .. } => Some(*downtime),
+            Fault::Crash { downtime, .. } | Fault::PeerRestart { downtime, .. } => Some(*downtime),
             Fault::Partition { duration, .. }
             | Fault::Hold { duration, .. }
             | Fault::MessageLoss { duration, .. }
             | Fault::ControlOutage { duration }
             | Fault::ControlLatency { duration, .. }
-            | Fault::LostCasResponses { duration, .. } => Some(*duration),
-            Fault::FailSync { .. } => None,
+            | Fault::LostCasResponses { duration, .. }
+            | Fault::RemoteLink { duration, .. }
+            | Fault::UdpBlock { duration, .. } => Some(*duration),
+            Fault::RebuildControlStore { downtime, .. } => Some(*downtime),
+            Fault::FailSync { .. } | Fault::Join { .. } | Fault::LoseControlStore => None,
         }
     }
 }
@@ -150,6 +213,9 @@ pub struct FaultProfile {
     pub control: usize,
     /// The longest duration of a fault.
     pub max_duration: Duration,
+    /// Faults of the SkyS3 peer: partitions and holds between it and a
+    /// node, and restarts. None by default.
+    pub peer: usize,
 }
 
 impl Default for FaultProfile {
@@ -164,6 +230,7 @@ impl Default for FaultProfile {
             sync_failures: 1,
             control: 3,
             max_duration: Duration::from_secs(2),
+            peer: 0,
         }
     }
 }
@@ -273,6 +340,29 @@ impl FaultPlan {
             };
             plan.push(at(rng), fault);
         }
+        // Drawn last, and only if asked for, so that what else a seed draws
+        // stays the same.
+        let peer = if profile.peer > 0 {
+            rng.random_range(0..=profile.peer)
+        } else {
+            0
+        };
+        for _ in 0..peer {
+            let (a, b, duration) = (
+                Endpoint::Node(rng.random_range(0..nodes)),
+                Endpoint::Peer,
+                lasting(rng),
+            );
+            let fault = match rng.random_range(0..3) {
+                0 => Fault::Partition { a, b, duration },
+                1 => Fault::Hold { a, b, duration },
+                _ => Fault::PeerRestart {
+                    power_loss: rng.random_bool(0.5),
+                    downtime: duration,
+                },
+            };
+            plan.push(at(rng), fault);
+        }
         plan
     }
 }
@@ -298,6 +388,18 @@ mod tests {
         assert_eq!(order, [crash(1), crash(0), crash(2)]);
         assert_eq!(crash(0).duration(), Some(Duration::from_secs(1)));
         assert_eq!(Fault::FailSync { node: 0, disk: 0 }.duration(), None);
+        assert_eq!(Fault::Join { node: 3 }.duration(), None);
+        assert_eq!(Fault::LoseControlStore.duration(), None);
+        let link = Fault::RemoteLink {
+            node: 0,
+            duration: Duration::from_secs(2),
+        };
+        assert_eq!(link.duration(), Some(Duration::from_secs(2)));
+        let rebuild = Fault::RebuildControlStore {
+            power_loss: true,
+            downtime: Duration::from_secs(1),
+        };
+        assert_eq!(rebuild.duration(), Some(Duration::from_secs(1)));
         assert_eq!(FaultPlan::none().faults(), []);
     }
 
@@ -341,6 +443,16 @@ mod tests {
                         assert!((0.2..0.8).contains(probability));
                         6
                     }
+                    Fault::Join { .. }
+                    | Fault::PeerRestart { .. }
+                    | Fault::LoseControlStore
+                    | Fault::RebuildControlStore { .. }
+                    | Fault::RemoteLink { .. }
+                    | Fault::UdpBlock { .. } => {
+                        panic!(
+                            "a random plan joins no node, loses no store, and drops no remote link"
+                        )
+                    }
                 };
                 kinds[kind] += 1;
             }
@@ -358,5 +470,51 @@ mod tests {
                 .iter()
                 .all(|f| !matches!(f.fault, Fault::Partition { .. } | Fault::Hold { .. }))
         );
+    }
+
+    #[test]
+    fn peer_faults_cut_a_node_off_the_peer_or_restart_it() {
+        let profile = FaultProfile {
+            peer: 6,
+            ..FaultProfile::default()
+        };
+        let mut kinds = [0; 2];
+        for seed in 0..32 {
+            let plain = FaultPlan::random(
+                &mut SmallRng::seed_from_u64(seed),
+                &FaultProfile::default(),
+                3,
+                2,
+                4,
+            );
+            let plan = FaultPlan::random(&mut SmallRng::seed_from_u64(seed), &profile, 3, 2, 4);
+            // The other faults are those of the same seed without the peer.
+            let others: Vec<_> = plan
+                .faults()
+                .iter()
+                .filter(|f| match &f.fault {
+                    Fault::Partition { b, .. } | Fault::Hold { b, .. } => *b != Endpoint::Peer,
+                    fault => !matches!(fault, Fault::PeerRestart { .. }),
+                })
+                .cloned()
+                .collect();
+            assert_eq!(others, plain.faults());
+            for scheduled in plan.faults() {
+                match &scheduled.fault {
+                    Fault::Partition { a, b, .. } | Fault::Hold { a, b, .. }
+                        if *b == Endpoint::Peer =>
+                    {
+                        assert!(matches!(a, Endpoint::Node(n) if *n < 3));
+                        kinds[0] += 1;
+                    }
+                    Fault::PeerRestart { downtime, .. } => {
+                        assert!(*downtime <= profile.max_duration);
+                        kinds[1] += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(kinds.iter().all(|&count| count > 0), "{kinds:?}");
     }
 }

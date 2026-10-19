@@ -10,13 +10,14 @@ use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
     Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
-    Extent, ExtentRef, Flushed, Import, ImportCheckpoint, ImportProgress, ImportRange, LogRecord,
-    MAX_IMPORT_RANGES, MAX_PAYLOAD_LEN, Metadata, MpuAbort, MpuComplete, MpuCreate, MpuPart, Put,
-    PutData, RecordBody, ShardRef, TagSet, Tags, UploadChecksum,
+    EcPublish, EcRelocate, Extent, ExtentRef, Flushed, FragmentMove, Import, ImportCheckpoint,
+    ImportProgress, ImportRange, LogRecord, MAX_IMPORT_RANGES, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
+    MpuComplete, MpuCreate, MpuPart, PartFlushed, Put, PutData, RecordBody, RemoteStep, ShardRef,
+    TagSet, Tags, UploadBegin, UploadChecksum,
 };
 use skys3_types::{
-    BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
-    VersionIdentity,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Geometry, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId, VersionIdentity,
 };
 
 /// A lowercase DNS-label identifier of 1 to `max` bytes.
@@ -222,6 +223,34 @@ fn mpu_complete(position: EpochSeq) -> impl Strategy<Value = MpuComplete> {
         )
 }
 
+fn part_flushed(position: EpochSeq) -> impl Strategy<Value = PartFlushed> {
+    let step = prop_oneof![
+        Just(None),
+        Just(Some(None)),
+        (1..=10_000_u16, 1..=1_000_u64, etag())
+            .prop_map(Some)
+            .prop_map(Some),
+    ];
+    (key(), position_before(position), "[!-~]{1,200}", step)
+        .prop_filter("the part fits after the upload", |(_, upload, _, _)| {
+            upload.seq.get() < u64::MAX - 1_000
+        })
+        .prop_map(|(key, upload, remote_upload_id, step)| PartFlushed {
+            key,
+            upload,
+            remote_upload_id,
+            step: match step {
+                None => RemoteStep::Opened,
+                Some(None) => RemoteStep::Ended,
+                Some(Some((number, offset, remote_etag))) => RemoteStep::Part {
+                    number,
+                    position: EpochSeq::new(upload.epoch, Seq::new(upload.seq.get() + offset)),
+                    remote_etag,
+                },
+            },
+        })
+}
+
 fn put(position: EpochSeq) -> impl Strategy<Value = Put> {
     (
         (key(), any::<u64>(), etag()),
@@ -250,6 +279,97 @@ fn put(position: EpochSeq) -> impl Strategy<Value = Put> {
                     copy_source,
                     data,
                 }
+            },
+        )
+}
+
+/// A valid `EC_PUBLISH` at `position`: one to four stripes of narrow
+/// geometries, on distinct nodes.
+pub fn ec_publish(position: EpochSeq) -> impl Strategy<Value = EcPublish> {
+    let stripe = (1..=1_000_000_u64, 1..=4_usize, 1..=3_usize, 1..=3_u16).prop_flat_map(
+        |(data_len, k, m, codec)| {
+            (
+                Just((data_len, k, m, codec)),
+                btree_set(node_id(), k + m),
+                vec(any::<u128>(), k + m),
+            )
+        },
+    );
+    (
+        (key(), position_before(position), etag()),
+        (any::<u64>(), any::<u64>()),
+        vec(stripe, 1..=4),
+    )
+        .prop_map(|((key, version, etag), (epoch, number), stripes)| {
+            let mut offset = 0;
+            let stripes: Vec<CodedStripe> = stripes
+                .into_iter()
+                .enumerate()
+                .map(|(number, ((data_len, k, m, codec), nodes, ids))| {
+                    let fragments = nodes
+                        .into_iter()
+                        .zip(ids)
+                        .map(|(node, id)| FragmentLocation {
+                            node,
+                            fragment: FragmentId::new(id),
+                        })
+                        .collect();
+                    let geometry = Geometry::new(k, m).unwrap();
+                    let stripe = CodedStripe::new(
+                        u32::try_from(number).unwrap(),
+                        offset,
+                        data_len,
+                        geometry,
+                        CodecId::new(codec),
+                        fragments,
+                    )
+                    .unwrap();
+                    offset = stripe.end();
+                    stripe
+                })
+                .collect();
+            EcPublish {
+                key,
+                version,
+                etag,
+                attempt: AttemptId::new(Epoch::new(epoch), number),
+                size: offset,
+                stripes,
+            }
+        })
+}
+
+/// A valid `EC_RELOCATE` at `position`: one to eight moves, in stripe and
+/// index order, each to a location other than its own.
+pub fn ec_relocate(position: EpochSeq) -> impl Strategy<Value = EcRelocate> {
+    let location = || {
+        (node_id(), any::<u128>()).prop_map(|(node, id)| FragmentLocation {
+            node,
+            fragment: FragmentId::new(id),
+        })
+    };
+    let moved =
+        (location(), location()).prop_filter("a move goes somewhere else", |(from, to)| from != to);
+    (
+        (key(), position_before(position), etag()),
+        (any::<u64>(), any::<u64>()),
+        btree_map((any::<u32>(), any::<u8>()), moved, 1..=8),
+    )
+        .prop_map(
+            |((key, version, etag), (epoch, number), moves)| EcRelocate {
+                key,
+                version,
+                etag,
+                attempt: AttemptId::new(Epoch::new(epoch), number),
+                moves: moves
+                    .into_iter()
+                    .map(|((stripe, index), (from, to))| FragmentMove {
+                        stripe,
+                        index,
+                        from,
+                        to,
+                    })
+                    .collect(),
             },
         )
 }
@@ -309,6 +429,8 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
         mpu_complete(position).prop_map(RecordBody::MpuComplete),
         (key(), position_before(position))
             .prop_map(|(key, upload)| RecordBody::MpuAbort(MpuAbort { key, upload })),
+        key().prop_map(|key| RecordBody::UploadBegin(UploadBegin { key })),
+        part_flushed(position).prop_map(RecordBody::PartFlushed),
         (key(), tags()).prop_map(|(key, tags)| RecordBody::Tags(Tags { key, tags })),
         (
             key(),
@@ -361,6 +483,8 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
                     })
                 }
             ),
+        ec_publish(position).prop_map(RecordBody::EcPublish),
+        ec_relocate(position).prop_map(RecordBody::EcRelocate),
         shard_config(shard, position.epoch).prop_map(RecordBody::Config),
         Just(RecordBody::Truncate),
         import_progress().prop_map(RecordBody::ImportProgress),

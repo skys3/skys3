@@ -1916,6 +1916,304 @@ of this file. A task with nothing unexpected keeps "None."
   the current format re-encodes byte for byte, and an older one re-encodes
   in the current format to the same value. A unit test keeps the case.
 
+### M1-20 Read-through fill and ADOPT
+
+- **Nothing evicted payload yet.** Imported and adopted stubs are evicted,
+  but no clean entry could become one, and the design left open how the
+  move between clean and evicted is recorded. Both directions are now
+  node-local and made by no record (design §4.2): `Shard::fill` and
+  `Shard::evict`, through a new `Index::update_local` that commits like an
+  apply without moving the applied position. Each names the version it was
+  decided for and is refused once the entry holds another, so a write that
+  committed in between wins. `Shard::evict` is the transition only; the LRU
+  policy and its budget are M1-21's. It refuses multipart objects: an
+  evicted stub has no place for part boundaries, which `partNumber` reads
+  and a later `TAGS` flush need, so M1-21 has to add one before it evicts
+  them.
+- **Where filled bytes go.** The design says only that they become clean
+  cache. A fill commits them as `EXTENT` records of the shard, like a
+  PUT's body, so the location map, compaction, and the gateway's extent
+  streaming all apply unchanged. The cost is that fill extents take shard
+  positions and are refused while the shard is sealed (a read then answers
+  `503` until the DeleteBucket ends), and they are replicated to every
+  member (see the replication bullet below).
+- **The store reads whole bodies, and returned no `Last-Modified`.**
+  `ObjectStore::get_object` returns one `Bytes`, so a fill reads ranges of
+  at most 8 MiB (`FILL_CHUNK_BYTES`), each with the same `If-Match` and
+  `versionId`, which also bounds its memory; the fills of a target hold at
+  most `flush_max_inflight_bytes_per_target` at once, a budget beside the
+  flushers' own. Ranges are
+  served as soon as the extents covering them are applied, so a read far
+  into a large object waits for the fill to reach it. `ObjectInfo` gained
+  `last_modified_ms` for the `ADOPT` record; the AWS client fills it, and
+  `SimS3`, which keeps no times, leaves it out, so the primary's clock
+  stands in.
+- **Review: extents larger than a chunk.** A read was a whole number of
+  extents, at least one, so `extent_bytes` above 8 MiB (the configuration
+  allows 16 MiB) made each GET one 16 MiB extent, past the chunk limit,
+  and a GET larger than the in-flight budget took the whole budget and
+  still held more. A fill's extents are now at most 8 MiB, and a read is
+  the most whole extents that fit both the chunk and the budget. Extents
+  are not cut below that to fit a smaller budget: the index holds at most
+  81,920 extents per object, which 64 KiB extents of a 5 GiB object
+  reach, so a budget smaller than one extent still admits one extent at a
+  time. Regression tests fill two objects at once with 16 MiB extents,
+  and with a budget of two and a half extents, and check every GET and
+  the bytes all GETs ask for at once.
+- **`versionId` pins the version.** The plan's "Done when" reads as if a
+  fill always notices an out-of-band write, but with `versionId` a GET of
+  the named version succeeds after one. A versioned remote therefore keeps
+  serving the version SkyS3 knows, which matches its metadata, and adopts
+  only once that version is gone (`NoSuchVersion`, for example after a
+  lifecycle rule expired it). Design §9.2 says so; the simulation expires
+  versions on versioned seeds to reach the `ADOPT`.
+- **An out-of-band delete cannot be adopted.** `ADOPT` always makes an
+  evicted stub, and no record removes a clean entry. When the HEAD after a
+  failed fill finds no object, the conflict is counted, the read answers
+  `503`, and the stub stays until a write replaces it (design §9.2).
+  Adopting the delete as a tombstone would need a new record or a `DELETE`
+  that SkyS3 itself would then flush; neither seemed right for M1.
+- **How the gateway reaches the fill.** The gateway does not depend on
+  `skys3-flush` or `skys3-remote`, so it defines a `Fills` trait (a boxed
+  future and an `mpsc` body of `io::Result<Bytes>`), set in
+  `GatewayConfig::fills`. The node implements it over each bucket's
+  `Filler`, which `FlushService` keeps beside the bucket's flushers and
+  creates before the probe finishes (reads need none), so the flush
+  service is now built before the gateway. A GET resolves the key again
+  after `FillError::Changed`, at most three times. Because the filler's
+  counters are taken when the node starts following a bucket, the flush
+  counters' series now appear then too, not after the probe; the metrics
+  reference says so. `FlushSettings` gained `extent_bytes`, which the node
+  sets from `[storage]`.
+- **Fills and the dirty budget (M1-17).** A fill commits `EXTENT` records,
+  but its bytes are clean cache: the flushers count only dirty versions,
+  so fills never count against `max_dirty_bytes`, and the budget does not
+  hold them back, since refusing a read would not drain it. They do take
+  disk space, so the node does not fill a shard whose disk, or the data
+  directory, is below `disk_min_free_bytes`: the read answers `503`, as a
+  write would. Bounding the clean cache itself is M1-21's.
+- **The simulation needed a deliberate race.** Random interleavings almost
+  never commit a local write while a fill that will adopt is at the
+  remote, so a mutation that applies `ADOPT` over a dirty entry passed 300
+  seeds. The scenario now also stages that race (out-of-band write, a
+  delayed fill, a local PUT while its GET is in flight) and requires the
+  key to end at the local write. With it, that mutation fails at seed 0;
+  a fill without its `If-Match` and `versionId`, and a fill that caches
+  over a changed entry, fail at seed 7. 300 seeds take about 30 seconds.
+- **Rebased onto replication (M2-07 to M2-17, M3, M6).** The fill was
+  written for a shard alone; on the replicated stack it now runs only on
+  the serving primary. The `Filler` reads the entry through
+  `Shard::entry`, which admits reads only on a serving primary with its
+  leases, so a member, a learner, a primary still reconciling, one that
+  stepped down for a handoff, and a stopped replica refuse before any
+  remote request (a new test covers the stopped case). The `EXTENT`
+  records and the `ADOPT` go through `Shard::commit`, so the primary
+  sequences them and they replicate like any record; members apply the
+  `ADOPT` alike, its `expected_seq` check included. `Shard::fill` now
+  checks the replica serves, as `commit` does, and not just that it runs:
+  its payload must be records this replica sequenced as the primary it
+  still is. `Shard::evict` still only needs a running replica, since it
+  drops a payload of the replica's own. Learner snapshots already turn
+  clean entries into evicted ones, which a later primary fills on demand.
+  No index or log format changed; the index stays at format 6.
+- **Open: fills on the members and across nodes.** The members hold the
+  fill's `EXTENT` records in their logs, but their entries stay evicted,
+  so the bytes are dead weight until compaction (M1-22) reclaims them;
+  §9.2's "clean cache on up to `clean_copies` members" needs either a
+  node-local fill path or members that make the entry clean when the
+  primary does, which is §9.3's (M1-21). The node binary still serves
+  every shard alone, so `NodeFills` fills the local replica only. On a
+  routed node the gateway may resolve an evicted entry on another node's
+  primary, and the local fill then answers `503`; forwarding fills to the
+  primary needs a `Request` variant in the routing wire format.
+- **Fills and the namespace import (M1-18).** An `ADOPT` from a fill
+  stored a `Content-Type` only when the remote returned one, so an
+  adopted object without one looked like an imported stub whose metadata
+  was never loaded, and the next read would HEAD the remote and commit a
+  second `ADOPT`. The fill now builds the metadata with the import's
+  `loaded_metadata`, which defaults to `binary/octet-stream`, as design
+  §9.1 requires of every `ADOPT`. In the gateway, a GET of a key only at
+  the remote reads it there; any other key goes through the import's
+  lookup, which loads a stub's metadata first, and then reads local bytes
+  or fills. The lookup now also returns the entry's version, which the
+  fill names.
+- **Left open.** A copy whose source is evicted still answers `503`
+  (§7.2's remote `CopyObject` row would avoid reading the bytes at all). A
+  `TAGS` change of an evicted stub still cannot flush, since the flusher
+  needs the bytes: reading them from the remote under `If-Match` would
+  need its own conflict handling in the flusher. The node's `Fills` is
+  wired in the binary but, like the flusher, not exercised end to end: no
+  S3 server in the tests honors preconditions, so the `Filler` runs against
+  `SimS3`, and M1-26 runs it against real providers.
+
+### M1-21 Clean cache and eviction
+
+- **Fills on members stay on the primary (M1-20's open item).** A member
+  sees a fill only as `EXTENT` records of the key, which look exactly like
+  the extents of a PUT body still on its way, so it cannot tell that they
+  hold the version its entry names; linking them would need a record,
+  which the node-local Clean ↔ Evicted rule forbids, or a log format
+  change. Only the primary serves reads until read plans (M2-18), so a
+  member's filled copy would serve nothing but a later takeover, where
+  the new primary fills on demand anyway. A fill therefore keeps one copy,
+  the primary's, whatever `clean_copies` says, and design §9.2 now says
+  so. Copies on more members come from flushes: when a `FLUSHED` makes an
+  entry clean, each replica keeps the payload only if its rank (primary 0,
+  then the other members in configuration order; learners none) is below
+  the bucket's `clean_copies`, and evicts it at once otherwise.
+- **Multipart objects are evicted after all: index format 7.** M1-20
+  refused them because a stub had nowhere to keep part boundaries. The
+  entry's `Payload::Parts` already holds them, so an evicted multipart
+  object keeps that payload and its part rows, with ETags and checksums,
+  and only the rows' payloads become `Payload::None`. The codec refused a
+  part without bytes, so it now accepts one, and the index format went
+  from 6 to 7 because older builds would fail to decode such a part. A
+  fill cuts its chunks at the part boundaries and gives each part its own
+  extents back. The gateway used to decide "fill" from `Payload::None`; it
+  now asks whether the entry is evicted, and a part without bytes answers
+  `503` like any version whose bytes are not cached.
+- **Eviction frees no disk space until compaction (M1-22).** The §9.3
+  capacity model with `reserve_fraction` reads each disk's free space, but
+  a byte evicted stays in the log until compaction reclaims it, so a disk
+  over its reserve would have evicted its whole cache, one refresh after
+  another, without gaining a byte. A disk's room for clean payload now
+  counts what this node evicted from it since it started as free:
+  available + cached + evicted − `reserve_fraction` × size. Evicting
+  leaves the room unchanged, so the cache gives back exactly the
+  shortfall. After a restart the evicted payload counts as used again,
+  which is conservative; M1-22 should tell the cache what compaction
+  reclaims. The free-space watcher of M1-17 now also feeds the cache, so
+  it reads `statvfs` even when `disk_min_free_bytes` is 0;
+  `skys3_io::disk::space` returns the size with the free space.
+- **Reports to the cache had to be ordered.** The cache keeps in memory
+  which entries are clean, from reports the replicas send after each
+  change. A fill reported its Clean after its index commit, so a write
+  applied in between could report Gone first and leave the cache counting
+  a dirty entry as clean (and it then could not count it out). Every change
+  the cache follows (applied records, fills, evictions, and the scan a
+  replica gets when it opens) now runs under one lock per replica together
+  with its report, so the cache sees them in index order. The eviction
+  itself never trusts the cache: it names the version and refuses anything
+  not clean at it.
+- **The simulation needed deliberate races.** The seeded scenario first
+  passed with an eviction that checked neither the version nor the state,
+  because the evictor almost never interleaved with a write. It now also
+  evicts at whatever version an entry holds, in any state, and stages
+  "evict a version a write has just replaced"; it compares the index with
+  a replay of the log up to which clean payloads were kept. With those, a
+  check-free eviction and a state-blind one fail at seed 0. 256 seeds take
+  about a minute in a debug build, so the scenario is declared at cost 4.
+- **The cluster harness had no fills.** Evicted keys would have failed
+  the final reads, so `ClusterConfig::clean_cache` turns on the cache and
+  fills (`SimFills`, the node binary's without the free-space check). With
+  a cache, the durability checker counts a dirty copy whose bytes its node
+  does not locate as no copy, so `every_member_durable` checks that no
+  member evicted dirty payload, also across crashes and power loss.
+- **`TAGS` over an evicted member copy.** `TAGS` keeps the bytes of the
+  version it changes; on a member that dropped its copy beyond
+  `clean_copies`, the new dirty version has none. Nothing is lost (the
+  bytes are the remote's), but it widens M1-20's open item: such a version
+  cannot be flushed from that replica until the flusher fills before it
+  flushes. Design §9.3 records it.
+- **No copy is evicted before its bucket's policy is known.** Review found
+  that a restarted node opened its replicas, and the cache scanned them,
+  before the node first read the buckets' `clean_copies`: under the
+  default of one copy, every member copy beyond rank 0 went, for good,
+  since a higher setting brings none back. A bucket made at runtime had
+  the same gap until the next round of the flush follower. The cache now
+  keeps every copy of a bucket it was not told about, and evicts the extra
+  ones when it is told, or when the setting drops; the node and the
+  cluster harness also install the policies before the cache runs and
+  before each round's reconcile awaits.
+- **Left open.** A learner's snapshot still turns clean multipart entries
+  into stubs without parts, as before. A new primary does not revisit
+  copies already kept; LRU reclaims them. Only
+  reads on the primary count as uses, since members serve none yet; read
+  plans (M2-18) and the hot cache (M2-19) change that.
+
+### M1-22 Segment compaction
+
+- **Liveness needs the index, not just the location map.** Applying never
+  removes a location for a replaced version (a read may still stream it),
+  so the location map alone says nothing about what is live. A record is
+  live when the map locates it in the segment *and* an entry, a completed
+  object's parts, or a part of an open upload names its position;
+  `IndexReader::holders` answers that per key. The index format stays at
+  7: compaction adds no table, and its one durable commit per chunk only
+  moves and removes locations. `Index::update_durable` commits with
+  `Durability::Immediate`; a non-durable commit there lost data at seed 0
+  of both simulations, because the segment file is removed right after.
+- **Unnamed extents wait instead of being copied.** `EXTENT` records no
+  entry names are a body still arriving, a failed upload, or a peer's
+  staging (§7.8). Copying them would rewrite garbage forever, so their
+  segment waits until it has been sealed for `peer_staging_ttl_seconds`
+  and they are then dropped. The log tracks when it sealed each segment,
+  in memory; a segment recovered at startup counts from startup, which
+  only delays reclamation. A member's copy of a fill's extents, which
+  nothing on the member names (M1-21), is dropped the same way.
+- **Replicas hold what their members may lack.** Replay applies a
+  replicated shard's durable tail past the commit watermark, so a
+  segment's records can be applied and released while a member that is
+  behind still needs them sent from this log. `Shard::replicated_through`
+  is the highest commit watermark the replica learned since it opened
+  (`None` for a replica alone); records after it keep their segment, as
+  do records of a shard not open on the node. The unit test that opens a
+  replicated shard whose member never reports catches dropping this hold;
+  the cluster simulations do not, as the window is short there.
+- **Dropping a `TRUNCATE` broke reading the tail.** Once compaction drops
+  a `TRUNCATE`, the records it invalidated may still be in an older
+  segment, so `read_tail` found two records for one `seq` and failed.
+  It now keeps the newest epoch for each `seq` (a copied record, found
+  twice, is alike). Design §10.3 records the rule.
+- **The latest `CONFIG` is copied, though the index also keeps it.** The
+  plan asks for it to stay reachable in the log; the record matching the
+  index's `configs` row is copied and older ones are dropped. Both
+  simulations check every node's log for each shard's latest `CONFIG`.
+- **Hot clean payload is the most recently used half.** The cache ranks
+  entries by last use per disk; compaction copies a clean payload only if
+  it is among the most recently used entries holding half of the disk's
+  cached bytes, and only while the cache is within its bounds. A node
+  without a clean cache copies clean payload, since it never evicts.
+- **The cache now hears what compaction reclaims (M1-21's open item).**
+  `CleanCache::reclaimed` lowers the evicted bytes a disk's room counts as
+  free by every payload byte compaction drops from that disk, evicted or
+  replaced. That can count less free than there is, never more.
+- **Retired segments stay readable for a minute.** A read that located a
+  record just before compaction retired its segment keeps the file handle
+  for `RETIRE_GRACE` (60 s), so streaming a GET is not cut off; the files
+  are already unlinked and synced out of the directory. Review found two
+  gaps: the segment left the listing before it joined the retired ones,
+  so a read in between failed, and scans did not look at retired
+  segments, so `read_tail`, which lists the segments and scans them one
+  by one, could hit one compaction had just retired and abort a
+  reconciliation; skipping it would lose records copied into a segment
+  created after the listing. The move is now one step under the segments
+  lock, scans see retired segments within the grace, and `read_tail`
+  takes every scanner at once (`SegmentLog::scan_all`), each holding its
+  file, so no time bound applies to it. One test catches the first gap
+  with a clock that scans the segment each time `retire` reads the
+  clock; another scans a listed segment after retiring it.
+- **Teeth.** The shard simulation runs 2 to 4 process lives of writers
+  over overwritten keys, multipart uploads, and `TAGS`, cuts the power at
+  a random sync inside a compaction pass in 70% of seeds, and races a
+  `TAGS`/`FLUSHED` writer against compaction in half of them; it compares
+  the index with a replay of the model and checks every named payload's
+  bytes. Copies without new locations, a non-durable index commit, a
+  dropped `CONFIG`, and a relocation that ignored a racing write each
+  fail it; the last only with the racer. Classifying dirty payload as
+  droppable does not, because the relocation's re-check keeps the
+  segment: that check is the safety net, not the classification. With
+  `SKYS3_SIM_SEEDS=256` in a debug build: the shard scenario (cost 8, 32
+  seeds) takes 33 s; the cluster scenarios take 29 s (crashes, message
+  loss, and a partition; cost 32, 8 seeds) and 38 s (power loss at four
+  syncs of a base run; cost 128, 2 seeds of five runs each).
+- **Left open.** Every pass scans each released segment whole to measure
+  its live bytes; per-segment live counters would avoid that, at the cost
+  of keeping them across crashes. Segments of a shard dropped from the
+  node are still never released (§10.2), so compaction never sees them.
+  Compaction has no rate limit of its own beyond chunking (32 MiB or 4096
+  records per durable commit). Fragment segments (M7) are not handled.
+
 ### M1-23 OIDC token validation
 
 - **`jsonwebtoken` was not a good fit after all.** Design §15 named
@@ -2051,6 +2349,114 @@ of this file. A task with nothing unexpected keeps "None."
 - **Per-role session limits were left out.** AWS roles carry a
   `MaxSessionDuration`; here `DurationSeconds` is bounded by
   `session_maximum_seconds` only, which keeps the role register small.
+
+### M1-25 SDK matrix
+
+- **The matrix needs HTTPS.** botocore sends `aws-chunked` bodies with
+  trailing checksums only over TLS, and plain HTTP would have left the
+  trailer forms untested. The node serves the test certificate from
+  `crates/skys3/tests/data/`, and every client is told to trust its CA:
+  `AWS_CA_BUNDLE` (Python, Go, CLI), `NODE_EXTRA_CA_CERTS`, a TLS context
+  (Rust), and, for Java, a PKCS12 trust store the client writes at start
+  and makes the JVM default, since the STS client inside the web-identity
+  provider ignores any HTTP client the test configures. Every SDK client
+  checks that at least one upload went as
+  `STREAMING-UNSIGNED-PAYLOAD-TRAILER`.
+- **Getting an issuer and a role into the binary.** The node fetches OIDC
+  documents over HTTPS from the system roots only, and nothing writes
+  identity registers but the control store's own API. The test starts the
+  binary with `SSL_CERT_FILE` naming the test CA (which
+  `rustls-native-certs` honours), runs its own issuer with the test
+  certificate (`tests/support/issuer.rs`), and writes the provider and
+  role registers as files into the file control store while the node is
+  down: it starts the node once to create the store, stops it, writes
+  them, and starts it again, since the store reads its files when opened.
+- **Sessions cannot be short, so each SDK is told to refresh early.**
+  900 seconds is the STS minimum, too long to wait for in CI. Go's
+  `ExpiryWindow`, Java's `prefetchTime` and `staleTime`, and a `memoize`
+  around JavaScript's `fromTokenFile` (the default chain's own cache
+  refreshes five minutes before expiry and cannot be told otherwise)
+  refresh five seconds after issue. botocore (Python and the CLI)
+  refreshes within 15 minutes of expiry, so with 900-second sessions every
+  request refreshes. The Rust SDK's identity cache jitters its buffer by up
+  to half, so no buffer gives a short fixed refresh age; a buffer of twice
+  the session makes every request due, as in botocore, while the cache
+  still loads one session at a time. Under load that is about one STS
+  call per request: locally, Rust issued 475 to 1,700 sessions in 20
+  seconds, each a `PUT` in `sys-sessions`, without a failed request.
+- **Refresh must be proven per provider, and with expiring tokens.** A
+  review found three ways the first version could pass without a
+  refresh. JavaScript seeded its set of keys with the default chain's
+  first key, so the tested provider's own first session made two. The
+  CLI's workers have their own caches, so their first sessions made
+  eight between them. And tokens lasted 60 seconds plus the node's 60
+  seconds of skew, longer than the load, so a client that never reread
+  the token file still worked. Now every client seeds its keys from the
+  provider or cache under test (each CLI worker needs two of its own),
+  and the node accepts a token for at most seven seconds
+  (`oidc_clock_skew_seconds = 1`, tokens of six seconds) while the file
+  gets a new one every two, written atomically since clients read it at
+  any moment. The Rust client checks after the load that the token it
+  read before it is refused with `ExpiredTokenException` and the current
+  one accepted, so the clients that kept working reread the file.
+- **SDK defaults differ.** botocore presigns with SigV2 unless told
+  `signature_version="s3v4"`, which SkyS3 refuses as designed. The CLI's
+  default checksum is CRC64NVME (it bundles the Common Runtime), the
+  others' CRC32. Java needs `aws-crt` for CRC32C and CRC64NVME, and
+  Python `botocore[crt]`. The SDKs' checksum enums now also list MD5,
+  SHA512, and XXHASH algorithms, which SkyS3 answers with
+  `501 NotImplemented` (design section 7.4); the clients test the five
+  design section 11 names.
+- **The CLI's session cache is not safe across processes.** Concurrent
+  `aws` processes sharing a home failed with a `KeyError` on the cache
+  file under `~/.aws/cli/cache` that another process was replacing. Each
+  load worker of the CLI client has its own home.
+- **s3-tests cleans up with versioning APIs.** Before and after every test
+  it lists object versions, which SkyS3 rejects with `501`, so every test
+  failed in teardown. A pytest plugin (`skys3_s3tests.py`) lists with
+  ListObjectsV2 instead; nothing else about the tests changes. A full run
+  of `test_s3.py` and `test_headers.py` at the pinned commit passed 236
+  tests; the subset is the 209 of them that do not pass only by accident
+  or slowly, and `subset.txt` lists why the rest are out. No failure was
+  a gateway bug that this PR could fix in scope: most are rejected or
+  unbuilt features, and the remaining differences (the encoding of a
+  space as `+`, an echoed empty `Delimiter`, re-completing a completed
+  upload, `BadDigest` for a malformed whole-object checksum, and others
+  `subset.txt` names) are design decisions or need checking against AWS
+  S3 first, which M7-01 owns.
+- **Rust runs in the test, the rest in images.** The Rust client is part
+  of `cargo test -p skys3 --test sdk`, so it runs in every `rust` and
+  `coverage` job too; an image would rebuild `aws-sdk-s3` for versions
+  `Cargo.lock` already pins. The other clients run in images built from
+  digests of pinned tags, with versions pinned by `requirements.txt`,
+  `go.sum`, `package-lock.json`, `pom.xml`, and the s3-tests commit.
+- **Run locally without containers.** The docker daemon was not running in
+  the sandbox, so the images were never built here: CI's `sdk` job is
+  their first build. Every client ran on the host instead
+  (`SKYS3_SDK_LOCAL=1`), with the same SDK versions but other runtimes:
+  Python 3.11, Go 1.24.7, Node 22.22, Ubuntu's OpenJDK 21 with Maven
+  3.9.16, and AWS CLI 2.37.8 from its installer. All seven passed at once
+  in three minutes, the s3-tests subset being the longest at 2.5 minutes.
+- **A full disk looks like a broken gateway.** The sandbox's shared disk
+  filled up during a first full s3-tests run, and the node answered
+  `503 SlowDown` (admission control's free-space reserve) to most of the
+  later tests. The runs counted above were made with enough space.
+- **Test ports can be taken before the binary binds them.** In one full
+  workspace run the matrix's node exited at start; its log was lost, but
+  the likely cause is the tests' `free_port`, which binds port 0 and
+  drops the socket, so a test running in parallel can bind the port
+  before the binary does (also while a node is down between restarts),
+  and two calls could even return the same port. `Process::start` now
+  recognises an exit whose log says `Address already in use`, rewrites
+  the configuration's `[gateway]` and `[admin]` addresses with fresh
+  ports, and starts again, five times at most; any other early exit still
+  panics with the log. Callers read the addresses from the returned
+  `Process`. Readiness waits for the node's own `serving` line before
+  probing `/readyz`, with a deadline per probe, because until the node
+  holds the admin port another process may answer there, or accept and
+  never answer. `free_ports` holds its listeners until all are chosen, so
+  a gateway and an admin port never coincide. A test holds a configured
+  port and checks the node moves.
 
 ## M2 Replicated shards
 
@@ -2986,6 +3392,23 @@ of this file. A task with nothing unexpected keeps "None."
   grace later. Without that, the simulation found a member proposing over
   epoch `e` forever after the winner crashed. A loser the register no
   longer names stays stopped.
+- **A new primary's session restarts the grace.** A loser can learn of the
+  winner from the winner's session rather than from its own refused
+  compare-and-swap: the session arrives while it still waits out its
+  takeover delay, before it stopped granting. It adopted the winner's
+  configuration but granted nothing yet, so once the delay ended its
+  grace, still counted from the old primary's last grant, had passed,
+  and it proposed over the winner at once: a second takeover, epoch
+  `e+2`, milliseconds after the first. Leases kept that safe (it had
+  granted the winner nothing), but it deposed a live primary, against
+  §6.5's "if the winner stays silent for `primary_grace` too". The
+  loopback takeover test caught it under CPU load (about 4% of runs).
+  `Grace::resume_for` now counts a session from a primary the member
+  did not follow before as a grant, as a lost proposal already did
+  (`Grace::resume`), under the same lock, and still refuses a session no
+  newer than the epoch a stopped candidate proposes over. A session of
+  the same primary in a newer epoch (its removal of other members) does
+  not restart it, so a candidate still proposes over that at once.
 - **The proposal is not recorded (decided, design §6.3).** §6.3 asks a
   candidate to record its proposal before the compare-and-swap. A lost
   answer is retried while the candidate stays stopped, and after a restart
@@ -3578,6 +4001,170 @@ of this file. A task with nothing unexpected keeps "None."
 - **Size.** About 1,170 lines of non-test code added (net +840), with
   the cluster-simulation harness counted.
 
+### M2-18 Read plans and holder fetch
+
+- **A plan carries the version's layout (decided, design §9.2).**
+  `Shard::plan` reads the entry and its layout in one index transaction.
+  The layout is the version's bytes as log positions in body order, with
+  a multipart object's parts flattened (`reads::layout`). Positions name
+  the same immutable payload on every replica, so a holder can serve a
+  version its own entry no longer names, as long as it still locates
+  every position. The holders are every member, primary first, while the
+  version is not clean. Once it is clean, they are the first
+  `clean_copies` members (`CleanCache::clean_copies`), or every member
+  while the cache has not been told the count. An evicted version has no
+  holders.
+- **Registration pins, then checks, in one exclusive section (decided,
+  design §8.7, §10.3).** `Shard::register_read` serves the holder's own
+  copy if its entry is at the planned version with bytes. Otherwise it
+  serves the plan's layout if every position is still located, and
+  otherwise it answers `None`, counted as `not_held`. The pin and the
+  location check run inside `Reads::exclusive`, and so does compaction's
+  relocating index commit. Either the registration pins a position
+  first and compaction keeps it, or compaction removes the location first
+  and the registration refuses.
+- **`Reads` is node-wide and in memory.** One `Reads` per `ShardSet`
+  holds registrations with their expiry, pin counts by shard and
+  position, and counts of `registered`, `not_held`, and `lapsed`.
+  `Shard::read_registered` refuses a fetch whose registration lapsed, as
+  `Unavailable`. A restarted holder has no registrations, so a stream
+  from it fails the same way. The binary configures it from
+  `read_registration_ttl_seconds` and `fragment_release_delay_seconds`.
+- **Compaction keeps what reads need (the coordinator's M1-22 hook;
+  decided, design §10.3).** A pinned record is classified `Copy`, ahead
+  of every other rule, so it is never evicted or dropped. `relocate`
+  checks the pins again under `Reads::exclusive`. Payload that no entry
+  names waits until compaction has found it unreferenced for the release
+  delay. The `Compactor` remembers, per shard and position, when a pass
+  first found it so, and a pass that does not find it so again forgets
+  it. Compaction's own eviction of cold clean payload is not delayed: a
+  plan from just before it finds the positions unlocated and asks the
+  next holder or plans again. Shard tests and the shard simulation set a
+  zero delay; `registered_reads_and_recently_unreferenced_payload_are_kept`
+  covers the delay and a pin.
+- **The gateway streams from one holder.** `HolderReads::open` orders
+  the holders with its own node first, then by its own count of reads in
+  progress from each. It registers, fetches the first piece before the
+  response starts, and streams the rest through a channel of one piece.
+  From registration on, a task renews every
+  `read_registration_renew_interval_seconds`. Starting it only after the
+  first fetch let a holder slower than the TTL lapse the read (found in
+  review). It releases the registration at the end, and the renewal
+  stops on every path that ends the read. A failed fetch ends the
+  stream, so the client sees the body break off. If no holder holds the
+  version, the GET resolves the key again, up to three rounds, then
+  answers 503. HEAD reads the entry alone.
+- **Five routed operations.** Plan, Register, Renew, Release, and Fetch
+  are wire ops 14 to 18, and Register carries its layout as the frame
+  payload. Holder operations (`Request::is_holder`) bypass the epoch and
+  role checks: any replica with the payload may serve, and the version
+  check is the holder's own.
+- **Simulation.** `HolderFaults` delays registrations and fetches by a
+  seeded random amount, and `HolderAudit` counts what holders did and
+  flags fetches served under lapsed registrations. The scenarios are in
+  `tests/simulation/reads.rs`: four nodes, three replicas,
+  `clean_copies` 2, and a 4 KiB cache. Overwrites and evictions racing
+  reads never return the wrong version, with and without crashes and
+  message loss. Members serve reads, and some reads are of superseded
+  versions. Registrations with a 100 ms TTL and a 1 s renewal fail GETs
+  mid-stream (`Report::broken_reads`). The cluster-sim compaction
+  scenario uses a 2 s release delay (`ReadRegistration::release_delay`).
+  Every scenario declares `COST`. At `SKYS3_SIM_SEEDS=256` (8 seeds
+  each, debug build) they take 25 s, 31 s, and 36 s, and the two
+  seeded-bug scenarios take 6 s and 4 s. The compaction scenarios take
+  28 s and 30 s.
+- **Seeded bugs are caught at seed 0.** A holder that registers its
+  current copy, whatever version the plan names (`ignore_version`), is
+  caught by "a GET whose body does not match". That scenario uses
+  prefix-only bodies, since a shorter new version only makes the gateway
+  pass the holder over, and 500 ms registration delays. A holder that
+  serves lapsed registrations (`ignore_lapse`) is caught by the holder
+  audit. Both were caught on each of seeds 0 to 31 (`SKYS3_SIM_SEEDS=1024`).
+- **Left open.** Fills still run only on the primary and are not
+  forwarded, so a GET of an evicted version through another node
+  answers 503. CopyObject still reads its source through the primary's
+  `payload`. Load is what each gateway sees; no node reports its own.
+  About 1,700 lines of non-test code, 400 of them in the simulation
+  crate.
+
+### M2-19 Hot cache
+
+- **The cache is in memory, so the default dropped to 1 GiB (decided,
+  design §9.2, §14).** The design gave `hot_cache_bytes_per_node` a
+  64 GiB default without saying where the bytes live. A disk-backed cache
+  would need the `Disk` trait in the gateway, which is generic over
+  `Shards` and holds its collaborators as trait objects, and it would
+  duplicate on the gateway's disk what the clean cache already keeps on
+  the holders. The hot cache holds whole objects in memory instead, and
+  64 GiB of memory is no default, so it is now 1 GiB; the configuration
+  reference and the §14 example say so.
+- **Keyed by bucket and key, one version per entry (decided).** The entry
+  names its version by record position and ETag; a lookup of any other
+  version misses and drops it. A fill of an earlier version that finishes
+  after a later one was cached keeps the later one. Objects above an
+  eighth of the cache are not kept, nor ranges, nor reads from the
+  gateway's own replicas, nor reads that broke off: `HolderReads::open`
+  collects the pieces it streams (`Keep`) and fills the cache only once
+  the whole object streamed. A cached version is also served after the
+  primary evicted it, without a fill.
+- **Fills in progress count against the bound (decided, review of
+  #70).** The first version gave each eligible miss a buffer of the
+  object's full size, outside the cache's accounting, so a burst of
+  misses could hold many times `hot_cache_bytes_per_node` at the 1 GiB
+  default (up to 128 MiB per GET). Now a fill reserves the object's size
+  when its stream starts (`HotCache::reserve`), evicting the least
+  recently used objects to make room, so held bytes plus reservations
+  never exceed the bound; one bound rather than a separate one for fills,
+  so the setting stays the node's whole hot-cache memory. A reservation
+  that does not fit beside the other fills, or a second fill of a version
+  already filling (the coalescing: the first fill wins, later GETs just
+  stream), is refused, and that GET keeps nothing. A fill keeps the
+  response's own `Bytes` pieces, so the buffers grow as the bytes arrive
+  and nothing is copied; entries are held as those pieces, and a range
+  across pieces is copied on lookup. The reservation is a guard
+  (`Fill`): finishing turns it into the entry, and dropping it, on a
+  lapsed registration, a failed fetch, a dropped response body, or a
+  short read, releases it. A burst of 36 GETs of 12 uncached objects
+  against room for 8 peaks at exactly the bound and refuses 28 fills
+  (`tests/hot_cache.rs`). New: `skys3_hot_cache_filling_bytes`, and
+  `reserved`/`refused` in `HotCacheUsage`.
+- **`GatewayConfig::hot_cache` is a shared handle.** Clones of a gateway
+  configuration share one cache, which the cluster harness's nodes would
+  have done, since every node's configuration is a clone of one. The
+  harness now gives each node's every life a new cache, and the binary
+  makes its own with metrics (`skys3_hot_cache_*`).
+- **Counting who served each GET needed two sources.** A GET is served
+  either by a holder, which the holder audit now counts per node
+  (`ReplicatedServices::holder_reads`), or by a gateway's hot cache, which
+  `Report::hot_cache_hits` counts per node over every life. The workload
+  gained `get_percent`, `GET`s drawn ahead of the usual mix, since the
+  mix's deletes made a hot key absent most of the time; with 0 it draws
+  nothing extra, so other scenarios' seeds are unchanged.
+- **Spread across gateways.** Five nodes, one replica of one key, 95% of
+  operations `GET`s through any node: without hot caches the holder
+  serves every `GET`; with them every node serves some, and the holder
+  25% to 41% of them on seeds 0 to 7. The test runs both on each seed.
+- **The seeded bug needed prefix-only bodies.** A cache lookup that
+  ignores the version (`HotCaches::ignore_version`) first went unnoticed
+  on seed 5: with bodies of random length, a new version is often longer
+  than the cached one, and the cache then cannot hold the planned range,
+  so it misses. With bodies no longer than their prefix and half the
+  operations `GET`s, "a GET whose body does not match" catches it at
+  seed 0, and on each of seeds 0 to 31 (`SKYS3_SIM_SEEDS=1024`).
+- **Compaction had to be made to happen.** With 40 operations per client,
+  the racing scenario compacted nothing on seeds 0 and 1, the two a run
+  without `SKYS3_SIM_SEEDS` uses; 60 operations with shorter pauses
+  compact on every seed but one of 0 to 7, and the test asserts that
+  some seed compacted and some `GET` hit a hot cache.
+- **Simulation cost.** At `SKYS3_SIM_SEEDS=256` (debug build) the
+  racing scenario (overwrites, clean-cache evictions, compaction) takes
+  30 s, the one with crashes and message loss 36 s, and the seeded bug
+  5 s, at 8 seeds each. The spread scenario runs two clusters per seed,
+  so it is declared at twice the cost: 4 seeds, about 22 s.
+- **Merged the M2-18 fix** that starts renewing a registration at
+  registration: the stream task no longer starts its own renewal, and
+  the hot-cache collection sits in the same loop.
+
 ## M3 Coordinator
 
 ### M3-01 Coordinator lease and change propagation
@@ -4030,6 +4617,15 @@ of this file. A task with nothing unexpected keeps "None."
   M2-15's backfill scenarios now run on it unchanged, and
   `DurabilityWindows` gained `restored`, the time until the register had
   `replicas` members again.
+- **The replacement scenarios' cost (found).** One seed of either costs
+  140 to 160 s of run time, against about 13 s for a typical seed, and at
+  `with_cost(3, COST)` CI's fixed set of 256 ran eight of each: 2010 s and
+  1773 s, the two slowest scenarios, which made the simulation job take
+  half as long again. They now declare `8 * COST`, as `crash.rs` does for
+  its heavy scenario, so the fixed set runs one seed of each (162 s and
+  141 s) and larger seed sets more, and the clients write 500 operations,
+  not 700, which still ends after the lost node is forgotten. No seed
+  hung: all 59 scenarios finished at 256 seeds.
 - **Numbers.** Over 10 seeds of each scenario (from seed 100), with the
   commit and R3 audits after every step: with five nodes and two buckets,
   losing the first node (often the coordinator) left four shards short
@@ -4061,6 +4657,383 @@ of this file. A task with nothing unexpected keeps "None."
     `ClusterScan` would save two listings per round.
   - **Pushes to a dead node still take their timeout** per change (M3-02
     notes); batching makes it a cost per change, not per shard.
+
+### M3-06 Rebalancing
+
+- **The coordinator asks the primary with a `Handoff` admin message
+  (decided, design §6.7).** Only a primary can hand off (R1). M2-02 had
+  already reserved `MessageKind::Handoff` in the admin class, and M6-01's
+  peer protocol has nothing for it, so no new kind was needed. Its body
+  names the bucket, the shard, the epoch the coordinator read, and the
+  member; the answer (`HandoffAck`) says whether the handoff started. The
+  node starts it only on its serving primary in that epoch, to another
+  member, so a request from an older register or a former coordinator
+  does nothing. `AdminEndpoint::with_handoffs` serves it through a
+  `HandoffSink` (the extension point for the binary's replication), and
+  `HandoffClient` sends it. A proptest and the `coord_handoff` fuzz target
+  cover the decoder.
+- **Shares (decided).** Among live eligible nodes, members follow disk
+  capacity and primaries are split equally. A shard moves from `a` to `t`
+  while `(s_a − 1) / c_a ≥ (s_t + 1) / c_t`, which stops with every node
+  within one shard of the others at equal capacity and never moves a
+  shard back; a primary moves alone only from a node that leads two more.
+  A move whose source leads the shard moves the primary to the target
+  when that helps primary balance, so a new node mostly gets its
+  primaries without a primary being moved alone.
+- **Composition with replacement (decided).** `Rebalancing` is the
+  placement `Replacement` wraps, so it plans only in rounds where nothing
+  needs repair. It starts moves only in a settled cluster (no learner, no
+  surplus member, no outstanding handoff, no suspect node), one batch at a
+  time, counting each move as done when it plans the next, so a batch
+  never overshoots. The member that leaves is the one the move named, or
+  after a coordinator failover the one on the node furthest over its
+  share, so moves complete without state that must survive a failover.
+- **Moves within a domain fought replacement (found).** At the `rack`
+  level, a new node in a rack every shard already uses could only replace
+  the member in its own rack. Replacement counted the member first, so it
+  dropped the learner as co-located, and after a promotion it would have
+  removed the new member. `Census` now counts the later of two non-primary
+  nodes in one domain (a learner after the members), which is what a move
+  appends; the primary keeps its domain, so rebalancing moves a primary
+  only across domains. For a relabeled node this changes which of two
+  co-located members replacement removes, not how many count. Recorded in
+  §6.7.
+- **A re-added learner could not follow its shard (found).** In the
+  two-join scenario (seed 1), the second new node was suspect for a moment
+  after joining, so replacement swapped its learners for live nodes; those
+  were promoted, and rebalancing then added the new node again. Its
+  replica, still a learner of the older epoch under the same primary,
+  refused the new configuration ("a member joins only as a learner": a
+  member it never knew had joined), so it never caught up and the shard
+  kept a learner for the rest of the run. M3-05's fix reopened a learner
+  only when its primary changed; `ShardSet` now also reopens a learner
+  whose new configuration has members it never knew. A shard test covers
+  it.
+- **A departing primary, and primaries moved alone.** A primary that does
+  not count is handed off once the other members that count reach
+  `replicas`, which replacement brings about. A primary moved alone
+  leaves the shard short one member until replacement adds a learner,
+  since a handoff drops the old primary (M2-13); rebalancing moves one
+  only once no shard needs to move.
+- **Pace (decided).** `RebalanceConfig`: at most 4 moves per batch, a
+  handoff every 2 s at most across the cluster (one shard's writes wait
+  for a handoff at a time), and a handoff that did not land asked for
+  again after 10 s. Named `rebalance_max_moves`,
+  `rebalance_handoff_interval`, and `rebalance_handoff_retry` in §6.7;
+  like M3-05's pace, they get configuration keys when the binary runs the
+  coordinator.
+- **The harness grew joining nodes and write timing.**
+  `ClusterConfig::joining` holds the last nodes back, with empty disks
+  and no shards, until a `Fault::Join`. `Report::writes` times every
+  client write end to end, and `ReplicatedServices::handoff_times` times
+  each handoff the coordinator asked for, from the step-down until a
+  primary served the next epoch (`sample_serving`). The sim's handoff sink
+  (`NodeServices::handoff_sink`) checks epoch, role, and member, and runs
+  `Replication::hand_off`.
+- **A write can fail fast while its primary is behind the register
+  (found, left open).** In one seed a gateway learned a shard's new epoch
+  from the register before the primary followed it (the sim's 100 ms
+  register poll stands in for propagation, M2-08b). Every member answered
+  with an older epoch, the gateway had read the register within
+  `register_interval`, and it answered 503 after 20 ms. It is not a stall,
+  happens after every coordinator change (replacement's too), and
+  retrying an "is still in epoch" answer in the routing client, or pushes
+  to replicas, would remove it.
+- **Handoffs went to silent nodes (found in review).** `successor` took
+  the move's target whenever it was still a member that counts, even
+  once its node turned suspect, and its fallback only sorted live nodes
+  first, so with none live it still chose a suspect one. A handoff to a
+  node that does not answer stops a healthy primary and leaves the shard
+  to another member's `primary_grace`. A handoff now goes only to a
+  member on a live node, and none is asked for while no successor is
+  live: the primary keeps serving (§6.7).
+- **The latency check left out writes that never connected, which hid a
+  harness flaw (found in review).** A `PUT`, multipart completion, or
+  `DELETE` whose connection failed or timed out returned before it was
+  timed. Timed now, as unanswered, the two-join scenario failed: a write
+  waited 2.4 s, and others up to the client's whole 8 s timeout, outside
+  the moves as well. Every one was sent to a node that had not joined
+  yet: `Routes::nodes` listed every node, so any-gateway clients drew
+  nodes still down, the connection hanging until the client gave up or
+  the node started (and failed then). Nothing in rebalancing stalled.
+  Clients and the bucket creator now address only the nodes present
+  from the start, as `ClusterConfig::joining` already said; no write
+  then failed to connect, and the bound held unchanged.
+- **Writes on a write-back bucket wait up to 1 s per commit behind lazy
+  `FLUSHED` records (found in CI, left open).** CI's seed set (8 seeds of
+  each scenario) failed seed 3: a `PUT` on a shard no move touched (it
+  stayed at epoch 1 all run) took 2.011 s. Traced with timing prints:
+  its extent commit took 1.0 s, then its index record 1.0 s, with no
+  register read over 200 ms and no slow round trip. A replicated shard's
+  pipeline is ordered (M2-07): before it queues a record of the other
+  segment class it drains every record in flight. The flusher commits
+  `FLUSHED` (hot class) lazily (M1-16), and a lazy record becomes durable
+  only once another record starts a group commit or `LAZY_MAX_DELAY`
+  (1 s) passes. An extent (bulk class) queued after one therefore waits
+  out the full delay: the drain holds back the very record that would
+  have committed it. An index record queued behind such extents waits
+  again. Setting `LAZY_MAX_DELAY` to 300 ms made the same seed's slowest
+  write 388 ms, against 2.011 s, and the slowest write outside the moves
+  317 ms, against 1.017 s. So the ~1 s write latency seen throughout
+  these scenarios was this delay, not control-store faults on register
+  reads, as the notes said before. It contradicts the log's promise
+  that a lazy record delays others only while nothing else is written,
+  and it costs every replicated write-back bucket up to 2 s per `PUT`.
+  The fix belongs to the log and the shard pipeline, not to
+  rebalancing: for instance, a way to commit the waiting lazy records
+  now, called by the pipeline before a class-switch drain. Until then
+  the scenarios' bound for a write that meets no handoff is derived from
+  it: two `LAZY_MAX_DELAY` waits plus `ROUTING_SLACK` (2.8 s), checked to
+  stay below `member_suspect_after` (3 s), the shortest wait a write
+  held up by a membership change would see. Comparing with the run's
+  own writes outside the moves was considered and rejected: two waits in
+  one write are rare enough that a run's baseline often has none, as in
+  seed 3 (1.017 s).
+- **Numbers.** CI's seed set: 8 seeds of one node joining four, and 8
+  of two nodes joining one after the other (`SKYS3_SIM_SEEDS=256` over a
+  cost of 32), with two buckets of four shards and three members each,
+  one of them `write_back`, four clients writing through any of the
+  initial nodes' gateways, and the commit, R3, lease, and routing audits
+  after every step. Each new node ended with its share: 4 or 5 of 24
+  members and 1 or 2 of 8 primaries (4 members and 1 or 2 primaries
+  each with six nodes). A join took 4 moves (8 to 14 promotions for two
+  joins, a seed with replacement swapping learners as above);
+  promotions' compare-and-swaps took at most 60 ms. One or two handoffs
+  per run moved primaries, each serving again after 22 to 58 ms (about
+  30 ms on average). No shard had fewer than `replicas` members after
+  the review fixes; before them, once for 204 to 316 ms in one two-join
+  seed. With every write timed, including any that never connected,
+  writes in flight while shards moved and meeting no handoff took at
+  most 2.011 s (seed 3, two lazy-record waits on a shard no move
+  touched, above), otherwise at most 1.75 s, against up to 2.0 s before
+  and after the moves: the same lazy-record waits, not moves. Up to
+  three per run were unanswered, fast 503s (above). Writes meeting a
+  handoff took at most 27 ms, at most 10 ms after the review fixes, most
+  of them fast 503s. So the only stall moves cause is the handoff, tens
+  of milliseconds. (Measured before and after merging M6-04 and the
+  M3-05 removal-timer fixes, after the review fixes, and on CI's seed
+  set; ranges cover all runs.)
+- **Left for later.**
+  - **Configuration keys** for the pace, with the coordinator's wiring.
+  - **Rebalancing scans the shard registers itself**, a fourth listing per
+    round (M3-05 notes).
+  - **Primaries moved alone cost a short durability window.** Re-adding
+    the old primary as the learner, rather than letting placement choose,
+    would keep its verified log; the old primary is likely to be chosen
+    anyway, since it lost a shard.
+  - **A new node that is briefly suspect** gets its rebalancing learners
+    swapped by replacement. Nothing breaks, but the moves take longer.
+
+### M3-07 Control-store rebuild tool
+
+- **What the binary can do (found).** The node binary runs only the file
+  control store, every shard alone (M2-08b is not wired), so
+  `skys3 control export` and `skys3 control rebuild` rebuild that store:
+  from the one node's export, with the node stopped (the data directory's
+  lock), and claimed for it with its `.owner.json`. Another backend is
+  refused with a message. The plan and the write are backend-agnostic
+  (`skys3_control::RebuildPlan`), and the simulation rebuilds a shared S3
+  control store with them. A lone replica keeps a `CONFIG` record of its
+  own, which is no register's, so the binary's export leaves shard
+  configurations out; the simulation's exports carry them.
+- **Exports are taken from stopped nodes, after log recovery (decided).**
+  The index keeps the configuration of the latest `CONFIG` record a
+  replica *applied*; a primary's removal makes its record durable, and
+  acts on it, before the record commits. An export of a running node
+  could therefore miss a configuration the node acts on, and rebuilding
+  the older one would let a removed member take over over it: two
+  configurations of one epoch. Replay applies every durable record, so
+  an export after recovery holds the newest `CONFIG` record the node has.
+  Stopping every node also leaves no proposal in memory that the rebuilt
+  store could accept (an etcd store rebuilt from scratch reuses
+  revisions). Recorded in design §6.2.
+- **Registers are rebuilt byte for byte, not at fresh epochs (decided).**
+  Each shard's newest configuration among the exports is written
+  unchanged, `proposal_id` included. A replica compares its register with
+  its whole configuration and is deposed by "another configuration of its
+  epoch", so a rewritten `proposal_id` would have stopped every replica;
+  at a fresh epoch every replica would have to adopt a configuration no
+  one proposed. Fresh epochs buy nothing once every member of the newest
+  configuration exported: the primary of any later configuration was a
+  member of it (R1) and made the record durable first. So the plan
+  refuses a configuration whose members did not all export, unless they
+  are declared lost (`--lost`), and refuses two configurations of one
+  epoch. Recorded takeovers and promotions need no handling: they are
+  sent again over the rebuilt register and land or lose as usual.
+- **Identity cached on some nodes only: the newest copy wins (decided).**
+  Each node's copy is a whole listing at its generation, so the plan takes
+  the copy with the highest generation, byte for byte. Merging copies was
+  rejected: a role deleted after an older copy was read would come back,
+  with its trust policy.
+- **Copies of the newest generation that differ need the operator's
+  choice (decided, review).** The first version broke ties by the sync's
+  start time. Review found that unsafe: a register is written before the
+  increment that announces it, nodes also sync on a timer, and a failed
+  increment leaves a write unannounced, so two copies of one generation
+  can differ. `synced_at_ms` comes from each node's own clock, and a sync
+  that started later can still have listed a register earlier, so the
+  tie-break could rebuild a deleted bucket or role, or drop a new one.
+  No register carries a version that would order the copies. So the plan
+  refuses differing copies of the newest generation
+  (`RebuildError::DivergentCopies`), naming the nodes, grouped by equal
+  copies, and the registers that differ. The operator then chooses one
+  with `skys3 control rebuild --prefer <node>` (`RebuildOptions::prefer`),
+  and each other copy is noted (`RebuildNote::CopyDiffers`). Only a copy
+  of the newest generation can be chosen
+  (`RebuildError::PreferredNotNewest`): a higher generation always wins.
+  Equal copies need no choice, and the lowest node ID names them. The
+  export keeps `synced_at_ms` for the operator; nothing orders by it.
+  Recorded in design §6.2 and §6.9, with the limit: a write that only
+  copies of older generations hold is lost with the store.
+- **Shards of buckets the copy does not name (decided).** A bucket created
+  shortly before the loss may be missing from every copy, and its nodes
+  would drop its shards at their next start (§4.1). The export says which
+  shards hold objects; such a shard stops the rebuild unless
+  `--allow-unnamed`. An empty one is a deleted bucket's leftover and only
+  reported.
+- **A lost store stopped every replica that read its register (found).**
+  M2-16 deposes a replica whose register is gone, and resumes nothing for
+  one. With the whole store gone, a node restarted during the loss opened
+  no replica, and a primary whose removal found its register "gone" would
+  have stopped. `ControlRegisters` now answers `NotBootstrapped` for a
+  register absent from a store that holds no `cluster.json` either, so the
+  replica runs on in its kept configuration until the store is rebuilt.
+  The drill fails without it (seed 0: the restarted node opened nothing).
+  Recorded in design §6.2.
+- **Nodes no longer follow a store backwards (decided).** A node with a
+  copy synced from any store whose generation merely differed, so a store
+  recreated at generation 1, by a node that never synced bootstrapping a
+  lost shared store for instance, would have replaced its copy with
+  nothing. `ControlCopy::fetch_since` now refuses a store behind the copy
+  (`ControlError::GenerationBehind`), and the rebuilt `cluster.json` is
+  at the generation after the newest copy's, so every exported node syncs.
+- **Racing a store that is alive (decided).** The rebuild writes nothing
+  into a store holding `cluster.json` or a bucket, shard, or identity
+  register it does not write. Node registrations and a coordinator lease
+  that a running coordinator writes into a lost store (M3-01, M3-02 write
+  regardless of `cluster.json`) are left; nodes register again at start.
+  `cluster.json` goes last with a `proposal_id` derived from the plan, so
+  an interrupted rebuild, run again with the same exports, completes and
+  then reports itself complete.
+- **Simulation.** `Fault::LoseControlStore` deletes every register;
+  `Fault::RebuildControlStore` stops every node, exports each from its
+  disks through `skys3::rebuild::export` after `storage::recover`, and
+  applies the plan through injected lost requests, lost answers,
+  conflicts, and outages. `Report::rebuilds` and `Report::registers` (the
+  final shard registers) carry the outcome. The drill
+  (`rebuild::a_lost_control_store_is_rebuilt_and_membership_changes_resume`)
+  loses the store at 1 s, restarts one node during the loss, rebuilds at
+  4 s, and takes node 3 down at 13 s.
+- **Numbers.** 32 seeds (0 to 31) ran clean, about 27 s each, 861 s in
+  all. In each, writes were acknowledged on 6 or 7 of the 8 shards while
+  the store was lost, the restarted node resumed its replicas, the plan
+  held all 8 shard registers with no note, and `cluster.json` went from
+  generation 2 to 3. Lost answers made 1 to 5 of the 11 registers turn up
+  already written when sent again. After the restart every shard was
+  served in its rebuilt configuration, and the first membership change on
+  the rebuilt store landed 728 to 755 ms after node 3 went down
+  (`member_suspect_after` is 700 ms); every shard node 3 belonged to
+  ended without it. The scenario declares `4 * COST`, so CI's fixed set
+  (`SKYS3_SIM_SEEDS=256`) runs 2 seeds, about 55 s.
+- **Left open.**
+  - **Rebuilding an etcd or S3 store from the binary**, with the binary's
+    multi-node wiring (M2-08b).
+  - **A full stop for the export.** An export from running replicas'
+    in-memory configurations, with nodes frozen for membership, would
+    avoid it.
+  - **Writes into a lost store.** The coordinator and node registry still
+    write into a store without `cluster.json`; a node that never synced
+    would bootstrap one. The rebuild and the generation check make both
+    safe, but they should wait for `cluster.json`.
+
+### M3-08 Heal tests
+
+- **No real-cluster heal test is possible yet (left open).** The node
+  binary serves every shard alone (`LocalShards`), with the file control
+  store only. It runs no coordinator and no replication, and does not
+  wire the transport (M2-08, M3-04, and M3-07 notes). Several binaries are
+  therefore several one-node clusters, and none of the four scenarios can
+  be run against them. No plan task owns the binary's multi-node wiring,
+  which M2-20's kill and partition tests need as well. The heal tests run
+  the real node code under the cluster harness instead, and the
+  real-binary versions wait for that wiring.
+- **Nodes did not follow the registers of buckets created through a
+  gateway (found, harness).** `ReplicatedServices::following_registers`
+  looped over the static placement only, and the static placement is
+  empty when the gateways create the buckets (`create_buckets`). So a
+  primary never adopted the coordinator's learner additions for those
+  buckets. In the rack scenario (seed 0) gateways answered 503 ("still in
+  epoch 1") for 40 s, and a shard kept two members and a learner until
+  the run ended. M3-04's scenarios do not follow registers, and M3-05's
+  and M3-06's use the static placement, so the gap never showed. Nodes now
+  follow every shard register in the store. The node code was not at
+  fault.
+- **Clients stalled on a lost node (found, harness).** Any-gateway clients
+  draw from the initial nodes, and a connection to a crashed host waits
+  out the whole request timeout (8 s). With one of five nodes lost, four
+  clients managed about 1.5 operations a second, and the first run of the
+  node scenario lasted 600 s of simulated time, until the lost node came
+  back. `Workload::connect_timeout` (300 ms here) lets clients move on
+  from a node that is down, as clients behind a load balancer would. The
+  default is unchanged. M3-05's replacement scenarios have the same stall,
+  which is likely why each of their seeds costs 140 to 160 s; giving
+  them a connect timeout would cut that.
+- **A coordinator lost in the middle of a change needed a fault the
+  services trigger.** A fault plan names nodes by position at fixed times,
+  but which node coordinates, and when its first move starts, depend on
+  the seed. `NodeServices::triggered_faults` (default: none) hands the
+  driver faults that fall at a protocol state. With
+  `CoordinationConfig::lose_coordinator`, the first change that writes a
+  shard register crashes its coordinator, either once the change is
+  planned (`ChangeStage::Planned`: writes in flight, or landed but not
+  announced) or once some of its writes landed (`ChangeStage::Applied`:
+  learners added, with promotion and removal still to come).
+  `CoordinatedServices::lost_coordinator` reports what was lost.
+- **Rack labels and the gateways' level were fixed.** The harness labelled
+  nodes with two alternating racks, and gateways created buckets at the
+  `node` level. `CoordinationConfig::racks` and
+  `ClusterConfig::failure_domain` make both configurable, with the old
+  values as defaults. The rack scenario runs six nodes in four racks
+  (`rack-0` and `rack-1` hold two nodes each) and loses `rack-0`, so three
+  racks remain for three replicas.
+- **Rebalancing raced the rack loss (seen, not a bug).** In seed 0 the
+  coordinator planned two moves 80 ms after both `rack-0` nodes crashed,
+  each onto one of them, because neither was suspect yet. Once they were,
+  replacement swapped those learners (M3-05's rule), and the shards healed
+  in 16.5 s.
+- **Each scenario fails when a heal step is broken.** Seed 0 fails in each
+  case, which is the seed CI runs:
+  - Node loss and addition, with forgetting disabled
+    (`node_forget_after` of an hour): the lost node stays suspect,
+    rebalancing never starts, and the new node ends with no primary ("the
+    load is uneven").
+  - Rack loss, with the coordinator placing at the `node` level while
+    gateways place at `rack`: a shard ends with two members in `rack-1`.
+  - Rack loss, with the harness gap above put back: a shard ends with a
+    learner that never joins.
+  - Coordinator loss, with rebalancing's failover rule removed (only the
+    member the coordinator's own move named may leave): a shard ends with
+    four members. Before this run the mapping was the other way round
+    (even seeds `Planned`), and seed 0 healed while seed 1 failed. So the
+    even seeds now lose the coordinator after its writes landed, the case
+    that catches this bug.
+- **No product bug was found.** Every failure traced back to the harness
+  or to the scenarios.
+- **Numbers.** Seeds 0 to 15 of each scenario passed, with the commit and
+  R3 audits after every step and the history checks at the end. Times are
+  until the cluster was healed for good, from the fault:
+  - Node lost for good, new node joining 2 s later: 11.6 to 13.1 s. The
+    lost node was forgotten about 7 to 8 s after the loss.
+  - Rack lost: 10.4 to 16.6 s.
+  - Coordinator lost: 3.0 to 5.4 s when it came back after 2 s, and 11.4
+    to 13.6 s when it was lost for good and forgotten.
+
+  Every heal finished while the clients were still writing, as the check
+  requires. A seed takes 30 to 40 s in a debug build. Each scenario
+  declares `8 * COST`, so CI's fixed set (`SKYS3_SIM_SEEDS=256`) runs one
+  seed of each: 31 s, 35 s, and 32 s, about 100 s added to the simulation
+  job. At `SKYS3_SIM_SEEDS=1024`, four seeds of each passed, in 220 s with
+  the three scenarios running side by side.
 
 ## M6 Native peer transport
 
@@ -4377,3 +5350,3389 @@ of this file. A task with nothing unexpected keeps "None."
   `COMMIT`'s without an identity entry, stay 116 bytes below 8 KiB. A
   gateway test and a message-rules test each check the new bound, and
   both fail without it.
+
+### M6-05 Small-object batches
+
+- **No shard call wrote several records at once.** `Shards::write` commits
+  one record, and each conditional write reads its key in its own index
+  transaction. Concurrent writes share a group commit only if they reach
+  the log within `group_commit_max_delay`. `Shard::commit_all_if` now
+  reads the keys of a batch in one transaction and sequences every record
+  whose check passes in one pass of the sequencer, so the records take
+  consecutive positions and are queued for the log back to back. A test
+  commits 30 records within `group_commit_max_bytes` and counts exactly
+  one group commit in the log's statistics.
+  `Shards::write_all` exposes it. By default it sends each write on its
+  own, all at once, and `LocalShards` overrides it.
+- **The forwarding protocol has no batch request.** A forwarded request
+  carries its condition in a frame header, and `skys3-net` limits headers
+  to 64 KiB. The peer conditions of 1,024 items take about 300 KiB. A
+  batch request would need its conditions in the payload and a new answer
+  with one result per item, so it is left out. `RoutedShards::write_all`
+  sequences a batch in process when the map names this node as the
+  primary, through `ForwardServer::write_all`, which observes it like any
+  other request. Otherwise it forwards each write on its own, all at once.
+  Recorded in §7.8 ("Batches").
+- **A batch must look for races before it ends its read (found in
+  testing).** The first version of `commit_all_if` ended its read and only
+  then looked for records of its keys sequenced since the read began.
+  Ending a read forgets the applied writes that no reader still needs, so
+  a racing write could go unnoticed, and two writers each created the
+  same key under `Absent`. A test that races batches against single
+  conditional writes failed in 2 of 15 runs. The batch now looks for
+  races first, as `commit_if` does, and the test passed 40 runs out of 40.
+- **Batch items can be longer than `inline_max_bytes`.** By default
+  `peer_frame_bytes` is 256 KiB and `inline_max_bytes` is 128 KiB, and a
+  record in a hot segment carries at most `inline_max_bytes`. The
+  destination therefore commits a longer body first as `extent_bytes`
+  `EXTENT` records, as it does for a client upload. Such an item's `PUT`
+  follows one group commit later.
+- **Deletes read their key first.** A delete of a key with no current
+  version must write nothing (M6-04), and a condition cannot express "skip
+  without failing". Delete items therefore read their key before they are
+  written, as a `COMMIT` does. Puts skip that read. A replayed put fails
+  the condition's identity clause, and the entry read afterwards supplies
+  its stored result.
+- **Batch items are not hashed again either.** The `BATCH`'s CRC32C
+  covers the bytes in transit, as each `DATA` frame's CRC32C does, so the
+  final checksums are stored as the source sent them. Nothing answers
+  `checksum mismatch` yet.
+- **The round trips are counted, not timed.**
+  `skys3-flush/tests/round_trips.rs` flushes 1,500 small objects over
+  REST to the simulated store, which counts 1,500 requests (1.000 per
+  object, not counting TCP and TLS handshakes). The same objects then go
+  over loopback QUIC to a destination that applies them through
+  `PeerCommits`. Connecting takes 2 round trips (the QUIC handshake and
+  the `HELLO`s), and the two `BATCH`es take 1 each, for 4 in total (0.0027
+  per object). `send_batch` sends the whole batch and finishes its stream
+  before it reads anything, so one round trip per batch follows from its
+  structure. The test asserts exactly 2 plus one per batch. `skys3-flush`
+  gains `skys3-peer`, `skys3-net`, and `rcgen` as dev-dependencies.
+- **Simulation and fuzzing.** Quinn under turmoil still waits for M6-08.
+  Writers in the shard simulation now also commit batches of puts and
+  deletes, some conditional, and the scenario's crash, replay, and
+  in-order checks cover them. At 256 seeds its run time went from 47.8 s
+  to 51.7 s, so no new scenario or cost was added. `BATCH` decoding
+  already has M6-01's `peer_messages` fuzz target, and the builder parses
+  no input, so this PR adds no fuzz target. A proptest packs random items
+  (some with repeated keys or identities) and checks that every batch
+  encodes, decodes, and that no item is lost.
+- **A batch could outgrow one group commit (review).** A `BATCH` may hold
+  16 MiB of inline bytes, but the log closes a group once it holds
+  `group_commit_max_bytes` (4 MiB by default), so a large batch's records
+  of one shard took several syncs. A test confirms it: 100 records of
+  about 57 KiB with a 16 KiB cap take between 2 and 4 group commits.
+  Letting one submission form a single larger group was rejected,
+  because recovery's tear window (`LogConfig::tear_window`, §10.1) relies
+  on no group passing the cap plus one record. The fix is on the source:
+  by default `BatchBuilder` also closes a batch at 4 MiB of estimated
+  records (`DEFAULT_BATCH_RECORD_BYTES`), and `with_record_bytes` sets
+  another budget. Each item counts its bytes in the batch plus 256 bytes,
+  which covers its record header and the destination's identity entry. A
+  gateway test packs 1,024 objects of 8 KiB, some with the most metadata.
+  The builder makes several batches, and each one writes at most 4 MiB of
+  records at the destination. §7.8 now states the guarantee exactly. A shard's records of a
+  batch share one group commit when they fit `group_commit_max_bytes` and
+  reach the queue within `group_commit_max_delay`, and otherwise take one
+  group commit per cap. A destination configured with a smaller cap
+  splits default-size batches.
+
+### M6-06 Source-side flusher integration
+
+- **The transport sits behind a link trait.** `skys3-flush` gains
+  `PeerLink`, which opens a stream of messages, and `PeerTransport`,
+  which `FlushService::with_peer_transport` takes. `ShardLease` (M6-02)
+  implements `PeerLink`; the tests use channels, and the cluster
+  simulation uses TCP over turmoil, since Quinn under turmoil waits for
+  M6-08. `skys3-peer` gains `Inbound` and `Outbound`, so that
+  `StagingService::serve` runs over any stream, and
+  `StreamError::Transport` for those streams' errors. The node binary
+  passes no transport yet, and the destination side is not wired in
+  either, so a `native` target falls back to S3 REST with a warning
+  until M6-07. Recorded in §7.8 ("Source side, as built").
+- **Nothing new is persisted.** M4-04 persists `MPU_FLUSH_OPEN` so that a
+  new primary finds the remote upload. A peer upload needs nothing like
+  it: staging is keyed by the write identity, which the log holds, and
+  the bytes of an identity never change, so every version is staged as
+  piece 0. A flusher after a restart or a takeover sends `BEGIN` and
+  resumes from the `RESUME`. What is never committed expires after
+  `peer_staging_ttl_seconds`.
+- **`FLUSHED` keeps the destination's identity as the remote version ID.**
+  The next version of the key is conditioned on it. An S3 fill would
+  send it as a `versionId`, so `fill.rs` now ignores a remote version ID
+  that parses as a write identity. A key whose identity the entry does
+  not know, such as an imported one, is committed on absence first, and
+  its identity is learned from the failed precondition.
+- **Multipart objects go as one piece.** The destination answers a
+  multipart `COMMIT` `unavailable` (M6-04), so the flusher stages a
+  multipart object at flush time as one piece that keeps its multipart
+  ETag. Part boundaries are lost, and objects over 5 GiB
+  (`MAX_PIECE_BYTES`) cannot be sent. That stays open until the
+  destination publishes multipart commits.
+- **Batches fill only under load (found in testing).** The first
+  in-memory test expected six small objects to share batches. With 4
+  batches in flight and a flush concurrency of 4, each object went in a
+  batch of its own. That is the intended behavior: an item waits only
+  while 4 batches are unanswered, so an idle target adds no delay. The
+  test now checks that small objects never open a staging stream. Since
+  the S3 fence (below), a batch holds at most 1 MiB of records and 16
+  are in flight.
+- **The cluster simulation has a peer.** `ClusterConfig::peer` adds a
+  destination cluster of one node. It recovers its shards from a
+  simulated disk in each life, and serves the real `StagingService` and
+  `PeerCommits` over TCP, one connection per stream, 20 ms from every
+  node. The `write_back` buckets and the backups flush to it.
+  `Endpoint::Peer` and `Fault::PeerRestart` cut, hold, and restart it,
+  on top of the usual crashes and takeovers. The audits:
+  - every `FLUSHED` a flusher decides on, which a new test hook
+    (`observe_flushed`) reports before it commits, names an identity the
+    peer answered `committed` or named as current;
+  - each write-through acknowledgement finds the write in the peer's
+    index, or in what the peer last held while it is down;
+  - at the end, after a power loss of the peer too, it holds what every
+    member holds, and no write identity is in two of its `PUT` records.
+- **The seeded bugs need distance (found in testing).**
+  `PeerBug::FlushedOnCommit` records `FLUSHED` once the `COMMIT` is sent,
+  and `PeerBug::AnsweredOnCommit` answers write-through waits then. The
+  second bug is caught only if the client's answer arrives before the
+  `COMMIT` is applied. The peer's 20 ms link guarantees that. Both bugs
+  were caught at every one of 32 seeds.
+- **The replicated backup scenarios do not replay exactly (found in
+  testing).** A replay test of the peer scenario failed with no peer
+  configured. The same test on the base branch failed the same way: its
+  backup scenario, with replicated shards, takeovers, and write-through
+  acknowledgements, also differs between two runs of one seed. M4-13
+  traced this to tokio's own randomness, which takeovers and restarts
+  wake. The peer's replay test therefore runs with one member per shard,
+  and replays exactly at 16 seeds.
+- **Merging M4-13.** Native targets skip the orphan sweep that now runs
+  beside the copy probe: they open no remote multipart upload, so none
+  is ever left open, and they still skip the probe, becoming ready
+  through `Ready::new` before their flushers start. In the flusher's
+  `biased` `select!`, finished body stagings come with the flusher's
+  other tasks, before the shard's changes, so a busy shard cannot starve
+  them. At 256 seeds the peer scenarios took 58.4 s in all after the
+  merge.
+- **Run times at 256 seeds.** `peer::every_committed_change_reaches_the_peer_under_faults`
+  takes 23.1 s, `peer::write_through_writes_are_acknowledged_once_the_peer_applied_them`
+  28.8 s, `peer::a_seed_with_a_peer_replays_exactly` 4.6 s, and the two
+  seeded-bug scenarios about 2 s each, which is about 61 s in all. All
+  but the replay test use `Runner::with_cost(_, COST)`; the replay test,
+  which runs each seed twice, uses twice the cost.
+- **No new fuzz target.** The simulation's TCP framing reads frames with
+  `parse_prefix` and `Message::decode_parts`, which M6-01's
+  `peer_messages` target already fuzzes.
+
+### M6-07 Discovery and fallback
+
+- **The descriptor lives in the receiving bucket.** A destination serves
+  it at the reserved key `.skys3/peer-descriptor` of each bucket that
+  has a `peer_source`, on nodes that set `[peering] quic_advertise`. The
+  source reads it through the target's own S3 store, with a ranged `GET`
+  of at most 64 KiB. This needs no new port, DNS name, or credential,
+  and it reaches the source wherever its flushes do. The gateway answers
+  `GET` and `HEAD` itself, without the shards, and only for the bucket's
+  own `peer_source`; in any other bucket the key is an ordinary key.
+  Recorded in §7.8 and in the plan's §14 table.
+- **It is signed with the node's transport key.** `skys3-peer` gains
+  `PeerDescriptor`, `DescriptorSigner`, and `DescriptorVerifier`. The
+  envelope is protobuf: the body, a TLS 1.3 signature scheme, the
+  signature over `skys3 peer descriptor\0` and the body, and the chain.
+  The verifier reuses `PeerVerifier` for the chain, so the trust domain,
+  the role, and the bundle checks are those of the handshake. It then
+  checks the signature with webpki, the times (5 minutes of skew, at most
+  24 hours of life), the bucket and the source, and the versions. A
+  descriptor lasts an hour, and the node signs a new one after half of
+  that.
+- **A SkyS3 destination refused the fallback's writes (found in M7-05).**
+  A SkyS3 gateway refuses `x-amz-meta-skys3-wid` from clients, so a
+  source that fell back to S3 REST could not flush to it. The decision:
+  `[peering.peers.<id>] s3_access_key_ids` lists the peer's flusher
+  keys. A request signed with one of them may write the buckets that
+  receive from that peer, and may carry an identity that names the peer
+  and one of its bucket pairs. The gateway stores it as `COMMIT` does,
+  so either transport finds an earlier copy of a write. `HEAD` and `GET`
+  show it only to the peer's keys, and every other carrier still gets
+  `400 InvalidArgument`. A key belongs to one peer. Recorded in §7.8,
+  §12, and the plan's §14 table.
+- **Discovery is one task per target.** It is `Waiting`, `Native`
+  (with a link), `PeerS3`, or `PlainS3`. Each change of choice is a
+  generation. `FlushService::reconcile` rebuilds the target and drops its
+  shard flushers, as a restart does. Re-probes back off from 15 s,
+  doubling, to 5 minutes (`DEFAULT_REPROBE_MIN` and `_MAX`). A native
+  flush whose link fails wakes the task, which tries a fresh handshake at
+  once. `native` never falls back any more: M6-06's fallback with a
+  warning is gone, and a node without peers does not flush a `native`
+  target.
+- **The quarantine moved to the shard flushers (found in review).** It
+  first delayed only the target's readiness when it fell back. A takeover
+  on a target that had fallen back long before skipped it, and a
+  `COMMIT` that a deposed primary sent could still be on its way. Each
+  shard flusher on S3 REST to a target that served a descriptor now
+  waits the quarantine (90 s) from its own start. That covers
+  fallbacks, restarts, and takeovers alike. The exactly-once argument is
+  in §7.8.
+- **A new link is a new choice (found in review).** A choice was the
+  same as the last when its kind was, so the link of a handshake that
+  followed a broken one was dropped. The target stayed on QUIC with the
+  dead link, its flushes failing, until a handshake failed and it fell
+  back. Now each new link is a new generation, and the shard flushers
+  restart on it without a quarantine, since every `COMMIT` stays on QUIC
+  as after any native restart. Only a change between QUIC and S3 REST
+  counts as a switch.
+- **The pool counts the shard flushers (found in review).** The node's
+  handshake attached one lease of the pool for a target, which all its
+  shard flushers shared, so a bucket got one shard's connection budget
+  however many shards this node flushed. `PeerLink::set_shards` now
+  tells the link how many shard flushers use it, after each reconcile,
+  and a `ShardLease` can stand for that many shards
+  (`ShardLease::set_shards`), at least one. A link per shard flusher
+  would not fit: the batcher and the uploads share the target's link.
+- **COMMITs carry an apply-by time (found in review).** The quarantine
+  assumed that the destination applies a `COMMIT` only while its
+  connection is open. It did not: each stream ran on a detached task, and
+  a `COMMIT` already read waited in `CommitSink::apply` for its shard as
+  long as that took, after the connection idled out. A write routed to a
+  primary on another node can wait longer still, so no timer on the
+  destination's gateway bounds when a write is sequenced. Now each
+  `COMMIT` and `BATCH` item carries `apply_by_ms`: the source's wall clock
+  as it sends it, plus the commit window (the answer timeout). The shard
+  checks it as it sequences the write, in `LocalShards`' precondition
+  check, on its node's wall clock (`ConditionFailed::Expired`), and the
+  gateway refuses a late arrival at once; both answer `unavailable`. The
+  quarantine is the commit window plus twice a clock tolerance of 30 s
+  (`CLOCK_TOLERANCE`): still 90 s by default. This adds the design's one
+  wall-clock assumption, recorded in §2.3 and §7.8. The destination also
+  aborts a connection's stream tasks when it closes. A unit test stalls a
+  `COMMIT` in front of its shard past its apply-by time and checks that
+  it is not applied; the simulation's audit now ignores a `COMMIT` that
+  arrives after its apply-by time, and its commit window is the
+  destination's idle timeout, so the seeded bug of no quarantine is still
+  caught.
+- **The apply-by time is negotiated (found in review).** A node that did
+  not know `apply_by_ms` ignored it, and a `COMMIT` without one was
+  unbounded, yet both spoke protocol version 1, so the shorter
+  quarantine relied on a field neither end had to send or check. The
+  protocol is now version 2 only (`PROTOCOL_VERSION`,
+  `APPLY_BY_VERSION`): version 1 was never released, so no node keeps
+  it. `Session::check` refuses a `COMMIT` or `BATCH` item without an
+  apply-by time, on send and on receipt (`ProtocolError::NoApplyBy`), so
+  every `COMMIT` of a session is bounded, and the field became required
+  for every sender (`Native` always stamps). The routing wire's condition
+  carries the time for any kind of condition (tag 6), as the destination
+  checks it on whichever node sequences the write. Recorded in §7.8.
+- **S3 writes to a peer are fenced too (found in review).** The reverse
+  switch had no fence: an S3 REST write to a SkyS3 peer carried no
+  apply-by time, so one held in the destination's routing could be
+  sequenced over a `COMMIT` sent after the target returned to QUIC.
+  Now each S3 write that publishes or deletes a version, to a target that
+  served a descriptor, carries `x-skys3-apply-by`
+  (`WriteIdentity::APPLY_BY_HEADER`), signed with the request. The
+  `Stamping` store adds it as the REST window admits the request, and
+  `Target::with_apply_by` turns it on, probes included. The gateway
+  reads it only from the peer's keys (`ApplyBy`) and checks it with the
+  precondition (`Precondition::ApplyBy`), as it checks a `COMMIT`'s; it
+  requires it where that peer reaches the bucket over QUIC too, the
+  bucket's `peer_source` on a node serving the descriptor. A multipart
+  upload's completion carries it, its parts and creation do not. Each
+  shard flusher that starts on QUIC waits the quarantine from the later
+  of its tenure's start (the shard's sequencing epoch, as this node
+  first saw it) and the node's last S3 flush of the target, so a node's
+  start, a takeover, and a `native` target wait as well: 90 s by default
+  before a new flusher's first `COMMIT`. A deadline covers the
+  destination's work, not a body's transfer, so the bytes it covers stay
+  at 1 MiB (`MAX_BOUNDED_BYTES`): a `BATCH` holds at most 1 MiB of
+  records and objects of at most 1 MiB, with 16 batches in flight
+  instead of 4 to keep the throughput; over S3 to a peer, a `PUT` over
+  1 MiB becomes a multipart upload (`put_body_parts`), so its remote
+  ETag is a multipart one, and a copy is sent as an object. The
+  simulation's audit now records each S3 write's apply-by time and
+  fails a `COMMIT` sent while one of its key could still apply; the
+  seeded bug `PeerBug::NoReturnQuarantine` is caught. The replay
+  scenario's UDP block is longer, since the first QUIC flushes now wait
+  out the quarantine.
+- **A refused descriptor that disappears (found in review).** Discovery
+  compared choices other than QUIC by kind only, so a target whose refused
+  descriptor was later removed stayed `PlainS3 { found: true }`: stamped
+  with `x-skys3-apply-by`, its large PUTs sent as multipart uploads, and
+  no server-side copies, after its discovery had ended. A change of
+  `found` is now a new choice, and the target is rebuilt as a plain
+  store. Since that rebuild, and a peer whose descriptor disappears
+  while on QUIC, lead to a plain store without the quarantine, the
+  service records when this node last stopped flushing the target over
+  QUIC (`native_until`), and a shard flusher that starts on S3 REST waits
+  out what is left of the quarantine since then.
+- **A peer writes only the buckets that receive from it (found in
+  review).** The gateway's guard let a peer's key write any bucket with
+  no `peer_source`, and any bucket with `peer_local_writes`, whichever
+  cluster it receives from, as far as the key's permissions allowed. A
+  peer's request now writes objects only in the buckets whose
+  `peer_source` is that peer (`403 AccessDenied` elsewhere);
+  `peer_local_writes` opens a bucket to this cluster's clients only. The
+  design was silent on buckets that receive from no peer; the stricter
+  rule was chosen. Recorded in §7.8 and §12.
+- **A stalled-commit test was flaky.** The gate of
+  `a_commit_that_stalls_past_its_apply_by_time_never_applies` released
+  its permits back, so a later poll could pass early. It now forgets
+  them.
+- **The descriptor key is reserved (found in review).** Only `GET` and
+  `HEAD` knew the key. A client could write it in a source bucket, the
+  peer would store that version, and every read there would answer the
+  descriptor instead. Now every gateway refuses writes of the key in
+  every bucket with `400 InvalidArgument`, from clients and peers, over
+  S3 or in a `COMMIT` or `BATCH` item, and a multi-object delete refuses
+  that key alone. A namespace import skips a remote object at the key, so
+  it is never filled. Recorded in §7.2 and §7.8.
+- **A peer's copy carries its identity (found in review).** CopyObject
+  checked `REPLACE` metadata as a client's, so a peer's server-side copy
+  with its `x-amz-meta-skys3-wid` was refused with `400
+  InvalidArgument`, and the flusher fell back to uploading the bytes.
+  The copy now takes its carrier from the request, as PUT and multipart
+  uploads do.
+- **The node binary peers.** `NodePeering` binds the QUIC endpoint when
+  peers are configured. It serves `StagingService` with `PeerCommits`
+  over the node's shards, adapts the pool every second, and signs the
+  descriptors. Its handshake opens a fresh connection with `HELLO`s to
+  each resolved address, closes it, and hands the flushers a pool link.
+  The admin bucket status gains `flush.transport`. The gauge
+  `skys3_flush_transport{bucket, transport}` exists for verified peers
+  and `native` targets. The alert `SkyS3PeerTransportFallback` fires
+  after 30 minutes on S3, and the dashboard has a panel for it.
+- **The simulation falls back to the peer's real gateway.** The
+  destination now runs `Gateway` over a `MemoryControlStore` beside its
+  native service. Its authenticator takes the access key from a header,
+  and its descriptors are signed in the simulation on simulated wall
+  time. The nodes reach the gateway through a relay host, so faults on
+  the node-to-peer links block only the native path. `PeerS3` is a small
+  HTTP S3 client over turmoil, and `SimStore` lets one flush service mix
+  it with `SimS3`. The destination's PKI is Ed25519 with fixed serials,
+  so descriptors and chains have the same size in every run. The
+  existing M6-06 scenarios also read their descriptor through the
+  gateway now.
+- **The destination idles streams out.** A sim stream that sends nothing
+  for `Peer::idle` ends, as a QUIC connection does after its idle
+  timeout. Without this, a held `COMMIT` could arrive any time later, and
+  no quarantine would bound it.
+- **UDP blocks are a fault of their own (found in testing).** Blocks
+  built from per-node partitions ended early when an overlapping
+  partition healed the same link. `Fault::UdpBlock` cuts or holds every
+  node-to-peer link, and blocks the link again whenever another heal
+  repairs it. Overlapping blocks extend each other.
+- **Random holds rarely caught a `COMMIT` (found in testing).** Each sim
+  stream has its own TCP connection, so a hold that starts before the
+  connect holds the SYN, and no `COMMIT` is ever sent. The missing
+  quarantine went unnoticed on 3 of 4 seeds. `Peer::aimed` starts a held
+  block as a node sends a `COMMIT`, which catches it on the wire. The
+  main scenario aims two such blocks, ending before or after the idle
+  timeout, besides two drawn blocks of 8 to 12 s.
+- **The clients must outlast the blocks (found in testing).** On one
+  seed in 32 extra ones, the drawn blocks ended late and an aimed hold
+  began as the first `COMMIT` after them was sent. The clients stopped
+  writing before the nodes were back on QUIC, so no `COMMIT` reached the
+  peer. The drawn blocks now start within the first 3 s, and the clients
+  send 200 operations each, which keeps them writing for about 25 s.
+- **Multipart flushes over S3 (found in testing).** The flushers' 512-byte
+  parts got `EntityTooSmall`, so the destination's gateway takes parts of
+  any size, as the nodes' do. The peer's ETag of a streamed `PUT` sent
+  as a multipart upload is not the client's. The final audit reads such
+  objects back through a gateway and compares their MD5, as it does for
+  the remote store. The descriptor also lacked an ETag, which S3 clients
+  require, so the gateway now answers it with the MD5 of its bytes.
+- **The audits.**
+  - Exactly once: the M6-06 final audit, now over both transports.
+  - No `COMMIT` reaches the peer after an S3 write of its key that was
+    acknowledged after the `COMMIT` was sent.
+  - No `COMMIT` reaches a peer whose descriptor is forged or expired.
+  - Sampled every 250 ms, each live node's metric matches its status,
+    and every change of transport increments `switches`.
+  - After healing, every peer target is back on QUIC within 30 s.
+- **Seeded bugs.** `PeerBug::UnverifiedDescriptor` decodes the
+  descriptor without checking it, and `PeerBug::NoQuarantine` flushes over
+  S3 at once.
+- **Seeds and run times at 256 seeds.** With `SKYS3_SIM_SEEDS=256`, a
+  scenario at `COST` runs seeds 0 to 7 and one at twice that seeds 0 to
+  3. On toolchain 1.98.1:
+  - `discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`,
+    2 × `COST`, seeds 0 to 3: 46.8 s.
+  - `discovery::a_seed_with_udp_blocked_replays_exactly`, 2 × `COST`,
+    seeds 0 to 3, each run twice: 20.5 s.
+  - `discovery::forged_and_expired_descriptors_are_refused`, `COST`,
+    seeds 0 to 7: 32.2 s.
+  - `discovery::the_audit_catches_an_unverified_descriptor`, `COST`,
+    seeds 0 to 7: 2.4 s.
+  - `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`,
+    2 × `COST`, seeds 0 to 3: 21.6 s.
+  - That is 123.4 s for M6-07. The M6-06 scenarios now take 62.1 s in
+    all (23.1, 29.7, 5.1, 2.0, and 2.2 s), about as before.
+  - Beyond CI's seeds, the main scenario passed 64 more (100 to 131 and
+    300 to 331). Forged and expired descriptors were refused on seeds
+    100 to 131. Both seeded bugs were caught on all of seeds 100 to 131.
+  - The 256-seed `harness` run passes too.
+- **Fuzz target.** `peer_descriptor` decodes arbitrary bytes as a
+  descriptor and checks the decoder's invariants. A verifier that trusts
+  nobody refuses every input.
+
+### M6-08 Peer protocol simulation
+
+- **The simulation runs real QUIC.** M6-06 put a TCP stream model under
+  the peer scenarios. It is gone: the nodes and the destination now run
+  Quinn over turmoil's UDP. `skys3-cluster-sim`'s `quic` module adapts a
+  turmoil `UdpSocket` to Quinn's `AsyncUdpSocket`. It reports that it
+  may fragment, so Quinn skips MTU discovery. The nodes use the node
+  binary's `PeerEndpoint`, handshake, and `ConnectionPool`, and the
+  destination runs the real `StagingService` and `PeerCommits`. Holds,
+  partitions, message loss, and peer restarts now lose datagrams and
+  stall connections until their idle timeout (`Peer::idle`), as on a
+  real network. Recorded in §16.1.
+- **Seeded endpoints make QUIC replay.** `PeerEndpoint::with_socket`
+  takes any socket and an optional seed. With a seed, Quinn's
+  `rng_seed`, the connection IDs, the initial destination IDs, and the
+  keys of stateless resets and tokens all come from it (SplitMix64 and
+  `aws-lc-rs` keys from fixed bytes). TLS still draws its own key shares
+  and randoms. That changes bytes on the wire but not their sizes, and
+  the simulation's PKI is Ed25519 for that reason, so a seed replays.
+  Quinn uses the Tokio runtime's clock, which is the simulation's paused
+  clock. `EndpointSettings` gains `idle_timeout`, with keep-alives at a
+  sixth of it. The node binary passes neither a seed nor a socket and
+  is unchanged.
+- **Determinism findings.** The QUIC adapter test, the new
+  `peer_protocol::a_seed_with_protocol_faults_replays_exactly`,
+  `peer::a_seed_with_a_peer_replays_exactly`, and
+  `discovery::a_seed_with_udp_blocked_replays_exactly` all replay
+  exactly. As in M6-06, the replay tests use one member per shard,
+  because tokio's own unseeded randomness makes replicated takeovers
+  differ between runs. CI's flags are unchanged. The destination's
+  fault draws come from a `SmallRng` forked from the run's seed, and
+  every map it keeps is a `BTreeMap`.
+- **Protocol faults at the destination.** `Peer::faults`
+  (`ProtocolFaults`) wraps each stream the destination serves in a tap.
+  The tap can:
+  - lose `BEGIN`, `DATA`, `COMMIT`, and `BATCH` frames, or `RESUME`,
+    `DURABLE`, and `APPLIED` answers;
+  - close the connection as a `DATA` frame arrives, after a `DURABLE`,
+    or with an `APPLIED` in flight;
+  - make a `COMMIT` arrive late.
+  Aimed faults (`AimedBlocks::scope`) hold a `COMMIT`'s UDP path, hold
+  its sender's link, or depose its sender by holding its link and
+  crashing it.
+- **Audits added.** Each tap checks its stream:
+  - no `DATA` resends bytes the stream's `RESUME` reported durable;
+  - every `APPLIED` for the identity the key's current version carries
+    says `committed` with that version's ETag, for replays and for a
+    deposed primary's copy alike, or `unavailable`, which claims nothing;
+  - a `COMMIT` that arrived while its staging covered the whole object is
+    never answered `incomplete`, unless its source aborted it;
+  - a `COMMIT` that arrived past the commit window of its identity's
+    latest send is never answered `committed`. Its apply-by time passed,
+    whichever send it is, and `PeerCommits` checks that before it looks
+    for a stored result.
+  At the end, the staging left over must expire and give back its whole
+  quota charge. `PeerAudit` counts the faults that struck and what the
+  sources did, so that each scenario can show its faults happened.
+- **Scenarios.** `peer_protocol` runs three replicated nodes with
+  takeovers, under the M6-06 cluster faults plus:
+  - `lost_messages_are_retried_and_each_write_applies_once`: loses 5 %
+    of messages either way, for staged objects and batches, over 20
+    keys.
+  - `reconnects_mid_transfer_resend_only_what_is_not_durable`: drops 6 %
+    of connections mid-transfer, with 128-byte frames, and checks that
+    `RESUME`s reported durable bytes that were not resent.
+  - `duplicate_commits_apply_once_and_are_answered_alike`: replays after
+    lost `APPLIED`s (4 % loss), and deposes a `COMMIT`'s sender once the
+    `COMMIT` reached the destination, so that its successor sends it
+    too. At least one seed of each run must have a `COMMIT` from two
+    nodes.
+  - `staging_that_expires_before_its_commit_is_staged_again`: a 400 ms
+    TTL, late `COMMIT`s, and held senders.
+  - `commits_that_arrive_past_their_window_are_refused`: a 1.5 s commit
+    window, with one `COMMIT` in two arriving 2.5 s late. At one in
+    three, seed 109 saw no overdue `COMMIT`: a peer restart killed all
+    five late ones, and every later write went in a batch.
+  - `a_seed_with_protocol_faults_replays_exactly`.
+- **Seeded bugs.** All three were added in `skys3-flush`, and each one is
+  caught on every seed tried:
+  - `PeerBug::ResendDurable` ignores the `RESUME`.
+  - `PeerBug::ExpiredAsCommitted` takes an `incomplete` answer or expired
+    staging for a commit. The `FLUSHED` audit catches it.
+  - `PeerBug::NoCommitWindow` stamps each `COMMIT`'s apply-by time a day
+    past the commit window. It was added after M6-07's apply-by merge.
+    It first sent no apply-by time at all, which M6-07's protocol
+    version 2 now refuses on send.
+- **Product change: staging stays while its `COMMIT` applies.**
+  `Staging::pin` and `Staging::unpin` keep staging that was live when its
+  `COMMIT` arrived from expiring while the `COMMIT` waits for the
+  stream's frames in flight and applies. `Staging::expire` skips pinned
+  staging. The destination holds the pin in a guard, so a stream task
+  aborted when its connection closes releases it. Before this, an append
+  that outlived the TTL could expire the staging under its own `COMMIT`.
+  No simulation run hit that; the race was found by reading the code
+  while writing the expiry audit. A unit test covers it. Recorded in
+  §7.8 ("Expiry"). No other product bug turned up.
+- **A closed connection takes held COMMITs with it (found in testing).**
+  Under QUIC, `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`
+  let `PeerBug::NoQuarantine` through on 3 of 12 seeds. The fault held
+  the link only once the `COMMIT` reached the destination's side.
+  Falling back, the source closed its connection, and the held `COMMIT`
+  died with it. Aimed faults now hold the sender's link as the `COMMIT`
+  is sent. The bug scenario uses `AimedBlocks::late`: the destination
+  takes the `COMMIT` and applies it after four fifths of the hold, while
+  the links are held and before it can hear the close. With that, the
+  bug is caught on seeds 0 to 11, and the correct cluster passes the
+  same faults.
+- **Deposing by partition never duplicated a COMMIT (found in
+  testing).** A partitioned primary was re-elected and its keys were
+  rewritten, so no `COMMIT` came from two nodes. `AimScope::Deposed`
+  crashes the sender while its link is held, and the scenario writes 40
+  keys, so that the successor flushes the same write.
+- **The expiry scenario needed a sweeper and late COMMITs (found in
+  testing).** Staging expires lazily, so on some seeds nothing expired.
+  The simulated destination now sweeps every TTL, and one `COMMIT` in
+  two arrives a second late. The first version of the covered-stream
+  audit also flagged staging that had expired before its `COMMIT`
+  arrived; it now counts only staging that is still there on arrival.
+- **Merging M6-07's apply-by time.** The simulated destination records
+  each `COMMIT` with its apply-by time, so the quarantine audit ignores
+  `COMMIT`s that arrive too late to apply. The nodes' transports take
+  the commit window. The tapped accept loop keeps each connection's
+  streams in a `JoinSet`, as `serve_connection` now does.
+- **A late replay is answered `unavailable` (found in testing).** The
+  first run of the overdue scenario at 256 seeds failed on seed 5. A
+  replay of an applied write arrived past its apply-by time and was
+  answered `unavailable`, and the consistency audit wanted `committed`.
+  `PeerCommits` checks the apply-by time before it looks for the stored
+  result, and §7.8 makes every such refusal `unavailable` for the source
+  to retry. That is correct, so the audit now accepts `unavailable` too.
+- **Merging M6-07's QUIC start wait.** M6-07 then required an apply-by
+  time on every `COMMIT`, and made each shard flusher that starts on
+  QUIC wait the quarantine before its first `COMMIT`.
+  - `PeerBug::NoApplyBy` became `PeerBug::NoCommitWindow`.
+  - With the default 8 s commit window and 2 s answer timeout, the wait
+    is 12 s. The peer protocol scenarios then flushed only about a dozen
+    `COMMIT`s per run, mostly after the cluster faults, and on some seeds
+    no protocol fault struck. Their peer now has a 3 s commit window and
+    a 1 s answer timeout, so the wait is 5 s. The loss and drop rates
+    grew, and so did the traffic: 20 keys for lost
+    messages, and 128-byte frames for reconnects and for
+    `PeerBug::ResendDurable`.
+  - The main discovery scenario failed on seed 2: it wrote nothing over
+    S3. Over QUIC, a held connection fails only at its idle timeout, and
+    a flusher then waits the quarantine on S3 REST. Its UDP blocks now
+    last 11 to 14 s instead of 8 to 12 s, and it passes seeds 0 to 15.
+    Both of M6-07's quarantine bugs are still caught on seeds 0 to 11.
+- **The duplicate scenario now asserts a COMMIT from two nodes (found
+  in review).** It asserted only `replayed > 0`, which same-node
+  retries after lost answers satisfy. `from_two_nodes` was 0 on every
+  seed after the start-wait merge, for two reasons:
+  - Aimed faults start only while the clients write. The clients
+    finished at about 5 s, before the 12 s start wait let any `COMMIT`
+    out, so every aim was released.
+  - A sender deposed for 3 s regained its shard before its successor's
+    start wait ended, and sent the `COMMIT` again itself.
+  The scenario now aims in late mode: the fault starts once the `COMMIT`
+  reaches the destination, which applies it 1.2 s later. Its peer has a
+  2 s commit window and a 0.5 s answer timeout, so the start wait is
+  3 s. The clients pause up to 300 ms between requests and still write
+  when the aims fall due. A deposed sender stays down for 6 s.
+  - Some seeds still get no `COMMIT` from two nodes: no other node takes
+    the deposed shard over while its sender is down. So each seed must
+    replay a `COMMIT`, and at least one seed of each run must have one
+    from two nodes. The test prints the counts by seed.
+  - At 256 seeds (seeds 0 to 7) the counts are 4, 0, 2, 3, 2, 3, 0 and
+    3. Seeds 100 to 115 had one on all but 100 and 111.
+  - A dedicated scenario would have cost a full run more; this one cost
+    no more than before. The seeded bugs do not use this path.
+- **Seeds and run times at 256 seeds.** Every new scenario uses
+  `Runner::with_cost`. With `SKYS3_SIM_SEEDS=256`, one at `COST` runs
+  seeds 0 to 7, and one at twice that runs seeds 0 to 3; the replay
+  test runs each of its seeds twice. On toolchain 1.98.1, after the
+  start-wait merge:
+  - At `COST`: `lost_messages_are_retried_and_each_write_applies_once`
+    29.9 s, `reconnects_mid_transfer_resend_only_what_is_not_durable`
+    27.2 s, `duplicate_commits_apply_once_and_are_answered_alike`
+    40.7 s, `staging_that_expires_before_its_commit_is_staged_again`
+    29.2 s, and `commits_that_arrive_past_their_window_are_refused`
+    32.4 s.
+  - At twice `COST`: `a_seed_with_protocol_faults_replays_exactly`
+    8.7 s, and the seeded-bug scenarios
+    `the_audit_catches_durable_ranges_sent_again` 10.2 s,
+    `the_audit_catches_expired_staging_taken_for_a_commit` 11.9 s, and
+    `the_audit_catches_commits_applied_past_their_window` 11.1 s. The
+    start wait delays each bug's first chance to show, so these went to
+    twice `COST`, as M6-07's bug scenarios are.
+  - That is 201.3 s for M6-08, over the 3 minutes planned. Before the
+    start wait it was 185.1 s.
+  - The M6-06 scenarios now take 122.1 s (29.0, 12.1, 35.2, 22.7, and
+    23.1 s): the start wait slows their seeded bugs too. Over TCP before
+    the wait they took 62.1 s. The M6-07 scenarios take 178.6 s (44.9,
+    19.4, 30.0, 14.4, 33.4, and 36.5 s).
+  - Beyond CI's seeds, after the start-wait merge, every M6-08 scenario
+    and seeded bug passed seeds 0 to 15 and 100 to 115. Before it, with
+    each bug taken out, the scenarios of `PeerBug::NoQuarantine` and
+    `PeerBug::NoCommitWindow` passed seeds 0 to 7, so the correct cluster
+    passes the same faults.
+  - The 256-seed `harness` run passes too.
+- **No new fuzz target.** The simulation adds no parser. Frames travel
+  through `skys3-peer`'s own wire code, which `peer_messages` already
+  fuzzes.
+
+## M4 Large objects
+
+### M4-01 Write identity for streamed single PUTs
+
+- **The flusher needed no change, but the 412 rule had a trap.** The
+  flusher already sends `write_identity.unwrap_or(version)`, written for
+  `MPU_CREATE` (M1-12, M1-16b), so a `PUT` that inherits an
+  `UPLOAD_BEGIN`'s position is created, replayed, and recognized after a
+  412 by that one identity, as `tests/streamed.rs` checks. The trap is the
+  "earlier write of this shard" clause: a write of the key that commits
+  while a streamed body arrives has a *later* identity than the streamed
+  PUT but is an *earlier* version. Comparing the remote identity with the
+  inherited one instead of the version's position makes it foreign, and
+  under `hold` the acknowledged streamed PUT is never flushed. The code
+  already compared with the version; a unit test and the flush simulation
+  (which now interleaves such writes) both fail under that mutation, the
+  simulation at seed 11. Design §7.2 now says which position is compared.
+- **When the record commits.** The gateway commits `UPLOAD_BEGIN` when the
+  bytes received reach `streaming_flush_min_bytes`, not from
+  `Content-Length`, and awaits it before taking another byte, so the
+  identity is durable before M4-03 could stream anything. Only `write_back`
+  buckets do it; copies and multipart parts never do. Its body is the key
+  alone. Defining a reserved kind needs no new log version, and applying it
+  changes no entry (`Effect::UploadBegun`), so the index format stays at 7.
+  It is a client write (a sealed shard refuses it) but takes no
+  conditional-write slot, and the forwarding wire accepts it as a write.
+  `GatewayConfig::streaming_flush_min_bytes` (`None` turns it off) comes
+  from `[flush]`; until M4-03 streams, a large PUT costs one more small
+  record and is still flushed as one `PutObject`.
+- **Compaction and a body still arriving (orchestrator's question).** The
+  `UPLOAD_BEGIN` itself may go once applied: nothing reads it back, and the
+  `PUT` holds its position. The body's extents are the problem, and not
+  only for streamed PUTs: nothing names them until the `PUT`, and M1-22
+  keeps unnamed extents only until their segment has been sealed for
+  `peer_staging_ttl_seconds`. Nothing bounded how long a body could take,
+  so a body slower than the TTL (it may be configured as low as a second)
+  would commit a `PUT` naming dropped extents, on any replica. The shard
+  checks only that the extents are *applied*. A hold per in-flight upload
+  was rejected: members must know it too, so it would have to come from
+  replicated state, and a failed PUT writes no record that could end it
+  (a new record or index table would be a format change). Instead the
+  gateway gives every body streamed as extents half of the TTL from its
+  first extent (`GatewayConfig::max_body_duration`), then answers
+  `400 RequestTimeout`. Design §10.3 and the configuration reference say
+  so. `a_streamed_put_keeps_its_extents_and_identity_while_it_streams`
+  compacts mid-stream, checks the `UPLOAD_BEGIN` is gone and the extents
+  are kept, completes the PUT, compacts again, and crashes; with a zero TTL
+  the extents go and the test fails.
+- **Remote requests are counted.** The flush tests count requests to show
+  that an inherited identity adds none: one
+  `PutObject` for a streamed PUT, as for any single PUT; three (the lost
+  `PutObject`, the refused retry, the HEAD) when the answer is lost; four
+  when it supersedes a write whose `FLUSHED` was lost.
+- **Simulation.** The flush scenario now also runs streamed PUTs: some
+  with a write of the key in between, a quarter of them failed, and a check
+  that no remote object or version carries a failed upload's identity. It
+  took 51 s for 256 seeds alone, about as before. The cluster simulation's
+  node settings set the streaming threshold to 1,024 bytes, below the
+  workload's 2,048-byte bodies, so `UPLOAD_BEGIN` crosses forwarding,
+  replication, crashes, takeovers, and compaction in every scenario
+  without a new one. With `SKYS3_SIM_SEEDS=256` in a debug build, all 66
+  cluster scenarios passed in 1,734 s (29 min). This machine has no
+  baseline time from the same build.
+- **Merging M2-18: compaction reclaimed nothing, and a 1 s stall.** With
+  M2-18 merged, `replicated_compaction_survives_power_loss_at_its_syncs`
+  reclaimed no segment at seeds 0 and 1 (5 of the first 16 seeds). It was
+  not M2-18's rules alone, nor `UPLOAD_BEGIN` itself:
+  - An overwritten body's unnamed `EXTENT` waits out the TTL from its
+    segment's seal, and only then the release delay, from the first pass
+    after it (M2-18). That order is needed: before the TTL, an extent may
+    still be named and unnamed again between two passes, so an earlier
+    sighting proves nothing. With 2 s each and a pass a second, a segment
+    went about 4.3 s after its seal, and the workload's writes end about
+    4 s in.
+  - M2-18's runs lasted longer only because of a stall. A replica's
+    `Appender` drains before a record of the other class, and a lazy
+    `FLUSHED` in flight was then committed only after `LAZY_MAX_DELAY`,
+    since the record held back was the one that would have started its
+    group. So on a `write_back` shard, the first extent after a flush
+    waited up to a second (about 0.9 s seen), as did every write behind
+    it. An `UPLOAD_BEGIN`, a hot record, started the group first and hid
+    the stall, so M4-01's runs were 1.5 to 2.5 s shorter.
+  - The fix for the stall: `SegmentLog::commit_lazy_now` wakes the
+    committer, and the appender calls it before any drain while a lazy
+    record of its own is in flight. `a_lazy_record_does_not_hold_up_one_of_the_other_class`
+    (shard) took 1.0 s before and passes now; the log test checks the
+    call. With the stall gone, the scenario failed at 14 of 16 seeds.
+  - The fix for the scenario: a 1 s TTL and a 1 s release delay, with the
+    budget written in its doc comment. All 16 seeds pass, and both
+    compaction scenarios pass at `SKYS3_SIM_SEEDS=2048`. The cluster
+    nodes' gateways now get half the compaction TTL as their body deadline,
+    as a real configuration has it; before, a 12 h deadline beside a 2 s
+    TTL left bodies unbounded. The workload takes a `400 RequestTimeout`
+    as a failed write, which faults now cause.
+- **Left open.** M4-03 opens the remote multipart upload where the
+  `UPLOAD_BEGIN` commits (`Upload::begin`). It must log the remote upload
+  ID itself, because compaction drops the `UPLOAD_BEGIN`, and nothing finds
+  an `UPLOAD_BEGIN` without a `PUT` after a crash. The same TTL hole
+  applies to a peer's staging (M6-03): its staging lives on while `DATA`
+  keeps arriving, but compaction counts the TTL from when each segment
+  was sealed. A transfer that stages for longer than
+  `peer_staging_ttl_seconds` can lose its first extents before its
+  `COMMIT`.
+
+### M4-02 Streaming multipart flush
+
+- **Parts are sent from local extents, not teed from the body.** Design
+  §7.3 said each remote part streams "from the incoming body and also from
+  the local extents". A tee is not possible at the flusher: a part's body
+  reaches the primary as `EXTENT` records, from its own gateway or
+  forwarded by another node's, and an `EXTENT` names a key and an offset
+  but not the upload or the part. Parts of one upload also arrive
+  concurrently. Teeing in the gateway would need a remote connection for
+  each part being uploaded, on every node, and would touch the gateway's
+  part creation, which M4-05 is changing in parallel. So the primary's
+  flusher sends a part once its `MPU_PART` is applied, reading the extents
+  just written, which the page cache usually still holds, through the
+  target's in-flight budget. The client gets its part ETag after the local
+  commit, as before, and the transfer of part *n* overlaps the upload of
+  the parts after it. The design's diagram and first bullet now say this,
+  and a new "as built" list under §7.3 records the decisions. A part that
+  fails local validation never commits, so it is never sent and never
+  listed. A number uploaded again is sent again once the earlier send of
+  that number ends, so the remote holds the later bytes.
+- **`PART_FLUSHED` records each step; the log format is unchanged.**
+  `PART_FLUSHED` was already a reserved kind of log version 2 (code 10), so
+  defining it needs no new log version. Its body is the key, the local
+  upload's position, the remote upload ID (1 to 1,024 bytes), and a step:
+  *opened*; a *part* with its number, the `MPU_PART` position it sent, and
+  the remote ETag; or *ended*. Each rides a lazy group commit
+  (`commit_lazy`), like `FLUSHED`, from a detached task. The flusher awaits
+  the *opened* record before it sends any part, so the ID is in the log
+  before any data reaches the remote. It does not await part records.
+  `ShardFlusher::stop` awaits every record still in flight, so a stopping
+  flusher does not lose one. The state machine applies a step only to the
+  remote upload the index holds with the same ID (`Rejection::NoRemoteUpload`
+  otherwise), and an *opened* step replaces any earlier one. Applying it
+  changes no entry, so compaction drops it once applied, like other
+  metadata records.
+- **Index format 8: two new tables.** This is a format change. The index
+  `FORMAT_VERSION` goes from 7 to 8. Version 8 adds `remote_uploads`,
+  keyed by `(shard, upload position)` (the same bytes as that upload's
+  parts prefix), holding the key and the remote upload ID, and
+  `remote_parts`, keyed by `(shard, upload position, part number)`, holding
+  the `MPU_PART` position sent and the remote ETag. Rows outlive the local
+  upload until an *ended* step, so the flusher can still complete or abort
+  the remote upload after the local one is gone. Older builds refuse
+  version 8, since they would forget those remote uploads. The value format
+  stays 3; the new values decode only at format 3. Learner snapshots carry
+  both tables (`ShardTable::RemoteUploads` = 4, `RemoteParts` = 5). Codec
+  property tests, a table test, and the `index_codec` fuzz target cover
+  them.
+- **`Change` is now an enum.** `Shard::subscribe` reported only
+  committed versions. The flusher now also needs uploads opened, parts
+  stored, and uploads aborted, so `Change` has the variants `Stored`,
+  `Opened`, `Part`, and `Aborted`. `Stored` carries the upload whose
+  completion stored it. The flusher is the only subscriber.
+- **Completion goes through the key's ordinary flush.** The version a
+  local `MPU_COMPLETE` committed is flushed in the per-key order of §7.1.
+  When the version's write identity is the upload, `put_parts` claims the
+  stream. The claim waits for sends in flight. The flush then sends every
+  kept part the remote does not hold from that same `MPU_PART`, lists
+  exactly the kept parts, and completes with the §7.2 precondition.
+  - A version without a stream takes the M1-16b after-commit path. That
+    covers a version a `TAGS` record retagged, one whose remote upload is
+    gone, and one whose flusher has streaming off.
+  - A `404 NoSuchUpload` from the Complete aborts the stream. The flush is
+    done if a HEAD then finds the version's identity (a lost answer);
+    otherwise the next attempt sends the version after commit.
+  - The remote multipart ETag equals the local one in every streaming
+    test.
+- **Aborts, and when a stream is reaped.** A remote upload is aborted when
+  its local upload aborts, when the remote no longer has it, and when its
+  key is clean or held in conflict without it. In those last two cases
+  nothing will complete it. The conflict case was found in the
+  simulation: a conflicted key's stream otherwise stayed open forever.
+  Aborts are retried until `Ok` or `NoSuchUpload`, then recorded as
+  *ended*. `FlushSettings::streaming` (default on) turns streaming off for
+  new uploads. Remote uploads already recorded are still completed or
+  aborted.
+- **Load the streams before the entry scan.** The restart test raced: a
+  stream loaded after the scan found its key untracked and was doomed
+  wrongly. `run` now loads streams first, scans, and then reaps the
+  streams of keys the scan left untracked.
+- **Overlap metric.** `skys3_flush_streaming_overlap_ratio{bucket}` is a
+  histogram, observed once per streamed completion: the fraction of the
+  kept bytes the remote held when the local completion applied. Each part's
+  send task timestamps the remote's answer, and the flusher timestamps the
+  completion's `Stored` change when it reads it. The completion counts the
+  parts acknowledged by then.
+  Because Prometheus histograms have no `count()` or `sum()` outside
+  test-util, the service test reads them from the encoded registry. The
+  admin status gains `streamed_uploads` (the open streams). Both are in
+  `docs/skys3-metrics.md` and §16.3.
+- **Tests.** `tests/streaming.rs` has eight tests:
+  - parts stream before completion, with one more request for the
+    Complete and an overlap of 1.0;
+  - a completion lists exactly its kept parts;
+  - a part re-uploaded during a slow send follows it;
+  - aborted and abandoned uploads are aborted at the remote;
+  - a retagged object is sent after commit;
+  - a restarted flusher resumes from the index;
+  - a vanished remote upload is replaced after commit;
+  - a lost Complete answer is recognized by the upload identity.
+
+  The shard tests cover the new `Change` variants and `PART_FLUSHED`
+  application. The log tests cover its layout and round trip.
+- **Copied parts (after merging M4-05).** UploadPartCopy stores the copied
+  bytes in the upload's shard and commits an ordinary `MPU_PART`, so the
+  flusher streams it like an uploaded part, and no flush code changed.
+  `tests/streamed_copies.rs` checks this end to end through the gateway,
+  real shards, and the flush service: one part copies a whole 6 MiB
+  source, and a second copies a 100-byte range. Both reach the remote
+  upload before the client completes. The completion then sends only the
+  Complete, and the remote object has the local ETag and the copied
+  bytes. With streaming off, the test fails waiting for the remote
+  upload.
+- **Copied-part test runs in real time.** The flush tests' runtime pauses
+  tokio time, and the paused clock auto-advances whenever every task
+  waits. A holder's read of the 6 MiB source from the simulated disk is
+  such a wait. The clock then jumped past the 30 s read-registration TTL,
+  and the copy answered `503` "The object changed while it was read" in
+  19 of 20 runs.
+  - This is a test-harness trap, not a fault in M4-05: the copy works on
+    a clock that runs normally.
+  - The test now builds a real-time runtime and passed 20 of 20 runs.
+  - Other tests that read large objects through holders on a paused
+    clock would hit the same trap.
+- **Simulation.** `streamed_uploads_reach_the_remote_only_after_their_local_commit`
+  (`Runner::with_cost(8, 2)`) mixes the following on an AWS-like or
+  R2-like `SimS3`:
+  - concurrent uploads with random part sizes, re-uploaded numbers, and
+    completions that keep a subset of the parts;
+  - aborts, PUTs, `TAGS`, and DELETEs;
+  - flusher restarts and injected faults.
+
+  Before each local commit it checks that no remote object or version
+  carries the upload's identity. Afterwards it checks that the remote
+  object's ETag is the local one and that aborted identities never appear
+  anywhere. It ends when no remote upload is open beyond the creates whose
+  answers were lost, and no stream, orphan, or index row is left. The
+  existing flush scenario now streams on half its seeds. Two fixes came
+  from it:
+  - `check_unpublished` retried a GET forever after a flush deleted the
+    object, so a 404 now ends its wait.
+  - M1-16b orphans left remote uploads open (seed 127), so the final
+    check aborts them with `abort_orphaned_uploads` and requires none.
+- **Seeded bugs the simulation catches.**
+  - Completing the remote upload from `pump` as soon as the local
+    upload's parts were sent, before the local commit, fails at
+    **seed 0**: "upload c-test/b-flush/0/1.47 is at the remote before its
+    local commit".
+  - Listing every part the remote holds, instead of the kept parts
+    (which lists a part the completion dropped or one replaced since),
+    fails at **seed 1**: the flush never settles, with `400 InvalidPart`
+    for part 2.
+  - Both runs used `SKYS3_SIM_SEEDS=256`, and both mutations are reverted.
+- **Timings.** At `SKYS3_SIM_SEEDS=256` in a debug build, the new scenario
+  took 14.7 s alone (CI runs 128 of its seeds), and
+  `flushes_reach_the_remote_through_faults` took 44.6 s on a loaded
+  machine (28.1 s earlier in this task). All four flush scenarios
+  together took 50.8 s. Streaming is on by default, so the cluster
+  simulation's one-part multipart uploads now stream across forwarding,
+  takeovers, crashes, and compaction. CI's whole simulation set
+  (`cargo test --workspace --all-features --test simulation`,
+  `SKYS3_SIM_SEEDS=256`) passed, with the 75 cluster scenarios taking
+  2,337 s.
+- **Review fixes.**
+  - *A failed read could orphan an opened remote upload.* After
+    `CreateMultipartUpload` and its *opened* record succeeded, the open
+    read the local parts, and a failed read ended the open as if the local
+    upload had closed. The stream was then dropped while the index still
+    recorded the remote upload. Nothing completed or aborted it, and the
+    completion opened a second one. The open now reads the parts in the
+    read it already retries, before the Create, so nothing fallible
+    follows the record. A part stored after that read reaches the stream
+    by its change.
+  - *Testing it.* `tests/stream_faults.rs` uses a `test-util` failpoint
+    (`skys3_flush::test_hooks`) to fail one such read. Without the fix
+    the parts never stream.
+  - *Overlap depended on event order.* It counted the parts whose step
+    the flusher had handled before the completion's change, and
+    `select!` may take either first. It now compares each part's
+    acknowledgement time with the completion's. A unit test handles the
+    change before both steps, one part acknowledged before it and one
+    after. Without the fix it counts neither part.
+  - *Remaining skew.* A part acknowledged after the completion applied,
+    but before the flusher read its change, still counts. The bound is
+    the change's queueing delay in the flusher's loop.
+- **Left open.**
+  - Plan M4-04 adds the `ListParts` reconciliation. Until then, a part
+    whose `PART_FLUSHED` was lost is sent again, which is correct but
+    costs a transfer.
+  - A remote upload whose `CreateMultipartUpload` answer was lost, or
+    whose *opened* record a crash lost, is left to the bucket's
+    abort-incomplete-uploads lifecycle rule (§7.3).
+  - There is no tee of the incoming body (see the first bullet), so a
+    part is read back from the local log once.
+
+### M4-03 Streaming flush for large single PUTs
+
+- **The gateway announces a streamed body; no record names it.** M4-01
+  gave a streamed `PUT` an `UPLOAD_BEGIN` and an inherited write identity,
+  but its `EXTENT` records name a key and an offset, not the upload, and a
+  key may have several bodies arriving at once. The primary's flusher
+  cannot tell which extents belong to which body until the `PUT` commits.
+  So the gateway tells it: a `StreamedBody` announcement (key,
+  `UPLOAD_BEGIN` position, metadata, tags, extents by offset) once at
+  `UPLOAD_BEGIN`, and again each time at least `flush_part_bytes` more
+  extents are committed. `Shards::announce` routes it to the primary,
+  `Shard::announce` passes it to the flusher's subscription as
+  `Change::Streamed`, and nothing is logged. The gateway sends
+  announcements on spawned tasks, so the body's upload never waits for
+  them, and awaits them all before the `PUT` commits, so the flusher sees
+  them before the `PUT`'s `Stored`. Extents are keyed by offset, so their
+  order does not matter. A failed announcement is logged at debug level
+  and only costs overlap: the completion sends what the stream lacks.
+- **Formats.** The log (version 2) and the index (format 8) do not
+  change. The forwarding wire gains operation 19 (`Announcement`, its
+  metadata and tags in the index's upload codec) and answer 15
+  (`Announced`); the existing `gateway_forward` fuzz target decodes it.
+- **Streams reuse M4-02's machinery.** A body stream is a `Stream` keyed
+  by its `UPLOAD_BEGIN` position, opened with the announced metadata,
+  tags, and identity, and recorded with `PART_FLUSHED` *opened* and
+  *ended*. Part *n* is bytes `[(n−1)·P, n·P)`, `P` fixed from
+  `FlushSettings::part_bytes` when the stream first pumps. A part goes out
+  once announced extents cover it, read from the log, with a
+  `Content-MD5` the flusher computes (inline up to 1 MiB, otherwise on the
+  blocking pool). Part records are not written: their `MPU_PART` position
+  does not exist, and a part only counts if it was sent from exactly the
+  extents the `PUT` names in its range, which only memory knows. So a
+  resumed body stream sends every part again.
+- **Completion and ETags.** `Attempt::put` completes the stream when the
+  version's `write_identity` names an open body stream and the version is
+  streamable (bytes in the log, at most 10,000 parts). It shares the tail
+  of the multipart completion (`complete_claimed`): the §7.2 precondition,
+  the `404 NoSuchUpload` handling, and a `FLUSHED` with the remote
+  multipart ETag as `remote_etag`, while `local_etag` stays the MD5 that
+  clients see. The next flush of the key is conditioned on that
+  `remote_etag`. A retagged or unstreamable version goes out as one
+  `PutObject`, and its stream is aborted once the key is clean.
+- **Bodies that never commit.** `FlushSettings::body_timeout` (the node
+  uses `peer_staging_ttl_seconds`, twice the gateway's
+  `max_body_duration`) dooms a body stream whose `PUT` has not committed
+  that long after its last announcement; the flusher's loop sleeps until
+  the next deadline, aborts the remote upload, and records *ended*. After
+  a restart, an open remote upload without a local multipart upload is a
+  body: completed by its key's flush if the `PUT` committed with its
+  identity, otherwise kept for `body_timeout` and aborted. The crash test
+  in `tests/streamed_puts.rs` finds the logged remote upload ID after a
+  crash before the `PUT` and aborts it.
+- **Surprises.**
+  - *`claim` returned nothing while the stream was opening.* A `PUT` that
+    commits right after `UPLOAD_BEGIN` found its stream in
+    `Remote::Opening` and fell back to `PutObject`, aborting a stream that
+    had just begun: in the flush simulation few streams completed. `claim`
+    now waits for an open in flight, and an open whose `Create` failed
+    after the `PUT` committed returns no stream.
+  - *The paused clock times bodies out.* Flusher tests with
+    `start_paused` and the index on the blocking pool let tokio jump the
+    clock past `body_timeout` while a read waited for a pool thread. The
+    new tests and the flush simulation open nodes with
+    `Node::open_inline`, so the index runs on the caller's thread.
+  - *Identical bytes, identical ETags.* The flush simulation copies a
+    flushed object's bytes out of band to make conflicts. A streamed
+    `PUT` flushed as `PutObject` has the same MD5 ETag as such a copy, so
+    the flusher took the copy for its own write and deleted it. That is
+    the inherent limit of ETag preconditions (§7.2); the simulation now
+    copies a streamed version only when the remote holds it as its
+    multipart object.
+  - *A member took announcements.* `Shard::announce` first checked only
+    that the shard ran, so after a primary change a gateway with a stale
+    map had its announcement accepted by a member, whose flusher never
+    sees the `PUT`; the cluster simulation's routing audit caught it
+    (`routing_while_a_primary_restarts`, seed 0, intermittently). It now
+    checks as a write does: a member answers `NotPrimary`, which
+    redirects the gateway, and a primary that does not serve yet is
+    unavailable.
+  - *Crash tests need recovery.* The flusher test support reopened the
+    index without replaying the log, which a crash test needs; `open_on`
+    now replays with a `Checkpointer`.
+- **Simulation.** The flush simulation (`tests/simulation.rs`) streams
+  half of its large `PUT`s with 16-byte parts, two announcements, and a
+  2 s body timeout, on half the seeds, and checks that each entry's
+  `remote_etag` is the remote object's ETag. Seeded bugs: recording the
+  `local_etag` as `remote_etag` after a streamed completion fails at seed
+  18 (the `remote_etag` check), and with that check off at seed 122 (the
+  flusher deletes another writer's object); completing the remote upload
+  before the `PUT` commits fails at seed 2 (a failed `PUT`'s identity is
+  published). No scenario was added, so no cost changes. At
+  `SKYS3_SIM_SEEDS=256` in a debug build on four loaded cores,
+  `flushes_reach_the_remote_through_faults` took 43.5 s alone (M4-02
+  reported 44.6 s), the four flush scenarios 116 s one at a time, and
+  CI's whole simulation set passed, its cluster simulation in 2,274.5 s.
+- **Cluster simulation.** Gateways now announce bodies, so
+  `skys3-cluster-sim` streams every `PUT` of 1,024 bytes or more in
+  `write_back` buckets, with 512-byte parts, `min_part_size` 1 on the
+  remote, and `body_timeout` twice `max_body_duration`. Such a `PUT` has
+  at least two parts, so the durability check maps a remote ETag of two
+  parts or more back to the MD5 of the remote bytes; the workload's own
+  multipart uploads have one part.
+- **Left open.**
+  - Announcements are not durable. After a primary change or restart a
+    body stream resumes only if its *opened* record survived, and then
+    sends every part again; a body announced to a dead primary streams
+    nothing and is sent after commit.
+  - A body that is never completed after a restart waits for the full
+    `body_timeout` (24 h by default) before its abort.
+  - A version that falls back to `PutObject` is read whole into memory,
+    as every single-PUT flush is.
+
+### M4-04 Upload takeover after a primary change
+
+- **Trusting `PART_FLUSHED` never built a wrong object; it could wedge
+  one.** A `PART_FLUSHED` is written only after the remote acknowledged its
+  part, it names the `MPU_PART` it was read from, and S3 checks every ETag
+  a Complete lists. So M4-02's resumed streams could only cost transfers
+  (a part whose record was lost was sent again), with one exception: a
+  send of the deposed primary that its flusher took for failed, or that
+  was still in flight when it died, can land after the new primary sent
+  that part. The Complete then lists an ETag the remote no longer holds,
+  gets `400 InvalidPart`, and M4-02 kept the stream as it was and retried
+  forever. The simulation shows exactly that when the listing is removed
+  (seeded bug below). The fix has two halves: a resumed stream lists the
+  remote upload before it sends or completes, and an `InvalidPart` makes
+  the stream list again before the retry (`Verdict::Relist`).
+- **When a stream lists (decided, design §7.3).** A stream loaded from the
+  index starts `Listing::Due`. An open one (local upload or body still
+  arriving) lists at once from the flusher's pump, retrying with backoff,
+  and sends nothing until then, so parts still to come are sent only if
+  the remote lacks them. A closed one is listed by its completion. A claim
+  never waits for a listing in flight: it would block a flush slot while
+  the remote fails, without reporting an error. It drops the listing
+  instead (listings are numbered, so a late answer is ignored) and the
+  completion lists itself, which fails and backs off like any request.
+- **What counts as held.** A recorded part counts only if the listing shows
+  its recorded ETag. A part to send is not sent if the listing shows the
+  local part's MD5 under its number: for a multipart part that is the
+  index's ETag, so nothing is read; for a body part the bytes are read and
+  hashed (`upload_span` now hashes before deciding). A multipart part
+  found this way gets its `PART_FLUSHED`, so the index catches up. A
+  number sent since the listing, or whose send failed (it may have
+  landed), is dropped from the listing.
+- **A gone remote upload is the completion's to judge.** The first version
+  doomed any stream whose listing found `404 NoSuchUpload`. For a closed
+  stream that is the "crash during complete" case: the old primary's
+  Complete applied and only its `FLUSHED` was lost. Dooming made the key
+  go the after-commit way, uploading every part again only to find its
+  own object through the 412. Now only an open stream is ended that way;
+  a closed one leaves it to its completion, whose `ListParts` failure goes
+  through the same path as a Complete's (`claim_failed`): `NoSuchUpload`
+  and a HEAD that finds the version's identity mean the flush is done.
+  The test of that case sends three requests (`ListParts`, HEAD, abort).
+- **Body streams are covered (decided, the orchestrator's question).**
+  M4-03 sent every part of a resumed body again. With the listing, the
+  completion keeps each part whose ETag is the MD5 of the `PUT`'s bytes
+  in that part's range and sends only the others, so the resend is gone
+  at the price of a local read. Announcements are still not durable: a
+  body whose *opened* record never committed streams under a new remote
+  upload if more announcements reach the new primary, and is otherwise
+  sent after commit.
+- **No format change.** The log stays at version 2, the index at format 8,
+  and the forwarding wire is untouched. Listing results live in memory.
+- **Simulation.** `primary_changes_at_every_step_of_a_streamed_upload_leave_no_partial_object`
+  (`tests/takeover_simulation`, `Runner::with_cost(8, 4)`, so CI runs 64
+  seeds) interleaves multipart uploads (re-uploaded numbers, partial
+  completions, aborts), streamed PUTs (some never commit, some first
+  announce extents their `PUT` will not name), and plain PUTs on an
+  AWS-like or R2-like `SimS3` with faults. About one operation in six is
+  a primary change aimed at a step: after open (the remote upload is
+  recorded), mid-part (a moment after a part commits), after
+  `PART_FLUSHED` (some parts recorded), or during complete (a moment
+  after the local completion, or once the remote object appears). The
+  flusher is dropped where it is, the node loses power (uncommitted
+  `PART_FLUSHED` and `FLUSHED` records go, as with a dead primary), and a
+  new flusher takes over from the log. At each change the deposed
+  primary's sends of earlier part bodies may land up to 150 ms later.
+  The checks: no identity at the remote before its local commit; every
+  remote object and version with a committed write's identity holds
+  exactly its bytes and ETag; aborted and failed writes never published;
+  every key clean with its latest write and `remote_etag`; every remote
+  upload the log ever recorded completed or aborted.
+- **Seeded bugs it catches** (each run at `SKYS3_SIM_SEEDS=1024`, which is
+  256 seeds of this scenario, and reverted):
+  - Trusting `PART_FLUSHED` without `ListParts` (resumed streams start
+    `Known`, and `InvalidPart` keeps the stream as M4-02 did): **seed 39**,
+    the flush never settles, `400 InvalidPart: part 4`.
+  - Reusing a listed part whose ETag differs from the local MD5, in both
+    `upload_part` and `upload_span`: **seed 7**, the remote object of an
+    upload holds an earlier body of its part 3.
+  - The same for body parts only: **seed 9**, a streamed `PUT`'s remote
+    object starts with the stale extents' bytes. Before the scenario
+    announced stale extents, this bug passed all 256 seeds: the old
+    primary sends a body's own bytes, so only extents the `PUT` does not
+    name make a listed body part wrong.
+  - Earlier in this task, the first version of the scenario caught both
+    of the first two bugs at seed 0.
+- **Timings.** At `SKYS3_SIM_SEEDS=1024` (256 seeds of the scenario) in a
+  debug build, the scenario took 74.2 s alone; CI's 64 seeds take about a
+  quarter of that. CI's whole simulation set (`cargo test --workspace
+  --all-features --test simulation`, `SKYS3_SIM_SEEDS=256`) passed in 39.7 min of wall time, build
+  included: the 78 cluster scenarios in 1,942 s, and the five flush
+  scenarios, this one at 64 seeds, in 64.7 s.
+- **Tests.** `tests/takeover.rs` plays the old primary's requests straight
+  to the remote and counts the new primary's: a part sent without its
+  record is not sent again (after a failed `ListParts`, too); a recorded
+  part a late send replaced is sent again; a refused Complete lists again;
+  a Complete the old primary sent is found by its identity; an open upload
+  whose remote upload vanished is sent after commit; a resumed body sends
+  only the parts whose MD5 the remote lacks; and a store that pages one
+  part at a time, or whose pages stop advancing. Two existing restart
+  tests now count the `ListParts`, and the resumed body test asserts it
+  no longer sends its first part again.
+- **Left open.**
+  - The `InvalidPart` safety net relies on the target checking each part's
+    ETag in `CompleteMultipartUpload`, as S3 and `SimS3` do. A target that
+    assembled whatever its parts hold would let a late send through. The
+    capability probe does not test it.
+  - Remote uploads whose *opened* record died with the primary are still
+    left to the lifecycle rule (§7.3).
+  - The cluster simulation exercises takeovers of streamed uploads, but
+    not aimed at steps; this scenario does that at the flusher, with a
+    power loss standing in for the primary change (a new primary holds
+    every committed record, and may lose the same uncommitted ones).
+
+### M4-05 UploadPartCopy
+
+- **The source is read as a GET reads it, not through the primary.**
+  CopyObject (M1-10) reads its source's payload through the source
+  shard's primary and answers `503` for an evicted source. The plan asks
+  for a copy "from any source object in the cluster", so GET's loop
+  (remote for a key the import has not reached, hot cache, holders on any
+  node, fill of an evicted version, resolve again up to three times)
+  moved out of `get` into `Objects::open`, which takes a selector of the
+  bytes to serve; GET and UploadPartCopy both call it. An UploadPartCopy
+  of an evicted source therefore fills just its range, and one on another
+  node streams from a holder. CopyObject was left as it was (its whole-
+  object `PUT` with a copy source is M4-07's to revisit). No record kind,
+  wire operation, or index format changed: a copied part is an
+  `MPU_PART` like any other, so completion, ListParts, `partNumber` reads,
+  and the multipart flush (M1-16b) needed nothing.
+- **ETag rule and known values.** A copied part's ETag is the MD5 of the
+  bytes copied, which is S3's rule for objects without SSE-KMS or SSE-C,
+  so the completed ETag is S3's. The tests take S3's answers from
+  ceph/s3-tests at the pinned commit
+  (`test_multipart_reupload_checksum_and_etag` and
+  `test_multipart_use_cksum_helper_*`, which run against AWS S3 and are
+  not marked as failing there): three ranged copies of one 15 MiB object
+  of `A`, `B`, and `C` complete with `b2add96cc9702bbf4efb0ccdfc6b7747-3`
+  and S3's per-part and whole-object checksums for SHA256, SHA1, CRC64NVME
+  (also as the default), CRC32, and CRC32C. Every SDK client also checks
+  that a copy at the source's own part boundaries has the source's ETag.
+- **Checksums of a copied part.** UploadPart without checksum headers
+  stores CRC64NVME beside the upload's algorithm (the validator always
+  stores the request's algorithm or its default). A copy has no request
+  checksum, so it computes only MD5 and the upload's algorithm, and the
+  `CopyPartResult` carries only that one, as S3's does.
+- **Which error for a range past the end.** s3-tests'
+  `test_multipart_copy_invalid_range` accepts `400` or `416` but requires
+  `InvalidRange`; S3-compatible servers that copy AWS's messages answer
+  `400 InvalidArgument` there. The gateway answers `416 InvalidRange`, as
+  a GET does, and every other form than `bytes=first-last` with both
+  offsets `400 InvalidArgument`. The S3 documentation was unreachable from
+  the sandbox, so M7-01 should confirm both against AWS S3. The parser
+  has a proptest and a fuzz target, `gateway_copy_range`; a 30-second
+  run executed about 5.3 million inputs with no failure.
+- **Ranges need a source over 5 MiB (review).** The first version copied
+  a range of any source. The UploadPartCopy API reference says a range
+  may be copied only from a source larger than 5 MB, and AWS answers a
+  smaller one with `400 InvalidRequest` ("The specified copy source is
+  not supported as a byte-range copy source"). The check
+  (`MIN_RANGED_SOURCE_BYTES`, 5 MiB) runs after the range is checked
+  against the source, so a range past the end of a small source is still
+  `416 InvalidRange`, which s3-tests' invalid-range test expects of a
+  5-byte source; its improper-range test sends malformed ranges, which
+  are refused before the source is read. No pinned s3-tests test, and no
+  SDK client, makes a valid ranged copy of a source of 5 MiB or less. The
+  gateway tests that did now use larger sources, and a test copies a
+  range of 5 MiB + 1 and is refused one of exactly 5 MiB.
+- **SDK copy helpers.** boto3's `copy` (s3transfer 0.19.2) and the AWS
+  CLI's `aws s3 cp` between objects use UploadPartCopy above their
+  multipart threshold, and s3transfer sends each part with
+  `x-amz-copy-source-if-match` naming the ETag its HeadObject saw; the
+  Python client asserts both. The Java transfer manager's copy needed the
+  `s3-transfer-manager` artifact, over the multipart-enabled async client.
+  The SDK for Go v2 has no copy helper (`feature/s3/manager` 1.23.11 and
+  `feature/s3/transfermanager` 0.4.13 have none), nor has `lib-storage`
+  for JavaScript, so those clients copy part by part with UploadPartCopy
+  as the AWS documentation's examples do, as does the Rust client. Each
+  also checks that a failed source condition answers `412`.
+- **s3-tests.** Seven UploadPartCopy tests joined the subset (small,
+  invalid and improper ranges, without a range, special key names,
+  multiple sizes, and a percent-encoded key); the versioned, SSE, bucket
+  policy, and logging variants stay out with their features. The subset
+  now has 216 tests.
+- **Local run.** As in M1-25 the docker daemon was not running, so every
+  client ran on the host (`SKYS3_SDK_LOCAL=1`). This sandbox had no AWS
+  CLI or boto3: the CLI 2.37.8 came from its installer and the Python
+  packages from the pinned requirements, into scratch directories. All
+  seven clients passed together in about four minutes.
+- **No new simulation scenario.** The copy adds nothing to the
+  replication, flush, encoding, or peer paths: its source read is M2-18's
+  holder read, already simulated, and its write is an ordinary
+  `MPU_PART`.
+- **A slow source is not the client's fault.** A copy streams into the
+  shard through the same `Upload` as a client body, with the same
+  deadline (`max_body_duration`, half the compaction TTL, M4-01), which
+  keeps compaction from dropping its first extents before the `MPU_PART`
+  names them. Missing it answers a client `400 RequestTimeout`; for a copy
+  the source was slow (a slow fill or holder), so the copy maps it to
+  `503 ServiceUnavailable`, which SDKs retry.
+- **Left open.** CopyObject still reads through the primary and still
+  answers `503` for an evicted source. With M4-02, a copied part must also be
+  streamed to the remote upload; it reaches the shard through the same
+  `Upload` as an UploadPart body.
+
+### M4-06 Conflict policies and conflict administration
+
+- **A resolution is flusher state, not a record (decided, design §4.2,
+  §7.2).** Conflict was already an in-memory phase of the primary
+  flusher. Conflict → Dirty puts the key back in line with the policy to
+  apply attached (`Tracked::resolution`), and the key's next flush carries
+  it out with the usual ordering, retries, and write identity; it is
+  cleared once a flush of the key succeeds. A restarted or new primary
+  finds the conflict again by flushing and applies the bucket's policy,
+  so nothing needs to be durable. `overwrite` and `discard_local` resolve
+  at once, in the same step that finds the conflict.
+- **`discard_local` reuses `ADOPT` (decided, no format change).** The
+  fill's `ADOPT` (M1-06) already turned an entry into an evicted stub of a
+  remote object. Its rule widened from "a clean or evicted entry at the
+  named `seq`" to "the entry at the named `seq`, in any state", so it
+  drops a dirty version or tombstone too; a fill's `ADOPT` is unaffected,
+  since a clean version never becomes dirty again at its `seq`. A
+  different `seq` on an entry that is not clean is still `NotClean`, so
+  a write committed after the version named rejects the discard, and the
+  next attempt names the newer version. Before adopting, the flush HEADs
+  the key: if the foreign object is gone, or is SkyS3's own write, it
+  flushes normally. A replica of an earlier build rejects such an
+  `ADOPT`, so a mixed-build cluster must not discard (upgrade rules,
+  M7-09).
+- **The opt-in (decided, design §7.2).** `discard_local` in `[flush]` was
+  already rejected; it is now also rejected in a `[buckets.<name>]` table
+  whose bucket does not resolve to `write_back`. An operator may still
+  resolve one inspected key with `discard_local` in any `write_back`
+  bucket. A `local` bucket's backup target never discards: its effective
+  policy is `hold` if configured `discard_local` (unreachable through
+  validation, warned about), and the admin API refuses the resolution with
+  `409`, since adopting the backup's object would replace acknowledged
+  data with a version no read path serves (§8.9).
+- **Unprotected operations need nothing new.** They are sent without a
+  precondition under every policy, so an out-of-band write there is
+  overwritten silently; only the HEADs a flush sends anyway (a key the
+  import has not passed, a delete without a known remote ETag) can find
+  a foreign object, and the policy decides as for a 412. Tested per
+  policy in `skys3-flush/tests/conflicts.rs`.
+- **Write-through waits.** A dropped version cannot reach the remote, so
+  `discard_local` answers waiters as for a held conflict, `409
+  OperationAborted`; under `overwrite` they keep waiting for the flush.
+- **Fixed: a wait that arrives after the drop.** A flush could drop a
+  version and untrack its key before the version's write-through wait
+  reached the flusher, which then answered an untracked key `Flushed`
+  and the client `200`. The flusher now remembers the newest dropped
+  version of the last 4096 keys it discarded and answers such a wait
+  `Conflict`; reading the shard's entry instead could not tell an
+  adopted stub from a later version's.
+- **Admin API shape (decided, design §12).** `GET
+  /v1/buckets/<name>/conflicts` and `POST
+  /v1/buckets/<name>/conflicts/<policy>/<key>`, with the policy before the
+  key so that the rest of the path, percent-decoded, is the key, slashes
+  included; there is no query string or body to parse. The decoder is
+  twenty lines in `admin.rs`, not a new dependency. `NodeAdmin` reaches
+  the flush service through a small object-safe trait (`Flushers`) so the
+  admin router stays generic only over the disk. Conflicts live on the
+  primary of the key's shard, so the listing and the resolution are
+  node-local; a resolution sent to another node answers `404`.
+- **Surprise: an import replaces foreign objects.** The end-to-end admin
+  test first wrote its out-of-band objects before the namespace import
+  finished; the import passed those keys with the foreign objects as
+  their remote state, so no flush ever met a conflict (§9.1, as designed).
+  The test now waits for the import.
+- **Surprise: imports stall in multi-node clusters.** A node's import
+  commits `IMPORT` records only to shards it leads, and retries forever
+  on one led by another node (`shard ... is served by its primary`), so a
+  foreign object at the remote before every import ends leaves some
+  node's import running, and its tombstones waiting for it. The conflict
+  simulation found it at seed 22 of the `overwrite` scenario; its
+  out-of-band writer now starts once every node's import is done. Fixing
+  the import itself belongs to plan M2-17.
+- **Simulation.** `tests/simulation/conflicts.rs`, with
+  `ClusterConfig::conflicts`: three nodes, three replicas, one `local` and
+  one `write_back` bucket, an out-of-band writer that puts 16 objects
+  straight into the remote at the workload's keys (recorded in the history
+  as `PUT`s that never get an answer), crashes with and without power
+  loss, partitions, message loss, control-store faults, takeovers, and
+  2% remote errors. A final phase drains the flushers, writes about half
+  the keys out of band again (the burst), writes every key once more
+  through the cluster, and drains again; under `hold` an operator then
+  resolves each held key through `FlushService::resolve`, alternating
+  `overwrite` and `discard_local`. After the final recovery the audit
+  checks every key: each member's copy equals the remote object, and the
+  remote object is the final write under `overwrite`, the burst's object
+  for a burst key (adopted) under `discard_local`, and under `hold` what
+  the operator chose for a held key (every burst key must have been held
+  with the burst's object still at the remote). The three policy
+  scenarios run at `Runner::with_cost(4, COST)`: CI runs seeds 0 to 7 of
+  each, 25 to 30 s apiece and 65 s for all five scenarios of the file
+  side by side at `SKYS3_SIM_SEEDS=256` in a debug build. All three
+  passed 64 seeds (`SKYS3_SIM_SEEDS=2048`), 220 to 284 s apiece.
+- **Seeded bugs** (`ConflictBug`, without faults, 20 operations,
+  `Runner::with_cost(2, COST)`, 16 and 19 s at `SKYS3_SIM_SEEDS=256`):
+  - `ConflictBug::DiscardsWithoutOptIn`, flushers that discard whatever
+    the bucket's policy, run under `overwrite`: caught (the remote holds an
+    out-of-band write, "but the rule is overwrite: the final write") at
+    every one of seeds 0 to 63, first
+    at **seed 0**.
+  - `ConflictBug::ResolvesClean`, an operator's resolution that commits
+    `FLUSHED` for the held version instead of returning the key to dirty,
+    run under `hold`: caught (the remote keeps the
+    other writer's object, "but the rule is hold, resolved with
+    overwrite: the final write") at every one of seeds 0 to 63, first at **seed 0**.
+- **Left open.** A resolution is not forwarded to the key's primary, and
+  the listing is per node; an operator asks each node, or a later
+  coordinator view gathers them. A resolution is lost with the flusher
+  that holds it, so after a primary change a `hold` key is held again and
+  must be resolved again. The namespace import's stall (M2-17) is worked
+  around in the simulation, not fixed.
+
+### M4-07 Remote server-side copy
+
+- **"The same target" is the same remote bucket (decided, design §11).**
+  Every flush target is reached with the node's one set of target
+  credentials (`connect`), so one endpoint and bucket name are one remote
+  bucket the flusher can read as well as write. The flush service keeps,
+  per endpoint and bucket, the buckets it follows that flush there, with
+  their prefixes (`CopySources`, shared by every `Target` of that bucket
+  and refreshed on each reconcile; a list is emptied, never dropped,
+  since a target being built may hold it). A copy's flush looks its
+  source's bucket up there. A `read_only` origin has its own credentials
+  and is never listed; a copy from one is already refused (M4-12).
+- **"Clean" is checked by the remote, not by the flusher (decided).** The
+  copy's `PUT` already records the source's `remote_etag`, present only
+  if the source was clean or evicted when the copy read it, and the
+  flush sends it as `x-amz-copy-source-if-match`. Whether the source
+  is clean when the copy flushes does not matter: the remote either still
+  holds the version copied, and copies exactly its bytes, or the copy
+  fails.
+- **A changed source is never a conflict (decided, design §11).** A `412`
+  (or `404`, the remote's answer for a missing source or destination)
+  does not say which precondition failed. The flusher HEADs the
+  destination as after any failed precondition: its own write identity
+  is a landed copy whose answer was lost; a destination still as the
+  copy was conditioned on (the expected ETag, or absent under
+  `If-None-Match: *`) means its precondition held, so the source's
+  failed, and the copy falls back to a regular upload of its local bytes
+  with the same precondition and identity. Anything else follows the
+  §7.2 rule. A `409` writes nothing and is retried as a copy. Under an
+  `overwrite` resolution only the source has a precondition, so any
+  failed precondition falls back.
+- **Refusals fall back too.** A `501` or another `400` to the copy itself
+  (a stale probe result, a source the store cannot copy) is answered
+  with an upload, so a wrong probe costs a round trip, never a stuck key.
+- **Sizes (decided).** The gateway already refuses copy sources over
+  5 GiB, S3's `CopyObject` limit, so every copy fits one request; the
+  flusher checks the limit anyway and uploads a larger version.
+- **Backup targets copy too (decided, M4-09).** A `local` bucket's backup
+  is followed like a `write_back` target, and a clean entry's
+  `remote_etag` is the backup's ETag, so a copy within or between
+  buckets backed up to one remote bucket is copied from the backup's own
+  object. Write-through buckets likewise.
+- **The probe (design §7.2).** `ConditionalWrites` gained `copy_object:
+  CopySupport` (metadata directive, tagging directive, source `If-Match`,
+  destination preconditions), and copies flush server-side only if every
+  one is honored (`CopySupport::is_usable`). Within the scratch prefix it
+  writes `copy-source` with metadata and a tag, copies it to
+  `copy-object` with each `REPLACE` directive and HEADs the result, sends
+  a failing and a holding `x-amz-copy-source-if-match`, and probes the
+  destination preconditions on `copy-destination` as for `PutObject`.
+  A directive the store ignores leaves the source's metadata or tag
+  count; one it rejects fails the copy. A probe now sends 6 `PutObject`,
+  8 `CopyObject` (7 to an R2-like store, which ignores the destination
+  preconditions), and 2 `HeadObject` in all, so the request counts in
+  the probe tests and the AWS mock's `501` test changed. The flush
+  service logs at info when a target's copies will be uploaded, and the
+  admin flush status has `server_side_copy`.
+- **The copies are probed apart (decided).** The probe does not retry,
+  and a run fails on any transient error, so the copy steps' requests
+  (about 20 more) made a run on a store failing or losing 7% of
+  requests succeed several times less often; with the backoff, a
+  flusher of the conflicts scenario at seed 2 did not drain in time. The
+  flush service now probes the writes alone (`run_writes`), starts
+  flushing, and then probes the copies alone (`run_copies`), retried
+  with the same backoff; the target's copy support is a cell the second
+  run fills (`Target::copy_support`), and copies are uploaded until it
+  does. `ConditionalProbe::run` still probes both.
+- **Surprise: tags are seen through HEAD.** Checking the tagging
+  directive needs the destination's tags, and the object-store interface
+  had no `GetObjectTagging`. `HeadObject` returns `x-amz-tagging-count`,
+  so `ObjectInfo` gained `tag_count`. S3 sends it only to a caller with
+  `s3:GetObjectTagging`; without it the directive reads as ignored, which
+  costs uploads, never a wrong copy.
+- **Surprise: `MetadataDirective::Replace` lacked the standard headers.**
+  It carried user metadata and content type only; a copy must carry the
+  version's `cache-control`, `content-disposition`, `content-encoding`,
+  `content-language`, and `expires` too, so it gained `headers`, filled
+  from the same `request_headers` an upload uses. `CopyObject` gained a
+  `TaggingDirective`.
+- **Simulated store.** `SimS3Config::copy_directives` says whether the
+  directives are honored, ignored (copied as `COPY`), or rejected
+  (`501`): `CopyDirectives::AWS_S3`, and `WITHOUT_TAGS` for a store
+  without the tagging directive. The copy-source precondition and the
+  destination preconditions already existed. The store now logs the keys
+  each operation applied (`SimS3::applied`), so tests and audits can tell
+  a server-side copy from an upload, answered or not.
+- **Flush tests** (`skys3-flush/tests/copies.rs`): copies within and
+  across buckets of one remote bucket flush as `CopyObject`, dirty sources
+  and sources in another remote bucket as uploads; a lost copy answer
+  then a `412` retry recognizes its own identity, over a new and an
+  existing destination, also when the source changed meanwhile; a source
+  overwritten or deleted at the remote falls back to an upload, over a
+  new and an existing destination; targets without the tagging
+  directive or with the metadata directive rejected get uploads, and a
+  stale probe gets one fallback per copy; `overwrite`, `hold`, and a
+  `409` race.
+- **Cluster simulation** (`tests/simulation/copies.rs`,
+  `ClusterConfig::copies`). A copier client writes two source keys in
+  each of two `write_back` buckets that flush to one remote bucket, then
+  copies them within and across the buckets through any node, with
+  `REPLACE` metadata and, for every other copy, tags. Before most copies
+  it waits until the remote holds the source's last write and its lazy
+  `FLUSHED` is due; before some it makes the remote fail its next
+  `CopyObject` (`Copies::stalls`), and after some it writes the source
+  again (`Copies::rewrites`), so the source changes at the remote before
+  the stalled copy's retry. After a final drain the audit reads every
+  copier key on every member and checks the members agree on its version
+  and the remote holds that version: bytes by MD5, user metadata, content type, tags,
+  and the write identity of the version's record; any key held in
+  conflict fails it. The main scenario adds crashes with and without
+  power loss, partitions, message loss, control-store faults, and 2% of
+  remote requests failing or losing their answer, and requires some
+  copies applied as `CopyObject`.
+- **Surprise: the last `FLUSHED` records may be lost.** The audit first
+  required every copier key clean after the drain. `FLUSHED` rides a
+  later group commit, which the final power loss can cut, so the audit
+  allows a dirty entry and still requires the remote to hold its version.
+- **Surprise: a high remote error rate disables copies.** The first
+  version failed a quarter of remote requests to hold copies back while
+  their sources changed. The probe sends about 30 requests and does not
+  retry, so it almost never passed and every copy was uploaded, and the
+  test of a seeded bug passed on a drain failure, whose message contains
+  the flusher's state and so the word "conflicts". Copies are now stalled by a scripted
+  `InternalError` on the next `CopyObject`, without random errors, and
+  the bug tests match the start of the audit's reason.
+- **Costs.** At 2% remote errors, 25% stalls, and a third of sources
+  rewritten, a seed of the main scenario takes about 7 s in a debug
+  build and the seeded ones 3 to 5 s, so all three run at
+  `Runner::with_cost(_, 2 * COST)`: CI runs seeds 0 to 3 of each, 29 s
+  for the main scenario, 11 and 21 s for the seeded ones, and 27 s for
+  the three side by side at `SKYS3_SIM_SEEDS=256`. All three passed 64
+  seeds (`SKYS3_SIM_SEEDS=4096`), 475 s side by side.
+- **Seeded bugs** (`CopyBug`, without faults, 12 operations and 12
+  copies, `Runner::with_cost(2, 2 * COST)`):
+  - `CopyBug::WithoutIdentity`, copies sent without the copy's write
+    identity: caught ("the remote object has the write identity None")
+    at every one of seeds 0 to 63, first at **seed 0**.
+  - `CopyBug::SourceFailureAsConflict`, a failed source precondition
+    taken for a conflict at the destination, with every copy stalled and
+    its source rewritten: caught ("a conflict was reported for the
+    cluster's own write") at every one of seeds 0 to 63, first at
+    **seed 0**.
+- **No format changes.** No record, index, or wire format changed; the
+  probe result and the admin status gained fields.
+- **Left open.** A copy of a source in another remote bucket is
+  uploaded; S3 could copy across buckets the credentials can read, but
+  that would need a probe per pair. A server-side copy's entry records
+  whatever ETag the remote gives the copy as its `remote_etag`, as for
+  any flush; the ETag clients see stays the local one (§7.4).
+
+### M4-08 Write-through buckets
+
+- **Which writes wait (decided, design §7.5).** The plan names PUTs only.
+  Every write that makes a version of a key waits: PutObject, CopyObject,
+  CompleteMultipartUpload, DeleteObject, each key of DeleteObjects, and
+  the tagging writes. An acknowledged delete lost with the cluster would
+  bring the object back, which is loss of an acknowledged write too.
+  Parts, CreateMultipartUpload, and AbortMultipartUpload make no version
+  and answer after their local commit. Only `write_back` buckets wait;
+  `local` buckets have `backup_ack` (M4-09).
+- **"The remote flush" needed a definition.** Coalescing (§7.1) means the
+  version a write made may never be sent itself. A write is acknowledged
+  once the remote holds its version or a later one of the key; a delete
+  once `DeleteObject` succeeded, also while its tombstone waits for the
+  import. The answer does not wait for the lazy `FLUSHED`: the remote is
+  the durable copy, and waiting for the record would add up to a second
+  (`LAZY_MAX_DELAY`) to every write on an idle disk.
+- **The flusher had to be told in order.** The gateway cannot see the
+  primary's flusher, which may be on another node, so it asks with a new
+  `Shards::flushed`, forwarded as operation 20 (answer 16). The shard
+  passes the wait to its flusher through the subscription
+  (`Change::Awaited`), after the change that stored the version; then a
+  key the flusher no longer tracks has had its latest version flushed,
+  and needs no index read. That relied on an ordering the shard did not
+  quite give: the apply loop advanced the applied position under the
+  sequencer's lock but reported the changes after releasing it, so a wait
+  queued in between could overtake the version's own `Stored`. The report
+  now happens under the lock, and `Shard::await_flush` refuses a version
+  not applied yet. `Change` lost nothing: `FlushWaiter` compares by key,
+  version, and reply channel, so the enum keeps `Clone` and `Eq`.
+- **What the client sees (decided, design §7.5).** A write is never
+  undone: it is on every member and readable before its answer. A flush
+  that does not finish within the new key `write_through_timeout_seconds`
+  (default 30, added to §14 and the configuration reference) is answered
+  `503 SlowDown`, and the flusher keeps sending it. A held conflict is
+  answered `409 OperationAborted` at once, since a retry cannot succeed
+  before the conflict is resolved. A primary change while a write waits
+  ends the wait unanswered (the old flusher stops, or the replica answers
+  as a member), and the gateway asks again every 100 ms; the new
+  primary's flusher re-flushes the version under the same identity and
+  answers. Each ask waits at most 5 s, and at most half the forwarding
+  timeout, so a forwarded ask never outlives its request.
+- **Tests.** `skys3-flush/tests/write_through.rs` runs the gateway, real
+  shards, and the flush service against a remote whose requests take 5
+  to 20 ms: each kind of write is answered only once the remote holds it
+  (a streamed PUT's ETag is the remote multipart one), an outage gives
+  `503 SlowDown` and the write lands once the remote is back, an
+  out-of-band object gives `409 OperationAborted` (a later DELETE of the
+  held key too), and a write whose flushers stop while it waits is
+  answered by the next ones. With `ack_policy = "local"` all four fail.
+  Unit tests cover the policy lookup, the wire round trip and refusals of
+  operation 20, the forwarded wait, and the shard's ordering and errors.
+- **Simulation.** `ClusterConfig::write_through` makes the cluster's
+  `write_back` buckets write-through and audits them with the remote store
+  as the only survivor, as if every node's disks were destroyed: each
+  client checks the key right after it records an acknowledged write
+  (the workload gained an acknowledgement hook), and the driver checks
+  every key once the clients are done, before any fault heals.
+  `write_through::losing_every_node_after_an_acknowledgement_loses_no_write`
+  (`Runner::with_cost(4, COST)`, so CI runs 8 seeds) runs three
+  replicated nodes with takeovers, any-gateway clients, random crashes,
+  partitions, message loss, and control-store faults, and a remote that
+  delays every request 2 to 15 ms each way and fails or loses 2% of
+  them. With `SKYS3_SIM_SEEDS=8192` (256 seeds of each scenario) in a
+  debug build, both scenarios passed in 711 s, run side by side: about
+  2.8 s a seed, so CI's 8 seeds take about 22 s (21.6 s measured at
+  `SKYS3_SIM_SEEDS=256`).
+- **Seeded bug.** `WriteThrough::AckedLocally` keeps the audit but
+  acknowledges after the local commit, as `ack_policy = "local"` does.
+  `the_audit_catches_writes_acknowledged_after_their_local_commit`
+  (no faults, CI's 8 seeds in 1.8 s) expects it caught, and it was at
+  every one of 256 seeds, first at **seed 0**: `bucket-1/key-0`, a
+  multipart completion acknowledged while the remote held nothing. The
+  remote's 2 to 15 ms delays outlast a message's 1 to 5 ms, so the
+  flush of a write acknowledged early never lands before its answer
+  reaches the client.
+- **Left open.** The native peer transport (§7.8) waits for `APPLIED`;
+  its source side is M6. A destination cluster that receives a `COMMIT`
+  for a write-through bucket of its own does not wait for its own remote.
+  Write-through waits have no metric of their own; a timeout is logged as
+  a warning.
+
+### M4-09 Backup targets for local buckets
+
+- **A backup is a flush target without a system of record.** The flush
+  service now follows a `local` bucket whose `[buckets.<name>]` table
+  names a `backup_target` (`FlushService::followed`, `Role::Backup`), with
+  the same `ShardFlusher`s as a `write_back` bucket, so ordering,
+  coalescing, conditional writes, write identity, and streaming are the
+  ones M1-16 to M4-04 built. What a remote of record has and a backup
+  does not is now optional (`SystemOfRecord`): no import (the target is
+  `ImportDone`, so a key without a remote ETag is written with
+  `If-None-Match: *` and a foreign object there is a conflict), no filler
+  or `RemoteReader`, and no dirty budget, so a slow backup never refuses
+  writes. `BucketStatus` gained `backup` and its `import` became an
+  `Option`, which the admin flush status shows.
+- **Clean, not evictable (decided, design §8.9, §9.3).** A backup's
+  `FLUSHED` makes an entry clean, as in a `write_back` bucket, and every
+  path that drops clean payload would then have dropped a `local` bucket's
+  durable copy: the cache's LRU and its copies beyond `clean_copies`,
+  compaction, and a learner's snapshot and backfill. Rather than make
+  each of them ask the bucket's mode, the clean cache now evicts only the
+  buckets it was told a `clean_copies` for (`CleanCache::evicts`), and the
+  node tells it only of non-`local` ones. `Shard::evict` refuses the
+  others (`CacheRefusal::Kept`), compaction copies their clean payload,
+  and snapshots and backfill carry it (`Shard::evicts_clean`, also false
+  with no cache). The same rule now covers a bucket whose policy the node
+  has not read yet: M1-21 kept its copies but let LRU evict them, and now
+  it is kept in full, and its replicas are scanned again once the cache
+  is told. Read plans already named every member while the cache was not
+  told, so a backed-up version is read from any member.
+- **Deletes keep their tombstone (decided, design §4.2, §8.7).** In a
+  `local` bucket without a backup the gateway commits the tombstone's
+  `FLUSHED` itself (M1-09). With a backup it must not, or the backup
+  flusher, finding no entry, would never delete the key there. The
+  gateway's `Removal` and lifecycle expiration (`lifecycle::Tombstones`)
+  both leave it to the backup's flush, so **lifecycle expirations reach
+  the backup as ordinary deletes**, with no path of their own; the
+  backup's own lifecycle rules are its business. DeleteBucket refuses a
+  backed-up bucket with `409 BucketNotEmpty` while a tombstone remains,
+  since detaching would stop its flusher and leave the object at the
+  backup.
+- **Relation to M4-08.** `backup_ack = "write_through"` is the M4-08 wait
+  unchanged: `WriteThrough::wait_of` now decides by mode (`write_back` by
+  `ack_policy`, `local` by a backup target and `backup_ack`), and the
+  gateway then calls the same `reach_remote`, operation 20, and
+  `Change::Awaited`, with `write_through_timeout_seconds`, `503 SlowDown`,
+  and `409 OperationAborted`. The flusher answers the wait whichever role
+  it has. The gateway also streams large single PUTs (`UPLOAD_BEGIN`,
+  M4-03) to a backed-up `local` bucket, which a write-through wait on a
+  large object needs.
+- **Encoding waits for the backup (decided, design §8.4).** The flusher
+  reads a version from the local replica, which encoding drops, so the
+  encoder skips a version of a backed-up bucket that is not clean yet
+  (`EncoderSettings::after_backup`, `Skip::NotBackedUp`). A later `TAGS`
+  of a coded version cannot be flushed until the flusher reads coded
+  objects; it stays dirty and visible in the flush metrics.
+- **Base build fix.** The M5-10 base did not build the node binary
+  without the `test-util` feature: the lifecycle module uses
+  `tags_from_xml`, whose re-export was gated. It no longer is.
+- **Tests.** `skys3-flush/tests/backup.rs` runs the gateway, real shards
+  with a cache that has no room, and the flush service against a remote
+  delaying requests 5 to 20 ms: every kind of write reaches the backup
+  (a streamed PUT with its identity, a copy, tags), nothing is evicted, a
+  delete keeps its tombstone through an outage, a bucket detaches only
+  once its deletes reached the backup, and with `write_through` each
+  write is answered once the backup holds it, `503` through an outage and
+  `409` on a conflict. Unit and crate tests cover the cache, compaction,
+  backfill, lifecycle, encoder, and gateway rules above.
+- **Simulation.** `ClusterConfig::backup` gives the cluster's `local`
+  buckets a backup target in the same `SimS3`, under `backup/<bucket>/`,
+  and audits it. Once the clients are done and faults healed, a drain
+  waits (at most 60 s of simulated time) until every live node's backup
+  flushers are idle, and after the final power loss the backup must hold
+  exactly what every member holds of each key, deletes included
+  (`backup::audit`). Members are still checked to hold every
+  acknowledged write's bytes, clean entries included. With
+  `Backup::WriteThrough`, M4-08's `RemoteAudit`, now given a key prefix
+  per bucket, checks each acknowledgement and every key against the
+  backup alone, as if every node's disks were destroyed. Both scenarios
+  in `tests/simulation/backup.rs` run three replicated nodes with
+  takeovers, any-gateway clients, random crashes, partitions, message
+  loss, and control-store faults, a remote delaying requests 2 to 15 ms
+  each way and failing or losing 2% of them, a 2 KiB clean cache, and
+  compaction. They are `Runner::with_cost(4, COST)`, so CI runs seeds 0
+  to 7: 37 s for the asynchronous one and 40 s for the write-through one
+  at `SKYS3_SIM_SEEDS=256` in a debug build. Both passed 64 seeds each
+  (`SKYS3_SIM_SEEDS=2048`) in 580 s, run side by side. Their check that
+  the backup holds some object, and M4-08's that the remote does, allow
+  a run whose clients deleted every key last: M4-08's scenario does at
+  seed 3 on this branch, where its imports run 32 streams (below).
+- **A seed did not replay.** The simulated flush services now get the
+  node's `BucketsConfig`, which backup targets need, and with it the
+  default `import_parallel_streams` of 32 instead of `FlushSettings`'s 1.
+  A parallel import first discovers split points by listing the remote,
+  and that listing sees the capability probe's scratch keys, whose nonce
+  `FlushService` drew from a randomly keyed hasher and the time: the
+  split points, and so the import's checkpoint stores, differed between
+  two runs of a seed, and `harness::a_seed_replays_exactly` failed at
+  seed 3 with one more disk sync. `FlushService::with_probe_nonces` now
+  gives probe runs consecutive nonces from a seed, which the simulation
+  derives from each life's seed; nodes keep fresh ones. The shard
+  flusher's open streams also moved from a `HashMap` to a `BTreeMap`,
+  since the pump opened streams and handed out part sends in iteration
+  order. The replay test passed seeds 0 to 127 afterwards.
+- **Seeded bugs**, each without faults. The first two are
+  `Runner::with_cost(2, COST)`, so CI runs seeds 0 to 7, in 19.4 s and
+  2.6 s at `SKYS3_SIM_SEEDS=256`; the third runs twice the operations and
+  is `Runner::with_cost(2, 2 * COST)`, seeds 0 to 3 in 16.3 s:
+  - `Backup::EvictsLocal` tells the caches the `local` buckets'
+    `clean_copies`, with a 1 MiB cache and no compaction, so only copies
+    beyond it go and every read still succeeds. The member audit finds a
+    lost copy ("is lost") at every one of seeds 0 to 63, first at
+    **seed 0**.
+  - `Backup::AckedLocally` acknowledges after the local commit while the
+    audit expects `write_through`. The audit at acknowledgement finds a
+    write the backup lacks ("is lost") at every one of seeds 0 to 63,
+    first at **seed 0**.
+  - `Backup::ForgetsDeletes` records each delete as flushed without
+    deleting the key at the backup, through a `test-util` hook in
+    `skys3-flush` (`test_hooks::forget_deletes`, thread-local as
+    `skys3_shard::seed_bug` is). The final audit finds an object the
+    members deleted ("the backup target holds") at every one of seeds 0
+    to 127, first at **seed 0**. A lost delete shows only if it is a
+    key's last change and the backup held the key, so this scenario runs
+    16 keys and twice the operations; with the common workload seed 33
+    missed it. Making the gateway remove the tombstone itself, the bug
+    the design rules out, was tried first and went unnoticed even at seed
+    0: the flusher nearly always reads the entry before it goes.
+- **Hooks left.** M4-11 finds a bucket's backup with
+  `FlushService::target_of`, for snapshots and the lost-key report. M6-06
+  sees backups as ordinary `ShardFlusher`s, so a native transport for
+  them comes with the one for `write_back` targets.
+- **Left open.** `backup_target` is per-node configuration, as
+  `ack_policy` is: a node whose table lacks it neither flushes the bucket
+  nor keeps its tombstones, so tables must agree across nodes. The
+  backup is assumed empty under its prefix; restoring from a backup, and
+  a backup that already holds the bucket's objects, are left to M4-11.
+  Backup lag has no metric of its own: the flush metrics carry it under
+  the bucket's name.
+
+### M4-10 Adaptive flush concurrency
+
+- **The concurrency was per shard; the window is per target.** M1-16 fixed
+  each shard at `flush_min_concurrency_per_shard` keys, and streamed parts
+  had a cap of their own. A link has one bandwidth-delay product however
+  many shards a node leads, so every request the flushers send to a target
+  (a key's flush, a streamed part, an abort) now takes a slot of one
+  window per target (`Target` wraps its store in `Paced`), shared first
+  come, first served. The per-shard keys scale its bounds by the shards
+  the node flushes there, and `flush_max_concurrency_per_shard` still caps
+  the keys and parts one shard has under way. `FlushSettings::concurrency`
+  became `min_concurrency` and `max_concurrency`; tests that relied on a
+  fixed concurrency set both. Nodes do not coordinate: competing AIMD
+  windows share a bottleneck fairly, and anything else would put the
+  coordinator on the flush path. Fills, origin reads (M4-12), imports,
+  and snapshots (M4-11) use the raw store and take no slot: they are not
+  flushes, and a slow flush backlog must not hold up a client's read.
+- **Decisions recorded in design §7.7.** Latency samples are successes and
+  non-throttle `4xx` answers, timed from the slot to the answer. A round
+  ends when a request sent after it began is answered. The base round trip
+  is a windowed minimum of round means over 1,024 rounds. A round within
+  25% of the base, ending with requests waiting, grows the window (double
+  in slow start, then +1); a mean above that shrinks it to 0.9 of the knee
+  the mean implies, at most halving it, so the sawtooth dips below the
+  knee and the min filter keeps seeing the real base (a decrease that
+  stayed above the knee let the base creep up in the model test). A
+  throttle shrinks it by 0.7 once per window. The round after a decrease
+  only measures. `S3Error::is_throttle` (any `503`, `429`, or a code in
+  `THROTTLE_CODES`, after the AWS SDKs' list) is new in `skys3-remote`.
+- **In-flight bytes are reserved before the slot.** A body is read into
+  memory, and counted, before its request asks for a slot, so requests
+  the byte bound holds back never wait at the window and cannot make it
+  grow. Multipart and streamed uploads count each part in flight, never
+  the whole object. `Target::reserve` returns a guard that keeps the byte
+  count for the new gauge.
+- **Growth first counted the wrong waits.** "Some request waited for a
+  slot this round" also counted requests released by the previous growth,
+  so a slow start doubled past what the byte bound allowed (seed 1: window
+  16 with a bound of 7 objects). Growth now needs requests waiting as the
+  round ends, and grows at most to the requests in flight and waiting
+  (seed 6 had doubled from 16 to 32 under a bound of 22).
+- **The paused clock rounds every sleep to a millisecond.** The first
+  1 ms scenario reached a window of 489 against a product of 108: Tokio's
+  timer wheel quantized sub-millisecond transfer times, so queueing was
+  invisible. The scenarios run their paths 100 times slower (the
+  controller only compares latencies and counts rounds, so its window is
+  scale-free) and report unscaled times; the controller's unit test drives
+  it with an exact event model instead.
+- **`SimS3` gained a network path** (`SimLink`, `SimS3::set_link`): a
+  round trip, a bandwidth that request and response bodies queue for, one
+  bottleneck queue each way, and a GCRA rate limit answering `503
+  SlowDown` unapplied. `SimS3Stats` gained `rate_limited` and the peak
+  requests and request-body bytes in progress. The default path is
+  instant and never yields, so earlier seeds replay unchanged.
+- **A rate limiter without burst rejects clumps.** A window's requests
+  leave together, so a limit with no burst refused most of each window
+  even with the window at its floor (seed 2: 34% slowed down at a window
+  of 4). Real stores allow bursts; the scenario draws a burst of 10 to 20
+  and counts slow-downs only in the second half of the limit, after the
+  window came down (the first collapse from 64 alone is about 120
+  slow-downs).
+- **Results.** The model test (exact times, 64 KiB requests, floor 1)
+  ends at 1.07 to 1.10 times the product for every round trip from 1 to
+  150 ms at 16 to 256 MiB/s, products 1.3 to 615. In the flusher
+  scenario, over 256 seeds (products 6 to 60, without a byte bound) the
+  mean window over the second half of the flush was 1.06 to 1.24 times
+  the product: 1.12 on average at 1 ms, 1.13 at 10 ms, 1.13 at 50 ms,
+  1.14 at 100 ms, 1.13 at 150 ms; with a byte bound, the window settles
+  at what it lets through. Under a rate limit the window held 0.9 to 1.3
+  times the limit's in-flight equivalent, 7.5% of requests were slowed
+  down on average once it had come down, and it grew back past the
+  product after the limit, with every object at the remote exactly once.
+- **Seeded bugs** (`test_hooks::seed_concurrency_bug`, a test in the
+  `simulation` target): `IgnoresThrottles` is caught at seed 0 in 1.7 s
+  (window 55 under a limit of 10 in flight); `IgnoresInflightBytes` at
+  seed 1 in 0.4 s (32 KiB in flight against a 7 KiB bound).
+- **Cost.** A seed costs about 0.8 s (product scenario) and 1.3 s (rate
+  limit) unoptimized, so they run `Runner::with_cost(5, 8)` and
+  `Runner::with_cost(2, 16)`: at `SKYS3_SIM_SEEDS=256`, 32 seeds in 25 s
+  and 16 in 21 s, plus 2.6 s for the seeded bugs. 256 seeds of each
+  passed too (6 minutes). The other flush scenarios pass all their CI
+  seeds unchanged, now that streamed parts and keys share one window.
+- **Left open.** Write-through waiters queue behind other flushes of their
+  bucket's target, first come, first served; a priority for them is left
+  until measurements ask for it. The base window is counted in rounds, so
+  a path whose round trip grows for good runs at a smaller window for up
+  to 1,024 rounds (2.5 minutes at 150 ms). The design's measurement
+  against real providers at 1 to 150 ms (§16.3) is M7-06's.
+
+### M4-11 Index snapshots and lost-key report
+
+- **Configuration was already there.** `index_snapshot_interval_seconds`
+  and `snapshot_target` (defaulting to `backup_target`) were in §14, the
+  configuration reference, and `skys3-config` since M0-03. Nothing names a
+  default for a `write_back` bucket, so one without a `snapshot_target`
+  writes no snapshots (decided, design §8.9).
+- **Rows as a learner's snapshot sends them.** The snapshot reuses M2-14's
+  read: one read transaction at the applied position
+  (`Shard::snapshot`, `Shard::snapshot_rows`, now public), and the rows as
+  the index stores them, so the object format adds only a header, the
+  digests of removed rows, and an MD5 trailer (`snapshot::Snapshot`). It
+  ships with a proptest and the fuzz target `flush_snapshot`.
+- **When a snapshot is valid (decided, §8.9).** The time is read before
+  the rows, and the snapshot is written only if the replica serves reads,
+  with a lease from every member, both before and after reading them: a
+  write is applied before it is acknowledged, and no other primary can
+  acknowledge one while those leases hold, so every write acknowledged
+  before that time is in the rows.
+- **Across primary changes (decided).** Snapshots are primary-scoped, as
+  M5-10's lifecycle passes are, but not stateless: a `local` bucket's
+  deltas need the previous snapshot. A writer keeps its chain in memory
+  and extends it only in the epoch it started it in, and chains are named
+  by that epoch first. A new primary, a restarted one, or one leading
+  again later starts a chain of its own that sorts after every older one,
+  so a deposed primary's late delta only extends a chain no restore
+  picks. Naming chains by their base position alone was the first plan;
+  it fails when a new primary's first base has the same applied position
+  as the old primary's base (nothing applied in the new epoch yet), and
+  the two would interleave deltas under one name.
+- **Deltas need removed rows.** A `local` bucket without a backup removes
+  a tombstone at once, so "rows changed since the last position" misses
+  deletes. The writer keeps the MD5 digest of every row key with a digest
+  of its value, in memory (about 24 bytes and a map node per row of each
+  shard it leads), and a delta lists the digests of the rows gone. A new
+  base starts once the deltas wrote as many rows as the base, or after 64.
+- **Restoring from a backup** (left open by M4-09) is not needed for the
+  report: a backup is read only as a durable home, with a `HeadObject` per
+  candidate key that compares write identities. Copying a backup back into
+  a cluster stays open.
+- **The drill as a model of loss.** Losing every member of a shard with
+  three replicas on three nodes is losing the cluster, after which the
+  run's other checks cannot go on. As M4-08's `RemoteAudit` does, the
+  driver instead forks the remote store at random moments
+  (`SimS3::fork`, new) and builds the reports from the forks after the
+  run. The window's start, on the nodes' wall clock, maps to the history's
+  moments through the moment the driver notes at each step
+  (`History::now`, new), two steps early.
+- **Simulation cost.** `tests/simulation/snapshots.rs`: two scenarios
+  (with and without backup targets) under crashes, partitions, message
+  loss, control-store faults, and remote faults, `Runner::with_cost(4,
+  COST)`: CI runs seeds 0 to 7 of each, 38 s side by side at
+  `SKYS3_SIM_SEEDS=256` in a debug build, and 70 s for all five
+  scenarios of the file with the seeded bugs below. Both passed 64 seeds
+  (`SKYS3_SIM_SEEDS=2048`) in 331 s side by side. Each run checks 21 to
+  46 keys against the history over 36 reports, all from a snapshot.
+- **Seeded bugs**, each without faults and with `local` buckets that are
+  not backed up:
+  - `SnapshotBug::SkipsDirty`, a snapshot without dirty entries: caught
+    ("is not reported") at every one of seeds 0 to 63, first at **seed 0**.
+  - `SnapshotBug::BaseOnly`, a restore that applies the base alone but
+    dates it as the last delta, so the window starts after the state it
+    restored: caught at seeds 0 to 16, first at **seed 0**, as a key not
+    reported, one reported with an older value, or a deleted one reported;
+    missed at seed 17: the bug shows only when a loss restores a chain
+    whose deltas changed a key that is not written again before the
+    loss.
+  - `SnapshotBug::KeepsRemoved`, deltas without removed rows: caught ("is
+    reported lost") at seeds 0 to 25, missed at **seed 26**: a delete
+    shows only if it falls between two snapshots of one chain and the key
+    is not written again before the loss, and small shards start new
+    bases often. It runs 16 keys, twice the operations, and six losses,
+    at `Runner::with_cost(2, 2 * COST)`.
+- **Left open.** No operator command builds the report yet; it is a
+  library call (`skys3_flush::snapshot::{latest, lost_keys}`) for the
+  restore drills of M5-11, whose hook is `Restored::rows`. There are no
+  snapshot metrics, and the admin API does not show
+  `SnapshotService::status`. A pass reads the whole shard index locally
+  each interval; only what it writes is bounded by the changes.
+
+### M4-12 Read-only origin buckets
+
+- **Configuration.** `freshness` (`revalidate` by default, or `ttl`),
+  `freshness_ttl_seconds` (default 60, from 1 to 86,400), and
+  `origin_profile` (a profile of the shared AWS configuration, 1 to 128
+  visible ASCII bytes without brackets) are new bucket settings, in §14,
+  the configuration reference, and `skys3-config`. The plan names no
+  credential setting; one was needed (below).
+- **How revalidation asks the origin (decided, §9.5).** A `HeadObject`,
+  not a conditional GET: it answers the current ETag without a body, and
+  a changed object's metadata, which the `ADOPT` that records it needs.
+  The bytes are then read by the fill, or straight from the origin, under
+  `If-Match`, so a change between the HEAD and the read resolves the key
+  again instead of caching another version's bytes. A read gives up after
+  three rounds with `503`.
+- **How the TTL bounds staleness (decided, §9.5).** Each gateway keeps
+  what its HEADs saw (`OriginValidations`, in memory, at most 65,536
+  keys, oldest first out), timed from when the HEAD was sent, so a read
+  within the TTL serves what the origin held at most the TTL before it.
+  Answers are not kept in the shards: a TTL in a replicated entry would
+  need a clock the replicas agree on, and each gateway asking on its own
+  only costs one HEAD per key per TTL per node. Missing and refused keys
+  are kept too, so a deleted or refused key also costs one HEAD per TTL.
+- **The cache key (decided, §9.5).** Validations are keyed by the origin
+  scope, the origin's endpoint, bucket, and prefix with the credential
+  scope (`profile:<name>` or `default`), so two buckets of one origin
+  with different credentials never share an answer. Bytes stay keyed by
+  bucket ID, as for every bucket.
+- **Credentials need a profile.** Every `write_back` target is read with
+  one default credential chain, but the plan asks that the cache key
+  include the credential scope, which only means something if buckets can
+  have different ones. `origin_profile` names a profile of the shared AWS
+  configuration (`skys3_remote::aws::profile_credentials`); the flush
+  service builds each origin's store with it (`OriginConnect`,
+  `FlushService::with_origin_connect`).
+- **Entries are made with `IMPORT` then `ADOPT`.** An `ADOPT` changes an
+  existing entry only, and a `read_only` bucket has no namespace import
+  to create them, so a read of a key without an entry first commits an
+  `IMPORT` stub, which applies only where a key has no entry, then
+  `ADOPT`s the origin's version onto the entry, conditional on its
+  sequence number. Routed writes refused both record kinds, since only a
+  node's own import or flusher sent them; `routing::wire` now carries
+  them.
+- **Fills are not forwarded, so other nodes read the origin directly.**
+  Only a shard's primary fills (M3-04), and a gateway on another node had
+  no way to ask it to. Rather than forward fills, which is a larger change
+  of the shard protocol, a non-primary gateway reads an evicted version
+  from the origin itself in ranged GETs of 8 MiB under `If-Match`, and
+  caches nothing (`objects::origin::read_origin`). A clean copy is still
+  read from its holders. Forwarding fills stays open.
+- **A direct read under a TTL could loop.** Its first version was a 503:
+  a direct read whose `If-Match` failed resolved the key again, which
+  found the same, still fresh, validation and read the same version. A
+  failed direct read now forgets the key's validation
+  (`OriginValidations::forget`), so the next round asks the origin.
+- **Fill readers woke in a random order.** CI's replay of seed 1 found
+  two runs one stale read apart; it failed about half the time locally
+  too, with or without load. Two reads on one node joined one fill, and
+  their answers left in either order. A fill's readers followed it
+  through a `watch` channel, which registers each waiter with one of 8
+  notifiers that tokio's thread-local random number generator picks,
+  and wakes them notifier by notifier. That generator is not seeded in a
+  simulation, since turmoil seeds it only under `--cfg tokio_unstable`;
+  a build with that flag replayed 12 of 12 times. The filler now keeps
+  each fill's progress behind a `Notify` (`fill::Tracker`), which wakes
+  readers in the order they began waiting. Other `watch` channels with
+  several waiters, and unbiased `tokio::select!`, draw from the same
+  generator; they are left as they are, and are the first suspects if
+  another replay diverges.
+- **Listings are forwarded, not cached.** `listing::forward` lists the
+  origin with the request's prefix and delimiter, starting after the
+  gateway's own start point, and follows the origin's continuation tokens
+  until the page is full, at most 64 origin pages. The gateway's tokens
+  are its own HMAC-signed ones (§9.4), so an origin token never reaches a
+  client.
+- **What a `read_only` bucket refuses.** Writes answer `403 AccessDenied`
+  (`require_writable`). CopyObject from a `read_only` source and
+  GetObjectTagging on one answer `501`: a copy reads its source's entry
+  without revalidating it, and tags are not read from an origin.
+  UploadPartCopy from one is allowed, since it reads its source as a GET.
+- **The simulated store had no access control.** `SimS3::with_credentials`
+  makes handles that name credentials, and `SimS3::deny` refuses their
+  `GetObject` and `HeadObject` of a key with `403`, as a bucket policy
+  would. The refusal is checked outside the store's lock.
+- **The simulation.** `skys3_cluster_sim::origin`: three nodes, two
+  `read_only` buckets over one origin prefix, one read with the default
+  credentials and one with a guest profile. An out-of-band writer makes
+  40 changes to 4 keys, one every 150 ms: a new body, a delete, or a
+  refusal of the key to the guest imposed or lifted. Three readers send
+  60 GETs and HEADs each, each to a random node's gateway. The audit
+  checks each answer (body, `404`, or `403`) against the origin's history
+  as the reader's credentials saw it: under `revalidate`, a state the
+  origin held between the request and the answer, and under `ttl`, one
+  it held from the TTL before the request. Random interleavings seldom
+  reach the two races the seeded bugs need, so a *stager* stages them on
+  keys of its own: a key cached on its primary, replaced at the origin,
+  and read through every node after the TTL; and a key both buckets
+  cached, denied to the guest, and read with both credentials through
+  one node. M4-06's finding about imports does not apply: a `read_only`
+  bucket has no import.
+- **Simulation cost.** `tests/simulation/origin.rs`, six scenarios:
+  revalidate, TTL, a replay of one seed, crashes and message loss, and
+  the two seeded bugs. The clean ones run at
+  `Runner::with_cost(2, COST)`, the replay and the seeded bugs at twice
+  the cost: CI runs seeds 0 to 7 of the clean ones and 0 to 3 of the
+  rest, 71 s for all six side by side at `SKYS3_SIM_SEEDS=256` in a debug
+  build (a run is about 2.5 s). Revalidate, TTL, and the fault scenario
+  each passed seeds 0 to 63 (`SKYS3_SIM_SEEDS=2048`, 296 s side by
+  side). Under `revalidate` no read was stale; under a TTL of 1 s, 14 to
+  30 reads per run served a version the origin had replaced within the
+  TTL, which the audit allows.
+- **Seeded bugs** (test-only switches on `OriginValidations`):
+  - `OriginValidations::skip_revalidation`, serving whatever version an
+    entry holds without asking the origin: caught at every one of seeds 0
+    to 63 (`SKYS3_SIM_SEEDS=4096`), first at **seed 0**, as a read
+    serving an ETag the origin had replaced before the read began.
+  - `OriginValidations::ignore_credentials`, validations keyed without
+    their credential scope: caught at every one of seeds 0 to 63, first
+    at **seed 0**, as a `full` read answered `403` from the guest's
+    answer, or a guest read served past its denial. Its first version
+    missed at **seed 6**: the stager read the denied key with each
+    credential through that bucket's primary, two different nodes, and
+    validations are each gateway's own. It now reads both through one
+    node.
+- **Left open.** Fills are not forwarded to a shard's primary, so only
+  the primary's node caches what its reads fetch. Validations are per
+  gateway and in memory, so a restart asks again. A key deleted at the
+  origin keeps its stub until a later version replaces it; nothing
+  removes stubs of keys the origin no longer has. There are no metrics
+  of revalidations or forwarded listings.
+
+### M4-13 Large-object fault injection
+
+- **The audit watches the store, not the clients.** `SimS3::observe`
+  calls an observer, outside the store's lock, with every request the
+  store applied and, for a write, the object it left at the key. The
+  observer checks each object as it appears: a version a client
+  registered before sending it (`x-amz-meta-op` names it), with every
+  byte, its shard's write identity that no other version has, and the
+  ETag it must have there (the MD5 of a PUT sent whole, the 512-byte
+  multipart ETag of one that streamed, the client's ETag of an upload).
+  A run's end checks the final logs: every identity the remote held is
+  committed with the client's ETag, every `FLUSHED` names an ETag the
+  remote held for its version, and every remote upload the final
+  primary's log opened ended unless its local upload is still open.
+  Uploads whose IDs were never committed are counted for the lifecycle
+  rule (§7.3), 3 to 15 a seed.
+- **New store hooks.** `SimS3::from_source` gives a node its own handle,
+  and `set_source_down` drops that handle's link: requests sent while it
+  is down are lost unapplied, and answers of requests in flight when it
+  drops are lost after they applied (`SimS3Stats::cut_off`).
+  `set_operation_faults` gives one operation fault rates of its own.
+  Default behaviour is unchanged. `Fault::RemoteLink` drives the link,
+  and the observer aims crashes (`Fault::Crash`, power loss on half)
+  right after a step applied, one step in 40, at most four a run.
+  `ListParts` is not aimed at: it changes nothing.
+- **Small parts.** S3 refuses parts but the last below 5 MiB, and ranged
+  UploadPartCopy from sources up to 5 MiB, so `GatewayConfig` gained
+  `min_part_bytes` (not a configuration key) and the client copies whole
+  sources, read first and copied under `x-amz-copy-source-if-match`.
+  Parts but the last are 520 to 900 bytes, never the 512 of a streamed
+  body, so a multipart ETag tells a client's upload from a streamed PUT.
+- **Remote copies (after merging M4-07).** Copies of clean sources now
+  flush as remote `CopyObject`s, so `CopyObject` is among the faulted
+  steps and the steps crashes are aimed after. The large-object mix
+  sends no client `CopyObject` (M4-07's `copies` scenario audits those
+  flushes under crashes and faults), so here only the capability
+  probe's copies meet these faults, which keeps the probe's copy run
+  honest under a flaky store; their keys are not audited. No
+  `UploadPartCopy` reaches the remote: `ObjectStore` has none, and a
+  copied part is flushed as an `UploadPart` from the local log, so the
+  audit of multipart objects is unchanged. The orphan sweep now runs
+  alongside the copy probe, once the target is ready.
+- **What the merge's seeds found.** M4-07's copy audit required the
+  members to agree on each key's state as well as its version, though
+  the final power loss may cut a lazy `FLUSHED` on some members and not
+  others: `the_audit_catches_copies_without_their_identity` seed 1 ended
+  with one member clean and two dirty at the same version. The audit now
+  compares versions and checks each member's entry against the remote
+  (a clean one must record the remote's ETag). The seeded bug of given-up
+  aborts fails half the aborts instead of a quarter: a seed ends a dozen
+  or so streamed uploads, and seed 0 after the merge failed none.
+- **A real bug: uploads left open with no later flush.** An upload whose
+  abort failed, or whose flush was cancelled, was aborted only before
+  the target's next multipart flush. When the key's next version was a
+  single PUT, or the node no longer led the shard, none came: write-back
+  seed 9 at `SKYS3_SIM_SEEDS=2048` ended with "bucket-0 has 1 uploads to
+  abort". The probe task now sweeps the target's orphans after a backoff
+  that grows while some stay open (`run_probe`, design §7.4). The service
+  test `uploads_left_open_are_aborted_without_another_multipart_flush`
+  fails without it.
+- **Seeds did not replay.** Tokio draws unbiased `select!` branches and
+  the slot a `watch` waiter parks in from an RNG it seeds only under
+  `cfg(tokio_unstable)`. The flusher loop, the log committer's lazy wait,
+  the replication beacon wait, and the coordinator's idle wait are
+  `biased` now, the flusher's own tasks before the shard's changes (a
+  busy shard sends changes without end) and released backoffs taken on
+  every turn. The target the shard flushers wait for became a mutex and
+  a `Notify`, and a stopping flusher ends its waiters in key order: the
+  fault-free mix had diverged at seed 7 of 16, and it and the mix with
+  step faults and dropped links now replay at 16 of 16. With crashes
+  and partitions most seeds still do not (1 of 12; 7 of 8 without the
+  mix), within one process or across processes. A `--cfg
+  tokio_unstable` build, in which turmoil seeds tokio's RNG, replayed a
+  diverging seed 10 times of 10, so what is left is tokio's own
+  randomness: other `watch` channels with several waiters, which
+  takeovers and restarts wake. `a_large_object_seed_replays_exactly`
+  covers what replays.
+- **The audit's first false alarms.** A primary that crashed before its
+  lazy *opened* `PART_FLUSHED` reached the others leaves the record only
+  in its own log tail (write-back seed 4): the uploads' state is now the
+  final primary's log. The client forgot uploads by ID alone, but each
+  shard numbers its own, so a completion on one key forgot another's
+  upload, and the drain never ended; it matches path and ID now.
+- **Heavy faults starve the probe.** Half of all Complete answers lost
+  kept one node's capability probe failing for 90 s (seed 1), so its
+  shards never flushed. The ETag bug scenario loses 40% of them.
+- **Results.** At `SKYS3_SIM_SEEDS=256`, eight seeds of each scenario,
+  with 4 to 11 faults a seed, every seed with four aimed crashes:
+  `write_back` 36 s (single PUTs 5 to 23, streamed 0 to 11 with a
+  quarter of seeds not streaming, uploads 6 to 14, aborts 40 to 86),
+  `write_through` 40 s (7 to 12, 6 to 14, 13 to 23, 49 to 67), backup
+  35 s (5 to 13, 0 to 15, 3 to 22, 48 to 79). The replay test takes
+  24 s. Costs are `Runner::with_cost(4, 32)`, `(2, 32)` for the bugs,
+  and `(1, 128)` for the replay.
+- **Seeded bugs** (`test_hooks::seed_large_object_bug`), each caught at
+  seeds 0 to 7: `CompletesWithoutLastPart` as the truncated object
+  appears (4 s for eight seeds); `RecordsLocalEtagAfterLostComplete`
+  at the final audit (54 s), and at 31 of seeds 0 to 31 (seed 26
+  streamed two objects); `GivesUpFailedAborts` with a quarter of aborts
+  failing (47 s).
+- **Left open.** Crash replay needs `tokio_unstable` in simulation
+  builds, a workspace-wide flag left for a decision. The lifecycle rule
+  that ends uncommitted uploads is counted, not simulated. Aimed crashes
+  stop a node right after a step applied; a crash between the client's
+  steps of one upload is left to the random plan.
+
+## M5 Local erasure coding
+
+### M5-01 EcCodec
+
+- **The library's default rate is not a stable format.** `reed-solomon-simd`
+  has two encodings, high rate and low rate, which produce different parity
+  and cannot decode each other's. Its default encoder picks one per call
+  from the fragment counts with a heuristic (high rate for every design
+  geometry today, low rate for shapes like 2+3). A future release could
+  change the heuristic and silently change fragments, so codec 1 uses the
+  high-rate encoder and decoder explicitly; high rate supports every
+  geometry up to the 255-fragment cap.
+- **Fragment sizes.** Version 3 of the library accepts any even shard size,
+  but its README promises identical output across versions only for
+  multiples of 64. Codec 1 rounds the fragment length up to 64 bytes, at a
+  cost of under `64·k` bytes per stripe.
+- **Golden vectors checked independently.** The vectors were generated with
+  `reed-solomon-simd` 3.1.0 and checked outside the repository against
+  `reed-solomon-16` 0.1.0, the crate it was forked from; the high-rate
+  parity matched byte for byte. A unit test also checks the run-time SIMD
+  engine against the portable one, so a CI runner with a different CPU
+  cannot pass with different bytes.
+- **Decoding is slow unoptimized.** Every decode with a missing data
+  fragment runs a transform over all of GF(2^16), whatever the fragment
+  size. Unoptimized, the exhaustive erasure tests took over 30 seconds, and
+  about 5 with the codec built at `opt-level = 3`, now set for
+  `reed-solomon-simd` in the dev profile of the root `Cargo.toml`. The same
+  cost keeps the fuzz target at about 800 runs per second.
+- **`cpufeatures` 0.2.** `reed-solomon-simd` 3.1.0, the latest release,
+  detects SIMD support with `cpufeatures` 0.2, while `sha1`, `sha2`, and
+  `chacha20` are on 0.3. `deny.toml` skips `cpufeatures@0.2` until it
+  moves.
+- **Left open.** Configuration does not bound `ec.max_data_fragments +
+  ec.parity_fragments` by the 255-fragment cap of `Geometry`; M5-03, which
+  turns the configuration into geometries, should. A codec decodes whole
+  stripes; decoding only the range a coded read needs (§8.5) is left to
+  M5-06.
+
+### M5-02 Fragment segments and fragment store
+
+- **Fragments do not fit the log.** A fragment of a default 64 MiB stripe
+  at 3+2 is about 21 MiB, past the log's 16 MiB payload limit, and a
+  fragment has no shard position, so log records would distort segment
+  summaries and replay. Fragment segments therefore hold their own record
+  format (`skys3_ec::fragment`), in `frag-<id>.seg` files beside the log's,
+  written by `FragmentStore` with the log's durability rules. The log's
+  recovery already ignored files it does not know, so neither the log nor
+  the index format changes. Compaction (M1-22's open point) only sees the
+  segments `SegmentLog::segments` lists, so it leaves fragment segments
+  alone; a test opens a log and a store on one disk and checks that each
+  ignores the other's files.
+- **The plan's fragment ID ignored disks.** A node has several disks, each
+  with its own store, so an ID unique per disk is not unique per node. The
+  ID is 128 bits: the disk's number (its position in label order), the
+  segment, and the offset where the fragment was first written. That needs
+  no persistent counter, never reuses an acknowledged ID (segment numbers
+  only grow and the last segment stays), and survives moves by compaction.
+  Recovery refuses a disk opened under another number.
+- **`Geometry` and `CodecId` moved to `skys3-types`** (M5-01's open point),
+  with the new `FragmentId` and `AttemptId`. `skys3-ec` now depends on
+  `skys3-log` for the S3 field limits and error classes, so the log could
+  not depend on `skys3-ec` for `EC_PUBLISH` (M5-04); `skys3-ec` re-exports
+  the types, so its API keeps its names. `Geometry::new` now returns a
+  `GeometryError`, which converts into `EcError::InvalidGeometry`.
+- **Range reads need block checksums.** One CRC over a fragment would make
+  a read of a range read the whole fragment to verify it. The header holds
+  a CRC32C per 64 KiB block, and the header's own CRC covers them. A read
+  returns the range with a CRC32C of its bytes, for the transfer to the
+  gateway (M5-06).
+- **Tags go stale in headers.** Tags change with `TAGS` records without a
+  new version, so a header can only hold the tags of when its attempt read
+  the object. Re-indexing takes those of the latest attempt; everything
+  else in the object's metadata must agree across headers.
+- **Re-indexing meets several attempts.** An abandoned encoding, a repair,
+  and a move can each leave headers for the same object version, even with
+  a different stripe count. `rebuild_layouts` keeps, per fragment index,
+  the latest attempt's copy, and per stripe the latest attempt's layout
+  that can be decoded, falling back to an older stripe count when the
+  newest is incomplete. Design §8.4 records the rules.
+- **The tear window depends on the largest fragment.** A crash can leave
+  one group commit plus one record unsynced, and a record can be a 256 MiB
+  fragment, so recovery's damage check only looks past that. The store's
+  `max_fragment_bytes` (default 256 MiB) bounds both writes and the window;
+  tests lower it to exercise the damage path. Configuration does not yet
+  bound `ec_stripe_data_bytes / k` by it: M5-04 should, when it turns the
+  configuration into stripes.
+- **A seeded bug surfaced as a refusal, not a loss.** With recovery's syncs
+  skipped, a process killed at its first data sync left a fragment only in
+  the page cache; the next life kept it, wrote into a new segment, and the
+  next power loss tore it inside a segment that was no longer the last, so
+  recovery refused to start. The kill scenario counts that as a failure,
+  as it should.
+- **The crash simulation.** `crates/skys3-ec/tests/simulation.rs` draws
+  one to four concurrent writers of one to four fragments each, of 64 B to
+  about 195 KiB, on 256 KiB segments and 128 KiB group commits, with torn
+  writes on half the crashes. It cuts the power before and after every
+  sync of the workload (`SimPower`), and kills the process at every sync
+  with a test-side mount that keeps the page cache; after each, every
+  acknowledged fragment must read back whole with its header and a
+  matching CRC32C, and the recovered store must take a fragment that
+  survives the next power cut. Seeded bugs behind the new `test-util`
+  feature (acknowledging before the sync, never syncing the directory,
+  skipping recovery's syncs) each fail it within the first seeds. The
+  scenarios declare a cost of 2: with `SKYS3_SIM_SEEDS=256` in a debug
+  build they run 128 seeds each, in 18 s (power cuts) and 25 s (process
+  crashes).
+- **Fuzzing past the checksums.** The `ec_fragment_header` target decodes
+  arbitrary bytes, and a copy with the payload's block checksums and the
+  header's CRC recomputed, so the field parsers are reached; a decoded
+  record must re-encode to the same bytes. 30 s ran 6.5 million inputs
+  without a failure.
+- **Left open.** The fragment map is rebuilt by reading one header per
+  fragment at startup: a disk of ten million fragments would take ten
+  million small reads, and if that proves too slow the map should move to
+  an index table with checkpoints. Damage in a segment other than the last
+  makes recovery refuse to start, as in the log, although repair (M5-08)
+  could rebuild the fragments lost; skipping the damaged range is a
+  candidate for M7. The store is not wired into the node: the fragment
+  write and read RPCs come with M5-04 and M5-06.
+
+### M5-03 Geometry and fragment placement
+
+- **The §8.3 table follows no stated rule.** Taking the widest `k` that
+  leaves one spare node gives 5+2 at 8 nodes and 7+2 at 10, where the
+  table has 4+2 and 6+2, and 3+2 at 5 nodes has no spare at all. The rule
+  that reproduces it: the narrowest geometry has `k = min_eligible_nodes −
+  m` and needs no spare; wider ones step `k` by `m` up to
+  `max_data_fragments` and need one spare node. Steps of `m` cost nothing
+  at the `rack` and `zone` levels, since a `k` between two multiples of
+  `m` needs as many domains as the next one. A `max_data_fragments` off
+  the steps is still offered as the widest. Recorded in §8.3.
+- **`⌈(k+m)/m⌉` domains are not always enough.** With uneven domains the
+  cap of `m` per domain binds earlier: 11 nodes in racks of 9, 1, and 1
+  span three racks but hold only four fragments of a stripe. Geometry is
+  chosen from `Σ min(n_D, m)` over the eligible domains, which equals the
+  design's domain count rule when every domain has at least `m` eligible
+  nodes. A greedy placement under the caps then always completes, so the
+  planner never returns a plan short of fragments.
+- **Where the code lives.** Placement reuses `Topology`, `Candidate`, the
+  domains, and the rendezvous hash of M3-03, so it is in `skys3-coord`
+  (`fragments.rs`). The encoder (M5-04) runs on shard primaries and will
+  depend on `skys3-coord` for it, as the gateway already does.
+- **The record type had to leave `skys3-ec`.** `skys3-ec` depends on
+  `skys3-log`, so `EC_PUBLISH` cannot name `skys3-ec`'s `StripeLayout`.
+  `CodedStripe` and `FragmentLocation` are in `skys3-types`; `skys3-ec`
+  re-exports `FragmentLocation` and converts a `CodedStripe` into its
+  rebuilt `StripeLayout`, which keeps optional slots for re-indexing.
+  `StripePlan::locate` joins a plan with the acknowledged fragment IDs.
+- **Free space is not in the registrations.** A registration lists the
+  bytes each disk offers, not what is used, so the planner ranks nodes by
+  fragment bytes it is told they hold (`FragmentPlanner::hold`) plus
+  those it planned. Durability preferences come first: a node in a rack
+  with fewer of the stripe's fragments wins over an emptier node.
+- **Configuration.** `[ec]` now rejects `max_data_fragments +
+  parity_fragments` above 255. The other open bound, keeping a fragment
+  of `ec_stripe_data_bytes` within the fragment store's 256 MiB, depends
+  on the narrowest `k` (`GeometryPolicy::narrowest`) and spans `[ec]` and
+  the bucket tables; it stays with M5-04, which turns the configuration
+  into stripes, as M5-02 recorded.
+- **Left open.** Nothing calls the planner yet: the encoder (M5-04)
+  checks `FragmentPlanner::geometry` before an object qualifies, plans
+  each stripe, and logs the `CodedStripe`s. Cluster health does not yet
+  report a policy whose geometry the cluster cannot support. Repair
+  (M5-08) and moves (M5-09) need placement around fragments a stripe
+  keeps; `choose_nodes` is the place to add kept fragments to the
+  per-domain counts.
+
+### M5-04 Encoder and EC_PUBLISH
+
+- **No new log version; index format 9.** `EC_PUBLISH` was reserved kind
+  14, so defining its body (`skys3_log::record::EcPublish`) keeps log
+  version 2: the key, the version's position and ETag, the attempt, the
+  size, and per stripe its length, `k`, `m`, codec, and each fragment's
+  node and ID. The index moves from format 8 to 9 for two tables,
+  `fragments` (the per-shard index from node to fragments, keyed by
+  shard, node, key, stripe, and index) and `attempts`, and its values
+  from format 3 to 4 for the entry's coded layout (`ObjectVersion::coded`:
+  the `EC_PUBLISH` position, the version its fragments were written for,
+  the attempt, the stripes). Both recorded in §10.1 and §10.2.
+- **What supersedes a publish.** Applying `EC_PUBLISH` codes the version
+  only if the entry still has its position, ETag, and size and is not
+  coded; otherwise it is rejected (`Rejection::Superseded`,
+  `AlreadyCoded`, `NoEntry`, `Deleted`). `TAGS` moves `Entry::version`,
+  so tags changed during an attempt supersede it, which is conservative;
+  `TAGS` after a publish keeps the layout. `PUT`, `DELETE`, `ADOPT`, and
+  `MPU_COMPLETE` replace the layout and remove its `fragments` rows.
+- **A retagged layout records its fragments' version.** The layout first
+  held only the publish position, the attempt, and the stripes, so after
+  a `TAGS` record moved `Entry::version` nothing named the version the
+  fragment headers carry, and a read (M5-06) or repair (M5-08) checking a
+  fragment's identity against the entry's version refused every fragment
+  of a retagged coded object. `Coded::version` now records the position
+  the `EC_PUBLISH` named (set as it is applied, so a superseded publish
+  under `SeededBug::PublishSuperseded` records the version it named, not
+  the entry's), and a fragment's identity is `Coded::version` with the
+  object's ETag, which a retag does not change. It is encoded right after
+  the publish position and must precede it, as in the record. Index
+  format 9 and value format 4 are new in this PR, so the field went into
+  them rather than a new format.
+- **Members drop replicas through compaction, gated on the commit.** A
+  coded version's payload is `Holder::Coded` in the index. Compaction
+  treats it as unreferenced only once the replica's commit watermark
+  (`Shard::replicated_through`) covers the `EC_PUBLISH`, or the replica is
+  alone, and then waits the release delay as for any unreferenced
+  payload. The gate is needed because replay applies a log's uncommitted
+  tail: a member that restarts holding an uncommitted `EC_PUBLISH` codes
+  the entry, and a takeover could still truncate the record.
+- **Fragment writes use the cluster transport, not the forwarding wire
+  op.** Two message kinds in the replication class, `FragmentWrite` (7)
+  and `FragmentWritten` (8), so mutual TLS names both ends and an admin
+  certificate cannot write fragments. A write is the encoded
+  `FragmentHeader` (`to_bytes`/`from_bytes`, new) and the fragment in
+  frames of at most 8 MiB, under the transport's 32 MiB payload limit;
+  the first frame's body carries both lengths and the fragment's CRC32C,
+  and the receiver checks the lengths before it buffers anything. The
+  receiver keeps the fragment in its store holding the fewest bytes and
+  answers once it is durable. One connection per write, the answer read
+  while frames go out so an early refusal never stalls both ends, and a
+  node writes its own fragments without a connection.
+- **Attempt numbers are reserved durably.** `Index::reserve_attempts`
+  hands out blocks of 64 per shard in one durable commit and never goes
+  back, so a primary that restarts in the same epoch never reuses a
+  number. The encoder's `Attempts` tracks each attempt as writing, then
+  publishing, until its record commits: `Attempts::abandon` succeeds only
+  while it writes, which is the fence M5-05 needs, and an attempt whose
+  commit was not confirmed stays publishing until the primary applies the
+  record.
+- **The encoder lives in `skys3-ec`** and now depends on `skys3-shard`,
+  `skys3-coord`, `skys3-index`, and `skys3-net`. It reads the object from
+  the primary's replica (`Shard::plan`, `Shard::payload`), plans each
+  stripe with `FragmentPlanner`, writes the fragments in parallel through
+  the `FragmentWriter` trait, re-plans a stripe without nodes whose writes
+  failed (three times), and commits `EC_PUBLISH` on a task of its own so
+  it is appended even if the encoder is dropped. An `EncodeObserver` sees
+  each step; the simulation crashes nodes at them.
+- **Stripe size bound.** Configuration validation now rejects an
+  `ec_stripe_data_bytes` whose fragments in the narrowest geometry
+  (`k = min_eligible_nodes − m`, clamped as `GeometryPolicy::narrowest`
+  does) would exceed the fragment store's 256 MiB: at
+  `[buckets.defaults]` and at each bucket whose table changes the stripe
+  size. With the defaults the limit is 768 MiB. `skys3_config` exports
+  `MAX_FRAGMENT_BYTES`, which the encoder asserts equals
+  `MAX_FRAGMENT_LEN`.
+- **The simulation has its own harness.** `Cluster::run` reads objects
+  back through `GET` and checks survivors by replicated payload, neither
+  of which understands a coded object until M5-06, so
+  `skys3_cluster_sim::coding` runs six real nodes itself: one shard with
+  members n0 to n2 under a static configuration, a fragment store and a
+  fragment server on every node, checkpoints, and compaction with a
+  300 ms release delay. Every 10 ms it checks that each object is
+  readable from a member's replica or from `k` listed fragments of each
+  stripe of a coded layout (nodes that are down count as holding what
+  they held), and that no member dropped a coded version's bytes before
+  some replica learned a watermark past its `EC_PUBLISH`. Once every
+  object is coded and its replicas dropped, every node loses power and
+  is recovered outside the simulation, and each member's entry must read
+  back the last bytes written, from its log or decoded from fragments
+  whose headers name the layout's version, the stripe, and the index.
+- **Crashes and seeded bugs.** The crash scenario covers, each seed,
+  every step (a stripe's start, two fragments durable, a stripe's end,
+  the last stripe's start, `EC_PUBLISH` sequenced, and committed) against
+  every target (the primary, either member, one holder outside the shard,
+  every holder of the stripe but the primary), with a kill, a power loss,
+  or a power cut at the next sync drawn per run. A host whose disks lost
+  power at a sync stops 3 ms later, so what it sent before the sync still
+  leaves. Each seeded bug is first run clean and must pass: a fragment
+  store that acknowledges before its sync (holders of the last stripe
+  cut at their next sync) is caught by the read-back, since the lost
+  fragments' IDs are reused for later fragments; members dropping
+  replicas on an uncommitted `EC_PUBLISH` (`SeededBug::DropBeforeCommit`,
+  one member down 3 s and the other restarted at once) is caught by the
+  drop rule; and applying a superseded `EC_PUBLISH`
+  (`SeededBug::PublishSuperseded`, the first object overwritten with as
+  many bytes during its encoding) is caught by the read-back.
+- **Seeds and cost.** CI's 256 seeds run seed 0 of the crash scenario
+  (30 runs, 35 s in a debug build) and seeds 0 to 15 of each seeded-bug
+  scenario (about 36 s, 40 s, and 55 s). All pass, every bug is caught
+  on every one of them, and the crash scenario also passed seeds 1 to
+  40 (1,200 runs, 25 minutes). The live check counts listed fragments
+  without reading them, so a fragment lost under a reused ID shows only
+  in the read-back.
+- **Left open.** The node binary runs neither replication nor fragment
+  stores yet, so nothing starts the encoder outside tests; the harness's
+  accept loop (a first frame of kind `FragmentWrite` goes to the fragment
+  server, anything else to replication) is how a node will dispatch.
+  Cluster health does not report that no geometry is supportable;
+  `ScanReport::paused` carries the `NoGeometry` for it. An object whose
+  layout cannot fit the 2 MiB record header stays replicated. While an
+  attempt's commit is unconfirmed the next scan may encode the object
+  again, and the later `EC_PUBLISH` is rejected as `AlreadyCoded`. Orphan
+  reclamation (M5-05) can use `Attempts::abandon` and
+  `Attempts::in_progress`; coded reads (M5-06) have `ObjectVersion::coded`;
+  repair (M5-08) has `IndexReader::fragments_on`.
+- **Fuzzing.** A new target, `ec_transfer`, decodes the fragment header
+  that starts a write and both message bodies; `log_record` and
+  `index_codec` already reach the new record body and values.
+
+### M5-05 Orphan fragment reclamation
+
+- **The plan's fence had two holes.** Confirming only attempts not in
+  progress, after reconciliation, is not enough. A primary deposed
+  without knowing it does not track its successor's attempts, so it
+  would judge their fragments orphans: the judge now treats an attempt of
+  a later epoch than the one its replica sequences in as in progress
+  (the seeded `JudgeBug::IgnoreLaterEpochs` is caught). And the
+  encoder's shard handle outlives epochs, so an attempt started under one
+  primary could publish under a later epoch of the same node, after
+  another primary judged it abandoned: `EC_PUBLISH` now goes through the
+  new `Shard::commit_in`, which appends only while the replica still
+  sequences in the attempt's epoch. Recorded in §8.4.
+- **`Attempts::abandon` was the wrong hook.** It abandons a writing
+  attempt, but the plan counts writing attempts as in progress; using it
+  would abandon every encoding that outlasts
+  `fragment_orphan_after_seconds`, so a large object would never be
+  coded. The judge uses a new `Attempts::orphaned(attempt, epoch)`: a
+  writing attempt of the replica's epoch, or a publishing one, is in
+  progress; one still writing from an earlier epoch cannot publish any
+  more and is abandoned in the same step; an unknown one is not in
+  progress. The encoder also forgets an attempt whose future is dropped
+  before it publishes, which would otherwise stay "writing" forever.
+- **The judge reads the index without leases.** `Shard::entry` admits a
+  read only while the primary holds every member's lease, which a
+  deposed primary loses within `primary_lease`. Reading through it would
+  hide the epoch rule behind a clock bound, so the judge reads its
+  replica's index directly on a blocking pool: the fence relies on
+  epochs, not clocks.
+- **Orphan queries are messages of their own.** `OrphanQuery` (9) and
+  `OrphanVerdicts` (10), in the replication class, with the bodies in
+  the frame's payload: a query of 256 fragments with long keys exceeds
+  the 64 KiB frame header. The asking node is the TLS peer, so a node
+  only learns verdicts on fragments it says it holds. A first version
+  tried the nodes that may lead the shard in turn, each within the
+  transport's 10 s handshake bound; in the takeover runs a node that was
+  down then held every sweep that asked it for 10 s, past the whole
+  window in which the before-reconciliation bug can strike (seed 25 of
+  that scenario let it through even with 2 s per node). A query now goes
+  to every such node at once, and each node gets 1 s, so an outage holds a
+  sweep up about a second. Taking the first verdicts then failed wide
+  runs (seed 7 of the primary-change scenario at 2048, the primary
+  isolated as its `EC_PUBLISH` was appended): the deposed primary, back
+  but still believing it led epoch 1, kept answering "in progress" for
+  its own publishing attempt, at once since it asked itself, and its
+  orphan was never reclaimed. "In progress" is safe but not final, so the
+  first answer counts only if it decides every fragment; otherwise the
+  answers are combined, a decided verdict winning over one in progress
+  and referenced over orphan. A new `ec_orphans` fuzz target decodes and
+  checks both bodies (1.1 million inputs in 30 s, no failure);
+  proptests round-trip them.
+- **Ages without timestamps.** The fragment map keeps no write time, and
+  adding one would change the fragment format. The reclaimer counts a
+  fragment's age from when its life first saw it, so a restart only
+  delays reclamation, and it keeps the fragments a primary judged
+  referenced out of further queries for the rest of the life.
+- **Reclaiming without a format change.** A reclaimed fragment leaves the
+  fragment map, and a segment whose records are all reclaimed is removed
+  unless it is the last (recovery already tolerated gaps in segment
+  numbers). Nothing is written: a restart finds the fragments of
+  surviving segments again, and they are reclaimed again once asked
+  about. Partly reclaimed segments wait for fragment-segment compaction
+  (M5-07).
+- **A member dropped the extents of a `PUT` it had not applied.** In the
+  first takeover runs, the new primary could not encode an object: "no
+  payload is located". The old primary had committed the object's `PUT`
+  and died before its watermark reached the members; a member then held
+  the `PUT` unapplied and, as compaction drops unnamed `EXTENT` records
+  once their segment has been sealed for `unreferenced_ttl` (1 s in the
+  harness), dropped the extents before the takeover applied the `PUT`.
+  The production default is a day, so takeover runs use 15 s, but
+  compaction could keep extents past the replica's applied position
+  instead (an open point for M1-22's owner).
+- **The harness grew rather than forked.** `skys3_cluster_sim::coding`
+  takes `OrphanConfig` (reclaimers and judges on every node, with a
+  seeded `JudgeBug`), `write_delay` (slow fragment writes, through a
+  writer that also records each fragment's attempt), `takeover` (an
+  in-memory shard register, removal and takeover, an encoder on every
+  member that works while it leads), and `CrashKind::Isolate` (the
+  primary cut off from the members and the register, still reachable by
+  fragment holders). Nodes ask all of the first three members, so a
+  stale primary gets asked too. The new check reads the
+  layouts of every replica that leads and serves, since members can
+  replay uncommitted records; the final check reads every member's. A
+  run settles only once every fragment held is named by a member's
+  layout or was published once (released fragments are M5-07's), which
+  is the "orphans are reclaimed" half of Done when. The readability
+  check still spans the first three members, because a new primary
+  applies its predecessor's last commits only after reconciliation, and
+  members are taken from the register everywhere else.
+- **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
+  reclamation racing publication (`orphan_after` 0 to 60 ms, a crash at
+  a drawn step and target, then an overwrite that supersedes an attempt)
+  runs 8 seeds of two runs in 34 s; encodings outlasting `orphan_after`
+  (150 ms per fragment write against 100 ms) 8 seeds in 21 s; a primary
+  change (the primary killed or isolated for 9 to 12 s at a drawn step)
+  2 seeds of two runs in 43 s. Seeded bugs, each run clean first:
+  confirming orphans without the tracker (`IgnoreAttempts`, caught with
+  slow writes) 8 seeds in 26 s; answering before serving
+  (`BeforeServing`: a member killed as the `EC_PUBLISH` is appended, the
+  primary 200 ms later, the survivor taking over and rolling the record
+  forward once it serves) 4 seeds in 36 s; a deposed primary judging a
+  later epoch (`IgnoreLaterEpochs`, the primary isolated for 12 s) 2
+  seeds in 38 s. Every bug is caught on every seed tried, with "which
+  was reclaimed". Wider runs, at `SKYS3_SIM_SEEDS=2048` with the final
+  client, all passed: 64 seeds each of racing, outlasting, and
+  confirming without the tracker; 16 of the primary change; 32 of
+  answering before serving; 16 of the deposed primary. The M5-04
+  scenarios still pass at 256 seeds (44, 62, 46, and 42 s).
+- **How repair and moves join the fence (M5-08, M5-09).** Register each
+  attempt in the node's shared `Attempts` for the shard (`begin`,
+  `publish`, `sequenced`, `finish`, crate-private in `skys3-ec`), append
+  `EC_RELOCATE` with `Shard::commit_in(attempt.epoch, …)`, and have
+  applying it update the entry's coded layout, which the judge reads.
+  The fragment a move or repair replaces is then unreferenced, and an
+  orphan unless M5-07 releases it first. The harness's `write_delay` and
+  `takeover` give the "outlasts `fragment_orphan_after_seconds`" and
+  primary-change scenarios.
+- **Left open.** Nothing runs reclaimers or judges in the node binary
+  yet (M5-04's open point); the harness's accept loop shows the
+  dispatch, and a node will need the shard map (M2-08) as its source of
+  primaries. A version overwritten after it was coded leaves fragments
+  no layout names, which the judge calls orphans: once coded reads exist
+  (M5-06), reclaiming those must also wait for the release delay and
+  read registrations (M5-07), and the reclaimer is the place to check
+  them. The reclaimer keeps one entry per fragment in memory, as the
+  fragment map does. There are no metrics yet; `SweepReport` has the
+  counts.
+
+### M5-06 Coded reads
+
+- **Ranged decoding needed two codec methods.** `EcCodec` could only
+  decode whole fragments, so a degraded 1 MiB read of a 64 MiB stripe
+  would have read and decoded all of it. reed-solomon-simd's high-rate
+  code works on each 64-byte column on its own, so `EcCodec` gained
+  `columns` (the 64-byte-aligned columns that hold a range of a
+  fragment) and `decode_columns` (the data fragments' bytes of those
+  columns from any `k` fragments' bytes of the same columns). Both are
+  required trait methods; codec 1 implements them with the same checks
+  as whole decoding, and a new `EcError::OutsideFragment` refuses
+  columns past the fragment's length. Recorded in §8.5.
+- **The reader is transport-free.** `skys3_ec::read::read_coded` takes a
+  `FragmentSource` (one async `read` of a fragment range) and a
+  `CodedRead` (the entry's coded layout, the object's size, the range)
+  and returns a channel of body pieces, the first read before it
+  returns. Pieces are at most 1 MiB within one data fragment. A failed
+  fragment (not held, damaged, CRC32C mismatch, short) is skipped for
+  the rest of its stripe and an unreachable node for the rest of the
+  read; a degraded piece takes data fragments first, then parity, in
+  index order. `FragmentReadClient` is the network source, with a local
+  shortcut to the node's own `FragmentServer`.
+- **Reads name what they expect.** A fragment ID alone is not enough: a
+  fragment reclaimed since the plan (M5-05) or an ID reused on a
+  replaced disk would serve another fragment's bytes, which pass their
+  checksums. A `FragmentRead` names the shard, key, version, ETag,
+  stripe, geometry, codec, and index, and the node answers "not held"
+  unless the fragment's header matches. Recorded in §8.5.
+- **Reads name the layout's version, not the entry's.** A `TAGS` record
+  after an `EC_PUBLISH` moves the entry's version but keeps the coded
+  layout, whose fragments' headers name the version the encoder read.
+  Reads first named the entry's version, so a retagged coded object
+  failed every identity check and its GETs, UploadPartCopy, and
+  CopyObject answered `503`. Once #83 recorded that version in the
+  layout (`Coded::version`), every read names it with the object's
+  ETag, which no retag changes; `FragmentIdentity` and `CodedRead`
+  gained the ETag and `FragmentRead` carries it (field 17). The read
+  plan, the hot cache, and a copy's source reference still name the
+  entry's version. The gateway test
+  `a_coded_object_retagged_after_its_publish_reads_its_bytes` (retag,
+  then GET whole and by range, HEAD, GetObjectTagging, and a degraded
+  copy) fails on the entry's version. Recorded in §8.5.
+- **Two message kinds, no format change.** `FragmentRead` (11) and
+  `FragmentData` (12), replication class, request in the frame header
+  (it is small), bytes in the payload with their CRC32C. The fragment
+  listener dispatches on the first frame's kind, so writes and reads
+  share it. The node computes the CRC32C from the bytes it verified
+  against the fragment's block checksums, so corruption on the way is
+  caught by the gateway. A new `ec_read` fuzz target decodes and checks
+  both bodies (1.5 million inputs in 30 s, no failure); a proptest
+  round-trips them. Nothing on disk changed.
+- **Coded plans name no holders.** `Shard::plan` gave a coded version
+  the layout of its dropped replica payload, so the gateway would ask
+  each member and be refused before reading fragments. The plan of a
+  coded version now has no layout and no holders, and the gateway reads
+  the entry's coded layout instead (`GatewayConfig::fragments`; without
+  a source a coded GET answers `503`). A stripe with fewer than `k`
+  readable fragments re-resolves the key like a holder miss, up to three
+  times, then `503`. Whole reads fill the hot cache. Recorded in §9.2.
+- **No fragment read registrations (the M5-05 open point).** A
+  registration only matters once something removes fragments a plan may
+  still name. Today that is only the orphan reclaimer, for a version
+  overwritten after it was coded; such a read fails cleanly (identity
+  check, then re-resolution finds the new version). Release with
+  `fragment_release_delay_seconds` and registrations, honoured by the
+  reclaimer too, are left to M5-07, which owns release. Recorded in §8.5.
+- **CopyObject reads coded sources from their fragments.** It read its
+  source by the entry's payload positions from the source primary's log,
+  so once the members dropped a coded object's replicas a copy of it
+  failed. A coded source is now read whole through `read_coded`
+  (`Objects::coded_source`), naming the version the copy records, and a
+  stripe that cannot be read answers `503`. UploadPartCopy already read
+  its source as a GET does. `tests/coded.rs` in the gateway codes an
+  object with an `EC_PUBLISH` over in-memory fragments and checks GETs,
+  ranges, and copies, with a fragment of each stripe lost, and the
+  `503`s; both tests fail on the old copy path. Recorded in §8.5 and
+  §9.2.
+- **Other readers of a version's log payload.** The rest were checked:
+  GETs and UploadPartCopy go through `Objects::open`, which serves a
+  coded version from the hot cache or its fragments, never from holders
+  or a remote fill, and fills the hot cache from the fragments; HEAD
+  reads no bytes; a fill (`skys3-flush` `fill.rs`) reads back
+  the extents it just wrote; the encoder reads only versions not yet
+  coded; STS session records live in the system bucket, which nothing
+  codes; the payload reads in `peering.rs` are its tests'. The backup
+  flusher (`attempt.rs`, `stream.rs`) is the one left, below.
+- **Flusher reads of coded objects stay open (M4-09).** The flusher
+  reads a version's payload from the primary's log, which a coded
+  version no longer has. The encoder codes a version of a bucket with a
+  backup target only once the backup holds it (M5-04), so a regular
+  flush never needs a coded version's bytes; one that must send a coded
+  version again would fail and retry. Reading through `read_coded`
+  there touches the flusher, which M4-11 is changing in parallel, so it
+  is left for a follow-up.
+- **The property test.** `tests/reads.rs` reads, for every geometry of
+  the design's table, every set of up to `m` lost fragments, each
+  missing or corrupt in flight, over three stripes, for the whole object
+  and a range cutting through fragments; a proptest draws geometries
+  1+1 to 10+4, object and stripe sizes, ranges, and up to `m` losses per
+  stripe of any kind (not held, damaged, unreachable, corrupt). More
+  than `m` losses fail with `Unreadable`. The seeded bugs
+  `ReadBug::TrustCrc` (keep bytes that fail their CRC32C) and
+  `ReadBug::WrongIndices` (decode with the fragments read packed into
+  the first slots) read wrong bytes there.
+- **The simulation.** `skys3_cluster_sim::coding` takes a `ReadConfig`:
+  after the coding scenario's objects are coded and their replicas
+  dropped, every node runs a gateway (an in-memory control store and
+  shard map, routed shard client, hot cache) and three clients send 40
+  requests each through drawn nodes, whole or ranged GETs and, one in
+  eight each, a CopyObject to a new key whose copy is read back and a
+  PutObjectTagging followed by a whole GET, while, for four seconds,
+  up to two *lossy* nodes of n1 to n5 (`m` is 2 on six nodes) crash,
+  with or without power loss, lose their fragment disk for good, or
+  corrupt the bytes they send. Every answer must be its version's bytes,
+  by its ETag (a copy keeps its source's); `503` and broken-off bodies
+  are allowed. The harness's fragment source counts parity reads, and
+  the scenario requires some, and some copies and retags. The copies
+  stay out of the coding checks, though the encoder may code them during
+  the reads. Since a `503` is allowed under faults, each client GETs
+  every object it retagged again once the faults are over, up to 40
+  times 250 ms apart, and one never served fails the run: with the
+  gateway naming the entry's version, seed 0 fails so.
+- **Crashes do not replay within one process.** Two runs of a seed in
+  one process differed after a crash. A crashed host's runtime drops its
+  tasks in an order tokio shards by task ID, and task IDs are global to
+  the process, so its sockets close in another order on the second run
+  and the latencies drawn after them differ. A fresh process replays a
+  seed exactly. The replay scenario therefore runs coded reads with
+  corruption only; the crashing scenarios still check every answer.
+  (ECDSA signatures in the handshakes also vary in length, harmlessly:
+  nothing depends on their size.)
+- **Scenarios, seeds, and cost.** At CI's 256 seeds in a debug build:
+  replay (cost 128) 2 seeds in 16 s; degraded reads (lossy 2 on
+  even seeds, else 1; cost 32) 8 seeds in 34 s; trusting bad CRCs
+  (corruption only) 4 seeds in 32 s; wrong indices (crashes and lost
+  disks) 4 seeds in 37 s, with copies and retags. Both bugs are caught
+  on every seed tried, with "not those of version". At
+  `SKYS3_SIM_SEEDS=2048` all passed, copies and retags included: 64
+  seeds of degraded reads, 32 of each bug, 16 of replay (273 s, four at
+  a time); before the copies, replay passed 32 seeds at 4096. The copies
+  added about a third to each run. Adding copies first
+  found a harness bug: the harness's gateways used the default
+  `inline_max_bytes`, above the shard log's 512 bytes, so the shard
+  refused every copy's inline body until the gateways took the log's
+  bound.
+- **Hooks for M5-07, M5-08, M5-09.** Release should register fragment
+  reads where the gateway resolves a coded plan (`objects/coded.rs`) and
+  have `FragmentServer::read` check registrations, like holder reads.
+  Repair (M5-08) can reuse `read_coded`'s column decoding through
+  `EcCodec::decode_columns`, or read whole fragments through
+  `FragmentReadClient`. A move (M5-09) changes the coded layout by
+  `EC_RELOCATE`; readers holding the old plan fail on the identity check
+  and re-resolve.
+- **Left open.** The node binary does not serve fragment reads or set
+  `GatewayConfig::fragments` yet (as for M5-04's encoder). A CopyObject
+  whose coded source was replaced and reclaimed after the copy read its
+  entry answers `503` rather than resolving again, as a GET would. There
+  are no metrics for degraded reads yet.
+
+### M5-08 Repair
+
+- **When is a node lost?** The plan said "when a node is lost" and left
+  the moment open. The topology's *departing* comes after
+  `node_forget_after_hours` (24 h), far too late for fragments, and a
+  node that restarts on an empty disk is never silent at all. Repair
+  therefore checks fragments itself: each pass reads one byte of a few
+  of each node's fragments in turn, under the identity the layout
+  expects, and checks all of a node's fragments once one is missing. A
+  node silent for the new `fragment_repair_after_seconds` (default 600)
+  has lost them all, so a restart costs no rebuild. Recorded in §8.6 and
+  the configuration reference.
+- **`EC_RELOCATE` needed no format bump.** Kind 15 was reserved, so it
+  is defined in log format version 2 as the multipart records were. The
+  index format is unchanged too: applying it rewrites the entry's coded
+  layout and moves the `fragments` rows (`IndexWriter::move_fragment`),
+  and `IndexReader::fragment_nodes` lists the nodes with a seek per node.
+- **Moves apply a stripe at a time.** The first version applied each
+  move and checked the stripe after it, so a relocation in which two
+  fragments of a stripe trade nodes was rejected: after the first move,
+  two fragments shared a node. Now all of a stripe's moves apply before
+  `CodedStripe::new` checks it (`fragments_of_a_stripe_may_trade_nodes`).
+- **One fence for every attempt.** Attempt numbers (`AttemptNumbers`),
+  the guard that forgets a dropped attempt (`Writing`), and publishing
+  under the attempt's epoch (`publish`) moved from the encoder into
+  `encoder/attempts.rs`, so a repair is fenced exactly as an encoding is.
+  The seeded `RepairBug::Unfenced`, which registers the attempt only once
+  its fragments are written, is caught by orphan reclamation reclaiming
+  a fragment a committed layout names.
+- **Placement keeps the stripe's other fragments.**
+  `FragmentPlanner::replace` places rebuilt fragments counting the kept
+  ones toward each failure domain's cap and avoiding their nodes, so a
+  repaired stripe obeys the same rules as a new one (a proptest over
+  random topologies checks both rules).
+- **Retagged coded versions.** `TAGS` moves the entry's version and
+  keeps the layout, while fragment headers keep the version they were
+  written for, so checks named by the entry's version read every fragment
+  as missing. The first version skipped such versions; once #83 recorded
+  `Coded::version` and #87 read fragments by it and the ETag, repair
+  does the same: checks, the reads that rebuild a stripe, and the
+  rebuilt headers (`fragment_header` now takes the version) name the
+  layout's version and the ETag. The test
+  `a_version_retagged_after_coding_is_repaired_and_reads_back` and the
+  scenario `a_lost_holder_is_repaired_while_reads_go_on`, which retags
+  three of four objects before the loss, fail if any of the three names
+  the entry's version, or if the skip comes back.
+- **`EC_RELOCATE` keeps naming the entry's version.** The record could
+  have named the layout's version, which no retag changes, but then a
+  relocation would commit across a retag, with rebuilt headers holding
+  the tags and write identity from before it. Naming the entry's version
+  (its latest committing record, a `TAGS` included) makes a retag since
+  the read reject the relocation; the next pass rebuilds under the new
+  tags (`a_relocation_names_the_entry_s_version_which_a_retag_moves`).
+- **A node lost for good kept receiving rebuilt fragments.** Once its
+  fragments were rebuilt elsewhere, a silent node held nothing, so no
+  check named it, it left the pass's silent set, and the planner, whose
+  topology still listed it, placed later rebuilt fragments on it; each
+  write waited 10 s to time out. Seed 5 of the two-holder scenario,
+  whose readers now retag objects and so supersede some repairs, took
+  17.7 s, past its 15 s bound. A node silent at its last check now stays
+  silent to the repairer until it answers one
+  (`a_silent_node_is_repaired_once_it_stays_silent`).
+- **Re-indexing had to accept a retag's write identity.** A retag makes
+  the `TAGS` record the write identity and drops an inherited one and
+  the identity metadata carried from another cluster, so a fragment
+  rebuilt after a retag disagreed with the others on the version's
+  fixed metadata, and `rebuild_layouts` refused the whole object.
+  Like the tags, the write identity and that metadata entry now come
+  from the latest attempt (`later_attempts_win_where_copies_overlap`;
+  the repair test rebuilds the retagged object from its headers).
+- **A new disk repeats fragment IDs.** IDs are disk, segment, and
+  offset, so a node restarting on an empty disk hands out IDs its old
+  disk used. At 256 seeds the harness reported layouts naming fragments
+  "which lost it" that were in fact the old disk's: it now keys
+  acknowledged and reclaimed fragments by node, disk generation, and ID,
+  and takes a layout fragment's generation from the record of the same
+  key, stripe, and index. The system itself is safe: a check or read
+  names the header it expects, so a reused ID reads as missing.
+- **Outlasting `orphan_after` needed a slow acknowledgement.** Rebuilt
+  fragments were acknowledged within milliseconds, so with orphan
+  reclamation asking after 100 ms the `Unfenced` bug went unnoticed. The
+  harness can now hold each repair write's answer back (`ack_delay`,
+  300 ms) after the fragment is durable.
+- **A power cut armed at placement hit another sync.** Cutting the new
+  holder's power at its next sync from the `Placed` step let a seeded
+  `AcknowledgeBeforeSync` through at seed 5: the node synced something
+  else while the write waited for the bandwidth cap. The cut is now
+  armed as the repair write leaves.
+- **Priority is per pass, over what the pass knows.** Losses of two
+  lost disks are found as each node answers again, possibly passes
+  apart, so a stripe that lost both may be repaired first as having lost
+  one. The order check holds in every run, but the scenario requires a
+  stripe found missing two only when both holders are lost for good,
+  which one pass finds together; the harness picks, by the seed, a pair
+  of holders that shares some stripes and not others. The seeded bug
+  became `LeastLostFirst`, which turns the order around, since key order
+  only sometimes puts a stripe that lost one first.
+- **Readers avoided the lost node late.** Readers picked a gateway at
+  random, the lost node included, and waited out 10 s timeouts on it;
+  a run settled at 75 s. They now skip lost nodes (about 4 s a run).
+  Downtime `Duration::MAX` for a node lost for good overflowed the
+  clock; it is now 2^40 s.
+- **Seeds and costs.** A repair run costs 16 typical seeds: the
+  encoding of the coding scenarios, then seconds of repairs at a 64 KiB/s
+  cap. At `SKYS3_SIM_SEEDS=256` each scenario runs 4 to 16 seeds, and
+  all seven passed, one test thread each: a lost holder with reads and
+  retags (8 seeds, 27 s), two lost holders (8, 27 s), crashes during
+  repairs (16, 32 s), repairs outlasting `orphan_after` (8, 21 s), and
+  the seeded bugs, each seed run with and without the bug: `Unfenced`
+  (4, 15 s), `AcknowledgeBeforeSync` at the new holder (8, 25 s), and
+  `LeastLostFirst` and `Unthrottled` (4, 24 s); about 170 s in all.
+  Each bug is caught at every seed run: 0 to 3, 0 to 7, and 0 to 3.
+  Seeds 1 and 5 found the harness problems above. Repairs that do not
+  end within the run's bound now end the run, which then fails; before,
+  such a run went on indefinitely.
+- **Hooks for M5-07 and M5-09.** A fragment an `EC_RELOCATE` replaced is
+  named by no layout, so orphan reclamation reclaims it, from a node
+  that comes back, without waiting for read registrations: fragment
+  release should release moved-from fragments as it does replaced
+  versions'. Rebalancing (M5-09) can commit the same `EC_RELOCATE`, with
+  moves across stripes, take its writes from the node's
+  `RepairBandwidth` or one like it, and share the `Attempts` tracker.
+- **Left open.** The node binary does not run repairers, as it runs no
+  encoder or reclaimer yet. A check costs a header read and one block
+  read on the holder; a node holding many fragments would want a
+  batched presence check. Each pass loads every fragment row of the
+  shard, so memory grows with the shard's fragments. Unrecoverable
+  stripes are logged and counted in the pass report, with no metric of
+  their own.
+
+### M5-09 Fragment rebalancing
+
+- **What moves a fragment (decided).** The plan named the steps, not the
+  triggers. `FragmentPlanner::moves` (skys3-coord) plans moves for three
+  reasons, in order: a stripe over a failure domain's cap of `m` (as
+  after a relabel), a fragment on a node that is listed but no longer
+  eligible (departing, no capacity, or unlabeled: a drain), and balance:
+  a fragment of `f` bytes moves from `a` to `t` only while
+  `(b_a − f) / c_a ≥ (b_t + f) / c_t`, M3-06's rule in bytes, which makes
+  `Σ b² / c` fall with every move, so moves settle and never go back (a
+  proptest over random clusters that change under their stripes checks
+  the rules and that moves settle). Targets are live eligible nodes
+  outside the stripe whose domain stays within the cap, the emptiest
+  first. Recorded in §8.3.
+- **Shares are each shard's own (decided).** Nothing counts fragment
+  bytes across the cluster: `FragmentPlanner::hold` exists, but no node
+  reports what it stores. Each primary balances its own shard's
+  fragments, which it knows exactly from the `fragments` table; shards
+  that each spread their own spread the cluster's, to within a fragment
+  per shard and node.
+- **A departing node is drained, not rebuilt (changed M5-08's rule).**
+  Repair treated a departing node's fragments as lost at once, which
+  would rebuild every fragment of a decommissioned node from `k` reads
+  while the node could still serve each with one. Repair now checks a
+  departing node like any other; moves drain it while it answers, and if
+  it falls silent it is lost after `fragment_repair_after_seconds`, as
+  any node. A node the topology no longer lists is still lost at once.
+  `a_departing_node_is_repaired_without_checks` became
+  `a_forgotten_node_is_repaired_without_checks`. §8.6 is updated.
+- **Repairs keep priority twice over (decided).** A pass that finds any
+  fragment lost repairs and moves nothing; moves run only in a pass that
+  found none, at most `moves_per_pass` (16, a constant like
+  `checks_per_node`, so no new configuration key). Across shards, moves
+  share the node's `RepairBandwidth` (`repair_bytes_per_second_per_node`)
+  but wait to take it while any repairer of the node holds a `Repairing`
+  guard (`take_after_repairs`); a repair waits for at most the move
+  transfers already started. The cap's metric `skys3_repair_bytes_total`
+  counts moves too; `skys3_moved_fragments_total` is new.
+- **Moves reuse the repair machinery whole.** A move is an attempt in the
+  shard's `Attempts` from its start, with a number from the reserved
+  blocks, published with `publish` under its epoch, and commits an
+  `EC_RELOCATE` with one move: the record needed no change, and repair's
+  commit step became `Repairer::relocate`, which both share. The moves
+  live in the repairer (`repair/moves.rs`), since they need its
+  inventory, silence tracking, bandwidth, and fence, and must follow its
+  repairs.
+- **Retiring is orphan reclamation's (decided, safe).** A move deletes
+  nothing: the old fragment is retired only once no committed layout
+  names it, so a stripe always keeps `k + m` named fragments and a reader
+  holding an older plan still finds the old one.
+- **Moved-from fragments keep their space while their holder runs
+  (found, left open).** The outlasting scenario first required the
+  fragments moves leave to be reclaimed, and none was: a fragment node
+  asks about a fragment once, and a fragment it was told is referenced is
+  not asked about again until the node restarts (M5-05). M5-08's
+  replaced fragments sit on nodes that were down, which ask again when
+  they return; a move's old holder is up. Safe, but balancing frees no
+  space on the source until it restarts. Fragment release (M5-07) should
+  release moved-from fragments as it does replaced versions', or the
+  reclaimer should ask again about referenced fragments now and then.
+- **Moves planned from the pass's snapshot were rejected by retags
+  (found).** The harness's readers retag objects; a move names the
+  entry's version, so a retag between the pass's index read and a move
+  later in the pass rejected it, wasting a copy (six of the first seven
+  moves after the joins in seed 0). Each move now re-reads the entry and skips a move whose
+  layout changed. A pass also stops moving from a node it could not read
+  or to one it could not write, which would otherwise cost a write
+  timeout per planned move.
+- **The harness's balance check had to count the readers' copies
+  (found).** `CopyObject` copies are coded too, so the shard holds more
+  coded objects than the run wrote; a check over the written keys found
+  the nodes unbalanced while the primary, which balances them all,
+  rightly planned nothing. The checks now take every key with fragment
+  rows.
+- **The harness grew joins, drains, and racks.**
+  `CodingConfig::rebalance` (`RebalanceConfig`) adds nodes `n6` on,
+  crashed before the run starts and counted lost until they join, and
+  lists each in the planner's topology once its software is up; drains
+  mark a node departing; the topology is now a world field the encoder's
+  and repairers' planners read, optionally at the `rack` level (three
+  racks of two, one node joining the first rack). Joins and drains strike
+  with the repair losses. The driver checks the domain caps at every
+  step, that no pass both repairs and moves, and, within the repair
+  bound, that drained nodes hold nothing, joined ones hold fragments,
+  and the live nodes' fragment bytes are within two fragments of each
+  other. `MoveCrash` strikes the primary or the moved fragment's old or
+  new holder at each step of a move.
+- **Seeds and costs.** At `SKYS3_SIM_SEEDS=256`, one test thread each,
+  every scenario passed every seed it runs: two nodes joining under
+  reads and a drawn loss (4 seeds, 28 s), a node drained as another
+  joins, under reads and a drawn loss (4, 24 s), joins at the `rack`
+  level (8, 18 s), crashes at a drawn step of a move of the primary or
+  a moved fragment's old or new holder (16, 36 s), moves outlasting
+  `orphan_after` (8, 27 s), and the seeded bugs, each seed run with and
+  without the bug and caught at every seed run: `UnfencedMove` (seeds 0
+  to 3, 17 s), `RebalanceBug::RetireEarly` with the primary killed once
+  a copy is placed (0 to 3, 10 s), `AcknowledgeBeforeSync` at a copy's
+  new holder (0 to 3, 13 s), and `MovesBeforeRepairs` and
+  `RebalanceBug::NodeLevel` (0 and 1, 16 s); about 190 s in all. The
+  coding, coded-read, and repair scenarios, which share the harness,
+  pass at 256 seeds too.
+- **Left open.** The node binary runs no repairer, so no mover either.
+  Moves are planned per shard from the pass's index read, one fragment
+  per `EC_RELOCATE`; moves of one stripe could share a record. The space
+  moved-from fragments keep is above.
+
+### M5-10 Lifecycle expiration and multipart cleanup
+
+- **The configuration lives in the bucket register.** An optional
+  `lifecycle` field of `BucketDocument`, written only when set (as
+  `departing` is on a node registration), so registers without one keep
+  their bytes and no format bump was needed. It travels with the
+  generation and the local copies, and a rebuild keeps it. The field had
+  to be added to some two dozen `BucketDocument` literals across the crates.
+  Validation (`skys3_types::lifecycle`) runs both in the gateway and in
+  `BucketDocument::validate`, which also refuses a configuration on a
+  bucket that is not `local`.
+- **Only `local` buckets.** A `write_back` (or `write_through`) bucket
+  answers PUT with `501 NotImplemented`: its durable home is the remote,
+  and expiring the local copy alone would be undone by an import or
+  diverge from the remote's own rules. Recorded in §8.7.
+- **What is supported.** Prefix, tag, and size filters and `And`,
+  `Expiration` by `Days` or `Date`, and `AbortIncompleteMultipartUpload`;
+  transitions, noncurrent-version actions, and `ExpiredObjectDeleteMarker`
+  set to true answer `501`. `ExpiredObjectDeleteMarker` set to false is
+  accepted and ignored, as there are no delete markers, so a rule that has
+  only it answers `400 InvalidRequest` for having no action. s3s does not
+  require `Content-MD5` on this PUT, so the gateway does. Recorded in §11.
+- **`Days` rounds to midnight UTC.** S3 counts a rule's days from
+  `Last-Modified` and rounds up to the next midnight UTC, so an object
+  written at 23:59 with `Days = 1` expires two minutes later at the
+  earliest. The evaluator and the property test's reference evaluator do
+  the same. `s3s` hands a `Date` as a `time` value, so the gateway gained
+  the `time` crate, already in the tree, to convert it.
+- **Passes keep no state.** Each expiration is a `DELETE` committed with
+  `Shard::commit_all_if` only if the entry still holds the version the
+  page read, followed by a `FLUSHED` that removes the tombstone, as for
+  any delete in a `local` bucket. A pass resumes after a primary change
+  simply because the new primary runs the next one; it skips a primary
+  that is not serving yet, so it never judges an index that lacks what
+  the earlier primaries committed.
+- **The simulation needs its own clock.** The gateway stamps
+  `Last-Modified` from the real wall clock, not simulated time, so the
+  cluster simulation cannot age objects. Its passes read a lifecycle
+  clock instead, which starts at a midnight in the 23rd century when the
+  workload starts and runs a day per simulated second; `Date` rules fall
+  at chosen moments of the run and `Days` rules at its first pass.
+- **Abandoned deletes are not always truncated.** In the simulation, a
+  deposed primary that the coordinator then replaced keeps the `DELETE`s
+  it never committed in its log with no `TRUNCATE` after them. The audit
+  therefore counts as abandoned every `DELETE` some node's log holds that
+  the final primary's does not commit, and checks exactly-once on the
+  final primary's log. Holding the primary's messages across a rule's
+  date must last less than `member_suspect_after`, or the primary removes
+  its members and nothing is taken over.
+- **Simulation cost.** Both scenarios together take about 18 s in a
+  debug build at CI's 256 seeds (8 seeds each, cost 32), and 75 s at 1,024.
+- **Left open.** A pass over a large shard runs to its end in one interval
+  with no rate limit; deletes of a page share group commits. Expired
+  objects stay readable until the next pass, as S3 allows. There are no
+  per-bucket lifecycle metrics, and bucket status does not report the
+  last pass.
+
+### M5-11 Re-indexing and restore drills
+
+- **The operator command is a library call, wrapped later by an admin
+  endpoint.** `skys3_flush::snapshot::drill` takes the shard, its snapshot
+  target and durable home, every node, the lost nodes, and the loss time,
+  and lists headers through `skys3_ec::reindex::HeaderSource`. A
+  command-line tool was rejected: the drill needs the bucket's credentials
+  for the snapshot target and the home, fragment listing over the cluster
+  transport is for node certificates only (§8.5), and the result has to be
+  installed on a node. The node binary runs no fragment stores yet, so the
+  admin endpoint and a transport message that lists a node's headers are
+  left to the task that wires them in. `HeaderSource` is implemented for a
+  map of in-process `FragmentServer`s, which the tests and the simulation
+  use. Recorded in §8.9 ("Restore drills, as built").
+- **Pure rules in `skys3-ec`, the drill in `skys3-flush`.**
+  `skys3_ec::reindex::reindex` is a synchronous function of the snapshot's
+  entries and position and the headers found; the drill around it reads
+  the snapshot, asks the nodes, consults the home, and builds the report.
+  `skys3-flush` now depends on `skys3-ec`. M4-11's hook `Restored::rows`
+  stayed unused: the drill decodes `Restored::entries` instead.
+- **Combining a snapshot and headers.** A header version after the
+  snapshot's position supersedes the snapshot's entry, and the newest such
+  version is restored from headers alone, or reported unrecoverable;
+  never an older version in its place (`ReindexBug::FallsBack`). Header
+  versions at or before the position that the entry does not name are
+  orphans of an overwrite or delete and are never restored
+  (`ReindexBug::Resurrects`). Tags and the entry's version come from
+  whichever of the snapshot entry and the latest attempt's header names
+  the later position: a retag after coding moves the entry, a repair
+  after a retag writes headers whose write identity names it
+  (`ReindexBug::HeaderTags`, `ReindexBug::OlderAttempt`).
+- **Deletes and overwrites after the snapshot.** Their only trace is the
+  absence of a newer header, so without a durable home a coded object
+  deleted in the window comes back; the window covers it. With a home,
+  an object restored from headers is dropped if the home holds no object
+  at the key or a later write of the shard. The home is matched by write
+  identity, not ETag: a multipart flush's remote ETag differs from the
+  local one, so comparing ETags, as the first version did, left such an
+  entry dirty.
+- **Two copies of a fragment on one node.** Simulation seed 7 found a
+  stripe whose rebuilt fragment 4 went to a node that already held a stale
+  copy of fragment 0 from an older attempt, after the node came back.
+  Taking each index's latest copy put two fragments on one node, which
+  `CodedStripe::new` refuses. Locations are now a maximum bipartite
+  matching of indices to nodes over every copy found (latest attempts
+  tried first); the harness checks recoverability with the same
+  distinct-node rule.
+- **Replicated entries with coded headers.** Seed 6 had a replicated
+  snapshot entry whose version had been coded after the snapshot but too
+  few headers survived: it was reported lost with no reason. It is now
+  unrecoverable with the rebuild error, like a coded entry.
+- **Missing fragments get placeholders.** A slot no header fills keeps the
+  snapshot's location, or goes to a lost node, else any unused node, under
+  `UNKNOWN_FRAGMENT` (`u128::MAX`, which no store assigns): reads decode
+  around it and repair rebuilds it. A layout restored from headers alone
+  is published at the restored index's position, its `EC_PUBLISH` lost.
+- **The restored index is coded-only** and installs as a learner's
+  snapshot does (`begin_install`, `install_rows`, `finish_install`), at a
+  position after everything the snapshot and headers name; the shard must
+  start in an epoch after every attempt's. Installing it on a live shard is
+  not done here: the simulation installs it into a fresh index and reads
+  every object back through it.
+- **The simulation is its own harness** (`skys3_cluster_sim::drill`), not
+  the cluster: one single-member shard on n0 of eight nodes with fragment
+  stores, 3+2 coding, the real encoder, repairer, orphan reclamation, and
+  snapshot service, driven by a turmoil client for deterministic time. A
+  loss is modelled by forking the state at a random moment (the snapshot
+  target with `SimS3::fork`) and silencing n0 plus up to two random nodes;
+  before each loss the run retags and deletes before a snapshot, then
+  retags, damages, and repairs and overwrites a coded key after it, so
+  every drill has work after the snapshot. Expected tags are evidence
+  based: the latest retag that a snapshot or a surviving header records.
+- **Seeded bugs** (`skys3_ec::reindex::seeded::ReindexBug`, `test-util`):
+  `OlderAttempt`, `HeaderTags`, `PrefersSnapshot`, `Resurrects`,
+  `FallsBack`. Each test runs a seed without the bug, which must pass,
+  then with it, which must fail for the expected reason; every seed of
+  each test catches its bug (seeds 0 to 7 at CI's count, and seeds 0 to
+  255 at `SKYS3_SIM_SEEDS=8192`). `Resurrects` needs orphan reclamation off
+  (`orphan_after` 600 s), and `FallsBack` a loss that takes the latest
+  version's holders (`lose_latest`).
+- **Simulation cost.** One run is cost 16 (about 0.8 s in a debug build);
+  the main scenario runs 16 seeds and each bug test 8 (two runs each) at
+  CI's 256 seeds: 65 s for the six tests one at a time in a debug build,
+  33 s on four threads. At `SKYS3_SIM_SEEDS=8192` (512 seeds of the main
+  scenario, 256 of each bug) all passed in 733 s on four cores.
+- **Left open.** The admin endpoint and the transport message listing a
+  node's headers; installing the restored index on a shard that serves
+  again; copying a backup's replicated objects back; listing every header
+  of a shard at once holds them all in memory; nothing stops reclamation
+  on a node whose shard still has a live primary elsewhere (the drill
+  assumes none).
+
+## M7 Hardening
+
+### M7-03 Fuzzing campaign
+
+- **The agreed time.** Every one of the 35 targets ran 10 CPU-minutes
+  (`-max_total_time=600`, three at a time on four cores) from its seeds
+  and a 15-second smoke run, and the plan entry records the bar: that
+  before the PR, then 30 minutes a night on a core of its own. The
+  request pipeline, SigV4, and forwarding targets, still finding coverage
+  at the end, got 20 to 30 more minutes on the spare core. About half the
+  targets (the small text parsers and the frame-level decoders) found no
+  new coverage in the second half of their run; the larger ones (the
+  request pipeline, SigV4, forwarding, policies, tokens and key sets, peer
+  and replication messages, log records, the index codec, and rebuild
+  exports) still did in their last minutes. That is what the nightly runs
+  are for, and why they carry the corpus from night to night in an
+  Actions cache instead of starting from the committed one each time.
+- **One finding: control characters in XML answers.** The request
+  pipeline target found that `GET /?prefix=%1F` answered `500`: `s3s`
+  refuses to send an XML response holding a control character below
+  U+0020 other than tab, line feed, and carriage return, and ListBuckets
+  echoed the prefix (minimized with `-minimize_crash` from a 67-byte
+  ListObjectsV2 request). The same held for every query value an answer
+  echoes, for keys echoed by CreateMultipartUpload, listings, and
+  DeleteObjects (which answered `500` after deleting), and for lifecycle
+  rule IDs, prefixes, and tags, which made every later
+  GetBucketLifecycleConfiguration of the bucket answer `500`. The
+  gateway now refuses those with `400 InvalidArgument` (design §12,
+  `skys3_types::limits::is_xml_text`); a key with one that an import
+  finds at the remote still reads and deletes and lists URL-encoded.
+  Regression tests: `control_characters_never_reach_an_xml_answer` (the
+  harness), `query_values_with_control_characters_are_refused`,
+  `keys_with_control_characters_are_refused_before_any_delete`,
+  `an_imported_key_with_a_control_character_lists_url_encoded`, the
+  lifecycle validation test, and the minimized input in the request
+  pipeline's corpus (`regression-list-buckets-prefix-control-character`). No other crash, timeout, or out-of-memory
+  report came up: every target's slowest input took under a second and
+  its peak RSS stayed under 600 MiB.
+- **U+FFFE and U+FFFF too (review).** XML 1.0's `Char` production also
+  leaves out U+FFFE and U+FFFF. `s3s` checks only bytes below 0x20, so it
+  sent those two as they are, in answers strict XML parsers refuse.
+  `is_xml_text` now follows the production exactly; its last gap, the
+  surrogates, cannot occur in a Rust `str`.
+- **One nightly cache for all targets (review).** The first version kept
+  a cache per runner, keyed by its number, so adding a target, which
+  moves most targets to another runner, would have restarted them from
+  the committed corpus. Now every runner restores one cache holding a
+  directory per target, hands what it grew to a final `save` job as an
+  artifact, and that job overlays it, a target at a time, on the
+  previous cache and saves the result. A target whose runner failed
+  keeps its previous corpus. Minimized with hit counts, this campaign's
+  corpora took 13 MB, far below the 10 GB a repository's caches may hold.
+- **Stricter lifecycle validation applies to stored registers too.**
+  `LifecycleConfiguration::validate` runs when a bucket register is read,
+  so a register stored with a control character in a rule would now fail
+  to load. No release has shipped, so there is nothing to migrate.
+- **`cargo fuzz build -O` turns debug assertions off.** By default
+  cargo-fuzz builds with optimizations *and* debug assertions and
+  overflow checks; `-O` (`--release`) drops the assertions. Every run here
+  and in CI uses the default, so overflow checks stay on.
+- **`max_len` is not reached in short runs.** libFuzzer grows inputs
+  gradually (`-len_control`): after 30 minutes the request pipeline's
+  inputs were still under 700 bytes, far from the 16 KiB head limits.
+  Seeds at the limits keep those refusals covered: a 16 KiB request
+  target, 101 header fields, a 16 KiB header value, a 1,025-byte key, XML
+  nested 33 deep, and an `aws-chunked` body with a 5,000-byte trailer,
+  nine trailers, and a 200-byte chunk line.
+- **Bounds per target.** `fuzz/run.sh` sets `max_len`, `malloc_limit_mb`,
+  `rss_limit_mb`, and `timeout` per target from its parser's limits; the
+  smoke job, the nightly job, and local runs all go through it.
+  AddressSanitizer's quarantine alone holds 256 MiB, so peak RSS sat at
+  450 to 580 MiB for every target, and the RSS limit is 1 GiB (2 GiB for
+  the gateway harness, which keeps simulated shards for 256 inputs). The
+  malloc limit (64 MiB, 128 MiB for the gateway) is the one that would
+  catch an allocation sized from a declared length.
+- **`cargo fuzz cmin` keeps too much by default.** After the runs the
+  corpora held 114,093 inputs (31.5 MB). The default merge keeps an input
+  for every new feature, hit-count buckets included, and still left
+  36,712 inputs (13.0 MB), 3.5 MB of them rebuild exports. Merging on
+  edges alone (`-use_counters=0`, now what `fuzz/run.sh --cmin` does)
+  left 11,193 inputs and 1.1 MB, the largest target's 340 KB, with the
+  same edge coverage. The nightly cache keeps the hit-count features
+  (`-use_counters=1`), which the next night's mutations build on.
+- **Seeds.** The SigV4 test suite's signed requests, S3 requests and XML
+  bodies for every operation the harness routes, tokens and key sets
+  (real RSA, P-256, P-384, and Ed25519 keys), policies, small text
+  parsers' examples, the log record golden vectors, and rebuild exports
+  taken from the rebuild tests' scenarios (by a test that was not kept).
+  `cargo fuzz cmin` keeps only those that add coverage.
+- **`cargo fuzz run` rebuilds when sources change.** The fix landed while
+  the campaign ran, so the targets started after it, among them every
+  gateway target whose code it touches, were rebuilt and fuzzed the fixed
+  code; the extra 30 minutes of the request pipeline also ran on it.
+
+### M7-04 Metrics, alerts, and dashboards
+
+- **A labeled family is invisible until it has a series.** `prometheus-client`
+  leaves a `Family` with no label set out of the exposition entirely, so
+  neither a scrape nor `MetricsRegistry::encode` shows
+  `skys3_admission_refusals_total` or `skys3_admin_requests_total` before
+  their first event. Checking the reference against an encoding would
+  therefore miss them. `MetricsRegistry` now records each registration
+  (`registered()`: the family name with its unit, and its type), and the
+  reference test builds a catalog from that: a test in the `skys3` crate
+  registers every component's metrics in one registry, as a node does,
+  without running one.
+- **The catalog cannot know about a new component.** A metric registered by a
+  struct the catalog does not build would slip through, so a second test
+  scans `crates/*/src` for `.register("name", ...)` and
+  `.register_with_unit("name", ...)` calls (skipping comments, test files,
+  and trailing `mod tests`) and fails for a name the catalog lacks.
+- **`skys3_control_store_live` does not show a later outage.** It is set at
+  startup and when a node first syncs from the store, and never goes back to
+  0: a store that stops answering after startup left no trace in the
+  metrics. Its meaning is documented as is, and not changed (dashboards may
+  rely on it). The node now also exports
+  `skys3_control_store_last_success_timestamp_seconds`, set on every
+  successful generation read or sync, and the identity copy's sync time and
+  `identity_max_staleness`, so that the identity-staleness alert compares
+  with each node's own setting.
+- **Several §13 rows had no metric in the code.** The coordinator's tenure
+  and placement health existed only in the admin API's report. They are now
+  gauges in `skys3-coord` (`CoordinatorMetrics`), cleared when a tenure
+  begins or ends so that only the coordinator reports a judgement (a
+  `Drop` guard clears them also if the coordinator's task is dropped). The
+  coordinator, replication, and repair do not run in the node binary yet,
+  so their metrics are "defined" and their alerts cannot fire until they
+  are wired in.
+- **Rows that cannot be shown, or not yet.** Clock rate drift cannot be
+  measured by a node against its own clock; the alert uses node_exporter's
+  `node_timex_sync_status`, so the rules need node_exporter on every host.
+  A high-latency control-store link is not measured because the node
+  binary only runs the file control store. UDP blocked between peer
+  clusters needs the fallback of M6-07, so its metric
+  (`skys3_flush_transport`) is listed as planned for M6-07. The gateway
+  exports no S3 request or error metrics, so the `503`s of a failover, and
+  reads of evicted data failing during a remote outage, are not counted;
+  the coverage table says so.
+- **No YAML parser in the tree, and no `promtool`.** `serde_yaml` is
+  deprecated by its author, and `serde_yml` is unsound (RUSTSEC-2025-0068,
+  which `cargo deny` rejects), so the rules test uses
+  `yaml-rust2` 0.13 with default features off (a dev-dependency of `skys3`;
+  it adds `arraydeque` and `hashlink` and no duplicate versions).
+  `promtool` is not installed, and was not installed: the test parses the
+  rules, checks each rule's fields against the reference's alert table, and
+  extracts the metric names of each PromQL expression with a small scanner
+  (strings, label matchers, ranges, functions, aggregation operators, and
+  modifier label lists removed), but it does not check PromQL syntax.
+- **Where the files live.** The rules and the dashboard are under `deploy/`
+  (`deploy/prometheus/`, `deploy/grafana/`), not `docs/`: they are
+  configuration installed as is. The plan's repository layout lists the new
+  directory.
+
+### M7-05 Runbooks
+
+- **A SkyS3 node cannot be another node's S3 REST target.** The drills were
+  meant to run two binaries, one the remote target of the other. Every
+  flush failed with `400 InvalidArgument: x-amz-meta-skys3-wid is reserved
+  for SkyS3's write identity`: a gateway refuses the write-identity
+  metadata from clients, and every S3 REST flush sends it. So a SkyS3
+  cluster reached over S3 REST, the fallback of `target_transport = "auto"`
+  when UDP is blocked (design sections 7.8 and 13), fails every flush as
+  the code stands. Left for plan M6-07, which builds the fallback, and
+  listed in the runbooks' open points. The flush and conflict drills run
+  the node's flush service, metrics, and admin API in process over a
+  simulated remote whose link an outage drops, as the M4-06 conflict test
+  does.
+- **The file control store does not come back by itself after a failed
+  write.** It answers reads from memory, so a store whose directory goes
+  away under a running node is noticed only at the next write, which fails
+  and makes the store refuse every later request until it is opened again.
+  The node reopens only a store it could not open, so it needs a restart
+  once the directory is back, although design section 6.2 has it use the
+  store "once it answers". The CreateBucket that hit the failure answered
+  `500 InternalError` ("The cluster's control store failed"), not the
+  `503` the design gives a node that runs from its copy. Both are
+  documented in the runbook and its open points rather than changed here,
+  since the node's control-store loop is shared with work in flight.
+- **An outage that starts after startup shows only in the last-success
+  gauge.** `skys3_control_store_live` stays 1 through it (as M7-04 found),
+  so the runbook diagnoses it from
+  `skys3_control_store_last_success_timestamp_seconds`, and the drill checks
+  that the gauge stops and resumes.
+- **Drilling a disk failure without privileges.** A sync cannot be made to
+  fail on a real file system without root, and the node uses its real disk.
+  The drill moves a disk's directory away under a running node with small
+  segments, so the next segment cannot be created: the node takes the disk
+  out of service, and cannot write the fence into the missing directory,
+  which it logs. The fenced start is drilled by writing the fence with the
+  node's own `skys3::datadir::fence`. A review found that the drill first
+  moved a fixed disk away, but a bucket's random ID places its shards on
+  the disks by hash, so in about one run in sixteen every shard was on the
+  other disk and the drill timed out. It now computes the placement as
+  `ShardSet::disk_of` does and moves the disk that holds the most of the
+  bucket's shards.
+- **Low disk space, for real.** The drill writes 256 MiB of ballast, sets
+  `disk_min_free_bytes` to half of it above the free space left, and removes
+  the ballast: the node admits writes again within a second, as the runbook
+  says, with 128 MiB of slack either way for other writers on the file
+  system. It skips itself on a file system with less than 1 GiB free.
+- **Most multi-node runbooks cannot be drilled on the binary.** Replication,
+  the coordinator, encoding and repair, the peer transport, and the etcd and
+  S3 control stores do not run in the node binary. Those runbooks cite the
+  simulation scenarios that exercise the automatic recovery they rely on
+  (all 23 cited scenarios pass at the default seed count); no new scenario
+  was added, so the simulation job's time is unchanged. etcd majority loss
+  is not drilled at all: CI's etcd job runs a single member.
+- **Keeping the runbooks honest.** A test next to the metrics reference
+  tests (`crates/skys3/src/metrics/runbooks.rs`) checks that every alert's
+  anchor is a heading (computed as GitHub computes anchors), that the
+  index lists every row of design section 13 and every item of section 6.9
+  in order, that every runbook has its parts and a drill row, that every
+  drill names a test function that exists, and that every metric the
+  runbooks name is in the metrics reference.
+
+### M7-08 Security review
+
+- **The review is a document.** `docs/skys3-security-review.md` has one
+  row per claim of design section 12 and per item of the plan entry, the
+  internal paths with how each authenticates, 0-RTT on every QUIC and TLS
+  endpoint, secrets, input bounds, the dependency audit, and the tracked
+  findings, written for the issues the orchestrator opens.
+- **Most internal paths are not in the binary yet.** Replication,
+  routing, the coordinator, and fragment transfer run over `skys3-net`'s
+  mutual TLS in the libraries and the simulation, but the node binary
+  binds no intra-cluster listener, and it refuses the S3 and etcd control
+  stores. Those rows are "not applicable yet", judged on the library code
+  and its tests. Only the peer QUIC endpoint, the peer S3 fallback, the
+  file control store, the gateway, and the admin listener run in the
+  binary.
+- **The admin token's equality was not constant-time.** `AdminToken`
+  derived `PartialEq`, so `==` compared the token byte by byte, and its
+  own `matches` was a hand-written fold that the optimizer may shorten.
+  Both now call `aws-lc-rs`'s `verify_slices_are_equal`, as SigV4 and STS
+  do, so `skys3-obs` gains `aws-lc-rs` (already in every node build) and
+  `zeroize`, and the token and its file buffer are zeroed on drop.
+- **The control-prefix overlap check missed other AWS regions.** It ran
+  only when the target's failure scope equalled the control store's, but
+  AWS bucket names are global: the control bucket named through another
+  region's endpoint, or the global one, passed, and that target's
+  credential would reach the registers. The overlap check now treats every
+  AWS endpoint of one partition as one bucket namespace
+  (`bucket_namespace`), while the correlation check still compares
+  regions. Recorded in design §6.1.
+- **AWS bucket names are global only within a partition (review).** The
+  first fix folded every `amazonaws.com` endpoint into one namespace, but
+  did not recognize `amazonaws.com.cn`, which the remote client treats as
+  AWS: two China regions got unrelated `dns:` scopes, and the overlap
+  check was skipped for the same bucket. Bucket names are unique per
+  partition (`aws`, `aws-cn`, `aws-us-gov`), so a failure scope is now
+  `<partition>:<region>`, and GovCloud, whose host names end in
+  `amazonaws.com`, is its own partition, told apart by its `us-gov-`
+  regions. `skys3_types::aws` holds the one definition of AWS host names
+  and their partition and region, used by the configuration checks and by
+  `AwsS3`'s addressing; both crates already depend on `skys3-types`.
+- **"Reads at most 64 KiB" was not enforced.** The descriptor fetch asks
+  for a range, but `AwsS3::get_object` buffered whatever body came back,
+  so a store that ignores `Range` could make a source buffer any size.
+  A ranged read now refuses a `Content-Length` longer than its range can
+  select before reading the body (`ByteRange::max_len`). Recorded in
+  §7.8. Unranged reads (snapshots, S3 control registers) stay unbounded,
+  tracked as T4 and T5.
+- **Intra-cluster TLS had no test of its "no resumption" claim.** The
+  peer transport tests 0-RTT directly; `skys3-net` only set the options.
+  A raw client with a ticket store now reads a frame after its handshake
+  with a node and must have received no ticket; with the server's ticket
+  settings removed it receives two. Early data is now refused explicitly
+  too. §12 now says that a node issues no tickets.
+- **§12 promised versioning without saying who checks it.** Nothing in
+  the code reads the control bucket's versioning, and the least-privilege
+  credential of §6.1 could not (`s3:GetBucketVersioning`). §12 now says
+  what SkyS3 enforces (prefix-only keys, no overlapping target) and that
+  credential scope and versioning are the operator's. A startup check is
+  tracked (T8).
+- **The four known items still hold.** The file control store is not
+  reopened after a failed write, bucket changes answer `500` when it
+  fails, a rollback is detected by generation alone, and the gateway
+  exports no request metrics: each verified against the code and tracked
+  (K1 to K4).
+- **No `cargo audit`.** It is not installed; `cargo deny check
+  advisories` reads the same RustSec database and passes with no ignored
+  advisory.
+- **No new fuzz target or simulation scenario.** The fixes add no parser
+  (the ranged-read check compares a header the SDK already parsed), and
+  change no behavior the simulation exercises (it uses no `AwsS3`, and
+  the TLS options made explicit were the defaults), so the 256-seed
+  `harness` run is the only simulation run.

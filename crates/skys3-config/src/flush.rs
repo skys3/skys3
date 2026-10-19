@@ -1,5 +1,7 @@
 //! `[flush]`: write-back flushing (§7).
 
+use std::time::Duration;
+
 use serde::Deserialize;
 
 use crate::error::Checker;
@@ -37,6 +39,10 @@ pub enum ConflictPolicy {
 pub struct FlushConfig {
     /// `ack_policy`: the default for every bucket (§7.5).
     pub ack_policy: AckPolicy,
+    /// `write_through_timeout_seconds`: how long a write to a
+    /// `write_through` bucket waits for the remote flush before it is
+    /// answered `503 SlowDown` (§7.5).
+    pub write_through_timeout_seconds: u64,
     /// `flush_min_concurrency_per_shard`: the floor of adaptive flush
     /// concurrency (§7.7).
     pub flush_min_concurrency_per_shard: u32,
@@ -68,6 +74,7 @@ impl Default for FlushConfig {
     fn default() -> Self {
         Self {
             ack_policy: AckPolicy::Local,
+            write_through_timeout_seconds: 30,
             flush_min_concurrency_per_shard: 4,
             flush_max_concurrency_per_shard: 64,
             flush_max_inflight_bytes_per_target: GIB,
@@ -81,6 +88,13 @@ impl Default for FlushConfig {
     }
 }
 
+crate::durations! {
+    FlushConfig {
+        /// `write_through_timeout_seconds` as a duration.
+        write_through_timeout => write_through_timeout_seconds, Duration::from_secs;
+    }
+}
+
 impl FlushConfig {
     /// The smallest part S3 accepts in a multipart upload, except the last.
     pub const MIN_PART_BYTES: u64 = 5 * MIB;
@@ -88,6 +102,10 @@ impl FlushConfig {
     pub const MAX_PART_BYTES: u64 = 5 * GIB;
 
     pub(crate) fn check(&self, checker: &mut Checker) {
+        checker.nonzero(
+            "flush.write_through_timeout_seconds",
+            self.write_through_timeout_seconds,
+        );
         checker.nonzero(
             "flush.flush_min_concurrency_per_shard",
             self.flush_min_concurrency_per_shard.into(),

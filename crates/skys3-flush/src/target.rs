@@ -1,20 +1,24 @@
 //! What every shard flusher of one remote target shares: the store, the
-//! preconditions it honors, and the settings.
+//! preconditions it honors, the settings, and the window and byte bound of
+//! its requests in flight (§7.7).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use skys3_config::FlushConfig;
+use skys3_config::{ConflictPolicy, FlushConfig, PeeringConfig};
 use skys3_io::{SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::UploadId;
-use skys3_remote::probe::ConditionalWrites;
-use skys3_types::{ClusterId, EpochSeq, WriteIdentity};
+use skys3_remote::probe::{ConditionalWrites, CopySupport};
+use skys3_types::{BucketId, ClusterId, EpochSeq, WriteIdentity};
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+use crate::concurrency::{ConcurrencyBug, ConcurrencyStatus, Membership, Paced, Window, hooks};
 use crate::metrics::Counters;
+use crate::peer::{Native, PeerLink};
 
 /// The most abandoned remote uploads a target keeps to abort; beyond it,
 /// they are left to the remote bucket's lifecycle rule (§7.3).
@@ -26,14 +30,18 @@ type Orphans = VecDeque<(String, UploadId)>;
 /// How a shard flusher paces itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushSettings {
-    /// Keys flushed at once per shard. Fixed at
-    /// `flush_min_concurrency_per_shard` until adaptive concurrency
-    /// (plan M4-10) moves it between that and
-    /// `flush_max_concurrency_per_shard` (§7.7).
-    pub concurrency: usize,
+    /// `flush_min_concurrency_per_shard`: the least requests per shard the
+    /// adaptive window of a target allows in flight (§7.7).
+    pub min_concurrency: u32,
+    /// `flush_max_concurrency_per_shard`: the most requests per shard the
+    /// window allows, and the most keys, and parts of streamed uploads,
+    /// one shard flushes at once. Equal bounds fix the window.
+    pub max_concurrency: u32,
     /// `flush_max_inflight_bytes_per_target`: the bytes all flushers of a
-    /// target hold in memory for requests at once. A larger object takes
-    /// the whole budget.
+    /// target hold in memory for requests at once: a whole object's body
+    /// for a single PUT, and a part's for each part of a multipart or
+    /// streamed upload in flight, from reading it until its answer. A
+    /// larger body takes the whole budget.
     pub max_inflight_bytes: u64,
     /// `import_max_keys_per_second`: the most remote keys a bucket's
     /// namespace import lists a second (§9.1).
@@ -50,6 +58,23 @@ pub struct FlushSettings {
     pub min_backoff: Duration,
     /// The longest delay between retries of a key; delays double up to it.
     pub max_backoff: Duration,
+    /// `extent_bytes`: the size of the `EXTENT` records a read-through
+    /// fill commits (§9.2), as a PUT's body is committed.
+    pub extent_bytes: u64,
+    /// Whether multipart uploads and large single PUTs stream to the
+    /// remote while the client uploads (§7.3). Without it, an object is
+    /// sent only once it commits; remote uploads streamed earlier are still
+    /// completed or aborted.
+    pub streaming: bool,
+    /// `flush_part_bytes`: the part size of the remote multipart upload a
+    /// streamed single PUT is sent as (§7.3).
+    pub part_bytes: u64,
+    /// How long after the last announcement of a streamed single PUT's body
+    /// its `PUT` may still commit: `peer_staging_ttl_seconds`, twice the
+    /// gateway's deadline for a body (§10.3), which leaves room for clock
+    /// drift and the commit itself. A remote upload whose `PUT` has not
+    /// committed by then never completes, and is aborted.
+    pub body_timeout: Duration,
 }
 
 impl FlushSettings {
@@ -57,11 +82,14 @@ impl FlushSettings {
     #[must_use]
     pub fn from_config(config: &FlushConfig) -> Self {
         Self {
-            concurrency: usize::try_from(config.flush_min_concurrency_per_shard)
-                .unwrap_or(usize::MAX)
+            min_concurrency: config.flush_min_concurrency_per_shard.max(1),
+            max_concurrency: config
+                .flush_max_concurrency_per_shard
+                .max(config.flush_min_concurrency_per_shard)
                 .max(1),
             max_inflight_bytes: config.flush_max_inflight_bytes_per_target,
             import_keys_per_second: config.import_max_keys_per_second,
+            part_bytes: config.flush_part_bytes,
             ..Self::default()
         }
     }
@@ -79,20 +107,73 @@ impl FlushSettings {
 impl Default for FlushSettings {
     fn default() -> Self {
         Self {
-            concurrency: 4,
-            max_inflight_bytes: 1 << 30,
+            min_concurrency: FlushConfig::default().flush_min_concurrency_per_shard,
+            max_concurrency: FlushConfig::default().flush_max_concurrency_per_shard,
+            max_inflight_bytes: FlushConfig::default().flush_max_inflight_bytes_per_target,
             import_keys_per_second: FlushConfig::default().import_max_keys_per_second,
             import_page_keys: crate::IMPORT_PAGE_KEYS,
             import_streams: 1,
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
+            extent_bytes: 1 << 20,
+            streaming: true,
+            part_bytes: FlushConfig::default().flush_part_bytes,
+            body_timeout: PeeringConfig::default().peer_staging_ttl(),
         }
+    }
+}
+
+/// Where a target's copies find their sources for a server-side copy
+/// (§7.2, §11): the buckets whose objects the target's remote bucket
+/// holds, each with the key prefix it flushes under.
+///
+/// A bucket is listed only if it flushes to the same remote bucket, on the
+/// same endpoint, with the same credentials, as the target: then a
+/// `CopyObject` within that remote bucket reaches the source's object.
+/// The [`FlushService`](crate::FlushService) keeps one list per remote
+/// bucket, updated as buckets come and go; clones share it. A version
+/// copied from a bucket that is not listed is sent as a regular upload.
+#[derive(Debug, Clone, Default)]
+pub struct CopySources(Arc<Mutex<BTreeMap<BucketId, String>>>);
+
+impl CopySources {
+    /// A list without buckets: every copy is sent as a regular upload.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lists `bucket`, whose objects are under `prefix` in the remote
+    /// bucket.
+    #[must_use]
+    pub fn with(self, bucket: BucketId, prefix: impl Into<String>) -> Self {
+        self.lock().insert(bucket, prefix.into());
+        self
+    }
+
+    /// Replaces the list.
+    pub fn set(&self, buckets: BTreeMap<BucketId, String>) {
+        *self.lock() = buckets;
+    }
+
+    /// The prefix `bucket`'s objects are under, if it is listed.
+    #[must_use]
+    pub fn prefix(&self, bucket: &BucketId) -> Option<String> {
+        self.lock().get(bucket).cloned()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<BucketId, String>> {
+        // Every update is a single step.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 /// One remote target as its shard flushers see it.
 pub struct Target<S> {
-    pub(crate) store: Arc<S>,
+    /// The store, each request through the window.
+    pub(crate) store: Paced<S>,
+    /// The requests in flight (§7.7).
+    window: Arc<Window>,
     pub(crate) prefix: String,
     pub(crate) writes: ConditionalWrites,
     pub(crate) cluster: ClusterId,
@@ -102,11 +183,23 @@ pub struct Target<S> {
     pub(crate) import: bool,
     pub(crate) wall: Arc<dyn WallClock>,
     pub(crate) counters: Counters,
+    /// What a flush that finds an out-of-band write does (§7.2).
+    pub(crate) conflict_policy: ConflictPolicy,
+    /// Where copies find their sources for a server-side copy.
+    pub(crate) copy_sources: CopySources,
+    /// The server-side copy support the probe found: `writes.copy_object`
+    /// until a later probe of copies alone replaces it.
+    copies: Mutex<CopySupport>,
     /// The in-flight budget, in KiB.
     inflight: Semaphore,
     inflight_kib: u32,
+    /// The bytes reserved from it.
+    inflight_bytes: AtomicU64,
     /// Remote multipart uploads that flushes left open, oldest first.
     orphans: Mutex<Orphans>,
+    /// For a SkyS3 peer reached over the native protocol (§7.8), how; its
+    /// flushes then send no S3 request.
+    pub(crate) native: Option<Native>,
 }
 
 impl<S> fmt::Debug for Target<S> {
@@ -123,8 +216,8 @@ impl<S> Target<S> {
     /// A target: `store`, under the key prefix `prefix` (empty for a whole
     /// bucket), honoring the preconditions in `writes` (from the
     /// capability probe), written by `cluster`. Every key is taken as
-    /// imported, ages are measured on the system clock, and nothing is
-    /// counted until the `with_*` methods say otherwise.
+    /// imported, ages are measured on the system clock, conflicts are held,
+    /// and nothing is counted until the `with_*` methods say otherwise.
     pub fn new(
         store: Arc<S>,
         prefix: impl Into<String>,
@@ -135,19 +228,77 @@ impl<S> Target<S> {
         let inflight_kib = u32::try_from(settings.max_inflight_bytes.div_ceil(1024))
             .unwrap_or(u32::MAX)
             .clamp(1, u32::try_from(Semaphore::MAX_PERMITS).unwrap_or(u32::MAX));
+        let copies = Mutex::new(writes.copy_object);
+        let window = Arc::new(Window::new((
+            settings.min_concurrency,
+            settings.max_concurrency,
+        )));
+        let counters = Counters::default();
+        window.count_throttles(counters.throttles.clone());
         Self {
-            store,
+            store: Paced::new(store, Arc::clone(&window)),
+            window,
             prefix: prefix.into(),
             writes,
             cluster,
             settings,
             import: false,
             wall: Arc::new(SystemWallClock),
-            counters: Counters::default(),
+            counters,
+            conflict_policy: ConflictPolicy::Hold,
+            copy_sources: CopySources::new(),
+            copies,
             inflight: Semaphore::new(inflight_kib as usize),
             inflight_kib,
+            inflight_bytes: AtomicU64::new(0),
             orphans: Mutex::default(),
+            native: None,
         }
+    }
+
+    /// Flushes to a SkyS3 peer over the native protocol (§7.8) instead of
+    /// the store: `COMMIT`s reach the destination bucket `bucket` through
+    /// `link`, large objects staged in `DATA` frames of `frame_bytes`
+    /// (`peer_frame_bytes`), and each stream must make progress within
+    /// `timeout`. Starts the target's batcher on the current Tokio runtime.
+    #[must_use]
+    pub fn with_peer(
+        mut self,
+        link: Arc<dyn PeerLink>,
+        bucket: skys3_types::BucketName,
+        frame_bytes: u64,
+        timeout: Duration,
+    ) -> Self {
+        let stamp = crate::peer::Stamp::new(Arc::clone(&self.wall), timeout);
+        self.native = Some(Native::new(link, bucket, frame_bytes, timeout, stamp));
+        self
+    }
+
+    /// Whether the target is a SkyS3 peer reached over the native protocol.
+    pub fn is_native(&self) -> bool {
+        self.native.is_some()
+    }
+
+    pub(crate) fn with_native(mut self, native: Option<Native>) -> Self {
+        self.native = native;
+        self
+    }
+
+    /// Stamps every S3 write that publishes or deletes a version with its
+    /// apply-by time, as the S3 writes to a target that may be a SkyS3
+    /// peer must carry it (§7.8). Such a target then gets no `PutObject`
+    /// body over [`MAX_BOUNDED_BYTES`](crate::MAX_BOUNDED_BYTES), which a
+    /// remote multipart upload sends instead, and no server-side copy.
+    #[must_use]
+    pub fn with_apply_by(mut self, window: Duration) -> Self {
+        let stamp = crate::peer::Stamp::new(Arc::clone(&self.wall), window);
+        self.store.stamp_with(stamp);
+        self
+    }
+
+    /// Whether S3 writes carry apply-by times ([`Target::with_apply_by`]).
+    pub(crate) fn stamped(&self) -> bool {
+        self.store.stamped()
     }
 
     /// Makes the flushers follow the bucket's namespace import (§9.1): a
@@ -178,13 +329,75 @@ impl<S> Target<S> {
     /// Sets the counters flushes, retries, and conflicts are counted in.
     #[must_use]
     pub fn with_counters(mut self, counters: Counters) -> Self {
+        self.window.count_throttles(counters.throttles.clone());
         self.counters = counters;
         self
     }
 
-    /// The preconditions the target honors.
+    /// Sets what a flush that finds an out-of-band write does (§7.2):
+    /// `hold` the key, `overwrite` the remote's write, or `discard_local`,
+    /// adopting the remote's write in place of the local version. The
+    /// caller decides whether the bucket may discard
+    /// ([`FlushService`](crate::FlushService) allows it only for a
+    /// `write_back` bucket whose own table opted in).
+    #[must_use]
+    pub fn with_conflict_policy(mut self, policy: ConflictPolicy) -> Self {
+        self.conflict_policy = policy;
+        self
+    }
+
+    /// Sets where copies find their sources: a copy of a clean version of
+    /// a bucket in `sources` is sent as a server-side `CopyObject`, if the
+    /// probe found the target supports it (§7.2, §11). Without it, every
+    /// copy is sent as a regular upload.
+    #[must_use]
+    pub fn with_copy_sources(mut self, sources: CopySources) -> Self {
+        self.copy_sources = sources;
+        self
+    }
+
+    /// What a flush that finds an out-of-band write does.
+    pub fn conflict_policy(&self) -> ConflictPolicy {
+        self.conflict_policy
+    }
+
+    /// The preconditions the target honors. Its `copy_object` is the
+    /// copy support the target was built with; [`Target::copy_support`]
+    /// is the current one.
     pub fn writes(&self) -> &ConditionalWrites {
         &self.writes
+    }
+
+    /// What the target supports of a server-side copy (§11): what it was
+    /// built with, until the flush service's probe of copies alone
+    /// replaces it.
+    pub fn copy_support(&self) -> CopySupport {
+        *self.copies.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces what the target supports of a server-side copy.
+    pub(crate) fn set_copy_support(&self, support: CopySupport) {
+        *self.copies.lock().unwrap_or_else(PoisonError::into_inner) = support;
+    }
+
+    /// The counters its flushers count events in.
+    pub fn counters(&self) -> &Counters {
+        &self.counters
+    }
+
+    /// The window of requests in flight to the target, and the bytes held
+    /// for them (§7.7).
+    pub fn concurrency(&self) -> ConcurrencyStatus {
+        ConcurrencyStatus {
+            inflight_bytes: self.inflight_bytes.load(Ordering::Relaxed),
+            ..self.window.status()
+        }
+    }
+
+    /// Counts a shard's flusher among those sending to the target, which
+    /// widens the window's bounds, until the membership is dropped.
+    pub(crate) fn join(&self) -> Membership {
+        self.window.join()
     }
 
     /// How many remote multipart uploads flushes left open, because their
@@ -227,18 +440,41 @@ impl<S> Target<S> {
     }
 
     /// Waits until `size` bytes fit the target's in-flight budget, and
-    /// holds them until the permit is dropped.
-    pub(crate) async fn reserve(&self, size: u64) -> Option<SemaphorePermit<'_>> {
+    /// holds them until the reservation is dropped.
+    pub(crate) async fn reserve(&self, size: u64) -> Reservation<'_> {
         let kib = u32::try_from(size.div_ceil(1024))
             .unwrap_or(u32::MAX)
             .clamp(1, self.inflight_kib);
-        self.inflight.acquire_many(kib).await.ok()
+        let permit = if hooks::bug() == ConcurrencyBug::IgnoresInflightBytes {
+            None
+        } else {
+            self.inflight.acquire_many(kib).await.ok()
+        };
+        self.inflight_bytes.fetch_add(size, Ordering::Relaxed);
+        Reservation {
+            _permit: permit,
+            bytes: size,
+            counted: &self.inflight_bytes,
+        }
+    }
+}
+
+/// Bytes held within a target's in-flight budget, until dropped.
+pub(crate) struct Reservation<'t> {
+    _permit: Option<SemaphorePermit<'t>>,
+    bytes: u64,
+    counted: &'t AtomicU64,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.counted.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use skys3_remote::probe::{OperationSupport, PreconditionSupport};
+    use skys3_remote::probe::{CopySupport, OperationSupport, PreconditionSupport};
 
     use super::*;
 
@@ -251,6 +487,7 @@ mod tests {
             put_object: honored,
             complete_multipart_upload: honored,
             delete_object: honored,
+            copy_object: CopySupport::FULL,
         };
         let cluster = ClusterId::new("c-test").unwrap();
         Target::new(
@@ -277,5 +514,17 @@ mod tests {
         );
         assert_eq!(target.orphaned_uploads(), MAX_ORPHANS - 1);
         assert!(format!("{target:?}").contains("p/"));
+    }
+
+    #[test]
+    fn copy_sources_are_shared_and_replaced() {
+        let (a, b) = (BucketId::new("b-a").unwrap(), BucketId::new("b-b").unwrap());
+        let sources = CopySources::new().with(a.clone(), "a/");
+        let target = target().with_copy_sources(sources.clone());
+        assert_eq!(target.copy_sources.prefix(&a).as_deref(), Some("a/"));
+        assert_eq!(target.copy_sources.prefix(&b), None);
+        sources.set(BTreeMap::from([(b.clone(), String::new())]));
+        assert_eq!(target.copy_sources.prefix(&a), None);
+        assert_eq!(target.copy_sources.prefix(&b).as_deref(), Some(""));
     }
 }

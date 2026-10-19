@@ -38,13 +38,13 @@ pub mod model;
 pub mod probe;
 mod store;
 
-pub use error::{S3Error, S3ErrorKind};
+pub use error::{S3Error, S3ErrorKind, THROTTLE_CODES};
 pub use metadata::{MetadataError, UserMetadata};
 pub use model::{
     AbortMultipartUpload, ByteRange, CompleteMultipartUpload, CompletedPart, CopyObject,
     CreateMultipartUpload, DeleteObject, DeleteOutput, GetObject, GetOutput, HeadObject,
     ListObjectsV2, ListObjectsV2Output, ListParts, ListPartsOutput, ListedObject, ListedPart,
     MAX_KEY_LEN, MAX_LIST_KEYS, MAX_LIST_PARTS, MetadataDirective, ObjectInfo, PART_NUMBERS,
-    PutObject, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
+    PutObject, TaggingDirective, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
 };
 pub use store::{ObjectStore, S3Result};

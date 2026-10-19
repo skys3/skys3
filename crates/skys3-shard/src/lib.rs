@@ -7,11 +7,14 @@
 //! - [`StateMachine`]: the deterministic `apply(record)`. It moves entries
 //!   through the object states of §4.2 and decides the conditional
 //!   records: `IMPORT` only for a key with no entry (§9.1), `ADOPT` only
-//!   for an entry still clean at the named `seq` (§9.2), and `FLUSHED`,
+//!   for an entry still at the named `seq`, clean after a fill (§9.2) or
+//!   dirty when a conflict policy discards it (§7.2), and `FLUSHED`,
 //!   which cleans an entry only at its current `seq` (§7.1). It depends on
 //!   nothing but the record and the index, so every replica, and replay
 //!   after a crash, reaches the same index. It plugs into the index as its
-//!   [`Applier`](skys3_index::Applier).
+//!   [`Applier`](skys3_index::Applier). It also applies `EC_PUBLISH`,
+//!   which marks an object version coded, only if the version is still
+//!   the key's current one (§8.4).
 //! - [`Shard`]: one shard replica with `replicas = 1`. It gives each record
 //!   the shard's next position `(epoch, seq)`, commits it once the log has
 //!   made it durable, and applies records in position order, whatever order
@@ -19,6 +22,23 @@
 //!   is deleted (§4.1).
 //! - [`ShardSet`]: the shards open on a node, as the gateway opens, seals,
 //!   and drops them.
+//! - [`cache`]: the node-local transitions between clean and evicted, which
+//!   no record makes: a read-through fill ([`Shard::fill`]) and eviction
+//!   ([`Shard::evict`]); and [`CleanCache`], which keeps clean payload on up
+//!   to `clean_copies` replicas and evicts it least recently used first
+//!   within the node's bounds (§9.3).
+//! - [`compaction`]: [`Compactor`] reclaims released log segments whose
+//!   live ratio is low, copying what the index and the shard's members
+//!   still need, and evicting cold clean payload instead of copying it
+//!   (§10.3).
+//! - [`lifecycle`]: a `local` bucket's lifecycle rules, evaluated by each
+//!   shard primary over its index: expirations commit as ordinary
+//!   conditional deletes, and abandoned multipart uploads are aborted
+//!   (§8.7).
+//! - [`reads`]: read plans, which a primary answers a GET with, and the
+//!   read registrations of a node's replicas as holders of the bytes
+//!   (§8.7, §9.2), which pin payload against compaction while a gateway
+//!   streams it.
 //!
 //! Replication (M2) runs the same state machine on every member; only the
 //! commit rule changes, and a primary serves reads only while every member
@@ -52,21 +72,38 @@
 //! ```
 
 mod ack;
+pub mod cache;
+pub mod compaction;
 mod error;
+mod flush_wait;
 mod leader;
 mod lease;
+pub mod lifecycle;
 pub mod lineage;
 mod machine;
 mod multipart;
 mod pipeline;
+pub mod reads;
 pub mod replication;
+mod seeded;
 mod set;
 mod shard;
 
 pub use ack::{AckMode, AckTimeout};
+pub use cache::{CacheMetrics, CacheRefusal, CacheSettings, CacheUsage, CleanCache};
+pub use compaction::{
+    CompactionError, CompactionMetrics, CompactionReport, CompactionSettings, Compactor,
+};
 pub use error::ShardError;
+pub use flush_wait::{FlushState, FlushWait, FlushWaiter};
 pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
+pub use reads::{ReadCounts, ReadId, ReadPlan, ReadSettings, Reads, Registered};
+#[doc(hidden)]
+pub use seeded::SeededBug;
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub use seeded::seed_bug;
 pub use set::ShardSet;
-pub use shard::{Change, Committed, Role, Shard, ShardSummary};
+pub use shard::{Change, Committed, Role, Shard, ShardSummary, StreamedBody};

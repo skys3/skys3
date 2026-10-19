@@ -14,19 +14,23 @@
 //! every position it may name, and the replica sequences it at the next
 //! position of its own log. The reply's header says
 //! whether the replica served the request, and its payload holds the
-//! answer: [`Answer`] for a served request. Both ends decode frames from
+//! answer: [`Answer`] for a served request. A read registration carries
+//! the plan's layout as its payload instead, a [`Layout`]. Both ends decode frames from
 //! authenticated but untrusted peers, so every field is checked before it
 //! is used.
+
+use std::time::Duration;
 
 use bytes::Bytes;
 use prost::{Message, Oneof};
 use skys3_index::codec;
-use skys3_index::{Entry, EntryState, ListItem, ListPage, ListQuery};
-use skys3_log::record::ExtentRef;
+use skys3_index::{Entry, EntryState, ListItem, ListPage, ListQuery, Upload};
+use skys3_log::record::{ExtentRef, MAX_EXTENTS, MAX_KEY_LEN};
 use skys3_log::{LogRecord, RecordBody};
 use skys3_net::{Frame, Header, MessageKind};
+use skys3_shard::{FlushState, ReadPlan, Registered, StreamedBody};
 use skys3_types::{
-    BucketId, ClusterId, Epoch, EpochSeq, RegisterDocument, Seq, ShardConfig, ShardId,
+    BucketId, ClusterId, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig, ShardId,
 };
 
 use super::{Reply, Request, Response};
@@ -35,6 +39,10 @@ use crate::shard::{ShardError, ShardRef, ShardSummary};
 
 /// The longest refusal reason a reply carries, in bytes.
 const MAX_REASON_LEN: usize = 1024;
+
+/// The longest a forwarded flush wait may ask its replica to wait. A
+/// gateway asks for less than its request timeout, and asks again.
+pub const MAX_FLUSH_WAIT: Duration = Duration::from_secs(60);
 
 /// Gateway to replica: one call of the gateway's shard interface.
 #[derive(Clone, PartialEq, Message)]
@@ -49,7 +57,10 @@ pub struct Forward {
     #[prost(uint64, tag = "3")]
     pub epoch: u64,
     /// The call.
-    #[prost(oneof = "Op", tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
+    #[prost(
+        oneof = "Op",
+        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+    )]
     pub op: Option<Op>,
 }
 
@@ -86,6 +97,102 @@ pub enum Op {
     /// Lift one seal.
     #[prost(bool, tag = "13")]
     Unseal(bool),
+    /// The read plan of this key.
+    #[prost(string, tag = "14")]
+    Plan(String),
+    /// Register a read of a version, whose plan's layout is the frame's
+    /// payload, a [`Layout`].
+    #[prost(message, tag = "15")]
+    Register(RegisterQuery),
+    /// Renew this registration.
+    #[prost(uint64, tag = "16")]
+    Renew(u64),
+    /// Release this registration.
+    #[prost(uint64, tag = "17")]
+    Release(u64),
+    /// The payload at a position for a registered read.
+    #[prost(message, tag = "18")]
+    Fetch(FetchQuery),
+    /// Announce more of a streamed single PUT's body.
+    #[prost(message, tag = "19")]
+    Announce(Announcement),
+    /// Wait for a version of a key to reach the remote target.
+    #[prost(message, tag = "20")]
+    Flushed(FlushQuery),
+}
+
+/// A write-through write's wait for its version's flush (design §7.5).
+#[derive(Clone, PartialEq, Message)]
+pub struct FlushQuery {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The version's position.
+    #[prost(message, optional, tag = "2")]
+    pub version: Option<Position>,
+    /// How long the replica may wait, in milliseconds: at most
+    /// [`MAX_FLUSH_WAIT`].
+    #[prost(uint64, tag = "3")]
+    pub wait_ms: u64,
+}
+
+/// More of a streamed single PUT's body (design §7.3).
+#[derive(Clone, PartialEq, Message)]
+pub struct Announcement {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The position of the body's `UPLOAD_BEGIN`.
+    #[prost(message, optional, tag = "2")]
+    pub upload: Option<Position>,
+    /// The metadata and tags the `PUT` will store, as the index encodes
+    /// an open upload's, whose other fields are unused.
+    #[prost(bytes = "vec", tag = "3")]
+    pub headers: Vec<u8>,
+    /// Applied extents of the body.
+    #[prost(message, repeated, tag = "4")]
+    pub extents: Vec<BodyExtent>,
+}
+
+/// An extent of a streamed body.
+#[derive(Clone, PartialEq, Message)]
+pub struct BodyExtent {
+    /// Its offset in the body.
+    #[prost(uint64, tag = "1")]
+    pub offset: u64,
+    /// The `EXTENT` record.
+    #[prost(message, optional, tag = "2")]
+    pub extent: Option<ExtentAnswer>,
+}
+
+/// A read registration of a key's version.
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisterQuery {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The version's position.
+    #[prost(message, optional, tag = "2")]
+    pub version: Option<Position>,
+}
+
+/// A fetch under a registered read.
+#[derive(Clone, PartialEq, Message)]
+pub struct FetchQuery {
+    /// The registration.
+    #[prost(uint64, tag = "1")]
+    pub read: u64,
+    /// The payload's position.
+    #[prost(message, optional, tag = "2")]
+    pub position: Option<Position>,
+}
+
+/// A version's bytes as log positions, in body order.
+#[derive(Clone, PartialEq, Message)]
+pub struct Layout {
+    /// The extents.
+    #[prost(message, repeated, tag = "1")]
+    pub extents: Vec<ExtentAnswer>,
 }
 
 /// A log position.
@@ -185,6 +292,10 @@ pub struct Condition {
     /// The cluster of a peer write's destination: this cluster.
     #[prost(string, tag = "5")]
     pub cluster: String,
+    /// A peer cluster's write's apply-by time, in milliseconds since the
+    /// Unix epoch, with any kind (design §7.8).
+    #[prost(uint64, optional, tag = "6")]
+    pub apply_by_ms: Option<u64>,
 }
 
 /// Replica to gateway: whether the replica served a [`Forward`].
@@ -230,7 +341,10 @@ pub const OUTCOME_NOT_ACKNOWLEDGED: u32 = 7;
 #[derive(Clone, PartialEq, Message)]
 pub struct Answer {
     /// The answer, by the call it answers.
-    #[prost(oneof = "Result", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(
+        oneof = "Result",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16"
+    )]
     pub result: Option<Result>,
 }
 
@@ -267,6 +381,56 @@ pub enum Result {
     /// The seal was lifted.
     #[prost(bool, tag = "10")]
     Unsealed(bool),
+    /// A read plan.
+    #[prost(message, tag = "11")]
+    Plan(PlanAnswer),
+    /// A read registration, or that the holder does not hold the version.
+    #[prost(message, tag = "12")]
+    Registered(RegisteredAnswer),
+    /// Whether the registration was renewed.
+    #[prost(bool, tag = "13")]
+    Renewed(bool),
+    /// The registration was released.
+    #[prost(bool, tag = "14")]
+    Released(bool),
+    /// The announcement was passed on.
+    #[prost(bool, tag = "15")]
+    Announced(bool),
+    /// Where the version waited for is: see the `FLUSH_*` constants.
+    #[prost(uint32, tag = "16")]
+    Flushed(u32),
+}
+
+/// The remote holds the version waited for, or a later one.
+pub const FLUSH_FLUSHED: u32 = 0;
+/// The key is held in conflict.
+pub const FLUSH_CONFLICT: u32 = 1;
+/// Neither, within the wait.
+pub const FLUSH_PENDING: u32 = 2;
+
+/// A read plan.
+#[derive(Clone, PartialEq, Message)]
+pub struct PlanAnswer {
+    /// The encoded entry, empty for none.
+    #[prost(bytes = "vec", tag = "1")]
+    pub entry: Vec<u8>,
+    /// The version's layout.
+    #[prost(message, optional, tag = "2")]
+    pub layout: Option<Layout>,
+    /// The holders, by node ID.
+    #[prost(string, repeated, tag = "3")]
+    pub holders: Vec<String>,
+}
+
+/// A read registration.
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisteredAnswer {
+    /// The registration, absent if the holder does not hold the version.
+    #[prost(uint64, optional, tag = "1")]
+    pub read: Option<u64>,
+    /// Where the holder serves the version from.
+    #[prost(message, optional, tag = "2")]
+    pub layout: Option<Layout>,
 }
 
 /// A listing page.
@@ -436,19 +600,37 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
             limit: *limit as u64,
         }),
         Request::Payload(at) => Op::Payload(position(*at)),
+        Request::Plan { key } => Op::Plan(key.clone()),
+        Request::Register {
+            key,
+            version,
+            layout,
+        } => {
+            payload = Bytes::from(layout_of(layout).encode_to_vec());
+            Op::Register(RegisterQuery {
+                key: key.clone(),
+                version: Some(position(*version)),
+            })
+        }
+        Request::Renew(read) => Op::Renew(*read),
+        Request::Release(read) => Op::Release(*read),
+        Request::Fetch { read, position: at } => Op::Fetch(FetchQuery {
+            read: *read,
+            position: Some(position(*at)),
+        }),
         Request::AppendExtent(extent) => {
             payload = record(RecordBody::Extent(extent.clone()))?;
             Op::AppendExtent(true)
         }
+        Request::Announce(body) => Op::Announce(announcement(body)?),
+        Request::Flushed { key, version, wait } => Op::Flushed(FlushQuery {
+            key: key.clone(),
+            version: Some(position(*version)),
+            wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        }),
         Request::Write { body, condition } => {
             payload = record(body.clone())?;
-            Op::Write(match condition {
-                Precondition::None => condition_of(0, ""),
-                Precondition::Absent => condition_of(1, ""),
-                Precondition::Exists => condition_of(2, ""),
-                Precondition::Matches(etag) => condition_of(3, etag),
-                Precondition::Peer(peer) => peer_condition(peer),
-            })
+            Op::Write(encode_condition(condition))
         }
         Request::Seal => Op::Seal(true),
         Request::Unseal => Op::Unseal(true),
@@ -463,6 +645,24 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
         Header::new(MessageKind::Forward).with_body(forward.encode_to_vec()),
         payload,
     ))
+}
+
+/// The wire form of a write's precondition.
+fn encode_condition(condition: &Precondition) -> Condition {
+    match condition {
+        Precondition::None => condition_of(0, ""),
+        Precondition::Absent => condition_of(1, ""),
+        Precondition::Exists => condition_of(2, ""),
+        Precondition::Matches(etag) => condition_of(3, etag),
+        Precondition::Peer(peer) => peer_condition(peer),
+        Precondition::ApplyBy {
+            condition,
+            apply_by_ms,
+        } => Condition {
+            apply_by_ms: Some(*apply_by_ms),
+            ..encode_condition(condition)
+        },
+    }
 }
 
 fn condition_of(kind: u32, etag: &str) -> Condition {
@@ -485,6 +685,7 @@ fn peer_condition(peer: &PeerCondition) -> Condition {
         identity: peer.identity.to_string(),
         expected,
         cluster: peer.cluster.to_string(),
+        apply_by_ms: None,
     }
 }
 
@@ -496,6 +697,7 @@ fn decode_condition(condition: Condition, shard: &ShardRef) -> Decoded<Precondit
         identity,
         expected,
         cluster,
+        apply_by_ms,
     } = condition;
     let plain = identity.is_empty() && expected.is_empty() && cluster.is_empty();
     let peer = |expected| -> Decoded<Precondition> {
@@ -506,7 +708,7 @@ fn decode_condition(condition: Condition, shard: &ShardRef) -> Decoded<Precondit
             shard: shard.clone(),
         }))
     };
-    match (kind, etag.is_empty(), plain) {
+    let condition = match (kind, etag.is_empty(), plain) {
         (0, true, true) => Ok(Precondition::None),
         (1, true, true) => Ok(Precondition::Absent),
         (2, true, true) => Ok(Precondition::Exists),
@@ -517,7 +719,8 @@ fn decode_condition(condition: Condition, shard: &ShardRef) -> Decoded<Precondit
         )),
         (6, true, _) if expected.is_empty() => peer(skys3_peer::Precondition::Unconditional),
         _ => Err(format!("condition {kind}")),
-    }
+    }?;
+    Ok(condition.apply_by(apply_by_ms))
 }
 
 /// Decodes a forwarded request: its shard, the gateway's epoch, and the
@@ -582,22 +785,56 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
                 | RecordBody::Delete(_)
                 | RecordBody::Tags(_)
                 | RecordBody::Flushed(_)
-                | RecordBody::Import(_)
                 | RecordBody::ImportProgress(_)
-                | RecordBody::Adopt(_)
                 | RecordBody::MpuCreate(_)
                 | RecordBody::MpuPart(_)
                 | RecordBody::MpuComplete(_)
-                | RecordBody::MpuAbort(_)) => body,
+                | RecordBody::MpuAbort(_)
+                | RecordBody::UploadBegin(_)
+                // What a read records of a remote: lazily loaded metadata
+                // (§9.1), and the versions of an origin (§9.5).
+                | RecordBody::Import(_)
+                | RecordBody::Adopt(_)) => body,
                 other => return Err(format!("a write request carries a {:?}", other.kind())),
             },
             condition: decode_condition(condition, &shard)?,
         },
         Op::Seal(_) => Request::Seal,
         Op::Unseal(_) => Request::Unseal,
+        Op::Plan(key) => Request::Plan { key },
+        Op::Register(query) => Request::Register {
+            key: query.key,
+            version: epoch_seq(query.version)?,
+            layout: decode_layout(
+                Layout::decode(frame.payload.clone()).map_err(|error| error.to_string())?,
+            )?,
+        },
+        Op::Renew(read) => Request::Renew(read),
+        Op::Release(read) => Request::Release(read),
+        Op::Fetch(query) => Request::Fetch {
+            read: query.read,
+            position: epoch_seq(query.position)?,
+        },
+        Op::Announce(announced) => Request::Announce(decode_announcement(announced)?),
+        Op::Flushed(query) => {
+            if query.key.is_empty() || query.key.len() > MAX_KEY_LEN {
+                return Err(format!("a key of {} bytes", query.key.len()));
+            }
+            let wait = Duration::from_millis(query.wait_ms);
+            if wait > MAX_FLUSH_WAIT {
+                return Err(format!("a flush wait of {} ms", query.wait_ms));
+            }
+            Request::Flushed {
+                key: query.key,
+                version: epoch_seq(query.version)?,
+                wait,
+            }
+        }
     };
-    if !matches!(request, Request::AppendExtent(_) | Request::Write { .. })
-        && !frame.payload.is_empty()
+    if !matches!(
+        request,
+        Request::AppendExtent(_) | Request::Write { .. } | Request::Register { .. }
+    ) && !frame.payload.is_empty()
     {
         return Err("a request without a record carries a payload".to_owned());
     }
@@ -772,6 +1009,7 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
                     ConditionFailed::PreconditionFailed => 2,
                     ConditionFailed::NoSuchUpload => 3,
                     ConditionFailed::InvalidPart => 4,
+                    ConditionFailed::Expired => 5,
                 },
             },
         }),
@@ -780,6 +1018,31 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
             unflushed: summary.unflushed,
         }),
         Response::Unsealed => Result::Unsealed(true),
+        Response::Plan(plan) => Result::Plan(PlanAnswer {
+            entry: plan
+                .entry
+                .as_ref()
+                .map(|entry| encoded(codec::encode_entry(entry)))
+                .unwrap_or_default(),
+            layout: Some(layout_of(&plan.layout)),
+            holders: plan.holders.iter().map(ToString::to_string).collect(),
+        }),
+        Response::Registered(registered) => Result::Registered(match registered {
+            Some(registered) => RegisteredAnswer {
+                read: Some(registered.id),
+                layout: Some(layout_of(&registered.layout)),
+            },
+            None => RegisteredAnswer::default(),
+        }),
+        Response::Renewed(renewed) => Result::Renewed(*renewed),
+        Response::Released => Result::Released(true),
+        Response::Announced => Result::Announced(true),
+        Response::Flushed(state) => Result::Flushed(match state {
+            FlushState::Flushed => FLUSH_FLUSHED,
+            FlushState::Conflict => FLUSH_CONFLICT,
+            // A state added later is reported as not flushed yet.
+            _ => FLUSH_PENDING,
+        }),
     };
     match failed.into_inner() {
         Some(error) => Err(error),
@@ -905,6 +1168,7 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
             (None, 2) => Err(ConditionFailed::PreconditionFailed),
             (None, 3) => Err(ConditionFailed::NoSuchUpload),
             (None, 4) => Err(ConditionFailed::InvalidPart),
+            (None, 5) => Err(ConditionFailed::Expired),
             (_, failed) => return Err(format!("write outcome {failed}")),
         }),
         Result::Sealed(summary) => Response::Sealed(ShardSummary {
@@ -912,7 +1176,136 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
             unflushed: summary.unflushed,
         }),
         Result::Unsealed(_) => Response::Unsealed,
+        Result::Plan(plan) => {
+            let entry = if plan.entry.is_empty() {
+                None
+            } else {
+                Some(codec::decode_entry(&plan.entry).map_err(codec)?)
+            };
+            let holders = plan
+                .holders
+                .iter()
+                .map(|node| {
+                    node.parse()
+                        .map_err(|error| format!("holder {node}: {error}"))
+                })
+                .collect::<Decoded<Vec<NodeId>>>()?;
+            if entry.is_none() && !holders.is_empty() {
+                return Err("holders of a key with no entry".to_owned());
+            }
+            Response::Plan(ReadPlan {
+                entry,
+                layout: decode_layout(plan.layout.unwrap_or_default())?,
+                holders,
+            })
+        }
+        Result::Registered(registered) => Response::Registered(match registered.read {
+            Some(id) => Some(Registered {
+                id,
+                layout: decode_layout(registered.layout.unwrap_or_default())?,
+            }),
+            None if registered.layout.is_none() => None,
+            None => return Err("a layout without a registration".to_owned()),
+        }),
+        Result::Renewed(renewed) => Response::Renewed(renewed),
+        Result::Released(_) => Response::Released,
+        Result::Announced(_) => Response::Announced,
+        Result::Flushed(state) => Response::Flushed(match state {
+            FLUSH_FLUSHED => FlushState::Flushed,
+            FLUSH_CONFLICT => FlushState::Conflict,
+            FLUSH_PENDING => FlushState::Pending,
+            other => return Err(format!("flush state {other}")),
+        }),
     })
+}
+
+/// The wire form of a streamed body's announcement.
+fn announcement(body: &StreamedBody) -> Decoded<Announcement> {
+    let headers = Upload {
+        initiated_ms: 0,
+        metadata: body.metadata.clone(),
+        tags: body.tags.clone(),
+        checksum: None,
+    };
+    Ok(Announcement {
+        key: body.key.clone(),
+        upload: Some(position(body.upload)),
+        headers: codec::encode_upload(&headers).map_err(|error| error.to_string())?,
+        extents: body
+            .extents
+            .iter()
+            .map(|(offset, extent)| BodyExtent {
+                offset: *offset,
+                extent: Some(ExtentAnswer {
+                    position: Some(position(extent.position)),
+                    len: extent.len,
+                }),
+            })
+            .collect(),
+    })
+}
+
+/// An announcement from its wire form: a key, an upload, metadata and tags
+/// within their limits, and at most a `PUT`'s extents, each with bytes.
+fn decode_announcement(announced: Announcement) -> Decoded<StreamedBody> {
+    if announced.key.is_empty() || announced.key.len() > MAX_KEY_LEN {
+        return Err(format!("a key of {} bytes", announced.key.len()));
+    }
+    if announced.extents.len() > MAX_EXTENTS {
+        return Err(format!("{} extents", announced.extents.len()));
+    }
+    let headers = codec::decode_upload(&announced.headers).map_err(|error| error.to_string())?;
+    let extents = announced
+        .extents
+        .into_iter()
+        .map(|extent| {
+            let offset = extent.offset;
+            let layout = Layout {
+                extents: extent.extent.into_iter().collect(),
+            };
+            match decode_layout(layout)?.as_slice() {
+                [extent] => Ok((offset, *extent)),
+                _ => Err("an announced extent is missing".to_owned()),
+            }
+        })
+        .collect::<Decoded<_>>()?;
+    Ok(StreamedBody {
+        key: announced.key,
+        upload: epoch_seq(announced.upload)?,
+        metadata: headers.metadata,
+        tags: headers.tags,
+        extents,
+    })
+}
+
+/// The wire form of a layout.
+fn layout_of(layout: &[ExtentRef]) -> Layout {
+    Layout {
+        extents: layout
+            .iter()
+            .map(|extent| ExtentAnswer {
+                position: Some(position(extent.position)),
+                len: extent.len,
+            })
+            .collect(),
+    }
+}
+
+/// A layout from its wire form: every extent has a position and bytes.
+fn decode_layout(layout: Layout) -> Decoded<Vec<ExtentRef>> {
+    layout
+        .extents
+        .into_iter()
+        .map(|extent| {
+            if extent.len == 0 {
+                return Err("an empty extent in a layout".to_owned());
+            }
+            Ok(ExtentRef {
+                position: epoch_seq(extent.position)?,
+                len: extent.len,
+            })
+        })
+        .collect()
 }
 
 /// Decodes the body of `frame`, which must be of `kind`.

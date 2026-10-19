@@ -1,0 +1,2 @@
+subt
+{"Version": "20121--017", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated":tringLik:/ {"idp.:*"}]}

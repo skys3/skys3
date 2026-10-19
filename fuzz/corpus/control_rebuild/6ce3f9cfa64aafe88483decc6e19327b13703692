@@ -1,0 +1,1 @@
+{"format":1,"cluster_id":"prod","node_id":"node-1","instance_id":"instance-1","copy":{"generation":4,"synced_at_ms":100,"registers":{"bun":"{\"role\":\"gone\"}"}},"configs":[{"bucket_id":"b-1","epoch":0,"epoch":3,"prima"shard":1,"objects":true}]}

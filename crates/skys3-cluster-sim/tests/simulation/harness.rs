@@ -12,8 +12,8 @@ use skys3_cluster_sim::{
     NodeEnv, NodeServices, RunError, TRANSPORT_PORT, View, Workload,
 };
 use skys3_gateway::{
-    ConditionFailed, LocalShards, Precondition, ShardError, ShardRef, ShardSummary, Shards,
-    UploadParts,
+    ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError, ShardRef,
+    ShardSummary, Shards, UploadParts,
 };
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::SimMount;
@@ -137,12 +137,79 @@ impl Shards for LosingShards {
         self.inner.payload(shard, position).await
     }
 
+    fn node(&self) -> Option<NodeId> {
+        self.inner.node()
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        self.inner.plan(shard, key).await
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        self.inner
+            .register(shard, holder, key, version, layout)
+            .await
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        self.inner.renew(shard, holder, read).await
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        self.inner.release(shard, holder, read).await
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        self.inner.fetch(shard, holder, read, position).await
+    }
+
     async fn append_extent(
         &self,
         shard: &ShardRef,
         extent: Extent,
     ) -> Result<ExtentRef, ShardError> {
         self.inner.append_extent(shard, extent).await
+    }
+
+    async fn announce(
+        &self,
+        shard: &ShardRef,
+        body: skys3_gateway::StreamedBody,
+    ) -> Result<(), ShardError> {
+        self.inner.announce(shard, body).await
+    }
+
+    async fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: std::time::Duration,
+    ) -> Result<skys3_gateway::FlushState, ShardError> {
+        self.inner.flushed(shard, key, version, wait).await
     }
 
     async fn write(

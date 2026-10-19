@@ -1,0 +1,7 @@
+/fuzz/phot
+content-type: image/jpemz+++;+++++++++++++++++&response-con=text%3pl
+
+60
+content-length:L 4
+6
+hello

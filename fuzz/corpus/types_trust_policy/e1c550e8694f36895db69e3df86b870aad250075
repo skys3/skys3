@@ -1,0 +1,2 @@
+{} subject
+{"Version": "2012-10-17", "Id": "", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https://id"]}, "Action": ["sts:AsleWs:*"], "Condition": {"StringLike": {"idpp.example:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "p.example"}, "Action": "sts:*"}]}

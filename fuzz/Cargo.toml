@@ -18,11 +18,16 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
+bytes = "1"
 crc32c = "0.6"
 libfuzzer-sys = "0.4"
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
 serde_json = "1"
+skys3-config = { path = "../crates/skys3-config" }
 skys3-control = { path = "../crates/skys3-control" }
 skys3-coord = { path = "../crates/skys3-coord" }
+skys3-ec = { path = "../crates/skys3-ec" }
+skys3-flush = { path = "../crates/skys3-flush" }
 skys3-gateway = { path = "../crates/skys3-gateway", features = ["test-util"] }
 skys3-index = { path = "../crates/skys3-index" }
 skys3-log = { path = "../crates/skys3-log" }
@@ -42,6 +47,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "control_rebuild"
+path = "fuzz_targets/control_rebuild.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "coord_control_changed"
 path = "fuzz_targets/coord_control_changed.rs"
 test = false
@@ -49,8 +61,57 @@ doc = false
 bench = false
 
 [[bin]]
+name = "coord_handoff"
+path = "fuzz_targets/coord_handoff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "coord_heartbeat"
 path = "fuzz_targets/coord_heartbeat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_decode"
+path = "fuzz_targets/ec_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_fragment_header"
+path = "fuzz_targets/ec_fragment_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_orphans"
+path = "fuzz_targets/ec_orphans.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_read"
+path = "fuzz_targets/ec_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ec_transfer"
+path = "fuzz_targets/ec_transfer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flush_snapshot"
+path = "fuzz_targets/flush_snapshot.rs"
 test = false
 doc = false
 bench = false
@@ -65,6 +126,13 @@ bench = false
 [[bin]]
 name = "gateway_checksums"
 path = "fuzz_targets/gateway_checksums.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gateway_copy_range"
+path = "fuzz_targets/gateway_copy_range.rs"
 test = false
 doc = false
 bench = false
@@ -135,6 +203,13 @@ bench = false
 [[bin]]
 name = "obs_bearer"
 path = "fuzz_targets/obs_bearer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_descriptor"
+path = "fuzz_targets/peer_descriptor.rs"
 test = false
 doc = false
 bench = false

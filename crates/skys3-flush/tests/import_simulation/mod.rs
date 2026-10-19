@@ -70,6 +70,7 @@ fn bucket() -> BucketDocument {
             prefix: Some(PREFIX.to_owned()),
         }),
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new("p-1").unwrap(),
     }
 }
@@ -144,7 +145,7 @@ async fn settle(service: &FlushService<SimS3, skys3_io::SimMount>, node: &Node) 
     let patience = Patience::new();
     loop {
         let status = service.status(&bucket().bucket_id).ok_or("no flusher")?;
-        let done = status.import.checkpoint == ImportCheckpoint::Done;
+        let done = status.import.as_ref().unwrap().checkpoint == ImportCheckpoint::Done;
         let unclean = node.unclean().await;
         if done && unclean.is_empty() {
             return Ok(());
@@ -165,7 +166,7 @@ async fn check(
 ) -> Outcome {
     let status = service.status(&bucket().bucket_id).ok_or("no flusher")?;
     // The probe ran under the faults too, and found every precondition.
-    if !matches!(&status.probe, ProbeStatus::Done { unprotected } if unprotected.is_empty()) {
+    if !matches!(&status.probe, ProbeStatus::Done { unprotected, .. } if unprotected.is_empty()) {
         return Err(format!("the probe found {:?}", status.probe).into());
     }
     let conflicts: Vec<_> = status

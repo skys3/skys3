@@ -14,8 +14,9 @@ use skys3_types::{
     BucketId, ETag, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, VersionIdentity, WriteIdentity,
 };
 
+use super::coding::{EcPublish, EcRelocate};
 use super::error::{FieldError, Problem};
-use super::multipart::{MpuAbort, MpuComplete, MpuCreate, MpuPart};
+use super::multipart::{MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed};
 use super::wire::{Reader, Writer};
 use super::{MAX_PAYLOAD_LEN, RecordKind, ShardRef};
 
@@ -153,6 +154,16 @@ pub struct Extent {
     pub data: Bytes,
 }
 
+/// Starts a streamed single PUT and fixes its write identity (§7.2): the
+/// record's position names the write, and the `PUT` that completes the
+/// upload inherits it ([`Put::inherited_identity`]). It changes no entry,
+/// and an upload that fails leaves it naming no write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadBegin {
+    /// The object key.
+    pub key: String,
+}
+
 /// Replaces an object's tags (`PutObjectTagging`, or `DeleteObjectTagging`
 /// with an empty set).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,14 +204,16 @@ pub struct Import {
     pub storage_class: Option<String>,
 }
 
-/// Adopts a remote version that changed out of band (§9.2):
+/// Adopts a remote version that changed out of band (§9.2, §7.2):
 /// `ADOPT(key, remote_etag, remote_version_id, metadata)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Adopt {
     /// The object key.
     pub key: String,
-    /// The sequence number of the clean version the read plan named. The
-    /// record applies only if the entry is still clean at it.
+    /// The sequence number of the version the remote's replaces: the clean
+    /// version a fill's read plan named (§9.2), or the dirty version the
+    /// `discard_local` conflict policy drops (§7.2). The record applies
+    /// only if the entry is still at it.
     pub expected_seq: Seq,
     /// The remote object's size in bytes.
     pub size: u64,
@@ -300,14 +313,22 @@ pub enum RecordBody {
     MpuComplete(MpuComplete),
     /// `MPU_ABORT`.
     MpuAbort(MpuAbort),
+    /// `UPLOAD_BEGIN`.
+    UploadBegin(UploadBegin),
     /// `TAGS`.
     Tags(Tags),
     /// `FLUSHED`.
     Flushed(Flushed),
+    /// `PART_FLUSHED`.
+    PartFlushed(PartFlushed),
     /// `IMPORT`.
     Import(Import),
     /// `ADOPT`.
     Adopt(Adopt),
+    /// `EC_PUBLISH`.
+    EcPublish(EcPublish),
+    /// `EC_RELOCATE`.
+    EcRelocate(EcRelocate),
     /// `CONFIG`: the replica's full shard configuration (§6.2). Its bucket,
     /// shard, and epoch are the record's.
     Config(ShardConfig),
@@ -333,10 +354,14 @@ impl RecordBody {
             Self::MpuPart(_) => RecordKind::MpuPart,
             Self::MpuComplete(_) => RecordKind::MpuComplete,
             Self::MpuAbort(_) => RecordKind::MpuAbort,
+            Self::UploadBegin(_) => RecordKind::UploadBegin,
             Self::Tags(_) => RecordKind::Tags,
             Self::Flushed(_) => RecordKind::Flushed,
+            Self::PartFlushed(_) => RecordKind::PartFlushed,
             Self::Import(_) => RecordKind::Import,
             Self::Adopt(_) => RecordKind::Adopt,
+            Self::EcPublish(_) => RecordKind::EcPublish,
+            Self::EcRelocate(_) => RecordKind::EcRelocate,
             Self::Config(_) => RecordKind::Config,
             Self::Truncate => RecordKind::Truncate,
             Self::ImportProgress(_) => RecordKind::ImportProgress,
@@ -354,10 +379,14 @@ impl RecordBody {
             | Self::MpuPart(MpuPart { key, .. })
             | Self::MpuComplete(MpuComplete { key, .. })
             | Self::MpuAbort(MpuAbort { key, .. })
+            | Self::UploadBegin(UploadBegin { key })
             | Self::Tags(Tags { key, .. })
             | Self::Flushed(Flushed { key, .. })
+            | Self::PartFlushed(PartFlushed { key, .. })
             | Self::Import(Import { key, .. })
-            | Self::Adopt(Adopt { key, .. }) => Some(key),
+            | Self::Adopt(Adopt { key, .. })
+            | Self::EcPublish(EcPublish { key, .. })
+            | Self::EcRelocate(EcRelocate { key, .. }) => Some(key),
             Self::Config(_) | Self::Truncate | Self::ImportProgress(_) => None,
         }
     }
@@ -389,13 +418,17 @@ impl RecordBody {
             Self::MpuPart(part) => part.encode(w, position),
             Self::MpuComplete(complete) => complete.encode(w, position),
             Self::MpuAbort(abort) => abort.encode(w, position),
+            Self::UploadBegin(begin) => w.str16("upload_begin.key", &begin.key, 1, MAX_KEY_LEN),
             Self::Tags(tags) => {
                 w.str16("tags.key", &tags.key, 1, MAX_KEY_LEN)?;
                 write_tags(w, "tags.tags", &tags.tags)
             }
             Self::Flushed(flushed) => flushed.encode(w),
+            Self::PartFlushed(flushed) => flushed.encode(w, position),
             Self::Import(import) => import.encode(w),
             Self::Adopt(adopt) => adopt.encode(w),
+            Self::EcPublish(publish) => publish.encode(w, position),
+            Self::EcRelocate(relocate) => relocate.encode(w, position),
             Self::Config(config) => encode_config(w, config, shard, position),
             Self::Truncate => Ok(()),
             Self::ImportProgress(progress) => progress.encode(w),
@@ -423,13 +456,19 @@ impl RecordBody {
             RecordKind::MpuPart => Self::MpuPart(MpuPart::decode(&mut r, payload, position)?),
             RecordKind::MpuComplete => Self::MpuComplete(MpuComplete::decode(&mut r, position)?),
             RecordKind::MpuAbort => Self::MpuAbort(MpuAbort::decode(&mut r, position)?),
+            RecordKind::UploadBegin => Self::UploadBegin(UploadBegin {
+                key: r.str16("upload_begin.key", 1, MAX_KEY_LEN)?,
+            }),
             RecordKind::Tags => Self::Tags(Tags {
                 key: r.str16("tags.key", 1, MAX_KEY_LEN)?,
                 tags: read_tags(&mut r, "tags.tags")?,
             }),
             RecordKind::Flushed => Self::Flushed(Flushed::decode(&mut r)?),
+            RecordKind::PartFlushed => Self::PartFlushed(PartFlushed::decode(&mut r, position)?),
             RecordKind::Import => Self::Import(Import::decode(&mut r)?),
             RecordKind::Adopt => Self::Adopt(Adopt::decode(&mut r)?),
+            RecordKind::EcPublish => Self::EcPublish(EcPublish::decode(&mut r, position)?),
+            RecordKind::EcRelocate => Self::EcRelocate(EcRelocate::decode(&mut r, position)?),
             RecordKind::Config => Self::Config(decode_config(&mut r, shard, position)?),
             RecordKind::Truncate => Self::Truncate,
             RecordKind::ImportProgress => Self::ImportProgress(ImportProgress::decode(&mut r)?),

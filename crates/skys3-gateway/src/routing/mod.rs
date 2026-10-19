@@ -22,6 +22,12 @@
 //!   passes forwarded requests to it and replication links to the
 //!   replication service.
 //!
+//! A GET's bytes do not go through the primary (§9.2): its read plan
+//! names the holders, and the gateway registers the read with one of them
+//! and fetches from it directly ([`Request::is_holder`]). Those requests
+//! go to the node named, are served by any replica of the shard there
+//! that holds the bytes, member or primary, and are never redirected.
+//!
 //! A request whose answer is lost after it was sent is not sent again
 //! unless it only reads: a write may have been applied, so the client
 //! sees it fail (`503`), which means not acknowledged (§5.2).
@@ -33,10 +39,13 @@ mod server;
 mod tests;
 pub mod wire;
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
+use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, StreamedBody};
 use skys3_types::{Epoch, EpochSeq, ShardConfig};
 
 pub use client::{RoutedShards, RoutingConfig, RoutingStats};
@@ -92,8 +101,44 @@ pub enum Request {
     },
     /// [`Shards::payload`](crate::Shards::payload).
     Payload(EpochSeq),
+    /// [`Shards::plan`](crate::Shards::plan).
+    Plan {
+        /// The key.
+        key: String,
+    },
+    /// [`Shards::register`](crate::Shards::register), to the holder.
+    Register {
+        /// The key.
+        key: String,
+        /// The version the plan named.
+        version: EpochSeq,
+        /// The version's layout in the plan.
+        layout: Vec<ExtentRef>,
+    },
+    /// [`Shards::renew`](crate::Shards::renew), to the holder.
+    Renew(ReadId),
+    /// [`Shards::release`](crate::Shards::release), to the holder.
+    Release(ReadId),
+    /// [`Shards::fetch`](crate::Shards::fetch), to the holder.
+    Fetch {
+        /// The registered read.
+        read: ReadId,
+        /// The position of the payload.
+        position: EpochSeq,
+    },
     /// [`Shards::append_extent`](crate::Shards::append_extent).
     AppendExtent(Extent),
+    /// [`Shards::announce`](crate::Shards::announce).
+    Announce(StreamedBody),
+    /// [`Shards::flushed`](crate::Shards::flushed).
+    Flushed {
+        /// The key.
+        key: String,
+        /// The version waited for.
+        version: EpochSeq,
+        /// How long the replica may wait.
+        wait: Duration,
+    },
     /// [`Shards::write`](crate::Shards::write).
     Write {
         /// The record.
@@ -108,8 +153,9 @@ pub enum Request {
 }
 
 impl Request {
-    /// Whether the request only reads, so that sending it again after its
-    /// answer was lost changes nothing.
+    /// Whether the request only reads, announces a streamed body, or waits
+    /// for a flush, so that sending it again after its answer was lost
+    /// changes nothing.
     #[must_use]
     pub fn is_read(&self) -> bool {
         !matches!(
@@ -117,15 +163,22 @@ impl Request {
             Self::AppendExtent(_) | Self::Write { .. } | Self::Seal | Self::Unseal
         )
     }
+
+    /// Whether the request goes to a holder of read payload, whatever its
+    /// role, rather than to the shard's primary: a registration, a renewal
+    /// or release of one, or a fetch under one (§8.7).
+    #[must_use]
+    pub fn is_holder(&self) -> bool {
+        matches!(
+            self,
+            Self::Register { .. } | Self::Renew(_) | Self::Release(_) | Self::Fetch { .. }
+        )
+    }
 }
 
 /// The result of a served [`Request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one value per request, moved a few times; boxing would allocate for each"
-)]
 pub enum Response {
     /// The entry of [`Request::Entry`].
     Entry(Option<Entry>),
@@ -137,10 +190,24 @@ pub enum Response {
     Uploads(Vec<(String, EpochSeq, Upload)>),
     /// The parts of [`Request::Parts`].
     Parts(Vec<(u16, Part)>),
-    /// The bytes of [`Request::Payload`].
+    /// The bytes of [`Request::Payload`] or [`Request::Fetch`].
     Payload(Bytes),
+    /// The read plan of [`Request::Plan`].
+    Plan(ReadPlan),
+    /// The registration of [`Request::Register`], or `None` if the holder
+    /// does not hold the version.
+    Registered(Option<Registered>),
+    /// Whether [`Request::Renew`] renewed the registration, which it does
+    /// not once it lapsed.
+    Renewed(bool),
+    /// [`Request::Release`] released the registration.
+    Released,
     /// The extent of [`Request::AppendExtent`].
     Extent(ExtentRef),
+    /// [`Request::Announce`] was passed to the flusher.
+    Announced,
+    /// Where the version of [`Request::Flushed`] is.
+    Flushed(FlushState),
     /// The outcome of [`Request::Write`].
     Written(Result<EpochSeq, ConditionFailed>),
     /// The summary of [`Request::Seal`].

@@ -108,6 +108,8 @@ struct WireCommit {
     precondition: Option<WirePrecondition>,
     #[prost(oneof = "WireWrite", tags = "7, 8")]
     write: Option<WireWrite>,
+    #[prost(uint64, optional, tag = "9")]
+    apply_by_ms: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Oneof)]
@@ -478,6 +480,13 @@ fn decode_ranges(wire: WireRanges) -> Result<StagedRanges, MessageError> {
     })
 }
 
+/// The bytes `commit` adds to the header of a `BATCH` as one of its
+/// items.
+pub(crate) fn batch_item_len(commit: &Commit) -> usize {
+    let mut payload = Vec::new();
+    prost::encoding::message::encoded_len(1, &encode_commit(commit, &mut payload))
+}
+
 fn encode_commit(commit: &Commit, payload: &mut Vec<Bytes>) -> WireCommit {
     let precondition = match &commit.precondition {
         Precondition::Absent => WirePrecondition::Absent(true),
@@ -494,6 +503,7 @@ fn encode_commit(commit: &Commit, payload: &mut Vec<Bytes>) -> WireCommit {
         key: commit.key.clone(),
         precondition: Some(precondition),
         write: Some(write),
+        apply_by_ms: commit.apply_by_ms,
     }
 }
 
@@ -565,6 +575,7 @@ fn decode_commit(wire: WireCommit, payload: &mut Bytes) -> Result<Commit, Messag
         key: wire.key,
         precondition,
         write,
+        apply_by_ms: wire.apply_by_ms,
     })
 }
 
@@ -752,6 +763,7 @@ mod tests {
             key: "k".to_owned(),
             precondition,
             write,
+            apply_by_ms: None,
         }
     }
 

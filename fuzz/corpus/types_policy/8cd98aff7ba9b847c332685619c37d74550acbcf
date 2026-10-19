@@ -1,0 +1,2 @@
+aaaaateaaaaaaaaaaab
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:*e", "Resource": "arn:aws:s3:::*a*a*a*a*c"}}

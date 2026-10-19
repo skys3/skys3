@@ -1,0 +1,2 @@
+subject
+{"Version": "2112-10S17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https:7.0.0.1:808,"]}, "Action": ["stseWitAWebIdentity", "sts:*"], "Condition":			nul	]}

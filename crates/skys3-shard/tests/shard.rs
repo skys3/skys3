@@ -8,14 +8,16 @@ use std::sync::Arc;
 use skys3_index::{EntryState, Index, IndexDump};
 use skys3_io::{BlockingPool, SimDisk, SimMount};
 use skys3_log::record::ExtentRef;
+use skys3_log::record::RemoteStep;
 use skys3_log::{RecordBody, RecordKind, SegmentLog};
 use skys3_shard::{
-    Committed, Effect, Outcome, Role, Shard, ShardError, ShardSet, ShardSummary, StateMachine,
+    Change, Committed, Effect, FlushState, FlushWait, Outcome, Role, Shard, ShardError, ShardSet,
+    ShardSummary, StateMachine, StreamedBody,
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
-    at, config, delete, extent, flushed, import, index_config, mpu_complete, mpu_create, mpu_part,
-    open_log, pool, put, put_extents, runtime, shard, tags,
+    at, config, delete, extent, flushed, import, index_config, mpu_abort, mpu_complete, mpu_create,
+    mpu_part, open_log, part_flushed, pool, put, put_extents, runtime, shard, tags, upload_begin,
 };
 
 /// A node's disk, log, index, and pool.
@@ -130,6 +132,36 @@ fn reopening_continues_the_sequence_and_adopts_newer_epochs() {
                 .to_string()
                 .contains("older than the applied position 3.3")
         );
+    });
+}
+
+#[test]
+fn a_record_commits_in_an_epoch_only_while_the_shard_sequences_in_it() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard0 = node.open(1).await.unwrap();
+        let committed = shard0
+            .commit_in(Epoch::new(1), put("a", 1, 1))
+            .await
+            .unwrap();
+        assert_eq!(committed.position, at(1));
+        drop(shard0);
+
+        // In a newer epoch, nothing is appended for the older one.
+        let shard0 = node.open(3).await.unwrap();
+        let applied = shard0.applied();
+        let error = shard0
+            .commit_in(Epoch::new(1), put("b", 1, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ShardError::Unavailable { .. }), "{error}");
+        assert_eq!(shard0.last_sequenced(), applied.seq);
+        let committed = shard0
+            .commit_in(Epoch::new(3), put("b", 1, 3))
+            .await
+            .unwrap();
+        let next = Seq::new(applied.seq.get() + 1);
+        assert_eq!(committed.position, EpochSeq::new(Epoch::new(3), next));
     });
 }
 
@@ -304,7 +336,12 @@ fn seals_fence_client_writes_and_count_entries() {
             }
         );
         assert!(shard0.is_sealed());
-        for body in [put("e", 1, 6), delete("a"), tags("a", "x")] {
+        for body in [
+            put("e", 1, 6),
+            delete("a"),
+            tags("a", "x"),
+            upload_begin("e"),
+        ] {
             let result = shard0.commit(body).await;
             assert_eq!(result, Err(ShardError::Sealed(shard(0))));
         }
@@ -710,13 +747,23 @@ fn subscribers_see_applied_client_writes() {
         let first = shard.commit(put("a", 3, 1)).await.unwrap();
         let tagged = shard.commit(tags("a", "x")).await.unwrap();
         let deleted = shard.commit(delete("b")).await.unwrap();
-        // An upload and its parts change no version; its completion does.
+        // An upload is reported as it opens, takes a part, and completes.
         let upload = shard.commit(mpu_create("m")).await.unwrap().position;
         let part = shard.commit(mpu_part("m", upload, 1, 4, vec![])).await;
-        let parts = [(1, part.unwrap().position)];
-        let completed = shard.commit(mpu_complete("m", upload, &parts, 4)).await;
+        let part = part.unwrap().position;
+        // Its remote upload's steps are not reported.
+        let opened = part_flushed("m", upload, "r-1", RemoteStep::Opened);
+        assert!(shard.commit(opened).await.unwrap().outcome.is_applied());
+        let completed = shard
+            .commit(mpu_complete("m", upload, &[(1, part)], 4))
+            .await;
         let completed = completed.unwrap();
         assert!(completed.outcome.is_applied());
+        // So is an aborted upload, but not a part refused after the abort.
+        let aborted = shard.commit(mpu_create("n")).await.unwrap().position;
+        let abort = shard.commit(mpu_abort("n", aborted)).await.unwrap();
+        let late = shard.commit(mpu_part("n", aborted, 1, 4, vec![])).await;
+        assert!(!late.unwrap().outcome.is_applied());
         // A rejected TAGS and a FLUSHED change no version and are not
         // reported. The lazy FLUSHED rides the next commit's group.
         shard.commit(tags("missing", "x")).await.unwrap();
@@ -724,19 +771,40 @@ fn subscribers_see_applied_client_writes() {
         let (lazy, next) = tokio::join!(lazy, shard.commit(put("c", 1, 2)));
         assert!(lazy.unwrap().outcome.is_applied());
         let next = next.unwrap();
+        let stored = |key: &str, position, size, upload| Change::Stored {
+            key: key.to_owned(),
+            position,
+            size,
+            upload,
+        };
         let expected = [
-            ("a", first.position, Some(3)),
-            ("a", tagged.position, None),
-            ("b", deleted.position, Some(0)),
-            ("m", completed.position, Some(4)),
-            ("c", next.position, Some(1)),
+            stored("a", first.position, Some(3), None),
+            stored("a", tagged.position, None, None),
+            stored("b", deleted.position, Some(0), None),
+            Change::Opened {
+                key: "m".into(),
+                upload,
+            },
+            Change::Part {
+                key: "m".into(),
+                upload,
+                number: 1,
+                position: part,
+            },
+            stored("m", completed.position, Some(4), Some(upload)),
+            Change::Opened {
+                key: "n".into(),
+                upload: aborted,
+            },
+            Change::Aborted {
+                key: "n".into(),
+                upload: aborted,
+            },
+            stored("c", next.position, Some(1), None),
         ];
-        for (key, position, size) in expected {
-            let change = changes.recv().await.unwrap();
-            assert_eq!(
-                (change.key.as_str(), change.position, change.size),
-                (key, position, size)
-            );
+        assert!(abort.outcome.is_applied());
+        for expected in expected {
+            assert_eq!(changes.recv().await.unwrap(), expected);
         }
         let entries = shard.entries(None, 10).await.unwrap();
         let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
@@ -751,6 +819,101 @@ fn subscribers_see_applied_client_writes() {
         assert!(shard.is_stopped());
         assert!(newer.recv().await.is_none());
         assert!(shard.subscribe().recv().await.is_none());
+    });
+}
+
+#[test]
+fn announcements_of_a_streamed_body_reach_the_subscriber_before_its_put() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let body = |upload, extents| StreamedBody {
+            key: "big".into(),
+            upload,
+            metadata: Default::default(),
+            tags: Default::default(),
+            extents,
+        };
+        // Without a subscriber an announcement goes nowhere.
+        shard.announce(body(at(1), Vec::new())).unwrap();
+        let mut changes = shard.subscribe();
+        let begun = shard.commit(upload_begin("big")).await.unwrap().position;
+        let extent = shard.append_extent(extent("big", 0, 5)).await.unwrap();
+        let announced = body(begun, vec![(0, extent)]);
+        shard.announce(announced.clone()).unwrap();
+        // The PUT names the identity it inherits: its stream's upload.
+        let RecordBody::Put(mut streamed) = put_extents("big", vec![extent], 1) else {
+            unreachable!("put_extents makes a PUT")
+        };
+        streamed.inherited_identity = Some(begun);
+        let stored = shard.commit(RecordBody::Put(streamed)).await.unwrap();
+        assert_eq!(
+            changes.recv().await,
+            Some(Change::Streamed(announced.clone()))
+        );
+        assert_eq!(
+            changes.recv().await,
+            Some(Change::Stored {
+                key: "big".into(),
+                position: stored.position,
+                size: Some(5),
+                upload: Some(begun),
+            })
+        );
+        // A stopped shard refuses announcements.
+        shard.close().await.unwrap();
+        assert!(matches!(
+            shard.announce(announced),
+            Err(ShardError::Unavailable { .. })
+        ));
+    });
+}
+
+#[test]
+fn a_flush_wait_reaches_the_flusher_after_its_version() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let first = shard.commit(put("a", 3, 1)).await.unwrap().position;
+        let unavailable = |result: Result<FlushWait, ShardError>, why: &str| match result {
+            Err(ShardError::Unavailable { reason, .. }) => {
+                assert!(reason.contains(why), "{reason}")
+            }
+            other => panic!("expected the shard to be unavailable, got {other:?}"),
+        };
+        // Nothing flushes the shard yet.
+        unavailable(shard.await_flush("a", first), "no flusher");
+        let mut changes = shard.subscribe();
+        // A version the shard has not applied cannot be waited for.
+        let later = EpochSeq::new(first.epoch, Seq::new(first.seq.get() + 10));
+        unavailable(shard.await_flush("a", later), "not applied");
+
+        let second = shard.commit(put("a", 4, 2)).await.unwrap().position;
+        let mut wait = shard.await_flush("a", second).unwrap();
+        // The wait follows the change that stored its version.
+        let Some(Change::Stored { position, .. }) = changes.recv().await else {
+            panic!("the PUT's change comes first");
+        };
+        assert_eq!(position, second);
+        let Some(Change::Awaited(waiter)) = changes.recv().await else {
+            panic!("then the wait");
+        };
+        assert_eq!((waiter.key(), waiter.version()), ("a", second));
+        waiter.answer(FlushState::Flushed);
+        assert_eq!(wait.answered().await, Some(FlushState::Flushed));
+
+        // A wait whose subscription ended has no answer.
+        let mut unanswered = shard.await_flush("a", first).unwrap();
+        drop(changes);
+        assert_eq!(unanswered.answered().await, None);
+        unavailable(shard.await_flush("a", first), "flusher stopped");
+
+        let _changes = shard.subscribe();
+        shard.close().await.unwrap();
+        assert!(matches!(
+            shard.await_flush("a", first),
+            Err(ShardError::Unavailable { .. })
+        ));
     });
 }
 
@@ -830,9 +993,12 @@ fn a_subscription_during_an_apply_hears_of_it() {
         let committed = commit.await.unwrap().unwrap();
         assert!(committed.outcome.is_applied());
         let change = changes.try_recv().expect("the write is reported");
-        assert_eq!(
-            (change.key.as_str(), change.position, change.size),
-            ("a", committed.position, Some(3))
-        );
+        let expected = Change::Stored {
+            key: "a".into(),
+            position: committed.position,
+            size: Some(3),
+            upload: None,
+        };
+        assert_eq!(change, expected);
     });
 }

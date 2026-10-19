@@ -75,6 +75,23 @@ async fn objects_and_buckets_survive_restarts() {
         metrics.contains("skys3_disks_out_of_service 0"),
         "{metrics}"
     );
+    // The store answered at startup, and the identity copy came from a
+    // sync of it; both are recent Unix times.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    for name in [
+        "skys3_control_store_last_success_timestamp_seconds",
+        "skys3_identity_synced_timestamp_seconds",
+    ] {
+        let at = gauge(&metrics, name);
+        assert!(at > now - 600.0 && at <= now + 1.0, "{name} {at}");
+    }
+    assert_eq!(
+        gauge(&metrics, "skys3_identity_max_staleness_seconds"),
+        86400.0
+    );
 
     // A deleted object stays deleted after a restart.
     s3.delete_object()
@@ -141,6 +158,25 @@ async fn a_node_runs_from_its_copy_while_the_control_store_fails() {
     })
     .await;
     node.shutdown().await.unwrap();
+}
+
+/// The value of the unlabeled gauge `name` in a scrape.
+fn gauge(metrics: &str, name: &str) -> f64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("no {name} in {metrics}"))
+        .parse()
+        .unwrap()
+}
+
+/// The admin listener's scrape.
+async fn scrape(node: &Node) -> String {
+    let (status, metrics) = http_get(&node.admin_addr().to_string(), "/metrics")
+        .await
+        .unwrap();
+    assert_eq!(status, 200);
+    metrics
 }
 
 /// Health's `control_store.live`.
@@ -222,11 +258,29 @@ async fn a_node_runs_from_its_copy_until_the_store_opens() {
     let s3 = client(&endpoint(&node));
     assert_eq!(get(&s3, "kept", "a").await, b"alpha");
     assert!(s3.create_bucket().bucket("new").send().await.is_err());
+    let metrics = scrape(&node).await;
+    assert!(metrics.contains("skys3_control_store_live 0"), "{metrics}");
+    let name = "skys3_control_store_last_success_timestamp_seconds";
+    assert_eq!(
+        gauge(&metrics, name),
+        0.0,
+        "not read since the node started"
+    );
+    // The identity copy is the stored one, as old as the sync that made it.
+    let synced = gauge(&metrics, "skys3_identity_synced_timestamp_seconds");
+    assert!(synced > 0.0, "{metrics}");
 
     // Once the store can be opened, the running node uses it.
     std::fs::remove_file(&control).unwrap();
     std::fs::rename(&moved, &control).unwrap();
     eventually("the node opens the control store", || live(&node)).await;
+    let metrics = scrape(&node).await;
+    assert!(metrics.contains("skys3_control_store_live 1"), "{metrics}");
+    assert!(gauge(&metrics, name) > 0.0, "{metrics}");
+    assert!(
+        gauge(&metrics, "skys3_identity_synced_timestamp_seconds") > synced,
+        "the identity copy is synced from the store: {metrics}"
+    );
     s3.create_bucket().bucket("new").send().await.unwrap();
     put(&s3, "new", "b", b"beta").await;
     node.shutdown().await.unwrap();
@@ -320,9 +374,15 @@ async fn write_back_buckets_get_flushers() {
     assert_eq!(status["unflushed"], 1);
     assert_eq!(status["flush"]["conflicts"], serde_json::json!([]));
     assert_eq!(status["flush"]["orphaned_uploads"], 0);
+    // No window before the probe is done (§7.7).
+    assert_eq!(status["flush"]["concurrency"], serde_json::Value::Null);
     let (_, metrics) = http_get(&admin, "/metrics").await.unwrap();
     assert!(
         metrics.contains("skys3_dirty_bytes{bucket=\"archive\"}"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("skys3_flush_concurrency{bucket=\"archive\"} 0"),
         "{metrics}"
     );
     // A bucket with unflushed writes cannot be detached.
@@ -501,4 +561,118 @@ async fn startup_refuses_what_it_cannot_run() {
     );
     let error = Node::start(text.parse().unwrap()).await.unwrap_err();
     assert!(matches!(error, StartError::Io { .. }), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_control_store_is_rebuilt_from_the_nodes_copy() {
+    use skys3::rebuild::{CommandError, export_data_dir, rebuild};
+    use skys3_control::{RebuildError, RebuildOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config: Config = config_text(dir.path(), "127.0.0.1:0", "127.0.0.1:0", "")
+        .parse()
+        .unwrap();
+    // A data directory that holds no node is not exported.
+    let refused = export_data_dir(&config).await.unwrap_err();
+    assert!(refused.to_string().contains("holds no node"), "{refused}");
+    let node = Node::start(config.clone()).await.unwrap();
+    let s3 = client(&endpoint(&node));
+    for bucket in ["kept", "other"] {
+        s3.create_bucket().bucket(bucket).send().await.unwrap();
+        put(&s3, bucket, "a", bucket.as_bytes()).await;
+    }
+    let admin = node.admin_addr().to_string();
+    let generation = admin_json(&admin, "/v1/health").await["control_store"]["generation"]
+        .as_u64()
+        .unwrap();
+    node.shutdown().await.unwrap();
+
+    // The control store is lost. A node runs from its copy, and while it
+    // runs, its state cannot be exported.
+    let control = dir.path().join("data/control");
+    std::fs::remove_dir_all(&control).unwrap();
+    let node = Node::start(config.clone()).await.unwrap();
+    assert!(!live(&node).await);
+    let refused = export_data_dir(&config).await.unwrap_err();
+    assert!(matches!(refused, CommandError::Start(_)), "{refused}");
+    node.shutdown().await.unwrap();
+
+    let export = export_data_dir(&config).await.unwrap();
+    let copy = export.copy.as_ref().unwrap();
+    assert_eq!(copy.generation.get(), generation);
+    assert_eq!(copy.registers.len(), 2);
+    // A single node keeps no shard configurations; its shards hold objects.
+    assert!(export.configs.is_empty());
+    assert_eq!(export.held.len(), 8);
+    assert!(export.held.iter().filter(|held| held.objects).count() >= 2);
+
+    // A dry run writes nothing.
+    let options = RebuildOptions::default();
+    let planned = rebuild(&config, std::slice::from_ref(&export), &options, true)
+        .await
+        .unwrap();
+    assert!(planned.applied.is_none());
+    assert!(!control.exists());
+    let summary = skys3::rebuild::summary(&planned.plan);
+    assert!(
+        summary[1].starts_with("2 bucket, 0 identity, and 0 shard"),
+        "{summary:?}"
+    );
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.starts_with("note: 4 shards of bucket"))
+    );
+
+    // Another data directory's export is refused, and so are two.
+    let mut foreign = export.clone();
+    foreign.instance_id = "another".to_owned();
+    let refused = rebuild(&config, &[foreign], &options, false)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("instance another"),
+        "{refused}"
+    );
+    let mut second = export.clone();
+    second.node_id = "node-other".parse().unwrap();
+    let refused = rebuild(&config, &[export.clone(), second], &options, false)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("serves one node"), "{refused}");
+    assert!(!control.exists());
+
+    let rebuilt = rebuild(&config, std::slice::from_ref(&export), &options, false)
+        .await
+        .unwrap();
+    let applied = rebuilt.applied.unwrap();
+    assert_eq!((applied.written, applied.present), (3, 0));
+    // Running it again finds the store complete.
+    let again = rebuild(&config, &[export], &options, false).await.unwrap();
+    assert_eq!(again.applied.unwrap().written, 0);
+
+    // The node uses the rebuilt store, at a newer generation, with every
+    // bucket and object, and bucket changes work again.
+    let node = Node::start(config.clone()).await.unwrap();
+    assert!(live(&node).await);
+    let admin = node.admin_addr().to_string();
+    let health = admin_json(&admin, "/v1/health").await;
+    assert_eq!(health["control_store"]["generation"], generation + 1);
+    assert_eq!(health["shards_open"], 9, "no shard is reclaimed");
+    let s3 = client(&endpoint(&node));
+    for bucket in ["kept", "other"] {
+        assert_eq!(get(&s3, bucket, "a").await, bucket.as_bytes());
+    }
+    s3.create_bucket().bucket("new").send().await.unwrap();
+    node.shutdown().await.unwrap();
+
+    // A store that is not lost is never rebuilt over.
+    let export = export_data_dir(&config).await.unwrap();
+    let refused = rebuild(&config, &[export], &options, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, CommandError::Rebuild(RebuildError::StoreInUse)),
+        "{refused}"
+    );
 }

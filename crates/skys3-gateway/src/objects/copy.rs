@@ -1,6 +1,7 @@
 //! CopyObject (design §7.2, §10.1, §11).
 //!
-//! A copy reads the source object's bytes from its shard and writes them
+//! A copy reads the source object's bytes from its shard, or from its
+//! fragments if it is coded (§8.5), and writes them
 //! into the destination's shard as a new body, inline or as `EXTENT`
 //! records, exactly as a PUT of the same bytes would be stored. It then
 //! commits a `PUT` that records its source: the source bucket's ID, its
@@ -22,7 +23,8 @@
 //! - **Metadata** (`x-amz-metadata-directive`): `COPY`, the default, keeps
 //!   the source's stored headers and user metadata and ignores the
 //!   request's; `REPLACE` takes them from the request, with PutObject's
-//!   limits. A write identity the source carries is never copied (§7.2).
+//!   limits. A write identity the source carries is never copied (§7.2);
+//!   a peer cluster's flusher may set its own, as on PutObject (§7.8).
 //! - **Tags** (`x-amz-tagging-directive`): `COPY`, the default, keeps the
 //!   source's tags; `REPLACE` takes `x-amz-tagging`, or none. Copying a
 //!   tagged source's tags needs `s3:GetObjectTagging` on the source and
@@ -54,13 +56,16 @@ use skys3_types::{BucketDocument, ETag, EpochSeq, VersionIdentity, WriteIdentity
 
 use super::tagging::parse_tagging_header;
 use super::upload::Upload;
-use super::{MAX_OBJECT_BYTES, Objects, USER_METADATA_PREFIX, download, metadata_of, now_ms};
+use super::{
+    MAX_OBJECT_BYTES, Objects, USER_METADATA_PREFIX, coded, download, metadata_of, now_ms,
+};
 use crate::authz::{CopiedTags, access_denied};
 use crate::buckets::shard_error;
 use crate::checksum::{DEFAULT_ALGORITHM, Digests, PooledHasher, parse_algorithm};
 use crate::conditions::{
     Precondition, ReadConditions, last_modified, no_such_key, precondition_failed, s3_etag,
 };
+use crate::peer_s3::ApplyBy;
 use crate::shard::{ShardRef, Shards};
 
 /// What a copy does with the source's metadata or tags.
@@ -84,18 +89,19 @@ impl Directive {
     }
 }
 
-/// The source of a CopyObject request: its bucket's name and its key.
+/// The bucket name and key of a CopyObject's or UploadPartCopy's source,
+/// its `x-amz-copy-source`.
 ///
 /// # Errors
 ///
 /// `501 NotImplemented` for an access point or outpost ARN, and
 /// `400 InvalidArgument` for a version ID other than `null`.
-pub(crate) fn copy_source(input: &CopyObjectInput) -> S3Result<(&str, &str)> {
+pub(crate) fn copy_source(source: &S3CopySource) -> S3Result<(&str, &str)> {
     let S3CopySource::Bucket {
         bucket,
         key,
         version_id,
-    } = &input.copy_source
+    } = source
     else {
         return Err(s3_error!(
             NotImplemented,
@@ -121,8 +127,8 @@ impl<H: Shards> Objects<H> {
             .extensions
             .get::<CopiedTags>()
             .is_some_and(|copied| copied.allowed());
-        let input = req.input;
-        let (_, source_key) = copy_source(&input)?;
+        let (input, extensions) = (req.input, req.extensions);
+        let (_, source_key) = copy_source(&input.copy_source)?;
         let source_key = source_key.to_owned();
         let metadata_directive = Directive::parse(
             input.metadata_directive.as_ref().map(|d| d.as_str()),
@@ -148,6 +154,8 @@ impl<H: Shards> Objects<H> {
             Directive::Replace => Some(metadata_of(
                 standard_headers!(input),
                 input.metadata.as_ref(),
+                // A peer's flusher may carry its write identity (§7.8).
+                self.carrier(bucket, &extensions),
             )?),
         };
         let replaced_tags = match tagging_directive {
@@ -167,7 +175,8 @@ impl<H: Shards> Objects<H> {
             .map(|algorithm| parse_algorithm(algorithm.as_str()))
             .transpose()?;
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(ApplyBy::of(&extensions));
 
         let source_shard = ShardRef::for_key(source_bucket, &source_key);
         let entry = self
@@ -249,7 +258,13 @@ impl<H: Shards> Objects<H> {
             hashed.push(ChecksumAlgorithm::Md5);
         }
         let (data, digests) = self
-            .copy_bytes(&source_shard, &object, &shard, &input.key, &hashed)
+            .copy_bytes(
+                (&source_shard, &source_key),
+                &object,
+                &shard,
+                &input.key,
+                &hashed,
+            )
             .await?;
         let checksums = if wanted.is_empty() {
             object.checksums.clone()
@@ -298,10 +313,13 @@ impl<H: Shards> Objects<H> {
             checksums: put.checksums.clone(),
             ..object
         };
-        self.shards
+        let key = put.key.clone();
+        let version = self
+            .shards
             .write(&shard, RecordBody::Put(put), condition)
             .await
             .map_err(shard_error)??;
+        self.acknowledge(bucket, &shard, &key, version).await?;
         let mut result = CopyObjectResult {
             e_tag: Some(s3_etag(&copied)),
             last_modified: Some(last_modified(&copied)),
@@ -314,27 +332,35 @@ impl<H: Shards> Objects<H> {
         })
     }
 
-    /// Writes the bytes of `object`, in `source`, into `shard` as the body
-    /// of a `PUT` of `key`, and returns where they are and their digests in
-    /// the `hashed` algorithms.
+    /// Writes the bytes of `object`, the current version of
+    /// `source_key` in `source`, into `shard` as the body of a `PUT` of
+    /// `key`, and returns where they are and their digests in the `hashed`
+    /// algorithms. A coded source is read from its fragments, since its
+    /// replicas drop their copies once it is coded (§8.5).
     async fn copy_bytes(
         &self,
-        source: &ShardRef,
+        (source, source_key): (&ShardRef, &str),
         object: &ObjectVersion,
         shard: &ShardRef,
         key: &str,
         hashed: &[ChecksumAlgorithm],
     ) -> S3Result<(PutData, Digests)> {
-        let positions: Vec<_> = match &object.payload {
-            Payload::Inline(position) => vec![(*position, object.size)],
-            Payload::Extents(extents) => extent_positions(extents),
-            Payload::Parts { upload, parts } => {
-                let whole = 0..object.size;
-                let (extents, _) =
-                    download::part_extents(&self.shards, source, *upload, parts, whole).await?;
-                extent_positions(&extents)
-            }
-            Payload::None => return Err(download::not_cached()),
+        let (mut coded, positions) = if object.coded.is_some() {
+            let body = self.coded_source(source, source_key, object).await?;
+            (Some(body), Vec::new())
+        } else {
+            let positions = match &object.payload {
+                Payload::Inline(position) => vec![(*position, object.size)],
+                Payload::Extents(extents) => extent_positions(extents),
+                Payload::Parts { upload, parts } => {
+                    let whole = 0..object.size;
+                    let (extents, _) =
+                        download::part_extents(&self.shards, source, *upload, parts, whole).await?;
+                    extent_positions(&extents)
+                }
+                Payload::None => return Err(download::not_cached()),
+            };
+            (None, positions)
         };
         let mut upload = Upload::new(
             self.shards.clone(),
@@ -342,20 +368,33 @@ impl<H: Shards> Objects<H> {
             key.to_owned(),
             self.inline_max_bytes,
             self.extent_bytes,
+            self.max_body_duration,
         );
         let mut hasher = (!hashed.is_empty())
             .then(|| PooledHasher::new(hashed.iter().copied(), self.pool.clone()));
         let mut copied = 0u64;
-        for (position, len) in positions {
-            let data: Bytes = self
-                .shards
-                .payload(source, position)
-                .await
-                .map_err(shard_error)?;
-            if data.len() as u64 != len {
-                return Err(size_mismatch());
-            }
-            copied += len;
+        let mut positions = positions.into_iter();
+        loop {
+            let data: Bytes = if let Some(body) = &mut coded {
+                match body.recv().await {
+                    Some(piece) => piece.map_err(coded::unreadable_source)?,
+                    None => break,
+                }
+            } else {
+                let Some((position, len)) = positions.next() else {
+                    break;
+                };
+                let data = self
+                    .shards
+                    .payload(source, position)
+                    .await
+                    .map_err(shard_error)?;
+                if data.len() as u64 != len {
+                    return Err(size_mismatch());
+                }
+                data
+            };
+            copied += data.len() as u64;
             upload.push(&data).await?;
             if let Some(hasher) = &mut hasher {
                 hasher.update(data).await.map_err(|_| unavailable())?;
@@ -445,13 +484,13 @@ mod tests {
             })
             .build()
             .unwrap();
-        assert_eq!(copy_source(&input).unwrap(), ("src", "a/b"));
+        assert_eq!(copy_source(&input.copy_source).unwrap(), ("src", "a/b"));
         input.copy_source = S3CopySource::Bucket {
             bucket: "src".into(),
             key: "a/b".into(),
             version_id: Some("3HL4kqtJlcpXroDTDmJ".into()),
         };
-        let error = copy_source(&input).unwrap_err();
+        let error = copy_source(&input.copy_source).unwrap_err();
         assert_eq!(*error.code(), S3ErrorCode::InvalidArgument);
         input.copy_source = S3CopySource::AccessPoint {
             partition: "aws".into(),
@@ -461,7 +500,7 @@ mod tests {
             key: "k".into(),
             version_id: None,
         };
-        let error = copy_source(&input).unwrap_err();
+        let error = copy_source(&input.copy_source).unwrap_err();
         assert_eq!(*error.code(), S3ErrorCode::NotImplemented);
     }
 }

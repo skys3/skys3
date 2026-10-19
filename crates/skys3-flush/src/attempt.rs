@@ -6,21 +6,28 @@ use std::fmt;
 
 use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
+use skys3_config::ConflictPolicy;
 use skys3_index::{Entry, EntryState, ObjectVersion, Payload};
 use skys3_io::Disk;
+use skys3_log::RecordBody;
+use skys3_log::record::{Adopt, Metadata, TagSet};
 use skys3_remote::probe::ConditionalOperation;
 use skys3_remote::{
     CompleteMultipartUpload, DeleteObject, HeadObject, ObjectInfo, ObjectStore, PutObject, S3Error,
     S3ErrorKind, UserMetadata, WriteOutput, WritePrecondition,
 };
-use skys3_shard::Shard;
+use skys3_shard::{Outcome as Applied, Shard};
 use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
 
+use crate::copy::Copied;
+use crate::import::loaded_metadata;
+use crate::peer::{Bodies, LinkError};
+use crate::stream::{Streams, test_hooks};
 use crate::target::Target;
 
 /// How many times one attempt follows a failed precondition with another
 /// request before it gives up and retries later: the remote kept changing.
-const MAX_ROUNDS: usize = 3;
+pub(crate) const MAX_ROUNDS: usize = 3;
 
 /// What a flush put at the remote for one version of a key, until the
 /// `FLUSHED` that records it is applied.
@@ -65,6 +72,12 @@ pub(crate) enum Outcome {
     Settled,
     /// The remote changed out of band.
     Conflict(Conflict),
+    /// The `discard_local` policy dropped the version for the remote's
+    /// out-of-band write, which an `ADOPT` made the key's version (§7.2).
+    Discarded {
+        /// The version dropped.
+        version: EpochSeq,
+    },
     /// A retryable failure: back off and try again.
     Retry(String),
 }
@@ -100,6 +113,19 @@ pub(crate) struct Attempt<'a, S, D: Disk> {
     pub(crate) shard: &'a Shard<D>,
     pub(crate) target: &'a Target<S>,
     pub(crate) key: &'a str,
+    /// The streams of the shard's uploads (§7.3).
+    pub(crate) streams: &'a Streams,
+    /// How the key's conflict was resolved, if it was in one (§7.2):
+    /// `overwrite` sends the version unconditionally, `discard_local`
+    /// adopts the remote's write if it is still there, and `hold` flushes
+    /// as usual.
+    pub(crate) resolution: Option<ConflictPolicy>,
+    /// The streamed bodies of the shard, for a native target (§7.8).
+    pub(crate) bodies: &'a Bodies,
+    /// Called once a native target's `COMMIT` is sent: only the seeded bug
+    /// [`PeerBug::AnsweredOnCommit`](crate::PeerBug::AnsweredOnCommit)
+    /// sets it.
+    pub(crate) early: Option<&'a (dyn Fn() + Send + Sync)>,
 }
 
 impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
@@ -122,6 +148,33 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             || pending.is_some_and(|remote| remote.seq == entry.version.seq)
         {
             return Outcome::Settled;
+        }
+        if let Some(native) = &self.target.native {
+            // A streamed body's `PUT`: its flush stages what the body's
+            // own stream has not (§7.8).
+            if let Some(upload) = entry.object.as_ref().and_then(|o| o.write_identity) {
+                self.bodies.claim(upload);
+            }
+            let known = match pending {
+                Some(remote) => (remote.etag.clone(), remote.version_id.clone()),
+                None => (entry.remote_etag.clone(), entry.remote_version_id.clone()),
+            };
+            return self
+                .native(native, &entry, known, passed)
+                .await
+                .unwrap_or_else(|error| {
+                    if matches!(error, Failure::Link(_)) {
+                        native.link_failed();
+                    }
+                    Outcome::Retry(error.to_string())
+                });
+        }
+        if self.resolution == Some(ConflictPolicy::DiscardLocal) {
+            match self.discard(&entry).await {
+                Ok(Some(outcome)) => return outcome,
+                Ok(None) => {}
+                Err(error) => return Outcome::Retry(error.to_string()),
+            }
         }
         let known = match pending {
             Some(remote) => remote.etag.clone(),
@@ -148,16 +201,71 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         format!("{}{}", self.target.prefix, self.key)
     }
 
+    /// Tells the seeded bug, if any, that a native target's `COMMIT` is
+    /// sent.
+    pub(crate) fn sent(&self) {
+        if let Some(early) = self.early {
+            early();
+        }
+    }
+
+    /// Whether `operation` is sent with its precondition: the target
+    /// honors it, and the key's conflict was not resolved by overwriting
+    /// the remote's write (§7.2).
     fn protected(&self, operation: ConditionalOperation) -> bool {
-        self.target.writes.operation(operation).is_protected()
+        self.resolution != Some(ConflictPolicy::Overwrite)
+            && self.target.writes.operation(operation).is_protected()
+    }
+
+    /// Resolves the key's conflict under `discard_local` (§7.2): HEADs the
+    /// key and, if it still holds a write SkyS3 did not make, commits an
+    /// `ADOPT` of that write naming `entry`'s version, which drops the
+    /// version, an acknowledged write. Returns `None` if the remote holds
+    /// no such write any more: there is nothing to adopt, and the version
+    /// is flushed as any other.
+    async fn discard(&self, entry: &Entry) -> Result<Option<Outcome>, Failure> {
+        let version = entry.version;
+        let written = entry.object.as_ref().and_then(|o| o.write_identity);
+        let identity = self
+            .target
+            .identity(self.shard.shard(), written.unwrap_or(version));
+        let info = match self.inspect(&identity, version, None).await? {
+            Found::Foreign(info) => info,
+            Found::Mine(info) => return Ok(Some(flushed(version, Some(info), true))),
+            Found::Missing | Found::Supersede(_) => return Ok(None),
+            // A newer primary flushed a later write: never replaced.
+            Found::Later => return Err(Failure::Later),
+        };
+        let last_modified_ms = info.last_modified_ms.unwrap_or_else(|| {
+            u64::try_from(self.target.wall.now().as_millis()).unwrap_or(u64::MAX)
+        });
+        let adopt = Adopt {
+            key: self.key.to_owned(),
+            expected_seq: version.seq,
+            size: info.size,
+            last_modified_ms,
+            remote_etag: info.etag.clone(),
+            remote_version_id: info.version_id.clone().map(|id| id.0),
+            metadata: loaded_metadata(&info),
+            checksums: Default::default(),
+        };
+        let committed = self.shard.commit(RecordBody::Adopt(adopt)).await?;
+        match committed.outcome {
+            Applied::Applied(_) => Ok(Some(Outcome::Discarded { version })),
+            // A write committed after the version: it is the one to resolve.
+            Applied::Rejected(rejection) => Err(Failure::Local(format!(
+                "the remote's write was not adopted: {rejection}"
+            ))),
+        }
     }
 
     /// Flushes an object version (§7.2): `If-Match` on the known remote
     /// ETag, `If-None-Match: *` where the key is known to be absent, and a
     /// HEAD first where the remote state is unknown. A version made of
     /// parts is sent as a remote multipart upload with the same part
-    /// boundaries, so that the remote ETag is the local one (§7.4); any
-    /// other version with `PutObject`.
+    /// boundaries, so that the remote ETag is the local one (§7.4); a
+    /// streamed single PUT by completing the remote upload its body
+    /// streamed to (§7.3); any other version with `PutObject`.
     async fn put(
         &self,
         entry: &Entry,
@@ -187,9 +295,39 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 .put_parts(version, object, *upload, parts, &identity, expected)
                 .await;
         }
+        // A streamed single PUT completes the remote upload its body
+        // streamed to (§7.3); a `TAGS` version has an identity of its own.
+        if let Some(upload) = object.write_identity
+            && self.streamable(object)
+            && let Some(claim) = self.streams.claim(upload).await
+        {
+            return self
+                .complete_body(version, object, upload, claim, &identity, expected)
+                .await;
+        }
+        // A copy of a clean source in the same remote bucket is copied
+        // there, unless the source changed (§7.2, §11).
+        let mut expected = expected;
+        if let Some(source) = self.copy_source(object) {
+            match self
+                .copy(version, object, source, &identity, expected)
+                .await?
+            {
+                Copied::Done(outcome) => return Ok(outcome),
+                Copied::Upload(etag) => expected = etag,
+            }
+        }
+        // An apply-by time bounds a body only as large as the commit
+        // window can carry: a larger one is uploaded in parts, and the
+        // completion carries it (§7.8).
+        if self.target.stamped() && object.size > crate::MAX_BOUNDED_BYTES {
+            return self
+                .put_body_parts(version, object, &identity, expected)
+                .await;
+        }
         let request = put_request(self.remote_key(), object, &identity)?;
         let _permit = self.target.reserve(object.size).await;
-        let body = self.read(&object.payload, object.size).await?;
+        let body = read_payload(self.shard, &object.payload, object.size).await?;
         let request = PutObject { body, ..request };
         Ok(
             match self
@@ -248,7 +386,12 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 Err(error) => return Err(Failure::Remote(error)),
             };
             match self.inspect(identity, version, expected.as_ref()).await? {
-                Found::Mine(info) => return Ok(Err(flushed(version, Some(info), true))),
+                Found::Mine(mut info) => {
+                    if matches!(write, Write::Complete(_)) {
+                        self.seeded_etag(&mut info).await;
+                    }
+                    return Ok(Err(flushed(version, Some(info), true)));
+                }
                 Found::Supersede(etag) => expected = Some(etag),
                 // The object the flush conditioned on is gone, perhaps
                 // deleted by an earlier flush whose answer was lost: no
@@ -274,6 +417,19 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         record: bool,
     ) -> Result<Outcome, Failure> {
         let version = entry.version;
+        if test_hooks::forgets_deletes() {
+            return Ok(flushed(version, None, record));
+        }
+        if self.resolution == Some(ConflictPolicy::Overwrite) {
+            // The local delete wins over whatever the remote holds.
+            let request = DeleteObject::new(self.remote_key());
+            self.target
+                .store
+                .delete_object(request)
+                .await
+                .map_err(Failure::Remote)?;
+            return Ok(flushed(version, None, record));
+        }
         let mut expected = known;
         for _ in 0..MAX_ROUNDS {
             let etag = match expected.take() {
@@ -356,7 +512,15 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// Whether the remote object is a write of this shard from before
     /// `version`: one SkyS3 flushed earlier, which the version supersedes.
     fn ours_before(&self, info: &ObjectInfo, version: EpochSeq) -> bool {
-        self.ours(info).is_some_and(|position| position < version)
+        info.metadata
+            .write_identity()
+            .and_then(|value| value.parse::<WriteIdentity>().ok())
+            .is_some_and(|wid| self.wrote_before(&wid, version))
+    }
+
+    /// Whether `wid` names a write of this shard from before `version`.
+    pub(crate) fn wrote_before(&self, wid: &WriteIdentity, version: EpochSeq) -> bool {
+        self.of_shard(wid) && wid.position < version
     }
 
     /// Whether the remote object is a write of this shard from after
@@ -364,22 +528,16 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// later primary holds, so the replica has not applied that write yet,
     /// or is no longer the primary: the version must not replace it.
     fn ours_after(&self, info: &ObjectInfo, version: EpochSeq) -> bool {
-        self.ours(info).is_some_and(|position| position > version)
-    }
-
-    /// The position of the write the remote object carries the identity
-    /// of, if it is one of this shard's.
-    fn ours(&self, info: &ObjectInfo) -> Option<EpochSeq> {
-        let shard = self.shard.shard();
         info.metadata
             .write_identity()
             .and_then(|value| value.parse::<WriteIdentity>().ok())
-            .filter(|wid| {
-                wid.cluster == self.target.cluster
-                    && wid.bucket == shard.bucket
-                    && wid.shard == shard.shard
-            })
-            .map(|wid| wid.position)
+            .is_some_and(|wid| self.of_shard(&wid) && wid.position > version)
+    }
+
+    /// Whether `wid` names a write of this shard.
+    fn of_shard(&self, wid: &WriteIdentity) -> bool {
+        let shard = self.shard.shard();
+        wid.cluster == self.target.cluster && wid.bucket == shard.bucket && wid.shard == shard.shard
     }
 
     async fn head(&self) -> Result<Option<ObjectInfo>, Failure> {
@@ -394,36 +552,40 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             Err(error) => Err(Failure::Remote(error)),
         }
     }
+}
 
-    /// Reads `size` bytes from the local log: those of a version, or of a
-    /// part of one.
-    pub(crate) async fn read(&self, payload: &Payload, size: u64) -> Result<Bytes, Failure> {
-        let body = match payload {
-            Payload::Inline(position) => self.shard.payload(*position).await?,
-            Payload::Extents(extents) => {
-                let mut body = BytesMut::new();
-                for extent in extents {
-                    body.extend_from_slice(&self.shard.payload(extent.position).await?);
-                }
-                body.freeze()
+/// Reads `size` bytes of `payload` from `shard`'s local log: those of a
+/// version, or of a part of one.
+pub(crate) async fn read_payload<D: Disk>(
+    shard: &Shard<D>,
+    payload: &Payload,
+    size: u64,
+) -> Result<Bytes, Failure> {
+    let body = match payload {
+        Payload::Inline(position) => shard.payload(*position).await?,
+        Payload::Extents(extents) => {
+            let mut body = BytesMut::new();
+            for extent in extents {
+                body.extend_from_slice(&shard.payload(extent.position).await?);
             }
-            // An imported or evicted stub changed by `TAGS`: its bytes must
-            // be filled from the remote first (plan M1-20).
-            Payload::None => return Err(Failure::Local("the version has no local bytes".into())),
-            Payload::Parts { .. } => {
-                return Err(Failure::Local(
-                    "a multipart object is read part by part".into(),
-                ));
-            }
-        };
-        if body.len() as u64 != size {
-            return Err(Failure::Local(format!(
-                "the version's bytes are {} long, not {size}",
-                body.len()
-            )));
+            body.freeze()
         }
-        Ok(body)
+        // An imported or evicted stub changed by `TAGS`: its bytes must be
+        // filled from the remote first (plan M1-20).
+        Payload::None => return Err(Failure::Local("the version has no local bytes".into())),
+        Payload::Parts { .. } => {
+            return Err(Failure::Local(
+                "a multipart object is read part by part".into(),
+            ));
+        }
+    };
+    if body.len() as u64 != size {
+        return Err(Failure::Local(format!(
+            "the version's bytes are {} long, not {size}",
+            body.len()
+        )));
     }
+    Ok(body)
 }
 
 /// Why an attempt must be retried.
@@ -436,6 +598,17 @@ pub(crate) enum Failure {
     Changing,
     /// The remote holds a later write of the shard than the version.
     Later,
+    /// The link to a native target failed, or no answer came in time.
+    Link(LinkError),
+    /// A native target did not apply the write (§7.8).
+    Peer(String),
+}
+
+impl Failure {
+    /// The failure of a link to a native target.
+    pub(crate) fn link(error: LinkError) -> Self {
+        Failure::Link(error)
+    }
 }
 
 impl fmt::Display for Failure {
@@ -445,6 +618,8 @@ impl fmt::Display for Failure {
             Failure::Local(reason) => f.write_str(reason),
             Failure::Changing => f.write_str("the remote object kept changing"),
             Failure::Later => f.write_str("the remote holds a later write of the shard"),
+            Failure::Link(error) => write!(f, "the link to the peer failed: {error}"),
+            Failure::Peer(reason) => write!(f, "the peer did not apply the write: {reason}"),
         }
     }
 }
@@ -459,7 +634,7 @@ impl From<skys3_shard::ShardError> for Failure {
 /// `412`, `404 NoSuchKey` to `If-Match` on a missing object, or `409
 /// ConditionalRequestConflict` from a racing write (§7.2). Nothing was
 /// written; the remote must be read.
-fn failed_precondition(error: &S3Error) -> bool {
+pub(crate) fn failed_precondition(error: &S3Error) -> bool {
     matches!(
         error.kind(),
         S3ErrorKind::PreconditionFailed
@@ -497,7 +672,7 @@ pub(crate) fn flushed(version: EpochSeq, info: Option<ObjectInfo>, record: bool)
     }
 }
 
-fn conflict(version: EpochSeq, info: Option<ObjectInfo>) -> Conflict {
+pub(crate) fn conflict(version: EpochSeq, info: Option<ObjectInfo>) -> Conflict {
     Conflict {
         seq: version.seq,
         remote_identity: info
@@ -516,10 +691,27 @@ pub(crate) fn put_request(
     object: &ObjectVersion,
     identity: &WriteIdentity,
 ) -> Result<PutObject, Failure> {
+    let mut request = request_headers(key, &object.metadata, &object.tags, identity)?;
+    // A single PUT's ETag is the MD5 of its bytes; a copy's need not be.
+    if object.copy_source.is_none() {
+        request.content_md5 = content_md5(&object.local_etag);
+    }
+    Ok(request)
+}
+
+/// A `PutObject` without a body of an object with stored `metadata` and
+/// `tags`, written with `identity`: the metadata split into user metadata,
+/// `Content-Type`, and the other standard headers.
+pub(crate) fn request_headers(
+    key: String,
+    stored: &Metadata,
+    tags: &TagSet,
+    identity: &WriteIdentity,
+) -> Result<PutObject, Failure> {
     let mut metadata = UserMetadata::new();
     let mut headers = BTreeMap::new();
     let mut request = PutObject::new(key, Bytes::new());
-    for (name, value) in &object.metadata {
+    for (name, value) in stored {
         if let Some(user) = name.strip_prefix("x-amz-meta-") {
             metadata
                 .insert(user, value.clone())
@@ -533,11 +725,7 @@ pub(crate) fn put_request(
     metadata.set_write_identity(identity);
     request.metadata = metadata;
     request.headers = headers;
-    request.tags = object.tags.clone();
-    // A single PUT's ETag is the MD5 of its bytes; a copy's need not be.
-    if object.copy_source.is_none() {
-        request.content_md5 = content_md5(&object.local_etag);
-    }
+    request.tags = tags.clone();
     Ok(request)
 }
 

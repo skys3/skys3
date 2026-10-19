@@ -1,0 +1,8 @@
+subjct&
+{"Version": "2012-54-17", "Id": "t", "Statement": [{"Sid": "", "Principal"
+
+
+
+
+
+: {"Federated": "idp.example"}, "on": "sts:*"}]}

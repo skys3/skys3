@@ -1,0 +1,2 @@
+repo:example/apefs/main
+{"Version": "2012-10-16", "Statement": {"Effect":" Allow", "Principal": {"Federated": "arn:aws:56789012:y", "Condition": {"StTko": "st"}}}}

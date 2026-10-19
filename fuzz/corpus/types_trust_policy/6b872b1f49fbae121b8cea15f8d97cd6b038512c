@@ -1,0 +1,2 @@
+repo:example/a
+{"Version": "4050-10-17", "Statement": {"Effect":" Allow", "Principal": {"Federated": "a:nraws:iam::00Ef&fect1731799785:oidc-proctm/"}, "Action": "sts:AssumeRoleWbIdenty", "NotAction": {"Stringmmmmmmmmmmm\uCCCCCCCCtion": {"StringEq":" Allow", ".\uCCCCCn": "68582-17", ".\uCCC-CCCCCCCC}}}}

@@ -16,7 +16,8 @@ use skys3_remote::{
     DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
     ListPartsOutput, ListedObject, ListedPart, MAX_KEY_LEN, MAX_LIST_KEYS, MAX_LIST_PARTS,
     MetadataDirective, ObjectInfo, PART_NUMBERS, PutObject, S3Error, S3ErrorKind, S3Result,
-    UploadId, UploadPart, UserMetadata, VersionId, WriteOutput, WritePrecondition,
+    TaggingDirective, UploadId, UploadPart, UserMetadata, VersionId, WriteOutput,
+    WritePrecondition,
 };
 use skys3_types::ETag;
 
@@ -37,7 +38,7 @@ struct Stored {
 }
 
 /// One entry in a key's version history: an object, or a delete marker.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Version {
     /// `None` on an unversioned bucket.
     id: Option<VersionId>,
@@ -45,14 +46,14 @@ struct Version {
     object: Option<Arc<Stored>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Part {
     body: Bytes,
     md5: [u8; 16],
     etag: ETag,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Upload {
     key: String,
     metadata: UserMetadata,
@@ -62,7 +63,7 @@ struct Upload {
 }
 
 /// The objects and uploads of one simulated bucket.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Bucket {
     config: SimS3Config,
     /// Each key's versions, oldest first. On an unversioned bucket a key
@@ -324,6 +325,7 @@ impl Bucket {
             metadata: object.metadata.clone(),
             content_type: object.content_type.clone(),
             last_modified_ms: None,
+            tag_count: u32::try_from(object.tags.len()).unwrap_or(u32::MAX),
         }
     }
 
@@ -497,10 +499,16 @@ impl Bucket {
                 }
                 (source.metadata.clone(), source.content_type.clone())
             }
+            // The bucket keeps no standard headers but `Content-Type`.
             MetadataDirective::Replace {
                 metadata,
                 content_type,
+                headers: _,
             } => (metadata, content_type),
+        };
+        let tags = match request.tagging_directive {
+            TaggingDirective::Copy => source.tags.clone(),
+            TaggingDirective::Replace(tags) => tags,
         };
         self.check_metadata(&metadata)?;
         self.check_precondition(&request.key, &request.precondition)?;
@@ -514,7 +522,7 @@ impl Bucket {
                 etag,
                 metadata,
                 content_type,
-                tags: source.tags.clone(),
+                tags,
             },
         ))
     }

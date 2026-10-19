@@ -32,8 +32,13 @@
 //!   place their shards on the registered nodes (plan M3-04).
 //! - **Faults.** A [`FaultPlan`]: crashes with or without power loss,
 //!   partitions, held links (delay and reordering), random message loss,
+//!   a node's link to the remote store dropped ([`Fault::RemoteLink`]),
+//!   UDP blocked between every node and a SkyS3 peer
+//!   ([`Fault::UdpBlock`]),
 //!   failed syncs, control-store outages, control-store round trips of
-//!   100 ms and more, and lost control-store answers, plus a new clock
+//!   100 ms and more, lost control-store answers, and a lost control
+//!   store, which an operator rebuilds from the nodes' exports (plan
+//!   M3-07), plus a new clock
 //!   drift for every life of a node, or a fixed one, even beyond `ρ`
 //!   ([`ClusterConfig::node_drifts`]). Separately,
 //!   [`Cluster::power_loss_at_sync`] cuts a node's power at one numbered
@@ -53,7 +58,10 @@
 //! a node's crash ends the operations it had not answered
 //! ([`skys3_sim::history::History::crashed`]), so a write cut off by a
 //! crash cannot resurface over a later acknowledged one unnoticed.
-//! [`Invariant`]s run after every step.
+//! [`Invariant`]s run after every step. With
+//! [`ClusterConfig::large_objects`], every object the remote store holds
+//! is audited as it appears and once more against the final logs
+//! ([`LargeObjects`]).
 //!
 //! # Extending it
 //!
@@ -85,32 +93,71 @@
 //! });
 //! ```
 
+mod backup;
 mod cluster;
+pub mod coding;
+mod conflicts;
 mod coordination;
+mod copies;
 mod creation;
+pub mod drill;
 mod faults;
+mod holders;
+mod large_objects;
 mod learners;
+mod lifecycle;
 mod node;
+mod origin;
+mod peer;
+mod peer_s3;
+mod peer_wire;
 mod pki;
+mod quic;
 mod replication;
 mod routing;
 mod s3;
+mod snapshots;
 mod workload;
+mod write_through;
 
-pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View};
-pub use coordination::{
-    Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
+pub use backup::Backup;
+pub use cluster::{
+    Cluster, ClusterConfig, HotCaches, Invariant, ReadRegistration, Rebuild, Report, RunError,
+    View, WriteTiming,
 };
+pub use conflicts::{ConflictAudit, Conflicts};
+pub use coordination::{
+    Change, ChangeStage, CoordinatedServices, CoordinationConfig, CoordinatorLoss, Forgotten,
+    LostCoordinator, PUSH_PORT, PushDelays, RegistryView,
+};
+pub use copies::{Copies, CopyAudit};
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
+pub use holders::{HolderCounts, HolderFaults};
+pub use large_objects::{LargeObjectAudit, LargeObjects};
 pub use learners::{DurabilityWindows, LearnerCounts};
+pub use lifecycle::{Lifecycle, LifecycleAudit, LifecycleObject, LifecycleStart, ORIGIN_DAY};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
+pub use origin::{FULL, GUEST, Origin, OriginAudit, OriginBug, OriginFreshness};
+pub use peer::{AimScope, AimedBlocks, DescriptorKind, Peer, PeerAudit, ProtocolFaults};
 pub use replication::{
-    HandoffCounts, IoCounts, LateWrites, LeaseCounts, ReplicaState, ReplicatedServices,
-    ReplicatedShards,
+    HandoffCounts, HandoffTime, IoCounts, LateWrites, LeaseCounts, ReplicaState,
+    ReplicatedServices, ReplicatedShards,
 };
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
+/// The seeded bugs of [`Peer`].
+pub use skys3_flush::PeerBug;
+/// The seeded bugs of conflict handling ([`Conflicts::bug`]).
+pub use skys3_flush::test_hooks::ConflictBug;
+/// The seeded bugs of server-side copies ([`Copies::bug`]).
+pub use skys3_flush::test_hooks::CopyBug;
+/// The seeded bugs of large-object flushes ([`LargeObjects::bug`]).
+pub use skys3_flush::test_hooks::LargeObjectBug;
+/// The seeded bugs of index snapshots ([`Snapshots::bug`]).
+pub use skys3_flush::test_hooks::SnapshotBug;
+pub use snapshots::{SnapshotAudit, Snapshots};
 pub use workload::Workload;
+pub use write_through::WriteThrough;
 
 /// The control-store fault rates of [`ClusterConfig::control_rates`].
 pub use skys3_control::faults::FaultRates;

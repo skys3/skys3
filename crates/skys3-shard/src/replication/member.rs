@@ -170,8 +170,10 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
 /// should it go silent. A member that proposed itself as primary follows
 /// only a newer configuration than the one it proposed over, which tells
 /// it that its proposal lost (R1, §6.3), also when it recorded the proposal
-/// in an earlier life. A refusal carries the member's
-/// epoch, if it knows the shard, and why.
+/// in an earlier life. A session from a new primary restarts the member's
+/// grace, so that it does not propose over the winner of a takeover before
+/// that winner had a whole grace to reach it (§6.5). A refusal carries the
+/// member's epoch, if it knows the shard, and why.
 async fn accept<N: Network, D: Disk>(
     request: &Sync,
     peer: &PeerIdentity,
@@ -205,10 +207,13 @@ async fn accept<N: Network, D: Disk>(
         );
     }
     // A takeover recorded in an earlier life may have made this node the
-    // primary: no primary of an older configuration is followed (§6.3).
+    // primary: no primary of an older configuration is followed (§6.3). A
+    // new primary gets a whole grace to reach this member before the member
+    // may propose over it (§6.5).
     let proposed = replica.outstanding_takeover();
+    let new_primary = theirs.primary != ours.primary;
     if proposed.is_some_and(|proposed| theirs.epoch < proposed.epoch)
-        || !inner.grace_of(&shard).resume_for(theirs.epoch)
+        || !inner.grace_of(&shard).resume_for(theirs.epoch, new_primary)
     {
         return refuse(ours.epoch, "this member proposed itself as primary");
     }

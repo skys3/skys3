@@ -1,5 +1,6 @@
 //! The bodies of the multipart upload records: `MPU_CREATE`, `MPU_PART`,
-//! `MPU_COMPLETE`, and `MPU_ABORT` (§7.2, §7.4).
+//! `MPU_COMPLETE`, and `MPU_ABORT` (§7.2, §7.4), and `PART_FLUSHED`, which
+//! follows an upload's remote counterpart while it streams (§7.3).
 //!
 //! An upload is named by the position of its `MPU_CREATE` record, which is
 //! unique within the shard. The other records name it by that position, and
@@ -178,6 +179,56 @@ pub struct MpuAbort {
     pub upload: EpochSeq,
 }
 
+/// The longest remote multipart upload ID a `PART_FLUSHED` carries, in
+/// bytes. S3 does not bound it; AWS's are about 150 bytes.
+pub const MAX_UPLOAD_ID_LEN: usize = 1024;
+
+/// The remote side of a streamed multipart upload moved on (§7.3):
+/// `PART_FLUSHED(upload, part, remote_etag)`.
+///
+/// The flusher of the shard's primary opens a remote multipart upload for
+/// each local one, uploads each stored part to it, and completes or aborts
+/// it. Each step is recorded with a `PART_FLUSHED` that rides the next
+/// group commit, like a `FLUSHED`, and names the remote upload by its ID,
+/// so the shard log keeps the remote upload IDs (§7.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartFlushed {
+    /// The object key.
+    pub key: String,
+    /// The position of the local upload's `MPU_CREATE`.
+    pub upload: EpochSeq,
+    /// The remote upload's ID: from 1 to [`MAX_UPLOAD_ID_LEN`] bytes.
+    pub remote_upload_id: String,
+    /// What happened to the remote upload.
+    pub step: RemoteStep,
+}
+
+/// A step of a remote multipart upload, as a [`PartFlushed`] records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteStep {
+    /// The remote upload was opened for the local one.
+    Opened,
+    /// The remote upload holds a local part.
+    Part {
+        /// The part number, from 1 to [`MAX_PARTS`].
+        number: u16,
+        /// The position of the `MPU_PART` record whose bytes were sent. It
+        /// follows the upload and precedes the `PART_FLUSHED`.
+        position: EpochSeq,
+        /// The ETag the remote returned for the part.
+        remote_etag: ETag,
+    },
+    /// The remote upload is completed or aborted: nothing refers to it any
+    /// more.
+    Ended,
+}
+
+impl RemoteStep {
+    const OPENED: u8 = 0;
+    const PART: u8 = 1;
+    const ENDED: u8 = 2;
+}
+
 /// The field names an `MPU_PART`'s data reports errors under.
 const PART_DATA_FIELDS: DataFields = DataFields {
     data: "mpu_part.data",
@@ -319,6 +370,83 @@ impl MpuAbort {
         check_precedes("mpu_abort.upload", upload, position)?;
         Ok(Self { key, upload })
     }
+}
+
+impl PartFlushed {
+    pub(super) fn encode(&self, w: &mut Writer<'_>, position: EpochSeq) -> Result<(), FieldError> {
+        w.str16("part_flushed.key", &self.key, 1, MAX_KEY_LEN)?;
+        check_precedes("part_flushed.upload", self.upload, position)?;
+        w.position(self.upload);
+        w.str16(
+            "part_flushed.remote_upload_id",
+            &self.remote_upload_id,
+            1,
+            MAX_UPLOAD_ID_LEN,
+        )?;
+        match &self.step {
+            RemoteStep::Opened => w.u8(RemoteStep::OPENED),
+            RemoteStep::Part {
+                number,
+                position: part,
+                remote_etag,
+            } => {
+                w.u8(RemoteStep::PART);
+                check_flushed_part(*number, self.upload, *part, position)?;
+                w.u16(*number);
+                w.position(*part);
+                write_etag(w, "part_flushed.remote_etag", remote_etag)?;
+            }
+            RemoteStep::Ended => w.u8(RemoteStep::ENDED),
+        }
+        Ok(())
+    }
+
+    pub(super) fn decode(r: &mut Reader<'_>, position: EpochSeq) -> Result<Self, FieldError> {
+        let key = r.str16("part_flushed.key", 1, MAX_KEY_LEN)?;
+        let upload = r.position("part_flushed.upload")?;
+        check_precedes("part_flushed.upload", upload, position)?;
+        let remote_upload_id = r.str16("part_flushed.remote_upload_id", 1, MAX_UPLOAD_ID_LEN)?;
+        let step = match r.u8("part_flushed.step")? {
+            RemoteStep::OPENED => RemoteStep::Opened,
+            RemoteStep::PART => {
+                let number = r.u16("part_flushed.number")?;
+                let part = r.position("part_flushed.position")?;
+                check_flushed_part(number, upload, part, position)?;
+                RemoteStep::Part {
+                    number,
+                    position: part,
+                    remote_etag: read_etag(r, "part_flushed.remote_etag")?,
+                }
+            }
+            RemoteStep::ENDED => RemoteStep::Ended,
+            tag => {
+                return Err(FieldError::new(
+                    "part_flushed.step",
+                    Problem::InvalidTag(tag),
+                ));
+            }
+        };
+        Ok(Self {
+            key,
+            upload,
+            remote_upload_id,
+            step,
+        })
+    }
+}
+
+/// Checks a flushed part: a valid number, stored after the upload opened
+/// and before the record at `position`.
+fn check_flushed_part(
+    number: u16,
+    upload: EpochSeq,
+    part: EpochSeq,
+    position: EpochSeq,
+) -> Result<(), FieldError> {
+    let field = "part_flushed.position";
+    check_part_number("part_flushed.number", number)?;
+    check_precedes(field, upload, part)?;
+    check_precedes(field, part, position)
 }
 
 fn check_part_number(field: &'static str, number: u16) -> Result<(), FieldError> {

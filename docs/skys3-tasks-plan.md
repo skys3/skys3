@@ -117,6 +117,7 @@ crates/
   skys3-sim/            seeded runner, simulated S3 store, history checkers (§16.1)
   skys3-cluster-sim/    cluster simulation harness: real nodes, faults, workload (§16.1)
 spec/                   protocol model
+deploy/                 Prometheus alerting rules and Grafana dashboard (M7-04)
 tests/                  SDK matrix, s3-tests subset, provider and fault-injection tests
 bench/                  performance suite (§16.3)
 ```
@@ -129,7 +130,7 @@ bench/                  performance suite (§16.3)
 | `cargo-deny` (licenses, advisories, bans) and an MSRV build | M0-01 | Every push and PR |
 | Simulation with a fixed seed set | M0-04 | Every push and PR |
 | Simulation with random seeds and long runs | M2-03 | Nightly. A failing seed becomes a regression test with its replay command. |
-| Fuzz smoke runs | M1-01 | Every push and PR, briefly per target. Long runs nightly (M7-03). |
+| Fuzz smoke runs | M1-01 | Every push and PR, briefly per target, from the committed corpus. Long runs nightly (M7-03, `fuzz-nightly.yml`). |
 | Protocol model check | M2-01 | Changes under `spec/`, and nightly |
 | etcd integration | M2-05 | Every push and PR |
 | SDK matrix | M1-25 | PRs that touch the gateway or identity, and nightly |
@@ -980,6 +981,8 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 - Long runs of every fuzz target, a corpus kept in the repository, and fixes for what they find.
 - **Done when:** every target has run for the agreed time with no open findings.
+- **The agreed time (decided in M7-03).** Every target runs 10 CPU-minutes before the PR merges, three at a time on four cores, and from then on 30 minutes on a core of its own every night (`.github/workflows/fuzz-nightly.yml`), which carries the corpus each night grows to the next in an Actions cache, so the nights add up. About half the targets, the small text parsers and frame-level decoders, found no new coverage in the second half of their first 10 minutes; the larger ones still did in their last minutes, which is what the nightly runs are for.
+- **The corpus (decided in M7-03).** `fuzz/corpus/<target>` holds each target's corpus, minimized with `cargo fuzz cmin` to the inputs that reach code no smaller input reaches (`fuzz/run.sh --cmin`), at most `max_len` bytes each: 1.1 MB in 11,193 files after the campaign, at most 340 KB for one target. It was seeded from the SigV4 test suite, S3 request and XML bodies, tokens, key sets, policies, the log record golden vectors, and rebuild exports. Every run starts from it: the pull-request smoke job, the nightly job, and local runs through `fuzz/run.sh`, which also sets each target's input length, allocation, memory, and time bounds from its parser's limits in design §12.
 
 #### M7-04 Metrics, alerts, and dashboards
 
@@ -1044,7 +1047,8 @@ The design leaves these points open. Each named PR decides the point and records
 | TLS for the admin HTTP listener, and `admin` certificates of the node PKI as an alternative to its bearer token (§12). M2-02 defines the PKI and the `admin` role. | M3-02 |
 | The fragment header fields needed to re-index coded objects: §8.4 omits the fragment index, geometry, codec ID, and stripe length | M5-02 |
 | Fencing orphan-fragment reclamation against fragment-writing attempts still in progress (encoding, repair, and moves), which §8.4 does not specify | M5-04, M5-05, M5-08, M5-09 |
-| The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07 |
+| The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07: the reserved key `.skys3/peer-descriptor` of the receiving bucket, through the target's own S3 endpoint; signed by the destination node's `[transport]` key, with its chain, for an hour; verified against the named peer's trust bundle |
+| How a destination accepts a peer's write identity over S3 REST, which a SkyS3 gateway refuses from clients (§7.2, §7.8) | M6-07: requests signed with an access key listed in the peer's `s3_access_key_ids` may carry identities of that peer's bucket pairs |
 | Upgrade rules for on-disk and wire format versions | M7-09, with version fields present from M1-01 |
 
 ## 15. Open questions from design section 19

@@ -4,9 +4,10 @@
 //! Bucket registers live in the control store, keyed by S3 name
 //! (`buckets/<name>.json`). The gateway answers HeadBucket, ListBuckets,
 //! and GetBucketLocation from its local copy, so those requests never
-//! touch the control store (§6.2). CreateBucket and DeleteBucket write the
-//! register, then increment the generation in `cluster.json`, which
-//! announces the change to every node.
+//! touch the control store (§6.2). CreateBucket, DeleteBucket, and the
+//! lifecycle operations (`crate::lifecycle`) write the register, then
+//! increment the generation in `cluster.json`, which announces the change
+//! to every node.
 //!
 //! **Creation.** A request picks a bucket's mode with the
 //! [`MODE_HEADER`] header, defaulting to the `mode` of the bucket's
@@ -53,13 +54,20 @@ use skys3_control::{
     propose_document, read, read_with_retries,
 };
 use skys3_coord::{Creation, CreationError, Pending, create_bucket, settle};
+use skys3_ec::FragmentSource;
 use skys3_io::BlockingPool;
+use skys3_types::lifecycle::LifecycleConfiguration;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
 use crate::admission::{Admission, AdmitAll};
 use crate::authz::Permissions;
+use crate::fill::Fills;
+use crate::hot_cache::HotCache;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
+use crate::objects::backed_up;
+use crate::origin::OriginValidations;
+use crate::peer_s3::{PeerAccess, PeerDescriptors};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
@@ -67,9 +75,9 @@ use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 /// `local`, or `read_only`. S3 has no field for it.
 pub const MODE_HEADER: &str = "x-skys3-bucket-mode";
 
-/// The CreateBucket header that names a `write_back` bucket's target, as a
-/// path-style URL: `https://host[:port]/bucket` or
-/// `https://host[:port]/bucket/prefix`.
+/// The CreateBucket header that names a `write_back` bucket's target, or a
+/// `read_only` bucket's origin, as a path-style URL:
+/// `https://host[:port]/bucket` or `https://host[:port]/bucket/prefix`.
 pub const TARGET_HEADER: &str = "x-skys3-bucket-target";
 
 /// What the gateway needs from the node's configuration.
@@ -97,10 +105,34 @@ pub struct GatewayConfig {
     /// `extent_bytes`: the size of the `EXTENT` records a large body is
     /// streamed in.
     pub extent_bytes: u64,
+    /// `streaming_flush_min_bytes`: a single PUT to a `write_back` bucket
+    /// whose body reaches this size commits an `UPLOAD_BEGIN` record while
+    /// it streams, and its `PUT` inherits that record's write identity
+    /// (§7.2, §7.3). `None` gives every PUT the identity of its own record.
+    pub streaming_flush_min_bytes: Option<u64>,
+    /// `flush_part_bytes`: the part size a streamed single PUT is sent to
+    /// the remote in. Its gateway announces the body to the shard's
+    /// primary each time this many more bytes of it are applied (§7.3).
+    pub flush_part_bytes: u64,
+    /// The smallest size of every part of a multipart upload but the last
+    /// that `CompleteMultipartUpload` accepts: S3's 5 MiB
+    /// ([`MIN_PART_BYTES`](crate::MIN_PART_BYTES)). It is not a
+    /// configuration key: simulations lower it to keep objects of several
+    /// parts small.
+    pub min_part_bytes: u64,
+    /// How long a request body may stream as `EXTENT` records before the
+    /// record that names them is committed: half of
+    /// `peer_staging_ttl_seconds`, after which compaction may drop extents
+    /// that nothing names (§10.3). A body that takes longer is refused with
+    /// `400 RequestTimeout`.
+    pub max_body_duration: Duration,
     /// The pool that hashes object bodies (§7.4). Without one, bodies are
     /// hashed on the request's task, which only tests should do; the node
     /// sets one.
     pub hashing_pool: Option<BlockingPool>,
+    /// Read-through fill of evicted versions of `write_back` buckets
+    /// (§9.2). Without it, a GET of one answers `503`; the node sets it.
+    pub fills: Option<Arc<dyn Fills>>,
     /// The keys that sign and verify ListObjectsV2 continuation tokens
     /// (§9.4). [`GatewayConfig::new`] generates a key, so tokens are valid
     /// on this gateway until it restarts.
@@ -111,11 +143,43 @@ pub struct GatewayConfig {
     pub admission: Arc<dyn Admission>,
     /// The remote targets of `write_back` buckets, which reads of keys the
     /// namespace import has not reached and lazily loaded metadata use
-    /// (§9.1). [`GatewayConfig::new`] has none: every read is local.
+    /// (§9.1), and the origins of `read_only` buckets, which every read of
+    /// one checks and every listing of one is forwarded to (§9.5).
+    /// [`GatewayConfig::new`] has none: every read is local, and a
+    /// `read_only` bucket answers `503`.
     pub remote: Option<Arc<dyn RemoteReads>>,
+    /// What the origins of `read_only` buckets were seen to hold, which
+    /// reads under `freshness = "ttl"` use (§9.5). Clones of a
+    /// configuration share it, so gateways built from clones on several
+    /// nodes need one each.
+    pub origin_validations: OriginValidations,
     /// Where new buckets' shards live. [`GatewayConfig::new`] keeps them
     /// on this node, as a single-node cluster does.
     pub placement: ShardPlacement,
+    /// `read_registration_renew_interval_seconds`: how often a GET renews
+    /// the registration of the read it streams with its holder (§8.7).
+    pub read_registration_renew_interval: Duration,
+    /// `write_through_timeout_seconds`: how long a write to a
+    /// `write_through` bucket waits for its version to reach the remote
+    /// target before it is answered `503 SlowDown` (§7.5). Which buckets
+    /// wait is their `ack_policy` in [`GatewayConfig::buckets`].
+    pub write_through_timeout: Duration,
+    /// Where GETs of coded objects read fragments from (§8.5): the node's
+    /// fragment read client. [`GatewayConfig::new`] has none, so a GET of
+    /// a coded object answers `503`.
+    pub fragments: Option<Arc<dyn FragmentSource>>,
+    /// The node's hot cache of recently read objects (§9.2):
+    /// [`GatewayConfig::new`] makes one of `hot_cache_bytes_per_node`
+    /// without metrics. Clones of a configuration share it, so gateways
+    /// built from clones on several nodes need one each.
+    pub hot_cache: HotCache,
+    /// The access keys of peer clusters' flushers on this S3 endpoint, and
+    /// the bucket pairs each peer may write (§7.8, §12).
+    pub peer_access: PeerAccess,
+    /// Signs the peer descriptors of the buckets that receive native
+    /// replication (§7.8). [`GatewayConfig::new`] has none, so the node
+    /// serves no descriptor and sources flush to it over S3 REST.
+    pub descriptors: Option<Arc<dyn PeerDescriptors>>,
 }
 
 /// Where CreateBucket puts a new bucket's shards (design §4.1, §6.7).
@@ -148,11 +212,23 @@ impl GatewayConfig {
             anonymous: anonymous_permissions(config.identity()),
             inline_max_bytes: config.storage().inline_max_bytes,
             extent_bytes: config.storage().extent_bytes,
+            streaming_flush_min_bytes: Some(config.flush().streaming_flush_min_bytes),
+            flush_part_bytes: config.flush().flush_part_bytes,
+            min_part_bytes: crate::MIN_PART_BYTES,
+            max_body_duration: config.peering().peer_staging_ttl() / 2,
             hashing_pool: None,
+            fills: None,
             list_token_keys: ListTokenKeys::generate(),
             admission: Arc::new(AdmitAll),
             remote: None,
+            origin_validations: OriginValidations::new(),
             placement: ShardPlacement::Local,
+            read_registration_renew_interval: config.storage().read_registration_renew_interval(),
+            write_through_timeout: config.flush().write_through_timeout(),
+            hot_cache: HotCache::new(config.cache().hot_cache_bytes_per_node),
+            fragments: None,
+            peer_access: PeerAccess::from_config(config.peering()),
+            descriptors: None,
         }
     }
 }
@@ -227,6 +303,10 @@ impl IdSource {
 /// oldest is forgotten: its shards stay sealed until a restart, and startup
 /// recovery reclaims them if the register is gone.
 const MAX_PENDING_DELETIONS: usize = 256;
+
+/// How many times a lifecycle change reads the bucket register and swaps
+/// it before it gives up on a register that keeps changing.
+const LIFECYCLE_ATTEMPTS: usize = 3;
 
 /// The longest pause between two attempts at an announcement still owed.
 const OWED_MAX_PAUSE: Duration = Duration::from_secs(30);
@@ -313,18 +393,45 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     /// writes from this cluster's clients: a bucket that receives native
     /// replication from a peer cluster (`peer_source`) is read-only to them,
     /// so each key has a single writer, unless `peer_local_writes` is set
-    /// (design §7.8).
-    pub(crate) fn require_writable(&self, name: &BucketName) -> Result<BucketDocument, S3Error> {
+    /// (design §7.8), and a `read_only` bucket takes none (§9.5). A write
+    /// from the flusher of `peer`, over S3 REST, may write only the buckets
+    /// that receive from that peer, whether or not `peer_local_writes` is
+    /// set.
+    pub(crate) fn require_writable(
+        &self,
+        name: &BucketName,
+        peer: Option<&ClusterId>,
+    ) -> Result<BucketDocument, S3Error> {
         let bucket = self.require(name)?;
+        if bucket.mode == BucketMode::ReadOnly {
+            return Err(s3_error!(
+                AccessDenied,
+                "Bucket {name} is a read_only bucket: it caches an origin that SkyS3 does not \
+                 own, and takes no writes"
+            ));
+        }
         let settings = self.config.buckets.get(name);
-        match &settings.peer_source {
-            Some(source) if !settings.peer_local_writes => Err(s3_error!(
+        match (peer, &settings.peer_source) {
+            // A peer's flusher writes only the buckets that receive from
+            // it, whatever `peer_local_writes` lets this cluster's clients
+            // do: its key is the peer's, not a local client's.
+            (Some(peer), source) if source.as_ref() != Some(peer) => Err(s3_error!(
+                AccessDenied,
+                "The request is cluster {peer}'s, and bucket {name} does not receive \
+                 replication from it"
+            )),
+            (None, Some(source)) if !settings.peer_local_writes => Err(s3_error!(
                 AccessDenied,
                 "Bucket {name} receives native replication from cluster {source} and is \
                  read-only to this cluster's clients"
             )),
             _ => Ok(bucket),
         }
+    }
+
+    /// The settings of the bucket named `name`.
+    pub(crate) fn settings(&self, name: &BucketName) -> &skys3_config::BucketSettings {
+        self.config.buckets.get(name)
     }
 
     /// Every bucket, in name order, from the local copy.
@@ -361,20 +468,14 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             None => settings.mode,
         };
         let target = match (mode, target) {
-            (BucketMode::ReadOnly, _) => {
-                return Err(s3_error!(
-                    NotImplemented,
-                    "read_only buckets are not supported yet"
-                ));
-            }
-            (BucketMode::WriteBack, None) => {
+            (BucketMode::WriteBack | BucketMode::ReadOnly, None) => {
                 return Err(s3_error!(
                     InvalidArgument,
-                    "A write_back bucket needs a target: set the {TARGET_HEADER} header to \
+                    "A {mode} bucket needs a target: set the {TARGET_HEADER} header to \
                      https://host[:port]/bucket or https://host[:port]/bucket/prefix"
                 ));
             }
-            (BucketMode::WriteBack, Some(url)) => {
+            (BucketMode::WriteBack | BucketMode::ReadOnly, Some(url)) => {
                 let target = parse_target(url).map_err(|e| s3_error!(InvalidArgument, "{e}"))?;
                 self.config
                     .control_store
@@ -404,6 +505,7 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             clean_copies: settings.replication.clean_copies,
             target,
             created_unix_ms: unix_ms(SystemTime::now()),
+            lifecycle: None,
             proposal_id,
         };
         if let ShardPlacement::Cluster(level) = self.config.placement {
@@ -542,7 +644,8 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 }
             }
         }
-        if let Some(refusal) = refuse_detach(bucket.mode, summary) {
+        let backed_up = backed_up(&self.config.buckets, bucket);
+        if let Some(refusal) = refuse_detach(bucket.mode, backed_up, summary) {
             // Held seals came from a check that passed, and no client write
             // has committed since, so they cannot lead here; they are kept
             // all the same while the earlier delete may apply.
@@ -591,6 +694,67 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 Err(control_error(&error))
             }
         }
+    }
+
+    /// Sets the lifecycle configuration of the bucket `name`, or removes it
+    /// with `None` (design §8.7): a compare-and-swap of the bucket's
+    /// register, announced to every node like any bucket change. A swap
+    /// that loses to another change of the register is tried again from a
+    /// fresh read, up to [`LIFECYCLE_ATTEMPTS`] times.
+    ///
+    /// # Errors
+    ///
+    /// `404 NoSuchBucket`; `501 NotImplemented` for a configuration of a
+    /// bucket that is not `local`; `409 OperationAborted` once the attempts
+    /// are used up; and `503` if the control store does not answer.
+    pub(crate) async fn set_lifecycle(
+        &self,
+        name: &BucketName,
+        lifecycle: Option<LifecycleConfiguration>,
+    ) -> Result<(), S3Error> {
+        let key = TypedKey::bucket(name);
+        let retry = &self.config.retry;
+        for _ in 0..LIFECYCLE_ATTEMPTS {
+            let current = read_with_retries(&self.store, &key, retry)
+                .await
+                .map_err(|error| control_error(&error))?;
+            let Some(current) = current else {
+                self.remember(name, None);
+                return Err(no_such_bucket());
+            };
+            if lifecycle.is_some() && current.value.mode != BucketMode::Local {
+                return Err(s3_error!(
+                    NotImplemented,
+                    "Lifecycle configurations are supported on local buckets only; a {} \
+                     bucket's objects follow its remote target's lifecycle rules",
+                    current.value.mode
+                ));
+            }
+            if current.value.lifecycle == lifecycle {
+                self.remember(name, Some(current.value));
+                return Ok(());
+            }
+            let bucket = BucketDocument {
+                lifecycle: lifecycle.clone(),
+                proposal_id: lock(&self.ids).proposal_id(),
+                ..current.value
+            };
+            let expected = Expected::Version(current.version);
+            match propose_document(&self.store, &key, expected, &bucket, retry).await {
+                Ok(ProposalOutcome::Accepted(_)) => {
+                    self.remember(name, Some(bucket));
+                    self.announce().await;
+                    return Ok(());
+                }
+                Ok(ProposalOutcome::Rejected) => {}
+                Err(error) => return Err(control_error(&error)),
+            }
+        }
+        Err(s3_error!(
+            OperationAborted,
+            "A conflicting conditional operation is currently in progress against this \
+             resource. Please try again."
+        ))
     }
 
     /// Drops a deleted bucket's shards and announces the deletion.
@@ -702,13 +866,21 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     }
 }
 
-/// Why a bucket with these contents cannot be detached, if it cannot.
-fn refuse_detach(mode: BucketMode, summary: ShardSummary) -> Option<S3Error> {
+/// Why a bucket with these contents cannot be detached, if it cannot. A
+/// `local` bucket with a backup target (`backed_up`) also waits until its
+/// deletes reached the backup: their tombstones exist nowhere else (§8.9).
+fn refuse_detach(mode: BucketMode, backed_up: bool, summary: ShardSummary) -> Option<S3Error> {
     match mode {
         BucketMode::Local if summary.objects > 0 => Some(s3_error!(
             BucketNotEmpty,
             "The bucket you tried to delete is not empty: it holds {} objects",
             summary.objects
+        )),
+        BucketMode::Local if backed_up && summary.unflushed > 0 => Some(s3_error!(
+            BucketNotEmpty,
+            "The bucket has {} deletes not yet sent to its backup target; delete it once \
+                 they are sent",
+            summary.unflushed
         )),
         BucketMode::WriteBack | BucketMode::ReadOnly if summary.unflushed > 0 => Some(s3_error!(
             BucketNotEmpty,
@@ -830,6 +1002,7 @@ mod tests {
                 clean_copies: 0,
                 target: None,
                 created_unix_ms: 0,
+                lifecycle: None,
                 proposal_id: "p".parse().unwrap(),
             },
             version: Version::new("1"),
@@ -872,10 +1045,14 @@ mod tests {
     #[test]
     fn detach_refusals_follow_the_mode() {
         let summary = |objects, unflushed| ShardSummary { objects, unflushed };
-        assert!(refuse_detach(BucketMode::Local, summary(0, 0)).is_none());
-        assert!(refuse_detach(BucketMode::Local, summary(1, 1)).is_some());
-        assert!(refuse_detach(BucketMode::WriteBack, summary(5, 0)).is_none());
-        let refusal = refuse_detach(BucketMode::WriteBack, summary(5, 2)).unwrap();
+        assert!(refuse_detach(BucketMode::Local, false, summary(0, 0)).is_none());
+        assert!(refuse_detach(BucketMode::Local, false, summary(1, 1)).is_some());
+        // Tombstones waiting for a backup target hold a local bucket.
+        assert!(refuse_detach(BucketMode::Local, false, summary(0, 2)).is_none());
+        let refusal = refuse_detach(BucketMode::Local, true, summary(0, 2)).unwrap();
+        assert!(refusal.message().unwrap().contains("2 deletes"));
+        assert!(refuse_detach(BucketMode::WriteBack, false, summary(5, 0)).is_none());
+        let refusal = refuse_detach(BucketMode::WriteBack, false, summary(5, 2)).unwrap();
         assert_eq!(*refusal.code(), S3ErrorCode::BucketNotEmpty);
         assert!(refusal.message().unwrap().contains("2 changes"));
     }

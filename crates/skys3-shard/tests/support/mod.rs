@@ -15,7 +15,7 @@ use skys3_index::{
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{
     Adopt, CompletedPart, Delete, Extent, ExtentRef, Flushed, Import, MpuAbort, MpuComplete,
-    MpuCreate, MpuPart, Put, PutData, Tags,
+    MpuCreate, MpuPart, PartFlushed, Put, PutData, RemoteStep, Tags, UploadBegin,
 };
 use skys3_log::{
     LogConfig, LogRecord, RecordBody, RecordLocation, SegmentId, SegmentLog, ShardRef,
@@ -76,6 +76,22 @@ pub fn extent(key: &str, offset: u64, len: usize) -> Extent {
         offset,
         data: fill(len),
     }
+}
+
+/// The `UPLOAD_BEGIN` of a streamed PUT of `key`.
+pub fn upload_begin(key: &str) -> RecordBody {
+    RecordBody::UploadBegin(UploadBegin {
+        key: key.to_owned(),
+    })
+}
+
+/// `put`, inheriting the write identity of the `UPLOAD_BEGIN` at `begin`.
+pub fn streamed(put: RecordBody, begin: EpochSeq) -> RecordBody {
+    let RecordBody::Put(mut body) = put else {
+        panic!("only a PUT inherits an identity")
+    };
+    body.inherited_identity = Some(begin);
+    RecordBody::Put(body)
 }
 
 /// A `DELETE` of `key`.
@@ -196,6 +212,17 @@ pub fn mpu_abort(key: &str, upload: EpochSeq) -> RecordBody {
     RecordBody::MpuAbort(MpuAbort {
         key: key.to_owned(),
         upload,
+    })
+}
+
+/// A `PART_FLUSHED` of the remote upload `id` of `key`'s upload at
+/// `upload`.
+pub fn part_flushed(key: &str, upload: EpochSeq, id: &str, step: RemoteStep) -> RecordBody {
+    RecordBody::PartFlushed(PartFlushed {
+        key: key.to_owned(),
+        upload,
+        remote_upload_id: id.to_owned(),
+        step,
     })
 }
 

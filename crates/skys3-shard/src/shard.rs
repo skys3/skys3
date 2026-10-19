@@ -5,26 +5,31 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use skys3_index::{
-    Entry, EntryState, ImportRanges, Index, IndexError, ListPage, ListQuery, Part, Upload,
+    Entry, EntryState, ImportRanges, Index, IndexError, IndexWriter, ListPage, ListQuery, Part,
+    Payload, RemoteParts, RemoteUpload, Upload,
 };
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::truncated_by;
-use skys3_log::record::{Extent, ExtentRef, MpuPart, Put, PutData};
+use skys3_log::record::{Extent, ExtentRef, Metadata, MpuPart, Put, PutData, TagSet};
 use skys3_log::{LogRecord, RecordBody, RecordKind, SegmentClass, SegmentLog, ShardRef};
-use skys3_types::{Epoch, EpochSeq, NodeId, Seq, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, Label, NodeId, Seq, ShardConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::ack::{AckMode, AckTimeout};
+use crate::cache::{self, CacheRefusal, CleanCache, Link, Note};
 use crate::error::ShardError;
+use crate::flush_wait::{FlushWait, FlushWaiter};
 use crate::leader::Leader;
 use crate::lineage::{Lineage, Reconcile};
 use crate::machine::{Effect, Outcome, Recorder, StateMachine};
 use crate::pipeline::{Durable, Pipeline, Ready};
+use crate::reads::{self, ReadId, ReadPlan, Reads, Registered};
 
 mod backfill;
 
@@ -32,6 +37,10 @@ pub(crate) use self::backfill::FillCursor;
 
 /// How many entries a summary reads per index transaction.
 const SUMMARY_PAGE: usize = 1024;
+
+/// How many entries a scan for the clean cache reads per index
+/// transaction.
+const CACHE_PAGE: usize = 1024;
 
 /// A record the shard committed: its position and what applying it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,18 +52,91 @@ pub struct Committed {
     pub outcome: Outcome,
 }
 
-/// A client write the shard applied, as [`Shard::subscribe`] reports it:
-/// a `PUT`, `DELETE`, or `TAGS` that stored a new version of its key.
+/// A client write the shard applied, as [`Shard::subscribe`] reports it to
+/// the shard's flusher.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Change {
-    /// The key written.
+pub enum Change {
+    /// A `PUT`, `DELETE`, `TAGS`, or `MPU_COMPLETE` stored a new version of
+    /// its key.
+    Stored {
+        /// The key written.
+        key: String,
+        /// The position of the record, which is the new version's.
+        position: EpochSeq,
+        /// The new version's size: the object's for a `PUT` or an
+        /// `MPU_COMPLETE`, 0 for a `DELETE`, and `None` for a `TAGS`,
+        /// which keeps the size it had.
+        size: Option<u64>,
+        /// The upload whose remote stream the version may complete
+        /// (§7.3): for an `MPU_COMPLETE`, the upload it completed; for the
+        /// `PUT` of a streamed single PUT, its `UPLOAD_BEGIN`.
+        upload: Option<EpochSeq>,
+    },
+    /// An `MPU_CREATE` opened an upload of `key`, named by its position.
+    Opened {
+        /// The key.
+        key: String,
+        /// The position of the `MPU_CREATE`.
+        upload: EpochSeq,
+    },
+    /// An `MPU_PART` stored a part of an open upload, replacing any with
+    /// its number.
+    Part {
+        /// The key.
+        key: String,
+        /// The upload.
+        upload: EpochSeq,
+        /// The part number.
+        number: u16,
+        /// The position of the `MPU_PART`.
+        position: EpochSeq,
+    },
+    /// An `MPU_ABORT` removed an open upload.
+    Aborted {
+        /// The key.
+        key: String,
+        /// The upload.
+        upload: EpochSeq,
+    },
+    /// The gateway receiving a streamed single PUT announced more of its
+    /// body ([`Shard::announce`]). Nothing is committed: it tells the
+    /// flusher which applied extents the body has so far, so that it can
+    /// send them before the `PUT` commits (§7.3).
+    Streamed(StreamedBody),
+    /// A write-through write waits for its version to reach the remote
+    /// ([`Shard::await_flush`], §7.5). It comes after the change that
+    /// stored the version, or after the subscription began if the version
+    /// was applied before, so a flusher that does not track the key once
+    /// it reads this has flushed the key's latest version, at or after the
+    /// one waited for.
+    Awaited(FlushWaiter),
+}
+
+/// The body of a streamed single PUT so far, as the gateway that receives
+/// it announces it to the shard's primary (§7.3).
+///
+/// A streamed PUT's `EXTENT` records name its key and their offsets, but
+/// not the upload, and two bodies of one key may stream at once. The
+/// gateway knows which extents are its body's, and tells the primary's
+/// flusher, which sends them to the remote as parts while the client
+/// uploads. An announcement is a hint and is never committed: a flusher
+/// that misses one, or a later primary, sends what its remote upload lacks
+/// once the `PUT` commits, from the extents the `PUT` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedBody {
+    /// The object key.
     pub key: String,
-    /// The position of the record, which is the new version's.
-    pub position: EpochSeq,
-    /// The new version's size: the object's for a `PUT` or an
-    /// `MPU_COMPLETE`, 0 for a `DELETE`, and `None` for a `TAGS`, which
-    /// keeps the size it had.
-    pub size: Option<u64>,
+    /// The position of the body's `UPLOAD_BEGIN`, whose write identity its
+    /// `PUT` inherits (§7.2).
+    pub upload: EpochSeq,
+    /// The metadata the `PUT` will store, which the remote upload is
+    /// created with.
+    pub metadata: Metadata,
+    /// The tags the `PUT` will store.
+    pub tags: TagSet,
+    /// Applied extents of the body, each with its offset in the body. An
+    /// announcement need not repeat those of earlier ones.
+    pub extents: Vec<(u64, ExtentRef)>,
 }
 
 /// What a shard holds, as deleting its bucket needs to know (§4.1).
@@ -232,6 +314,11 @@ struct Inner<D: Disk> {
     /// How many reads of the index are in progress, admitted while the
     /// replica served reads.
     reads: watch::Sender<usize>,
+    /// The node's clean cache, once the replica reports to it (§9.3).
+    cache: Arc<Link>,
+    /// The highest commit watermark the replica has learned in this life:
+    /// every member holds the shard's records through it (§5.1).
+    watermark: Arc<AtomicU64>,
 }
 
 /// One shard replica on this node: the shard's only member, its primary,
@@ -503,6 +590,8 @@ impl<D: Disk> Shard<D> {
         if role != Role::Alone {
             pipeline.require_commit(last.seq);
         }
+        let cache = Arc::new(Link::default());
+        let watermark = Arc::new(AtomicU64::new(0));
         let task = PipelineTask {
             shard: shard.clone(),
             index: Arc::clone(&index),
@@ -511,6 +600,8 @@ impl<D: Disk> Shard<D> {
             pipeline,
             durable: durable_tx,
             leader: Arc::clone(&leader),
+            cache: Arc::clone(&cache),
+            watermark: Arc::clone(&watermark),
             stopped: None,
         };
         tokio::spawn(task.run(receiver));
@@ -521,6 +612,7 @@ impl<D: Disk> Shard<D> {
             leader: Arc::clone(&leader),
             ordered: role != Role::Alone,
             in_flight: JoinSet::new(),
+            lazy: 0,
             class: SegmentClass::Hot,
         };
         tokio::spawn(task.run(jobs));
@@ -536,6 +628,8 @@ impl<D: Disk> Shard<D> {
                 durable,
                 leader,
                 reads: watch::Sender::new(0),
+                cache,
+                watermark,
             }),
         })
     }
@@ -637,11 +731,27 @@ impl<D: Disk> Shard<D> {
         self.sequencer().last_sequenced().seq
     }
 
+    /// The `seq` through which every member of the shard is known to hold
+    /// its records durably, or `None` on a replica alone, whose log no
+    /// other replica reads. A member that is behind is sent records after
+    /// it, from this replica's log if it leads the shard or comes to, so
+    /// compaction keeps every record after it (§10.3).
+    ///
+    /// It is the commit watermark this replica learned in this life (§5.1):
+    /// a primary's own, a member's or a learner's from its primary. It
+    /// starts at zero when the replica opens, which keeps everything until
+    /// the replica learns one.
+    #[must_use]
+    pub fn replicated_through(&self) -> Option<Seq> {
+        (self.role() != Role::Alone)
+            .then(|| Seq::new(self.inner.watermark.load(AtomicOrdering::Acquire)))
+    }
+
     /// Commits `body` as the shard's next record, and returns its position
     /// and what applying it did, once it is durable and applied.
     ///
-    /// Client writes (`PUT`, `DELETE`, `TAGS`, `EXTENT`, and the multipart
-    /// records) are refused while the shard is sealed; `FLUSHED`, `IMPORT`,
+    /// Client writes (`PUT`, `DELETE`, `TAGS`, `EXTENT`, `UPLOAD_BEGIN`, and
+    /// the multipart records) are refused while the shard is sealed; `FLUSHED`, `IMPORT`,
     /// and `ADOPT` are not. A `PUT` or `MPU_PART` that references extents is
     /// accepted only once each of them is applied: append them with
     /// [`Shard::append_extent`] first (§10.1).
@@ -679,6 +789,29 @@ impl<D: Disk> Shard<D> {
     /// As [`Shard::commit`].
     pub async fn commit_lazy(&self, body: RecordBody) -> Result<Committed, ShardError> {
         let (position, reply) = self.submit_locked(&mut self.sequencer(), body, true)?;
+        self.within_ack(self.answer(reply))
+            .await
+            .map_err(|error| error.sequenced_at(position))
+    }
+
+    /// Commits `body` like [`Shard::commit`], but only if the replica still
+    /// sequences records in `epoch` when the record would be appended. A
+    /// shard primary's fragment-writing attempts publish this way, so an
+    /// attempt started under one primary is never published under a later
+    /// one, which may have judged its fragments orphans (§8.4).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`], with nothing appended, if the replica
+    /// sequences in another epoch; otherwise as [`Shard::commit`].
+    pub async fn commit_in(&self, epoch: Epoch, body: RecordBody) -> Result<Committed, ShardError> {
+        let (position, reply) = {
+            let mut sequencer = self.sequencer();
+            if sequencer.next.epoch != epoch {
+                return Err(self.unavailable("the replica no longer sequences in that epoch"));
+            }
+            self.submit_locked(&mut sequencer, body, false)?
+        };
         self.within_ack(self.answer(reply))
             .await
             .map_err(|error| error.sequenced_at(position))
@@ -784,10 +917,16 @@ impl<D: Disk> Shard<D> {
             .seq
             .checked_next()
             .ok_or_else(|| ShardError::invalid(shard, "the shard's seq is exhausted"))?;
-        // A `FLUSHED` changes no object version, so conditional checks
-        // need not wait for it (see `commit_if`).
+        // A `FLUSHED`, an `EC_PUBLISH`, or an `EC_RELOCATE` changes no
+        // object version, so conditional checks need not wait for it (see
+        // `commit_if`).
         let key = entry_key(&body)
-            .filter(|_| !matches!(body, RecordBody::Flushed(_)))
+            .filter(|_| {
+                !matches!(
+                    body,
+                    RecordBody::Flushed(_) | RecordBody::EcPublish(_) | RecordBody::EcRelocate(_)
+                )
+            })
             .map(str::to_owned);
         let receiver = self.sequence(sequencer, position, body, None, lazy)?;
         sequencer.next = EpochSeq::new(position.epoch, next);
@@ -1333,8 +1472,10 @@ impl<D: Disk> Shard<D> {
         let log = &self.inner.log;
         let failed = |error: &dyn fmt::Display| ShardError::unavailable(shard, error);
         let (mut candidates, mut truncates) = (Vec::new(), Vec::new());
-        for segment in log.segments() {
-            let mut scanner = log.scan(segment.id).map_err(|e| failed(&e))?;
+        // Scanners taken at once: compaction may retire a segment while
+        // the scan reads the others, having copied its records into a
+        // segment created after them, which this scan does not see.
+        for mut scanner in log.scan_all().map_err(|e| failed(&e))? {
             while let Some(record) = scanner.next().await.map_err(|e| failed(&e))? {
                 let header = &record.header;
                 let seq = header.position.seq;
@@ -1352,11 +1493,22 @@ impl<D: Disk> Shard<D> {
             }
         }
         // Records a reconciliation truncated are not the shard's (§6.6).
-        let found: BTreeMap<_, _> = candidates
-            .into_iter()
-            .filter(|(position, _)| !truncates.iter().any(|t| truncated_by(*t, *position)))
-            .map(|(position, bytes)| (position.seq, (position, bytes)))
-            .collect();
+        // Compaction may have dropped a `TRUNCATE` whose records are still
+        // in an older segment: a `seq` this replica holds again was then
+        // taken by a later epoch, and the record of the newest epoch is the
+        // shard's. A record compaction copied is found twice, alike.
+        let mut found: BTreeMap<Seq, (EpochSeq, Bytes)> = BTreeMap::new();
+        for (position, bytes) in candidates {
+            if truncates.iter().any(|t| truncated_by(*t, position)) {
+                continue;
+            }
+            match found.get(&position.seq) {
+                Some((held, _)) if *held >= position => {}
+                _ => {
+                    found.insert(position.seq, (position, bytes));
+                }
+            }
+        }
         let expected = through.get().saturating_sub(after.get());
         if found.len() as u64 != expected {
             return Err(failed(&format!(
@@ -1461,6 +1613,163 @@ impl<D: Disk> Shard<D> {
         }
     }
 
+    /// Commits `bodies`, records that each name a different key, as
+    /// [`Shard::commit_if`] commits each one, but sequenced together: the
+    /// records whose `check` passes take consecutive positions in one pass
+    /// of the sequencer, so their appends reach the log together and share
+    /// its group commit (§10.4). A peer cluster's `BATCH` is applied this
+    /// way (§7.8).
+    ///
+    /// `check` gets each record's index in `bodies` and its key's entry as
+    /// it is when the record is sequenced, as in [`Shard::commit_if`]. The
+    /// keys are read in one index transaction. A record of a key with a
+    /// write not yet applied waits for it, and one whose read raced a write
+    /// of its key is checked again, in a later pass.
+    ///
+    /// Returns one result per record, in the order of `bodies`; the outer
+    /// error and the inner one are as in [`Shard::commit_if`]. A record that
+    /// names no key, is an `EXTENT`, or repeats an earlier record's key is
+    /// refused with [`ShardError::InvalidRecord`]. The shard's
+    /// [`AckTimeout`] bounds the whole call: a record not answered by then
+    /// fails as not acknowledged, and may still commit.
+    pub async fn commit_all_if<E>(
+        &self,
+        bodies: Vec<RecordBody>,
+        mut check: impl FnMut(usize, Option<&Entry>) -> Result<(), E>,
+    ) -> Vec<Result<Result<Committed, E>, ShardError>> {
+        let mut results: Vec<Option<Result<Result<Committed, E>, ShardError>>> =
+            bodies.iter().map(|_| None).collect();
+        let mut pending = Vec::with_capacity(bodies.len());
+        let mut keys = std::collections::BTreeSet::new();
+        for (at, body) in bodies.into_iter().enumerate() {
+            match entry_key(&body).map(str::to_owned) {
+                Some(key) if keys.insert(key.clone()) => pending.push((at, key, body)),
+                Some(_) => {
+                    let reason = "the record repeats the key of an earlier one";
+                    results[at] = Some(Err(ShardError::invalid(self.shard(), reason)));
+                }
+                None => {
+                    let reason = "the record names no entry";
+                    results[at] = Some(Err(ShardError::invalid(self.shard(), reason)));
+                }
+            }
+        }
+        let sequenced: Vec<OnceLock<EpochSeq>> = results.iter().map(|_| OnceLock::new()).collect();
+        let committed = self
+            .within_ack(async {
+                let replies = self
+                    .sequence_all(pending, &mut check, &sequenced, &mut results)
+                    .await?;
+                for (at, reply) in replies {
+                    let answer = self.answer(reply).await;
+                    results[at] = Some(answer.map(Ok));
+                }
+                Ok(())
+            })
+            .await;
+        results
+            .into_iter()
+            .zip(sequenced)
+            .map(|(result, position)| {
+                result.unwrap_or_else(|| {
+                    let error = committed.clone().err().unwrap_or_else(|| {
+                        self.unavailable("the record was neither sequenced nor refused")
+                    });
+                    Err(match position.get() {
+                        Some(&position) => error.sequenced_at(position),
+                        None => error,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// The passes of [`Shard::commit_all_if`]: checks and sequences each of
+    /// `pending`, an index into the call's records with its key and record,
+    /// and returns the replies of those it sequenced. A record `check`
+    /// refuses, or that cannot be sequenced, gets its result in `results`.
+    async fn sequence_all<E>(
+        &self,
+        mut pending: Vec<(usize, String, RecordBody)>,
+        check: &mut impl FnMut(usize, Option<&Entry>) -> Result<(), E>,
+        sequenced: &[OnceLock<EpochSeq>],
+        results: &mut [Option<Result<Result<Committed, E>, ShardError>>],
+    ) -> Result<Vec<(usize, WriteReceiver)>, ShardError> {
+        let mut replies = Vec::with_capacity(pending.len());
+        while !pending.is_empty() {
+            // Records of the keys sequenced before the read must be
+            // applied, so that the index holds their outcome.
+            let begun = {
+                let mut sequencer = self.sequencer();
+                sequencer.check_serving(self.shard())?;
+                let applied = sequencer.applied;
+                let unapplied = pending.iter().any(|(_, key, _)| {
+                    sequencer
+                        .writes
+                        .get(key)
+                        .is_some_and(|&position| position > applied)
+                });
+                if unapplied {
+                    Err(self.barrier())
+                } else {
+                    Ok(sequencer.begin_read())
+                }
+            };
+            let since = match begun {
+                Ok(since) => since,
+                Err(barrier) => {
+                    barrier.await?;
+                    continue;
+                }
+            };
+            let read = ReadGuard {
+                shard: self,
+                since: Some(since),
+            };
+            let keys = pending.iter().map(|(_, key, _)| key.clone()).collect();
+            let entries = self.entries_of(keys).await?;
+            let mut sequencer = self.sequencer();
+            // A record of a key sequenced since the read began is still
+            // listed while the read lasts, and the read may have missed it.
+            let missed: Vec<bool> = pending
+                .iter()
+                .map(|(_, key, _)| sequencer.writes.get(key).is_some_and(|&p| p >= since))
+                .collect();
+            read.end(&mut sequencer);
+            let mut raced = Vec::new();
+            for (((at, key, body), entry), missed) in pending.into_iter().zip(entries).zip(missed) {
+                if missed {
+                    raced.push((at, key, body));
+                    continue;
+                }
+                if let Err(error) = check(at, entry.as_ref()) {
+                    results[at] = Some(Ok(Err(error)));
+                    continue;
+                }
+                match self.submit_locked(&mut sequencer, body, false) {
+                    Ok((position, reply)) => {
+                        let _ = sequenced[at].set(position);
+                        replies.push((at, reply));
+                    }
+                    Err(error) => results[at] = Some(Err(error)),
+                }
+            }
+            pending = raced;
+        }
+        Ok(replies)
+    }
+
+    /// The entries of `keys`, in order, read in one index transaction.
+    async fn entries_of(&self, keys: Vec<String>) -> Result<Vec<Option<Entry>>, ShardError> {
+        let _read = self.admit_read()?;
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            let read = index.read()?;
+            keys.iter().map(|key| read.entry(&shard, key)).collect()
+        })
+        .await
+    }
+
     /// The entry of `key` as the index holds it: the outcome of every
     /// applied record of the key, and of no record not yet applied.
     ///
@@ -1470,15 +1779,22 @@ impl<D: Disk> Shard<D> {
     /// [`Shard::check_readable`].
     pub async fn entry(&self, key: &str) -> Result<Option<Entry>, ShardError> {
         let _read = self.admit_read()?;
-        let (index, shard, key) = (
+        let (index, shard, owned) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
             key.to_owned(),
         );
-        run(&self.inner.pool, self.shard(), move || {
-            index.read()?.entry(&shard, &key)
+        let entry = run(&self.inner.pool, self.shard(), move || {
+            index.read()?.entry(&shard, &owned)
         })
-        .await
+        .await?;
+        // A read uses the clean payload it may go on to read (§9.3).
+        if let Some(cache) = self.inner.cache.get()
+            && entry.as_ref().is_some_and(|e| e.state == EntryState::Clean)
+        {
+            cache.touch(self.shard(), key);
+        }
+        Ok(entry)
     }
 
     /// One page of the shard's listing (§9.4), as the index holds it: the
@@ -1584,6 +1900,42 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
+    /// The remote upload a streaming flush keeps for the upload opened at
+    /// `upload` (§7.3), with the parts it holds, as `PART_FLUSHED` records
+    /// left them.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails, and as
+    /// [`Shard::check_readable`].
+    pub async fn remote_upload(
+        &self,
+        upload: EpochSeq,
+    ) -> Result<Option<(RemoteUpload, RemoteParts)>, ShardError> {
+        let _read = self.admit_read()?;
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.remote_upload(&shard, upload)
+        })
+        .await
+    }
+
+    /// Every remote upload streaming flushes keep for the shard, by local
+    /// upload (§7.3).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails, and as
+    /// [`Shard::check_readable`].
+    pub async fn remote_uploads(&self) -> Result<Vec<(EpochSeq, RemoteUpload)>, ShardError> {
+        let _read = self.admit_read()?;
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.remote_uploads(&shard)
+        })
+        .await
+    }
+
     /// The payload of the record at `position`, as an entry or a part names
     /// it: an `EXTENT`'s data, or the inline bytes of a `PUT` or an
     /// `MPU_PART`.
@@ -1614,6 +1966,342 @@ impl<D: Disk> Shard<D> {
             Some(data) if record.shard == *shard && record.position == position => Ok(data.clone()),
             _ => Err(self.unavailable(&format!("the record at {position} holds no payload"))),
         }
+    }
+
+    /// The read plan of `key` (§9.2): its entry as [`Shard::entry`] reads
+    /// it, the layout of its version, read with it, and the members that
+    /// should hold its bytes. See [`reads`](crate::reads).
+    ///
+    /// # Errors
+    ///
+    /// As [`Shard::entry`].
+    pub async fn plan(&self, key: &str) -> Result<ReadPlan, ShardError> {
+        let _read = self.admit_read()?;
+        let config = self.config();
+        let clean_copies = self
+            .inner
+            .cache
+            .get()
+            .and_then(|cache| cache.clean_copies(&self.shard().bucket));
+        let (index, shard, owned) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        let (entry, layout) = run(&self.inner.pool, self.shard(), move || {
+            let reader = index.read()?;
+            let entry = reader.entry(&shard, &owned)?;
+            // A coded version is read from its fragments, which its entry
+            // names (§8.5); its replicas are dropped.
+            let object = entry
+                .as_ref()
+                .filter(|entry| entry.state != EntryState::Evicted)
+                .and_then(|entry| entry.object.as_ref())
+                .filter(|object| object.coded.is_none());
+            let layout = match object {
+                Some(object) => reads::layout(&reader, &shard, object)?,
+                None => None,
+            };
+            Ok((entry, layout))
+        })
+        .await?;
+        if let Some(cache) = self.inner.cache.get()
+            && entry.as_ref().is_some_and(|e| e.state == EntryState::Clean)
+        {
+            cache.touch(self.shard(), key);
+        }
+        let holders = match (&entry, &layout) {
+            (Some(entry), Some(_)) => reads::holders(&config, entry, clean_copies),
+            _ => Vec::new(),
+        };
+        Ok(ReadPlan {
+            entry,
+            layout: layout.unwrap_or_default(),
+            holders,
+        })
+    }
+
+    /// Registers a read of `version` of `key` in `reads`, the node's
+    /// registrations, as a holder (§8.7): from this replica's own copy if
+    /// its entry still names `version` with local bytes, and otherwise from
+    /// `plan`, the layout the primary's read plan gave, if this replica
+    /// still locates every position of it. `None` if it does neither: it
+    /// does not hold the version. Any replica that runs may hold one, a
+    /// member or a learner too, since it only serves payload it has.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the shard stopped or its index fails.
+    pub async fn register_read(
+        &self,
+        reads: &Reads,
+        key: &str,
+        version: EpochSeq,
+        plan: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        self.sequencer().check_running(self.shard())?;
+        let (index, shard, owned) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+        );
+        let own = run(&self.inner.pool, self.shard(), move || {
+            let reader = index.read()?;
+            let held = reader
+                .entry(&shard, &owned)?
+                .filter(|entry| entry.version == version && entry.state != EntryState::Evicted);
+            let Some((state, object)) = held.and_then(|entry| Some((entry.state, entry.object?)))
+            else {
+                return Ok(None);
+            };
+            Ok(reads::layout(&reader, &shard, &object)?.map(|layout| (state, layout)))
+        })
+        .await?;
+        let clean = own
+            .as_ref()
+            .is_some_and(|(state, _)| *state == EntryState::Clean);
+        let layout = own.map_or(plan, |(_, layout)| layout);
+        // Pinned and checked in one decision against compaction's, so a
+        // compaction that drops a position either does so first, and the
+        // check fails, or finds the pin and keeps it (see `reads`).
+        let (index, shard, gate, layout) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            reads.clone(),
+            layout,
+        );
+        let registered = run(&self.inner.pool, self.shard(), move || {
+            gate.exclusive(|| {
+                let id = gate.pin(&shard, &layout);
+                let reader = index.read().inspect_err(|_| gate.release(id))?;
+                for extent in &layout {
+                    match reader.location(&shard, extent.position) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            gate.release(id);
+                            gate.not_held();
+                            return Ok(None);
+                        }
+                        Err(error) => {
+                            gate.release(id);
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(Some(Registered { id, layout }))
+            })
+        })
+        .await?;
+        let Some(registered) = registered else {
+            return Ok(None);
+        };
+        // A read of a copy this replica keeps uses it (§9.3).
+        if clean && let Some(cache) = self.inner.cache.get() {
+            cache.touch(self.shard(), key);
+        }
+        Ok(Some(registered))
+    }
+
+    /// The payload at `position` for the read `id` registered in `reads`
+    /// ([`Shard::register_read`]), as [`Shard::payload`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the registration lapsed, or does not
+    /// pin `position` of this shard, and as [`Shard::payload`].
+    pub async fn read_registered(
+        &self,
+        reads: &Reads,
+        id: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        if !reads.admits(id, self.shard(), position) {
+            return Err(self.unavailable(&format!(
+                "read {id} is not registered for {position}: its registration lapsed"
+            )));
+        }
+        self.payload(position).await
+    }
+
+    /// Evicted → Clean (§4.2): makes the evicted version `version` of `key`
+    /// clean on this node with `payload`, the `EXTENT` records a
+    /// read-through fill committed its bytes in (§9.2), unless the entry no
+    /// longer is that evicted version. See [`cache::fill`].
+    ///
+    /// Only the serving primary fills, as only it commits the `EXTENT`
+    /// records a fill writes: the payload must be records this replica
+    /// sequenced as the primary it still is. The members have the extents
+    /// in their logs too, but their entries stay as they are.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is [`ShardError::Unavailable`] if the shard stopped,
+    /// stepped down, or does not serve yet, or its index fails, and
+    /// [`ShardError::NotPrimary`] on a member; the inner one says why the
+    /// transition was refused.
+    pub async fn fill(
+        &self,
+        key: &str,
+        version: EpochSeq,
+        payload: Payload,
+    ) -> Result<Result<(), CacheRefusal>, ShardError> {
+        self.sequencer().check_serving(self.shard())?;
+        let size = match &payload {
+            Payload::Extents(extents) => extents.iter().map(|extent| u64::from(extent.len)).sum(),
+            _ => 0,
+        };
+        let note = Note::Clean {
+            key: key.to_owned(),
+            version,
+            size,
+            held: true,
+            last_used: None,
+        };
+        self.update_cache(key, note, move |index, shard, key| {
+            cache::fill(index, shard, key, version, payload)
+        })
+        .await
+    }
+
+    /// Clean → Evicted (§4.2): drops this node's payload of the clean
+    /// version `version` of `key`. See [`cache::evict`]; the node's
+    /// [`CleanCache`] decides what to evict and when.
+    ///
+    /// Any replica that runs may evict, a member too: the transition only
+    /// drops a payload of its own, which no other replica reads. A replica
+    /// whose cache keeps its bucket's payload ([`Shard::evicts_clean`])
+    /// refuses with [`CacheRefusal::Kept`].
+    ///
+    /// # Errors
+    ///
+    /// The outer error is [`ShardError::Unavailable`] if the shard stopped
+    /// or its index fails; the inner one says why the transition was
+    /// refused.
+    pub async fn evict(
+        &self,
+        key: &str,
+        version: EpochSeq,
+    ) -> Result<Result<(), CacheRefusal>, ShardError> {
+        if self
+            .inner
+            .cache
+            .get()
+            .is_some_and(|cache| !cache.evicts(&self.shard().bucket))
+        {
+            return Ok(Err(CacheRefusal::Kept));
+        }
+        let note = Note::Gone {
+            key: key.to_owned(),
+        };
+        self.update_cache(key, note, move |index, shard, key| {
+            cache::evict(index, shard, key, version)
+        })
+        .await
+    }
+
+    /// Runs a cache transition of `key` on the index pool, and reports
+    /// `note` to the node's clean cache once it is made.
+    async fn update_cache(
+        &self,
+        key: &str,
+        note: Note,
+        transition: impl FnOnce(
+            &mut IndexWriter<'_>,
+            &ShardRef,
+            &str,
+        ) -> Result<Result<(), CacheRefusal>, IndexError>
+        + Send
+        + 'static,
+    ) -> Result<Result<(), CacheRefusal>, ShardError> {
+        let rank = {
+            let sequencer = self.sequencer();
+            sequencer.check_running(self.shard())?;
+            sequencer.copy_rank()
+        };
+        let (index, shard, key, link) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            key.to_owned(),
+            Arc::clone(&self.inner.cache),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            let _order = link.order();
+            let made = index.update_local(|writer| transition(writer, &shard, &key))?;
+            if let (Ok(()), Some(cache)) = (&made, link.get()) {
+                cache.note(&shard, rank, vec![note]);
+            }
+            Ok(made)
+        })
+        .await
+    }
+
+    /// Makes the replica report to `cache`, the clean cache of its node,
+    /// whose records are on `disk` (§9.3): its clean entries are scanned,
+    /// and from then on every entry that becomes clean or stops being so is
+    /// reported. A replica reports to one cache; attaching it again changes
+    /// nothing.
+    /// Whether this node evicts the shard's clean payload: whether its
+    /// clean cache was told the bucket's `clean_copies`
+    /// ([`CleanCache::evicts`]). A replica of a `local` bucket keeps every
+    /// payload, also of entries a backup target made clean (§8.9), and so
+    /// does a replica on a node without a cache, or whose cache has not
+    /// read the bucket's policy yet. A learner's snapshot and backfill
+    /// leave out only the clean payload of buckets evicted.
+    #[must_use]
+    pub fn evicts_clean(&self) -> bool {
+        self.inner
+            .cache
+            .get()
+            .is_some_and(|cache| cache.evicts(&self.shard().bucket))
+    }
+
+    pub(crate) fn attach_cache(&self, cache: &CleanCache, disk: &Label) {
+        if self.inner.cache.set(cache) {
+            cache.attach(self.shard(), disk);
+        }
+    }
+
+    /// The replica's rank among the holders of the shard's clean copies
+    /// (§9.3), or `None` if it holds none: the primary first, then the
+    /// other members in the order of the configuration.
+    pub(crate) fn copy_rank(&self) -> Option<u8> {
+        self.sequencer().copy_rank()
+    }
+
+    /// Reports the clean entries of a page of the shard's entries after
+    /// `after` to the node's clean cache, each as used when it was last
+    /// modified, as the cache learns them when the replica opens, and
+    /// returns where the next page starts, or `None` after the last.
+    pub(crate) async fn scan_cache(
+        &self,
+        after: Option<String>,
+    ) -> Result<Option<String>, ShardError> {
+        let rank = self.copy_rank();
+        let (index, shard, link) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            Arc::clone(&self.inner.cache),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            let _order = link.order();
+            let reader = index.read()?;
+            let page = reader.entries(&shard, after.as_deref(), CACHE_PAGE)?;
+            let next = (page.len() == CACHE_PAGE)
+                .then(|| page.last().map(|(key, _)| key.clone()))
+                .flatten();
+            let mut notes = Vec::new();
+            for (key, entry) in page {
+                if entry.state == EntryState::Clean {
+                    let last_used = entry.object.as_ref().map(|o| o.last_modified_ms);
+                    notes.push(cache::note(&reader, &shard, key, Some(&entry), last_used)?);
+                }
+            }
+            if let Some(cache) = link.get() {
+                cache.note(&shard, rank, notes);
+            }
+            Ok(next)
+        })
+        .await
     }
 
     /// Adopts `config`, a newer epoch of the shard, in order with its
@@ -1826,9 +2514,13 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
-    /// Reports every client write applied from now on: each `PUT`,
-    /// `DELETE`, and `TAGS` that stored a new version, in position order.
-    /// The shard's flusher follows it (§7.1). A shard has one subscriber; a
+    /// Reports every client write applied from now on, in position order:
+    /// each `PUT`, `DELETE`, `TAGS`, and `MPU_COMPLETE` that stored a new
+    /// version, and each `MPU_CREATE`, `MPU_PART`, and `MPU_ABORT` that
+    /// opened, filled, or aborted an upload, interleaved with the
+    /// [announcements](Self::announce) of streamed bodies as they arrive.
+    /// The shard's flusher follows it (§7.1, §7.3). A shard has one
+    /// subscriber; a
     /// new subscription replaces the previous one, whose stream then ends.
     /// The stream also ends when the shard stops.
     ///
@@ -1843,6 +2535,64 @@ impl<D: Disk> Shard<D> {
             sequencer.subscriber = Some(sender);
         }
         receiver
+    }
+
+    /// Passes the announcement of a streamed single PUT's body on to the
+    /// subscriber, if the shard has one: its flusher, on the primary
+    /// (§7.3). It commits nothing, and a replica without a subscriber
+    /// drops it. Only a primary that serves client requests takes it, as
+    /// only one takes the body's `PUT`.
+    ///
+    /// The subscriber hears of it in order with the writes applied: an
+    /// announcement made before the body's `PUT` is sent comes before the
+    /// `PUT`'s [`Change::Stored`].
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotPrimary`] on a member, and
+    /// [`ShardError::Unavailable`] if the shard stopped or its primary does
+    /// not serve.
+    pub fn announce(&self, body: StreamedBody) -> Result<(), ShardError> {
+        let sequencer = self.sequencer();
+        sequencer.check_serving(self.shard())?;
+        if let Some(subscriber) = &sequencer.subscriber {
+            // A subscriber that went away needs nothing.
+            let _ = subscriber.send(Change::Streamed(body));
+        }
+        Ok(())
+    }
+
+    /// Passes a wait for `version` of `key` to reach the remote target to
+    /// the subscriber, the shard's flusher, and returns the caller's end of
+    /// it (§7.5): a write to a `write_through` bucket is acknowledged once
+    /// the flusher answers [`FlushState::Flushed`](crate::FlushState).
+    /// `version` must be a version of `key` this primary applied, such as
+    /// one a write it acknowledged committed.
+    ///
+    /// The flusher hears of the wait after every change applied before it,
+    /// the version's own included. The wait ends without an answer if the
+    /// flusher stops; nothing is logged, so a new primary's flusher must be
+    /// asked again.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotPrimary`] on a member; [`ShardError::Unavailable`]
+    /// if the shard stopped, its primary does not serve, it has not applied
+    /// `version` yet, or nothing flushes it.
+    pub fn await_flush(&self, key: &str, version: EpochSeq) -> Result<FlushWait, ShardError> {
+        let sequencer = self.sequencer();
+        sequencer.check_serving(self.shard())?;
+        if sequencer.applied < version {
+            return Err(self.unavailable("the version waited for is not applied yet"));
+        }
+        let Some(subscriber) = &sequencer.subscriber else {
+            return Err(self.unavailable("no flusher follows the shard"));
+        };
+        let (waiter, wait) = FlushWaiter::new(key.to_owned(), version);
+        subscriber
+            .send(Change::Awaited(waiter))
+            .map_err(|_| self.unavailable("the shard's flusher stopped"))?;
+        Ok(wait)
     }
 
     /// Whether the shard stopped: it was closed, or a record failed. A
@@ -2067,6 +2817,25 @@ impl<D: Disk> Drop for SealGuard<'_, D> {
 }
 
 impl Sequencer {
+    /// See [`Shard::copy_rank`].
+    fn copy_rank(&self) -> Option<u8> {
+        match self.role {
+            Role::Alone | Role::Primary => Some(0),
+            Role::Member => {
+                let node = self.node.as_ref()?;
+                let primary = &self.config.primary;
+                let rank = self
+                    .config
+                    .members
+                    .iter()
+                    .filter(|member| *member != primary)
+                    .position(|member| member == node)?;
+                Some(u8::try_from(rank + 1).unwrap_or(u8::MAX))
+            }
+            Role::Learner => None,
+        }
+    }
+
     fn check_running(&self, shard: &ShardRef) -> Result<(), ShardError> {
         match &self.stopped {
             Some(reason) => Err(ShardError::unavailable(shard, reason)),
@@ -2223,51 +2992,85 @@ fn is_client_write(body: &RecordBody) -> bool {
             | RecordBody::MpuPart(_)
             | RecordBody::MpuComplete(_)
             | RecordBody::MpuAbort(_)
+            | RecordBody::UploadBegin(_)
     )
 }
 
 /// The key of the entry `body` changes: every record that names a key
-/// except an `EXTENT`, which changes only the location map, and the
-/// multipart records other than `MPU_COMPLETE`, which change only uploads.
+/// except an `EXTENT`, which changes only the location map, the multipart
+/// records other than `MPU_COMPLETE`, which change only uploads, a
+/// `PART_FLUSHED`, which changes only remote uploads, and an
+/// `UPLOAD_BEGIN`, which changes nothing.
 fn entry_key(body: &RecordBody) -> Option<&str> {
     match body {
         RecordBody::Extent(_)
         | RecordBody::MpuCreate(_)
         | RecordBody::MpuPart(_)
-        | RecordBody::MpuAbort(_) => None,
+        | RecordBody::MpuAbort(_)
+        | RecordBody::PartFlushed(_)
+        | RecordBody::UploadBegin(_) => None,
         other => other.key(),
     }
 }
 
 /// The change a client write would report once applied, by position.
 fn change(record: &LogRecord) -> Option<(EpochSeq, Change)> {
-    let (key, size) = match &record.body {
-        RecordBody::Put(put) => (&put.key, Some(put.size)),
-        RecordBody::MpuComplete(complete) => (&complete.key, Some(complete.size)),
-        RecordBody::Delete(delete) => (&delete.key, Some(0)),
-        RecordBody::Tags(tags) => (&tags.key, None),
-        _ => return None,
-    };
-    let change = Change {
+    let stored = |key: &String, size, upload| Change::Stored {
         key: key.clone(),
         position: record.position,
         size,
+        upload,
+    };
+    let change = match &record.body {
+        RecordBody::Put(put) => stored(&put.key, Some(put.size), put.inherited_identity),
+        RecordBody::MpuComplete(complete) => {
+            stored(&complete.key, Some(complete.size), Some(complete.upload))
+        }
+        RecordBody::Delete(delete) => stored(&delete.key, Some(0), None),
+        RecordBody::Tags(tags) => stored(&tags.key, None, None),
+        RecordBody::MpuCreate(create) => Change::Opened {
+            key: create.key.clone(),
+            upload: record.position,
+        },
+        RecordBody::MpuPart(part) => Change::Part {
+            key: part.key.clone(),
+            upload: part.upload,
+            number: part.part_number,
+            position: record.position,
+        },
+        RecordBody::MpuAbort(abort) => Change::Aborted {
+            key: abort.key.clone(),
+            upload: abort.upload,
+        },
+        _ => return None,
     };
     Some((record.position, change))
 }
 
-/// Sends the subscriber each change whose record stored a new version.
+/// Sends the subscriber each change whose record was applied: a new
+/// version stored, or an upload opened, given a part, or aborted.
 fn report(
     subscriber: &mpsc::UnboundedSender<Change>,
     outcomes: &BTreeMap<EpochSeq, Outcome>,
     changes: &mut BTreeMap<EpochSeq, Change>,
 ) {
     for (position, outcome) in outcomes {
-        let stored = matches!(
-            outcome,
-            Outcome::Applied(Effect::Stored { .. } | Effect::Tombstoned { .. })
-        );
-        if let Some(change) = changes.remove(position).filter(|_| stored) {
+        let applied = |change: &Change| {
+            let Outcome::Applied(effect) = outcome else {
+                return false;
+            };
+            match change {
+                Change::Stored { .. } => {
+                    matches!(effect, Effect::Stored { .. } | Effect::Tombstoned { .. })
+                }
+                Change::Opened { .. } => *effect == Effect::UploadCreated,
+                Change::Part { .. } => *effect == Effect::PartStored,
+                Change::Aborted { .. } => matches!(effect, Effect::Aborted { .. }),
+                // Never made from a record.
+                Change::Streamed(_) | Change::Awaited(_) => false,
+            }
+        };
+        if let Some(change) = changes.remove(position).filter(applied) {
             // A subscriber that went away needs nothing.
             let _ = subscriber.send(change);
         }
@@ -2352,6 +3155,11 @@ struct PipelineTask {
     durable: watch::Sender<Seq>,
     /// A primary's replication state, told of every change.
     leader: Arc<OnceLock<Arc<Leader>>>,
+    /// The node's clean cache, told of every entry that becomes clean or
+    /// stops being so.
+    cache: Arc<Link>,
+    /// The highest commit watermark learned, published for compaction.
+    watermark: Arc<AtomicU64>,
     /// Why the shard stopped, once a record failed or applying did.
     stopped: Option<ShardError>,
 }
@@ -2396,7 +3204,10 @@ impl PipelineTask {
                 self.pipeline.marker_resolved(position, result);
             }
             Message::Barrier(reply) => self.pipeline.barrier(reply),
-            Message::Commit(seq) => self.pipeline.commit_through(seq),
+            Message::Commit(seq) => {
+                self.watermark.fetch_max(seq.get(), AtomicOrdering::Release);
+                self.pipeline.commit_through(seq);
+            }
             Message::Truncate { after, marker } => {
                 self.pipeline.truncate(after);
                 self.pipeline.marked(marker);
@@ -2464,11 +3275,22 @@ impl PipelineTask {
                     .collect();
                 let mut changes: BTreeMap<EpochSeq, Change> =
                     records.iter().filter_map(|(r, _)| change(r)).collect();
-                let index = Arc::clone(&self.index);
+                let (index, shard, link) = (
+                    Arc::clone(&self.index),
+                    self.shard.clone(),
+                    Arc::clone(&self.cache),
+                );
+                let rank = lock(&self.sequencer).copy_rank();
                 let applied = run(&self.pool, &self.shard, move || {
+                    let _order = link.order();
                     let recorder = Recorder::default();
                     index.apply(&recorder, &records)?;
-                    Ok(recorder.take())
+                    let outcomes = recorder.take();
+                    if let Some(cache) = link.get() {
+                        let notes = cache::notes(&index, &shard, &records, &outcomes)?;
+                        cache.note(&shard, rank, notes);
+                    }
+                    Ok(outcomes)
                 })
                 .await;
                 match applied {
@@ -2478,21 +3300,24 @@ impl PipelineTask {
                         // they were applied may have scanned the index
                         // without them, so it must hear of them; one that
                         // subscribes later finds them in the index.
-                        let (subscriber, under) = {
+                        // Every record is past the applied position, so none
+                        // was skipped and each has an outcome.
+                        let mut outcomes: BTreeMap<_, _> = outcomes.into_iter().collect();
+                        let under = {
                             let mut sequencer = lock(&self.sequencer);
                             if let Some(&(last, _)) = positions.last() {
                                 sequencer.applied = last;
                                 sequencer.forget_applied();
                             }
-                            let under = sequencer.under_replicated(&self.shard);
-                            (sequencer.subscriber.clone(), under)
+                            // The subscriber is reported to under the lock
+                            // that advances the applied position, so a flush
+                            // waiter queued for an applied version comes
+                            // after its change (`Shard::await_flush`).
+                            if let Some(subscriber) = &sequencer.subscriber {
+                                report(subscriber, &outcomes, &mut changes);
+                            }
+                            sequencer.under_replicated(&self.shard)
                         };
-                        // Every record is past the applied position, so none
-                        // was skipped and each has an outcome.
-                        let mut outcomes: BTreeMap<_, _> = outcomes.into_iter().collect();
-                        if let Some(subscriber) = subscriber {
-                            report(&subscriber, &outcomes, &mut changes);
-                        }
                         for ((position, client), reply) in positions.into_iter().zip(replies) {
                             let committed = outcomes
                                 .remove(&position)
@@ -2544,17 +3369,22 @@ impl PipelineTask {
 /// independently, so a crash could otherwise keep a record without an
 /// earlier one of the other class (§10.1). The replica's log therefore
 /// always holds a run of the shard's records with no holes, which is what
-/// its acknowledgements and catching up after a restart rely on. A
-/// primary hands each record to its [`Leader`], to send to its members, as
-/// soon as it is encoded.
+/// its acknowledgements and catching up after a restart rely on. Lazy
+/// records it waits for are committed at once
+/// ([`SegmentLog::commit_lazy_now`]): nothing else would start their group
+/// while it waits. A primary hands each record to its [`Leader`], to send
+/// to its members, as soon as it is encoded.
 struct Appender<D: Disk> {
     log: SegmentLog<D>,
     pipeline: mpsc::UnboundedSender<Message>,
     leader: Arc<OnceLock<Arc<Leader>>>,
     /// Whether records of different classes are queued in order.
     ordered: bool,
-    /// The appends queued and not yet acknowledged.
-    in_flight: JoinSet<()>,
+    /// The appends queued and not yet acknowledged, each telling whether
+    /// it was lazy.
+    in_flight: JoinSet<bool>,
+    /// How many of them are lazy.
+    lazy: usize,
     /// The class of the records in flight.
     class: SegmentClass,
 }
@@ -2564,7 +3394,9 @@ impl<D: Disk> Appender<D> {
     /// flight then are acknowledged.
     async fn run(mut self, mut jobs: mpsc::UnboundedReceiver<Job>) {
         while let Some(job) = jobs.recv().await {
-            while self.in_flight.try_join_next().is_some() {}
+            while let Some(joined) = self.in_flight.try_join_next() {
+                self.joined(joined);
+            }
             match job {
                 Job::Settle(reply) => {
                     self.drain().await;
@@ -2581,8 +3413,27 @@ impl<D: Disk> Appender<D> {
         self.drain().await;
     }
 
+    /// Waits until every append in flight is acknowledged, committing the
+    /// lazy ones now rather than waiting for another record to.
     async fn drain(&mut self) {
-        while self.in_flight.join_next().await.is_some() {}
+        if self.lazy > 0 {
+            self.log.commit_lazy_now();
+        }
+        while let Some(joined) = self.in_flight.join_next().await {
+            self.joined(joined);
+        }
+        // Nothing is in flight now, whatever the tasks that ended did.
+        self.lazy = 0;
+    }
+
+    /// Counts an append that is no longer in flight.
+    fn joined(&mut self, joined: Result<bool, tokio::task::JoinError>) {
+        // A task that panicked or was cancelled was lazy or not; the count
+        // only decides whether a drain asks for lazy records, so it may
+        // stay high, at the cost of one sync.
+        if let Ok(true) = joined {
+            self.lazy = self.lazy.saturating_sub(1);
+        }
     }
 
     async fn append(&mut self, record: LogRecord, encoded: Option<Bytes>, lazy: bool) {
@@ -2608,6 +3459,7 @@ impl<D: Disk> Appender<D> {
             Err(error) => return self.resolved(position, Err(error.to_string())),
         };
         let pipeline = self.pipeline.clone();
+        self.lazy += usize::from(lazy);
         self.in_flight.spawn(async move {
             let result = match queued.durable().await {
                 Ok(location) => Ok(Box::new((record, location))),
@@ -2615,6 +3467,7 @@ impl<D: Disk> Appender<D> {
             };
             // The pipeline is gone only if the shard is; nobody waits then.
             let _ = pipeline.send(Message::Appended { position, result });
+            lazy
         });
     }
 
@@ -2649,6 +3502,7 @@ impl<D: Disk> Appender<D> {
         };
         self.in_flight.spawn(async move {
             done(queued.durable().await.map(drop).map_err(|e| e.to_string()));
+            false
         });
     }
 }

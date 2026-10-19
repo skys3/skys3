@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow",  "Action": ["A:st[ssumeRoleWithWebIdentity:*"], "Condition": {"StringLike": {"idp.example:sub": ["a*", "?b"], "le:oub": ["a*", "?b"], "idp.exampletioexample:oube ": ["a?b"], "yoleWitAWebIidp.example:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.example"}, "Action": "sts:*"}]}

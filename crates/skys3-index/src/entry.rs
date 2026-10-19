@@ -2,7 +2,7 @@
 //! their parts, and control-state copies.
 
 use skys3_log::record::{Checksums, CopySource, ExtentRef, Metadata, TagSet, UploadChecksum};
-use skys3_types::{ETag, EpochSeq, Generation};
+use skys3_types::{AttemptId, CodedStripe, ETag, EpochSeq, Generation};
 
 /// Where an entry is in its life cycle (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,8 +97,36 @@ pub struct ObjectVersion {
     pub storage_class: Option<String>,
     /// For a copy, its source (§11).
     pub copy_source: Option<CopySource>,
-    /// Where the object's bytes are on this replica.
+    /// Where the object's bytes are on this replica, as the write that
+    /// stored them named them. Once the version is [`coded`](Self::coded),
+    /// the replicas drop them (§8.4) and the positions may no longer be
+    /// located.
     pub payload: Payload,
+    /// The version's erasure-coded layout, once an `EC_PUBLISH` of it was
+    /// applied (§8.4); `None` while it is only replicated. A `TAGS` record
+    /// keeps it, as it keeps the bytes, though it moves [`Entry::version`]
+    /// past the version the fragments name ([`Coded::version`]); any other
+    /// write replaces it.
+    pub coded: Option<Coded>,
+}
+
+/// An object version's erasure-coded layout, as its `EC_PUBLISH` record
+/// gave it (§8.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coded {
+    /// The position of the `EC_PUBLISH` record. Replicas drop the
+    /// version's replicated bytes once they know it committed.
+    pub publish: EpochSeq,
+    /// The position of the record that committed the version the
+    /// fragments were written for, as the `EC_PUBLISH` named it: with the
+    /// object's ETag, the version identity the fragment headers carry. It
+    /// precedes [`publish`](Self::publish), and stays when a `TAGS` record
+    /// moves [`Entry::version`] past it.
+    pub version: EpochSeq,
+    /// The attempt that wrote the fragments.
+    pub attempt: AttemptId,
+    /// The stripes, in order, covering the object exactly once.
+    pub stripes: Vec<CodedStripe>,
 }
 
 /// Where an object version's bytes are, by log position.
@@ -107,7 +135,8 @@ pub struct ObjectVersion {
 /// segment, offset, and length on this node's disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
-    /// No local bytes: an evicted entry or an imported stub.
+    /// No local bytes: an evicted entry that is not a multipart object, or
+    /// an imported stub.
     None,
     /// Inline in the record at this position, usually the version's own
     /// `PUT`.
@@ -116,6 +145,8 @@ pub enum Payload {
     Extents(Vec<ExtentRef>),
     /// In the parts of the completed multipart upload opened at `upload`,
     /// in object order. Each part's [`Part`] row says where its bytes are.
+    /// An evicted multipart object keeps this payload, for its part
+    /// boundaries, and its parts hold no bytes.
     Parts {
         /// The position of the upload's `MPU_CREATE`.
         upload: EpochSeq,
@@ -162,9 +193,39 @@ pub struct Part {
     /// The part's checksums.
     pub checksums: Checksums,
     /// Where the part's bytes are: [`Payload::Inline`] in its `MPU_PART`
-    /// record, or [`Payload::Extents`].
+    /// record, or [`Payload::Extents`], those a stored part or a fill
+    /// committed. A part of an evicted multipart object has none
+    /// ([`Payload::None`]): the object's entry keeps its parts, and the
+    /// parts keep their boundaries, ETags, and checksums (§9.3).
     pub payload: Payload,
 }
+
+/// The remote multipart upload that the primary's flusher opened for a
+/// local upload, to stream its parts while the client uploads (§7.3). The
+/// local upload is named by the position of its `MPU_CREATE`; the remote
+/// one stays recorded until a `PART_FLUSHED` ends it, also after the local
+/// upload completed or was aborted, so the flusher can still complete or
+/// abort it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteUpload {
+    /// The object key.
+    pub key: String,
+    /// The remote upload's ID.
+    pub id: String,
+}
+
+/// A part a [`RemoteUpload`] holds: which local part was sent, and the
+/// remote's ETag for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePart {
+    /// The position of the `MPU_PART` record whose bytes were sent.
+    pub position: EpochSeq,
+    /// The ETag the remote returned for the part.
+    pub etag: ETag,
+}
+
+/// The parts a [`RemoteUpload`] holds, in part order.
+pub type RemoteParts = Vec<(u16, RemotePart)>;
 
 /// A node's local copy of one control-store register (§6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]

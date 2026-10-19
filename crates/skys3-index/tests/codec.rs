@@ -7,8 +7,8 @@ use proptest::option;
 use proptest::prelude::*;
 use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 use skys3_index::{
-    ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges, ObjectPart,
-    ObjectVersion, Part, Payload, Upload,
+    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges,
+    ObjectPart, ObjectVersion, Part, Payload, RemotePart, RemoteUpload, Upload,
 };
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, ShardRef,
@@ -16,7 +16,8 @@ use skys3_log::record::{
 };
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::{
-    BucketId, ETag, Epoch, EpochSeq, Generation, Label, Seq, ShardId, VersionIdentity,
+    AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
+    Generation, Geometry, Label, NodeId, Seq, ShardId, VersionIdentity,
 };
 
 fn position() -> impl Strategy<Value = EpochSeq> {
@@ -90,6 +91,64 @@ fn copy_source() -> impl Strategy<Value = CopySource> {
     )
 }
 
+fn node() -> impl Strategy<Value = NodeId> {
+    "[a-z0-9]([a-z0-9-]{0,10}[a-z0-9])?".prop_map(|s| NodeId::new(s).unwrap())
+}
+
+/// A coded layout with one to three stripes of up to 3+2, and the object
+/// size its stripes cover.
+fn coded() -> impl Strategy<Value = (Coded, u64)> {
+    let stripe =
+        (1..=u64::from(u32::MAX), 1..=3_usize, 1..=2_usize).prop_flat_map(|(len, k, m)| {
+            (
+                Just((len, Geometry::new(k, m).unwrap())),
+                proptest::collection::btree_set(node(), k + m),
+                vec(any::<u128>(), k + m),
+            )
+        });
+    // The version precedes the publish.
+    let positions = (position(), position())
+        .prop_filter("distinct positions", |(a, b)| a != b)
+        .prop_map(|(a, b)| (a.max(b), a.min(b)));
+    (positions, (any::<u64>(), any::<u64>()), vec(stripe, 1..4)).prop_map(
+        |((publish, version), (epoch, number), stripes)| {
+            let mut offset = 0;
+            let stripes = stripes
+                .into_iter()
+                .zip(0..)
+                .map(|(((len, geometry), nodes, ids), number)| {
+                    let fragments = nodes
+                        .into_iter()
+                        .zip(ids)
+                        .map(|(node, id)| FragmentLocation {
+                            node,
+                            fragment: FragmentId::new(id),
+                        })
+                        .collect();
+                    let stripe = CodedStripe::new(
+                        number,
+                        offset,
+                        len,
+                        geometry,
+                        CodecId::CURRENT,
+                        fragments,
+                    )
+                    .unwrap();
+                    offset = stripe.end();
+                    stripe
+                })
+                .collect();
+            let coded = Coded {
+                publish,
+                version,
+                attempt: AttemptId::new(Epoch::new(epoch), number),
+                stripes,
+            };
+            (coded, offset)
+        },
+    )
+}
+
 fn object() -> impl Strategy<Value = ObjectVersion> {
     (
         (any::<u64>(), any::<u64>(), etag(), option::of(position())),
@@ -99,14 +158,17 @@ fn object() -> impl Strategy<Value = ObjectVersion> {
             checksums(),
         ),
         (option::of(text(12)), option::of(copy_source()), payload()),
+        option::of(coded()),
     )
         .prop_map(
             |(
                 (size, last_modified_ms, local_etag, write_identity),
                 (metadata, tags, checksums),
                 (storage_class, copy_source, payload),
+                coded,
             )| ObjectVersion {
-                size,
+                // A coded object's stripes cover it exactly.
+                size: coded.as_ref().map_or(size, |(_, size)| *size),
                 last_modified_ms,
                 local_etag,
                 write_identity,
@@ -116,6 +178,7 @@ fn object() -> impl Strategy<Value = ObjectVersion> {
                 storage_class,
                 copy_source,
                 payload,
+                coded: coded.map(|(coded, _)| coded),
             },
         )
 }
@@ -329,6 +392,7 @@ fn sample_entry() -> Entry {
                 position: EpochSeq::new(Epoch::new(1), Seq::new(1)),
                 len: 3,
             }]),
+            coded: None,
         }),
         remote_etag: None,
         remote_version_id: None,
@@ -400,6 +464,7 @@ fn format_1_entries_still_decode() {
             storage_class: None,
             copy_source: None,
             payload: Payload::None,
+            coded: None,
         }),
         remote_etag: None,
         remote_version_id: None,
@@ -408,7 +473,8 @@ fn format_1_entries_still_decode() {
     // It re-encodes in the current format: a part count, zero, after each
     // digest.
     let v2 = codec::encode_entry(&entry).unwrap();
-    let mut expected_v2 = ENTRY_V1.replacen("01", "03", 1);
+    // And no coded layout.
+    let mut expected_v2 = ENTRY_V1.replacen("01", "04", 1) + "00";
     expected_v2 = expected_v2.replace("0101020304", "01010203040000");
     expected_v2 = expected_v2.replace("0c0d0e0f", "0c0d0e0f0000");
     assert_eq!(v2, unhex(&expected_v2));
@@ -429,7 +495,7 @@ fn rejects_broken_entries() {
     let bytes = codec::encode_entry(&sample_entry()).unwrap();
     let decode = |bytes: &[u8]| codec::decode_entry(bytes).unwrap_err().field();
     assert_eq!(decode(&[]), "entry");
-    for format in [0, 4, u8::MAX] {
+    for format in [0, 5, u8::MAX] {
         assert_eq!(decode(&with(&bytes, 0, format)), "entry", "format {format}");
     }
     // The state code follows the format byte and the version.
@@ -440,11 +506,13 @@ fn rejects_broken_entries() {
     let b = bytes.iter().position(|&b| b == b'b').unwrap();
     let swapped = with(&with(&bytes, a, b'b'), b, b'a');
     assert_eq!(decode(&swapped), "object.metadata");
-    // An extent of zero bytes, at the very end.
-    let zero = with(&bytes, bytes.len() - 4, 0);
+    // An extent of zero bytes, just before the coded layout's presence
+    // byte, which ends the entry.
+    let zero = with(&bytes, bytes.len() - 5, 0);
     assert_eq!(decode(&zero), "object.extents");
     // An invalid payload tag: the byte before the extent count.
-    assert_eq!(decode(&with(&bytes, bytes.len() - 25, 9)), "object.payload");
+    assert_eq!(decode(&with(&bytes, bytes.len() - 26, 9)), "object.payload");
+    assert_eq!(decode(&with(&bytes, bytes.len() - 1, 2)), "object.coded");
     // A checksum algorithm that does not exist: find the CRC32 code.
     let crc = bytes
         .windows(7)
@@ -582,6 +650,7 @@ fn part() -> impl Strategy<Value = Part> {
     (
         (position(), any::<u64>(), any::<u64>(), etag(), checksums()),
         prop_oneof![
+            Just(Payload::None),
             position().prop_map(Payload::Inline),
             vec(
                 (position(), 1..=skys3_log::record::MAX_PAYLOAD_LEN)
@@ -710,7 +779,8 @@ fn multipart_values_are_validated() {
             "object.parts"
         );
     }
-    // A part's bytes are inline or in extents.
+    // A part's bytes are inline or in extents, or it has none once its
+    // object is evicted; they are never parts themselves.
     let part = Part {
         position: EpochSeq::new(Epoch::new(1), Seq::new(2)),
         size: 0,
@@ -719,18 +789,24 @@ fn multipart_values_are_validated() {
         checksums: BTreeMap::new(),
         payload: Payload::None,
     };
+    let evicted = codec::encode_part(&part).unwrap();
+    assert_eq!(codec::decode_part(&evicted).unwrap(), part);
+    let nested = Part {
+        payload: Payload::Parts {
+            upload: part.position,
+            parts: Vec::new(),
+        },
+        ..part.clone()
+    };
     assert_eq!(
-        codec::encode_part(&part).unwrap_err().field(),
+        codec::encode_part(&nested).unwrap_err().field(),
         "part.payload"
     );
-    let mut bytes = codec::encode_part(&Part {
-        payload: Payload::Inline(part.position),
-        ..part.clone()
-    })
-    .unwrap();
-    let tag = bytes.len() - 17;
-    bytes.truncate(tag + 1);
-    bytes[tag] = 0;
+    // The evicted part's payload tag, then a parts payload with no parts:
+    // an upload position and a count of 0.
+    let mut bytes = evicted[..evicted.len() - 1].to_vec();
+    bytes.push(3);
+    bytes.extend_from_slice(&[0; 18]);
     assert_eq!(
         codec::decode_part(&bytes).unwrap_err().field(),
         "part.payload"
@@ -874,4 +950,102 @@ fn import_ranges_reject_unknown_states_and_disorder() {
     };
     assert!(running.passed("a") && running.passed("m") && !running.passed("n"));
     assert!(!ImportCheckpoint::Running { after: None }.passed(""));
+}
+
+proptest! {
+    #[test]
+    fn remote_uploads_and_parts_round_trip(
+        shard in shard(),
+        upload in position(),
+        number in any::<u16>(),
+        key in ".{1,40}",
+        id in "[!-~]{1,80}",
+        position in position(),
+        etag in etag(),
+    ) {
+        let remote = RemoteUpload { key, id };
+        let bytes = codec::encode_remote_upload(&remote).unwrap();
+        prop_assert_eq!(bytes[0], VALUE_FORMAT);
+        prop_assert_eq!(codec::decode_remote_upload(&bytes).unwrap(), remote);
+        prop_assert!(codec::decode_remote_upload(&bytes[..bytes.len() - 1]).is_err());
+        // Formats before 3 have no uploads.
+        prop_assert!(codec::decode_remote_upload(&with(&bytes, 0, 2)).is_err());
+
+        let part = RemotePart { position, etag };
+        let bytes = codec::encode_remote_part(&part).unwrap();
+        prop_assert_eq!(codec::decode_remote_part(&bytes).unwrap(), part);
+        prop_assert!(codec::decode_remote_part(&bytes[..bytes.len() - 1]).is_err());
+        prop_assert!(codec::decode_remote_part(&with(&bytes, 0, 2)).is_err());
+
+        // A remote upload's key is its local upload's parts prefix, so the
+        // two tables name an upload alike.
+        let key = codec::remote_upload_key(&shard, upload);
+        prop_assert_eq!(&key, &codec::upload_parts_prefix(&shard, upload));
+        prop_assert!(codec::part_key(&shard, upload, number).starts_with(&key));
+        prop_assert_eq!(codec::decode_remote_upload_key(&key).unwrap(), (shard, upload));
+    }
+
+    #[test]
+    fn arbitrary_remote_upload_bytes_decode_canonically(mut bytes in vec(any::<u8>(), 0..120)) {
+        if !bytes.is_empty() {
+            bytes[0] = VALUE_FORMAT;
+        }
+        if let Ok(remote) = codec::decode_remote_upload(&bytes) {
+            prop_assert_eq!(codec::encode_remote_upload(&remote).unwrap(), bytes.clone());
+        }
+        if let Ok(part) = codec::decode_remote_part(&bytes) {
+            prop_assert_eq!(codec::encode_remote_part(&part).unwrap(), bytes.clone());
+        }
+        if let Ok((shard, upload)) = codec::decode_remote_upload_key(&bytes) {
+            prop_assert_eq!(codec::remote_upload_key(&shard, upload), bytes.clone());
+        }
+    }
+}
+
+#[test]
+fn remote_uploads_need_a_key_and_an_id() {
+    let valid = RemoteUpload {
+        key: "k".to_owned(),
+        id: "u".to_owned(),
+    };
+    let bytes = codec::encode_remote_upload(&valid).unwrap();
+    for (remote, field) in [
+        (
+            RemoteUpload {
+                key: String::new(),
+                ..valid.clone()
+            },
+            "remote_upload.key",
+        ),
+        (
+            RemoteUpload {
+                id: String::new(),
+                ..valid.clone()
+            },
+            "remote_upload.id",
+        ),
+        (
+            RemoteUpload {
+                id: "u".repeat(skys3_log::record::MAX_UPLOAD_ID_LEN + 1),
+                ..valid.clone()
+            },
+            "remote_upload.id",
+        ),
+    ] {
+        assert_eq!(
+            codec::encode_remote_upload(&remote).unwrap_err().field(),
+            field
+        );
+    }
+    // The same bytes with an empty ID: the key, then a zero length.
+    let mut empty = bytes[..bytes.len() - 3].to_vec();
+    empty.extend_from_slice(&[0, 0]);
+    assert_eq!(
+        codec::decode_remote_upload(&empty).unwrap_err().field(),
+        "remote_upload.id"
+    );
+    // Trailing bytes are refused.
+    let mut long = bytes.clone();
+    long.push(0);
+    assert!(codec::decode_remote_upload(&long).is_err());
 }

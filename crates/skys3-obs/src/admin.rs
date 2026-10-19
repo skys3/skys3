@@ -40,6 +40,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_lc_rs::constant_time;
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderValue};
 use http::{Method, Request, Response, StatusCode};
@@ -54,6 +55,7 @@ use prometheus_client::metrics::family::Family;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use zeroize::Zeroizing;
 
 use crate::health::Health;
 use crate::metrics::{MetricsRegistry, OPENMETRICS_CONTENT_TYPE};
@@ -124,10 +126,11 @@ fn is_loopback(ip: IpAddr) -> bool {
 
 /// The admin bearer token.
 ///
-/// It is compared in constant time and never printed: `Debug` shows only
-/// that a token is present.
-#[derive(Clone, PartialEq, Eq)]
-pub struct AdminToken(Box<str>);
+/// It is compared in constant time, by [`PartialEq`] too, and never
+/// printed: `Debug` shows only that a token is present. Its memory is
+/// zeroed when it is dropped.
+#[derive(Clone)]
+pub struct AdminToken(Zeroizing<String>);
 
 impl AdminToken {
     /// Validates a token: at least [`MIN_TOKEN_LEN`] bytes of visible ASCII
@@ -137,42 +140,43 @@ impl AdminToken {
     ///
     /// Returns an [`AdminTokenError`] naming the rule the token breaks.
     pub fn new(token: impl Into<String>) -> Result<Self, AdminTokenError> {
-        let token = token.into();
+        let token = Zeroizing::new(token.into());
         if !token.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(AdminTokenError::InvalidCharacter);
         }
         if token.len() < MIN_TOKEN_LEN {
             return Err(AdminTokenError::TooShort { len: token.len() });
         }
-        Ok(Self(token.into_boxed_str()))
+        Ok(Self(token))
     }
 
     /// Reads a token from a file, ignoring trailing whitespace such as a
-    /// final newline.
+    /// final newline. The buffer the file is read into is zeroed too.
     ///
     /// # Errors
     ///
     /// Returns [`AdminTokenError::Read`] if the file cannot be read as
     /// UTF-8, and otherwise the errors of [`AdminToken::new`].
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, AdminTokenError> {
-        let contents = std::fs::read_to_string(path).map_err(AdminTokenError::Read)?;
+        let contents =
+            Zeroizing::new(std::fs::read_to_string(path).map_err(AdminTokenError::Read)?);
         Self::new(contents.trim_end())
     }
 
     /// Compares `candidate` with the token in time that depends only on
     /// their lengths, so a caller cannot find the token byte by byte.
     fn matches(&self, candidate: &[u8]) -> bool {
-        let token = self.0.as_bytes();
-        if token.len() != candidate.len() {
-            return false;
-        }
-        token
-            .iter()
-            .zip(candidate)
-            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-            == 0
+        constant_time::verify_slices_are_equal(self.0.as_bytes(), candidate).is_ok()
     }
 }
+
+impl PartialEq for AdminToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.matches(other.0.as_bytes())
+    }
+}
+
+impl Eq for AdminToken {}
 
 impl fmt::Debug for AdminToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -737,6 +741,27 @@ mod tests {
             invalid.to_string(),
             "the admin token must be visible ASCII with no spaces"
         );
+    }
+
+    #[test]
+    fn tokens_compare_whole_and_alike_by_eq_and_by_header() {
+        let token = AdminToken::new(TOKEN).unwrap();
+        assert!(token.matches(TOKEN.as_bytes()));
+        assert_eq!(token, AdminToken::new(TOKEN).unwrap());
+        // The same length, differing in the first byte or the last.
+        let mut first = TOKEN.as_bytes().to_vec();
+        first[0] ^= 1;
+        let mut last = TOKEN.as_bytes().to_vec();
+        *last.last_mut().unwrap() ^= 1;
+        for other in [first, last] {
+            assert!(!token.matches(&other));
+            let other = AdminToken::new(String::from_utf8(other).unwrap()).unwrap();
+            assert_ne!(token, other);
+        }
+        // A prefix or an extension of the token is not the token.
+        assert!(!token.matches(&TOKEN.as_bytes()[..TOKEN.len() - 1]));
+        assert!(!token.matches(format!("{TOKEN}x").as_bytes()));
+        assert!(!token.matches(b""));
     }
 
     #[test]

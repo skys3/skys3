@@ -1,0 +1,6 @@
+/fuzz/photos/2024/cat.jpg
+content-type:$ima
+x-amz-tagging: a=1&b=2
+x-amz-checksum-crc32c: 
+
+hello

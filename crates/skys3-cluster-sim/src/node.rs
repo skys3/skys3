@@ -15,7 +15,9 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ops::Range;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -24,11 +26,15 @@ use rand::{Rng, SeedableRng};
 use skys3::control::{self, NodeStore};
 use skys3::remote::NodeRemote;
 use skys3::storage;
+use skys3_config::BucketsConfig;
 use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
+use skys3_coord::HandoffSink;
+use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{Commit, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    Gateway, GatewayConfig, IdSource, LocalShards, Precondition, ShardRef, Shards, TrustAll,
+    FillBody, FillError, Fills, Gateway, GatewayConfig, HotCache, IdSource, LocalShards,
+    OriginValidations, Precondition, ShardRef, Shards, TrustAll,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{
@@ -37,9 +43,24 @@ use skys3_io::{
 use skys3_log::LogConfig;
 use skys3_net::{Credentials, Transport, TurmoilNetwork};
 use skys3_obs::MetricsRegistry;
+use skys3_shard::{
+    CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
+    ReadSettings,
+};
 use skys3_sim::{NodeClock, SimS3};
-use skys3_types::{BucketDocument, ClusterId, Generation, Label, NodeAddress, NodeId, ShardConfig};
+use skys3_types::{
+    BucketDocument, BucketMode, ClusterId, EpochSeq, Generation, Label, NodeAddress, NodeId,
+    ShardConfig,
+};
 
+use crate::backup::Flushers;
+use crate::cluster::HotCaches;
+use crate::faults::Fault;
+use crate::lifecycle::{self, Lifecycle};
+use crate::origin::{Origin, OriginBug};
+use crate::peer::{self, Peer, PeerSide};
+use crate::peer_s3::{PeerS3, SimStore};
+use crate::peer_wire::NodePeering;
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -108,6 +129,22 @@ pub trait NodeServices: Clone + 'static {
     fn ready(&self) -> bool {
         true
     }
+
+    /// What starts the planned handoffs a coordinator asks `node` for
+    /// (plan M3-06), in the life the services last started on it, if the
+    /// services replicate.
+    fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
+        let _ = node;
+        None
+    }
+
+    /// Faults that must fall at a protocol state rather than at a time,
+    /// such as the coordinator's crash in the middle of a change, which
+    /// the services triggered since the last call. The driver takes them
+    /// after every step of the workload and starts them at once.
+    fn triggered_faults(&self) -> Vec<Fault> {
+        Vec::new()
+    }
 }
 
 /// The single-node services of M1: every shard is local, and the node is
@@ -134,6 +171,34 @@ pub(crate) struct NodeSettings {
     pub retry: RetryPolicy,
     pub poll_interval: Duration,
     pub flush: FlushSettings,
+    /// The clean cache each node keeps, if any (§9.3).
+    pub clean_cache: Option<CacheSettings>,
+    /// The node's read registrations as a holder (§8.7).
+    pub reads: ReadSettings,
+    /// Segment compaction, if nodes run it (§10.3): a pass after each
+    /// checkpoint interval.
+    pub compaction: Option<CompactionSettings>,
+    /// The hot cache each node's gateway keeps (§9.2).
+    pub hot_cache: HotCaches,
+    /// Lifecycle passes, if nodes run them (§8.7).
+    pub lifecycle: Option<Lifecycle>,
+    /// Each bucket's settings as the flushers see them: the `local`
+    /// buckets' backup targets (§8.9).
+    pub buckets: BucketsConfig,
+    /// A seeded bug: the clean cache is told the `local` buckets'
+    /// `clean_copies` too, and evicts payload a backup made clean.
+    pub evict_local: bool,
+    /// Whether nodes write index snapshots of the buckets whose settings
+    /// name a snapshot target (§8.9).
+    pub snapshots: bool,
+    /// The `read_only` buckets' origin, if the run has one (§9.5): the
+    /// gateways then read origins as the node binary does.
+    pub origin: Option<Origin>,
+    /// The SkyS3 peer the buckets flush to over the native protocol, if
+    /// any.
+    pub peer: Option<Peer>,
+    /// What the nodes know of the peer, if any.
+    pub peer_side: Option<PeerSide>,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -209,6 +274,30 @@ pub(crate) struct Shared<S> {
     pub peers: BTreeMap<NodeId, NodeAddress>,
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
     pub remote: SimS3,
+    /// Segments compaction reclaimed, over every node and life.
+    pub compacted: Arc<AtomicU64>,
+    /// The hot cache of every node's every life, by node.
+    pub hot_caches: Mutex<Vec<(NodeId, HotCache)>>,
+    /// The flush service of every node's every life.
+    pub flushers: Arc<Flushers>,
+}
+
+impl<S> Shared<S> {
+    /// The `GET`s each node served from its hot caches, over every life.
+    pub(crate) fn hot_cache_hits(&self) -> BTreeMap<NodeId, u64> {
+        let mut hits = BTreeMap::new();
+        let caches = self
+            .hot_caches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for (node, cache) in caches.iter() {
+            let served = cache.usage().hits;
+            if served > 0 {
+                *hits.entry(node.clone()).or_default() += served;
+            }
+        }
+        hits
+    }
 }
 
 /// The index settings of a simulated node: a small page cache, so redb
@@ -275,6 +364,7 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
 
+    recovered.shards.set().reads().configure(settings.reads);
     let env = NodeEnv {
         node: slot.id.clone(),
         position: slot.position,
@@ -291,10 +381,69 @@ pub(crate) async fn run<S: NodeServices>(
         seed: seed.rotate_left(17),
     };
     let shards = shared.services.start(env).await?;
-    let flush =
-        Arc::new(flush_service(settings, &shared.remote).with_commit(commit_through(&shards)));
+    // The node's own link to the remote store, which can drop.
+    let remote = shared.remote.from_source(&slot.host);
+    // The node's peer endpoint, in each life, with draws of its own.
+    let peering = match &settings.peer_side {
+        Some(side) => Some(NodePeering::bind(side, slot.position, seed.rotate_left(41)).await?),
+        None => None,
+    };
+    let flush = Arc::new(
+        flush_service(
+            settings,
+            &remote,
+            seed.rotate_left(29),
+            peering
+                .as_ref()
+                .map(|peering| (peering, slot.position, slot.host.as_str())),
+        )
+        .with_commit(commit_through(&shards)),
+    );
+    shared
+        .flushers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Arc::downgrade(&flush));
     let mut gateway_config = settings.gateway.clone();
-    gateway_config.remote = Some(Arc::new(NodeRemote(Arc::clone(&flush))));
+    // A hot cache of the node's own, empty in each life, as the node
+    // binary's is.
+    gateway_config.hot_cache = HotCache::new(settings.hot_cache.bytes);
+    if settings.hot_cache.ignore_version {
+        gateway_config.hot_cache.ignore_versions();
+    }
+    // What the gateway learns of origins, its own in each life.
+    gateway_config.origin_validations = OriginValidations::new();
+    // Reads of `write_back` targets for keys the import has not reached,
+    // and of origins (§9.1, §9.5).
+    gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
+    if let Some(origin) = &settings.origin {
+        match origin.bug {
+            Some(OriginBug::SkipRevalidation) => {
+                gateway_config.origin_validations.skip_revalidation()
+            }
+            Some(OriginBug::IgnoreCredentials) => {
+                gateway_config.origin_validations.ignore_credentials()
+            }
+            None => {}
+        }
+    }
+    shared
+        .hot_caches
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((slot.id.clone(), gateway_config.hot_cache.clone()));
+    let mut cache = None;
+    if let Some(bounds) = settings.clean_cache {
+        // The clean cache, and fills of what it evicts, as the node
+        // binary keeps them; it runs once the bucket policies are in.
+        let clean = CleanCache::new(bounds, CacheMetrics::default());
+        recovered.shards.set().use_cache(&clean).await;
+        cache = Some(clean);
+        gateway_config.fills = Some(Arc::new(SimFills {
+            shards: recovered.shards.clone(),
+            flush: Arc::clone(&flush),
+        }));
+    }
     let gateway = Gateway::new(
         gateway_config,
         store.clone(),
@@ -304,14 +453,41 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
     open_shards(&shards, &gateway.buckets()).await?;
+    let evict_local = settings.evict_local;
+    if let Some(cache) = cache {
+        install_clean_copies(&recovered.shards, &gateway.buckets(), evict_local);
+        let set = recovered.shards.set().clone();
+        tokio::spawn(async move { cache.run(set).await });
+    }
+    let snapshots = settings.snapshots.then(|| {
+        let remote = remote.clone();
+        SnapshotService::new(Box::new(move |_| remote.clone()), settings.buckets.clone())
+            .with_wall_clock(Arc::new(SimWallClock))
+    });
     {
         let (gateway, local) = (gateway.clone(), recovered.shards.clone());
-        tokio::spawn(async move { follow_flushes(&flush, &gateway, &local).await });
+        tokio::spawn(async move {
+            follow_flushes(&flush, snapshots.as_ref(), &gateway, &local, evict_local).await;
+        });
+    }
+    if let Some(lifecycle) = settings.lifecycle.clone() {
+        let (gateway, set) = (gateway.clone(), recovered.shards.set().clone());
+        let buckets = settings.gateway.buckets.clone();
+        tokio::spawn(async move { lifecycle::follow(&lifecycle, &gateway, &set, &buckets).await });
     }
 
     let checkpointer = Arc::clone(&recovered.checkpointer);
     let interval = settings.checkpoint_interval;
     let checkpoints = tokio::spawn(async move { checkpointer.run(interval).await });
+    if let Some(compaction) = settings.compaction {
+        let compactor = Compactor::new(
+            recovered.shards.set().clone(),
+            compaction,
+            CompactionMetrics::default(),
+        );
+        let compacted = Arc::clone(&shared.compacted);
+        tokio::spawn(async move { compact(&compactor, interval, &compacted).await });
+    }
     {
         let (settings, index, gateway, shards) = (
             shared.settings.clone(),
@@ -337,6 +513,20 @@ pub(crate) async fn run<S: NodeServices>(
     Ok(())
 }
 
+/// Compacts the node's logs every `interval`, as the node binary does, and
+/// counts the segments reclaimed in `compacted`.
+async fn compact(compactor: &Compactor<SimMount>, interval: Duration, compacted: &AtomicU64) {
+    loop {
+        tokio::time::sleep(interval).await;
+        match compactor.compact().await {
+            Ok(report) => {
+                compacted.fetch_add(report.segments, Ordering::Relaxed);
+            }
+            Err(error) => tracing::debug!(%error, "compaction failed"),
+        }
+    }
+}
+
 /// Opens the shards of every bucket in `buckets`.
 async fn open_shards<H: Shards>(shards: &H, buckets: &[BucketDocument]) -> Result<(), BoxError> {
     for bucket in buckets {
@@ -348,17 +538,47 @@ async fn open_shards<H: Shards>(shards: &H, buckets: &[BucketDocument]) -> Resul
 }
 
 /// The node's flushers: every `write_back` bucket flushes to `remote`, the
-/// harness's one remote store, whatever its target names; bucket prefixes
-/// keep their keys apart.
-fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3, SimMount> {
-    let remote = remote.clone();
-    FlushService::new(
+/// harness's one remote store, whatever its target names, but for a target
+/// at the SkyS3 peer, which they reach over S3 REST through its gateway;
+/// bucket prefixes keep their keys apart. Their capability probes take
+/// nonces from `seed`, so that a seed replays the scratch keys they write,
+/// which a parallel import's split points see. With a peer, they reach it
+/// over QUIC through `peering`, the endpoint of the node at its position.
+fn flush_service(
+    settings: &NodeSettings,
+    remote: &SimS3,
+    seed: u64,
+    peering: Option<(&NodePeering, usize, &str)>,
+) -> FlushService<SimStore, SimMount> {
+    let (remote, origin) = (remote.clone(), remote.clone());
+    let at_peer = settings
+        .peer_side
+        .as_ref()
+        .map(|side| PeerS3::new(peer::BUCKET, Arc::clone(&side.log)));
+    let service = FlushService::new(
         settings.cluster.clone(),
         settings.flush.clone(),
-        Box::new(move |_| remote.clone()),
+        Box::new(move |target| match &at_peer {
+            Some(at_peer) if target.endpoint == peer::ENDPOINT => SimStore::Peer(at_peer.clone()),
+            _ => SimStore::Remote(remote.clone()),
+        }),
         FlushMetrics::register(&MetricsRegistry::new()),
     )
+    // An origin is the remote store, read with the bucket's credentials.
+    .with_origin_connect(Box::new(move |_, profile| {
+        SimStore::Remote(
+            origin.with_credentials(profile.unwrap_or(skys3_flush::DEFAULT_CREDENTIALS)),
+        )
+    }))
     .with_wall_clock(Arc::new(SimWallClock))
+    .with_buckets(settings.buckets.clone())
+    .with_probe_nonces(seed);
+    match (settings.peer, &settings.peer_side, peering) {
+        (Some(peer), Some(side), Some((peering, node, host))) => {
+            service.with_peer_transport(peering.transport(peer, side, node, host))
+        }
+        _ => service,
+    }
 }
 
 /// Commits the records of an import this node owns through `shards`, the
@@ -381,16 +601,85 @@ fn commit_through<H: Shards>(shards: &H) -> Commit {
     })
 }
 
-/// Keeps a flusher on every `write_back` bucket shard open on the node, as
-/// the node binary does (§7.1).
+/// Keeps a flusher on every shard open on the node of a `write_back`
+/// bucket or a `local` one with a backup target, and a snapshot writer on
+/// every one of a bucket with a snapshot target, and gives the clean cache
+/// each bucket's `clean_copies`, as the node binary does (§7.1, §8.9,
+/// §9.3); with `evict_local`, a seeded bug, the `local` buckets' too.
 async fn follow_flushes(
-    flush: &FlushService<SimS3, SimMount>,
+    flush: &FlushService<SimStore, SimMount>,
+    snapshots: Option<&SnapshotService<SimS3, SimMount>>,
     gateway: &Gateway<TrustAll>,
     shards: &LocalShards<SimMount>,
+    evict_local: bool,
 ) {
     loop {
-        flush.reconcile(&gateway.buckets(), shards.set()).await;
+        let buckets = gateway.buckets();
+        install_clean_copies(shards, &buckets, evict_local);
+        flush.reconcile(&buckets, shards.set()).await;
+        if let Some(snapshots) = snapshots {
+            snapshots.reconcile(&buckets, shards.set()).await;
+        }
         tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+    }
+}
+
+/// Gives the clean cache each bucket's `clean_copies`, before it scans
+/// or a flush lands, as the node binary does (§9.3): every bucket but the
+/// `local` ones, which are never evicted (§8.9), unless `evict_local`
+/// seeds that bug.
+fn install_clean_copies(
+    shards: &LocalShards<SimMount>,
+    buckets: &[BucketDocument],
+    evict_local: bool,
+) {
+    if let Some(cache) = shards.set().cache() {
+        let copies = buckets
+            .iter()
+            .filter(|b| b.mode != BucketMode::Local || evict_local)
+            .map(|b| (b.bucket_id.clone(), b.clean_copies));
+        cache.set_clean_copies(copies);
+    }
+}
+
+/// Read-through fills into the node's own replica of a shard (§9.2), as
+/// the node binary's are, without its free-space check: a simulated disk
+/// does not run out of space.
+#[derive(Debug)]
+struct SimFills {
+    shards: LocalShards<SimMount>,
+    flush: Arc<FlushService<SimStore, SimMount>>,
+}
+
+impl Fills for SimFills {
+    fn read(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        range: Range<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>> {
+        let (shard, key) = (shard.clone(), key.to_owned());
+        Box::pin(async move {
+            let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
+            let local = self
+                .shards
+                .set()
+                .get(&(&shard).into())
+                .await
+                .ok_or_else(|| unavailable("the shard is not open on this node"))?;
+            let filler = self
+                .flush
+                .filler(&shard.bucket)
+                .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
+            filler
+                .read(&local, &key, version, range)
+                .await
+                .map_err(|error| match error {
+                    skys3_flush::FillError::Changed => FillError::Changed,
+                    other => FillError::Unavailable(other.to_string()),
+                })
+        })
     }
 }
 

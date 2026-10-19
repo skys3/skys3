@@ -20,12 +20,13 @@ use skys3_control::{
 use skys3_index::{Index, IndexConfig, ListItem, ListQuery};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::RecordBody;
-use skys3_log::record::{Delete, Extent, MpuCreate, MpuPart, PutData};
+use skys3_log::record::{Delete, Extent, MpuCreate, MpuPart, PutData, UploadBegin};
 use skys3_net::{
     CertificateDer, Credentials, Frame, Header, MessageKind, PeerIdentity, PrivateKeyDer,
     TokioNetwork, Transport,
 };
 use skys3_shard::replication::{Replication, ReplicationConfig};
+use skys3_shard::{Change, FlushState};
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, ClusterId, ETag, Epoch, EpochSeq, NodeAddress, NodeId,
     ProposalId, Seq, ShardConfig, ShardCount, ShardId,
@@ -114,6 +115,7 @@ fn bucket() -> BucketDocument {
         clean_copies: 0,
         target: None,
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new("p").unwrap(),
     }
 }
@@ -187,7 +189,7 @@ impl Cluster {
         let served = Arc::new(Mutex::new(Vec::new()));
         let mut nodes = Vec::new();
         for (n, (transport, listener)) in (1..).zip(listeners) {
-            let shards = MemoryShards::open(SimDisk::new(u64::from(n)))
+            let shards = MemoryShards::open_as(SimDisk::new(u64::from(n)), node(n))
                 .await
                 .unwrap();
             let set = shards.local().set().clone();
@@ -361,6 +363,34 @@ async fn every_call_is_forwarded_to_the_primary() {
         .unwrap();
     assert_eq!(payload, Bytes::from_static(b"extent bytes"));
 
+    // A streamed body's announcement reaches the primary's subscriber.
+    let replica = primary.local().set().get(&(&shard).into()).await.unwrap();
+    let mut changes = replica.subscribe();
+    let announced = announcement(extent);
+    timed(gateway.announce(&shard, announced.clone()))
+        .await
+        .unwrap();
+    assert_eq!(changes.recv().await, Some(Change::Streamed(announced)));
+
+    // A write-through write's wait reaches the primary's flusher, which
+    // answers it; a wait it does not answer in time is pending.
+    let waited = tokio::spawn({
+        let (gateway, shard) = (gateway.clone(), shard.clone());
+        async move {
+            gateway
+                .flushed(&shard, "gone", at, Duration::from_secs(5))
+                .await
+        }
+    });
+    let Some(Change::Awaited(waiter)) = changes.recv().await else {
+        panic!("the wait reaches the flusher");
+    };
+    assert_eq!((waiter.key(), waiter.version()), ("gone", at));
+    waiter.answer(FlushState::Flushed);
+    assert_eq!(timed(waited).await.unwrap(), Ok(FlushState::Flushed));
+    let pending = gateway.flushed(&shard, "gone", at, Duration::from_millis(50));
+    assert_eq!(timed(pending).await, Ok(FlushState::Pending));
+
     // A multipart upload and its parts.
     let create = RecordBody::MpuCreate(MpuCreate {
         key: "multi".into(),
@@ -414,6 +444,14 @@ async fn every_call_is_forwarded_to_the_primary() {
         .unwrap();
     assert_eq!(payload, Bytes::from_static(b"part"));
 
+    // The identity of a streamed PUT.
+    let begin = RecordBody::UploadBegin(UploadBegin { key: "big".into() });
+    let begun = timed(gateway.write(&shard, begin, Precondition::None))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(begun > upload, "{begun} follows {upload}");
+
     // Seals.
     let summary = timed(gateway.seal(&shard)).await.unwrap();
     assert_eq!(summary.objects, 1);
@@ -439,6 +477,95 @@ async fn every_call_is_forwarded_to_the_primary() {
     assert_eq!(gateway.map().get(&shard), None);
     let replicas = cluster.nodes[1].0.local().set().shards().await;
     assert!(replicas.is_empty(), "{replicas:?}");
+}
+
+/// A GET's plan comes from the primary, and its bytes from whichever
+/// holder the gateway asks, over the wire or in process; a holder that
+/// lacks the version says so, and one that does not answer fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_are_planned_by_the_primary_and_served_by_any_holder() {
+    let cluster = Cluster::start(timing()).await;
+    let shard = shard(0);
+    let extent = Extent {
+        key: "big".into(),
+        offset: 0,
+        data: Bytes::from_static(b"extent bytes"),
+    };
+    let primary = cluster.gateway(1);
+    let extent = timed(primary.append_extent(&shard, extent)).await.unwrap();
+    let put = RecordBody::Put(skys3_log::record::Put {
+        key: "big".into(),
+        size: 12,
+        last_modified_ms: 0,
+        etag: etag(1),
+        inherited_identity: None,
+        metadata: BTreeMap::new(),
+        tags: BTreeMap::new(),
+        checksums: BTreeMap::new(),
+        copy_source: None,
+        data: PutData::Extents(vec![extent]),
+    });
+    let version = timed(primary.write(&shard, put, Precondition::None))
+        .await
+        .unwrap()
+        .unwrap();
+    let observed = cluster.served().len();
+
+    let gateway = cluster.gateway(2);
+    assert_eq!(gateway.node(), Some(node(2)));
+    let plan = timed(gateway.plan(&shard, "big")).await.unwrap();
+    assert_eq!(plan.entry.unwrap().version, version);
+    assert_eq!((plan.layout, plan.holders), (vec![extent], vec![node(1)]));
+    let none = timed(gateway.plan(&shard, "none")).await.unwrap();
+    assert_eq!((none.entry, none.holders), (None, Vec::new()));
+
+    // Node 1 holds the version: the read is registered, renewed, fetched,
+    // and released over the wire.
+    let registered = timed(gateway.register(&shard, &node(1), "big", version, vec![extent]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(registered.layout, [extent]);
+    assert_eq!(
+        timed(gateway.renew(&shard, &node(1), registered.id)).await,
+        Ok(true)
+    );
+    let fetched = timed(gateway.fetch(&shard, &node(1), registered.id, extent.position)).await;
+    assert_eq!(fetched, Ok(Bytes::from_static(b"extent bytes")));
+    timed(gateway.release(&shard, &node(1), registered.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        timed(gateway.renew(&shard, &node(1), registered.id)).await,
+        Ok(false)
+    );
+    let lapsed = timed(gateway.fetch(&shard, &node(1), registered.id, extent.position)).await;
+    assert!(
+        matches!(&lapsed, Err(ShardError::Unavailable { reason, .. }) if reason.contains("lapsed")),
+        "{lapsed:?}"
+    );
+
+    // Node 2's replica never got the records, so it says it lacks them,
+    // in process.
+    let missing = timed(gateway.register(&shard, &node(2), "big", version, vec![extent])).await;
+    assert_eq!(missing, Ok(None));
+    // Node 3 never answers.
+    let silent = timed(gateway.register(&shard, &node(3), "big", version, vec![extent])).await;
+    assert!(
+        matches!(silent, Err(ShardError::Unavailable { .. })),
+        "{silent:?}"
+    );
+    // Node 1 has no replica of shard 1.
+    let other = shard_number(1);
+    let absent = timed(gateway.register(&other, &node(1), "big", version, Vec::new())).await;
+    assert_eq!(absent, Err(ShardError::NotFound(other)));
+
+    // Only the plans were observed: holders are not audited as primaries.
+    assert_eq!(cluster.served().len(), observed + 2);
+}
+
+fn shard_number(n: u8) -> ShardRef {
+    shard(n)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -626,6 +753,53 @@ fn refusals_and_hints_round_trip() {
             epoch: Epoch::new(4),
             hint: Some(config(0, 4, &[1])),
         },
+        Reply::Served {
+            response: Response::Plan(ReadPlan {
+                entry: Some(skys3_index::Entry {
+                    version: EpochSeq::new(Epoch::new(4), Seq::new(9)),
+                    state: skys3_index::EntryState::Dirty,
+                    object: None,
+                    remote_etag: None,
+                    remote_version_id: None,
+                }),
+                layout: vec![extent_ref(3, 5), extent_ref(4, 1)],
+                holders: vec![node(2), node(1)],
+            }),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Plan(ReadPlan {
+                entry: None,
+                layout: Vec::new(),
+                holders: Vec::new(),
+            }),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Registered(Some(Registered {
+                id: 7,
+                layout: vec![extent_ref(3, 5)],
+            })),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Registered(None),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Renewed(false),
+            epoch: Epoch::new(4),
+            hint: None,
+        },
+        Reply::Served {
+            response: Response::Released,
+            epoch: Epoch::new(4),
+            hint: None,
+        },
     ];
     for reply in replies {
         let frame = wire::reply_frame(&reply, 9);
@@ -672,6 +846,221 @@ fn refusals_and_hints_round_trip() {
         wire::decode_reply(&frame, &shard),
         Ok(Reply::Refused(ShardError::Unavailable { .. }))
     ));
+
+    // Answers about reads that make no sense are refused.
+    let served = |answer: wire::Result| {
+        let reply = wire::ForwardReply {
+            outcome: wire::OUTCOME_SERVED,
+            epoch: 1,
+            config: Vec::new(),
+            reason: String::new(),
+            position: None,
+        };
+        let answer = wire::Answer {
+            result: Some(answer),
+        };
+        Frame::new(
+            Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+            Bytes::from(answer.encode_to_vec()),
+        )
+    };
+    let empty_extent = wire::Layout {
+        extents: vec![wire::ExtentAnswer {
+            position: Some(wire::Position { epoch: 1, seq: 1 }),
+            len: 0,
+        }],
+    };
+    let malformed = [
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: Vec::new(),
+            layout: None,
+            holders: vec!["node-1".into()],
+        }),
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: Vec::new(),
+            layout: Some(empty_extent),
+            holders: Vec::new(),
+        }),
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: vec![1, 2, 3],
+            layout: None,
+            holders: Vec::new(),
+        }),
+        wire::Result::Plan(wire::PlanAnswer {
+            entry: Vec::new(),
+            layout: None,
+            holders: vec!["Not A Node".into()],
+        }),
+        wire::Result::Registered(wire::RegisteredAnswer {
+            read: None,
+            layout: Some(wire::Layout::default()),
+        }),
+        wire::Result::Registered(wire::RegisteredAnswer {
+            read: Some(1),
+            layout: Some(wire::Layout {
+                extents: vec![wire::ExtentAnswer {
+                    position: None,
+                    len: 1,
+                }],
+            }),
+        }),
+    ];
+    for answer in malformed {
+        let frame = served(answer.clone());
+        assert!(wire::decode_reply(&frame, &shard).is_err(), "{answer:?}");
+    }
+}
+
+fn extent_ref(seq: u64, len: u32) -> skys3_log::record::ExtentRef {
+    skys3_log::record::ExtentRef {
+        position: EpochSeq::new(Epoch::new(4), Seq::new(seq)),
+        len,
+    }
+}
+
+/// An announcement of the streamed body of `big` begun at 4.7, with
+/// metadata, tags, and `extent` at offset 0.
+fn announcement(extent: skys3_log::record::ExtentRef) -> StreamedBody {
+    StreamedBody {
+        key: "big".into(),
+        upload: EpochSeq::new(Epoch::new(4), Seq::new(7)),
+        metadata: BTreeMap::from([("x-amz-meta-color".into(), "blue".into())]),
+        tags: BTreeMap::from([("team".into(), "a".into())]),
+        extents: vec![(0, extent)],
+    }
+}
+
+#[test]
+fn announcements_round_trip_and_malformed_ones_are_refused() {
+    let shard = shard(0);
+    let request = Request::Announce(announcement(extent_ref(9, 100)));
+    let frame = wire::request_frame(&shard, Epoch::new(1), &request).unwrap();
+    assert_eq!(
+        wire::decode_request(&frame),
+        Ok((shard.clone(), Epoch::new(1), request.clone()))
+    );
+    let reply = Reply::Served {
+        response: Response::Announced,
+        epoch: Epoch::new(1),
+        hint: None,
+    };
+    let frame = wire::reply_frame(&reply, 3);
+    assert_eq!(wire::decode_reply(&frame, &shard), Ok(reply));
+
+    let Request::Announce(body) = request else {
+        unreachable!("an announcement")
+    };
+    let Ok(wire::Op::Announce(valid)) =
+        wire::request_frame(&shard, Epoch::new(1), &Request::Announce(body.clone())).map(|frame| {
+            prost::Message::decode(frame.header.body)
+                .map(|forward: wire::Forward| forward.op.unwrap())
+                .unwrap()
+        })
+    else {
+        panic!("an announcement encodes as one");
+    };
+    let refused = |change: &dyn Fn(&mut wire::Announcement)| {
+        let mut announced = valid.clone();
+        change(&mut announced);
+        let forward = wire::Forward {
+            bucket_id: "b-r".into(),
+            shard: 0,
+            epoch: 1,
+            op: Some(wire::Op::Announce(announced)),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::Forward).with_body(prost::Message::encode_to_vec(&forward)),
+            Bytes::new(),
+        );
+        wire::decode_request(&frame).is_err()
+    };
+    assert!(refused(&|a| a.key.clear()));
+    assert!(refused(&|a| a.key = "k".repeat(1025)));
+    assert!(refused(&|a| a.upload = None));
+    assert!(refused(&|a| a.headers = vec![0xff]));
+    assert!(refused(&|a| a.extents[0].extent = None));
+    assert!(refused(&|a| {
+        if let Some(extent) = &mut a.extents[0].extent {
+            extent.len = 0;
+        }
+    }));
+    assert!(refused(&|a| {
+        let extent = a.extents[0].clone();
+        a.extents = vec![extent; skys3_log::record::MAX_EXTENTS + 1];
+    }));
+    // A body announced with too much metadata does not encode.
+    let mut big = body;
+    big.metadata
+        .insert("x-amz-meta-big".into(), "v".repeat(9 * 1024));
+    assert!(wire::request_frame(&shard, Epoch::new(1), &Request::Announce(big)).is_err());
+}
+
+#[test]
+fn flush_waits_round_trip_and_malformed_ones_are_refused() {
+    let shard = shard(0);
+    for state in [
+        FlushState::Flushed,
+        FlushState::Conflict,
+        FlushState::Pending,
+    ] {
+        let reply = Reply::Served {
+            response: Response::Flushed(state),
+            epoch: Epoch::new(1),
+            hint: None,
+        };
+        let frame = wire::reply_frame(&reply, 3);
+        assert_eq!(wire::decode_reply(&frame, &shard), Ok(reply));
+    }
+    let answer = wire::Answer {
+        result: Some(wire::Result::Flushed(7)),
+    };
+    let reply = wire::ForwardReply {
+        outcome: wire::OUTCOME_SERVED,
+        epoch: 1,
+        ..wire::ForwardReply::default()
+    };
+    let frame = Frame::new(
+        Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+        Bytes::from(answer.encode_to_vec()),
+    );
+    assert!(wire::decode_reply(&frame, &shard).is_err());
+
+    let valid = wire::FlushQuery {
+        key: "k".into(),
+        version: Some(wire::Position { epoch: 1, seq: 2 }),
+        wait_ms: 5_000,
+    };
+    let decoded = |query: wire::FlushQuery| {
+        let forward = wire::Forward {
+            bucket_id: "b-r".into(),
+            shard: 0,
+            epoch: 1,
+            op: Some(wire::Op::Flushed(query)),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::Forward).with_body(forward.encode_to_vec()),
+            Bytes::new(),
+        );
+        wire::decode_request(&frame).map(|(_, _, request)| request)
+    };
+    assert_eq!(
+        decoded(valid.clone()),
+        Ok(Request::Flushed {
+            key: "k".into(),
+            version: EpochSeq::new(Epoch::new(1), Seq::new(2)),
+            wait: Duration::from_secs(5),
+        })
+    );
+    let refused = |change: &dyn Fn(&mut wire::FlushQuery)| {
+        let mut query = valid.clone();
+        change(&mut query);
+        decoded(query).is_err()
+    };
+    assert!(refused(&|q| q.key.clear()));
+    assert!(refused(&|q| q.key = "k".repeat(1025)));
+    assert!(refused(&|q| q.version = None));
+    assert!(refused(&|q| q.wait_ms = 60_001));
+    assert!(!refused(&|q| q.wait_ms = 60_000));
 }
 
 #[test]
@@ -733,6 +1122,43 @@ fn malformed_requests_are_refused() {
     let mut frame = forward(wire::Op::Write(wire::Condition::default()), 1);
     frame.payload = record;
     assert!(wire::decode_request(&frame).is_err());
+
+    // A registration carries its layout, and only it, as its payload.
+    let register = |payload: &'static [u8]| {
+        let mut frame = forward(
+            wire::Op::Register(wire::RegisterQuery {
+                key: "k".into(),
+                version: Some(wire::Position { epoch: 1, seq: 2 }),
+            }),
+            0,
+        );
+        frame.payload = Bytes::from_static(payload);
+        frame
+    };
+    assert!(matches!(
+        wire::decode_request(&register(b"")),
+        Ok((_, _, Request::Register { layout, .. })) if layout.is_empty()
+    ));
+    assert!(wire::decode_request(&register(&[0xff, 0xff])).is_err());
+    let without_version = forward(
+        wire::Op::Register(wire::RegisterQuery {
+            key: "k".into(),
+            version: None,
+        }),
+        0,
+    );
+    assert!(wire::decode_request(&without_version).is_err());
+    let fetch = forward(
+        wire::Op::Fetch(wire::FetchQuery {
+            read: 1,
+            position: None,
+        }),
+        0,
+    );
+    assert!(wire::decode_request(&fetch).is_err());
+    let mut renew = forward(wire::Op::Renew(1), 0);
+    renew.payload = Bytes::from_static(b"stray");
+    assert!(wire::decode_request(&renew).is_err());
 }
 
 /// A peer cluster's conditions travel to the primary whole, and a
@@ -756,7 +1182,25 @@ fn peer_conditions_round_trip() {
                 expected,
                 cluster: ClusterId::new("prod-eu").unwrap(),
                 shard: shard.clone(),
-            }),
+            })
+            .apply_by(Some(1_800_000_000_000)),
+        };
+        let frame = wire::request_frame(&shard, Epoch::new(1), &write).unwrap();
+        assert_eq!(
+            wire::decode_request(&frame),
+            Ok((shard.clone(), Epoch::new(1), write))
+        );
+    }
+    // A peer's S3 write: a plain condition with an apply-by time.
+    for condition in [
+        Precondition::None,
+        Precondition::Absent,
+        Precondition::Exists,
+        Precondition::Matches("0123".into()),
+    ] {
+        let write = Request::Write {
+            body: delete.clone(),
+            condition: condition.apply_by(Some(1_800_000_000_000)),
         };
         let frame = wire::request_frame(&shard, Epoch::new(1), &write).unwrap();
         assert_eq!(
@@ -847,6 +1291,23 @@ proptest! {
             }),
             Request::Uploads { prefix: key.clone(), after: Some((key.clone(), None)), limit },
             Request::Payload(EpochSeq::new(Epoch::new(epoch), Seq::new(1))),
+            Request::Plan { key: key.clone() },
+            Request::Register {
+                key: key.clone(),
+                version: EpochSeq::new(Epoch::new(epoch), Seq::new(2)),
+                layout: (0..limit % 5)
+                    .map(|n| skys3_log::record::ExtentRef {
+                        position: EpochSeq::new(Epoch::new(epoch), Seq::new(n as u64)),
+                        len: u32::try_from(limit).unwrap() + 1,
+                    })
+                    .collect(),
+            },
+            Request::Renew(epoch),
+            Request::Release(epoch),
+            Request::Fetch {
+                read: epoch,
+                position: EpochSeq::new(Epoch::new(1), Seq::new(epoch)),
+            },
             Request::Write {
                 body: RecordBody::Delete(Delete { key: format!("k{key}") }),
                 condition: Precondition::Peer(PeerCondition {
@@ -862,8 +1323,23 @@ proptest! {
                     },
                     cluster: ClusterId::new("prod-eu").unwrap(),
                     shard: shard(3),
-                }),
+                })
+                .apply_by((limit % 2 == 0).then_some(limit as u64)),
             },
+            Request::Flushed {
+                key: format!("k{key}"),
+                version: EpochSeq::new(Epoch::new(epoch), Seq::new(4)),
+                wait: Duration::from_millis(limit as u64),
+            },
+            Request::Announce(StreamedBody {
+                key: format!("k{key}"),
+                upload: EpochSeq::new(Epoch::new(epoch), Seq::new(3)),
+                metadata: BTreeMap::from([(format!("x-amz-meta-k{}", limit % 7), key.clone())]),
+                tags: BTreeMap::from([(format!("t{key}"), key.clone())]),
+                extents: (0..limit % 5)
+                    .map(|n| (n as u64 * 9, extent_ref(n as u64, 9)))
+                    .collect(),
+            }),
         ];
         for request in requests {
             let frame = wire::request_frame(&shard(3), Epoch::new(epoch), &request).unwrap();
@@ -873,4 +1349,59 @@ proptest! {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batched_writes_are_sequenced_on_a_local_primary_and_routed_otherwise() {
+    let cluster = Cluster::start(timing()).await;
+    let shard = shard(0);
+    let deletes = |keys: &[&str], condition: Precondition| -> Vec<_> {
+        keys.iter()
+            .map(|key| {
+                let body = RecordBody::Delete(Delete {
+                    key: (*key).to_owned(),
+                });
+                (body, condition.clone())
+            })
+            .collect()
+    };
+
+    // Node 1, the primary, sequences its gateway's batch in process: the
+    // writes take consecutive positions, and one request is observed.
+    let local = cluster.gateway(1);
+    timed(local.map().learn(config(0, 2, &[1]))).await;
+    let written =
+        timed(local.write_all(&shard, deletes(&["a", "b", "c"], Precondition::None))).await;
+    let positions: Vec<_> = written
+        .into_iter()
+        .map(|written| written.unwrap().unwrap().seq.get())
+        .collect();
+    assert_eq!(
+        positions,
+        [positions[0], positions[0] + 1, positions[0] + 2]
+    );
+    assert_eq!(local.stats().forwarded, 0);
+    assert_eq!(cluster.served().len(), 1);
+    // Conditions are checked as for single writes.
+    let written = timed(local.write_all(&shard, deletes(&["a", "x"], Precondition::Exists))).await;
+    assert_eq!(
+        written,
+        [
+            Ok(Err(ConditionFailed::NoSuchKey)),
+            Ok(Err(ConditionFailed::NoSuchKey))
+        ]
+    );
+
+    // Node 2's map names itself, but its replica is only a member: each
+    // write is routed on its own, and node 1 serves them.
+    let remote = cluster.gateway(2);
+    timed(remote.map().learn(config(0, 0, &[2]))).await;
+    let written = timed(remote.write_all(&shard, deletes(&["d", "e"], Precondition::None))).await;
+    assert!(
+        written.iter().all(|w| matches!(w, Ok(Ok(_)))),
+        "{written:?}"
+    );
+    assert_eq!(remote.stats().forwarded, 2);
+    let entry = timed(remote.entry(&shard, "e")).await.unwrap().unwrap();
+    assert!(entry.object.is_none());
 }

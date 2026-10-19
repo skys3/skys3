@@ -9,25 +9,32 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
-use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
+use skys3_config::{Config, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
+use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    CredentialError, Gateway, GatewayConfig, GatewayListener, IdSource, LocalShards, ShardRef,
-    Shards, SigV4Authenticator, StaticCredentials, StsService,
+    BucketLookup, CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig,
+    GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, ShardRef, Shards,
+    SigV4Authenticator, StaticCredentials, StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
-use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
-use skys3_remote::aws::{AwsS3, default_credentials};
+use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health};
+use skys3_remote::aws::{AwsS3, default_credentials, profile_credentials};
+use skys3_shard::lifecycle::{self, LifecycleMetrics};
+use skys3_shard::{
+    CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
+    ReadSettings,
+};
 use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
 };
 use skys3_types::Generation;
-use skys3_types::{BucketDocument, BucketId, Label, NodeId};
+use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, Label, NodeId};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -36,6 +43,8 @@ use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
+use crate::metrics::{ControlMetrics, NodeMetrics};
+use crate::peering::NodePeering;
 use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
@@ -70,6 +79,63 @@ type NodeAuth = SigV4Authenticator<NodeCredentials<Sessions>>;
 type NodeGateway = Gateway<NodeAuth>;
 /// The flushers of `write_back` buckets.
 pub(crate) type NodeFlush = FlushService<AwsS3, RealDisk>;
+
+/// The node's index snapshots (§8.9).
+type NodeSnapshots = SnapshotService<AwsS3, RealDisk>;
+
+/// Read-through fill on this node (§9.2): the gateway's [`Fills`] over
+/// each `write_back` bucket's [`skys3_flush::Filler`], into the bucket's
+/// local shards.
+///
+/// Filled bytes are clean cache, so they never count against the dirty
+/// budget, and the budget does not hold fills back. They do take disk
+/// space, so a shard whose disk (or the data directory) is low on space
+/// is not filled: the read answers `503` until space is freed, as a write
+/// would be.
+#[derive(Debug)]
+struct NodeFills {
+    shards: NodeShards,
+    flush: Arc<NodeFlush>,
+    space: Arc<DiskSpace>,
+}
+
+impl Fills for NodeFills {
+    fn read(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: skys3_types::EpochSeq,
+        range: std::ops::Range<u64>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>> {
+        let (shard, key) = (shard.clone(), key.to_owned());
+        Box::pin(async move {
+            let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
+            if self
+                .space
+                .is_low(self.shards.set().disk_of(&(&shard).into()))
+            {
+                return Err(unavailable("the node is low on disk space; retry later"));
+            }
+            let local = self
+                .shards
+                .set()
+                .get(&(&shard).into())
+                .await
+                .ok_or_else(|| unavailable("the shard is not open on this node"))?;
+            let filler = self
+                .flush
+                .filler(&shard.bucket)
+                .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
+            filler
+                .read(&local, &key, version, range)
+                .await
+                .map_err(|error| match error {
+                    skys3_flush::FillError::Changed => FillError::Changed,
+                    other => FillError::Unavailable(other.to_string()),
+                })
+        })
+    }
+}
 
 /// Why a node could not start.
 #[derive(Debug, thiserror::Error)]
@@ -192,8 +258,9 @@ struct Shared {
     identity: Arc<IdentityCopy>,
     sts: Option<Arc<Sts>>,
     control: Arc<Mutex<ControlState>>,
-    control_live: Gauge,
+    control_metrics: ControlMetrics,
     flush: Arc<NodeFlush>,
+    snapshots: NodeSnapshots,
 }
 
 impl Shared {
@@ -203,14 +270,16 @@ impl Shared {
         match &self.sts {
             Some(sts) => {
                 sts.sync_identity_as_of(&self.store, &self.retry, started)
-                    .await
+                    .await?;
             }
-            None => self
-                .identity
-                .sync_as_of(&self.store, &self.retry, started)
-                .await
-                .map(drop),
+            None => {
+                self.identity
+                    .sync_as_of(&self.store, &self.retry, started)
+                    .await?;
+            }
         }
+        self.control_metrics.identity_synced(started);
+        Ok(())
     }
 
     /// Opens the shards of every bucket the gateway knows.
@@ -264,8 +333,9 @@ impl Shared {
     async fn sync(&self) -> Result<(), StartError> {
         let copy = self.refresh_copy().await?;
         let started = copy.synced_at;
+        self.control_metrics.store_answered(self.wall.now());
         self.store.go_live();
-        self.control_live.set(1);
+        self.control_metrics.set_live(true);
         self.gateway.reload_buckets().await?;
         self.sync_identity(started).await?;
         self.open_bucket_shards().await?;
@@ -313,7 +383,10 @@ impl Shared {
                 },
             };
             let moved = match read_cluster(&store, &cluster, &self.retry).await {
-                Ok(current) => Some(current.value.generation) != known,
+                Ok(current) => {
+                    self.control_metrics.store_answered(self.wall.now());
+                    Some(current.value.generation) != known
+                }
                 Err(error) => {
                     tracing::warn!(%error, "cannot read the control store's generation");
                     continue;
@@ -330,25 +403,34 @@ impl Shared {
     }
 
     /// Keeps a flusher on every `write_back` bucket shard open on the node
-    /// (§7.1), and refreshes the flush gauges.
+    /// (§7.1) and an index snapshot writer on every shard it leads of a
+    /// bucket with a snapshot target (§8.9), refreshes the flush gauges, and
+    /// gives the clean cache each bucket's `clean_copies` (§9.3).
     async fn follow_flushes(self: Arc<Self>) {
-        let mut warned = BTreeSet::new();
         loop {
             let buckets = self.gateway.buckets();
-            for bucket in &buckets {
-                let policy = self
-                    .config
-                    .buckets()
-                    .get(&bucket.name)
-                    .flush_conflict_policy;
-                if policy != ConflictPolicy::Hold && warned.insert(bucket.bucket_id.clone()) {
-                    tracing::warn!(bucket = %bucket.name, ?policy,
-                        "only the hold conflict policy is implemented; conflicts are held");
-                }
-            }
+            // Before the reconcile awaits: a bucket made since the last
+            // round may already have clean entries.
+            self.install_clean_copies(&buckets);
             self.flush.reconcile(&buckets, self.shards.set()).await;
+            self.snapshots.reconcile(&buckets, self.shards.set()).await;
             self.flush.refresh_metrics();
             tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
+        }
+    }
+
+    /// Gives the clean cache each bucket's `clean_copies` (§9.3). The
+    /// cache keeps every copy of a bucket until it is told, and is never
+    /// told of a `local` bucket, whose replicas are its durable home even
+    /// once a backup target made its entries clean (§8.9).
+    fn install_clean_copies(&self, buckets: &[BucketDocument]) {
+        if let Some(cache) = self.shards.set().cache() {
+            cache.set_clean_copies(
+                buckets
+                    .iter()
+                    .filter(|bucket| bucket.mode != BucketMode::Local)
+                    .map(|bucket| (bucket.bucket_id.clone(), bucket.clean_copies)),
+            );
         }
     }
 
@@ -368,6 +450,39 @@ impl Shared {
             Err(error) => {
                 tracing::error!(%error, "refusing the control store; serving the local copy");
                 None
+            }
+        }
+    }
+
+    /// Runs a lifecycle pass every `lifecycle_interval_seconds` over the
+    /// shards this node leads of each `local` bucket with lifecycle rules
+    /// (§8.7). Each pass starts from the shards' indexes, so a shard this
+    /// node took over is evaluated from what its log holds.
+    async fn follow_lifecycle(self: Arc<Self>, metrics: LifecycleMetrics) {
+        let interval = self.config.storage().lifecycle_interval();
+        loop {
+            tokio::time::sleep(interval).await;
+            let buckets = self.gateway.buckets();
+            let now = u64::try_from(self.wall.now().as_millis()).unwrap_or(u64::MAX);
+            // A backup target's flusher removes the tombstones (§8.9).
+            let tombstones = |bucket: &BucketDocument| match self
+                .config
+                .buckets()
+                .get(&bucket.name)
+                .backup_target
+            {
+                Some(_) => lifecycle::Tombstones::Keep,
+                None => lifecycle::Tombstones::Remove,
+            };
+            let report =
+                lifecycle::run_pass(self.shards.set(), &buckets, now, &metrics, tombstones).await;
+            if report != lifecycle::LifecycleReport::default() {
+                tracing::debug!(
+                    expired = report.expired,
+                    aborted = report.aborted,
+                    failed = report.failed,
+                    "ran a lifecycle pass"
+                );
             }
         }
     }
@@ -420,37 +535,6 @@ async fn watch_disks(
     }
 }
 
-/// The node's metrics beyond the admin listener's own.
-struct NodeMetrics {
-    registry: MetricsRegistry,
-    disks_out_of_service: Gauge,
-    control_store_live: Gauge,
-}
-
-impl NodeMetrics {
-    fn new() -> Self {
-        let registry = MetricsRegistry::new();
-        let disks_out_of_service = Gauge::default();
-        registry.register(
-            "disks_out_of_service",
-            "Disks taken out of service after an I/O error; used again after a host restart.",
-            disks_out_of_service.clone(),
-        );
-        let control_store_live = Gauge::default();
-        registry.register(
-            "control_store_live",
-            "1 once the control store answered since startup; 0 while the node serves its \
-             local copy of control state.",
-            control_store_live.clone(),
-        );
-        Self {
-            registry,
-            disks_out_of_service,
-            control_store_live,
-        }
-    }
-}
-
 /// The storage engine after recovery.
 struct Storage {
     disks: Vec<(DiskDir, SegmentLog<RealDisk>)>,
@@ -493,6 +577,11 @@ async fn open_storage(
         data_dir.node_id().clone(),
     )
     .await?;
+    // Read registrations of this node's replicas as holders (§8.7).
+    recovered.shards.set().reads().configure(ReadSettings {
+        ttl: config.storage().read_registration_ttl(),
+        release_delay: config.ec().fragment_release_delay(),
+    });
     let disks = dirs
         .into_iter()
         .map(|dir| {
@@ -673,12 +762,14 @@ struct Opened {
 /// 6. Serve the gateway (HTTPS when `[gateway]` names a certificate) and
 ///    the admin listener, and start the background work: checkpoints,
 ///    control-store polling, session expiry, disk fencing, free-space
-///    checks, and the flushers of `write_back` buckets, which track their
+///    checks, the flushers of `write_back` buckets, which track their
 ///    dirty keys at once and flush them once each target's probe succeeds
-///    (`skys3_flush`).
+///    (`skys3_flush`), the index snapshots of the shards it leads
+///    (`skys3_flush::snapshot`), and the lifecycle passes of `local`
+///    buckets (`skys3_shard::lifecycle`).
 ///
 /// [`Node::shutdown`] stops accepting requests, drains those in flight,
-/// stops the flushers, stops every shard once its sequenced records are
+/// stops the flushers and snapshot writers, stops every shard once its sequenced records are
 /// applied, and takes a final checkpoint, so the next start replays
 /// little.
 pub struct Node {
@@ -694,6 +785,8 @@ pub struct Node {
     checkpointer: Arc<Checkpointer<RealDisk>>,
     background: JoinSet<()>,
     shared: Arc<Shared>,
+    /// The QUIC endpoint of native replication, if the node peers.
+    peer_endpoint: Option<skys3_peer::PeerEndpoint>,
     _data_dir: DataDir,
 }
 
@@ -767,7 +860,7 @@ impl Node {
         tracing::info!(%node_id, %cluster, "starting");
         let storage = open_storage(&config, data_dir, &mut pools, &mut opened.index).await?;
 
-        let metrics = NodeMetrics::new();
+        let metrics = NodeMetrics::new(config.identity().identity_max_staleness());
         let health = Health::new();
         let serving = health.register("gateway");
         let storage_ready = health.register("storage");
@@ -792,7 +885,10 @@ impl Node {
             wall.now(),
         )
         .await?;
-        metrics.control_store_live.set(i64::from(store.is_live()));
+        metrics.control.set_live(store.is_live());
+        if store.is_live() {
+            metrics.control.store_answered(wall.now());
+        }
         let control = Arc::new(Mutex::new(ControlState {
             live: store.is_live(),
             generation: Some(copy.generation),
@@ -837,7 +933,32 @@ impl Node {
         let budget = Arc::new(
             DirtyBudget::new(config.flush().max_dirty_bytes).with_buckets(config.buckets().clone()),
         );
-        let space = Arc::new(DiskSpace::new(config.storage().disk_min_free_bytes));
+        // The clean cache (§9.3): every replica reports to it, and it
+        // evicts within `[cache]` and each disk's room, which the space
+        // watcher reads.
+        let cache = CleanCache::new(
+            CacheSettings {
+                max_bytes: config.cache().cache_max_bytes_per_node,
+                reserve_fraction: config.cache().reserve_fraction,
+            },
+            CacheMetrics::register(&metrics.registry),
+        );
+        storage.shards.set().use_cache(&cache).await;
+        // Segment compaction (§10.3) after every checkpoint interval: it
+        // reclaims released segments and tells the cache what it evicted.
+        let compactor = Compactor::new(
+            storage.shards.set().clone(),
+            CompactionSettings {
+                live_threshold: config.storage().compaction_live_threshold,
+                unreferenced_ttl: config.peering().peer_staging_ttl(),
+            },
+            CompactionMetrics::register(&metrics.registry),
+        );
+        // Lifecycle passes (§8.7) on the shards this node leads.
+        let lifecycle_metrics = LifecycleMetrics::register(&metrics.registry);
+        let space = Arc::new(
+            DiskSpace::new(config.storage().disk_min_free_bytes).with_cache(cache.clone()),
+        );
         let watched: Vec<Watched> = storage
             .disks
             .iter()
@@ -863,30 +984,71 @@ impl Node {
             disk_of,
             &metrics.registry,
         );
-        let flush = {
-            let region = config.flush().target_region.clone();
-            let credentials = default_credentials(&region).await;
-            let connect = move |target: &skys3_types::RemoteTarget| {
+        let region = config.flush().target_region.clone();
+        let credentials = default_credentials(&region).await;
+        let connect = {
+            let (region, credentials) = (region.clone(), credentials.clone());
+            move |target: &skys3_types::RemoteTarget| {
                 AwsS3::builder(target, region.clone(), credentials.clone())
                     .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
                     .build()
+            }
+        };
+        // A `read_only` bucket's origin is read with its `origin_profile`'s
+        // credentials, or the default chain's (§9.5).
+        let connect_origin = move |target: &skys3_types::RemoteTarget, profile: Option<&str>| {
+            let credentials = profile.map_or_else(
+                || credentials.clone(),
+                |profile| profile_credentials(profile, &region),
+            );
+            AwsS3::builder(target, region.clone(), credentials)
+                .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
+                .build()
+        };
+        let snapshots = SnapshotService::new(Box::new(connect.clone()), config.buckets().clone())
+            .with_wall_clock(Arc::clone(&wall));
+        // Native replication with peer clusters (§7.8), if any is
+        // configured.
+        let peering = NodePeering::open(&config, Arc::clone(&wall))?;
+        let flush = {
+            let settings = FlushSettings {
+                extent_bytes: config.storage().extent_bytes,
+                // A body the gateway streams for at most half the TTL.
+                body_timeout: config.peering().peer_staging_ttl(),
+                ..FlushSettings::from_config(config.flush())
             };
-            Arc::new(
-                FlushService::new(
-                    cluster.clone(),
-                    FlushSettings::from_config(config.flush()),
-                    Box::new(connect),
-                    FlushMetrics::register(&metrics.registry),
-                )
-                .with_budget(budget)
-                .with_buckets(config.buckets().clone()),
+            let service = FlushService::new(
+                cluster.clone(),
+                settings,
+                Box::new(connect),
+                FlushMetrics::register(&metrics.registry),
             )
+            .with_budget(budget)
+            .with_buckets(config.buckets().clone())
+            .with_origin_connect(Box::new(connect_origin));
+            Arc::new(match &peering {
+                Some(peering) => service.with_peer_transport(peering.transport(&config)),
+                None => service,
+            })
         };
         let mut gateway_config = GatewayConfig::new(&config);
         gateway_config.retry = retry;
         gateway_config.hashing_pool = Some(pools.hashing.clone());
         gateway_config.admission = Arc::new(admission);
-        gateway_config.remote = Some(Arc::new(NodeRemote(Arc::clone(&flush))));
+        gateway_config.fills = Some(Arc::new(NodeFills {
+            shards: storage.shards.clone(),
+            flush: Arc::clone(&flush),
+            space: Arc::clone(&space),
+        }));
+        gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
+        gateway_config.hot_cache = HotCache::with_metrics(
+            config.cache().hot_cache_bytes_per_node,
+            HotCacheMetrics::register(&metrics.registry),
+        );
+        gateway_config.descriptors = peering.as_ref().and_then(NodePeering::descriptors);
+        // The destination side applies peers' commits as the gateway's
+        // writes are applied.
+        let peer_gateway_config = peering.as_ref().map(|_| gateway_config.clone());
         let ids = IdSource::from_os_rng();
         let mut gateway = Gateway::new(
             gateway_config,
@@ -913,8 +1075,9 @@ impl Node {
             identity,
             sts,
             control: Arc::clone(&control),
-            control_live: metrics.control_store_live.clone(),
+            control_metrics: metrics.control.clone(),
             flush: Arc::clone(&flush),
+            snapshots,
         });
         shared.sync_identity(copy.synced_at).await?;
         shared.open_bucket_shards().await?;
@@ -946,7 +1109,7 @@ impl Node {
             disks: storage.disks.clone(),
             control,
             health: health.clone(),
-            flush: Arc::new(move |bucket| flush.status(bucket)),
+            flush,
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?
@@ -973,7 +1136,28 @@ impl Node {
         background.spawn(Arc::clone(&shared).follow_control_store());
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
+        background.spawn(Arc::clone(&shared).follow_lifecycle(lifecycle_metrics));
+        let peer_endpoint = peering.as_ref().map(NodePeering::closer);
+        if let (Some(peering), Some(gateway_config)) = (peering, peer_gateway_config) {
+            let gateway = shared.gateway.clone();
+            let buckets: BucketLookup = Arc::new(move |name: &BucketName| gateway.bucket(name));
+            let (shared, shards) = (Arc::clone(&shared), storage.shards.clone());
+            background.spawn(peering.adapt_pool());
+            background.spawn(async move {
+                peering
+                    .serve(&shared.config, &gateway_config, shards, buckets)
+                    .await;
+            });
+        }
         background.spawn(watch_space(space, watched, DISK_WATCH_INTERVAL));
+        {
+            // The policies go in before the cache scans the replicas open
+            // already, so that the scans apply them at once.
+            shared.install_clean_copies(&shared.gateway.buckets());
+            let set = storage.shards.set().clone();
+            background.spawn(async move { cache.run(set).await });
+        }
+        background.spawn(async move { compactor.run(interval).await });
         background.spawn(watch_disks(
             storage.disks,
             pools.index.clone(),
@@ -996,6 +1180,7 @@ impl Node {
             checkpointer: storage.checkpointer,
             background,
             shared,
+            peer_endpoint,
             _data_dir: opened.data_dir.take().expect("the data directory is open"),
         })
     }
@@ -1060,6 +1245,7 @@ impl Node {
             checkpointer,
             mut background,
             shared,
+            peer_endpoint,
             _data_dir: data_dir,
             ..
         } = self;
@@ -1068,9 +1254,13 @@ impl Node {
         let _ = stop_gateway.send(());
         let _ = gateway_task.await;
         background.shutdown().await;
+        if let Some(endpoint) = peer_endpoint {
+            endpoint.close();
+        }
         checkpoints.abort();
         let _ = checkpoints.await;
         shared.flush.shutdown().await;
+        shared.snapshots.shutdown().await;
         if let Err(error) = shared.shards.set().close_all().await {
             tracing::warn!(%error, "a shard stopped with an error");
         }
@@ -1094,6 +1284,92 @@ impl Node {
         checkpoint?;
         tracing::info!("stopped");
         Ok(())
+    }
+}
+
+/// A stopped node's data directory and its storage, recovered as a start
+/// recovers them but without serving, for an offline command such as
+/// `skys3 control export`. The data directory's lock keeps the node from
+/// starting meanwhile, and a running node keeps the command out.
+pub(crate) struct Offline {
+    /// The data directory, locked.
+    pub(crate) data_dir: DataDir,
+    /// The index, with every log replayed into it.
+    pub(crate) index: Arc<Index>,
+    /// The pool index work runs on.
+    pub(crate) pool: BlockingPool,
+    pools: Pools,
+}
+
+impl Offline {
+    /// Opens the data directory of `config`, which must hold a node, and
+    /// recovers its logs into its index.
+    ///
+    /// # Errors
+    ///
+    /// [`StartError::Unsupported`] if the data directory holds no node, and
+    /// otherwise what stops a start from recovering its storage, such as a
+    /// data directory in use by a running node.
+    pub(crate) async fn open(config: &Config) -> Result<Self, StartError> {
+        let node_file = config.node().data_dir.join(datadir::NODE_FILE);
+        if !node_file.exists() {
+            return Err(StartError::Unsupported(format!(
+                "{} holds no node",
+                config.node().data_dir.display()
+            )));
+        }
+        let mut pools = Pools {
+            index: pool("index", INDEX_THREADS)?,
+            hashing: pool("hashing", 1)?,
+            control: pool("control", 1)?,
+            disks: Vec::new(),
+        };
+        let mut opened = Opened::default();
+        let recovered = async {
+            let (node, cluster) = (config.node().clone(), config.cluster().cluster_id.clone());
+            let boot_id = datadir::boot_id();
+            let data_dir = on_pool(&pools.index, move || {
+                DataDir::open(&node, &cluster, boot_id.as_deref())
+            })
+            .await?;
+            let data_dir = opened.data_dir.insert(data_dir);
+            open_storage(config, data_dir, &mut pools, &mut opened.index).await
+        }
+        .await;
+        match recovered {
+            Ok(storage) => {
+                let index = Arc::clone(&storage.index);
+                drop(storage);
+                Ok(Self {
+                    data_dir: opened.data_dir.take().expect("the data directory is open"),
+                    index,
+                    pool: pools.index.clone(),
+                    pools,
+                })
+            }
+            Err(error) => {
+                if let Some(index) = opened.index.take() {
+                    close_index(index).await;
+                }
+                drop(opened);
+                pools.shutdown();
+                Err(error)
+            }
+        }
+    }
+
+    /// Closes the index, then the data directory.
+    pub(crate) async fn close(self) {
+        let Self {
+            data_dir,
+            index,
+            pool,
+            pools,
+        } = self;
+        drop(pool);
+        close_index(index).await;
+        pools.shutdown();
+        drop(data_dir);
     }
 }
 

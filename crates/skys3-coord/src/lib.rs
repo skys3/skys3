@@ -37,9 +37,18 @@
 //!   their labels and capacity, and a bucket's policy to shard members,
 //!   never two in one domain at the `failure_domain` level. A policy the
 //!   cluster cannot satisfy is [`Unsatisfiable`].
+//! - [`GeometryPolicy`] and [`FragmentPlanner`]: the geometry of new
+//!   erasure-coded stripes, the widest the counts of eligible nodes and
+//!   domains allow, and the node of each fragment, at most one per node
+//!   and `m` per domain (§8.3). A [`StripePlan`] becomes the stripe layout
+//!   an `EC_PUBLISH` record holds, which is never recomputed; its
+//!   fragments are placed again by repair ([`ReplaceRequest`]) and moved
+//!   one at a time by a shard primary ([`MoveRequest`]).
 //! - [`PolicyWatch`] and [`report`]: the coordinator judges which buckets
 //!   the cluster does not satisfy now, and publishes a [`PolicyReport`]
 //!   through [`PlacementHealth`] for cluster health.
+//! - [`CoordinatorMetrics`]: whether the node is coordinator, and how many
+//!   buckets and shards its latest judgement found unsatisfied.
 //! - [`create_bucket`] and [`BucketShards`]: a gateway creates a bucket's
 //!   register and its placed shard registers in one change, and the
 //!   coordinator finishes a creation cut short and drops the shard
@@ -49,7 +58,13 @@
 //!   placement chooses, for their primaries to backfill and promote, and
 //!   removes the members placement no longer counts once they are
 //!   replaced, at a pace [`ReplacementConfig`] bounds.
-//! - [`AdminEndpoint`]: serves pushes and heartbeats on a node.
+//! - [`Rebalancing`]: the coordinator moves shard members and primaries so
+//!   that every live node holds its share, a newly joined one included:
+//!   shards by add-learner, promote, and remove steps, primaries by a
+//!   planned handoff it asks the primary for ([`Handoff`],
+//!   [`HandoffClient`]), at a pace [`RebalanceConfig`] bounds.
+//! - [`AdminEndpoint`]: serves pushes, heartbeats, and handoff requests on
+//!   a node, the last through a [`HandoffSink`].
 //!
 //! ```
 //! use std::sync::Arc;
@@ -84,12 +99,16 @@ mod admin;
 mod buckets;
 mod change;
 mod coordinator;
+mod fragments;
+mod handoff;
 mod heartbeat;
 mod join;
 mod lease;
+mod metrics;
 mod place;
 mod policy;
 mod push;
+mod rebalance;
 mod registry;
 mod replace;
 #[cfg(test)]
@@ -103,11 +122,19 @@ pub use change::{
     Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
 };
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
+pub use fragments::{
+    FragmentPlanner, GeometryPolicy, MoveReason, MoveRequest, NoGeometry, PlannedMove,
+    ReplaceRequest, ShardStripe, StripePlan, StripeRequest, StripeRoom,
+};
+pub use handoff::{
+    Handoff, HandoffAck, HandoffClient, HandoffError, HandoffFuture, HandoffSink, RequestHandoff,
+};
 pub use heartbeat::{
     Heartbeat, HeartbeatAck, HeartbeatConfig, HeartbeatError, HeartbeatStatus, Heartbeater,
 };
 pub use join::{NodeProfile, Registered, Registration, RegistrationError, register};
 pub use lease::{Elector, Leadership, LeaseConfig, LeaseConfigError};
+pub use metrics::CoordinatorMetrics;
 pub use place::{Candidate, Domain, NewShard, Placed, ShardRequest, Topology, Unsatisfiable};
 pub use policy::{
     BucketPolicy, ClusterScan, CoLocated, PlacementHealth, PolicyReport, PolicyWatch, ShortShard,
@@ -116,6 +143,7 @@ pub use policy::{
 pub use push::{
     Announce, ControlChanged, ControlHints, HintError, PUSH_IDLE_TIMEOUT, PushError, Pushed, Pusher,
 };
+pub use rebalance::{RebalanceConfig, Rebalancing};
 pub use registry::{
     Lifecycle, NodeEntry, NodeRegistry, NodeState, PeerSink, RegistryConfig, Rehoming, ShardScan,
 };

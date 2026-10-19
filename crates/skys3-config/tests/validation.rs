@@ -184,6 +184,16 @@ fn read_registration_renewal_must_be_shorter_than_its_ttl() {
     );
 }
 
+#[test]
+fn lifecycle_passes_need_an_interval() {
+    assert_violations(
+        "[storage]\nlifecycle_interval_seconds = 0",
+        &["storage.lifecycle_interval_seconds"],
+    );
+    let config = load("").unwrap();
+    assert_eq!(config.storage().lifecycle_interval().as_secs(), 3600);
+}
+
 // Reporting.
 
 #[test]
@@ -318,6 +328,7 @@ fn durations_and_sizes_must_be_positive() {
         ("flush", "import_max_keys_per_second"),
         ("ec", "max_data_fragments"),
         ("ec", "fragment_orphan_after_seconds"),
+        ("ec", "fragment_repair_after_seconds"),
         ("ec", "repair_bytes_per_second_per_node"),
         ("peering", "peer_connect_timeout_ms"),
         ("peering", "peer_connections_per_shard"),
@@ -412,12 +423,61 @@ fn flush_rules() {
         "[flush]\nflush_conflict_policy = \"discard_local\"",
         &["flush.flush_conflict_policy"],
     );
+    assert_violations(
+        "[flush]\nwrite_through_timeout_seconds = 0",
+        &["flush.write_through_timeout_seconds"],
+    );
+    let config = load("[flush]\nwrite_through_timeout_seconds = 5").unwrap();
+    assert_eq!(
+        config.flush().write_through_timeout(),
+        std::time::Duration::from_secs(5)
+    );
 }
 
 #[test]
 fn ec_rules() {
     assert_violations("[ec]\nmin_eligible_nodes = 2", &["ec.min_eligible_nodes"]);
     assert_violations("[ec]\nparity_fragments = 0", &["ec.parity_fragments"]);
+    // A stripe has at most 255 fragments.
+    load("[ec]\nmax_data_fragments = 253").unwrap();
+    load("[ec]\nmax_data_fragments = 251\nparity_fragments = 4").unwrap();
+    assert_violations("[ec]\nmax_data_fragments = 254", &["ec.max_data_fragments"]);
+    assert_violations(
+        "[ec]\nmax_data_fragments = 4294967295\nparity_fragments = 4294967295\nmin_eligible_nodes = 4294967295",
+        &["ec.max_data_fragments", "ec.min_eligible_nodes"],
+    );
+}
+
+#[test]
+fn stripes_fit_the_fragment_store_in_the_narrowest_geometry() {
+    const MIB: u64 = 1 << 20;
+    let config = load("").unwrap();
+    assert_eq!(config.ec().narrowest_data_fragments(), 3);
+    assert_eq!(config.ec().fragment_bytes(64 * MIB), 21_845 * 1024 + 384);
+    // The defaults' narrowest geometry is 3+2: three fragments of at most
+    // 256 MiB, each rounded up to 64 bytes.
+    let stripe = |bytes: u64| format!("[buckets.defaults]\nec_stripe_data_bytes = {bytes}");
+    load(&stripe(768 * MIB)).unwrap();
+    assert_violations(
+        &stripe(768 * MIB + 1),
+        &["buckets.defaults.ec_stripe_data_bytes"],
+    );
+    // Fewer eligible nodes narrow it: 1+2 holds 256 MiB a stripe.
+    let narrow = "[ec]\nmin_eligible_nodes = 3";
+    load(&format!("{narrow}\n{}", stripe(256 * MIB))).unwrap();
+    assert_violations(
+        &format!("{narrow}\n{}", stripe(256 * MIB + 64)),
+        &["buckets.defaults.ec_stripe_data_bytes"],
+    );
+    // A bucket is checked where its own table changes the stripe.
+    assert_violations(
+        &format!(
+            "{narrow}\n[buckets.photos]\nec_stripe_data_bytes = {}",
+            512 * MIB
+        ),
+        &["buckets.photos.ec_stripe_data_bytes"],
+    );
+    assert_eq!(skys3_config::MAX_FRAGMENT_BYTES, 256 * MIB);
 }
 
 #[test]
@@ -962,6 +1022,36 @@ fn backup_targets_belong_to_local_buckets() {
 }
 
 #[test]
+fn only_write_back_buckets_discard_local_writes() {
+    for mode in ["local", "read_only"] {
+        assert_violations(
+            &format!(
+                "[buckets.vault]\nmode = \"{mode}\"\nflush_conflict_policy = \"discard_local\""
+            ),
+            &["buckets.vault.flush_conflict_policy"],
+        );
+    }
+    // Inherited from the defaults' mode too.
+    assert_violations(
+        "[buckets.defaults]\nmode = \"local\"\n\
+         [buckets.vault]\nflush_conflict_policy = \"discard_local\"",
+        &["buckets.vault.flush_conflict_policy"],
+    );
+    let config = load(
+        "[buckets.defaults]\nmode = \"local\"\n\
+         [buckets.vault]\nmode = \"local\"\nbackup_target = \"https://h/b\"\n\
+         flush_conflict_policy = \"overwrite\"\n\
+         [buckets.cache]\nmode = \"write_back\"\nflush_conflict_policy = \"discard_local\"",
+    )
+    .unwrap();
+    let vault = config.buckets().get(&BucketName::new("vault").unwrap());
+    assert_eq!(
+        vault.flush_conflict_policy,
+        skys3_config::ConflictPolicy::Overwrite
+    );
+}
+
+#[test]
 fn target_urls_are_checked() {
     assert_violations(
         "[buckets.alpha]\nmode = \"local\"\nbackup_target = \"s3://bucket\"\n\
@@ -1023,6 +1113,45 @@ fn peer_local_writes_needs_a_peer_source() {
     assert_violations(
         "[buckets.defaults]\npeer_local_writes = false",
         &["buckets.defaults.peer_local_writes"],
+    );
+}
+
+#[test]
+fn read_only_freshness_and_credentials() {
+    let config = load(
+        "[buckets.defaults]\nfreshness = \"ttl\"\nfreshness_ttl_seconds = 30\n\
+         [buckets.mirror]\nmode = \"read_only\"\norigin_profile = \"datasets-reader\"\n\
+         [buckets.strict]\nmode = \"read_only\"\nfreshness = \"revalidate\"",
+    )
+    .unwrap();
+    let mirror = config.buckets().get(&BucketName::new("mirror").unwrap());
+    assert_eq!(mirror.freshness, skys3_config::Freshness::Ttl);
+    assert_eq!(mirror.freshness_ttl(), std::time::Duration::from_secs(30));
+    assert_eq!(mirror.origin_profile.as_deref(), Some("datasets-reader"));
+    let strict = config.buckets().get(&BucketName::new("strict").unwrap());
+    assert_eq!(strict.freshness, skys3_config::Freshness::Revalidate);
+    assert_eq!(strict.origin_profile, None);
+    let defaults = load("").unwrap();
+    let defaults = &defaults.buckets().defaults;
+    assert_eq!(defaults.freshness, skys3_config::Freshness::Revalidate);
+    assert_eq!(defaults.freshness_ttl_seconds, 60);
+
+    assert_violations(
+        "[buckets.defaults]\nfreshness_ttl_seconds = 0\n\
+         [buckets.mirror]\nfreshness_ttl_seconds = 86401\norigin_profile = \"\"\n\
+         [buckets.other]\norigin_profile = \"[profile x]\"",
+        &[
+            "buckets.defaults.freshness_ttl_seconds",
+            "buckets.mirror.freshness_ttl_seconds",
+            "buckets.mirror.origin_profile",
+            "buckets.other.origin_profile",
+        ],
+    );
+    assert!(
+        parse_error(&format!(
+            "{BASE}\n[buckets.defaults]\nfreshness = \"never\""
+        ))
+        .contains("freshness")
     );
 }
 
@@ -1216,6 +1345,82 @@ fn attached_targets_must_not_share_the_control_stores_scope() {
     let control = skys3_config::parse_target("https://s3.us-west-2.amazonaws.com/ctl").unwrap();
     let error = s3(true).check_target_independence(&control).unwrap_err();
     assert!(error.contains("overlap"), "{error}");
+    // AWS bucket names are global, so the control bucket reached through
+    // another region's endpoint, or the global one, is still refused.
+    for other in [
+        "https://s3.eu-west-1.amazonaws.com/ctl",
+        "https://s3.amazonaws.com/ctl/",
+        "https://s3.dualstack.ap-south-1.amazonaws.com/ctl",
+    ] {
+        let target = skys3_config::parse_target(other).unwrap();
+        for allow in [false, true] {
+            let error = s3(allow).check_target_independence(&target).unwrap_err();
+            assert!(error.contains("overlap"), "{other}: {error}");
+        }
+    }
+    // A bucket of the same name on another provider is another bucket.
+    let minio = skys3_config::parse_target("https://minio.example/ctl").unwrap();
+    s3(false).check_target_independence(&minio).unwrap();
+}
+
+#[test]
+fn aws_bucket_names_are_compared_within_their_partition() {
+    let store = |endpoint: &str| {
+        control_store(&format!(
+            "backend = \"s3\"\nendpoint = \"{endpoint}\"\nbucket = \"ctl\"\n\
+             allow_correlated_control_store = true"
+        ))
+        .parse::<Config>()
+        .unwrap()
+        .control_store()
+        .clone()
+    };
+    let target = |url: &str| skys3_config::parse_target(url).unwrap();
+    let overlaps = |store: &skys3_config::ControlStoreConfig, url: &str| {
+        store
+            .check_target_independence(&target(url))
+            .is_err_and(|error| error.contains("overlap"))
+    };
+
+    // China: one namespace across its regions, apart from the others.
+    let china = store("https://s3.cn-north-1.amazonaws.com.cn");
+    assert!(overlaps(
+        &china,
+        "https://s3.cn-northwest-1.amazonaws.com.cn/ctl"
+    ));
+    assert!(overlaps(
+        &china,
+        "https://ctl.s3.cn-north-1.amazonaws.com.cn/ctl"
+    ));
+    for other in [
+        "https://s3.amazonaws.com/ctl",
+        "https://s3.us-west-2.amazonaws.com/ctl",
+        "https://s3.us-gov-west-1.amazonaws.com/ctl",
+    ] {
+        china.check_target_independence(&target(other)).unwrap();
+    }
+
+    // GovCloud: its own partition, though its host names end in
+    // amazonaws.com.
+    let gov = store("https://s3.us-gov-west-1.amazonaws.com");
+    assert!(overlaps(
+        &gov,
+        "https://s3-fips.us-gov-east-1.amazonaws.com/ctl"
+    ));
+    for other in [
+        "https://s3.amazonaws.com/ctl",
+        "https://s3.us-east-1.amazonaws.com/ctl",
+        "https://s3.cn-north-1.amazonaws.com.cn/ctl",
+    ] {
+        gov.check_target_independence(&target(other)).unwrap();
+    }
+
+    // The commercial partition does not reach GovCloud's or China's buckets.
+    let commercial = store("https://s3.eu-west-1.amazonaws.com");
+    assert!(overlaps(&commercial, "https://s3.amazonaws.com/ctl"));
+    commercial
+        .check_target_independence(&target("https://s3.us-gov-east-1.amazonaws.com/ctl"))
+        .unwrap();
 }
 
 #[test]
@@ -1231,4 +1436,67 @@ fn target_regions_are_names() {
         .parse()
         .unwrap();
     assert_eq!(config.flush().target_region, "auto");
+}
+
+#[test]
+fn discovery_rules() {
+    const TLS: &str = r#"
+[transport]
+tls_cert_file = "/etc/skys3/node.crt"
+tls_key_file = "/etc/skys3/node.key"
+tls_ca_file = "/etc/skys3/ca.crt"
+"#;
+    let config = load(&format!(
+        "{TLS}[peering]\nquic_advertise = [\"peer.example.internal:7443\", \
+         \"[2001:db8::1]:7443\", \"198.51.100.7:7443\"]\n\
+         [peering.peers.skys3-prod-eu]\nca_file = \"/eu.crt\"\n\
+         s3_access_key_ids = [\"AKIAEUFLUSHER\"]\n"
+    ))
+    .unwrap();
+    assert_eq!(config.peering().quic_advertise.len(), 3);
+    let eu = &config.peering().peers[&ClusterId::new("skys3-prod-eu").unwrap()];
+    assert_eq!(eu.s3_access_key_ids, ["AKIAEUFLUSHER"]);
+    assert!(load("").unwrap().peering().quic_advertise.is_empty());
+
+    for bad in [
+        "peer.example.internal",
+        "peer.example.internal:0",
+        "peer.example.internal:70000",
+        ":7443",
+        "[not-v6]:7443",
+        "peer_host:7443",
+    ] {
+        assert_violations(
+            &format!("[peering]\nquic_advertise = [\"{bad}\"]"),
+            &["peering.quic_advertise"],
+        );
+    }
+    let many: Vec<String> = (0..17).map(|n| format!("\"h{n}:7443\"")).collect();
+    assert_violations(
+        &format!("[peering]\nquic_advertise = [{}]", many.join(", ")),
+        &["peering.quic_advertise"],
+    );
+    let long = format!("[peering]\nquic_advertise = [\"{}.x:1\"]", "a".repeat(252));
+    assert_violations(&long, &["peering.quic_advertise"]);
+
+    // An access key belongs to one peer, once, and looks like one.
+    let peer = |name: &str, keys: &str| {
+        format!("[peering.peers.{name}]\nca_file = \"/{name}.crt\"\ns3_access_key_ids = {keys}\n")
+    };
+    assert_violations(
+        &format!("{TLS}{}", peer("skys3-prod-eu", r#"["AKIA1", "AKIA1"]"#)),
+        &["peering.peers.skys3-prod-eu.s3_access_key_ids"],
+    );
+    assert_violations(
+        &format!(
+            "{TLS}{}{}",
+            peer("skys3-prod-eu", r#"["AKIA1"]"#),
+            peer("skys3-prod-us", r#"["AKIA1"]"#)
+        ),
+        &["peering.peers.skys3-prod-us.s3_access_key_ids"],
+    );
+    assert_violations(
+        &format!("{TLS}{}", peer("skys3-prod-eu", r#"["AKIA 1"]"#)),
+        &["peering.peers.skys3-prod-eu.s3_access_key_ids"],
+    );
 }

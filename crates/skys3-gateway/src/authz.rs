@@ -22,9 +22,9 @@
 //! Operations whose authorization depends on their input are checked again
 //! in the matching `S3Access` method, once `s3s` has parsed the input:
 //!
-//! - CopyObject also needs its [`source_actions`], `s3:GetObject`, on the
-//!   object `x-amz-copy-source` names, so a copy reads nothing its caller
-//!   could not GET. UploadPartCopy will need the same (plan M4-05).
+//! - CopyObject and UploadPartCopy also need their [`source_actions`],
+//!   `s3:GetObject`, on the object `x-amz-copy-source` names, so a copy
+//!   reads nothing its caller could not GET.
 //! - Tags take their own actions, as in S3, so a caller denied them cannot
 //!   reach them through a write. PutObject, CreateMultipartUpload, and a
 //!   CopyObject with the `REPLACE` tagging directive that carry
@@ -50,7 +50,7 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::dto::{
     CopyObjectInput, CopySource, CreateMultipartUploadInput, DeleteObjectsInput, PutObjectInput,
-    TaggingDirective,
+    TaggingDirective, UploadPartCopyInput,
 };
 use s3s::path::S3Path;
 use s3s::{S3Error, S3Request, S3Result, s3_error};
@@ -366,10 +366,11 @@ pub fn is_per_key(operation: &str) -> bool {
 }
 
 /// The IAM actions an operation needs on the object it copies from, besides
-/// its [`s3_actions`] on its own resource: `s3:GetObject` for CopyObject.
+/// its [`s3_actions`] on its own resource: `s3:GetObject` for CopyObject
+/// and UploadPartCopy.
 #[must_use]
 pub fn source_actions(operation: &str) -> Option<&'static [&'static str]> {
-    (operation == "CopyObject").then_some(&["s3:GetObject"])
+    matches!(operation, "CopyObject" | "UploadPartCopy").then_some(&["s3:GetObject"])
 }
 
 /// The IAM actions a write needs on its object, besides its
@@ -423,6 +424,22 @@ pub fn resource_arn(path: &S3Path) -> String {
 /// The ARN of an object.
 fn object_arn(bucket: &str, key: &str) -> String {
     format!("{S3_ARN_PREFIX}{bucket}/{key}")
+}
+
+/// The ARN of the object a copy's `x-amz-copy-source` names.
+///
+/// # Errors
+///
+/// `501 NotImplemented` for an access point or outpost source.
+fn source_arn(source: &CopySource) -> S3Result<String> {
+    let CopySource::Bucket { bucket, key, .. } = source else {
+        return Err(s3_error!(
+            NotImplemented,
+            "x-amz-copy-source must name a bucket and a key; \
+             access points and outposts are not supported"
+        ));
+    };
+    Ok(object_arn(bucket, key))
 }
 
 /// The answer to a request its caller may not make. It says no more than
@@ -534,15 +551,25 @@ impl S3Access for Access {
         authorize(principal, self.anonymous.as_ref(), &operation, &resource)
     }
 
+    async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
+        let source = source_arn(&req.input.copy_source)?;
+        let principal = req
+            .extensions
+            .get::<Authenticated>()
+            .map(|caller| &caller.principal);
+        let operation = "UploadPartCopy";
+        let actions = source_actions(operation);
+        authorize_actions(
+            principal,
+            self.anonymous.as_ref(),
+            operation,
+            actions,
+            &source,
+        )
+    }
+
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
-        let CopySource::Bucket { bucket, key, .. } = &req.input.copy_source else {
-            return Err(s3_error!(
-                NotImplemented,
-                "x-amz-copy-source must name a bucket and a key; \
-                 access points and outposts are not supported"
-            ));
-        };
-        let source = object_arn(bucket, key);
+        let source = source_arn(&req.input.copy_source)?;
         let destination = object_arn(&req.input.bucket, &req.input.key);
         let principal = req
             .extensions
@@ -750,7 +777,12 @@ mod tests {
         assert!(is_per_key("DeleteObjects"));
         assert!(!is_per_key("DeleteObject"));
         assert_eq!(source_actions("CopyObject"), Some(&["s3:GetObject"][..]));
+        assert_eq!(
+            source_actions("UploadPartCopy"),
+            Some(&["s3:GetObject"][..])
+        );
         assert_eq!(source_actions("PutObject"), None);
+        assert_eq!(source_actions("UploadPart"), None);
         assert_eq!(s3_actions("PostObject"), None);
     }
 

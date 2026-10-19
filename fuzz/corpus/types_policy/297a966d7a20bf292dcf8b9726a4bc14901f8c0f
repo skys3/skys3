@@ -1,0 +1,9 @@
+bucket/key
+{"Version": "", "Statement": [{"Condition": {
+
+
+
+
+	
+
+"gLike": {"s/:pre": ["home/*",0]}}}]}

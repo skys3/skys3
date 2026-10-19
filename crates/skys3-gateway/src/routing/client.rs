@@ -13,13 +13,15 @@ use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_net::{Connection, Frame, Network, Transport};
-use skys3_shard::ShardSet;
+use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, ShardSet, StreamedBody};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeAddress, NodeId, ShardConfig};
 use tokio::time::Instant;
 
 use super::{ForwardServer, Reply, Request, Response, Served, ShardMap, wire};
 use crate::conditions::{ConditionFailed, Precondition};
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
+use crate::shard::{
+    ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome, write_each,
+};
 
 /// How many times one call follows a redirect or reads the shard's
 /// register before it gives up. Each redirect it follows names a newer
@@ -369,6 +371,30 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
         }
     }
 
+    /// Sends `request`, a holder's (see [`Request::is_holder`]), to the
+    /// replica of `shard` on `holder`, and returns its answer. It is never
+    /// redirected: the holder serves what it holds, whatever its role.
+    async fn hold(
+        &self,
+        holder: &NodeId,
+        shard: &ShardRef,
+        request: Request,
+    ) -> Result<Response, ShardError> {
+        let epoch = self.inner.map.get(shard).map_or(Epoch::ZERO, |c| c.epoch);
+        let failed = |reason: String| ShardError::Unavailable {
+            shard: shard.clone(),
+            reason: format!("{holder} did not serve the read: {reason}"),
+        };
+        match self.ask(holder, shard, epoch, &request).await {
+            Attempt::Reply(Reply::Served { response, .. }) => Ok(response),
+            Attempt::Reply(Reply::Refused(error)) => Err(error),
+            Attempt::Reply(Reply::Redirect(_) | Reply::Behind(_)) => {
+                Err(failed("it answered as a primary would".to_owned()))
+            }
+            Attempt::Unreached(error) | Attempt::Lost(error) => Err(failed(error)),
+        }
+    }
+
     /// An idle connection to `node`, or a new one.
     async fn connection(
         &self,
@@ -573,6 +599,79 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
         }
     }
 
+    fn node(&self) -> Option<NodeId> {
+        Some(self.inner.node.clone())
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        let request = Request::Plan {
+            key: key.to_owned(),
+        };
+        match self.call(shard, request).await? {
+            Response::Plan(plan) => Ok(plan),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        let request = Request::Register {
+            key: key.to_owned(),
+            version,
+            layout,
+        };
+        match self.hold(holder, shard, request).await? {
+            Response::Registered(registered) => Ok(registered),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        match self.hold(holder, shard, Request::Renew(read)).await? {
+            Response::Renewed(renewed) => Ok(renewed),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        match self.hold(holder, shard, Request::Release(read)).await? {
+            Response::Released => Ok(()),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        match self
+            .hold(holder, shard, Request::Fetch { read, position })
+            .await?
+        {
+            Response::Payload(bytes) => Ok(bytes),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
     async fn append_extent(
         &self,
         shard: &ShardRef,
@@ -580,6 +679,36 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
     ) -> Result<ExtentRef, ShardError> {
         match self.call(shard, Request::AppendExtent(extent)).await? {
             Response::Extent(extent) => Ok(extent),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
+        match self.call(shard, Request::Announce(body)).await? {
+            Response::Announced => Ok(()),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> Result<FlushState, ShardError> {
+        // Answered well within the request's timeout: a wait that ends
+        // unanswered is `Pending`, and the caller asks again.
+        let wait = wait
+            .min(self.config.request_timeout / 2)
+            .min(wire::MAX_FLUSH_WAIT);
+        let request = Request::Flushed {
+            key: key.to_owned(),
+            version,
+            wait,
+        };
+        match self.call(shard, request).await? {
+            Response::Flushed(state) => Ok(state),
             _ => Err(mismatched(shard)),
         }
     }
@@ -594,5 +723,44 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
             Response::Written(written) => Ok(written),
             _ => Err(mismatched(shard)),
         }
+    }
+
+    /// Sequences the writes together on this node's replica when the map
+    /// names this node the shard's primary, so that they share a group
+    /// commit. Otherwise, and for writes the replica refuses because it no
+    /// longer serves, each write is routed on its own, all at once.
+    async fn write_all(
+        &self,
+        shard: &ShardRef,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> Vec<WriteOutcome> {
+        let inner = &self.inner;
+        let mut written: Vec<Option<WriteOutcome>> = writes.iter().map(|_| None).collect();
+        if let Some(config) = inner.map.get(shard)
+            && config.primary == inner.node
+            && let Some(local) = inner
+                .server
+                .write_all(shard, config.epoch, writes.clone())
+                .await
+        {
+            for (slot, outcome) in written.iter_mut().zip(local) {
+                if !matches!(
+                    outcome,
+                    Err(ShardError::NotPrimary { .. } | ShardError::NotFound(_))
+                ) {
+                    *slot = Some(outcome);
+                }
+            }
+        }
+        let (at, routed): (Vec<_>, Vec<_>) = writes
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| written[*at].is_none())
+            .unzip();
+        let routed = write_each(self.clone(), shard.clone(), routed).await;
+        for (at, outcome) in at.into_iter().zip(routed) {
+            written[at] = Some(outcome);
+        }
+        written.into_iter().flatten().collect()
     }
 }

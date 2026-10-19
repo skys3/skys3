@@ -11,6 +11,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Test support: seeding bugs into the erasure-coding steps, for the
+# simulations that show their checkers catch them.
+test-util = []
+
 [dependencies]
 bytes.workspace = true
 prometheus-client.workspace = true
@@ -31,5 +36,7 @@ bytes.workspace = true
 proptest.workspace = true
 rand.workspace = true
 rcgen.workspace = true
+# Enables `test-util` for this crate's own tests.
+skys3-shard = { path = ".", features = ["test-util"] }
 skys3-sim.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }

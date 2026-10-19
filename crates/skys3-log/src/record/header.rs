@@ -62,12 +62,13 @@ pub enum RecordKind {
     MpuComplete,
     /// Aborts a multipart upload (defined).
     MpuAbort,
-    /// Starts a streamed single PUT and fixes its write identity (reserved
-    /// for M4).
+    /// Starts a streamed single PUT and fixes its write identity
+    /// (defined).
     UploadBegin,
     /// The remote accepted a flush (defined).
     Flushed,
-    /// The remote accepted one part of a streamed upload (reserved for M4).
+    /// A streamed upload's remote counterpart moved on: it was opened,
+    /// took a part, or ended (defined).
     PartFlushed,
     /// Replaces an object's tags (defined).
     Tags,
@@ -76,9 +77,9 @@ pub enum RecordKind {
     Import,
     /// Adopts a remote version that changed out of band (defined).
     Adopt,
-    /// Publishes an erasure-coded object (reserved for M5).
+    /// Publishes an erasure-coded object version's layout (defined).
     EcPublish,
-    /// Moves erasure-coded fragments (reserved for M5).
+    /// Moves erasure-coded fragments to new locations (defined).
     EcRelocate,
     /// Releases a replicated copy after encoding (reserved for M5).
     EcRelease,
@@ -186,10 +187,14 @@ impl RecordKind {
                 | Self::MpuPart
                 | Self::MpuComplete
                 | Self::MpuAbort
+                | Self::UploadBegin
                 | Self::Flushed
+                | Self::PartFlushed
                 | Self::Tags
                 | Self::Import
                 | Self::Adopt
+                | Self::EcPublish
+                | Self::EcRelocate
                 | Self::Truncate
                 | Self::Config
                 | Self::ImportProgress

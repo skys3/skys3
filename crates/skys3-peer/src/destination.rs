@@ -24,6 +24,14 @@
 //! A `COMMIT` is applied by a [`CommitSink`], which publishes what the
 //! staging holds in one record of the key's shard. A `COMMIT` that commits
 //! consumes the staging of its identity.
+//!
+//! ```text
+//!   BATCH        ->     CommitSink::apply_batch     ->     PUTs and DELETEs, one group commit
+//!                <-     APPLIED per item            <-     per shard
+//! ```
+//!
+//! A `BATCH` skips staging: its items carry their bytes inline, and the
+//! [`CommitSink`] applies them together.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -41,7 +49,7 @@ use crate::message::{
     Abort, AbortReason, Applied, ApplyError, Begin, Commit, Data, MAX_REASON_LEN, Message, Outcome,
 };
 use crate::staging::{Admitted, StagedObject, Staging};
-use crate::stream::{InboundSender, InboundStream, StreamError};
+use crate::stream::{Inbound, Outbound, StreamError};
 
 /// The most frames of one stream being staged at once. A stream whose
 /// frames are all in flight is not read until one finishes, so QUIC flow
@@ -90,12 +98,22 @@ pub trait CommitSink: Clone + Send + Sync + 'static {
     ///
     /// A commit is applied at most once: a sink that finds the commit's
     /// write already applied, as after a lost `APPLIED`, answers with the
-    /// result it had.
+    /// result it had. A commit with an apply-by time
+    /// ([`Commit::apply_by_ms`]) is sequenced by then, on the wall clock of
+    /// the node that sequences it, or never, and answered `unavailable`
+    /// otherwise (§7.8).
     fn apply(
         &self,
         commit: &Commit,
         staged: Option<&StagedObject>,
     ) -> impl Future<Output = Outcome> + Send;
+
+    /// Applies the items of a `BATCH`, which carry their bytes inline, and
+    /// returns one result per item, in order, for its `APPLIED`. The items
+    /// name distinct keys and distinct write identities. A sink applies
+    /// them together where it can, the items of each shard in one group
+    /// commit, and applies each at most once, as it does a `COMMIT`.
+    fn apply_batch(&self, items: &[Commit]) -> impl Future<Output = Vec<Outcome>> + Send;
 }
 
 /// A [`CommitSink`] that applies nothing: every `COMMIT` is answered
@@ -107,6 +125,11 @@ pub struct NoCommits;
 impl CommitSink for NoCommits {
     async fn apply(&self, _: &Commit, _: Option<&StagedObject>) -> Outcome {
         unavailable("this destination does not apply COMMIT")
+    }
+
+    async fn apply_batch(&self, items: &[Commit]) -> Vec<Outcome> {
+        let refusal = || unavailable("this destination does not apply BATCH");
+        items.iter().map(|_| refusal()).collect()
     }
 }
 
@@ -195,26 +218,38 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     }
 
     /// Serves every stream a source opens on `connection`, each on its own
-    /// task, until the connection closes.
+    /// task, until the connection closes. The streams' tasks end with it:
+    /// nothing is read from a source, or applied for it, after its
+    /// connection is gone. A write already handed to its shard may still
+    /// be sequenced, which the `COMMIT`'s apply-by time bounds (§7.8).
     pub async fn serve_connection(&self, connection: PeerConnection) {
+        let mut streams = tokio::task::JoinSet::new();
         loop {
-            match connection.accept_stream().await {
+            let accepted = tokio::select! {
+                accepted = connection.accept_stream() => accepted,
+                // Reap the streams that ended, so the set stays small.
+                Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+            };
+            match accepted {
                 Ok(stream) => {
                     let service = self.clone();
-                    tokio::spawn(async move {
+                    streams.spawn(async move {
                         if let Err(error) = service.serve(stream).await {
                             tracing::debug!(%error, "a peer stream ended with an error");
                         }
                     });
                 }
                 Err(StreamError::ZeroRtt) => {}
+                // Dropping the set aborts the streams still being served.
                 Err(_) => return,
             }
         }
     }
 
     /// Serves one stream until the source finishes it, then waits for its
-    /// frames in flight, reports them, and finishes the stream.
+    /// frames in flight, reports them, and finishes the stream. The stream
+    /// is an [`InboundStream`](crate::InboundStream) over QUIC, or another
+    /// [`Inbound`] transport of the same messages.
     ///
     /// - `BEGIN` opens or resumes the staging of its identity and is
     ///   answered with its `RESUME`, or with `ABORT` (`refused`) if the
@@ -224,12 +259,14 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     ///   the stream's later `DATA` is dropped until a new `BEGIN`.
     /// - `ABORT` discards the staging it names.
     /// - `COMMIT` waits for the stream's frames in flight, so that the
-    ///   staging holds every frame sent before it, and is answered with the
+    ///   staging holds every frame sent before it, and keeps the staging
+    ///   from expiring meanwhile ([`Staging::pin`]). It is answered with the
     ///   `APPLIED` of the [`CommitSink`]. A commit that commits consumes the
     ///   staging, and so does one that is refused or whose bytes do not
     ///   match: the source stages the object again.
-    /// - `BATCH` items are answered `unavailable`: this destination does
-    ///   not apply them yet.
+    /// - `BATCH` is applied by the [`CommitSink`], with no staging, and
+    ///   each of its items is answered with its own `APPLIED`, in item
+    ///   order.
     ///
     /// Frames in flight when the stream fails still settle into the
     /// staging, so the next `RESUME` reports them.
@@ -237,14 +274,15 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     /// # Errors
     ///
     /// The stream's errors, other than refused messages, which
-    /// [`InboundStream`] answers itself.
-    pub async fn serve(&self, mut stream: InboundStream) -> Result<(), StreamError> {
+    /// [`InboundStream`](crate::InboundStream) answers itself.
+    pub async fn serve<I: Inbound>(&self, mut stream: I) -> Result<(), StreamError> {
         let (events, received) = mpsc::unbounded_channel();
         let reports = Reports {
             events,
             refused: Arc::default(),
         };
-        let reporter = tokio::spawn(report(Arc::clone(&self.staging), stream.sender(), received));
+        let sender = stream.sender();
+        let reporter = tokio::spawn(report(Arc::clone(&self.staging), sender.clone(), received));
         let appends = Arc::new(Semaphore::new(MAX_APPENDS_PER_STREAM as usize));
         let mut current: Option<Begin> = None;
         loop {
@@ -259,12 +297,12 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     current = match self.staging.begin(&begin, Instant::now()) {
                         Ok(resume) => {
                             reports.refused().remove(&begin.identity);
-                            stream.send(&Message::Resume(resume)).await?;
+                            sender.send(&Message::Resume(resume)).await?;
                             Some(begin)
                         }
                         Err(reason) => {
                             let message = abort(&begin.identity, reason, discarded(reason));
-                            stream.send(&message).await?;
+                            sender.send(&message).await?;
                             None
                         }
                     };
@@ -294,7 +332,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                         }
                         Err(reason) => {
                             let message = abort(&begin.identity, reason, discarded(reason));
-                            stream.send(&message).await?;
+                            sender.send(&message).await?;
                             current = None;
                         }
                     }
@@ -309,6 +347,10 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     }
                 }
                 Message::Commit(commit) => {
+                    // Staging live as the COMMIT arrives stays until it is
+                    // applied, however long its frames in flight take, or
+                    // until the stream's task is aborted.
+                    let pinned = Pinned::new(&self.staging, &commit.identity);
                     drop(
                         appends
                             .acquire_many(MAX_APPENDS_PER_STREAM)
@@ -316,6 +358,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                             .expect("the semaphore is never closed"),
                     );
                     let applied = self.commit(commit).await;
+                    drop(pinned);
                     if matches!(applied.outcome, Outcome::Committed { .. })
                         && current
                             .as_ref()
@@ -323,11 +366,21 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     {
                         current = None;
                     }
-                    stream.send(&Message::Applied(applied)).await?;
+                    sender.send(&Message::Applied(applied)).await?;
                 }
                 Message::Batch(batch) => {
-                    for item in batch.items {
-                        stream.send(&not_applied(item.identity)).await?;
+                    let outcomes = self.commits.apply_batch(&batch.items).await;
+                    // A sink that answers too few items leaves the rest to
+                    // the source's retry.
+                    let outcomes = outcomes.into_iter().chain(std::iter::repeat_with(|| {
+                        unavailable("the destination did not answer this item")
+                    }));
+                    for (item, outcome) in batch.items.into_iter().zip(outcomes) {
+                        let applied = Applied {
+                            identity: item.identity,
+                            outcome: bounded(outcome),
+                        };
+                        sender.send(&Message::Applied(applied)).await?;
                     }
                 }
                 // The session refuses every other message from a source
@@ -342,7 +395,7 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
         drop(reports);
         // The reporter ends once every append has reported.
         let _ = reporter.await;
-        stream.finish().await
+        sender.finish().await
     }
 
     /// Applies `commit` to what is staged for its identity, and consumes the
@@ -358,23 +411,19 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
             }
             staged => self.commits.apply(&commit, staged.as_ref()).await,
         };
-        let (outcome, consumed) = match outcome {
-            Outcome::Failed { error, reason } => (
-                Outcome::Failed {
-                    error,
-                    reason: truncated(reason),
-                },
-                matches!(error, ApplyError::Refused | ApplyError::ChecksumMismatch),
-            ),
-            committed @ Outcome::Committed { .. } => (committed, true),
-            failed @ Outcome::PreconditionFailed { .. } => (failed, false),
+        let consumed = match &outcome {
+            Outcome::Failed { error, .. } => {
+                matches!(error, ApplyError::Refused | ApplyError::ChecksumMismatch)
+            }
+            Outcome::Committed { .. } => true,
+            Outcome::PreconditionFailed { .. } => false,
         };
         if consumed {
             self.staging.discard(&commit.identity);
         }
         Applied {
             identity: commit.identity,
-            outcome,
+            outcome: bounded(outcome),
         }
     }
 
@@ -427,13 +476,39 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     }
 }
 
+/// A [`Staging::pin`] of one identity's staging, released when dropped,
+/// as when a stream's task is aborted while its `COMMIT` is applied.
+struct Pinned {
+    staging: Arc<Staging>,
+    identity: WriteIdentity,
+    generation: Option<u64>,
+}
+
+impl Pinned {
+    fn new(staging: &Arc<Staging>, identity: &WriteIdentity) -> Self {
+        Self {
+            staging: Arc::clone(staging),
+            identity: identity.clone(),
+            generation: staging.pin(identity),
+        }
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            self.staging.unpin(&self.identity, generation);
+        }
+    }
+}
+
 /// Sends a `DURABLE` for the pieces that grew, one per identity for
 /// everything that arrived while the last was sent, and an `ABORT` for
 /// staging the destination refused, until every append has reported.
 /// Once the stream fails, it keeps receiving without sending.
-async fn report(
+async fn report<O: Outbound>(
     staging: Arc<Staging>,
-    sender: InboundSender,
+    sender: O,
     mut received: mpsc::UnboundedReceiver<Event>,
 ) {
     let mut open = true;
@@ -486,6 +561,18 @@ fn truncated(mut reason: String) -> String {
     reason
 }
 
+/// `outcome`, with its reason cut to the [`MAX_REASON_LEN`] bytes a
+/// message carries.
+fn bounded(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Failed { error, reason } => Outcome::Failed {
+            error,
+            reason: truncated(reason),
+        },
+        other => other,
+    }
+}
+
 /// An `unavailable` result: the source retries.
 fn unavailable(reason: &str) -> Outcome {
     Outcome::Failed {
@@ -504,13 +591,4 @@ fn discarded(reason: AbortReason) -> &'static str {
         }
         AbortReason::Expired | AbortReason::Cancelled => "the staging expired or was discarded",
     }
-}
-
-/// The `APPLIED` of a `BATCH` item, which this destination does not apply
-/// yet.
-fn not_applied(identity: WriteIdentity) -> Message {
-    Message::Applied(Applied {
-        identity,
-        outcome: unavailable("this destination does not apply BATCH yet"),
-    })
 }

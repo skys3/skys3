@@ -19,6 +19,10 @@
 //! - **Identities** ([`WriteIdentity`], [`VersionIdentity`], [`ETag`]): the
 //!   identity every flushed object carries (§7.2) and the identity of a
 //!   committed version (§9.2).
+//! - **Erasure coding** ([`Geometry`], [`CodecId`], [`FragmentId`],
+//!   [`FragmentLocation`], [`AttemptId`], [`CodedStripe`]): what a stripe
+//!   records about how it was coded and where its fragments are, and which
+//!   attempt wrote a fragment (§8.3, §8.4).
 //! - **Checksums** ([`checksum`]): the checksum algorithms S3 clients
 //!   use, `FULL_OBJECT` and `COMPOSITE` checksum types, and the stored form
 //!   of an object's checksums (§7.4).
@@ -32,6 +36,12 @@
 //! - **Policies** ([`policy`]): the subset of the IAM policy language that
 //!   authorizes requests, and the trust policies that say who may assume a
 //!   role ([`policy::trust`]) (§11).
+//! - **AWS endpoints** ([`aws`]): which host names are AWS, and the
+//!   partition, with its own bucket namespace, and region an S3 endpoint
+//!   names.
+//! - **Lifecycle** ([`lifecycle`]): a `local` bucket's expiration and
+//!   upload-cleanup rules, as its register stores them, and their
+//!   evaluation (§8.7).
 //!
 //! ```
 //! use skys3_types::{BucketId, ClusterId, EpochSeq, ShardCount, WriteIdentity, shard_for_key};
@@ -45,9 +55,12 @@
 //! ```
 
 mod address;
+pub mod aws;
 pub mod checksum;
+mod ec;
 mod id;
 mod identity;
+pub mod lifecycle;
 pub mod limits;
 pub mod policy;
 mod position;
@@ -55,6 +68,10 @@ mod register;
 pub mod shard;
 
 pub use address::{AddressError, DnsName, Host, NodeAddress};
+pub use ec::{
+    AttemptId, CodecId, CodedStripe, CodedStripeError, FragmentId, FragmentLocation, Geometry,
+    GeometryError,
+};
 pub use id::{BucketId, BucketName, ClusterId, IdError, Label, NodeId, ProposalId};
 pub use identity::{ETag, ETagError, ParseWriteIdentityError, VersionIdentity, WriteIdentity};
 pub use position::{Epoch, EpochSeq, Generation, ParseNumberError, Seq};

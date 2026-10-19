@@ -1,0 +1,2 @@
+r:res/heads/m
+{"Version": "2-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "\rexample/ap"}}}}

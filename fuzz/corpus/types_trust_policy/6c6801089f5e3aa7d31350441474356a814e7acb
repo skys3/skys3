@@ -1,0 +1,2 @@
+subject
+{"Version": "17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["arn:aws:iam0.1:8080"]}, "Action": ["A:st[ssumeRoleWithWebIdentity:*"], "Condition": {"StringLike": {"": ["a*", "?b"], "ioleWitAIidp.example:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.example"}, "Actmon": "sts:*"}]}

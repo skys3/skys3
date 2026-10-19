@@ -39,6 +39,7 @@ fn bucket() -> BucketDocument {
             prefix: Some(PREFIX.to_owned()),
         }),
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new("p-1").unwrap(),
     }
 }
@@ -69,7 +70,7 @@ async fn import(service: &FlushService<SimS3, SimMount>, node: &Node) -> ImportS
     let patience = Patience::new();
     loop {
         service.reconcile(&[bucket()], &node.set).await;
-        let status = service.status(&bucket().bucket_id).unwrap().import;
+        let status = service.status(&bucket().bucket_id).unwrap().import.unwrap();
         if status.checkpoint == ImportCheckpoint::Done {
             return status;
         }
@@ -191,7 +192,7 @@ fn an_import_of_one_page_keeps_to_its_rate() {
                 "{} keys after {elapsed:?}",
                 entries.len()
             );
-            let status = service.status(&bucket().bucket_id).unwrap().import;
+            let status = service.status(&bucket().bucket_id).unwrap().import.unwrap();
             if status.checkpoint == ImportCheckpoint::Done {
                 assert_eq!(status.imported, 3);
                 break;
@@ -320,6 +321,7 @@ fn loaded_metadata_always_has_a_content_type() {
         metadata: UserMetadata::new(),
         content_type: content_type.map(str::to_owned),
         last_modified_ms: None,
+        tag_count: 0,
     };
     assert_eq!(
         loaded_metadata(&info(Some("image/png")))["content-type"],

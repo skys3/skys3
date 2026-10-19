@@ -39,6 +39,28 @@ pub enum MessageKind {
     /// Learner to primary: a snapshot is installed, or the payload it
     /// needs next, until its backfill is complete.
     BackfillAck = 6,
+    /// Shard primary to fragment node: a fragment to make durable, in one
+    /// or more frames (§8.4). The payloads hold the fragment's header and
+    /// then its bytes.
+    FragmentWrite = 7,
+    /// Fragment node to shard primary: the fragment's ID once it is
+    /// durable, or why it is not.
+    FragmentWritten = 8,
+    /// Fragment node to shard primary: which of its fragments, unreferenced
+    /// for `fragment_orphan_after_seconds`, are orphans it may reclaim
+    /// (§8.4).
+    OrphanQuery = 9,
+    /// Shard primary to fragment node: a verdict per fragment of an
+    /// [`MessageKind::OrphanQuery`], or why it gives none.
+    OrphanVerdicts = 10,
+    /// Gateway to fragment node: a byte range of one fragment of a coded
+    /// object, which must be the fragment of the stripe and object version
+    /// the request names (§8.5).
+    FragmentRead = 11,
+    /// Fragment node to gateway: the bytes of a
+    /// [`MessageKind::FragmentRead`] with their CRC32C, or why the node
+    /// does not serve them.
+    FragmentData = 12,
 
     /// Primary to member or learner: a lease beacon sent at a primary-local
     /// time, carrying the commit watermark as a heartbeat (§5.4).
@@ -72,7 +94,9 @@ pub enum MessageKind {
 /// A group of message kinds that the same roles may send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageClass {
-    /// Log replication, reconciliation, and backfill (§5.1, §6.4, §6.6).
+    /// Log replication, reconciliation, and backfill (§5.1, §6.4, §6.6),
+    /// and the fragment writes, orphan queries, and fragment reads of
+    /// erasure coding (§8.4, §8.5).
     Replication,
     /// Leases and planned handoff (§5.4).
     Lease,
@@ -94,7 +118,13 @@ impl MessageKind {
             | Self::Sync
             | Self::SyncAck
             | Self::Backfill
-            | Self::BackfillAck => MessageClass::Replication,
+            | Self::BackfillAck
+            | Self::FragmentWrite
+            | Self::FragmentWritten
+            | Self::OrphanQuery
+            | Self::OrphanVerdicts
+            | Self::FragmentRead
+            | Self::FragmentData => MessageClass::Replication,
             Self::Beacon | Self::BeaconAck | Self::StepDown => MessageClass::Lease,
             Self::Forward | Self::ForwardReply => MessageClass::Request,
             Self::NodeHeartbeat | Self::ControlChanged | Self::Handoff | Self::AdminReply => {
@@ -133,7 +163,7 @@ impl Role {
 mod tests {
     use super::*;
 
-    const ALL: [MessageKind; 16] = [
+    const ALL: [MessageKind; 22] = [
         MessageKind::Unspecified,
         MessageKind::Append,
         MessageKind::AppendAck,
@@ -141,6 +171,12 @@ mod tests {
         MessageKind::SyncAck,
         MessageKind::Backfill,
         MessageKind::BackfillAck,
+        MessageKind::FragmentWrite,
+        MessageKind::FragmentWritten,
+        MessageKind::OrphanQuery,
+        MessageKind::OrphanVerdicts,
+        MessageKind::FragmentRead,
+        MessageKind::FragmentData,
         MessageKind::Beacon,
         MessageKind::BeaconAck,
         MessageKind::StepDown,
@@ -167,7 +203,7 @@ mod tests {
             assert_eq!(kind.class(), expected, "{kind:?}");
             assert_eq!(MessageKind::try_from(kind as i32), Ok(kind));
         }
-        assert!(MessageKind::try_from(7).is_err());
+        assert!(MessageKind::try_from(13).is_err());
     }
 
     #[test]

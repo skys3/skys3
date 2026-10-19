@@ -51,6 +51,7 @@ use crate::checksum::{
     ChecksumValidator, DEFAULT_ALGORITHM, ExpectedChecksums, MultipartChecksum, MultipartEtag,
 };
 use crate::conditions::{Precondition, invalid_part, no_such_upload};
+use crate::peer_s3::ApplyBy;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::Trailers;
 
@@ -101,7 +102,7 @@ pub fn parse_upload_id(id: &str) -> Option<EpochSeq> {
 
 /// The upload of `key` that `id` names, which must be open, with up to
 /// `limit` of its parts after part `after`, all from one read of the shard.
-async fn open_upload<H: Shards>(
+pub(super) async fn open_upload<H: Shards>(
     shards: &H,
     shard: &ShardRef,
     key: &str,
@@ -118,7 +119,24 @@ async fn open_upload<H: Shards>(
 }
 
 /// No parts: [`open_upload`] only checks that the upload is open.
-const NO_PARTS: (u16, usize) = (0, 0);
+pub(super) const NO_PARTS: (u16, usize) = (0, 0);
+
+/// The part number of an UploadPart or UploadPartCopy request.
+///
+/// # Errors
+///
+/// `400 InvalidArgument` for a number outside 1 to [`MAX_PARTS`].
+pub(super) fn part_number(number: i32) -> S3Result<u16> {
+    u16::try_from(number)
+        .ok()
+        .filter(|&n| n >= 1 && u32::from(n) <= MAX_PARTS)
+        .ok_or_else(|| {
+            s3_error!(
+                InvalidArgument,
+                "Part number must be an integer between 1 and {MAX_PARTS}, inclusive"
+            )
+        })
+}
 
 /// The checksum an upload asks for, from CreateMultipartUpload's
 /// `x-amz-checksum-algorithm` and `x-amz-checksum-type`.
@@ -176,14 +194,14 @@ fn upload_checksum(
 
 /// The checksum every part of `upload` carries, and the type of the
 /// object's.
-fn effective_checksum(upload: &Upload) -> UploadChecksum {
+pub(super) fn effective_checksum(upload: &Upload) -> UploadChecksum {
     upload.checksum.unwrap_or(UploadChecksum {
         algorithm: DEFAULT_ALGORITHM,
         checksum_type: ChecksumType::FullObject,
     })
 }
 
-fn timestamp(ms: u64) -> Timestamp {
+pub(super) fn timestamp(ms: u64) -> Timestamp {
     Timestamp::from(UNIX_EPOCH + Duration::from_millis(ms))
 }
 
@@ -203,8 +221,13 @@ impl<H: Shards> Objects<H> {
         bucket: &BucketDocument,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<CreateMultipartUploadOutput> {
+        let carrier = self.carrier(bucket, &req.extensions);
+        let metadata = metadata_of(
+            standard_headers!(req.input),
+            req.input.metadata.as_ref(),
+            carrier,
+        )?;
         let input = req.input;
-        let metadata = metadata_of(standard_headers!(input), input.metadata.as_ref())?;
         // The tags are the completed object's, kept in the `MPU_CREATE`.
         let tags = input
             .tagging
@@ -251,15 +274,7 @@ impl<H: Shards> Objects<H> {
             extensions,
             ..
         } = req;
-        let part_number = u16::try_from(input.part_number)
-            .ok()
-            .filter(|&n| n >= 1 && u32::from(n) <= MAX_PARTS)
-            .ok_or_else(|| {
-                s3_error!(
-                    InvalidArgument,
-                    "Part number must be an integer between 1 and {MAX_PARTS}, inclusive"
-                )
-            })?;
+        let part_number = part_number(input.part_number)?;
         if input.content_length.is_some_and(|length| {
             u64::try_from(length).map_or(true, |n| n > super::MAX_OBJECT_BYTES)
         }) {
@@ -285,8 +300,8 @@ impl<H: Shards> Objects<H> {
         let trailers = extensions.get::<Trailers>().cloned();
         let validator =
             ChecksumValidator::requiring(expected, trailers, self.pool.clone(), Some(required))?;
-        let (verified, data) = self
-            .receive(&shard, &input.key, input.body.take(), validator)
+        let (verified, data, _) = self
+            .receive(&shard, &input.key, input.body.take(), validator, None)
             .await?;
         let part = MpuPart {
             key: input.key,
@@ -316,9 +331,13 @@ impl<H: Shards> Objects<H> {
         bucket: &BucketDocument,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<CompleteMultipartUploadOutput> {
+        // The completion publishes the version, so it alone carries a
+        // peer's apply-by time (§7.8): parts change no key.
+        let apply_by = ApplyBy::of(&req.extensions);
         let input = req.input;
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(apply_by);
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
         if condition != Precondition::None {
@@ -354,7 +373,7 @@ impl<H: Shards> Objects<H> {
                 "You must specify at least one part"
             ));
         }
-        let parts = match_parts(listed, &stored, checksum.algorithm)?;
+        let parts = match_parts(listed, &stored, checksum.algorithm, self.min_part_bytes)?;
 
         let mut etag = MultipartEtag::new();
         let mut object_checksum =
@@ -419,10 +438,13 @@ impl<H: Shards> Objects<H> {
                 })
                 .collect(),
         };
-        self.shards
+        let version = self
+            .shards
             .write(&shard, RecordBody::MpuComplete(complete), condition)
             .await
             .map_err(shard_error)??;
+        self.acknowledge(bucket, &shard, &input.key, version)
+            .await?;
         let mut output = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket.clone()),
             location: Some(format!("/{}/{}", input.bucket, input.key)),
@@ -613,11 +635,13 @@ impl<H: Shards> Objects<H> {
 ///
 /// `400 InvalidPartOrder` for part numbers out of order, `400 InvalidPart`
 /// for a part that is missing or whose ETag or checksum differs, and `400
-/// EntityTooSmall` for a part under [`MIN_PART_BYTES`] before the last.
+/// EntityTooSmall` for a part under `min_part_bytes` (S3's
+/// [`MIN_PART_BYTES`]) before the last.
 fn match_parts<'a>(
     listed: &[s3s::dto::CompletedPart],
     stored: &'a [(u16, Part)],
     algorithm: ChecksumAlgorithm,
+    min_part_bytes: u64,
 ) -> S3Result<Vec<(u16, &'a Part)>> {
     let mut parts: Vec<(u16, &Part)> = Vec::with_capacity(listed.len());
     for (index, entry) in listed.iter().enumerate() {
@@ -652,7 +676,7 @@ fn match_parts<'a>(
         if !etag_matches || !checksum_matches {
             return Err(invalid_part());
         }
-        if index + 1 < listed.len() && part.size < MIN_PART_BYTES {
+        if index + 1 < listed.len() && part.size < min_part_bytes {
             return Err(s3_error!(
                 EntityTooSmall,
                 "Your proposed upload is smaller than the minimum allowed object size."

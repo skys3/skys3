@@ -3,7 +3,8 @@ use std::fmt::Debug;
 use bytes::Bytes;
 use md5::{Digest, Md5};
 use skys3_remote::{
-    ByteRange, CompletedPart, ListedObject, MAX_KEY_LEN, MetadataDirective, VersionId,
+    ByteRange, CompletedPart, ListedObject, MAX_KEY_LEN, MetadataDirective, TaggingDirective,
+    VersionId,
 };
 use tokio::time::Instant;
 
@@ -118,6 +119,7 @@ async fn multipart_uploads_keep_tags_and_check_content_md5() {
             etag,
         }],
         precondition: WritePrecondition::None,
+        apply_by_ms: None,
     };
     store.complete_multipart_upload(request).await.unwrap();
     assert_eq!(store.tags("m"), Some(tags));
@@ -149,6 +151,7 @@ async fn put_get_and_head_round_trip() {
         metadata,
         content_type: Some("text/plain".into()),
         last_modified_ms: None,
+        tag_count: 0,
     };
     assert_eq!(got.info, expected);
     assert_eq!(
@@ -326,6 +329,7 @@ async fn user_metadata_is_limited_to_2_kib() {
     let copy = CopyObject::new("k", "c").with_metadata_directive(MetadataDirective::Replace {
         metadata: over,
         content_type: None,
+        headers: BTreeMap::new(),
     });
     assert_eq!(
         kind(store.copy_object(copy).await),
@@ -433,6 +437,7 @@ fn complete(
         upload_id: upload_id.clone(),
         parts,
         precondition,
+        apply_by_ms: None,
     }
 }
 
@@ -610,6 +615,105 @@ async fn r2_profile_honors_only_put_and_copy_source() {
     let delete = DeleteObject::new("k").with_if_match(etag("0123"));
     store.delete_object(delete).await.unwrap();
     assert_eq!(store.keys(), ["c"]);
+}
+
+#[tokio::test]
+async fn copy_directives_are_honored_ignored_or_rejected() {
+    let tags = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    let mut marked = UserMetadata::new();
+    marked.insert("mark", "replaced").unwrap();
+    let replace = || {
+        CopyObject::new("src", "dst")
+            .with_metadata_directive(MetadataDirective::Replace {
+                metadata: marked.clone(),
+                content_type: Some("a/b".into()),
+                headers: BTreeMap::from([("cache-control".into(), "no-cache".into())]),
+            })
+            .with_tagging_directive(TaggingDirective::Replace(tags(&[("new", "1")])))
+    };
+    for (directives, replaced_metadata, replaced_tags) in [
+        (CopyDirectives::AWS_S3, true, true),
+        (CopyDirectives::WITHOUT_TAGS, true, false),
+        (
+            CopyDirectives {
+                metadata: ConditionalSupport::Ignored,
+                tagging: ConditionalSupport::Honored,
+            },
+            false,
+            true,
+        ),
+    ] {
+        let store = SimS3::new(
+            1,
+            SimS3Config {
+                copy_directives: directives,
+                ..config()
+            },
+        );
+        let source = PutObject::new("src", "data").with_tags(tags(&[("old", "0")]));
+        store.put_object(source).await.unwrap();
+        store.copy_object(replace()).await.unwrap();
+        let copy = store.object("dst").unwrap();
+        assert_eq!(copy.body, Bytes::from("data"));
+        assert_eq!(
+            copy.info.metadata == marked,
+            replaced_metadata,
+            "{directives:?}"
+        );
+        let expected = if replaced_tags {
+            tags(&[("new", "1")])
+        } else {
+            tags(&[("old", "0")])
+        };
+        assert_eq!(store.tags("dst"), Some(expected), "{directives:?}");
+        assert_eq!(copy.info.tag_count, 1);
+        // A plain copy keeps the source's metadata and tags everywhere.
+        store
+            .copy_object(CopyObject::new("src", "plain"))
+            .await
+            .unwrap();
+        assert_eq!(store.tags("plain"), Some(tags(&[("old", "0")])));
+        assert_eq!(store.applied(Operation::CopyObject), ["dst", "plain"]);
+        assert_eq!(store.applied(Operation::PutObject), ["src"]);
+    }
+
+    // A provider that rejects a directive fails the copy, and writes
+    // nothing; one without it still copies.
+    for directives in [
+        CopyDirectives {
+            metadata: ConditionalSupport::Rejected,
+            tagging: ConditionalSupport::Honored,
+        },
+        CopyDirectives {
+            metadata: ConditionalSupport::Honored,
+            tagging: ConditionalSupport::Rejected,
+        },
+    ] {
+        let store = SimS3::new(
+            1,
+            SimS3Config {
+                copy_directives: directives,
+                ..config()
+            },
+        );
+        put(&store, "src", "data").await;
+        assert_eq!(
+            kind(store.copy_object(replace()).await),
+            S3ErrorKind::NotImplemented
+        );
+        assert_eq!(store.keys(), ["src"]);
+        assert!(store.applied(Operation::CopyObject).is_empty());
+        store
+            .copy_object(CopyObject::new("src", "dst"))
+            .await
+            .unwrap();
+        assert_eq!(store.keys(), ["dst", "src"]);
+    }
 }
 
 // 409 ConditionalRequestConflict.
@@ -1339,6 +1443,7 @@ async fn copies_keep_or_replace_metadata() {
         CopyObject::new("src", "replaced").with_metadata_directive(MetadataDirective::Replace {
             metadata: replacement.clone(),
             content_type: None,
+            headers: BTreeMap::new(),
         });
     store.copy_object(replace).await.unwrap();
     let replaced = store.object("replaced").unwrap();
@@ -1363,6 +1468,7 @@ async fn copying_an_object_to_itself_must_replace_metadata() {
     let replace = CopyObject::new("k", "k").with_metadata_directive(MetadataDirective::Replace {
         metadata: UserMetadata::new(),
         content_type: Some("a/b".into()),
+        headers: BTreeMap::new(),
     });
     store.copy_object(replace).await.unwrap();
     let head = store.head_object(HeadObject::new("k")).await.unwrap();
@@ -1758,5 +1864,225 @@ async fn version_ids_need_a_versioned_bucket() {
                 .await
         ),
         invalid
+    );
+}
+
+#[tokio::test]
+async fn credentials_can_be_refused_reads() {
+    let store = store();
+    store.put_object(PutObject::new("k", "body")).await.unwrap();
+    let guest = store.with_credentials("guest");
+    let owner = store.with_credentials("owner");
+    store.deny("guest", "k", true);
+    store.deny("guest", "missing", true);
+    assert!(store.denies("guest", "k"));
+    for key in ["k", "missing"] {
+        let error = guest.get_object(GetObject::new(key)).await.unwrap_err();
+        assert_eq!((error.status(), error.code()), (Some(403), "AccessDenied"));
+        let error = guest.head_object(HeadObject::new(key)).await.unwrap_err();
+        assert_eq!(error.status(), Some(403));
+    }
+    // Other credentials, and requests without any, read as before; and
+    // writes are not refused.
+    assert_eq!(
+        owner.head_object(HeadObject::new("k")).await.unwrap().size,
+        4
+    );
+    assert_eq!(
+        store.get_object(GetObject::new("k")).await.unwrap().body,
+        "body"
+    );
+    guest.put_object(PutObject::new("k", "new")).await.unwrap();
+    store.deny("guest", "k", false);
+    assert!(!store.denies("guest", "k"));
+    assert_eq!(
+        guest.get_object(GetObject::new("k")).await.unwrap().body,
+        "new"
+    );
+}
+
+// The network path and the rate limit.
+
+#[tokio::test(start_paused = true)]
+async fn bodies_queue_for_the_bandwidth_and_wait_a_round_trip() {
+    let store = store();
+    store.set_link(SimLink {
+        round_trip: Duration::from_millis(10),
+        bandwidth: std::num::NonZeroU64::new(1_000_000),
+        rate_limit: None,
+    });
+    assert_eq!(store.link().round_trip, Duration::from_millis(10));
+    let start = Instant::now();
+    let timed = |key: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .put_object(PutObject::new(key, vec![0u8; 1_000]))
+                .await
+                .unwrap();
+            start.elapsed()
+        }
+    };
+    // 1 ms to send each body, the second after the first, and a round trip.
+    let (first, second) = tokio::join!(timed("a"), timed("b"));
+    assert_eq!(first, Duration::from_millis(11));
+    assert_eq!(second, Duration::from_millis(12));
+    assert_eq!(store.stats().max_in_flight, 2);
+    assert_eq!(store.stats().max_in_flight_bytes, 2_000);
+    // A read's body comes back the same way.
+    let start = Instant::now();
+    let read = store.get_object(GetObject::new("a")).await.unwrap();
+    assert_eq!(read.body.len(), 1_000);
+    assert_eq!(start.elapsed(), Duration::from_millis(11));
+    let head = Instant::now();
+    store.head_object(HeadObject::new("a")).await.unwrap();
+    assert_eq!(head.elapsed(), Duration::from_millis(10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_beyond_the_rate_limit_slow_down_and_are_not_applied() {
+    let store = store();
+    store.set_link(SimLink {
+        rate_limit: Some(RateLimit {
+            requests_per_second: std::num::NonZeroU32::new(10).unwrap(),
+            burst: 1,
+        }),
+        ..SimLink::with_round_trip(Duration::from_millis(2))
+    });
+    let mut kinds = Vec::new();
+    for n in 0..4 {
+        let result = store.put_object(PutObject::new(format!("k{n}"), "x")).await;
+        kinds.push(result.err().map(|error| error.kind()));
+    }
+    assert_eq!(
+        kinds,
+        [
+            None,
+            None,
+            Some(S3ErrorKind::SlowDown),
+            Some(S3ErrorKind::SlowDown)
+        ]
+    );
+    assert_eq!(store.keys(), ["k0", "k1"]);
+    let stats = store.stats();
+    assert_eq!((stats.slow_downs, stats.rate_limited), (2, 2));
+    // The limit refills at its rate.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    store.put_object(PutObject::new("k4", "x")).await.unwrap();
+    // A path without a limit admits everything.
+    store.set_link(SimLink::default());
+    for n in 5..20 {
+        store
+            .put_object(PutObject::new(format!("k{n}"), "x"))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_link_loses_its_sources_requests_and_answers() {
+    let store = store();
+    store.set_faults(SimS3Faults {
+        min_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        ..SimS3Faults::NONE
+    });
+    let node = store.from_source("node-1");
+    let other = store.from_source("node-2");
+    store.set_source_down("node-1", true);
+    let lost = node.put_object(PutObject::new("a", "1")).await;
+    assert_eq!(kind(lost), S3ErrorKind::Timeout);
+    assert_eq!(body(&store, "a"), None, "a request sent while down is lost");
+    // Another source, and a handle without one, still reach the store.
+    other.put_object(PutObject::new("b", "1")).await.unwrap();
+    store.put_object(PutObject::new("c", "1")).await.unwrap();
+
+    // A link that drops while a request is in progress loses its answer,
+    // though the store applied it: the store applies the request at 10 ms,
+    // and the link drops and comes back before the answer at 20 ms.
+    store.set_source_down("node-1", false);
+    let flap = async {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        store.set_source_down("node-1", true);
+        store.set_source_down("node-1", false);
+    };
+    let (written, ()) = tokio::join!(node.put_object(PutObject::new("a", "2")), flap);
+    assert_eq!(kind(written), S3ErrorKind::Timeout);
+    assert_eq!(body(&store, "a").as_deref(), Some(&b"2"[..]));
+    assert_eq!(store.unanswered(Operation::PutObject), 1);
+    assert_eq!(store.stats().cut_off, 2);
+    node.put_object(PutObject::new("a", "3")).await.unwrap();
+
+    // Credentials and sources combine, whichever comes first.
+    store.deny("reader", "a", true);
+    let reader = node.with_credentials("reader");
+    let denied = reader.get_object(GetObject::new("a")).await;
+    assert_eq!(denied.unwrap_err().status(), Some(403));
+    store.set_source_down("node-1", true);
+    let reader = store.with_credentials("reader").from_source("node-1");
+    assert_eq!(
+        kind(reader.get_object(GetObject::new("b")).await),
+        S3ErrorKind::Timeout
+    );
+}
+
+#[tokio::test]
+async fn observers_see_every_request_applied_and_the_key_it_left() {
+    let store = store();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    store.observe(Some(Arc::new(move |applied: &Applied<'_>| {
+        let current = applied
+            .current
+            .map(|object| String::from_utf8_lossy(&object.body).into_owned());
+        log.lock().unwrap().push(format!(
+            "{:?} {:?} {:?} {current:?}",
+            applied.operation, applied.source, applied.key
+        ));
+    })));
+    let node = store.from_source("node-1");
+    node.put_object(PutObject::new("a", "one")).await.unwrap();
+    let id = node
+        .create_multipart_upload(CreateMultipartUpload::new("b"))
+        .await
+        .unwrap();
+    let part = node
+        .upload_part(UploadPart::new("b", id.clone(), 1, "part"))
+        .await
+        .unwrap();
+    // A refused request is not seen.
+    let refused = PutObject::new("a", "two").with_precondition(WritePrecondition::IfAbsent);
+    assert_eq!(
+        kind(node.put_object(refused).await),
+        S3ErrorKind::PreconditionFailed
+    );
+    // One whose answer is lost is.
+    store.inject(Operation::CompleteMultipartUpload, Fault::LostResponse);
+    let complete = CompleteMultipartUpload {
+        key: "b".to_owned(),
+        upload_id: id,
+        parts: vec![CompletedPart {
+            part_number: 1,
+            etag: part,
+        }],
+        precondition: WritePrecondition::None,
+        apply_by_ms: None,
+    };
+    assert!(store.complete_multipart_upload(complete).await.is_err());
+    store.delete_object(DeleteObject::new("a")).await.unwrap();
+    store.observe(None);
+    store
+        .put_object(PutObject::new("c", "unseen"))
+        .await
+        .unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            "PutObject Some(\"node-1\") Some(\"a\") Some(\"one\")",
+            "CreateMultipartUpload Some(\"node-1\") None None",
+            "UploadPart Some(\"node-1\") None None",
+            "CompleteMultipartUpload None Some(\"b\") Some(\"part\")",
+            "DeleteObject None Some(\"a\") None",
+        ]
     );
 }
