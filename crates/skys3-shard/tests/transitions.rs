@@ -1,11 +1,11 @@
 //! Every object-state transition (§4.2) that `PUT`, `DELETE`, `TAGS`,
-//! `FLUSHED`, `ADOPT`, and `IMPORT` records drive, and the rejection of
+//! `FLUSHED`, `ADOPT`, `IMPORT`, and `IMPORT_PROGRESS` records drive, and the rejection of
 //! every transition they may not make.
 
 mod support;
 
-use skys3_index::{EntryState, Index, Payload};
-use skys3_log::record::{Extent, ExtentRef};
+use skys3_index::{EntryState, ImportCheckpoint, Index, Payload};
+use skys3_log::record::{Extent, ExtentRef, ImportProgress, ImportRange};
 use skys3_log::{RecordBody, RecordKind};
 use skys3_shard::{Effect, Outcome, Rejection};
 use skys3_types::Seq;
@@ -384,6 +384,90 @@ fn a_deleted_key_is_imported_again_only_after_its_tombstone_is_flushed() {
     assert_eq!(
         step(&index, 4, import("k", 6)),
         Outcome::Applied(Effect::Imported)
+    );
+}
+
+/// An `IMPORT_PROGRESS` numbered `update` of `ranges`.
+fn progress(update: u64, ranges: Vec<ImportRange>) -> RecordBody {
+    RecordBody::ImportProgress(ImportProgress { update, ranges })
+}
+
+/// A range up to `end`, or to the end of the key space, at `checkpoint`.
+fn range(end: Option<&str>, checkpoint: ImportCheckpoint) -> ImportRange {
+    ImportRange {
+        end: end.map(str::to_owned),
+        checkpoint,
+    }
+}
+
+fn after(key: &str) -> ImportCheckpoint {
+    ImportCheckpoint::Running {
+        after: Some(key.to_owned()),
+    }
+}
+
+#[test]
+fn import_progress_keeps_the_newest_and_drops_imports_it_has_passed() {
+    let (_, index) = new_index();
+    let progressed = Outcome::Applied(Effect::Progressed);
+    // A key the import had not reached is deleted, the import passes it,
+    // and the flushed tombstone goes.
+    step(&index, 1, delete("b"));
+    assert_eq!(
+        step(&index, 2, progress(1, vec![range(None, after("c"))])),
+        progressed
+    );
+    step(&index, 3, flushed("b", 1, true));
+    assert!(entry(&index, "b").is_none());
+    // A late copy of the key's `IMPORT` does not bring it back; a key
+    // after the progress is still imported.
+    rejected(&index, 4, import("b", 6), Rejection::ImportPassed);
+    assert_eq!(
+        step(&index, 5, import("d", 6)),
+        Outcome::Applied(Effect::Imported)
+    );
+
+    // Progress no newer than the shard's, or out of order, is dropped.
+    let stale = Rejection::StaleProgress {
+        update: 1,
+        current: 1,
+    };
+    rejected(&index, 6, progress(1, vec![range(None, after("z"))]), stale);
+    let unordered = vec![
+        range(Some("m"), ImportCheckpoint::Done),
+        range(Some("a"), ImportCheckpoint::Done),
+        range(None, ImportCheckpoint::Done),
+    ];
+    rejected(
+        &index,
+        7,
+        progress(2, unordered),
+        Rejection::InvalidProgress,
+    );
+    rejected(
+        &index,
+        8,
+        progress(2, Vec::new()),
+        Rejection::InvalidProgress,
+    );
+
+    let done = vec![
+        range(Some("m"), ImportCheckpoint::Done),
+        range(None, ImportCheckpoint::Done),
+    ];
+    assert_eq!(step(&index, 9, progress(2, done)), progressed);
+    let (update, ranges) = index
+        .read()
+        .unwrap()
+        .import_progress(&shard(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(update, 2);
+    assert_eq!(ranges.position(), ImportCheckpoint::Done);
+    rejected(&index, 10, import("e", 6), Rejection::ImportPassed);
+    assert_eq!(
+        Rejection::ImportPassed.to_string(),
+        "the import has passed the key"
     );
 }
 

@@ -63,8 +63,9 @@
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
 //! [`MpuComplete`], [`MpuAbort`], [`UploadBegin`], [`Tags`], [`Flushed`],
 //! [`PartFlushed`], [`Import`], [`Adopt`], [`EcPublish`], [`EcRelocate`],
-//! `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig) without the bucket, shard, and epoch the fixed header holds, and
-//! `TRUNCATE`, which has no fields):
+//! `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig) without the
+//! bucket, shard, and epoch the fixed header holds, `TRUNCATE`, which has
+//! no fields, and [`ImportProgress`]):
 //!
 //! - integers as fixed-width little-endian values; positions as epoch then
 //!   sequence number; timestamps as milliseconds since the Unix epoch,
@@ -89,7 +90,11 @@
 //! - an `EC_PUBLISH`'s stripes as a `u32` count and, per stripe, its data
 //!   length, `k` and `m` (`u8` each), codec ID (`u16`), and each fragment's
 //!   node ID (`u8` length) and fragment ID (`u128`); a stripe's number and
-//!   offset follow from its place in the list.
+//!   offset follow from its place in the list,
+//! - an `IMPORT_PROGRESS`'s ranges as a `u16` count from 1 to
+//!   [`MAX_IMPORT_RANGES`] followed by each range's optional end and its
+//!   checkpoint: a tag byte, 0 for a running range followed by its optional
+//!   last imported key, or 1 for a done one.
 //!
 //! # Decoding
 //!
@@ -116,9 +121,10 @@ use skys3_types::{EpochSeq, KeyHash, limits};
 
 pub use body::{
     Adopt, CopySource, Delete, Extent, ExtentRef, Flushed, IDENTITY_METADATA,
-    IDENTITY_METADATA_RESERVED, Import, MAX_EXTENTS, MAX_KEY_LEN, MAX_METADATA_LEN,
-    MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN,
-    Metadata, Put, PutData, RecordBody, TagSet, Tags, UploadBegin,
+    IDENTITY_METADATA_RESERVED, Import, ImportCheckpoint, ImportProgress, ImportRange, MAX_EXTENTS,
+    MAX_IMPORT_RANGES, MAX_KEY_LEN, MAX_METADATA_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
+    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, Put, PutData, RecordBody, TagSet,
+    Tags, UploadBegin,
 };
 pub use coding::{EcPublish, EcRelocate, FragmentMove, MAX_MOVES, MAX_STRIPES};
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};

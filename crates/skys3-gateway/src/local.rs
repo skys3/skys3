@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
+use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
@@ -208,6 +208,19 @@ impl<D: Disk> Shards for LocalShards<D> {
         let local = self.find(shard).await?;
         local
             .entry(key)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
+    async fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> Result<Option<(u64, ImportRanges)>, ShardError> {
+        // Asked of the primary, whose progress is at least what any entry
+        // it served reflects: a member may lag behind a removed tombstone.
+        let local = self.serving(shard).await?;
+        local
+            .import_progress()
             .await
             .map_err(|error| convert(shard, error))
     }

@@ -113,6 +113,8 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 (None, true) => WritePrecondition::IfAbsent,
             };
             let request = request.clone().with_precondition(precondition);
+            // Only a primary that holds its leases writes the remote (§7.1).
+            self.shard.check_readable()?;
             let error = match self.target.store.copy_object(request).await {
                 Ok(output) => {
                     self.target.counters.copies.inc();
@@ -133,7 +135,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             let held = match &found {
                 Found::Missing => expected.is_none(),
                 Found::Supersede(etag) => expected.as_ref() == Some(etag),
-                Found::Mine(_) | Found::Foreign(_) => false,
+                Found::Mine(_) | Found::Foreign(_) | Found::Later => false,
             };
             // A 409 wrote nothing because of a racing write: copy again.
             let raced = error.kind() == S3ErrorKind::ConditionalRequestConflict;
@@ -148,6 +150,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 Found::Mine(info) => return Ok(Copied::Done(flushed(version, Some(info), true))),
                 Found::Supersede(etag) => expected = Some(etag),
                 Found::Missing => expected = None,
+                Found::Later => return Err(Failure::Later),
                 Found::Foreign(info) => {
                     tracing::debug!(key = self.key, %error, "a copy found a foreign object");
                     return Ok(Copied::Done(Outcome::Conflict(conflict(

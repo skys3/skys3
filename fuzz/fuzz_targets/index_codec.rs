@@ -57,6 +57,14 @@ fn check(data: &[u8]) {
         let encoded = codec::encode_import(&import).expect("a decoded checkpoint encodes");
         same(data, &encoded, &import, |b| codec::decode_import(b).ok());
     }
+    if let Ok((update, ranges)) = codec::decode_import_progress(data) {
+        let encoded =
+            codec::encode_import_progress(update, &ranges).expect("decoded progress encodes");
+        let decoded = (update, ranges);
+        same(data, &encoded, &decoded, |b| {
+            codec::decode_import_progress(b).ok()
+        });
+    }
     if let Ok(location) = codec::decode_location(data) {
         let encoded = codec::encode_location(&location);
         same(data, &encoded, &location, |b| codec::decode_location(b).ok());

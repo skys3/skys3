@@ -104,6 +104,7 @@ use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
 use crate::fill::{FillError, Fills};
 use crate::hot_cache::{HotCache, ObjectName, VersionName};
+use crate::imports::ImportProgress;
 use crate::origin::OriginValidations;
 use crate::peer_s3::{ApplyBy, Carrier, PeerAccess, reveals_identity};
 use crate::remote::RemoteReads;
@@ -283,6 +284,9 @@ pub(crate) struct Objects<H> {
     fills: Option<Arc<dyn Fills>>,
     admission: Arc<dyn Admission>,
     remote: Option<Arc<dyn RemoteReads>>,
+    /// What the gateway knows of the shards' namespace imports, which
+    /// decides whether a read falls through to the remote (§9.1).
+    imports: ImportProgress,
     holders: HolderReads,
     hot_cache: HotCache,
     fragments: Option<Arc<dyn FragmentSource>>,
@@ -297,7 +301,7 @@ pub(crate) struct Objects<H> {
 }
 
 impl<H: Shards> Objects<H> {
-    pub(crate) fn new(shards: H, config: &GatewayConfig) -> Self {
+    pub(crate) fn new(shards: H, config: &GatewayConfig, imports: ImportProgress) -> Self {
         Self {
             shards,
             inline_max_bytes: usize::try_from(config.inline_max_bytes).unwrap_or(usize::MAX),
@@ -310,6 +314,7 @@ impl<H: Shards> Objects<H> {
             fills: config.fills.clone(),
             admission: Arc::clone(&config.admission),
             remote: config.remote.clone(),
+            imports,
             holders: HolderReads::new(config.read_registration_renew_interval),
             hot_cache: config.hot_cache.clone(),
             fragments: config.fragments.clone(),
@@ -399,11 +404,7 @@ impl<H: Shards> Objects<H> {
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
         if condition != Precondition::None {
-            let entry = self
-                .shards
-                .entry(&shard, &input.key)
-                .await
-                .map_err(shard_error)?;
+            let entry = self.conditional_entry(bucket, &shard, &input.key).await?;
             condition.check(entry.as_ref())?;
         }
 

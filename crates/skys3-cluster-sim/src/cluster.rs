@@ -19,12 +19,13 @@ use skys3_control::{
 };
 use skys3_flush::FlushSettings;
 use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
-use skys3_index::{Entry, EntryState, Index, IndexReader, Payload};
+use skys3_index::{Entry, EntryState, ImportCheckpoint, Index, IndexReader, Payload};
 use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SimMount, SyncCut};
 use skys3_log::{LogConfig, LogRecord, RecordBody, RecordKind, SegmentId};
+use skys3_remote::{DeleteObject, ObjectStore, PutObject};
 use skys3_shard::{CacheSettings, CompactionSettings, ReadSettings};
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
-use skys3_sim::history::{History, Operation, Outcome};
+use skys3_sim::history::{Call, Condition, History, Operation, Outcome};
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
 use skys3_sim::{SimContext, SimS3};
 use skys3_types::{
@@ -50,6 +51,7 @@ use crate::peer::{
 use crate::peer_s3;
 use crate::pki::Pki;
 use crate::replication::register;
+use crate::s3;
 use crate::snapshots::{self, Drill, SnapshotAudit, Snapshots};
 use crate::workload::{Client, Routes, Timings, Workload, etag_of, single_put_etags};
 use crate::write_through::{self, RemoteAudit, WriteThrough, write_back_prefix};
@@ -175,6 +177,34 @@ pub struct ClusterConfig {
     /// backups flush to over the native protocol, instead of the remote
     /// store, and its audits ([`Peer`]). `None` by default.
     pub peer: Option<Peer>,
+    /// Above zero, the remote store holds objects under each `write_back`
+    /// bucket's prefix before the cluster starts, which the namespace
+    /// import (§9.1) brings in: one at every key of the workload, recorded
+    /// in the history as written before anything else, and this many
+    /// more, which no client touches.
+    pub remote_objects: usize,
+    /// Whether the remote store keeps every version, so that the settled
+    /// check can find a write flushed twice.
+    pub remote_versioning: bool,
+    /// The most keys a second each bucket's import lists, if not the
+    /// default; pages then hold a tenth of a second's keys, so that an
+    /// import takes many pages.
+    pub import_keys_per_second: Option<u64>,
+    /// Above zero, how long the cluster runs on after the final reads,
+    /// with every fault healed, the remote store's too, before the power
+    /// loss; the run then also checks that it settled
+    /// ([`Cluster::run`]). The remote store's faults then start with the
+    /// workload rather than with the nodes, so that the nodes' capability
+    /// probes, which need a run of requests to succeed, do not hold up
+    /// the start.
+    pub settle: Duration,
+    /// With [`ClusterConfig::settle`], whether the run deletes every key
+    /// of the workload's `write_back` buckets after the final reads, and,
+    /// once settled, puts an out-of-band object at each at the remote and
+    /// reads it through every node: each must answer `404`, since the
+    /// key's shard has passed it (§9.1), whatever the node holds of the
+    /// bucket. The objects are deleted again before the checks.
+    pub probe_deleted: bool,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -253,6 +283,11 @@ impl Default for ClusterConfig {
             large_objects: None,
             copies: None,
             peer: None,
+            remote_objects: 0,
+            remote_versioning: false,
+            import_keys_per_second: None,
+            settle: Duration::ZERO,
+            probe_deleted: false,
         }
     }
 }
@@ -651,7 +686,7 @@ impl<S: NodeServices> Cluster<S> {
         workload: &Workload,
         plan: &FaultPlan,
     ) -> Result<Report, RunError> {
-        let world = World::build(context, &self.config, self.services.clone())?;
+        let world = World::build(context, &self.config, self.services.clone(), workload.keys)?;
         // Every node runs on this thread, and so does the seeded bug, if any.
         skys3_flush::test_hooks::forget_deletes(self.config.backup.forgets_deletes());
         skys3_flush::test_hooks::seed_snapshot_bug(
@@ -686,6 +721,14 @@ impl<S: NodeServices> Cluster<S> {
                 .cut_at_sync(planned.sync, planned.cut);
         }
         let history = History::new();
+        for (name, value) in &world.initial {
+            let call = Call::Put {
+                value: value.clone(),
+                condition: Condition::None,
+            };
+            let pending = history.call("remote", name, call);
+            history.answer(pending, Outcome::Done);
+        }
         let mut builder = context.builder();
         builder
             .simulation_duration(TIME_LIMIT)
@@ -788,6 +831,9 @@ impl<S: NodeServices> Cluster<S> {
             world.routes.clone()
         };
         driver.origin = Some(sim.elapsed());
+        if !self.config.settle.is_zero() {
+            world.remote.set_faults(self.config.remote_faults.clone());
+        }
         if let Some(lifecycle) = &self.config.lifecycle {
             lifecycle.start(sim.elapsed());
         }
@@ -932,6 +978,44 @@ impl<S: NodeServices> Cluster<S> {
         .with_large_objects(driver.large.clone());
         sim.client("verifier", reader.read_all(FINAL_READ_ATTEMPTS));
         self.drive(&mut sim, &mut driver, &history, true)?;
+        let probed: Vec<_> = routes
+            .keys(workload.keys)
+            .into_iter()
+            .filter(|(_, bucket, _)| bucket.mode == BucketMode::WriteBack)
+            .filter(|_| self.config.probe_deleted && !self.config.settle.is_zero())
+            .collect();
+        if !probed.is_empty() {
+            // Deleted now, each key's tombstone goes once its delete is
+            // flushed in the settle (§4.2).
+            let mut deleter = Client::new(
+                "deleter".to_owned(),
+                routes.clone(),
+                history.clone(),
+                workload.clone(),
+                context.fork_seed(),
+            );
+            let keys = probed.clone();
+            sim.client("deleter", async move {
+                deleter.delete_each(&keys, FINAL_READ_ATTEMPTS).await
+            });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
+        if !self.config.settle.is_zero() {
+            // The remote heals too: a node whose capability probe keeps
+            // failing never starts its flushers (§7.2).
+            world.remote.set_faults(SimS3Faults::NONE);
+            let settle = self.config.settle;
+            sim.client("settler", async move {
+                tokio::time::sleep(settle).await;
+                Ok(())
+            });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
+        if !probed.is_empty() {
+            let (remote, nodes) = (world.remote.clone(), routes.nodes.clone());
+            sim.client("prober", probe_deleted(remote, nodes, probed));
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
         // Every committed change of a `local` bucket reaches its backup:
         // wait until the flushers have sent everything.
         let drained = Arc::new(AtomicBool::new(false));
@@ -1075,7 +1159,12 @@ impl<S: NodeServices> Cluster<S> {
             }
             None => LifecycleAudit::default(),
         };
-        let (survivors, evicted) = world.survivors(&routes, workload.keys, &held)?;
+        let (survivors, evicted, indexes) = world.survivors(&routes, workload.keys, &held)?;
+        if !self.config.settle.is_zero() {
+            world
+                .check_settled(&routes, workload.keys, &survivors, &indexes)
+                .map_err(|error| RunError::Simulation(format!("not settled: {error}")))?;
+        }
         check_linearizable(&operations).map_err(RunError::Check)?;
         check_durable(&operations, &survivors).map_err(RunError::Check)?;
         if self.config.every_member_durable {
@@ -1328,6 +1417,12 @@ struct World<S> {
     origin_buckets: Vec<BucketDocument>,
     /// The SkyS3 peer of [`ClusterConfig::peer`].
     destination: Option<Arc<Destination>>,
+    /// The value of each workload key the remote store held at the start,
+    /// by its name in the history.
+    initial: Vec<(String, String)>,
+    /// The keys of each `write_back` bucket the remote store held at the
+    /// start that no client touches.
+    imported: Vec<(BucketDocument, String)>,
 }
 
 impl<S: NodeServices> World<S> {
@@ -1338,15 +1433,19 @@ impl<S: NodeServices> World<S> {
         context: &mut SimContext,
         config: &ClusterConfig,
         services: S,
+        keys: usize,
     ) -> Result<Self, BoxError> {
         let cluster = ClusterId::new(CLUSTER)?;
         let control = context.s3(SimS3Config::default());
         // Streamed bodies send parts as small as the flushers' 512 bytes.
         let remote = context.s3(SimS3Config {
             min_part_size: 1,
+            versioning: config.remote_versioning,
             ..SimS3Config::default()
         });
-        remote.set_faults(config.remote_faults.clone());
+        if config.settle.is_zero() {
+            remote.set_faults(config.remote_faults.clone());
+        }
         let settings = settings(&cluster, config)?;
         let store = S3ControlStore::new(
             control.clone(),
@@ -1375,12 +1474,14 @@ impl<S: NodeServices> World<S> {
         } else {
             &buckets[..]
         };
-        tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
-            .build()?
-            .block_on(write_registers(
-                &store, &cluster, written, &placement, &mut ids,
-            ))?;
+            .build()?;
+        runtime.block_on(write_registers(
+            &store, &cluster, written, &placement, &mut ids,
+        ))?;
+        let (initial, imported) =
+            runtime.block_on(fill_remote(&remote, &buckets, keys, config.remote_objects))?;
 
         let pki = Pki::new()?;
         let mut slots = Vec::new();
@@ -1467,6 +1568,8 @@ impl<S: NodeServices> World<S> {
             remote,
             origin_buckets,
             destination,
+            initial,
+            imported,
         })
     }
 
@@ -1578,13 +1681,21 @@ impl<S: NodeServices> World<S> {
     /// reads each key's value on every member of its shard and, for a
     /// `write_back` bucket, whether the member's entry is clean, and the
     /// key's value in the remote store. Also returns how many of those
-    /// copies are evicted.
+    /// copies are evicted, and every node's recovered index.
+    #[allow(clippy::type_complexity)]
     fn survivors(
         &self,
         routes: &Routes,
         keys: usize,
         held: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<(BTreeMap<String, Survivors>, usize), BoxError> {
+    ) -> Result<
+        (
+            BTreeMap<String, Survivors>,
+            usize,
+            BTreeMap<NodeId, Arc<Index>>,
+        ),
+        BoxError,
+    > {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()?;
@@ -1674,7 +1785,95 @@ impl<S: NodeServices> World<S> {
             }
             survivors.insert(name, survivor);
         }
-        Ok((survivors, evicted))
+        let indexes = indexes
+            .into_iter()
+            .map(|(node, (index, ..))| (node, index))
+            .collect();
+        Ok((survivors, evicted, indexes))
+    }
+
+    /// Checks that the primary-scoped work of every `write_back` bucket
+    /// finished (§7.1, §9.1), from the members' recovered `indexes`: every
+    /// key of the workload is clean on every member, which holds exactly
+    /// what the remote store holds; every key the remote store held at the
+    /// start that no client touched is a clean stub of it on every member;
+    /// every member's import progress is done; and no write identity is on
+    /// two versions of a remote object.
+    fn check_settled(
+        &self,
+        routes: &Routes,
+        keys: usize,
+        survivors: &BTreeMap<String, Survivors>,
+        indexes: &BTreeMap<NodeId, Arc<Index>>,
+    ) -> Result<(), BoxError> {
+        for (name, bucket, _) in routes.keys(keys) {
+            if bucket.mode != BucketMode::WriteBack {
+                continue;
+            }
+            let survivor = &survivors[&name];
+            let flushed = survivor.flushed.clone().unwrap_or_default();
+            for (copy, clean) in survivor.copies.iter().zip(&survivor.clean) {
+                if !clean || *copy != flushed {
+                    return Err(format!(
+                        "{name} holds {copy:?} (clean: {clean}), the remote {flushed:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        for (bucket, key) in &self.imported {
+            let shard = ShardRef::for_key(bucket, key);
+            let remote = self
+                .remote
+                .object(&format!("{}{key}", remote_prefix(bucket)));
+            let remote = remote.map(|object| object.info.etag);
+            for member in self.members(routes, &shard) {
+                let entry = indexes[&member].read()?.entry(&(&shard).into(), key)?;
+                let clean = entry
+                    .as_ref()
+                    .is_some_and(|e| matches!(e.state, EntryState::Clean | EntryState::Evicted));
+                let local = entry.and_then(|e| e.object).map(|o| o.local_etag);
+                if !clean || local.is_none() || local != remote {
+                    return Err(format!(
+                        "{key}, imported, is {local:?} (clean: {clean}) on {member}, \
+                        the remote {remote:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        for bucket in &routes.buckets {
+            if bucket.mode != BucketMode::WriteBack {
+                continue;
+            }
+            for shard in ShardRef::all(bucket) {
+                for member in self.members(routes, &shard) {
+                    let progress = indexes[&member].read()?.import_progress(&(&shard).into())?;
+                    let done =
+                        progress.is_some_and(|(_, r)| r.position() == ImportCheckpoint::Done);
+                    if !done {
+                        return Err(
+                            format!("the import of {shard:?} is not done on {member}").into()
+                        );
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, identity) in self.remote.identities() {
+            if let Some(identity) = identity
+                && !seen.insert((key.clone(), identity.clone()))
+            {
+                return Err(format!("{key} has two versions written as {identity}").into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The members of `shard`'s configuration now.
+    fn members(&self, routes: &Routes, shard: &ShardRef) -> Vec<NodeId> {
+        register(&self.registers, shard)
+            .map_or_else(|| routes.placement[shard].members.clone(), |c| c.members)
     }
 
     /// Recovers every node from its disks, outside the simulation, and
@@ -2003,6 +2202,14 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
                 .large_objects
                 .as_ref()
                 .is_none_or(|large| large.streaming),
+            import_keys_per_second: shape
+                .import_keys_per_second
+                .unwrap_or(FlushSettings::default().import_keys_per_second),
+            import_page_keys: shape
+                .import_keys_per_second
+                .map_or(FlushSettings::default().import_page_keys, |rate| {
+                    u32::try_from(rate / 10).unwrap_or(u32::MAX).max(1)
+                }),
             ..FlushSettings::default()
         },
         checkpoint_interval: Duration::from_secs(1),
@@ -2020,6 +2227,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         evict_local: shape.backup.evicts_local(),
         snapshots: shape.snapshots.is_some(),
         origin: shape.origin.clone(),
+        remote_reads: shape.remote_objects > 0,
         peer: shape.peer,
         peer_side: None,
     })
@@ -2119,6 +2327,96 @@ pub(crate) fn remote_prefix(bucket: &BucketDocument) -> &str {
         .as_ref()
         .and_then(|target| target.prefix.as_deref())
         .unwrap_or_default()
+}
+
+/// Fills the remote store before the cluster starts, if `objects` is
+/// above zero: under each `write_back` bucket's prefix, an object at each
+/// of the workload's `keys` keys and at `objects` more. Returns the
+/// workload keys' values by their names in the history, and the other
+/// keys.
+async fn fill_remote(
+    remote: &SimS3,
+    buckets: &[BucketDocument],
+    keys: usize,
+    objects: usize,
+) -> Result<(Vec<(String, String)>, Vec<(BucketDocument, String)>), BoxError> {
+    let (mut initial, mut imported) = (Vec::new(), Vec::new());
+    if objects == 0 {
+        return Ok((initial, imported));
+    }
+    for bucket in buckets.iter().filter(|b| b.mode == BucketMode::WriteBack) {
+        let workload = (0..keys).map(|n| (true, format!("key-{n}")));
+        let others = (0..objects).map(|n| (false, format!("imported-{n:04}")));
+        for (touched, key) in workload.chain(others) {
+            let body = format!("remote {} {key}", bucket.name);
+            let remote_key = format!("{}{key}", remote_prefix(bucket));
+            remote
+                .put_object(PutObject::new(remote_key, body.clone()))
+                .await?;
+            if touched {
+                initial.push((format!("{}/{key}", bucket.name), etag_of(body.as_bytes())));
+            } else {
+                imported.push((bucket.clone(), key));
+            }
+        }
+    }
+    Ok((initial, imported))
+}
+
+/// How many times the prober asks a node before it gives up on an answer.
+const PROBE_ATTEMPTS: usize = 40;
+
+/// For each of `keys`, deleted and settled: puts an out-of-band object at
+/// the remote, which the index no longer has a tombstone to hide, and
+/// reads the key through every one of `nodes`, which must each answer
+/// `404` (§9.1): the key's shard has passed it, so the remote's object is
+/// not the key's, whether or not the node holds a replica of the bucket
+/// or has seen its import progress. Then deletes the object again.
+async fn probe_deleted(
+    remote: SimS3,
+    nodes: Vec<NodeId>,
+    keys: Vec<(String, BucketDocument, String)>,
+) -> turmoil::Result {
+    for (name, bucket, key) in &keys {
+        let remote_key = format!("{}{key}", remote_prefix(bucket));
+        if remote.object(&remote_key).is_some() {
+            return Err(format!("{name}, deleted and settled, is still at the remote").into());
+        }
+        let body = format!("out of band {name}");
+        remote
+            .put_object(PutObject::new(remote_key.clone(), body))
+            .await?;
+        for node in &nodes {
+            let host = node.to_string();
+            let mut answered = false;
+            for _ in 0..PROBE_ATTEMPTS {
+                let request = http::Request::get(format!("/{}/{key}", bucket.name))
+                    .body(http_body_util::Full::new(bytes::Bytes::new()))?;
+                if let Ok(connection) = s3::connect(&host, Duration::from_secs(1)).await {
+                    match connection.send(request, Duration::from_secs(5)).await {
+                        Ok(response) if response.status() == http::StatusCode::NOT_FOUND => {
+                            answered = true;
+                            break;
+                        }
+                        Ok(response) if !response.status().is_server_error() => {
+                            return Err(format!(
+                                "{name}, deleted, reappeared through {host}: {}",
+                                response.status()
+                            )
+                            .into());
+                        }
+                        _ => {}
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if !answered {
+                return Err(format!("{host} never answered a read of {name}").into());
+            }
+        }
+        remote.delete_object(DeleteObject::new(remote_key)).await?;
+    }
+    Ok(())
 }
 
 /// Writes `cluster.json`, every bucket register, and every shard register,

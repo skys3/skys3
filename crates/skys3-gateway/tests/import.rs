@@ -1,6 +1,7 @@
 //! Reads and listings of a `write_back` bucket while its namespace import
 //! runs, and lazily loaded metadata of imported stubs (design §9.1),
-//! against a scripted remote.
+//! against a scripted remote. The import's progress is the shards' own,
+//! committed to each as the import's owner commits it.
 
 mod common;
 
@@ -15,21 +16,22 @@ use skys3_gateway::{
     Precondition, RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads,
     ShardRef, Shards,
 };
-use skys3_index::{EntryState, ImportCheckpoint, ListItem, ListQuery, ObjectVersion, Payload};
+use skys3_index::{
+    EntryState, ImportCheckpoint, ImportRange, ImportRanges, ListItem, ListQuery, ObjectVersion,
+    Payload,
+};
 use skys3_log::RecordBody;
 use skys3_log::record::Import;
 use skys3_types::{BucketDocument, BucketId, ETag};
 
-/// A remote whose objects, import progress, and failures a test sets.
+/// A remote whose objects and failures a test sets.
 #[derive(Debug, Default)]
 struct Remote(Mutex<State>);
 
 #[derive(Debug, Default)]
 struct State {
-    import: Option<ImportCheckpoint>,
-    /// Keys after the first and up to the second that a range listed in
-    /// parallel has passed ahead of the import's position.
-    ahead: Option<(String, String)>,
+    /// Whether the node does not read the bucket's target.
+    unread: bool,
     objects: BTreeMap<String, (RemoteObject, Bytes)>,
     failing: bool,
     heads: usize,
@@ -38,16 +40,6 @@ struct State {
 impl Remote {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.0.lock().unwrap()
-    }
-
-    fn set_import(&self, import: Option<ImportCheckpoint>) {
-        self.lock().import = import;
-    }
-
-    fn running(&self, after: Option<&str>) {
-        self.set_import(Some(ImportCheckpoint::Running {
-            after: after.map(str::to_owned),
-        }));
     }
 
     /// Stores `body` at `key` with a `Content-Type` and a user metadata
@@ -89,18 +81,8 @@ impl Remote {
 }
 
 impl RemoteReads for Remote {
-    fn import(&self, _bucket: &BucketId) -> Option<ImportCheckpoint> {
-        self.lock().import.clone()
-    }
-
-    fn passed(&self, _bucket: &BucketId, key: &str) -> bool {
-        let state = self.lock();
-        let ahead = state.ahead.as_ref();
-        state
-            .import
-            .as_ref()
-            .is_none_or(|import| import.passed(key))
-            || ahead.is_some_and(|(start, end)| key > start.as_str() && key <= end.as_str())
+    fn reads(&self, _bucket: &BucketId) -> bool {
+        !self.lock().unread
     }
 
     fn head<'a>(
@@ -205,6 +187,35 @@ async fn import(setup: &Setup, bucket: &BucketDocument, key: &str, etag: &ETag) 
         .unwrap();
 }
 
+/// Commits `ranges` as the import's progress to every shard of `bucket`,
+/// numbered after the progress each holds, as the import's owner does.
+async fn progress(setup: &Setup, bucket: &BucketDocument, ranges: &ImportRanges) {
+    for shard in ShardRef::all(bucket) {
+        let held = setup.shards.import_progress(&shard).await.unwrap();
+        let update = held.map_or(1, |(update, _)| update + 1);
+        let body = RecordBody::ImportProgress(ranges.to_progress(update));
+        setup
+            .shards
+            .write(&shard, body, Precondition::None)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// The import has passed every key up to `after`.
+async fn running(setup: &Setup, bucket: &BucketDocument, after: &str) {
+    let ranges = ImportCheckpoint::Running {
+        after: Some(after.to_owned()),
+    };
+    progress(setup, bucket, &ranges.into()).await;
+}
+
+/// The import is done.
+async fn done(setup: &Setup, bucket: &BucketDocument) {
+    progress(setup, bucket, &ImportCheckpoint::Done.into()).await;
+}
+
 async fn entry(setup: &Setup, bucket: &BucketDocument, key: &str) -> Option<skys3_index::Entry> {
     let shard = ShardRef::for_key(bucket, key);
     setup.shards.entry(&shard, key).await.unwrap()
@@ -234,8 +245,7 @@ fn listed(body: &str) -> Vec<String> {
 #[tokio::test]
 async fn a_miss_falls_through_to_the_remote_until_the_import_passes_the_key() {
     let remote = Arc::new(Remote::default());
-    let (setup, _) = setup(&remote).await;
-    remote.running(None);
+    let (setup, bucket) = setup(&remote).await;
     let etag = remote.put("a.txt", "hello");
     remote.put("b.txt", "world");
 
@@ -270,16 +280,18 @@ async fn a_miss_falls_through_to_the_remote_until_the_import_passes_the_key() {
     failing.assert(503, Some("ServiceUnavailable"));
     remote.lock().failing = false;
 
-    // Once the import has passed a key, or is done, a miss is a 404.
-    remote.running(Some("c"));
+    // Once the key's shard has passed a key, or is done, a miss is a 404.
+    running(&setup, &bucket, "c").await;
+    let heads = remote.lock().heads;
     let passed = setup.call(Method::HEAD, "/photos/b.txt", &[], "").await;
     assert_eq!(passed.status, 404);
-    remote.set_import(Some(ImportCheckpoint::Done));
-    let done = setup.call(Method::GET, "/photos/b.txt", &[], "").await;
-    done.assert(404, Some("NoSuchKey"));
-    remote.set_import(None);
-    let unknown = setup.call(Method::GET, "/photos/b.txt", &[], "").await;
-    unknown.assert(404, Some("NoSuchKey"));
+    done(&setup, &bucket).await;
+    let finished = setup.call(Method::GET, "/photos/b.txt", &[], "").await;
+    finished.assert(404, Some("NoSuchKey"));
+    assert_eq!(remote.lock().heads, heads, "nothing passed is read through");
+    remote.lock().unread = true;
+    let unread = setup.call(Method::GET, "/photos/b.txt", &[], "").await;
+    unread.assert(404, Some("NoSuchKey"));
 }
 
 /// A key with a control character can come from the remote, though no
@@ -289,7 +301,6 @@ async fn a_miss_falls_through_to_the_remote_until_the_import_passes_the_key() {
 async fn an_imported_key_with_a_control_character_lists_url_encoded() {
     let remote = Arc::new(Remote::default());
     let (setup, _) = setup(&remote).await;
-    remote.running(None);
     remote.put("bell\u{7}.txt", "ding");
 
     setup
@@ -334,9 +345,6 @@ async fn a_get_fails_if_the_object_changes_after_its_head() {
     #[derive(Debug)]
     struct Changing(Remote);
     impl RemoteReads for Changing {
-        fn import(&self, bucket: &BucketId) -> Option<ImportCheckpoint> {
-            self.0.import(bucket)
-        }
         fn head<'a>(
             &'a self,
             b: &'a BucketId,
@@ -358,7 +366,6 @@ async fn a_get_fails_if_the_object_changes_after_its_head() {
         }
     }
     let remote = Changing(Remote::default());
-    remote.0.running(None);
     remote.0.put("a.txt", "hello");
     let mut config = config("");
     config.remote = Some(Arc::new(remote));
@@ -372,7 +379,6 @@ async fn a_get_fails_if_the_object_changes_after_its_head() {
 async fn the_first_read_of_an_imported_stub_loads_its_metadata() {
     let remote = Arc::new(Remote::default());
     let (setup, bucket) = setup(&remote).await;
-    remote.set_import(Some(ImportCheckpoint::Done));
     let etag = remote.put("c.txt", "hello");
     import(&setup, &bucket, "c.txt", &etag).await;
     let stub = entry(&setup, &bucket, "c.txt").await.unwrap();
@@ -442,7 +448,6 @@ async fn the_first_read_of_an_imported_stub_loads_its_metadata() {
 async fn listings_merge_the_remote_while_the_import_runs() {
     let remote = Arc::new(Remote::default());
     let (setup, bucket) = setup(&remote).await;
-    remote.running(Some("b"));
     // Local: two writes, a stub the import committed, and a tombstone of a
     // key the import has not reached.
     for key in ["a/1", "c"] {
@@ -453,6 +458,7 @@ async fn listings_merge_the_remote_while_the_import_runs() {
     }
     let etag = remote.put("b", "remote");
     import(&setup, &bucket, "b", &etag).await;
+    running(&setup, &bucket, "b").await;
     for key in ["a/2", "c", "d", "e/1", "x/1", "y/1", "y/2"] {
         remote.put(key, "remote");
     }
@@ -498,19 +504,19 @@ async fn listings_merge_the_remote_while_the_import_runs() {
     }
     assert_eq!(names, ["a/", "b", "c", "d", "e/", "y/"]);
 
-    // Once the import is done, the index alone lists.
-    remote.set_import(Some(ImportCheckpoint::Done));
-    let done = setup
-        .call(Method::GET, "/photos?list-type=2", &[], "")
-        .await;
-    assert_eq!(listed(&done.body), ["a/1", "b", "c"]);
-
-    remote.running(None);
     remote.lock().failing = true;
     let failing = setup
         .call(Method::GET, "/photos?list-type=2", &[], "")
         .await;
     failing.assert(503, Some("ServiceUnavailable"));
+    remote.lock().failing = false;
+
+    // Once the import is done, the index alone lists.
+    done(&setup, &bucket).await;
+    let finished = setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await;
+    assert_eq!(listed(&finished.body), ["a/1", "b", "c"]);
 }
 
 #[tokio::test]
@@ -520,9 +526,9 @@ async fn a_common_prefix_the_import_is_inside_still_lists() {
     // The import has passed `a/x`, which was then deleted; `a/y` is only
     // on the remote. The remote's listing starts after `a/x`, so it leaves
     // the common prefix `a/` out.
-    remote.running(Some("a/x"));
     let etag = remote.put("a/x", "remote");
     import(&setup, &bucket, "a/x", &etag).await;
+    running(&setup, &bucket, "a/x").await;
     remote.put("a/y", "remote");
     remote.put("b/1", "remote");
     setup
@@ -557,7 +563,6 @@ async fn a_common_prefix_the_import_is_inside_still_lists() {
 async fn a_stopped_shard_never_falls_through_to_the_remote() {
     let remote = Arc::new(Remote::default());
     let (setup, bucket) = setup(&remote).await;
-    remote.running(None);
     remote.put("a.txt", "hello");
     // The key's shard stops: it refuses reads, so a miss cannot be told
     // from an entry it would have held.
@@ -580,15 +585,25 @@ async fn a_stopped_shard_never_falls_through_to_the_remote() {
 async fn keys_a_later_range_has_passed_are_read_from_the_index_alone() {
     let remote = Arc::new(Remote::default());
     let (setup, bucket) = setup(&remote).await;
-    // The first range has passed nothing yet; a later one has passed
-    // every key after `m` up to `m/9`.
-    remote.running(None);
-    remote.lock().ahead = Some(("m".to_owned(), "m/9".to_owned()));
     for key in ["a", "m/2", "z"] {
         remote.put(key, "remote");
     }
     let etag = remote.put("m/1", "remote");
     import(&setup, &bucket, "m/1", &etag).await;
+    // The first range has passed nothing yet; a later one has passed
+    // every key after `m` up to `m/9`.
+    let running = ImportCheckpoint::Running { after: None };
+    let range = |end: Option<&str>, checkpoint: &ImportCheckpoint| ImportRange {
+        end: end.map(str::to_owned),
+        checkpoint: checkpoint.clone(),
+    };
+    let ranges = ImportRanges::from_ranges(vec![
+        range(Some("m"), &running),
+        range(Some("m/9"), &ImportCheckpoint::Done),
+        range(None, &running),
+    ])
+    .unwrap();
+    progress(&setup, &bucket, &ranges).await;
     // `m/2` came after its range passed it: as once the import is done,
     // neither a read nor a listing sees it.
     let head = setup.call(Method::HEAD, "/photos/m/2", &[], "").await;
@@ -617,4 +632,95 @@ async fn keys_a_later_range_has_passed_are_read_from_the_index_alone() {
         .call(Method::GET, "/photos?list-type=2&delimiter=/", &[], "")
         .await;
     assert_eq!(listed(&rolled.body), ["a", "z"]);
+}
+
+#[tokio::test]
+async fn a_conditional_write_sees_an_object_only_at_the_remote() {
+    let remote = Arc::new(Remote::default());
+    let (setup, bucket) = setup(&remote).await;
+    let a = remote.put("a.txt", "hello");
+    let b = remote.put("b.txt", "world");
+    let c = remote.put("c.txt", "again");
+
+    // The remote's object fails `If-None-Match: *`, and its `IMPORT`,
+    // committed first, leaves the key's stub.
+    let absent = [("if-none-match", "*")];
+    let put = setup.call(Method::PUT, "/photos/a.txt", &absent, "x").await;
+    put.assert(412, Some("PreconditionFailed"));
+    let stub = entry(&setup, &bucket, "a.txt").await.unwrap();
+    assert_eq!(stub.state, EntryState::Evicted);
+    assert_eq!(stub.remote_etag.as_ref(), Some(&a));
+
+    // `If-Match` on its ETag holds, and the write replaces it there.
+    let quoted = format!("\"{b}\"");
+    let matches = [("if-match", quoted.as_str())];
+    let put = setup
+        .call(Method::PUT, "/photos/b.txt", &matches, "x")
+        .await;
+    put.assert(200, None);
+    let written = entry(&setup, &bucket, "b.txt").await.unwrap();
+    assert_eq!(written.state, EntryState::Dirty);
+    assert_eq!(written.remote_etag.as_ref(), Some(&b));
+
+    // A conditional delete is checked the same way.
+    let wrong = [("if-match", "\"0123456789abcdef0123456789abcdef\"")];
+    let delete = setup
+        .call(Method::DELETE, "/photos/c.txt", &wrong, "")
+        .await;
+    delete.assert(412, Some("PreconditionFailed"));
+    let quoted = format!("\"{c}\"");
+    let matches = [("if-match", quoted.as_str())];
+    let delete = setup
+        .call(Method::DELETE, "/photos/c.txt", &matches, "")
+        .await;
+    delete.assert(204, None);
+
+    // A key the remote does not hold is absent.
+    let put = setup.call(Method::PUT, "/photos/new", &absent, "x").await;
+    put.assert(200, None);
+
+    // A remote that cannot answer cannot decide the condition.
+    remote.put("d.txt", "later");
+    remote.lock().failing = true;
+    let put = setup.call(Method::PUT, "/photos/d.txt", &absent, "x").await;
+    put.assert(503, Some("ServiceUnavailable"));
+    remote.lock().failing = false;
+
+    // Once the import has passed a key, the index alone decides.
+    running(&setup, &bucket, "z").await;
+    let heads = remote.lock().heads;
+    let put = setup.call(Method::PUT, "/photos/d.txt", &absent, "x").await;
+    put.assert(200, None);
+    assert_eq!(remote.lock().heads, heads);
+}
+
+/// A gateway that has seen none of the import's progress, as on a node
+/// that holds no replica of the bucket or has just started, asks the key's
+/// shard: a key it has passed, whose tombstone is gone, never falls
+/// through to an object an out-of-band writer put at the remote, to a read
+/// or a listing (§9.1).
+#[tokio::test]
+async fn a_key_its_shard_has_passed_never_falls_through() {
+    let remote = Arc::new(Remote::default());
+    let (setup, bucket) = setup(&remote).await;
+    done(&setup, &bucket).await;
+    // Deleted, flushed, and its tombstone dropped: the key has no entry.
+    remote.put("gone.txt", "out of band");
+    assert!(entry(&setup, &bucket, "gone.txt").await.is_none());
+
+    let head = setup.call(Method::HEAD, "/photos/gone.txt", &[], "").await;
+    assert_eq!(head.status, 404);
+    let get = setup.call(Method::GET, "/photos/gone.txt", &[], "").await;
+    get.assert(404, Some("NoSuchKey"));
+    let all = setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await;
+    all.assert(200, None);
+    assert!(listed(&all.body).is_empty(), "{}", all.body);
+    let absent = [("if-none-match", "*")];
+    setup
+        .call(Method::PUT, "/photos/gone.txt", &absent, "x")
+        .await
+        .assert(200, None);
+    assert_eq!(remote.lock().heads, 0, "nothing was read from the remote");
 }

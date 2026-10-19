@@ -11,11 +11,13 @@
 //! any shard has an item left, in its page or beyond it.
 //!
 //! While the bucket's namespace import runs, the remote is one more source
-//! (§9.1), for the keys after the last one the import has passed without a
-//! gap: the index holds every key up to it. A remote key lists only if the
-//! import has not passed it, where a range listed in parallel is ahead,
-//! and the index has no entry for it, since a live entry lists from its
-//! shard and a delete tombstone hides it. A remote common prefix that no shard lists
+//! (§9.1), for the keys after the last one every shard's import progress
+//! has passed without a gap: the index holds every key up to it. A remote
+//! key lists only if the index has no entry for it, since a live entry
+//! lists from its shard and a delete tombstone hides it, and only if its
+//! shard's progress, asked of the shard's primary after the entry was
+//! looked up, has not passed it, where a range listed in parallel may be
+//! ahead: a passed key's tombstone may be gone. A remote common prefix that no shard lists
 //! is checked: it lists only if a remote key under it lists. S3 leaves out
 //! a common prefix at or before the listing's start even if keys under it
 //! come after, so when the import's position is inside a common prefix the
@@ -28,6 +30,7 @@ use skys3_index::{ListItem, ListPage, ListQuery};
 use skys3_types::BucketDocument;
 use tokio::task::JoinSet;
 
+use crate::imports::ImportProgress;
 use crate::remote::{RemoteError, RemoteListing, RemoteReads};
 use crate::shard::{ShardError, ShardRef, Shards};
 
@@ -62,8 +65,10 @@ pub(crate) enum MergeError {
 pub(crate) struct RemoteSide<'a> {
     /// The bucket's remote.
     pub(crate) remote: &'a dyn RemoteReads,
-    /// The last key the import has passed, if any: the index holds every
-    /// key up to it.
+    /// What the gateway knows of the shards' import progress.
+    pub(crate) imports: &'a ImportProgress,
+    /// The last key every shard's import has passed, if any: the index
+    /// holds every key up to it.
     pub(crate) passed: Option<String>,
 }
 
@@ -282,14 +287,10 @@ async fn refill_remote<H: Shards>(
         .filter(|item| after.is_none_or(|after| item.name() > after))
         .filter(|item| straddled.is_none_or(|prefix| item.name() != prefix))
         .collect();
-    let items = unpassed(bucket, remote, items);
-    let entries = local_entries(shards, bucket, object_keys(&items)).await?;
+    let items = unindexed(shards, bucket, remote, items).await?;
     cursor
         .items
-        .extend(items.into_iter().filter(|item| match item {
-            ListItem::Object { key, .. } => !entries.contains(key),
-            ListItem::Prefix(_) => true,
-        }));
+        .extend(unpassed(shards, bucket, remote, items).await?);
     Ok(())
 }
 
@@ -322,9 +323,9 @@ async fn lists_under<H: Shards>(
             max_items: REMOTE_CHECK_BATCH,
         };
         let page = remote.remote.list(&bucket.bucket_id, listing).await?;
-        let keys = object_keys(&unpassed(bucket, remote, page.items));
-        let entries = local_entries(shards, bucket, keys.clone()).await?;
-        if keys.iter().any(|key| !entries.contains(key)) {
+        let items = unindexed(shards, bucket, remote, page.items).await?;
+        let items = unpassed(shards, bucket, remote, items).await?;
+        if !object_keys(&items).is_empty() {
             return Ok(true);
         }
         match page.next {
@@ -334,20 +335,60 @@ async fn lists_under<H: Shards>(
     }
 }
 
-/// `items` without the remote keys the import has passed, which the index
-/// holds as the remote listed them.
-fn unpassed(
+/// `items` without the remote keys known passed and the keys the index
+/// has an entry for: a live one lists from its shard, and a tombstone
+/// hides the key.
+async fn unindexed<H: Shards>(
+    shards: &H,
     bucket: &BucketDocument,
     remote: &RemoteSide<'_>,
     items: Vec<ListItem>,
-) -> Vec<ListItem> {
-    items
+) -> Result<Vec<ListItem>, MergeError> {
+    let items: Vec<ListItem> = items
         .into_iter()
         .filter(|item| match item {
-            ListItem::Object { key, .. } => !remote.remote.passed(&bucket.bucket_id, key),
+            ListItem::Object { key, .. } => !remote
+                .imports
+                .known_passed(&ShardRef::for_key(bucket, key), key),
             ListItem::Prefix(_) => true,
         })
-        .collect()
+        .collect();
+    let entries = local_entries(shards, bucket, object_keys(&items)).await?;
+    Ok(items
+        .into_iter()
+        .filter(|item| match item {
+            ListItem::Object { key, .. } => !entries.contains(key),
+            ListItem::Prefix(_) => true,
+        })
+        .collect())
+}
+
+/// `items` without the remote keys their shard's import progress has
+/// passed, which the index holds as the remote listed them, or dropped.
+/// Called after the keys' entries were looked up, it asks each shard
+/// whose progress is not known to pass a key once, so that a key passed
+/// since, whose tombstone may be gone, is not listed.
+async fn unpassed<H: Shards>(
+    shards: &H,
+    bucket: &BucketDocument,
+    remote: &RemoteSide<'_>,
+    items: Vec<ListItem>,
+) -> Result<Vec<ListItem>, ShardError> {
+    let mut asked = BTreeSet::new();
+    let mut kept = Vec::with_capacity(items.len());
+    for item in items {
+        if let ListItem::Object { key, .. } = &item {
+            let shard = ShardRef::for_key(bucket, key);
+            if !remote.imports.known_passed(&shard, key) && asked.insert(shard.clone()) {
+                remote.imports.fetch(shards, &shard).await?;
+            }
+            if remote.imports.known_passed(&shard, key) {
+                continue;
+            }
+        }
+        kept.push(item);
+    }
+    Ok(kept)
 }
 
 /// The keys of the objects among `items`.
