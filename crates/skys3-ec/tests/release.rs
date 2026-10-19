@@ -17,7 +17,9 @@ use prost::Message;
 use skys3_config::{EcConfig, FailureDomain, StorageConfig};
 use skys3_coord::{Candidate, FragmentPlanner, GeometryPolicy, NodeState, Topology};
 use skys3_ec::read::{HoldFuture, ReadFuture};
-use skys3_ec::release::{FragmentNoted, FragmentRelease, ReleasedBody};
+use skys3_ec::release::{
+    FragmentHold, FragmentNoted, FragmentRelease, MAX_HOLDS, MAX_RELEASES, ReleasedBody,
+};
 use skys3_ec::{
     CodecId, CodedRead, CodedStripe, FragmentBytes, FragmentHolds, FragmentId, FragmentLocation,
     FragmentReadClient, FragmentRequest, FragmentServer, FragmentSource, FragmentStore, Geometry,
@@ -829,4 +831,28 @@ fn a_source_without_holds_registers_nothing() {
         let error = Plain.hold(node(1), 1, Vec::new(), false).await;
         assert!(error.is_err());
     });
+}
+
+#[test]
+fn releases_and_holds_are_bounded() {
+    let released = |n: usize| ReleasedFragment {
+        fragment: FragmentId::new(n as u128),
+        key: "k".into(),
+        version: position(1, 2),
+        stripe: 0,
+        index: 0,
+    };
+    let most: Vec<ReleasedFragment> = (0..MAX_RELEASES).map(released).collect();
+    let body = FragmentRelease::new(&shard(), &most);
+    assert_eq!(body.parse().unwrap().1, most);
+    let mut over = body.clone();
+    over.fragments.push(over.fragments[0].clone());
+    assert!(over.parse().unwrap_err().contains("fragments"));
+
+    let ids: Vec<FragmentId> = (0..MAX_HOLDS as u128).map(FragmentId::new).collect();
+    let hold = FragmentHold::new(7, &ids, false);
+    assert_eq!(hold.parse().unwrap(), ids);
+    let mut over = hold.clone();
+    over.fragments.push(over.fragments[0].clone());
+    assert!(over.parse().unwrap_err().contains("fragments"));
 }

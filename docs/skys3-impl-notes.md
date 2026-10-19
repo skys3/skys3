@@ -8178,6 +8178,16 @@ of this file. A task with nothing unexpected keeps "None."
   lost fragments. The seeded bugs are caught: `RemoveBeforeCopy` by a
   power cut after the directory sync, `IgnoreHolds` and `NoDelay` by a
   read that held its fragments failing.
+- **The release scenario runs on a paused clock, deliberately.** Its
+  fragment source is in memory with no transport, so nothing waits on
+  real time and every seed replays exactly.
+- **`ec_release` has a corpus of its own.** Seeds built from the test
+  vectors (valid bodies, no entries, 256 and 257, unsorted, duplicate,
+  malformed IDs, keys, buckets, and indices, and an `EC_RELEASE` record
+  body), fuzzed for 120 s and minimized with `cargo fuzz cmin` and
+  `-use_counters=0`: 136 files, 10 KiB. `fuzz/run.sh` gives the target a
+  `max_len` of 8 KiB, which a release of 256 fragments fits; the bounds
+  themselves have a unit test.
 - **Later tasks checked.** Repair (M5-08) lists only what the
   `fragments` table names, which no longer holds a replaced version's
   rows, so it never rebuilds a released stripe; what a relocation moves
