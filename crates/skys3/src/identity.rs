@@ -36,6 +36,23 @@
 //! and registers the file does not name are kept. `delete` removes the
 //! named registers. Either one then increments the generation in
 //! `cluster.json` once, which announces the change to every node (§6.2).
+//! It does so even when it changed nothing: an earlier run whose writes
+//! landed but whose increment failed leaves registers that a rerun finds
+//! unchanged, and they still need announcing. A needless increment only
+//! makes the nodes list the registers again.
+//!
+//! **Issuers.** Nodes ignore an issuer that several providers name, so
+//! `put` refuses a provider whose issuer a register it does not name
+//! already allowlists. That check cannot see a concurrent `put` that adds
+//! another provider for the same issuer, and the two writes, to different
+//! registers, do not conflict. So `put` lists the providers again after
+//! its writes and fails, naming every register, if one of its issuers is
+//! now allowlisted twice: of two such runs, the one whose write landed
+//! last lists after both writes, so at least one reports it. The operator
+//! then deletes one of them. A reservation register per issuer would
+//! prevent the duplicate instead, but it would be a register kind of its
+//! own that the copies, the rebuild, and the identity sync would all have
+//! to know, for a race between two operators that the check reports.
 //!
 //! Writes use the control store's conditional writes
 //! ([`propose`](skys3_control::propose)), so a concurrent writer is never
@@ -100,6 +117,20 @@ pub enum IdentityError {
         issuer: String,
         /// The register that names it.
         key: RegisterKey,
+    },
+    /// After the writes, an issuer of the file is allowlisted by several
+    /// provider registers: another writer added one for it meanwhile. The
+    /// writes stay, and are announced; nodes ignore the issuer until all
+    /// but one of the registers are deleted.
+    #[error(
+        "issuer {issuer:?} is now allowlisted by provider registers {}: another writer added          one at the same time, and nodes ignore the issuer until all but one are deleted",
+        joined(.keys)
+    )]
+    IssuerDuplicated {
+        /// The issuer.
+        issuer: String,
+        /// Every provider register that names it.
+        keys: Vec<RegisterKey>,
     },
     /// A register kept changing under the command's writes.
     #[error("{0} kept changing while it was written; try again")]
@@ -276,10 +307,6 @@ impl Change {
             Change::Absent => "absent",
         }
     }
-
-    fn wrote(self) -> bool {
-        matches!(self, Change::Created | Change::Replaced | Change::Deleted)
-    }
 }
 
 /// What [`put`] or [`delete`] did.
@@ -287,9 +314,16 @@ impl Change {
 pub struct Applied {
     /// Each register the command named, in the order it was handled.
     pub changes: Vec<(RegisterKey, Change)>,
-    /// The generation that announces the changes, or `None` if nothing
-    /// changed.
-    pub generation: Option<Generation>,
+    /// The generation that announces the changes.
+    pub generation: Generation,
+}
+
+/// `keys`, separated by commas.
+fn joined(keys: &[RegisterKey]) -> String {
+    keys.iter()
+        .map(RegisterKey::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A register document whose content can be compared without its
@@ -326,10 +360,12 @@ impl Content for RoleDocument {
 /// # Errors
 ///
 /// [`IdentityError::IssuerTaken`] if a provider register the file does not
-/// name allowlists one of its issuers, [`IdentityError::Contended`] if a
-/// register keeps changing, and [`IdentityError::Store`] if the store
-/// fails or is not `cluster`'s. Registers written before an error stay
-/// written; running the command again finishes the job.
+/// name allowlists one of its issuers, and nothing is written;
+/// [`IdentityError::IssuerDuplicated`] if one does after the writes, which
+/// stay written and announced; [`IdentityError::Contended`] if a register
+/// keeps changing; and [`IdentityError::Store`] if the store fails or is
+/// not `cluster`'s. Registers written before an error stay written;
+/// running the command again finishes the job.
 pub async fn put<C: ControlStore>(
     store: &C,
     cluster: &ClusterId,
@@ -353,7 +389,9 @@ pub async fn put<C: ControlStore>(
         let change = write(store, &key, ids, retry, |id| role.document(id)).await?;
         changes.push((key.key().clone(), change));
     }
-    announce(store, cluster, ids, retry, changes).await
+    let applied = announce(store, cluster, ids, retry, changes).await?;
+    check_duplicates(store, file, retry).await?;
+    Ok(applied)
 }
 
 /// Deletes the provider registers `providers` and the roles `roles` from
@@ -400,37 +438,69 @@ fn invalid_key(kind: &'static str, name: &str, error: &KeyError) -> IdentityErro
     }
 }
 
-/// Refuses a file whose issuer a provider register it does not name
-/// already allowlists. Registers that do not parse name no issuer a node
-/// would use.
-async fn check_issuers<C: ControlStore>(
+/// The provider registers in `store` by the issuer each allowlists.
+/// Registers that do not parse name no issuer a node would use.
+async fn providers_by_issuer<C: ControlStore>(
     store: &C,
-    file: &IdentityFile,
     retry: &RetryPolicy,
-) -> Result<(), IdentityError> {
-    let issuers: BTreeSet<&str> = file
-        .providers
-        .values()
-        .map(|provider| provider.issuer.as_str())
-        .collect();
-    let named: BTreeSet<RegisterKey> = file
-        .providers
-        .keys()
-        .filter_map(|name| provider_key(name).ok().map(|key| key.key().clone()))
-        .collect();
+) -> Result<BTreeMap<String, Vec<RegisterKey>>, IdentityError> {
+    let mut issuers: BTreeMap<String, Vec<RegisterKey>> = BTreeMap::new();
     for (key, _) in store.list(&KeyPrefix::identity()).await? {
-        if !key.as_str().starts_with(PROVIDERS_PREFIX) || named.contains(&key) {
+        if !key.as_str().starts_with(PROVIDERS_PREFIX) {
             continue;
         }
         let Some(current) = get_with_retries(store, &key, retry).await? else {
             continue;
         };
-        if let Ok(document) = ProviderDocument::from_json(&current.value)
-            && issuers.contains(document.issuer.as_str())
-        {
+        if let Ok(document) = ProviderDocument::from_json(&current.value) {
+            issuers.entry(document.issuer).or_default().push(key);
+        }
+    }
+    Ok(issuers)
+}
+
+/// Refuses a file whose issuer a provider register it does not name
+/// already allowlists.
+async fn check_issuers<C: ControlStore>(
+    store: &C,
+    file: &IdentityFile,
+    retry: &RetryPolicy,
+) -> Result<(), IdentityError> {
+    let named: BTreeSet<RegisterKey> = file
+        .providers
+        .keys()
+        .filter_map(|name| provider_key(name).ok().map(|key| key.key().clone()))
+        .collect();
+    let existing = providers_by_issuer(store, retry).await?;
+    for provider in file.providers.values() {
+        let other = existing
+            .get(&provider.issuer)
+            .and_then(|keys| keys.iter().find(|key| !named.contains(*key)));
+        if let Some(key) = other {
             return Err(IdentityError::IssuerTaken {
-                issuer: document.issuer,
-                key,
+                issuer: provider.issuer.clone(),
+                key: key.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Fails if, after the writes, an issuer of `file` is allowlisted by more
+/// than one provider register (see the [module documentation](self)).
+async fn check_duplicates<C: ControlStore>(
+    store: &C,
+    file: &IdentityFile,
+    retry: &RetryPolicy,
+) -> Result<(), IdentityError> {
+    let existing = providers_by_issuer(store, retry).await?;
+    for provider in file.providers.values() {
+        if let Some(keys) = existing.get(&provider.issuer)
+            && keys.len() > 1
+        {
+            return Err(IdentityError::IssuerDuplicated {
+                issuer: provider.issuer.clone(),
+                keys: keys.clone(),
             });
         }
     }
@@ -488,7 +558,9 @@ async fn remove<C: ControlStore>(
     Err(IdentityError::Contended(key.clone()))
 }
 
-/// Increments the generation once if any of `changes` wrote something.
+/// Increments the generation once, whatever `changes` holds: registers an
+/// earlier run wrote without announcing them read as unchanged now (see
+/// the [module documentation](self)).
 async fn announce<C: ControlStore>(
     store: &C,
     cluster: &ClusterId,
@@ -496,11 +568,7 @@ async fn announce<C: ControlStore>(
     retry: &RetryPolicy,
     changes: Vec<(RegisterKey, Change)>,
 ) -> Result<Applied, IdentityError> {
-    let generation = if changes.iter().any(|(_, change)| change.wrote()) {
-        Some(skys3_control::bump_generation(store, cluster, ids, retry).await?)
-    } else {
-        None
-    };
+    let generation = skys3_control::bump_generation(store, cluster, ids, retry).await?;
     Ok(Applied {
         changes,
         generation,
@@ -740,7 +808,7 @@ mod tests {
                 ("identity/roles/reader.json".to_owned(), Change::Created),
             ]
         );
-        assert_eq!(applied.generation, Some(Generation::new(2)));
+        assert_eq!(applied.generation, Generation::new(2));
 
         // What a node's copy reads is what the file says.
         let copy = IdentityCopy::new(Arc::new(SystemWallClock), Duration::from_secs(60));
@@ -748,12 +816,12 @@ mod tests {
         assert_eq!(snapshot.providers(), [file.providers["ci"].clone()]);
         assert!(snapshot.role("builder").is_some() && snapshot.role("reader").is_some());
 
-        // The same file again changes nothing and announces nothing.
+        // The same file again changes nothing, and announces it anyway.
         let again = put(&store, &cluster, &file, &mut ids, &retry)
             .await
             .unwrap();
         assert!(again.changes.iter().all(|(_, c)| *c == Change::Unchanged));
-        assert_eq!(again.generation, None);
+        assert_eq!(again.generation, Generation::new(3));
 
         // A changed role is replaced; the others are left alone.
         let mut changed = file.clone();
@@ -769,7 +837,7 @@ mod tests {
                 ("identity/roles/reader.json".to_owned(), Change::Replaced),
             ]
         );
-        assert_eq!(applied.generation, Some(Generation::new(3)));
+        assert_eq!(applied.generation, Generation::new(4));
         let snapshot = copy.sync(&store, &retry).await.unwrap();
         assert_eq!(
             snapshot.providers().len(),
@@ -858,7 +926,7 @@ mod tests {
                 ("identity/roles/gone.json".to_owned(), Change::Absent),
             ]
         );
-        assert!(applied.generation.is_some());
+        assert_eq!(applied.generation, Generation::new(3));
         let left: Vec<_> = store
             .list(&KeyPrefix::identity())
             .await
@@ -878,7 +946,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(nothing.generation, None);
+        assert_eq!(nothing.generation, Generation::new(4));
         let error = delete(
             &store,
             &cluster,
@@ -896,6 +964,201 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// What [`Meddling`] does besides passing requests to its store.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Meddle {
+        /// Before the first provider write, another writer adds the
+        /// provider register `rival` for the same issuer, as a concurrent
+        /// `put` that passed the same issuer check would.
+        RivalProvider,
+        /// Every write of `cluster.json` fails as unavailable.
+        NoAnnouncement,
+    }
+
+    /// A memory store that does what its [`Meddle`] says.
+    #[derive(Clone, Debug)]
+    struct Meddling {
+        store: MemoryControlStore,
+        meddle: Meddle,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Meddling {
+        fn new(store: &MemoryControlStore, meddle: Meddle) -> Self {
+            Self {
+                store: store.clone(),
+                meddle,
+                done: Arc::default(),
+            }
+        }
+    }
+
+    impl ControlStore for Meddling {
+        type Changes = <MemoryControlStore as ControlStore>::Changes;
+
+        async fn get(
+            &self,
+            key: &RegisterKey,
+        ) -> Result<Option<skys3_control::Versioned>, ControlError> {
+            self.store.get(key).await
+        }
+
+        async fn put_if(
+            &self,
+            key: &RegisterKey,
+            expected: Expected,
+            value: Bytes,
+        ) -> Result<PutOutcome, ControlError> {
+            match self.meddle {
+                Meddle::RivalProvider
+                    if key.as_str().starts_with(PROVIDERS_PREFIX)
+                        && !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) =>
+                {
+                    let rival = ProviderDocument::new(
+                        OidcProvider::new(ISSUER, ["other"]),
+                        ProposalId::from_u128(99),
+                    );
+                    let key = provider_key("rival").unwrap();
+                    let outcome = propose_document(
+                        &self.store,
+                        &key,
+                        Expected::Absent,
+                        &rival,
+                        &RetryPolicy::default(),
+                    )
+                    .await?;
+                    assert!(matches!(outcome, ProposalOutcome::Accepted(_)));
+                }
+                Meddle::NoAnnouncement if *key == RegisterKey::cluster() => {
+                    return Err(ControlError::Unavailable("cluster.json is down".to_owned()));
+                }
+                _ => {}
+            }
+            self.store.put_if(key, expected, value).await
+        }
+
+        async fn delete_if(
+            &self,
+            key: &RegisterKey,
+            expected: &skys3_control::Version,
+        ) -> Result<skys3_control::DeleteOutcome, ControlError> {
+            self.store.delete_if(key, expected).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &KeyPrefix,
+        ) -> Result<Vec<(RegisterKey, skys3_control::Version)>, ControlError> {
+            self.store.list(prefix).await
+        }
+
+        async fn changes(&self, after: Generation) -> Result<Self::Changes, ControlError> {
+            self.store.changes(after).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_provider_for_the_same_issuer_is_reported() {
+        let (store, cluster, mut ids) = bootstrapped().await;
+        let retry = RetryPolicy::default();
+        let racing = Meddling::new(&store, Meddle::RivalProvider);
+        let file = parse(&file_json()).unwrap();
+        let error = put(&racing, &cluster, &file, &mut ids, &retry)
+            .await
+            .unwrap_err();
+        let IdentityError::IssuerDuplicated { issuer, keys } = &error else {
+            panic!("{error}");
+        };
+        assert_eq!(issuer, ISSUER);
+        let keys: Vec<_> = keys.iter().map(RegisterKey::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "identity/providers/ci.json",
+                "identity/providers/rival.json"
+            ]
+        );
+        assert!(error.to_string().contains("identity/providers/rival.json"));
+        // The writes stay, and are announced.
+        let generation = read_cluster(&store, &cluster, &retry)
+            .await
+            .unwrap()
+            .value
+            .generation;
+        assert_eq!(generation, Generation::new(2));
+        // Once the operator deletes one, a rerun succeeds.
+        delete(
+            &store,
+            &cluster,
+            &["rival".to_owned()],
+            &[],
+            &mut ids,
+            &retry,
+        )
+        .await
+        .unwrap();
+        put(&store, &cluster, &file, &mut ids, &retry)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rerun_announces_what_a_failed_run_wrote() {
+        let (store, cluster, mut ids) = bootstrapped().await;
+        let quick = RetryPolicy {
+            max_attempts: 2,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        };
+        let file = parse(&file_json()).unwrap();
+        let down = Meddling::new(&store, Meddle::NoAnnouncement);
+        let error = put(&down, &cluster, &file, &mut ids, &quick)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IdentityError::Store(ControlError::RetriesExhausted { .. })
+        ));
+        // The registers landed, unannounced.
+        assert_eq!(store.list(&KeyPrefix::identity()).await.unwrap().len(), 3);
+        let retry = RetryPolicy::default();
+        let applied = put(&store, &cluster, &file, &mut ids, &retry)
+            .await
+            .unwrap();
+        assert!(
+            applied
+                .changes
+                .iter()
+                .all(|(_, change)| *change == Change::Unchanged)
+        );
+        assert_eq!(applied.generation, Generation::new(2));
+
+        // The same holds for a delete.
+        let error = delete(
+            &down,
+            &cluster,
+            &[],
+            &["reader".to_owned()],
+            &mut ids,
+            &quick,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, IdentityError::Store(_)), "{error}");
+        let applied = delete(
+            &store,
+            &cluster,
+            &[],
+            &["reader".to_owned()],
+            &mut ids,
+            &retry,
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied.changes[0].1, Change::Absent);
+        assert_eq!(applied.generation, Generation::new(3));
     }
 
     #[tokio::test]

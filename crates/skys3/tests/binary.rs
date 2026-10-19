@@ -321,9 +321,15 @@ async fn the_command_line_manages_identity_registers() {
             .join("data/control/identity/roles/builder.json")
             .is_file()
     );
+    // A rerun changes nothing, and announces the registers again, in case
+    // the first run's announcement had failed.
     let output = put();
     assert!(output.status.success(), "{output:?}");
-    assert!(stdout(&output).ends_with("nothing changed\n"), "{output:?}");
+    assert_eq!(
+        stdout(&output),
+        "unchanged: identity/providers/ci.json\nunchanged: identity/roles/builder.json\n\
+         announced at generation 3; nodes follow it on their next sync\n"
+    );
 
     // An invalid file is a usage error, and writes nothing.
     std::fs::write(&file, r#"{"roles": {".bad": {"trust_policy": {}}}}"#).unwrap();
@@ -336,7 +342,7 @@ async fn the_command_line_manages_identity_registers() {
     assert_eq!(
         stdout(&output),
         "absent: identity/providers/gone.json\ndeleted: identity/roles/builder.json\n\
-         announced at generation 3; nodes follow it on their next sync\n"
+         announced at generation 4; nodes follow it on their next sync\n"
     );
     let output = delete(&["--role", "a/../b"]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");
