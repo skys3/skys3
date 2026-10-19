@@ -289,7 +289,7 @@ async fn stage<S, D: Disk>(
     let (mut stream, durable) = match staged.open().await.map_err(Failure::link)? {
         Ok(opened) => opened,
         Err(Ended::Aborted(reason, detail)) => {
-            return Err(Failure::Peer(format!("{reason:?}: {detail}")));
+            return Err(Failure::aborted(reason, &detail));
         }
         Err(Ended::Applied(outcome)) => return Err(Failure::Peer(format!("{outcome:?}"))),
     };

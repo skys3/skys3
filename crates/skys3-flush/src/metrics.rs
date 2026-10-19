@@ -13,6 +13,7 @@ use skys3_obs::MetricsRegistry;
 
 use crate::peer::{Transport, TransportStatus};
 use crate::reconcile::{DifferenceKind, ReconcileReport};
+use crate::refusal::{RefusalCode, Refusals};
 
 /// The label set of every flush metric: `bucket`, the bucket's name.
 type Labels = Vec<(String, String)>;
@@ -99,6 +100,10 @@ pub struct Gauges {
     pub inflight_bytes: u64,
     /// The base round trip of the target, in seconds; 0 until measured.
     pub base_round_trip: f64,
+    /// Keys a refusal holds up: their latest flush attempt was refused,
+    /// or the target's capability probe, which their flush waits for, was
+    /// (§7.6).
+    pub refused_keys: u64,
 }
 
 /// The flush metrics of a node.
@@ -114,6 +119,8 @@ pub struct FlushMetrics {
     inflight_bytes: Family<Labels, Gauge>,
     base_round_trip: Family<Labels, Gauge<f64, AtomicU64>>,
     throttles: Family<Labels, Counter>,
+    refusals: Family<Labels, Counter>,
+    refused_keys: Family<Labels, Gauge>,
     flushes: Family<Labels, Counter>,
     retries: Family<Labels, Counter>,
     conflicts: Family<Labels, Counter>,
@@ -142,6 +149,8 @@ impl Default for FlushMetrics {
             inflight_bytes: Family::default(),
             base_round_trip: Family::default(),
             throttles: Family::default(),
+            refusals: Family::default(),
+            refused_keys: Family::default(),
             flushes: Family::default(),
             retries: Family::default(),
             conflicts: Family::default(),
@@ -228,6 +237,20 @@ impl FlushMetrics {
             "Flush requests the remote target answered with a throttle (503 SlowDown, 429, or \
              a throttling code), each of which may shrink the flush concurrency.",
             metrics.throttles.clone(),
+        );
+        registry.register(
+            "flush_refusals",
+            "Flush attempts and capability probe runs the remote target refused, by code: a \
+             401 or 403 (AccessDenied, InvalidAccessKeyId, SignatureDoesNotMatch, or other), \
+             or a SkyS3 peer's native refused answer (refused). They are retried after a \
+             backoff.",
+            metrics.refusals.clone(),
+        );
+        registry.register(
+            "flush_refused_keys",
+            "Dirty keys a refusal holds up: their latest flush attempt was refused, or the \
+             target's capability probe, which their flush waits for, was. 0 once they flush.",
+            metrics.refused_keys.clone(),
         );
         registry.register(
             "flushes",
@@ -327,6 +350,18 @@ impl FlushMetrics {
         }
     }
 
+    /// The refusal counters of `bucket`'s flushers and probe, whose
+    /// target is `target` (§7.6). Every code's series exists from then on,
+    /// at 0 until a refusal is counted.
+    #[must_use]
+    pub fn refusals(&self, bucket: &str, target: &str) -> Refusals {
+        let counters = RefusalCode::ALL.map(|code| {
+            self.refusals
+                .get_or_create_owned(&code_labels(bucket, code))
+        });
+        Refusals::new(counters, target)
+    }
+
     /// Sets `bucket`'s gauges.
     pub fn set(&self, bucket: &str, gauges: Gauges) {
         let labels = labels(bucket);
@@ -356,6 +391,9 @@ impl FlushMetrics {
         self.base_round_trip
             .get_or_create(&labels)
             .set(gauges.base_round_trip);
+        self.refused_keys
+            .get_or_create(&labels)
+            .set(saturate(gauges.refused_keys));
     }
 
     /// Sets which transport `bucket`'s flushers use, if its target is a
@@ -418,6 +456,7 @@ impl FlushMetrics {
         self.concurrency.remove(&labels);
         self.inflight_bytes.remove(&labels);
         self.base_round_trip.remove(&labels);
+        self.refused_keys.remove(&labels);
     }
 }
 
@@ -429,6 +468,13 @@ fn kind_labels(bucket: &str, kind: DifferenceKind) -> Labels {
     vec![
         ("bucket".to_owned(), bucket.to_owned()),
         ("kind".to_owned(), kind.as_str().to_owned()),
+    ]
+}
+
+fn code_labels(bucket: &str, code: RefusalCode) -> Labels {
+    vec![
+        ("bucket".to_owned(), bucket.to_owned()),
+        ("code".to_owned(), code.as_str().to_owned()),
     ]
 }
 

@@ -85,7 +85,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 }
                 Applied::PreconditionFailed { current } => current,
                 Applied::Failed { error, reason } => {
-                    return Err(Failure::Peer(format!("{error:?}: {reason}")));
+                    return Err(Failure::applied(error, &reason));
                 }
             };
             precondition = match current {
@@ -230,9 +230,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             .map_err(Failure::link)?
         {
             super::upload::Ended::Applied(applied) => Ok(applied),
-            super::upload::Ended::Aborted(reason, detail) => {
-                Err(Failure::Peer(format!("{reason:?}: {detail}")))
-            }
+            super::upload::Ended::Aborted(reason, detail) => Err(Failure::aborted(reason, &detail)),
         }
     }
 
