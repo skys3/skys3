@@ -303,6 +303,12 @@ impl<N: Network, D: Disk> Replication<N, D> {
         self
     }
 
+    /// The node this service replicates for.
+    #[must_use]
+    pub fn node(&self) -> &NodeId {
+        &self.inner.node
+    }
+
     /// The node's shard replicas.
     #[must_use]
     pub fn set(&self) -> &ShardSet<D> {
