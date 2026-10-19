@@ -9,6 +9,7 @@
 //! | `GET /v1/buckets/<name>` | The status of one bucket, or 404. |
 //! | `GET /v1/buckets/<name>/conflicts` | The keys of the bucket that this node's flushers hold in conflict (§7.2). |
 //! | `POST /v1/buckets/<name>/conflicts/<policy>/<key>` | Resolves the conflict `key` is held in under `policy` (M4-06, below). |
+//! | `GET /v1/buckets/<name>/reconcile` | The bucket's reconciliation scans on this node (§9.1, M7-07, below). |
 //!
 //! Answers are JSON objects; later fields are added, never renamed. A
 //! bucket's status counts the objects and the unflushed entries (dirty,
@@ -84,6 +85,24 @@
 //! flusher's memory until the key's next flush succeeds: if the primary
 //! changes first, the new primary finds the conflict again and applies the
 //! bucket's policy, holding it for the operator again under `hold`.
+//!
+//! **Reconciliation** (§9.1, plan M7-07). `GET /v1/buckets/<name>/reconcile`
+//! answers the bucket's `name` and, where its `reconcile_interval_seconds`
+//! is set and it is a `write_back` bucket this node follows, `enabled`
+//! true with `interval_seconds`; `running_since_unix_ms` and `after`, the
+//! last key compared, while a scan runs; `error`, the scan's last request
+//! error until a request succeeds; and `last`, the last finished scan's
+//! report, `null` before one: `started_unix_ms` and `finished_unix_ms`,
+//! `shards` (those the node led throughout), `listed` (remote objects),
+//! `compared` (keys of those shards), `counts` by kind, `unconfirmed`
+//! (candidates past the report's 1,000 differences), and `differences`,
+//! each with its `key`, `shard`, `kind` (`remote_only`, `index_only`,
+//! `etag_mismatch`, or `size_mismatch`), `index` (`version`, `state`,
+//! `size`, `remote_etag`, `remote_version_id`; `null` for `remote_only`),
+//! and `remote` (`etag`, `size`, `version_id`, `write_identity`, and
+//! `writer`: `outside`, `own`, `foreign`, or `unknown`; `null` for
+//! `index_only`). Each node scans only the shards it leads, so an operator
+//! asks every node.
 
 use std::fmt;
 use std::future::Future;
@@ -96,7 +115,9 @@ use http::{Method, Response, StatusCode, header};
 use http_body_util::Full;
 use serde_json::{Value, json};
 use skys3_config::{ConflictPolicy, TargetTransport};
-use skys3_flush::{BucketStatus, FlushService, ProbeStatus, Transport, Unresolved};
+use skys3_flush::{
+    BucketStatus, Difference, FlushService, ProbeStatus, ReconcileStatus, Transport, Unresolved,
+};
 use skys3_gateway::{LocalShards, ShardRef};
 use skys3_index::ImportCheckpoint;
 use skys3_io::{Disk, SystemWallClock, WallClock};
@@ -140,6 +161,10 @@ pub trait Flushers: Send + Sync + 'static {
         key: &'a str,
         policy: ConflictPolicy,
     ) -> ResolveFuture<'a>;
+
+    /// The reconciliation scans of `bucket` on this node
+    /// ([`FlushService::reconciliation`]).
+    fn reconciliation(&self, bucket: &BucketId) -> Option<ReconcileStatus>;
 }
 
 impl<S: ObjectStore, D: Disk> Flushers for FlushService<S, D> {
@@ -154,6 +179,10 @@ impl<S: ObjectStore, D: Disk> Flushers for FlushService<S, D> {
         policy: ConflictPolicy,
     ) -> ResolveFuture<'a> {
         Box::pin(FlushService::resolve(self, bucket, key, policy))
+    }
+
+    fn reconciliation(&self, bucket: &BucketId) -> Option<ReconcileStatus> {
+        FlushService::reconciliation(self, bucket)
     }
 }
 
@@ -286,6 +315,38 @@ impl<D: Disk> NodeAdmin<D> {
         })
     }
 
+    /// The answer to `GET /v1/buckets/<name>/reconcile`.
+    fn reconciliation(&self, bucket: &BucketDocument) -> Value {
+        let status = self.flush.reconciliation(&bucket.bucket_id);
+        let mut answer = json!({
+            "bucket": bucket.name.as_str(),
+            "enabled": status.is_some(),
+        });
+        if let Some(status) = status {
+            answer["interval_seconds"] = json!(status.interval.as_secs());
+            answer["running_since_unix_ms"] = json!(status.running_since_ms);
+            answer["after"] = json!(status.after);
+            answer["error"] = json!(status.error);
+            answer["last"] = status.last.map_or(Value::Null, |report| {
+                let counts: serde_json::Map<String, Value> = skys3_flush::DifferenceKind::ALL
+                    .into_iter()
+                    .map(|kind| (kind.as_str().to_owned(), json!(report.count(kind))))
+                    .collect();
+                json!({
+                    "started_unix_ms": report.started_ms,
+                    "finished_unix_ms": report.finished_ms,
+                    "shards": report.shards.iter().map(|shard| shard.get()).collect::<Vec<_>>(),
+                    "listed": report.listed,
+                    "compared": report.compared,
+                    "counts": counts,
+                    "unconfirmed": report.unconfirmed,
+                    "differences": report.differences.iter().map(difference).collect::<Vec<_>>(),
+                })
+            });
+        }
+        answer
+    }
+
     /// The answer to `POST /v1/buckets/<name>/conflicts/<policy>/<key>`,
     /// with `rest` the path after `conflicts/`.
     async fn resolve(&self, bucket: &BucketDocument, rest: &str) -> Response<Full<Bytes>> {
@@ -373,6 +434,14 @@ impl<D: Disk> NodeAdmin<D> {
             }
             return Some(json_response(StatusCode::OK, &self.conflicts(&find(name)?)));
         }
+        if let Some(name) = route
+            .strip_prefix("buckets/")
+            .and_then(|rest| rest.strip_suffix("/reconcile"))
+            .filter(|name| !name.contains('/'))
+        {
+            let body = self.reconciliation(&find(name)?);
+            return Some(json_response(StatusCode::OK, &body));
+        }
         let body = match route {
             "health" => self.health().await,
             "buckets" => {
@@ -449,6 +518,29 @@ fn conflicts(status: &BucketStatus) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// One difference of a reconciliation report.
+fn difference(difference: &Difference) -> Value {
+    json!({
+        "key": difference.key,
+        "shard": difference.shard.get(),
+        "kind": difference.kind.as_str(),
+        "index": difference.index.as_ref().map(|index| json!({
+            "version": index.version.to_string(),
+            "state": format!("{:?}", index.state).to_ascii_lowercase(),
+            "size": index.size,
+            "remote_etag": index.remote_etag.as_str(),
+            "remote_version_id": index.remote_version_id,
+        })),
+        "remote": difference.remote.as_ref().map(|remote| json!({
+            "etag": remote.etag.as_str(),
+            "size": remote.size,
+            "version_id": remote.version_id,
+            "write_identity": remote.identity,
+            "writer": remote.writer.as_str(),
+        })),
+    })
 }
 
 /// The `flush` object of a bucket's status.

@@ -608,7 +608,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// stretch of `t` seconds commits more than `rate * (t + 1)` keys, however
 /// many streams there are and however slow the requests before it were.
 #[derive(Debug)]
-struct Throttle {
+pub(crate) struct Throttle {
     /// Keys a second.
     rate: f64,
     /// The most keys the bucket holds: a second's, and at least one.
@@ -619,7 +619,7 @@ struct Throttle {
 }
 
 impl Throttle {
-    fn new(keys_per_second: u64) -> Self {
+    pub(crate) fn new(keys_per_second: u64) -> Self {
         let capacity = keys_per_second.max(1);
         Self {
             rate: capacity as f64,
@@ -630,7 +630,7 @@ impl Throttle {
 
     /// Reserves `keys` keys, at most the capacity, and waits until they
     /// may be committed.
-    async fn admit(&self, keys: u64) {
+    pub(crate) async fn admit(&self, keys: u64) {
         let keys = keys.min(self.capacity) as f64;
         let wait = {
             let mut tokens = lock(&self.tokens);
@@ -683,17 +683,10 @@ impl<'a> Retry<'a> {
 }
 
 /// The `IMPORT` record of a listed object, or `None` for a key outside the
-/// prefix, the empty key, a key too long, one under the probe's scratch
-/// prefix or the index snapshots' directory (§8.9), or the peer
-/// descriptor's reserved key, which no SkyS3 gateway writes (§7.8).
+/// prefix or one the index does not mirror ([`mirrored`]).
 fn import_of(object: ListedObject, prefix: &str, wall: &dyn WallClock) -> Option<Import> {
     let key = object.key.strip_prefix(prefix)?;
-    if key.is_empty()
-        || key.len() > MAX_KEY_LEN
-        || key.starts_with(ConditionalProbe::SCRATCH_DIR)
-        || key.starts_with(crate::snapshot::SNAPSHOT_DIR)
-        || key == skys3_peer::DESCRIPTOR_KEY
-    {
+    if !mirrored(key) {
         return None;
     }
     Some(Import {
@@ -707,6 +700,18 @@ fn import_of(object: ListedObject, prefix: &str, wall: &dyn WallClock) -> Option
             .storage_class
             .filter(|class| !class.is_empty() && class.len() <= MAX_STORAGE_CLASS_LEN),
     })
+}
+
+/// Whether the remote key `key`, without the target's prefix, is one the
+/// index mirrors (§9.1): not empty or too long, and not under the probe's
+/// scratch prefix or the index snapshots' directory (§8.9), or the peer
+/// descriptor's reserved key, which no SkyS3 gateway writes (§7.8).
+pub(crate) fn mirrored(key: &str) -> bool {
+    !(key.is_empty()
+        || key.len() > MAX_KEY_LEN
+        || key.starts_with(ConditionalProbe::SCRATCH_DIR)
+        || key.starts_with(crate::snapshot::SNAPSHOT_DIR)
+        || key == skys3_peer::DESCRIPTOR_KEY)
 }
 
 /// Commits `imports` to their shards concurrently, through `commit`, and

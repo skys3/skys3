@@ -1246,6 +1246,16 @@ Until the import finishes, a local miss falls through to a remote HEAD, and LIST
 
 An optional periodic **reconciliation scan** re-lists the remote and reports differences. Under exclusive ownership there should be none.
 
+**The reconciliation scan, as built** (plan M7-07):
+
+- **Where and when.** A `write_back` bucket whose `reconcile_interval_seconds` is set, 0 (off) by default, is scanned by every node that leads one of its shards: it waits the interval, scans the shards whose primary it is and that serve, and waits again. Each node compares only those shards, whose index has applied every `FLUSHED` their flushers committed, so the scan follows primaries across failover as the flusher does (section 7.1); a shard that stops being led here during a scan is left out of its report. A node lists the whole prefix once per scan, whatever the number of its shards; a cluster lists it at most once per node.
+- **What differs.** A key is compared if the remote lists it or the index has an entry for it, it belongs to one of those shards, and the index mirrors it (not the probe's scratch keys, the snapshots' directory, or the peer descriptor). Only a clean or evicted entry says what the remote holds: `remote_only`, the remote holds an object the index has no entry for, once the shard's import progress has passed the key (before, the import creates its stub); `index_only`, a clean or evicted entry and no remote object; `etag_mismatch`, the remote's ETag is not the entry's `remote_etag`; `size_mismatch`, the same ETag and another size. A dirty entry, a tombstone, or a key in conflict is skipped: its flush is pending, and the flush's conditional request finds any out-of-band write there. Version IDs are not compared: `ListObjectsV2` returns none, and a HEAD of every key would multiply the scan's requests up to a thousandfold, so an out-of-band rewrite with the same bytes, which leaves the ETag and size, is not seen.
+- **Who wrote it.** A difference where the remote holds an object names its writer from the object's write identity: `outside` (none: a writer outside SkyS3), `own` (an identity of this cluster's bucket: a write of SkyS3's the index does not show, such as a request a deposed primary sent late), `foreign` (another cluster's or bucket's: another SkyS3 bucket writes the same prefix), or `unknown` (a `skys3-wid` value that is no identity). It is a property of the difference, not a kind of its own: a foreign object that matches the index is no difference.
+- **No false positives.** The listing and the index are read at different moments while flushes go on, so a candidate is confirmed before it is reported: a HEAD of the key, then a second read of its entry. It stands only if the entry still has the version and the expected remote state it was compared with (eviction changes neither), and what the HEAD found still differs from it; its kind is the HEAD's. A key written, flushed, or deleted in between is left to the next scan. A remote object whose identity names the key's own shard at a position after the shard's applied position when the scan read the entry is a write the scan raced with, an entry that came and went, and is not reported. The scan relies on the remote's read-after-write consistency, as the flusher's 412 check does (section 7.2).
+- **It changes nothing.** The scan sends only `ListObjectsV2` and `HeadObject`, and reads the index through a read-only interface that admits no client read and makes no clean payload recently used. It commits no record, writes nothing to the remote, and wakes no flusher; resolving a difference is the operator's (plan M7-05's runbook).
+- **Pacing.** Pages of 1,000 keys. Every request of a node's scans of one bucket waits for one token bucket of `reconcile_requests_per_second` (10 by default: about 10,000 keys a second, three hours for 100 million objects) and is sent one at a time, outside the flushers' adaptive window (section 7.7), whose latency samples a listing would distort. It yields to flushing: no request is sent while the flushers keep the target's window full. Errors are retried after the flusher's backoff. A scan confirms at most 1,000 differences; candidates past them are counted as unconfirmed, without a HEAD.
+- **The report.** `GET /v1/buckets/<name>/reconcile` on the admin API answers the node's last finished report (the shards it covered, keys listed and compared, the differences by kind, each with what the index and the remote hold and the writer, and the unconfirmed count) and the scan in progress. `skys3_reconcile_differences{bucket,kind}` holds each kind's count of the last finished scan, and `skys3_reconcile_scans_total{bucket}` counts scans. Each difference is logged as a warning, at most 100 per scan, with one line for the rest. Each node reports its own shards, so an operator asks every node, and sums the gauges across nodes.
+
 ### 9.2 GET and HEAD
 
 1. The gateway sends the request to the shard primary, which resolves the key under a valid lease. HEAD and conditional checks are answered here.
@@ -1669,6 +1679,7 @@ flush_part_bytes = 67108864
 flush_conflict_policy = "hold" # or "overwrite"; "discard_local" only in a write_back bucket's own table
 max_dirty_bytes = 2199023255552
 import_max_keys_per_second = 100000   # per bucket (section 9.1)
+reconcile_requests_per_second = 10    # per bucket and node: the reconciliation scan (section 9.1)
 target_region = "us-east-1"    # the region requests to write_back targets are signed for
 
 [ec]
@@ -1692,6 +1703,7 @@ ec_stripe_data_bytes = 67108864
 ec_after_seconds = 600
 backup_ack = "local"
 index_snapshot_interval_seconds = 3600
+reconcile_interval_seconds = 0  # write_back buckets: the wait between reconciliation scans; 0 is off (section 9.1)
 target_transport = "auto"     # "auto", "native" (QUIC to a SkyS3 peer), or "s3"
 # max_dirty_bytes = 549755813888   # the bucket's budget (section 7.6); defaults to flush.max_dirty_bytes
 freshness = "revalidate"      # read_only buckets (section 9.5): "revalidate" or "ttl"
