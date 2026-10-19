@@ -50,6 +50,7 @@ use skys3_types::{BucketDocument, BucketMode};
 
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::conditions::{last_modified, s3_etag};
+use crate::imports::{ImportProgress, progress_unknown, remote_of};
 use crate::remote::{RemoteError, RemoteReads};
 use crate::shard::Shards;
 use merge::{MergeError, MergedPage, RemoteSide};
@@ -68,6 +69,8 @@ pub(crate) struct Listings<H> {
     keys: ListTokenKeys,
     owner: Owner,
     remote: Option<Arc<dyn RemoteReads>>,
+    /// What the gateway knows of the shards' namespace imports (§9.1).
+    imports: ImportProgress,
 }
 
 /// The parameters V1 and V2 share.
@@ -123,7 +126,7 @@ struct Page {
 }
 
 impl<H: Shards> Listings<H> {
-    pub(crate) fn new(shards: H, config: &GatewayConfig) -> Self {
+    pub(crate) fn new(shards: H, config: &GatewayConfig, imports: ImportProgress) -> Self {
         Self {
             shards,
             keys: config.list_token_keys.clone(),
@@ -132,6 +135,7 @@ impl<H: Shards> Listings<H> {
                 display_name: None,
             },
             remote: config.remote.clone(),
+            imports,
         }
     }
 
@@ -271,18 +275,23 @@ impl<H: Shards> Listings<H> {
     /// keys while a `write_back` bucket's import runs (§9.1).
     async fn merge(&self, bucket: &BucketDocument, query: &ListQuery) -> S3Result<MergedPage> {
         // While a `write_back` bucket's import runs, the remote lists the
-        // keys the import has not reached (§9.1).
-        let remote = self
-            .remote
-            .as_deref()
-            .filter(|_| bucket.mode == BucketMode::WriteBack)
-            .and_then(|remote| match remote.import(&bucket.bucket_id)? {
+        // keys its shards' import progress has not passed (§9.1).
+        let remote = match remote_of(self.remote.as_ref(), bucket) {
+            None => None,
+            Some(remote) => match self
+                .imports
+                .bucket(&self.shards, bucket)
+                .await
+                .map_err(|error| progress_unknown(&error))?
+            {
                 ImportCheckpoint::Running { after } => Some(RemoteSide {
-                    remote,
+                    remote: &**remote,
+                    imports: &self.imports,
                     passed: after,
                 }),
                 ImportCheckpoint::Done => None,
-            });
+            },
+        };
         merge::list(&self.shards, bucket, query, remote)
             .await
             .map_err(merge_error)

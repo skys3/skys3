@@ -22,7 +22,7 @@ use skys3_gateway::{GatewayConfig, ShardPlacement, ShardRef};
 use skys3_index::{Entry, EntryState, ImportCheckpoint, Index, IndexReader, Payload};
 use skys3_io::{BlockingPool, Drift, MonotonicClock, SimDiskFaults, SimMount, SyncCut};
 use skys3_log::{LogConfig, LogRecord, RecordBody, RecordKind, SegmentId};
-use skys3_remote::{ObjectStore, PutObject};
+use skys3_remote::{DeleteObject, ObjectStore, PutObject};
 use skys3_shard::{CacheSettings, CompactionSettings, ReadSettings};
 use skys3_sim::check::{Survivors, Violation, check_durable, check_linearizable};
 use skys3_sim::history::{Call, Condition, History, Operation, Outcome};
@@ -51,6 +51,7 @@ use crate::peer::{
 use crate::peer_s3;
 use crate::pki::Pki;
 use crate::replication::register;
+use crate::s3;
 use crate::snapshots::{self, Drill, SnapshotAudit, Snapshots};
 use crate::workload::{Client, Routes, Timings, Workload, etag_of, single_put_etags};
 use crate::write_through::{self, RemoteAudit, WriteThrough, write_back_prefix};
@@ -197,6 +198,13 @@ pub struct ClusterConfig {
     /// probes, which need a run of requests to succeed, do not hold up
     /// the start.
     pub settle: Duration,
+    /// With [`ClusterConfig::settle`], whether the run deletes every key
+    /// of the workload's `write_back` buckets after the final reads, and,
+    /// once settled, puts an out-of-band object at each at the remote and
+    /// reads it through every node: each must answer `404`, since the
+    /// key's shard has passed it (§9.1), whatever the node holds of the
+    /// bucket. The objects are deleted again before the checks.
+    pub probe_deleted: bool,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -279,6 +287,7 @@ impl Default for ClusterConfig {
             remote_versioning: false,
             import_keys_per_second: None,
             settle: Duration::ZERO,
+            probe_deleted: false,
         }
     }
 }
@@ -969,6 +978,28 @@ impl<S: NodeServices> Cluster<S> {
         .with_large_objects(driver.large.clone());
         sim.client("verifier", reader.read_all(FINAL_READ_ATTEMPTS));
         self.drive(&mut sim, &mut driver, &history, true)?;
+        let probed: Vec<_> = routes
+            .keys(workload.keys)
+            .into_iter()
+            .filter(|(_, bucket, _)| bucket.mode == BucketMode::WriteBack)
+            .filter(|_| self.config.probe_deleted && !self.config.settle.is_zero())
+            .collect();
+        if !probed.is_empty() {
+            // Deleted now, each key's tombstone goes once its delete is
+            // flushed in the settle (§4.2).
+            let mut deleter = Client::new(
+                "deleter".to_owned(),
+                routes.clone(),
+                history.clone(),
+                workload.clone(),
+                context.fork_seed(),
+            );
+            let keys = probed.clone();
+            sim.client("deleter", async move {
+                deleter.delete_each(&keys, FINAL_READ_ATTEMPTS).await
+            });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
         if !self.config.settle.is_zero() {
             // The remote heals too: a node whose capability probe keeps
             // failing never starts its flushers (§7.2).
@@ -978,6 +1009,11 @@ impl<S: NodeServices> Cluster<S> {
                 tokio::time::sleep(settle).await;
                 Ok(())
             });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
+        if !probed.is_empty() {
+            let (remote, nodes) = (world.remote.clone(), routes.nodes.clone());
+            sim.client("prober", probe_deleted(remote, nodes, probed));
             self.drive(&mut sim, &mut driver, &history, true)?;
         }
         // Every committed change of a `local` bucket reaches its backup:
@@ -2325,6 +2361,62 @@ async fn fill_remote(
         }
     }
     Ok((initial, imported))
+}
+
+/// How many times the prober asks a node before it gives up on an answer.
+const PROBE_ATTEMPTS: usize = 40;
+
+/// For each of `keys`, deleted and settled: puts an out-of-band object at
+/// the remote, which the index no longer has a tombstone to hide, and
+/// reads the key through every one of `nodes`, which must each answer
+/// `404` (§9.1): the key's shard has passed it, so the remote's object is
+/// not the key's, whether or not the node holds a replica of the bucket
+/// or has seen its import progress. Then deletes the object again.
+async fn probe_deleted(
+    remote: SimS3,
+    nodes: Vec<NodeId>,
+    keys: Vec<(String, BucketDocument, String)>,
+) -> turmoil::Result {
+    for (name, bucket, key) in &keys {
+        let remote_key = format!("{}{key}", remote_prefix(bucket));
+        if remote.object(&remote_key).is_some() {
+            return Err(format!("{name}, deleted and settled, is still at the remote").into());
+        }
+        let body = format!("out of band {name}");
+        remote
+            .put_object(PutObject::new(remote_key.clone(), body))
+            .await?;
+        for node in &nodes {
+            let host = node.to_string();
+            let mut answered = false;
+            for _ in 0..PROBE_ATTEMPTS {
+                let request = http::Request::get(format!("/{}/{key}", bucket.name))
+                    .body(http_body_util::Full::new(bytes::Bytes::new()))?;
+                if let Ok(connection) = s3::connect(&host, Duration::from_secs(1)).await {
+                    match connection.send(request, Duration::from_secs(5)).await {
+                        Ok(response) if response.status() == http::StatusCode::NOT_FOUND => {
+                            answered = true;
+                            break;
+                        }
+                        Ok(response) if !response.status().is_server_error() => {
+                            return Err(format!(
+                                "{name}, deleted, reappeared through {host}: {}",
+                                response.status()
+                            )
+                            .into());
+                        }
+                        _ => {}
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if !answered {
+                return Err(format!("{host} never answered a read of {name}").into());
+            }
+        }
+        remote.delete_object(DeleteObject::new(remote_key)).await?;
+    }
+    Ok(())
 }
 
 /// Writes `cluster.json`, every bucket register, and every shard register,

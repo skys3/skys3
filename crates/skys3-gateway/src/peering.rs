@@ -1313,6 +1313,12 @@ mod tests {
         async fn entry(&self, s: &ShardRef, k: &str) -> Result<Option<Entry>, ShardError> {
             self.0.entry(s, k).await
         }
+        async fn import_progress(
+            &self,
+            s: &ShardRef,
+        ) -> Result<Option<(u64, skys3_index::ImportRanges)>, ShardError> {
+            self.0.import_progress(s).await
+        }
         async fn list(
             &self,
             s: &ShardRef,

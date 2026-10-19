@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{
-    Checkpointer, Entry, EntryState as IndexState, Index, IndexConfig, ListPage, ListQuery, Part,
-    Upload,
+    Checkpointer, Entry, EntryState as IndexState, ImportRanges, Index, IndexConfig, ListPage,
+    ListQuery, Part, Upload,
 };
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Delete, Extent, ExtentRef, Flushed, Put, PutData};
@@ -315,6 +315,14 @@ impl Shards for MemoryShards {
     async fn entry(&self, shard: &ShardRef, key: &str) -> Result<Option<Entry>, ShardError> {
         self.check(shard)?;
         self.local.entry(shard, key).await
+    }
+
+    async fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> Result<Option<(u64, ImportRanges)>, ShardError> {
+        self.check(shard)?;
+        self.local.import_progress(shard).await
     }
 
     async fn upload(

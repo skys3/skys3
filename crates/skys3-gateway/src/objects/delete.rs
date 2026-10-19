@@ -160,10 +160,11 @@ impl<H: Shards> Objects<H> {
                 let shard = ShardRef::for_key(bucket, &object.key);
                 let key = object.key.clone();
                 let (remote, bucket) = (self.remote.clone(), bucket.clone());
+                let imports = self.imports.clone();
                 pending.spawn(async move {
                     let mut outcome = Ok(None);
                     if condition != Precondition::None {
-                        let remote = remote.as_ref();
+                        let remote = remote.as_ref().map(|remote| (remote, &imports));
                         outcome = conditional_entry(&shards, remote, &bucket, &shard, &key).await;
                     }
                     let outcome = match outcome {

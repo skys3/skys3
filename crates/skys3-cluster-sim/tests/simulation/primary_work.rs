@@ -210,3 +210,30 @@ fn handoffs_move_flushes_and_the_import() {
         Ok(())
     });
 }
+
+/// Three nodes, the bucket's one shard on two of them: node 2 holds no
+/// replica of it, so it has seen none of the import's progress, though it
+/// reads the bucket's target. Once the import is done, every key is
+/// deleted, and the settle flushes the deletes and drops their
+/// tombstones, an out-of-band writer puts an object at each key. No node
+/// may serve it: the key's shard has passed the key (§9.1), and only its
+/// progress, asked of its primary, decides whether a read falls through
+/// to the remote ([`ClusterConfig::probe_deleted`]).
+#[test]
+fn a_node_without_a_replica_never_reads_a_passed_key_through() {
+    Runner::with_cost(3, COST).run(|context| {
+        let started = Instant::now();
+        let services = services(ReplicatedServices::new(fast()).with_takeover());
+        let config = ClusterConfig {
+            replicas: 2,
+            shards_per_bucket: 1,
+            probe_deleted: true,
+            ..config(3, 20)
+        };
+        let report_ =
+            cluster(config, &services).run(context, &workload(context, 30), &FaultPlan::none())?;
+        let done = report_.count(|o| *o == Outcome::Done);
+        report("probe", context.seed(), started, &services, done);
+        Ok(())
+    });
+}
