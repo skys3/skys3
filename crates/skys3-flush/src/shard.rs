@@ -816,7 +816,7 @@ async fn run<S: ObjectStore, D: Disk>(
                 Some(step) = staging.join_next(), if !staging.is_empty() => {
                     // A body is staged only once there is a target.
                     if let (Ok(step), Some(target)) = (step, &target) {
-                        bodies.finish(step, &target.settings);
+                        bodies.finish(step, target);
                     }
                 }
                 Some(recorded) = records.join_next(), if !records.is_empty() => {

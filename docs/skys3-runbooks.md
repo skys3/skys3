@@ -256,7 +256,9 @@ section 7.6).
    `target`, what was refused, and `at_unix_ms`. An `error` that starts with
    `probe:` means the target refuses the capability probe, so nothing has
    been flushed since the node started and every dirty key waits; one that
-   starts with a key means flushes are refused.
+   starts with `copy probe:` means only server-side copies are refused, so
+   copies are uploaded and no key waits; one that starts with a key means
+   that key's flush, or the staging of its streamed body, is refused.
 2. The code:
    - `InvalidAccessKeyId` or `SignatureDoesNotMatch`: the target does not
      know the node's access key, or the secret is wrong. The node takes its
