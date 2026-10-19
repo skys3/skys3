@@ -8143,6 +8143,103 @@ of this file. A task with nothing unexpected keeps "None."
   entry answers `503` rather than resolving again, as a GET would. There
   are no metrics for degraded reads yet.
 
+### M5-07 Fragment release and reclamation
+
+- **`EC_RELEASE` records what was told, not what was replaced.** §8.7
+  had a superseded version's fragments "released with an `EC_RELEASE`
+  record". Applying the replacing write (or an `EC_RELOCATE`, for the
+  locations it moves from) already knows the fragments, so it moves
+  them into a new `released` table of the shard's index on every
+  replica (index format 11, snapshot table 8), and a new primary takes
+  up what its predecessor left without a scan. The primary's
+  `Releaser` tells the nodes and then commits `EC_RELEASE` (log kind 16,
+  defined in log format 2 as reserved kinds may be) to remove the rows.
+  It was the last reserved kind, so the log and frame tests that used a
+  reserved kind as their example now use unknown kinds (20 for records,
+  19 for frames, whose kinds 13 to 15 are now `FragmentRelease`,
+  `FragmentHold`, and `FragmentNoted`). Recorded in §8.7 and §10.1.
+- **Rows name the stripe and index too.** The first rows named only
+  the key and the layout's version, which a node checks against the
+  fragment's header. On a replaced disk an ID can be assigned again,
+  possibly to another fragment of the same version placed there later
+  by a repair or move, which the release would then have taken. Rows,
+  releases on the wire, and the node's check now include the stripe
+  number and fragment index. Recorded in §8.7.
+- **Fragment holds are their own registrations.** Holder read
+  registrations (M2-18) pin log positions inside one node's `Reads`;
+  fragments live in node-local stores the shard knows nothing of. A
+  node's `FragmentHolds` keeps released fragments with the time it
+  learned of them, and holds keyed by the reading node (from its
+  certificate) and a registration number the reader picks. Holds
+  travel on the pooled fragment-read connections. `read_coded`
+  registers before its first fetch and renews from a task it owns, so
+  the gateway needs no change: holds come with a source built with
+  `FragmentReadClient::with_holds`, which M5-06's hook expected in
+  `objects/coded.rs`.
+- **The delay starts when the node learns of the release.** Counting
+  from the commit would compare clocks of two nodes (§2.3). The node's
+  own time of learning is later, so the delay only grows. Release times
+  and holds are kept in memory; after a restart orphan reclamation
+  finds the fragment again and releases it, at the cost of
+  `fragment_orphan_after_seconds`.
+- **Orphans take the same path.** M5-05's reclaimer dropped an orphan at
+  once; its judge also calls a replaced version's fragments orphans, so
+  a read holding the old plan could lose them under it.
+  `OrphanReclaimer::with_holds` releases orphans through the holds
+  instead, and stops asking about fragments already released.
+- **Compaction copies through the committer.** A copy is a second kind
+  of commit request (`Record::Copy`), so it shares group commits and
+  the rule that only the committer appends, to the last segment. The
+  copy becomes the fragment's location only if the map still locates it
+  where compaction read it, so a reclaim racing a copy wins. `locate`
+  now takes the segment's file while it holds the map lock (lock order
+  map, segments, dead), so a read cannot locate a fragment in a segment
+  that compaction removes before the read opens it.
+- **Simulations need inline pools.** A shard opened with a threaded
+  `BlockingPool` let the paused clock run ahead while the index worked,
+  so runs did not replay; the release scenario opens the shard and the
+  releaser with `BlockingPool::inline`.
+- **Scenarios, seeds, and cost.** In `skys3-ec`'s simulation target, at
+  CI's 256 seeds in a debug build: compaction crashes (cost 4, 64 seeds,
+  each a power cut before and after, and a process kill, at every sync of
+  the reclaims and the compaction) in 36 s; a read holding an old plan
+  across release and compaction (cost 1, 256 seeds) in 20 s. The whole
+  target takes 71 s with the scenarios M5-02 added.
+  On about half the seeds the holds to one to four nodes are lost for a
+  minute; a few of those reads fail cleanly, the rest decode around the
+  lost fragments. The seeded bugs are caught: `RemoveBeforeCopy` by a
+  power cut after the directory sync, `IgnoreHolds` and `NoDelay` by a
+  read that held its fragments failing.
+- **The release scenario runs on a paused clock, deliberately.** Its
+  fragment source is in memory with no transport, so nothing waits on
+  real time and every seed replays exactly.
+- **`ec_release` has a corpus of its own.** Seeds built from the test
+  vectors (valid bodies, no entries, 256 and 257, unsorted, duplicate,
+  malformed IDs, keys, buckets, and indices, and an `EC_RELEASE` record
+  body), fuzzed for 120 s and minimized with `cargo fuzz cmin` and
+  `-use_counters=0`: 136 files, 10 KiB. `fuzz/run.sh` gives the target a
+  `max_len` of 8 KiB, which a release of 256 fragments fits; the bounds
+  themselves have a unit test.
+- **Later tasks checked.** Repair (M5-08) lists only what the
+  `fragments` table names, which no longer holds a replaced version's
+  rows, so it never rebuilds a released stripe; what a relocation moves
+  from is now released (§8.6). Moves (M5-09) no longer wait for orphan
+  reclamation to retire the fragment they leave (§8.3). Lifecycle
+  expirations (M5-10) are deletes and release like them. The restore
+  drill (M5-11) installs only the namespace and fragment rows, so a
+  restored shard's released rows are left to orphan reclamation, and a
+  location restored from an older snapshot may name a fragment released
+  since, which reads as missing and is repaired (§8.9). M6-06 reads
+  replicas only. The security review (M7-08) lists the new message kinds
+  and the new `ec_release` fuzz target; `index_codec` also decodes
+  released rows.
+- **Left open.** The node binary runs no fragment stores yet (M5-04), so
+  no releaser or sweep runs in it, and the cluster simulation's coding
+  world does not run them either. The sweep interval is the caller's;
+  there is no setting. A node the topology lists but that never answers
+  keeps its rows pending until it leaves the topology, and there is no
+  metric for that backlog.
+
 ### M5-08 Repair
 
 - **When is a node lost?** The plan said "when a node is lost" and left
@@ -8797,6 +8894,13 @@ of this file. A task with nothing unexpected keeps "None."
 - **A paused clock gives every report the same time.** The tests use a
   manual wall clock, so reports' start times could not tell scans apart;
   the status gained `scans`, the count of finished scans.
+- **A report claimed shards it had stopped comparing (review).** A
+  confirmation that found the primary stepped down, or whose second index
+  read failed, skipped its candidate but kept the shard, so the report
+  listed the shard as covered with differences missing; on the last page
+  nothing checked again. Both now drop the shard for the rest of the scan,
+  as a failed page read did, and the scan stops listing once no shard is
+  left, instead of fetching every remaining page.
 - **No cluster-simulation scenario.** The scan writes nothing, so a
   scenario would check only the absence of reports under faults, which the
   flush crate's workload test does in under a second. The simulation jobs'

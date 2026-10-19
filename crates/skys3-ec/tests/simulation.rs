@@ -18,7 +18,22 @@
 //! A further test seeds bugs (acknowledging before the sync, never syncing
 //! the directory, and skipping recovery's syncs) and checks that the
 //! scenarios catch each of them.
+//!
+//! Fragment release and reclamation (plan M5-07) adds two scenarios:
+//!
+//! - [`compaction`]: power cuts and process crashes at every sync of a
+//!   fragment-segment compaction lose no live fragment.
+//! - [`release`]: a coded read that holds an old plan across the release
+//!   of its fragments and the compaction of their segments delivers the
+//!   old version or fails cleanly, and everything released is reclaimed.
+//!
+//! Each catches its seeded bugs: removing a segment before its copies are
+//! durable, and nodes that ignore holds or the release delay.
 
+#[path = "simulation/compaction.rs"]
+mod compaction;
+#[path = "simulation/release.rs"]
+mod release;
 mod support;
 
 use std::ops::Range;
@@ -27,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use rand::Rng;
 use skys3_ec::fragment::FragmentHeader;
+use skys3_ec::release::HoldsBug;
 use skys3_ec::{FragmentId, FragmentStore, SeededBug};
 use skys3_io::{Disk, SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_sim::{Runner, SimContext};
@@ -286,6 +302,55 @@ fn the_scenarios_catch_seeded_bugs() {
         let caught = (0..8).find_map(|seed| scenario(&mut SimContext::new(seed), Some(bug)).err());
         assert!(caught.is_some(), "{bug:?} was not caught");
     }
+}
+
+/// Each compaction seed runs about this many typical seeds' worth.
+const COMPACTION_COST: u64 = 4;
+
+/// Each release seed runs about this many typical seeds' worth.
+const RELEASE_COST: u64 = 1;
+
+#[test]
+fn crashes_at_every_sync_of_a_compaction_lose_no_live_fragment() {
+    Runner::with_cost(4, COMPACTION_COST)
+        .run(|context| compaction::crashes(context, None).map_err(Into::into));
+}
+
+#[test]
+fn reads_holding_an_old_plan_outlive_its_release_and_compaction() {
+    Runner::with_cost(8, RELEASE_COST)
+        .run(|context| release::scenario(context, None).map_err(Into::into));
+}
+
+#[test]
+fn the_release_scenarios_catch_seeded_bugs() {
+    let caught = (0..8).find_map(|seed| {
+        compaction::crashes(
+            &mut SimContext::new(seed),
+            Some(SeededBug::RemoveBeforeCopy),
+        )
+        .err()
+    });
+    assert!(caught.is_some(), "RemoveBeforeCopy was not caught");
+    for bug in [HoldsBug::IgnoreHolds, HoldsBug::NoDelay] {
+        let caught =
+            (0..16).find_map(|seed| release::scenario(&mut SimContext::new(seed), Some(bug)).err());
+        assert!(caught.is_some(), "{bug:?} was not caught");
+    }
+}
+
+#[test]
+fn compactions_and_releases_replay_exactly() {
+    let first = compaction::uncut(3);
+    assert!(
+        first.2.as_ref().is_some_and(|report| report.segments > 0),
+        "{first:?}"
+    );
+    assert_eq!(compaction::uncut(3), first);
+    let plan = release::Plan::draw(&mut SimContext::new(3));
+    let outcome = release::run(&plan, None).unwrap();
+    assert!(outcome.released > 0);
+    assert_eq!(release::run(&plan, None).unwrap(), outcome);
 }
 
 #[test]
