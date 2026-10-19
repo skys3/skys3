@@ -194,6 +194,13 @@ pub(crate) struct NodeSettings {
     /// The `read_only` buckets' origin, if the run has one (§9.5): the
     /// gateways then read origins as the node binary does.
     pub origin: Option<Origin>,
+    /// Whether the gateways read `write_back` targets for keys the import
+    /// has not passed (§9.1), as the node binary does. Off unless the
+    /// remote holds objects to import: a gateway that has not yet seen its
+    /// bucket's import progress, as after a restart, reads through, which
+    /// would serve the out-of-band writes some runs make at keys the index
+    /// has dropped.
+    pub remote_reads: bool,
     /// The SkyS3 peer the buckets flush to over the native protocol, if
     /// any.
     pub peer: Option<Peer>,
@@ -415,7 +422,9 @@ pub(crate) async fn run<S: NodeServices>(
     gateway_config.origin_validations = OriginValidations::new();
     // Reads of `write_back` targets for keys the import has not reached,
     // and of origins (§9.1, §9.5).
-    gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
+    if settings.remote_reads || settings.origin.is_some() {
+        gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
+    }
     if let Some(origin) = &settings.origin {
         match origin.bug {
             Some(OriginBug::SkipRevalidation) => {

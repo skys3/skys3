@@ -4000,6 +4000,12 @@ of this file. A task with nothing unexpected keeps "None."
   - A conditional write of a key that the import has not passed costs a
     remote HEAD.
   - The binary still commits imports to its local shards (M2-08b).
+  - A gateway decides whether the import passed a key from the progress
+    its own node's replicas applied, not the key's shard's. A node that
+    has not seen any (just restarted, or holding no replica of the
+    bucket) reads a missing key through to the remote. That is correct
+    under exclusive ownership, but serves an out-of-band object at a key
+    the index dropped; asking the key's primary would close it.
 - **Merged with the review stack (found in merging).** The stack's later
   flush paths needed the same two guards:
   - server-side copies (M4-07) and the `overwrite` policy's unconditional
@@ -4014,6 +4020,13 @@ of this file. A task with nothing unexpected keeps "None."
     resumed by a new primary from the index (upload takeover), and their
     completion goes through the conditional write, so they needed
     nothing new; backup targets (M4-09) use the same flushers.
+  - The simulated gateways read the remote only in runs whose remote
+    holds objects to import (`ClusterConfig::remote_objects`). With
+    reads on everywhere, the `discard_local` conflict scenario failed at
+    seed 1: a gateway that had not yet seen its bucket's import progress
+    read through to the remote at a key whose tombstone was gone, and
+    served the out-of-band writer's object. Under exclusive ownership the
+    remote holds nothing there; see Left open.
   - The import stall that M4-06 found (an import that commits only to the
     shards its node leads) is fixed: the import runs on the owner and
     commits through `Commit` to each shard's primary. The conflict

@@ -2191,6 +2191,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         evict_local: shape.backup.evicts_local(),
         snapshots: shape.snapshots.is_some(),
         origin: shape.origin.clone(),
+        remote_reads: shape.remote_objects > 0,
         peer: shape.peer,
         peer_side: None,
     })
