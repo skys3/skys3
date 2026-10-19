@@ -113,6 +113,8 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 (None, true) => WritePrecondition::IfAbsent,
             };
             let request = request.clone().with_precondition(precondition);
+            // Only a primary that holds its leases writes the remote (§7.1).
+            self.shard.check_readable()?;
             let error = match self.target.store.copy_object(request).await {
                 Ok(output) => {
                     self.target.counters.copies.inc();

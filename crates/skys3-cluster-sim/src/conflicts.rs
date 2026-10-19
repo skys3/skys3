@@ -252,7 +252,7 @@ pub(crate) struct Writer {
     pub history: History,
     pub workload: Workload,
     pub flushers: Arc<Flushers>,
-    /// The cluster's nodes, every one of which runs an import.
+    /// The cluster's nodes, every one of which shows the import's progress.
     pub nodes: usize,
 }
 
@@ -263,11 +263,13 @@ const IMPORT_LIMIT: Duration = Duration::from_secs(30);
 /// keys of the `write_back` buckets, each after a pause of up to
 /// `think_time`. Counts the writes the store applied in `phase`.
 ///
-/// It starts once every node's namespace import of the `write_back`
-/// buckets is done, or after [`IMPORT_LIMIT`]. A node imports only into
-/// the shards it leads, so an import that finds an object of a shard
-/// another node leads waits for it forever (plan M2-17); the remote holds
-/// only SkyS3's flushes, which no import meets, until the imports end.
+/// It starts once every node shows the namespace import of the
+/// `write_back` buckets done, or after [`IMPORT_LIMIT`]: an object the
+/// import lists becomes the key's remote state, not a conflict (§9.1), so
+/// the remote holds only SkyS3's flushes until the import ends. Since plan
+/// M2-17 the import runs on the primary of each bucket's shard 0 and
+/// commits to every shard's primary, so it no longer stalls on shards
+/// another node leads.
 pub(crate) async fn writer(
     writer: Writer,
     writes: usize,

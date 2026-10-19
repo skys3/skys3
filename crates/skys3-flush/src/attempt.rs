@@ -422,6 +422,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         }
         if self.resolution == Some(ConflictPolicy::Overwrite) {
             // The local delete wins over whatever the remote holds.
+            self.shard.check_readable()?;
             let request = DeleteObject::new(self.remote_key());
             self.target
                 .store
@@ -531,7 +532,12 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         info.metadata
             .write_identity()
             .and_then(|value| value.parse::<WriteIdentity>().ok())
-            .is_some_and(|wid| self.of_shard(&wid) && wid.position > version)
+            .is_some_and(|wid| self.wrote_after(&wid, version))
+    }
+
+    /// Whether `wid` names a write of this shard from after `version`.
+    pub(crate) fn wrote_after(&self, wid: &WriteIdentity, version: EpochSeq) -> bool {
+        self.of_shard(wid) && wid.position > version
     }
 
     /// Whether `wid` names a write of this shard.

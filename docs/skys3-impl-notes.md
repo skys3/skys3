@@ -3896,8 +3896,10 @@ of this file. A task with nothing unexpected keeps "None."
   at most 256 ranges.
   - For each shard, the state machine keeps the progress with the highest
     `update` in the index table `import_progress`. That table is index
-    format 7, and snapshots carry it as table code 4. Stale or
-    out-of-order progress is rejected.
+    format 10 (format 7 when first written, renumbered when the review
+    stack's formats 7 to 9 merged in), and snapshots carry it as table
+    code 7. Index snapshots of a `write_back` shard (M4-11) keep the row.
+    Stale or out-of-order progress is rejected.
   - After each page, the owner commits the progress to shard 0 on its own
     replica first, then to the other shards through `Commit`. In the
     simulation `Commit` is the gateway's routing; in the binary it is the
@@ -3998,6 +4000,25 @@ of this file. A task with nothing unexpected keeps "None."
   - A conditional write of a key that the import has not passed costs a
     remote HEAD.
   - The binary still commits imports to its local shards (M2-08b).
+- **Merged with the review stack (found in merging).** The stack's later
+  flush paths needed the same two guards:
+  - server-side copies (M4-07) and the `overwrite` policy's unconditional
+    delete (M4-06) check the shard's leases before they write, and a copy
+    that finds a later write identity of the shard retries later;
+  - native `COMMIT`s to a SkyS3 peer (M6-06) check the leases before each
+    send, and a destination that holds a later write of the shard ends
+    the attempt with `Failure::Later` instead of a conflict;
+  - the `discard_local` policy (M4-06) never adopts a later write of the
+    shard;
+  - streamed puts and their remote uploads (M4-01 to M4-03) were already
+    resumed by a new primary from the index (upload takeover), and their
+    completion goes through the conditional write, so they needed
+    nothing new; backup targets (M4-09) use the same flushers.
+  - The import stall that M4-06 found (an import that commits only to the
+    shards its node leads) is fixed: the import runs on the owner and
+    commits through `Commit` to each shard's primary. The conflict
+    simulation still waits for the import before its out-of-band writer,
+    which an object the import lists needs anyway.
 - **Size.** About 1,170 lines of non-test code added (net +840), with
   the cluster-simulation harness counted.
 
