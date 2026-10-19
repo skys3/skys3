@@ -2,9 +2,10 @@
 #
 #   promtool test rules skys3-alerts.test.yml
 #
-# CI runs them with the pinned prom/prometheus image (docs/skys3-metrics.md,
-# section 4). Each case feeds synthetic series, one sample a minute, and
-# checks which alerts fire when.
+# CI runs them with promtool from a pinned Prometheus release
+# (scripts/ci/promtool.sh; docs/skys3-metrics.md, section 4). Each case
+# feeds synthetic series, one sample a minute, and checks which alerts fire
+# when.
 
 rule_files:
   - skys3-alerts.yml

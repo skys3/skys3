@@ -431,7 +431,9 @@ jobs:
   # trust store, which the node's OIDC fetcher reads, and the peering
   # scenario drops UDP with iptables through sudo. When the suite fails,
   # its directory (logs, configurations, and data directories) is
-  # uploaded.
+  # uploaded. The job also checks the alerting rules and runs their unit
+  # tests with promtool from a pinned Prometheus release, which takes
+  # seconds (scripts/ci/promtool.sh).
   e2e:
     name: End-to-end suite
     needs: changes
@@ -453,6 +455,9 @@ jobs:
         with:
           key: e2e
           cache-on-failure: true
+
+      - name: Check the alerting rules
+        run: sh scripts/ci/promtool.sh
 
       - name: Find the MinIO version
         id: minio

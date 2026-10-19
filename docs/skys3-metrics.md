@@ -322,16 +322,13 @@ that every node is scraped by a job named `skys3`.
 | `SkyS3FragmentsUnrepaired` | warning | 15m | `fragment-repair` | A lost fragment has waited over an hour for repair (`skys3_oldest_unrepaired_age_seconds`). |
 
 The tests parse the file, check each rule's fields against this table, and
-check that each expression reads only metrics listed here. CI's `docs` job also
+check that each expression reads only metrics listed here. CI's `e2e` job also
 runs `promtool check rules` on the file and `promtool test rules` on
 [`deploy/prometheus/skys3-alerts.test.yml`](../deploy/prometheus/skys3-alerts.test.yml),
 whose cases fire alerts from synthetic series (`SkyS3FlushRefused` so far),
-with the pinned `prom/prometheus` image:
-
-```sh
-docker run --rm -v "$PWD/deploy/prometheus:/rules:ro" -w /rules --entrypoint promtool \
-    prom/prometheus:v3.5.0 test rules skys3-alerts.test.yml
-```
+with promtool from a pinned Prometheus release whose checksum it verifies
+([`scripts/ci/promtool.sh`](../scripts/ci/promtool.sh), which runs on any
+linux-amd64 host). A new rule should get a case there.
 
 ## 5. Dashboard
 
