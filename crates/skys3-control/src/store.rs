@@ -10,6 +10,30 @@ use skys3_types::{ClusterId, Generation, NodeId, RegisterError};
 
 use crate::key::{KeyError, KeyPrefix, RegisterKey};
 
+/// The largest register value, in bytes: 1 MiB.
+///
+/// Register documents are a few hundred bytes to a few kilobytes; the
+/// largest, a role with its policies, stays far below this. Every backend
+/// refuses to write a larger value, and refuses one it reads before it
+/// buffers it, so that a control store holding a huge object (a provider
+/// fault, or a writer of the control bucket) cannot exhaust a node's
+/// memory: the S3 backend reads at most one byte past the bound, and the
+/// file backend checks each file's length (design §6.1). etcd's message
+/// limit bounds its answers, and its backend applies the same bound.
+pub const MAX_REGISTER_BYTES: usize = 1 << 20;
+
+/// Refuses a value of `len` bytes for `key` if it is over
+/// [`MAX_REGISTER_BYTES`].
+pub(crate) fn check_register_len(key: &RegisterKey, len: u64) -> Result<(), ControlError> {
+    if len > MAX_REGISTER_BYTES as u64 {
+        return Err(ControlError::TooLarge {
+            key: key.clone(),
+            len,
+        });
+    }
+    Ok(())
+}
+
 /// The version of a register's value: an S3 ETag, an etcd `mod_revision`,
 /// or a backend's own counter or content hash.
 ///
@@ -251,6 +275,16 @@ pub enum ControlError {
         #[source]
         source: RegisterError,
     },
+    /// A register value is over [`MAX_REGISTER_BYTES`]: a write of one is
+    /// refused before it is sent, and a read that finds one fails before
+    /// the value is buffered. Nothing was written.
+    #[error("register {key} is {len} bytes, over the {MAX_REGISTER_BYTES}-byte limit")]
+    TooLarge {
+        /// The register.
+        key: RegisterKey,
+        /// The value's length; for a read, at least how long it is.
+        len: u64,
+    },
     /// The store holds a key outside the register-key grammar.
     #[error(transparent)]
     InvalidKey(#[from] KeyError),
@@ -372,6 +406,14 @@ mod tests {
             last: Box::new(ControlError::Unavailable("down".into())),
         };
         assert!(exhausted.may_have_applied() && !exhausted.is_retryable());
+        let cluster = RegisterKey::cluster();
+        let large = check_register_len(&cluster, MAX_REGISTER_BYTES as u64 + 1).unwrap_err();
+        assert!(!large.is_retryable() && !large.may_have_applied());
+        assert_eq!(
+            large.to_string(),
+            "register cluster.json is 1048577 bytes, over the 1048576-byte limit"
+        );
+        assert!(check_register_len(&cluster, MAX_REGISTER_BYTES as u64).is_ok());
         assert_eq!(
             exhausted.to_string(),
             "gave up on cluster.json after 3 attempts: \

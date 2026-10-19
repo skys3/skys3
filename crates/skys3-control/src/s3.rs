@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_remote::{
-    DeleteObject, GetObject, ListObjectsV2, ObjectStore, PutObject, S3Error, S3ErrorKind,
-    WritePrecondition,
+    ByteRange, DeleteObject, GetObject, GetOutput, ListObjectsV2, ObjectStore, PutObject, S3Error,
+    S3ErrorKind, WritePrecondition,
 };
 use skys3_types::{ETag, Generation};
 
 use crate::feed::ChangeFeed;
 use crate::key::{KeyError, KeyPrefix, RegisterKey};
 use crate::store::{
-    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version,
-    Versioned,
+    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, MAX_REGISTER_BYTES,
+    PutOutcome, Version, Versioned, check_register_len,
 };
 
 /// Where an [`S3ControlStore`] keeps its registers, and how often its
@@ -40,11 +40,18 @@ pub struct S3StoreConfig {
 ///
 /// | Operation | S3 request |
 /// |---|---|
-/// | `get` | `GetObject` |
+/// | `get` | `GetObject` with `Range: bytes=0-<MAX_REGISTER_BYTES>` |
 /// | `put_if` | `PutObject` with `If-None-Match: *` or `If-Match: <etag>` |
 /// | `delete_if` | `DeleteObject` with `If-Match: <etag>` |
 /// | `list` | `ListObjectsV2` under the prefix, page by page |
 /// | `changes` | `GetObject` of `cluster.json` with `If-None-Match: <etag>` every poll interval |
+///
+/// Reads ask for at most one byte past
+/// [`MAX_REGISTER_BYTES`](crate::MAX_REGISTER_BYTES), so a store that
+/// holds a huge object at a register key costs a node no more than that
+/// (`AwsS3` refuses a longer body from its `Content-Length` before reading
+/// it), and the read fails with [`ControlError::TooLarge`]. Writes of
+/// larger values are refused before they are sent.
 ///
 /// A register's version is its object's ETag. Answers map to the
 /// [`ControlStore`] contract:
@@ -172,17 +179,43 @@ impl<O: ObjectStore> S3ControlStore<O> {
         let Ok(etag) = ETag::new(version.as_str()) else {
             return self.get(key).await.map(Polled::Changed);
         };
-        let request = GetObject::new(self.object_key(key)).with_if_none_match(etag);
+        let request = self.read_request(key).with_if_none_match(etag);
         match self.shared.objects.get_object(request).await {
-            Ok(output) => Ok(Polled::Changed(Some(Versioned {
-                value: output.body,
-                version: version_of(&output.info.etag),
-            }))),
+            Ok(output) => Ok(Polled::Changed(Some(register(key, output)?))),
             Err(error) if error.kind() == S3ErrorKind::NotModified => Ok(Polled::Unchanged),
             Err(error) if error.kind() == S3ErrorKind::NoSuchKey => Ok(Polled::Changed(None)),
-            Err(error) => Err(control_error(None, error)),
+            Err(error) => Err(read_error(key, error)),
         }
     }
+
+    /// A read of a register: a ranged `GetObject` of at most one byte past
+    /// [`MAX_REGISTER_BYTES`], so that the store refuses a larger body
+    /// before buffering it, and [`register`] refuses a larger object.
+    fn read_request(&self, key: &RegisterKey) -> GetObject {
+        let mut request = GetObject::new(self.object_key(key));
+        request.range = ByteRange::inclusive(0, MAX_REGISTER_BYTES as u64);
+        request
+    }
+}
+
+/// The register a ranged read of `key` returned, or
+/// [`ControlError::TooLarge`] if the object is longer than
+/// [`MAX_REGISTER_BYTES`].
+fn register(key: &RegisterKey, output: GetOutput) -> Result<Versioned, ControlError> {
+    check_register_len(key, output.info.size.max(output.body.len() as u64))?;
+    Ok(Versioned {
+        value: output.body,
+        version: version_of(&output.info.etag),
+    })
+}
+
+/// Maps a failed read of `key`. A ranged read of an empty object is
+/// answered with `416`: no register is empty, so it is an invalid one.
+fn read_error(key: &RegisterKey, error: S3Error) -> ControlError {
+    if error.kind() == S3ErrorKind::InvalidRange {
+        return ControlError::Rejected(format!("register {key} is an empty object"));
+    }
+    control_error(None, error)
 }
 
 /// The version of an object with `etag`.
@@ -227,14 +260,10 @@ impl<O: ObjectStore> ControlStore for S3ControlStore<O> {
     type Changes = S3Changes<O>;
 
     async fn get(&self, key: &RegisterKey) -> Result<Option<Versioned>, ControlError> {
-        let request = GetObject::new(self.object_key(key));
-        match self.shared.objects.get_object(request).await {
-            Ok(output) => Ok(Some(Versioned {
-                value: output.body,
-                version: version_of(&output.info.etag),
-            })),
+        match self.shared.objects.get_object(self.read_request(key)).await {
+            Ok(output) => Ok(Some(register(key, output)?)),
             Err(error) if error.kind() == S3ErrorKind::NoSuchKey => Ok(None),
-            Err(error) => Err(control_error(None, error)),
+            Err(error) => Err(read_error(key, error)),
         }
     }
 
@@ -244,6 +273,7 @@ impl<O: ObjectStore> ControlStore for S3ControlStore<O> {
         expected: Expected,
         value: Bytes,
     ) -> Result<PutOutcome, ControlError> {
+        check_register_len(key, value.len() as u64)?;
         let precondition = match &expected {
             Expected::Absent => WritePrecondition::IfAbsent,
             Expected::Version(version) => match if_match(version) {
