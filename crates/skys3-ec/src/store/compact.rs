@@ -24,6 +24,7 @@
 //! file handle.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use skys3_io::{Disk, SegmentFile};
@@ -179,28 +180,40 @@ impl<D: Disk> FragmentStore<D> {
             let last = segments.keys().next_back().copied();
             let referenced = map.values().any(|located| located.segment == segment);
             if referenced || last == Some(segment) {
-                false
+                None
             } else {
                 self.shared.dead().remove(&segment);
-                segments.remove(&segment).is_some()
+                segments.remove(&segment)
             }
         };
-        if !removed {
+        let Some(file) = removed else {
             return Ok(false);
-        }
-        self.drop_segment(segment).await?;
+        };
+        self.unlink(segment, Some(file)).await?;
         Ok(true)
     }
 
-    /// Removes `segment`'s file and syncs the directory.
+    /// Drops `segment` from the store, then removes its file and syncs the
+    /// directory.
     async fn drop_segment(&self, segment: u64) -> Result<(), FragmentError> {
-        self.shared.segments().remove(&segment);
+        let file = self.shared.segments().remove(&segment);
+        self.unlink(segment, file).await
+    }
+
+    /// Removes the file of `segment`, which the store no longer lists, and
+    /// syncs the directory. If the file cannot be removed, `file` goes back
+    /// into the store, so a later pass compacts the segment again instead
+    /// of leaving its file on the disk until a restart.
+    async fn unlink(&self, segment: u64, file: Option<Arc<D::File>>) -> Result<(), FragmentError> {
         let name = segment_name(segment);
-        let removing = async {
-            self.disk.remove(&name).await?;
-            self.disk.sync_dir().await
-        };
-        removing
+        if let Err(source) = self.disk.remove(&name).await {
+            if let Some(file) = file {
+                self.shared.restore_segment(segment, file);
+            }
+            return Err(FragmentError::Remove { name, source });
+        }
+        self.disk
+            .sync_dir()
             .await
             .map_err(|source| FragmentError::Remove { name, source })
     }
