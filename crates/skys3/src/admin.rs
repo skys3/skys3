@@ -93,8 +93,9 @@
 //! last key compared, while a scan runs; `error`, the scan's last request
 //! error until a request succeeds; and `last`, the last finished scan's
 //! report, `null` before one: `started_unix_ms` and `finished_unix_ms`,
-//! `shards` (those the node led throughout), `listed` (remote objects),
-//! `compared` (keys of those shards), `counts` by kind, `unconfirmed`
+//! `shards` (those the node led and could read throughout), `listed`
+//! (remote objects), `compared` (keys of those shards), `counts` by kind,
+//! `unconfirmed`
 //! (candidates past the report's 1,000 differences), and `differences`,
 //! each with its `key`, `shard`, `kind` (`remote_only`, `index_only`,
 //! `etag_mismatch`, or `size_mismatch`), `index` (`version`, `state`,

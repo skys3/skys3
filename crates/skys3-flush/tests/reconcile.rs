@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use skys3_config::Config;
 use skys3_flush::{
-    DifferenceKind, FlushMetrics, FlushService, FlushSettings, ReconcileReport, RemoteWriter,
+    DifferenceKind, FlushMetrics, FlushService, FlushSettings, ProbeStatus, ReconcileReport,
+    RemoteWriter,
 };
 use skys3_index::{Entry, EntryState};
 use skys3_io::{ManualWallClock, SimMount};
@@ -152,11 +153,26 @@ impl World {
             let status = self.service.status(&bucket().bucket_id).unwrap();
             let imported = status
                 .import
+                .as_ref()
                 .is_some_and(|import| import.checkpoint == skys3_index::ImportCheckpoint::Done);
-            if unclean == held && imported {
+            // The probe of server-side copies writes scratch keys of its
+            // own after flushing starts.
+            let probed = matches!(
+                status.probe,
+                ProbeStatus::Done {
+                    server_side_copy: true,
+                    ..
+                }
+            );
+            // A held key has had its conflicting flush sent.
+            let conflicts: usize = status.shards.iter().map(|(_, s)| s.conflicts.len()).sum();
+            if unclean == held && conflicts == held && imported && probed {
                 return;
             }
-            assert!(!patience.is_exhausted(), "the flush did not settle");
+            assert!(
+                !patience.is_exhausted(),
+                "the flush did not settle: {status:?}"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -275,7 +291,13 @@ fn out_of_band_changes_appear_in_the_report_and_the_scan_changes_nothing() {
         // The scan changed nothing: not the index, not the remote, and it
         // started no flush.
         assert_eq!(world.index().await, before);
-        assert_eq!(world.store.apply_by_times().len(), writes);
+        let after = world.store.apply_by_times();
+        assert_eq!(
+            after.len(),
+            writes,
+            "{:?}",
+            &after[writes.min(after.len())..]
+        );
         assert_eq!(world.store.keys(), keys);
         let text = world.registry.encode().unwrap();
         assert!(text.contains(&flushes), "{flushes} changed:\n{text}");

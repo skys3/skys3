@@ -186,7 +186,9 @@ pub struct ReconcileReport {
     /// When it finished.
     pub finished_ms: u64,
     /// The shards it compared from start to end: those the node led and
-    /// served throughout.
+    /// served throughout, and whose index it could read throughout. A
+    /// shard left out may still have differences in the report, confirmed
+    /// before it was dropped, but others of it may be missing.
     pub shards: Vec<ShardId>,
     /// Remote objects listed under the prefix.
     pub listed: u64,
@@ -642,6 +644,10 @@ impl<'a, S: ObjectStore> Scan<'a, S> {
                 self.compare_page(&page, bound.as_deref()).await;
                 job.state().after = bound;
             }
+            // Nothing is left to compare the rest of the listing with.
+            if self.cursors.is_empty() {
+                break;
+            }
             match page.next_continuation_token.filter(|_| page.is_truncated) {
                 Some(next) => token = Some(next),
                 None => break,
@@ -657,7 +663,15 @@ impl<'a, S: ObjectStore> Scan<'a, S> {
     async fn compare_page(&mut self, page: &ListObjectsV2Output, bound: Option<&str>) {
         let job = self.job;
         let led = job.inputs.led();
-        self.cursors.retain(|id, _| led.contains_key(id));
+        let lost: Vec<ShardId> = self
+            .cursors
+            .keys()
+            .filter(|id| !led.contains_key(id))
+            .copied()
+            .collect();
+        for id in lost {
+            self.drop_shard(id, "the node no longer leads it");
+        }
         let bucket = &job.bucket;
         // The page's objects of each shard compared, in key order.
         let mut remote: BTreeMap<ShardId, VecDeque<(&str, Listed<'_>)>> = BTreeMap::new();
@@ -679,9 +693,7 @@ impl<'a, S: ObjectStore> Scan<'a, S> {
                 let chunk = match cursor.chunk(bound, page_keys).await {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        tracing::warn!(bucket = bucket.name.as_str(), shard = %id, %error,
-                            "the reconciliation scan stops reading a shard");
-                        self.cursors.remove(&id);
+                        self.drop_shard(id, error);
                         break;
                     }
                 };
@@ -752,11 +764,16 @@ impl<'a, S: ObjectStore> Scan<'a, S> {
         let Some(cursor) = self.cursors.get(&candidate.shard) else {
             return;
         };
-        let Ok(after) = cursor.shard.peek(&candidate.key).await else {
-            return;
+        let after = match cursor.shard.peek(&candidate.key).await {
+            Ok(after) => after,
+            Err(error) => {
+                self.drop_shard(candidate.shard, error);
+                return;
+            }
         };
         // Only a primary that serves has applied every `FLUSHED`.
         if !self.job.inputs.leads(candidate.shard) {
+            self.drop_shard(candidate.shard, "the node no longer leads it");
             return;
         }
         let (cluster, bucket) = (&self.job.cluster, &self.job.bucket);
@@ -786,6 +803,20 @@ impl<'a, S: ObjectStore> Scan<'a, S> {
             );
         }
         self.report.differences.push(difference);
+    }
+
+    /// Stops comparing `shard` for the rest of the scan, which then does
+    /// not count it as covered: its report leaves the shard out of
+    /// [`ReconcileReport::shards`], whatever it confirmed before.
+    fn drop_shard(&mut self, shard: ShardId, why: impl std::fmt::Display) {
+        if self.cursors.remove(&shard).is_some() {
+            tracing::warn!(
+                bucket = self.job.bucket.name.as_str(),
+                %shard,
+                reason = %why,
+                "the reconciliation scan stops comparing a shard"
+            );
+        }
     }
 
     /// One listing page, after `token` if given, retried until it succeeds.
@@ -1240,5 +1271,201 @@ mod tests {
         assert_eq!(report.count(DifferenceKind::RemoteOnly), 2);
         assert_eq!(report.count(DifferenceKind::IndexOnly), 0);
         assert_eq!(report.count(DifferenceKind::SizeMismatch), 1);
+    }
+
+    /// What a test shard's second read of an entry does.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Peek {
+        /// Reads the entry.
+        Reads,
+        /// Fails.
+        Fails,
+        /// Reads it, while the shard's primary steps down.
+        StepsDown,
+    }
+
+    /// A shard replica of the bucket `b-a` whose index holds `entries`.
+    struct TestShard {
+        shard: ShardRef,
+        entries: Vec<(String, Entry)>,
+        leads: std::sync::atomic::AtomicBool,
+        reads_fail: bool,
+        peek: Peek,
+    }
+
+    impl TestShard {
+        fn new(entries: Vec<(String, Entry)>, reads_fail: bool, peek: Peek) -> Arc<Self> {
+            Arc::new(Self {
+                shard: ShardRef::new(bucket(), ShardId::new(0)),
+                entries,
+                leads: std::sync::atomic::AtomicBool::new(true),
+                reads_fail,
+                peek,
+            })
+        }
+
+        fn failure(&self) -> ShardError {
+            ShardError::NotFound(self.shard.clone())
+        }
+    }
+
+    impl ShardReader for TestShard {
+        fn shard_ref(&self) -> &ShardRef {
+            &self.shard
+        }
+
+        fn leads(&self) -> bool {
+            self.leads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn applied(&self) -> EpochSeq {
+            position(100)
+        }
+
+        fn entries(
+            &self,
+            after: Option<String>,
+            limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<(String, Entry)>, ShardError>> {
+            let read = if self.reads_fail {
+                Err(self.failure())
+            } else {
+                Ok(self
+                    .entries
+                    .iter()
+                    .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
+                    .take(limit)
+                    .cloned()
+                    .collect())
+            };
+            Box::pin(async move { read })
+        }
+
+        fn peek<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<Entry>, ShardError>> {
+            Box::pin(async move {
+                match self.peek {
+                    Peek::Fails => return Err(self.failure()),
+                    Peek::StepsDown => {
+                        self.leads.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Peek::Reads => {}
+                }
+                Ok(self
+                    .entries
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, entry)| entry.clone()))
+            })
+        }
+
+        fn import_progress(&self) -> BoxFuture<'_, Result<Option<ImportRanges>, ShardError>> {
+            Box::pin(async {
+                Ok(Some(ImportRanges::from(
+                    skys3_index::ImportCheckpoint::Done,
+                )))
+            })
+        }
+    }
+
+    /// Scans `shard` once, over a remote under `p/` holding `objects`, a
+    /// page of one key at a time; returns the report and the requests the
+    /// remote received.
+    fn scan(shard: Arc<TestShard>, objects: &[&str]) -> (ReconcileReport, u64) {
+        use skys3_remote::PutObject;
+        use skys3_sim::SimS3;
+        use skys3_sim::s3::SimS3Config;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = SimS3::new(1, SimS3Config::default());
+            for key in objects {
+                let request = PutObject::new(format!("p/{key}"), "x");
+                store.put_object(request).await.unwrap();
+            }
+            let before = store.stats().requests;
+            let inputs = Arc::new(ScanInputs::default());
+            inputs.set(vec![shard as Arc<dyn ShardReader>], Ready::new(None));
+            let job = ScanJob {
+                bucket: BucketDocument {
+                    bucket_id: bucket(),
+                    name: skys3_types::BucketName::new("photos").unwrap(),
+                    mode: skys3_types::BucketMode::WriteBack,
+                    shards: skys3_types::ShardCount::new(1).unwrap(),
+                    replicas: 1,
+                    min_write_replicas: 1,
+                    clean_copies: 1,
+                    target: None,
+                    created_unix_ms: 0,
+                    lifecycle: None,
+                    proposal_id: skys3_types::ProposalId::new("p-1").unwrap(),
+                },
+                cluster: cluster(),
+                store: Arc::new(store.clone()),
+                prefix: "p/".to_owned(),
+                inputs: Arc::clone(&inputs),
+                interval: Duration::from_secs(1),
+                settings: FlushSettings {
+                    reconcile_page_keys: 1,
+                    reconcile_requests_per_second: 1000,
+                    ..FlushSettings::default()
+                },
+                wall: Arc::new(skys3_io::ManualWallClock::new(Duration::from_secs(1))),
+                state: Arc::new(ScanState::default()),
+                metrics: FlushMetrics::default(),
+            };
+            let throttle = Throttle::new(1000);
+            let report = Scan::new(&job, &throttle, inputs.led()).run().await;
+            (report, store.stats().requests - before)
+        })
+    }
+
+    #[test]
+    fn a_scan_covers_a_shard_it_compared_throughout() {
+        let shard = TestShard::new(
+            vec![("a".to_owned(), clean(1, "aaa", 1))],
+            false,
+            Peek::Reads,
+        );
+        let (report, _) = scan(shard, &["a", "b"]);
+        assert_eq!(report.shards, [ShardId::new(0)]);
+        // "a" differs in ETag, "b" is the remote's only.
+        let kinds: Vec<_> = report.differences.iter().map(|d| d.kind).collect();
+        assert_eq!(
+            kinds,
+            [DifferenceKind::EtagMismatch, DifferenceKind::RemoteOnly]
+        );
+    }
+
+    #[test]
+    fn a_shard_whose_primary_steps_down_during_a_confirmation_is_not_covered() {
+        // The only candidate is on the last page, after which nothing
+        // checks leadership again.
+        let shard = TestShard::new(Vec::new(), false, Peek::StepsDown);
+        let (report, _) = scan(shard, &["b"]);
+        assert_eq!(report.shards, []);
+        assert!(report.differences.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_shard_whose_confirming_read_fails_is_not_covered() {
+        let shard = TestShard::new(Vec::new(), false, Peek::Fails);
+        let (report, _) = scan(shard, &["b"]);
+        assert_eq!(report.shards, []);
+        assert!(report.differences.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn listing_stops_once_every_shard_is_dropped() {
+        // Pages of one key: three pages, but the shard's index fails on
+        // the first, so only it is listed.
+        let shard = TestShard::new(Vec::new(), true, Peek::Reads);
+        let (report, requests) = scan(shard, &["a", "b", "c"]);
+        assert_eq!(report.shards, []);
+        assert_eq!(report.listed, 1);
+        assert_eq!(requests, 1, "one ListObjectsV2, no HEAD");
     }
 }

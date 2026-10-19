@@ -8797,6 +8797,13 @@ of this file. A task with nothing unexpected keeps "None."
 - **A paused clock gives every report the same time.** The tests use a
   manual wall clock, so reports' start times could not tell scans apart;
   the status gained `scans`, the count of finished scans.
+- **A report claimed shards it had stopped comparing (review).** A
+  confirmation that found the primary stepped down, or whose second index
+  read failed, skipped its candidate but kept the shard, so the report
+  listed the shard as covered with differences missing; on the last page
+  nothing checked again. Both now drop the shard for the rest of the scan,
+  as a failed page read did, and the scan stops listing once no shard is
+  left, instead of fetching every remaining page.
 - **No cluster-simulation scenario.** The scan writes nothing, so a
   scenario would check only the absence of reports under faults, which the
   flush crate's workload test does in under a second. The simulation jobs'
