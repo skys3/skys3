@@ -259,6 +259,24 @@ Each `[identity.static_credentials.<name>]` table is one static access key, for 
 | `secret_access_key_file` | path | Not empty. A file holding the secret access key, read when the gateway starts: 32 to 128 visible ASCII characters, optionally followed by a line ending. |
 | `policy` | string (JSON policy) | The policy that authorizes the credential's requests. |
 
+**OIDC providers and roles** are not configuration keys: they are cluster state, the control store's `identity/` registers, which every node follows (design §6.1, §11). Operators write them with `skys3 control identity put [--config <path>] --file <identity.json>`, which creates or replaces each provider and role the file names and leaves the others, and remove them with `skys3 control identity delete [--config <path>] [--provider <name>]... [--role <name>]...`. Both reach the control store through the configuration's `[control_store]`, check the whole request before writing, and print what changed. The file is JSON, at most 1 MiB:
+
+```json
+{
+  "providers": {
+    "ci": {"issuer": "https://token.example", "audiences": ["sts.amazonaws.com"]}
+  },
+  "roles": {
+    "builder": {
+      "trust_policy": {"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "https://token.example"}, "Action": "sts:AssumeRoleWithWebIdentity"}},
+      "policies": [{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::builds/*"}}]
+    }
+  }
+}
+```
+
+A provider takes `issuer`, `audiences`, and optionally `authorized_parties` and `algorithms` (default `["RS256"]`); its name is that of its register, `identity/providers/<name>.json`. A role takes a `trust_policy` and up to 10 `policies`, each a JSON object or a string holding one; its name follows the role-name rules (design §11). With `backend = "file"`, the store belongs to its node: run the command while the node is stopped, after its first start, and the node follows the change when it starts again.
+
 ## `[admin]`
 
 The admin HTTP listener: metrics, health, and the admin API.

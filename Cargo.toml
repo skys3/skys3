@@ -89,3 +89,12 @@ zeroize = "1.9.0"
 # thousands of stripes (skys3-ec), so the codec is optimized in dev builds.
 [profile.dev.package.reed-solomon-simd]
 opt-level = 3
+
+# The end-to-end suite's build (tests/e2e/run.sh, CI's `e2e` job): the node
+# binary at opt-level 1, which compiles about as fast as a debug build but
+# moves the suite's objects several times faster, without debug info.
+[profile.e2e]
+inherits = "dev"
+opt-level = 1
+debug = false
+incremental = false

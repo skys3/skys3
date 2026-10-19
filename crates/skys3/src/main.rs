@@ -6,6 +6,8 @@
 //! skys3 control export [--config <path>] [--output <path>]
 //! skys3 control rebuild [--config <path>] --from <export>... [--lost <node-id>]...
 //!                       [--allow-unnamed] [--prefer <node-id>] [--dry-run]
+//! skys3 control identity put [--config <path>] --file <identity.json>
+//! skys3 control identity delete [--config <path>] [--provider <name>]... [--role <name>]...
 //! ```
 //!
 //! It loads and validates the configuration (default
@@ -22,12 +24,18 @@
 //! `--allow-unnamed` rebuilds although shards holding objects belong to
 //! no bucket of the newest copy; `--prefer` names the node whose copy is
 //! rebuilt when the copies of the newest generation differ.
+//!
+//! `control identity put` writes the OIDC providers and roles of an
+//! identity file into the control store, and `control identity delete`
+//! removes the named ones (`skys3::identity`). With the file control
+//! store, the node must be stopped, and follows the change when it starts.
 
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use skys3::identity::{IdentityError, Request};
 use skys3::{Node, log_config};
 use skys3_config::Config;
 use skys3_control::{ControlExport, RebuildError, RebuildOptions};
@@ -39,7 +47,9 @@ const DEFAULT_CONFIG: &str = "/etc/skys3/skys3.toml";
 const USAGE: &str = "usage: skys3 [--config <path>] [--check-config]
        skys3 control export [--config <path>] [--output <path>]
        skys3 control rebuild [--config <path>] --from <export>... [--lost <node-id>]...
-                             [--allow-unnamed] [--prefer <node-id>] [--dry-run]";
+                             [--allow-unnamed] [--prefer <node-id>] [--dry-run]
+       skys3 control identity put [--config <path>] --file <identity.json>
+       skys3 control identity delete [--config <path>] [--provider <name>]... [--role <name>]...";
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +73,13 @@ enum Command {
         prefer: Option<String>,
         dry_run: bool,
     },
+    /// Write the providers and roles of an identity file.
+    IdentityPut { file: Option<PathBuf> },
+    /// Delete identity registers.
+    IdentityDelete {
+        providers: Vec<String>,
+        roles: Vec<String>,
+    },
 }
 
 /// A usage mistake: the message and the usage, with exit code 2.
@@ -71,7 +88,7 @@ fn usage(message: impl std::fmt::Display) -> (String, ExitCode) {
 }
 
 /// The command a command line starts with: `control export`, `control
-/// rebuild`, or serving.
+/// rebuild`, `control identity put` or `delete`, or serving.
 fn command(
     args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
 ) -> Result<Command, (String, ExitCode)> {
@@ -88,8 +105,19 @@ fn command(
             prefer: None,
             dry_run: false,
         }),
+        Some("identity") => match args.next().as_deref() {
+            Some("put") => Ok(Command::IdentityPut { file: None }),
+            Some("delete") => Ok(Command::IdentityDelete {
+                providers: Vec::new(),
+                roles: Vec::new(),
+            }),
+            Some(other) => Err(usage(format!("unknown identity command {other:?}"))),
+            None => Err(usage("control identity needs a command: put or delete")),
+        },
         Some(other) => Err(usage(format!("unknown control command {other:?}"))),
-        None => Err(usage("control needs a command: export or rebuild")),
+        None => Err(usage(
+            "control needs a command: export, rebuild, or identity",
+        )),
     }
 }
 
@@ -115,6 +143,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, (String, ExitC
             ("--allow-unnamed", Command::Rebuild { allow_unnamed, .. }) => *allow_unnamed = true,
             ("--prefer", Command::Rebuild { prefer, .. }) => *prefer = Some(value("--prefer")?),
             ("--dry-run", Command::Rebuild { dry_run, .. }) => *dry_run = true,
+            ("--file" | "-f", Command::IdentityPut { file }) => {
+                *file = Some(PathBuf::from(value("--file")?));
+            }
+            ("--provider", Command::IdentityDelete { providers, .. }) => {
+                providers.push(value("--provider")?);
+            }
+            ("--role", Command::IdentityDelete { roles, .. }) => roles.push(value("--role")?),
             ("--help" | "-h", _) => return Err((USAGE.to_owned(), ExitCode::SUCCESS)),
             ("--version" | "-V", _) => {
                 return Err((
@@ -129,6 +164,19 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, (String, ExitC
         && from.is_empty()
     {
         return Err(usage("control rebuild needs at least one --from <export>"));
+    }
+    match &command {
+        Command::IdentityPut { file: None } => {
+            return Err(usage("control identity put needs --file <identity.json>"));
+        }
+        Command::IdentityDelete { providers, roles }
+            if providers.is_empty() && roles.is_empty() =>
+        {
+            return Err(usage(
+                "control identity delete needs at least one --provider or --role",
+            ));
+        }
+        _ => {}
     }
     Ok(Args { config, command })
 }
@@ -205,6 +253,47 @@ fn main() -> ExitCode {
             prefer.as_deref(),
             dry_run,
         )),
+        Command::IdentityPut { file } => {
+            let file = file.expect("parse_args requires --file");
+            match skys3::identity::read_file(&file) {
+                Ok(file) => runtime.block_on(identity(&config, Request::Put(file))),
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        Command::IdentityDelete { providers, roles } => {
+            runtime.block_on(identity(&config, Request::Delete { providers, roles }))
+        }
+    }
+}
+
+/// `skys3 control identity put` and `delete`: applies `request` to the
+/// identity registers and prints what changed, one register a line.
+async fn identity(config: &Config, request: Request) -> ExitCode {
+    match skys3::identity::run(config, &request).await {
+        Ok(applied) => {
+            for (key, change) in &applied.changes {
+                println!("{}: {key}", change.as_str());
+            }
+            match applied.generation {
+                Some(generation) => println!(
+                    "announced at generation {}; nodes follow it on their next sync",
+                    generation.get()
+                ),
+                None => println!("nothing changed"),
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error @ IdentityError::Invalid { .. }) => {
+            eprintln!("{error}");
+            ExitCode::from(2)
+        }
+        Err(error) => {
+            eprintln!("the identity registers were not changed as asked: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -418,5 +507,55 @@ mod tests {
             }
         );
         assert!(parse(&["control", "rebuild", "--from", "a.json", "--prefer"]).is_err());
+    }
+
+    #[test]
+    fn identity_commands_are_parsed() {
+        let args = parse(&[
+            "control", "identity", "put", "-c", "/x.toml", "--file", "i.json",
+        ])
+        .ok()
+        .unwrap();
+        assert_eq!(args.config, PathBuf::from("/x.toml"));
+        assert_eq!(
+            args.command,
+            Command::IdentityPut {
+                file: Some(PathBuf::from("i.json"))
+            }
+        );
+        let args = parse(&[
+            "control",
+            "identity",
+            "delete",
+            "--provider",
+            "ci",
+            "--role",
+            "a",
+            "--role",
+            "b",
+        ])
+        .ok()
+        .unwrap();
+        assert_eq!(
+            args.command,
+            Command::IdentityDelete {
+                providers: vec!["ci".to_owned()],
+                roles: vec!["a".to_owned(), "b".to_owned()],
+            }
+        );
+        for args in [
+            &["control", "identity"][..],
+            &["control", "identity", "bogus"][..],
+            &["control", "identity", "put"][..],
+            &["control", "identity", "put", "--file"][..],
+            &["control", "identity", "put", "--role", "a"][..],
+            &["control", "identity", "delete"][..],
+            &["control", "identity", "delete", "--file", "i.json"][..],
+        ] {
+            let Err((_, code)) = parse(args) else {
+                panic!("{args:?} parsed");
+            };
+            assert_eq!(code, ExitCode::from(2), "{args:?}");
+        }
     }
 }
