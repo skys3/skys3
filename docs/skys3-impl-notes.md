@@ -9092,6 +9092,14 @@ of this file. A task with nothing unexpected keeps "None."
   started for the run and stopped after it. The peering scenario's node configuration
   moved into `tests/e2e/lib.sh` (`peer_configure`, `peer_aws`) for reuse,
   and the PKI gained the clusters `ra` and `rb`.
+- **Two refusal paths were missed at first (review).** A streamed body's
+  own staging at a SkyS3 peer, before its `PUT` commits, ends in its own
+  task, which kept only the error text; and the server-side copy probe
+  takes a `403` on `CopyObject` for an error to retry forever, not for
+  missing support. Both are now counted and named in `last_refusal`
+  (`<key>: ...` and `copy probe: ...`), but neither holds up a key: the
+  body's version is not dirty yet, and copies are uploaded while the copy
+  probe is pending.
 - **The unused `sign` import M8-01 noted is fixed**, since this task
   touches `skys3-gateway`: it is imported under the same `cfg` as its
   users.

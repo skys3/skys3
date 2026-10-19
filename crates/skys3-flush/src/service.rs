@@ -1402,6 +1402,8 @@ async fn run_probe<S: ObjectStore>(
 ) {
     let prefix = parts.prefix.clone();
     let settings = parts.settings.clone();
+    // Refusals of either probe are counted with the flushes' (§7.6).
+    let (refusals, wall) = (parts.refusals.clone(), Arc::clone(&parts.wall));
     // Probes are not flushes: they go to the store directly, outside the
     // target's window (§7.7), with apply-by times to what may be a SkyS3
     // peer (§7.8).
@@ -1440,8 +1442,7 @@ async fn run_probe<S: ObjectStore>(
                 let refused = RefusalCode::of(&error.error);
                 if let Some(code) = refused {
                     // Retried all the same, as a refused flush is (§7.6).
-                    let at = parts.wall.now();
-                    parts.refusals.record(code, format!("probe: {error}"), at);
+                    refusals.record(code, format!("probe: {error}"), wall.now());
                     tracing::warn!(%error, "the target refused its capability probe");
                 } else {
                     tracing::warn!(%error, "the target's capability probe failed");
@@ -1461,7 +1462,14 @@ async fn run_probe<S: ObjectStore>(
                 Ok(support) => break support,
                 Err(error) => {
                     failures += 1;
-                    tracing::warn!(%error, "the target's server-side copy probe failed");
+                    // Counted, but it holds up no key: copies are uploaded
+                    // until the probe succeeds.
+                    if let Some(code) = RefusalCode::of(&error.error) {
+                        refusals.record(code, format!("copy probe: {error}"), wall.now());
+                        tracing::warn!(%error, "the target refused its server-side copy probe");
+                    } else {
+                        tracing::warn!(%error, "the target's server-side copy probe failed");
+                    }
                     tokio::time::sleep(settings.backoff(failures)).await;
                 }
             }

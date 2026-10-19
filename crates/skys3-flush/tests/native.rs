@@ -12,7 +12,7 @@ mod support;
 
 use std::time::Duration;
 
-use skys3_flush::FlushSettings;
+use skys3_flush::{FlushSettings, RefusalCode};
 use skys3_index::EntryState;
 use skys3_log::record::IDENTITY_METADATA;
 use skys3_peer::{Message, Precondition, StagedRanges};
@@ -353,6 +353,44 @@ async fn a_body_whose_put_never_commits_is_aborted() {
     .await;
     assert_eq!(flusher.status().streams, 0);
     flusher.stop().await;
+}
+
+/// A destination that refuses the staging (§7.6): the refusals of a
+/// streamed body's own stream count before its `PUT` commits, those of its
+/// flush after, and only then does the key wait on a refusal. Once the
+/// destination takes the staging again, the key flushes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_staging_counts_for_streamed_bodies_and_their_flush() {
+    let destination = Destination::start(true).await;
+    destination.faults().refuse_begins = true;
+    let node = Node::open(13).await;
+    let settings = FlushSettings {
+        streaming: true,
+        ..settings()
+    };
+    let target = destination.target(settings, FRAME);
+    let flusher = node.flusher(&target);
+    let text = body(300);
+    let begun = node.begin("big").await;
+    let extents = node.extents("big", &text, 100).await;
+    node.announce("big", begun, &extents);
+    until("the body's stream refused", || {
+        target.refusals().count(RefusalCode::Refused) >= 1
+    })
+    .await;
+    let refusal = target.refusals().latest().unwrap();
+    assert_eq!(refusal.code, RefusalCode::Refused);
+    assert!(refusal.error.starts_with("big: "), "{}", refusal.error);
+    assert_eq!(flusher.status().refused, 0, "no dirty version waits yet");
+
+    let seq = node.complete_extents("big", &text, begun, &extents).await;
+    until("the flush refused", || flusher.status().refused == 1).await;
+    destination.faults().refuse_begins = false;
+    node.settle(&flusher).await;
+    assert_eq!(flusher.status().refused, 0);
+    flusher.stop().await;
+    assert_eq!(destination.bytes("big").await.unwrap(), text.as_bytes());
+    assert_eq!(node.entry("big").await.unwrap().version, at(seq));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -32,6 +32,9 @@ const NOW: Duration = Duration::from_secs(1_750_000_000);
 struct Refusing {
     inner: SimS3,
     refusal: Arc<Mutex<Option<S3Error>>>,
+    /// Refuses `CopyObject` alone, as a policy without the copy's
+    /// permissions does.
+    copy_refusal: Arc<Mutex<Option<S3Error>>>,
 }
 
 impl Refusing {
@@ -39,16 +42,19 @@ impl Refusing {
         Self {
             inner,
             refusal: Arc::default(),
+            copy_refusal: Arc::default(),
         }
     }
 
     /// Refuses writes with `403 <code>` from now on, or takes them again.
     fn refuse(&self, code: Option<&str>) {
-        *self.refusal.lock().unwrap() = code.map(|code| {
-            S3Error::new(S3ErrorKind::Other, "refused by the test")
-                .with_status(403)
-                .with_code(code)
-        });
+        *self.refusal.lock().unwrap() = code.map(forbidden);
+    }
+
+    /// Refuses `CopyObject` with `403 <code>` from now on, or takes it
+    /// again.
+    fn refuse_copies(&self, code: Option<&str>) {
+        *self.copy_refusal.lock().unwrap() = code.map(forbidden);
     }
 
     fn admit(&self) -> S3Result<()> {
@@ -81,6 +87,11 @@ impl ObjectStore for Refusing {
 
     async fn copy_object(&self, request: CopyObject) -> S3Result<WriteOutput> {
         self.admit()?;
+        self.copy_refusal
+            .lock()
+            .unwrap()
+            .clone()
+            .map_or(Ok(()), Err)?;
         self.inner.copy_object(request).await
     }
 
@@ -109,6 +120,13 @@ impl ObjectStore for Refusing {
     async fn list_parts(&self, request: ListParts) -> S3Result<ListPartsOutput> {
         self.inner.list_parts(request).await
     }
+}
+
+/// A `403` answer with `code`.
+fn forbidden(code: &str) -> S3Error {
+    S3Error::new(S3ErrorKind::Other, "refused by the test")
+        .with_status(403)
+        .with_code(code)
 }
 
 fn bucket() -> BucketDocument {
@@ -308,6 +326,66 @@ fn refused_flushes_are_retried_and_counted_until_they_succeed() {
         assert!(store.inner.object("team/cat.jpg").is_some());
         service.refresh_metrics();
         assert_eq!(refused_keys(&registry), Some(0.0));
+    });
+}
+
+/// A target that refuses only `CopyObject`: the copy probe's refusals are
+/// counted and named, but hold up no key, since copies are uploaded until
+/// that probe succeeds.
+#[test]
+fn a_refused_copy_probe_is_counted_but_holds_up_no_key() {
+    runtime().block_on(async {
+        let node = Node::open(63).await;
+        let store = Refusing::new(remote(63, false));
+        store.refuse_copies(Some("AccessDenied"));
+        let registry = MetricsRegistry::new();
+        let service = service(&store, &registry);
+        node.put("cat.jpg", "meow").await;
+
+        let status = until(&service, &node, "the copy probe is refused", |status| {
+            status
+                .last_refusal
+                .as_ref()
+                .is_some_and(|refusal| refusal.error.starts_with("copy probe: "))
+        })
+        .await;
+        let refusal = status.last_refusal.unwrap();
+        assert_eq!(refusal.code, RefusalCode::AccessDenied);
+        assert!(refusal.error.contains("CopyObject"), "{}", refusal.error);
+        // Flushing goes on meanwhile, without server-side copies.
+        let status = until(&service, &node, "the key flushes", |status| {
+            store.inner.object("team/cat.jpg").is_some()
+                && status
+                    .shards
+                    .iter()
+                    .all(|(_, s)| s.dirty == 0 && s.flushing == 0)
+        })
+        .await;
+        assert_eq!(
+            status.probe,
+            ProbeStatus::Done {
+                unprotected: Vec::new(),
+                server_side_copy: false,
+            }
+        );
+        assert_eq!(status.gauges(NOW).refused_keys, 0);
+        assert!(store.inner.object("team/cat.jpg").is_some());
+        service.refresh_metrics();
+        assert!(refusals(&registry, "AccessDenied") >= 1.0);
+        assert_eq!(refused_keys(&registry), Some(0.0));
+
+        // Once the target takes copies, the probe passes.
+        store.refuse_copies(None);
+        until(&service, &node, "the copy probe passes", |status| {
+            matches!(
+                status.probe,
+                ProbeStatus::Done {
+                    server_side_copy: true,
+                    ..
+                }
+            )
+        })
+        .await;
     });
 }
 

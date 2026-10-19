@@ -19,7 +19,8 @@ use skys3_gateway::stub::MemoryShards;
 use skys3_gateway::{BucketLookup, GatewayConfig, PeerCommits, PeerExtents, ShardRef, Shards};
 use skys3_index::Entry;
 use skys3_peer::{
-    Inbound, Message, Outbound, StagedObject, Staging, StagingLimits, StagingService, StreamError,
+    Abort, AbortReason, Inbound, Message, Outbound, StagedObject, Staging, StagingLimits,
+    StagingService, StreamError,
 };
 use skys3_sim::SimS3;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ProposalId, ShardCount};
@@ -40,6 +41,9 @@ pub struct Faults {
     pub lose_applied: usize,
     /// Refuse to open streams.
     pub down: bool,
+    /// Answer every `BEGIN` with an `ABORT` (`refused`), as a destination
+    /// does for a bucket that does not receive from the source (§7.8).
+    pub refuse_begins: bool,
 }
 
 /// What the destination received and answered.
@@ -319,9 +323,24 @@ impl Inbound for ChannelInbound {
         if self.cut.load(Ordering::SeqCst) {
             return Err(StreamError::Transport("the link dropped".to_owned()));
         }
-        let Some(message) = self.received.recv().await else {
+        let Some(mut message) = self.received.recv().await else {
             return Ok(None);
         };
+        // A refused `BEGIN` is answered here, before the staging sees it.
+        while let Message::Begin(begin) = &message
+            && self.sender.destination.faults().refuse_begins
+        {
+            let abort = Abort {
+                identity: begin.identity.clone(),
+                reason: AbortReason::Refused,
+                detail: "the bucket does not receive from this source".to_owned(),
+            };
+            self.sender.send(&Message::Abort(abort)).await?;
+            let Some(next) = self.received.recv().await else {
+                return Ok(None);
+            };
+            message = next;
+        }
         if matches!(message, Message::Data(_)) {
             self.data += 1;
             if self.cut_after_data.is_some_and(|limit| self.data > limit) {
