@@ -140,6 +140,10 @@ pub struct Released {
     /// The version the fragment was written for: the layout's
     /// [`Coded::version`], which the fragment's header names.
     pub version: EpochSeq,
+    /// The stripe's number within the object, which the header names too.
+    pub stripe: u32,
+    /// The fragment's index within the stripe, which the header names too.
+    pub index: u8,
 }
 
 /// Where an object version's bytes are, by log position.

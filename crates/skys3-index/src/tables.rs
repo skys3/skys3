@@ -512,32 +512,34 @@ impl<'txn> IndexWriter<'txn> {
         key: &str,
         coded: &Coded,
     ) -> Result<(), IndexError> {
-        for (_, _, location) in fragment_rows(coded) {
-            self.release_fragment(shard, key, coded.version, location)?;
+        for (stripe, index, location) in fragment_rows(coded) {
+            let released = Released {
+                key: key.to_owned(),
+                version: coded.version,
+                stripe,
+                index,
+            };
+            self.release_fragment(shard, &released, location)?;
         }
         Ok(())
     }
 
-    /// Adds the fragment at `location`, written for version `version` of
-    /// `key`, to the shard's index of released fragments (§8.7), as an
-    /// `EC_RELOCATE` that moves it away leaves it.
+    /// Adds the fragment at `location`, which `released` describes, to the
+    /// shard's index of released fragments (§8.7), as an `EC_RELOCATE`
+    /// that moves it away leaves it.
     ///
     /// # Errors
     ///
-    /// Returns an [`IndexError`] if the key is too long or the write fails.
+    /// Returns an [`IndexError`] if the key is empty or too long, or the
+    /// write fails.
     pub fn release_fragment(
         &mut self,
         shard: &ShardRef,
-        key: &str,
-        version: EpochSeq,
+        released: &Released,
         location: &FragmentLocation,
     ) -> Result<(), IndexError> {
         let row = codec::released_key(shard, &location.node, location.fragment);
-        let released = Released {
-            key: key.to_owned(),
-            version,
-        };
-        let value = codec::encode_released(&released).map_err(IndexError::codec("released"))?;
+        let value = codec::encode_released(released).map_err(IndexError::codec("released"))?;
         self.released.insert(row.as_slice(), value.as_slice())?;
         Ok(())
     }

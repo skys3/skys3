@@ -38,7 +38,7 @@
 //! | takeovers | shard | the [`ShardConfig`] a member proposed to take over in, as its register's JSON |
 //! | fragments | shard, node ID (`u8` length and bytes), the object key's bytes, stripe number (`u32`), fragment index (`u8`) | the [`FragmentId`] of a coded version's fragment on that node |
 //! | attempts | shard | the next attempt number this node's primary may use (`u64`, not a value of this module) |
-//! | released | shard, node ID (`u8` length and bytes), fragment ID (`u128`, big-endian) | [`Released`]: the object key (`u16` length) and the position of the version whose layout named the fragment |
+//! | released | shard, node ID (`u8` length and bytes), fragment ID (`u128`, big-endian) | [`Released`]: the object key (`u16` length), the position of the version whose layout named the fragment, the stripe number (`u32`), and the fragment index (`u8`) |
 //! | imports | bucket ID (UTF-8) | [`ImportRanges`]: one range as its [`ImportCheckpoint`] alone, a tag (0 running, 1 done) and for a running import the last key imported, as an option; or several as tag 2, a `u16` count of at least two, and each range's end, as an option present on all but the last, followed by its checkpoint |
 //! | import_progress | shard | the latest `IMPORT_PROGRESS` the shard applied: its number (`u64`), then its [`ImportRanges`] as in imports |
 //!
@@ -1399,6 +1399,8 @@ pub fn encode_released(released: &Released) -> Result<Vec<u8>> {
     let mut w = Writer::value();
     w.str16("released.key", &released.key, MAX_KEY_LEN)?;
     w.position(released.version);
+    w.u32(released.stripe);
+    w.u8(released.index);
     Ok(w.0)
 }
 
@@ -1421,8 +1423,15 @@ pub fn decode_released(bytes: &[u8]) -> Result<Released> {
         return Err(CodecError::new("released.key", "empty"));
     }
     let version = r.position("released.version")?;
+    let stripe = r.u32("released.stripe")?;
+    let index = r.u8("released.index")?;
     r.finish("released")?;
-    Ok(Released { key, version })
+    Ok(Released {
+        key,
+        version,
+        stripe,
+        index,
+    })
 }
 
 fn write_payload(w: &mut Writer, payload: &Payload) -> Result<()> {

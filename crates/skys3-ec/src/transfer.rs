@@ -35,7 +35,7 @@ use skys3_net::{
 use skys3_types::{NodeAddress, NodeId};
 
 use crate::fragment::{FragmentHeader, MAX_FRAGMENT_LEN, MAX_HEADER_LEN};
-use crate::{FragmentId, FragmentStore};
+use crate::{FragmentHolds, FragmentId, FragmentStore};
 
 /// The most fragment bytes one frame carries.
 pub const CHUNK_LEN: usize = 8 << 20;
@@ -249,12 +249,14 @@ fn parse_written(node: &NodeId, written: FragmentWritten) -> Result<FragmentId, 
 /// one of the node's fragment stores, the one holding the fewest bytes.
 pub struct FragmentServer<D: Disk> {
     stores: Arc<Vec<FragmentStore<D>>>,
+    holds: Option<FragmentHolds>,
 }
 
 impl<D: Disk> Clone for FragmentServer<D> {
     fn clone(&self) -> Self {
         Self {
             stores: Arc::clone(&self.stores),
+            holds: self.holds.clone(),
         }
     }
 }
@@ -271,6 +273,7 @@ impl<D: Disk> FragmentServer<D> {
         assert!(!stores.is_empty(), "a fragment server needs a store");
         Self {
             stores: Arc::new(stores),
+            holds: None,
         }
     }
 
@@ -280,12 +283,29 @@ impl<D: Disk> FragmentServer<D> {
         &self.stores
     }
 
+    /// Keeps the fragments its shard primaries release, and the reads that
+    /// hold fragments, in `holds` (§8.7). Without holds, the server refuses
+    /// releases and holds.
+    #[must_use]
+    pub fn with_holds(mut self, holds: FragmentHolds) -> Self {
+        self.holds = Some(holds);
+        self
+    }
+
+    /// The node's released fragments and read holds, if it keeps them.
+    #[must_use]
+    pub fn holds(&self) -> Option<&FragmentHolds> {
+        self.holds.as_ref()
+    }
+
     /// Accepts connections on `listener` until it fails, serving each
-    /// fragment write, or each connection's fragment reads, on a task of
-    /// its own. A node whose transport carries other messages too accepts
-    /// connections itself and hands the links whose first frame is a
-    /// `FragmentWrite` to [`FragmentServer::serve`], and those whose first
-    /// frame is a `FragmentRead` to [`FragmentServer::serve_reads`].
+    /// fragment write, each connection's fragment reads and holds, or its
+    /// releases, on a task of its own. A node whose transport carries other
+    /// messages too accepts connections itself and hands the links whose
+    /// first frame is a `FragmentWrite` to [`FragmentServer::serve`], those
+    /// whose first frame is a `FragmentRead` or a `FragmentHold` to
+    /// [`FragmentServer::serve_reads`], and those whose first frame is a
+    /// `FragmentRelease` to [`FragmentServer::serve_releases`].
     pub async fn serve_listener<N: Network>(&self, listener: Listener<N>) {
         loop {
             let Ok(incoming) = listener.accept().await else {
@@ -301,10 +321,14 @@ impl<D: Disk> FragmentServer<D> {
                 if let Ok(Ok(Some(first))) =
                     tokio::time::timeout(FRAME_TIMEOUT, receiver.recv()).await
                 {
-                    if first.header.kind == MessageKind::FragmentRead {
-                        server.serve_reads((receiver, sender), first).await;
-                    } else {
-                        server.serve((receiver, sender), first).await;
+                    match first.header.kind {
+                        MessageKind::FragmentRead | MessageKind::FragmentHold => {
+                            server.serve_reads((receiver, sender), first).await;
+                        }
+                        MessageKind::FragmentRelease => {
+                            server.serve_releases((receiver, sender), first).await;
+                        }
+                        _ => server.serve((receiver, sender), first).await,
                     }
                 }
             });

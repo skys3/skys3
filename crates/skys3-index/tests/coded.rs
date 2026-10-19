@@ -328,6 +328,8 @@ fn released_rows_round_trip_and_sort_by_node_and_id() {
     let released = Released {
         key: "a/b".into(),
         version: position(3),
+        stripe: 70_000,
+        index: 4,
     };
     let value = codec::encode_released(&released).unwrap();
     assert_eq!(value[0], codec::VALUE_FORMAT);
@@ -343,7 +345,7 @@ fn released_rows_round_trip_and_sort_by_node_and_id() {
     }
     let empty = Released {
         key: String::new(),
-        version: position(3),
+        ..released.clone()
     };
     assert!(codec::encode_released(&empty).is_err());
     let mut no_key = vec![codec::VALUE_FORMAT, 0, 0];
@@ -366,7 +368,13 @@ fn released_fragments_wait_until_an_ec_release_removes_them() {
     index
         .update_durable(|writer| {
             writer.release_fragments(&one, "k", &coded(100))?;
-            writer.release_fragment(&one, "other", position(5), &moved)?;
+            let other = Released {
+                key: "other".into(),
+                version: position(5),
+                stripe: 1,
+                index: 2,
+            };
+            writer.release_fragment(&one, &other, &moved)?;
             writer.release_fragments(&two, "k", &coded(200))
         })
         .unwrap();
@@ -381,12 +389,14 @@ fn released_fragments_wait_until_an_ec_release_removes_them() {
     let mut sorted = order.clone();
     sorted.sort();
     assert_eq!(order, sorted);
-    let named = |key: &str, seq| Released {
+    let named = |key: &str, seq, stripe, index| Released {
         key: key.into(),
         version: position(seq),
+        stripe,
+        index,
     };
-    assert_eq!(all[0].1, named("k", 3));
-    assert_eq!(all[6], (moved.clone(), named("other", 5)));
+    assert_eq!(all[0].1, named("k", 3, 0, 0));
+    assert_eq!(all[6], (moved.clone(), named("other", 5, 1, 2)));
     // Pages follow on from where the last ended.
     let first = reader.released(&one, None, 3).unwrap();
     let rest = reader.released(&one, Some(&first[2].0), 10).unwrap();
@@ -425,7 +435,7 @@ fn released_fragments_wait_until_an_ec_release_removes_them() {
         .unwrap();
     assert_eq!(removed, 6);
     let left = index.read().unwrap().released(&one, None, 100).unwrap();
-    assert_eq!(left, vec![(moved, named("other", 5))]);
+    assert_eq!(left, vec![(moved, named("other", 5, 1, 2))]);
     let again = index
         .update_durable(|writer| writer.unrelease(&one, "k", &locations))
         .unwrap();

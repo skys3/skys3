@@ -21,7 +21,7 @@ use std::fmt;
 
 use skys3_index::{
     Applier, Coded, Entry, EntryState, ImportRanges, IndexError, IndexWriter, ObjectVersion,
-    Payload,
+    Payload, Released,
 };
 use skys3_log::record::{
     Adopt, Delete, EcPublish, EcRelocate, Flushed, IDENTITY_METADATA, Import, ImportProgress, Put,
@@ -770,7 +770,13 @@ fn relocate_coded(
             &moved.from,
             &moved.to,
         )?;
-        index.release_fragment(shard, &relocate.key, coded.version, &moved.from)?;
+        let released = Released {
+            key: relocate.key.clone(),
+            version: coded.version,
+            stripe: moved.stripe,
+            index: moved.index,
+        };
+        index.release_fragment(shard, &released, &moved.from)?;
     }
     coded.stripes = stripes;
     index.put_entry(shard, &relocate.key, &entry)?;
