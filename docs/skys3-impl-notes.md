@@ -4037,6 +4037,14 @@ of this file. A task with nothing unexpected keeps "None."
     commits through `Commit` to each shard's primary. The conflict
     simulation still waits for the import before its out-of-band writer,
     which an object the import lists needs anyway.
+  - The large-object scenario that seeds a wrong recorded ETag after a
+    lost Complete (M4-13) missed its bug at seed 7, which runs at
+    `SKYS3_SIM_SEEDS=256`. The bug shows only when a Complete of a
+    streamed `PUT` body loses its answer; a client's multipart object has
+    the same ETag at both ends. The miss rate was the same before the
+    merge (7 of seeds 0 to 119 on the stack, 9 after), with other seeds
+    missing. The scenario now runs twice the operations, and 1 of seeds
+    0 to 79 misses.
 - **Size.** About 1,170 lines of non-test code added (net +840), with
   the cluster-simulation harness counted.
 

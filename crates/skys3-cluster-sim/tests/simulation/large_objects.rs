@@ -246,6 +246,19 @@ fn caught(
     step_faults: Vec<(Operation, SimS3Faults)>,
     reason: &str,
 ) -> turmoil::Result {
+    let workload = workload(context);
+    caught_in(context, &workload, target, bug, step_faults, reason)
+}
+
+/// [`caught`], with `workload` in place of the scenarios' own.
+fn caught_in(
+    context: &mut SimContext,
+    workload: &Workload,
+    target: Target,
+    bug: LargeObjectBug,
+    step_faults: Vec<(Operation, SimS3Faults)>,
+    reason: &str,
+) -> turmoil::Result {
     let large = LargeObjects {
         step_faults,
         step_crash_probability: 0.0,
@@ -256,9 +269,8 @@ fn caught(
         remote_faults: DELAYS,
         ..config(target, large)
     };
-    let workload = workload(context);
     let cluster = Cluster::with_services(config, services());
-    match cluster.run(context, &workload, &FaultPlan::none()) {
+    match cluster.run(context, workload, &FaultPlan::none()) {
         Err(RunError::Check(violation)) if violation.reason.contains(reason) => Ok(()),
         other => Err(format!("{bug:?} went unnoticed: {other:?}").into()),
     }
@@ -282,6 +294,11 @@ fn the_audit_catches_a_completion_without_its_last_part() {
 /// Recording the local ETag after a lost Complete answer leaves a
 /// `FLUSHED` whose ETag no remote object of its version had: the MD5 of a
 /// streamed body, not the multipart ETag of its parts.
+///
+/// Only a lost Complete of a streamed `PUT` body shows it: a client's
+/// multipart object has the same ETag at both ends. With the scenarios'
+/// operations, 9 of seeds 0 to 119 lost none; this one runs twice as
+/// many, and 1 of seeds 0 to 79 lost none.
 #[test]
 fn the_audit_catches_a_wrong_etag_recorded_after_a_lost_complete() {
     Runner::with_cost(2, COST).run(|context| {
@@ -289,8 +306,14 @@ fn the_audit_catches_a_wrong_etag_recorded_after_a_lost_complete() {
             lost_response_probability: 0.4,
             ..DELAYS
         };
-        caught(
+        let usual = workload(context);
+        let workload = Workload {
+            operations: 2 * usual.operations,
+            ..usual
+        };
+        caught_in(
             context,
+            &workload,
             Target::WriteBack,
             LargeObjectBug::RecordsLocalEtagAfterLostComplete,
             vec![(Operation::CompleteMultipartUpload, lost)],
