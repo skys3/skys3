@@ -1167,7 +1167,7 @@ The design leaves these points open. Each named PR decides the point and records
 | `replicas` above the node count, and migrating `LocalShards` data directories | M8-05b |
 | Who may trigger a handoff or a drain: any node or only the coordinator, a token or an `admin` certificate (T1, T6), and the admin cluster API | M8-06 |
 | Where the fragment store lives: `[node] disks` or `[ec] fragment_disks` | M8-07a |
-| A `401` or `403` from a target: does it only stall flushing, retried, or hold the key as a conflict? | M8-02 |
+| A `401` or `403` from a target: does it only stall flushing, retried, or hold the key as a conflict? | M8-02: it stalls, retried with the usual backoff, never held (§7.6): a refusal is about the path to the target, not the key, and is fixed once for every key; `skys3_flush_refusals_total`, `skys3_flush_refused_keys`, the bucket status, and `SkyS3FlushRefused` show it |
 
 ## 15. Open questions from design section 19
 

@@ -16,8 +16,8 @@ use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     BucketLookup, CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig,
-    GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, ShardRef, Shards,
-    SigV4Authenticator, StaticCredentials, StsService,
+    GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, PeerRefusals, ShardRef,
+    Shards, SigV4Authenticator, StaticCredentials, StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
@@ -925,8 +925,13 @@ impl Node {
             Arc::clone(&identity),
             Arc::clone(&wall),
         );
+        // Peers' requests the S3 endpoint refuses for their configuration
+        // (§7.8): counted where authentication refuses unsigned SkyS3
+        // headers, and where the gateway refuses a peer's writes.
+        let peer_refusals = PeerRefusals::register(&metrics.registry);
         let auth = SigV4Authenticator::new(lookup, Arc::clone(&wall))
-            .with_hashing_pool(pools.hashing.clone());
+            .with_hashing_pool(pools.hashing.clone())
+            .with_peer_refusals(peer_refusals.clone());
         // Admission control (§7.6, §13): the dirty budgets, which the
         // flushers count against, and free disk space, read once now and
         // then every second.
@@ -1046,6 +1051,7 @@ impl Node {
             HotCacheMetrics::register(&metrics.registry),
         );
         gateway_config.descriptors = peering.as_ref().and_then(NodePeering::descriptors);
+        gateway_config.peer_access = gateway_config.peer_access.with_refusals(peer_refusals);
         // The destination side applies peers' commits as the gateway's
         // writes are applied.
         let peer_gateway_config = peering.as_ref().map(|_| gateway_config.clone());

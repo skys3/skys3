@@ -19,6 +19,7 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use crate::concurrency::{ConcurrencyBug, ConcurrencyStatus, Membership, Paced, Window, hooks};
 use crate::metrics::Counters;
 use crate::peer::{Native, PeerLink};
+use crate::refusal::Refusals;
 
 /// The most abandoned remote uploads a target keeps to abort; beyond it,
 /// they are left to the remote bucket's lifecycle rule (§7.3).
@@ -192,6 +193,8 @@ pub struct Target<S> {
     pub(crate) import: bool,
     pub(crate) wall: Arc<dyn WallClock>,
     pub(crate) counters: Counters,
+    /// Where the flushers report the target's refusals (§7.6).
+    pub(crate) refusals: Refusals,
     /// What a flush that finds an out-of-band write does (§7.2).
     pub(crate) conflict_policy: ConflictPolicy,
     /// Where copies find their sources for a server-side copy.
@@ -254,6 +257,7 @@ impl<S> Target<S> {
             import: false,
             wall: Arc::new(SystemWallClock),
             counters,
+            refusals: Refusals::default(),
             conflict_policy: ConflictPolicy::Hold,
             copy_sources: CopySources::new(),
             copies,
@@ -341,6 +345,19 @@ impl<S> Target<S> {
         self.window.count_throttles(counters.throttles.clone());
         self.counters = counters;
         self
+    }
+
+    /// Sets where the flushers report the target's refusals: `401` and
+    /// `403` answers, and a SkyS3 peer's native `refused` (§7.6).
+    #[must_use]
+    pub fn with_refusals(mut self, refusals: Refusals) -> Self {
+        self.refusals = refusals;
+        self
+    }
+
+    /// Where the flushers report the target's refusals.
+    pub fn refusals(&self) -> &Refusals {
+        &self.refusals
     }
 
     /// Sets what a flush that finds an out-of-band write does (§7.2):

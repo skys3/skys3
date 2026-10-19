@@ -33,13 +33,25 @@
 //!   to a bucket that receives from the peer on a node that serves its
 //!   descriptor, the header is required ([`ApplyBy::of_request`]). The
 //!   gateway reads it only from a peer's keys.
+//! - **Refusals** ([`PeerRefusals`], §7.6). The writes a peer's flusher
+//!   gets refused for its configuration, not for the key, are counted in
+//!   `skys3_peer_s3_refusals_total{peer, reason}`: a bucket whose
+//!   `peer_source` is not the peer (`peer_source`), a write identity for a
+//!   bucket pair the peer lacks (`bucket_pair`), and a request whose
+//!   `x-skys3-*` headers are not signed (`unsigned_header`, whose `peer`
+//!   is `unknown`, since the request is refused before it is
+//!   authenticated). The source keeps retrying them, so a count that keeps
+//!   rising is a configuration to fix on one side or the other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http::{Extensions, HeaderMap};
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use skys3_config::PeeringConfig;
+use skys3_obs::MetricsRegistry;
 use skys3_types::{BucketId, BucketName, ClusterId, WriteIdentity};
 
 use s3s::{S3Error, S3Result, s3_error};
@@ -75,6 +87,95 @@ pub trait PeerDescriptors: Send + Sync + std::fmt::Debug + 'static {
     fn descriptor(&self, bucket: &BucketName, source: &ClusterId) -> Option<Bytes>;
 }
 
+/// Why the gateway refused a peer cluster's S3 request (§7.8), as the
+/// `reason` label of `skys3_peer_s3_refusals_total` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PeerRefusal {
+    /// An object write by a peer's flusher to a bucket whose `peer_source`
+    /// is not that peer: `403 AccessDenied`.
+    PeerSource,
+    /// A peer's write whose write identity names another cluster, or a
+    /// bucket pair the peer's `[peering.peers]` table does not list: `400
+    /// InvalidArgument`.
+    BucketPair,
+    /// A request with `x-skys3-*` headers that are not signed: `403
+    /// AccessDenied`, before the request is authenticated.
+    UnsignedHeader,
+}
+
+impl PeerRefusal {
+    /// Every reason, in label order.
+    pub const ALL: [PeerRefusal; 3] = [
+        PeerRefusal::PeerSource,
+        PeerRefusal::BucketPair,
+        PeerRefusal::UnsignedHeader,
+    ];
+
+    /// The label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PeerRefusal::PeerSource => "peer_source",
+            PeerRefusal::BucketPair => "bucket_pair",
+            PeerRefusal::UnsignedHeader => "unsigned_header",
+        }
+    }
+}
+
+/// The `peer` label of a refusal whose sender is not authenticated.
+pub const UNKNOWN_PEER: &str = "unknown";
+
+/// `skys3_peer_s3_refusals_total{peer, reason}`: the requests of peer
+/// clusters this node's S3 endpoint refused for their configuration
+/// ([`PeerRefusal`]). `peer` is the peer cluster an access key in
+/// `s3_access_key_ids` authenticated, or [`UNKNOWN_PEER`]; both labels take
+/// values from bounded sets. Clones share the counters; the default
+/// belongs to no registry.
+#[derive(Debug, Clone, Default)]
+pub struct PeerRefusals {
+    counters: Family<Vec<(String, String)>, Counter>,
+}
+
+impl PeerRefusals {
+    /// Registers the counters in `registry`.
+    #[must_use]
+    pub fn register(registry: &MetricsRegistry) -> Self {
+        let refusals = Self::default();
+        registry.register(
+            "peer_s3_refusals",
+            "Requests of peer SkyS3 clusters' flushers this node's S3 endpoint refused for \
+             their configuration, by peer (the authenticated peer cluster, or unknown) and \
+             reason: peer_source (the bucket does not receive from the peer), bucket_pair (a \
+             write identity for a bucket pair the peer lacks), or unsigned_header (unsigned \
+             x-skys3-* headers).",
+            refusals.counters.clone(),
+        );
+        refusals
+    }
+
+    /// Counts a refusal of a request from `peer` (`None`: not
+    /// authenticated) for `reason`.
+    pub fn count(&self, peer: Option<&ClusterId>, reason: PeerRefusal) {
+        self.counters.get_or_create(&labels(peer, reason)).inc();
+    }
+
+    /// How many refusals of `peer`'s requests for `reason` were counted.
+    #[must_use]
+    pub fn get(&self, peer: Option<&ClusterId>, reason: PeerRefusal) -> u64 {
+        self.counters
+            .get(&labels(peer, reason))
+            .map_or(0, |counter| counter.get())
+    }
+}
+
+fn labels(peer: Option<&ClusterId>, reason: PeerRefusal) -> Vec<(String, String)> {
+    let peer = peer.map_or(UNKNOWN_PEER, ClusterId::as_str);
+    vec![
+        ("peer".to_owned(), peer.to_owned()),
+        ("reason".to_owned(), reason.as_str().to_owned()),
+    ]
+}
+
 /// A request from a peer cluster's flusher over S3 REST: signed with one
 /// of the access keys the peer's table lists. The gateway adds it to the
 /// request's extensions.
@@ -87,6 +188,7 @@ pub(crate) struct PeerCaller(pub(crate) ClusterId);
 pub struct PeerAccess {
     keys: Arc<BTreeMap<String, ClusterId>>,
     pairs: Arc<BTreeSet<(ClusterId, BucketId, BucketName)>>,
+    refusals: PeerRefusals,
 }
 
 impl PeerAccess {
@@ -110,7 +212,21 @@ impl PeerAccess {
         Self {
             keys: Arc::new(keys),
             pairs: Arc::new(pairs),
+            refusals: PeerRefusals::default(),
         }
+    }
+
+    /// Counts the refusals of peers' requests in `refusals`.
+    #[must_use]
+    pub fn with_refusals(mut self, refusals: PeerRefusals) -> Self {
+        self.refusals = refusals;
+        self
+    }
+
+    /// Where the refusals of peers' requests are counted.
+    #[must_use]
+    pub fn refusals(&self) -> &PeerRefusals {
+        &self.refusals
     }
 
     /// The peer whose access key signed the request with `extensions`, if
@@ -167,7 +283,8 @@ impl<'a> Carrier<'a> {
         }
     }
 
-    /// Whether the write may store the write identity `value`.
+    /// Whether the write may store the write identity `value`. A peer's
+    /// write that may not is counted as refused for its bucket pair.
     pub(crate) fn accepts(&self, value: &str) -> bool {
         match self {
             Carrier::Client => false,
@@ -175,7 +292,13 @@ impl<'a> Carrier<'a> {
                 access,
                 caller,
                 bucket,
-            } => access.may_carry(caller, bucket, value),
+            } => {
+                let accepted = access.may_carry(caller, bucket, value);
+                if !accepted {
+                    access.refusals.count(Some(caller), PeerRefusal::BucketPair);
+                }
+                accepted
+            }
         }
     }
 }
@@ -300,5 +423,32 @@ mod tests {
         let other = BucketName::new("other").unwrap();
         assert!(!Carrier::of(&access, &extensions, &other).accepts("prod-us/b-src/3/2.17"));
         assert!(!Carrier::of(&access, &client, &archive).accepts("prod-us/b-src/3/2.17"));
+    }
+
+    #[test]
+    fn refusals_are_exported_by_peer_and_reason() {
+        let registry = MetricsRegistry::new();
+        let access = access().with_refusals(PeerRefusals::register(&registry));
+        let us = ClusterId::new("prod-us").unwrap();
+        let mut extensions = signed_with("AKIAUS");
+        access.caller(&mut extensions);
+        let archive = BucketName::new("archive").unwrap();
+        // A refused identity counts against the peer's bucket pair.
+        let carrier = Carrier::of(&access, &extensions, &archive);
+        assert!(!carrier.accepts("prod-us/b-other/1/1.1"));
+        access.refusals().count(None, PeerRefusal::UnsignedHeader);
+        assert_eq!(access.refusals().get(Some(&us), PeerRefusal::BucketPair), 1);
+        assert_eq!(access.refusals().get(Some(&us), PeerRefusal::PeerSource), 0);
+        let text = registry.encode().unwrap();
+        for line in [
+            "skys3_peer_s3_refusals_total{peer=\"prod-us\",reason=\"bucket_pair\"} 1",
+            "skys3_peer_s3_refusals_total{peer=\"unknown\",reason=\"unsigned_header\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} is not in {text}");
+        }
+        assert_eq!(
+            PeerRefusal::ALL.map(PeerRefusal::as_str),
+            ["peer_source", "bucket_pair", "unsigned_header"]
+        );
     }
 }

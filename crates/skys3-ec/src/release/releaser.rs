@@ -2,7 +2,7 @@
 //! what the shard released, and records with `EC_RELEASE` that they know.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use skys3_index::{Index, IndexError, Released};
@@ -75,6 +75,11 @@ pub struct Releaser<D: Disk, S: ReleaseSink> {
     planner: PlannerSource,
     pool: BlockingPool,
     settings: ReleaseSettings,
+    /// Where the next pass starts reading the index of released
+    /// fragments: after the last row the previous pass read, or at the
+    /// start once a pass reached the end. Rows a node does not answer for
+    /// stay pending without holding back the rows after them.
+    cursor: Mutex<Option<FragmentLocation>>,
 }
 
 impl<D: Disk, S: ReleaseSink> Releaser<D, S> {
@@ -95,6 +100,7 @@ impl<D: Disk, S: ReleaseSink> Releaser<D, S> {
             planner,
             pool,
             settings,
+            cursor: Mutex::new(None),
         }
     }
 
@@ -229,14 +235,28 @@ impl<D: Disk, S: ReleaseSink> Releaser<D, S> {
     }
 
     /// Up to a batch of the shard's released fragments, from one index
-    /// transaction.
+    /// transaction, after where the previous pass stopped; the pass after
+    /// one that reached the end starts again at the start.
     async fn pending(&self) -> Result<Vec<(FragmentLocation, Released)>, IndexError> {
         let index: Arc<Index> = Arc::clone(self.shard.index());
         let shard = self.shard.shard().clone();
         let batch = self.settings.batch;
-        self.pool
-            .run(move || index.read()?.released(&shard, None, batch))
-            .await?
+        let after = self.cursor().clone();
+        let rows = self
+            .pool
+            .run(move || index.read()?.released(&shard, after.as_ref(), batch))
+            .await??;
+        *self.cursor() = if rows.len() < batch {
+            None
+        } else {
+            rows.last().map(|(location, _)| location.clone())
+        };
+        Ok(rows)
+    }
+
+    fn cursor(&self) -> MutexGuard<'_, Option<FragmentLocation>> {
+        // A plain assignment, which a panic cannot leave half done.
+        self.cursor.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

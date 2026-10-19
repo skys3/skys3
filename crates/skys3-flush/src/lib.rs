@@ -94,6 +94,12 @@
 //!   second read of the entry before it reports it. It changes nothing.
 //! - [`FlushMetrics`]: `dirty_bytes`, `oldest_dirty_age`,
 //!   `flush_lag_seconds`, conflict counts, and fill counts, by bucket.
+//! - **Refusals** (§7.6, [`Refusals`]): a `401` or `403` from the target,
+//!   to a flush or to the capability probe, or a SkyS3 peer's native
+//!   `refused`, does not hold the key: it stays dirty and is retried with
+//!   the usual backoff. Each refusal is counted by its [`RefusalCode`],
+//!   the bucket's status names the latest, and the keys a refusal holds
+//!   up are counted.
 //! - [`DirtyBudget`] (§7.6): the flushers' dirty bytes counted against each
 //!   bucket's and the cluster's `max_dirty_bytes`, which admission control
 //!   checks before a write. Each node enforces a share of each budget in
@@ -132,6 +138,7 @@ mod multipart;
 mod origin;
 mod peer;
 mod reconcile;
+mod refusal;
 mod service;
 mod shard;
 mod single;
@@ -162,6 +169,7 @@ pub use reconcile::{
     Difference, DifferenceKind, IndexVersion, MAX_LOGGED_DIFFERENCES, MAX_REPORTED_DIFFERENCES,
     ReconcileReport, ReconcileStatus, RemoteVersion, RemoteWriter,
 };
+pub use refusal::{Refusal, RefusalCode, Refusals};
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
 pub use target::{CopySources, FlushSettings, Target};

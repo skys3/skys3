@@ -22,6 +22,7 @@ exist.
 - [3. Flush and the remote target](#3-flush-and-the-remote-target)
   - [Dirty data age](#dirty-data-age)
   - [Flush stalled](#flush-stalled)
+  - [Flush refused](#flush-refused)
   - [Dirty budget](#dirty-budget)
   - [Held conflicts](#held-conflicts)
   - [Discarded conflicts](#discarded-conflicts)
@@ -113,6 +114,7 @@ Each row of design section 13, in its order, with the runbooks to follow.
 | Node holding EC fragments lost | [Fragment repair](#fragment-repair), [Node down](#node-down) |
 | Node fails while the control store is unreachable | [Control store unreachable](#control-store-unreachable), [Node down](#node-down) |
 | Remote target unreachable | [Flush stalled](#flush-stalled), [Dirty budget](#dirty-budget), [Dirty data age](#dirty-data-age) |
+| Remote target refuses the flushes (`401` or `403`, or a SkyS3 peer's `refused`) | [Flush refused](#flush-refused), [Flush stalled](#flush-stalled) |
 | Link to a peer SkyS3 cluster drops or flaps | [Peer link](#peer-link) |
 | UDP blocked between peer clusters | [Peer transport fallback](#peer-transport-fallback), [Peer link](#peer-link) |
 | Control store unreachable | [Control store unreachable](#control-store-unreachable), [Identity staleness](#identity-staleness) |
@@ -213,8 +215,8 @@ exposure grows with the dirty age.
      unknown bucket).
    - `errors`: each shard's latest flush error, `<key>: <error>`. A
      timeout or connection error means the target is unreachable from this
-     node; `403` means the credentials (from the `aws-config` default chain
-     on the node) lost access; `503 SlowDown` means throttling.
+     node; `401` or `403` means the target refuses the node's flushes
+     ([Flush refused](#flush-refused)); `503 SlowDown` means throttling.
    - `dirty`, `flushing`, and `dirty_bytes`: how much waits.
 2. Whether it is one node or all: the alert's series by `instance`. One node
    alone points at its network or credentials.
@@ -232,6 +234,79 @@ run again after its backoff.
 **Do not.** Do not detach the bucket: DeleteBucket refuses a `write_back`
 bucket with unflushed entries. Do not raise the dirty budget as a first
 step ([Dirty budget](#dirty-budget)).
+
+### Flush refused
+
+**Symptoms.** `SkyS3FlushRefused`: a bucket's `skys3_flush_refused_keys`
+has been above 0 for 10 minutes, while `skys3_flush_refusals_total` rises
+with a `code`. `SkyS3FlushStalled` and `SkyS3DirtyDataOld` follow. When the
+target is a SkyS3 cluster, `skys3_peer_s3_refusals_total` rises on its nodes,
+with this cluster as `peer` and a `reason`.
+
+**Impact.** As in [Flush stalled](#flush-stalled): the refused keys stay
+dirty, writes go on until the bucket's dirty budget is used up, and the loss
+exposure grows. Nothing is dropped or held: each key is retried with a
+backoff of up to 30 seconds, and flushes once the target takes it (design
+section 7.6).
+
+**Diagnosis.**
+
+1. `GET /v1/buckets/<bucket>` on a node that alerts. In `flush`,
+   `refused_keys` is the gauge, and `last_refusal` names the `code`, the
+   `target`, what was refused, and `at_unix_ms`. An `error` that starts with
+   `probe:` means the target refuses the capability probe, so nothing has
+   been flushed since the node started and every dirty key waits; one that
+   starts with a key means flushes are refused.
+2. The code:
+   - `InvalidAccessKeyId` or `SignatureDoesNotMatch`: the target does not
+     know the node's access key, or the secret is wrong. The node takes its
+     credentials from the `aws-config` default chain (environment, profile,
+     instance role).
+   - `AccessDenied`: the credentials work, but something forbids the
+     writes: the bucket policy, the key's own policy, or, on a SkyS3 peer,
+     its configuration (step 3).
+   - `refused`: a SkyS3 peer refused a native `COMMIT` or `BEGIN` over QUIC:
+     its bucket does not receive from this cluster, or the bucket pair is
+     missing (step 3).
+   - `other`: another `401` or `403`, such as an expired session token or
+     `RequestTimeTooSkewed`; `last_refusal.error` has the target's answer.
+3. When the target is a SkyS3 cluster, on its nodes,
+   `skys3_peer_s3_refusals_total{peer="<this cluster>"}` by `reason`:
+   - `peer_source`: the destination bucket's `[buckets.<name>]` table does
+     not name this cluster as its `peer_source`.
+   - `bucket_pair`: the destination's `[peering.peers.<this cluster>]`
+     table lacks the pair `{ source = "<bucket ID here>", destination =
+     "<bucket>" }`. This cluster sees `400 InvalidArgument`, which is not a
+     refusal here: `flush.errors` shows it, and `refused_keys` stays 0.
+   - `unsigned_header`, with `peer="unknown"`: a request carried
+     `x-skys3-*` headers it did not sign, for example through a proxy that
+     adds them.
+
+   No series for this cluster at all, with `AccessDenied` here, means the
+   destination does not take this cluster's access key for a peer's: its
+   `s3_access_key_ids` lacks the key this cluster's flushers sign with, and
+   its own policy for that key refuses.
+
+**Remediation.** Fix the path, not the keys. Give the source nodes working
+credentials (restart them if the credentials come from their environment),
+correct the bucket or key policy, or correct the destination's
+configuration (`peer_source`, the `buckets` pairs, `s3_access_key_ids`) and
+restart its nodes, which read it at startup. Nothing is needed on the
+source: the keys retry by themselves, and a refused probe runs again after
+its backoff.
+
+**Verification.** `flush.refused_keys` and `skys3_flush_refused_keys`
+return to 0, `rate(skys3_flush_refusals_total[5m])` returns to 0, and
+`flush.dirty` drains. On a SkyS3 destination,
+`skys3_peer_s3_refusals_total` stops rising. `last_refusal` keeps the last
+refusal until the node restarts; its `at_unix_ms` stops moving.
+
+**Do not.** Do not resolve conflicts for these keys: they are not held,
+and `POST /v1/buckets/<bucket>/conflicts/...` answers `404`. Do not loosen
+the destination's rules to let the writes in, such as `peer_local_writes`
+or a broader policy for the peer's key: a bucket that receives from a peer
+has that peer as its single writer (design section 7.8). Do not raise the
+dirty budget to ride out a refusal ([Dirty budget](#dirty-budget)).
 
 ### Dirty budget
 
@@ -1245,6 +1320,7 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 |---|---|---|---|
 | [Dirty data age](#dirty-data-age) | `runbooks::drill_remote_outage` (in process: flush service, metrics, admin API) | During a remote outage `skys3_oldest_dirty_age_seconds` and `skys3_flush_lag_seconds` grow and `skys3_flush_retries_total` counts retries; `flush.errors` names the key and the error; once the remote returns, everything drains with no action, and the gauges return to 0. Held keys age without flush lag (`runbooks::drill_out_of_band_writes`). | Nothing. |
 | [Flush stalled](#flush-stalled) | `runbooks::drill_remote_outage`; `runbooks::drill_dirty_budget` | As above. On the binary, a target unreachable from the start shows `probe` `running` with its `probe_error`. | A SkyS3 node cannot stand in for a remote target unless it lists the source as a peer: its gateway refuses the write-identity metadata of every flush. The drills use a simulated remote; section 8. |
+| [Flush refused](#flush-refused) | `refusals::a_refused_probe_holds_every_dirty_key_until_the_target_takes_writes` and `refusals::refused_flushes_are_retried_and_counted_until_they_succeed` (in process: flush service and metrics); `peer_s3::refusals_of_a_peers_writes_are_counted_by_reason`; on the binary, the end-to-end scenario flush-refused (tests/e2e/scenarios/80-flush-refused.sh) | A target that refuses the probe holds every dirty key: `skys3_flush_refused_keys` counts them, `skys3_flush_refusals_total{code="AccessDenied"}` rises, and `last_refusal` names the code, the target, and `probe:`. A flush refused after the probe counts its key until an attempt ends otherwise. Once the target takes writes, the keys flush and the gauge returns to 0. A SkyS3 destination counts each reason by peer. On the binary, a destination bucket without `peer_source` stalls a peer's flushes with both counters rising, and a restart with `peer_source` drains them. | The flush-stalled runbook read a `403` as lost credentials only; a SkyS3 peer's configuration refuses too. |
 | [Dirty budget](#dirty-budget) | `runbooks::drill_dirty_budget` | The share fills, a write gets `503 SlowDown`, `skys3_admission_refusals_total{reason="bucket_budget"}` counts it, and `GET /v1/buckets/<bucket>` shows `dirty_bytes` at `dirty_budget_bytes`. A larger `max_dirty_bytes` and a restart admit writes, and the dirty data stays dirty. | Nothing. |
 | [Held conflicts](#held-conflicts) | `runbooks::drill_out_of_band_writes` (in process); `conflicts::conflicts_are_listed_and_resolved_under_each_policy`; `simulation::conflicts::hold_keeps_conflicts_until_an_operator_resolves_them` | `skys3_conflicted_keys` and `skys3_flush_conflicts_total` count the held keys; the conflicts list shows each with `remote_identity` null for a writer outside SkyS3; `overwrite` puts the local version at the remote and counts it; `hold` after the other writer's object is removed flushes; a key not held answers `404`. | Nothing. |
 | [Discarded conflicts](#discarded-conflicts) | `runbooks::drill_out_of_band_writes` (in process) | A `discard_local` resolution adopts the remote's version and counts it in `skys3_flush_conflicts_discarded_total`, the series the alert reads. | The log lines the runbook quotes were not checked: the in-process drill has no log. |

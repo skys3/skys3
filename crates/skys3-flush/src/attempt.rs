@@ -22,6 +22,7 @@ use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
 use crate::copy::Copied;
 use crate::import::loaded_metadata;
 use crate::peer::{Bodies, LinkError};
+use crate::refusal::RefusalCode;
 use crate::stream::{Streams, test_hooks};
 use crate::target::Target;
 
@@ -79,7 +80,24 @@ pub(crate) enum Outcome {
         version: EpochSeq,
     },
     /// A retryable failure: back off and try again.
-    Retry(String),
+    Retry {
+        /// What failed.
+        error: String,
+        /// Why the target refused the attempt, if it did (§7.6): the key
+        /// is retried all the same.
+        refused: Option<RefusalCode>,
+    },
+}
+
+impl Outcome {
+    /// The retry after `failure`.
+    pub(crate) fn retry(failure: impl Into<Failure>) -> Self {
+        let failure = failure.into();
+        Outcome::Retry {
+            refused: failure.refusal(),
+            error: failure.to_string(),
+        }
+    }
 }
 
 /// What the remote holds at a key after a failed precondition, compared
@@ -137,12 +155,12 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         // key, the entry read next holds its `IMPORT` (§9.1).
         let passed = match self.passed().await {
             Ok(passed) => passed,
-            Err(error) => return Outcome::Retry(error.to_string()),
+            Err(error) => return Outcome::retry(error),
         };
         let entry = match self.shard.entry(self.key).await {
             Ok(Some(entry)) => entry,
             Ok(None) => return Outcome::Settled,
-            Err(error) => return Outcome::Retry(error.to_string()),
+            Err(error) => return Outcome::retry(error),
         };
         if matches!(entry.state, EntryState::Clean | EntryState::Evicted)
             || pending.is_some_and(|remote| remote.seq == entry.version.seq)
@@ -166,14 +184,14 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                     if matches!(error, Failure::Link(_)) {
                         native.link_failed();
                     }
-                    Outcome::Retry(error.to_string())
+                    Outcome::retry(error)
                 });
         }
         if self.resolution == Some(ConflictPolicy::DiscardLocal) {
             match self.discard(&entry).await {
                 Ok(Some(outcome)) => return outcome,
                 Ok(None) => {}
-                Err(error) => return Outcome::Retry(error.to_string()),
+                Err(error) => return Outcome::retry(error),
             }
         }
         let known = match pending {
@@ -184,7 +202,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             Some(object) => self.put(&entry, object, known, passed).await,
             None => self.delete(&entry, known, passed).await,
         };
-        result.unwrap_or_else(|error| Outcome::Retry(error.to_string()))
+        result.unwrap_or_else(Outcome::retry)
     }
 
     /// Whether the bucket's import has passed the key, by the progress
@@ -608,12 +626,45 @@ pub(crate) enum Failure {
     Link(LinkError),
     /// A native target did not apply the write (§7.8).
     Peer(String),
+    /// A native target refused the write or its staging (§7.8): an
+    /// `APPLIED` or an `ABORT` with `refused`.
+    Refused(String),
 }
 
 impl Failure {
     /// The failure of a link to a native target.
     pub(crate) fn link(error: LinkError) -> Self {
         Failure::Link(error)
+    }
+
+    /// The failure of a write a native target answered with an `APPLIED`
+    /// that reports `error`, for `reason`.
+    pub(crate) fn applied(error: skys3_peer::ApplyError, reason: &str) -> Self {
+        match error {
+            skys3_peer::ApplyError::Refused => Failure::Refused(reason.to_owned()),
+            error => Failure::Peer(format!("{error:?}: {reason}")),
+        }
+    }
+
+    /// The failure of a staging a native target ended with an `ABORT` for
+    /// `reason`, with `detail`.
+    pub(crate) fn aborted(reason: skys3_peer::AbortReason, detail: &str) -> Self {
+        match reason {
+            skys3_peer::AbortReason::Refused => {
+                Failure::Refused(format!("the staging was refused: {detail}"))
+            }
+            reason => Failure::Peer(format!("{reason:?}: {detail}")),
+        }
+    }
+
+    /// Why the target refused the attempt, if this failure is a refusal: a
+    /// `401` or `403` answer, or a native `refused` (§7.6).
+    pub(crate) fn refusal(&self) -> Option<RefusalCode> {
+        match self {
+            Failure::Remote(error) => RefusalCode::of(error),
+            Failure::Refused(_) => Some(RefusalCode::Refused),
+            _ => None,
+        }
     }
 }
 
@@ -626,6 +677,7 @@ impl fmt::Display for Failure {
             Failure::Later => f.write_str("the remote holds a later write of the shard"),
             Failure::Link(error) => write!(f, "the link to the peer failed: {error}"),
             Failure::Peer(reason) => write!(f, "the peer did not apply the write: {reason}"),
+            Failure::Refused(reason) => write!(f, "the peer refused the write: {reason}"),
         }
     }
 }
@@ -778,5 +830,47 @@ mod tests {
         ] {
             assert_eq!(failed_precondition(&S3Error::new(kind, "")), failed);
         }
+    }
+
+    #[test]
+    fn refusals_are_sorted_from_other_failures() {
+        use skys3_peer::{AbortReason, ApplyError};
+
+        let denied = S3Error::new(S3ErrorKind::Other, "no")
+            .with_status(403)
+            .with_code("AccessDenied");
+        let retry = Outcome::retry(Failure::Remote(denied));
+        let Outcome::Retry { error, refused } = retry else {
+            panic!("{retry:?}");
+        };
+        assert_eq!(refused, Some(RefusalCode::AccessDenied));
+        assert!(error.contains("403 AccessDenied"), "{error}");
+        let throttled = S3Error::new(S3ErrorKind::SlowDown, "");
+        assert_eq!(Failure::Remote(throttled).refusal(), None);
+
+        // A native target's `refused`, in an `APPLIED` or an `ABORT`, is
+        // the protocol's refusal; its other answers are not.
+        let applied = Failure::applied(ApplyError::Refused, "not a peer_source");
+        assert_eq!(applied.refusal(), Some(RefusalCode::Refused));
+        assert_eq!(
+            applied.to_string(),
+            "the peer refused the write: not a peer_source"
+        );
+        let aborted = Failure::aborted(AbortReason::Refused, "no pair");
+        assert_eq!(aborted.refusal(), Some(RefusalCode::Refused));
+        for failure in [
+            Failure::applied(ApplyError::Unavailable, "late"),
+            Failure::aborted(AbortReason::Expired, "ttl"),
+            Failure::Changing,
+            Failure::Local("disk".to_owned()),
+        ] {
+            assert_eq!(failure.refusal(), None, "{failure}");
+        }
+        let shard = skys3_log::ShardRef::new(
+            skys3_types::BucketId::new("b").unwrap(),
+            skys3_types::ShardId::new(0),
+        );
+        let local = Outcome::retry(skys3_shard::ShardError::NotFound(shard));
+        assert!(matches!(local, Outcome::Retry { refused: None, .. }));
     }
 }

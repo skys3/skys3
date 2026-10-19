@@ -262,6 +262,12 @@ impl<F> Shared<F> {
         self.segments().insert(id, file);
     }
 
+    /// Puts back segment `id`, which was dropped but whose file could not
+    /// be removed, so the store lists it again and compaction takes it up.
+    fn restore_segment(&self, id: u64, file: Arc<F>) {
+        self.segments().entry(id).or_insert(file);
+    }
+
     pub(crate) fn last_segment(&self) -> Option<(u64, Arc<F>)> {
         self.segments()
             .last_key_value()
@@ -533,13 +539,13 @@ impl<D: Disk> FragmentStore<D> {
     /// # Errors
     ///
     /// [`FragmentError::Remove`] if a segment file could not be removed;
-    /// the fragment is reclaimed all the same, and the file stays until
-    /// the next life finds it again.
+    /// the fragment is reclaimed all the same, and the segment stays in
+    /// the store for [`FragmentStore::compact`] to remove.
     pub async fn reclaim(&self, id: FragmentId) -> Result<bool, FragmentError> {
         let Some(located) = self.shared.map().remove(&id) else {
             return Ok(false);
         };
-        let removable = {
+        let removed = {
             let mut segments = self.shared.segments();
             let mut dead = self.shared.dead();
             let bytes = dead.entry(located.segment).or_default();
@@ -549,19 +555,19 @@ impl<D: Disk> FragmentStore<D> {
                 .get(&located.segment)
                 .is_some_and(|file| file.len() <= *bytes);
             // Only the committer appends, and only to the last segment.
-            let removable = whole && last != Some(located.segment);
-            if removable {
+            if whole && last != Some(located.segment) {
                 dead.remove(&located.segment);
-                segments.remove(&located.segment);
+                segments.remove(&located.segment)
+            } else {
+                None
             }
-            removable
         };
-        if removable {
+        if let Some(file) = removed {
             let name = segment_name(located.segment);
-            self.disk
-                .remove(&name)
-                .await
-                .map_err(|source| FragmentError::Remove { name, source })?;
+            if let Err(source) = self.disk.remove(&name).await {
+                self.shared.restore_segment(located.segment, file);
+                return Err(FragmentError::Remove { name, source });
+            }
         }
         Ok(true)
     }
