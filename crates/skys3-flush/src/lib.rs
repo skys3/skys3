@@ -87,6 +87,11 @@
 //!   resumes from. Until the import passes a key, its flushers keep its
 //!   tombstone and HEAD before writing it, and [`RemoteReader`] serves
 //!   client reads that miss locally from the remote.
+//! - **Reconciliation scan** (§9.1, [`ReconcileStatus`]): where a
+//!   `write_back` bucket's `reconcile_interval_seconds` is set, each node
+//!   re-lists the remote prefix that often and compares it with the index
+//!   of the shards it leads, confirming each difference with a HEAD and a
+//!   second read of the entry before it reports it. It changes nothing.
 //! - [`FlushMetrics`]: `dirty_bytes`, `oldest_dirty_age`,
 //!   `flush_lag_seconds`, conflict counts, and fill counts, by bucket.
 //! - [`DirtyBudget`] (§7.6): the flushers' dirty bytes counted against each
@@ -126,6 +131,7 @@ mod metrics;
 mod multipart;
 mod origin;
 mod peer;
+mod reconcile;
 mod service;
 mod shard;
 mod single;
@@ -151,6 +157,10 @@ pub use peer::{
     BoxFuture, CLOCK_TOLERANCE, DEFAULT_ANSWER_TIMEOUT, DEFAULT_REPROBE_MAX, DEFAULT_REPROBE_MIN,
     FlushedRecord, LinkError, MAX_BOUNDED_BYTES, PeerBug, PeerConnect, PeerLink, PeerReceive,
     PeerSend, PeerStream, PeerTransport, Transport, TransportStatus,
+};
+pub use reconcile::{
+    Difference, DifferenceKind, IndexVersion, MAX_LOGGED_DIFFERENCES, MAX_REPORTED_DIFFERENCES,
+    ReconcileReport, ReconcileStatus, RemoteVersion, RemoteWriter,
 };
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};

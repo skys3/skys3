@@ -157,6 +157,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
 | `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
 | `import_max_keys_per_second` | integer | `100000` | Positive. The most remote keys the namespace import of one bucket lists a second (§9.1), so an attach does not crowd out client writes on the shards' logs or exceed the target's request rate. |
+| `reconcile_requests_per_second` | integer | `10` | Positive. The most requests, listings of 1,000 keys and HEADs, that a node's reconciliation scans of one bucket send a second (§9.1). They are sent one at a time, and not while the flushers keep the target's window full. |
 | `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets and `read_only` origins for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain, or an origin's `origin_profile`. |
 
 ## `[ec]`
@@ -190,6 +191,7 @@ Erasure coding of `local` buckets (§8).
 | `ec_after_seconds` | integer | `600` | May be 0. |
 | `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). `"write_through"` answers a write once the backup holds it, with `flush.write_through_timeout_seconds` as for `ack_policy` (§7.5). |
 | `index_snapshot_interval_seconds` | integer | `3600` | Positive (§8.9). |
+| `reconcile_interval_seconds` | integer | `0` | How long each node waits between reconciliation scans of a `write_back` bucket, which re-list its remote prefix and report where it differs from the index without changing anything (§9.1). 0 never scans. Only `write_back` buckets are scanned; a `[buckets.<name>]` table of another mode may not set it above 0. |
 | `target_transport` | `"auto"`, `"native"`, or `"s3"` | `"auto"` | §7.8. On a node with `[peering.peers]` tables, `auto` uses QUIC when the target serves a peer descriptor that verifies and a handshake succeeds, and S3 REST otherwise; `native` uses QUIC only, and waits while it cannot; `s3` never looks for a peer. Without peers, `auto` is S3 REST and a `native` target is not flushed. |
 | `max_dirty_bytes` | integer | `flush.max_dirty_bytes` | Positive. The bucket's dirty-data budget (§7.6). Only `write_back` buckets take one: what a `local` bucket's backup lacks is not charged (§8.9). |
 | `freshness` | `"revalidate"` or `"ttl"` | `"revalidate"` | Only `read_only` buckets use it (§9.5). `"revalidate"` asks the origin on every GET and HEAD; `"ttl"` lets a read use what a HEAD sent up to `freshness_ttl_seconds` earlier saw. |

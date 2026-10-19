@@ -4005,12 +4005,6 @@ of this file. A task with nothing unexpected keeps "None."
   - A conditional write of a key that the import has not passed costs a
     remote HEAD.
   - The binary still commits imports to its local shards (M2-08b).
-  - A gateway decides whether the import passed a key from the progress
-    its own node's replicas applied, not the key's shard's. A node that
-    has not seen any (just restarted, or holding no replica of the
-    bucket) reads a missing key through to the remote. That is correct
-    under exclusive ownership, but serves an out-of-band object at a key
-    the index dropped; asking the key's primary would close it.
 - **Merged with the review stack (found in merging).** The stack's later
   flush paths needed the same two guards:
   - server-side copies (M4-07) and the `overwrite` policy's unconditional
@@ -4031,7 +4025,7 @@ of this file. A task with nothing unexpected keeps "None."
     seed 1: a gateway that had not yet seen its bucket's import progress
     read through to the remote at a key whose tombstone was gone, and
     served the out-of-band writer's object. Under exclusive ownership the
-    remote holds nothing there; see Left open.
+    remote holds nothing there; gateways now ask the key's shard (below).
   - The import stall that M4-06 found (an import that commits only to the
     shards its node leads) is fixed: the import runs on the owner and
     commits through `Commit` to each shard's primary. The conflict
@@ -4045,6 +4039,44 @@ of this file. A task with nothing unexpected keeps "None."
     merge (7 of seeds 0 to 119 on the stack, 9 after), with other seeds
     missing. The scenario now runs twice the operations, and 1 of seeds
     0 to 79 misses.
+- **Gateway read-through by the key's shard (found in review).** A
+  gateway decided whether the import had passed a key from the progress
+  its own node had seen (`ImportState`, through `RemoteReads::passed`). A
+  node that holds no replica of the bucket still follows its target, so
+  its flusher record showed nothing passed, and every miss there read
+  through to the remote. After a delete was flushed and its tombstone
+  dropped, an object an out-of-band writer then put at the key was served
+  as the key's. Now:
+  - `Shards::import_progress` returns the progress a shard applied, asked
+    of its serving primary (`LocalShards` refuses on a member, which may
+    lag a dropped tombstone). Over routing it is the new forwarded call
+    `ImportProgress` (op 21, answer 17, encoded as the index stores it). A
+    replica of an older build refuses the call, and the read then fails
+    with `503`.
+  - The gateway keeps the newest progress it learned from each shard
+    (`imports::ImportProgress`), shared by reads and listings. A cached
+    pass is trusted, since progress only grows. For any other key the
+    shard is asked again after the entry was read; if it has passed the
+    key since, the entry is read again. Progress that cannot be read
+    answers `503`, never a read-through.
+  - Listings ask every shard not known done for the starting position,
+    and drop each remote key whose shard's progress, asked once per shard
+    after the entries were read, has passed it. Once every shard is
+    known done, a listing asks nothing.
+  - `RemoteReads::import` and `passed` are gone. `RemoteReads::reads` only
+    says whether the node follows the bucket's target, and
+    `RemoteReader` no longer holds the import state, which only the admin
+    API shows now.
+  - A fourth scenario,
+    `a_node_without_a_replica_never_reads_a_passed_key_through`, runs
+    three nodes with the bucket's one shard on two of them, without node
+    faults. After the final reads it deletes every key, and after the
+    settle it puts an out-of-band object at each key and reads it through
+    every node (`ClusterConfig::probe_deleted`): each must answer `404`.
+    Without the fix it failed at seed 0 ("bucket-0/key-0, deleted,
+    reappeared through node-3: 200 OK"). The gateway test
+    `a_key_its_shard_has_passed_never_falls_through` checks the same for
+    reads, listings, and conditional writes, with no remote HEAD.
 - **Size.** About 1,170 lines of non-test code added (net +840), with
   the cluster-simulation harness counted.
 
@@ -8807,6 +8839,72 @@ of this file. A task with nothing unexpected keeps "None."
   in order, that every runbook has its parts and a drill row, that every
   drill names a test function that exists, and that every metric the
   runbooks name is in the metrics reference.
+
+### M7-07 Reconciliation scan
+
+- **The scan needed shard handles the flush service could not hold.**
+  `FlushService<S, D>` puts no `Disk` bound on `D`, and `Shard<D>` needs
+  one, so keeping the bucket's shards for its scan would have added the
+  bound to a public type, breaking `skys3::remote::NodeRemote` and any
+  sibling branch that names the service without it. The scan reads shards
+  through a small object-safe trait instead (`ShardReader`: `entries`,
+  `peek`, `import_progress`, `applied`, and whether the replica leads),
+  which also makes "the scan only reads" hold by type: it has no handle
+  that can commit.
+- **`Shard::entry` is not a pure read.** It admits a client read, which a
+  step-down waits for, and makes a clean payload recently used in the clean
+  cache, which changes eviction order. The scan's second read of a
+  candidate goes through a new `Shard::peek`, which reads the entry as
+  `Shard::entries` does, with neither.
+- **Listings carry no version IDs.** `ListObjectsV2` returns key, ETag,
+  size, and time only, so the planned "version mismatch" would have needed
+  a HEAD of every key, up to a thousand times the scan's requests. Version
+  IDs are not compared; an out-of-band rewrite with identical bytes is not
+  seen, and is recorded so in design section 9.1. HEADs confirm candidates
+  only.
+- **A foreign or unknown write identity is not a kind of difference.** It
+  is only known from a HEAD, which the scan sends for candidates only, and
+  an object of another writer that matches the index is no difference.
+  So the writer (`outside`, `own`, `foreign`, `unknown`) is a property of
+  each difference the report and log carry, and the metric's `kind` label
+  has the four comparison kinds.
+- **A listing and the index are never read at one moment.** The first
+  workload test, writes and deletes flushed during scans with delayed and
+  failing requests, found false positives as soon as dirty entries were
+  compared (checked by breaking the filter on purpose), so dirty entries,
+  tombstones, and conflicts are skipped, and every candidate is confirmed
+  by a HEAD and a second read of its entry. One race remains that neither
+  catches: a key absent at both reads whose object was written, flushed,
+  deleted, and flushed in between. A write of the key's shard after its
+  applied position at the first read is therefore not reported; the
+  remaining hole needs a multipart or streamed upload begun before the
+  scan read the index, completed, flushed, deleted, and flushed within one
+  confirmation, and is noted in the code.
+- **Reserved keys on both sides.** The import skips the probe's scratch
+  prefix, the snapshots' directory, and the peer descriptor; a client may
+  still write such a key through SkyS3, and comparing it with a listing
+  that skips them would report it as `index_only`. The import's filter
+  became `import::mirrored`, which both sides use.
+- **The flushers' window would misread the scan.** Sending listings
+  through the target's adaptive window (§7.7) would feed their latency, a
+  page of 1,000 keys, to the controller sized on small writes, and shrink
+  the flushers' window. The scan sends one request at a time outside the
+  window, paced by `reconcile_requests_per_second` with the import's token
+  bucket (made `pub(crate)`), and waits while the window is full.
+- **A paused clock gives every report the same time.** The tests use a
+  manual wall clock, so reports' start times could not tell scans apart;
+  the status gained `scans`, the count of finished scans.
+- **A report claimed shards it had stopped comparing (review).** A
+  confirmation that found the primary stepped down, or whose second index
+  read failed, skipped its candidate but kept the shard, so the report
+  listed the shard as covered with differences missing; on the last page
+  nothing checked again. Both now drop the shard for the rest of the scan,
+  as a failed page read did, and the scan stops listing once no shard is
+  left, instead of fetching every remaining page.
+- **No cluster-simulation scenario.** The scan writes nothing, so a
+  scenario would check only the absence of reports under faults, which the
+  flush crate's workload test does in under a second. The simulation jobs'
+  time is unchanged.
 
 ### M7-08 Security review
 

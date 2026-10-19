@@ -73,17 +73,16 @@ pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 /// The prefix of user metadata names in stored metadata.
 const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 
-/// Where a bucket's import is as this node knows it, for the reads that
-/// fall through to the remote ([`RemoteReader`]) and the admin API.
+/// Where a bucket's import is as this node knows it, for the admin API.
 ///
 /// It shows the newest `IMPORT_PROGRESS` that the import task stored, if
 /// it runs here, or that a replica of one of the bucket's shards on the
 /// node applied ([`FlushService::reconcile`](crate::FlushService::reconcile)).
-/// Each is a bound that holds for the whole bucket, since the owner stores
-/// progress only once the `IMPORT` records it covers are applied on every
-/// shard. It starts with nothing passed, which is safe: keys fall through
-/// to the remote until it shows more. The flushers ask their own shard
-/// instead ([`Target::with_import`](crate::Target::with_import)).
+/// A node that holds no replica of the bucket, or has not reconciled since
+/// it started, has seen none and shows nothing passed, so nothing decides
+/// by it: the flushers ask their own shard
+/// ([`Target::with_import`](crate::Target::with_import)), and the gateway
+/// asks the key's shard whether a read falls through to the remote.
 #[derive(Debug, Default)]
 pub struct ImportState {
     inner: Mutex<StateInner>,
@@ -608,7 +607,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// stretch of `t` seconds commits more than `rate * (t + 1)` keys, however
 /// many streams there are and however slow the requests before it were.
 #[derive(Debug)]
-struct Throttle {
+pub(crate) struct Throttle {
     /// Keys a second.
     rate: f64,
     /// The most keys the bucket holds: a second's, and at least one.
@@ -619,7 +618,7 @@ struct Throttle {
 }
 
 impl Throttle {
-    fn new(keys_per_second: u64) -> Self {
+    pub(crate) fn new(keys_per_second: u64) -> Self {
         let capacity = keys_per_second.max(1);
         Self {
             rate: capacity as f64,
@@ -630,7 +629,7 @@ impl Throttle {
 
     /// Reserves `keys` keys, at most the capacity, and waits until they
     /// may be committed.
-    async fn admit(&self, keys: u64) {
+    pub(crate) async fn admit(&self, keys: u64) {
         let keys = keys.min(self.capacity) as f64;
         let wait = {
             let mut tokens = lock(&self.tokens);
@@ -683,17 +682,10 @@ impl<'a> Retry<'a> {
 }
 
 /// The `IMPORT` record of a listed object, or `None` for a key outside the
-/// prefix, the empty key, a key too long, one under the probe's scratch
-/// prefix or the index snapshots' directory (§8.9), or the peer
-/// descriptor's reserved key, which no SkyS3 gateway writes (§7.8).
+/// prefix or one the index does not mirror ([`mirrored`]).
 fn import_of(object: ListedObject, prefix: &str, wall: &dyn WallClock) -> Option<Import> {
     let key = object.key.strip_prefix(prefix)?;
-    if key.is_empty()
-        || key.len() > MAX_KEY_LEN
-        || key.starts_with(ConditionalProbe::SCRATCH_DIR)
-        || key.starts_with(crate::snapshot::SNAPSHOT_DIR)
-        || key == skys3_peer::DESCRIPTOR_KEY
-    {
+    if !mirrored(key) {
         return None;
     }
     Some(Import {
@@ -707,6 +699,18 @@ fn import_of(object: ListedObject, prefix: &str, wall: &dyn WallClock) -> Option
             .storage_class
             .filter(|class| !class.is_empty() && class.len() <= MAX_STORAGE_CLASS_LEN),
     })
+}
+
+/// Whether the remote key `key`, without the target's prefix, is one the
+/// index mirrors (§9.1): not empty or too long, and not under the probe's
+/// scratch prefix or the index snapshots' directory (§8.9), or the peer
+/// descriptor's reserved key, which no SkyS3 gateway writes (§7.8).
+pub(crate) fn mirrored(key: &str) -> bool {
+    !(key.is_empty()
+        || key.len() > MAX_KEY_LEN
+        || key.starts_with(ConditionalProbe::SCRATCH_DIR)
+        || key.starts_with(crate::snapshot::SNAPSHOT_DIR)
+        || key == skys3_peer::DESCRIPTOR_KEY)
 }
 
 /// Commits `imports` to their shards concurrently, through `commit`, and
@@ -742,7 +746,6 @@ fn millis(since_epoch: Duration) -> u64 {
 pub struct RemoteReader<S> {
     store: Arc<S>,
     prefix: String,
-    import: Arc<ImportState>,
     wall: Arc<dyn WallClock>,
 }
 
@@ -751,7 +754,6 @@ impl<S> Clone for RemoteReader<S> {
         Self {
             store: Arc::clone(&self.store),
             prefix: self.prefix.clone(),
-            import: Arc::clone(&self.import),
             wall: Arc::clone(&self.wall),
         }
     }
@@ -768,33 +770,12 @@ pub struct RemoteObject {
 }
 
 impl<S: ObjectStore> RemoteReader<S> {
-    pub(crate) fn new(
-        store: Arc<S>,
-        prefix: String,
-        import: Arc<ImportState>,
-        wall: Arc<dyn WallClock>,
-    ) -> Self {
+    pub(crate) fn new(store: Arc<S>, prefix: String, wall: Arc<dyn WallClock>) -> Self {
         Self {
             store,
             prefix,
-            import,
             wall,
         }
-    }
-
-    /// How far the bucket's import has got without a gap
-    /// ([`ImportState::checkpoint`]).
-    #[must_use]
-    pub fn import(&self) -> ImportCheckpoint {
-        self.import.checkpoint()
-    }
-
-    /// Whether the bucket's import has passed `key`
-    /// ([`ImportState::passed`]), which a later range may have done before
-    /// [`RemoteReader::import`] gets there.
-    #[must_use]
-    pub fn passed(&self, key: &str) -> bool {
-        self.import.passed(key)
     }
 
     /// HEADs `key`: `None` if the remote has no object there.

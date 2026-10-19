@@ -17,6 +17,7 @@ use skys3_types::{BucketDocument, BucketMode, EpochSeq, NodeId};
 use super::{Found, Objects};
 use crate::buckets::shard_error;
 use crate::conditions::{Precondition, no_such_key};
+use crate::imports::{ImportProgress, progress_unknown, remote_of};
 use crate::remote::{RemoteError, RemoteReads};
 use crate::shard::{ShardRef, Shards};
 
@@ -45,17 +46,16 @@ impl<H: Shards> Objects<H> {
     /// The remote reads of `bucket`, if it is a `write_back` bucket whose
     /// target this node reads.
     fn remote_of(&self, bucket: &BucketDocument) -> Option<&Arc<dyn RemoteReads>> {
-        self.remote
-            .as_ref()
-            .filter(|_| bucket.mode == BucketMode::WriteBack)
+        remote_of(self.remote.as_ref(), bucket)
     }
 
     /// The object a read of `key` in `shard` serves (§9.1), with its read
     /// plan if `planned` (§9.2): a GET reads the bytes from the plan's
     /// holders, a HEAD needs no plan.
     ///
-    /// A key with no entry falls through to a remote HEAD while the
-    /// bucket's import has not passed it; once it has, or for a delete
+    /// A key with no entry falls through to a remote HEAD only while its
+    /// shard's import progress, asked of the shard's primary after the
+    /// entry was read, has not passed it; once it has, or for a delete
     /// tombstone, the key has no object. An imported stub has its
     /// metadata loaded first ([`Objects::load`]). A key of a `read_only`
     /// bucket is checked against its origin ([`Objects::origin_lookup`]).
@@ -63,7 +63,8 @@ impl<H: Shards> Objects<H> {
     /// # Errors
     ///
     /// `404 NoSuchKey`, `503 ServiceUnavailable` if the remote cannot
-    /// answer, and the shard's errors.
+    /// answer or the shard's import progress cannot be read, and the
+    /// shard's errors.
     pub(super) async fn lookup(
         &self,
         bucket: &BucketDocument,
@@ -74,39 +75,58 @@ impl<H: Shards> Objects<H> {
         if bucket.mode == BucketMode::ReadOnly {
             return self.origin_lookup(bucket, shard, key, planned).await;
         }
-        let plan = self.read_plan(shard, key, planned).await?;
-        let Some(remote) = self.remote_of(bucket) else {
-            return local(plan);
+        let Some(remote) = self
+            .remote
+            .as_ref()
+            .filter(|_| bucket.mode == BucketMode::WriteBack)
+        else {
+            return local(self.read_plan(shard, key, planned).await?);
         };
-        match plan.entry {
-            Some(entry) if unloaded(&entry) => {
-                let loaded = self.load(&**remote, bucket, shard, key, entry).await?;
-                if planned {
-                    // The plan of what the key holds after the load.
-                    local(self.read_plan(shard, key, true).await?)
-                } else {
-                    local(unplanned(loaded))
+        // A node that does not read the bucket's target reads nothing
+        // through to it; a stub's metadata still asks, and fails with
+        // `503`. Known before the entry is read, a pass covers what it
+        // reads.
+        let mut passed = !remote.reads(&bucket.bucket_id) || self.imports.known_passed(shard, key);
+        loop {
+            let plan = self.read_plan(shard, key, planned).await?;
+            match plan.entry {
+                Some(entry) if unloaded(&entry) => {
+                    let loaded = self.load(&**remote, bucket, shard, key, entry).await?;
+                    return if planned {
+                        // The plan of what the key holds after the load.
+                        local(self.read_plan(shard, key, true).await?)
+                    } else {
+                        local(unplanned(loaded))
+                    };
                 }
+                Some(_) => return local(plan),
+                None if passed => return Err(no_such_key()),
+                None => {}
             }
-            Some(_) => local(plan),
-            None => {
-                if remote.passed(&bucket.bucket_id, key) {
-                    return Err(no_such_key());
-                }
-                let found = remote
-                    .head(&bucket.bucket_id, key)
-                    .await
-                    .map_err(unavailable)?
-                    .ok_or_else(no_such_key)?;
-                Ok(Lookup {
-                    version: EpochSeq::default(),
-                    object: found.object,
-                    remote: true,
-                    evicted: false,
-                    layout: Vec::new(),
-                    holders: Vec::new(),
-                })
+            if self
+                .imports
+                .passed(&self.shards, shard, key)
+                .await
+                .map_err(|error| progress_unknown(&error))?
+            {
+                // Passed since the entry was read, which the import may
+                // have brought in: read it again.
+                passed = true;
+                continue;
             }
+            let found = remote
+                .head(&bucket.bucket_id, key)
+                .await
+                .map_err(unavailable)?
+                .ok_or_else(no_such_key)?;
+            return Ok(Lookup {
+                version: EpochSeq::default(),
+                object: found.object,
+                remote: true,
+                evicted: false,
+                layout: Vec::new(),
+                holders: Vec::new(),
+            });
         }
     }
 
@@ -123,7 +143,8 @@ impl<H: Shards> Objects<H> {
         shard: &ShardRef,
         key: &str,
     ) -> S3Result<Option<Entry>> {
-        conditional_entry(&self.shards, self.remote_of(bucket), bucket, shard, key).await
+        let remote = self.remote_of(bucket).map(|remote| (remote, &self.imports));
+        conditional_entry(&self.shards, remote, bucket, shard, key).await
     }
 
     /// The read plan of `key`, or, unless `planned`, its entry alone.
@@ -231,30 +252,44 @@ impl<H: Shards> Objects<H> {
 /// The entry of `key` in `shard` that a conditional write is checked
 /// against, here and by the shard when it commits the write.
 ///
-/// A key with no entry that the bucket's import has not passed may still
-/// hold an object at the remote, which a condition must see (§9.1): if a
-/// remote HEAD finds one, the key's `IMPORT` is committed first, as the
-/// import would commit it, and the condition then holds or fails against
-/// its stub. The `IMPORT` is a no-op once anything else committed the key,
-/// or once the shard's import progress has passed it (§4.2).
+/// A key with no entry that its shard's import progress has not passed may
+/// still hold an object at the remote, which a condition must see (§9.1):
+/// if a remote HEAD finds one, the key's `IMPORT` is committed first, as
+/// the import would commit it, and the condition then holds or fails
+/// against its stub. The `IMPORT` is a no-op once anything else committed
+/// the key, or once the shard's import progress has passed it (§4.2).
+/// `remote` is the bucket's remote reads, if this node reads its target,
+/// and what the gateway knows of the shards' import progress.
 ///
 /// # Errors
 ///
-/// `503 ServiceUnavailable` if the remote cannot answer, and the shard's
-/// errors.
+/// `503 ServiceUnavailable` if the remote cannot answer or the shard's
+/// import progress cannot be read, and the shard's errors.
 pub(super) async fn conditional_entry<H: Shards>(
     shards: &H,
-    remote: Option<&Arc<dyn RemoteReads>>,
+    remote: Option<(&Arc<dyn RemoteReads>, &ImportProgress)>,
     bucket: &BucketDocument,
     shard: &ShardRef,
     key: &str,
 ) -> S3Result<Option<Entry>> {
+    let remote = remote.filter(|(remote, _)| remote_of(Some(remote), bucket).is_some());
+    // Known before the entry is read, a pass covers what it reads.
+    let known = remote.is_some_and(|(_, imports)| imports.known_passed(shard, key));
     let entry = shards.entry(shard, key).await.map_err(shard_error)?;
-    let Some(remote) = remote.filter(|_| bucket.mode == BucketMode::WriteBack) else {
+    let Some((remote, imports)) = remote else {
         return Ok(entry);
     };
-    if entry.is_some() || remote.passed(&bucket.bucket_id, key) {
+    if entry.is_some() || known {
         return Ok(entry);
+    }
+    if imports
+        .passed(shards, shard, key)
+        .await
+        .map_err(|error| progress_unknown(&error))?
+    {
+        // Passed since the entry was read: the import may have brought
+        // the key in.
+        return shards.entry(shard, key).await.map_err(shard_error);
     }
     let Some(found) = remote
         .head(&bucket.bucket_id, key)

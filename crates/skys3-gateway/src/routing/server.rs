@@ -229,6 +229,9 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
                 shards.unseal(shard).await?;
                 Response::Unsealed
             }
+            Request::ImportProgress => {
+                Response::ImportProgress(shards.import_progress(shard).await?)
+            }
         })
     }
 

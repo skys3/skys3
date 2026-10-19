@@ -230,6 +230,7 @@ flush_part_bytes = 16777216
 flush_conflict_policy = "overwrite"
 max_dirty_bytes = 1099511627776
 import_max_keys_per_second = 5000
+reconcile_requests_per_second = 25
 target_region = "auto"
 
 [ec]
@@ -253,6 +254,7 @@ ec_stripe_data_bytes = 33554432
 ec_after_seconds = 300
 backup_ack = "write_through"
 index_snapshot_interval_seconds = 600
+reconcile_interval_seconds = 86400
 target_transport = "s3"
 max_dirty_bytes = 107374182400
 freshness = "ttl"
@@ -360,6 +362,8 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.flush().write_through_timeout().as_secs(), 12);
     assert_eq!(defaults.ec_after().as_secs(), 300);
     assert_eq!(defaults.index_snapshot_interval().as_secs(), 600);
+    assert_eq!(defaults.reconcile_interval().as_secs(), 86_400);
+    assert_eq!(config.flush().reconcile_requests_per_second, 25);
     assert_eq!(defaults.max_dirty_bytes, 100 << 30);
     assert_eq!(config.storage().disk_min_free_bytes, 0);
     assert_eq!(config.storage().lifecycle_interval().as_secs(), 600);
@@ -373,6 +377,7 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(logs.backup_target, None);
     assert_eq!(logs.snapshot_target.as_ref().unwrap().bucket, "snaps");
     assert_eq!(logs.max_dirty_bytes, 1 << 30);
+    assert_eq!(logs.reconcile_interval_seconds, 86_400, "from the defaults");
 
     let mirror = config.buckets().get(&BucketName::new("mirror").unwrap());
     assert_eq!(
