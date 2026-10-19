@@ -1451,12 +1451,7 @@ fn system_of_record<S: ObjectStore>(
         Arc::clone(&parts.wall),
     );
     SystemOfRecord {
-        remote: RemoteReader::new(
-            Arc::clone(&store),
-            prefix.clone(),
-            Arc::clone(&import),
-            Arc::clone(&parts.wall),
-        ),
+        remote: RemoteReader::new(Arc::clone(&store), prefix.clone(), Arc::clone(&parts.wall)),
         import,
         import_task: None,
         filler,

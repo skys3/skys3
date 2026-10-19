@@ -73,17 +73,16 @@ pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 /// The prefix of user metadata names in stored metadata.
 const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 
-/// Where a bucket's import is as this node knows it, for the reads that
-/// fall through to the remote ([`RemoteReader`]) and the admin API.
+/// Where a bucket's import is as this node knows it, for the admin API.
 ///
 /// It shows the newest `IMPORT_PROGRESS` that the import task stored, if
 /// it runs here, or that a replica of one of the bucket's shards on the
 /// node applied ([`FlushService::reconcile`](crate::FlushService::reconcile)).
-/// Each is a bound that holds for the whole bucket, since the owner stores
-/// progress only once the `IMPORT` records it covers are applied on every
-/// shard. It starts with nothing passed, which is safe: keys fall through
-/// to the remote until it shows more. The flushers ask their own shard
-/// instead ([`Target::with_import`](crate::Target::with_import)).
+/// A node that holds no replica of the bucket, or has not reconciled since
+/// it started, has seen none and shows nothing passed, so nothing decides
+/// by it: the flushers ask their own shard
+/// ([`Target::with_import`](crate::Target::with_import)), and the gateway
+/// asks the key's shard whether a read falls through to the remote.
 #[derive(Debug, Default)]
 pub struct ImportState {
     inner: Mutex<StateInner>,
@@ -747,7 +746,6 @@ fn millis(since_epoch: Duration) -> u64 {
 pub struct RemoteReader<S> {
     store: Arc<S>,
     prefix: String,
-    import: Arc<ImportState>,
     wall: Arc<dyn WallClock>,
 }
 
@@ -756,7 +754,6 @@ impl<S> Clone for RemoteReader<S> {
         Self {
             store: Arc::clone(&self.store),
             prefix: self.prefix.clone(),
-            import: Arc::clone(&self.import),
             wall: Arc::clone(&self.wall),
         }
     }
@@ -773,33 +770,12 @@ pub struct RemoteObject {
 }
 
 impl<S: ObjectStore> RemoteReader<S> {
-    pub(crate) fn new(
-        store: Arc<S>,
-        prefix: String,
-        import: Arc<ImportState>,
-        wall: Arc<dyn WallClock>,
-    ) -> Self {
+    pub(crate) fn new(store: Arc<S>, prefix: String, wall: Arc<dyn WallClock>) -> Self {
         Self {
             store,
             prefix,
-            import,
             wall,
         }
-    }
-
-    /// How far the bucket's import has got without a gap
-    /// ([`ImportState::checkpoint`]).
-    #[must_use]
-    pub fn import(&self) -> ImportCheckpoint {
-        self.import.checkpoint()
-    }
-
-    /// Whether the bucket's import has passed `key`
-    /// ([`ImportState::passed`]), which a later range may have done before
-    /// [`RemoteReader::import`] gets there.
-    #[must_use]
-    pub fn passed(&self, key: &str) -> bool {
-        self.import.passed(key)
     }
 
     /// HEADs `key`: `None` if the remote has no object there.

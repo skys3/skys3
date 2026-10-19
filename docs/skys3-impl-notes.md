@@ -4005,12 +4005,6 @@ of this file. A task with nothing unexpected keeps "None."
   - A conditional write of a key that the import has not passed costs a
     remote HEAD.
   - The binary still commits imports to its local shards (M2-08b).
-  - A gateway decides whether the import passed a key from the progress
-    its own node's replicas applied, not the key's shard's. A node that
-    has not seen any (just restarted, or holding no replica of the
-    bucket) reads a missing key through to the remote. That is correct
-    under exclusive ownership, but serves an out-of-band object at a key
-    the index dropped; asking the key's primary would close it.
 - **Merged with the review stack (found in merging).** The stack's later
   flush paths needed the same two guards:
   - server-side copies (M4-07) and the `overwrite` policy's unconditional
@@ -4031,7 +4025,7 @@ of this file. A task with nothing unexpected keeps "None."
     seed 1: a gateway that had not yet seen its bucket's import progress
     read through to the remote at a key whose tombstone was gone, and
     served the out-of-band writer's object. Under exclusive ownership the
-    remote holds nothing there; see Left open.
+    remote holds nothing there; gateways now ask the key's shard (below).
   - The import stall that M4-06 found (an import that commits only to the
     shards its node leads) is fixed: the import runs on the owner and
     commits through `Commit` to each shard's primary. The conflict
@@ -4045,6 +4039,44 @@ of this file. A task with nothing unexpected keeps "None."
     merge (7 of seeds 0 to 119 on the stack, 9 after), with other seeds
     missing. The scenario now runs twice the operations, and 1 of seeds
     0 to 79 misses.
+- **Gateway read-through by the key's shard (found in review).** A
+  gateway decided whether the import had passed a key from the progress
+  its own node had seen (`ImportState`, through `RemoteReads::passed`). A
+  node that holds no replica of the bucket still follows its target, so
+  its flusher record showed nothing passed, and every miss there read
+  through to the remote. After a delete was flushed and its tombstone
+  dropped, an object an out-of-band writer then put at the key was served
+  as the key's. Now:
+  - `Shards::import_progress` returns the progress a shard applied, asked
+    of its serving primary (`LocalShards` refuses on a member, which may
+    lag a dropped tombstone). Over routing it is the new forwarded call
+    `ImportProgress` (op 21, answer 17, encoded as the index stores it). A
+    replica of an older build refuses the call, and the read then fails
+    with `503`.
+  - The gateway keeps the newest progress it learned from each shard
+    (`imports::ImportProgress`), shared by reads and listings. A cached
+    pass is trusted, since progress only grows. For any other key the
+    shard is asked again after the entry was read; if it has passed the
+    key since, the entry is read again. Progress that cannot be read
+    answers `503`, never a read-through.
+  - Listings ask every shard not known done for the starting position,
+    and drop each remote key whose shard's progress, asked once per shard
+    after the entries were read, has passed it. Once every shard is
+    known done, a listing asks nothing.
+  - `RemoteReads::import` and `passed` are gone. `RemoteReads::reads` only
+    says whether the node follows the bucket's target, and
+    `RemoteReader` no longer holds the import state, which only the admin
+    API shows now.
+  - A fourth scenario,
+    `a_node_without_a_replica_never_reads_a_passed_key_through`, runs
+    three nodes with the bucket's one shard on two of them, without node
+    faults. After the final reads it deletes every key, and after the
+    settle it puts an out-of-band object at each key and reads it through
+    every node (`ClusterConfig::probe_deleted`): each must answer `404`.
+    Without the fix it failed at seed 0 ("bucket-0/key-0, deleted,
+    reappeared through node-3: 200 OK"). The gateway test
+    `a_key_its_shard_has_passed_never_falls_through` checks the same for
+    reads, listings, and conditional writes, with no remote HEAD.
 - **Size.** About 1,170 lines of non-test code added (net +840), with
   the cluster-simulation harness counted.
 

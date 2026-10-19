@@ -136,8 +136,8 @@ impl Origin {
 }
 
 impl RemoteReads for Origin {
-    fn import(&self, _bucket: &BucketId) -> Option<skys3_index::ImportCheckpoint> {
-        None
+    fn reads(&self, _bucket: &BucketId) -> bool {
+        false
     }
 
     fn head<'a>(
@@ -745,8 +745,8 @@ async fn a_bucket_whose_origin_is_not_read_here_answers_503() {
 struct HeadOnly(Arc<Origin>);
 
 impl RemoteReads for HeadOnly {
-    fn import(&self, bucket: &BucketId) -> Option<skys3_index::ImportCheckpoint> {
-        self.0.import(bucket)
+    fn reads(&self, bucket: &BucketId) -> bool {
+        self.0.reads(bucket)
     }
 
     fn head<'a>(

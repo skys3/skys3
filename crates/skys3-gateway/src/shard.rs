@@ -14,7 +14,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
+use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, StreamedBody};
@@ -160,6 +160,20 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         shard: &ShardRef,
         key: &str,
     ) -> impl Future<Output = Result<Option<Entry>, ShardError>> + Send;
+
+    /// The newest namespace import progress the shard applied (§9.1): its
+    /// progress number and key ranges, or `None` if it applied none. A key
+    /// the ranges have passed holds every remote object its `IMPORT`
+    /// brought in, and no later `IMPORT` of it applies. Progress only
+    /// grows: a key passed stays passed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shards::entry`].
+    fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> impl Future<Output = Result<Option<(u64, ImportRanges)>, ShardError>> + Send;
 
     /// One page of the shard's listing (§9.4): its live objects and common
     /// prefixes in key order, after `query.start_after`, at most
