@@ -4,9 +4,14 @@
 
 mod support;
 
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use bytes::Bytes;
 use skys3_ec::fragment::{BLOCK_LEN, FragmentHeader, FragmentRecord};
 use skys3_ec::{CompactionReport, FragmentError, FragmentId, FragmentStore};
+use skys3_io::disk::SimFile;
 use skys3_io::{Disk, SegmentFile, SimDisk, SimMount};
 use support::{fragment, runtime, small_config};
 
@@ -160,6 +165,92 @@ fn damaged_fragments_are_dropped_not_copied() {
         disk.crash();
         let store = open(disk.mount()).await;
         assert_eq!(store.ids(), [good.0, next.0]);
+    });
+}
+
+/// A mount whose file removals fail while `failing` is set.
+#[derive(Clone, Debug)]
+struct FailRemoves {
+    mount: SimMount,
+    failing: Arc<AtomicBool>,
+}
+
+impl Disk for FailRemoves {
+    type File = SimFile;
+
+    async fn create(&self, name: &str) -> io::Result<SimFile> {
+        self.mount.create(name).await
+    }
+
+    async fn open(&self, name: &str) -> io::Result<SimFile> {
+        self.mount.open(name).await
+    }
+
+    async fn remove(&self, name: &str) -> io::Result<()> {
+        if self.failing.load(Ordering::Relaxed) {
+            return Err(io::Error::other("the removal failed"));
+        }
+        self.mount.remove(name).await
+    }
+
+    async fn list(&self) -> io::Result<Vec<String>> {
+        self.mount.list().await
+    }
+
+    async fn sync_dir(&self) -> io::Result<()> {
+        self.mount.sync_dir().await
+    }
+}
+
+#[test]
+fn a_segment_whose_file_was_not_removed_is_compacted_again() {
+    runtime().block_on(async {
+        let disk = SimDisk::new(5);
+        let failing = Arc::new(AtomicBool::new(false));
+        let mount = FailRemoves {
+            mount: disk.mount(),
+            failing: Arc::clone(&failing),
+        };
+        let store = FragmentStore::open(mount, small_config()).await.unwrap().0;
+        let ids = |store: &FragmentStore<FailRemoves>| -> Vec<u64> {
+            store.segments().iter().map(|segment| segment.id).collect()
+        };
+        let files = || async { disk.mount().list().await.unwrap().len() };
+        // Three 64 KiB fragments to a segment: segments 0 to 2.
+        let mut all = Vec::new();
+        for n in 0..7 {
+            let (header, payload) = fragment(&format!("d/{n}"), 65_536, n);
+            let id = store.write(&header, payload.clone()).await.unwrap();
+            all.push((id, header, payload));
+        }
+        let before = ids(&store);
+        assert_eq!(before.len(), 3, "{before:?}");
+
+        // Compaction copies the live fragment of segment 0, then fails to
+        // remove its file: the segment stays listed, for the next pass.
+        store.reclaim(all[1].0).await.unwrap();
+        store.reclaim(all[2].0).await.unwrap();
+        failing.store(true, Ordering::Relaxed);
+        let error = store.compact(0.5).await.unwrap_err();
+        assert!(matches!(error, FragmentError::Remove { .. }), "{error}");
+        assert!(ids(&store).contains(&before[0]), "{:?}", ids(&store));
+        // So does a segment that reclaiming empties.
+        for (id, ..) in &all[3..6] {
+            let _ = store.reclaim(*id).await;
+        }
+        assert!(ids(&store).contains(&before[1]), "{:?}", ids(&store));
+        let listed = files().await;
+
+        failing.store(false, Ordering::Relaxed);
+        let report = store.compact(0.5).await.unwrap();
+        assert_eq!(report.segments, 2, "{report:?}");
+        assert_eq!(files().await, listed - 2);
+        let after = ids(&store);
+        assert!(!after.contains(&before[0]) && !after.contains(&before[1]));
+        for (id, header, payload) in [&all[0], &all[6]] {
+            let read = store.read(*id, 0..payload.len() as u64).await.unwrap();
+            assert_eq!((&read.header, &read.data), (header, payload));
+        }
     });
 }
 

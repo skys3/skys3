@@ -462,6 +462,52 @@ fn a_primary_tells_nodes_what_writes_released_and_records_it() {
     });
 }
 
+#[test]
+fn a_node_that_never_answers_holds_back_only_its_own_releases() {
+    support::runtime().block_on(async {
+        let disk = SimDisk::new(8);
+        let shard = alone(&disk).await;
+        // Two coded keys, then both overwritten: node 1 holds the first
+        // two rows, a whole batch, and never answers.
+        for (key, first) in [("a", 100), ("b", 200)] {
+            let version = write(&shard, key, 300, 1).await;
+            publish(&shard, key, version, 300, 1, first).await;
+            write(&shard, key, 10, 2).await;
+        }
+        assert_eq!(pending(&shard), 10);
+        let script = Arc::new(Script::default());
+        script.silent.lock().unwrap().insert(node(1));
+        let releaser = Releaser::new(
+            shard.clone(),
+            Arc::clone(&script),
+            planner(vec![0, 1, 2, 3, 4, 5]),
+            BlockingPool::new("release", NonZeroUsize::MIN).unwrap(),
+            ReleaseSettings {
+                batch: 2,
+                ..ReleaseSettings::default()
+            },
+        );
+        let first = releaser.pass().await;
+        assert_eq!((first.pending, first.unanswered), (2, 2), "{first:?}");
+        // Later passes read on past node 1's rows, and come back to them.
+        for _ in 0..6 {
+            releaser.pass().await;
+        }
+        assert_eq!(pending(&shard), 2);
+        let told = script.told.lock().unwrap().clone();
+        assert_eq!(
+            told.keys().cloned().collect::<Vec<_>>(),
+            [node(2), node(3), node(4), node(5)]
+        );
+        // Once node 1 answers, its rows go too.
+        script.silent.lock().unwrap().clear();
+        for _ in 0..2 {
+            releaser.pass().await;
+        }
+        assert_eq!(pending(&shard), 0);
+    });
+}
+
 /// A primary that answers every orphan query with an orphan verdict.
 struct Orphans;
 
