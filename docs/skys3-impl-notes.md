@@ -3867,11 +3867,16 @@ of this file. A task with nothing unexpected keeps "None."
 - **Primary-scoped work follows the serving role (decided, design
   §7.1, §9.1).** `FlushService::reconcile` runs every second on the node
   and more often in the simulation. It keeps a flusher on each replica
-  that is `is_serving()`, not following, and not stopped, and stops every
-  other flusher.
+  that is not following and not stopped, and stops every other flusher.
+  (M2-17 first also required `is_serving()`; merged with the stack, that
+  delayed the start of flushers enough that the M6-07 seeded-bug scenario
+  `the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`
+  no longer caught its bug at seed 3. The per-write check of serving and
+  leases already keeps a primary that does not serve from writing.)
   - A takeover, a handoff, a learner's promotion, or a restart starts the
-    flusher once the new primary serves.
-  - A step-down, a deposition, or a stop ends it at the next reconcile.
+    flusher; it writes the remote once the new primary serves.
+  - A deposition or a stop ends it at the next reconcile; after a
+    step-down it writes nothing.
   - The import of a bucket runs on its owner: the replica of shard 0 that
     serves as primary. The same reconcile starts and stops it. It no
     longer starts when the bucket is first flushed.

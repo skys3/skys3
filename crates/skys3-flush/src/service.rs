@@ -134,10 +134,11 @@ impl BucketStatus {
 /// no probe.
 ///
 /// **Primary-scoped work across failover** (§7.1, §9.1). A bucket's shard
-/// flushers run on the replicas that serve as their shard's primary, and
-/// nowhere else. A replica becomes primary by a takeover, a handoff, or a
-/// restart, and stops being one when it steps down or is deposed; the
-/// next reconcile starts or stops the work. A new primary rebuilds
+/// flushers run on the replicas that are their shard's primary, and
+/// nowhere else, and write the remote only while the replica serves and
+/// holds its leases, which each write checks. A replica becomes primary by
+/// a takeover, a handoff, or a restart, and stops being one when it is
+/// deposed; the next reconcile starts or stops the work. A new primary rebuilds
 /// everything from its index, which its log keeps: dirty entries,
 /// tombstones, remote uploads, and the remote ETags of `FLUSHED` records.
 /// A version flushed without its `FLUSHED` is found by its write identity,
@@ -467,9 +468,9 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
 
     /// Starts and stops flushers so that every `write_back` bucket in
     /// `buckets`, and every `local` one with a backup target, with shards
-    /// open in `set` as their serving primary is flushed, and nothing
-    /// else, and runs the import of each `write_back` bucket whose shard 0
-    /// is one of them. Shows each bucket's import progress as the newest
+    /// open in `set` as their primary is flushed, and nothing else, and
+    /// runs the import of each `write_back` bucket whose shard 0 is one of
+    /// them and serves. Shows each bucket's import progress as the newest
     /// its replicas on the node applied.
     pub async fn reconcile(&self, buckets: &[BucketDocument], set: &ShardSet<D>) {
         self.follow_origins(buckets);
@@ -494,9 +495,11 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 }
                 // Only a shard's primary flushes it (§7.1): a member or a
                 // learner refuses the `FLUSHED` records its primary does
-                // not send, and one that stepped down or was deposed no
-                // longer serves.
-                if !shard.is_stopped() && shard.is_serving() && !shard.role().follows() {
+                // not send. A primary that does not serve, not yet or no
+                // longer, keeps its flusher, which writes nothing: every
+                // remote write checks that the shard serves and holds its
+                // leases first.
+                if !shard.is_stopped() && !shard.role().follows() {
                     shards.push(shard);
                 }
             }
@@ -531,10 +534,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 if let Some((update, ranges)) = progress {
                     record.import.observe(update, ranges);
                 }
-                // The import runs on the primary of shard 0 (§9.1).
+                // The import runs on the serving primary of shard 0 (§9.1).
                 let owner = shards
                     .iter()
-                    .find(|shard| shard.shard().shard == ShardId::new(0))
+                    .find(|shard| shard.shard().shard == ShardId::new(0) && shard.is_serving())
                     .cloned();
                 match owner {
                     Some(owner) => self.start_import(bucket, flusher, owner, set),
