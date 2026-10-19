@@ -8916,14 +8916,26 @@ of this file. A task with nothing unexpected keeps "None."
   the SDK matrix's hand-written registers did. The command is generic
   over `ControlStore` and opens only the file backend in this build;
   M8-03 adds the others to the same function.
+- **The `e2e` profile is not optimized.** The plan asked for opt-level 1.
+  On four cores a cold build of the node at opt-level 1 took about three
+  times as long as an unoptimized one without debug info (about 11
+  minutes against 3.5), which alone would break the 15-minute budget on a
+  cold cache, and the single-node scenarios ran 151 s with the
+  unoptimized binary against 131 s: the suite moves little data, and the
+  AWS CLI's start-up dominates. The profile is a debug build without debug
+  info, which also keeps debug assertions and overflow checks on.
 - **No Docker daemon and no AWS CLI on the development machine.** The
   Docker daemon could be started (`dockerd` as root), so the suite runs
   the CLI from the SDK matrix's `amazon/aws-cli` image when the host has
   no `aws`, at about a second a call; CI uses the runner's CLI. A full
-  local run passed in 5 m 10 s (peering 308 s; the others 131 s together),
-  and fails as expected with `SKYS3_E2E_FAULT=flusher-off` (flush, import,
+  local run with the `e2e` binary passed in 5 m 15 s (peering 311 s
+  beside the others, 157 s together), after a cold build of 3 m 42 s. It
+  fails as expected with `SKYS3_E2E_FAULT=flusher-off` (flush, import,
   reconciliation, and admin fail) and with `udp-blocked` (QUIC never
-  returns).
+  returns). The CI path that installs the CA into the system trust store
+  was not run here, so as not to change the shared machine's store;
+  locally the nodes get the same CA through `SSL_CERT_FILE`, which the
+  same root loader reads.
 - **`command -v aws` found the suite's own function.** `lib.sh` wraps the
   CLI in a shell function named `aws`, so the runner looks for the
   executable with `type -P`.

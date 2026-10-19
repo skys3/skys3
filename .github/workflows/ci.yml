@@ -446,10 +446,13 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      # Saved even when the suite fails, so the next run builds only the
+      # workspace.
       - name: Cache the build
         uses: Swatinem/rust-cache@v2
         with:
           key: e2e
+          cache-on-failure: true
 
       - name: Find the MinIO version
         id: minio
