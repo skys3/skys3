@@ -14,7 +14,7 @@ use skys3_types::{Epoch, EpochSeq, FragmentId, FragmentLocation, Generation, Nod
 use crate::codec;
 use crate::codec::FragmentKey;
 use crate::entry::{
-    Coded, ControlEntry, Entry, Part, RemotePart, RemoteParts, RemoteUpload, Upload,
+    Coded, ControlEntry, Entry, Part, Released, RemotePart, RemoteParts, RemoteUpload, Upload,
 };
 use crate::error::IndexError;
 use crate::holders::{self, Holders};
@@ -97,6 +97,15 @@ pub(crate) const ATTEMPTS: TableDefinition<Bytes, u64> = TableDefinition::new("a
 /// a new format version.
 pub(crate) const IMPORT_PROGRESS: TableDefinition<Bytes, Bytes> =
     TableDefinition::new("import_progress");
+/// The fragments of each shard that a write or an `EC_RELOCATE` left
+/// behind and that the shard's primary has yet to tell their nodes to
+/// release (§8.7), keyed by shard, node, and fragment ID. Applying the
+/// write that replaces a coded version, or the relocation, adds them, and
+/// applying `EC_RELEASE` removes them, so every replica holds the same rows
+/// and a new primary takes up the releases its predecessor did not finish.
+/// A build that ignored them would never release those fragments, so they
+/// came with a new format version.
+pub(crate) const RELEASED: TableDefinition<Bytes, Bytes> = TableDefinition::new("released");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -298,11 +307,13 @@ pub enum ShardTable {
     Fragments,
     /// The shard's import progress (§9.1).
     ImportProgress,
+    /// The fragments the shard has yet to release (§8.7).
+    Released,
 }
 
 impl ShardTable {
     /// Every table, in the order a snapshot sends them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Namespace,
         Self::Uploads,
         Self::Parts,
@@ -310,6 +321,7 @@ impl ShardTable {
         Self::RemoteParts,
         Self::Fragments,
         Self::ImportProgress,
+        Self::Released,
     ];
 
     /// The table's code in a snapshot.
@@ -323,6 +335,7 @@ impl ShardTable {
             Self::RemoteParts => 5,
             Self::Fragments => 6,
             Self::ImportProgress => 7,
+            Self::Released => 8,
         }
     }
 
@@ -364,6 +377,10 @@ impl ShardTable {
                 codec::decode_import_progress(value).map_err(|e| e.to_string())?;
                 codec::decode_shard_key(key)
             }
+            Self::Released => {
+                codec::decode_released(value).map_err(|e| e.to_string())?;
+                codec::decode_released_key(key).map(|(shard, _)| shard)
+            }
         }
         .map_err(|e| e.to_string())?;
         if theirs == *shard {
@@ -390,6 +407,7 @@ pub struct IndexWriter<'txn> {
     configs: Table<'txn, Bytes, Bytes>,
     fragments: Table<'txn, Bytes, Bytes>,
     import_progress: Table<'txn, Bytes, Bytes>,
+    released: Table<'txn, Bytes, Bytes>,
 }
 
 impl<'txn> IndexWriter<'txn> {
@@ -405,6 +423,7 @@ impl<'txn> IndexWriter<'txn> {
             configs: txn.open_table(CONFIGS)?,
             fragments: txn.open_table(FRAGMENTS)?,
             import_progress: txn.open_table(IMPORT_PROGRESS)?,
+            released: txn.open_table(RELEASED)?,
         })
     }
 
@@ -478,6 +497,80 @@ impl<'txn> IndexWriter<'txn> {
             self.fragments.remove(row.as_slice())?;
         }
         Ok(())
+    }
+
+    /// Adds every fragment of `coded`, the layout of a version of `key`
+    /// that a write replaced, to the shard's index of released fragments
+    /// (§8.7).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the key is too long or the write fails.
+    pub fn release_fragments(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        coded: &Coded,
+    ) -> Result<(), IndexError> {
+        for (_, _, location) in fragment_rows(coded) {
+            self.release_fragment(shard, key, coded.version, location)?;
+        }
+        Ok(())
+    }
+
+    /// Adds the fragment at `location`, written for version `version` of
+    /// `key`, to the shard's index of released fragments (§8.7), as an
+    /// `EC_RELOCATE` that moves it away leaves it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if the key is too long or the write fails.
+    pub fn release_fragment(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        location: &FragmentLocation,
+    ) -> Result<(), IndexError> {
+        let row = codec::released_key(shard, &location.node, location.fragment);
+        let released = Released {
+            key: key.to_owned(),
+            version,
+        };
+        let value = codec::encode_released(&released).map_err(IndexError::codec("released"))?;
+        self.released.insert(row.as_slice(), value.as_slice())?;
+        Ok(())
+    }
+
+    /// Removes the fragments at `locations` that the shard's index of
+    /// released fragments holds for `key`, as an `EC_RELEASE` does (§8.7),
+    /// and returns how many it removed. A location the index holds for
+    /// another key, or not at all, stays as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading, decoding, or the write fails.
+    pub fn unrelease(
+        &mut self,
+        shard: &ShardRef,
+        key: &str,
+        locations: &[FragmentLocation],
+    ) -> Result<usize, IndexError> {
+        let mut removed = 0;
+        for location in locations {
+            let row = codec::released_key(shard, &location.node, location.fragment);
+            let released = match self.released.get(row.as_slice())? {
+                Some(value) => {
+                    codec::decode_released(value.value()).map_err(IndexError::codec("released"))?
+                }
+                None => continue,
+            };
+            if released.key == key {
+                self.released.remove(row.as_slice())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Moves fragment `index` of stripe `stripe` of `key`'s current version
@@ -843,6 +936,7 @@ impl<'txn> IndexWriter<'txn> {
             &mut self.remote_uploads,
             &mut self.remote_parts,
             &mut self.fragments,
+            &mut self.released,
         ] {
             let range = prefix.as_slice()..end.as_slice();
             table.retain_in(range, |key, _| !key.starts_with(&prefix))?;
@@ -987,6 +1081,8 @@ pub struct IndexDump {
     /// The fragments of coded versions, by shard, node, key, stripe, and
     /// index.
     pub fragments: BTreeMap<FragmentKey, FragmentId>,
+    /// The fragments left to release, by shard and location.
+    pub released: BTreeMap<(ShardRef, FragmentLocation), Released>,
     /// The local copy of control state, by register key.
     pub control: BTreeMap<String, ControlEntry>,
     /// The generation the control-state copy is complete up to.
@@ -1010,6 +1106,7 @@ pub struct IndexReader {
     takeovers: ReadOnlyTable<Bytes, Bytes>,
     fragments: ReadOnlyTable<Bytes, Bytes>,
     import_progress: ReadOnlyTable<Bytes, Bytes>,
+    released: ReadOnlyTable<Bytes, Bytes>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
 
@@ -1031,6 +1128,7 @@ impl IndexReader {
             takeovers: txn.open_table(TAKEOVERS)?,
             fragments: txn.open_table(FRAGMENTS)?,
             import_progress: txn.open_table(IMPORT_PROGRESS)?,
+            released: txn.open_table(RELEASED)?,
             meta: txn.open_table(META)?,
         })
     }
@@ -1061,6 +1159,45 @@ impl IndexReader {
             from = prefix_end(&codec::fragment_node_prefix(shard, &key.node));
             nodes.push(key.node);
         }
+    }
+
+    /// Returns up to `limit` of the fragments `shard` has yet to release
+    /// (§8.7), in order of node and fragment ID, starting after `after`
+    /// (from the first if `None`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn released(
+        &self,
+        shard: &ShardRef,
+        after: Option<&FragmentLocation>,
+        limit: usize,
+    ) -> Result<Vec<(FragmentLocation, Released)>, IndexError> {
+        let prefix = codec::shard_key(shard);
+        let end = prefix_end(&prefix);
+        let start = after.map_or_else(
+            || prefix.clone(),
+            |after| {
+                let mut key = codec::released_key(shard, &after.node, after.fragment);
+                // The smallest key after `after`'s.
+                key.push(0);
+                key
+            },
+        );
+        let mut rows = Vec::new();
+        for row in self.released.range(start.as_slice()..end.as_slice())? {
+            if rows.len() == limit {
+                break;
+            }
+            let (key, value) = row?;
+            let (_, location) =
+                codec::decode_released_key(key.value()).map_err(IndexError::codec("released"))?;
+            let released =
+                codec::decode_released(value.value()).map_err(IndexError::codec("released"))?;
+            rows.push((location, released));
+        }
+        Ok(rows)
     }
 
     /// Returns the fragments `node` holds of the coded versions of
@@ -1503,6 +1640,7 @@ impl IndexReader {
             ShardTable::RemoteParts => &self.remote_parts,
             ShardTable::Fragments => &self.fragments,
             ShardTable::ImportProgress => &self.import_progress,
+            ShardTable::Released => &self.released,
         };
         let (mut rows, mut bytes) = (Vec::new(), 0);
         for row in table.range(prefix.as_slice()..end.as_slice())? {
@@ -1570,6 +1708,12 @@ impl IndexReader {
                 "fragments",
                 codec::decode_fragment_key,
                 codec::decode_fragment,
+            )?,
+            released: read_all(
+                &self.released,
+                "released",
+                codec::decode_released_key,
+                codec::decode_released,
             )?,
             control,
             control_generation: self.control_generation()?,

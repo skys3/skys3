@@ -17,7 +17,8 @@
 //! written for (which precedes it), the attempt (epoch and number, `u64`
 //! each), and the stripes as the `EC_PUBLISH` record encodes them (§10.1).
 //! The
-//! fragment values of index version 9 exist only in format 4. Integers in
+//! fragment values of index version 9, and the released values of index
+//! version 11, exist only in format 4. Integers in
 //! values are little-endian. Keys use big-endian integers so that redb's
 //! byte order sorts them numerically:
 //!
@@ -37,6 +38,7 @@
 //! | takeovers | shard | the [`ShardConfig`] a member proposed to take over in, as its register's JSON |
 //! | fragments | shard, node ID (`u8` length and bytes), the object key's bytes, stripe number (`u32`), fragment index (`u8`) | the [`FragmentId`] of a coded version's fragment on that node |
 //! | attempts | shard | the next attempt number this node's primary may use (`u64`, not a value of this module) |
+//! | released | shard, node ID (`u8` length and bytes), fragment ID (`u128`, big-endian) | [`Released`]: the object key (`u16` length) and the position of the version whose layout named the fragment |
 //! | imports | bucket ID (UTF-8) | [`ImportRanges`]: one range as its [`ImportCheckpoint`] alone, a tag (0 running, 1 done) and for a running import the last key imported, as an option; or several as tag 2, a `u16` count of at least two, and each range's end, as an option present on all but the last, followed by its checkpoint |
 //! | import_progress | shard | the latest `IMPORT_PROGRESS` the shard applied: its number (`u64`), then its [`ImportRanges`] as in imports |
 //!
@@ -73,8 +75,8 @@ use skys3_types::{
 };
 
 use crate::entry::{
-    Coded, ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, RemotePart,
-    RemoteUpload, Upload,
+    Coded, ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Released,
+    RemotePart, RemoteUpload, Upload,
 };
 use crate::import::{ImportCheckpoint, ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 
@@ -1355,6 +1357,72 @@ pub fn decode_fragment(bytes: &[u8]) -> Result<FragmentId> {
     let fragment = FragmentId::new(u128::from_le_bytes(r.array("fragment")?));
     r.finish("fragment")?;
     Ok(fragment)
+}
+
+/// Returns the released-table key of fragment `fragment` on `node` in
+/// `shard`. Keys of one node sort together, by fragment ID.
+#[must_use]
+pub fn released_key(shard: &ShardRef, node: &NodeId, fragment: FragmentId) -> Vec<u8> {
+    let mut bytes = fragment_node_prefix(shard, node);
+    bytes.extend_from_slice(&fragment.get().to_be_bytes());
+    bytes
+}
+
+/// Decodes a released-table key into its shard and the fragment's
+/// location.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the shard or node is malformed, or the key
+/// does not end with exactly one fragment ID.
+pub fn decode_released_key(bytes: &[u8]) -> Result<(ShardRef, FragmentLocation)> {
+    let field = "released key";
+    let mut r = Reader(bytes, VALUE_FORMAT);
+    let shard = r.shard(field)?;
+    let len = r.len8(field, NodeId::MAX_LEN)?;
+    let node = NodeId::new(Reader::text(field, r.take(field, len)?)?)
+        .map_err(|e| CodecError::new(field, e))?;
+    let fragment = FragmentId::new(u128::from_be_bytes(r.array(field)?));
+    r.finish(field)?;
+    Ok((shard, FragmentLocation { node, fragment }))
+}
+
+/// Encodes a released-table value.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the key is empty or too long.
+pub fn encode_released(released: &Released) -> Result<Vec<u8>> {
+    if released.key.is_empty() {
+        return Err(CodecError::new("released.key", "empty"));
+    }
+    let mut w = Writer::value();
+    w.str16("released.key", &released.key, MAX_KEY_LEN)?;
+    w.position(released.version);
+    Ok(w.0)
+}
+
+/// Decodes a released-table value.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded value of a format
+/// that has them.
+pub fn decode_released(bytes: &[u8]) -> Result<Released> {
+    let mut r = Reader::value(bytes, "released")?;
+    if r.1 < CODED_SINCE {
+        return Err(CodecError::new(
+            "released",
+            format_args!("format {} has no released fragments", r.1),
+        ));
+    }
+    let key = r.str16("released.key", MAX_KEY_LEN)?;
+    if key.is_empty() {
+        return Err(CodecError::new("released.key", "empty"));
+    }
+    let version = r.position("released.version")?;
+    r.finish("released")?;
+    Ok(Released { key, version })
 }
 
 fn write_payload(w: &mut Writer, payload: &Payload) -> Result<()> {

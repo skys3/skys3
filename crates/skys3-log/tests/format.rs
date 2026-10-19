@@ -317,6 +317,7 @@ fn record_kinds_have_fixed_codes_and_names() {
             "ADOPT",
             "EC_PUBLISH",
             "EC_RELOCATE",
+            "EC_RELEASE",
             "TRUNCATE",
             "CONFIG",
             "IMPORT_PROGRESS"

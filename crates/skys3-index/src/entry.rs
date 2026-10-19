@@ -129,6 +129,19 @@ pub struct Coded {
     pub stripes: Vec<CodedStripe>,
 }
 
+/// A fragment that a write or an `EC_RELOCATE` left behind, which the
+/// shard's primary has yet to tell its node to release (§8.7): a row of
+/// the shard's index of released fragments, keyed by the fragment's node
+/// and ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Released {
+    /// The object key whose layout named the fragment.
+    pub key: String,
+    /// The version the fragment was written for: the layout's
+    /// [`Coded::version`], which the fragment's header names.
+    pub version: EpochSeq,
+}
+
 /// Where an object version's bytes are, by log position.
 ///
 /// The node-local location map (§10.2) resolves each position to a

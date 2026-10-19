@@ -110,8 +110,15 @@ pub enum Effect {
     /// An `EC_PUBLISH` marked the key's current version coded (§8.4).
     Published,
     /// An `EC_RELOCATE` moved fragments of the current version's layout to
-    /// new locations (§8.6).
+    /// new locations (§8.6). The fragments it moved away from are released
+    /// (§8.7).
     Relocated,
+    /// An `EC_RELEASE` removed fragments from the shard's index of released
+    /// fragments (§8.7): those it named that the index held for its key.
+    Released {
+        /// How many it removed.
+        fragments: usize,
+    },
     /// A `CONFIG` or `TRUNCATE`, which change no entry.
     Unchanged,
 }
@@ -283,6 +290,10 @@ impl StateMachine {
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
             RecordBody::EcPublish(publish) => publish_coded(index, shard, position, publish)?,
             RecordBody::EcRelocate(relocate) => relocate_coded(index, shard, relocate)?,
+            RecordBody::EcRelease(release) => {
+                let fragments = index.unrelease(shard, &release.key, &release.fragments)?;
+                Ok(Effect::Released { fragments })
+            }
             // A replica's own bookkeeping: the configuration it adopted,
             // which the index keeps as the replica's local copy of it
             // (§6.2), or where reconciliation cut its log (§6.6).
@@ -684,9 +695,11 @@ fn publish_coded(
 /// in the layout of the version it names, if that is still the key's
 /// current version, coded, and the layout still locates each fragment where
 /// the record moves it from (§8.6). The shard's index from node to
-/// fragments follows. Otherwise nothing changes, and the new fragments are
-/// orphans. The entry keeps everything else, its `EC_PUBLISH` position
-/// included, which is what replicas drop their copies by.
+/// fragments follows, and the fragments moved away from enter the shard's
+/// index of released fragments (§8.7). Otherwise nothing changes, and the
+/// new fragments are orphans. The entry keeps everything else, its
+/// `EC_PUBLISH` position included, which is what replicas drop their
+/// copies by.
 fn relocate_coded(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -757,16 +770,18 @@ fn relocate_coded(
             &moved.from,
             &moved.to,
         )?;
+        index.release_fragment(shard, &relocate.key, coded.version, &moved.from)?;
     }
     coded.stripes = stripes;
     index.put_entry(shard, &relocate.key, &entry)?;
     Ok(Ok(Effect::Relocated))
 }
 
-/// Removes the fragments of `prior`'s coded layout, if it has one, from the
-/// shard's index from node to fragments, as a write replaces the version.
-/// The fragments themselves stay until the version is released (plan
-/// M5-07).
+/// Moves the fragments of `prior`'s coded layout, if it has one, from the
+/// shard's index from node to fragments to its index of released
+/// fragments, as a write replaces the version. Their nodes keep them until
+/// the primary has told them to release them, and then for the release
+/// delay and while reads hold them (§8.7).
 fn release_coded(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
@@ -778,6 +793,7 @@ fn release_coded(
         .and_then(|object| object.coded.as_ref())
     {
         index.remove_fragments(shard, key, coded)?;
+        index.release_fragments(shard, key, coded)?;
     }
     Ok(())
 }

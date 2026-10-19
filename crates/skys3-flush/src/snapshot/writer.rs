@@ -344,7 +344,8 @@ fn unflushed(rows: Rows) -> Result<Rows, SnapshotError> {
                 uploads.contains(&upload)
             }
             ShardTable::RemoteUploads | ShardTable::RemoteParts => true,
-            ShardTable::Fragments => false,
+            // A `write_back` bucket codes nothing (§8.1).
+            ShardTable::Fragments | ShardTable::Released => false,
             // How far the import has passed: what drops a late `IMPORT` of a
             // key whose tombstone is gone (§9.1).
             ShardTable::ImportProgress => true,
