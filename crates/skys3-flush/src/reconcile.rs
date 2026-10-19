@@ -192,8 +192,8 @@ pub struct ReconcileReport {
     pub listed: u64,
     /// Keys of those shards compared.
     pub compared: u64,
-    /// The differences it confirmed, at most [`MAX_REPORTED_DIFFERENCES`],
-    /// in key order.
+    /// The differences it confirmed, at most [`MAX_REPORTED_DIFFERENCES`]:
+    /// each listing page's in key order, shard by shard.
     pub differences: Vec<Difference>,
     /// Candidates left unconfirmed because the report was full.
     pub unconfirmed: u64,
@@ -416,13 +416,21 @@ impl<D: Disk> ShardReader for Shard<D> {
 /// shards: the bucket's shards whose primary is here, and its target,
 /// whose window of requests in flight the scan yields to.
 pub(crate) struct ScanInputs<S> {
-    inner: Mutex<(Vec<Arc<dyn ShardReader>>, Option<Arc<Ready<S>>>)>,
+    inner: Mutex<Inputs<S>>,
+}
+
+struct Inputs<S> {
+    shards: Vec<Arc<dyn ShardReader>>,
+    target: Option<Arc<Ready<S>>>,
 }
 
 impl<S> Default for ScanInputs<S> {
     fn default() -> Self {
         Self {
-            inner: Mutex::new((Vec::new(), None)),
+            inner: Mutex::new(Inputs {
+                shards: Vec::new(),
+                target: None,
+            }),
         }
     }
 }
@@ -430,13 +438,16 @@ impl<S> Default for ScanInputs<S> {
 impl<S> ScanInputs<S> {
     /// Replaces the shards and the target.
     pub(crate) fn set(&self, shards: Vec<Arc<dyn ShardReader>>, target: Arc<Ready<S>>) {
-        *lock(&self.inner) = (shards, Some(target));
+        *lock(&self.inner) = Inputs {
+            shards,
+            target: Some(target),
+        };
     }
 
     /// The shards the node leads and that serve now.
     fn led(&self) -> BTreeMap<ShardId, Arc<dyn ShardReader>> {
         lock(&self.inner)
-            .0
+            .shards
             .iter()
             .filter(|shard| shard.leads())
             .map(|shard| (shard.shard_ref().shard, Arc::clone(shard)))
@@ -451,7 +462,10 @@ impl<S> ScanInputs<S> {
     /// Whether the flushers keep the target's window full: every request
     /// they may have in flight is (§7.7).
     fn window_full(&self) -> bool {
-        let target = lock(&self.inner).1.as_ref().and_then(|ready| ready.get());
+        let target = lock(&self.inner)
+            .target
+            .as_ref()
+            .and_then(|ready| ready.get());
         target.is_some_and(|target| {
             let window = target.concurrency();
             window.in_flight >= window.limit
@@ -638,68 +652,93 @@ impl<'a, S: ObjectStore> Scan<'a, S> {
         self.report
     }
 
-    /// Compares the objects of `page` with the entries up to `bound`.
+    /// Compares the objects of `page` with the entries up to `bound`,
+    /// shard by shard, at most a page of entries of a shard at a time.
     async fn compare_page(&mut self, page: &ListObjectsV2Output, bound: Option<&str>) {
         let job = self.job;
         let led = job.inputs.led();
         self.cursors.retain(|id, _| led.contains_key(id));
         let bucket = &job.bucket;
-        let mut remote = BTreeMap::new();
+        // The page's objects of each shard compared, in key order.
+        let mut remote: BTreeMap<ShardId, VecDeque<(&str, Listed<'_>)>> = BTreeMap::new();
         for object in &page.objects {
             let Some(key) = object.key.strip_prefix(job.prefix.as_str()) else {
                 continue;
             };
             let shard = shard_for_key(&bucket.bucket_id, key.as_bytes(), bucket.shards);
             if mirrored(key) && self.cursors.contains_key(&shard) {
-                remote.insert(key.to_owned(), (shard, (&object.etag, object.size)));
+                let listed = (&object.etag, object.size);
+                remote.entry(shard).or_default().push_back((key, listed));
             }
         }
-        let mut local = BTreeMap::new();
-        let mut reads = BTreeMap::new();
-        let mut lost = BTreeSet::new();
-        for (id, cursor) in &mut self.cursors {
-            match cursor
-                .through(bound, job.settings.reconcile_page_keys)
-                .await
-            {
-                Ok((entries, since, progress)) => {
-                    for (key, entry) in entries.into_iter().filter(|(key, _)| mirrored(key)) {
-                        local.insert(key, entry);
+        let shards: Vec<ShardId> = self.cursors.keys().copied().collect();
+        for id in shards {
+            let mut objects = remote.remove(&id).unwrap_or_default();
+            while let Some(cursor) = self.cursors.get_mut(&id) {
+                let page_keys = job.settings.reconcile_page_keys;
+                let chunk = match cursor.chunk(bound, page_keys).await {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        tracing::warn!(bucket = bucket.name.as_str(), shard = %id, %error,
+                            "the reconciliation scan stops reading a shard");
+                        self.cursors.remove(&id);
+                        break;
                     }
-                    reads.insert(*id, (since, progress));
+                };
+                // The chunk holds every entry up to `upto`.
+                let upto = match chunk.entries.last() {
+                    Some((last, _)) if !chunk.complete => Some(last.clone()),
+                    _ => bound.map(str::to_owned),
+                };
+                let mut listed = BTreeMap::new();
+                while let Some(&(key, object)) = objects.front()
+                    && upto.as_deref().is_none_or(|upto| key <= upto)
+                {
+                    listed.insert(key, object);
+                    objects.pop_front();
                 }
-                Err(error) => {
-                    tracing::warn!(bucket = bucket.name.as_str(), shard = %id, %error,
-                        "the reconciliation scan stops reading a shard");
-                    lost.insert(*id);
+                let candidates = self.candidates(id, &chunk, &listed);
+                for candidate in candidates {
+                    self.confirm(candidate).await;
+                }
+                if chunk.complete {
+                    break;
                 }
             }
         }
-        self.cursors.retain(|id, _| !lost.contains(id));
-        let keys: BTreeSet<&String> = local.keys().chain(remote.keys()).collect();
+    }
+
+    /// The keys of `chunk` and of `listed`, the remote's objects up to the
+    /// same key, that differ, counting each key compared.
+    fn candidates(
+        &mut self,
+        shard: ShardId,
+        chunk: &Chunk,
+        listed: &BTreeMap<&str, Listed<'_>>,
+    ) -> Vec<Candidate> {
+        let local: BTreeMap<&str, &Entry> = chunk
+            .entries
+            .iter()
+            .filter(|(key, _)| mirrored(key))
+            .map(|(key, entry)| (key.as_str(), entry))
+            .collect();
+        let keys: BTreeSet<&str> = local.keys().chain(listed.keys()).copied().collect();
         let mut candidates = Vec::new();
         for key in keys {
-            let shard = shard_for_key(&bucket.bucket_id, key.as_bytes(), bucket.shards);
-            let Some((since, progress)) = reads.get(&shard) else {
-                continue;
-            };
             self.report.compared += 1;
-            let entry = local.get(key);
-            let passed = progress.as_ref().is_some_and(|p| p.passed(key));
-            let listed = remote.get(key).map(|(_, object)| *object);
-            if compare(entry, listed, passed).is_some() {
+            let entry = local.get(key).copied();
+            let passed = chunk.progress.as_ref().is_some_and(|p| p.passed(key));
+            if compare(entry, listed.get(key).copied(), passed).is_some() {
                 candidates.push(Candidate {
-                    key: key.clone(),
+                    key: key.to_owned(),
                     shard,
                     entry: entry.cloned(),
-                    since: *since,
+                    since: chunk.since,
                     passed,
                 });
             }
         }
-        for candidate in candidates {
-            self.confirm(candidate).await;
-        }
+        candidates
     }
 
     /// Confirms `candidate` with a HEAD and a second read of its entry,
@@ -827,6 +866,22 @@ impl<'a, S: ObjectStore> Scan<'a, S> {
     }
 }
 
+/// A remote object's ETag and size, as a listing gives them.
+type Listed<'a> = (&'a ETag, u64);
+
+/// A shard's entries up to some key, after those read before.
+struct Chunk {
+    entries: Vec<(String, Entry)>,
+    /// Whether they reach the bound they were read up to; otherwise they
+    /// are a page, and more follow.
+    complete: bool,
+    /// The shard's applied position before the earliest read they come
+    /// from: every write after it may have raced with the scan.
+    since: EpochSeq,
+    /// The shard's import progress, read before them.
+    progress: Option<ImportRanges>,
+}
+
 /// A shard's entries, read in key order a page at a time.
 struct Cursor {
     shard: Arc<dyn ShardReader>,
@@ -853,27 +908,34 @@ impl Cursor {
         }
     }
 
-    /// The entries up to `bound`, or to the end without one, after those
-    /// returned before; the applied position before the earliest read
-    /// they come from; and the shard's import progress, read first.
-    async fn through(
-        &mut self,
-        bound: Option<&str>,
-        page: u32,
-    ) -> Result<(Vec<(String, Entry)>, EpochSeq, Option<ImportRanges>), ShardError> {
+    /// The entries after those returned before, up to `bound`, or to the
+    /// end without one, at most `page` of them.
+    async fn chunk(&mut self, bound: Option<&str>, page: u32) -> Result<Chunk, ShardError> {
         let progress = self.shard.import_progress().await?;
-        let since = self.since;
         let page = usize::try_from(page.max(1)).unwrap_or(usize::MAX);
-        let mut entries = Vec::new();
+        let mut chunk = Chunk {
+            entries: Vec::new(),
+            complete: true,
+            since: self.since,
+            progress,
+        };
         loop {
             while let Some((key, _)) = self.ahead.front() {
                 if bound.is_some_and(|bound| key.as_str() > bound) {
-                    return Ok((entries, since, progress));
+                    return Ok(chunk);
                 }
-                entries.extend(self.ahead.pop_front());
+                if chunk.entries.len() == page {
+                    chunk.complete = false;
+                    return Ok(chunk);
+                }
+                chunk.entries.extend(self.ahead.pop_front());
             }
             if self.done {
-                return Ok((entries, since, progress));
+                return Ok(chunk);
+            }
+            if chunk.entries.len() == page {
+                chunk.complete = false;
+                return Ok(chunk);
             }
             self.since = self.shard.applied();
             let read = self.shard.entries(self.read.clone(), page).await?;
