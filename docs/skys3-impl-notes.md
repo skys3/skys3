@@ -9125,3 +9125,47 @@ of this file. A task with nothing unexpected keeps "None."
   now subscribes before it spawns the task;
   `native::a_body_announced_before_its_flusher_runs_is_staged`, on a
   single-threaded runtime, fails without that.
+
+### M8-05a Replicated shards as library code
+
+- **The plan's home could not hold it.** The plan put the code in a
+  `cluster` module of `skys3-shard`, but `ReplicatedShards` implements the
+  gateway's `Shards` (in `skys3-gateway`, which depends on `skys3-shard`)
+  and the asked-handoff sink implements `skys3-coord`'s `HandoffSink`. It
+  went into a new crate, `skys3-cluster`, recorded in design §6.3, the
+  plan entry, and the plan's repository layout.
+- **"The handoff driver" was two things.** The simulation had a
+  `HandoffSink` that starts the handoffs a coordinator asks for, and a
+  driver that hands primaries off on a timer as a scenario workload. Only
+  the first is production code and moved (`Handoffs`); the timed driver
+  stays in the harness.
+- **Moving the code without changing a simulated run.** The harness's
+  replicated shards audited every replica as it opened, every replica the
+  register following found, and every asked handoff, at those exact
+  points; doing it afterwards would let invariants that run after every
+  step see a different audit. The library calls a `ReplicaObserver` at
+  each of those points instead, and the harness's audit is that observer.
+  The harness's shards wrap the library's with the seeded bugs and the
+  read and write audits, and its stand-in for the registers (read straight
+  from the control bucket without faults, with the static placement as a
+  fallback when opening) is a `ShardConfigs`. Readings that used to be
+  synchronous are boxed futures that are ready at once, so no await point
+  was added. The fixed-seed set passed the same 173 scenarios before and
+  after (256 seeds).
+- **Production register following reads only what changed.** The harness
+  read every register on every pass, which costs nothing in a simulation;
+  `ControlShardConfigs` lists `shards/` and reads a register only when its
+  listed version differs from the one it last read.
+- **`Replication` had no accessor for its node**, so the library's types
+  would have needed the node ID passed twice; `Replication::node` was
+  added.
+- **The simulation set is slow on the development machine.** The cluster
+  simulation target at 256 seeds took 114 minutes on the base while other
+  builds shared the four cores, and 61 minutes after the move without
+  them; CI's job is about 32 minutes.
+- **An unrelated test is timing-sensitive.** In one full
+  `cargo test --all-targets --all-features` run,
+  `skys3-flush`'s `parallel_import::every_stream_shares_one_rate_limit`
+  failed (20 requests counted, 40 expected) while every simulation ran
+  beside it; alone it passed. This task does not touch `skys3-flush`, so
+  it was left as it is.
