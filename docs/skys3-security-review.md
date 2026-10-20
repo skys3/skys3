@@ -65,7 +65,7 @@ transfer run in the simulation and the libraries' tests only.
 | Peer QUIC transport (`skys3-peer`) | Yes, when `[peering.peers]` is set (`skys3/src/peering.rs`) | Yes: mTLS, the peer's chain against that peer's own `ca_file` (`skys3-peer/src/tls.rs:210`) | Leaf's trust domain must be a configured peer and lead to its bundle; holder must be a `node`; a source checks the destination cluster from the server name (`tls.rs:296`); `HELLO`'s cluster must equal the certificate's (`endpoint.rs:466`); every `BEGIN`, `COMMIT`, `BATCH` item, and `ABORT` authorized against the peer's bucket pairs (`trust.rs:198`) | Holds |
 | Peer S3 REST fallback (`s3_access_key_ids`, `x-skys3-apply-by`; `skys3-gateway/src/peer_s3.rs`) | Yes | No: the source signs with SigV4 (a shared secret); the destination is authenticated only by the target endpoint's TLS (WebPKI), or not at all over `http://` | The access key maps to one peer (`peer_s3.rs:118`, config refuses a key listed twice); a write identity must name that peer and one of its pairs (`peer_s3.rs:129`); `x-skys3-*` headers must be signed (`sigv4/mod.rs:356`); the apply-by time is read only from the peer's keys and required where `COMMIT`s land (`peer_s3.rs:199`); the descriptor is verified against the peer's bundle before any address is used (`skys3-peer/src/descriptor.rs:409`) | Holds as designed; finding T2 (no destination authentication over `http://`) |
 | Control store, file (`skys3-control/src/file.rs`) | Yes | Not a network path: a local directory under an exclusive lock | Directory permissions | Holds; T4 and K1 fixed in M8-03 (values bounded; a failed store is detached and reopened, `skys3/src/node.rs` `Shared::detach`) |
-| Control store, S3 (`skys3-control/src/s3.rs`) | Yes, since M8-03 (`skys3/src/control/backend.rs`), after the startup probe, one node per store until M8-05b | One-way: the store by its endpoint's TLS; SkyS3 by its SigV4 credential, from `[control_store] profile` or the default chain | Keys only under the prefix (`s3.rs:160`); targets may not overlap it (`skys3-config/src/cluster.rs:137`, fixed here for AWS regions and partitions) | Holds; T4 and T8 fixed in M8-03 (ranged reads bounded by `MAX_REGISTER_BYTES`; versioning read at startup, `skys3_control_store_versioning`) |
+| Control store, S3 (`skys3-control/src/s3.rs`) | Yes, since M8-03 (`skys3/src/control/backend.rs`), after the startup probe, one node per store until M8-05b | One-way: the store by its endpoint's TLS (`http://` only on loopback, refused at configuration loading and again in `backend::connect`, fixed in M8-03, see T2); SkyS3 by its SigV4 credential, from `[control_store] profile` or the default chain | Keys only under the prefix (`s3.rs:160`); targets may not overlap it (`skys3-config/src/cluster.rs:137`, fixed here for AWS regions and partitions) | Holds; T4 and T8 fixed in M8-03 (ranged reads bounded by `MAX_REGISTER_BYTES`; versioning read at startup, `skys3_control_store_versioning`) |
 | Control store, etcd (`skys3-control/src/etcd`) | Yes, since M8-03, one node per store until M8-05b | `https://`, verified against `etcd_tls_ca_file` or the system roots, with the client certificate of `etcd_tls_cert_file` and `etcd_tls_key_file` (`skys3/src/tls.rs` `client_config`); `http://` only on loopback, refused at configuration loading (`skys3-config/src/cluster.rs` `etcd_backend`) | etcd's `--client-cert-auth` against the client certificate | Holds; T3 fixed in M8-03 (`tests/control_stores.rs` `a_node_runs_on_etcd_over_mutual_tls`, `tests/validation.rs` `etcd_backend_rules`) |
 | Admin HTTP listener: metrics, health, admin API (`skys3-obs/src/admin.rs`) | Yes | No: plain HTTP, bearer token, loopback by default | Token of at least 32 bytes in constant time (`admin.rs:168`, fixed here); a non-loopback `listen` without a token is refused (`admin.rs:111`); `/healthz` and `/readyz` are open by design | Holds as designed; finding T1 (no TLS, no `admin` certificates) |
 | Gateway (S3 and STS clients) | Yes | No, by design: clients sign with SigV4; the gateway serves HTTPS when configured (`skys3/src/tls.rs:35`) and warns on plain HTTP off loopback (`node.rs:724`) | SigV4 signatures in constant time (`sigv4/canonical.rs:260`) | Holds |
@@ -236,6 +236,18 @@ fix. Each is written for an issue of its own.
   the control store at configuration loading, unless the host is
   loopback or `allow_plaintext_endpoint = true` is set on that target;
   warn at startup when it is.
+- **The control-store part is fixed in M8-03.** Once the binary ran the S3
+  control store, an `http://` control endpoint off loopback was the same
+  hole on the trust anchor (§12): SigV4 authenticates requests, not
+  answers, so a machine on the path could pass the startup probe through,
+  then forge register reads and listings, or acknowledge writes that were
+  never applied. Configuration loading now refuses it like an etcd
+  endpoint (T3), with the same message, and `backend::connect`, the only
+  way the node, its reopen path, and `skys3 control identity` reach an
+  etcd or S3 store, checks again (`ControlStoreConfig::check_transport`).
+  There is no opt-in key, as for etcd: a control store is reached over
+  TLS or on loopback. Targets, origins, and the peer fallback stay open
+  under #103.
 
 ### T3. The etcd control store accepts `http://` and has no certificate keys
 

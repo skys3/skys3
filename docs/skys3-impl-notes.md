@@ -9167,6 +9167,15 @@ of this file. A task with nothing unexpected keeps "None."
   store has none, so a node that has never synced from it treats the
   registers it finds as not its own and reclaims no shards on its first
   sync (`claimed` is false on a first open).
+- **Plain HTTP was refused for etcd but not S3 at first.** Review found
+  that an `http://` S3 control endpoint off loopback still loaded and
+  connected; SigV4 does not authenticate answers, so it was the same
+  trust-anchor hole as T3. Loading now refuses it with etcd's message, and
+  `backend::connect` checks both backends again
+  (`ControlStoreConfig::check_transport`), which covers the node, its
+  reopen path, and `skys3 control identity`. No opt-in key, as for etcd;
+  the e2e S3 leg is on 127.0.0.1 and unaffected. Two scope tests used
+  `http://` control endpoints off loopback and now use `https://`.
 - **An etcd CA file is optional.** With `https://` endpoints and no
   `etcd_tls_ca_file`, the node trusts the system roots (as for OIDC),
   which keeps the design's example valid. `http://` is refused except on
