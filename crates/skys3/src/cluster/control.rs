@@ -89,15 +89,23 @@ impl Shared {
     /// `cluster.json` moved, reading only the registers that changed, or
     /// if half of `identity_max_staleness` passed since the last sync.
     /// While the node runs from its copy, it tries a sync every interval.
-    /// A store that refuses every request until it is reopened (a file
+    /// A generation another node pushes (`ControlChanged`, recorded in the
+    /// node's hints) ends the wait early, once per pushed generation, so a
+    /// push costs at most a read of `cluster.json` even if it is forged. A
+    /// store that refuses every request until it is reopened (a file
     /// store after a failed write) is detached, and opened again.
     pub(crate) async fn follow_control_store(self: Arc<Self>) {
         let interval = self.config.control_store().config_poll_interval();
         let cluster = self.config.cluster().cluster_id.clone();
+        let mut hinted = Generation::ZERO;
         loop {
             let known = self.generation();
-            if self.store.is_live() {
-                let after = known.unwrap_or(Generation::ZERO);
+            let after = known.unwrap_or(Generation::ZERO);
+            let wait = async {
+                if !self.store.is_live() {
+                    tokio::time::sleep(interval).await;
+                    return;
+                }
                 match self.store.changes(after).await {
                     Ok(mut changes) => {
                         if let Ok(Err(error)) = timeout(interval, changes.next()).await {
@@ -110,8 +118,13 @@ impl Shared {
                         tokio::time::sleep(interval).await;
                     }
                 }
-            } else {
-                tokio::time::sleep(interval).await;
+            };
+            tokio::select! {
+                () = wait => {}
+                pushed = self.hints.newer_than(after.max(hinted)) => {
+                    tracing::debug!(%pushed, "a pushed generation wakes the sync");
+                    hinted = pushed;
+                }
             }
             if self.store.store().is_some_and(|store| store.failed()) {
                 self.detach().await;

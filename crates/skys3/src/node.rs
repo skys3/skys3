@@ -10,6 +10,7 @@ use std::time::Duration;
 use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ControlStoreBackend, LogFormat};
 use skys3_control::{ControlError, ProposalIds, RetryPolicy};
+use skys3_coord::ControlHints;
 use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
@@ -20,7 +21,9 @@ use skys3_gateway::{
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
-use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health};
+use skys3_obs::{
+    AdminConfig, AdminError, AdminListener, AdminToken, HandshakeLimit, HandshakeMetrics, Health,
+};
 use skys3_remote::aws::{AwsS3, default_credentials, profile_credentials};
 use skys3_shard::lifecycle::{self, LifecycleMetrics};
 use skys3_shard::{
@@ -38,6 +41,7 @@ use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
+use crate::cluster::ClusterServices;
 use crate::cluster::peering::NodePeering;
 use crate::control::backend::{self, Backend, ConnectError, Opener};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner};
@@ -179,6 +183,11 @@ pub enum StartError {
     /// STS could not be set up.
     #[error("STS: {0}")]
     Sts(String),
+    /// The cluster services of `[cluster] multi_node = true` cannot start:
+    /// a certificate that does not name this node, or a registration of
+    /// this node's ID from another data directory.
+    #[error("the cluster: {0}")]
+    Cluster(String),
     /// A shard could not be opened.
     #[error("shard {shard}: {reason}")]
     Shard {
@@ -258,6 +267,9 @@ pub(crate) struct Shared {
     pub(crate) control_metrics: ControlMetrics,
     pub(crate) flush: Arc<NodeFlush>,
     pub(crate) snapshots: NodeSnapshots,
+    /// The generations other nodes push, which wake the sync of the
+    /// node's copy; none arrive without `[cluster] multi_node = true`.
+    pub(crate) hints: ControlHints,
 }
 
 impl Shared {
@@ -564,10 +576,12 @@ fn sts_endpoint(
 }
 
 /// Binds the gateway's listener, with TLS when `[gateway]` names a
-/// certificate.
+/// certificate, and at most `max_inflight_handshakes` handshakes at once,
+/// exported in `handshakes` (§12).
 async fn bind_gateway(
     config: &Config,
     gateway: NodeGateway,
+    handshakes: &HandshakeMetrics,
 ) -> Result<GatewayListener<NodeAuth>, StartError> {
     let settings = config.gateway();
     let listener = GatewayListener::bind(settings.listen, gateway)
@@ -577,7 +591,11 @@ async fn bind_gateway(
             settings.listen
         )))?;
     if let Some((cert, key)) = settings.tls() {
-        return Ok(listener.with_tls(crate::tls::server_config(cert, key)?));
+        let limit = HandshakeLimit::new(settings.max_inflight_handshakes)
+            .with_metrics(handshakes, "gateway");
+        return Ok(listener
+            .with_tls(crate::tls::server_config(cert, key)?)
+            .with_handshake_limit(limit));
     }
     if !settings.listen.ip().is_loopback() {
         tracing::warn!(
@@ -709,6 +727,9 @@ impl Node {
         let data_dir = opened.data_dir.insert(data_dir);
         let node_id = data_dir.node_id().clone();
         tracing::info!(%node_id, %cluster, "starting");
+        // A certificate that does not name this node stops the start before
+        // anything is recovered.
+        let node_credentials = crate::cluster::credentials(&config, &node_id)?;
         let storage = open_storage(&config, data_dir, &mut pools, &mut opened.index).await?;
 
         let metrics = NodeMetrics::new(config.identity().identity_max_staleness());
@@ -734,7 +755,7 @@ impl Node {
                         ConnectError::Tls(error) => StartError::Tls(error),
                         other => StartError::ControlStore(other.to_string()),
                     })?;
-                Opener::shared(store, node_id.clone())
+                Opener::shared(store, node_id.clone(), config.cluster().multi_node)
             }
         };
         let OpenedControl {
@@ -871,7 +892,7 @@ impl Node {
             .with_wall_clock(Arc::clone(&wall));
         // Native replication with peer clusters (§7.8), if any is
         // configured.
-        let peering = NodePeering::open(&config, Arc::clone(&wall))?;
+        let peering = NodePeering::open(&config, Arc::clone(&wall), &metrics.handshakes)?;
         let flush = {
             let settings = FlushSettings {
                 extent_bytes: config.storage().extent_bytes,
@@ -940,6 +961,7 @@ impl Node {
             control_metrics: metrics.control.clone(),
             flush: Arc::clone(&flush),
             snapshots,
+            hints: ControlHints::new(),
         });
         shared.sync_identity(copy.synced_at).await?;
         shared.open_bucket_shards().await?;
@@ -948,7 +970,23 @@ impl Node {
         }
 
         // Listeners.
-        let listener = bind_gateway(&shared.config, shared.gateway.clone()).await?;
+        let cluster_services = match (&node_credentials, shared.opener.shared_store()) {
+            (Some(credentials), Some(store)) => Some(
+                ClusterServices::start(
+                    &shared.config,
+                    credentials,
+                    data_dir,
+                    store.clone(),
+                    shared.hints.clone(),
+                    &metrics.handshakes,
+                    &pools.index,
+                )
+                .await?,
+            ),
+            _ => None,
+        };
+        let listener =
+            bind_gateway(&shared.config, shared.gateway.clone(), &metrics.handshakes).await?;
         let gateway_addr = listener
             .local_addr()
             .map_err(io_error("reading the gateway's address"))?;
@@ -972,6 +1010,7 @@ impl Node {
             control,
             health: health.clone(),
             flush,
+            cluster: cluster_services.as_ref().map(ClusterServices::view),
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?
@@ -1003,6 +1042,9 @@ impl Node {
             });
         }
         background.spawn(Arc::clone(&shared).follow_control_store());
+        if let Some(services) = cluster_services {
+            services.spawn(&mut background);
+        }
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(Arc::clone(&shared).follow_lifecycle(lifecycle_metrics));

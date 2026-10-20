@@ -5,6 +5,166 @@
 //!   and reopens a store that failed.
 //! - [`peering`]: native replication with peer clusters over QUIC (design
 //!   §7.8).
+//! - [`transport`]: the intra-cluster transport listener (design §12),
+//!   with its cap on in-flight handshakes.
+//! - [`registration`]: node registration in `nodes/<node-id>.json` and
+//!   heartbeats to the coordinator (design §6.7).
+//! - [`hints`]: the receiver of admin messages from other nodes, pushed
+//!   generations above all (design §6.2).
+//!
+//! The last three run only with `[cluster] multi_node = true`
+//! ([`ClusterServices`]); without it, the node behaves as a single node and
+//! never binds the transport.
 
 pub(crate) mod control;
+pub(crate) mod hints;
 pub(crate) mod peering;
+pub(crate) mod registration;
+pub(crate) mod transport;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use skys3_config::Config;
+use skys3_coord::ControlHints;
+use skys3_io::{BlockingPool, Clock, MonotonicClock};
+use skys3_net::{Credentials, Listener, PeerIdentity, TokioNetwork, Transport};
+use skys3_obs::{HandshakeLimit, HandshakeMetrics};
+use skys3_types::NodeId;
+use tokio::task::JoinSet;
+
+use crate::admin::ClusterView;
+use crate::control::backend::Backend;
+use crate::datadir::DataDir;
+use crate::node::StartError;
+use registration::NodeHeartbeater;
+
+/// Loads the node's `[transport]` credentials for `[cluster] multi_node =
+/// true`, and checks that the certificate names this node: a node's ID is
+/// the one its certificate names (design §12). `None` for a single node.
+///
+/// # Errors
+///
+/// [`StartError::Cluster`] for credentials that cannot be loaded, such as
+/// a certificate of another cluster, or one that names another node.
+pub(crate) fn credentials(
+    config: &Config,
+    node: &NodeId,
+) -> Result<Option<Credentials>, StartError> {
+    if !config.cluster().multi_node {
+        return Ok(None);
+    }
+    let cluster = &config.cluster().cluster_id;
+    let files = config.transport().tls_files().ok_or_else(|| {
+        StartError::Cluster("the [transport] certificate files are not set".to_owned())
+    })?;
+    let credentials =
+        Credentials::load(cluster.clone(), files.cert, files.key, files.ca).map_err(|error| {
+            StartError::Cluster(format!(
+                "the [transport] certificate of cluster {cluster} is not usable: {error}"
+            ))
+        })?;
+    match credentials.identity() {
+        PeerIdentity::Node(named) if named == node => Ok(Some(credentials)),
+        other => Err(StartError::Cluster(format!(
+            "the [transport] certificate names {other}, but this node is {node}: a node's ID is \
+             the one its certificate names, so set [node] node_id to it, or use the certificate \
+             issued for {node}"
+        ))),
+    }
+}
+
+/// The cluster services of a node with `[cluster] multi_node = true`, bound
+/// and registered, ready to run ([`ClusterServices::spawn`]).
+pub(crate) struct ClusterServices {
+    listener: Listener<TokioNetwork>,
+    limit: HandshakeLimit,
+    services: transport::Services,
+    heartbeater: NodeHeartbeater,
+    view: ClusterView,
+}
+
+impl ClusterServices {
+    /// Binds the transport listener with `credentials`, and registers the
+    /// node in `store` (the control store's own client, so that the node
+    /// registers even while it runs from its copy). Pushed generations go
+    /// to `hints`, and the listener's handshakes are exported in
+    /// `handshakes`.
+    ///
+    /// # Errors
+    ///
+    /// [`StartError`] if the listener cannot bind, a disk's capacity cannot
+    /// be read, or the register holds the node's ID for another data
+    /// directory.
+    pub(crate) async fn start(
+        config: &Config,
+        credentials: &Credentials,
+        data_dir: &DataDir,
+        store: Backend,
+        hints: ControlHints,
+        handshakes: &HandshakeMetrics,
+        pool: &BlockingPool,
+    ) -> Result<Self, StartError> {
+        let settings = config.transport();
+        let advertise = settings.advertised().ok_or_else(|| {
+            StartError::Cluster(
+                "[transport] advertise is required with this listen address".to_owned(),
+            )
+        })?;
+        let transport = Transport::new(TokioNetwork, credentials);
+        let listener = transport
+            .bind(settings.listen)
+            .await
+            .map_err(|error| StartError::Io {
+                what: format!("binding the transport to {}", settings.listen),
+                source: std::io::Error::other(error.to_string()),
+            })?;
+        let listen: SocketAddr = listener.local_addr().map_err(|source| StartError::Io {
+            what: "reading the transport's address".to_owned(),
+            source,
+        })?;
+        let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+        let limit = HandshakeLimit::new(settings.max_inflight_handshakes)
+            .with_metrics(handshakes, "transport");
+        let services = transport::Services {
+            admin: hints::endpoint(config, hints.clone(), Arc::clone(&clock)),
+        };
+        let profile = registration::profile(config, data_dir, advertise.clone(), pool).await?;
+        let mut heartbeater = registration::heartbeater(config, store, transport, profile, clock);
+        registration::register_at_start(&mut heartbeater).await?;
+        tracing::info!(%listen, %advertise, "the transport listens");
+        let view = ClusterView {
+            listen,
+            advertise,
+            heartbeats: heartbeater.subscribe(),
+            hints,
+            handshakes: limit.clone(),
+        };
+        Ok(Self {
+            listener,
+            limit,
+            services,
+            heartbeater,
+            view,
+        })
+    }
+
+    /// What the admin API reports of the services.
+    pub(crate) fn view(&self) -> ClusterView {
+        self.view.clone()
+    }
+
+    /// Serves the transport and sends heartbeats, for as long as the
+    /// node's background tasks run.
+    pub(crate) fn spawn(self, background: &mut JoinSet<()>) {
+        let Self {
+            listener,
+            limit,
+            services,
+            heartbeater,
+            ..
+        } = self;
+        background.spawn(transport::serve(listener, limit, services));
+        background.spawn(heartbeater.run());
+    }
+}
