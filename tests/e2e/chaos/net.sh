@@ -10,7 +10,8 @@
 #   net.sh down                   removes every namespace skc-*, the
 #                                 bridge, and the host's FORWARD rule
 #   net.sh check                  exits 0 if namespaces, veths, a bridge,
-#                                 and iptables in a namespace all work
+#                                 and every iptables rule the faults add
+#                                 in a namespace all work
 #   net.sh netem                  exits 0 if the kernel has tc netem
 #   net.sh isolate <name> cluster drops every packet between <name> and
 #                                 the other namespaces; the host (the
@@ -87,7 +88,14 @@ check() {
     ip netns add "$probe" || return 1
     if ip link add "${link}a" type veth peer name "${link}b" 2>/dev/null; then
         ip link del "${link}a"
-        ip netns exec "$probe" iptables -L INPUT -n >/dev/null 2>&1 || ok=1
+        # Every rule the faults add, in the probe's own iptables.
+        {
+            ip netns exec "$probe" iptables -N skc-part &&
+                ip netns exec "$probe" iptables -N skc-loss &&
+                partition_rules "$probe" cluster &&
+                partition_rules "$probe" full &&
+                loss_rules "$probe" 0.0100
+        } >/dev/null 2>&1 || ok=1
     else
         ok=1
     fi
@@ -109,17 +117,23 @@ netem() {
     return "$ok"
 }
 
-isolate() {
-    local name=$1 mode=$2
-    in_ns "$name" iptables -F skc-part
+# The rules of a partition, in namespace <netns>'s chain skc-part.
+partition_rules() {
+    local netns=$1 mode=$2
+    local -a rule=(ip netns exec "$netns" iptables -A skc-part)
+    ip netns exec "$netns" iptables -F skc-part
     case "$mode" in
     cluster)
-        in_ns "$name" iptables -A skc-part -i eth0 -s "$subnet" ! -s "$host_ip" -j DROP
-        in_ns "$name" iptables -A skc-part -o eth0 -d "$subnet" ! -d "$host_ip" -j DROP
+        # iptables takes one -s (and one -d) per rule: the host's packets
+        # return from the chain before the subnet's are dropped.
+        "${rule[@]}" -i eth0 -s "$host_ip" -j RETURN
+        "${rule[@]}" -o eth0 -d "$host_ip" -j RETURN
+        "${rule[@]}" -i eth0 -s "$subnet" -j DROP
+        "${rule[@]}" -o eth0 -d "$subnet" -j DROP
         ;;
     full)
-        in_ns "$name" iptables -A skc-part -i eth0 -j DROP
-        in_ns "$name" iptables -A skc-part -o eth0 -j DROP
+        "${rule[@]}" -i eth0 -j DROP
+        "${rule[@]}" -o eth0 -j DROP
         ;;
     *)
         echo "isolate: the mode is cluster or full, not $mode" >&2
@@ -127,6 +141,16 @@ isolate() {
         ;;
     esac
 }
+
+# The loss fallback, in namespace <netns>'s chain skc-loss.
+loss_rules() {
+    local netns=$1 probability=$2
+    ip netns exec "$netns" iptables -F skc-loss
+    ip netns exec "$netns" iptables -A skc-loss -m statistic --mode random \
+        --probability "$probability" -j DROP
+}
+
+isolate() { partition_rules "$(ns "$1")" "$2"; }
 
 heal() { in_ns "$1" iptables -F skc-part; }
 
@@ -136,11 +160,9 @@ shape() {
         in_ns "$name" tc qdisc replace dev eth0 root netem \
             delay "${delay}ms" "${jitter}ms" loss "${loss}%"
     else
-        in_ns "$name" iptables -F skc-loss
         local probability
         probability=$(awk -v l="$loss" 'BEGIN { printf "%.4f", l / 100 }')
-        in_ns "$name" iptables -A skc-loss -m statistic --mode random \
-            --probability "$probability" -j DROP
+        loss_rules "$(ns "$name")" "$probability"
     fi
 }
 
