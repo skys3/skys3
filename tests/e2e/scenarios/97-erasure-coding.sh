@@ -24,7 +24,7 @@
 # segments are 2 MiB, so the object's bytes fill closed segments that
 # compaction can remove, and checkpoints, which compaction follows, come
 # every second. It runs only over etcd (`# e2e: etcd`), beside the other
-# cluster scenarios, takes about 45 seconds, and uses the ports
+# cluster scenarios, takes about 25 seconds, and uses the ports
 # E2E_PORT+50 to E2E_PORT+61, which only the single-node scenarios of the
 # file store use otherwise.
 # e2e: etcd
