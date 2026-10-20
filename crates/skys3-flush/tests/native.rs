@@ -123,8 +123,45 @@ async fn a_dropped_link_resends_only_what_the_destination_lacks() {
     let node = Node::open(3).await;
     let text = body(1000);
     let seq = node.put("big", &text).await;
-    destination.faults().cut_after_data = Some(5);
+    {
+        let mut faults = destination.faults();
+        faults.cut_after_data = Some(5);
+        faults.down_after_cut = true;
+    }
     let flusher = node.flusher(&destination.default_target(FRAME));
+    // The link stays down after the cut until the destination has staged
+    // what the first stream sent, so that the next `RESUME` reports it,
+    // however long its appends take.
+    until("the first stream's frames staged", || {
+        if !destination.faults().down {
+            return false;
+        }
+        let sent: Vec<(u64, u64)> = destination
+            .seen()
+            .received
+            .iter()
+            .filter_map(|m| match m {
+                Message::Data(data) => Some((data.offset, data.offset + data.bytes.len() as u64)),
+                _ => None,
+            })
+            .collect();
+        let Some(&(_, end)) = sent.iter().max_by_key(|(_, end)| *end) else {
+            return false;
+        };
+        let durable = destination
+            .staging
+            .report(&wid(seq), [0])
+            .and_then(|staged| staged.pieces.get(&0).cloned())
+            .unwrap_or_default();
+        let missing = durable.missing(end);
+        sent.iter().all(|&(start, stop)| {
+            missing
+                .iter()
+                .all(|gap| gap.end <= start || stop <= gap.start)
+        })
+    })
+    .await;
+    destination.faults().down = false;
     node.settle(&flusher).await;
     flusher.stop().await;
     assert_eq!(destination.bytes("big").await.unwrap(), text.as_bytes());

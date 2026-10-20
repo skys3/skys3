@@ -41,6 +41,9 @@ pub struct Faults {
     pub lose_applied: usize,
     /// Refuse to open streams.
     pub down: bool,
+    /// Set `down` as the stream is cut, before the source can notice, so
+    /// that it opens no stream until the test lifts `down`.
+    pub down_after_cut: bool,
     /// Answer every `BEGIN` with an `ABORT` (`refused`), as a destination
     /// does for a bucket that does not receive from the source (§7.8).
     pub refuse_begins: bool,
@@ -344,6 +347,9 @@ impl Inbound for ChannelInbound {
         if matches!(message, Message::Data(_)) {
             self.data += 1;
             if self.cut_after_data.is_some_and(|limit| self.data > limit) {
+                let mut faults = self.sender.destination.faults();
+                faults.down |= faults.down_after_cut;
+                drop(faults);
                 self.cut.store(true, Ordering::SeqCst);
                 return Err(StreamError::Transport("the link dropped".to_owned()));
             }
