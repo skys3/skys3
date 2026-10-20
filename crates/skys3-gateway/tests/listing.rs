@@ -272,9 +272,12 @@ async fn listing_requests_are_checked() {
     assert_eq!(text(&none.body, "IsTruncated").as_deref(), Some("false"));
     let capped = setup.list("max-keys=5000").await;
     assert_eq!(text(&capped.body, "MaxKeys").as_deref(), Some("1000"));
-    // An empty delimiter rolls up nothing.
-    let flat = setup.list("list-type=2&delimiter=").await;
-    assert_eq!(keys(&flat), ["a"]);
+    // An empty delimiter rolls up nothing, and is not echoed.
+    for query in ["list-type=2&delimiter=", "delimiter=&max-keys=1"] {
+        let flat = setup.list(query).await;
+        assert_eq!(keys(&flat), ["a"]);
+        assert_eq!(text(&flat.body, "Delimiter"), None, "{}", flat.body);
+    }
 
     setup
         .call(Method::GET, "/missing?list-type=2", &[], "")

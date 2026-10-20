@@ -397,7 +397,9 @@ jobs:
   # and Rust, the AWS CLI, and the ceph/s3-tests subset, all at once
   # (crates/skys3/tests/sdk.rs). Each client but Rust runs in its own
   # image with pinned versions (tests/sdk/run.sh), built while the test
-  # compiles.
+  # compiles. The run also checks the compatibility matrix's STS, s3-tests,
+  # and SDK sections (docs/skys3-s3-compatibility.md, plan M7-01); the
+  # `rust` job checks its operation tables.
   sdk:
     name: SDK matrix
     needs: changes

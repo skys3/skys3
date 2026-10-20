@@ -8,10 +8,11 @@
 #   scripts/ci/docs-only.sh BASE HEAD
 #
 # Documentation is any Markdown file and any file named LICENSE, except
-# the design doc and the configuration reference, which tests read. Both
-# commits must be present locally. The README is also the crate's rustdoc
-# (src/lib.rs includes it), so CI still runs the doctests and rustdoc for
-# a docs-only change; see the `docs` job in .github/workflows/ci.yml.
+# the design doc, the configuration reference, and the compatibility
+# matrix, which tests read. Both commits must be present locally. The
+# README is also the crate's rustdoc (src/lib.rs includes it), so CI still
+# runs the doctests and rustdoc for a docs-only change; see the `docs` job
+# in .github/workflows/ci.yml.
 set -eu
 
 base=${1:?base commit}
@@ -24,8 +25,9 @@ printf '%s\n' "$paths" | while IFS= read -r path; do
     case $path in
         # Tests read these documents: the configuration tests load the
         # design's section 14 example and check the configuration
-        # reference, so a change to either must run them.
-        docs/skys3-design.md | docs/skys3-config.md)
+        # reference, and the compatibility tests check the matrix's
+        # generated sections, so a change to any must run them.
+        docs/skys3-design.md | docs/skys3-config.md | docs/skys3-s3-compatibility.md)
             echo "docs-only: $path is read by tests"
             exit 1
             ;;
