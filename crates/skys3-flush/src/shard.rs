@@ -100,6 +100,8 @@ struct Tracked {
     phase: Phase,
     /// Failed attempts since the last success.
     failures: u32,
+    /// Whether the latest attempt ended in a refusal (§7.6).
+    refused: bool,
     /// When a change arrived while the key was flushing.
     newer_since: Option<Duration>,
     /// The newest version the remote is known to hold while the key is
@@ -134,6 +136,9 @@ pub struct ShardStatus {
     pub dirty: u64,
     /// Of those, the keys being flushed.
     pub flushing: u64,
+    /// Of those, the keys whose latest attempt the target refused (§7.6):
+    /// they wait for their retry.
+    pub refused: u64,
     /// Bytes of the versions not at the remote, every key included.
     pub dirty_bytes: u64,
     /// When the oldest change not at the remote was made, every key
@@ -204,6 +209,7 @@ impl State {
                 size,
                 phase: Phase::Dirty,
                 failures: 0,
+                refused: false,
                 newer_since: None,
                 remote: None,
                 waiters: Vec::new(),
@@ -290,6 +296,7 @@ impl State {
             return;
         };
         tracked.failures = 0;
+        tracked.refused = false;
         // A resolution ends with the flush that carried it out: a newer
         // version builds on what that flush left at the remote.
         tracked.resolution = None;
@@ -315,11 +322,13 @@ impl State {
         })
     }
 
-    /// Ends the flush of `key` with a failure: it retries at `at`.
-    fn failed(&mut self, key: &str, error: String, at: Instant) {
+    /// Ends the flush of `key` with a failure, a refusal if `refused`: it
+    /// retries at `at`.
+    fn failed(&mut self, key: &str, error: String, refused: bool, at: Instant) {
         self.flushing -= 1;
         self.record_error(key, error);
         if let Some(tracked) = self.keys.get_mut(key) {
+            tracked.refused = refused;
             tracked.phase = Phase::Backoff(at);
             self.backoff.insert((at, tracked.order), key.to_owned());
         }
@@ -335,6 +344,7 @@ impl State {
         let Some(tracked) = self.keys.get_mut(key) else {
             return;
         };
+        tracked.refused = false;
         if policy == ConflictPolicy::Hold {
             self.pending.remove(&(tracked.since, key.to_owned()));
             tracked.phase = Phase::Conflict(conflict);
@@ -512,6 +522,7 @@ impl State {
                 }),
                 _ => {
                     status.dirty += 1;
+                    status.refused += u64::from(tracked.refused);
                     continue;
                 }
             }
@@ -624,8 +635,12 @@ impl ShardFlusher {
         let bodies = Arc::new(Bodies::default());
         let (commands, resolutions) = mpsc::unbounded_channel();
         let not_before = Instant::now() + quarantine;
+        // Subscribed before the task runs, so that a body announced once
+        // this returns reaches the flusher, however late the task starts.
+        let changes = shard.subscribe();
         let task = tokio::spawn(run(
             shard,
+            changes,
             (ready, not_before),
             wall,
             Arc::clone(&state),
@@ -726,16 +741,17 @@ type Done = (String, EpochSeq, Option<ConflictPolicy>, Outcome);
 type Recorded = (String, Seq, Result<(), ShardError>);
 
 /// The flusher's task. It tracks the shard's dirty keys from the start,
-/// and flushes them once the target is ready.
+/// following the `changes` it subscribed to, and flushes them once the
+/// target is ready.
 async fn run<S: ObjectStore, D: Disk>(
     shard: Shard<D>,
+    mut changes: mpsc::UnboundedReceiver<Change>,
     (ready, not_before): (Arc<Ready<S>>, Instant),
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
     (streams, bodies): (Arc<Streams>, Arc<Bodies>),
     mut resolutions: mpsc::UnboundedReceiver<Resolve>,
 ) {
-    let mut changes = shard.subscribe();
     // A native target is ready from the start: its bodies are staged at the
     // peer, and no remote multipart upload is ever opened (§7.8).
     let native = ready.get().is_some_and(|target| target.native.is_some());
@@ -805,7 +821,7 @@ async fn run<S: ObjectStore, D: Disk>(
                 Some(step) = staging.join_next(), if !staging.is_empty() => {
                     // A body is staged only once there is a target.
                     if let (Ok(step), Some(target)) = (step, &target) {
-                        bodies.finish(step, &target.settings);
+                        bodies.finish(step, target);
                     }
                 }
                 Some(recorded) = records.join_next(), if !records.is_empty() => {
@@ -1035,7 +1051,7 @@ fn finish<S, D: Disk>(
                 // A tombstone stays until the import passes its key
                 // (§4.2): look again later, less often the longer it waits.
                 let at = Instant::now() + target.settings.backoff(state.wait(&key));
-                state.failed(&key, "waiting for the import".to_owned(), at);
+                state.failed(&key, "waiting for the import".to_owned(), false, at);
             }
         }
         Outcome::Settled => {
@@ -1058,11 +1074,20 @@ fn finish<S, D: Disk>(
             state.discarded(&key, version);
             state.finished(&key, dispatched);
         }
-        Outcome::Retry(error) => {
+        Outcome::Retry { error, refused } => {
             target.counters.retries.inc();
-            tracing::debug!(shard = %shard.shard(), key, %error, "a flush will be retried");
+            if let Some(code) = refused {
+                // Retried all the same: the path to the target is wrong,
+                // not the key, and an operator's fix lets it flush (§7.6).
+                let at = target.wall.now();
+                target.refusals.record(code, format!("{key}: {error}"), at);
+                tracing::debug!(shard = %shard.shard(), key, %error, %code,
+                    "the target refused a flush; it will be retried");
+            } else {
+                tracing::debug!(shard = %shard.shard(), key, %error, "a flush will be retried");
+            }
             let at = Instant::now() + target.settings.backoff(state.wait(&key));
-            state.failed(&key, error, at);
+            state.failed(&key, error, refused.is_some(), at);
         }
     }
     if !state.awaits_flush(&key) {
@@ -1197,7 +1222,7 @@ mod tests {
         );
         // A failed attempt keeps the resolution; a flush ends it.
         let now = Instant::now();
-        state.failed("k", "the remote failed".to_owned(), now);
+        state.failed("k", "the remote failed".to_owned(), false, now);
         state.release_due(now);
         let (_, _, resolution) = state.take_ready().unwrap();
         assert_eq!(resolution, Some(ConflictPolicy::Overwrite));
@@ -1297,6 +1322,46 @@ mod tests {
         assert_eq!(state.discard_order.len(), MAX_DISCARDS);
         assert!(!state.discards.contains_key("k0"));
         assert_eq!(state.discards["k1"], position(2));
+    }
+
+    /// A key counts as refused from a refused attempt until its next
+    /// attempt ends otherwise: it flushes, fails another way, or finds a
+    /// conflict.
+    #[test]
+    fn a_refused_key_counts_until_an_attempt_ends_otherwise() {
+        let now = Instant::now();
+        let mut state = flushing();
+        state.changed("other", position(2), Some(1), Duration::from_secs(1));
+        state.failed("k", "403 AccessDenied".to_owned(), true, now);
+        assert_eq!(state.status().refused, 1);
+        assert_eq!(state.status().dirty, 2);
+        // A newer version does not clear it: no attempt has been made.
+        state.changed("k", position(3), Some(5), Duration::from_secs(2));
+        assert_eq!(state.status().refused, 1);
+
+        // Another kind of failure does.
+        state.release_due(now);
+        state.take_ready().unwrap();
+        state.failed("k", "503 SlowDown".to_owned(), false, now);
+        assert_eq!(state.status().refused, 0);
+
+        // So does a flush, and the key is no longer tracked.
+        state.release_due(now);
+        state.take_ready().unwrap();
+        state.failed("k", "403 AccessDenied".to_owned(), true, now);
+        state.release_due(now);
+        let (key, version, _) = state.take_ready().unwrap();
+        assert_eq!(state.status().refused, 1, "a retry in flight still counts");
+        state.finished(&key, version);
+        assert_eq!(state.status().refused, 0);
+
+        // And a conflict.
+        let mut state = flushing();
+        state.failed("k", "403 AccessDenied".to_owned(), true, now);
+        state.release_due(now);
+        state.take_ready().unwrap();
+        state.conflicted("k", conflict(), ConflictPolicy::Hold);
+        assert_eq!(state.status().refused, 0);
     }
 
     #[test]

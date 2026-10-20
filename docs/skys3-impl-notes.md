@@ -9060,3 +9060,68 @@ of this file. A task with nothing unexpected keeps "None."
   import of `sign` in `skys3-gateway/src/sigv4/chunked.rs`, used only under
   `test-util` since M1-07a. CI's clippy runs with every feature, so it
   never saw it; left alone here, as it is not this task's crate.
+
+### M8-02 Refused-flush metric and alert
+
+- **A destination without `peer_source` refuses the probe, not the
+  flushes.** The plan has the flusher sort `403` answers to flushes. But
+  such a destination serves no peer descriptor, so the source takes it for
+  a plain S3 store and runs the capability probe first, and the probe's
+  first `PutObject` gets the `403`: no flush is ever attempted, and a
+  per-key gauge would read 0 throughout the e2e scenario. The probe's
+  refusals are counted too, and while the probe is refused every dirty key
+  counts as refused (design section 7.6). The probe status gained a
+  `refused` flag for that.
+- **The native `refused` answer is not only about authorization.** An
+  `APPLIED` or `ABORT` with `refused` also answers a bucket being deleted
+  or a staging that needs too many extents. It is counted under its own
+  code, `refused`, rather than mapped onto `AccessDenied`.
+- **A missing bucket pair is a `400`, not a `403`.** The destination
+  refuses a write identity for a pair the peer lacks with `400
+  InvalidArgument`, which the source does not count as a refusal (only
+  `401` and `403` are, as the task says); the destination's
+  `bucket_pair` reason and the source's `flush.errors` show it, and the
+  runbook says so.
+- **Unsigned `x-skys3-*` headers are refused before authentication.** Their
+  `peer` label is always `unknown`, and the count includes clients' unsigned
+  `x-skys3-bucket-*` CreateBucket headers, since nothing tells them apart
+  at that point. The access key the request claims was not used for the
+  label: it is not verified yet.
+- **No promtool image could be pulled.** Docker Hub answered `429 Too Many
+  Requests` for `prom/prometheus`, and quay.io is out of reach from the
+  development machine. `scripts/ci/promtool.sh` downloads the pinned
+  Prometheus 3.5.0 release from GitHub instead, checks its SHA-256, and
+  runs `promtool check rules` and `promtool test rules`; it takes seconds,
+  so it runs in the `e2e` job, which has room in its 15 minutes. Locally
+  both passed, and a deliberately wrong expectation in the test file
+  failed as it should.
+- **S3-REST-only peering for the e2e scenario.** The source cluster has no
+  `[peering.peers]` table, so it flushes over S3 REST with no descriptor,
+  no QUIC, and no quarantine. The scenario passed alone in 32 s (the
+  probe's backoff dominates), and the whole suite passed locally in 5 m
+  41 s with the `e2e` binary (flush-refused 66 s and peering 338 s beside
+  the others), with the AWS CLI from its image and the Docker daemon
+  started for the run and stopped after it. The peering scenario's node configuration
+  moved into `tests/e2e/lib.sh` (`peer_configure`, `peer_aws`) for reuse,
+  and the PKI gained the clusters `ra` and `rb`.
+- **Two refusal paths were missed at first (review).** A streamed body's
+  own staging at a SkyS3 peer, before its `PUT` commits, ends in its own
+  task, which kept only the error text; and the server-side copy probe
+  takes a `403` on `CopyObject` for an error to retry forever, not for
+  missing support. Both are now counted and named in `last_refusal`
+  (`<key>: ...` and `copy probe: ...`), but neither holds up a key: the
+  body's version is not dirty yet, and copies are uploaded while the copy
+  probe is pending.
+- **The unused `sign` import M8-01 noted is fixed**, since this task
+  touches `skys3-gateway`: it is imported under the same `cfg` as its
+  users.
+- **A flusher could miss a body announced as it started.** CI on aarch64
+  timed out in `native::a_body_whose_put_never_commits_is_aborted`, an
+  M6-06 test: the flusher subscribed to the shard's changes only when its
+  task first ran, and `Shard::announce` drops an announcement while the
+  shard has no subscriber, so a body announced before that was never
+  staged, and never aborted. Delaying the task's first poll by 50 ms
+  failed that test and three others the same way. `ShardFlusher::start`
+  now subscribes before it spawns the task;
+  `native::a_body_announced_before_its_flusher_runs_is_staged`, on a
+  single-threaded runtime, fails without that.

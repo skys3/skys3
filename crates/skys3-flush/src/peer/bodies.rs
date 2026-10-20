@@ -34,6 +34,7 @@ use super::Native;
 use super::link::Stream;
 use super::upload::{Ended, Layout, Staged};
 use crate::attempt::Failure;
+use crate::refusal::RefusalCode;
 use crate::target::{FlushSettings, Target};
 
 /// One streamed body, by the position of its `UPLOAD_BEGIN`.
@@ -59,8 +60,9 @@ struct Body {
 pub(crate) enum BodyStep {
     /// Its stream staged the announced extents at these offsets.
     Staged(EpochSeq, Vec<u64>),
-    /// Its stream failed; it is tried again after a backoff.
-    Failed(EpochSeq, String),
+    /// Its stream failed, refused by the destination if a code is given
+    /// (§7.6); it is tried again after a backoff.
+    Failed(EpochSeq, String, Option<RefusalCode>),
     /// An `ABORT` of a body's staging was sent, or could not be.
     Aborted,
 }
@@ -162,8 +164,11 @@ impl Bodies {
             .min()
     }
 
-    /// Records what a body's task did.
-    pub(crate) fn finish(&self, step: BodyStep, settings: &FlushSettings) {
+    /// Records what a body's task for `target` did. A refusal is counted
+    /// with the target's others, under the body's key; the key's own
+    /// refusal state is the flush's to set, once the `PUT` commits.
+    pub(crate) fn finish<S>(&self, step: BodyStep, target: &Target<S>) {
+        let settings = &target.settings;
         let mut bodies = self.lock();
         match step {
             BodyStep::Staged(upload, offsets) => {
@@ -176,8 +181,13 @@ impl Bodies {
                     }
                 }
             }
-            BodyStep::Failed(upload, error) => {
+            BodyStep::Failed(upload, error, refused) => {
                 if let Some(body) = bodies.get_mut(&upload) {
+                    if let Some(code) = refused {
+                        let at = target.wall.now();
+                        let error = format!("{}: {error}", body.key);
+                        target.refusals.record(code, error, at);
+                    }
                     tracing::debug!(key = body.key, %error, "a streamed body will be staged again");
                     body.staging = None;
                     body.failures += 1;
@@ -241,7 +251,9 @@ impl Bodies {
             let task = tasks.spawn(async move {
                 match stage(&shard, &target, key, upload, &layout).await {
                     Ok(()) => BodyStep::Staged(upload, layout.0.iter().map(|s| s.offset).collect()),
-                    Err(failure) => BodyStep::Failed(upload, failure.to_string()),
+                    Err(failure) => {
+                        BodyStep::Failed(upload, failure.to_string(), failure.refusal())
+                    }
                 }
             });
             body.staging = Some(task);
@@ -289,7 +301,7 @@ async fn stage<S, D: Disk>(
     let (mut stream, durable) = match staged.open().await.map_err(Failure::link)? {
         Ok(opened) => opened,
         Err(Ended::Aborted(reason, detail)) => {
-            return Err(Failure::Peer(format!("{reason:?}: {detail}")));
+            return Err(Failure::aborted(reason, &detail));
         }
         Err(Ended::Applied(outcome)) => return Err(Failure::Peer(format!("{outcome:?}"))),
     };

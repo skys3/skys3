@@ -162,3 +162,94 @@ node_stop() {
     rm -f "$E2E_DIR/$name/pid"
     log "node $name stopped"
 }
+
+# --- Peered clusters ---------------------------------------------------------
+#
+# The scenarios with two single-node clusters, one flushing to the other
+# (peering, flush-refused), share a static credential that may do anything
+# on every node, and the access key every node's flushers sign their S3
+# requests with, which a destination lists in its peer's s3_access_key_ids.
+PEER_ADMIN_KEY=AKIASKYS3E2EPEERADMIN
+PEER_ADMIN_SECRET=skys3-e2e-peer-admin-secret-0123456789
+PEER_FLUSH_KEY=AKIASKYS3E2EPAPEER
+PEER_FLUSH_SECRET=skys3-e2e-pa-peer-secret-0123456789abc
+
+# peer_configure <cluster> <node> <gateway port> <quic port> <extra>: the
+# directory $E2E_DIR/<cluster> and the configuration of the one node of
+# cluster <cluster>, with <extra> appended to its TOML. Its admin listener
+# is on the gateway port plus 1 and its transport on the gateway port plus
+# 2; its flushers sign with PEER_FLUSH_KEY, whose secret is also in
+# <cluster>/peer-secret for a destination's credential to name.
+peer_configure() {
+    local cluster=$1 node=$2 port=$3 quic=$4 extra=$5 dir=$E2E_DIR/$1
+    local pki=$E2E_DIR/pki
+    mkdir -p "$dir"
+    printf '%s' "$PEER_ADMIN_SECRET" >"$dir/admin-secret"
+    printf '%s' "$PEER_FLUSH_SECRET" >"$dir/peer-secret"
+    echo "127.0.0.1:$((port + 1))" >"$dir/admin"
+    cat >"$dir/skys3.toml" <<EOF
+[cluster]
+cluster_id = "$cluster"
+
+[node]
+node_id = "$node"
+data_dir = "$dir/data"
+
+[gateway]
+listen = "127.0.0.1:$port"
+
+[control_store]
+backend = "file"
+config_poll_interval_seconds = 1
+
+[transport]
+listen = "127.0.0.1:$((port + 2))"
+tls_cert_file = "$pki/$cluster-$node.pem"
+tls_key_file = "$pki/$cluster-$node.key"
+tls_ca_file = "$pki/$cluster-ca.pem"
+
+[storage]
+disk_min_free_bytes = 0
+
+[buckets.defaults]
+mode = "local"
+shards_per_bucket = 2
+replicas = 1
+min_write_replicas = 1
+
+[identity]
+sts_web_identity = false
+
+[identity.static_credentials.admin]
+access_key_id = "$PEER_ADMIN_KEY"
+secret_access_key_file = "$dir/admin-secret"
+policy = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}}'
+
+[admin]
+listen = "127.0.0.1:$((port + 1))"
+
+[logging]
+filter = "info"
+
+[peering]
+quic_listen = "127.0.0.1:$quic"
+peer_connect_timeout_ms = 2000
+$extra
+EOF
+    {
+        echo "AWS_ACCESS_KEY_ID=$PEER_FLUSH_KEY"
+        echo "AWS_SECRET_ACCESS_KEY=$PEER_FLUSH_SECRET"
+        echo "AWS_EC2_METADATA_DISABLED=true"
+        echo "AWS_CONFIG_FILE=$E2E_DIR/aws/no-config"
+        echo "AWS_SHARED_CREDENTIALS_FILE=$E2E_DIR/aws/no-credentials"
+    } >"$dir/env"
+}
+
+# peer_aws <endpoint> <args...>: the AWS CLI against a peered cluster's
+# gateway, with its static credential.
+peer_aws() {
+    local endpoint=$1
+    shift
+    AWS_ACCESS_KEY_ID=$PEER_ADMIN_KEY AWS_SECRET_ACCESS_KEY=$PEER_ADMIN_SECRET \
+        aws --endpoint-url "$endpoint" "$@"
+}

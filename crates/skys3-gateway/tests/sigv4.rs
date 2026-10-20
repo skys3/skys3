@@ -16,7 +16,10 @@ use http::{Method, Request};
 use http_body_util::BodyExt;
 use s3s::{Body, S3Error, S3ErrorCode};
 use skys3_gateway::sigv4::{AuthMethod, MAX_CLOCK_SKEW, MemoryCredentials};
-use skys3_gateway::{Authenticated, Authenticator, BodyError, SigV4Authenticator, Trailers};
+use skys3_gateway::{
+    Authenticated, Authenticator, BodyError, PeerRefusal, PeerRefusals, SigV4Authenticator,
+    Trailers,
+};
 use skys3_io::ManualWallClock;
 
 /// The credentials of the examples in the S3 documentation.
@@ -595,10 +598,16 @@ async fn bad_credentials_and_signatures_are_refused() {
 #[tokio::test]
 async fn skys3_and_amz_headers_must_be_signed() {
     let (auth, _) = authenticator(NOW);
-    for name in ["x-skys3-bucket-mode", "x-amz-meta-late"] {
+    // Refusals for unsigned SkyS3 headers are counted, with no peer: the
+    // request is not authenticated (§7.8).
+    let refusals = PeerRefusals::default();
+    let auth = auth.with_peer_refusals(refusals.clone());
+    let unsigned = || refusals.get(None, PeerRefusal::UnsignedHeader);
+    for (name, counted) in [("x-skys3-bucket-mode", 1), ("x-amz-meta-late", 1)] {
         let mut signed = sdk_signed(Method::PUT, "/bucket", &[], b"", Signing::default());
         signed.headers_mut().insert(name, "local".parse().unwrap());
         assert_code(auth.authenticate(signed).await, S3ErrorCode::AccessDenied);
+        assert_eq!(unsigned(), counted, "{name}");
     }
     // Other headers need not be signed.
     let mut signed = sdk_signed(Method::PUT, "/bucket", &[], b"", Signing::default());
@@ -617,6 +626,7 @@ async fn skys3_and_amz_headers_must_be_signed() {
         auth.authenticate(anonymous).await,
         S3ErrorCode::AccessDenied,
     );
+    assert_eq!(unsigned(), 2);
     // The host header must be signed.
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={KEY}/20261001/us-east-1/s3/aws4_request, \

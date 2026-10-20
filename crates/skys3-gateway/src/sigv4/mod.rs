@@ -27,6 +27,9 @@
 //! An unsigned request passes as it is, without an [`Authenticated`]
 //! extension, unless it carries `x-skys3-*` headers, which must be signed.
 //! Whether anonymous requests are allowed is for authorization to decide.
+//! A request refused for an unsigned `x-skys3-*` header, signed or not, is
+//! counted in the [`PeerRefusals`] the authenticator is given: only peer
+//! clusters' flushers and SkyS3 clients send those headers (§7.8).
 //!
 //! A wrapped body reports a failed check as a [`BodyError`] from the read
 //! that finds it; the whole body is authenticated only once it has been
@@ -50,6 +53,8 @@ use http::{Request, Uri};
 use s3s::{Body, S3Error, s3_error};
 use secrecy::{ExposeSecret, SecretBox};
 use skys3_io::{BlockingPool, WallClock};
+
+use crate::peer_s3::{PeerRefusal, PeerRefusals};
 
 pub use body::{BodyError, BodyErrorKind};
 pub use chunked::{MAX_CHUNK_LINE_BYTES, MAX_TRAILER_BYTES, MAX_TRAILERS, Trailers};
@@ -180,6 +185,7 @@ pub struct SigV4Authenticator<L> {
     lookup: L,
     clock: Arc<dyn WallClock>,
     hashing: Option<BlockingPool>,
+    refusals: PeerRefusals,
 }
 
 impl<L> SigV4Authenticator<L> {
@@ -191,7 +197,16 @@ impl<L> SigV4Authenticator<L> {
             lookup,
             clock,
             hashing: None,
+            refusals: PeerRefusals::default(),
         }
+    }
+
+    /// Counts the requests refused for unsigned `x-skys3-*` headers in
+    /// `refusals` (§7.8), as a node does in its metrics.
+    #[must_use]
+    pub fn with_peer_refusals(mut self, refusals: PeerRefusals) -> Self {
+        self.refusals = refusals;
+        self
     }
 
     /// Computes the SHA-256 that `x-amz-content-sha256` declares on `pool`,
@@ -221,6 +236,7 @@ impl<L: CredentialLookup> Authenticator for SigV4Authenticator<L> {
                 .keys()
                 .any(|name| name.as_str().starts_with(SKYS3_HEADER_PREFIX))
             {
+                self.refusals.count(None, PeerRefusal::UnsignedHeader);
                 return Err(not_signed());
             }
             let body = match Payload::declared(&parts.headers)? {
@@ -232,7 +248,12 @@ impl<L: CredentialLookup> Authenticator for SigV4Authenticator<L> {
             return Ok(Request::from_parts(parts, body));
         };
         self.check_time(&signed)?;
-        check_signed_headers(&parts, &signed)?;
+        check_signed_headers(&parts, &signed).inspect_err(|_| {
+            if unsigned_skys3_header(&parts, &signed) {
+                // Not authenticated yet, so whose it is is unknown.
+                self.refusals.count(None, PeerRefusal::UnsignedHeader);
+            }
+        })?;
         check_unique_parameters(&parts)?;
         let declared = Payload::declared(&parts.headers)?;
         let (payload, payload_hash) = match (signed.method, declared) {
@@ -362,6 +383,14 @@ fn check_signed_headers(parts: &Parts, signed: &Signed) -> Result<(), S3Error> {
         (name.starts_with("x-amz-") || name.starts_with(SKYS3_HEADER_PREFIX)) && !signed.signs(name)
     });
     if unsigned { Err(not_signed()) } else { Ok(()) }
+}
+
+/// Whether the request has an `x-skys3-*` header that is not signed.
+fn unsigned_skys3_header(parts: &Parts, signed: &Signed) -> bool {
+    parts.headers.keys().any(|name| {
+        let name = name.as_str();
+        name.starts_with(SKYS3_HEADER_PREFIX) && !signed.signs(name)
+    })
 }
 
 /// Removes the signature: the `Authorization` header, or the presigned

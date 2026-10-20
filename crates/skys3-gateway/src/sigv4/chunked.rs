@@ -32,7 +32,9 @@ use http_body::{Frame, SizeHint};
 use s3s::{Body, StdError};
 
 use super::body::BodyError;
-use super::canonical::{EMPTY_SHA256, hex, sha256, sign};
+#[cfg(any(test, feature = "test-util"))]
+use super::canonical::sign;
+use super::canonical::{EMPTY_SHA256, hex, sha256};
 use super::params::decode_signature;
 
 /// The longest chunk header line, CRLF included. A signed chunk's line is
