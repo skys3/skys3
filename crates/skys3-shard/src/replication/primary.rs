@@ -12,7 +12,7 @@ use tokio::time::Instant;
 
 use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
 use super::{LinkError, ReplicationConfig, recv};
-use crate::leader::{Leader, Pending};
+use crate::leader::{Leader, Outgoing, Pending};
 use crate::shard::Shard;
 
 /// How many records a link takes from the leader at a time.
@@ -198,8 +198,29 @@ impl<N: Network, D: Disk> Link<N, D> {
                             return Err(error.into());
                         }
                     };
-                    self.leader.restore(cursor, records);
-                    continue;
+                    // Sent as read: a learner outside the acknowledgement
+                    // set lacks records that commit meanwhile, and the next
+                    // commit may drop them from memory again (§6.4).
+                    let next = cursor.get().saturating_add(1);
+                    let contiguous = records
+                        .iter()
+                        .zip(next..)
+                        .take_while(|((position, _), seq)| position.seq.get() == *seq)
+                        .count();
+                    if contiguous == 0 {
+                        self.leader.restore(cursor, records);
+                        continue;
+                    }
+                    records
+                        .into_iter()
+                        .take(contiguous)
+                        .map(|(position, bytes)| Outgoing {
+                            seq: position.seq,
+                            epoch: position.epoch,
+                            bytes,
+                            lazy: false,
+                        })
+                        .collect()
                 }
             };
             // A learner gets only what the primary holds durably: a primary
