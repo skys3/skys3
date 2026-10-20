@@ -137,10 +137,11 @@ count() {
     echo "${value%.*}"
 }
 
-# present <port> <certificate stem>: kept or refused (cluster.py).
+# present <port> <certificate stem> [<seconds>]: kept or refused
+# (cluster.py), with <seconds> for the connection and handshake (10).
 present() {
     python3 "$E2E_HERE/cluster.py" present --port "$1" --ca "$pki/c3-ca.pem" \
-        --cert "$pki/$2.pem" --key "$pki/$2.key" || true
+        --cert "$pki/$2.pem" --key "$pki/$2.key" --timeout "${3:-10}" || true
 }
 
 # --- Configuration ----------------------------------------------------------
@@ -244,10 +245,39 @@ grown=$(((peak - before) / 1024))
 after=$(count "$c3_admin" "$handshakes=\"timed_out\"}")
 [ "$after" -ge $((timed_out + 4)) ] ||
     fail "c3 timed out $after handshakes; the flood's first 4 should have"
-idle() { [ "$(count "$c3_admin" "$in_flight")" = 0 ]; }
-eventually 60 "c3's handshake slots are free again" idle
-[ "$(present "$c3_port" c3-c1)" = kept ] || fail "c3 refused c1 after the flood"
-log "flood: $opened connections established, at most $most handshakes in flight, RSS $((before / 1024)) -> $((peak / 1024)) MiB, timed out $after"
+# The flood's last connections reach c3 after it ends: the kernel
+# completes, as their retransmissions arrive, handshakes the full accept
+# queue held back, and such a connection, whose client is gone, can hold
+# a slot until the handshake timeout (10 s). The scenario waits until none
+# is left: no handshake in flight and c3's accept queue empty (the
+# listener's receive queue in /proc/net/tcp), over four samples in a row.
+accept_queue() {
+    local hex
+    hex=$(awk -v port="$(printf ':%04X' "$c3_port")" \
+        '$4 == "0A" && substr($2, length($2) - 4) == port { split($5, q, ":"); print q[2]; exit }' \
+        /proc/net/tcp)
+    echo $((16#${hex:-0}))
+}
+quiet=0
+drained() {
+    if [ "$(metric "$c3_admin" "$in_flight")" = 0 ] && [ "$(accept_queue)" = 0 ]; then
+        quiet=$((quiet + 1))
+    else
+        quiet=0
+    fi
+    [ "$quiet" -ge 4 ]
+}
+eventually 90 "the flood's connections are gone from c3" drained
+# A node gets in. Should a late flood connection still take a slot, the
+# node waits for it, at most one handshake timeout: 30 s is ample.
+started=$SECONDS
+result=$(present "$c3_port" c3-c1 30)
+[ "$result" = kept ] || {
+    curl -sS --max-time 10 "http://$c3_admin/metrics" | grep "^skys3_handshakes" >&2
+    tail -n 20 "$E2E_DIR/logs/c3.log" >&2
+    fail "c3 refused c1 after the flood: $result"
+}
+log "flood: $opened connections established, at most $most handshakes in flight, RSS $((before / 1024)) -> $((peak / 1024)) MiB, timed out $(count "$c3_admin" "$handshakes=\"timed_out\"}"); c1's probe took $((SECONDS - started))s after the drain, 5 of them checking it was kept"
 
 for i in 1 2 3; do
     node_stop "c$i"

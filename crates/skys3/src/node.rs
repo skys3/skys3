@@ -10,7 +10,7 @@ use std::time::Duration;
 use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ControlStoreBackend, LogFormat};
 use skys3_control::{ControlError, ProposalIds, RetryPolicy};
-use skys3_coord::ControlHints;
+use skys3_coord::{ControlHints, HeartbeatStatus};
 use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{Commit, DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
@@ -35,7 +35,7 @@ use skys3_sts::{
     StsEndpoint, StsSettings, ValidatorSettings,
 };
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, Label, NodeId};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
@@ -274,6 +274,11 @@ pub enum NodeError {
     /// A background task ended unexpectedly.
     #[error("a background task failed: {0}")]
     Task(String),
+    /// With `[cluster] multi_node = true`, the node's registration turned
+    /// out to belong to another data directory after it had started; it
+    /// stops rather than serve under another node's ID (§6.7).
+    #[error("the cluster: {0}")]
+    Cluster(String),
 }
 
 /// Pools the node runs its blocking work on.
@@ -729,10 +734,12 @@ pub struct Node {
     checkpoints: JoinHandle<IndexError>,
     checkpointer: Arc<Checkpointer<RealDisk>>,
     background: JoinSet<()>,
+    /// What the heartbeater reports, with `[cluster] multi_node = true`.
+    registration: Option<watch::Receiver<HeartbeatStatus>>,
     shared: Arc<Shared>,
     /// The QUIC endpoint of native replication, if the node peers.
     peer_endpoint: Option<skys3_peer::PeerEndpoint>,
-    _data_dir: DataDir,
+    data_dir: DataDir,
 }
 
 impl std::fmt::Debug for Node {
@@ -1077,7 +1084,7 @@ impl Node {
         });
         shared.sync_identity(copy.synced_at).await?;
         let mut background = JoinSet::new();
-        let cluster_view = match (shared.opener.shared_store(), &shared.cluster) {
+        let (cluster_view, registration) = match (shared.opener.shared_store(), &shared.cluster) {
             (Some(store), Some(cluster)) => {
                 // The transport serves, and the node is registered, before
                 // its replicas open: other nodes' primaries link to them
@@ -1092,14 +1099,14 @@ impl Node {
                     cluster,
                 )
                 .await?;
-                let view = services.view();
+                let (view, status) = (services.view(), services.status());
                 services.spawn(&mut background);
                 cluster.resume().await?;
-                Some(view)
+                (Some(view), Some(status))
             }
             _ => {
                 shared.open_bucket_shards().await?;
-                None
+                (None, None)
             }
         };
         if reclaim {
@@ -1238,9 +1245,10 @@ impl Node {
             checkpoints,
             checkpointer: storage.checkpointer,
             background,
+            registration,
             shared,
             peer_endpoint,
-            _data_dir: opened.data_dir.take().expect("the data directory is open"),
+            data_dir: opened.data_dir.take().expect("the data directory is open"),
         })
     }
 
@@ -1262,19 +1270,28 @@ impl Node {
         self.admin_addr
     }
 
-    /// Serves until `stop` completes or a checkpoint fails, then shuts
-    /// down.
+    /// Serves until `stop` completes, a checkpoint fails, or, with
+    /// `[cluster] multi_node = true`, the node's registration turns out to
+    /// belong to another data directory, then shuts down.
     ///
     /// # Errors
     ///
-    /// [`NodeError`] if a checkpoint failed, while serving or at shutdown.
+    /// [`NodeError`] if a checkpoint failed, while serving or at shutdown,
+    /// or [`NodeError::Cluster`] for a registration another data directory
+    /// holds.
     pub async fn run_until(mut self, stop: impl Future<Output = ()>) -> Result<(), NodeError> {
+        let claimed = crate::cluster::claimed(
+            self.registration.take(),
+            self.node_id.clone(),
+            self.data_dir.instance_id().to_owned(),
+        );
         let failed = tokio::select! {
             () = stop => None,
             ended = &mut self.checkpoints => Some(match ended {
                 Ok(error) => NodeError::Checkpoint(error),
                 Err(error) => NodeError::Task(error.to_string()),
             }),
+            reason = claimed => Some(NodeError::Cluster(reason)),
         };
         let shutdown = self.shutdown().await;
         match failed {
@@ -1305,7 +1322,7 @@ impl Node {
             mut background,
             shared,
             peer_endpoint,
-            _data_dir: data_dir,
+            data_dir,
             ..
         } = self;
         tracing::info!("shutting down");

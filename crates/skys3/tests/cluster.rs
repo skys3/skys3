@@ -11,8 +11,10 @@
 
 mod support;
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rcgen::{
@@ -20,7 +22,7 @@ use rcgen::{
     KeyUsagePurpose, SanType, date_time_ymd,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
-use skys3::{Node, StartError};
+use skys3::{Node, NodeError, StartError};
 use skys3_control::Version;
 use skys3_control::etcd_fake::Fake;
 use skys3_coord::{
@@ -30,8 +32,8 @@ use skys3_coord::{
 use skys3_io::{Clock, MonoTime, MonotonicClock};
 use skys3_net::{ALPN_PROTOCOL, Credentials, Frame, Header, MessageKind, TokioNetwork, Transport};
 use skys3_types::{
-    ClusterId, CoordinatorLease, Generation, NodeAddress, NodeId, NodeRegistration, ProposalId,
-    RegisterDocument,
+    ClusterId, CoordinatorLease, Generation, Label, NodeAddress, NodeId, NodeRegistration,
+    ProposalId, RegisterDocument,
 };
 use support::process::free_port;
 use support::{admin_json, config_text, eventually, http_get};
@@ -567,6 +569,94 @@ async fn a_node_needs_usable_credentials_and_its_transport_port() {
     );
     // Neither registered.
     assert!(fake.get(&format!("{CLUSTER}/nodes/n1.json")).is_none());
+}
+
+/// A TCP forwarder to `target` on a port of its own, which refuses every
+/// connection while `up` is false: an etcd that stops and starts answering
+/// at the same address.
+async fn forwarder(target: SocketAddr, up: Arc<AtomicBool>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            if !up.load(Ordering::SeqCst) {
+                continue;
+            }
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_claim_found_after_starting_from_the_copy_stops_the_node() {
+    let root = tempfile::tempdir().unwrap();
+    let pki = Pki::new(root.path());
+    let fake = Fake::start(None).await;
+    let up = Arc::new(AtomicBool::new(true));
+    // The fake listens on loopback, and names itself `localhost:<port>`.
+    let fake_port = fake
+        .url("http")
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let target = SocketAddr::from(([127, 0, 0, 1], fake_port));
+    let port = forwarder(target, Arc::clone(&up)).await;
+    let store = format!("backend = \"etcd\"\netcd_endpoints = [\"http://127.0.0.1:{port}\"]");
+    let dir = root.path().join("n1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = node_config(&dir, &pki, &store, "n1", "n1", free_port(), 256);
+
+    // A first start registers n1 and leaves a copy of control state.
+    let node = Node::start(text.parse().unwrap()).await.unwrap();
+    let key = format!("{CLUSTER}/nodes/n1.json");
+    let ours = NodeRegistration::from_json(&fake.get(&key).unwrap()).unwrap();
+    let instance = ours.instance_id.clone().unwrap();
+    node.shutdown().await.unwrap();
+
+    // The store does not answer: the node starts from its copy, and its
+    // registration waits.
+    up.store(false, Ordering::SeqCst);
+    let node = Node::start(text.parse().unwrap()).await.unwrap();
+    let state = cluster_state(&node).await;
+    assert_eq!(state["registration"]["registered"], false);
+    assert_eq!(state["registration"]["claimed_by"], serde_json::Value::Null);
+
+    // Meanwhile another data directory registers n1, and the store
+    // answers again.
+    let theirs = NodeRegistration {
+        instance_id: Some(Label::new("another-data-dir").unwrap()),
+        proposal_id: ProposalId::new("theirs-1").unwrap(),
+        ..ours
+    };
+    fake.put(&key, &theirs.to_json().unwrap());
+    up.store(true, Ordering::SeqCst);
+    eventually("the node finds the claim", || async {
+        cluster_state(&node).await["registration"]["claimed_by"] == "another-data-dir"
+    })
+    .await;
+
+    // The node stops, as it does when it finds the claim at startup, and
+    // leaves the other registration alone.
+    let stopped = tokio::time::timeout(WAIT, node.run_until(std::future::pending()))
+        .await
+        .expect("the node went on serving under a claimed ID");
+    let Err(NodeError::Cluster(message)) = &stopped else {
+        panic!("{stopped:?}");
+    };
+    assert!(message.contains("another-data-dir"), "{message}");
+    assert!(message.contains(instance.as_str()), "{message}");
+    assert!(message.contains("Node ID in use"), "{message}");
+    assert_eq!(
+        NodeRegistration::from_json(&fake.get(&key).unwrap()).unwrap(),
+        theirs
+    );
 }
 
 /// Replication timing short enough for a test: a member takes over about

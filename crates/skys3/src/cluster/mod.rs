@@ -31,11 +31,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use skys3_config::Config;
-use skys3_coord::ControlHints;
+use skys3_coord::{ControlHints, HeartbeatStatus};
 use skys3_io::{BlockingPool, Clock, MonotonicClock};
 use skys3_net::{Credentials, Listener, PeerIdentity, TokioNetwork};
 use skys3_obs::{HandshakeLimit, HandshakeMetrics};
 use skys3_types::NodeId;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::admin::ClusterView;
@@ -164,6 +165,11 @@ impl ClusterServices {
         self.view.clone()
     }
 
+    /// What the heartbeater reports, which [`claimed`] follows.
+    pub(crate) fn status(&self) -> watch::Receiver<HeartbeatStatus> {
+        self.view.heartbeats.clone()
+    }
+
     /// Serves the transport and sends heartbeats, for as long as the
     /// node's background tasks run.
     pub(crate) fn spawn(self, background: &mut JoinSet<()>) {
@@ -177,4 +183,34 @@ impl ClusterServices {
         background.spawn(transport::serve(listener, limit, services));
         background.spawn(heartbeater.run());
     }
+}
+
+/// Completes once the heartbeater finds the node's register held by another
+/// data directory ([`HeartbeatStatus::claimed_by`]), however late, for
+/// example when the node started from its copy while the store did not
+/// answer: the node must then stop, as when it finds the claim at startup,
+/// rather than serve under an ID another node's registration holds. It
+/// returns why, naming both instances and the runbook. `ours` is this
+/// node's data directory instance. Without a heartbeater, or once it is
+/// gone, it never completes.
+pub(crate) async fn claimed(
+    status: Option<watch::Receiver<HeartbeatStatus>>,
+    node: NodeId,
+    ours: String,
+) -> String {
+    let Some(mut status) = status else {
+        return std::future::pending().await;
+    };
+    let theirs = match status.wait_for(|status| status.claimed_by.is_some()).await {
+        Ok(status) => status.claimed_by.clone(),
+        Err(_) => None,
+    };
+    let Some(theirs) = theirs else {
+        return std::future::pending().await;
+    };
+    format!(
+        "nodes/{node}.json registers node {node} for data directory instance {theirs}, but this \
+         node runs on instance {ours}: another node holds this node ID, so this one stops (see \
+         the runbook \"Node ID in use\")"
+    )
 }

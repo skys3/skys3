@@ -926,8 +926,11 @@ in; a directory that holds none takes the configured mode.
 
 **Procedure.** Move the buckets, not the directory:
 
-1. Start the cluster's nodes, each with `multi_node = true` and a new data
-   directory, and wait until `GET /v1/health` `cluster` on each shows its
+1. Start the cluster's nodes, each with `multi_node = true`, a new data
+   directory, and a node ID that no other data directory registered (a
+   single node never registers, so its own ID is free unless a cluster
+   node used it; otherwise follow [Node ID in use](#node-id-in-use)), and
+   wait until `GET /v1/health` `cluster` on each shows its
    registration and heartbeats.
 2. For a `write_back` bucket: stop writes to it, wait on the single node
    until `skys3_dirty_bytes` and `skys3_oldest_dirty_age_seconds` for it
@@ -991,7 +994,13 @@ its copies of every shard it held, and on a node alone, every dirty write.
 
 **Symptoms.** A node with `[cluster] multi_node = true` does not start, and
 logs `the node cannot start` with `nodes/<node-id>.json registers node
-<node-id> for another data directory (instance ...), not this one`.
+<node-id> for another data directory (instance ...), not this one`. Or a
+running node stops, and logs `the node stopped with an error` with
+`nodes/<node-id>.json registers node <node-id> for data directory instance
+<theirs>, but this node runs on instance <ours>`: it had started from its
+copy of control state while the store did not answer, and found the claim
+once the store answered. Until it stops, `GET /v1/health`
+`cluster.registration.claimed_by` names the other instance.
 
 **Impact.** The node does not serve. The registration, and the node that
 holds it, are untouched: a node never takes over another data directory's
@@ -1012,7 +1021,9 @@ process that could run it, delete `nodes/<node-id>.json` from the control
 store (with `etcdctl del <prefix>nodes/<node-id>.json`, or the S3
 `DeleteObject` of that key), and start the node: it registers anew, and
 replacement treats it as a new node, its old data directory's shards as
-lost members.
+lost members. Until the binary runs the coordinator (plan M8-06), no
+replacement happens: the shards it held stay short of that member
+([Under-replication](#under-replication)).
 
 **Verification.** The node starts; `GET /v1/health` `cluster.registration`
 has `registered` true and no `error`, and the register's `instance_id` is
@@ -1432,7 +1443,7 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Provisioning](#provisioning) | `simulation::registry::a_node_with_valid_credentials_joins_with_no_other_action`; `simulation::rebalancing::a_new_node_receives_its_share_of_shards_and_primaries`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one` | A node with valid credentials joins and receives its share; a lost node is replaced, forgotten, and succeeded. | No command retires a node sooner than `node_forget_after_hours`, and node labels have no configuration key (section 8). |
 | [Moving a single node into a cluster](#moving-a-single-node-into-a-cluster) | `cluster::a_single_nodes_data_directory_does_not_join_a_cluster` | A single node's directory that holds a bucket is refused with `multi_node`, and a cluster node's directory without it; the log names the buckets and the mode. | The moves of steps 2 and 3 were not drilled. |
 | [Node down](#node-down) | `runbooks::drill_node_down`; `simulation::takeover::a_crashed_primary_fails_over_within_ten_seconds` | After `SIGKILL`, scrapes and `/healthz` fail; a restart recovers every acknowledged write and reports `ready` with every disk in service. A crashed primary's shards fail over within 10 seconds, also on the binary (`cluster::three_nodes_replicate_route_take_over_and_readmit`, the end-to-end scenario `replication`). | Nothing. |
-| [Node ID in use](#node-id-in-use) | `cluster::three_nodes_register_heartbeat_and_take_pushes` | A second data directory started with a registered node's ID does not start, logs the reason, and leaves the registration alone; so does the binary over etcd in the end-to-end scenario `cluster` (`tests/e2e/scenarios/90-cluster.sh`). | The deletion of the registration was not drilled: no command deletes a register, so the operator uses the store's own tools. |
+| [Node ID in use](#node-id-in-use) | `cluster::three_nodes_register_heartbeat_and_take_pushes`; `cluster::a_claim_found_after_starting_from_the_copy_stops_the_node` | A second data directory started with a registered node's ID does not start, a node that started from its copy stops once it finds the claim, each logs the reason, and leaves the registration alone; so does the binary over etcd in the end-to-end scenario `cluster` (`tests/e2e/scenarios/90-cluster.sh`). | The deletion of the registration was not drilled: no command deletes a register, so the operator uses the store's own tools. |
 | [Cluster power loss](#cluster-power-loss) | `runbooks::drill_node_down`; `simulation::restart::a_whole_cluster_restart_while_the_control_store_is_unreachable` | A node that restarts while its control store cannot be opened serves from its copy (`live` false), then opens the store by itself and logs it. In a cluster, unchanged shards serve again and changed ones stay fenced. | Nothing. |
 | [Disk out of service](#disk-out-of-service) | `runbooks::drill_disk_out_of_service`; `simulation::harness::a_failed_sync_is_fenced_once` | A disk whose directory disappears fails its next segment: `skys3_disks_out_of_service` 1, `/readyz` `503`, the disk `in_service` false with its error, and `cannot fence the disk` logged. A fenced disk stops the next start, naming `out-of-service.json`; with the disk back and the fence removed, every acknowledged write reads back. | The drill cannot fail a sync on a real disk; it removes the disk's directory, and plants the fence a failed sync writes with the node's own function. |
 | [Disk space](#disk-space) | `runbooks::drill_disk_space` | Below `disk_min_free_bytes`, writes get `503 SlowDown` and count as `disk_space` refusals, the log names the place, reads and deletes go on; freeing space admits writes within seconds without a restart. | Nothing. |
