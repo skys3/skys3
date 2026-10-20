@@ -11,8 +11,11 @@
 //!   runs no elector, so it answers that it is not, and the sender looks
 //!   the coordinator up again; plan M8-06 gives the endpoint the
 //!   elector's leadership.
-//! - A handoff request (`Handoff`) is refused: this node starts no
-//!   handoffs until it serves shards across nodes (plan M8-05b).
+//! - A handoff request (`Handoff`) is refused. The node serves shards
+//!   across nodes, and `skys3_cluster::Handoffs` could start the handoff,
+//!   but any node of the cluster may send the message, and threat T6 asks
+//!   that only the coordinator or an `admin` certificate may: plan M8-06
+//!   gives the endpoint its sink once it can tell them apart.
 
 use std::sync::Arc;
 

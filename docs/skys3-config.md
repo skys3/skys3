@@ -46,7 +46,7 @@ Only `[cluster]` and its `cluster_id` are required. Every other key has a defaul
 |---|---|---|---|
 | `cluster_id` | string | required | 1 to 24 bytes of lowercase ASCII letters, digits, and `-`, starting and ending with a letter or digit. The limit keeps every write identity within 96 bytes (§7.2). |
 | `failure_domain` | `"node"`, `"rack"`, or `"zone"` | `"node"` | The level at which shard members and fragments are kept apart (§6.7). |
-| `multi_node` | boolean | `false` | Whether the node runs as one of several nodes of the cluster (design §6.2, §6.7): it binds the `[transport]` listener, registers itself in `nodes/<node-id>.json`, sends the coordinator heartbeats, and receives pushed generations. It needs `backend = "etcd"` or `"s3"`, never `"file"`, which serves one node; the three `[transport]` certificate files; and an address other nodes reach it at (`[transport] advertise`, or a `listen` that is neither a wildcard address nor port 0). Until replication is wired into the binary (plan M8-05b), each node still serves every shard of its buckets alone. A gate that plan M8-09 removes once the cluster is complete in the binary. |
+| `multi_node` | boolean | `false` | Whether the node runs as one of several nodes of the cluster (design §6.2, §6.7): it binds the `[transport]` listener, registers itself in `nodes/<node-id>.json`, sends the coordinator heartbeats, and receives pushed generations. It needs `backend = "etcd"` or `"s3"`, never `"file"`, which serves one node; the three `[transport]` certificate files; and an address other nodes reach it at (`[transport] advertise`, or a `listen` that is neither a wildcard address nor port 0). Its buckets' shards are replicated across the nodes their registers name, with `replicas` members each, and its gateway routes every request to the shard's primary (plan M8-05b). A data directory that holds a bucket's shards serves them in the mode it was in when it took them, so turning `multi_node` on for a single node that holds buckets, or off for a node of a cluster, is refused at startup: start it with a new data directory (runbook "Moving a single node into a cluster"). Until plan M8-06 runs the coordinator, no learner is added, so a lost member is not replaced and a node a takeover left out is not re-admitted. A gate that plan M8-09 removes once the cluster is complete in the binary. |
 
 ## `[node]`
 
@@ -113,7 +113,7 @@ The three files are set together or not at all, and are required with `[cluster]
 
 ## `[replication]`
 
-Timeouts, failure detection, and leases (§5.2, §5.4, §6.3–§6.5). `ρ` is `assumed_clock_drift`.
+Timeouts, failure detection, and leases (§5.2, §5.4, §6.3–§6.5). `ρ` is `assumed_clock_drift`. A node uses them with `[cluster] multi_node = true` (plan M8-05b); a single node's shards have no other member.
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
@@ -193,7 +193,7 @@ Erasure coding of `local` buckets (§8).
 |---|---|---|---|
 | `mode` | `"write_back"`, `"local"`, or `"read_only"` | `"write_back"` | Fixed at creation (§4.1). |
 | `shards_per_bucket` | integer | `8` | From 1 to 256. Fixed at creation. |
-| `replicas` | integer | `3` | From 1 to 255. |
+| `replicas` | integer | `3` | From 1 to 255. With `[cluster] multi_node = true`, a CreateBucket is refused (`400 InvalidRequest`) while the registered nodes span fewer `failure_domain` domains than `replicas` (§6.7); a single node keeps one copy whatever it says. |
 | `min_write_replicas` | integer | `2` | From 1 to `replicas` (§6.4). |
 | `clean_copies` | integer | `1` | From 0 to `replicas` (§9.3). |
 | `import_parallel_streams` | integer | `32` | From 1 to 256. Key ranges a new namespace import lists in parallel, each with its own checkpoint; one rate limit, `import_max_keys_per_second`, covers them all (§9.1). |

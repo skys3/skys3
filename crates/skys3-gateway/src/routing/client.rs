@@ -12,7 +12,7 @@ use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_net::{Connection, Frame, Network, Transport};
+use skys3_net::{Connection, Frame, Network, Peers, Transport};
 use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, ShardSet, StreamedBody};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeAddress, NodeId, ShardConfig};
 use tokio::time::Instant;
@@ -97,7 +97,7 @@ struct Inner<L, D: Disk, N: Network, C> {
     server: ForwardServer<L, D>,
     map: ShardMap,
     transport: Transport<N>,
-    peers: BTreeMap<NodeId, NodeAddress>,
+    peers: Peers,
     store: C,
     idle: Mutex<Idle<N::Stream>>,
     /// The last read of each shard's register: when it finished, and the
@@ -158,8 +158,9 @@ enum Round {
 
 impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     /// The shards of node `node`, whose own shards are `local` over the
-    /// replicas in `set`, routing by `map` to the other nodes at `peers`
-    /// through `transport`, and reading shard registers from `store`.
+    /// replicas in `set`, routing by `map` to the other nodes at the
+    /// addresses `peers` holds when it connects to them, through
+    /// `transport`, and reading shard registers from `store`.
     #[must_use]
     pub fn new(
         node: NodeId,
@@ -167,7 +168,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
         set: ShardSet<D>,
         map: ShardMap,
         transport: Transport<N>,
-        peers: BTreeMap<NodeId, NodeAddress>,
+        peers: impl Into<Peers>,
         store: C,
     ) -> Self {
         Self {
@@ -177,7 +178,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 local,
                 map,
                 transport,
-                peers,
+                peers: peers.into(),
                 store,
                 idle: Mutex::default(),
                 register_reads: tokio::sync::Mutex::default(),
@@ -336,7 +337,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 }));
             }
         };
-        let mut connection = match self.connection(node, address).await {
+        let mut connection = match self.connection(node, &address).await {
             Ok(connection) => connection,
             Err(error) => return Attempt::Unreached(error),
         };
