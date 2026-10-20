@@ -1074,7 +1074,7 @@ This section is unnumbered so that sections 14 and 15, which other documents cit
 - A backend enum replaces `NodeStore<FileControlStore>`. `open_control` runs the startup probe and keeps the local copies.
 - Security findings: **T3**, `[control_store] etcd_tls_ca_file`, `etcd_tls_cert_file`, and `etcd_tls_key_file` build `EtcdStoreConfig::tls`, and `http://` is refused except on loopback; **T4**, a `MAX_REGISTER_BYTES` bound; **T8**, a versioning warning and gauge; **K1**, a failed file store is reopened.
 - Until M8-05b, a node refuses to start if `nodes/` holds another node's registration.
-- **Done when:** the single-node suite passes on etcd over mutual TLS and on MinIO as an S3 control store, and the refusal is tested.
+- **Done when:** the single-node suite passes on etcd over mutual TLS and on an S3 control store that passes the startup probe, and the refusal is tested. MinIO can't be that store: it ignores `If-Match` on `DeleteObject`, so the probe refuses it, and the suite checks that refusal.
 
 #### M8-04 Transport and node registration in the binary
 
