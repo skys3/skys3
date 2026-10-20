@@ -1,9 +1,11 @@
 //! Shared helpers: node configurations in a temporary directory, an S3
 //! client, plain HTTP requests to the admin listener, the binary as a
-//! child process ([`process`]), and an OIDC issuer ([`issuer`]).
+//! child process ([`process`]), an OIDC issuer ([`issuer`]), and clusters
+//! of several nodes ([`cluster`]).
 
 #![allow(dead_code)]
 
+pub mod cluster;
 pub mod issuer;
 pub mod process;
 
@@ -148,9 +150,21 @@ pub async fn http_get(addr: &str, path: &str) -> std::io::Result<(u16, String)> 
 /// Sends a bodiless `method path` to `addr` over plain HTTP and returns the
 /// status and body.
 pub async fn http_request(addr: &str, method: &str, path: &str) -> std::io::Result<(u16, String)> {
+    http_send(addr, method, path, "").await
+}
+
+/// Sends `method path` with `body` to `addr` over plain HTTP and returns
+/// the status and body.
+pub async fn http_send(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> std::io::Result<(u16, String)> {
     let mut stream = tokio::net::TcpStream::connect(addr).await?;
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: skys3\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: skys3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
     stream.write_all(request.as_bytes()).await?;
     let mut response = String::new();

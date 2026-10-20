@@ -566,4 +566,22 @@ async fn rejoining() {
     assert!(same.is_stopped());
     assert_eq!(reopened.role(), Role::Learner);
     assert_eq!(reopened.config(), grown);
+
+    // Stopped in the configuration that names it a learner, as an old
+    // primary that adopts the register naming it so once it handed the
+    // shard off: opening it in that configuration opens it again.
+    let handed_off = ShardConfig {
+        epoch: Epoch::new(11),
+        primary: node(3),
+        members: vec![node(3), node(4), node(5)],
+        learners: vec![node(2)],
+        ..grown
+    };
+    reopened.depose("handed off", Some(&handed_off));
+    assert!(reopened.is_stopped());
+    assert_eq!(reopened.config(), handed_off);
+    let again = set.open_replica(&handed_off, &node(2)).await.unwrap();
+    assert!(!again.is_stopped());
+    assert_eq!(again.role(), Role::Learner);
+    assert_eq!(again.config(), handed_off);
 }

@@ -723,6 +723,7 @@ async fn register_node(setup: &common::Setup, node: usize, departing: bool) {
         }],
         instance_id: None,
         departing,
+        draining: false,
         proposal_id: format!("p-node-{node}").parse().unwrap(),
     };
     let key = TypedKey::node(&registration.node_id);

@@ -9758,3 +9758,93 @@ of this file. A task with nothing unexpected keeps "None."
   the store returns; a gracefully stopped primary does not hand off, so
   its shards wait out `primary_grace`; DeleteBucket drops only the local
   replica.
+
+### M8-06 Coordinator, handoff, and member lifecycle in the binary
+
+- **Who may be elected.** `[cluster] coordinator` (off by default, needs
+  `multi_node`) decides whether a node contends for `coordinator.lease`.
+  A node with it off never contends, answers heartbeats as a follower,
+  and is placed like any other; it still serves handoffs through its
+  replicas and the admin API's cluster routes. A cluster where no node
+  has the flag runs as M8-05b left it. The flag decides eligibility, not
+  just whether the services start, because an operator who keeps some
+  nodes out of coordination (small or remote ones) needs them never to
+  take the lease.
+- **T6 and plan §14 decision 5.** Over the transport a node starts a
+  handoff only for the node `coordinator.lease` names or an `admin`
+  certificate (`skys3_coord::CoordinatorOrAdmin`), and logs any other
+  sender. The lease is read from the store, at most once a second, rather
+  than taken from the node's own registry, which a node that does not
+  contend has none of; a flood of handoff frames costs one read a second.
+  `AdminEndpoint::with_handoffs` (any sender) stays for the simulation,
+  whose network has no identities to check. Operators use the admin HTTP
+  API behind its token: the shard's primary starts a handoff itself, the
+  coordinator sends it, and any other node answers `409` naming both,
+  so the API adds no transport sender the check would have to admit. A
+  drain is a CAS on the registration, served by any node: whoever may
+  write the control store can already reassign shards (§12, T1).
+- **A drain mark of its own.** `departing` is the coordinator's mark,
+  which a node clears by registering again; a drain must survive a
+  restart, so it is a new registration field, `draining`, written only
+  when true, which the node keeps when it registers and placement and the
+  registry treat as departing (`NodeRegistration::is_leaving`). A drained
+  node is never forgotten for it: forgetting still needs
+  `node_forget_after` of silence.
+- **The lease has no epoch.** `GET /v1/cluster` reports the lease's
+  version, which changes at every renewal, and the cluster generation in
+  place of the epoch the plan names.
+- **The admin listener read no bodies.** Handoffs take an optional
+  `{"to": ...}` body, so `skys3-obs` reads an API request's body, only
+  after the token is checked, up to 64 KiB within 10 s (`413`, `400`,
+  `408` otherwise), through a new `AdminApi::call_with_body` whose
+  default ignores it.
+- **Pace keys.** The design said the replacement and rebalancing pace
+  would get keys when the binary ran the coordinator:
+  `[replication] removal_interval_seconds`, `rebalance_max_moves`,
+  `rebalance_handoff_interval_seconds`, and
+  `rebalance_handoff_retry_seconds`. Replacement's bounds on one change
+  (32 registers, 64 learners) stay constants.
+- **DeleteBucket across the cluster.** Within reach: the deleting node
+  already deletes the bucket register and its shard registers in one
+  change. Every other node drops its replicas of a bucket that a sync
+  whose generation advanced no longer lists, among those open before the
+  sync (a bucket created meanwhile is not dropped), and the follower
+  skips shard registers of buckets dropped so (`LiveShards`), so a late
+  listing cannot reopen them; the coordinator's bucket shards deletes any
+  register the change left behind.
+- **Three bugs the e2e scenario found in M8-05b's code.** (1) A primary
+  that handed off and then read the register while the coordinator had
+  already named it a learner adopted that configuration as it stopped;
+  the follower then saw a replica at the register's epoch and never
+  reopened it, so the shard stayed one member short. A replica stopped in
+  a configuration that names it a learner now opens again as one
+  (`ShardSet::open_replica`, `RegisterFollower::follow`). (2) A member
+  removed while up, as every rebalancing move does, stayed open as a
+  member of its old configuration for good: its takeover found itself
+  removed and gave up, leaving a replica `GET /v1/shards` reported with
+  stale members. It now stops in the register's configuration, as at a
+  restart. (3) A gateway kept up to 8 idle connections to a node; after
+  the node restarted, each was dead, and every write that drew one failed
+  as "may have applied it", up to 8 in a row, beyond any SDK's retries.
+  A lost answer now drops the node's idle connections.
+- **curl does not retry into a pipe.** `--retry` with `-o /dev/null`, or
+  with the body on standard output, gives up after the first attempt with
+  exit 23 (curl 8.5), as it cannot truncate what it wrote; the scenarios
+  write answers to files.
+- **The e2e scenario's cost.** `coordinator` runs 76 s on the development
+  machine, beside `replication` (95 s) and `cluster` (81 s) in the etcd
+  leg, which the single-node scenarios bound: the leg stays within the
+  peering scenario's five minutes, and the job within its 15. A handoff
+  moved a primary in 0.2 to 0.8 s; cc4 received its 3 shards in 9 s; the
+  drained coordinator was emptied in 6 s; a successor took the lease 9 s
+  after `kill -9` (the default lease of 10 s times (1+ρ), counted from
+  the last renewal, up to a third of a lease before the kill), with the
+  slowest request meanwhile 0.11 s; and the restarted node received
+  3 shards again in 9 s.
+- **Open points.** A coordinator that stops cleanly does not release the
+  lease, so its successor waits a whole lease as after a crash; no SkyS3
+  command sends a handoff with an `admin` certificate; the e2e scenario
+  checks the transport-level T6 refusal only in process
+  (`skys3-coord` `handoff/tests.rs`, `skys3/tests/coordinator.rs`); a
+  coordinator's metrics are exported only by the nodes that may be
+  elected.
