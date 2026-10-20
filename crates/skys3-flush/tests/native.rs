@@ -355,6 +355,31 @@ async fn a_body_whose_put_never_commits_is_aborted() {
     flusher.stop().await;
 }
 
+/// A body announced as soon as its flusher starts is staged: the flusher
+/// follows the shard from when it is started, not from when its task
+/// first runs, which on this single thread is only after the announcement.
+#[tokio::test]
+async fn a_body_announced_before_its_flusher_runs_is_staged() {
+    let destination = Destination::start(true).await;
+    let node = Node::open(14).await;
+    let settings = FlushSettings {
+        streaming: true,
+        ..settings()
+    };
+    let text = body(300);
+    let begun = node.begin("big").await;
+    let extents = node.extents("big", &text, 100).await;
+    let flusher = node.flusher(&destination.target(settings, FRAME));
+    node.announce("big", begun, &extents);
+    until("the body staged", || {
+        destination
+            .staged(&identity(begun))
+            .is_some_and(|staged| staged.extents(0, 300).is_some())
+    })
+    .await;
+    flusher.stop().await;
+}
+
 /// A destination that refuses the staging (§7.6): the refusals of a
 /// streamed body's own stream count before its `PUT` commits, those of its
 /// flush after, and only then does the key wait on a refusal. Once the

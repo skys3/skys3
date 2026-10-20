@@ -9103,6 +9103,16 @@ of this file. A task with nothing unexpected keeps "None."
 - **The unused `sign` import M8-01 noted is fixed**, since this task
   touches `skys3-gateway`: it is imported under the same `cfg` as its
   users.
+- **A flusher could miss a body announced as it started.** CI on aarch64
+  timed out in `native::a_body_whose_put_never_commits_is_aborted`, an
+  M6-06 test: the flusher subscribed to the shard's changes only when its
+  task first ran, and `Shard::announce` drops an announcement while the
+  shard has no subscriber, so a body announced before that was never
+  staged, and never aborted. Delaying the task's first poll by 50 ms
+  failed that test and three others the same way. `ShardFlusher::start`
+  now subscribes before it spawns the task;
+  `native::a_body_announced_before_its_flusher_runs_is_staged`, on a
+  single-threaded runtime, fails without that.
 
 ### M8-05a Replicated shards as library code
 
