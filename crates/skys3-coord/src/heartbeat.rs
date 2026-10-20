@@ -30,7 +30,7 @@ use prost::Message;
 use skys3_control::{ControlStore, ProposalIds, RetryPolicy, TypedKey, read};
 use skys3_io::{Clock, MonoTime};
 use skys3_net::{Connection, Frame, Header, MessageKind, Network, Transport};
-use skys3_types::{ClusterId, NodeAddress, NodeId};
+use skys3_types::{ClusterId, Label, NodeAddress, NodeId};
 use tokio::sync::watch;
 
 use crate::change::{Pending, settle};
@@ -189,6 +189,12 @@ pub struct HeartbeatStatus {
     pub coordinator: Option<NodeId>,
     /// Why the latest attempt to register failed, until one succeeds.
     pub registration_error: Option<String>,
+    /// The data directory instance the node's register names when it is
+    /// not this node's ([`RegistrationError::Claimed`]), however late the
+    /// heartbeater found it: another node holds this node's ID. The
+    /// heartbeater has stopped, and the node must stop too: it must not
+    /// serve under an ID another node's registration holds.
+    pub claimed_by: Option<Label>,
 }
 
 /// The coordinator a node heartbeats to, and its connection.
@@ -289,10 +295,15 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
     }
 
     /// Registers the node, then sends heartbeats every interval, for as
-    /// long as the task runs.
+    /// long as the task runs, or until a registration finds the node's
+    /// register held by another data directory
+    /// ([`HeartbeatStatus::claimed_by`]): that is never retried.
     pub async fn run(mut self) {
         loop {
             self.round().await;
+            if self.status.borrow().claimed_by.is_some() {
+                return;
+            }
             self.clock.sleep(self.config.interval).await;
         }
     }
@@ -303,14 +314,24 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
     ///
     /// # Errors
     ///
-    /// [`RegistrationError`]; [`Heartbeater::run`] keeps trying. A write
-    /// left unsettled is kept and settled before the next attempt, so that
-    /// a registration that lands late is still announced.
+    /// [`RegistrationError`]; [`Heartbeater::run`] keeps trying, except
+    /// after [`RegistrationError::Claimed`], which it records in
+    /// [`HeartbeatStatus::claimed_by`] and stops at. A write left unsettled
+    /// is kept and settled before the next attempt, so that a registration
+    /// that lands late is still announced.
     pub async fn register(&mut self) -> Result<Registered, RegistrationError> {
         let registered = self.try_register().await;
         if let Err(error) = &registered {
-            self.status
-                .send_modify(|status| status.registration_error = Some(error.to_string()));
+            let claimed_by = match error {
+                RegistrationError::Claimed { instance, .. } => Some(instance.clone()),
+                _ => None,
+            };
+            self.status.send_modify(|status| {
+                status.registration_error = Some(error.to_string());
+                if claimed_by.is_some() {
+                    status.claimed_by = claimed_by;
+                }
+            });
         }
         registered
     }
@@ -362,7 +383,11 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
         if !self.registered
             && let Err(error) = self.register().await
         {
-            tracing::warn!(%error, "cannot register the node; trying again");
+            if matches!(error, RegistrationError::Claimed { .. }) {
+                tracing::error!(%error, "another data directory holds this node's ID; heartbeats stop");
+            } else {
+                tracing::warn!(%error, "cannot register the node; trying again");
+            }
             return;
         }
         self.beat().await;

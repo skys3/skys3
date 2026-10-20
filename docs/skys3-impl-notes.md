@@ -9406,6 +9406,22 @@ of this file. A task with nothing unexpected keeps "None."
   fails for any reason other than a claim (a store that does not answer)
   is logged, and the heartbeater retries it: the node serves from its copy
   meanwhile, as without `multi_node`.
+- **A claim found late stops the node (review finding).** The first
+  version refused a claim only at startup: a node that started from its
+  copy while the store did not answer, and found its ID registered by
+  another data directory once the store answered, retried that like any
+  failure and went on serving under the other node's ID. Now the
+  heartbeater records the claim (`HeartbeatStatus::claimed_by`, reported
+  as `cluster.registration.claimed_by`) and stops, and `Node::run_until`
+  stops the node with `NodeError::Cluster`, through the same shutdown as
+  a failed checkpoint, logging both instance IDs and naming the runbook
+  "Node ID in use". Stopping rather than withdrawing from serving: the
+  node cannot become itself again without an operator, who either gives
+  it another ID or deletes the other registration, and a stopped process
+  is what the service manager and the alerts already watch.
+  `a_claim_found_after_starting_from_the_copy_stops_the_node` cuts the
+  store off with a TCP forwarder, and fails without the change (the node
+  keeps serving).
 - **What "its own node ID with a different identity" means.** The task
   asked that a node refuse a registration claiming its node ID with
   another identity. Certificates cannot tell the nodes apart (two
@@ -9454,6 +9470,22 @@ of this file. A task with nothing unexpected keeps "None."
   at its peak, over three runs). The in-process test checks
   that a node's own handshake waits while the flood holds every slot and
   gets in once it ends.
+- **A flood leaves late connections behind.** The scenario's first CI run
+  failed at "c3 refused c1 after the flood". The flood's connections do
+  not all end when its client closes them: the kernel completes, as their
+  retransmissions arrive, handshakes the full accept queue held back, and
+  such a connection, whose client is gone, can hold a slot until the
+  handshake timeout. Run without its wait for the slots to free, the
+  scenario failed the same way locally under load (`refused (timed out)`,
+  4 more handshakes timed out 10 s after the flood, with 129 queued
+  connections behind them), and the gauge's check could pass in the moment
+  before such connections arrived. The scenario now waits until no
+  handshake is in flight and the listener's accept queue
+  (`/proc/net/tcp`) is empty over four samples in a row, then gives the
+  node's handshake 30 s, more than one handshake timeout, and logs how
+  long it took. The product works as designed: at its cap a listener makes
+  new connections wait for at most one handshake timeout per round of
+  stale ones.
 - **The refactor.** The first commit moves the control-store follower and
   the peering service out of `node.rs` into `crates/skys3/src/cluster/`
   (`control.rs`, `peering.rs`) without changing them; the new services
@@ -9475,7 +9507,9 @@ of this file. A task with nothing unexpected keeps "None."
   Locally, with the AWS CLI from its image and the Docker daemon started
   for the run, the whole `control-stores.sh` passed in 5 m 23 s with the
   scenario (M8-03 measured 5 m 43 s without it), the peering scenario
-  taking 314 s; it has not run in CI yet.
+  taking 314 s. Under a CPU hog on every core, the scenario passed all seven
+  runs (two batches), a node getting in within a second of the drain;
+  the whole `control-stores.sh` passed again in 5 m 12 s.
 - **Not done here.** Handoff commands are refused on the node's transport
   (no handoff sink until the binary serves shards across nodes, M8-05b),
   and replication and forwarded requests are closed after their first

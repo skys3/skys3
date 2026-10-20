@@ -3,11 +3,13 @@
 cluster scenario (plan M8-04, design section 12).
 
     cluster.py present --port <port> --ca <pem> --cert <pem> --key <pem>
+                       [--timeout <s>]
     cluster.py flood --port <port> --connections <n> --seconds <s>
 
 `present` opens a TLS 1.3 connection to 127.0.0.1:<port>, verifies the
 node as `localhost` against <ca>, negotiates the cluster protocol
-(`skys3-cluster/1`), and presents the certificate <cert>. In TLS 1.3 the
+(`skys3-cluster/1`), and presents the certificate <cert>, giving the
+connection and the handshake <s> seconds (10 by default). In TLS 1.3 the
 server judges a client certificate after the client has finished, so it
 then waits up to five seconds for the node to close the connection. It
 prints `kept` and exits 0 if the node kept it open, or prints `refused`
@@ -40,7 +42,8 @@ def present(args: argparse.Namespace) -> int:
     context.load_cert_chain(args.cert, args.key)
     context.set_alpn_protocols([ALPN])
     try:
-        with socket.create_connection(("127.0.0.1", args.port), timeout=10) as raw:
+        address = ("127.0.0.1", args.port)
+        with socket.create_connection(address, timeout=args.timeout) as raw:
             with context.wrap_socket(raw, server_hostname="localhost") as tls:
                 tls.settimeout(5)
                 try:
@@ -95,6 +98,7 @@ def main() -> int:
     p.add_argument("--ca", required=True)
     p.add_argument("--cert", required=True)
     p.add_argument("--key", required=True)
+    p.add_argument("--timeout", type=float, default=10.0)
     f = commands.add_parser("flood")
     f.add_argument("--port", type=int, required=True)
     f.add_argument("--connections", type=int, required=True)
