@@ -8729,7 +8729,22 @@ of this file. A task with nothing unexpected keeps "None."
   unrepaired (seed 0); `RepairBug::TrustSilent` never counts a silent
   node's fragments lost (seeds 0 and 1). Each is run clean first, which
   must pass.
-- **Seeds and cost.** TIMES
+- **Seeds and cost.** Every scenario declares `Runner::with_cost`. At
+  `SKYS3_SIM_SEEDS=256`, one test thread each, on a loaded four-core
+  machine (the M5-09 scenarios took 289 s there, against the 190 s
+  above), every scenario passed every seed it runs: the loss combinations
+  (2 seeds, 33 s) and `FillMissing` (3, 40 s), the encoding crash matrix
+  (3, 43 s) and `InProgressReferenced` there (2, 26 s), the repair crash
+  matrix (3, 143 s) and `InProgressReferenced` there (2, 33 s), the
+  overwrite and delete races (4, 29 s) and `ReleaseRelocatedTarget` (4,
+  20 s), the holder lost mid-drain (4, 55 s) and `LeaveDepartingToMoves`
+  (1, 23 s), and healing (4, 32 s) and `TrustSilent` (2, 25 s); about
+  500 s in all, which scales to about 330 s unloaded and, CI's runners
+  being about twice as fast, about three minutes in CI. The rust job,
+  which sets no seed count, runs one seed of each. The nightly 1,024
+  seeds run four times as many of each. The coding, coded-read, repair,
+  and move scenarios pass at 256 seeds after the harness changes, and so
+  does the whole cluster simulation.
 - **Left open.** The node binary still runs none of this (M8-07a,
   M8-07b). The encoder's placement on silent nodes, above. In-place
   repairs go uncounted by the repair metrics. The crash matrices strike
