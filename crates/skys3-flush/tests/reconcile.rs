@@ -177,9 +177,19 @@ impl World {
         }
     }
 
-    /// Follows the bucket until more than `after` scans finished, and
-    /// returns the last one's report and the number of scans.
-    async fn next_report(&self, after: u64) -> (Arc<ReconcileReport>, u64) {
+    /// Follows the bucket until a scan that starts after this call has
+    /// finished, and returns its report: one that saw every change made
+    /// before the call.
+    ///
+    /// The scan interval is no barrier: the runtime's paused clock jumps
+    /// to the scan's timer whenever the runtime waits for the index's
+    /// blocking thread, so a scan may have finished, or be under way,
+    /// before the test's last change. A scan takes its shards and marks
+    /// itself running in one step, so the scan in progress, if any, is
+    /// skipped, and the next one to finish started after this call.
+    async fn next_report(&self) -> Arc<ReconcileReport> {
+        let status = self.service.reconciliation(&bucket().bucket_id).unwrap();
+        let after = status.scans + u64::from(status.running_since_ms.is_some());
         let patience = Patience::new();
         loop {
             self.reconcile().await;
@@ -187,7 +197,7 @@ impl World {
             if let Some(last) = &status.last
                 && status.scans > after
             {
-                return (Arc::clone(last), status.scans);
+                return Arc::clone(last);
             }
             assert!(!patience.is_exhausted(), "no scan finished: {status:?}");
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -216,7 +226,7 @@ fn out_of_band_changes_appear_in_the_report_and_the_scan_changes_nothing() {
         world.settle(0).await;
         let wall = Duration::from_secs(1_700_000_000).as_millis() as u64;
         // Nothing differs yet.
-        let (report, scans) = world.next_report(0).await;
+        let report = world.next_report().await;
         assert!(report.differences.is_empty(), "{report:?}");
         assert_eq!(report.shards, [ShardId::new(0), ShardId::new(1)]);
         assert_eq!(report.listed, 10);
@@ -251,7 +261,7 @@ fn out_of_band_changes_appear_in_the_report_and_the_scan_changes_nothing() {
             .unwrap()
             .to_owned();
 
-        let (report, _) = world.next_report(scans).await;
+        let report = world.next_report().await;
         let found: Vec<(&str, DifferenceKind, Option<RemoteWriter>)> = report
             .differences
             .iter()
@@ -357,7 +367,7 @@ fn keys_written_and_flushed_during_scans_are_never_reported() {
         // Once flushing settles, a scan compares every key and agrees.
         world.store.set_faults(SimS3Faults::NONE);
         world.settle(0).await;
-        let (report, _) = world.next_report(seen).await;
+        let report = world.next_report().await;
         assert!(report.differences.is_empty(), "{report:#?}");
         assert!(report.compared > 0);
         assert!(
@@ -384,7 +394,7 @@ fn only_the_shards_the_node_leads_are_compared() {
             world.store.delete_object(request).await.unwrap();
         }
         world.shards[1].close().await.unwrap();
-        let (report, _) = world.next_report(0).await;
+        let report = world.next_report().await;
         assert_eq!(report.shards, [ShardId::new(0)]);
         let of_shard_0: Vec<&String> = keys
             .iter()
