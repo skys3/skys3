@@ -18,8 +18,10 @@
 //! Answers are JSON objects; later fields are added, never renamed. A
 //! bucket's status counts the objects and the unflushed entries (dirty,
 //! flushing, in conflict, and tombstones) of the shards open on this node,
-//! read from the index. A `write_back` bucket's status also has a `flush`
-//! object from its flushers on this node (§7.1, §7.2):
+//! read from the index, leaving out stopped replicas (`shards_stopped`),
+//! whose index a move or a takeover left behind (plan M8-08). A
+//! `write_back` bucket's status also has a `flush` object from its
+//! flushers on this node (§7.1, §7.2):
 //!
 //! - `probe`: `running` until the target's capability probe succeeds, with
 //!   `probe_error` from its last failed run, then `done`, with
@@ -601,11 +603,18 @@ impl<D: Disk> NodeAdmin<D> {
     /// The status of `bucket`.
     pub async fn bucket(&self, bucket: &BucketDocument) -> Value {
         let (mut open, mut sealed, mut objects, mut unflushed) = (0_u32, 0_u32, 0_u64, 0_u64);
+        let mut stopped = 0_u32;
         let mut errors = Vec::new();
         for shard in ShardRef::all(bucket) {
             let Some(local) = self.shards.set().get(&(&shard).into()).await else {
                 continue;
             };
+            // A replica a move or a takeover left out keeps its index as it
+            // was, which no longer counts: its entries are the members'.
+            if local.is_stopped() {
+                stopped += 1;
+                continue;
+            }
             open += 1;
             sealed += u32::from(local.is_sealed());
             match local.summary().await {
@@ -629,6 +638,7 @@ impl<D: Disk> NodeAdmin<D> {
             "shards": bucket.shards.get(),
             "shards_open": open,
             "shards_sealed": sealed,
+            "shards_stopped": stopped,
             "objects": objects,
             "unflushed": unflushed,
             "errors": errors,
