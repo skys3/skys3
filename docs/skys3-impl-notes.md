@@ -8990,3 +8990,73 @@ of this file. A task with nothing unexpected keeps "None."
   change no behavior the simulation exercises (it uses no `AwsS3`, and
   the TLS options made explicit were the defaults), so the 256-seed
   `harness` run is the only simulation run.
+
+## M8 Cluster binary
+
+### M8-01 End-to-end harness and single-node suite
+
+- **MinIO publishes no binary or image any more.** Its community edition
+  is source-only now: `minio/minio` on Docker Hub answers "repository does
+  not exist", and quay.io and dl.min.io are out of reach from the
+  development machine (and the binary is no longer published there
+  anyway). The suite builds MinIO with `go install` from the Go module
+  proxy, at the last commit it serves (`v0.0.0-20260212201848-7aac2a2c5b7c`,
+  about 4 minutes and a 150 MB binary), in `tests/e2e/minio.sh`, which CI
+  runs beside the cargo build and caches by version. It runs as a process
+  rather than a container, and so do the nodes and the issuer, which also
+  keeps every log and data directory in one place for the failure
+  artifact. etcd is not started: no scenario uses it yet.
+- **Every peer transport switch waits a 90-second quarantine.** A shard
+  flusher that starts on QUIC, at a node's start or after a switch back,
+  waits the commit window plus twice the clock tolerance since its tenure
+  began and since the node's last S3 flush, and one that falls back to S3
+  REST waits as long (design §7.8). So the peering scenario takes about
+  five minutes however fast the switches are (fallback 8 s after UDP was
+  dropped, return 15 s after it passed again). It runs beside the other
+  scenarios (a `# e2e: parallel` header line), and the whole suite takes
+  about as long as it does.
+- **A nearly full disk evicts all clean payload.** On a disk with less
+  than `reserve_fraction` (10%) free, every flushed object is evicted, so
+  a GET after the reconciliation check filled from MinIO and adopted the
+  out-of-band overwrite the check had just made: correct behavior, but it
+  made the suite depend on the machine's free space. The node runs with
+  `reserve_fraction = 0`, and the reconciliation scenario checks the index
+  with LIST and HEAD only, which never fill.
+- **The AWS CLI cannot choose a bucket's mode or target.** It has no way
+  to send the `x-skys3-bucket-mode` and `x-skys3-bucket-target` headers
+  of CreateBucket, so the suite creates write_back buckets with curl's
+  `--aws-sigv4`, which signs them; everything else goes through the CLI.
+- **The file control store needs its node stopped.** It is locked by the
+  node it serves and read when the node starts, so `skys3 control identity
+  put` against it runs between the node's first start and the next, as
+  the SDK matrix's hand-written registers did. The command is generic
+  over `ControlStore` and opens only the file backend in this build;
+  M8-03 adds the others to the same function.
+- **The `e2e` profile is not optimized.** The plan asked for opt-level 1.
+  On four cores a cold build of the node at opt-level 1 took about three
+  times as long as an unoptimized one without debug info (about 11
+  minutes against 3.5), which alone would break the 15-minute budget on a
+  cold cache, and the single-node scenarios ran 151 s with the
+  unoptimized binary against 131 s: the suite moves little data, and the
+  AWS CLI's start-up dominates. The profile is a debug build without debug
+  info, which also keeps debug assertions and overflow checks on.
+- **No Docker daemon and no AWS CLI on the development machine.** The
+  Docker daemon could be started (`dockerd` as root), so the suite runs
+  the CLI from the SDK matrix's `amazon/aws-cli` image when the host has
+  no `aws`, at about a second a call; CI uses the runner's CLI. A full
+  local run with the `e2e` binary passed in 5 m 15 s (peering 311 s
+  beside the others, 157 s together), after a cold build of 3 m 42 s. It
+  fails as expected with `SKYS3_E2E_FAULT=flusher-off` (flush, import,
+  reconciliation, and admin fail) and with `udp-blocked` (QUIC never
+  returns). The CI path that installs the CA into the system trust store
+  was not run here, so as not to change the shared machine's store;
+  locally the nodes get the same CA through `SSL_CERT_FILE`, which the
+  same root loader reads.
+- **`command -v aws` found the suite's own function.** `lib.sh` wraps the
+  CLI in a shell function named `aws`, so the runner looks for the
+  executable with `type -P`.
+- **A default-feature build warns.** `cargo build -p skys3` without
+  `--all-features`, as the e2e profile builds it, warns about an unused
+  import of `sign` in `skys3-gateway/src/sigv4/chunked.rs`, used only under
+  `test-util` since M1-07a. CI's clippy runs with every feature, so it
+  never saw it; left alone here, as it is not this task's crate.
