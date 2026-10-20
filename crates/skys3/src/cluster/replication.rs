@@ -25,27 +25,37 @@
 //!   starts and on every pass, re-reading only the registrations whose
 //!   version changed.
 //!
-//! What a coordinator does is not run here (plan M8-06): no node adds
-//! learners, re-admits a returning node, finishes a bucket creation cut
-//! short, drops the shard registers of a deleted bucket, or asks for a
-//! handoff. Replication itself needs none of it: placement happens when a
-//! gateway creates a bucket (`skys3_coord::create_bucket`), and leases,
+//! - **Deleted buckets.** The gateway that deletes a bucket drops its own
+//!   node's replicas at once. Every other node drops its replicas of the
+//!   bucket once a sync of its copy from the store finds the bucket
+//!   register gone ([`ClusterShards::drop_deleted`]), and opens them no
+//!   more, although the shard registers outlive the bucket until the
+//!   coordinator deletes them (design §6.7).
+//!
+//! What a coordinator does runs only on the nodes with `[cluster]
+//! coordinator = true` ([`super::coordinator`]): adding learners,
+//! re-admitting a returning node, finishing a bucket creation cut short,
+//! dropping the shard registers of a deleted bucket, and asking for
+//! handoffs. Replication itself needs none of it: placement happens when
+//! a gateway creates a bucket (`skys3_coord::create_bucket`), and leases,
 //! member removal, takeover, promotion, and backfill run on the shards'
 //! own nodes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use skys3_cluster::{ControlShardConfigs, RegisterFollower, ReplicatedShards};
+use skys3_cluster::{
+    BoxFuture, ControlShardConfigs, Handoffs, RegisterFollower, ReplicatedShards, ShardConfigs,
+};
 use skys3_config::Config;
 use skys3_control::{
     ControlError, ControlStore, KeyPrefix, ProposalIds, RegisterKind, RetryPolicy, TypedKey,
     Version, read_with_retries,
 };
 use skys3_gateway::routing::{ForwardServer, RoutedShards, RoutingConfig, ShardMap};
-use skys3_gateway::{LocalShards, ShardRef};
+use skys3_gateway::{LocalShards, ShardRef, Shards};
 use skys3_index::{Index, IndexError};
 use skys3_io::{BlockingPool, Clock, MonotonicClock, RealDisk};
 use skys3_net::{Credentials, Peers, TokioNetwork, Transport};
@@ -54,7 +64,7 @@ use skys3_shard::AckTimeout;
 use skys3_shard::replication::{
     ControlRegisters, Replication, ReplicationConfig, ReplicationMetrics,
 };
-use skys3_types::{BucketDocument, NodeAddress, NodeId};
+use skys3_types::{BucketDocument, BucketId, NodeAddress, NodeId, ShardConfig};
 
 use crate::admin::{ReportFuture, ShardsReport, shard_entry};
 use crate::control::backend::Backend;
@@ -89,6 +99,36 @@ pub(crate) fn replication_config(config: &skys3_config::ReplicationConfig) -> Re
     }
 }
 
+/// The buckets a node saw deleted. Bucket IDs are never reused (§4.1), so
+/// the set only grows, by the buckets deleted while the node runs.
+type Deleted = Arc<Mutex<BTreeSet<BucketId>>>;
+
+/// The shard registers, without those of the buckets the node saw
+/// deleted: they outlive their bucket until the coordinator deletes them
+/// (§6.7), and the node must not open its replicas of them again.
+struct LiveShards<C> {
+    registers: C,
+    deleted: Deleted,
+}
+
+impl<C: ShardConfigs> ShardConfigs for LiveShards<C> {
+    fn shards(&self) -> BoxFuture<'_, Result<BTreeSet<ShardRef>, ControlError>> {
+        Box::pin(async move {
+            let mut shards = self.registers.shards().await?;
+            let deleted = self.deleted.lock().unwrap_or_else(PoisonError::into_inner);
+            shards.retain(|shard| !deleted.contains(&shard.bucket));
+            Ok(shards)
+        })
+    }
+
+    fn config<'a>(
+        &'a self,
+        shard: &'a ShardRef,
+    ) -> BoxFuture<'a, Result<Option<ShardConfig>, ControlError>> {
+        self.registers.config(shard)
+    }
+}
+
 /// The replicated shards of a node with `[cluster] multi_node = true`,
 /// the gateway's routed shards over them, and what keeps them following
 /// the registers (see the [module](self) docs).
@@ -102,6 +142,8 @@ pub(crate) struct ClusterShards {
     retry: RetryPolicy,
     /// Each registration read last: its version and the address it names.
     registrations: Mutex<BTreeMap<NodeId, (Version, NodeAddress)>>,
+    /// The buckets this node saw deleted.
+    deleted: Deleted,
 }
 
 impl std::fmt::Debug for ClusterShards {
@@ -158,7 +200,11 @@ impl ClusterShards {
             store.clone(),
         )
         .with_config(RoutingConfig::default(), retry);
-        let follower = replicas.follower(Arc::new(ControlShardConfigs::new(store.clone(), retry)));
+        let deleted = Deleted::default();
+        let follower = replicas.follower(Arc::new(LiveShards {
+            registers: ControlShardConfigs::new(store.clone(), retry),
+            deleted: Arc::clone(&deleted),
+        }));
         Ok(Self {
             transport,
             replicas,
@@ -168,6 +214,7 @@ impl ClusterShards {
             store,
             retry,
             registrations: Mutex::default(),
+            deleted,
         })
     }
 
@@ -190,6 +237,11 @@ impl ClusterShards {
     /// The node's end of forwarded requests.
     pub(crate) fn server(&self) -> &Forwarded {
         self.routed.server()
+    }
+
+    /// What starts the planned handoffs of the shards this node leads.
+    pub(crate) fn handoffs(&self) -> Handoffs<TokioNetwork, RealDisk> {
+        self.replicas.handoffs()
     }
 
     /// Reopens the replicas the node keeps a configuration of, as a node
@@ -220,6 +272,50 @@ impl ClusterShards {
             tracing::debug!(%error, "cannot read the node registrations");
         }
         self.follower.follow().await
+    }
+
+    /// Drops the replicas of `open`, those open before a sync of the node's
+    /// copy began, whose bucket the copy's `buckets` no longer name, and
+    /// opens them no more: the bucket was deleted through another node's
+    /// gateway (§4.1). `keep` names the buckets without a register, which
+    /// are never dropped. Only a copy read from the store itself, at a
+    /// generation past the one before, may decide it, as at startup (§6.2):
+    /// a bucket register is written before the shard registers that open
+    /// a replica, so a listing that starts after the replica opened lists
+    /// the bucket unless it was deleted, and bucket IDs are never reused.
+    /// Returns how many replicas it dropped.
+    pub(crate) async fn drop_deleted(
+        &self,
+        open: &[skys3_log::ShardRef],
+        buckets: &[BucketDocument],
+        keep: &BucketId,
+    ) -> usize {
+        let known: BTreeSet<&BucketId> = buckets
+            .iter()
+            .map(|bucket| &bucket.bucket_id)
+            .chain([keep])
+            .collect();
+        let mut dropped = 0;
+        for shard in open.iter().filter(|shard| !known.contains(&shard.bucket)) {
+            self.deleted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(shard.bucket.clone());
+            let named = ShardRef {
+                bucket: shard.bucket.clone(),
+                shard: shard.shard,
+            };
+            match self.routed.remove(&named).await {
+                Ok(()) => {
+                    tracing::info!(%shard, "dropped the replica of a deleted bucket");
+                    dropped += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(%shard, %error, "cannot drop the replica of a deleted bucket");
+                }
+            }
+        }
+        dropped
     }
 
     /// Passes every `interval`, starting one `interval` from now, until the

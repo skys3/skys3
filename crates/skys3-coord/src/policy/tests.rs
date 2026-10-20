@@ -469,6 +469,7 @@ fn registrations_feed_a_topology_without_a_registry() {
         disks: Vec::new(),
         instance_id: None,
         departing: false,
+        draining: false,
         proposal_id: ProposalId::new("p1").unwrap(),
     };
     let topology = Topology::new(

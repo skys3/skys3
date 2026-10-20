@@ -239,8 +239,16 @@ impl<N: Network, D: Disk> Candidate<N, D> {
     async fn follow(&self, over: &ShardConfig, held: &ShardConfig) -> Proposed {
         let shard = self.shard.shard();
         if !held.is_member(&self.replication.inner.node) {
-            // Removed: it grants nothing more.
-            tracing::info!(%shard, epoch = %held.epoch, "removed while proposing a takeover");
+            // Removed, as a coordinator's move removes a member that is up:
+            // it grants nothing more, and the replica stops in the
+            // register's configuration, as at the node's next start, so
+            // that a later configuration naming the node a learner opens
+            // it again as one (§6.7).
+            tracing::info!(%shard, epoch = %held.epoch, "removed while proposing a takeover; the replica stops");
+            self.shard.depose(
+                "the shard's register no longer names this member",
+                Some(held),
+            );
             return Proposed::Done;
         }
         let adopted = self.shard.reconfigure(held).await;

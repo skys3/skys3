@@ -9208,6 +9208,85 @@ of this file. A task with nothing unexpected keeps "None."
   the TLS options made explicit were the defaults), so the 256-seed
   `harness` run is the only simulation run.
 
+### M7-01 S3 conformance and compatibility matrix
+
+- **The matrix's tables are test output.** `docs/skys3-s3-compatibility.md`
+  is prose around generated sections between `<!-- BEGIN/END -->`
+  markers. Each test that generates a section also compares it with the
+  committed one and fails on a difference, printing the table it
+  expected; `SKYS3_UPDATE_DOCS=1` rewrites it instead. So the doc is now
+  a test input, and `scripts/ci/docs-only.sh` no longer counts a change
+  to it as documentation only.
+- **Which operation a probe reached is read from `s3s`'s own log.**
+  `s3s` 0.17 emits a debug event "resolved route" with the operation's
+  name, and `tests/compatibility.rs` captures it with a subscriber of its
+  own, so every row checks both the routing and the answer. Tracing
+  caches a callsite's interest the first time it is hit, which made the
+  event vanish when probes ran on several test threads with scoped
+  dispatchers; all probes run in one test, and it rebuilds the interest
+  cache first.
+- **Unimplemented operations parse before they answer 501.** `s3s`
+  parses an operation's input before calling the default
+  `NotImplemented` handler, so a probe with a malformed body gets a
+  `400` instead; each probe carries a valid body. Operations with no IAM
+  action keep answering `403 AccessDenied` (design §11), as
+  `operations_without_an_action_are_denied_to_everyone` already decided;
+  the matrix says so rather than call them 501.
+- **Every s3-tests test is classified.** The plugin fails the run if a
+  collected test is neither selected nor excluded, or if a list line
+  matches nothing, so a new pinned revision cannot add or rename tests
+  unnoticed. Exclusions carry a kind; `open` was added beside
+  `unsupported`, `divergence`, and `assumption` so that gaps in supported
+  features show in the published table as open points instead of hiding
+  among unsupported features.
+- **Two divergences were fixed instead of excluded.** An empty delimiter
+  was echoed in listings although it rolls up nothing; it is now treated
+  as absent. A CompleteMultipartUpload sent again after the upload
+  completed answered `404 NoSuchUpload`; it now answers as the completion
+  did while the key's current version carries the upload's write
+  identity, so a client retrying a lost answer sees success, as with S3.
+  That moved five tests into the subset (both empty-delimiter listings,
+  `test_multipart_upload`, `test_multipart_upload_small`, and
+  `test_multipart_reupload_checksum_and_etag`).
+- **Two gaps are left open.** No answer carries `x-amz-request-id` and
+  no error document a `RequestId` (`test_object_requestid_matches_header_on_error`):
+  `s3s` can put one in its errors, but giving every answer an ID,
+  including those `s3s` builds itself, needs a layer around the service
+  and a choice of ID that logs can use, which is more than a fix.
+  PutObject and HeadObject do not return `x-amz-expiration`
+  (`test_lifecycle_expiration_header_put`, `_head`, `_tags_head`, and
+  `_and_tags_head`, which passes only because the header is never sent):
+  it needs the lifecycle rules evaluated on the request path.
+- **The divergences are not checked against AWS.** Nothing in this
+  environment reaches AWS S3, so each divergence follows the AWS
+  documentation as design §11 reads it; several of the tests that
+  disagree are also marked by s3-tests as failing on RGW.
+- **Tests that pass by accident stay excluded.** 35 excluded tests pass,
+  nearly all because they accept any error for a feature SkyS3 rejects
+  (S3 Select, POST object, some SSE-C and SSE-KMS tests). Five Object Lock
+  tests on a bucket without it, and the owner-only canned ACLs, pass
+  because SkyS3 answers what S3 answers there, so they are selected as
+  checks of the rejected features' answers.
+- **The lifecycle clock is shortened for s3-tests.** The selected
+  `test_lifecycle_expiration_date` waits three times `lc_debug_interval`
+  (10 seconds by default); the configuration now sets it to 2, since the
+  matrix's node applies lifecycle rules every second. The tests that rely
+  on RGW turning days into that interval stay excluded.
+- **The run was local, not in the images.** The subset ran on the host
+  with `SKYS3_SDK_LOCAL=1` against a checkout of the pinned commit; the
+  other SDK clients' images were not built here. A full run of every test
+  (`SKYS3_S3TESTS_ALL=1`) took about 21 minutes, most of it pytest
+  formatting tracebacks for the failures by reparsing the 20,000-line
+  `test_s3.py`; `run-subset.sh` now passes `--tb=no` in that mode. The
+  subset of 249 tests took 250 to 270 seconds locally, against 2.5 minutes
+  for the 216 of M1-25 in CI; the additions include the slow DeleteObjects
+  limits and `delimiter_not_skip_special`.
+- **A node warning predates this task.** The node log, which the matrix
+  prints when a client fails, showed every second that the node cannot
+  sync the control-state copy because a shard's configuration differs in
+  epoch 1, at the base commit too. It comes from
+  `skys3::cluster::control`, outside this task, and fails nothing.
+
 ## M8 Cluster binary
 
 ### M8-01 End-to-end harness and single-node suite
@@ -9695,3 +9774,93 @@ of this file. A task with nothing unexpected keeps "None."
   the store returns; a gracefully stopped primary does not hand off, so
   its shards wait out `primary_grace`; DeleteBucket drops only the local
   replica.
+
+### M8-06 Coordinator, handoff, and member lifecycle in the binary
+
+- **Who may be elected.** `[cluster] coordinator` (off by default, needs
+  `multi_node`) decides whether a node contends for `coordinator.lease`.
+  A node with it off never contends, answers heartbeats as a follower,
+  and is placed like any other; it still serves handoffs through its
+  replicas and the admin API's cluster routes. A cluster where no node
+  has the flag runs as M8-05b left it. The flag decides eligibility, not
+  just whether the services start, because an operator who keeps some
+  nodes out of coordination (small or remote ones) needs them never to
+  take the lease.
+- **T6 and plan §14 decision 5.** Over the transport a node starts a
+  handoff only for the node `coordinator.lease` names or an `admin`
+  certificate (`skys3_coord::CoordinatorOrAdmin`), and logs any other
+  sender. The lease is read from the store, at most once a second, rather
+  than taken from the node's own registry, which a node that does not
+  contend has none of; a flood of handoff frames costs one read a second.
+  `AdminEndpoint::with_handoffs` (any sender) stays for the simulation,
+  whose network has no identities to check. Operators use the admin HTTP
+  API behind its token: the shard's primary starts a handoff itself, the
+  coordinator sends it, and any other node answers `409` naming both,
+  so the API adds no transport sender the check would have to admit. A
+  drain is a CAS on the registration, served by any node: whoever may
+  write the control store can already reassign shards (§12, T1).
+- **A drain mark of its own.** `departing` is the coordinator's mark,
+  which a node clears by registering again; a drain must survive a
+  restart, so it is a new registration field, `draining`, written only
+  when true, which the node keeps when it registers and placement and the
+  registry treat as departing (`NodeRegistration::is_leaving`). A drained
+  node is never forgotten for it: forgetting still needs
+  `node_forget_after` of silence.
+- **The lease has no epoch.** `GET /v1/cluster` reports the lease's
+  version, which changes at every renewal, and the cluster generation in
+  place of the epoch the plan names.
+- **The admin listener read no bodies.** Handoffs take an optional
+  `{"to": ...}` body, so `skys3-obs` reads an API request's body, only
+  after the token is checked, up to 64 KiB within 10 s (`413`, `400`,
+  `408` otherwise), through a new `AdminApi::call_with_body` whose
+  default ignores it.
+- **Pace keys.** The design said the replacement and rebalancing pace
+  would get keys when the binary ran the coordinator:
+  `[replication] removal_interval_seconds`, `rebalance_max_moves`,
+  `rebalance_handoff_interval_seconds`, and
+  `rebalance_handoff_retry_seconds`. Replacement's bounds on one change
+  (32 registers, 64 learners) stay constants.
+- **DeleteBucket across the cluster.** Within reach: the deleting node
+  already deletes the bucket register and its shard registers in one
+  change. Every other node drops its replicas of a bucket that a sync
+  whose generation advanced no longer lists, among those open before the
+  sync (a bucket created meanwhile is not dropped), and the follower
+  skips shard registers of buckets dropped so (`LiveShards`), so a late
+  listing cannot reopen them; the coordinator's bucket shards deletes any
+  register the change left behind.
+- **Three bugs the e2e scenario found in M8-05b's code.** (1) A primary
+  that handed off and then read the register while the coordinator had
+  already named it a learner adopted that configuration as it stopped;
+  the follower then saw a replica at the register's epoch and never
+  reopened it, so the shard stayed one member short. A replica stopped in
+  a configuration that names it a learner now opens again as one
+  (`ShardSet::open_replica`, `RegisterFollower::follow`). (2) A member
+  removed while up, as every rebalancing move does, stayed open as a
+  member of its old configuration for good: its takeover found itself
+  removed and gave up, leaving a replica `GET /v1/shards` reported with
+  stale members. It now stops in the register's configuration, as at a
+  restart. (3) A gateway kept up to 8 idle connections to a node; after
+  the node restarted, each was dead, and every write that drew one failed
+  as "may have applied it", up to 8 in a row, beyond any SDK's retries.
+  A lost answer now drops the node's idle connections.
+- **curl does not retry into a pipe.** `--retry` with `-o /dev/null`, or
+  with the body on standard output, gives up after the first attempt with
+  exit 23 (curl 8.5), as it cannot truncate what it wrote; the scenarios
+  write answers to files.
+- **The e2e scenario's cost.** `coordinator` runs 76 s on the development
+  machine, beside `replication` (95 s) and `cluster` (81 s) in the etcd
+  leg, which the single-node scenarios bound: the leg stays within the
+  peering scenario's five minutes, and the job within its 15. A handoff
+  moved a primary in 0.2 to 0.8 s; cc4 received its 3 shards in 9 s; the
+  drained coordinator was emptied in 6 s; a successor took the lease 9 s
+  after `kill -9` (the default lease of 10 s times (1+ρ), counted from
+  the last renewal, up to a third of a lease before the kill), with the
+  slowest request meanwhile 0.11 s; and the restarted node received
+  3 shards again in 9 s.
+- **Open points.** A coordinator that stops cleanly does not release the
+  lease, so its successor waits a whole lease as after a crash; no SkyS3
+  command sends a handoff with an `admin` certificate; the e2e scenario
+  checks the transport-level T6 refusal only in process
+  (`skys3-coord` `handoff/tests.rs`, `skys3/tests/coordinator.rs`); a
+  coordinator's metrics are exported only by the nodes that may be
+  elected.
