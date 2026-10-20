@@ -78,8 +78,10 @@
 //!   its cap (design §12);
 //! - `registration`: `registered`, whether the node has registered since
 //!   it started; `registrations`, how often, an unchanged registration
-//!   included; and `error`, why the latest attempt failed, until one
-//!   succeeds;
+//!   included; `error`, why the latest attempt failed, until one
+//!   succeeds; and `claimed_by`, the instance ID of the data directory
+//!   whose registration holds the node's ID, which stops the node
+//!   (design §6.7);
 //! - `heartbeats`: `answered`, the heartbeats the lease holder answered,
 //!   `delivered`, those a coordinator acknowledged, and `coordinator`, the
 //!   node that acknowledged the latest one (design §6.7);
@@ -154,7 +156,7 @@ use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::SegmentLog;
 use skys3_obs::{AdminApi, ApiFuture, HandshakeLimit, Health};
 use skys3_remote::ObjectStore;
-use skys3_types::{BucketDocument, BucketId, ClusterId, Generation, NodeAddress, NodeId};
+use skys3_types::{BucketDocument, BucketId, ClusterId, Generation, Label, NodeAddress, NodeId};
 use tokio::sync::watch;
 
 use crate::datadir::DiskDir;
@@ -206,6 +208,7 @@ impl ClusterView {
                 "registered": status.registrations > 0,
                 "registrations": status.registrations,
                 "error": status.registration_error,
+                "claimed_by": status.claimed_by.as_ref().map(Label::as_str),
             },
             "heartbeats": {
                 "answered": status.answered,
