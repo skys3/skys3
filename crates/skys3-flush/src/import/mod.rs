@@ -242,8 +242,13 @@ impl Stop {
 /// progress the owner's shard 0 holds, at most
 /// `settings.import_keys_per_second` keys a second over all streams.
 ///
-/// Without progress in shard 0, it resumes from the checkpoint a build
-/// that kept it in the node's index stored, if any. An import with no
+/// Progress resumed from shard 0 is first committed again to every other
+/// shard ([`spread`]): an earlier run may have been stopped, or its node
+/// crashed, after shard 0 held it and before the others did, and a shard
+/// whose progress never passes a key keeps the key's tombstone, and its
+/// flusher waiting, for good. Without progress in shard 0, it resumes from
+/// the checkpoint a build that kept it in the node's index stored, if any.
+/// An import with no
 /// progress, or with one range, which a single-stream import stored, first
 /// discovers split points for `streams` streams after its checkpoint
 /// ([`split::split_points`]) and stores the ranges as progress. Stored
@@ -281,6 +286,14 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(mut job: ImportJob<S, D>) {
             }
         }
     };
+    if let Some((update, ranges)) = &stored
+        && *update > 0
+    {
+        let body = RecordBody::ImportProgress(ranges.to_progress(*update));
+        if !spread(&job.bucket, &job.commit, &body, &mut retry).await {
+            return;
+        }
+    }
     let (update, stored) = match stored {
         Some((update, ranges)) => (update, Some(ranges)),
         None => (0, None),
@@ -355,9 +368,9 @@ pub(crate) async fn run<S: ObjectStore, D: Disk>(mut job: ImportJob<S, D>) {
     tracing::info!(bucket = %import.bucket.name, "the namespace import is done");
 }
 
-/// Where an import resumes: the progress the owner's shard 0 holds, or
-/// else the checkpoint a build that kept it in the node's index stored, as
-/// progress number 0.
+/// Where an import resumes: the progress the owner's shard 0 holds, never
+/// numbered 0, or else the checkpoint a build that kept it in the node's
+/// index stored, as progress number 0.
 async fn resume_point<S, D: Disk>(
     job: &ImportJob<S, D>,
 ) -> Result<Option<(u64, ImportRanges)>, String> {
@@ -566,34 +579,47 @@ impl<S: ObjectStore, D: Disk> ImportRun<S, D> {
                 return false;
             }
         }
-        let mut pending: Vec<ShardId> = self.bucket.shards.shards().skip(1).collect();
-        while !pending.is_empty() {
-            let mut commits = JoinSet::new();
-            for shard in pending.drain(..) {
-                let shard_ref = ShardRef::new(self.bucket.bucket_id.clone(), shard);
-                let committed = (self.commit)(shard_ref, body.clone());
-                commits.spawn(async move { (shard, committed.await) });
-            }
-            let mut failed = None;
-            while let Some(done) = commits.join_next().await {
-                match done {
-                    Ok((_, Ok(()))) => {}
-                    Ok((shard, Err(error))) => {
-                        pending.push(shard);
-                        failed = Some(error);
-                    }
-                    Err(error) => failed = Some(error.to_string()),
+        spread(&self.bucket, &self.commit, &body, retry).await
+    }
+}
+
+/// Commits the `IMPORT_PROGRESS` `body`, which shard 0 holds, to every
+/// other shard of `bucket` through `commit`, retrying each that fails. A
+/// shard that holds it, or later progress, already ignores it. `false` if
+/// the import was stopped while a failed commit waited to be retried.
+async fn spread(
+    bucket: &BucketDocument,
+    commit: &Commit,
+    body: &RecordBody,
+    retry: &mut Retry<'_>,
+) -> bool {
+    let mut pending: Vec<ShardId> = bucket.shards.shards().skip(1).collect();
+    while !pending.is_empty() {
+        let mut commits = JoinSet::new();
+        for shard in pending.drain(..) {
+            let shard_ref = ShardRef::new(bucket.bucket_id.clone(), shard);
+            let committed = commit(shard_ref, body.clone());
+            commits.spawn(async move { (shard, committed.await) });
+        }
+        let mut failed = None;
+        while let Some(done) = commits.join_next().await {
+            match done {
+                Ok((_, Ok(()))) => {}
+                Ok((shard, Err(error))) => {
+                    pending.push(shard);
+                    failed = Some(error);
                 }
-            }
-            if let Some(error) = failed {
-                let error = format!("storing the import progress failed: {error}");
-                if !retry.wait(error).await {
-                    return false;
-                }
+                Err(error) => failed = Some(error.to_string()),
             }
         }
-        true
+        if let Some(error) = failed {
+            let error = format!("storing the import progress failed: {error}");
+            if !retry.wait(error).await {
+                return false;
+            }
+        }
     }
+    true
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

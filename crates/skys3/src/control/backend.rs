@@ -15,12 +15,15 @@
 //!   at the next attempt. At startup it also reads the control bucket's
 //!   versioning ([`read_versioning`]).
 //!
-//! **One node per store, until M8-05b.** Until replication is wired into
-//! the binary, every node serves each of its shards alone, so two nodes on
-//! one store would serve the same buckets apart. A node therefore refuses
-//! an etcd or S3 store whose `nodes/` registers another node
+//! **One node per store, unless `[cluster] multi_node`.** A single node
+//! serves each of its shards alone, so two of them on one store would
+//! serve the same buckets apart. A node without `multi_node` therefore
+//! refuses an etcd or S3 store whose `nodes/` registers another node
 //! ([`check_single_node`]), as the file store refuses a second node
-//! itself.
+//! itself. With `multi_node = true`, nodes share the store and register in
+//! it, and the guard gives way to registration, which refuses only a
+//! registration of the node's own ID from another data directory
+//! (`crate::cluster::registration`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -326,6 +329,9 @@ pub struct Opener {
     node: NodeId,
     retry: RetryPolicy,
     kind: Kind,
+    /// Whether nodes share the store (`[cluster] multi_node`), so that
+    /// other nodes' registrations are expected.
+    multi_node: bool,
 }
 
 #[derive(Debug)]
@@ -352,16 +358,19 @@ impl Opener {
                 owner,
                 pool,
             },
+            multi_node: false,
         }
     }
 
-    /// Opens `store`, an etcd or S3 store [`connect`] built, for `node`.
+    /// Opens `store`, an etcd or S3 store [`connect`] built, for `node`,
+    /// one of several nodes sharing it if `multi_node`.
     #[must_use]
-    pub fn shared(store: Backend, node: NodeId) -> Self {
+    pub fn shared(store: Backend, node: NodeId, multi_node: bool) -> Self {
         Self {
             node,
             retry: RetryPolicy::default(),
             kind: Kind::Shared(store),
+            multi_node,
         }
     }
 
@@ -379,8 +388,9 @@ impl Opener {
     /// `initialized`.
     ///
     /// A file store is opened as [`open_file_store`] opens it. A shared
-    /// store must not register another node ([`check_single_node`]), and
-    /// an S3 store must pass the startup probe ([`probe`]). A node that
+    /// store must not register another node ([`check_single_node`]) unless
+    /// nodes share it (`multi_node`), and an S3 store must pass the
+    /// startup probe ([`probe`]). A node that
     /// never synced from a shared store counts as claiming it, so that it
     /// drops no shard on the strength of registers it did not write.
     ///
@@ -401,7 +411,9 @@ impl Opener {
                 })
             }
             Kind::Shared(store) => {
-                check_single_node(store, &self.node, &self.retry).await?;
+                if !self.multi_node {
+                    check_single_node(store, &self.node, &self.retry).await?;
+                }
                 if let Backend::S3(_) = store {
                     probe(store).await?;
                 }

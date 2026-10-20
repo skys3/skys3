@@ -844,6 +844,7 @@ impl FlushRig {
             control: Arc::new(Mutex::new(ControlState::default())),
             health: Health::new(),
             flush: service.clone(),
+            cluster: None,
         };
         let rig = Self {
             store,

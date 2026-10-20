@@ -192,6 +192,7 @@ fn node_registration() -> impl Strategy<Value = NodeRegistration> {
                         capacity_bytes,
                     })
                     .collect(),
+                instance_id: None,
                 departing,
                 proposal_id,
             },

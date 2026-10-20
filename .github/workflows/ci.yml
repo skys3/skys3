@@ -435,7 +435,10 @@ jobs:
   # and over an S3 control bucket of a second SkyS3 cluster (plan M8-03;
   # MinIO fails the startup probe, which the suite checks), each on ports
   # and in a directory of its own (tests/e2e/control-stores.sh); they
-  # finish within the peering scenario's five minutes. When the suite
+  # finish within the peering scenario's five minutes. The etcd leg also
+  # runs the three-node cluster scenario (plan M8-04: registration,
+  # heartbeats, refused strangers, and a handshake flood), about a minute
+  # beside its single-node scenarios. When the suite
   # fails, its directories (logs, configurations, and data directories)
   # are uploaded. The job also checks the alerting rules and runs their unit
   # tests with promtool from a pinned Prometheus release, which takes

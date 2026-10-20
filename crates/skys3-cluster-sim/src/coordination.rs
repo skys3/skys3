@@ -609,6 +609,7 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
                     capacity_bytes: DISK_BYTES,
                 })
                 .collect(),
+            instance: None,
         };
         let seed = env.seed;
         let shards = self.inner.start(env).await?;

@@ -226,6 +226,7 @@ fn conflicts_are_listed_and_resolved_under_each_policy() {
             control: Arc::new(Mutex::new(ControlState::default())),
             health: Health::new(),
             flush: service.clone(),
+            cluster: None,
         };
 
         // Listing: each key, its shard, its local `seq`, and the remote's

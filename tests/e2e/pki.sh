@@ -22,16 +22,20 @@
 #   etcd-client.pem/.key        and a client certificate, both signed by
 #                               e2e-ca.pem, for the suites that run the
 #                               etcd control store
+#   c3-foreign.pem/.key         a node certificate naming
+#                               spiffe://c3/node/c9, signed by e2e-ca.pem,
+#                               a CA the nodes of cluster c3 do not trust
+#                               on their transport (the cluster scenario)
 #
 # The clusters and nodes are those of PKI_NODES, `cluster/node` pairs
-# separated by spaces (default: the single-node cluster, and the two pairs
-# of peered clusters of the suite). Everything is EC P-256 except the token
+# separated by spaces (default: the single-node cluster, the two pairs of
+# peered clusters, and the three nodes of cluster c3 of the suite). Everything is EC P-256 except the token
 # key, and valid for two days. Existing files are kept, so a rerun reuses
 # them.
 set -euo pipefail
 
 dir=${1:?usage: pki.sh <dir>}
-nodes=${PKI_NODES:-"e2e/n1 pa/pa1 pb/pb1 ra/ra1 rb/rb1"}
+nodes=${PKI_NODES:-"e2e/n1 pa/pa1 pb/pb1 ra/ra1 rb/rb1 c3/c1 c3/c2 c3/c3"}
 mkdir -p "$dir"
 cd "$dir"
 
@@ -71,8 +75,13 @@ EOF
 ca e2e-ca "SkyS3 e2e CA"
 leaf gateway e2e-ca "SkyS3 e2e gateway" "IP:127.0.0.1,DNS:localhost" serverAuth
 leaf issuer e2e-ca "SkyS3 e2e OIDC issuer" "IP:127.0.0.1,DNS:localhost" serverAuth
-leaf etcd-server e2e-ca "SkyS3 e2e etcd" "IP:127.0.0.1,DNS:localhost" serverAuth
+# etcd's JSON gateway, which the cluster scenario writes through, reaches
+# etcd's gRPC server with the server certificate, which --client-cert-auth
+# then checks as a client's.
+leaf etcd-server e2e-ca "SkyS3 e2e etcd" "IP:127.0.0.1,DNS:localhost" "serverAuth,clientAuth"
 leaf etcd-client e2e-ca "SkyS3 e2e etcd client" "DNS:skys3" clientAuth
+leaf c3-foreign e2e-ca c9 "URI:spiffe://c3/node/c9,IP:127.0.0.1,DNS:localhost" \
+    "serverAuth,clientAuth"
 [ -s oidc-signing.key ] || openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
     -out oidc-signing.key 2>/dev/null
 
