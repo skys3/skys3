@@ -28,7 +28,7 @@ use skys3_coord::{
     RegistryConfig,
 };
 use skys3_io::{Clock, MonoTime, MonotonicClock};
-use skys3_net::{ALPN_PROTOCOL, Credentials, TokioNetwork, Transport};
+use skys3_net::{ALPN_PROTOCOL, Credentials, Frame, Header, MessageKind, TokioNetwork, Transport};
 use skys3_types::{
     ClusterId, CoordinatorLease, Generation, NodeAddress, NodeId, NodeRegistration, ProposalId,
     RegisterDocument,
@@ -508,5 +508,60 @@ async fn the_transport_refuses_strangers_and_caps_its_handshakes() {
     })
     .await;
     assert!(present(&pki, port, &pki.cluster.node(CLUSTER, "n3")).await);
+
+    // A node's connection whose first frame is of a class this build
+    // serves nothing on is closed, as is one that ends before its first
+    // frame, and the listener goes on.
+    let peer = pki
+        .cluster
+        .node(CLUSTER, "n2")
+        .credentials(CLUSTER, &pki.cluster);
+    let transport = Transport::new(TokioNetwork, &peer);
+    let address: NodeAddress = format!("127.0.0.1:{port}").parse().unwrap();
+    let n1 = NodeId::new("n1").unwrap();
+    let mut connection = transport.connect(&n1, &address).await.unwrap();
+    let append = Frame::new(Header::new(MessageKind::Append), Vec::new());
+    connection.send(&append).await.unwrap();
+    let answer = tokio::time::timeout(WAIT, connection.recv()).await.unwrap();
+    assert!(matches!(answer, Ok(None) | Err(_)), "an answer to Append");
+    drop(transport.connect(&n1, &address).await.unwrap());
+    eventually("both connections were let in", || async {
+        metric(&node, &transport_handshakes("completed")).await == 4.0
+    })
+    .await;
+    assert!(present(&pki, port, &pki.cluster.node(CLUSTER, "n3")).await);
     node.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_needs_usable_credentials_and_its_transport_port() {
+    let root = tempfile::tempdir().unwrap();
+    let pki = Pki::new(root.path());
+    let fake = Fake::start(None).await;
+
+    // A certificate file that holds no certificate.
+    let dir = root.path().join("garbled");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = node_config(&dir, &pki, &etcd(&fake), "n1", "n1", free_port(), 256);
+    std::fs::write(dir.join("node.pem"), "not a certificate\n").unwrap();
+    let error = Node::start(text.parse().unwrap()).await.unwrap_err();
+    let StartError::Cluster(message) = &error else {
+        panic!("{error}");
+    };
+    assert!(message.contains("is not usable"), "{message}");
+
+    // A transport port another socket holds.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let dir = root.path().join("taken");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = node_config(&dir, &pki, &etcd(&fake), "n1", "n1", port, 256);
+    let error = Node::start(text.parse().unwrap()).await.unwrap_err();
+    assert!(matches!(error, StartError::Io { .. }), "{error}");
+    assert!(
+        error.to_string().contains("binding the transport"),
+        "{error}"
+    );
+    // Neither registered.
+    assert!(fake.get(&format!("{CLUSTER}/nodes/n1.json")).is_none());
 }
