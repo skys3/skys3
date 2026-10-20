@@ -12,6 +12,7 @@ use skys3_config::TargetTransport;
 use skys3_obs::MetricsRegistry;
 
 use crate::peer::{Transport, TransportStatus};
+use crate::reconcile::{DifferenceKind, ReconcileReport};
 
 /// The label set of every flush metric: `bucket`, the bucket's name.
 type Labels = Vec<(String, String)>;
@@ -124,6 +125,8 @@ pub struct FlushMetrics {
     fill_conflicts: Family<Labels, Counter>,
     streaming_overlap: Family<Labels, Histogram, fn() -> Histogram>,
     transport: Family<Labels, Gauge>,
+    reconcile_differences: Family<Labels, Gauge>,
+    reconcile_scans: Family<Labels, Counter>,
 }
 
 impl Default for FlushMetrics {
@@ -150,6 +153,8 @@ impl Default for FlushMetrics {
             fill_conflicts: Family::default(),
             streaming_overlap: Family::new_with_constructor(overlap_histogram),
             transport: Family::default(),
+            reconcile_differences: Family::default(),
+            reconcile_scans: Family::default(),
         }
     }
 }
@@ -288,6 +293,18 @@ impl FlushMetrics {
              QUIC path failed, for example because UDP is blocked.",
             metrics.transport.clone(),
         );
+        registry.register(
+            "reconcile_differences",
+            "Differences between the remote target and the index that this node's last \
+             reconciliation scan of the bucket confirmed, over the shards it leads, by kind: \
+             remote_only, index_only, etag_mismatch, or size_mismatch.",
+            metrics.reconcile_differences.clone(),
+        );
+        registry.register(
+            "reconcile_scans",
+            "Reconciliation scans of the bucket this node finished.",
+            metrics.reconcile_scans.clone(),
+        );
         metrics
     }
 
@@ -372,9 +389,25 @@ impl FlushMetrics {
             })
     }
 
+    /// Sets `bucket`'s reconciliation metrics from the `report` of a scan
+    /// that finished, and counts it.
+    pub fn set_reconciliation(&self, bucket: &str, report: &ReconcileReport) {
+        for kind in DifferenceKind::ALL {
+            let count = i64::try_from(report.count(kind)).unwrap_or(i64::MAX);
+            self.reconcile_differences
+                .get_or_create(&kind_labels(bucket, kind))
+                .set(count);
+        }
+        self.reconcile_scans.get_or_create(&labels(bucket)).inc();
+    }
+
     /// Forgets `bucket`'s series, once it is no longer flushed here.
     pub fn remove(&self, bucket: &str) {
         self.set_transport(bucket, None);
+        for kind in DifferenceKind::ALL {
+            self.reconcile_differences
+                .remove(&kind_labels(bucket, kind));
+        }
         let labels = labels(bucket);
         self.dirty_bytes.remove(&labels);
         self.dirty_budget.remove(&labels);
@@ -390,6 +423,13 @@ impl FlushMetrics {
 
 fn labels(bucket: &str) -> Labels {
     vec![("bucket".to_owned(), bucket.to_owned())]
+}
+
+fn kind_labels(bucket: &str, kind: DifferenceKind) -> Labels {
+    vec![
+        ("bucket".to_owned(), bucket.to_owned()),
+        ("kind".to_owned(), kind.as_str().to_owned()),
+    ]
 }
 
 fn transport_labels(bucket: &str, transport: Transport) -> Labels {

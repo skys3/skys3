@@ -64,6 +64,9 @@ pub struct FlushConfig {
     /// `import_max_keys_per_second`: the most remote keys the namespace
     /// import of one bucket lists a second (§9.1).
     pub import_max_keys_per_second: u64,
+    /// `reconcile_requests_per_second`: the most requests, listings and
+    /// HEADs, one bucket's reconciliation scan sends a second (§9.1).
+    pub reconcile_requests_per_second: u64,
     /// `target_region`: the region the flusher signs requests to
     /// `write_back` targets for, such as `us-east-1`, or `auto` for
     /// Cloudflare R2 (§7).
@@ -83,6 +86,7 @@ impl Default for FlushConfig {
             flush_conflict_policy: ConflictPolicy::Hold,
             max_dirty_bytes: 2 * TIB,
             import_max_keys_per_second: 100_000,
+            reconcile_requests_per_second: 10,
             target_region: "us-east-1".to_owned(),
         }
     }
@@ -153,6 +157,10 @@ impl FlushConfig {
         checker.nonzero(
             "flush.import_max_keys_per_second",
             self.import_max_keys_per_second,
+        );
+        checker.nonzero(
+            "flush.reconcile_requests_per_second",
+            self.reconcile_requests_per_second,
         );
         checker.require(
             !self.target_region.is_empty()

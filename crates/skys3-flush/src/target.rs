@@ -54,6 +54,12 @@ pub struct FlushSettings {
     /// the bucket's `import_parallel_streams`
     /// ([`FlushService::with_buckets`](crate::FlushService::with_buckets)).
     pub import_streams: usize,
+    /// `reconcile_requests_per_second`: the most requests, listings and
+    /// HEADs, a bucket's reconciliation scan sends a second (§9.1).
+    pub reconcile_requests_per_second: u64,
+    /// The most keys one listing request of a reconciliation scan asks
+    /// for, at most S3's 1,000.
+    pub reconcile_page_keys: u32,
     /// The first delay before a key is retried after a failure.
     pub min_backoff: Duration,
     /// The longest delay between retries of a key; delays double up to it.
@@ -89,6 +95,7 @@ impl FlushSettings {
                 .max(1),
             max_inflight_bytes: config.flush_max_inflight_bytes_per_target,
             import_keys_per_second: config.import_max_keys_per_second,
+            reconcile_requests_per_second: config.reconcile_requests_per_second,
             part_bytes: config.flush_part_bytes,
             ..Self::default()
         }
@@ -113,6 +120,8 @@ impl Default for FlushSettings {
             import_keys_per_second: FlushConfig::default().import_max_keys_per_second,
             import_page_keys: crate::IMPORT_PAGE_KEYS,
             import_streams: 1,
+            reconcile_requests_per_second: FlushConfig::default().reconcile_requests_per_second,
+            reconcile_page_keys: crate::IMPORT_PAGE_KEYS,
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
             extent_bytes: 1 << 20,
