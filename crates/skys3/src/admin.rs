@@ -64,7 +64,8 @@
 //!   `null` before one: its `code` (`AccessDenied`, `InvalidAccessKeyId`,
 //!   `SignatureDoesNotMatch`, `refused` for a SkyS3 peer's native refusal,
 //!   or `other`), the `target` (`<endpoint>/<bucket>`), `error`, what was
-//!   refused (`probe: ...` or `<key>: ...`) and how, and `at_unix_ms`.
+//!   refused (`probe: ...`, `copy probe: ...`, or `<key>: ...`) and how,
+//!   and `at_unix_ms`.
 //!   Flushing retries refused keys with its usual backoff, so it resumes
 //!   by itself once the target takes the writes again.
 //!

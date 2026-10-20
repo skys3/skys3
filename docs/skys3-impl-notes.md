@@ -8901,6 +8901,18 @@ of this file. A task with nothing unexpected keeps "None."
   nothing checked again. Both now drop the shard for the rest of the scan,
   as a failed page read did, and the scan stops listing once no shard is
   left, instead of fetching every remaining page.
+- **The scan interval was no barrier in the tests.** The flush crate's
+  scan tests failed about one run in ten under CPU load: a report still
+  covered shard 1 after the test closed it, or missed a key deleted just
+  before. It was the test, not the scan: each failing run had a scan
+  finished or under way before the test's last change, which the test then
+  took as the next report. The tests run on a paused clock, and the
+  runtime jumps to the next timer, the 60-second scan interval, whenever it
+  waits for the index's blocking thread, so the interval in simulated time
+  says nothing about when a scan runs. `next_report` now waits for a scan
+  that starts after the call, taking the finished-scan count and whether
+  one is running as its baseline; a scan takes its shards and marks itself
+  running in one step, so that scan saw every earlier change.
 - **No cluster-simulation scenario.** The scan writes nothing, so a
   scenario would check only the absence of reports under faults, which the
   flush crate's workload test does in under a second. The simulation jobs'
@@ -9092,9 +9104,27 @@ of this file. A task with nothing unexpected keeps "None."
   started for the run and stopped after it. The peering scenario's node configuration
   moved into `tests/e2e/lib.sh` (`peer_configure`, `peer_aws`) for reuse,
   and the PKI gained the clusters `ra` and `rb`.
+- **Two refusal paths were missed at first (review).** A streamed body's
+  own staging at a SkyS3 peer, before its `PUT` commits, ends in its own
+  task, which kept only the error text; and the server-side copy probe
+  takes a `403` on `CopyObject` for an error to retry forever, not for
+  missing support. Both are now counted and named in `last_refusal`
+  (`<key>: ...` and `copy probe: ...`), but neither holds up a key: the
+  body's version is not dirty yet, and copies are uploaded while the copy
+  probe is pending.
 - **The unused `sign` import M8-01 noted is fixed**, since this task
   touches `skys3-gateway`: it is imported under the same `cfg` as its
   users.
+- **A flusher could miss a body announced as it started.** CI on aarch64
+  timed out in `native::a_body_whose_put_never_commits_is_aborted`, an
+  M6-06 test: the flusher subscribed to the shard's changes only when its
+  task first ran, and `Shard::announce` drops an announcement while the
+  shard has no subscriber, so a body announced before that was never
+  staged, and never aborted. Delaying the task's first poll by 50 ms
+  failed that test and three others the same way. `ShardFlusher::start`
+  now subscribes before it spawns the task;
+  `native::a_body_announced_before_its_flusher_runs_is_staged`, on a
+  single-threaded runtime, fails without that.
 
 ### M8-03 Control stores in the binary
 
