@@ -1657,6 +1657,7 @@ The [configuration reference](skys3-config.md) lists every key with its type, de
 cluster_id = "skys3-prod-a"
 failure_domain = "node"       # "node", "rack", or "zone"; nodes carry rack and zone labels
 multi_node = false            # true: one of several nodes (transport, registration); never with backend = "file"
+coordinator = false           # true: the node may be elected coordinator (section 6.7); needs multi_node
 
 [node]
 node_id = "node-a1"           # optional; generated and kept in data_dir when unset
@@ -1705,6 +1706,10 @@ primary_lease_ms = 4000
 primary_grace_ms = 6000
 assumed_clock_drift = 0.01
 node_forget_after_hours = 24
+removal_interval_seconds = 10       # replacement removes at most one member per interval (section 6.7)
+rebalance_max_moves = 4             # shard moves per rebalancing batch
+rebalance_handoff_interval_seconds = 2   # at most one handoff asked for per interval
+rebalance_handoff_retry_seconds = 10     # a handoff that did not land is asked for again
 
 [storage]
 inline_max_bytes = 131072

@@ -260,6 +260,7 @@ async fn coordinator(pki: &Pki, fake: &Fake) -> Transport<TokioNetwork> {
         disks: Vec::new(),
         instance_id: None,
         departing: false,
+        draining: false,
         proposal_id: ProposalId::new("coord-1").unwrap(),
     };
     fake.put(

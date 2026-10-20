@@ -107,6 +107,7 @@ fn candidates_come_from_registrations_and_registry_entries() {
         ],
         instance_id: None,
         departing: false,
+        draining: false,
         proposal_id: ProposalId::new("p1").unwrap(),
     };
     let candidate = Candidate::from_registration(&registration);
@@ -132,6 +133,14 @@ fn candidates_come_from_registrations_and_registry_entries() {
         NodeState::Departing
     );
     assert_eq!(Candidate::from_entry(&entry).state, NodeState::Departing);
+    // So is one an operator drains.
+    entry.registration.departing = false;
+    entry.registration.draining = true;
+    assert_eq!(
+        Candidate::from_registration(&entry.registration).state,
+        NodeState::Departing
+    );
+    assert_eq!(Candidate::from_entry(&entry).state, NodeState::Departing);
 }
 
 #[test]
@@ -149,6 +158,7 @@ fn a_node_marked_departing_is_never_chosen() {
             }],
             instance_id: None,
             departing: n == 2,
+            draining: false,
             proposal_id: ProposalId::new(format!("p{n}")).unwrap(),
         })
         .collect();
