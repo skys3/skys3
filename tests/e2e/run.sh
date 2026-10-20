@@ -9,7 +9,9 @@
 # the script names without their number and `.sh`), in order. With an etcd
 # or S3 control store (SKYS3_E2E_CONTROL), the default is the scenarios of
 # the single-node cluster: those that run clusters of their own (`# e2e:
-# parallel`) run them over the file store whatever the setting. It prints a
+# parallel`) run them over the file store whatever the setting. A scenario
+# marked `# e2e: etcd` (the three-node cluster) needs the etcd store, and
+# runs, beside the others, only with SKYS3_E2E_CONTROL=etcd. It prints a
 # summary and exits non-zero if any failed. Everything a run makes, the
 # PKI, configurations, data directories, and logs, is in SKYS3_E2E_DIR
 # (default target/e2e-run), which CI uploads when the job fails.
@@ -65,7 +67,13 @@ scenarios=()
 for script in "$E2E_HERE"/scenarios/*.sh; do
     name=$(basename "$script" .sh)
     name=${name#[0-9][0-9]-}
-    if [ $# -eq 0 ]; then
+    if grep -q '^# e2e: etcd$' "$script"; then
+        if [ "$E2E_CONTROL" = etcd ] && { [ $# -eq 0 ] || [[ " $* " == *" $name "* ]]; }; then
+            scenarios+=("$script")
+        elif [[ " $* " == *" $name "* ]]; then
+            fail "scenario $name needs SKYS3_E2E_CONTROL=etcd"
+        fi
+    elif [ $# -eq 0 ]; then
         if [ "$E2E_CONTROL" = file ] || ! grep -q '^# e2e: parallel$' "$script"; then
             scenarios+=("$script")
         fi
@@ -212,6 +220,8 @@ etcd)
         fail "etcd answered a client without a certificate"
     fi
     log "etcd is up at $etcd_url (mutual TLS)"
+    # For the cluster scenario, whose nodes share the store.
+    export E2E_ETCD_URL=$etcd_url
     control_store="backend = \"etcd\"
 etcd_endpoints = [\"$etcd_url\"]
 etcd_tls_ca_file = \"$pki/e2e-ca.pem\"
@@ -455,10 +465,11 @@ fi
 
 # --- Scenarios --------------------------------------------------------------
 #
-# A scenario whose header has the line `# e2e: parallel` runs beside the
-# others, which run one after another: the peering scenario spends most of
-# its time waiting out the quarantines of transport switches (design
-# section 7.8), and shares nothing with the single-node cluster.
+# A scenario whose header has the line `# e2e: parallel` or `# e2e: etcd`
+# runs beside the others, which run one after another: the peering
+# scenario spends most of its time waiting out the quarantines of
+# transport switches (design section 7.8), and neither it nor the cluster
+# scenario shares anything with the single-node cluster.
 
 mkdir -p "$E2E_DIR/results"
 
@@ -484,16 +495,19 @@ report() {
         echo "::error::scenario $1 failed; its log: logs/scenario-$1.log"
 }
 
+# in_background <script>: whether the scenario runs beside the others.
+in_background() { grep -q '^# e2e: \(parallel\|etcd\)$' "$1"; }
+
 parallel=()
 for script in "${scenarios[@]}"; do
-    if grep -q '^# e2e: parallel$' "$script"; then
+    if in_background "$script"; then
         log "starting scenario $(basename "$script" .sh) in the background"
         run_scenario "$script" &
         parallel+=("$!:$script")
     fi
 done
 for script in "${scenarios[@]}"; do
-    grep -q '^# e2e: parallel$' "$script" && continue
+    in_background "$script" && continue
     run_scenario "$script"
     name=$(basename "$script" .sh)
     report "${name#[0-9][0-9]-}"
