@@ -1753,6 +1753,7 @@ reconcile_requests_per_second = 10    # per bucket and node: the reconciliation 
 target_region = "us-east-1"    # the region requests to write_back targets are signed for
 
 [ec]
+enabled = false               # true: fragment stores, encoders, coded reads (section 8); needs multi_node
 parity_fragments = 2
 max_data_fragments = 8
 min_eligible_nodes = 5

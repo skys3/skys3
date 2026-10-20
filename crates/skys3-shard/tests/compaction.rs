@@ -477,6 +477,83 @@ fn a_coded_versions_replicated_bytes_go_once_it_is_published() {
     });
 }
 
+/// Extents nothing names wait for the staging TTL, since they may be a
+/// body still arriving (§10.3); those of a coded version are named by its
+/// layout, and go after the release delay like its other bytes (§8.4).
+#[test]
+fn a_coded_versions_extents_do_not_wait_for_the_staging_ttl() {
+    use skys3_log::record::EcPublish;
+    use skys3_types::{
+        AttemptId, CodecId, CodedStripe, Epoch, FragmentId, FragmentLocation, Geometry,
+    };
+
+    runtime().block_on(async {
+        let disk = SimDisk::new(16);
+        let node = Node::open(&disk).await;
+        let shard = node.set.open(&config(&shard_ref(0), 1)).await.unwrap();
+        let mut extents = Vec::new();
+        // Most of a segment, so that once they go it is reclaimed.
+        for n in 0..5 {
+            let appended = shard.append_extent(extent("big", n * 1300, 1300)).await;
+            extents.push(appended.unwrap());
+        }
+        let version = shard.commit(put_extents("big", extents.clone(), 1)).await;
+        let version = version.unwrap().position;
+        // Later objects, each under a key of its own so that every extent
+        // stays named, fill segments so the coded one's is not the last.
+        for round in 0..12 {
+            let key = format!("later-{round}");
+            let appended = shard.append_extent(extent(&key, 0, 1000)).await;
+            let body = put_extents(&key, vec![appended.unwrap()], round);
+            shard.commit(body).await.unwrap();
+        }
+        let fragments = (0..3)
+            .map(|n| FragmentLocation {
+                node: format!("n{n}").parse().unwrap(),
+                fragment: FragmentId::new(n),
+            })
+            .collect();
+        let geometry = Geometry::new(2, 1).unwrap();
+        let stripe = CodedStripe::new(0, 0, 6500, geometry, CodecId::CURRENT, fragments).unwrap();
+        let publish = RecordBody::EcPublish(EcPublish {
+            key: "big".into(),
+            version,
+            etag: support::etag(1),
+            attempt: AttemptId::new(Epoch::new(1), 0),
+            size: 6500,
+            stripes: vec![stripe],
+        });
+        let published = shard.commit(publish).await.unwrap();
+        assert_eq!(published.outcome, Outcome::Applied(Effect::Published));
+        node.checkpointer.checkpoint().await.unwrap();
+
+        let report = node
+            .compactor(Duration::from_secs(86_400))
+            .compact()
+            .await
+            .unwrap();
+        assert!(report.segments > 0, "{report:?}");
+        let reader = node.index.read().unwrap();
+        for extent in &extents {
+            let located = reader.location(shard.shard(), extent.position).unwrap();
+            assert_eq!(located, None, "a coded version's extent waited");
+        }
+        for round in 0..12 {
+            let entry = reader.entry(shard.shard(), &format!("later-{round}"));
+            assert!(entry.unwrap().is_some());
+        }
+        drop(reader);
+        for round in 0..12 {
+            assert!(
+                node.bytes(&shard, &format!("later-{round}"))
+                    .await
+                    .is_some(),
+                "a named extent went"
+            );
+        }
+    });
+}
+
 #[test]
 fn a_replica_holds_what_its_members_may_lack() {
     runtime().block_on(async {

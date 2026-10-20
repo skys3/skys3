@@ -35,8 +35,10 @@
 //!   knows that the version's `EC_PUBLISH` record committed: its commit
 //!   watermark covers the record ([`Shard::replicated_through`]), or the
 //!   replica is alone. From then on nothing names it, and it is dropped
-//!   after the release delay like other unreferenced payload. This is how
-//!   a replica drops its copy of an object once the object is coded.
+//!   after the release delay like other unreferenced payload, its
+//!   `EXTENT` records too, without waiting for the staging TTL of extents
+//!   nothing names. This is how a replica drops its copy of an object once
+//!   the object is coded.
 //! - payload a live read registration pins ([`Reads::is_pinned`]), which
 //!   a gateway is streaming from this node (§8.7): copied, never evicted.
 //! - payload nothing names, until compaction has found it so for the
@@ -831,11 +833,15 @@ fn classify(
                 Fate::Copy
             } else {
                 let holders = holders_of(&mut memo, shard, key, || reader.holders(shard, key))?;
-                let holder = holders
-                    .get(&record.position)
-                    .filter(|holder| !dropped_as_coded(holder, shard, committed));
-                match holder {
-                    None if record.kind == RecordKind::Extent && !context.expired => Fate::Wait,
+                let holder = holders.get(&record.position);
+                // A coded version's extents are known to be named by it:
+                // unlike an extent nothing names, such as one of a body
+                // still arriving, they need not wait for the staging TTL.
+                let coded = holder.is_some_and(|holder| dropped_as_coded(holder, shard, committed));
+                match holder.filter(|_| !coded) {
+                    None if record.kind == RecordKind::Extent && !coded && !context.expired => {
+                        Fate::Wait
+                    }
                     None if !lock(&context.unreferenced).for_at_least(
                         shard,
                         record.position,
@@ -895,11 +901,11 @@ fn relocate(
             continue;
         }
         let holders = holders_of(&mut memo, shard, key, || writer.holders(shard, key))?;
-        let named = holders
-            .get(&record.position)
-            .is_some_and(|holder| !dropped_as_coded(holder, shard, committed));
+        let holder = holders.get(&record.position);
+        let coded = holder.is_some_and(|holder| dropped_as_coded(holder, shard, committed));
+        let named = holder.is_some() && !coded;
         if named
-            || (record.kind == RecordKind::Extent && !expired)
+            || (record.kind == RecordKind::Extent && !coded && !expired)
             || reads.is_pinned(shard, record.position)
         {
             relocated.kept = true;

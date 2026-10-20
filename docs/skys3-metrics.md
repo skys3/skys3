@@ -33,6 +33,7 @@ differ, or if section 6 misses a row of design section 13.
   - [3.9 Repair](#39-repair)
   - [3.10 Coordinator and placement](#310-coordinator-and-placement)
   - [3.11 Fragment release](#311-fragment-release)
+  - [3.12 Erasure coding](#312-erasure-coding)
 - [4. Alerts](#4-alerts)
 - [5. Dashboard](#5-dashboard)
 - [6. Failure matrix coverage](#6-failure-matrix-coverage)
@@ -267,17 +268,33 @@ Design sections 8.7 and 10.3. A node keeps each fragment its shard primary
 released, or that orphan reclamation judged an orphan, for
 `fragment_release_delay_seconds` and while reads hold it, then reclaims it;
 fragment-segment compaction then gives its space back. The metrics are
-defined by M5-07 (`skys3_ec::ReleaseMetrics`) and exported once fragment
-stores run in the node binary.
+defined by M5-07 (`skys3_ec::ReleaseMetrics`) and exported by nodes with
+`[ec] enabled = true` (M8-07a).
 
 | Name | Type | Labels | Design | Status | Description |
 |---|---|---|---|---|---|
-| `skys3_fragment_released_bytes_total` | counter | none | §8.7 | defined (M5-07) | Bytes of fragments released on this node: fragments of versions that writes replaced and fragments that relocations moved away from, as their shard primaries told it, and orphans their primaries judged. |
-| `skys3_fragment_releasing_bytes` | gauge | none | §8.7 | defined (M5-07) | Bytes of released fragments this node still keeps, for the release delay or while reads hold them. |
-| `skys3_fragment_reclaimed_bytes_total` | counter | none | §8.7 | defined (M5-07) | Bytes of released fragments this node reclaimed: dropped once the release delay passed and no read held them, for fragment-segment compaction to remove. |
-| `skys3_fragment_compaction_segments_total` | counter | none | §10.3 | defined (M5-07) | Fragment segments that compaction removed on this node. |
-| `skys3_fragment_compaction_removed_bytes_total` | counter | none | §10.3 | defined (M5-07) | Bytes of the fragment segments compaction removed: the size of their files. The disk space given back is this less `skys3_fragment_compaction_copied_bytes_total`. |
-| `skys3_fragment_compaction_copied_bytes_total` | counter | none | §10.3 | defined (M5-07) | Bytes of live fragments compaction copied out of the segments it removed. |
+| `skys3_fragment_released_bytes_total` | counter | none | §8.7 | exported (M5-07, M8-07a) | Bytes of fragments released on this node: fragments of versions that writes replaced and fragments that relocations moved away from, as their shard primaries told it, and orphans their primaries judged. |
+| `skys3_fragment_releasing_bytes` | gauge | none | §8.7 | exported (M5-07, M8-07a) | Bytes of released fragments this node still keeps, for the release delay or while reads hold them. |
+| `skys3_fragment_reclaimed_bytes_total` | counter | none | §8.7 | exported (M5-07, M8-07a) | Bytes of released fragments this node reclaimed: dropped once the release delay passed and no read held them, for fragment-segment compaction to remove. |
+| `skys3_fragment_compaction_segments_total` | counter | none | §10.3 | exported (M5-07, M8-07a) | Fragment segments that compaction removed on this node. |
+| `skys3_fragment_compaction_removed_bytes_total` | counter | none | §10.3 | exported (M5-07, M8-07a) | Bytes of the fragment segments compaction removed: the size of their files. The disk space given back is this less `skys3_fragment_compaction_copied_bytes_total`. |
+| `skys3_fragment_compaction_copied_bytes_total` | counter | none | §10.3 | exported (M5-07, M8-07a) | Bytes of live fragments compaction copied out of the segments it removed. |
+
+### 3.12 Erasure coding
+
+Design sections 8.2 to 8.5. Exported by nodes with `[ec] enabled = true`
+(M8-07a): each such node runs an encoder on every replica of a `local`
+bucket's shard, which codes only while the replica leads the shard, keeps a
+fragment store on each disk, and reads coded objects from their fragments in
+its gateway.
+
+| Name | Type | Labels | Design | Status | Description |
+|---|---|---|---|---|---|
+| `skys3_encoded_objects_total` | counter | none | §8.2, §8.4 | exported (M8-07a) | Object versions this node's shard primaries erasure-coded: their `EC_PUBLISH` committed and coded the version. The members then drop their replicas (design section 8.4). |
+| `skys3_encodings_superseded_total` | counter | none | §8.4 | exported (M8-07a) | Encodings whose `EC_PUBLISH` committed but was rejected when applied, because the version was overwritten, deleted, or retagged meanwhile. Their fragments are orphans, which orphan reclamation releases. |
+| `skys3_encodings_abandoned_total` | counter | none | §8.4 | exported (M8-07a) | Encodings that failed before they appended their `EC_PUBLISH`: a stripe whose fragments could not all be written after every re-plan, a replica that stopped leading, or an object whose bytes could not be read. The object stays replicated, and is encoded again at a later scan. A steady rise means nodes refuse or do not answer fragment writes: see the runbook "Turning erasure coding on". |
+| `skys3_fragment_stored_bytes` | gauge | none | §8.4, §10.1 | exported (M8-07a) | Bytes of fragments this node's fragment stores hold, released ones that are still kept included; refreshed every `index_checkpoint_interval`. |
+| `skys3_fragment_reads_total` | counter | `fragment` (`data`, `parity`), `outcome` (`read`, `failed`) | §8.5 | exported (M8-07a) | Fragment reads this node's gateway made for GETs of coded objects. A healthy read reads only data fragments; parity reads, and failed reads, mean degraded reads that decoded around a missing or damaged fragment (design section 8.5). |
 
 ## 4. Alerts
 

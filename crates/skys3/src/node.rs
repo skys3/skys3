@@ -43,6 +43,7 @@ use tokio::time::timeout;
 use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::cluster::ClusterServices;
+use crate::cluster::coding::NodeCoding;
 use crate::cluster::peering::NodePeering;
 use crate::cluster::replication::{ClusterShards, Routed};
 use crate::control::backend::{self, Backend, ConnectError, Opener};
@@ -215,6 +216,15 @@ pub enum StartError {
         #[source]
         source: skys3_log::RecoveryError,
     },
+    /// A disk's fragment store could not be recovered (`[ec] enabled`).
+    #[error("cannot recover the fragment store of disk {disk}: {source}")]
+    Fragments {
+        /// The disk.
+        disk: Label,
+        /// Why.
+        #[source]
+        source: skys3_ec::RecoveryError,
+    },
     /// The index could not be opened or replayed.
     #[error("the index: {0}")]
     Index(#[from] IndexError),
@@ -338,6 +348,9 @@ pub(crate) struct Shared {
     /// (plan M8-05b); `None` for a single node, whose shards are all its
     /// own ([`Shared::shards`]).
     pub(crate) cluster: Option<Arc<ClusterShards>>,
+    /// With `[ec] enabled = true`, erasure coding on the node's replicas of
+    /// `local` buckets' shards (plan M8-07a).
+    pub(crate) coding: Option<Arc<NodeCoding>>,
     /// The fills [`Shared::cluster`]'s transport serves to other nodes'
     /// gateways, which its server holds only weakly.
     _served_fills: Option<Arc<dyn Fills>>,
@@ -482,6 +495,8 @@ async fn watch_disks(
 /// The storage engine after recovery.
 struct Storage {
     disks: Vec<(DiskDir, SegmentLog<RealDisk>)>,
+    /// Each disk by label, which the fragment stores share with the logs.
+    mounts: Vec<(Label, RealDisk)>,
     index: Arc<Index>,
     checkpointer: Arc<Checkpointer<RealDisk>>,
     shards: NodeShards,
@@ -508,6 +523,7 @@ async fn open_storage(
         dirs.push(disk.clone());
         disks.push((disk.label.clone(), real));
     }
+    let mounts = disks.clone();
     let path = data_dir.path().join("index.redb");
     let index_config = IndexConfig::from_storage(config.storage());
     let index = on_pool(&pools.index, move || Index::open(&path, &index_config)).await?;
@@ -535,6 +551,7 @@ async fn open_storage(
         .collect();
     Ok(Storage {
         disks,
+        mounts,
         index: recovered.index,
         checkpointer: recovered.checkpointer,
         shards: recovered.shards,
@@ -870,6 +887,22 @@ impl Node {
             )),
             _ => None,
         };
+        // With [ec] enabled, the fragment stores, recovered now, and what
+        // codes and reads coded objects (plan M8-07a).
+        let coding = match &cluster_shards {
+            Some(cluster) if config.ec().enabled => Some(Arc::new(
+                NodeCoding::open(
+                    &config,
+                    &node_id,
+                    &storage.mounts,
+                    cluster,
+                    (Arc::clone(&wall), pools.index.clone()),
+                    &metrics.registry,
+                )
+                .await?,
+            )),
+            _ => None,
+        };
 
         // Identity, sessions, and the gateway.
         let retry = RetryPolicy::default();
@@ -1040,6 +1073,7 @@ impl Node {
             ..fills
         }));
         gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
+        gateway_config.fragments = coding.as_ref().map(|coding| coding.source());
         gateway_config.hot_cache = HotCache::with_metrics(
             config.cache().hot_cache_bytes_per_node,
             HotCacheMetrics::register(&metrics.registry),
@@ -1086,6 +1120,7 @@ impl Node {
             snapshots,
             hints: ControlHints::new(),
             cluster: cluster_shards,
+            coding,
             _served_fills: served_fills,
         });
         shared.sync_identity(copy.synced_at).await?;
@@ -1103,7 +1138,7 @@ impl Node {
                     shared.hints.clone(),
                     (&metrics.handshakes, &metrics.registry),
                     &pools.index,
-                    cluster,
+                    (cluster, shared.coding.as_ref().map(|c| c.services())),
                 )
                 .await?;
                 let (view, status) = (services.view(), services.status());
@@ -1198,6 +1233,12 @@ impl Node {
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(Arc::clone(&shared).follow_lifecycle(lifecycle_metrics));
+        if let Some(coding) = &shared.coding {
+            coding.spawn(&mut background);
+            let gateway = shared.gateway.clone();
+            let set = storage.shards.set().clone();
+            background.spawn(Arc::clone(coding).follow(set, move || gateway.buckets()));
+        }
         let peer_endpoint = peering.as_ref().map(NodePeering::closer);
         if let (Some(peering), Some(gateway_config)) = (peering, peer_gateway_config) {
             let gateway = shared.gateway.clone();
@@ -1346,6 +1387,9 @@ impl Node {
         let _ = checkpoints.await;
         shared.flush.shutdown().await;
         shared.snapshots.shutdown().await;
+        if let Some(coding) = &shared.coding {
+            coding.stop();
+        }
         if let Err(error) = shared.shards.set().close_all().await {
             tracing::warn!(%error, "a shard stopped with an error");
         }
