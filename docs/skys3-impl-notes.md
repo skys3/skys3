@@ -9688,3 +9688,73 @@ of this file. A task with nothing unexpected keeps "None."
   failed (20 requests counted, 40 expected) while every simulation ran
   beside it; alone it passed. This task does not touch `skys3-flush`, so
   it was left as it is.
+
+### M8-05b Replication and routing in the binary
+
+- **The libraries took a fixed map of peer addresses.** `Replication`
+  and `RoutedShards` were built with every node's address up front, as
+  the simulation knows them. A node of the binary learns them from the
+  registrations in `nodes/`, and a node that registers later must be
+  reachable without a restart. Both now share a `skys3_net::Peers`, a
+  handle on one address map that the node replaces on every register
+  pass (reading only registrations whose version changed), and a
+  primary's link loop links a member or learner whose address arrived
+  after the link began. In the simulation every address is known from
+  the start, so nothing changed there.
+- **A stopped node kept answering.** The transport spawned each accepted
+  connection on its own task, which outlived the node's shutdown: a
+  stopped primary's connections kept refusing requests with "the shard
+  was closed", which ended the other gateways' routing early instead of
+  moving them to the members, and kept the index open for 10 s. The
+  transport now keeps its connections in a `JoinSet`, ended with it.
+- **Fills had to be forwarded.** Design §9.2 as built said fills run only
+  on the shard's primary and are not forwarded, so a GET of an evicted
+  version through another node answered `503`. With the default
+  `clean_copies = 1`, members drop their copies once a version is
+  flushed, so after a takeover the new primary holds none of what was
+  flushed before, and two of three gateways failed every such GET: the
+  e2e scenario found it on its first read-back. A gateway on another
+  node now asks the primary to fill the whole version (routing request
+  `Fill`, `Fills::fill`, `skys3_flush::Filler::fill_whole`) and then reads
+  it from the primary as a holder. Waiting for the fill's end rather than
+  for the last byte matters: the entry turns clean only after the last
+  extent is committed, and a gateway that resolved the key in between
+  found it still evicted until its rounds ran out (seen once in four
+  e2e runs before the change). A review then found that one routed
+  request, with its 30 s timeout, could not cover the fill of a large
+  object or a slow target: the primary now answers after half the
+  request timeout with the bytes filled so far, and the gateway asks
+  again until the fill ends or makes no progress for a request timeout.
+- **A reference cycle kept the index open.** The forward server's fills
+  hold the flush service, whose import commits go through the routed
+  shards, which hold the forward server. The server now holds its fills
+  weakly, and the node keeps them until it stops.
+- **Two placement rules decided** (plan §14 decision 4, design §6.7):
+  `replicas` above the failure domains the registered nodes span refuses
+  the CreateBucket (`400 InvalidRequest`), and a data directory keeps the
+  mode it served its shards in (`multi_node` in `node.json`), so a single
+  node's directory does not join a cluster nor the reverse. A single
+  node's shards have no registers, and the replicated ones are opened from
+  their registers, so adopting a directory either way would serve shards
+  no register names.
+- **Coordinator duties wait for M8-06.** Nothing adds learners, finishes
+  a creation cut short, drops a deleted bucket's shard registers, or
+  takes handoff requests. The e2e scenario and the in-process test add
+  the restarted node as a learner themselves, by a CAS on the register.
+- **Failover time with the default timing.** In the e2e scenario writes
+  resumed 6.3 to 6.4 s after `kill -9` of a primary in every run
+  (`primary_grace` is 6 s), against the 10 s the plan asks for; the
+  in-process test's shorter timing takes about 2 s.
+- **The scenario depends on the disk's free space unless told not to.**
+  The development machine's disk had 2.6% free, below the default
+  `reserve_fraction` of 10%, so every clean version was evicted at once,
+  including those a primary had just filled for another node's gateway.
+  The scenario sets `reserve_fraction = 0.0`, as the single-node cluster
+  does.
+- **Open points.** STS sessions stay node-local (a session issued by one
+  node is unknown to the others); a node does not follow a peer's address
+  change on a link that is already up; `nodes/` is not in the local copy,
+  so a node restarted during a control-store outage reaches no peer until
+  the store returns; a gracefully stopped primary does not hand off, so
+  its shards wait out `primary_grace`; DeleteBucket drops only the local
+  replica.

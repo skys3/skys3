@@ -2474,6 +2474,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "skys3-cluster",
  "skys3-config",
  "skys3-control",
  "skys3-coord",

@@ -1101,12 +1101,14 @@ This section is unnumbered so that sections 14 and 15, which other documents cit
 - CreateBucket goes through `skys3_coord::create_bucket`. The gateway uses `RoutedShards` and `serve_peers`, with leases, member removal, takeover, backfill, and holder fetch.
 - Flush, import, lifecycle, snapshots, and the reconciliation scan run on primaries only. The admin API gains `GET /v1/shards`.
 - **Done when:** on a 3-node e2e cluster, writes and reads work through any node; after `kill -9` of a shard's primary, writes resume within 10 s; every acknowledged key reads back and is flushed exactly once; and the restarted node rejoins as a learner.
+- No node runs the coordinator yet: the scenario adds the restarted node as a learner itself, as M8-06's replacement will (design §6.7).
 
 #### M8-06 Coordinator, handoff, and member lifecycle in the binary
 
 **Design:** §6.7 · **After:** M8-05b · **Size:** M
 
 - The `Elector`, the `Coordinator`, and the `Pusher`. The admin API gains `GET /v1/cluster`, `POST /v1/shards/<bucket>/<n>/handoff`, and `POST /v1/nodes/<id>/drain`.
+- With the coordinator come what M8-05b leaves out (design §6.7): replacement, which adds learners for lost members and re-admits a node a takeover left out; finishing creations cut short and dropping a deleted bucket's shard registers (`BucketShards`); and the node's handoff sink.
 - **T6:** a `Handoff` is accepted only from the holder of the coordinator lease or from an `admin` certificate.
 - **Done when:** an e2e handoff moves a primary with no client errors beyond SDK retries, a 4th node joins and receives shards, and killing the coordinator delays only placement.
 
@@ -1166,7 +1168,7 @@ The design leaves these points open. Each named PR decides the point and records
 | Gating the cluster: a `[cluster] multi_node` flag, or inferred from `[transport]`. `file` is never allowed with more than one node. | M8-03: an explicit `[cluster] multi_node` flag, off by default, which M8-04 adds; not inferred from `[transport]`, which single-node clusters also configure to peer. `backend = "file"` is never allowed with it. Until M8-05b a node refuses an etcd or S3 store whose `nodes/` registers another node (design §6.2) |
 | New keys: `[transport] advertise`, `[node] zone` and `rack`, and the key that caps in-flight handshakes | M8-04: `[transport] advertise`, a host and port, defaulting to `listen` unless `listen` is a wildcard address or port 0, where it is required with `multi_node`; `[node] zone` and `rack`, optional labels registered as they are; one cap per listener, `[transport] max_inflight_handshakes`, `[gateway] max_inflight_handshakes`, and `[peering] peer_max_inflight_handshakes`, each 256 by default (1 to 65,536). The TCP listeners stop accepting at the cap, so further connections wait in the kernel's accept queue; the QUIC endpoint refuses them. A registration records its data directory's instance ID, and a node does not start while `nodes/<id>.json` registers its ID for another data directory (design §6.7, §12) |
 | How operators manage the identity registers: a CLI or the admin API, and how they authenticate | M8-01: `skys3 control identity put` and `delete`, which reach the control store with the nodes' configuration and credentials, so the store's own access control is the only gate; no admin API route (design §11) |
-| `replicas` above the node count, and migrating `LocalShards` data directories | M8-05b |
+| `replicas` above the node count, and migrating `LocalShards` data directories | M8-05b: a CreateBucket whose `replicas` exceeds the failure domains the registered nodes span is refused (`400 InvalidRequest`), never placed with fewer members; a data directory that holds a bucket's shards keeps the mode it served them in (recorded in `node.json`), so a single node's directory is refused with `multi_node`, and the reverse, and its buckets move through their targets or an S3 copy (design §6.7) |
 | Who may trigger a handoff or a drain: any node or only the coordinator, a token or an `admin` certificate (T1, T6), and the admin cluster API | M8-06 |
 | Where the fragment store lives: `[node] disks` or `[ec] fragment_disks` | M8-07a |
 | A `401` or `403` from a target: does it only stall flushing, retried, or hold the key as a conflict? | M8-02: it stalls, retried with the usual backoff, never held (§7.6): a refusal is about the path to the target, not the key, and is fixed once for every key; `skys3_flush_refusals_total`, `skys3_flush_refused_keys`, the bucket status, and `SkyS3FlushRefused` show it |

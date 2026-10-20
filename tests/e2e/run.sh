@@ -10,7 +10,7 @@
 # or S3 control store (SKYS3_E2E_CONTROL), the default is the scenarios of
 # the single-node cluster: those that run clusters of their own (`# e2e:
 # parallel`) run them over the file store whatever the setting. A scenario
-# marked `# e2e: etcd` (the three-node cluster) needs the etcd store, and
+# marked `# e2e: etcd` (the three-node clusters) needs the etcd store, and
 # runs, beside the others, only with SKYS3_E2E_CONTROL=etcd. It prints a
 # summary and exits non-zero if any failed. Everything a run makes, the
 # PKI, configurations, data directories, and logs, is in SKYS3_E2E_DIR
