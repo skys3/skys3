@@ -30,11 +30,12 @@ use std::time::Duration;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
+use skys3_coord::NodeState;
 use skys3_ec::read::ReadFuture;
 use skys3_ec::repair::RepairBug;
 use skys3_ec::{
-    Attempts, FragmentReadClient, FragmentRequest, FragmentSource, RepairEvent, RepairSettings,
-    RepairStep, Repairer,
+    Attempts, FragmentReadClient, FragmentRequest, FragmentSource, RepairEvent, RepairMetrics,
+    RepairSettings, RepairStep, Repairer,
 };
 use skys3_io::{BlockingPool, SimMount};
 use skys3_net::TurmoilNetwork;
@@ -67,6 +68,10 @@ pub struct RepairConfig {
     pub ack_delay: Duration,
     /// A bug seeded into every repairer.
     pub bug: Option<RepairBug>,
+    /// How long the run goes on once every stripe is whole again, for the
+    /// check that the repairers then leave the stripes alone: no repair
+    /// starts within it, and no move in its second half.
+    pub quiet: Duration,
     /// How many objects, the first in key order, are retagged through
     /// `n0`'s gateway once every object is coded and before the losses: a
     /// retag moves the entry's version past its coded layout's, which the
@@ -85,6 +90,7 @@ impl Default for RepairConfig {
             ack_delay: Duration::ZERO,
             bug: None,
             retag: 0,
+            quiet: Duration::ZERO,
         }
     }
 }
@@ -113,6 +119,11 @@ pub enum RepairPoint {
     Appended,
     /// The `EC_RELOCATE` committed.
     Committed,
+    /// After the losses, a node noted that the primary released fragments:
+    /// those a relocation replaced, which the node may hold no more. Only
+    /// a run with release reaches it, so it is not in
+    /// [`RepairPoint::ALL`].
+    Released,
 }
 
 impl RepairPoint {
@@ -125,7 +136,9 @@ impl RepairPoint {
         RepairPoint::Committed,
     ];
 
-    fn reached(self, step: &RepairStep) -> bool {
+    /// Whether a repair's `step` reaches the point; never for
+    /// [`RepairPoint::Released`], which no repair step reaches.
+    pub(super) fn reached(self, step: &RepairStep) -> bool {
         matches!(
             (self, step),
             (RepairPoint::Started, RepairStep::Started { .. })
@@ -145,6 +158,9 @@ pub enum RepairTarget {
     /// The new holder of the fragment the repair placed first. A power cut
     /// at its next sync is armed as the next repair write to it leaves.
     NewHolder,
+    /// At [`RepairPoint::Released`], the node that noted the release; no
+    /// node at the other points.
+    OldHolder,
 }
 
 /// A crash during the repairs: `kind` strikes `target` at `point`, which
@@ -180,6 +196,24 @@ pub struct RepairOutcome {
     pub retagged: usize,
     /// `EC_RELOCATE`s that committed and were applied for those objects.
     pub retagged_relocated: usize,
+    /// What the repair metrics said.
+    pub healing: HealingReport,
+}
+
+/// What the repair metrics of the nodes said (§8.6): the gauges behind
+/// `SkyS3FragmentsUnrepaired`, summed over the nodes' current lives, and
+/// the repaired fragments counted over every life.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HealingReport {
+    /// The most fragments known lost and not repaired at once.
+    pub peak_unrepaired: i64,
+    /// Those at the end of the run.
+    pub unrepaired_at_end: i64,
+    /// The age of the oldest of them at the end, in milliseconds; 0 when
+    /// there is none.
+    pub oldest_unrepaired_ms_at_end: u64,
+    /// Fragments the repairers counted repaired.
+    pub repaired: u64,
 }
 
 /// What the repairers did, as the driver sees it.
@@ -193,6 +227,9 @@ pub(super) struct RepairLog {
     transfers: std::sync::Mutex<Transfers>,
     /// The objects retagged before the losses, once every retag is done.
     retagged: std::sync::Mutex<Option<Vec<String>>>,
+    /// The repair metrics of every repairer, by the node and life it ran
+    /// in.
+    metrics: std::sync::Mutex<Vec<(usize, u64, RepairMetrics)>>,
 }
 
 /// The start and bytes of each transfer, by the node and life of its
@@ -284,6 +321,8 @@ pub(super) fn start(
     };
     let observed = Arc::clone(world);
     let planned = Arc::clone(world);
+    let metrics = RepairMetrics::default();
+    lock(&world.repair.metrics).push((index, life, metrics.clone()));
     let repairer = Repairer::new(
         shard,
         Arc::new(source),
@@ -293,6 +332,7 @@ pub(super) fn start(
         settings,
     )
     .with_attempts(attempts)
+    .with_metrics(metrics)
     .with_bug(config.bug)
     .with_observer(Arc::new(move |event: &RepairEvent| {
         super::moves::observe(&observed, event);
@@ -342,6 +382,14 @@ pub(super) struct Phase {
     retagging: bool,
     /// Why the repairs had not ended at the last check.
     unfinished: String,
+    /// How many releases the nodes had noted when the holders were lost.
+    told_seen: usize,
+    /// How many repair events there were when every stripe was whole
+    /// again, and halfway through the quiet time after.
+    quiet_from: Option<usize>,
+    half_from: Option<usize>,
+    /// The most fragments the nodes' metrics knew lost at once.
+    peak_unrepaired: i64,
 }
 
 impl Driver<'_> {
@@ -373,21 +421,58 @@ impl Driver<'_> {
             return true;
         }
         // Repairs that do not end within the bound end the run, which the
-        // outcome then reports.
-        let lost_at = self.repair.lost_at.unwrap_or_default();
-        self.repair.whole_at.is_none() && now <= lost_at + config.bound
+        // outcome then reports; once they ended, the quiet time follows.
+        match self.repair.whole_at {
+            Some(whole_at) => now < whole_at + config.quiet,
+            None => now <= self.repair.lost_at.unwrap_or_default() + config.bound,
+        }
     }
 
     /// Notes when every stripe is whole again after the losses, and, in a
     /// run that rebalances, the drains and the balance are done.
     pub(super) fn repair_progress(&mut self, now: Duration) {
-        if self.repair.lost_at.is_none() || self.repair.whole_at.is_some() {
+        let Some(config) = &self.world.run.repair else {
+            return;
+        };
+        if self.repair.lost_at.is_none() {
             return;
         }
-        match self.whole().and_then(|()| self.rebalanced()) {
-            Ok(()) => self.repair.whole_at = Some(now),
-            Err(why) => self.repair.unfinished = why,
+        let (unrepaired, _) = self.unrepaired();
+        self.repair.peak_unrepaired = self.repair.peak_unrepaired.max(unrepaired);
+        let events = lock(&self.world.repair.events).len();
+        match self.repair.whole_at {
+            Some(whole_at) => {
+                if self.repair.half_from.is_none() && now >= whole_at + config.quiet / 2 {
+                    self.repair.half_from = Some(events);
+                }
+            }
+            None => match self.whole().and_then(|()| self.rebalanced()) {
+                Ok(()) => {
+                    self.repair.whole_at = Some(now);
+                    self.repair.quiet_from = Some(events);
+                }
+                Err(why) => self.repair.unfinished = why,
+            },
         }
+    }
+
+    /// The fragments the current lives' repair metrics know lost, summed
+    /// over the nodes that are up, and the age of the oldest of them.
+    fn unrepaired(&self) -> (i64, Duration) {
+        let views = self.views();
+        let metrics = lock(&self.world.repair.metrics);
+        let mut latest: BTreeMap<usize, (u64, &RepairMetrics)> = BTreeMap::new();
+        for (node, life, metrics) in metrics.iter() {
+            if views[*node].is_some() && latest.get(node).is_none_or(|(at, _)| at < life) {
+                latest.insert(*node, (*life, metrics));
+            }
+        }
+        let count = latest.values().map(|(_, m)| m.unrepaired()).sum();
+        let oldest = latest
+            .values()
+            .map(|(_, m)| m.oldest_unrepaired_age())
+            .fold(0.0, f64::max);
+        (count, Duration::from_secs_f64(oldest.max(0.0)))
     }
 
     /// The nodes that hold each stripe of each object, by a member's
@@ -484,10 +569,7 @@ impl Driver<'_> {
             self.repair.lost.push((node, loss));
             let slot = &self.world.nodes[node];
             match &loss {
-                Loss::ForGood => {
-                    self.world.lost[node].store(true, Ordering::SeqCst);
-                    self.crash(sim, now, node, true, FOREVER);
-                }
+                Loss::ForGood => self.lose_for_good(sim, now, node),
                 Loss::Disk => {
                     self.lose_disk(node);
                     let down = Duration::from_millis(rng.random_range(20..300));
@@ -501,6 +583,7 @@ impl Driver<'_> {
         self.repair.lost_at = Some(now);
         self.repair.crash = config.crash;
         self.repair.seen = lock(&self.world.repair.events).len();
+        self.repair.told_seen = lock(&self.world.release.told).len();
     }
 
     /// Strikes the repair crash once its point is reached.
@@ -508,6 +591,10 @@ impl Driver<'_> {
         let Some(crash) = self.repair.crash else {
             return;
         };
+        if crash.point == RepairPoint::Released {
+            self.release_crash(now, crash);
+            return;
+        }
         let events = lock(&self.world.repair.events);
         let reached = events[self.repair.seen..]
             .iter()
@@ -528,6 +615,7 @@ impl Driver<'_> {
         let node = match crash.target {
             RepairTarget::Primary => Some(primary),
             RepairTarget::NewHolder => placed.and_then(|node| self.world.position(&node)),
+            RepairTarget::OldHolder => None,
         };
         self.repair.crash = None;
         let Some(node) = node.filter(|node| !self.world.lost[*node].load(Ordering::SeqCst)) else {
@@ -546,6 +634,33 @@ impl Driver<'_> {
                 .push((slot.id.to_string(), CrashKind::PowerAtNextSync));
             return;
         }
+        let crash = Crash {
+            delay: Duration::ZERO,
+            target: CrashTarget::Primary,
+            kind: crash.kind,
+            downtime: crash.downtime,
+        };
+        self.due.push((now, node, crash));
+    }
+
+    /// Strikes a crash at [`RepairPoint::Released`] once a node noted a
+    /// release after the losses: the releasing primary, or the node told.
+    fn release_crash(&mut self, now: Duration, crash: RepairCrash) {
+        let told = lock(&self.world.release.told);
+        let Some(first) = told.get(self.repair.told_seen) else {
+            return;
+        };
+        let node = match crash.target {
+            RepairTarget::Primary => Some(first.releaser),
+            RepairTarget::OldHolder => self.world.position(&first.node),
+            RepairTarget::NewHolder => None,
+        };
+        tracing::debug!(?first, node, "the release crash point is reached");
+        drop(told);
+        self.repair.crash = None;
+        let Some(node) = node.filter(|node| !self.world.lost[*node].load(Ordering::SeqCst)) else {
+            return;
+        };
         let crash = Crash {
             delay: Duration::ZERO,
             target: CrashTarget::Primary,
@@ -603,7 +718,7 @@ impl Driver<'_> {
     /// Checks that no layout a serving primary applied names a fragment
     /// its node lost while on the disk it was written to.
     pub(super) fn check_held(&self) -> Result<(), String> {
-        if self.world.run.repair.is_none() {
+        if self.world.run.repair.is_none() && self.world.run.release.is_none() {
             return Ok(());
         }
         let views = self.views();
@@ -696,7 +811,18 @@ impl Driver<'_> {
         let retagged = lock(&self.world.repair.retagged)
             .clone()
             .unwrap_or_default();
+        let (unrepaired_at_end, oldest) = self.unrepaired();
+        let healing = HealingReport {
+            peak_unrepaired: self.repair.peak_unrepaired,
+            unrepaired_at_end,
+            oldest_unrepaired_ms_at_end: u64::try_from(oldest.as_millis()).unwrap_or(u64::MAX),
+            repaired: lock(&self.world.repair.metrics)
+                .iter()
+                .map(|(_, _, metrics)| metrics.repaired())
+                .sum(),
+        };
         let events = lock(&self.world.repair.events);
+        self.quiet(&events)?;
         let moves = super::moves::move_attempts(&events);
         let mut outcome = RepairOutcome {
             lost: self
@@ -707,6 +833,7 @@ impl Driver<'_> {
                 .collect(),
             repair_time,
             retagged: retagged.len(),
+            healing,
             ..RepairOutcome::default()
         };
         // Within a pass, stripes that lost more fragments start first.
@@ -769,6 +896,32 @@ impl Driver<'_> {
     }
 }
 
+impl Driver<'_> {
+    /// Checks that once every stripe was whole again no repair started, and
+    /// no move in the second half of the quiet time.
+    fn quiet(&self, events: &[(usize, u64, RepairEvent)]) -> Result<(), String> {
+        let late = |from: Option<usize>| events.get(from.unwrap_or(events.len())..);
+        for (node, _, event) in late(self.repair.quiet_from).into_iter().flatten() {
+            if matches!(event.step, RepairStep::Started { .. }) {
+                return Err(format!(
+                    "n{node} started a repair of {} stripe {} once every stripe was whole again",
+                    event.key, event.stripe
+                ));
+            }
+        }
+        for (node, _, event) in late(self.repair.half_from).into_iter().flatten() {
+            if matches!(event.step, RepairStep::MoveStarted { .. }) {
+                return Err(format!(
+                    "n{node} still moved fragments of {} stripe {} well after every stripe was \
+                     whole again",
+                    event.key, event.stripe
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Whether node `node` is known to hold nothing of what it held before
 /// it went down: lost for good, or restarting on a new fragment disk.
 pub(super) fn holds_nothing(world: &World, node: usize) -> bool {
@@ -776,6 +929,22 @@ pub(super) fn holds_nothing(world: &World, node: usize) -> bool {
 }
 
 impl Driver<'_> {
+    /// Cuts the power of node `node` for good. The registry soon marks a
+    /// node it no longer hears from suspect, and placement then prefers
+    /// the live nodes: the topology says so at once.
+    pub(super) fn lose_for_good(&mut self, sim: &mut turmoil::Sim<'_>, now: Duration, node: usize) {
+        self.world.lost[node].store(true, Ordering::SeqCst);
+        self.crash(sim, now, node, true, FOREVER);
+        // Down already, it never restarts either.
+        self.down[node] = Some(now + FOREVER);
+        let id = &self.world.nodes[node].id;
+        for candidate in lock(&self.world.topology).iter_mut() {
+            if candidate.node == *id && candidate.state == NodeState::Live {
+                candidate.state = NodeState::Suspect;
+            }
+        }
+    }
+
     /// Fails node `node`'s fragment disk under it; it starts on an empty
     /// one at its next life.
     pub(super) fn lose_disk(&mut self, node: usize) {

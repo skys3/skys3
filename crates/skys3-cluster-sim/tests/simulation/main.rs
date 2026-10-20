@@ -74,6 +74,13 @@
 //!   retire, never leaving a stripe below `k` readable fragments or a
 //!   failure domain over its cap, through crashes at each step of a move,
 //!   with seeded move bugs caught.
+//! - [`ec_suite`]: the erasure-coding suite: every combination of up to
+//!   `m` lost fragments or holders read back and of `m + 1` failing
+//!   cleanly, at 2+1, 3+2, and 4+2; crashes of every kind at each step of
+//!   encoding and repair, with orphans and released fragments all
+//!   reclaimed; overwrites, deletes, and drains racing repairs; and a
+//!   holder lost for good healed with no operator action, with seeded bugs
+//!   caught.
 //! - [`compaction`]: segment compaction on replicated shards under
 //!   crashes, message loss, and power losses at sync boundaries, with
 //!   every member's dirty bytes and every shard's latest `CONFIG` record
@@ -160,6 +167,7 @@ mod copies;
 mod crash;
 mod discovery;
 mod drills;
+mod ec_suite;
 mod fragment_moves;
 mod handoff;
 mod harness;
