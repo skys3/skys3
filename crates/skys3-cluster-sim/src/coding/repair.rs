@@ -157,8 +157,10 @@ impl RepairPoint {
 pub enum RepairTarget {
     /// The repairing primary.
     Primary,
-    /// The new holder of the fragment the repair placed first. A power cut
-    /// at its next sync is armed as the next repair write to it leaves.
+    /// The new holder of the fragment placed first by the repair that
+    /// reached the point; the crash waits for that placement. A power cut
+    /// at its next sync is armed as that repair's write to it leaves, so
+    /// after the write left it never comes.
     NewHolder,
     /// At [`RepairPoint::Released`], the node that noted the release; no
     /// node at the other points.
@@ -381,6 +383,9 @@ pub(super) struct Phase {
     crash: Option<RepairCrash>,
     /// How many repair events the crash point was looked for in.
     seen: usize,
+    /// The repairing primary and the event that reached the crash point,
+    /// while a crash of the new holder waits for that repair's placement.
+    reached: Option<(usize, RepairEvent)>,
     /// The nodes lost, and how.
     lost: Vec<(usize, Loss)>,
     /// Whether the retags before the losses started.
@@ -603,28 +608,34 @@ impl Driver<'_> {
             return;
         }
         let events = lock(&self.world.repair.events);
-        let reached = events[self.repair.seen..]
-            .iter()
-            .find(|(_, _, event)| crash.point.reached(&event.step))
-            .cloned();
-        self.repair.seen = events.len();
-        let placed = events
-            .iter()
-            .rev()
-            .find_map(|(_, _, event)| match &event.step {
-                RepairStep::Placed { nodes } => nodes.first().map(|(_, node)| node.clone()),
-                _ => None,
-            });
-        drop(events);
-        let Some((primary, _, event)) = reached else {
+        if self.repair.reached.is_none() {
+            self.repair.reached = events[self.repair.seen..]
+                .iter()
+                .find(|(_, _, event)| crash.point.reached(&event.step))
+                .map(|(primary, _, event)| (*primary, event.clone()));
+            self.repair.seen = events.len();
+        }
+        let Some((primary, event)) = self.repair.reached.clone() else {
             return;
         };
-        let node = match crash.target {
-            RepairTarget::Primary => Some(primary),
-            RepairTarget::NewHolder => placed.and_then(|node| self.world.position(&node)),
-            RepairTarget::OldHolder => None,
+        // The first new holder of the repair that reached the point, not
+        // of another repair, once that repair placed its fragments.
+        let placed = events.iter().find_map(|(_, _, placed)| match &placed.step {
+            RepairStep::Placed { nodes } if placed.attempt == event.attempt => {
+                nodes.first().map(|(_, node)| node.clone())
+            }
+            _ => None,
+        });
+        drop(events);
+        let node = match (crash.target, placed) {
+            (RepairTarget::Primary, _) => Some(primary),
+            (RepairTarget::NewHolder, Some(node)) => self.world.position(&node),
+            // The repair has not placed its fragments yet: the crash waits.
+            (RepairTarget::NewHolder, None) => return,
+            (RepairTarget::OldHolder, _) => None,
         };
         self.repair.crash = None;
+        self.repair.reached = None;
         let Some(node) = node.filter(|node| !self.world.lost[*node].load(Ordering::SeqCst)) else {
             return;
         };
@@ -632,13 +643,17 @@ impl Driver<'_> {
         if crash.target == RepairTarget::NewHolder && crash.kind == CrashKind::PowerAtNextSync {
             // The new holder's next sync may be another's than the rebuilt
             // fragment's, which waits for the bandwidth cap first: the cut
-            // is armed as the fragment's write leaves.
+            // is armed as this repair's write to it leaves. Once that write
+            // left, the cut never comes.
             let slot = &self.world.nodes[node];
+            *lock(&self.world.cut_for_attempt[node]) = Some(event.attempt);
             self.world.cut_at_repair_write[node].store(true, Ordering::SeqCst);
             self.cut[node] = false;
             self.report
                 .crashes
                 .push((slot.id.to_string(), CrashKind::PowerAtNextSync));
+            let strike = self.plan_strike(node, crash.kind);
+            self.cutting[node] = Some(strike);
             return;
         }
         let strike = Crash {
@@ -647,7 +662,9 @@ impl Driver<'_> {
             kind: crash.kind,
             downtime: crash.downtime,
         };
-        self.due.push((now + crash.delay, node, strike));
+        let planned = self.plan_strike(node, crash.kind);
+        self.due
+            .push((now + crash.delay, node, strike, Some(planned)));
     }
 
     /// Strikes a crash at [`RepairPoint::Released`] once a node noted a
@@ -674,7 +691,9 @@ impl Driver<'_> {
             kind: crash.kind,
             downtime: crash.downtime,
         };
-        self.due.push((now + crash.delay, node, strike));
+        let planned = self.plan_strike(node, crash.kind);
+        self.due
+            .push((now + crash.delay, node, strike, Some(planned)));
     }
 
     /// Checks that every member's layout of every object names `k + m`

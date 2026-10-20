@@ -433,11 +433,14 @@ impl Driver<'_> {
         let slot = &self.world.nodes[node];
         if crash.target == MoveTarget::NewHolder && crash.kind == CrashKind::PowerAtNextSync {
             // As for a repair: the cut is armed as the copy's write leaves.
+            *lock(&self.world.cut_for_attempt[node]) = None;
             self.world.cut_at_repair_write[node].store(true, Ordering::SeqCst);
             self.cut[node] = false;
             self.report
                 .crashes
                 .push((slot.id.to_string(), CrashKind::PowerAtNextSync));
+            let strike = self.plan_strike(node, crash.kind);
+            self.cutting[node] = Some(strike);
             return;
         }
         let crash = Crash {
@@ -446,7 +449,8 @@ impl Driver<'_> {
             kind: crash.kind,
             downtime: crash.downtime,
         };
-        self.due.push((now, node, crash));
+        let strike = self.plan_strike(node, crash.kind);
+        self.due.push((now, node, crash, Some(strike)));
     }
 
     /// The stripes of the coded layouts of the first member that is up:
