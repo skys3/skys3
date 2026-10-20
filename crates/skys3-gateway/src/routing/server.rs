@@ -18,7 +18,7 @@ use skys3_log::RecordBody;
 use skys3_types::EpochSeq;
 
 use crate::conditions::Precondition;
-use crate::fill::{FillError, Fills};
+use crate::fill::{FillError, FillProgress, Fills};
 use crate::shard::{ShardError, ShardRef, Shards, WriteOutcome};
 
 /// How long an accepted connection may take to send its first frame.
@@ -252,21 +252,22 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
             Request::ImportProgress => {
                 Response::ImportProgress(shards.import_progress(shard).await?)
             }
-            Request::Fill { key, version } => {
-                Response::Filled(self.fill(shard, &key, version).await?)
+            Request::Fill { key, version, wait } => {
+                Response::Filled(self.fill(shard, &key, version, wait).await?)
             }
         })
     }
 
     /// Fills the whole of `version` of `key`, if the replica, as its
     /// shard's serving primary, still holds it evicted, and waits until
-    /// the version is clean cache.
+    /// the version is clean cache, or for `wait` at most.
     async fn fill(
         &self,
         shard: &ShardRef,
         key: &str,
         version: EpochSeq,
-    ) -> Result<Result<(), FillError>, ShardError> {
+        wait: Duration,
+    ) -> Result<Result<FillProgress, FillError>, ShardError> {
         // Read as a client read is, so that only the serving primary fills.
         let entry = self.inner.shards.entry(shard, key).await?;
         let Some(fills) = self.inner.fills.get().and_then(Weak::upgrade) else {
@@ -276,7 +277,7 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
         if !entry.is_some_and(|e| e.version == version && e.state == EntryState::Evicted) {
             return Ok(Err(FillError::Changed));
         }
-        Ok(fills.fill(shard, key, version).await)
+        Ok(fills.fill(shard, key, version, wait).await)
     }
 
     /// Serves the forwarded requests of one connection from a gateway, one

@@ -17,6 +17,9 @@
 //!   given, as S3 does; without one, clients resume after the last key.
 //!   Objects always carry their owner.
 //!
+//! An empty delimiter rolls up nothing and is not echoed, as if it were
+//! absent.
+//!
 //! With `encoding-type=url`, keys, common prefixes, and the echoed prefix,
 //! delimiter, `start-after`, and markers are URL-encoded ([`url_encode`]).
 //! Without it, a page holding a key with a control character, which XML
@@ -77,7 +80,7 @@ pub(crate) struct Listings<H> {
 struct Request<'a> {
     bucket: &'a BucketDocument,
     prefix: String,
-    /// The delimiter as given, which is echoed.
+    /// The delimiter as given.
     delimiter: Option<String>,
     max_keys: usize,
     url: bool,
@@ -170,7 +173,7 @@ impl<H: Shards> Listings<H> {
         Ok(ListObjectsV2Output {
             name: Some(bucket.name.to_string()),
             prefix: Some(request.encode(&request.prefix)),
-            delimiter: request.delimiter.as_deref().map(|d| request.encode(d)),
+            delimiter: request.effective_delimiter().map(|d| request.encode(d)),
             max_keys: i32::try_from(request.max_keys).ok(),
             key_count: i32::try_from(page.contents.len() + page.common_prefixes.len()).ok(),
             continuation_token: input.continuation_token,
@@ -202,12 +205,12 @@ impl<H: Shards> Listings<H> {
         let next_marker = page
             .last
             .as_deref()
-            .filter(|_| page.truncated && request.delimiter.is_some())
+            .filter(|_| page.truncated && request.effective_delimiter().is_some())
             .map(|last| request.encode(last));
         Ok(ListObjectsOutput {
             name: Some(bucket.name.to_string()),
             prefix: Some(request.encode(&request.prefix)),
-            delimiter: request.delimiter.as_deref().map(|d| request.encode(d)),
+            delimiter: request.effective_delimiter().map(|d| request.encode(d)),
             marker: Some(request.encode(&marker)),
             next_marker,
             max_keys: i32::try_from(request.max_keys).ok(),

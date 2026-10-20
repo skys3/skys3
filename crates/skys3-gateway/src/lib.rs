@@ -162,7 +162,7 @@ pub use authz::{Permissions, Principal};
 pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, ShardPlacement, TARGET_HEADER};
 pub use conditions::{ConditionFailed, PeerCondition, Precondition, current_identity};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
-pub use fill::{FillBody, FillError, Fills};
+pub use fill::{FillBody, FillError, FillProgress, Fills};
 pub use hot_cache::{HotCache, HotCacheMetrics, HotCacheUsage};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
