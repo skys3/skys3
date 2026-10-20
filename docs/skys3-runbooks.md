@@ -38,6 +38,7 @@ exist.
   - [Provisioning](#provisioning)
 - [5. Nodes, disks, and clocks](#5-nodes-disks-and-clocks)
   - [Node down](#node-down)
+  - [Node ID in use](#node-id-in-use)
   - [Cluster power loss](#cluster-power-loss)
   - [Disk out of service](#disk-out-of-service)
   - [Disk space](#disk-space)
@@ -882,13 +883,17 @@ held every committed one.
 Retiring one: its shards are re-homed before it is forgotten.
 
 **Procedure.** To add a node, give it a configuration with the cluster's
-`cluster_id` and control store, and a node certificate from the cluster's
-PKI (`[transport]`), and start it. It registers itself; every membership
-decision after that is automatic (design section 6.7). To retire a node,
-stop it: the coordinator marks it `departing` after `node_forget_after_hours`,
+`cluster_id` and control store, `[cluster] multi_node = true`, its labels
+(`[node] zone` and `rack`), and a node certificate from the cluster's PKI
+that names its `node_id` (`[transport]`, with `advertise` if `listen` is a
+wildcard address), and start it. It registers itself; every membership
+decision after that is automatic (design section 6.7). `GET /v1/health`
+`cluster` shows its registration and heartbeats. To retire a node, stop
+it: the coordinator marks it `departing` after `node_forget_after_hours`,
 re-homes its shards, and forgets it. No command marks a node `departing`
-sooner, and node labels (`zone`, `rack`) have no configuration key yet
-(section 8). The node binary does not run several nodes yet.
+sooner (section 8). The node binary registers nodes and sends heartbeats
+since M8-04, but does not yet run the coordinator or serve shards across
+nodes.
 
 **Verification.** For an added node, its share of shards; for a retired
 one, `SkyS3UnderReplicated` resolves and no shard register names it.
@@ -931,6 +936,42 @@ true, every disk `in_service`, and the expected `shards_open`;
 
 **Do not.** Do not wipe the data directory to make a node start: that loses
 its copies of every shard it held, and on a node alone, every dirty write.
+
+### Node ID in use
+
+**Symptoms.** A node with `[cluster] multi_node = true` does not start, and
+logs `the node cannot start` with `nodes/<node-id>.json registers node
+<node-id> for another data directory (instance ...), not this one`.
+
+**Impact.** The node does not serve. The registration, and the node that
+holds it, are untouched: a node never takes over another data directory's
+registration.
+
+**Diagnosis.** The registration records the instance ID of the data
+directory that registered it (`instance_id`); this node's data directory
+has another. Either two nodes are configured with the same `node_id`, or
+this node's data directory was replaced (a new disk, a wiped directory, a
+machine rebuilt under the old name). Read `nodes/<node-id>.json` from the
+control store, and `GET /v1/health` of the node at the address it names:
+whether that node runs, and on which machine.
+
+**Remediation.** If another node runs with the ID, give this one an ID of
+its own and a certificate that names it. If the node that held the ID is
+gone for good (its data directory was replaced on purpose), stop every
+process that could run it, delete `nodes/<node-id>.json` from the control
+store (with `etcdctl del <prefix>nodes/<node-id>.json`, or the S3
+`DeleteObject` of that key), and start the node: it registers anew, and
+replacement treats it as a new node, its old data directory's shards as
+lost members.
+
+**Verification.** The node starts; `GET /v1/health` `cluster.registration`
+has `registered` true and no `error`, and the register's `instance_id` is
+the node's.
+
+**Do not.** Do not delete the registration of a node that still runs: it
+registers again with its own data directory, and the node you meant to
+start keeps failing. Do not copy another node's data directory to make
+the instance IDs match: two nodes would then claim the same disks' records.
 
 ### Cluster power loss
 
@@ -1332,7 +1373,7 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Discarded conflicts](#discarded-conflicts) | `runbooks::drill_out_of_band_writes` (in process) | A `discard_local` resolution adopts the remote's version and counts it in `skys3_flush_conflicts_discarded_total`, the series the alert reads. | The log lines the runbook quotes were not checked: the in-process drill has no log. |
 | [Reconciliation differences](#reconciliation-differences) | `runbooks::drill_reconciliation_report` (in process); `reconcile::keys_written_and_flushed_during_scans_are_never_reported` | Another writer's new, replaced, and deleted objects appear in the report as `remote_only`, `etag_mismatch`, and `index_only`, with the writer `outside`, and in `skys3_reconcile_differences` by kind; once SkyS3's versions are written back and the other object removed, the next scan reports nothing. Scans during a workload of writes, deletes, and flushes report nothing. | The log lines were not checked: the in-process drill has no log. No command re-imports a `remote_only` key or re-flushes a clean one (section 8). |
 | [Peer link](#peer-link) | `simulation::peer::every_committed_change_reaches_the_peer_under_faults` | Under link faults, every committed change reaches the peer cluster, and stays dirty at the source until applied. | Not drilled on the binary. |
-| [Peer transport fallback](#peer-transport-fallback) | `simulation::discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`; `simulation::discovery::forged_and_expired_descriptors_are_refused` | With UDP blocked, under crashes, takeovers, and peer restarts, the flushers fall back to S3 REST through the peer's own SkyS3 gateway, which takes their writes with their write identities from the keys in `s3_access_key_ids`, and return to QUIC once UDP is allowed again. Every committed change reaches the peer once; no `COMMIT` reaches it after an S3 write of its key acknowledged after the `COMMIT` was sent; `skys3_flush_transport` and `flush.transport` follow every switch. Forged and expired descriptors are refused, and those targets are flushed as plain S3 stores. | Not drilled on the binary; its handshake and descriptor are tested in process (`crates/skys3/src/peering.rs`). The simulation shortens the quarantine and the re-probe backoff, and does not evaluate the alert's rule. |
+| [Peer transport fallback](#peer-transport-fallback) | `simulation::discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`; `simulation::discovery::forged_and_expired_descriptors_are_refused` | With UDP blocked, under crashes, takeovers, and peer restarts, the flushers fall back to S3 REST through the peer's own SkyS3 gateway, which takes their writes with their write identities from the keys in `s3_access_key_ids`, and return to QUIC once UDP is allowed again. Every committed change reaches the peer once; no `COMMIT` reaches it after an S3 write of its key acknowledged after the `COMMIT` was sent; `skys3_flush_transport` and `flush.transport` follow every switch. Forged and expired descriptors are refused, and those targets are flushed as plain S3 stores. | Not drilled on the binary; its handshake and descriptor are tested in process (`crates/skys3/src/cluster/peering.rs`). The simulation shortens the quarantine and the re-probe backoff, and does not evaluate the alert's rule. |
 | [Under-replication](#under-replication) | `simulation::backfill::a_lost_member_is_replaced_and_its_shards_regain_their_copies`; `simulation::replacement::after_a_node_loss_every_affected_shard_returns_to_replicas_members`; `simulation::takeover::a_single_survivor_takes_over` | A lost member is removed, replaced by a learner, backfilled, and promoted with no operator action; a single survivor takes over and serves what was committed. | Not drilled on the binary: it does not run replication, so its metrics and alerts and the `placement` report cannot be read yet. |
 | [Network partition](#network-partition) | `simulation::takeover::competing_candidates_across_a_partition` | Across a partition, one candidate's CAS wins and the shard serves on the majority side; no acknowledged write is lost. | Not drilled on the binary, as above. |
 | [Placement policy](#placement-policy) | `skys3_coord::policy::tests::losing_a_rack_leaves_buckets_unsatisfied_without_co_location`; `skys3_coord::metrics::tests::the_gauges_follow_tenures_and_reports`; `simulation::heal::a_lost_rack_is_replaced_across_the_remaining_racks` | The report names short and co-located shards and unlabeled nodes without co-locating; the gauges follow the coordinator's report; a lost rack heals across the others. | Not drilled on the binary, which does not run the coordinator, so `GET /v1/health` has no `placement` yet. |
@@ -1340,6 +1381,7 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Shard lost](#shard-lost) | `simulation::drills::restore_drills_match_the_history`; `simulation::snapshots::the_lost_key_report_matches_the_history_with_backups` | The lost-key report and the restore drill match the history: the keys only the members held, the window after the snapshot, and coded objects re-indexed from their fragments. | The report and the drill have no command, so an operator cannot run them yet, and nothing gives the shard members again; the runbook first said the shard would serve again, and that a listing of its snapshots gave the start of the window (section 8). |
 | [Provisioning](#provisioning) | `simulation::registry::a_node_with_valid_credentials_joins_with_no_other_action`; `simulation::rebalancing::a_new_node_receives_its_share_of_shards_and_primaries`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one` | A node with valid credentials joins and receives its share; a lost node is replaced, forgotten, and succeeded. | No command retires a node sooner than `node_forget_after_hours`, and node labels have no configuration key (section 8). |
 | [Node down](#node-down) | `runbooks::drill_node_down`; `simulation::takeover::a_crashed_primary_fails_over_within_ten_seconds` | After `SIGKILL`, scrapes and `/healthz` fail; a restart recovers every acknowledged write and reports `ready` with every disk in service. A crashed primary's shards fail over within 10 seconds. | Nothing. |
+| [Node ID in use](#node-id-in-use) | `cluster::three_nodes_register_heartbeat_and_take_pushes` | A second data directory started with a registered node's ID does not start, logs the reason, and leaves the registration alone; so does the binary over etcd in the end-to-end scenario `cluster` (`tests/e2e/scenarios/90-cluster.sh`). | The deletion of the registration was not drilled: no command deletes a register, so the operator uses the store's own tools. |
 | [Cluster power loss](#cluster-power-loss) | `runbooks::drill_node_down`; `simulation::restart::a_whole_cluster_restart_while_the_control_store_is_unreachable` | A node that restarts while its control store cannot be opened serves from its copy (`live` false), then opens the store by itself and logs it. In a cluster, unchanged shards serve again and changed ones stay fenced. | Nothing. |
 | [Disk out of service](#disk-out-of-service) | `runbooks::drill_disk_out_of_service`; `simulation::harness::a_failed_sync_is_fenced_once` | A disk whose directory disappears fails its next segment: `skys3_disks_out_of_service` 1, `/readyz` `503`, the disk `in_service` false with its error, and `cannot fence the disk` logged. A fenced disk stops the next start, naming `out-of-service.json`; with the disk back and the fence removed, every acknowledged write reads back. | The drill cannot fail a sync on a real disk; it removes the disk's directory, and plants the fence a failed sync writes with the node's own function. |
 | [Disk space](#disk-space) | `runbooks::drill_disk_space` | Below `disk_min_free_bytes`, writes get `503 SlowDown` and count as `disk_space` refusals, the log names the place, reads and deletes go on; freeing space admits writes within seconds without a restart. | Nothing. |
@@ -1385,8 +1427,10 @@ meets today, not a plan of this document.
   bucket status with each shard's members arrive with the coordinator and
   replication in the binary.
 - **Retiring a node.** No command marks a node `departing` before
-  `node_forget_after_hours`; node labels (`zone`, `rack`) have no
-  configuration key.
+  `node_forget_after_hours`.
+- **Deleting a registration.** No SkyS3 command deletes
+  `nodes/<node-id>.json` for [Node ID in use](#node-id-in-use); the
+  operator uses `etcdctl` or the S3 API.
 - **Control-store round trips.** No metric measures them, although the
   binary now runs the etcd and S3 backends.
 - **Rebuilding an etcd or S3 control store.** `skys3 control rebuild` writes
