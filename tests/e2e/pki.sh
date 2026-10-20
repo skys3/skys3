@@ -19,7 +19,8 @@
 #                               with the URI subject alternative name
 #                               spiffe://<cluster>/node/<node>
 #   etcd-server.pem/.key,       an etcd server certificate for 127.0.0.1
-#   etcd-client.pem/.key        and a client certificate, both signed by
+#   etcd-client.pem/.key        (and the addresses of PKI_ETCD_IPS) and a
+#                               client certificate, both signed by
 #                               e2e-ca.pem, for the suites that run the
 #                               etcd control store
 #   c3-foreign.pem/.key         a node certificate naming
@@ -33,7 +34,9 @@
 # of cluster rc of the replication scenario, and the four of cluster cc
 # of the coordinator scenario). Everything is EC
 # P-256 except the token key, and valid for two days. Existing files are
-# kept, so a rerun reuses them.
+# kept, so a rerun reuses them. PKI_ETCD_IPS, IPv4 addresses separated by
+# spaces, adds the addresses of etcd members that do not listen on
+# loopback (the nightly kill and partition suite, tests/e2e/chaos).
 set -euo pipefail
 
 dir=${1:?usage: pki.sh <dir>}
@@ -80,7 +83,11 @@ leaf issuer e2e-ca "SkyS3 e2e OIDC issuer" "IP:127.0.0.1,DNS:localhost" serverAu
 # etcd's JSON gateway, which the cluster scenario writes through, reaches
 # etcd's gRPC server with the server certificate, which --client-cert-auth
 # then checks as a client's.
-leaf etcd-server e2e-ca "SkyS3 e2e etcd" "IP:127.0.0.1,DNS:localhost" "serverAuth,clientAuth"
+etcd_names="IP:127.0.0.1,DNS:localhost"
+for ip in ${PKI_ETCD_IPS:-}; do
+    etcd_names="$etcd_names,IP:$ip"
+done
+leaf etcd-server e2e-ca "SkyS3 e2e etcd" "$etcd_names" "serverAuth,clientAuth"
 leaf etcd-client e2e-ca "SkyS3 e2e etcd client" "DNS:skys3" clientAuth
 leaf c3-foreign e2e-ca c9 "URI:spiffe://c3/node/c9,IP:127.0.0.1,DNS:localhost" \
     "serverAuth,clientAuth"

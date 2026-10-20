@@ -668,6 +668,32 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
             .unwrap();
         assert_eq!(listed.key_count(), Some(12));
     }
+    // Every member of a shard applies the same records (plan M8-08), and
+    // the writes reached each shard's log.
+    eventually(
+        "the members of every shard applied the same records",
+        || async {
+            let mut applied = std::collections::BTreeMap::<u64, Vec<String>>::new();
+            for host in nodes.iter().flatten() {
+                for entry in shards_of(host).await["shards"].as_array().unwrap() {
+                    let position = entry["applied"].as_str().unwrap().to_owned();
+                    applied
+                        .entry(entry["shard"].as_u64().unwrap())
+                        .or_default()
+                        .push(position);
+                }
+            }
+            applied.len() == 4
+                && applied.values().all(|positions| {
+                    positions.len() == 3
+                        && positions.iter().all(|position| *position == positions[0])
+                        && positions[0]
+                            .parse::<skys3_types::EpochSeq>()
+                            .is_ok_and(|position| position.seq.get() > 0)
+                })
+        },
+    )
+    .await;
     let forwarded = |answer: &serde_json::Value| answer["routing"]["forwarded"].as_u64().unwrap();
     assert!(forwarded(&shards_of(nodes[1].as_ref().unwrap()).await) > 0);
     let peers = shards_of(nodes[2].as_ref().unwrap()).await["peers"].clone();

@@ -156,9 +156,12 @@
 //! replica that stopped serving, as a deposed primary's or a removed
 //! member's does until it is opened again), or `none`. A replica also
 //! reports `serving`, whether it serves client requests (a primary whose
-//! members hold its log and grant it leases), and `stepped_down`, whether
-//! it handed the shard off. A single node reports each shard of its own
-//! replica, as primary. With `[cluster] multi_node = true` the answer also
+//! members hold its log and grant it leases), `stepped_down`, whether it
+//! handed the shard off, and `applied`, the position (`<epoch>.<seq>`) of
+//! the last record it applied, which the members of a shard reach alike
+//! once its writes stop (plan M8-08 checks that replicas converge so). A
+//! single node reports each shard of its own replica, as primary. With
+//! `[cluster] multi_node = true` the answer also
 //! has `peers`, the transport address of each registered node, and
 //! `routing`, the gateway's counts since the node started: `forwarded`
 //! (calls sent to another node), `redirects` (redirect hints that updated
@@ -458,6 +461,7 @@ pub(crate) async fn shard_entry<D: Disk>(
         });
         entry["serving"] = json!(replica.is_serving());
         entry["stepped_down"] = json!(replica.stepped_down().is_some());
+        entry["applied"] = json!(replica.applied().to_string());
     } else if let Some(config) = known {
         entry["source"] = json!("map");
         describe(&mut entry, &config);

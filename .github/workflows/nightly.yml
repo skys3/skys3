@@ -1,11 +1,26 @@
 name: Nightly
 
 # Long-running checks that are too slow for every pull request (plan
-# section 5). Each job runs on a schedule and can be started by hand.
+# section 5). Each job runs on a schedule and can be started by hand; by
+# hand, `suite: chaos` runs the kill, partition, and peering suite alone.
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      suite:
+        description: Which jobs to run
+        type: choice
+        options: [all, chaos]
+        default: all
+      chaos_seed:
+        description: The kill, partition, and peering suite's seed (empty for a random one)
+        type: string
+        default: ""
+      chaos_minutes:
+        description: How long the kill, partition, and peering suite strikes faults
+        type: string
+        default: "40"
 
 permissions:
   contents: read
@@ -20,6 +35,7 @@ jobs:
   # and their run times (about an hour on four cores).
   model:
     name: Protocol model check (nightly bounds)
+    if: inputs.suite != 'chaos'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
@@ -41,6 +57,7 @@ jobs:
   # runs that seed with `Runner::with_seeds` (plan section 5).
   simulation:
     name: Simulation with random seeds and long runs
+    if: inputs.suite != 'chaos'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -72,6 +89,7 @@ jobs:
   # night. A failure prints the seed and the end of the node's log.
   kill-loops:
     name: Kill loops against the binary
+    if: inputs.suite != 'chaos'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -110,6 +128,7 @@ jobs:
   # leaves behind.
   control-store:
     name: Control-store conformance (${{ matrix.provider }})
+    if: inputs.suite != 'chaos'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -153,3 +172,101 @@ jobs:
       - name: Run the conformance suite
         if: steps.secrets.outputs.configured == 'true'
         run: cargo test -p skys3-control --all-features --test conformance an_s3_provider_conforms -- --nocapture
+
+  # The kill, partition, and peering suite (plan M8-08, tests/e2e/chaos):
+  # the node binary as a 5-node cluster over a 3-member etcd, with a 3-node
+  # cluster it peers with, each process in a network namespace of its own,
+  # under a seeded schedule of kills, kill loops, iptables partitions of
+  # primaries, tc netem delay and loss, rack loss, the coordinator's loss in
+  # the middle of a join and of a handoff, and an etcd member's loss, while
+  # a client workload records every acknowledged write. It fails if a key
+  # does not read back with its acknowledged content, a read after an
+  # acknowledgment returns older content, the cluster does not heal with no
+  # operator action, replicas do not converge, or the peered keys do not
+  # arrive. The seed is printed and in the report, whose failover-time
+  # percentiles go to the job summary and an artifact; a failing night
+  # replays with SKYS3_CHAOS_SEED (runbook "Replaying a night of the kill,
+  # partition, and peering suite"). Started by hand, `suite: chaos` runs
+  # this job alone, with a chosen seed and length. The M8 exit asks for 7
+  # clean scheduled nights in a row, which the last step counts from the
+  # workflow's history into the summary (tests/e2e/chaos/nights.sh).
+  chaos:
+    name: Kill, partition, and peering suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache the build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+
+      - name: Build the node binary
+        run: cargo build --profile e2e -p skys3
+
+      - name: Download etcd
+        run: echo "SKYS3_E2E_ETCD=$(bash tests/e2e/etcd.sh)" >> "$GITHUB_ENV"
+        env:
+          SKYS3_E2E_CACHE: ${{ runner.temp }}/etcd
+
+      # The runner's kernel has the netem qdisc as a module, which some
+      # images keep in the extra modules package.
+      - name: Load tc netem
+        run: |
+          if ! sudo modprobe sch_netem; then
+            sudo apt-get update -q
+            sudo apt-get install -yq "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          fi
+
+      - name: Draw the seed
+        env:
+          SEED: ${{ inputs.chaos_seed }}
+        run: |
+          seed="${SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}"
+          echo "Seed: $seed"
+          echo "SKYS3_CHAOS_SEED=$seed" >> "$GITHUB_ENV"
+
+      - name: Run the suite
+        run: |
+          sudo --preserve-env=GITHUB_STEP_SUMMARY,SKYS3_CHAOS_SEED,SKYS3_CHAOS_MINUTES,SKYS3_CHAOS_NETEM,SKYS3_E2E_BINARY,SKYS3_E2E_ETCD \
+            env "PATH=$PATH" tests/e2e/chaos/run.sh
+        env:
+          SKYS3_CHAOS_MINUTES: ${{ inputs.chaos_minutes || '40' }}
+          SKYS3_CHAOS_NETEM: require
+          SKYS3_E2E_BINARY: target/e2e/skys3
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chaos-report
+          path: |
+            target/chaos-run/report.json
+            target/chaos-run/report.md
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload the run's directory
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: chaos-run
+          path: target/chaos-run/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Count the clean nights
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tests/e2e/chaos/nights.sh "$GITHUB_REPOSITORY" "${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
