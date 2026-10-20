@@ -8774,6 +8774,52 @@ of this file. A task with nothing unexpected keeps "None."
   matrix, one run shorter, 122 s. The coding, coded-read, repair,
   and move scenarios pass at 256 seeds after the harness changes, and so
   does the whole cluster simulation.
+- **A seed replayed alone but not after other tests (found, fixed).** CI's
+  simulation job failed `write_through_large_objects_are_never_partial_at_the_remote`
+  at seed 4 ("the flushers did not drain: ... key-0: waiting for the
+  import"), and so did one whole-binary run here, while the seed alone
+  passed every time. The cause was not real time. Skewing the gateway's
+  `SystemTime` stamps by a day either way, or running ten processes on four
+  cores, left the run's report the same. It was Tokio's task IDs. They come
+  from one counter per process, and a current-thread runtime keeps its
+  tasks in `OwnedTasks::new(1)`, a sharded list of 4 lists picked by
+  `id & 3`. Turmoil crashes a host by dropping its runtime, which drops the
+  tasks list by list, so the order the crashed node's connections closed
+  and its peers woke depended on how many tasks other tests had spawned.
+  Spawning k throwaway tasks before the seed showed it: k = 0 to 7 gave four
+  runs in turn, and k = 2 and 6 failed exactly as CI did. Now
+  `skys3_sim::tasks::align` moves the counter so that the next ID falls in
+  list `seed % 4`, before each seed (`Runner::run`) and each simulation
+  (`SimContext::builder`). Consecutive seeds therefore cover all four
+  orders. `SKYS3_SIM_TASK_SHIFT` picks another order of one seed, and the
+  replay command repeats it. `tests/task_ids.rs` checks that IDs count up
+  by one and that a dropped runtime drops its tasks by `id % 4`, oldest
+  first in each list, so a Tokio upgrade that changes either fails there.
+  The alignment holds only while no other test of the process spawns
+  tasks. Seed 4 alone, seed 4 after the six other `large_objects` tests in
+  one process (`--test-threads=1`), and seed 4 in a run of every simulation
+  test through the new script gave the same report. Four parallel
+  runs of those tests in one process gave four other reports. So CI's and
+  the nightly simulation jobs now run each test in a process of its own
+  (`scripts/ci/simulation.sh`: build the `simulation` targets, list their
+  tests, run them `nproc` at a time, each from its package directory, as
+  `cargo test` does). cargo-nextest would do the same, but this
+  environment cannot download it (`get.nexte.st` is refused), so it could
+  not be checked here; the script needs only `jq`.
+- **An import stopped between shard 0 and the other shards left a shard
+  behind for good (found, fixed).** The failing order showed it. An import
+  stores each `IMPORT_PROGRESS` on shard 0 first and then on the bucket's
+  other shards. Bucket-0's last one, number 5 and done, reached shards 0,
+  2, and 3. Shard 1's commit failed during a crash, and the run was stopped
+  while it waited to retry. The next run on the same owner resumed shard
+  0's done progress and ended at once, so shard 1 kept number 2 for good.
+  Its flusher keeps a tombstone until the import passes the key (§4.2), and
+  waited for key-0 forever. A run now commits the progress it resumes from
+  shard 0 to every other shard first; shards that hold it ignore it as
+  stale (§9.1). `a_resumed_import_brings_every_shard_up_to_shard_0s_progress`
+  fails without the fix. With the alignment and without the fix, seed 4
+  failed in order 3 (`SKYS3_SIM_TASK_SHIFT=3`, and the printed replay
+  command failed the same way). With the fix, it passed in all four orders.
 - **Left open.** The node binary still runs none of this (M8-07a,
   M8-07b). The encoder's placement on silent nodes, above. In-place
   repairs go uncounted by the repair metrics. The crash matrices strike
