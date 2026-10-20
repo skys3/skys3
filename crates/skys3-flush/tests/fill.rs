@@ -199,6 +199,42 @@ fn an_evicted_version_is_filled_and_becomes_clean() {
 }
 
 #[test]
+fn a_whole_fill_returns_once_the_version_is_clean() {
+    runtime().block_on(async {
+        let node = Node::open(23).await;
+        let store = remote(23, false);
+        let counters = Counters::default();
+        let filler = filler(&store, 4, &counters);
+        let etag = write_remote(&store, "k", "hello, world").await;
+        let stub = import(&node, "k", 12, etag).await;
+        // A read of the first bytes is under way when the whole fill joins.
+        store.inject(
+            Operation::GetObject,
+            Fault::Delay(Duration::from_millis(100)),
+        );
+        let (read, whole) = tokio::join!(
+            read(&filler, &node, "k", stub, 0..4),
+            filler.fill_whole(&node.shard, "k", stub),
+        );
+        assert_eq!(read.unwrap(), b"hell");
+        assert_eq!(whole, Ok(()));
+        // No wait: the version is clean as the whole fill returns.
+        let entry = node.entry("k").await.unwrap();
+        assert_eq!((entry.version, entry.state), (stub, EntryState::Clean));
+        assert_eq!(counters.fills.get(), 1);
+        // Now it is not evicted, and a version never was.
+        assert_eq!(
+            filler.fill_whole(&node.shard, "k", stub).await,
+            Err(FillError::Changed)
+        );
+        assert_eq!(
+            filler.fill_whole(&node.shard, "missing", stub).await,
+            Err(FillError::Changed)
+        );
+    });
+}
+
+#[test]
 fn a_large_object_is_filled_in_chunks_of_extents() {
     runtime().block_on(async {
         let node = Node::open(2).await;

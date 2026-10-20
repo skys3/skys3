@@ -95,11 +95,19 @@ type NodeSnapshots = SnapshotService<AwsS3, RealDisk>;
 /// space, so a shard whose disk (or the data directory) is low on space
 /// is not filled: the read answers `503` until space is freed, as a write
 /// would be.
-#[derive(Debug)]
+///
+/// Only a shard's serving primary fills (§9.2). With `routed`, the
+/// gateway's fills of a `write_back` bucket's shard this node does not
+/// lead ask the primary to fill the version, and answer
+/// [`FillError::Changed`] once it has, so that the gateway reads it from
+/// the primary as a holder. The fills the transport serves for other
+/// nodes have no `routed`, so they never forward in turn.
+#[derive(Debug, Clone)]
 struct NodeFills {
     shards: NodeShards,
     flush: Arc<NodeFlush>,
     space: Arc<DiskSpace>,
+    routed: Option<Routed>,
 }
 
 impl Fills for NodeFills {
@@ -110,6 +118,49 @@ impl Fills for NodeFills {
         version: skys3_types::EpochSeq,
         range: std::ops::Range<u64>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>> {
+        let (shard, key) = (shard.clone(), key.to_owned());
+        Box::pin(async move {
+            let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
+            let local = self.shards.set().get(&(&shard).into()).await;
+            let serving = local.as_ref().is_some_and(|l| l.check_readable().is_ok());
+            // A read_only bucket's versions are read straight from its
+            // origin elsewhere than on the primary (§9.5).
+            if let Some(routed) = self.routed.as_ref().filter(|_| !serving)
+                && self.flush.origin(&shard.bucket).is_none()
+            {
+                return match routed.fill(&shard, &key, version).await {
+                    Ok(Ok(()) | Err(FillError::Changed)) => Err(FillError::Changed),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(FillError::Unavailable(error.to_string())),
+                };
+            }
+            if self
+                .space
+                .is_low(self.shards.set().disk_of(&(&shard).into()))
+            {
+                return Err(unavailable("the node is low on disk space; retry later"));
+            }
+            let local = local.ok_or_else(|| unavailable("the shard is not open on this node"))?;
+            let filler = self
+                .flush
+                .filler(&shard.bucket)
+                .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
+            filler
+                .read(&local, &key, version, range)
+                .await
+                .map_err(|error| match error {
+                    skys3_flush::FillError::Changed => FillError::Changed,
+                    other => FillError::Unavailable(other.to_string()),
+                })
+        })
+    }
+
+    fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: skys3_types::EpochSeq,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), FillError>> + Send + '_>> {
         let (shard, key) = (shard.clone(), key.to_owned());
         Box::pin(async move {
             let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
@@ -130,7 +181,7 @@ impl Fills for NodeFills {
                 .filler(&shard.bucket)
                 .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
             filler
-                .read(&local, &key, version, range)
+                .fill_whole(&local, &key, version)
                 .await
                 .map_err(|error| match error {
                     skys3_flush::FillError::Changed => FillError::Changed,
@@ -276,6 +327,9 @@ pub(crate) struct Shared {
     /// (plan M8-05b); `None` for a single node, whose shards are all its
     /// own ([`Shared::shards`]).
     pub(crate) cluster: Option<Arc<ClusterShards>>,
+    /// The fills [`Shared::cluster`]'s transport serves to other nodes'
+    /// gateways, which its server holds only weakly.
+    _served_fills: Option<Arc<dyn Fills>>,
 }
 
 impl Shared {
@@ -955,10 +1009,22 @@ impl Node {
         gateway_config.retry = retry;
         gateway_config.hashing_pool = Some(pools.hashing.clone());
         gateway_config.admission = Arc::new(admission);
-        gateway_config.fills = Some(Arc::new(NodeFills {
+        let fills = NodeFills {
             shards: storage.shards.clone(),
             flush: Arc::clone(&flush),
             space: Arc::clone(&space),
+            routed: None,
+        };
+        // Other nodes' gateways ask this one to fill the shards it leads
+        // (§9.2). The node keeps these fills; the server holds them weakly.
+        let served_fills = cluster_shards.as_ref().map(|cluster| {
+            let served: Arc<dyn Fills> = Arc::new(fills.clone());
+            cluster.server().fill_with(&served);
+            served
+        });
+        gateway_config.fills = Some(Arc::new(NodeFills {
+            routed: cluster_shards.as_ref().map(|c| c.routed().clone()),
+            ..fills
         }));
         gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
         gateway_config.hot_cache = HotCache::with_metrics(
@@ -1007,6 +1073,7 @@ impl Node {
             snapshots,
             hints: ControlHints::new(),
             cluster: cluster_shards,
+            _served_fills: served_fills,
         });
         shared.sync_identity(copy.synced_at).await?;
         let mut background = JoinSet::new();

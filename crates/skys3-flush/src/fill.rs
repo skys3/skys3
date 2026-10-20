@@ -273,6 +273,25 @@ impl<S: ObjectStore> Filler<S> {
         Ok(receiver)
     }
 
+    /// Fills the whole of the evicted version `version` of `key`: joins the
+    /// fill of that version in progress, or starts one, and waits until it
+    /// ends, so that the version is clean cache once it returns `Ok`. A
+    /// gateway on another node then reads it from this one as a holder
+    /// (§9.2).
+    ///
+    /// # Errors
+    ///
+    /// As [`Filler::read`], for any byte of the version.
+    pub async fn fill_whole<D: Disk>(
+        &self,
+        shard: &Shard<D>,
+        key: &str,
+        version: EpochSeq,
+    ) -> Result<(), FillError> {
+        let progress = self.join(shard, key, version);
+        progress.wait_for(|p| p.end.clone()).await
+    }
+
     /// The progress of the fill of `version` of `key`, started if none is
     /// in progress.
     fn join<D: Disk>(&self, shard: &Shard<D>, key: &str, version: EpochSeq) -> Arc<Tracker> {

@@ -63,4 +63,30 @@ pub trait Fills: fmt::Debug + Send + Sync + 'static {
         version: EpochSeq,
         range: Range<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>>;
+
+    /// Fills the whole of the evicted version `version` of `key`, in
+    /// `shard`, and resolves once the fill has ended, the version clean
+    /// cache of this node's replica: the fill a gateway on another node
+    /// asks of the shard's primary (`Request::Fill` in
+    /// [`routing`](crate::routing)). Fills of the same version share one
+    /// fill, as reads do.
+    ///
+    /// By default it fills nothing: [`FillError::Unavailable`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Fills::read`].
+    fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+    ) -> Pin<Box<dyn Future<Output = Result<(), FillError>> + Send + '_>> {
+        let _ = (shard, key, version);
+        Box::pin(async {
+            Err(FillError::Unavailable(
+                "this node does not fill whole versions".to_owned(),
+            ))
+        })
+    }
 }

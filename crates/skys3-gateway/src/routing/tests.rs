@@ -1442,3 +1442,230 @@ async fn batched_writes_are_sequenced_on_a_local_primary_and_routed_otherwise() 
     let entry = timed(remote.entry(&shard, "e")).await.unwrap().unwrap();
     assert!(entry.object.is_none());
 }
+
+#[test]
+fn fills_round_trip_and_malformed_ones_are_refused() {
+    let shard = shard(0);
+    let request = Request::Fill {
+        key: "cold".into(),
+        version: EpochSeq::new(Epoch::new(2), Seq::new(5)),
+    };
+    assert!(request.is_read() && !request.is_holder());
+    let frame = wire::request_frame(&shard, Epoch::new(2), &request).unwrap();
+    assert_eq!(
+        wire::decode_request(&frame),
+        Ok((shard.clone(), Epoch::new(2), request))
+    );
+    for filled in [
+        Ok(()),
+        Err(crate::FillError::Changed),
+        Err(crate::FillError::Unavailable("the remote is down".into())),
+    ] {
+        let reply = Reply::Served {
+            response: Response::Filled(filled),
+            epoch: Epoch::new(2),
+            hint: None,
+        };
+        let frame = wire::reply_frame(&reply, 3);
+        assert_eq!(wire::decode_reply(&frame, &shard), Ok(reply));
+    }
+    // A long reason is cut short.
+    let reply = Reply::Served {
+        response: Response::Filled(Err(crate::FillError::Unavailable("é".repeat(600)))),
+        epoch: Epoch::new(2),
+        hint: None,
+    };
+    let decoded = wire::decode_reply(&wire::reply_frame(&reply, 3), &shard).unwrap();
+    assert!(matches!(
+        decoded,
+        Reply::Served {
+            response: Response::Filled(Err(crate::FillError::Unavailable(reason))),
+            ..
+        } if reason.len() <= 1024 && reason.starts_with('é')
+    ));
+
+    let served = |outcome: u32, reason: &str| {
+        let reply = wire::ForwardReply {
+            outcome: wire::OUTCOME_SERVED,
+            epoch: 1,
+            ..wire::ForwardReply::default()
+        };
+        let answer = wire::Answer {
+            result: Some(wire::Result::Filled(wire::FillAnswer {
+                outcome,
+                reason: reason.into(),
+            })),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+            Bytes::from(answer.encode_to_vec()),
+        );
+        wire::decode_reply(&frame, &shard)
+    };
+    assert!(served(wire::FILL_FILLED, "").is_ok());
+    assert!(served(wire::FILL_FILLED, "why").is_err());
+    assert!(served(wire::FILL_CHANGED, "why").is_err());
+    assert!(served(7, "").is_err());
+
+    let valid = wire::FillQuery {
+        key: "cold".into(),
+        version: Some(wire::Position { epoch: 2, seq: 5 }),
+    };
+    let refused = |change: &dyn Fn(&mut wire::FillQuery), payload: &'static [u8]| {
+        let mut query = valid.clone();
+        change(&mut query);
+        let forward = wire::Forward {
+            bucket_id: "b-r".into(),
+            shard: 0,
+            epoch: 1,
+            op: Some(wire::Op::Fill(query)),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::Forward).with_body(forward.encode_to_vec()),
+            Bytes::from_static(payload),
+        );
+        wire::decode_request(&frame).is_err()
+    };
+    assert!(!refused(&|_| {}, b""));
+    assert!(refused(&|q| q.key.clear(), b""));
+    assert!(refused(&|q| q.key = "k".repeat(1025), b""));
+    assert!(refused(&|q| q.version = None, b""));
+    assert!(refused(&|_| {}, b"x"));
+}
+
+/// Read-through fills that record the whole fills they are asked for.
+#[derive(Debug, Default)]
+struct RecordedFills {
+    asked: Mutex<Vec<(ShardRef, String, EpochSeq)>>,
+}
+
+impl crate::Fills for RecordedFills {
+    fn read(
+        &self,
+        _: &ShardRef,
+        _: &str,
+        _: EpochSeq,
+        _: std::ops::Range<u64>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<crate::FillBody, crate::FillError>> + Send + '_>,
+    > {
+        unreachable!("a forwarded fill fills the whole version")
+    }
+
+    fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), crate::FillError>> + Send + '_>> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((shard.clone(), key.to_owned(), version));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Fills that only stream ranges, as a node's that cannot fill whole
+/// versions.
+#[derive(Debug)]
+struct RangeFills;
+
+impl crate::Fills for RangeFills {
+    fn read(
+        &self,
+        _: &ShardRef,
+        _: &str,
+        _: EpochSeq,
+        _: std::ops::Range<u64>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<crate::FillBody, crate::FillError>> + Send + '_>,
+    > {
+        unreachable!("a forwarded fill fills the whole version")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_version_is_filled_on_the_primary_for_any_gateway() {
+    let cluster = Cluster::start(timing()).await;
+    let shard = shard(0);
+    let primary = cluster.gateway(1);
+    let extent = Extent {
+        key: "cold".into(),
+        offset: 0,
+        data: Bytes::from_static(b"cold bytes"),
+    };
+    let extent = timed(primary.append_extent(&shard, extent)).await.unwrap();
+    let put = RecordBody::Put(skys3_log::record::Put {
+        key: "cold".into(),
+        size: 10,
+        last_modified_ms: 0,
+        etag: etag(1),
+        inherited_identity: None,
+        metadata: BTreeMap::new(),
+        tags: BTreeMap::new(),
+        checksums: BTreeMap::new(),
+        copy_source: None,
+        data: PutData::Extents(vec![extent]),
+    });
+    let version = timed(primary.write(&shard, put, Precondition::None))
+        .await
+        .unwrap()
+        .unwrap();
+    cluster.nodes[0].0.flush(&bucket_id()).await;
+    let replica = cluster.nodes[0].0.local().set().get(&(&shard).into()).await;
+    let replica = replica.unwrap();
+    replica.evict("cold", version).await.unwrap().unwrap();
+
+    // Node 2's gateway asks node 1, which has no fills yet.
+    let gateway = cluster.gateway(2);
+    let refused = timed(gateway.fill(&shard, "cold", version)).await;
+    assert!(
+        matches!(&refused, Ok(Err(crate::FillError::Unavailable(reason))) if reason.contains("does not fill")),
+        "{refused:?}"
+    );
+    // With them, node 1 fills the whole version for it.
+    let fills = Arc::new(RecordedFills::default());
+    let served: Arc<dyn crate::Fills> = fills.clone();
+    primary.server().fill_with(&served);
+    assert_eq!(
+        timed(gateway.fill(&shard, "cold", version)).await,
+        Ok(Ok(()))
+    );
+    let asked = fills.asked.lock().unwrap().clone();
+    assert_eq!(asked, [(shard.clone(), "cold".to_owned(), version)]);
+    // A version the key no longer holds evicted is not filled, and neither
+    // is a key without an entry.
+    let other = EpochSeq::new(version.epoch, Seq::new(version.seq.get() + 1));
+    assert_eq!(
+        timed(gateway.fill(&shard, "cold", other)).await,
+        Ok(Err(crate::FillError::Changed))
+    );
+    assert_eq!(
+        timed(gateway.fill(&shard, "none", version)).await,
+        Ok(Err(crate::FillError::Changed))
+    );
+    // Node 1's own gateway fills in process.
+    timed(primary.map().learn(config(0, 2, &[1]))).await;
+    assert_eq!(
+        timed(primary.fill(&shard, "cold", version)).await,
+        Ok(Ok(()))
+    );
+    assert_eq!(primary.stats().forwarded, 0);
+    assert_eq!(fills.asked.lock().unwrap().len(), 2);
+    // The server holds the fills only while their owner does.
+    drop((served, fills));
+    let dropped = timed(gateway.fill(&shard, "cold", version)).await;
+    assert!(
+        matches!(&dropped, Ok(Err(crate::FillError::Unavailable(_)))),
+        "{dropped:?}"
+    );
+    // Fills that cannot fill whole versions refuse by default.
+    let ranges: Arc<dyn crate::Fills> = Arc::new(RangeFills);
+    assert_eq!(
+        timed(ranges.fill(&shard, "cold", version)).await,
+        Err(crate::FillError::Unavailable(
+            "this node does not fill whole versions".into()
+        ))
+    );
+}

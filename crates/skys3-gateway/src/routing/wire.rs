@@ -35,6 +35,7 @@ use skys3_types::{
 
 use super::{Reply, Request, Response};
 use crate::conditions::{ConditionFailed, PeerCondition, Precondition};
+use crate::fill::FillError;
 use crate::shard::{ShardError, ShardRef, ShardSummary};
 
 /// The longest refusal reason a reply carries, in bytes.
@@ -59,7 +60,7 @@ pub struct Forward {
     /// The call.
     #[prost(
         oneof = "Op",
-        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21"
+        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub op: Option<Op>,
 }
@@ -122,6 +123,21 @@ pub enum Op {
     /// The namespace import progress the shard applied last.
     #[prost(bool, tag = "21")]
     ImportProgress(bool),
+    /// Fill an evicted version from the bucket's remote target.
+    #[prost(message, tag = "22")]
+    Fill(FillQuery),
+}
+
+/// A read-through fill of an evicted version, on the shard's primary
+/// (design §9.2).
+#[derive(Clone, PartialEq, Message)]
+pub struct FillQuery {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The evicted version's position.
+    #[prost(message, optional, tag = "2")]
+    pub version: Option<Position>,
 }
 
 /// A write-through write's wait for its version's flush (design §7.5).
@@ -346,7 +362,7 @@ pub struct Answer {
     /// The answer, by the call it answers.
     #[prost(
         oneof = "Result",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
     )]
     pub result: Option<Result>,
 }
@@ -406,7 +422,29 @@ pub enum Result {
     /// then its ranges); empty for none.
     #[prost(bytes = "vec", tag = "17")]
     ImportProgress(Vec<u8>),
+    /// Whether the version was filled, and if not, why.
+    #[prost(message, tag = "18")]
+    Filled(FillAnswer),
 }
+
+/// The outcome of a fill: one of the `FILL_*` constants, with the reason
+/// of [`FILL_UNAVAILABLE`].
+#[derive(Clone, PartialEq, Message)]
+pub struct FillAnswer {
+    /// What happened.
+    #[prost(uint32, tag = "1")]
+    pub outcome: u32,
+    /// Why the fill failed, for [`FILL_UNAVAILABLE`]; empty otherwise.
+    #[prost(string, tag = "2")]
+    pub reason: String,
+}
+
+/// The version is filled: the primary holds its bytes.
+pub const FILL_FILLED: u32 = 0;
+/// The key no longer holds that evicted version.
+pub const FILL_CHANGED: u32 = 1;
+/// The fill failed.
+pub const FILL_UNAVAILABLE: u32 = 2;
 
 /// The remote holds the version waited for, or a later one.
 pub const FLUSH_FLUSHED: u32 = 0;
@@ -642,6 +680,10 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
         Request::Seal => Op::Seal(true),
         Request::Unseal => Op::Unseal(true),
         Request::ImportProgress => Op::ImportProgress(true),
+        Request::Fill { key, version } => Op::Fill(FillQuery {
+            key: key.clone(),
+            version: Some(position(*version)),
+        }),
     };
     let forward = Forward {
         bucket_id: shard.bucket.as_str().to_owned(),
@@ -837,6 +879,15 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
                 key: query.key,
                 version: epoch_seq(query.version)?,
                 wait,
+            }
+        }
+        Op::Fill(query) => {
+            if query.key.is_empty() || query.key.len() > MAX_KEY_LEN {
+                return Err(format!("a key of {} bytes", query.key.len()));
+            }
+            Request::Fill {
+                key: query.key,
+                version: epoch_seq(query.version)?,
             }
         }
     };
@@ -1058,6 +1109,20 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
                 .map(|(update, ranges)| encoded(codec::encode_import_progress(*update, ranges)))
                 .unwrap_or_default(),
         ),
+        Response::Filled(filled) => Result::Filled(match filled {
+            Ok(()) => FillAnswer {
+                outcome: FILL_FILLED,
+                reason: String::new(),
+            },
+            Err(FillError::Changed) => FillAnswer {
+                outcome: FILL_CHANGED,
+                reason: String::new(),
+            },
+            Err(FillError::Unavailable(reason)) => FillAnswer {
+                outcome: FILL_UNAVAILABLE,
+                reason: truncate(reason),
+            },
+        }),
     };
     match failed.into_inner() {
         Some(error) => Err(error),
@@ -1235,6 +1300,12 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
         Result::ImportProgress(bytes) => {
             Response::ImportProgress(Some(codec::decode_import_progress(&bytes).map_err(codec)?))
         }
+        Result::Filled(filled) => Response::Filled(match filled.outcome {
+            FILL_FILLED if filled.reason.is_empty() => Ok(()),
+            FILL_CHANGED if filled.reason.is_empty() => Err(FillError::Changed),
+            FILL_UNAVAILABLE => Err(FillError::Unavailable(filled.reason)),
+            other => return Err(format!("fill outcome {other}")),
+        }),
     })
 }
 

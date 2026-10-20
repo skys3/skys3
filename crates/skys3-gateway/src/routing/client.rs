@@ -19,6 +19,7 @@ use tokio::time::Instant;
 
 use super::{ForwardServer, Reply, Request, Response, Served, ShardMap, wire};
 use crate::conditions::{ConditionFailed, Precondition};
+use crate::fill::FillError;
 use crate::shard::{
     ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome, write_each,
 };
@@ -230,6 +231,32 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
             forwarded: inner.forwarded.load(Ordering::Relaxed),
             redirects: inner.redirects.load(Ordering::Relaxed),
             register_reads: inner.reads.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Asks the primary of `shard` to fill the whole of `version` of `key`,
+    /// evicted, from the bucket's remote target (§9.2), and waits until
+    /// it has. The gateway then reads the version from the primary as a
+    /// holder. The inner result is the fill's: [`FillError::Changed`] if
+    /// the key no longer holds that evicted version.
+    ///
+    /// # Errors
+    ///
+    /// As every routed call: no replica serves the shard, or the primary's
+    /// node does not answer within the request timeout.
+    pub async fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+    ) -> Result<Result<(), FillError>, ShardError> {
+        let request = Request::Fill {
+            key: key.to_owned(),
+            version,
+        };
+        match self.call(shard, request).await? {
+            Response::Filled(filled) => Ok(filled),
+            _ => Err(mismatched(shard)),
         }
     }
 
