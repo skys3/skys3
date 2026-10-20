@@ -57,6 +57,7 @@ import json
 import os
 import random
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -100,6 +101,7 @@ ALLOW_ALL = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action"
 # How long the cluster may take to heal after a fault, and the keys of
 # `peered` to arrive once the workload stops.
 HEAL_SECONDS = 300
+READ_BACK_PATIENCE_SECONDS = 120
 PEER_ARRIVAL_SECONDS = 900
 
 
@@ -205,13 +207,15 @@ class S3:
     def call(self, pick, method: str, path: str, body: bytes = b"",
              headers: dict[str, str] | None = None) -> tuple[int, bytes, str, int]:
         """A request retried on 5xx answers and on no answer, 3 attempts in
-        all with jittered backoff, as the AWS SDKs do by default. `pick`
-        chooses the node of each attempt, as a load balancer would. It
-        returns the final status and body, the last node, and the attempts."""
+        all with jittered backoff, as the AWS SDKs' standard retry mode does
+        by default: up to 1 s before the second attempt, and up to 2 s
+        before the third. `pick` chooses the node of each attempt, as a load
+        balancer would. It returns the final status and body, the last node,
+        and the attempts."""
         status, data, node = 0, b"", ""
         for attempt in range(self.ATTEMPTS):
             if attempt:
-                time.sleep(random.uniform(0, 0.1 * 2**attempt))
+                time.sleep(random.uniform(0, 2 ** (attempt - 1)))
             node, address = pick()
             status, data = self.once(address, method, path, body, headers)
             if status and status < 500:
@@ -298,8 +302,9 @@ class Processes:
             self.signal(name, signal.SIGTERM, timeout=20)
 
 
-def run_net(*args: str) -> None:
-    subprocess.run(["bash", os.path.join(os.path.dirname(__file__), "net.sh"), *args], check=True)
+def run_net(*args: str) -> str:
+    return subprocess.run(["bash", os.path.join(os.path.dirname(__file__), "net.sh"), *args], check=True,
+                          stdout=subprocess.PIPE, text=True).stdout
 
 
 # --- The clusters -------------------------------------------------------------------
@@ -855,6 +860,44 @@ class Faults:
             if self.suite.up(node) or node in ETCD:
                 self.suite.unreachable.discard(node)
 
+    def observe_partition(self, index: int, victim: str, step: dict) -> dict:
+        """Holds a partition of `victim` for the step's hold and records
+        what shows it took: the packets its rules dropped, whether the
+        host (the clients) still reached it, and when the other nodes named
+        another primary of the shard it led. A partition that dropped
+        nothing fails the run."""
+        suite = self.suite
+        key = (step["bucket"], step["shard"])
+        started = time.time()
+        moved: float | None = None
+        new_primary = None
+        while time.time() - started < step["hold"]:
+            if moved is None:
+                others = [node for node in suite.source_up() if node != victim]
+                primary = suite.shard_map(others).get(key, {}).get("primary")
+                if primary is not None and primary != victim:
+                    moved, new_primary = round(time.time() - started, 1), primary
+            time.sleep(0.5)
+        # A connection, not a request: the node cut off from the cluster is
+        # cut off from etcd too, and its admin answers may wait on etcd.
+        try:
+            socket.create_connection((suite.address(victim), GATEWAY), timeout=3.0).close()
+            reached = True
+        except OSError:
+            reached = False
+        seen = {
+            "node": victim,
+            "mode": step["mode"],
+            "dropped_packets": int(run_net("dropped", victim).strip() or 0),
+            "host_reached": reached,
+            "primary_moved_after": moved,
+            "new_primary": new_primary,
+        }
+        log(f"step {index}: {victim} cut off: {seen}")
+        if seen["dropped_packets"] == 0:
+            raise SuiteError(f"the partition of {victim} dropped no packets")
+        return seen
+
     def primary_of(self, bucket: str, shard: int) -> str:
         primary = self.suite.primaries().get((bucket, shard))
         if primary is None:
@@ -916,7 +959,7 @@ class Faults:
             self.lose(index, kind, [victim])
             self.isolate(victim, step["mode"])
             log(f"step {index}: partitioned {victim}, primary of {step['bucket']}/{step['shard']} ({step['mode']})")
-            time.sleep(step["hold"])
+            done["cut_off"] = self.observe_partition(index, victim, step)
             self.heal(victim)
         elif kind == "netem":
             for target in step["targets"]:
@@ -1026,6 +1069,12 @@ class Checker:
         violations: list[str] = []
         lock = threading.Lock()
         position = [0]
+        # The read-back checks what the cluster holds, not that it answers
+        # at once: a key whose shard is unavailable for a moment, as during
+        # a planned handoff that rebalancing starts after the faults heal
+        # (design 5.4), is read again until one deadline for the whole
+        # read-back. A shard unavailable past it is a violation.
+        patience = time.time() + READ_BACK_PATIENCE_SECONDS
 
         def reader() -> None:
             client = S3()
@@ -1038,7 +1087,11 @@ class Checker:
                 key = keys[i]
                 node = nodes[i % len(nodes)]
                 address = self.suite.address(node)
-                status, data, _, _ = client.call(lambda n=node, a=address: (n, a), "GET", f"/{path}/{key}")
+                while True:
+                    status, data, _, _ = client.call(lambda n=node, a=address: (n, a), "GET", f"/{path}/{key}")
+                    if (status and status < 500) or time.time() >= patience:
+                        break
+                    time.sleep(1)
                 got = hashlib.sha256(data).hexdigest() if status == 200 else None
                 allowed = self.allowed(histories[key])
                 if status not in (200, 404) or got not in allowed:
@@ -1289,6 +1342,16 @@ def write_report(directory: str, report: dict) -> None:
         if failover["no_write_after"]:
             lines.append("")
             lines.append(f"No acknowledged write after: {', '.join(failover['no_write_after'][:10])}")
+    partitions = [step for step in report["steps"] if step.get("cut_off")]
+    if partitions:
+        lines += ["", "### Partitions", "",
+                  "| # | Node | Mode | Packets dropped | Host reached it | Primary moved after (s) | Healed after (s) |",
+                  "|---:|---|---|---:|---|---:|---:|"]
+        for step in partitions:
+            seen = step["cut_off"]
+            moved = "-" if seen["primary_moved_after"] is None else f"{seen['primary_moved_after']} (to {seen['new_primary']})"
+            lines.append(f"| {step['index']} | {seen['node']} | {seen['mode']} | {seen['dropped_packets']} | "
+                         f"{'yes' if seen['host_reached'] else 'no'} | {moved} | {step.get('heal_seconds', '-')} |")
     if report["steps"]:
         lines += ["", "### Steps", "", "| # | Fault | Target | Healed after (s) |", "|---:|---|---|---:|"]
         for step in report["steps"]:

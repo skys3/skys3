@@ -18,6 +18,8 @@
 #                                 clients) still reaches it
 #   net.sh isolate <name> full    drops every packet on its eth0
 #   net.sh heal <name>            ends its isolation
+#   net.sh dropped <name>         prints how many packets its isolation
+#                                 has dropped so far
 #   net.sh shape <name> <delay ms> <jitter ms> <loss %>
 #                                 delays and drops what <name> sends, with
 #                                 tc netem; without netem (net.sh netem
@@ -154,6 +156,12 @@ isolate() { partition_rules "$(ns "$1")" "$2"; }
 
 heal() { in_ns "$1" iptables -F skc-part; }
 
+# The packets the partition rules of <name> dropped since it was isolated.
+dropped() {
+    in_ns "$1" iptables -L skc-part -n -v -x |
+        awk '$3 == "DROP" { sum += $1 } END { print sum + 0 }'
+}
+
 shape() {
     local name=$1 delay=$2 jitter=$3 loss=$4
     if netem; then
@@ -171,10 +179,10 @@ unshape() {
     in_ns "$1" iptables -F skc-loss
 }
 
-command=${1:?usage: net.sh up|down|check|netem|isolate|heal|shape|unshape ...}
+command=${1:?usage: net.sh up|down|check|netem|isolate|heal|dropped|shape|unshape ...}
 shift
 case "$command" in
-up | down | check | netem | isolate | heal | shape | unshape) "$command" "$@" ;;
+up | down | check | netem | isolate | heal | dropped | shape | unshape) "$command" "$@" ;;
 *)
     echo "net.sh: unknown command $command" >&2
     exit 2

@@ -1610,7 +1610,11 @@ left behind.
 long the cluster took to heal, the writes, the reads after
 acknowledgment, the keys read back, the peering result, and failover
 times, from a primary's loss to the first acknowledged write on its
-shard, as percentiles per fault. A failed night also uploads `chaos-run`:
+shard, as percentiles per fault. For each partition it shows that the
+partition took: the packets its rules dropped (none fails the run),
+whether the clients still reached the node (they should in `cluster`
+mode, not in `full`), and how long the other nodes took to name another
+primary of its shard. A failed night also uploads `chaos-run`:
 every process's log under `logs/`, the data directories, and `ops.jsonl`,
 one line per write with its key, version, content hash, start and end
 times, answer, and node. A violation names the key, the node read
