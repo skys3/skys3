@@ -78,7 +78,7 @@ Where the cluster's registers live (§6.1).
 | `etcd_tls_ca_file` | path | none | The PEM CA certificates that verify the `https://` endpoints' certificates; without it, the system's root certificates. Not empty. Allowed only with an `https://` endpoint. |
 | `etcd_tls_cert_file` | path | none | The PEM client certificate chain, leaf first, that etcd's `--client-cert-auth` checks. Set together with `etcd_tls_key_file`. Allowed only with an `https://` endpoint. |
 | `etcd_tls_key_file` | path | none | The client certificate's private key in PEM (PKCS #8, PKCS #1, or SEC1). Set together with `etcd_tls_cert_file`. |
-| `endpoint` | endpoint URL | none | Required for `backend = "s3"`. Not allowed for the other backends. |
+| `endpoint` | endpoint URL | none | Required for `backend = "s3"`. Not allowed for the other backends. `https://`, or `http://` on loopback only (`127.0.0.0/8`, `[::1]`, `localhost`), as for `etcd_endpoints`: SigV4 authenticates requests but not answers, so anyone on a plain-HTTP path could forge the registers' reads or acknowledge writes that never happened (design §12). |
 | `bucket` | string | none | The control bucket. Required for `backend = "s3"`: visible ASCII without `/`. Not allowed for the other backends. |
 | `region` | string | `"us-east-1"` | For `backend = "s3"`: the region requests are signed for, ASCII letters, numbers, and `-` (`"auto"` for R2). Not allowed for the other backends. |
 | `profile` | string | none | For `backend = "s3"`: the profile of the shared AWS configuration whose credentials the control store uses, so that it has a credential of its own (see below); without it, the default credential chain's. 1 to 128 visible ASCII characters other than `[` and `]`. Not allowed for the other backends. |
