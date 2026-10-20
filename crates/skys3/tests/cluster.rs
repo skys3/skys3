@@ -559,8 +559,31 @@ async fn reads(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: &[u8]
             .collect()
             .await
             .is_ok_and(|body| body.into_bytes() == data),
-        Err(_) => false,
+        Err(error) => {
+            eprintln!("GET {bucket}/{key}: {error:?}");
+            false
+        }
     }
+}
+
+/// Whether `client` reads `data` at `bucket/key` within [`WAIT`]: once a
+/// node stops, each shard it led serves reads again only after its own
+/// takeover and its new primary's leases, which may come after another
+/// shard's, and the test's clients do not retry.
+async fn reads_within_wait(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    data: &[u8],
+) -> bool {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while tokio::time::Instant::now() < deadline {
+        if reads(client, bucket, key, data).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -708,9 +731,11 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
     assert_eq!(after["epoch"], 2, "{after}");
     assert_ne!(after["primary"], primary.as_str(), "{after}");
     assert_eq!(after["members"].as_array().unwrap().len(), 2, "{after}");
+    // Shard 0 serves again; a shard the stopped node also led may still be
+    // taking over, and every shard it was a member of drops it.
     for (key, data) in &written {
         assert!(
-            reads(&clients[alive], "replicated", key, data).await,
+            reads_within_wait(&clients[alive], "replicated", key, data).await,
             "{key}"
         );
     }
