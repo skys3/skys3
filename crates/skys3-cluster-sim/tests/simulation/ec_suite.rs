@@ -58,7 +58,7 @@ const REPAIR_COST: u64 = 32;
 /// What a seed of a crash matrix declares: what makes CI's 256 seeds run
 /// the three consecutive seeds that strike every step with each kind of
 /// crash. A seed of the encoding matrix makes seven runs, about 15 seconds
-/// in a debug build, and one of the repair matrix twelve, about 45.
+/// in a debug build, and one of the repair matrix eleven, about 45.
 const MATRIX_COST: u64 = 85;
 
 /// The crash kinds, one per seed in turn: three consecutive seeds strike
@@ -187,6 +187,29 @@ fn encoding_steps() -> impl Iterator<Item = CrashPoint> {
         .chain([CrashPoint::ReplicaDropped])
 }
 
+/// The kind a crash matrix strikes `point` with in a seed of `kind`: the
+/// members drop their replicas last, and no node reliably syncs after
+/// they did (a cut armed there fired in 7 of 40 runs), so a power cut at
+/// the next sync becomes a power loss there.
+fn encoding_kind(point: CrashPoint, kind: CrashKind) -> CrashKind {
+    match (point, kind) {
+        (CrashPoint::ReplicaDropped, CrashKind::PowerAtNextSync) => CrashKind::PowerLoss,
+        _ => kind,
+    }
+}
+
+/// Checks that a crash matrix's run struck: its planned crash resolved to
+/// at least one node, every one of which it struck and which came back.
+fn struck(report: &CodingReport) -> Result<(), String> {
+    if report.strikes.is_empty() {
+        return Err("the crash resolved to no node".to_owned());
+    }
+    for strike in &report.strikes {
+        strike.check()?;
+    }
+    Ok(())
+}
+
 #[test]
 fn crashes_of_each_kind_at_each_encoding_step_lose_and_leak_nothing() {
     Runner::with_cost(1, MATRIX_COST).run(|context| {
@@ -195,7 +218,7 @@ fn crashes_of_each_kind_at_each_encoding_step_lose_and_leak_nothing() {
             let crash = Crash {
                 delay: Duration::ZERO,
                 target: *TARGETS.choose(context.rng()).expect("targets"),
-                kind,
+                kind: encoding_kind(point, kind),
                 downtime: Duration::from_millis(context.rng().random_range(200..2000)),
             };
             let config = reclaiming_and_releasing(
@@ -207,9 +230,7 @@ fn crashes_of_each_kind_at_each_encoding_step_lose_and_leak_nothing() {
             );
             let report = coding::run(context, &config)
                 .map_err(|error| format!("{point:?}, {crash:?}: {error}"))?;
-            if report.crashes.is_empty() {
-                return Err(format!("{point:?}: no crash struck: {report:?}").into());
-            }
+            struck(&report).map_err(|error| format!("{point:?}, {crash:?}: {error}"))?;
         }
         Ok(())
     });
@@ -270,16 +291,36 @@ fn repairs(report: &CodingReport) -> Result<&RepairOutcome, String> {
     Ok(repair)
 }
 
-/// Every step of a repair, and whom a crash there strikes.
+/// Every step of a repair, and whom a crash there strikes. A repair has no
+/// new holder until it placed its fragments, and a crash of the new holder
+/// at `Started` would wait for the placement and strike as one at `Placed`
+/// does, so the new holder is struck from `Placed` on.
 fn repair_steps() -> Vec<(RepairPoint, RepairTarget)> {
     let mut steps = Vec::new();
     for point in RepairPoint::ALL {
         steps.push((point, RepairTarget::Primary));
-        steps.push((point, RepairTarget::NewHolder));
+        if point != RepairPoint::Started {
+            steps.push((point, RepairTarget::NewHolder));
+        }
     }
     steps.push((RepairPoint::Released, RepairTarget::Primary));
     steps.push((RepairPoint::Released, RepairTarget::OldHolder));
     steps
+}
+
+/// The kind a crash matrix strikes `target` at `point` with in a seed of
+/// `kind`: a power cut at the new holder's next sync is armed as the
+/// repair's write to it leaves, which it did before `Written`, so it
+/// becomes a power loss from there on.
+fn repair_kind(point: RepairPoint, target: RepairTarget, kind: CrashKind) -> CrashKind {
+    let written = matches!(
+        point,
+        RepairPoint::Written | RepairPoint::Appended | RepairPoint::Committed
+    );
+    match (target, kind) {
+        (RepairTarget::NewHolder, CrashKind::PowerAtNextSync) if written => CrashKind::PowerLoss,
+        _ => kind,
+    }
 }
 
 #[test]
@@ -294,7 +335,7 @@ fn crashes_of_each_kind_at_each_repair_step_lose_and_leak_nothing() {
                 point,
                 delay: Duration::ZERO,
                 target,
-                kind,
+                kind: repair_kind(point, target, kind),
                 downtime: Duration::from_millis(context.rng().random_range(200..2000)),
             };
             if let Some(repair) = &mut config.repair {
@@ -302,6 +343,10 @@ fn crashes_of_each_kind_at_each_repair_step_lose_and_leak_nothing() {
             }
             let report =
                 coding::run(context, &config).map_err(|error| format!("{crash:?}: {error}"))?;
+            if report.strikes.len() != 1 {
+                return Err(format!("{crash:?}: struck {:?}", report.strikes).into());
+            }
+            struck(&report).map_err(|error| format!("{crash:?}: {error}"))?;
             repairs(&report).map_err(|error| format!("{crash:?}: {error}"))?;
             if report.released == 0 {
                 return Err(format!("{crash:?}: nothing was released: {report:?}").into());

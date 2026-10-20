@@ -8672,8 +8672,9 @@ of this file. A task with nothing unexpected keeps "None."
   M5-04 and M5-05 scenarios iterate and draw from, so their seeds keep
   what they test.
 - **Crash kinds rotate over seeds.** The two crash matrices strike every
-  step (seven of encoding; six of repair, each at the primary and the new
-  or old holder) with the kind `[Kill, PowerLoss, PowerAtNextSync][seed %
+  step (seven of encoding; of repair, five at the primary, four from the
+  placement on at the new holder, and the release at the primary and the
+  old holder) with the kind `[Kill, PowerLoss, PowerAtNextSync][seed %
   3]`, so three consecutive seeds strike every step with every kind. They
   declare a cost that makes CI's 256 seeds run seeds 0 to 2, and the
   nightly 1,024 run twelve.
@@ -8683,6 +8684,32 @@ of this file. A task with nothing unexpected keeps "None."
   simulation (seed 2: "n2 does not recover: simulated power loss during a
   sync"). Every cut still planned is now dropped at the run's final power
   loss, which comes first.
+- **Crashes that struck nothing passed (review, fixed).** The matrices
+  checked only that a crash was planned, and a power cut at the next sync
+  counted as soon as it was armed. With the strikes now recorded (when a
+  kill or power loss takes effect on a node that is up, or when the
+  planned cut actually fires, and when the node comes back), 6 of the 57
+  cases CI's seeds 0 to 2 ran struck nothing. In the encoding matrix it
+  was 1 of 21: seed 2's cut at `n2`'s next sync after the replica drop.
+  `n2` never synced again, and the final disarm dropped the cut. A probe
+  of every target with a cut at the replica drop over eight seeds fired in
+  7 of 40 runs, and at every other point in all 240, so the matrix now
+  strikes the replica drop with a power loss in a cut's seed. In the repair
+  matrix it was 5 of 36. In the 3 cases at `Started` at the new holder,
+  that repair had placed nothing, and no other repair had either, so the
+  crash resolved to no node. In seed 2's 2 cuts at the new holder at
+  `Written` and `Committed`, the cut is armed as the next repair write to
+  the node leaves, and none did. Now the new holder is that of the repair
+  that reached the point (not the latest placement of any repair), and the
+  crash waits for that repair's placement. A cut there is armed only for
+  that repair's write. `Started` at the new holder is dropped from the
+  matrix, since it would strike as `Placed` does. From `Written` on, a
+  cut's seed strikes the new holder with a power loss, because its write
+  already left. In CI's seeds the latest placement was always the
+  reaching repair's own, so no case struck an unrelated holder, but
+  nothing ruled it out. Each matrix run now fails unless its crash
+  resolved to a node (exactly one in the repair matrix) that it struck
+  and that came back (`Strike::check`).
 - **Rebuilt in place, not relocated (found, safe).** At 4+2 on six nodes a
   node that lost its disk is the only one that can take its stripes'
   rebuilt fragments, and its new disk hands out the old IDs again in the
@@ -8742,7 +8769,9 @@ of this file. A task with nothing unexpected keeps "None."
   500 s in all, which scales to about 330 s unloaded and, CI's runners
   being about twice as fast, about three minutes in CI. The rust job,
   which sets no seed count, runs one seed of each. The nightly 1,024
-  seeds run four times as many of each. The coding, coded-read, repair,
+  seeds run four times as many of each. With the strike checks, at a
+  lighter load (about 5), the encoding matrix took 40 s and the repair
+  matrix, one run shorter, 122 s. The coding, coded-read, repair,
   and move scenarios pass at 256 seeds after the harness changes, and so
   does the whole cluster simulation.
 - **Left open.** The node binary still runs none of this (M8-07a,
@@ -9278,6 +9307,24 @@ of this file. A task with nothing unexpected keeps "None."
   CI's runners call the CLI natively, so the suite step should stay near
   the peering scenario's length and the job within its 15 minutes; the
   first CI run will tell.
+- **The suite's `metric` helper failed by chance on GitHub.** The first
+  CI run of the three legs failed reconcile in the file and etcd legs,
+  admin in the etcd leg, and flush-refused in the file leg, each silently
+  at a `value=$(metric ...)` assignment; the S3 leg passed. Nothing
+  depended on the control store. `metric` piped curl into an awk that
+  exits at the first match. GitHub's runners have gawk, which stops
+  reading there, while the development machine's awk is mawk, which reads
+  its whole input first. Once `/metrics` passes curl's 16 KiB buffer
+  (about 17 KB by the reconcile scenario), curl writes it in two parts;
+  when gawk has already exited, the second write fails (curl exit 23),
+  and under `pipefail` the assignment ends the scenario before `fail` can
+  say why. Against the etcd leg's node, with gawk unpacked from Ubuntu's
+  package, the old helper failed 10 of 200 calls and the new one none; with
+  mawk, 0 of 300. Running three legs at once only changed the timing:
+  before them, the file leg had passed on GitHub. `metric` now reads the
+  whole answer before searching it, and fails only if `/metrics` does not
+  answer. With gawk as `awk`, the three legs then passed side by side in
+  5 m 28 s; the etcd leg alone, with mawk, in 2 m 33 s.
 - **A shared loopback is one failure scope.** MinIO and the `ctl`
   cluster both listen on 127.0.0.1, so every write_back CreateBucket of
   the S3 leg was refused (`400`, the target shares the control store's
@@ -9293,6 +9340,15 @@ of this file. A task with nothing unexpected keeps "None."
   store has none, so a node that has never synced from it treats the
   registers it finds as not its own and reclaims no shards on its first
   sync (`claimed` is false on a first open).
+- **Plain HTTP was refused for etcd but not S3 at first.** Review found
+  that an `http://` S3 control endpoint off loopback still loaded and
+  connected; SigV4 does not authenticate answers, so it was the same
+  trust-anchor hole as T3. Loading now refuses it with etcd's message, and
+  `backend::connect` checks both backends again
+  (`ControlStoreConfig::check_transport`), which covers the node, its
+  reopen path, and `skys3 control identity`. No opt-in key, as for etcd;
+  the e2e S3 leg is on 127.0.0.1 and unaffected. Two scope tests used
+  `http://` control endpoints off loopback and now use `https://`.
 - **An etcd CA file is optional.** With `https://` endpoints and no
   `etcd_tls_ca_file`, the node trusts the system roots (as for OIDC),
   which keeps the design's example valid. `http://` is refused except on

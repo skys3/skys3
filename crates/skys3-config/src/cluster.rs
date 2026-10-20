@@ -209,6 +209,43 @@ impl ControlStoreConfig {
              or set allow_correlated_control_store = true"
         ))
     }
+
+    /// Checks that no endpoint of the backend is plain `http://` off
+    /// loopback (§12), as configuration loading does. For callers that
+    /// build a configuration themselves, and to check again before a store
+    /// is opened.
+    ///
+    /// Whoever can write the store can reassign shards, and an S3 store
+    /// authenticates only the requests (SigV4 covers no answer): on the
+    /// path of a plain-HTTP store, anyone could forge register reads and
+    /// listings, or acknowledge writes that never happened.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the first such endpoint.
+    pub fn check_transport(&self) -> Result<(), String> {
+        let endpoints = match &self.backend {
+            ControlStoreBackend::Etcd { endpoints, .. } => endpoints.as_slice(),
+            ControlStoreBackend::S3 { endpoint, .. } => std::slice::from_ref(endpoint),
+            ControlStoreBackend::File { .. } => &[],
+        };
+        match endpoints
+            .iter()
+            .find(|endpoint| target::plaintext_off_loopback(endpoint))
+        {
+            Some(endpoint) => Err(plaintext_refusal(endpoint)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Why a plain `http://` control-store endpoint off loopback is refused
+/// (§12).
+fn plaintext_refusal(url: &str) -> String {
+    format!(
+        "{url:?} is plain HTTP off loopback, where anyone on the network path could forge the \
+         store's answers or rewrite the registers; use https://"
+    )
 }
 
 crate::durations! {
@@ -332,14 +369,9 @@ impl RawControlStore {
         let mut endpoints = Vec::with_capacity(urls.len());
         for url in urls {
             match target::parse_endpoint(url) {
-                // Whoever can write the store can reassign shards (§12).
-                Ok(endpoint) if target::plaintext_off_loopback(&endpoint) => checker.report(
-                    ENDPOINTS,
-                    format!(
-                        "{url:?} is plain HTTP off loopback, where anyone on the network could \
-                         rewrite the registers; use https://"
-                    ),
-                ),
+                Ok(endpoint) if target::plaintext_off_loopback(&endpoint) => {
+                    checker.report(ENDPOINTS, plaintext_refusal(url));
+                }
                 Ok(endpoint) => endpoints.push(endpoint),
                 Err(error) => checker.report(ENDPOINTS, error),
             }
@@ -426,6 +458,10 @@ impl RawControlStore {
     fn s3_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
         self.refuse_other_keys(&["endpoint", "bucket", "region", "profile"], "s3", checker);
         let endpoint = match self.endpoint.as_deref().map(target::parse_endpoint) {
+            Some(Ok(endpoint)) if target::plaintext_off_loopback(&endpoint) => {
+                checker.report("control_store.endpoint", plaintext_refusal(&endpoint));
+                endpoint
+            }
             Some(Ok(endpoint)) => endpoint,
             Some(Err(error)) => {
                 checker.report("control_store.endpoint", error);

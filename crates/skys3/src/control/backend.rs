@@ -167,8 +167,11 @@ pub enum ConnectError {
 /// # Errors
 ///
 /// [`ConnectError`]: a TLS file that cannot be used, a configuration the
-/// client refuses, or the file backend.
+/// client refuses (among them a plain `http://` endpoint off loopback,
+/// design §12, checked again here whoever built the configuration), or the
+/// file backend.
 pub async fn connect(config: &ControlStoreConfig) -> Result<Backend, ConnectError> {
+    config.check_transport().map_err(ConnectError::Invalid)?;
     match &config.backend {
         ControlStoreBackend::Etcd { endpoints, tls } => {
             let tls = match tls {
@@ -443,6 +446,56 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(written, PutOutcome::Written(_)));
+    }
+
+    /// A control store configuration built in code, past the checks of
+    /// configuration loading.
+    fn store_config(backend: ControlStoreBackend) -> ControlStoreConfig {
+        ControlStoreConfig {
+            backend,
+            prefix: "c1/".to_owned(),
+            allow_correlated_control_store: false,
+            coordinator_lease_seconds: 10,
+            config_poll_interval_seconds: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_http_off_loopback_is_never_connected() {
+        let s3 = |endpoint: &str| {
+            store_config(ControlStoreBackend::S3 {
+                endpoint: endpoint.to_owned(),
+                bucket: "control".to_owned(),
+                region: "us-east-1".to_owned(),
+                profile: Some("skys3-control".to_owned()),
+            })
+        };
+        let etcd = |endpoints: &[&str]| {
+            store_config(ControlStoreBackend::Etcd {
+                endpoints: endpoints.iter().map(|&url| url.to_owned()).collect(),
+                tls: None,
+            })
+        };
+        for config in [
+            s3("http://10.0.0.5:9000"),
+            s3("http://control.example"),
+            etcd(&["http://127.0.0.1:2379", "http://etcd-1:2379"]),
+        ] {
+            let Err(ConnectError::Invalid(message)) = connect(&config).await else {
+                panic!("connected over plain HTTP: {config:?}");
+            };
+            assert!(message.contains("plain HTTP off loopback"), "{message}");
+        }
+        for config in [
+            s3("http://127.0.0.1:9000"),
+            s3("http://[::1]:9000"),
+            s3("http://localhost:9000"),
+            s3("https://control.example"),
+            etcd(&["http://127.0.0.1:2379"]),
+        ] {
+            let backend = connect(&config).await.unwrap();
+            assert!(matches!(backend.kind(), "s3" | "etcd"), "{config:?}");
+        }
     }
 
     #[tokio::test]

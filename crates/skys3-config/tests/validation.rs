@@ -900,6 +900,35 @@ fn s3_backend_rules() {
         "backend = \"s3\"",
         &["control_store.endpoint", "control_store.bucket"],
     );
+    // Plain HTTP only on loopback (§12): SigV4 signs requests, not answers.
+    for endpoint in [
+        "http://10.0.0.5:9000",
+        "http://control.example",
+        "http://[fd00::1]",
+    ] {
+        let body = format!("backend = \"s3\"\nendpoint = \"{endpoint}\"\nbucket = \"ctl\"");
+        let violations = violations_of(&control_store(&body));
+        assert_eq!(violations.len(), 1, "{violations}");
+        assert_eq!(violations.as_slice()[0].key, "control_store.endpoint");
+        assert!(
+            violations.to_string().contains("plain HTTP off loopback"),
+            "{violations}"
+        );
+    }
+    for endpoint in [
+        "http://127.0.0.1:9000",
+        "http://[::1]:9000",
+        "http://[::ffff:127.0.0.1]",
+        "http://localhost:9000",
+        "https://10.0.0.5:9000",
+    ] {
+        let config: Config = control_store(&format!(
+            "backend = \"s3\"\nendpoint = \"{endpoint}\"\nbucket = \"ctl\""
+        ))
+        .parse()
+        .unwrap();
+        config.control_store().check_transport().unwrap();
+    }
     assert_control_store_violations(
         "backend = \"s3\"\nendpoint = \"ftp://x\"\nbucket = \"a/b\"\netcd_endpoints = []",
         &[
@@ -1435,8 +1464,8 @@ fn correlated_ip_endpoints_are_compared_as_addresses() {
         ))
     };
     for (control, backup) in [
-        ("http://[fd00::1]:9000", "http://[fd00:0:0:0:0:0:0:1]:9001"),
-        ("http://10.0.0.5:9000", "http://[::ffff:10.0.0.5]"),
+        ("https://[fd00::1]:9000", "http://[fd00:0:0:0:0:0:0:1]:9001"),
+        ("https://10.0.0.5:9000", "http://[::ffff:10.0.0.5]"),
         ("https://minio.example", "https://MINIO.example:9443"),
     ] {
         let violations = violations_of(&with(control, backup));
@@ -1446,7 +1475,7 @@ fn correlated_ip_endpoints_are_compared_as_addresses() {
             "{violations}"
         );
     }
-    with("http://[fd00::1]", "http://[fd00::2]")
+    with("https://[fd00::1]", "http://[fd00::2]")
         .parse::<Config>()
         .unwrap();
 }

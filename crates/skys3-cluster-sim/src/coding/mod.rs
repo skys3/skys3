@@ -235,6 +235,40 @@ pub struct Crash {
     pub downtime: Duration,
 }
 
+/// A planned crash of one node, and what became of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Strike {
+    /// The node.
+    pub node: String,
+    /// How.
+    pub kind: CrashKind,
+    /// When it took effect: the process died, the power failed (at the
+    /// node's next sync, for [`CrashKind::PowerAtNextSync`]), or the node
+    /// was cut off. `None` when it never did: the node was down already,
+    /// or never synced again.
+    pub struck_at: Option<Duration>,
+    /// When the node was up again after it, or reachable again after an
+    /// isolation.
+    pub restarted_at: Option<Duration>,
+}
+
+impl Strike {
+    /// Checks that the crash took effect and that its node came back,
+    /// unless it was lost for good; or says what did not happen.
+    pub fn check(&self) -> Result<(), String> {
+        if self.struck_at.is_none() {
+            return Err(format!("{:?} of {} never struck", self.kind, self.node));
+        }
+        if self.restarted_at.is_none() && self.kind != CrashKind::Lose {
+            return Err(format!(
+                "{} never came back from {:?}",
+                self.node, self.kind
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What a run encodes, and how it is hurt.
 #[derive(Debug, Clone)]
 pub struct CodingConfig {
@@ -334,8 +368,14 @@ pub struct CodingReport {
     pub abandoned: usize,
     /// Stripes planned, re-plans included.
     pub stripes: usize,
-    /// The crashes the driver made, as `(node, kind)`.
+    /// The crashes the driver made or armed, as `(node, kind)`: a power
+    /// cut at a node's next sync is listed once armed, whether or not the
+    /// node syncs again.
     pub crashes: Vec<(String, CrashKind)>,
+    /// The crashes the run planned (`CodingConfig::crashes`, a repair's,
+    /// or a move's), one for each node a crash resolved to, and what
+    /// became of each.
+    pub strikes: Vec<Strike>,
     /// When every object was coded and its replicas dropped.
     pub settled_at: Duration,
     /// Fragments reclaimed as orphans.
@@ -440,6 +480,9 @@ struct World {
     /// Whether each node is to lose power at the sync after the next
     /// repair write reaches it.
     cut_at_repair_write: Vec<AtomicBool>,
+    /// The attempt whose write that must be, for each node; any repair
+    /// write's if none.
+    cut_for_attempt: Vec<Mutex<Option<AttemptId>>>,
     /// What the repairers did.
     repair: repair::RepairLog,
     /// The nodes placement knows, as it judges them: those that joined,
@@ -562,6 +605,8 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         crashes: config.crashes.clone(),
         seen: 0,
         due: Vec::new(),
+        cutting: vec![None; world.nodes.len()],
+        restarting: vec![None; world.nodes.len()],
         committed: 0,
         report: CodingReport::default(),
         reading: false,
@@ -734,6 +779,7 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         generation: (0..count).map(|_| AtomicU64::new(0)).collect(),
         lives: (0..count).map(|_| AtomicU64::new(0)).collect(),
         cut_at_repair_write: (0..count).map(|_| AtomicBool::new(false)).collect(),
+        cut_for_attempt: (0..count).map(|_| Mutex::new(None)).collect(),
         repair: repair::RepairLog::default(),
         moves: moves::MoveLog::default(),
         release: release::ReleaseLog::default(),
@@ -1137,6 +1183,9 @@ impl FragmentWriter for Writer {
         let generation = |n: usize| self.world.generation[n].load(Ordering::SeqCst);
         let before = position.map(generation);
         if let Some(n) = position.filter(|_| self.repairer.is_some())
+            && lock(&self.world.cut_for_attempt[n])
+                .as_ref()
+                .is_none_or(|attempt| *attempt == header.attempt)
             && self.world.cut_at_repair_write[n].swap(false, Ordering::SeqCst)
         {
             let power = &self.world.nodes[n].power;
@@ -1343,8 +1392,13 @@ struct Driver<'a> {
     crashes: Option<(CrashPoint, Vec<Crash>)>,
     /// How many events the crash point was looked for in.
     seen: usize,
-    /// Crashes due at a time, with the node they hit.
-    due: Vec<(Duration, usize, Crash)>,
+    /// Crashes due at a time, with the node they hit and, for a planned
+    /// one, its index in the report's strikes.
+    due: Vec<(Duration, usize, Crash, Option<usize>)>,
+    /// For each node, the planned strike that waits for its power cut.
+    cutting: Vec<Option<usize>>,
+    /// For each node, the planned strike that waits for it to come back.
+    restarting: Vec<Option<usize>>,
     /// The highest commit watermark any replica has learned.
     committed: u64,
     report: CodingReport,
@@ -1386,23 +1440,27 @@ impl Driver<'_> {
                 let (_, crashes) = self.crashes.take().expect("crashes are planned");
                 for crash in crashes {
                     for node in self.targets(crash.target) {
-                        self.due.push((now + crash.delay, node, crash));
+                        let strike = self.plan_strike(node, crash.kind);
+                        self.due
+                            .push((now + crash.delay, node, crash, Some(strike)));
                     }
                 }
                 tracing::debug!(?event, "the crash point is reached");
             }
         }
         let mut due = Vec::new();
-        self.due.retain(|(at, node, crash)| {
+        self.due.retain(|(at, node, crash, strike)| {
             let ready = *at <= now;
             if ready {
-                due.push((*node, *crash));
+                due.push((*node, *crash, *strike));
             }
             !ready
         });
-        for (node, crash) in due {
+        for (node, crash, strike) in due {
             let slot = &self.world.nodes[node];
             self.report.crashes.push((slot.id.to_string(), crash.kind));
+            let up = self.down[node].is_none();
+            let reachable = self.isolated[node].is_none();
             match crash.kind {
                 CrashKind::Kill => self.crash(sim, now, node, false, crash.downtime),
                 CrashKind::PowerLoss => self.crash(sim, now, node, true, crash.downtime),
@@ -1413,11 +1471,22 @@ impl Driver<'_> {
                 CrashKind::Isolate => self.isolate(sim, now, node, crash.downtime),
                 CrashKind::Lose => self.lose_for_good(sim, now, node),
             }
+            if let Some(strike) = strike {
+                match crash.kind {
+                    CrashKind::PowerAtNextSync => self.cutting[node] = Some(strike),
+                    CrashKind::Isolate if reachable => self.struck(now, node, strike),
+                    CrashKind::Kill | CrashKind::PowerLoss | CrashKind::Lose if up => {
+                        self.struck(now, node, strike);
+                    }
+                    _ => {}
+                }
+            }
         }
         for node in 0..self.world.nodes.len() {
             let slot = &self.world.nodes[node];
             if self.isolated[node].is_some_and(|at| at <= now) {
                 self.isolated[node] = None;
+                self.came_back(now, node);
                 self.world.cut_off[node].store(false, Ordering::SeqCst);
                 for other in self.others(node) {
                     sim.repair(slot.id.as_str(), self.world.nodes[other].id.as_str());
@@ -1429,18 +1498,22 @@ impl Driver<'_> {
                 // an early acknowledgement, still leaves; nothing it does
                 // meanwhile reaches its disks.
                 self.cut[node] = true;
+                if let Some(strike) = self.cutting[node].take() {
+                    self.struck(now, node, strike);
+                }
                 let stop = Crash {
                     delay: CUT_GRACE,
                     target: CrashTarget::Primary,
                     kind: CrashKind::PowerLoss,
                     downtime: SUPERVISOR_DELAY,
                 };
-                self.due.push((now + CUT_GRACE, node, stop));
+                self.due.push((now + CUT_GRACE, node, stop, None));
             }
             match self.down[node] {
                 Some(at) if at <= now => {
                     self.down[node] = None;
                     sim.bounce(slot.id.as_str());
+                    self.came_back(now, node);
                 }
                 Some(_) => {}
                 None if !sim.is_host_running(slot.id.as_str()) => {
@@ -1449,6 +1522,31 @@ impl Driver<'_> {
                 }
                 None => {}
             }
+        }
+    }
+
+    /// Records a planned crash of `node` by `kind`, which has not struck
+    /// yet; returns its index in the report's strikes.
+    pub(super) fn plan_strike(&mut self, node: usize, kind: CrashKind) -> usize {
+        self.report.strikes.push(Strike {
+            node: self.world.nodes[node].id.to_string(),
+            kind,
+            struck_at: None,
+            restarted_at: None,
+        });
+        self.report.strikes.len() - 1
+    }
+
+    /// Notes that planned strike `strike` of `node` took effect now.
+    fn struck(&mut self, now: Duration, node: usize, strike: usize) {
+        self.report.strikes[strike].struck_at = Some(now);
+        self.restarting[node] = Some(strike);
+    }
+
+    /// Notes that `node` is up, or reachable, again.
+    fn came_back(&mut self, now: Duration, node: usize) {
+        if let Some(strike) = self.restarting[node].take() {
+            self.report.strikes[strike].restarted_at = Some(now);
         }
     }
 

@@ -86,10 +86,15 @@ admin() {
 
 # metric <host:port> <series>: the value of one series of the node's
 # /metrics, such as 'skys3_flush_transport{bucket="b",transport="quic"}',
-# or nothing if it is not exported.
+# or nothing if it is not exported. It fails only if /metrics does not
+# answer. The whole answer is read before it is searched: an awk that
+# exited at the first match while curl still wrote made curl fail on the
+# closed pipe, and under pipefail a `value=$(metric ...)` then ended its
+# scenario without a message, depending on how the answer arrived.
 metric() {
-    curl -sS --max-time 10 "http://$1/metrics" |
-        awk -v series="$2" '$1 == series { print $2; exit }'
+    local text
+    text=$(curl -sS --max-time 10 "http://$1/metrics") || return 1
+    awk -v series="$2" '$1 == series { print $2; exit }' <<<"$text"
 }
 
 # eventually <seconds> <what> <command...>: runs the command every half
