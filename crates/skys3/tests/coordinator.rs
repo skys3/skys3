@@ -230,16 +230,22 @@ async fn put(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: &[u8]) 
     panic!("PUT {bucket}/{key} never succeeded");
 }
 
-/// Whether `client` reads `data` at `bucket/key`.
+/// Whether `client` reads `data` at `bucket/key`, retrying while the
+/// shard's primary changes, as `put` does; the last failure is printed.
 async fn reads(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: &[u8]) -> bool {
-    match client.get_object().bucket(bucket).key(key).send().await {
-        Ok(object) => object
-            .body
-            .collect()
-            .await
-            .is_ok_and(|body| body.into_bytes() == data),
-        Err(_) => false,
+    let mut failure = String::new();
+    for _ in 0..50 {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(object) => match object.body.collect().await {
+                Ok(body) => return body.into_bytes() == data,
+                Err(error) => failure = format!("{error:?}"),
+            },
+            Err(error) => failure = format!("{error:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    eprintln!("GET {bucket}/{key} never succeeded: {failure}");
+    false
 }
 
 /// `POST path` with `body` on the admin listener at `addr`: the status
