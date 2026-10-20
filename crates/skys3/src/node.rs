@@ -4,13 +4,12 @@ use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ControlStoreBackend, LogFormat};
-use skys3_control::{ChangeStream, ControlStore};
-use skys3_control::{ControlError, ProposalIds, RetryPolicy, read_cluster};
+use skys3_control::{ControlError, ProposalIds, RetryPolicy};
 use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
@@ -32,7 +31,6 @@ use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
 };
-use skys3_types::Generation;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, Label, NodeId};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
@@ -40,11 +38,11 @@ use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
+use crate::cluster::peering::NodePeering;
 use crate::control::backend::{self, Backend, ConnectError, Opener};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::metrics::{ControlMetrics, NodeMetrics};
-use crate::peering::NodePeering;
 use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
@@ -219,8 +217,8 @@ pub enum NodeError {
 
 /// Pools the node runs its blocking work on.
 #[derive(Debug, Clone)]
-struct Pools {
-    index: BlockingPool,
+pub(crate) struct Pools {
+    pub(crate) index: BlockingPool,
     hashing: BlockingPool,
     control: BlockingPool,
     disks: Vec<BlockingPool>,
@@ -243,46 +241,28 @@ fn pool(name: &str, threads: usize) -> Result<BlockingPool, StartError> {
 }
 
 /// What the background tasks share.
-struct Shared {
-    config: Config,
-    retry: RetryPolicy,
-    wall: Arc<dyn WallClock>,
-    index: Arc<Index>,
-    pools: Pools,
-    store: Store,
+pub(crate) struct Shared {
+    pub(crate) config: Config,
+    pub(crate) retry: RetryPolicy,
+    pub(crate) wall: Arc<dyn WallClock>,
+    pub(crate) index: Arc<Index>,
+    pub(crate) pools: Pools,
+    pub(crate) store: Store,
     /// Opens the control store again while the node has none.
-    opener: Opener,
-    shards: NodeShards,
-    gateway: NodeGateway,
-    identity: Arc<IdentityCopy>,
-    sts: Option<Arc<Sts>>,
-    control: Arc<Mutex<ControlState>>,
-    control_metrics: ControlMetrics,
-    flush: Arc<NodeFlush>,
-    snapshots: NodeSnapshots,
+    pub(crate) opener: Opener,
+    pub(crate) shards: NodeShards,
+    pub(crate) gateway: NodeGateway,
+    pub(crate) identity: Arc<IdentityCopy>,
+    pub(crate) sts: Option<Arc<Sts>>,
+    pub(crate) control: Arc<Mutex<ControlState>>,
+    pub(crate) control_metrics: ControlMetrics,
+    pub(crate) flush: Arc<NodeFlush>,
+    pub(crate) snapshots: NodeSnapshots,
 }
 
 impl Shared {
-    /// Syncs the identity copy from the store, with its age running from
-    /// `started`, and allowlists its providers for STS.
-    async fn sync_identity(&self, started: Duration) -> Result<(), ControlError> {
-        match &self.sts {
-            Some(sts) => {
-                sts.sync_identity_as_of(&self.store, &self.retry, started)
-                    .await?;
-            }
-            None => {
-                self.identity
-                    .sync_as_of(&self.store, &self.retry, started)
-                    .await?;
-            }
-        }
-        self.control_metrics.identity_synced(started);
-        Ok(())
-    }
-
     /// Opens the shards of every bucket the gateway knows.
-    async fn open_bucket_shards(&self) -> Result<(), StartError> {
+    pub(crate) async fn open_bucket_shards(&self) -> Result<(), StartError> {
         for bucket in self.gateway.buckets() {
             for shard in ShardRef::all(&bucket) {
                 self.shards
@@ -295,115 +275,6 @@ impl Shared {
             }
         }
         Ok(())
-    }
-
-    /// Reads a fresh copy from the store and keeps it in the index.
-    async fn refresh_copy(&self) -> Result<ControlCopy, StartError> {
-        let cluster = &self.config.cluster().cluster_id;
-        let store = self.store.store().ok_or_else(no_store)?;
-        let (pool, started) = (&self.pools.index, self.wall.now());
-        control::refresh(&store, cluster, &self.retry, &self.index, pool, started).await
-    }
-
-    /// The generation of the node's copy.
-    fn generation(&self) -> Option<Generation> {
-        self.control
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .generation
-    }
-
-    /// Whether the copy should be synced although no generation moved, so
-    /// that the identity copy, whose age STS measures from its last sync,
-    /// never goes stale while the store answers (§6.2).
-    fn sync_due(&self) -> bool {
-        let synced_at = self
-            .control
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .synced_at;
-        let max_staleness = self.config.identity().identity_max_staleness();
-        control::sync_due(synced_at, self.wall.now(), max_staleness)
-    }
-
-    /// Reads a fresh copy from the store, keeps it, and serves from the
-    /// store from now on: buckets, identity, and the shards of new
-    /// buckets.
-    async fn sync(&self) -> Result<(), StartError> {
-        let copy = self.refresh_copy().await?;
-        let started = copy.synced_at;
-        self.control_metrics.store_answered(self.wall.now());
-        self.store.go_live();
-        self.control_metrics.set_live(true);
-        self.gateway.reload_buckets().await?;
-        self.sync_identity(started).await?;
-        self.open_bucket_shards().await?;
-        *self.control.lock().unwrap_or_else(PoisonError::into_inner) = ControlState {
-            live: true,
-            generation: Some(copy.generation),
-            synced_at: Some(copy.synced_at),
-        };
-        Ok(())
-    }
-
-    /// Keeps the node's copy current (§6.2): it waits for the store's
-    /// change stream to report a new generation, or at most
-    /// `config_poll_interval`, then syncs if the generation in
-    /// `cluster.json` moved, reading only the registers that changed, or
-    /// if half of `identity_max_staleness` passed since the last sync.
-    /// While the node runs from its copy, it tries a sync every interval.
-    /// A store that refuses every request until it is reopened (a file
-    /// store after a failed write) is detached, and opened again.
-    async fn follow_control_store(self: Arc<Self>) {
-        let interval = self.config.control_store().config_poll_interval();
-        let cluster = self.config.cluster().cluster_id.clone();
-        loop {
-            let known = self.generation();
-            if self.store.is_live() {
-                let after = known.unwrap_or(Generation::ZERO);
-                match self.store.changes(after).await {
-                    Ok(mut changes) => {
-                        if let Ok(Err(error)) = timeout(interval, changes.next()).await {
-                            tracing::warn!(%error, "the control store's change stream failed");
-                            tokio::time::sleep(interval).await;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "cannot follow the control store");
-                        tokio::time::sleep(interval).await;
-                    }
-                }
-            } else {
-                tokio::time::sleep(interval).await;
-            }
-            if self.store.store().is_some_and(|store| store.failed()) {
-                self.detach().await;
-            }
-            let store = match self.store.store() {
-                Some(store) => store,
-                None => match self.reopen().await {
-                    Some(store) => store,
-                    None => continue,
-                },
-            };
-            let moved = match read_cluster(&store, &cluster, &self.retry).await {
-                Ok(current) => {
-                    self.control_metrics.store_answered(self.wall.now());
-                    Some(current.value.generation) != known
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "cannot read the control store's generation");
-                    continue;
-                }
-            };
-            if (moved || !self.store.is_live() || self.sync_due())
-                && let Err(error) = self.sync().await
-            {
-                tracing::warn!(%error, "cannot sync the control-state copy");
-                // The stream would report the same generation at once.
-                tokio::time::sleep(interval).await;
-            }
-        }
     }
 
     /// Keeps a flusher on every `write_back` bucket shard open on the node
@@ -435,52 +306,6 @@ impl Shared {
                     .filter(|bucket| bucket.mode != BucketMode::Local)
                     .map(|bucket| (bucket.bucket_id.clone(), bucket.clean_copies)),
             );
-        }
-    }
-
-    /// Drops a store that refuses every request until it is reopened, and
-    /// serves the node's latest copy until [`Shared::reopen`] opens it
-    /// again and a sync succeeds (§6.2).
-    async fn detach(&self) {
-        match control::kept_copy(&self.index, &self.pools.index).await {
-            Ok(Some(copy)) => {
-                tracing::error!(
-                    generation = %copy.generation,
-                    "the control store failed; serving the local copy until it is reopened"
-                );
-                self.store.detach(copy);
-                self.control_metrics.set_live(false);
-                self.control
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .live = false;
-            }
-            // A running node always keeps a copy: it opened from one or
-            // saved one.
-            Ok(None) => tracing::error!("the control store failed, and the node has no copy"),
-            Err(error) => {
-                tracing::error!(%error, "the control store failed; cannot read the local copy");
-            }
-        }
-    }
-
-    /// Opens the control store for a node that runs from its copy without
-    /// one, and gives it to the node store.
-    async fn reopen(&self) -> Option<Backend> {
-        match self.opener.open(true).await {
-            Ok(opened) => {
-                tracing::info!("opened the control store");
-                self.store.attach(opened.store.clone());
-                Some(opened.store)
-            }
-            Err(OpenStoreError::Unavailable(error)) => {
-                tracing::warn!(%error, "cannot open the control store; serving the local copy");
-                None
-            }
-            Err(error) => {
-                tracing::error!(%error, "refusing the control store; serving the local copy");
-                None
-            }
         }
     }
 
@@ -706,7 +531,7 @@ async fn open_control(
 }
 
 /// The error a node without a control store gives for what needs one.
-fn no_store() -> ControlError {
+pub(crate) fn no_store() -> ControlError {
     ControlError::Unavailable("the control store has not been opened".to_owned())
 }
 
