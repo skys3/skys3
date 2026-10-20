@@ -332,6 +332,14 @@ async fn a_coordinator_is_elected_hands_off_and_is_succeeded() {
         assert_eq!(answer["primary"], cluster.names[primary].as_str());
         assert_eq!(answer["coordinator"], coord_name.as_str());
     }
+    // A primary that does not coordinate cannot tell which members are
+    // live, so it hands off only to a member it is told.
+    if primary != coordinator {
+        let (status, answer) = post(&cluster.admin(primary), "POST", path, "").await;
+        assert_eq!(status, 409, "{answer}");
+        let error = answer["error"].as_str().unwrap();
+        assert!(error.contains("only the coordinator"), "{answer}");
+    }
     // Malformed requests.
     let (status, _) = post(&cluster.admin(0), "POST", path, "{\"to\": 3}").await;
     assert_eq!(status, 400);

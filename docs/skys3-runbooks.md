@@ -949,8 +949,10 @@ re-admits it as a learner and the new primary promotes it.
    (the bucket's entries have `shard`, `epoch`, `primary`, `members`).
 2. Ask the primary's node, or the coordinator's (`GET /v1/cluster`
    `coordinator.holder`): `POST /v1/shards/<bucket>/<n>/handoff`, with
-   the body `{"to": "<node-id>"}` to name the member, or no body to let
-   the node choose a live member that leads the fewest shards. `202`
+   the body `{"to": "<node-id>"}` to name the member, or, at the
+   coordinator, no body to let it choose a member it judges live that
+   leads the fewest shards (a primary that does not coordinate answers
+   `409` without a named member). `202`
    answers with `from`, `to`, the `epoch`, and `via`. Any other node
    answers `409`, naming the `primary` and the `coordinator` to ask; `409`
    also means the member named is the primary or not a member, or that no
