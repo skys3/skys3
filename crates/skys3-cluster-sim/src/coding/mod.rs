@@ -61,6 +61,13 @@
 //! With those losses, nodes may join or be drained, for the repairers to
 //! move fragments onto and off them ([`CodingConfig::rebalance`], plan
 //! M5-09): see [`RebalanceConfig`].
+//!
+//! The erasure-coding suite (plan M5-12) adds fragment release on every
+//! node, with the stricter end that no fragment outlives the layouts that
+//! name it ([`CodingConfig::release`], see [`ReleaseConfig`]), reads of
+//! every combination of lost fragments and of lost holders
+//! ([`CodingConfig::combinations`]), and overwrites and deletes racing the
+//! repairs of their keys ([`CodingConfig::race`], see [`RaceConfig`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
@@ -106,13 +113,21 @@ use skys3_types::{
 use crate::node::{BoxError, TRANSPORT_PORT};
 use crate::pki::Pki;
 
+mod combinations;
 mod moves;
+mod races;
 mod reads;
+mod release;
 mod repair;
 
+pub use combinations::CombinationReport;
 pub use moves::{MoveCrash, MoveOutcome, MovePoint, MoveTarget, RebalanceBug, RebalanceConfig};
+pub use races::{RaceConfig, RaceOp, RaceOutcome};
 pub use reads::{ReadConfig, ReadFault, ReadReport};
-pub use repair::{Loss, RepairConfig, RepairCrash, RepairOutcome, RepairPoint, RepairTarget};
+pub use release::ReleaseConfig;
+pub use repair::{
+    HealingReport, Loss, RepairConfig, RepairCrash, RepairOutcome, RepairPoint, RepairTarget,
+};
 
 /// Where in an attempt the driver crashes nodes: at the first time the
 /// encoder reports the step.
@@ -131,6 +146,10 @@ pub enum CrashPoint {
     /// The last stripe of an object is planned and encoded: once its
     /// fragments are acknowledged, the attempt publishes.
     LastStripeStarted,
+    /// A member no longer locates the replicated bytes of a version whose
+    /// `EC_PUBLISH` it applied: it is dropping its replicas. Not a step of
+    /// an attempt, so not in [`CrashPoint::ALL`].
+    ReplicaDropped,
 }
 
 impl CrashPoint {
@@ -144,7 +163,9 @@ impl CrashPoint {
         CrashPoint::Committed,
     ];
 
-    /// Whether `events` reached the point at their last event.
+    /// Whether `events` reached the point at their last event; never for
+    /// [`CrashPoint::ReplicaDropped`], which the driver finds in the
+    /// members' indexes instead.
     fn reached(self, events: &[EncodeEvent]) -> bool {
         let Some(last) = events.last() else {
             return false;
@@ -195,6 +216,9 @@ pub enum CrashKind {
     /// The node is cut off from the shard's other members and from the
     /// shard register, but not from fragment holders, and keeps running.
     Isolate,
+    /// The node loses power and never comes back: it is lost for good, as
+    /// a holder [`Loss::ForGood`] is.
+    Lose,
 }
 
 /// One crash: `delay` after its point is reached, `kind` hits `target`,
@@ -209,6 +233,40 @@ pub struct Crash {
     pub kind: CrashKind,
     /// How long the node stays down.
     pub downtime: Duration,
+}
+
+/// A planned crash of one node, and what became of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Strike {
+    /// The node.
+    pub node: String,
+    /// How.
+    pub kind: CrashKind,
+    /// When it took effect: the process died, the power failed (at the
+    /// node's next sync, for [`CrashKind::PowerAtNextSync`]), or the node
+    /// was cut off. `None` when it never did: the node was down already,
+    /// or never synced again.
+    pub struck_at: Option<Duration>,
+    /// When the node was up again after it, or reachable again after an
+    /// isolation.
+    pub restarted_at: Option<Duration>,
+}
+
+impl Strike {
+    /// Checks that the crash took effect and that its node came back,
+    /// unless it was lost for good; or says what did not happen.
+    pub fn check(&self) -> Result<(), String> {
+        if self.struck_at.is_none() {
+            return Err(format!("{:?} of {} never struck", self.kind, self.node));
+        }
+        if self.restarted_at.is_none() && self.kind != CrashKind::Lose {
+            return Err(format!(
+                "{} never came back from {:?}",
+                self.node, self.kind
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// What a run encodes, and how it is hurt.
@@ -249,6 +307,18 @@ pub struct CodingConfig {
     /// the repairers move fragments (plan M5-09). Needs `repair`, whose
     /// repairers make the moves and whose losses strike at the same time.
     pub rebalance: Option<RebalanceConfig>,
+    /// Fragment release on every node (plan M5-07): the run then settles
+    /// only once every fragment a node holds is named by a member's layout.
+    /// Needs `orphans`, which finds again what a restart made a node forget.
+    pub release: Option<ReleaseConfig>,
+    /// Whether, once every object is coded, every combination of up to
+    /// `m + 1` lost fragments of each stripe, and of lost holders, is read
+    /// through the gateways (plan M5-12). Needs `reads`, whose gateways
+    /// serve them; their hot caches are then off.
+    pub combinations: bool,
+    /// An overwrite or a delete of a key racing its repair (plan M5-12).
+    /// Needs `repair`.
+    pub race: Option<RaceConfig>,
 }
 
 impl Default for CodingConfig {
@@ -267,6 +337,9 @@ impl Default for CodingConfig {
             ec: EcConfig::default(),
             repair: None,
             rebalance: None,
+            release: None,
+            combinations: false,
+            race: None,
         }
     }
 }
@@ -295,8 +368,14 @@ pub struct CodingReport {
     pub abandoned: usize,
     /// Stripes planned, re-plans included.
     pub stripes: usize,
-    /// The crashes the driver made, as `(node, kind)`.
+    /// The crashes the driver made or armed, as `(node, kind)`: a power
+    /// cut at a node's next sync is listed once armed, whether or not the
+    /// node syncs again.
     pub crashes: Vec<(String, CrashKind)>,
+    /// The crashes the run planned (`CodingConfig::crashes`, a repair's,
+    /// or a move's), one for each node a crash resolved to, and what
+    /// became of each.
+    pub strikes: Vec<Strike>,
     /// When every object was coded and its replicas dropped.
     pub settled_at: Duration,
     /// Fragments reclaimed as orphans.
@@ -309,6 +388,13 @@ pub struct CodingReport {
     pub repair: Option<RepairOutcome>,
     /// What the moves did, in a run that rebalances.
     pub moves: Option<MoveOutcome>,
+    /// What the reads of the loss combinations saw, in a run that makes
+    /// them.
+    pub combinations: Option<CombinationReport>,
+    /// What the race did, in a run that races a repair.
+    pub race: Option<RaceOutcome>,
+    /// Fragments the nodes noted released, in a run with release.
+    pub released: usize,
 }
 
 /// The nodes a run starts with; those that join come after them.
@@ -394,6 +480,9 @@ struct World {
     /// Whether each node is to lose power at the sync after the next
     /// repair write reaches it.
     cut_at_repair_write: Vec<AtomicBool>,
+    /// The attempt whose write that must be, for each node; any repair
+    /// write's if none.
+    cut_for_attempt: Vec<Mutex<Option<AttemptId>>>,
     /// What the repairers did.
     repair: repair::RepairLog,
     /// The nodes placement knows, as it judges them: those that joined,
@@ -401,6 +490,12 @@ struct World {
     topology: Mutex<Vec<Candidate>>,
     /// What the moves did.
     moves: moves::MoveLog,
+    /// What the nodes were told to release.
+    release: release::ReleaseLog,
+    /// The loss combinations' reads, in a run that makes them.
+    combinations: Option<combinations::Combinations>,
+    /// The race, and the keys deleted.
+    races: races::RaceLog,
 }
 
 /// A fragment on one of a node's disks: the node, the disk's generation,
@@ -510,6 +605,8 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         crashes: config.crashes.clone(),
         seen: 0,
         due: Vec::new(),
+        cutting: vec![None; world.nodes.len()],
+        restarting: vec![None; world.nodes.len()],
         committed: 0,
         report: CodingReport::default(),
         reading: false,
@@ -517,6 +614,10 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
         healing: Vec::new(),
         repair: repair::Phase::default(),
         moves: moves::Phase::default(),
+        dropped: false,
+        leaking: None,
+        combinations: combinations::Phase::default(),
+        race: races::Phase::default(),
     };
     for n in NODES..world.nodes.len() {
         // Held back until it joins: its software never ran.
@@ -536,27 +637,44 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
             next_check = now + CHECK_INTERVAL;
             driver.check()?;
             driver.repair_progress(now);
+            driver.race_progress();
             match driver.settled() {
                 Ok(()) => {
+                    driver.leaking = None;
                     let repairing = driver.repair_pending(&mut sim, &world, now);
                     let reading = driver.reads_pending(&mut sim, &world, now);
-                    if !repairing && !reading {
+                    let combining = !reading && driver.combinations_pending(&mut sim, &world)?;
+                    if !repairing && !reading && !combining {
                         driver.report.settled_at = now;
                         break;
                     }
                 }
-                Err(why) if now > SETTLE_LIMIT => {
+                Err(Unsettled::Leaking(why)) => {
+                    let since = driver.leaking.get_or_insert((now, why)).0;
+                    if now > since + release::LEAK_LIMIT {
+                        let why = driver.leaking.take().map(|(_, why)| why);
+                        return Err(format!(
+                            "fragments outlived their layouts for {:?}: {}",
+                            release::LEAK_LIMIT,
+                            why.unwrap_or_default()
+                        ));
+                    }
+                }
+                Err(Unsettled::Pending(why)) if now > SETTLE_LIMIT => {
                     return Err(format!(
                         "the objects were not all coded with their replicas dropped by \
                          {now:?}: {why} ({})",
                         driver.replicas()
                     ));
                 }
-                Err(_) => {}
+                Err(Unsettled::Pending(_)) => driver.leaking = None,
             }
         }
     }
     for slot in &world.nodes {
+        // A power cut planned at a sync that never came falls after this
+        // power loss, which no sync of the recovery reaches.
+        slot.power.cut_at_sync(u64::MAX, SyncCut::Before);
         slot.log_disk.crash();
         slot.fragment_disk().crash();
         *lock(&slot.view) = None;
@@ -583,6 +701,9 @@ pub fn run(context: &mut SimContext, config: &CodingConfig) -> Result<CodingRepo
     }
     driver.report.repair = driver.repair_outcome()?;
     driver.report.moves = driver.move_outcome()?;
+    driver.report.combinations = driver.combination_outcome()?;
+    driver.report.race = driver.race_outcome();
+    driver.report.released = world.release.noted();
     let report = driver.report.clone();
     drop(sim);
     final_check(&world)?;
@@ -658,8 +779,14 @@ fn build(context: &mut SimContext, config: &CodingConfig) -> Result<World, BoxEr
         generation: (0..count).map(|_| AtomicU64::new(0)).collect(),
         lives: (0..count).map(|_| AtomicU64::new(0)).collect(),
         cut_at_repair_write: (0..count).map(|_| AtomicBool::new(false)).collect(),
+        cut_for_attempt: (0..count).map(|_| Mutex::new(None)).collect(),
         repair: repair::RepairLog::default(),
         moves: moves::MoveLog::default(),
+        release: release::ReleaseLog::default(),
+        combinations: config
+            .combinations
+            .then(combinations::Combinations::default),
+        races: races::RaceLog::default(),
         config: shard_config,
         run: config.clone(),
         sizes,
@@ -765,9 +892,14 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         ttl: Duration::from_secs(30),
         release_delay: RELEASE_DELAY,
     });
-    let fragments = FragmentServer::new(vec![store.clone()]);
-    let transport = Transport::new(TurmoilNetwork, &slot.credentials);
     let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+    // The fragments this node was told are released, kept for the delay.
+    let holds = release::holds(world, &clock);
+    let fragments = match &holds {
+        Some(holds) => FragmentServer::new(vec![store.clone()]).with_holds(holds.clone()),
+        None => FragmentServer::new(vec![store.clone()]),
+    };
+    let transport = Transport::new(TurmoilNetwork, &slot.credentials);
     let mut replication = Replication::new(
         slot.id.clone(),
         set.clone(),
@@ -862,13 +994,20 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         });
         let reclaimer = OrphanReclaimer::new(
             slot.id.clone(),
-            vec![store],
+            vec![store.clone()],
             client,
             clock,
             config.orphan_after,
         )
         .with_observer(observer);
+        let reclaimer = match &holds {
+            Some(holds) => reclaimer.with_holds(holds.clone()),
+            None => reclaimer,
+        };
         tokio::spawn(reclaimer.run(config.sweep));
+    }
+    if let Some(holds) = holds {
+        release::sweep(world, holds, store);
     }
     if let Some(shard) = shard
         && (index == 0 || world.run.takeover)
@@ -882,6 +1021,7 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
         let reads =
             FragmentReadClient::new(slot.id.clone(), transport.clone(), world.peers.clone())
                 .with_local(fragments.clone());
+        release::start(world, index, shard.clone(), &transport, &fragments);
         let repairer = writer(Some((index, life_number)));
         let shared = attempts.clone();
         repair::start(
@@ -906,10 +1046,10 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Accepts links on the node's transport port: fragment writes and reads
-/// go to the fragment server, orphan queries to the judges, requests a
-/// gateway forwards to the node's shards, and everything else to
-/// replication.
+/// Accepts links on the node's transport port: fragment writes, reads,
+/// holds, and releases go to the fragment server, orphan queries to the
+/// judges, requests a gateway forwards to the node's shards, and
+/// everything else to replication.
 async fn serve(
     listener: Listener<TurmoilNetwork>,
     services: (
@@ -936,8 +1076,11 @@ async fn serve(
             };
             match (first.header.kind, forwards) {
                 (MessageKind::FragmentWrite, _) => fragments.serve((receiver, sender), first).await,
-                (MessageKind::FragmentRead, _) => {
+                (MessageKind::FragmentRead | MessageKind::FragmentHold, _) => {
                     fragments.serve_reads((receiver, sender), first).await;
+                }
+                (MessageKind::FragmentRelease, _) => {
+                    fragments.serve_releases((receiver, sender), first).await;
                 }
                 (MessageKind::OrphanQuery, _) => orphans.serve((receiver, sender), first).await,
                 (MessageKind::Forward, Some(forwards)) => {
@@ -1040,6 +1183,9 @@ impl FragmentWriter for Writer {
         let generation = |n: usize| self.world.generation[n].load(Ordering::SeqCst);
         let before = position.map(generation);
         if let Some(n) = position.filter(|_| self.repairer.is_some())
+            && lock(&self.world.cut_for_attempt[n])
+                .as_ref()
+                .is_none_or(|attempt| *attempt == header.attempt)
             && self.world.cut_at_repair_write[n].swap(false, Ordering::SeqCst)
         {
             let power = &self.world.nodes[n].power;
@@ -1110,6 +1256,9 @@ async fn primary(
         lock(&events.events).push(event.clone());
     }));
     tokio::spawn(encoder.run(SCAN_INTERVAL));
+    if index == 0 && world.run.race.is_some() {
+        tokio::spawn(races::serve(Arc::clone(&world), shard.clone()));
+    }
     if index == 0 && world.run.overwrite {
         overwrite(&world, &shard).await;
     }
@@ -1124,16 +1273,22 @@ async fn primary(
                 .is_some_and(|object| object.coded.is_some());
         }
         if coded {
-            let filler = Extent {
-                key: "filler".to_owned(),
-                offset: 0,
-                data: Bytes::from(vec![0; 4000]),
-            };
-            for _ in 0..8 {
-                let _ = shard.append_extent(filler.clone()).await;
-            }
+            roll(&shard).await;
             return;
         }
+    }
+}
+
+/// Appends unreferenced extents, so that the segment holding the latest
+/// replicas stops being the last and compaction may drop them.
+async fn roll(shard: &Shard<SimMount>) {
+    let filler = Extent {
+        key: "filler".to_owned(),
+        offset: 0,
+        data: Bytes::from(vec![0; 4000]),
+    };
+    for _ in 0..8 {
+        let _ = shard.append_extent(filler.clone()).await;
     }
 }
 
@@ -1237,8 +1392,13 @@ struct Driver<'a> {
     crashes: Option<(CrashPoint, Vec<Crash>)>,
     /// How many events the crash point was looked for in.
     seen: usize,
-    /// Crashes due at a time, with the node they hit.
-    due: Vec<(Duration, usize, Crash)>,
+    /// Crashes due at a time, with the node they hit and, for a planned
+    /// one, its index in the report's strikes.
+    due: Vec<(Duration, usize, Crash, Option<usize>)>,
+    /// For each node, the planned strike that waits for its power cut.
+    cutting: Vec<Option<usize>>,
+    /// For each node, the planned strike that waits for it to come back.
+    restarting: Vec<Option<usize>>,
     /// The highest commit watermark any replica has learned.
     committed: u64,
     report: CodingReport,
@@ -1252,6 +1412,16 @@ struct Driver<'a> {
     repair: repair::Phase,
     /// The rebalancing phase.
     moves: moves::Phase,
+    /// Whether a member was seen dropping its replicas, while a crash
+    /// waits for [`CrashPoint::ReplicaDropped`].
+    dropped: bool,
+    /// Since when, and why, the nodes hold fragments no layout names, in
+    /// a run that otherwise settled.
+    leaking: Option<(Duration, String)>,
+    /// The loss combinations' phase.
+    combinations: combinations::Phase,
+    /// The race's phase.
+    race: races::Phase,
 }
 
 impl Driver<'_> {
@@ -1262,30 +1432,35 @@ impl Driver<'_> {
             let events = lock(&self.world.events);
             let reached = (self.seen..events.len())
                 .find(|end| point.reached(&events[..=*end]))
-                .map(|end| events[end].clone());
+                .map(|end| Some(events[end].clone()));
             self.seen = events.len();
             drop(events);
-            if let Some(event) = reached {
+            let dropped = point == CrashPoint::ReplicaDropped && self.dropped;
+            if let Some(event) = reached.or(dropped.then_some(None)) {
                 let (_, crashes) = self.crashes.take().expect("crashes are planned");
                 for crash in crashes {
                     for node in self.targets(crash.target) {
-                        self.due.push((now + crash.delay, node, crash));
+                        let strike = self.plan_strike(node, crash.kind);
+                        self.due
+                            .push((now + crash.delay, node, crash, Some(strike)));
                     }
                 }
                 tracing::debug!(?event, "the crash point is reached");
             }
         }
         let mut due = Vec::new();
-        self.due.retain(|(at, node, crash)| {
+        self.due.retain(|(at, node, crash, strike)| {
             let ready = *at <= now;
             if ready {
-                due.push((*node, *crash));
+                due.push((*node, *crash, *strike));
             }
             !ready
         });
-        for (node, crash) in due {
+        for (node, crash, strike) in due {
             let slot = &self.world.nodes[node];
             self.report.crashes.push((slot.id.to_string(), crash.kind));
+            let up = self.down[node].is_none();
+            let reachable = self.isolated[node].is_none();
             match crash.kind {
                 CrashKind::Kill => self.crash(sim, now, node, false, crash.downtime),
                 CrashKind::PowerLoss => self.crash(sim, now, node, true, crash.downtime),
@@ -1294,12 +1469,24 @@ impl Driver<'_> {
                     self.cut[node] = false;
                 }
                 CrashKind::Isolate => self.isolate(sim, now, node, crash.downtime),
+                CrashKind::Lose => self.lose_for_good(sim, now, node),
+            }
+            if let Some(strike) = strike {
+                match crash.kind {
+                    CrashKind::PowerAtNextSync => self.cutting[node] = Some(strike),
+                    CrashKind::Isolate if reachable => self.struck(now, node, strike),
+                    CrashKind::Kill | CrashKind::PowerLoss | CrashKind::Lose if up => {
+                        self.struck(now, node, strike);
+                    }
+                    _ => {}
+                }
             }
         }
         for node in 0..self.world.nodes.len() {
             let slot = &self.world.nodes[node];
             if self.isolated[node].is_some_and(|at| at <= now) {
                 self.isolated[node] = None;
+                self.came_back(now, node);
                 self.world.cut_off[node].store(false, Ordering::SeqCst);
                 for other in self.others(node) {
                     sim.repair(slot.id.as_str(), self.world.nodes[other].id.as_str());
@@ -1311,18 +1498,22 @@ impl Driver<'_> {
                 // an early acknowledgement, still leaves; nothing it does
                 // meanwhile reaches its disks.
                 self.cut[node] = true;
+                if let Some(strike) = self.cutting[node].take() {
+                    self.struck(now, node, strike);
+                }
                 let stop = Crash {
                     delay: CUT_GRACE,
                     target: CrashTarget::Primary,
                     kind: CrashKind::PowerLoss,
                     downtime: SUPERVISOR_DELAY,
                 };
-                self.due.push((now + CUT_GRACE, node, stop));
+                self.due.push((now + CUT_GRACE, node, stop, None));
             }
             match self.down[node] {
                 Some(at) if at <= now => {
                     self.down[node] = None;
                     sim.bounce(slot.id.as_str());
+                    self.came_back(now, node);
                 }
                 Some(_) => {}
                 None if !sim.is_host_running(slot.id.as_str()) => {
@@ -1331,6 +1522,31 @@ impl Driver<'_> {
                 }
                 None => {}
             }
+        }
+    }
+
+    /// Records a planned crash of `node` by `kind`, which has not struck
+    /// yet; returns its index in the report's strikes.
+    pub(super) fn plan_strike(&mut self, node: usize, kind: CrashKind) -> usize {
+        self.report.strikes.push(Strike {
+            node: self.world.nodes[node].id.to_string(),
+            kind,
+            struck_at: None,
+            restarted_at: None,
+        });
+        self.report.strikes.len() - 1
+    }
+
+    /// Notes that planned strike `strike` of `node` took effect now.
+    fn struck(&mut self, now: Duration, node: usize, strike: usize) {
+        self.report.strikes[strike].struck_at = Some(now);
+        self.restarting[node] = Some(strike);
+    }
+
+    /// Notes that `node` is up, or reachable, again.
+    fn came_back(&mut self, now: Duration, node: usize) {
+        if let Some(strike) = self.restarting[node].take() {
+            self.report.strikes[strike].restarted_at = Some(now);
         }
     }
 
@@ -1392,6 +1608,25 @@ impl Driver<'_> {
         *lock(&slot.view) = None;
         sim.crash(slot.id.as_str());
         self.down[node] = Some(now + downtime);
+    }
+
+    /// Whether some member that is up no longer locates the replicated
+    /// bytes of a version it coded.
+    fn replica_dropped(&self) -> bool {
+        let views = self.views();
+        let keys: Vec<String> = lock(&self.world.expected).keys().cloned().collect();
+        views.iter().take(MEMBERS).flatten().any(|view| {
+            let Ok(reader) = view.index.read() else {
+                return false;
+            };
+            keys.iter().any(|key| {
+                let entry = reader.entry(&self.world.shard, key).ok().flatten();
+                entry.is_some_and(|entry| {
+                    let coded = entry.object.as_ref().is_some_and(|o| o.coded.is_some());
+                    coded && locates(&reader, &self.world.shard, &entry) == Ok(false)
+                })
+            })
+        })
     }
 
     /// The first members but `node`, which an isolated node cannot reach.
@@ -1470,8 +1705,12 @@ impl Driver<'_> {
             self.check_key(&views, key)
                 .map_err(|e| format!("{key}: {e}"))?;
         }
+        if matches!(self.crashes, Some((CrashPoint::ReplicaDropped, _))) && !self.dropped {
+            self.dropped = self.replica_dropped();
+        }
         self.check_reclaimed(&views, &keys)?;
         self.check_held()?;
+        self.check_deleted(&views)?;
         self.check_domains()
     }
 
@@ -1563,7 +1802,18 @@ impl Driver<'_> {
     /// up locates its replicated bytes, with every node up and reachable,
     /// and, with orphan reclamation, every fragment the nodes hold named
     /// by a member's layout or of an attempt that published; or says why not.
-    fn settled(&self) -> Result<(), String> {
+    fn settled(&self) -> Result<(), Unsettled> {
+        self.settling().map_err(Unsettled::Pending)?;
+        self.deletes_settled().map_err(Unsettled::Pending)?;
+        if self.world.run.release.is_some() {
+            self.unnamed().map_err(Unsettled::Leaking)?;
+        }
+        Ok(())
+    }
+
+    /// The checks of [`Driver::settled`] that fragment release does not
+    /// change.
+    fn settling(&self) -> Result<(), String> {
         if !self.world.written.load(Ordering::SeqCst) {
             return Err("the objects are not written".to_owned());
         }
@@ -1611,7 +1861,8 @@ impl Driver<'_> {
                 }
             }
         }
-        if self.world.run.orphans.is_some() {
+        // With release, [`Driver::unnamed`] checks more strictly.
+        if self.world.run.orphans.is_some() && self.world.run.release.is_none() {
             self.orphans_reclaimed(&views, &referenced)?;
         }
         Ok(())
@@ -1665,6 +1916,16 @@ impl Driver<'_> {
         }
         Ok(())
     }
+}
+
+/// Why a run has not settled yet.
+enum Unsettled {
+    /// Objects are still to be coded, replicas to be dropped, or nodes to
+    /// recover.
+    Pending(String),
+    /// Everything else settled, but the nodes hold fragments that no
+    /// member's layout names.
+    Leaking(String),
 }
 
 /// Checks that no coded layout of `keys` in `reader` names a fragment in
@@ -1752,6 +2013,14 @@ fn final_check(world: &World) -> Result<(), String> {
             let reader = storages[member].index.read().map_err(|e| e.to_string())?;
             no_reclaimed_fragment(world, &written, &reader, &keys, &reclaimed)
                 .map_err(|e| format!("member n{member}: {e}"))?;
+        }
+        let deleted = lock(&world.races.deleted).clone();
+        for key in &deleted {
+            for &member in &members {
+                let reader = storages[member].index.read().map_err(|e| e.to_string())?;
+                races::stays_deleted(&reader, &world.shard, key)
+                    .map_err(|e| format!("member n{member}: {e}"))?;
+            }
         }
         for (key, data) in &expected {
             for &member in &members {

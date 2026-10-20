@@ -35,7 +35,7 @@ use skys3_sim::{Runner, SimContext};
 const RUN_COST: u64 = 8;
 
 /// Every node a crash can hit.
-const TARGETS: [CrashTarget; 5] = [
+pub(crate) const TARGETS: [CrashTarget; 5] = [
     CrashTarget::Primary,
     CrashTarget::Member(1),
     CrashTarget::Member(2),
@@ -171,7 +171,7 @@ fn applying_a_superseded_publish_is_caught() {
 
 /// Orphan reclamation on every node, asking about fragments once they are
 /// `orphan_after` old.
-fn reclaiming(orphan_after: Duration, bug: Option<JudgeBug>) -> Option<OrphanConfig> {
+pub(crate) fn reclaiming(orphan_after: Duration, bug: Option<JudgeBug>) -> Option<OrphanConfig> {
     Some(OrphanConfig {
         orphan_after,
         sweep: Duration::from_millis(20),

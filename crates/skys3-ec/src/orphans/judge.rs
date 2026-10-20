@@ -40,6 +40,9 @@ pub enum JudgeBug {
     BeforeServing,
     /// Judges attempts of later epochs like those of earlier ones.
     IgnoreLaterEpochs,
+    /// Calls the fragments of attempts in progress referenced, which tells
+    /// their nodes to keep them for the rest of their lives.
+    InProgressReferenced,
 }
 
 /// The orphan verdicts of one shard's replica on this node, given only
@@ -122,7 +125,12 @@ impl<D: Disk> OrphanJudge<D> {
         let epoch = self.shard.sequencing();
         // Publishing records at or before the applied position committed.
         self.attempts.settle(self.shard.applied());
-        let mut verdicts = vec![Verdict::InProgress; suspects.len()];
+        let undecided = if self.has_bug_in_progress_referenced() {
+            Verdict::Referenced
+        } else {
+            Verdict::InProgress
+        };
+        let mut verdicts = vec![undecided; suspects.len()];
         let mut decide = Vec::new();
         for (at, suspect) in suspects.iter().enumerate() {
             let orphaned = if self.has_bug_ignore_attempts() {
@@ -211,6 +219,16 @@ impl<D: Disk> OrphanJudge<D> {
 
     #[cfg(not(feature = "test-util"))]
     fn has_bug_ignore_later_epochs(&self) -> bool {
+        false
+    }
+
+    #[cfg(feature = "test-util")]
+    fn has_bug_in_progress_referenced(&self) -> bool {
+        self.bug == Some(JudgeBug::InProgressReferenced)
+    }
+
+    #[cfg(not(feature = "test-util"))]
+    fn has_bug_in_progress_referenced(&self) -> bool {
         false
     }
 }

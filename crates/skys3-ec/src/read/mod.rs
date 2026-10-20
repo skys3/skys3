@@ -575,7 +575,9 @@ impl Reader {
                 }
             }
         }
-        if readable < needed {
+        if readable < needed
+            && !seeded::fill_missing(&mut slots, needed, columns.end - columns.start)
+        {
             return Err(CodedReadError::Unreadable {
                 stripe: number,
                 readable,
@@ -633,6 +635,10 @@ pub mod seeded {
         /// A degraded piece hands the codec the fragments it read in the
         /// first slots, whatever their indices.
         WrongIndices,
+        /// A piece of a stripe with fewer than `k` readable fragments is
+        /// decoded with zeros in place of the missing ones, rather than
+        /// failing.
+        FillMissing,
     }
 
     thread_local! {
@@ -646,6 +652,20 @@ pub mod seeded {
 
     pub(super) fn trusts_crc() -> bool {
         BUG.get() == Some(ReadBug::TrustCrc)
+    }
+
+    /// Under [`ReadBug::FillMissing`], fills the first empty `slots` with
+    /// `len` zeros until `needed` are present, and returns true.
+    pub(super) fn fill_missing(slots: &mut [Option<Bytes>], needed: usize, len: u64) -> bool {
+        if BUG.get() != Some(ReadBug::FillMissing) {
+            return false;
+        }
+        let zeros = Bytes::from(vec![0; usize::try_from(len).unwrap_or(0)]);
+        let missing = needed.saturating_sub(slots.iter().flatten().count());
+        for slot in slots.iter_mut().filter(|slot| slot.is_none()).take(missing) {
+            *slot = Some(zeros.clone());
+        }
+        true
     }
 
     pub(super) fn arrange(slots: &[Option<Bytes>]) -> Vec<Option<&[u8]>> {
@@ -664,6 +684,10 @@ mod seeded {
     use bytes::Bytes;
 
     pub(super) fn trusts_crc() -> bool {
+        false
+    }
+
+    pub(super) fn fill_missing(_: &mut [Option<Bytes>], _: usize, _: u64) -> bool {
         false
     }
 
