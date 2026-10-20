@@ -182,8 +182,13 @@ pub struct HeartbeatStatus {
     pub registrations: u64,
     /// How many heartbeats a coordinator acknowledged.
     pub delivered: u64,
+    /// How many heartbeats were answered at all: by a coordinator, or by
+    /// the lease holder saying it no longer coordinates.
+    pub answered: u64,
     /// The coordinator that acknowledged the latest one.
     pub coordinator: Option<NodeId>,
+    /// Why the latest attempt to register failed, until one succeeds.
+    pub registration_error: Option<String>,
 }
 
 /// The coordinator a node heartbeats to, and its connection.
@@ -302,6 +307,15 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
     /// left unsettled is kept and settled before the next attempt, so that
     /// a registration that lands late is still announced.
     pub async fn register(&mut self) -> Result<Registered, RegistrationError> {
+        let registered = self.try_register().await;
+        if let Err(error) = &registered {
+            self.status
+                .send_modify(|status| status.registration_error = Some(error.to_string()));
+        }
+        registered
+    }
+
+    async fn try_register(&mut self) -> Result<Registered, RegistrationError> {
         if let Some(pending) = &self.unsettled {
             let settled = settle(
                 &self.store,
@@ -335,7 +349,10 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
             registered => registered?,
         };
         self.registered = true;
-        self.status.send_modify(|status| status.registrations += 1);
+        self.status.send_modify(|status| {
+            status.registrations += 1;
+            status.registration_error = None;
+        });
         Ok(registered)
     }
 
@@ -366,6 +383,7 @@ impl<S: ControlStore, N: Network> Heartbeater<S, N> {
         };
         match ack {
             Ok(ack) => {
+                self.status.send_modify(|status| status.answered += 1);
                 if ack.coordinator {
                     self.status.send_modify(|status| {
                         status.delivered += 1;

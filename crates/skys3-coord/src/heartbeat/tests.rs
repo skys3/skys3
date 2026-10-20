@@ -58,6 +58,7 @@ fn profile(n: u8, address: NodeAddress) -> NodeProfile {
             disk_id: Label::new("disk-0").unwrap(),
             capacity_bytes: 1 << 30,
         }],
+        instance: None,
     }
 }
 
@@ -279,6 +280,9 @@ async fn a_node_follows_the_coordinator_when_the_lease_moves() {
     let mut status = heartbeater.subscribe();
     let task = tokio::spawn(heartbeater.run());
     until(&mut status, |status| status.registrations == 1).await;
+    // Node 1 answers, but delivers nothing: it is not coordinator.
+    let answered = until(&mut status, |status| status.answered >= 1).await;
+    assert_eq!((answered.delivered, answered.coordinator), (0, None));
 
     // The lease moves to node 3, and the node follows it.
     let lease = read(&store, &TypedKey::coordinator_lease())
@@ -455,6 +459,8 @@ async fn a_registration_left_unsettled_is_settled_before_the_next_attempt() {
         matches!(error, RegistrationError::Unsettled { .. }),
         "{error}"
     );
+    let reported = heartbeater.subscribe().borrow().registration_error.clone();
+    assert_eq!(reported, Some(error.to_string()));
     let before = skys3_control::read_cluster(&inner, &pki.cluster, &retry())
         .await
         .unwrap()
@@ -470,5 +476,6 @@ async fn a_registration_left_unsettled_is_settled_before_the_next_attempt() {
         .value
         .generation;
     assert!(after > before);
-    assert_eq!(heartbeater.subscribe().borrow().registrations, 1);
+    let status = heartbeater.subscribe().borrow().clone();
+    assert_eq!((status.registrations, status.registration_error), (1, None));
 }
