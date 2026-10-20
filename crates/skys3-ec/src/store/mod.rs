@@ -18,8 +18,11 @@
 //!   grow and the last segment is never removed.
 //! - The node-local fragment map, from ID to location, lives in memory. It
 //!   is rebuilt at open from the segments' headers, which recovery reads
-//!   anyway, so it needs no index table and no format change. Compaction of
-//!   fragment segments (M5-07) moves fragments and updates only this map.
+//!   anyway, so it needs no index table and no format change.
+//! - [`FragmentStore::reclaim`] drops a fragment from the map, and
+//!   [`FragmentStore::compact`] copies the live fragments out of segments
+//!   that hold little else, byte for byte under the same IDs, and removes
+//!   those segments: it changes only this map (§10.3).
 //! - [`FragmentStore::read`] reads a range of a fragment and verifies it
 //!   against the block checksums in the fragment's header.
 //!
@@ -28,6 +31,7 @@
 //! the store out of service, as it does the log (§10.4).
 
 mod commit;
+mod compact;
 mod recovery;
 
 use std::collections::BTreeMap;
@@ -46,7 +50,8 @@ use crate::fragment::{
     BLOCK_LEN, DecodedHeader, FragmentDecodeError, FragmentEncodeError, FragmentHeader,
     MAX_FRAGMENT_LEN, MAX_HEADER_LEN, encode_tail,
 };
-use commit::{Committer, Request};
+use commit::{Committer, Record, Reply, Request};
+pub use compact::CompactionReport;
 pub use recovery::{RecoveryError, RecoveryReport, TornTail};
 
 /// How many fragments may wait for the committer before writers wait to
@@ -209,6 +214,7 @@ pub(crate) struct Bugs {
     pub(crate) acknowledge_before_sync: bool,
     pub(crate) skip_directory_sync: bool,
     pub(crate) skip_recovery_sync: bool,
+    pub(crate) remove_before_copy: bool,
 }
 
 /// A bug to seed in a store, for tests that show the crash simulation
@@ -223,6 +229,8 @@ pub enum SeededBug {
     SkipDirectorySync,
     /// Skip recovery's syncs of the last segment and the directory.
     SkipRecoverySync,
+    /// Have compaction remove a segment before its copies are durable.
+    RemoveBeforeCopy,
 }
 
 /// State shared by the store's handles and its committer.
@@ -254,6 +262,12 @@ impl<F> Shared<F> {
         self.segments().insert(id, file);
     }
 
+    /// Puts back segment `id`, which was dropped but whose file could not
+    /// be removed, so the store lists it again and compaction takes it up.
+    fn restore_segment(&self, id: u64, file: Arc<F>) {
+        self.segments().entry(id).or_insert(file);
+    }
+
     pub(crate) fn last_segment(&self) -> Option<(u64, Arc<F>)> {
         self.segments()
             .last_key_value()
@@ -264,6 +278,20 @@ impl<F> Shared<F> {
     /// earlier one: a copy compaction made.
     pub(crate) fn insert(&self, fragments: impl IntoIterator<Item = (FragmentId, Located)>) {
         self.map().extend(fragments);
+    }
+
+    /// Makes `to`, a durable copy of fragment `id`'s record, its location
+    /// if the map still locates it at `from`; otherwise the fragment was
+    /// reclaimed meanwhile, and the copy is dead. Returns whether it moved.
+    pub(crate) fn relocate(&self, id: FragmentId, from: Located, to: Located) -> bool {
+        let mut map = self.map();
+        if map.get(&id) == Some(&from) {
+            map.insert(id, to);
+            return true;
+        }
+        drop(map);
+        *self.dead().entry(to.segment).or_default() += to.record_len();
+        false
     }
 
     pub(crate) fn take_out_of_service(&self, error: io::Error) -> Arc<io::Error> {
@@ -282,6 +310,9 @@ pub struct FragmentStore<D: Disk> {
     disk: Arc<D>,
     requests: mpsc::Sender<Request>,
     max_fragment_bytes: u64,
+    /// How many bytes of copies compaction keeps queued at once.
+    copy_window: u64,
+    bugs: Bugs,
 }
 
 impl<D: Disk> Clone for FragmentStore<D> {
@@ -291,6 +322,8 @@ impl<D: Disk> Clone for FragmentStore<D> {
             disk: Arc::clone(&self.disk),
             requests: self.requests.clone(),
             max_fragment_bytes: self.max_fragment_bytes,
+            copy_window: self.copy_window,
+            bugs: self.bugs,
         }
     }
 }
@@ -335,6 +368,7 @@ impl<D: Disk> FragmentStore<D> {
             acknowledge_before_sync: bug == SeededBug::AcknowledgeBeforeSync,
             skip_directory_sync: bug == SeededBug::SkipDirectorySync,
             skip_recovery_sync: bug == SeededBug::SkipRecoverySync,
+            remove_before_copy: bug == SeededBug::RemoveBeforeCopy,
         };
         Self::open_with(disk, config, bugs).await
     }
@@ -354,6 +388,7 @@ impl<D: Disk> FragmentStore<D> {
         shared.insert(recovered.fragments);
         let (requests, receiver) = mpsc::channel(QUEUE_LEN);
         let max_fragment_bytes = config.max_fragment_bytes.min(MAX_FRAGMENT_LEN);
+        let copy_window = config.group_commit_max_bytes;
         let disk = Arc::new(disk);
         let committer = Committer::new(
             Arc::clone(&disk),
@@ -369,6 +404,8 @@ impl<D: Disk> FragmentStore<D> {
             disk,
             requests,
             max_fragment_bytes,
+            copy_window,
+            bugs,
         };
         Ok((store, recovered.report))
     }
@@ -403,15 +440,25 @@ impl<D: Disk> FragmentStore<D> {
         }
         let tail = encode_tail(header, &payload).map_err(FragmentEncodeError)?;
         self.check_in_service()?;
+        let acknowledged = self.queue(Record::Fragment { tail, payload }).await?;
+        self.acknowledged(acknowledged).await
+    }
+
+    /// Queues `record` for the committer, and returns where its answer
+    /// comes.
+    async fn queue(&self, record: Record) -> Result<oneshot::Receiver<Reply>, FragmentError> {
         let (reply, acknowledged) = oneshot::channel();
-        let request = Request {
-            tail,
-            payload,
-            reply,
-        };
-        if self.requests.send(request).await.is_err() {
+        if self.requests.send(Request { record, reply }).await.is_err() {
             return Err(self.closed());
         }
+        Ok(acknowledged)
+    }
+
+    /// The committer's answer on `acknowledged`.
+    async fn acknowledged(
+        &self,
+        acknowledged: oneshot::Receiver<Reply>,
+    ) -> Result<FragmentId, FragmentError> {
         match acknowledged.await {
             Ok(Ok(id)) => Ok(id),
             Ok(Err(error)) => Err(FragmentError::OutOfService(error)),
@@ -479,27 +526,26 @@ impl<D: Disk> FragmentStore<D> {
         Ok(Self::read_header(id, located, &file).await?.header)
     }
 
-    /// Reclaims fragment `id`, an orphan (§8.4) or, later, a released
-    /// fragment (§8.7): it is no longer read or listed, and once every
-    /// record of its segment is reclaimed and the segment is not the last,
-    /// the segment file is removed. Returns whether the store held the
-    /// fragment.
+    /// Reclaims fragment `id`, an orphan (§8.4) or a released fragment
+    /// (§8.7): it is no longer read or listed, and once every record of its
+    /// segment is reclaimed and the segment is not the last, the segment
+    /// file is removed. Returns whether the store held the fragment.
     ///
     /// Reclaiming is not recorded on the disk. A fragment whose segment
     /// survives a restart is found again by recovery, and is reclaimed
     /// again once its node asks about it; segments that hold live
-    /// fragments too wait for fragment-segment compaction (plan M5-07).
+    /// fragments too wait for [`FragmentStore::compact`].
     ///
     /// # Errors
     ///
     /// [`FragmentError::Remove`] if a segment file could not be removed;
-    /// the fragment is reclaimed all the same, and the file stays until
-    /// the next life finds it again.
+    /// the fragment is reclaimed all the same, and the segment stays in
+    /// the store for [`FragmentStore::compact`] to remove.
     pub async fn reclaim(&self, id: FragmentId) -> Result<bool, FragmentError> {
         let Some(located) = self.shared.map().remove(&id) else {
             return Ok(false);
         };
-        let removable = {
+        let removed = {
             let mut segments = self.shared.segments();
             let mut dead = self.shared.dead();
             let bytes = dead.entry(located.segment).or_default();
@@ -509,19 +555,19 @@ impl<D: Disk> FragmentStore<D> {
                 .get(&located.segment)
                 .is_some_and(|file| file.len() <= *bytes);
             // Only the committer appends, and only to the last segment.
-            let removable = whole && last != Some(located.segment);
-            if removable {
+            if whole && last != Some(located.segment) {
                 dead.remove(&located.segment);
-                segments.remove(&located.segment);
+                segments.remove(&located.segment)
+            } else {
+                None
             }
-            removable
         };
-        if removable {
+        if let Some(file) = removed {
             let name = segment_name(located.segment);
-            self.disk
-                .remove(&name)
-                .await
-                .map_err(|source| FragmentError::Remove { name, source })?;
+            if let Err(source) = self.disk.remove(&name).await {
+                self.shared.restore_segment(located.segment, file);
+                return Err(FragmentError::Remove { name, source });
+            }
         }
         Ok(true)
     }
@@ -534,6 +580,13 @@ impl<D: Disk> FragmentStore<D> {
             .map()
             .get(&id)
             .map(|located| located.payload_len)
+    }
+
+    /// The bytes of every record the store holds, headers included: what
+    /// its segments would take if compaction left nothing else in them.
+    #[must_use]
+    pub fn live_bytes(&self) -> u64 {
+        self.shared.map().values().map(Located::record_len).sum()
     }
 
     /// The IDs of every fragment the store holds, in order.
@@ -564,9 +617,12 @@ impl<D: Disk> FragmentStore<D> {
 
     fn locate(&self, id: FragmentId) -> Result<(Located, Arc<D::File>), FragmentError> {
         self.check_in_service()?;
-        let located = self
-            .shared
-            .map()
+        // The map's lock is held while the segment is looked up, so
+        // compaction, which removes a segment only once the map locates
+        // nothing in it, cannot remove it in between. A removed segment's
+        // file stays readable through the handle taken here.
+        let map = self.shared.map();
+        let located = map
             .get(&id)
             .copied()
             .ok_or(FragmentError::UnknownFragment(id))?;

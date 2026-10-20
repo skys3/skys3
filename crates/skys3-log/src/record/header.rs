@@ -81,7 +81,8 @@ pub enum RecordKind {
     EcPublish,
     /// Moves erasure-coded fragments to new locations (defined).
     EcRelocate,
-    /// Releases a replicated copy after encoding (reserved for M5).
+    /// Records that fragments replaced layouts left were released
+    /// (defined).
     EcRelease,
     /// Invalidates a replica's records past a sequence number (defined).
     Truncate,
@@ -195,6 +196,7 @@ impl RecordKind {
                 | Self::Adopt
                 | Self::EcPublish
                 | Self::EcRelocate
+                | Self::EcRelease
                 | Self::Truncate
                 | Self::Config
                 | Self::ImportProgress

@@ -29,6 +29,15 @@
 //! the version the fragments were written for (§8.4): a `TAGS` record
 //! moves the entry's version past it, but not the fragments'.
 //!
+//! A source that takes holds ([`FragmentSource::register`]) has the read
+//! hold every fragment of the stripes its range covers on each node before
+//! the first fetch, renews the holds while the body streams, and ends them
+//! when it ends, so a write that releases the version's fragments (§8.7)
+//! does not take them away while the read streams. A hold that could not
+//! be registered or renewed costs nothing but that protection: a fragment
+//! reclaimed since reads as missing, and the read decodes around it or
+//! fails, never returning other bytes.
+//!
 //! Fragments travel on the intra-cluster transport ([`FragmentReadClient`],
 //! served by [`FragmentServer::serve_reads`]); a [`FragmentSource`] is what
 //! the reader asks, so tests can stand in for the nodes.
@@ -37,19 +46,20 @@
 
 mod wire;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_log::ShardRef;
 use skys3_types::{CodedStripe, ETag, EpochSeq, FragmentId, NodeId};
 use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::fragment::{FragmentHeader, StripeInfo};
 use crate::{EcCodec, EcError, codec};
@@ -155,12 +165,40 @@ pub enum FragmentReadError {
 pub type ReadFuture<'a> =
     Pin<Box<dyn Future<Output = Result<FragmentBytes, FragmentReadError>> + Send + 'a>>;
 
+/// A future of [`FragmentSource::hold`]: the node noted the hold, or why
+/// not.
+pub type HoldFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
 /// What a coded read fetches fragments from: [`FragmentReadClient`] over
-/// the cluster transport, or a test's stand-in. The method returns a boxed
-/// future so a gateway can hold any source behind one `Arc`.
+/// the cluster transport, or a test's stand-in. The methods return boxed
+/// futures so a gateway can hold any source behind one `Arc`.
 pub trait FragmentSource: fmt::Debug + Send + Sync + 'static {
     /// Reads `request`'s bytes from its node.
     fn read(&self, request: FragmentRequest) -> ReadFuture<'_>;
+
+    /// A new read's registration number, unique among this node's reads
+    /// in progress, and how often the read renews its holds
+    /// (`read_registration_renew_interval_seconds`); or `None`, the
+    /// default, if reads through this source take no holds (§8.7).
+    fn register(&self) -> Option<(u64, Duration)> {
+        None
+    }
+
+    /// Asks `node` to hold `fragments` for read `registration` until it
+    /// renews the hold or it lapses, or, if `end`, to end the hold. A
+    /// renewal adds `fragments` to those the hold names.
+    fn hold(
+        &self,
+        node: NodeId,
+        registration: u64,
+        fragments: Vec<FragmentId>,
+        end: bool,
+    ) -> HoldFuture<'_> {
+        let _ = (node, registration, fragments, end);
+        Box::pin(std::future::ready(Err(
+            "this source takes no holds".to_owned()
+        )))
+    }
 }
 
 /// A read of bytes `range` of a coded object version.
@@ -230,6 +268,7 @@ pub async fn read_coded(
     read: CodedRead,
 ) -> Result<CodedBody, CodedReadError> {
     let pieces = pieces(&read)?;
+    let registration = Registration::start(&source, &read).await;
     let mut reader = Reader {
         source,
         stripe_count: read.stripes.len() as u32,
@@ -244,6 +283,9 @@ pub async fn read_coded(
     };
     let (sender, receiver) = mpsc::channel(1);
     tokio::spawn(async move {
+        // The holds last as long as the stream: dropping the registration
+        // ends them.
+        let _registration = registration;
         let Some(first) = first else { return };
         if sender.send(Ok(first)).await.is_err() {
             return;
@@ -257,6 +299,91 @@ pub async fn read_coded(
         }
     });
     Ok(receiver)
+}
+
+/// A read's holds on the fragments it may fetch: every fragment of the
+/// stripes its range covers, by node. Renewed in the background while it
+/// lives, and ended when it is dropped.
+struct Registration {
+    source: Arc<dyn FragmentSource>,
+    number: u64,
+    nodes: Arc<BTreeMap<NodeId, Vec<FragmentId>>>,
+    renewer: JoinHandle<()>,
+}
+
+impl Registration {
+    /// Registers `read`'s holds with every node it may read from, if
+    /// `source` takes holds, and starts renewing them.
+    async fn start(source: &Arc<dyn FragmentSource>, read: &CodedRead) -> Option<Self> {
+        let (number, renew) = source.register()?;
+        let mut nodes: BTreeMap<NodeId, Vec<FragmentId>> = BTreeMap::new();
+        let covered = read
+            .stripes
+            .iter()
+            .filter(|stripe| stripe.offset() < read.range.end && read.range.start < stripe.end());
+        for location in covered.flat_map(|stripe| stripe.fragments()) {
+            nodes
+                .entry(location.node.clone())
+                .or_default()
+                .push(location.fragment);
+        }
+        if nodes.is_empty() {
+            return None;
+        }
+        let nodes = Arc::new(nodes);
+        tell(source, number, &nodes, false).await;
+        let renewer = tokio::spawn({
+            let (source, nodes) = (Arc::clone(source), Arc::clone(&nodes));
+            async move {
+                loop {
+                    tokio::time::sleep(renew).await;
+                    tell(&source, number, &nodes, false).await;
+                }
+            }
+        });
+        Some(Self {
+            source: Arc::clone(source),
+            number,
+            nodes,
+            renewer,
+        })
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.renewer.abort();
+        // Ending the holds frees the fragments before they lapse; a
+        // runtime that is gone lets them lapse.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (source, nodes) = (Arc::clone(&self.source), Arc::clone(&self.nodes));
+            let number = self.number;
+            runtime.spawn(async move { tell(&source, number, &nodes, true).await });
+        }
+    }
+}
+
+/// Asks every node of `nodes` at once to hold its fragments for read
+/// `number`, or to end the hold.
+async fn tell(
+    source: &Arc<dyn FragmentSource>,
+    number: u64,
+    nodes: &BTreeMap<NodeId, Vec<FragmentId>>,
+    end: bool,
+) {
+    let mut holds = JoinSet::new();
+    for (node, fragments) in nodes {
+        let (source, node, fragments) = (Arc::clone(source), node.clone(), fragments.clone());
+        holds.spawn(async move {
+            let held = source.hold(node.clone(), number, fragments, end).await;
+            (node, held)
+        });
+    }
+    while let Some(joined) = holds.join_next().await {
+        if let Ok((node, Err(reason))) = joined {
+            tracing::debug!(%node, reason, "a read's hold was not noted");
+        }
+    }
 }
 
 /// Bytes `within` of data fragment `fragment` of stripe `stripe` (an

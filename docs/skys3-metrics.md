@@ -32,6 +32,7 @@ differ, or if section 6 misses a row of design section 13.
   - [3.8 Lifecycle](#38-lifecycle)
   - [3.9 Repair](#39-repair)
   - [3.10 Coordinator and placement](#310-coordinator-and-placement)
+  - [3.11 Fragment release](#311-fragment-release)
 - [4. Alerts](#4-alerts)
 - [5. Dashboard](#5-dashboard)
 - [6. Failure matrix coverage](#6-failure-matrix-coverage)
@@ -250,6 +251,24 @@ once the coordinator runs in the node binary.
 | `skys3_coordinator` | gauge | none | §6.7 | defined (M7-04) | 1 while this node holds the coordinator lease and serves its tenure, otherwise 0. The sum over the nodes is 1 in a healthy cluster; it is 0 while no node holds the lease, and briefly more than 1 while a node that lost the lease has not noticed. |
 | `skys3_placement_unsatisfied_buckets` | gauge | none | §6.7 | defined (M7-04) | Buckets whose placement policy the cluster does not satisfy now, as the coordinator last judged them: shards short of members in separate failure domains, members sharing a domain, or too few eligible domains for `replicas`. The admin API's placement health lists them. 0 on every node but the coordinator. |
 | `skys3_placement_short_shards` | gauge | none | §6.7 | defined (M7-04) | Shards of those buckets with fewer members in separate failure domains than `replicas`, counting only members on registered nodes that are not departing and carry the label `failure_domain` needs. 0 on every node but the coordinator. |
+
+### 3.11 Fragment release
+
+Design sections 8.7 and 10.3. A node keeps each fragment its shard primary
+released, or that orphan reclamation judged an orphan, for
+`fragment_release_delay_seconds` and while reads hold it, then reclaims it;
+fragment-segment compaction then gives its space back. The metrics are
+defined by M5-07 (`skys3_ec::ReleaseMetrics`) and exported once fragment
+stores run in the node binary.
+
+| Name | Type | Labels | Design | Status | Description |
+|---|---|---|---|---|---|
+| `skys3_fragment_released_bytes_total` | counter | none | §8.7 | defined (M5-07) | Bytes of fragments released on this node: fragments of versions that writes replaced and fragments that relocations moved away from, as their shard primaries told it, and orphans their primaries judged. |
+| `skys3_fragment_releasing_bytes` | gauge | none | §8.7 | defined (M5-07) | Bytes of released fragments this node still keeps, for the release delay or while reads hold them. |
+| `skys3_fragment_reclaimed_bytes_total` | counter | none | §8.7 | defined (M5-07) | Bytes of released fragments this node reclaimed: dropped once the release delay passed and no read held them, for fragment-segment compaction to remove. |
+| `skys3_fragment_compaction_segments_total` | counter | none | §10.3 | defined (M5-07) | Fragment segments that compaction removed on this node. |
+| `skys3_fragment_compaction_removed_bytes_total` | counter | none | §10.3 | defined (M5-07) | Bytes of the fragment segments compaction removed: the size of their files. The disk space given back is this less `skys3_fragment_compaction_copied_bytes_total`. |
+| `skys3_fragment_compaction_copied_bytes_total` | counter | none | §10.3 | defined (M5-07) | Bytes of live fragments compaction copied out of the segments it removed. |
 
 ## 4. Alerts
 
