@@ -9152,6 +9152,24 @@ of this file. A task with nothing unexpected keeps "None."
   CI's runners call the CLI natively, so the suite step should stay near
   the peering scenario's length and the job within its 15 minutes; the
   first CI run will tell.
+- **The suite's `metric` helper failed by chance on GitHub.** The first
+  CI run of the three legs failed reconcile in the file and etcd legs,
+  admin in the etcd leg, and flush-refused in the file leg, each silently
+  at a `value=$(metric ...)` assignment; the S3 leg passed. Nothing
+  depended on the control store. `metric` piped curl into an awk that
+  exits at the first match. GitHub's runners have gawk, which stops
+  reading there, while the development machine's awk is mawk, which reads
+  its whole input first. Once `/metrics` passes curl's 16 KiB buffer
+  (about 17 KB by the reconcile scenario), curl writes it in two parts;
+  when gawk has already exited, the second write fails (curl exit 23),
+  and under `pipefail` the assignment ends the scenario before `fail` can
+  say why. Against the etcd leg's node, with gawk unpacked from Ubuntu's
+  package, the old helper failed 10 of 200 calls and the new one none; with
+  mawk, 0 of 300. Running three legs at once only changed the timing:
+  before them, the file leg had passed on GitHub. `metric` now reads the
+  whole answer before searching it, and fails only if `/metrics` does not
+  answer. With gawk as `awk`, the three legs then passed side by side in
+  5 m 28 s; the etcd leg alone, with mawk, in 2 m 33 s.
 - **A shared loopback is one failure scope.** MinIO and the `ctl`
   cluster both listen on 127.0.0.1, so every write_back CreateBucket of
   the S3 leg was refused (`400`, the target shares the control store's
