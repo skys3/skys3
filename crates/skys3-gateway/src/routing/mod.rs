@@ -57,7 +57,7 @@ pub use map::ShardMap;
 pub use server::{ForwardServer, Served, serve_peers};
 
 use crate::conditions::{ConditionFailed, Precondition};
-use crate::fill::FillError;
+use crate::fill::{FillError, FillProgress};
 use crate::shard::{ShardError, ShardSummary, UploadParts};
 
 /// One call of the gateway's shard interface, as it is forwarded.
@@ -160,12 +160,14 @@ pub enum Request {
     /// A read-through fill of the whole of an evicted version, on the
     /// shard's primary, through the [`Fills`](crate::Fills) of its node
     /// (see [`ForwardServer::fill_with`]); answered once the version is
-    /// filled.
+    /// filled, or after `wait` with the fill's progress.
     Fill {
         /// The key.
         key: String,
         /// The evicted version.
         version: EpochSeq,
+        /// How long the replica may wait for the fill to end.
+        wait: Duration,
     },
 }
 
@@ -235,8 +237,9 @@ pub enum Response {
     /// The progress number and ranges of [`Request::ImportProgress`], or
     /// `None` if the shard applied none.
     ImportProgress(Option<(u64, ImportRanges)>),
-    /// The outcome of [`Request::Fill`]: filled, or why not.
-    Filled(Result<(), FillError>),
+    /// The outcome of [`Request::Fill`]: filled, still filling, or why
+    /// not.
+    Filled(Result<FillProgress, FillError>),
 }
 
 /// What a replica answers a forwarded request.

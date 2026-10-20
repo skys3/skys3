@@ -9641,7 +9641,11 @@ of this file. A task with nothing unexpected keeps "None."
   for the last byte matters: the entry turns clean only after the last
   extent is committed, and a gateway that resolved the key in between
   found it still evicted until its rounds ran out (seen once in four
-  e2e runs before the change).
+  e2e runs before the change). A review then found that one routed
+  request, with its 30 s timeout, could not cover the fill of a large
+  object or a slow target: the primary now answers after half the
+  request timeout with the bytes filled so far, and the gateway asks
+  again until the fill ends or makes no progress for a request timeout.
 - **A reference cycle kept the index open.** The forward server's fills
   hold the flush service, whose import commits go through the routed
   shards, which hold the forward server. The server now holds its fills

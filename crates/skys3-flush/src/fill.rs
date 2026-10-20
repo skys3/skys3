@@ -41,6 +41,7 @@ use std::fmt;
 use std::io;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{Entry, EntryState, Payload};
@@ -98,6 +99,18 @@ struct Progress {
     filled: u64,
     /// How the fill ended, once it has.
     end: Option<Result<(), FillError>>,
+}
+
+/// How far a [`Filler::fill_whole`] got within its wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WholeFill {
+    /// The version is filled: clean cache of the shard's replica.
+    Filled,
+    /// The fill goes on.
+    Filling {
+        /// The bytes it committed so far.
+        filled: u64,
+    },
 }
 
 /// A fill in progress: of a version of a key of a shard.
@@ -275,9 +288,11 @@ impl<S: ObjectStore> Filler<S> {
 
     /// Fills the whole of the evicted version `version` of `key`: joins the
     /// fill of that version in progress, or starts one, and waits until it
-    /// ends, so that the version is clean cache once it returns `Ok`. A
-    /// gateway on another node then reads it from this one as a holder
-    /// (§9.2).
+    /// ends, or for `wait` at most. [`WholeFill::Filled`] means the version
+    /// is clean cache: a gateway on another node then reads it from this
+    /// one as a holder (§9.2). [`WholeFill::Filling`] means the fill goes
+    /// on, with the bytes it committed so far: the caller asks again, and
+    /// judges from them whether it still makes progress.
     ///
     /// # Errors
     ///
@@ -287,9 +302,15 @@ impl<S: ObjectStore> Filler<S> {
         shard: &Shard<D>,
         key: &str,
         version: EpochSeq,
-    ) -> Result<(), FillError> {
+        wait: Duration,
+    ) -> Result<WholeFill, FillError> {
         let progress = self.join(shard, key, version);
-        progress.wait_for(|p| p.end.clone()).await
+        match tokio::time::timeout(wait, progress.wait_for(|p| p.end.clone())).await {
+            Ok(ended) => ended.map(|()| WholeFill::Filled),
+            Err(_) => Ok(WholeFill::Filling {
+                filled: lock(&progress.progress).filled,
+            }),
+        }
     }
 
     /// The progress of the fill of `version` of `key`, started if none is

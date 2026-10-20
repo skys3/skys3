@@ -1449,6 +1449,7 @@ fn fills_round_trip_and_malformed_ones_are_refused() {
     let request = Request::Fill {
         key: "cold".into(),
         version: EpochSeq::new(Epoch::new(2), Seq::new(5)),
+        wait: Duration::from_secs(15),
     };
     assert!(request.is_read() && !request.is_holder());
     let frame = wire::request_frame(&shard, Epoch::new(2), &request).unwrap();
@@ -1457,7 +1458,9 @@ fn fills_round_trip_and_malformed_ones_are_refused() {
         Ok((shard.clone(), Epoch::new(2), request))
     );
     for filled in [
-        Ok(()),
+        Ok(crate::FillProgress::Filled),
+        Ok(crate::FillProgress::Filling { filled: 0 }),
+        Ok(crate::FillProgress::Filling { filled: 1 << 40 }),
         Err(crate::FillError::Changed),
         Err(crate::FillError::Unavailable("the remote is down".into())),
     ] {
@@ -1484,7 +1487,7 @@ fn fills_round_trip_and_malformed_ones_are_refused() {
         } if reason.len() <= 1024 && reason.starts_with('é')
     ));
 
-    let served = |outcome: u32, reason: &str| {
+    let served = |outcome: u32, reason: &str, filled: u64| {
         let reply = wire::ForwardReply {
             outcome: wire::OUTCOME_SERVED,
             epoch: 1,
@@ -1494,6 +1497,7 @@ fn fills_round_trip_and_malformed_ones_are_refused() {
             result: Some(wire::Result::Filled(wire::FillAnswer {
                 outcome,
                 reason: reason.into(),
+                filled,
             })),
         };
         let frame = Frame::new(
@@ -1502,14 +1506,19 @@ fn fills_round_trip_and_malformed_ones_are_refused() {
         );
         wire::decode_reply(&frame, &shard)
     };
-    assert!(served(wire::FILL_FILLED, "").is_ok());
-    assert!(served(wire::FILL_FILLED, "why").is_err());
-    assert!(served(wire::FILL_CHANGED, "why").is_err());
-    assert!(served(7, "").is_err());
+    assert!(served(wire::FILL_FILLED, "", 0).is_ok());
+    assert!(served(wire::FILL_FILLING, "", 9).is_ok());
+    assert!(served(wire::FILL_FILLED, "why", 0).is_err());
+    assert!(served(wire::FILL_FILLED, "", 9).is_err());
+    assert!(served(wire::FILL_FILLING, "why", 9).is_err());
+    assert!(served(wire::FILL_CHANGED, "why", 0).is_err());
+    assert!(served(wire::FILL_UNAVAILABLE, "why", 9).is_err());
+    assert!(served(7, "", 0).is_err());
 
     let valid = wire::FillQuery {
         key: "cold".into(),
         version: Some(wire::Position { epoch: 2, seq: 5 }),
+        wait_ms: 60_000,
     };
     let refused = |change: &dyn Fn(&mut wire::FillQuery), payload: &'static [u8]| {
         let mut query = valid.clone();
@@ -1530,6 +1539,7 @@ fn fills_round_trip_and_malformed_ones_are_refused() {
     assert!(refused(&|q| q.key.clear(), b""));
     assert!(refused(&|q| q.key = "k".repeat(1025), b""));
     assert!(refused(&|q| q.version = None, b""));
+    assert!(refused(&|q| q.wait_ms = 60_001, b""));
     assert!(refused(&|_| {}, b"x"));
 }
 
@@ -1552,17 +1562,66 @@ impl crate::Fills for RecordedFills {
         unreachable!("a forwarded fill fills the whole version")
     }
 
-    fn fill(
-        &self,
-        shard: &ShardRef,
-        key: &str,
-        version: EpochSeq,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), crate::FillError>> + Send + '_>> {
+    fn fill(&self, shard: &ShardRef, key: &str, version: EpochSeq, _: Duration) -> FillFuture<'_> {
         self.asked
             .lock()
             .unwrap()
             .push((shard.clone(), key.to_owned(), version));
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(crate::FillProgress::Filled) })
+    }
+}
+
+type FillFuture<'a> = std::pin::Pin<
+    Box<dyn Future<Output = Result<crate::FillProgress, crate::FillError>> + Send + 'a>,
+>;
+
+/// Whole fills that take their time: `slow` makes progress until it is
+/// filled after [`SLOW_FILL`], and `stuck` never gets past its first
+/// bytes. Each answers after the wait it is given, as a node's do while
+/// the fill goes on.
+#[derive(Debug, Default)]
+struct SlowFills {
+    started: Mutex<Option<tokio::time::Instant>>,
+}
+
+/// How long the `slow` fill of [`SlowFills`] takes: several request
+/// timeouts of [`timing`].
+const SLOW_FILL: Duration = Duration::from_secs(2);
+
+impl crate::Fills for SlowFills {
+    fn read(
+        &self,
+        _: &ShardRef,
+        _: &str,
+        _: EpochSeq,
+        _: std::ops::Range<u64>,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<crate::FillBody, crate::FillError>> + Send + '_>,
+    > {
+        unreachable!("a forwarded fill fills the whole version")
+    }
+
+    fn fill(&self, _: &ShardRef, key: &str, _: EpochSeq, wait: Duration) -> FillFuture<'_> {
+        let started = *self
+            .started
+            .lock()
+            .unwrap()
+            .get_or_insert_with(tokio::time::Instant::now);
+        let stuck = key == "stuck";
+        Box::pin(async move {
+            let ends = started + SLOW_FILL;
+            if !stuck && tokio::time::Instant::now() + wait >= ends {
+                tokio::time::sleep_until(ends).await;
+                return Ok(crate::FillProgress::Filled);
+            }
+            tokio::time::sleep(wait).await;
+            let filled = if stuck {
+                7
+            } else {
+                u64::try_from(started.elapsed().as_millis()).unwrap()
+            };
+            Ok(crate::FillProgress::Filling { filled })
+        })
     }
 }
 
@@ -1585,19 +1644,19 @@ impl crate::Fills for RangeFills {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_evicted_version_is_filled_on_the_primary_for_any_gateway() {
-    let cluster = Cluster::start(timing()).await;
+/// Writes `key` through node 1, the primary of shard 0, flushes it, and
+/// evicts it there. Returns its version.
+async fn evicted(cluster: &Cluster, key: &str) -> EpochSeq {
     let shard = shard(0);
     let primary = cluster.gateway(1);
     let extent = Extent {
-        key: "cold".into(),
+        key: key.into(),
         offset: 0,
         data: Bytes::from_static(b"cold bytes"),
     };
     let extent = timed(primary.append_extent(&shard, extent)).await.unwrap();
     let put = RecordBody::Put(skys3_log::record::Put {
-        key: "cold".into(),
+        key: key.into(),
         size: 10,
         last_modified_ms: 0,
         etag: etag(1),
@@ -1615,7 +1674,16 @@ async fn an_evicted_version_is_filled_on_the_primary_for_any_gateway() {
     cluster.nodes[0].0.flush(&bucket_id()).await;
     let replica = cluster.nodes[0].0.local().set().get(&(&shard).into()).await;
     let replica = replica.unwrap();
-    replica.evict("cold", version).await.unwrap().unwrap();
+    replica.evict(key, version).await.unwrap().unwrap();
+    version
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_evicted_version_is_filled_on_the_primary_for_any_gateway() {
+    let cluster = Cluster::start(timing()).await;
+    let shard = shard(0);
+    let primary = cluster.gateway(1);
+    let version = evicted(&cluster, "cold").await;
 
     // Node 2's gateway asks node 1, which has no fills yet.
     let gateway = cluster.gateway(2);
@@ -1663,9 +1731,39 @@ async fn an_evicted_version_is_filled_on_the_primary_for_any_gateway() {
     // Fills that cannot fill whole versions refuse by default.
     let ranges: Arc<dyn crate::Fills> = Arc::new(RangeFills);
     assert_eq!(
-        timed(ranges.fill(&shard, "cold", version)).await,
+        timed(ranges.fill(&shard, "cold", version, WAIT)).await,
         Err(crate::FillError::Unavailable(
             "this node does not fill whole versions".into()
         ))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fill_longer_than_a_request_succeeds_while_it_progresses() {
+    let cluster = Cluster::start(timing()).await;
+    let shard = shard(0);
+    let slow = evicted(&cluster, "slow").await;
+    let stuck = evicted(&cluster, "stuck").await;
+    let fills: Arc<dyn crate::Fills> = Arc::new(SlowFills::default());
+    cluster.gateway(1).server().fill_with(&fills);
+    let gateway = cluster.gateway(2);
+    let timeout = timing().request_timeout;
+    assert!(SLOW_FILL > timeout * 3);
+
+    // A fill that takes several request timeouts, making progress all the
+    // while, succeeds.
+    let started = tokio::time::Instant::now();
+    assert_eq!(timed(gateway.fill(&shard, "slow", slow)).await, Ok(Ok(())));
+    assert!(started.elapsed() >= SLOW_FILL);
+
+    // A fill that makes no progress fails once it made none for a request
+    // timeout, plus one wait of half of it.
+    let started = tokio::time::Instant::now();
+    let stalled = timed(gateway.fill(&shard, "stuck", stuck)).await;
+    assert!(
+        matches!(&stalled, Err(ShardError::Unavailable { reason, .. }) if reason.contains("no progress")),
+        "{stalled:?}"
+    );
+    let took = started.elapsed();
+    assert!(took >= timeout && took < timeout * 4, "{took:?}");
 }

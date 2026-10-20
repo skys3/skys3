@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_flush::{Counters, FILL_CHUNK_BYTES, FillBody, FillError, Filler, FlushSettings};
+use skys3_flush::{
+    Counters, FILL_CHUNK_BYTES, FillBody, FillError, Filler, FlushSettings, WholeFill,
+};
 use skys3_index::{Entry, EntryState, Payload};
 use skys3_io::ManualWallClock;
 use skys3_log::RecordBody;
@@ -27,6 +29,9 @@ use skys3_sim::SimS3;
 use skys3_sim::s3::{Fault, Operation};
 use skys3_types::{ETag, EpochSeq};
 use support::{Node, Patience, md5_etag, remote, runtime, settings, target};
+
+/// Long enough for any whole fill of these tests to end.
+const LONG: Duration = Duration::from_secs(30);
 
 /// A fill's settings: 1 KiB extents, unless the test says otherwise.
 fn fill_settings(extent_bytes: u64) -> FlushSettings {
@@ -200,35 +205,53 @@ fn an_evicted_version_is_filled_and_becomes_clean() {
 
 #[test]
 fn a_whole_fill_returns_once_the_version_is_clean() {
-    runtime().block_on(async {
+    // On the real clock: with the paused one, the runtime would skip ahead
+    // to the end of a whole fill's wait while the shard's disk work runs
+    // on other threads.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
         let node = Node::open(23).await;
         let store = remote(23, false);
         let counters = Counters::default();
         let filler = filler(&store, 4, &counters);
         let etag = write_remote(&store, "k", "hello, world").await;
         let stub = import(&node, "k", 12, etag).await;
-        // A read of the first bytes is under way when the whole fill joins.
+        let requests = store.stats().requests;
+        // A whole fill that does not end within its wait reports its
+        // progress, and the fill goes on.
         store.inject(
             Operation::GetObject,
-            Fault::Delay(Duration::from_millis(100)),
+            Fault::Delay(Duration::from_millis(300)),
         );
+        let short = Duration::from_millis(50);
+        assert_eq!(
+            filler.fill_whole(&node.shard, "k", stub, short).await,
+            Ok(WholeFill::Filling { filled: 0 })
+        );
+        // A read of the first bytes is under way when the next whole fill
+        // joins the same fill.
         let (read, whole) = tokio::join!(
             read(&filler, &node, "k", stub, 0..4),
-            filler.fill_whole(&node.shard, "k", stub),
+            filler.fill_whole(&node.shard, "k", stub, LONG),
         );
         assert_eq!(read.unwrap(), b"hell");
-        assert_eq!(whole, Ok(()));
+        assert_eq!(whole, Ok(WholeFill::Filled));
         // No wait: the version is clean as the whole fill returns.
         let entry = node.entry("k").await.unwrap();
         assert_eq!((entry.version, entry.state), (stub, EntryState::Clean));
         assert_eq!(counters.fills.get(), 1);
+        assert_eq!(store.stats().requests - requests, 1, "one GET");
         // Now it is not evicted, and a version never was.
         assert_eq!(
-            filler.fill_whole(&node.shard, "k", stub).await,
+            filler.fill_whole(&node.shard, "k", stub, LONG).await,
             Err(FillError::Changed)
         );
         assert_eq!(
-            filler.fill_whole(&node.shard, "missing", stub).await,
+            filler.fill_whole(&node.shard, "missing", stub, LONG).await,
             Err(FillError::Changed)
         );
     });

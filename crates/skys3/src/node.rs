@@ -12,11 +12,12 @@ use skys3_config::{Config, ControlStoreBackend, LogFormat};
 use skys3_control::{ControlError, ProposalIds, RetryPolicy};
 use skys3_coord::{ControlHints, HeartbeatStatus};
 use skys3_flush::snapshot::SnapshotService;
-use skys3_flush::{Commit, DirtyBudget, FlushMetrics, FlushService, FlushSettings};
+use skys3_flush::{Commit, DirtyBudget, FlushMetrics, FlushService, FlushSettings, WholeFill};
 use skys3_gateway::{
-    BucketLookup, CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig,
-    GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, PeerRefusals, Precondition,
-    ShardPlacement, ShardRef, Shards, SigV4Authenticator, StaticCredentials, StsService,
+    BucketLookup, CredentialError, FillBody, FillError, FillProgress, Fills, Gateway,
+    GatewayConfig, GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, PeerRefusals,
+    Precondition, ShardPlacement, ShardRef, Shards, SigV4Authenticator, StaticCredentials,
+    StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
@@ -160,7 +161,8 @@ impl Fills for NodeFills {
         shard: &ShardRef,
         key: &str,
         version: skys3_types::EpochSeq,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), FillError>> + Send + '_>> {
+        wait: Duration,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<FillProgress, FillError>> + Send + '_>> {
         let (shard, key) = (shard.clone(), key.to_owned());
         Box::pin(async move {
             let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
@@ -181,8 +183,12 @@ impl Fills for NodeFills {
                 .filler(&shard.bucket)
                 .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
             filler
-                .fill_whole(&local, &key, version)
+                .fill_whole(&local, &key, version, wait)
                 .await
+                .map(|filled| match filled {
+                    WholeFill::Filled => FillProgress::Filled,
+                    WholeFill::Filling { filled } => FillProgress::Filling { filled },
+                })
                 .map_err(|error| match error {
                     skys3_flush::FillError::Changed => FillError::Changed,
                     other => FillError::Unavailable(other.to_string()),

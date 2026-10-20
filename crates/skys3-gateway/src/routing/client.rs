@@ -19,7 +19,7 @@ use tokio::time::Instant;
 
 use super::{ForwardServer, Reply, Request, Response, Served, ShardMap, wire};
 use crate::conditions::{ConditionFailed, Precondition};
-use crate::fill::FillError;
+use crate::fill::{FillError, FillProgress};
 use crate::shard::{
     ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome, write_each,
 };
@@ -240,23 +240,52 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     /// holder. The inner result is the fill's: [`FillError::Changed`] if
     /// the key no longer holds that evicted version.
     ///
+    /// However large the version, each request is answered within half
+    /// the request timeout: the primary answers with the bytes it filled
+    /// so far when the fill has not ended by then, and the gateway asks
+    /// again. It gives up once the fill made no progress for a whole
+    /// request timeout.
+    ///
     /// # Errors
     ///
     /// As every routed call: no replica serves the shard, or the primary's
-    /// node does not answer within the request timeout.
+    /// node does not answer within the request timeout; and
+    /// [`ShardError::Unavailable`] for a fill that stopped making progress.
     pub async fn fill(
         &self,
         shard: &ShardRef,
         key: &str,
         version: EpochSeq,
     ) -> Result<Result<(), FillError>, ShardError> {
-        let request = Request::Fill {
-            key: key.to_owned(),
-            version,
-        };
-        match self.call(shard, request).await? {
-            Response::Filled(filled) => Ok(filled),
-            _ => Err(mismatched(shard)),
+        let stall = self.config.request_timeout;
+        let wait = (stall / 2).min(wire::MAX_FILL_WAIT);
+        // The progress last reported, and when it last changed.
+        let mut last: Option<(u64, Instant)> = None;
+        loop {
+            let request = Request::Fill {
+                key: key.to_owned(),
+                version,
+                wait,
+            };
+            let filled = match self.call(shard, request).await? {
+                Response::Filled(Ok(FillProgress::Filled)) => return Ok(Ok(())),
+                Response::Filled(Ok(FillProgress::Filling { filled })) => filled,
+                Response::Filled(Err(error)) => return Ok(Err(error)),
+                _ => return Err(mismatched(shard)),
+            };
+            match last {
+                Some((before, since)) if before == filled => {
+                    if since.elapsed() >= stall {
+                        return Err(ShardError::Unavailable {
+                            shard: shard.clone(),
+                            reason: format!(
+                                "the primary's fill of {key} made no progress for {stall:?}, at {filled} bytes"
+                            ),
+                        });
+                    }
+                }
+                _ => last = Some((filled, Instant::now())),
+            }
         }
     }
 
