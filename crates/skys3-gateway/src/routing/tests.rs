@@ -694,7 +694,9 @@ async fn a_lost_answer_fails_a_write_and_moves_a_read_on() {
 async fn a_lost_answer_drops_the_nodes_idle_connections() {
     let cluster = Cluster::start(timing()).await;
     // Node 4 refuses every request as not holding the shard, until it
-    // "restarts": every connection it accepted ends.
+    // "restarts": every connection it accepted ends. It answers only once
+    // it has accepted two connections: the request that holds the first
+    // keeps it busy, so another request has to open a second.
     let transport = cluster.pki.transport(&node(4));
     let listener = transport
         .bind("127.0.0.1:0".parse().unwrap())
@@ -702,16 +704,20 @@ async fn a_lost_answer_drops_the_nodes_idle_connections() {
         .unwrap();
     let address: NodeAddress = listener.local_addr().unwrap().to_string().parse().unwrap();
     let connections = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
-    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let (held, count) = (Arc::clone(&connections), Arc::clone(&accepted));
+    let (count, accepted) = tokio::sync::watch::channel(0_usize);
+    let held = Arc::clone(&connections);
     tokio::spawn(async move {
         while let Ok(incoming) = listener.accept().await {
-            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            count.send_modify(|count| *count += 1);
+            let mut two = count.subscribe();
             held.lock().unwrap().spawn(async move {
                 let Ok(mut connection) = incoming.handshake().await else {
                     return;
                 };
                 while let Ok(Some(frame)) = connection.recv().await {
+                    if two.wait_for(|count| *count >= 2).await.is_err() {
+                        return;
+                    }
                     let (shard, _, _) = wire::decode_request(&frame).unwrap();
                     let reply = Reply::Refused(ShardError::NotFound(shard));
                     let answer = wire::reply_frame(&reply, frame.header.request_id);
@@ -743,7 +749,7 @@ async fn a_lost_answer_drops_the_nodes_idle_connections() {
     let read = || gateway.entry(&first_shard, "k");
     let reads = timed(async { tokio::join!(read(), read(), read(), read()) }).await;
     assert!(reads.0.is_err() && reads.3.is_err());
-    let before = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    let before = *accepted.borrow();
     assert!(before >= 2, "{before} connections");
 
     // Node 4 restarts. The first write is lost on an idle connection; the
@@ -760,10 +766,7 @@ async fn a_lost_answer_drops_the_nodes_idle_connections() {
     let second = timed(gateway.write(&shard(0), delete(), Precondition::None)).await;
     let error = second.unwrap_err().to_string();
     assert!(!error.contains("may have applied it"), "{error}");
-    assert_eq!(
-        accepted.load(std::sync::atomic::Ordering::SeqCst),
-        before + 1
-    );
+    assert_eq!(*accepted.borrow(), before + 1);
 }
 
 #[tokio::test]
