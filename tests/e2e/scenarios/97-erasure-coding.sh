@@ -166,10 +166,20 @@ for i in 1 2 3 4; do
 done
 echo "${nodes[*]}" >"$work/running"
 create_bucket "$(s3_of ec1)" "$key" "$secret" "$bucket"
-placed() { shard ec1 | jq -e '(.members | length) == 3 and .primary != null' >/dev/null; }
+# placement: the shard as the first node that has it placed reports it;
+# a node that holds no replica of it reports no members.
+placement() {
+    local node
+    for node in "${nodes[@]}"; do
+        shard "$node" | jq -ce 'select((.members | length) == 3 and .primary != null)' && return
+    done
+    return 1
+}
+placed() { placement >/dev/null; }
 eventually 30 "the bucket's shard has 3 members" placed
-primary=$(shard ec1 | jq -r .primary)
-members=$(shard ec1 | jq -r '.members | join(" ")')
+placement >"$work/shard"
+primary=$(jq -r .primary "$work/shard")
+members=$(jq -r '.members | join(" ")' "$work/shard")
 replica() { shard "$1" | jq -e '.source == "replica"' >/dev/null; }
 for node in $members; do
     eventually 30 "$node holds its replica" replica "$node"

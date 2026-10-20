@@ -1,12 +1,12 @@
 //! Erasure coding in the node binary (plan M8-07a; design §8.2–§8.5,
 //! §8.7), on four nodes over the in-process stand-in for etcd: a large
 //! object of a `local` bucket is coded and its members drop their
-//! replicas; it reads back whole through every node, and through the
-//! others while each holder of a fragment that does not lead the shard is
-//! down; an overwrite codes the new version and releases the old
-//! version's fragments, which their nodes reclaim; a fragment no layout
-//! names is reclaimed as an orphan; and an operator tool's certificate
-//! cannot write fragments.
+//! replicas; it reads back whole through every node; a fragment no layout
+//! names is reclaimed as an orphan, and an operator tool's certificate
+//! cannot write fragments; an overwrite codes the new version and
+//! releases the old version's fragments, which their nodes reclaim; and
+//! the new version reads back through the others while each node that
+//! does not lead the shard is down in turn.
 
 mod support;
 
@@ -158,6 +158,20 @@ impl Cluster {
         holders
     }
 
+    /// The bucket's one shard as the first node that reports it placed
+    /// knows it: with three members and a primary. A node that holds no
+    /// replica of the shard reports no members.
+    async fn placed(&self) -> Option<serde_json::Value> {
+        for i in self.running() {
+            let shard = self.shard(i).await;
+            let members = shard["members"].as_array().map_or(0, Vec::len);
+            if members == 3 && shard["primary"].is_string() {
+                return Some(shard);
+            }
+        }
+        None
+    }
+
     /// The bucket's one shard as `node` knows it.
     async fn shard(&self, node: usize) -> serde_json::Value {
         let answer = admin_json(&self.admin(node), "/v1/shards").await;
@@ -283,12 +297,10 @@ async fn objects_are_coded_read_degraded_released_and_orphans_reclaimed() {
         .await
         .unwrap();
     until("the shard has three members", || async {
-        cluster.shard(0).await["members"]
-            .as_array()
-            .is_some_and(|members| members.len() == 3)
+        cluster.placed().await.is_some()
     })
     .await;
-    let shard = cluster.shard(0).await;
+    let shard = cluster.placed().await.unwrap();
     let primary_name = shard["primary"].as_str().unwrap().to_owned();
     let primary = cluster
         .names
@@ -324,7 +336,6 @@ async fn objects_are_coded_read_degraded_released_and_orphans_reclaimed() {
     })
     .await;
     assert_eq!(cluster.total("skys3_encoded_objects_total").await, 1.0);
-    let holders = cluster.holders().await;
 
     // The members drop their replicas: only the last bulk segment, which
     // still takes records, may hold some of its bytes.
@@ -349,33 +360,6 @@ async fn objects_are_coded_read_degraded_released_and_orphans_reclaimed() {
             .await
             > 0.0
     );
-
-    // With each holder that does not lead the shard down in turn, the
-    // object reads back through another node, decoded where the holder
-    // held a data fragment: at least one of them did.
-    let mut parity_reads = 0.0;
-    for &down in holders.iter().filter(|holder| **holder != primary) {
-        cluster.nodes[down]
-            .take()
-            .unwrap()
-            .shutdown()
-            .await
-            .unwrap();
-        let reader = (down + 1..down + 4)
-            .map(|i| i % 4)
-            .find(|i| *i != primary)
-            .unwrap();
-        let before = metric(&cluster.admin(reader), parity).await;
-        let client = cluster.client(reader);
-        until("the object reads back with a holder down", || {
-            reads(&client, "large", &large)
-        })
-        .await;
-        parity_reads += metric(&cluster.admin(reader), parity).await - before;
-        let node = cluster.boot(down).await;
-        cluster.nodes[down] = Some(node);
-    }
-    assert!(parity_reads > 0.0, "no read decoded around a lost holder");
 
     // A fragment of an attempt no primary started is an orphan: its node
     // asks the primary, and reclaims it.
@@ -441,6 +425,37 @@ async fn objects_are_coded_read_degraded_released_and_orphans_reclaimed() {
     for i in 0..4 {
         assert!(reads(&cluster.client(i), "large", &replaced).await);
     }
+
+    // With each node that does not lead the shard down in turn, the new
+    // version reads back through another node, decoded where the node held
+    // a data fragment. Three of the four nodes hold a fragment each, so at
+    // least one data fragment is on a node that does not lead. This comes
+    // last: without a coordinator, the members shut down are removed from
+    // the shard and not admitted again, which may leave it too few members
+    // to take writes.
+    let mut parity_reads = 0.0;
+    for down in (0..4).filter(|i| *i != primary) {
+        cluster.nodes[down]
+            .take()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        let reader = (down + 1..down + 4)
+            .map(|i| i % 4)
+            .find(|i| *i != primary)
+            .unwrap();
+        let before = metric(&cluster.admin(reader), parity).await;
+        let client = cluster.client(reader);
+        until("the object reads back with a node down", || {
+            reads(&client, "large", &replaced)
+        })
+        .await;
+        parity_reads += metric(&cluster.admin(reader), parity).await - before;
+        let node = cluster.boot(down).await;
+        cluster.nodes[down] = Some(node);
+    }
+    assert!(parity_reads > 0.0, "no read decoded around a node down");
 
     for node in cluster.nodes.iter_mut().filter_map(Option::take) {
         node.shutdown().await.unwrap();

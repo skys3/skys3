@@ -9907,11 +9907,18 @@ of this file. A task with nothing unexpected keeps "None."
   `a_coded_versions_extents_do_not_wait_for_the_staging_ttl`, which
   fails without the fix); the release delay still applies. Design §10.3
   says so.
-- **Waiting for placement.** The integration test first waited for all
-  four nodes' `GET /v1/shards` to show the shard's members, and timed out
-  on the node that holds no replica; it now waits for node 0's answer and
-  for each member to report its replica (`source` `replica`), as the e2e
-  scenario does.
+- **Flaky at first, two ways.** The integration test passed alone and
+  then failed in the full suite, and in two of three runs alone. (1) It
+  read the shard's placement from node 0's `GET /v1/shards`, and a node
+  that holds no replica of a shard reports no members: it timed out
+  whenever placement left node 0 out. The test and the e2e scenario now
+  take the first node that reports the shard placed. (2) Without a
+  coordinator, a member that is shut down is removed from the shard and
+  not admitted again (M8-05b), so when both holders it shut down were
+  members, the primary was left alone below `min_write_replicas`, and the
+  overwrite that followed answered `503` for good. The outages now come
+  last, over every node that does not lead, after the overwrite; it then
+  passed 6 runs in 6.
 - **New metrics.** `skys3_encoded_objects_total`,
   `skys3_encodings_superseded_total`, `skys3_encodings_abandoned_total`,
   `skys3_fragment_stored_bytes`, and `skys3_fragment_reads_total{fragment,
@@ -9919,14 +9926,15 @@ of this file. A task with nothing unexpected keeps "None."
   exported.
 - **Tests.** `skys3/tests/coding.rs`: 4 nodes over the fake etcd, a 2+1
   geometry; a large object is coded on 3 nodes, the members drop their
-  bytes, every node reads it with no parity read, each holder that does
-  not lead is shut down in turn and the object read through another
-  node (decoding where it held a data fragment), an `admin` certificate
+  bytes, every node reads it with no parity read, an `admin` certificate
   cannot write a fragment, a stray node's fragment is reclaimed as an
-  orphan, and an overwrite releases the old fragments; about 25 s.
+  orphan, an overwrite releases the old fragments, and each node that
+  does not lead is then shut down in turn and the new version read
+  through another node (decoding where it held a data fragment); about
+  28 s.
 - **The e2e scenario's cost.** `erasure-coding`
   (`tests/e2e/scenarios/97-erasure-coding.sh`, etcd leg only, ports
-  E2E_PORT+50 to +61) ran in 21 s on the development machine: the object
+  E2E_PORT+50 to +61) ran in 21 to 24 s on the development machine: the object
   was coded 2 s after its PUT and the members' replicas gone 4 s after
   it; GET after `kill -9` of a holder answered at once. It needs `[storage]
   segment_bytes` of 2 MiB so the object's bytes sit in sealed segments,
