@@ -8804,6 +8804,18 @@ of this file. A task with nothing unexpected keeps "None."
   nothing checked again. Both now drop the shard for the rest of the scan,
   as a failed page read did, and the scan stops listing once no shard is
   left, instead of fetching every remaining page.
+- **The scan interval was no barrier in the tests.** The flush crate's
+  scan tests failed about one run in ten under CPU load: a report still
+  covered shard 1 after the test closed it, or missed a key deleted just
+  before. It was the test, not the scan: each failing run had a scan
+  finished or under way before the test's last change, which the test then
+  took as the next report. The tests run on a paused clock, and the
+  runtime jumps to the next timer, the 60-second scan interval, whenever it
+  waits for the index's blocking thread, so the interval in simulated time
+  says nothing about when a scan runs. `next_report` now waits for a scan
+  that starts after the call, taking the finished-scan count and whether
+  one is running as its baseline; a scan takes its shards and marks itself
+  running in one step, so that scan saw every earlier change.
 - **No cluster-simulation scenario.** The scan writes nothing, so a
   scenario would check only the absence of reports under faults, which the
   flush crate's workload test does in under a second. The simulation jobs'
