@@ -12,5 +12,5 @@ RUN apt-get update \
 WORKDIR /client
 COPY requirements.txt .
 RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
-COPY run-subset.sh skys3_s3tests.py subset.txt ./
+COPY run-subset.sh skys3_s3tests.py subset.txt excluded.txt ./
 ENTRYPOINT ["sh", "/client/run-subset.sh", "/s3-tests"]

@@ -9192,6 +9192,85 @@ of this file. A task with nothing unexpected keeps "None."
   the TLS options made explicit were the defaults), so the 256-seed
   `harness` run is the only simulation run.
 
+### M7-01 S3 conformance and compatibility matrix
+
+- **The matrix's tables are test output.** `docs/skys3-s3-compatibility.md`
+  is prose around generated sections between `<!-- BEGIN/END -->`
+  markers. Each test that generates a section also compares it with the
+  committed one and fails on a difference, printing the table it
+  expected; `SKYS3_UPDATE_DOCS=1` rewrites it instead. So the doc is now
+  a test input, and `scripts/ci/docs-only.sh` no longer counts a change
+  to it as documentation only.
+- **Which operation a probe reached is read from `s3s`'s own log.**
+  `s3s` 0.17 emits a debug event "resolved route" with the operation's
+  name, and `tests/compatibility.rs` captures it with a subscriber of its
+  own, so every row checks both the routing and the answer. Tracing
+  caches a callsite's interest the first time it is hit, which made the
+  event vanish when probes ran on several test threads with scoped
+  dispatchers; all probes run in one test, and it rebuilds the interest
+  cache first.
+- **Unimplemented operations parse before they answer 501.** `s3s`
+  parses an operation's input before calling the default
+  `NotImplemented` handler, so a probe with a malformed body gets a
+  `400` instead; each probe carries a valid body. Operations with no IAM
+  action keep answering `403 AccessDenied` (design §11), as
+  `operations_without_an_action_are_denied_to_everyone` already decided;
+  the matrix says so rather than call them 501.
+- **Every s3-tests test is classified.** The plugin fails the run if a
+  collected test is neither selected nor excluded, or if a list line
+  matches nothing, so a new pinned revision cannot add or rename tests
+  unnoticed. Exclusions carry a kind; `open` was added beside
+  `unsupported`, `divergence`, and `assumption` so that gaps in supported
+  features show in the published table as open points instead of hiding
+  among unsupported features.
+- **Two divergences were fixed instead of excluded.** An empty delimiter
+  was echoed in listings although it rolls up nothing; it is now treated
+  as absent. A CompleteMultipartUpload sent again after the upload
+  completed answered `404 NoSuchUpload`; it now answers as the completion
+  did while the key's current version carries the upload's write
+  identity, so a client retrying a lost answer sees success, as with S3.
+  That moved five tests into the subset (both empty-delimiter listings,
+  `test_multipart_upload`, `test_multipart_upload_small`, and
+  `test_multipart_reupload_checksum_and_etag`).
+- **Two gaps are left open.** No answer carries `x-amz-request-id` and
+  no error document a `RequestId` (`test_object_requestid_matches_header_on_error`):
+  `s3s` can put one in its errors, but giving every answer an ID,
+  including those `s3s` builds itself, needs a layer around the service
+  and a choice of ID that logs can use, which is more than a fix.
+  PutObject and HeadObject do not return `x-amz-expiration`
+  (`test_lifecycle_expiration_header_put`, `_head`, `_tags_head`, and
+  `_and_tags_head`, which passes only because the header is never sent):
+  it needs the lifecycle rules evaluated on the request path.
+- **The divergences are not checked against AWS.** Nothing in this
+  environment reaches AWS S3, so each divergence follows the AWS
+  documentation as design §11 reads it; several of the tests that
+  disagree are also marked by s3-tests as failing on RGW.
+- **Tests that pass by accident stay excluded.** 35 excluded tests pass,
+  nearly all because they accept any error for a feature SkyS3 rejects
+  (S3 Select, POST object, some SSE-C and SSE-KMS tests). Five Object Lock
+  tests on a bucket without it, and the owner-only canned ACLs, pass
+  because SkyS3 answers what S3 answers there, so they are selected as
+  checks of the rejected features' answers.
+- **The lifecycle clock is shortened for s3-tests.** The selected
+  `test_lifecycle_expiration_date` waits three times `lc_debug_interval`
+  (10 seconds by default); the configuration now sets it to 2, since the
+  matrix's node applies lifecycle rules every second. The tests that rely
+  on RGW turning days into that interval stay excluded.
+- **The run was local, not in the images.** The subset ran on the host
+  with `SKYS3_SDK_LOCAL=1` against a checkout of the pinned commit; the
+  other SDK clients' images were not built here. A full run of every test
+  (`SKYS3_S3TESTS_ALL=1`) took about 21 minutes, most of it pytest
+  formatting tracebacks for the failures by reparsing the 20,000-line
+  `test_s3.py`; `run-subset.sh` now passes `--tb=no` in that mode. The
+  subset of 249 tests took 250 to 270 seconds locally, against 2.5 minutes
+  for the 216 of M1-25 in CI; the additions include the slow DeleteObjects
+  limits and `delimiter_not_skip_special`.
+- **A node warning predates this task.** The node log, which the matrix
+  prints when a client fails, showed every second that the node cannot
+  sync the control-state copy because a shard's configuration differs in
+  epoch 1, at the base commit too. It comes from
+  `skys3::cluster::control`, outside this task, and fails nothing.
+
 ## M8 Cluster binary
 
 ### M8-01 End-to-end harness and single-node suite
