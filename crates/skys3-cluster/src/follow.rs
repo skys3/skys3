@@ -206,7 +206,14 @@ impl<N: Network, D: Disk> RegisterFollower<N, D> {
             if let Some(replica) = &open {
                 self.shards.observer().found(replica);
             }
-            if open.is_some_and(|replica| replica.config().epoch >= config.epoch) {
+            // A replica that stopped in a configuration naming the node a
+            // learner, as a primary that handed off and adopted the
+            // register that re-admits it, opens again as one.
+            let readmitted =
+                |replica: &skys3_shard::Shard<D>| replica.is_stopped() && config.is_learner(node);
+            if open.is_some_and(|replica| {
+                replica.config().epoch >= config.epoch && !readmitted(&replica)
+            }) {
                 continue;
             }
             match self.shards.open_config(shard, &config).await {

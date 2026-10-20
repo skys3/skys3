@@ -380,11 +380,18 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 Err(error) => Err(error.to_string()),
             }
         };
+        let lost = |error: String| {
+            // The node's other idle connections most likely failed with
+            // this one, as when it restarted: the next request connects
+            // anew rather than lose its answer on one of them too.
+            self.forget_idle(node);
+            Attempt::Lost(error)
+        };
         let reply: Frame = match tokio::time::timeout(self.config.request_timeout, exchange).await {
             Ok(Ok(reply)) => reply,
-            Ok(Err(error)) => return Attempt::Lost(error),
+            Ok(Err(error)) => return lost(error),
             Err(_) => {
-                return Attempt::Lost(format!(
+                return lost(format!(
                     "no answer within {:?}",
                     self.config.request_timeout
                 ));
@@ -395,8 +402,13 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 self.idle(node, connection);
                 Attempt::Reply(reply)
             }
-            Err(error) => Attempt::Lost(format!("an answer that does not decode: {error}")),
+            Err(error) => lost(format!("an answer that does not decode: {error}")),
         }
+    }
+
+    /// Drops the idle connections to `node`.
+    fn forget_idle(&self, node: &NodeId) {
+        lock(&self.inner.idle).remove(node);
     }
 
     /// Sends `request`, a holder's (see [`Request::is_holder`]), to the

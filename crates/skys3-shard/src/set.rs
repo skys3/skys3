@@ -199,13 +199,17 @@ impl<D: Disk> ShardSet<D> {
             // under the same primary once members it never knew joined
             // (as rebalancing and replacement both do, plan M3-06): a
             // configuration change never makes an unknown node a member.
+            // So does a replica that stopped in the configuration that
+            // re-admits it, as a primary that handed the shard off does
+            // when the register it reads already names it a learner.
             let readmitted = node.is_some_and(|node| {
                 let unknown = |member: &NodeId| !held.is_member(member) && !held.is_learner(member);
-                config.epoch > held.epoch
-                    && config.is_learner(node)
-                    && (!held.is_learner(node)
-                        || held.primary != config.primary
-                        || config.members.iter().any(unknown))
+                config.is_learner(node)
+                    && ((shard.is_stopped() && config.epoch >= held.epoch)
+                        || (config.epoch > held.epoch
+                            && (!held.is_learner(node)
+                                || held.primary != config.primary
+                                || config.members.iter().any(unknown))))
             });
             if readmitted {
                 shard.abandon("the node is re-admitted as a learner").await;
