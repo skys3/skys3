@@ -490,6 +490,8 @@ mod tests {
             node_id: None,
             data_dir: dir.join("data"),
             disks: disks.iter().map(|disk| dir.join(disk)).collect(),
+            zone: None,
+            rack: None,
         }
     }
 
@@ -622,6 +624,8 @@ mod tests {
             node_id: None,
             data_dir: file.join("data"),
             disks: Vec::new(),
+            zone: None,
+            rack: None,
         };
         let error = DataDir::open(&config, &cluster("c"), None).unwrap_err();
         assert!(matches!(error, DataDirError::Io { .. }));

@@ -1634,3 +1634,132 @@ tls_ca_file = "/etc/skys3/ca.crt"
         &["peering.peers.skys3-prod-eu.s3_access_key_ids"],
     );
 }
+
+// [cluster] multi_node, the transport's address, labels, and handshake caps
+// (M8-04)
+
+/// A cluster with `multi_node = true` over etcd, plus `extra` sections.
+fn multi_node(extra: &str) -> String {
+    format!(
+        "[cluster]\ncluster_id = \"c1\"\nmulti_node = true\n\
+         [control_store]\netcd_endpoints = [\"https://etcd-1:2379\"]\n{extra}"
+    )
+}
+
+const NODE_FILES: &str = "tls_cert_file = \"/n.crt\"\ntls_key_file = \"/n.key\"\n\
+                          tls_ca_file = \"/ca.crt\"";
+
+/// The keys of the rules `text` breaks, in order.
+fn violated_keys(text: &str) -> Vec<String> {
+    violations_of(text)
+        .as_slice()
+        .iter()
+        .map(|v| v.key.clone())
+        .collect()
+}
+
+#[test]
+fn several_nodes_are_off_by_default() {
+    let config = load("").unwrap();
+    assert!(!config.cluster().multi_node);
+    // A single node needs neither certificates nor an address.
+    assert_eq!(config.transport().advertised(), None);
+    // Nor a store that several nodes can share.
+    "[cluster]\ncluster_id = \"c1\"\n[control_store]\nbackend = \"file\""
+        .parse::<Config>()
+        .unwrap();
+}
+
+#[test]
+fn several_nodes_need_a_shared_store_certificates_and_an_address() {
+    let config: Config = multi_node(&format!(
+        "[transport]\nlisten = \"0.0.0.0:7400\"\nadvertise = \"node-1.example:7400\"\n{NODE_FILES}"
+    ))
+    .parse()
+    .unwrap();
+    assert!(config.cluster().multi_node);
+    assert_eq!(
+        config.transport().advertised().unwrap().to_string(),
+        "node-1.example:7400"
+    );
+    // A specific listen address is the advertised one.
+    let config: Config = multi_node(&format!(
+        "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
+    ))
+    .parse()
+    .unwrap();
+    assert_eq!(
+        config.transport().advertised().unwrap().to_string(),
+        "10.0.0.5:7400"
+    );
+
+    // No certificates, and a wildcard listen address without advertise.
+    assert_eq!(
+        violated_keys(&multi_node("")),
+        [
+            "transport.tls_cert_file",
+            "transport.tls_key_file",
+            "transport.tls_ca_file",
+            "transport.advertise"
+        ]
+    );
+    // Some certificates: the usual rule names the missing ones.
+    assert_eq!(
+        violated_keys(&multi_node(
+            "[transport]\nlisten = \"10.0.0.5:7400\"\ntls_cert_file = \"/n.crt\""
+        )),
+        ["transport.tls_key_file", "transport.tls_ca_file"]
+    );
+    // The file store serves one node.
+    let text = format!(
+        "[cluster]\ncluster_id = \"c1\"\nmulti_node = true\n[control_store]\nbackend = \"file\"\n\
+         [transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}"
+    );
+    assert_eq!(violated_keys(&text), ["control_store.backend"]);
+    let violations = violations_of(&text);
+    assert!(
+        violations.to_string().contains("serves one node"),
+        "{violations}"
+    );
+    // An advertised address is host:port.
+    let error = parse_error(&multi_node("[transport]\nadvertise = \"no-port\""));
+    assert!(error.contains("advertise"), "{error}");
+}
+
+#[test]
+fn nodes_carry_valid_zone_and_rack_labels() {
+    let config = load("[node]\nzone = \"eu-1a\"\nrack = \"r12\"").unwrap();
+    assert_eq!(config.node().zone.as_ref().unwrap().as_str(), "eu-1a");
+    assert_eq!(config.node().rack.as_ref().unwrap().as_str(), "r12");
+    let config = load("").unwrap();
+    assert_eq!((&config.node().zone, &config.node().rack), (&None, &None));
+    assert_violations(
+        "[node]\nzone = \"EU 1a\"\nrack = \"\"",
+        &["node.zone", "node.rack"],
+    );
+}
+
+#[test]
+fn every_listener_caps_its_handshakes() {
+    let config = load("").unwrap();
+    assert_eq!(config.transport().max_inflight_handshakes, 256);
+    assert_eq!(config.gateway().max_inflight_handshakes, 256);
+    assert_eq!(config.peering().peer_max_inflight_handshakes, 256);
+    let config = load(
+        "[transport]\nmax_inflight_handshakes = 16\n[gateway]\nmax_inflight_handshakes = 1\n\
+         [peering]\npeer_max_inflight_handshakes = 65536",
+    )
+    .unwrap();
+    assert_eq!(config.transport().max_inflight_handshakes, 16);
+    assert_eq!(config.gateway().max_inflight_handshakes, 1);
+    assert_eq!(config.peering().peer_max_inflight_handshakes, 65_536);
+    assert_violations(
+        "[transport]\nmax_inflight_handshakes = 0\n[gateway]\nmax_inflight_handshakes = 65537\n\
+         [peering]\npeer_max_inflight_handshakes = 0",
+        &[
+            "gateway.max_inflight_handshakes",
+            "transport.max_inflight_handshakes",
+            "peering.peer_max_inflight_handshakes",
+        ],
+    );
+}

@@ -1645,16 +1645,20 @@ The [configuration reference](skys3-config.md) lists every key with its type, de
 [cluster]
 cluster_id = "skys3-prod-a"
 failure_domain = "node"       # "node", "rack", or "zone"; nodes carry rack and zone labels
+multi_node = false            # true: one of several nodes (transport, registration); never with backend = "file"
 
 [node]
 node_id = "node-a1"           # optional; generated and kept in data_dir when unset
 data_dir = "/var/lib/skys3"   # node.json, index.redb, and a file control store
 disks = ["/srv/nvme0/skys3", "/srv/nvme1/skys3"]   # log segments, one directory per disk
+zone = "eu-central-1a"        # labels the node registers (section 6.7); optional
+rack = "r12"
 
 [gateway]                     # S3 and STS
 listen = "0.0.0.0:443"
 tls_cert_file = "/etc/skys3/tls/server.crt"   # with tls_key_file: HTTPS; without both: plain HTTP
 tls_key_file = "/etc/skys3/tls/server.key"
+max_inflight_handshakes = 256 # TLS handshakes at once; more connections wait (section 12)
 
 [control_store]
 backend = "etcd"              # "etcd" (production default), "s3" (AWS S3, R2, other probed stores), or "file" (single node)
@@ -1675,6 +1679,8 @@ config_poll_interval_seconds = 30
 
 [transport]                   # intra-cluster mutual TLS (section 12)
 listen = "0.0.0.0:7400"
+advertise = "node-a1.example.internal:7400"   # registered for other nodes; defaults to a specific listen address
+max_inflight_handshakes = 256 # TLS handshakes at once; more connections wait
 tls_cert_file = "/etc/skys3/node.crt"   # leaf names the node: spiffe://<cluster_id>/node/<node-id>
 tls_key_file = "/etc/skys3/node.key"
 tls_ca_file = "/etc/skys3/cluster-ca.crt"
@@ -1772,6 +1778,7 @@ peer_connections_per_shard = 64    # upper bound; mirrors flush_max_concurrency_
 peer_max_inflight_bytes = 268435456
 peer_staging_quota_bytes = 1099511627776
 peer_staging_ttl_seconds = 86400
+peer_max_inflight_handshakes = 256   # handshakes at once; more connections are refused
 
 [peering.peers.skys3-prod-eu]   # a trusted peer cluster (section 12)
 ca_file = "/etc/skys3/peers/skys3-prod-eu-ca.crt"   # the peer's CA bundle

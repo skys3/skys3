@@ -98,7 +98,9 @@ pub use peering::{
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};
 pub use target::parse_target;
-pub use transport::{TlsFiles, TransportConfig};
+pub use transport::{
+    DEFAULT_MAX_INFLIGHT_HANDSHAKES, MAX_INFLIGHT_HANDSHAKES, TlsFiles, TransportConfig,
+};
 
 use buckets::BucketTable;
 use cluster::{RawCluster, RawControlStore};
@@ -217,6 +219,9 @@ impl Config {
         raw.peering.check(cluster_id, &raw.transport, &mut checker);
         raw.identity.check(&mut checker);
         raw.admin.check(&mut checker);
+        if raw.cluster.multi_node {
+            check_multi_node(&control_store, &raw.transport, &mut checker);
+        }
         check_control_store_independence(&control_store, &named_buckets, &mut checker);
         check_peer_sources(&raw.peering, &named_buckets, &mut checker);
         check_stripes(
@@ -351,6 +356,26 @@ impl FromStr for Config {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         Self::from_toml_str(text)
     }
+}
+
+/// The rules of `[cluster] multi_node = true` (§6.2, §6.7): a control store
+/// several nodes can share, never the file store, and the transport the
+/// nodes authenticate each other over, at an address they can reach.
+fn check_multi_node(
+    control_store: &ControlStoreConfig,
+    transport: &TransportConfig,
+    checker: &mut Checker,
+) {
+    checker.require(
+        !matches!(control_store.backend, ControlStoreBackend::File { .. }),
+        "control_store.backend",
+        || {
+            "is \"file\", which serves one node; [cluster] multi_node = true needs \"etcd\" or \
+             \"s3\""
+                .to_owned()
+        },
+    );
+    transport.check_multi_node(checker);
 }
 
 /// Refuses an S3 control store that a bucket's backup or snapshot target
