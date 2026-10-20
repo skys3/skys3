@@ -218,8 +218,8 @@ async fn drill_dirty_budget() {
 
 /// `control-store-unreachable` and `identity-staleness`: the control
 /// store's volume goes away under a running node, which serves from its
-/// copy and refuses bucket changes; the volume returns, and a restart
-/// reopens the store and refreshes the identity copy.
+/// copy and refuses bucket changes; the volume returns, and the node
+/// reopens the store by itself and refreshes the identity copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drill_control_store_outage() {
     let dir = tempfile::tempdir().unwrap();
@@ -252,7 +252,12 @@ async fn drill_control_store_outage() {
         Some("The cluster's control store failed"),
         "{refused:?}"
     );
-    // Symptoms: the last successful read stops moving.
+    // Symptoms: the node drops the failed store and serves its copy, and
+    // the last successful read stops moving.
+    until("the node serves its copy", async || {
+        metric(&node, "skys3_control_store_live").await == 0.0
+    })
+    .await;
     let mut last = metric(&node, read).await;
     until("the node stops reading the store", async || {
         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -260,31 +265,40 @@ async fn drill_control_store_outage() {
         std::mem::replace(&mut last, now) == now
     })
     .await;
-    // `skys3_control_store_live` stays 1: it shows only whether the store
-    // answered since startup.
-    assert_eq!(metric(&node, "skys3_control_store_live").await, 1.0);
-    // Diagnosis: the log says why, and the data path goes on.
-    assert!(log_text(dir.path()).contains("cannot read the control store's generation"));
+    // Diagnosis: the log says why, and the data path goes on; bucket
+    // changes now get the 503 of a node that runs from its copy.
+    let log = log_text(dir.path());
+    assert!(
+        log.contains("the control store failed; serving the local copy"),
+        "{log}"
+    );
+    assert!(log.contains("is missing"), "{log}");
     put(&s3, "kept", "b", b"beta").await;
     assert_eq!(get(&s3, "kept", "a").await, b"alpha");
     assert_eq!(metric(&node, synced).await, synced_before);
+    let refused = s3.create_bucket().bucket("new").send().await.unwrap_err();
+    let status = refused.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(status, Some(503), "{refused:?}");
 
-    // Remediation: the volume returns. The file store stays refused until
-    // the node opens it again, at its next start.
+    // Remediation: the volume returns, and the node opens the store again
+    // within the poll interval.
     std::fs::rename(&away, &control_dir).unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert_eq!(metric(&node, read).await, last);
-    assert!(s3.create_bucket().bucket("new").send().await.is_err());
-    assert!(node.terminate().await.success());
-    let node = start(&config).await;
+    until("the node opens the store again", async || {
+        metric(&node, "skys3_control_store_live").await == 1.0
+    })
+    .await;
+    assert!(log_text(dir.path()).contains("opened the control store"));
     // Verification: the store is read again, the identity copy is fresh,
     // and bucket changes work.
     assert!(metric(&node, read).await > last);
     assert!(metric(&node, synced).await > synced_before);
-    assert_eq!(metric(&node, "skys3_control_store_live").await, 1.0);
-    let s3 = node.s3();
     s3.create_bucket().bucket("new").send().await.unwrap();
     assert_eq!(get(&s3, "kept", "b").await, b"beta");
+    assert!(node.terminate().await.success());
+    // A restart finds the bucket.
+    let node = start(&config).await;
+    let listed = node.s3().list_buckets().send().await.unwrap();
+    assert_eq!(listed.buckets().len(), 2);
     assert!(node.terminate().await.success());
 }
 

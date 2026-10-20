@@ -4,14 +4,13 @@ use std::collections::BTreeSet;
 use std::io;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
-use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
+use skys3_control::{ControlError, ProposalIds, RetryPolicy, read_cluster};
 use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
@@ -41,7 +40,8 @@ use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
-use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
+use crate::control::backend::{self, Backend, ConnectError, Opener};
+use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::metrics::{ControlMetrics, NodeMetrics};
 use crate::peering::NodePeering;
@@ -70,7 +70,7 @@ type NodeShards = LocalShards<RealDisk>;
 /// Session records.
 type Sessions = SystemSessions<RealDisk>;
 /// The control store as the gateway uses it.
-type Store = NodeStore<FileControlStore>;
+type Store = NodeStore<Backend>;
 /// The STS endpoint.
 type Sts = StsEndpoint<HttpsFetcher, Sessions>;
 /// The gateway's authenticator.
@@ -250,9 +250,8 @@ struct Shared {
     index: Arc<Index>,
     pools: Pools,
     store: Store,
-    /// The file control store's directory and owner, for reopening it.
-    control_dir: PathBuf,
-    owner: StoreOwner,
+    /// Opens the control store again while the node has none.
+    opener: Opener,
     shards: NodeShards,
     gateway: NodeGateway,
     identity: Arc<IdentityCopy>,
@@ -353,6 +352,8 @@ impl Shared {
     /// `cluster.json` moved, reading only the registers that changed, or
     /// if half of `identity_max_staleness` passed since the last sync.
     /// While the node runs from its copy, it tries a sync every interval.
+    /// A store that refuses every request until it is reopened (a file
+    /// store after a failed write) is detached, and opened again.
     async fn follow_control_store(self: Arc<Self>) {
         let interval = self.config.control_store().config_poll_interval();
         let cluster = self.config.cluster().cluster_id.clone();
@@ -374,6 +375,9 @@ impl Shared {
                 }
             } else {
                 tokio::time::sleep(interval).await;
+            }
+            if self.store.store().is_some_and(|store| store.failed()) {
+                self.detach().await;
             }
             let store = match self.store.store() {
                 Some(store) => store,
@@ -434,10 +438,36 @@ impl Shared {
         }
     }
 
+    /// Drops a store that refuses every request until it is reopened, and
+    /// serves the node's latest copy until [`Shared::reopen`] opens it
+    /// again and a sync succeeds (§6.2).
+    async fn detach(&self) {
+        match control::kept_copy(&self.index, &self.pools.index).await {
+            Ok(Some(copy)) => {
+                tracing::error!(
+                    generation = %copy.generation,
+                    "the control store failed; serving the local copy until it is reopened"
+                );
+                self.store.detach(copy);
+                self.control_metrics.set_live(false);
+                self.control
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .live = false;
+            }
+            // A running node always keeps a copy: it opened from one or
+            // saved one.
+            Ok(None) => tracing::error!("the control store failed, and the node has no copy"),
+            Err(error) => {
+                tracing::error!(%error, "the control store failed; cannot read the local copy");
+            }
+        }
+    }
+
     /// Opens the control store for a node that runs from its copy without
     /// one, and gives it to the node store.
-    async fn reopen(&self) -> Option<FileControlStore> {
-        match open_file_store(&self.control_dir, &self.owner, true, &self.pools.control).await {
+    async fn reopen(&self) -> Option<Backend> {
+        match self.opener.open(true).await {
             Ok(opened) => {
                 tracing::info!("opened the control store");
                 self.store.attach(opened.store.clone());
@@ -607,14 +637,15 @@ struct OpenedControl {
     reclaim: bool,
 }
 
-/// Opens the file control store, bootstraps `cluster.json` if this node
-/// never synced, and syncs the copy kept in the index. If the store cannot
-/// be opened or does not answer, or looks reset, a node with a copy runs
-/// from it (§6.2); a store that belongs to another node is refused.
+/// Opens the control store with `opener` (the startup probe of an S3
+/// store, and the single-node guard), bootstraps `cluster.json` if this
+/// node never synced, and syncs the copy kept in the index. If the store
+/// cannot be opened or does not answer, or looks reset, a node with a copy
+/// runs from it (§6.2); a store that belongs to another node, registers
+/// one, or fails the probe is refused.
 async fn open_control(
     config: &Config,
-    owner: &StoreOwner,
-    directory: &Path,
+    opener: &Opener,
     index: &Arc<Index>,
     pools: &Pools,
     started: Duration,
@@ -623,9 +654,11 @@ async fn open_control(
     let retry = RetryPolicy::default();
     let kept = control::kept_copy(index, &pools.index).await?;
     let initialized = kept.is_some();
-    let opened = match open_file_store(directory, owner, initialized, &pools.control).await {
+    let opened = match opener.open(initialized).await {
         Ok(opened) => opened,
-        Err(OpenStoreError::Foreign(reason)) => return Err(StartError::ControlStore(reason)),
+        Err(OpenStoreError::Foreign(reason) | OpenStoreError::Refused(reason)) => {
+            return Err(StartError::ControlStore(reason));
+        }
         Err(error) => {
             let Some(kept) = kept else {
                 return Err(match error {
@@ -748,9 +781,12 @@ struct Opened {
 ///    this boot.
 /// 2. Recover each disk's log (torn tails cut, damage refused), open the
 ///    index, and replay every record after its shard's checkpoint.
-/// 3. Open the control store, bootstrap `cluster.json`, and sync the local
-///    copy of bucket bindings and identity configuration. If the store does
-///    not answer, run from the copy kept in the index ([`crate::control`]).
+/// 3. Open the control store `[control_store]` names, probing an S3 store
+///    first and refusing an etcd or S3 store that registers another node
+///    ([`crate::control::backend`]); bootstrap `cluster.json`; and sync the
+///    local copy of bucket bindings and identity configuration. If the
+///    store does not answer, run from the copy kept in the index
+///    ([`crate::control`]).
 /// 4. Build the gateway with SigV4 authentication over static credentials
 ///    and STS sessions, which live in the system bucket
 ///    ([`crate::sessions`]), STS if `sts_web_identity` is on, and admission
@@ -808,15 +844,6 @@ impl Node {
     /// [`StartError`] for whatever stopped the node from starting. Nothing
     /// is served then.
     pub async fn start(config: Config) -> Result<Self, StartError> {
-        let ControlStoreBackend::File { directory } = &config.control_store().backend else {
-            return Err(StartError::Unsupported(
-                "this build runs only with [control_store] backend = \"file\": until \
-                 replication (plan M2-07, M2-08) each node serves every shard alone, and an etcd \
-                 or s3 store that several nodes share would let two nodes serve one bucket apart"
-                    .to_owned(),
-            ));
-        };
-        let control_dir = directory.clone();
         let threads = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
         let index_pool = pool("index", INDEX_THREADS)?;
         let pools = Pools {
@@ -826,7 +853,7 @@ impl Node {
             index: index_pool,
         };
         let mut opened = Opened::default();
-        let result = Self::start_with(config, control_dir, pools.clone(), &mut opened).await;
+        let result = Self::start_with(config, pools.clone(), &mut opened).await;
         if result.is_err() {
             // Close the index before another process may take the data
             // directory.
@@ -841,7 +868,6 @@ impl Node {
 
     async fn start_with(
         config: Config,
-        control_dir: PathBuf,
         mut pools: Pools,
         opened: &mut Opened,
     ) -> Result<Self, StartError> {
@@ -867,24 +893,30 @@ impl Node {
         storage_ready.set_ready(true);
 
         let wall: Arc<dyn WallClock> = Arc::new(SystemWallClock);
-        let owner = StoreOwner::new(
-            cluster.clone(),
-            node_id.clone(),
-            data_dir.instance_id().to_owned(),
-        );
+        let opener = match &config.control_store().backend {
+            ControlStoreBackend::File { directory } => {
+                let owner = StoreOwner::new(
+                    cluster.clone(),
+                    node_id.clone(),
+                    data_dir.instance_id().to_owned(),
+                );
+                Opener::file(directory.clone(), owner, pools.control.clone())
+            }
+            _ => {
+                let store = backend::connect(config.control_store())
+                    .await
+                    .map_err(|error| match error {
+                        ConnectError::Tls(error) => StartError::Tls(error),
+                        other => StartError::ControlStore(other.to_string()),
+                    })?;
+                Opener::shared(store, node_id.clone())
+            }
+        };
         let OpenedControl {
             store,
             copy,
             reclaim,
-        } = open_control(
-            &config,
-            &owner,
-            &control_dir,
-            &storage.index,
-            &pools,
-            wall.now(),
-        )
-        .await?;
+        } = open_control(&config, &opener, &storage.index, &pools, wall.now()).await?;
         metrics.control.set_live(store.is_live());
         if store.is_live() {
             metrics.control.store_answered(wall.now());
@@ -1074,8 +1106,7 @@ impl Node {
             index: Arc::clone(&storage.index),
             pools: pools.clone(),
             store,
-            control_dir,
-            owner,
+            opener,
             shards: storage.shards.clone(),
             gateway,
             identity,
@@ -1139,6 +1170,13 @@ impl Node {
             tokio::spawn(async move { checkpointer.run(interval).await })
         };
         let mut background = JoinSet::new();
+        if let Some(store) = shared.opener.shared_store().cloned() {
+            // The S3 control bucket's versioning (§12), read once.
+            let control_metrics = shared.control_metrics.clone();
+            background.spawn(async move {
+                control_metrics.set_versioning(backend::read_versioning(&store).await);
+            });
+        }
         background.spawn(Arc::clone(&shared).follow_control_store());
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());

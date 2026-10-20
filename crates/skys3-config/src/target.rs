@@ -97,6 +97,23 @@ fn parse_authority(authority: &str, default_port: u16) -> Result<(Host, Option<u
     Ok((address.host().clone(), has_port.then(|| address.port())))
 }
 
+/// Whether `endpoint` is a plain `http://` URL whose host is not loopback:
+/// neither a loopback IP address (also IPv4-mapped) nor `localhost`.
+/// Such traffic crosses a network unencrypted and unauthenticated.
+pub(crate) fn plaintext_off_loopback(endpoint: &str) -> bool {
+    let Ok((origin, _)) = split_origin(endpoint) else {
+        return false;
+    };
+    let loopback = match &origin.host {
+        Host::Ipv4(ip) => ip.is_loopback(),
+        Host::Ipv6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+        Host::Dns(name) => name.as_str() == "localhost",
+    };
+    origin.scheme == "http" && !loopback
+}
+
 /// Checks an endpoint URL, a scheme and an authority with no path, and
 /// returns its canonical form.
 pub(crate) fn parse_endpoint(url: &str) -> Result<String, String> {
@@ -185,6 +202,29 @@ fn dns_scope(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_http_is_told_apart_from_loopback() {
+        for url in [
+            "http://etcd-1:2379",
+            "http://10.0.0.5:2379",
+            "http://[2001:db8::1]:2379",
+            "http://localhost.example:2379",
+        ] {
+            assert!(plaintext_off_loopback(url), "{url}");
+        }
+        for url in [
+            "https://etcd-1:2379",
+            "http://127.0.0.1:2379",
+            "http://127.3.4.5:2379",
+            "http://[::1]:2379",
+            "http://[::ffff:127.0.0.1]:2379",
+            "http://localhost:2379",
+            "not a url",
+        ] {
+            assert!(!plaintext_off_loopback(url), "{url}");
+        }
+    }
 
     #[test]
     fn targets_split_into_endpoint_bucket_and_prefix() {

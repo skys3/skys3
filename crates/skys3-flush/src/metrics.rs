@@ -240,10 +240,10 @@ impl FlushMetrics {
         );
         registry.register(
             "flush_refusals",
-            "Flush attempts and capability probe runs the remote target refused, by code: a \
-             401 or 403 (AccessDenied, InvalidAccessKeyId, SignatureDoesNotMatch, or other), \
-             or a SkyS3 peer's native refused answer (refused). They are retried after a \
-             backoff.",
+            "Flush attempts, streamed-body stagings, and capability probe runs (writes and \
+             server-side copies) the remote target refused, by code: a 401 or 403 \
+             (AccessDenied, InvalidAccessKeyId, SignatureDoesNotMatch, or other), or a SkyS3 \
+             peer's native refused answer (refused). They are retried after a backoff.",
             metrics.refusals.clone(),
         );
         registry.register(

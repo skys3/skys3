@@ -39,7 +39,7 @@
 //! # What the suite checks
 //!
 //! - One register at a time: [`conditional_writes`],
-//!   [`conditional_deletes`], and [`listing`].
+//!   [`values_are_bounded`], [`conditional_deletes`], and [`listing`].
 //! - Linearizable `put_if` under concurrency, with one writer per handle:
 //!   [`racing_creates_have_one_winner`], [`increments_are_linearizable`],
 //!   and [`histories_are_linearizable`], which records concurrent reads
@@ -86,8 +86,8 @@ use crate::propose::{
     propose_delete,
 };
 use crate::store::{
-    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version,
-    Versioned,
+    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, MAX_REGISTER_BYTES,
+    PutOutcome, Version, Versioned,
 };
 
 /// Makes the stores a conformance run tests.
@@ -185,6 +185,8 @@ pub async fn run_at<B: Backend>(backend: &mut B, scale: Scale) {
 
     announce("conditional_writes");
     conditional_writes(&backend.store().await).await;
+    announce("values_are_bounded");
+    values_are_bounded(&backend.store().await).await;
     announce("conditional_deletes");
     conditional_deletes(&backend.store().await).await;
     announce("listing");
@@ -320,6 +322,42 @@ pub async fn conditional_writes<S: ControlStore>(store: &S) {
         Some(Versioned {
             value: second,
             version: v2
+        })
+    );
+}
+
+/// A value of [`MAX_REGISTER_BYTES`] is written and read back whole; one
+/// byte more is refused with [`ControlError::TooLarge`], and nothing is
+/// written.
+pub async fn values_are_bounded<S: ControlStore>(store: &S) {
+    let register = key("buckets/bounded.json");
+    let largest = Bytes::from(vec![b' '; MAX_REGISTER_BYTES]);
+    let error = store
+        .put_if(
+            &register,
+            Expected::Absent,
+            Bytes::from(vec![b' '; MAX_REGISTER_BYTES + 1]),
+        )
+        .await
+        .expect_err("a value over the bound was written");
+    assert!(
+        matches!(error, ControlError::TooLarge { .. }),
+        "a value over the bound failed with {error}"
+    );
+    assert_eq!(store.get(&register).await.unwrap(), None);
+    let PutOutcome::Written(version) = store
+        .put_if(&register, Expected::Absent, largest.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("creating an absent register failed its precondition");
+    };
+    let read = store.get(&register).await.unwrap();
+    assert_eq!(
+        read,
+        Some(Versioned {
+            value: largest,
+            version
         })
     );
 }

@@ -9027,6 +9027,18 @@ of this file. A task with nothing unexpected keeps "None."
   nothing checked again. Both now drop the shard for the rest of the scan,
   as a failed page read did, and the scan stops listing once no shard is
   left, instead of fetching every remaining page.
+- **The scan interval was no barrier in the tests.** The flush crate's
+  scan tests failed about one run in ten under CPU load: a report still
+  covered shard 1 after the test closed it, or missed a key deleted just
+  before. It was the test, not the scan: each failing run had a scan
+  finished or under way before the test's last change, which the test then
+  took as the next report. The tests run on a paused clock, and the
+  runtime jumps to the next timer, the 60-second scan interval, whenever it
+  waits for the index's blocking thread, so the interval in simulated time
+  says nothing about when a scan runs. `next_report` now waits for a scan
+  that starts after the call, taking the finished-scan count and whether
+  one is running as its baseline; a scan takes its shards and marks itself
+  running in one step, so that scan saw every earlier change.
 - **No cluster-simulation scenario.** The scan writes nothing, so a
   scenario would check only the absence of reports under faults, which the
   flush crate's workload test does in under a second. The simulation jobs'
@@ -9218,9 +9230,97 @@ of this file. A task with nothing unexpected keeps "None."
   started for the run and stopped after it. The peering scenario's node configuration
   moved into `tests/e2e/lib.sh` (`peer_configure`, `peer_aws`) for reuse,
   and the PKI gained the clusters `ra` and `rb`.
+- **Two refusal paths were missed at first (review).** A streamed body's
+  own staging at a SkyS3 peer, before its `PUT` commits, ends in its own
+  task, which kept only the error text; and the server-side copy probe
+  takes a `403` on `CopyObject` for an error to retry forever, not for
+  missing support. Both are now counted and named in `last_refusal`
+  (`<key>: ...` and `copy probe: ...`), but neither holds up a key: the
+  body's version is not dirty yet, and copies are uploaded while the copy
+  probe is pending.
 - **The unused `sign` import M8-01 noted is fixed**, since this task
   touches `skys3-gateway`: it is imported under the same `cfg` as its
   users.
+- **A flusher could miss a body announced as it started.** CI on aarch64
+  timed out in `native::a_body_whose_put_never_commits_is_aborted`, an
+  M6-06 test: the flusher subscribed to the shard's changes only when its
+  task first ran, and `Shard::announce` drops an announcement while the
+  shard has no subscriber, so a body announced before that was never
+  staged, and never aborted. Delaying the task's first poll by 50 ms
+  failed that test and three others the same way. `ShardFlusher::start`
+  now subscribes before it spawns the task;
+  `native::a_body_announced_before_its_flusher_runs_is_staged`, on a
+  single-threaded runtime, fails without that.
+
+### M8-03 Control stores in the binary
+
+- **MinIO cannot be an S3 control store.** The task asked for the
+  single-node suite over MinIO as the S3 control store, but the node
+  refuses it at startup: the probe's delete at a stale version was
+  applied. MinIO's community server (the build M8-01 uses) ignores
+  `If-Match` on `DeleteObject` and deletes the object whatever its ETag,
+  which a `curl` request against it confirmed, versioned bucket or not.
+  This is the case design §6.1 refuses with no fallback. The suite now
+  checks that refusal (a node over a MinIO bucket exits with the probe's
+  message), and runs its S3 leg against a bucket of a second single-node
+  SkyS3 cluster, `ctl`, over the file store, which passes the probe.
+- **The three control stores run side by side.** `tests/e2e/control-stores.sh`,
+  which CI's e2e job now runs, starts `run.sh` three times on ports and
+  directories of their own: every scenario over the file store, and the
+  six single-node scenarios over etcd (one member, mutual TLS, the pinned
+  v3.6.10 GitHub release whose SHA-256 `tests/e2e/etcd.sh` checks, the
+  version of CI's etcd job; not the image, so that it runs as a process
+  with the PKI's certificates) and over S3. Locally, with the AWS CLI from
+  its image and the Docker daemon started for the run and stopped after,
+  the three passed together in 5 m 43 s; the single-node runs took about
+  5 minutes each beside the 327-second peering scenario, slowed by running
+  three at once (each passed alone in 2 m 37 s, etcd, and 2 m 55 s, S3).
+  CI's runners call the CLI natively, so the suite step should stay near
+  the peering scenario's length and the job within its 15 minutes; the
+  first CI run will tell.
+- **A shared loopback is one failure scope.** MinIO and the `ctl`
+  cluster both listen on 127.0.0.1, so every write_back CreateBucket of
+  the S3 leg was refused (`400`, the target shares the control store's
+  failure scope) until the suite set `allow_correlated_control_store`.
+- **The single-node guard waits for registrations.** A node refuses an
+  etcd or S3 store whose `nodes/` holds another node's registration, but
+  nothing in this build writes `nodes/` (node registration arrives with
+  M8-04), so two nodes of this build on one prefix are not caught yet; the
+  guard catches them once nodes register. Until then the configuration
+  reference and the runbooks say one store (or prefix) per node.
+- **A shared store's first sync reclaims nothing.** The file store's
+  owner record tells a node the registers are its own; an etcd or S3
+  store has none, so a node that has never synced from it treats the
+  registers it finds as not its own and reclaims no shards on its first
+  sync (`claimed` is false on a first open).
+- **An etcd CA file is optional.** With `https://` endpoints and no
+  `etcd_tls_ca_file`, the node trusts the system roots (as for OIDC),
+  which keeps the design's example valid. `http://` is refused except on
+  loopback, so tests that used `http://e:2379` now use `localhost`.
+- **Bounded reads need a ranged GET on S3.** The object-store client
+  buffers a whole body, so `S3ControlStore` asks for bytes 0 to
+  `MAX_REGISTER_BYTES` and refuses any object whose size is larger, before
+  anything over the bound is read. An empty object answers a ranged GET
+  with `416 InvalidRange`, which is mapped to a refused (empty) register.
+- **The versioning gauge is 0 on SkyS3.** SkyS3 keeps no versions and
+  answers GetBucketVersioning with no status, so the e2e S3 leg checks the
+  warning and `skys3_control_store_versioning` 0. The read runs in the
+  background after startup, so a slow or refused read never delays it.
+- **A detached file store changed the outage drill.** With K1 fixed, the
+  first CreateBucket after the control volume goes away still answers
+  `500`, but the node then drops the failed store, serves its copy (`live`
+  0, `503` for bucket changes), and reopens the store by itself when the
+  volume returns. `runbooks::drill_control_store_outage` and the runbook
+  now say so; the `500` stays an open point (K2).
+- **Gating several nodes: an explicit flag.** Plan §14 decision 1 is
+  recorded as an explicit `[cluster] multi_node` flag, off by default,
+  added by M8-04, not inferred from `[transport]` (single-node clusters
+  configure it to peer); `backend = "file"` is never allowed with it.
+- **Not done here.** `skys3 control rebuild` still writes only a file
+  store, and no metric measures control-store round trips; both are
+  runbook open points.
+- **The AWS SDK's GetBucketVersioning path ends with `/`.** The mock test
+  expected `/bucket` and got `/bucket/`.
 
 ### M8-05a Replicated shards as library code
 

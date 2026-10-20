@@ -62,10 +62,16 @@ fn the_design_example_loads_unchanged() {
 
     assert_eq!(config.cluster().cluster_id.as_str(), "skys3-prod-a");
     assert_eq!(config.cluster().failure_domain, FailureDomain::Node);
-    let ControlStoreBackend::Etcd { endpoints } = &config.control_store().backend else {
+    let ControlStoreBackend::Etcd { endpoints, tls } = &config.control_store().backend else {
         panic!("the example uses etcd");
     };
     assert_eq!(endpoints.len(), 3);
+    let tls = tls.as_ref().expect("the example's endpoints are https://");
+    assert_eq!(
+        tls.ca_file.as_deref(),
+        Some(std::path::Path::new("/etc/skys3/etcd-ca.crt"))
+    );
+    assert!(tls.client.is_some(), "the example authenticates to etcd");
     assert_eq!(config.control_store().prefix, "skys3-prod-a/");
     assert_eq!(
         config.replication().replica_ack_timeout_mode,
@@ -180,6 +186,8 @@ tls_key_file = "/etc/skys3/key.pem"
 backend = "s3"
 endpoint = "https://control.example"
 bucket = "control"
+region = "eu-central-1"
+profile = "skys3-control"
 prefix = "c1-registers/"
 allow_correlated_control_store = true
 coordinator_lease_seconds = 12
@@ -330,12 +338,22 @@ format = "json"
 #[test]
 fn every_key_parses_and_is_resolved() {
     let config: Config = EVERY_KEY.parse().unwrap_or_else(|e| panic!("{e}"));
-    let ControlStoreBackend::S3 { endpoint, bucket } = &config.control_store().backend else {
+    let ControlStoreBackend::S3 {
+        endpoint,
+        bucket,
+        region,
+        profile,
+    } = &config.control_store().backend
+    else {
         panic!("s3 backend expected");
     };
     assert_eq!(
         (endpoint.as_str(), bucket.as_str()),
         ("https://control.example", "control")
+    );
+    assert_eq!(
+        (region.as_str(), profile.as_deref()),
+        ("eu-central-1", Some("skys3-control"))
     );
     assert_eq!(config.control_store().prefix, "c1-registers/");
     assert_eq!(config.control_store().coordinator_lease().as_secs(), 12);
@@ -451,7 +469,8 @@ fn the_every_key_fixture_covers_the_design_example() {
     let uncovered: Vec<_> = keys(design_example())
         .into_iter()
         .filter(|path| !fixture.contains(path))
-        .filter(|path| path != "control_store.etcd_endpoints")
+        // The fixture's control store is S3, the example's etcd.
+        .filter(|path| !path.starts_with("control_store.etcd_"))
         .collect();
     assert!(uncovered.is_empty(), "add to EVERY_KEY: {uncovered:?}");
 }

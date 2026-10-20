@@ -13,8 +13,9 @@ workspace = true
 
 [features]
 # Test support for this crate's backends and later ones: fault injection
-# (`faults`) and the backend-agnostic conformance suite (`conformance`).
-test-util = []
+# (`faults`), the backend-agnostic conformance suite (`conformance`), and
+# an in-process etcd stand-in (`etcd_fake`), which serves HTTP/2.
+test-util = ["hyper/server"]
 
 [dependencies]
 bytes.workspace = true

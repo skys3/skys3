@@ -89,8 +89,10 @@ is an operator command yet.
 filter` sets. The runbooks quote the messages to search for.
 
 **What the node binary runs today.** Every node serves its buckets alone,
-over the file control store (`[control_store] backend = "file"`; the
-binary refuses `etcd` and `s3`). Replication, the coordinator, and
+over a control store of its own: the file store, etcd, or an S3 bucket
+(`[control_store] backend`). A node refuses to start on a store that
+registers another node, until replication runs in the binary (design
+section 6.2). Replication, the coordinator, and
 encoding and fragment repair are built and run in the cluster simulation,
 but the binary does not run them yet. Their metrics are listed as defined
 in the metrics reference, and their alerts cannot fire. The runbooks for
@@ -256,7 +258,9 @@ section 7.6).
    `target`, what was refused, and `at_unix_ms`. An `error` that starts with
    `probe:` means the target refuses the capability probe, so nothing has
    been flushed since the node started and every dirty key waits; one that
-   starts with a key means flushes are refused.
+   starts with `copy probe:` means only server-side copies are refused, so
+   copies are uploaded and no key waits; one that starts with a key means
+   that key's flush, or the staging of its streamed body, is refused.
 2. The code:
    - `InvalidAccessKeyId` or `SignatureDoesNotMatch`: the target does not
      know the node's access key, or the secret is wrong. The node takes its
@@ -1097,15 +1101,17 @@ updates do (design section 6.1).
 `skys3_control_store_live == 0` (it started without the store and serves
 its copy), or `time() - skys3_control_store_last_success_timestamp_seconds`
 over 5 minutes (it has not read the store since). The log has `cannot read
-the control store's generation` or `cannot open the control store; serving
-the local copy`.
+the control store's generation`, `cannot open the control store; serving
+the local copy`, or, for a file store that failed a write, `the control
+store failed; serving the local copy until it is reopened`.
 
 **Impact.** The data path goes on from the node's copy: reads, writes,
 flushing. CreateBucket and DeleteBucket fail: `503` from a node that runs
 from its copy, `500 InternalError` ("The cluster's control store failed")
-from a node whose store failed a write. No membership change can happen:
-a node that fails now takes the shards it belongs to out of service for
-writes, and for reads once their leases lapse, until the store returns
+for the request during which a file store failed a write. No membership
+change can happen: a node that fails now takes the shards it belongs to out
+of service for writes, and for reads once their leases lapse, until the
+store returns
 (design section 6.10). STS stops issuing sessions once the identity copy
 is older than `identity_max_staleness` ([Identity staleness](#identity-staleness)).
 
@@ -1125,8 +1131,9 @@ is older than `identity_max_staleness` ([Identity staleness](#identity-staleness
 
 **Remediation.** Restore the store or the path to it. A node that could not
 open it opens it within `config_poll_interval_seconds` and logs `opened the
-control store`. A file store that failed a write refuses every later
-request until it is opened again, which takes a restart of its node.
+control store`. A file store that failed a write is dropped by its node,
+which serves its copy and opens the store again the same way, without a
+restart.
 
 **Verification.** `skys3_control_store_last_success_timestamp_seconds`
 advances on every node, `skys3_control_store_live` is 1, and a
@@ -1304,7 +1311,6 @@ or for [Control store loss](#control-store-loss) after a rebuild.
 
 **Do not.** Do not let the nodes reach a restored etcd before deciding.
 Do not trust a restored store because its generation matches the nodes'.
-The node binary does not run the etcd backend yet.
 
 ## 7. Drills
 
@@ -1339,11 +1345,11 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Disk space](#disk-space) | `runbooks::drill_disk_space` | Below `disk_min_free_bytes`, writes get `503 SlowDown` and count as `disk_space` refusals, the log names the place, reads and deletes go on; freeing space admits writes within seconds without a restart. | Nothing. |
 | [Clock drift](#clock-drift) | `simulation::leases::drift_beyond_rho_risks_stale_reads_but_writes_stay_safe` | Drift beyond `ρ` risks stale reads, and writes stay safe, as the runbook's impact says. | The diagnosis and remediation are the host's time service's; nothing in SkyS3 to drill. |
 | [Fragment repair](#fragment-repair) | `simulation::repair::a_lost_holder_is_repaired_while_reads_go_on`; `simulation::fragment_moves::a_drained_node_is_emptied_while_reads_and_losses_go_on` | A lost holder's fragments are rebuilt elsewhere while degraded reads go on. | Not drilled on the binary, which does not run encoding or repair. |
-| [Control store unreachable](#control-store-unreachable) | `runbooks::drill_control_store_outage`; `simulation::removal::without_the_control_store_writes_fail_until_it_returns` | With the store's volume gone under a running node, `skys3_control_store_last_success_timestamp_seconds` stops, `skys3_control_store_live` stays 1, the log says `cannot read the control store's generation`, the data path goes on, and CreateBucket fails. In a cluster, a member that fails while the store is down stalls its shards' writes until the store returns. | CreateBucket answered `500 InternalError`, not the `503` the design gives a node that runs from its copy: the file store failed a write. And the file store stayed refused after its volume returned, until the node restarted. The runbook now says both. |
+| [Control store unreachable](#control-store-unreachable) | `runbooks::drill_control_store_outage`; `simulation::removal::without_the_control_store_writes_fail_until_it_returns` | With the store's volume gone under a running node, the first CreateBucket fails a write of the file store and answers `500`; the node then drops the store, `skys3_control_store_live` goes to 0, `skys3_control_store_last_success_timestamp_seconds` stops, the log says `the control store failed; serving the local copy`, the data path goes on, and CreateBucket answers `503`. When the volume returns, the node opens the store again without a restart, and CreateBucket succeeds. In a cluster, a member that fails while the store is down stalls its shards' writes until the store returns. | The first CreateBucket answers `500 InternalError`, not `503` (section 8). Until M8-03 the file store also stayed refused after its volume returned, until the node restarted. |
 | [Control store latency](#control-store-latency) | `simulation::workload::slow_and_lossy_control_store_with_partitions` | Client requests go on under control-store round trips of 100 ms and more. | The round trip is not measured (section 8). |
 | [Identity staleness](#identity-staleness) | `runbooks::drill_control_store_outage`; `sts::a_stale_identity_copy_stops_new_sessions_only` | `skys3_identity_synced_timestamp_seconds` stops during the outage and advances after a restart with the store answering; a stale copy refuses new sessions and keeps issued ones. | The drill cannot age a copy past `identity_max_staleness` (an hour at least) on the binary; the STS test does it on a simulated clock. |
 | [Control store loss](#control-store-loss) | `runbooks::drill_control_store_loss`; `simulation::rebuild::a_lost_control_store_is_rebuilt_and_membership_changes_resume` | A node without its registers serves from its copy and logs `the control store looks reset`; an export refuses a running node; the export, the dry run, and the rebuild write the store at the next generation, and buckets and objects are all there. In a cluster, membership changes resume on the rebuilt store. | Nothing. |
-| [etcd majority loss](#etcd-majority-loss) | None | Not drilled: the node binary does not run the etcd backend, and CI's etcd job runs a single member, so a majority cannot be lost and recovered. The SkyS3 side is the [Control store unreachable](#control-store-unreachable) and [Control store loss](#control-store-loss) drills. | Section 8. |
+| [etcd majority loss](#etcd-majority-loss) | None | Not drilled: CI's etcd job and the end-to-end suite run a single member, so a majority cannot be lost and recovered. The SkyS3 side is the [Control store unreachable](#control-store-unreachable) and [Control store loss](#control-store-loss) drills. | Section 8. |
 
 ## 8. Open points
 
@@ -1357,11 +1363,9 @@ meets today, not a plan of this document.
   and 12). A SkyS3 cluster therefore takes S3 REST flushes only from a
   cluster configured as its peer. One that is not, such as a single node
   standing in for a remote target in a drill, fails every flush.
-- **The file control store after a failed write.** It refuses every request
-  until it is opened again, and a running node reopens only a store it
-  could not open, so the node needs a restart once the store is back.
-- **Bucket changes on a failed store** answer `500 InternalError`, while
-  a node that runs from its copy answers `503`.
+- **Bucket changes on a failed store.** The request during which a file
+  store fails a write answers `500 InternalError`, while a node that runs
+  from its copy answers `503`.
 - **Lost-key report and restore drill commands.** `skys3_flush::snapshot`
   builds both, but no command or endpoint runs them, nor reads a shard's
   latest usable snapshot (`latest`) to show its `taken_ms`, the start of
@@ -1383,13 +1387,15 @@ meets today, not a plan of this document.
 - **Retiring a node.** No command marks a node `departing` before
   `node_forget_after_hours`; node labels (`zone`, `rack`) have no
   configuration key.
-- **Control-store round trips.** No metric measures them; the PR that runs
-  the S3 or etcd backend in the binary adds one.
+- **Control-store round trips.** No metric measures them, although the
+  binary now runs the etcd and S3 backends.
+- **Rebuilding an etcd or S3 control store.** `skys3 control rebuild` writes
+  only a file store; for etcd or S3 an operator has no command yet.
 - **Gateway request metrics.** Failover and refused writes show to clients
   as `503` answers that no metric counts.
 - **A control store rolled back to the same generation.** A node detects a
   store rolled back only by a generation below its copy's
-  (`ControlCopy::fetch_since` in `crates/skys3/src/control.rs`, design
+  (`ControlCopy::fetch_since` in `crates/skys3/src/control/mod.rs`, design
   section 6.2). A store restored to a state at the copy's generation, but
   lacking writes the copy listed, is followed: the node replaces its copy
   with the restored registers, losing newer buckets and roles, or bringing
@@ -1408,5 +1414,4 @@ meets today, not a plan of this document.
   exposure of unflushed deletes, and nothing bounds which deletes a lost
   shard took with it. Dating them would need the delete's commit time in
   its record or in the index.
-- **etcd in the binary**, and a multi-member etcd harness to drill majority
-  loss.
+- **A multi-member etcd harness** to drill majority loss.

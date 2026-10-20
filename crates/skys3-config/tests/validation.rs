@@ -1,6 +1,9 @@
 //! Each load-time rule, broken by a configuration.
 
-use skys3_config::{Config, ConfigError, ControlStoreBackend, ReplicationConfig, Violations};
+use skys3_config::{
+    Config, ConfigError, ControlStoreBackend, DEFAULT_CONTROL_REGION, EtcdTls, ReplicationConfig,
+    Violations,
+};
 use skys3_types::{BucketName, ClusterId};
 
 const BASE: &str = r#"
@@ -149,7 +152,7 @@ fn shards_per_bucket_is_at_most_256() {
 fn cluster_id_must_fit_the_write_identity() {
     let with_id = |id: &str| {
         format!(
-            "[cluster]\ncluster_id = \"{id}\"\n[control_store]\netcd_endpoints = [\"http://e:2379\"]"
+            "[cluster]\ncluster_id = \"{id}\"\n[control_store]\netcd_endpoints = [\"http://localhost:2379\"]"
         )
     };
     with_id(&"a".repeat(24)).parse::<Config>().unwrap();
@@ -272,7 +275,7 @@ fn unknown_keys_are_rejected_everywhere() {
             "region",
         ),
         (
-            "[cluster]\ncluster_id = \"a\"\n[control_store]\netcd_endpoint = [\"http://e\"]"
+            "[cluster]\ncluster_id = \"a\"\n[control_store]\netcd_endpoint = [\"http://localhost\"]"
                 .to_owned(),
             "etcd_endpoint",
         ),
@@ -351,7 +354,7 @@ fn durations_and_sizes_must_be_positive() {
     for section in ["control_store"] {
         for key in ["coordinator_lease_seconds", "config_poll_interval_seconds"] {
             let text = format!(
-                "[cluster]\ncluster_id = \"a\"\n[{section}]\netcd_endpoints = [\"http://e\"]\n{key} = 0"
+                "[cluster]\ncluster_id = \"a\"\n[{section}]\netcd_endpoints = [\"http://localhost\"]\n{key} = 0"
             );
             assert!(violations_of(&text).contains_key(&format!("{section}.{key}")));
         }
@@ -768,8 +771,89 @@ fn etcd_backend_rules() {
         ],
     );
     assert_control_store_violations(
-        "etcd_endpoints = [\"http://e\"]\nendpoint = \"https://s3\"\nbucket = \"b\"",
+        "etcd_endpoints = [\"http://localhost\"]\nendpoint = \"https://s3\"\nbucket = \"b\"",
         &["control_store.endpoint", "control_store.bucket"],
+    );
+    // Plain HTTP only on loopback (§12).
+    assert_control_store_violations(
+        "etcd_endpoints = [\"http://etcd-1:2379\", \"http://10.0.0.5:2379\"]",
+        &[
+            "control_store.etcd_endpoints",
+            "control_store.etcd_endpoints",
+        ],
+    );
+    let config: Config =
+        control_store("etcd_endpoints = [\"http://127.0.0.1:2379\", \"http://[::1]\"]")
+            .parse()
+            .unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::Etcd {
+            endpoints: vec![
+                "http://127.0.0.1:2379".to_owned(),
+                "http://[::1]".to_owned()
+            ],
+            tls: None,
+        }
+    );
+}
+
+#[test]
+fn etcd_tls_rules() {
+    let config: Config = control_store(
+        "etcd_endpoints = [\"https://etcd-1:2379\"]\netcd_tls_ca_file = \"/ca.pem\"\n\
+         etcd_tls_cert_file = \"/client.pem\"\netcd_tls_key_file = \"/client.key\"",
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::Etcd {
+            endpoints: vec!["https://etcd-1:2379".to_owned()],
+            tls: Some(EtcdTls {
+                ca_file: Some("/ca.pem".into()),
+                client: Some(("/client.pem".into(), "/client.key".into())),
+            }),
+        }
+    );
+    // Without a CA file, the system's roots verify etcd.
+    let config: Config = control_store("etcd_endpoints = [\"https://etcd-1:2379\"]")
+        .parse()
+        .unwrap();
+    let ControlStoreBackend::Etcd { tls, .. } = &config.control_store().backend else {
+        panic!("etcd expected");
+    };
+    assert_eq!(
+        tls,
+        &Some(EtcdTls {
+            ca_file: None,
+            client: None
+        })
+    );
+    assert_control_store_violations(
+        "etcd_endpoints = [\"https://e\"]\netcd_tls_cert_file = \"/c.pem\"",
+        &["control_store.etcd_tls_cert_file"],
+    );
+    assert_control_store_violations(
+        "etcd_endpoints = [\"https://e\"]\netcd_tls_key_file = \"/c.key\"\n\
+         etcd_tls_ca_file = \"\"",
+        &[
+            "control_store.etcd_tls_ca_file",
+            "control_store.etcd_tls_cert_file",
+        ],
+    );
+    assert_control_store_violations(
+        "etcd_endpoints = [\"http://localhost\"]\netcd_tls_ca_file = \"/ca.pem\"\n\
+         etcd_tls_cert_file = \"/c.pem\"\netcd_tls_key_file = \"/c.key\"",
+        &[
+            "control_store.etcd_tls_ca_file",
+            "control_store.etcd_tls_cert_file",
+            "control_store.etcd_tls_key_file",
+        ],
+    );
+    assert_control_store_violations(
+        "backend = \"file\"\netcd_tls_ca_file = \"/ca.pem\"",
+        &["control_store.etcd_tls_ca_file"],
     );
 }
 
@@ -784,7 +868,33 @@ fn s3_backend_rules() {
         ControlStoreBackend::S3 {
             endpoint: "https://r2.example".to_owned(),
             bucket: "ctl".to_owned(),
+            region: DEFAULT_CONTROL_REGION.to_owned(),
+            profile: None,
         }
+    );
+    let config: Config = control_store(
+        "backend = \"s3\"\nendpoint = \"https://r2.example/\"\nbucket = \"ctl\"\n\
+         region = \"auto\"\nprofile = \"skys3-control\"",
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        config.control_store().backend,
+        ControlStoreBackend::S3 {
+            endpoint: "https://r2.example".to_owned(),
+            bucket: "ctl".to_owned(),
+            region: "auto".to_owned(),
+            profile: Some("skys3-control".to_owned()),
+        }
+    );
+    assert_control_store_violations(
+        "backend = \"s3\"\nendpoint = \"https://r2.example/\"\nbucket = \"ctl\"\n\
+         region = \"us east\"\nprofile = \"[x]\"",
+        &["control_store.region", "control_store.profile"],
+    );
+    assert_control_store_violations(
+        "etcd_endpoints = [\"https://e\"]\nregion = \"auto\"\nprofile = \"p\"",
+        &["control_store.region", "control_store.profile"],
     );
     assert_control_store_violations(
         "backend = \"s3\"",
@@ -832,7 +942,7 @@ fn file_backend_rules() {
         }
     );
     assert_control_store_violations(
-        "backend = \"file\"\ndirectory = \"\"\netcd_endpoints = [\"http://e\"]\nbucket = \"b\"",
+        "backend = \"file\"\ndirectory = \"\"\netcd_endpoints = [\"http://localhost\"]\nbucket = \"b\"",
         &[
             "control_store.etcd_endpoints",
             "control_store.bucket",
@@ -840,7 +950,7 @@ fn file_backend_rules() {
         ],
     );
     assert_control_store_violations(
-        "etcd_endpoints = [\"http://e\"]\ndirectory = \"/ctl\"",
+        "etcd_endpoints = [\"http://localhost\"]\ndirectory = \"/ctl\"",
         &["control_store.directory"],
     );
 }
@@ -890,13 +1000,14 @@ fn prefix_rules() {
         too_long.as_str(),
     ] {
         assert_control_store_violations(
-            &format!("etcd_endpoints = [\"http://e\"]\nprefix = \"{prefix}\""),
+            &format!("etcd_endpoints = [\"http://localhost\"]\nprefix = \"{prefix}\""),
             &["control_store.prefix"],
         );
     }
-    let config: Config = control_store("etcd_endpoints = [\"http://e\"]\nprefix = \"a/b/\"")
-        .parse()
-        .unwrap();
+    let config: Config =
+        control_store("etcd_endpoints = [\"http://localhost\"]\nprefix = \"a/b/\"")
+            .parse()
+            .unwrap();
     assert_eq!(config.control_store().prefix, "a/b/");
 }
 

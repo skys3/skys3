@@ -635,8 +635,12 @@ impl ShardFlusher {
         let bodies = Arc::new(Bodies::default());
         let (commands, resolutions) = mpsc::unbounded_channel();
         let not_before = Instant::now() + quarantine;
+        // Subscribed before the task runs, so that a body announced once
+        // this returns reaches the flusher, however late the task starts.
+        let changes = shard.subscribe();
         let task = tokio::spawn(run(
             shard,
+            changes,
             (ready, not_before),
             wall,
             Arc::clone(&state),
@@ -737,16 +741,17 @@ type Done = (String, EpochSeq, Option<ConflictPolicy>, Outcome);
 type Recorded = (String, Seq, Result<(), ShardError>);
 
 /// The flusher's task. It tracks the shard's dirty keys from the start,
-/// and flushes them once the target is ready.
+/// following the `changes` it subscribed to, and flushes them once the
+/// target is ready.
 async fn run<S: ObjectStore, D: Disk>(
     shard: Shard<D>,
+    mut changes: mpsc::UnboundedReceiver<Change>,
     (ready, not_before): (Arc<Ready<S>>, Instant),
     wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
     (streams, bodies): (Arc<Streams>, Arc<Bodies>),
     mut resolutions: mpsc::UnboundedReceiver<Resolve>,
 ) {
-    let mut changes = shard.subscribe();
     // A native target is ready from the start: its bodies are staged at the
     // peer, and no remote multipart upload is ever opened (§7.8).
     let native = ready.get().is_some_and(|target| target.native.is_some());
@@ -816,7 +821,7 @@ async fn run<S: ObjectStore, D: Disk>(
                 Some(step) = staging.join_next(), if !staging.is_empty() => {
                     // A body is staged only once there is a target.
                     if let (Ok(step), Some(target)) = (step, &target) {
-                        bodies.finish(step, &target.settings);
+                        bodies.finish(step, target);
                     }
                 }
                 Some(recorded) = records.join_next(), if !records.is_empty() => {

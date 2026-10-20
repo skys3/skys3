@@ -72,8 +72,11 @@ pub(crate) enum BackendKind {
 pub enum ControlStoreBackend {
     /// An etcd v3 cluster, the production default.
     Etcd {
-        /// `etcd_endpoints`: client URLs, without a path.
+        /// `etcd_endpoints`: client URLs, without a path. A plain `http://`
+        /// one is on loopback (§12).
         endpoints: Vec<String>,
+        /// TLS for `https://` endpoints: `Some` exactly when there is one.
+        tls: Option<EtcdTls>,
     },
     /// An S3-compatible store that passes the conditional-write probe.
     S3 {
@@ -81,6 +84,12 @@ pub enum ControlStoreBackend {
         endpoint: String,
         /// `bucket`: the control bucket.
         bucket: String,
+        /// `region`: the region requests are signed for.
+        region: String,
+        /// `profile`: the profile of the shared AWS configuration the
+        /// control store's credentials come from; `None` for the default
+        /// credential chain.
+        profile: Option<String>,
     },
     /// A directory on this node, for a single-node cluster. It refuses to
     /// serve a second node.
@@ -90,6 +99,22 @@ pub enum ControlStoreBackend {
         directory: PathBuf,
     },
 }
+
+/// How a node reaches `https://` etcd endpoints (§12): the CA that
+/// verifies etcd's certificates, and the client certificate etcd's
+/// `--client-cert-auth` asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtcdTls {
+    /// `etcd_tls_ca_file`: PEM CA certificates; `None` for the system's
+    /// root certificates.
+    pub ca_file: Option<PathBuf>,
+    /// `etcd_tls_cert_file` and `etcd_tls_key_file`: the client's PEM
+    /// certificate chain, leaf first, and its private key.
+    pub client: Option<(PathBuf, PathBuf)>,
+}
+
+/// The region an S3 control store signs for unless `region` is set.
+pub const DEFAULT_CONTROL_REGION: &str = "us-east-1";
 
 /// `[control_store]`: where the cluster's registers live (§6.1) and how
 /// often nodes and the coordinator talk to it.
@@ -138,7 +163,10 @@ impl ControlStoreConfig {
     ///
     /// A message naming the shared bucket or scope.
     pub fn check_target_independence(&self, target: &RemoteTarget) -> Result<(), String> {
-        let ControlStoreBackend::S3 { endpoint, bucket } = &self.backend else {
+        let ControlStoreBackend::S3 {
+            endpoint, bucket, ..
+        } = &self.backend
+        else {
             return Ok(());
         };
         let Some(scope) = target::failure_scope(endpoint) else {
@@ -192,8 +220,13 @@ crate::durations! {
 pub(crate) struct RawControlStore {
     backend: BackendKind,
     etcd_endpoints: Option<Vec<String>>,
+    etcd_tls_ca_file: Option<PathBuf>,
+    etcd_tls_cert_file: Option<PathBuf>,
+    etcd_tls_key_file: Option<PathBuf>,
     endpoint: Option<String>,
     bucket: Option<String>,
+    region: Option<String>,
+    profile: Option<String>,
     directory: Option<PathBuf>,
     prefix: Option<String>,
     allow_correlated_control_store: bool,
@@ -206,8 +239,13 @@ impl Default for RawControlStore {
         Self {
             backend: BackendKind::Etcd,
             etcd_endpoints: None,
+            etcd_tls_ca_file: None,
+            etcd_tls_cert_file: None,
+            etcd_tls_key_file: None,
             endpoint: None,
             bucket: None,
+            region: None,
+            profile: None,
             directory: None,
             prefix: None,
             allow_correlated_control_store: false,
@@ -277,28 +315,83 @@ impl RawControlStore {
     }
 
     fn etcd_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
-        self.refuse_other_keys(&["etcd_endpoints"], "etcd", checker);
+        const ENDPOINTS: &str = "control_store.etcd_endpoints";
+        self.refuse_other_keys(ETCD_KEYS, "etcd", checker);
         let urls = self.etcd_endpoints.as_deref().unwrap_or_default();
-        checker.require(!urls.is_empty(), "control_store.etcd_endpoints", || {
+        checker.require(!urls.is_empty(), ENDPOINTS, || {
             "backend = \"etcd\" needs at least one endpoint".to_owned()
         });
         let mut endpoints = Vec::with_capacity(urls.len());
         for url in urls {
             match target::parse_endpoint(url) {
+                // Whoever can write the store can reassign shards (§12).
+                Ok(endpoint) if target::plaintext_off_loopback(&endpoint) => checker.report(
+                    ENDPOINTS,
+                    format!(
+                        "{url:?} is plain HTTP off loopback, where anyone on the network could \
+                         rewrite the registers; use https://"
+                    ),
+                ),
                 Ok(endpoint) => endpoints.push(endpoint),
-                Err(error) => checker.report("control_store.etcd_endpoints", error),
+                Err(error) => checker.report(ENDPOINTS, error),
             }
         }
-        ControlStoreBackend::Etcd { endpoints }
+        let https = endpoints.iter().any(|url| url.starts_with("https://"));
+        let tls = if https {
+            if let Some(ca_file) = &self.etcd_tls_ca_file {
+                crate::node::nonempty_path(checker, "control_store.etcd_tls_ca_file", ca_file);
+            }
+            Some(EtcdTls {
+                ca_file: self.etcd_tls_ca_file.clone(),
+                client: self.etcd_client_certificate(checker),
+            })
+        } else {
+            let set = [
+                ("etcd_tls_ca_file", self.etcd_tls_ca_file.is_some()),
+                ("etcd_tls_cert_file", self.etcd_tls_cert_file.is_some()),
+                ("etcd_tls_key_file", self.etcd_tls_key_file.is_some()),
+            ];
+            for (key, _) in set.into_iter().filter(|(_, set)| *set) {
+                checker.report(
+                    format!("control_store.{key}"),
+                    "applies only to https:// endpoints",
+                );
+            }
+            None
+        };
+        ControlStoreBackend::Etcd { endpoints, tls }
     }
 
-    /// Reports `etcd_endpoints`, `endpoint`, and `bucket` unless `allowed`
-    /// names them.
+    /// `etcd_tls_cert_file` and `etcd_tls_key_file`, which are set together.
+    fn etcd_client_certificate(&self, checker: &mut Checker) -> Option<(PathBuf, PathBuf)> {
+        match (&self.etcd_tls_cert_file, &self.etcd_tls_key_file) {
+            (Some(cert), Some(key)) => {
+                crate::node::nonempty_path(checker, "control_store.etcd_tls_cert_file", cert);
+                crate::node::nonempty_path(checker, "control_store.etcd_tls_key_file", key);
+                Some((cert.clone(), key.clone()))
+            }
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                checker.report(
+                    "control_store.etcd_tls_cert_file",
+                    "etcd_tls_cert_file and etcd_tls_key_file are set together",
+                );
+                None
+            }
+        }
+    }
+
+    /// Reports every backend-specific key `allowed` does not name.
     fn refuse_other_keys(&self, allowed: &[&str], backend: &str, checker: &mut Checker) {
         let keys = [
             ("etcd_endpoints", self.etcd_endpoints.is_some()),
+            ("etcd_tls_ca_file", self.etcd_tls_ca_file.is_some()),
+            ("etcd_tls_cert_file", self.etcd_tls_cert_file.is_some()),
+            ("etcd_tls_key_file", self.etcd_tls_key_file.is_some()),
             ("endpoint", self.endpoint.is_some()),
             ("bucket", self.bucket.is_some()),
+            ("region", self.region.is_some()),
+            ("profile", self.profile.is_some()),
         ];
         for (key, set) in keys {
             if set && !allowed.contains(&key) {
@@ -323,7 +416,7 @@ impl RawControlStore {
     }
 
     fn s3_backend(&self, checker: &mut Checker) -> ControlStoreBackend {
-        self.refuse_other_keys(&["endpoint", "bucket"], "s3", checker);
+        self.refuse_other_keys(&["endpoint", "bucket", "region", "profile"], "s3", checker);
         let endpoint = match self.endpoint.as_deref().map(target::parse_endpoint) {
             Some(Ok(endpoint)) => endpoint,
             Some(Err(error)) => {
@@ -345,6 +438,43 @@ impl RawControlStore {
             "backend = \"s3\" needs the control bucket's name, in visible ASCII without '/'"
                 .to_owned()
         });
-        ControlStoreBackend::S3 { endpoint, bucket }
+        let region = self
+            .region
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CONTROL_REGION.to_owned());
+        checker.require(
+            !region.is_empty()
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "control_store.region",
+            || format!("is {region:?}; a region is ASCII letters, numbers, and '-'"),
+        );
+        if let Some(profile) = &self.profile {
+            checker.require(
+                crate::buckets::valid_profile(profile),
+                "control_store.profile",
+                || {
+                    format!(
+                        "must be 1 to {} visible ASCII characters other than `[` and `]`",
+                        crate::buckets::MAX_ORIGIN_PROFILE_BYTES
+                    )
+                },
+            );
+        }
+        ControlStoreBackend::S3 {
+            endpoint,
+            bucket,
+            region,
+            profile: self.profile.clone(),
+        }
     }
 }
+
+/// The keys of `backend = "etcd"`.
+const ETCD_KEYS: &[&str] = &[
+    "etcd_endpoints",
+    "etcd_tls_ca_file",
+    "etcd_tls_cert_file",
+    "etcd_tls_key_file",
+];
