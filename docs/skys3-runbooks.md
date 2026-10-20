@@ -36,6 +36,9 @@ exist.
   - [Coordinator](#coordinator)
   - [Shard lost](#shard-lost)
   - [Provisioning](#provisioning)
+  - [Handing off a primary](#handing-off-a-primary)
+  - [Draining a node](#draining-a-node)
+  - [Replacing a node](#replacing-a-node)
   - [Moving a single node into a cluster](#moving-a-single-node-into-a-cluster)
 - [5. Nodes, disks, and clocks](#5-nodes-disks-and-clocks)
   - [Node down](#node-down)
@@ -96,9 +99,12 @@ etcd, or an S3 bucket (`[control_store] backend`), and refuses to start on
 a store that registers another node (design section 6.2). Nodes with
 `multi_node` share one store, register, and replicate their buckets'
 shards across each other, failing over a lost primary on their own (since
-M8-05b). The coordinator, and with it the replacement of lost members,
-and encoding and fragment repair are built and run in the cluster
-simulation, but the binary does not run them yet. Their metrics are listed
+M8-05b). Nodes with `[cluster] coordinator = true` also elect a
+coordinator, which replaces lost members, re-admits returning nodes,
+rebalances, and hands primaries off (since M8-06); the flag is off by
+default, and without it no node coordinates. Encoding and fragment repair
+are built and run in the cluster simulation, but the binary does not run
+them yet. Their metrics are listed
 as defined in the metrics reference, and their alerts cannot fire. The
 runbooks for them describe what to do once the binary runs them, and say
 which of their steps cannot be taken yet. The peer transport (design section 7.8) runs in
@@ -652,9 +658,12 @@ addresses succeeds from the same node.
 Each shard has `replicas` members; every member acknowledges every commit
 (design section 5). Failover and replacement are automatic. The node binary
 runs replication with `[cluster] multi_node = true` since M8-05b, and
-exports its metrics; it does not run the coordinator yet, so the steps
-that rely on it (replacement, `placement`, the coordinator's metrics)
-apply once it does.
+exports its metrics. It runs the coordinator since M8-06 on the nodes with
+`[cluster] coordinator = true`; the steps that rely on the coordinator
+(replacement, `placement`, the coordinator's metrics, handoffs, and
+drains) need at least one such node. `GET /v1/cluster` on any node shows
+the lease holder, the nodes with their marks and what each holds, and, on
+the coordinator, each node's state and the `placement` report.
 
 ### Under-replication
 
@@ -678,8 +687,8 @@ acknowledgement set, and serves reads.
    `skys3_under_replicated_bytes` by `instance`.
 2. Whether replacement can happen: the coordinator adds learners only on
    eligible nodes in failure domains the shard does not use. On the
-   coordinator, `GET /v1/health` reports `placement` (not served yet,
-   section 8); `skys3_placement_short_shards` counts shards short of members
+   coordinator, `GET /v1/health` and `GET /v1/cluster` report
+   `placement`; `skys3_placement_short_shards` counts shards short of members
    in separate domains. A non-zero count for long means no eligible node:
    follow [Placement policy](#placement-policy).
 3. Whether a coordinator runs: `sum(skys3_coordinator)` is 1. Otherwise
@@ -695,10 +704,9 @@ acknowledgement set, and serves reads.
 learner, the learner backfills (under-replicated data first), and the
 primary promotes it. If the cluster has no eligible node, add one
 ([Provisioning](#provisioning)) or bring the lost node back: a returning
-node rejoins as a learner. Until the binary runs the coordinator (plan
-M8-06), nothing adds the learner: a shard stays short until an operator
-adds one to its register (`learners`, by a CAS with the store's own
-tools), which its primary then backfills and promotes.
+node rejoins as a learner. Without a node configured with `[cluster]
+coordinator = true`, nothing adds the learner: turn the flag on for at
+least one node and restart it ([Coordinator](#coordinator)).
 
 **Verification.** `skys3_under_replicated_bytes` and
 `skys3_oldest_under_replicated_age_seconds` return to 0 on every node.
@@ -742,11 +750,11 @@ domains than `replicas`. The coordinator never co-locates members to make
 up the difference (design section 6.7), so the shards stay exposed until
 capacity returns.
 
-**Diagnosis.** On the coordinator, `GET /v1/health` `placement`:
+**Diagnosis.** On the coordinator, `GET /v1/health` or `GET /v1/cluster`
+`placement`:
 `failure_domain`, `eligible_nodes`, `domains`, `unlabeled` (nodes without
 the label the level needs, which never receive members), and per bucket
-`placeable`, `short`, and `co_located`. Not served yet (section 8): the
-node binary does not run the coordinator. `placeable` false means the
+`placeable`, `short`, and `co_located`. `placeable` false means the
 cluster has fewer eligible domains than `replicas`.
 
 **Remediation.** Add capacity in a missing domain, or label unlabeled
@@ -764,21 +772,33 @@ would let placement put members in one domain from then on.
 **Symptoms.** `SkyS3CoordinatorMissing`: `sum(skys3_coordinator) != 1` for 5
 minutes.
 
-**Impact.** None for clients. With no coordinator, placement work waits:
-replacing lost members, rebalancing, shards of new buckets. With more than
-one, all but one lose their CASes.
+**Impact.** None for clients: reads and writes go on, and shards fail
+over without it. With no coordinator, placement work waits: replacing
+lost members, re-admitting returning nodes, rebalancing, drains, handoffs
+asked through the coordinator, finishing bucket creations cut short, and
+dropping a deleted bucket's shard registers. With more than one, all but
+one lose their CASes. A coordinator that stops, even cleanly, does not
+release the lease: another node takes it once the lease expires, about
+`coordinator_lease_seconds` after the last renewal.
 
-**Diagnosis.** 0 for longer than `coordinator_lease_seconds` means no node
-takes the lease: check that the control store answers (every node's
+**Diagnosis.** `GET /v1/cluster` on any node: `coordinator.holder` names
+the node the lease names, `this_node` whether the answering node
+coordinates, and `candidate` whether it may (`[cluster] coordinator`).
+0 for longer than `coordinator_lease_seconds` means no node takes the
+lease: check that some node is a `candidate` and runs, and that the
+control store answers (every node's
 `skys3_control_store_last_success_timestamp_seconds`). More than 1 for long
 means a node believes it holds a lease it lost: its clock or process was
 paused; find it by the series of `skys3_coordinator` by `instance`, and read
 its log.
 
-**Remediation.** Restore the control store. Restart a node that keeps
-reporting itself coordinator after another has taken over.
+**Remediation.** Restore the control store. If no candidate runs, start
+one, or set `[cluster] coordinator = true` on another node and restart
+it. Restart a node that keeps reporting itself coordinator after another
+has taken over.
 
-**Verification.** `sum(skys3_coordinator)` is 1.
+**Verification.** `sum(skys3_coordinator)` is 1, and `GET /v1/cluster` on
+every node names the same `coordinator.holder`.
 
 **Do not.** Do not edit `coordinator.lease` in the control store.
 
@@ -896,13 +916,14 @@ Retiring one: its shards are re-homed before it is forgotten.
 that names its `node_id` (`[transport]`, with `advertise` if `listen` is a
 wildcard address), and start it. It registers itself; every membership
 decision after that is automatic (design section 6.7). `GET /v1/health`
-`cluster` shows its registration and heartbeats. To retire a node, stop
-it: the coordinator marks it `departing` after `node_forget_after_hours`,
-re-homes its shards, and forgets it. No command marks a node `departing`
-sooner (section 8). The node binary registers nodes and sends heartbeats
-since M8-04, and serves shards across nodes since M8-05b, but does not yet
-run the coordinator: an added node receives the shards of buckets created
-after it registers, and no shards move to it or off a stopped node.
+`cluster` shows its registration and heartbeats, and `GET /v1/cluster` the
+shards rebalancing moves to it. To retire a node, drain it first
+([Draining a node](#draining-a-node)), then stop it once it holds
+nothing; a node stopped without a drain is marked `departing` after
+`node_forget_after_hours`, its shards re-homed, and forgotten. Rebalancing
+needs a coordinator: without a node configured with `[cluster]
+coordinator = true`, an added node receives only the shards of buckets
+created after it registers.
 
 **Verification.** For an added node, its share of shards; for a retired
 one, `SkyS3UnderReplicated` resolves and no shard register names it.
@@ -910,6 +931,104 @@ one, `SkyS3UnderReplicated` resolves and no shard register names it.
 **Do not.** Do not retire several nodes, or several failure domains, at
 once: each takes a member from every shard it held. Retire one, and wait
 until under-replication clears before the next.
+
+### Handing off a primary
+
+**Symptoms.** None: moving a shard's primary is planned work, for example
+before maintenance of its node, or to move load off a node.
+
+**Impact.** The shard's writes wait from the old primary's step-down
+until the new primary serves (design section 5.4), usually well under a
+second; clients see at most a retried `503`. The old primary leaves the
+configuration, so the shard is one member short until the coordinator
+re-admits it as a learner and the new primary promotes it.
+
+**Procedure.**
+
+1. Find the shard's primary and members: `GET /v1/shards` on any node
+   (the bucket's entries have `shard`, `epoch`, `primary`, `members`).
+2. Ask the primary's node, or the coordinator's (`GET /v1/cluster`
+   `coordinator.holder`): `POST /v1/shards/<bucket>/<n>/handoff`, with
+   the body `{"to": "<node-id>"}` to name the member, or no body to let
+   the node choose a live member that leads the fewest shards. `202`
+   answers with `from`, `to`, the `epoch`, and `via`. Any other node
+   answers `409`, naming the `primary` and the `coordinator` to ask; `409`
+   also means the member named is the primary or not a member, or that no
+   member could take over, or the primary refused, for example while a
+   promotion is outstanding: ask again in a few seconds.
+
+**Verification.** `GET /v1/shards` shows the new `primary` at a later
+`epoch`, and within about a minute `replicas` members again, the old
+primary among them or another node.
+
+**Do not.** Do not hand off several shards of one node at once to empty
+it: drain it instead ([Draining a node](#draining-a-node)), which keeps
+every shard at `replicas` members. Do not edit `primary` in a shard's
+register by hand: a primary is moved only by a handoff (rule R1).
+
+### Draining a node
+
+**Symptoms.** None: emptying a node is planned work, before retiring it
+or taking it down for long.
+
+**Impact.** The coordinator re-homes the node's shards: it adds a learner
+elsewhere for each, which the primary backfills and promotes, then removes
+the node's member, at most one removal per `[replication]
+removal_interval_seconds` across the cluster, and hands off the shards the
+node leads. Shards never have fewer than `replicas` members on the way,
+if the cluster has another eligible node in each needed domain. The
+node's gateway keeps serving throughout, forwarding each request to its
+shard's primary.
+
+**Procedure.**
+
+1. Check that a coordinator runs (`GET /v1/cluster` `coordinator.holder`)
+   and that the other nodes have room in the failure domains the node's
+   shards need.
+2. `POST /v1/nodes/<node-id>/drain` on any node's admin API. `200`
+   answers with `draining` true, `changed`, and the `generation` that
+   announced the mark; `404` means the node is not registered. The mark
+   is kept in the node's registration, also across its restarts.
+3. Wait until `GET /v1/cluster` shows the node with `primaries`,
+   `members`, and `learners` all 0. Then stop it, or keep it as a spare.
+4. To put it back in service, `DELETE /v1/nodes/<node-id>/drain`;
+   rebalancing then moves shards back to it.
+
+**Verification.** No shard register names the node (`GET /v1/shards` on
+another node), and `SkyS3UnderReplicated` does not fire.
+
+**Do not.** Do not stop the node before it holds nothing: its shards lose
+a member each. Do not drain several nodes, or a whole failure domain, at
+once unless the others have room: replacement never co-locates members,
+so shards would stay short ([Placement policy](#placement-policy)).
+
+### Replacing a node
+
+**Symptoms.** A node is lost for good (`SkyS3NodeDown`, its disks gone),
+or its machine is to be swapped for another.
+
+**Impact.** Its shards run one member short ([Under-replication](#under-replication))
+until replacement adds learners on the other nodes, or on the new node
+once it registers.
+
+**Procedure.**
+
+1. If the old node still runs, drain it ([Draining a node](#draining-a-node))
+   and stop it once it holds nothing.
+2. Provision the new node ([Provisioning](#provisioning)), with a node ID
+   of its own. To reuse the old node's ID with a new data directory,
+   follow [Node ID in use](#node-id-in-use) first.
+3. The coordinator adds learners for the shards that lost the old node
+   (replacement), and rebalancing gives the new node its share. A lost
+   node that never returns is marked `departing` after
+   `node_forget_after_hours` and forgotten once no shard names it.
+
+**Verification.** `GET /v1/cluster` shows the new node with its share of
+`members`, and the old one with none; `skys3_under_replicated_bytes` is 0.
+
+**Do not.** Do not start the new node with a copy of the old node's data
+directory. Do not delete the old node's registration while a shard still
+names it.
 
 ### Moving a single node into a cluster
 
@@ -1021,9 +1140,7 @@ process that could run it, delete `nodes/<node-id>.json` from the control
 store (with `etcdctl del <prefix>nodes/<node-id>.json`, or the S3
 `DeleteObject` of that key), and start the node: it registers anew, and
 replacement treats it as a new node, its old data directory's shards as
-lost members. Until the binary runs the coordinator (plan M8-06), no
-replacement happens: the shards it held stay short of that member
-([Under-replication](#under-replication)).
+lost members ([Replacing a node](#replacing-a-node)).
 
 **Verification.** The node starts; `GET /v1/health` `cluster.registration`
 has `registered` true and no `error`, and the register's `instance_id` is
@@ -1435,12 +1552,15 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Reconciliation differences](#reconciliation-differences) | `runbooks::drill_reconciliation_report` (in process); `reconcile::keys_written_and_flushed_during_scans_are_never_reported` | Another writer's new, replaced, and deleted objects appear in the report as `remote_only`, `etag_mismatch`, and `index_only`, with the writer `outside`, and in `skys3_reconcile_differences` by kind; once SkyS3's versions are written back and the other object removed, the next scan reports nothing. Scans during a workload of writes, deletes, and flushes report nothing. | The log lines were not checked: the in-process drill has no log. No command re-imports a `remote_only` key or re-flushes a clean one (section 8). |
 | [Peer link](#peer-link) | `simulation::peer::every_committed_change_reaches_the_peer_under_faults` | Under link faults, every committed change reaches the peer cluster, and stays dirty at the source until applied. | Not drilled on the binary. |
 | [Peer transport fallback](#peer-transport-fallback) | `simulation::discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`; `simulation::discovery::forged_and_expired_descriptors_are_refused` | With UDP blocked, under crashes, takeovers, and peer restarts, the flushers fall back to S3 REST through the peer's own SkyS3 gateway, which takes their writes with their write identities from the keys in `s3_access_key_ids`, and return to QUIC once UDP is allowed again. Every committed change reaches the peer once; no `COMMIT` reaches it after an S3 write of its key acknowledged after the `COMMIT` was sent; `skys3_flush_transport` and `flush.transport` follow every switch. Forged and expired descriptors are refused, and those targets are flushed as plain S3 stores. | Not drilled on the binary; its handshake and descriptor are tested in process (`crates/skys3/src/cluster/peering.rs`). The simulation shortens the quarantine and the re-probe backoff, and does not evaluate the alert's rule. |
-| [Under-replication](#under-replication) | `simulation::backfill::a_lost_member_is_replaced_and_its_shards_regain_their_copies`; `simulation::replacement::after_a_node_loss_every_affected_shard_returns_to_replicas_members`; `simulation::takeover::a_single_survivor_takes_over`; on the binary, `cluster::three_nodes_replicate_route_take_over_and_readmit` and the end-to-end scenario replication (tests/e2e/scenarios/95-replication.sh) | A lost member is removed, replaced by a learner, backfilled, and promoted with no operator action; a single survivor takes over and serves what was committed. On the binary, a learner written into a shard's register by hand is backfilled and promoted by the primary. | The binary does not run the coordinator, so nothing adds the learner, and the `placement` report cannot be read yet. The alert's rule was not evaluated. |
+| [Under-replication](#under-replication) | `simulation::backfill::a_lost_member_is_replaced_and_its_shards_regain_their_copies`; `simulation::replacement::after_a_node_loss_every_affected_shard_returns_to_replicas_members`; `simulation::takeover::a_single_survivor_takes_over`; on the binary, `cluster::three_nodes_replicate_route_take_over_and_readmit` and the end-to-end scenario replication (tests/e2e/scenarios/95-replication.sh) | A lost member is removed, replaced by a learner, backfilled, and promoted with no operator action; a single survivor takes over and serves what was committed. On the binary, the coordinator adds a lost member back as a learner while it is down, and its primary backfills and promotes it once it returns (`coordinator::a_lost_member_is_replaced_and_a_deleted_bucket_dropped_everywhere`). | The alert's rule was not evaluated. Until M8-06 the drill on the binary wrote the learner into the register by hand. |
 | [Network partition](#network-partition) | `simulation::takeover::competing_candidates_across_a_partition` | Across a partition, one candidate's CAS wins and the shard serves on the majority side; no acknowledged write is lost. | Not drilled on the binary, as above. |
-| [Placement policy](#placement-policy) | `skys3_coord::policy::tests::losing_a_rack_leaves_buckets_unsatisfied_without_co_location`; `skys3_coord::metrics::tests::the_gauges_follow_tenures_and_reports`; `simulation::heal::a_lost_rack_is_replaced_across_the_remaining_racks` | The report names short and co-located shards and unlabeled nodes without co-locating; the gauges follow the coordinator's report; a lost rack heals across the others. | Not drilled on the binary, which does not run the coordinator, so `GET /v1/health` has no `placement` yet. |
-| [Coordinator](#coordinator) | `simulation::coordinator::coordinator_failover_delays_only_placement_work`; `simulation::heal::a_coordinator_lost_in_the_middle_of_a_change_is_succeeded` | Another node takes the lease; only placement work waits; a change cut short is completed by the successor. | Not drilled on the binary, as above. |
+| [Placement policy](#placement-policy) | `skys3_coord::policy::tests::losing_a_rack_leaves_buckets_unsatisfied_without_co_location`; `skys3_coord::metrics::tests::the_gauges_follow_tenures_and_reports`; `simulation::heal::a_lost_rack_is_replaced_across_the_remaining_racks`; on the binary, `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded` | The report names short and co-located shards and unlabeled nodes without co-locating; the gauges follow the coordinator's report; a lost rack heals across the others. On the binary, `GET /v1/cluster` and `GET /v1/health` of the coordinator report `placement`. | A lost rack was not drilled on the binary. |
+| [Coordinator](#coordinator) | `simulation::coordinator::coordinator_failover_delays_only_placement_work`; `simulation::heal::a_coordinator_lost_in_the_middle_of_a_change_is_succeeded`; on the binary, `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded` and the end-to-end scenario coordinator (tests/e2e/scenarios/96-coordinator.sh) | Another node takes the lease; only placement work waits; a change cut short is completed by the successor. On the binary, after `kill -9` of the coordinator, reads and writes go on, another node is elected, and placement resumes under it. | A cleanly stopped coordinator does not release the lease, so its successor waits a whole lease too (section 8). |
 | [Shard lost](#shard-lost) | `simulation::drills::restore_drills_match_the_history`; `simulation::snapshots::the_lost_key_report_matches_the_history_with_backups` | The lost-key report and the restore drill match the history: the keys only the members held, the window after the snapshot, and coded objects re-indexed from their fragments. | The report and the drill have no command, so an operator cannot run them yet, and nothing gives the shard members again; the runbook first said the shard would serve again, and that a listing of its snapshots gave the start of the window (section 8). |
-| [Provisioning](#provisioning) | `simulation::registry::a_node_with_valid_credentials_joins_with_no_other_action`; `simulation::rebalancing::a_new_node_receives_its_share_of_shards_and_primaries`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one` | A node with valid credentials joins and receives its share; a lost node is replaced, forgotten, and succeeded. | No command retires a node sooner than `node_forget_after_hours`, and node labels have no configuration key (section 8). |
+| [Provisioning](#provisioning) | `simulation::registry::a_node_with_valid_credentials_joins_with_no_other_action`; `simulation::rebalancing::a_new_node_receives_its_share_of_shards_and_primaries`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one`; on the binary, the end-to-end scenario coordinator | A node with valid credentials joins and receives its share; a lost node is replaced, forgotten, and succeeded. On the binary, a fourth node joins and rebalancing gives it its share of a bucket's shards. | Until M8-06 no command retired a node sooner than `node_forget_after_hours`; a drain does now. |
+| [Handing off a primary](#handing-off-a-primary) | `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded`; `skys3_coord::handoff::tests::only_the_lease_holder_and_operator_tools_may_ask_for_a_handoff`; on the binary, the end-to-end scenario coordinator | A handoff asked of the coordinator, which chooses the member, or of the primary, told it, moves the primary with no failed request beyond SDK retries; another node answers `409` naming both; the old primary is re-admitted. Over the transport, only the lease holder and an `admin` certificate are obeyed. | Nothing. |
+| [Draining a node](#draining-a-node) | `skys3_coord::drain::tests::a_drain_is_marked_announced_kept_by_the_node_and_cleared_by_an_operator`; `coordinator::a_coordinator_is_elected_hands_off_and_is_succeeded`; on the binary, the end-to-end scenario coordinator | The mark is written by a CAS, announced, kept when the node registers again, and cleared by `DELETE`. On the binary, the drained coordinator is emptied of its members and primaries while reads and writes go on, then killed. | Nothing. |
+| [Replacing a node](#replacing-a-node) | `coordinator::a_lost_member_is_replaced_and_a_deleted_bucket_dropped_everywhere`; `simulation::heal::a_lost_node_is_replaced_forgotten_and_succeeded_by_a_new_one`; on the binary, the end-to-end scenarios replication and coordinator | A lost member is replaced by a learner, backfilled, and promoted; a new node receives shards. | A node lost for good and then forgotten was not drilled on the binary: `node_forget_after_hours` is an hour at least. |
 | [Moving a single node into a cluster](#moving-a-single-node-into-a-cluster) | `cluster::a_single_nodes_data_directory_does_not_join_a_cluster` | A single node's directory that holds a bucket is refused with `multi_node`, and a cluster node's directory without it; the log names the buckets and the mode. | The moves of steps 2 and 3 were not drilled. |
 | [Node down](#node-down) | `runbooks::drill_node_down`; `simulation::takeover::a_crashed_primary_fails_over_within_ten_seconds` | After `SIGKILL`, scrapes and `/healthz` fail; a restart recovers every acknowledged write and reports `ready` with every disk in service. A crashed primary's shards fail over within 10 seconds, also on the binary (`cluster::three_nodes_replicate_route_take_over_and_readmit`, the end-to-end scenario `replication`). | Nothing. |
 | [Node ID in use](#node-id-in-use) | `cluster::three_nodes_register_heartbeat_and_take_pushes`; `cluster::a_claim_found_after_starting_from_the_copy_stops_the_node` | A second data directory started with a registered node's ID does not start, a node that started from its copy stops once it finds the claim, each logs the reason, and leaves the registration alone; so does the binary over etcd in the end-to-end scenario `cluster` (`tests/e2e/scenarios/90-cluster.sh`). | The deletion of the registration was not drilled: no command deletes a register, so the operator uses the store's own tools. |
@@ -1485,11 +1605,13 @@ meets today, not a plan of this document.
   reports a difference, nothing imports a `remote_only` object once the
   import is done, or flushes a clean key again; the operator writes the
   remote with its own tools or overwrites the key through SkyS3.
-- **Placement and membership status.** `GET /v1/health` `placement` and
-  bucket status with each shard's members arrive with the coordinator and
-  replication in the binary.
-- **Retiring a node.** No command marks a node `departing` before
-  `node_forget_after_hours`.
+- **Lease release.** A coordinator that stops cleanly does not release
+  `coordinator.lease`, so placement waits a whole lease for its
+  successor, as after a crash.
+- **Handoffs with an `admin` certificate.** The transport obeys a
+  `Handoff` from an `admin` certificate, but no SkyS3 command sends one;
+  an operator asks through the admin API of the primary or the
+  coordinator.
 - **Deleting a registration.** No SkyS3 command deletes
   `nodes/<node-id>.json` for [Node ID in use](#node-id-in-use); the
   operator uses `etcdctl` or the S3 API.
