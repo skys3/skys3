@@ -808,12 +808,16 @@ def schedule(seed: int):
 
 @dataclass
 class Loss:
-    """A primary's loss: when, why, and the shards it led."""
+    """A primary's loss: when, why, and the shards it led. `at` is when
+    the fault struck its first victim (a kill sent, or a partition's rules
+    in place), not when the step began: until then the primary still
+    answers, and a write acknowledged meanwhile measures nothing."""
     step: int
     kind: str
     at: float
     victims: list[str]
     shards: list[tuple[str, int]]
+    struck: bool = False
 
 
 class Faults:
@@ -829,11 +833,20 @@ class Faults:
         shards = sorted(key for key, primary in primaries.items() if primary in victims)
         self.losses.append(Loss(index, kind, time.time(), victims, shards))
 
+    def struck(self, node: str) -> None:
+        """Dates the latest loss of `node` from now, if not yet dated."""
+        for loss in reversed(self.losses):
+            if node in loss.victims:
+                if not loss.struck:
+                    loss.at, loss.struck = time.time(), True
+                return
+
     def kill(self, node: str) -> None:
         with self.suite.lock:
             self.suite.unreachable.add(node)
         time.sleep(0.2)
         self.suite.procs.kill(node)
+        self.struck(node)
 
     def restart(self, node: str) -> None:
         if node in ETCD:
@@ -852,6 +865,7 @@ class Faults:
             time.sleep(0.2)
         run_net("isolate", node, mode)
         self.isolated.add(node)
+        self.struck(node)
 
     def heal(self, node: str) -> None:
         run_net("heal", node)
