@@ -12,13 +12,14 @@ use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_net::{Connection, Frame, Network, Transport};
+use skys3_net::{Connection, Frame, Network, Peers, Transport};
 use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, ShardSet, StreamedBody};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeAddress, NodeId, ShardConfig};
 use tokio::time::Instant;
 
 use super::{ForwardServer, Reply, Request, Response, Served, ShardMap, wire};
 use crate::conditions::{ConditionFailed, Precondition};
+use crate::fill::{FillError, FillProgress};
 use crate::shard::{
     ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome, write_each,
 };
@@ -97,7 +98,7 @@ struct Inner<L, D: Disk, N: Network, C> {
     server: ForwardServer<L, D>,
     map: ShardMap,
     transport: Transport<N>,
-    peers: BTreeMap<NodeId, NodeAddress>,
+    peers: Peers,
     store: C,
     idle: Mutex<Idle<N::Stream>>,
     /// The last read of each shard's register: when it finished, and the
@@ -158,8 +159,9 @@ enum Round {
 
 impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     /// The shards of node `node`, whose own shards are `local` over the
-    /// replicas in `set`, routing by `map` to the other nodes at `peers`
-    /// through `transport`, and reading shard registers from `store`.
+    /// replicas in `set`, routing by `map` to the other nodes at the
+    /// addresses `peers` holds when it connects to them, through
+    /// `transport`, and reading shard registers from `store`.
     #[must_use]
     pub fn new(
         node: NodeId,
@@ -167,7 +169,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
         set: ShardSet<D>,
         map: ShardMap,
         transport: Transport<N>,
-        peers: BTreeMap<NodeId, NodeAddress>,
+        peers: impl Into<Peers>,
         store: C,
     ) -> Self {
         Self {
@@ -177,7 +179,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 local,
                 map,
                 transport,
-                peers,
+                peers: peers.into(),
                 store,
                 idle: Mutex::default(),
                 register_reads: tokio::sync::Mutex::default(),
@@ -229,6 +231,61 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
             forwarded: inner.forwarded.load(Ordering::Relaxed),
             redirects: inner.redirects.load(Ordering::Relaxed),
             register_reads: inner.reads.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Asks the primary of `shard` to fill the whole of `version` of `key`,
+    /// evicted, from the bucket's remote target (§9.2), and waits until
+    /// it has. The gateway then reads the version from the primary as a
+    /// holder. The inner result is the fill's: [`FillError::Changed`] if
+    /// the key no longer holds that evicted version.
+    ///
+    /// However large the version, each request is answered within half
+    /// the request timeout: the primary answers with the bytes it filled
+    /// so far when the fill has not ended by then, and the gateway asks
+    /// again. It gives up once the fill made no progress for a whole
+    /// request timeout.
+    ///
+    /// # Errors
+    ///
+    /// As every routed call: no replica serves the shard, or the primary's
+    /// node does not answer within the request timeout; and
+    /// [`ShardError::Unavailable`] for a fill that stopped making progress.
+    pub async fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+    ) -> Result<Result<(), FillError>, ShardError> {
+        let stall = self.config.request_timeout;
+        let wait = (stall / 2).min(wire::MAX_FILL_WAIT);
+        // The progress last reported, and when it last changed.
+        let mut last: Option<(u64, Instant)> = None;
+        loop {
+            let request = Request::Fill {
+                key: key.to_owned(),
+                version,
+                wait,
+            };
+            let filled = match self.call(shard, request).await? {
+                Response::Filled(Ok(FillProgress::Filled)) => return Ok(Ok(())),
+                Response::Filled(Ok(FillProgress::Filling { filled })) => filled,
+                Response::Filled(Err(error)) => return Ok(Err(error)),
+                _ => return Err(mismatched(shard)),
+            };
+            match last {
+                Some((before, since)) if before == filled => {
+                    if since.elapsed() >= stall {
+                        return Err(ShardError::Unavailable {
+                            shard: shard.clone(),
+                            reason: format!(
+                                "the primary's fill of {key} made no progress for {stall:?}, at {filled} bytes"
+                            ),
+                        });
+                    }
+                }
+                _ => last = Some((filled, Instant::now())),
+            }
         }
     }
 
@@ -336,7 +393,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
                 }));
             }
         };
-        let mut connection = match self.connection(node, address).await {
+        let mut connection = match self.connection(node, &address).await {
             Ok(connection) => connection,
             Err(error) => return Attempt::Unreached(error),
         };

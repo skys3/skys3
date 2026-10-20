@@ -12,11 +12,12 @@ use skys3_config::{Config, ControlStoreBackend, LogFormat};
 use skys3_control::{ControlError, ProposalIds, RetryPolicy};
 use skys3_coord::{ControlHints, HeartbeatStatus};
 use skys3_flush::snapshot::SnapshotService;
-use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
+use skys3_flush::{Commit, DirtyBudget, FlushMetrics, FlushService, FlushSettings, WholeFill};
 use skys3_gateway::{
-    BucketLookup, CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig,
-    GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, PeerRefusals, ShardRef,
-    Shards, SigV4Authenticator, StaticCredentials, StsService,
+    BucketLookup, CredentialError, FillBody, FillError, FillProgress, Fills, Gateway,
+    GatewayConfig, GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, PeerRefusals,
+    Precondition, ShardPlacement, ShardRef, Shards, SigV4Authenticator, StaticCredentials,
+    StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
@@ -43,6 +44,7 @@ use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::cluster::ClusterServices;
 use crate::cluster::peering::NodePeering;
+use crate::cluster::replication::{ClusterShards, Routed};
 use crate::control::backend::{self, Backend, ConnectError, Opener};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
@@ -94,11 +96,19 @@ type NodeSnapshots = SnapshotService<AwsS3, RealDisk>;
 /// space, so a shard whose disk (or the data directory) is low on space
 /// is not filled: the read answers `503` until space is freed, as a write
 /// would be.
-#[derive(Debug)]
+///
+/// Only a shard's serving primary fills (§9.2). With `routed`, the
+/// gateway's fills of a `write_back` bucket's shard this node does not
+/// lead ask the primary to fill the version, and answer
+/// [`FillError::Changed`] once it has, so that the gateway reads it from
+/// the primary as a holder. The fills the transport serves for other
+/// nodes have no `routed`, so they never forward in turn.
+#[derive(Debug, Clone)]
 struct NodeFills {
     shards: NodeShards,
     flush: Arc<NodeFlush>,
     space: Arc<DiskSpace>,
+    routed: Option<Routed>,
 }
 
 impl Fills for NodeFills {
@@ -109,6 +119,50 @@ impl Fills for NodeFills {
         version: skys3_types::EpochSeq,
         range: std::ops::Range<u64>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<FillBody, FillError>> + Send + '_>> {
+        let (shard, key) = (shard.clone(), key.to_owned());
+        Box::pin(async move {
+            let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
+            let local = self.shards.set().get(&(&shard).into()).await;
+            let serving = local.as_ref().is_some_and(|l| l.check_readable().is_ok());
+            // A read_only bucket's versions are read straight from its
+            // origin elsewhere than on the primary (§9.5).
+            if let Some(routed) = self.routed.as_ref().filter(|_| !serving)
+                && self.flush.origin(&shard.bucket).is_none()
+            {
+                return match routed.fill(&shard, &key, version).await {
+                    Ok(Ok(()) | Err(FillError::Changed)) => Err(FillError::Changed),
+                    Ok(Err(error)) => Err(error),
+                    Err(error) => Err(FillError::Unavailable(error.to_string())),
+                };
+            }
+            if self
+                .space
+                .is_low(self.shards.set().disk_of(&(&shard).into()))
+            {
+                return Err(unavailable("the node is low on disk space; retry later"));
+            }
+            let local = local.ok_or_else(|| unavailable("the shard is not open on this node"))?;
+            let filler = self
+                .flush
+                .filler(&shard.bucket)
+                .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
+            filler
+                .read(&local, &key, version, range)
+                .await
+                .map_err(|error| match error {
+                    skys3_flush::FillError::Changed => FillError::Changed,
+                    other => FillError::Unavailable(other.to_string()),
+                })
+        })
+    }
+
+    fn fill(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: skys3_types::EpochSeq,
+        wait: Duration,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<FillProgress, FillError>> + Send + '_>> {
         let (shard, key) = (shard.clone(), key.to_owned());
         Box::pin(async move {
             let unavailable = |reason: &str| FillError::Unavailable(reason.to_owned());
@@ -129,8 +183,12 @@ impl Fills for NodeFills {
                 .filler(&shard.bucket)
                 .ok_or_else(|| unavailable("the bucket's target is not attached yet"))?;
             filler
-                .read(&local, &key, version, range)
+                .fill_whole(&local, &key, version, wait)
                 .await
+                .map(|filled| match filled {
+                    WholeFill::Filled => FillProgress::Filled,
+                    WholeFill::Filling { filled } => FillProgress::Filling { filled },
+                })
                 .map_err(|error| match error {
                     skys3_flush::FillError::Changed => FillError::Changed,
                     other => FillError::Unavailable(other.to_string()),
@@ -275,11 +333,25 @@ pub(crate) struct Shared {
     /// The generations other nodes push, which wake the sync of the
     /// node's copy; none arrive without `[cluster] multi_node = true`.
     pub(crate) hints: ControlHints,
+    /// With `[cluster] multi_node = true`, the shards replicated across the
+    /// nodes their registers name, which the gateway reaches by routing
+    /// (plan M8-05b); `None` for a single node, whose shards are all its
+    /// own ([`Shared::shards`]).
+    pub(crate) cluster: Option<Arc<ClusterShards>>,
+    /// The fills [`Shared::cluster`]'s transport serves to other nodes'
+    /// gateways, which its server holds only weakly.
+    _served_fills: Option<Arc<dyn Fills>>,
 }
 
 impl Shared {
-    /// Opens the shards of every bucket the gateway knows.
+    /// Opens the shards of every bucket the gateway knows. A node of
+    /// several opens instead the replicas of the shards whose registers
+    /// name it (§6.3), as its periodic pass does.
     pub(crate) async fn open_bucket_shards(&self) -> Result<(), StartError> {
+        if let Some(cluster) = &self.cluster {
+            cluster.follow().await;
+            return Ok(());
+        }
         for bucket in self.gateway.buckets() {
             for shard in ShardRef::all(&bucket) {
                 self.shards
@@ -738,6 +810,7 @@ impl Node {
         // anything is recovered.
         let node_credentials = crate::cluster::credentials(&config, &node_id)?;
         let storage = open_storage(&config, data_dir, &mut pools, &mut opened.index).await?;
+        check_mode(&config, data_dir, &storage.index, &pools.index).await?;
 
         let metrics = NodeMetrics::new(config.identity().identity_max_staleness());
         let health = Health::new();
@@ -779,6 +852,24 @@ impl Node {
             generation: Some(copy.generation),
             synced_at: Some(copy.synced_at),
         }));
+        // With multi_node, the shards replicated across the nodes their
+        // registers name, and the gateway's routing to their primaries;
+        // shard registers change through the store's own client, never the
+        // copy (plan M8-05b).
+        let cluster_shards = match (&node_credentials, opener.shared_store()) {
+            (Some(credentials), Some(shared_store)) => Some(Arc::new(
+                ClusterShards::new(
+                    &config,
+                    node_id.clone(),
+                    &storage.shards,
+                    (Arc::clone(&storage.index), pools.index.clone()),
+                    credentials,
+                    shared_store.clone(),
+                )
+                .await?,
+            )),
+            _ => None,
+        };
 
         // Identity, sessions, and the gateway.
         let retry = RetryPolicy::default();
@@ -916,6 +1007,12 @@ impl Node {
             .with_budget(budget)
             .with_buckets(config.buckets().clone())
             .with_origin_connect(Box::new(connect_origin));
+            // An import's records go to each shard's primary, wherever it
+            // is (§9.1).
+            let service = match &cluster_shards {
+                Some(cluster) => service.with_commit(commit_through(cluster.routed())),
+                None => service,
+            };
             Arc::new(match &peering {
                 Some(peering) => service.with_peer_transport(peering.transport(&config)),
                 None => service,
@@ -925,10 +1022,22 @@ impl Node {
         gateway_config.retry = retry;
         gateway_config.hashing_pool = Some(pools.hashing.clone());
         gateway_config.admission = Arc::new(admission);
-        gateway_config.fills = Some(Arc::new(NodeFills {
+        let fills = NodeFills {
             shards: storage.shards.clone(),
             flush: Arc::clone(&flush),
             space: Arc::clone(&space),
+            routed: None,
+        };
+        // Other nodes' gateways ask this one to fill the shards it leads
+        // (§9.2). The node keeps these fills; the server holds them weakly.
+        let served_fills = cluster_shards.as_ref().map(|cluster| {
+            let served: Arc<dyn Fills> = Arc::new(fills.clone());
+            cluster.server().fill_with(&served);
+            served
+        });
+        gateway_config.fills = Some(Arc::new(NodeFills {
+            routed: cluster_shards.as_ref().map(|c| c.routed().clone()),
+            ..fills
         }));
         gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
         gateway_config.hot_cache = HotCache::with_metrics(
@@ -937,18 +1046,25 @@ impl Node {
         );
         gateway_config.descriptors = peering.as_ref().and_then(NodePeering::descriptors);
         gateway_config.peer_access = gateway_config.peer_access.with_refusals(peer_refusals);
+        if cluster_shards.is_some() {
+            // New buckets' shards are placed on the registered nodes, and
+            // their registers created with the bucket's (§4.1, §6.7).
+            gateway_config.placement = ShardPlacement::Cluster(config.cluster().failure_domain);
+        }
         // The destination side applies peers' commits as the gateway's
         // writes are applied.
         let peer_gateway_config = peering.as_ref().map(|_| gateway_config.clone());
         let ids = IdSource::from_os_rng();
-        let mut gateway = Gateway::new(
-            gateway_config,
-            store.clone(),
-            storage.shards.clone(),
-            ids,
-            auth,
-        )
-        .await?;
+        let mut gateway = match &cluster_shards {
+            Some(cluster) => {
+                let shards = cluster.routed().clone();
+                Gateway::new(gateway_config, store.clone(), shards, ids, auth).await?
+            }
+            None => {
+                let shards = storage.shards.clone();
+                Gateway::new(gateway_config, store.clone(), shards, ids, auth).await?
+            }
+        };
         if let Some(sts) = &sts {
             gateway = gateway.with_sts(Arc::clone(sts) as Arc<dyn StsService>);
         }
@@ -969,29 +1085,46 @@ impl Node {
             flush: Arc::clone(&flush),
             snapshots,
             hints: ControlHints::new(),
+            cluster: cluster_shards,
+            _served_fills: served_fills,
         });
         shared.sync_identity(copy.synced_at).await?;
-        shared.open_bucket_shards().await?;
-        if reclaim {
-            reclaim_orphans(&shared).await?;
-        }
-
-        // Listeners.
-        let cluster_services = match (&node_credentials, shared.opener.shared_store()) {
-            (Some(credentials), Some(store)) => Some(
-                ClusterServices::start(
+        let mut background = JoinSet::new();
+        let (cluster_view, registration) = match (shared.opener.shared_store(), &shared.cluster) {
+            (Some(store), Some(cluster)) => {
+                // The transport serves, and the node is registered, before
+                // its replicas open: other nodes' primaries link to them
+                // as they do.
+                let services = ClusterServices::start(
                     &shared.config,
-                    credentials,
                     data_dir,
                     store.clone(),
                     shared.hints.clone(),
                     &metrics.handshakes,
                     &pools.index,
+                    cluster,
                 )
-                .await?,
-            ),
-            _ => None,
+                .await?;
+                let (view, status) = (services.view(), services.status());
+                services.spawn(&mut background);
+                cluster.resume().await?;
+                (Some(view), Some(status))
+            }
+            _ => {
+                shared.open_bucket_shards().await?;
+                (None, None)
+            }
         };
+        if reclaim {
+            reclaim_orphans(&shared).await?;
+        }
+        // Registered now, before the admin listener takes the registry.
+        let exposure = shared
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.report_exposure(&metrics.registry));
+
+        // Listeners.
         let listener =
             bind_gateway(&shared.config, shared.gateway.clone(), &metrics.handshakes).await?;
         let gateway_addr = listener
@@ -1017,7 +1150,11 @@ impl Node {
             control,
             health: health.clone(),
             flush,
-            cluster: cluster_services.as_ref().map(ClusterServices::view),
+            cluster: cluster_view,
+            replicated: shared
+                .cluster
+                .clone()
+                .map(|cluster| cluster as Arc<dyn crate::admin::ShardsReport>),
         };
         let admin = AdminListener::bind(admin_config, metrics.registry, health)
             .await?
@@ -1040,8 +1177,6 @@ impl Node {
             let checkpointer = Arc::clone(&storage.checkpointer);
             tokio::spawn(async move { checkpointer.run(interval).await })
         };
-        let mut background = JoinSet::new();
-        let registration = cluster_services.as_ref().map(ClusterServices::status);
         if let Some(store) = shared.opener.shared_store().cloned() {
             // The S3 control bucket's versioning (§12), read once.
             let control_metrics = shared.control_metrics.clone();
@@ -1050,8 +1185,12 @@ impl Node {
             });
         }
         background.spawn(Arc::clone(&shared).follow_control_store());
-        if let Some(services) = cluster_services {
-            services.spawn(&mut background);
+        if let Some(cluster) = &shared.cluster {
+            let interval = shared.config.control_store().config_poll_interval();
+            background.spawn(Arc::clone(cluster).run(interval));
+        }
+        if let Some(exposure) = exposure {
+            background.spawn(exposure);
         }
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
@@ -1060,12 +1199,26 @@ impl Node {
         if let (Some(peering), Some(gateway_config)) = (peering, peer_gateway_config) {
             let gateway = shared.gateway.clone();
             let buckets: BucketLookup = Arc::new(move |name: &BucketName| gateway.bucket(name));
-            let (shared, shards) = (Arc::clone(&shared), storage.shards.clone());
+            let shared = Arc::clone(&shared);
             background.spawn(peering.adapt_pool());
+            // Peers' commits reach each shard's primary as the gateway's
+            // writes do.
             background.spawn(async move {
-                peering
-                    .serve(&shared.config, &gateway_config, shards, buckets)
-                    .await;
+                let config = &shared.config;
+                match shared.cluster.clone() {
+                    Some(cluster) => {
+                        let shards = cluster.routed().clone();
+                        peering
+                            .serve(config, &gateway_config, shards, buckets)
+                            .await;
+                    }
+                    None => {
+                        let shards = shared.shards.clone();
+                        peering
+                            .serve(config, &gateway_config, shards, buckets)
+                            .await;
+                    }
+                }
             });
         }
         background.spawn(watch_space(space, watched, DISK_WATCH_INTERVAL));
@@ -1316,6 +1469,94 @@ async fn close_index(index: Arc<Index>) {
     if closed.is_err() {
         tracing::warn!("the index is still in use; it closes when the process exits");
     }
+}
+
+/// Checks that the data directory serves as `[cluster] multi_node` says
+/// (plan M8-05b), and records the setting if the directory holds no
+/// bucket's shards yet. A single node serves each shard alone in epoch 1,
+/// and a node of several opens the replicas the shard registers name: a
+/// replica opened one way cannot be served the other, so a data directory
+/// that holds a bucket's shards keeps the mode it served them in. Moving a
+/// single node's buckets into a cluster goes through the buckets' targets
+/// or an S3 copy (runbook "Moving a single node into a cluster").
+///
+/// # Errors
+///
+/// [`StartError::DataDir`] for a data directory that holds a bucket's
+/// shards in the other mode; [`StartError::Index`] if the index cannot be
+/// read.
+async fn check_mode(
+    config: &Config,
+    data_dir: &DataDir,
+    index: &Arc<Index>,
+    pool: &BlockingPool,
+) -> Result<(), StartError> {
+    let multi_node = config.cluster().multi_node;
+    if data_dir.multi_node() == multi_node {
+        return Ok(());
+    }
+    let held = {
+        let index = Arc::clone(index);
+        on_pool(pool, move || {
+            let read = index.read()?;
+            let mut held: BTreeSet<BucketId> = read
+                .applied_positions()?
+                .into_keys()
+                .map(|shard| shard.bucket)
+                .collect();
+            held.extend(read.configs()?.into_keys().map(|shard| shard.bucket));
+            Ok::<_, IndexError>(held)
+        })
+        .await?
+    };
+    // Every node keeps STS sessions in a system bucket of its own.
+    let held: Vec<String> = held
+        .into_iter()
+        .filter(|bucket| bucket.as_str() != SESSIONS_BUCKET_ID)
+        .map(|bucket| bucket.as_str().to_owned())
+        .collect();
+    if !held.is_empty() {
+        let (was, is) = if multi_node {
+            ("a single node", "one node of several")
+        } else {
+            ("one node of several", "a single node")
+        };
+        return Err(DataDirError::Mismatch(format!(
+            "{} holds the shards of {} bucket(s) ({}) that it served as {was}; a node with \
+             [cluster] multi_node = {multi_node} serves as {is} and cannot take them over: start \
+             it with a new data directory, or keep multi_node = {} (runbook \"Moving a single \
+             node into a cluster\")",
+            data_dir.path().display(),
+            held.len(),
+            held.join(", "),
+            !multi_node,
+        ))
+        .into());
+    }
+    let path = data_dir.path().to_owned();
+    on_pool(pool, move || datadir::record_multi_node(&path, multi_node)).await?;
+    tracing::info!(multi_node, "recorded how the data directory serves");
+    Ok(())
+}
+
+/// Commits the records of an import through `shards`, the gateway's, which
+/// reach each shard's primary wherever it is (§9.1).
+fn commit_through(shards: &Routed) -> Commit {
+    let shards = shards.clone();
+    Arc::new(move |shard, body| {
+        let shards = shards.clone();
+        Box::pin(async move {
+            let shard = ShardRef {
+                bucket: shard.bucket,
+                shard: shard.shard,
+            };
+            match shards.write(&shard, body, Precondition::None).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(failed)) => Err(failed.to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    })
 }
 
 /// Drops shards whose bucket no register names (§4.1): left by a bucket

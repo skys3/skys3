@@ -28,6 +28,10 @@
 //! go to the node named, are served by any replica of the shard there
 //! that holds the bytes, member or primary, and are never redirected.
 //!
+//! A GET of an evicted version is filled on the shard's primary only
+//! (§9.2): a gateway on another node asks the primary to fill it
+//! ([`Request::Fill`]), then reads it from the primary as a holder.
+//!
 //! A request whose answer is lost after it was sent is not sent again
 //! unless it only reads: a write may have been applied, so the client
 //! sees it fail (`503`), which means not acknowledged (§5.2).
@@ -53,6 +57,7 @@ pub use map::ShardMap;
 pub use server::{ForwardServer, Served, serve_peers};
 
 use crate::conditions::{ConditionFailed, Precondition};
+use crate::fill::{FillError, FillProgress};
 use crate::shard::{ShardError, ShardSummary, UploadParts};
 
 /// One call of the gateway's shard interface, as it is forwarded.
@@ -152,12 +157,25 @@ pub enum Request {
     Unseal,
     /// [`Shards::import_progress`](crate::Shards::import_progress).
     ImportProgress,
+    /// A read-through fill of the whole of an evicted version, on the
+    /// shard's primary, through the [`Fills`](crate::Fills) of its node
+    /// (see [`ForwardServer::fill_with`]); answered once the version is
+    /// filled, or after `wait` with the fill's progress.
+    Fill {
+        /// The key.
+        key: String,
+        /// The evicted version.
+        version: EpochSeq,
+        /// How long the replica may wait for the fill to end.
+        wait: Duration,
+    },
 }
 
 impl Request {
-    /// Whether the request only reads, announces a streamed body, or waits
-    /// for a flush, so that sending it again after its answer was lost
-    /// changes nothing.
+    /// Whether the request only reads, announces a streamed body, waits
+    /// for a flush, or fills, so that sending it again after its answer
+    /// was lost changes nothing: a second fill of a version joins the
+    /// first, or finds it filled.
     #[must_use]
     pub fn is_read(&self) -> bool {
         !matches!(
@@ -219,6 +237,9 @@ pub enum Response {
     /// The progress number and ranges of [`Request::ImportProgress`], or
     /// `None` if the shard applied none.
     ImportProgress(Option<(u64, ImportRanges)>),
+    /// The outcome of [`Request::Fill`]: filled, still filling, or why
+    /// not.
+    Filled(Result<FillProgress, FillError>),
 }
 
 /// What a replica answers a forwarded request.

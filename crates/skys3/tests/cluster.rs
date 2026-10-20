@@ -511,9 +511,9 @@ async fn the_transport_refuses_strangers_and_caps_its_handshakes() {
     .await;
     assert!(present(&pki, port, &pki.cluster.node(CLUSTER, "n3")).await);
 
-    // A node's connection whose first frame is of a class this build
-    // serves nothing on is closed, as is one that ends before its first
-    // frame, and the listener goes on.
+    // A node's connection whose first frame is of erasure coding, which
+    // this build serves nothing of, is closed, as is one that ends before
+    // its first frame, and the listener goes on.
     let peer = pki
         .cluster
         .node(CLUSTER, "n2")
@@ -522,10 +522,13 @@ async fn the_transport_refuses_strangers_and_caps_its_handshakes() {
     let address: NodeAddress = format!("127.0.0.1:{port}").parse().unwrap();
     let n1 = NodeId::new("n1").unwrap();
     let mut connection = transport.connect(&n1, &address).await.unwrap();
-    let append = Frame::new(Header::new(MessageKind::Append), Vec::new());
-    connection.send(&append).await.unwrap();
+    let fragment = Frame::new(Header::new(MessageKind::FragmentWrite), Vec::new());
+    connection.send(&fragment).await.unwrap();
     let answer = tokio::time::timeout(WAIT, connection.recv()).await.unwrap();
-    assert!(matches!(answer, Ok(None) | Err(_)), "an answer to Append");
+    assert!(
+        matches!(answer, Ok(None) | Err(_)),
+        "an answer to FragmentWrite"
+    );
     drop(transport.connect(&n1, &address).await.unwrap());
     eventually("both connections were let in", || async {
         metric(&node, &transport_handshakes("completed")).await == 4.0
@@ -653,5 +656,333 @@ async fn a_claim_found_after_starting_from_the_copy_stops_the_node() {
     assert_eq!(
         NodeRegistration::from_json(&fake.get(&key).unwrap()).unwrap(),
         theirs
+    );
+}
+
+/// Replication timing short enough for a test: a member takes over about
+/// two seconds after its primary stops.
+const FAST_REPLICATION: &str = "
+[replication]
+lease_renew_interval_ms = 200
+primary_lease_ms = 1000
+primary_grace_ms = 1600
+member_suspect_after_ms = 1000
+replica_ack_timeout_ms = 2500
+
+[buckets.wide]
+replicas = 4
+";
+
+/// The configuration of node `name` of the replicated cluster in `root`,
+/// its transport on `port`.
+fn replicated_config(
+    root: &Path,
+    pki: &Pki,
+    store: &str,
+    name: &str,
+    port: u16,
+) -> skys3_config::Config {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = node_config(&dir, pki, store, name, name, port, 256) + FAST_REPLICATION;
+    text.parse().unwrap()
+}
+
+/// `GET /v1/shards` of `node`.
+async fn shards_of(node: &Node) -> serde_json::Value {
+    admin_json(&node.admin_addr().to_string(), "/v1/shards").await
+}
+
+/// The entry of shard `n` of `bucket` in `node`'s `/v1/shards`.
+async fn shard_on(node: &Node, bucket: &str, n: u64) -> serde_json::Value {
+    let answer = shards_of(node).await;
+    answer["shards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["bucket"] == bucket && entry["shard"] == n)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// A key of `bucket` (`bucket_id`, four shards) that falls in shard `n`.
+fn key_in(bucket_id: &str, n: u8, prefix: &str) -> String {
+    let id = skys3_types::BucketId::new(bucket_id).unwrap();
+    let count = skys3_types::ShardCount::new(4).unwrap();
+    (0..)
+        .map(|i| format!("{prefix}-{i}"))
+        .find(|key| skys3_types::shard_for_key(&id, key.as_bytes(), count).get() == n)
+        .unwrap()
+}
+
+/// Whether `client` reads `data` at `bucket/key`.
+async fn reads(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: &[u8]) -> bool {
+    match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(object) => object
+            .body
+            .collect()
+            .await
+            .is_ok_and(|body| body.into_bytes() == data),
+        Err(_) => false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_nodes_replicate_route_take_over_and_readmit() {
+    let root = tempfile::tempdir().unwrap();
+    let pki = Pki::new(root.path());
+    let fake = Fake::start(None).await;
+    let store = etcd(&fake);
+    let names = ["n1", "n2", "n3"];
+    let ports: Vec<u16> = names.iter().map(|_| free_port()).collect();
+    let mut nodes = Vec::new();
+    for (name, port) in names.iter().zip(&ports) {
+        let config = replicated_config(root.path(), &pki, &store, name, *port);
+        nodes.push(Some(Node::start(config).await.unwrap()));
+    }
+    let node = |nodes: &[Option<Node>], i: usize| -> String {
+        format!("http://{}", nodes[i].as_ref().unwrap().gateway_addr())
+    };
+    let clients: Vec<_> = (0..3).map(|i| support::client(&node(&nodes, i))).collect();
+
+    // A bucket created through one node is placed on all three, which
+    // open their replicas once they learn of it.
+    clients[0]
+        .create_bucket()
+        .bucket("replicated")
+        .send()
+        .await
+        .unwrap();
+    // More replicas than registered nodes cannot be placed, and the bucket
+    // is refused (plan section 14).
+    let refused = clients[1]
+        .create_bucket()
+        .bucket("wide")
+        .send()
+        .await
+        .unwrap_err();
+    let refused = format!("{refused:?}");
+    assert!(refused.contains("cannot place"), "{refused}");
+    for host in nodes.iter().flatten() {
+        eventually("every node holds a replica of every shard", || async {
+            let answer = shards_of(host).await;
+            let shards = answer["shards"].as_array().unwrap().clone();
+            shards.len() == 4
+                && shards.iter().all(|entry| {
+                    entry["source"] == "replica" && entry["members"].as_array().unwrap().len() == 3
+                })
+        })
+        .await;
+    }
+    let first = shard_on(nodes[0].as_ref().unwrap(), "replicated", 0).await;
+    assert_eq!(first["epoch"], 1, "{first}");
+    assert_eq!(first["learners"], serde_json::json!([]), "{first}");
+    let bucket_id = first["bucket_id"].as_str().unwrap().to_owned();
+    let primaries: std::collections::BTreeSet<String> = {
+        let answer = shards_of(nodes[0].as_ref().unwrap()).await;
+        answer["shards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["primary"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert!(
+        primaries.len() >= 2,
+        "placement spread no primaries: {primaries:?}"
+    );
+
+    // Writes and reads work through any node: each key goes to its
+    // shard's primary, wherever it is.
+    let mut written = Vec::new();
+    for i in 0..12_u8 {
+        let key = format!("key-{i}");
+        let data = support::body(i, 3000);
+        let writer = &clients[usize::from(i) % 3];
+        let mut attempts = 0;
+        loop {
+            match writer
+                .put_object()
+                .bucket("replicated")
+                .key(&key)
+                .body(data.clone().into())
+                .send()
+                .await
+            {
+                Ok(_) => break,
+                // A primary serves once its members granted it leases.
+                Err(_) if attempts < 100 => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("PUT {key}: {error:?}"),
+            }
+        }
+        written.push((key, data));
+    }
+    for client in &clients {
+        for (key, data) in &written {
+            assert!(reads(client, "replicated", key, data).await, "{key}");
+        }
+        let listed = client
+            .list_objects_v2()
+            .bucket("replicated")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.key_count(), Some(12));
+    }
+    let forwarded = |answer: &serde_json::Value| answer["routing"]["forwarded"].as_u64().unwrap();
+    assert!(forwarded(&shards_of(nodes[1].as_ref().unwrap()).await) > 0);
+    let peers = shards_of(nodes[2].as_ref().unwrap()).await["peers"].clone();
+    for (name, port) in names.iter().zip(&ports) {
+        assert_eq!(peers[name], format!("127.0.0.1:{port}"), "{peers}");
+    }
+
+    // The primary of shard 0 stops. A member takes over within seconds,
+    // and writes to the shard go on through the other nodes.
+    let primary = first["primary"].as_str().unwrap().to_owned();
+    let stopped = names.iter().position(|name| **name == primary).unwrap();
+    let alive = (stopped + 1) % 3;
+    let key = key_in(&bucket_id, 0, "after");
+    nodes[stopped].take().unwrap().shutdown().await.unwrap();
+    let stopped_at = tokio::time::Instant::now();
+    let data = support::body(99, 2000);
+    let mut resumed = None;
+    while stopped_at.elapsed() < Duration::from_secs(30) {
+        let put = clients[alive]
+            .put_object()
+            .bucket("replicated")
+            .key(&key)
+            .body(data.clone().into())
+            .send()
+            .await;
+        if put.is_ok() {
+            resumed = Some(stopped_at.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let resumed = resumed.expect("writes to the shard resumed");
+    assert!(
+        resumed < Duration::from_secs(10),
+        "writes resumed after {resumed:?}"
+    );
+    let after = shard_on(nodes[alive].as_ref().unwrap(), "replicated", 0).await;
+    assert_eq!(after["epoch"], 2, "{after}");
+    assert_ne!(after["primary"], primary.as_str(), "{after}");
+    assert_eq!(after["members"].as_array().unwrap().len(), 2, "{after}");
+    for (key, data) in &written {
+        assert!(
+            reads(&clients[alive], "replicated", key, data).await,
+            "{key}"
+        );
+    }
+
+    // Restarted, the old primary keeps no replica of the shard, whose
+    // register no longer names it.
+    let config = replicated_config(root.path(), &pki, &store, &primary, ports[stopped]);
+    nodes[stopped] = Some(Node::start(config).await.unwrap());
+    let restarted = nodes[stopped].as_ref().unwrap();
+    let entry = shard_on(restarted, "replicated", 0).await;
+    assert_ne!(entry["source"], "replica", "{entry}");
+    // The coordinator (plan M8-06) adds it back as a learner; here the
+    // test plays it. The restarted node follows the register, its new
+    // primary backfills it and promotes it to member.
+    let register = format!("{CLUSTER}/shards/{bucket_id}/0.json");
+    let mut config = skys3_types::ShardConfig::from_json(&fake.get(&register).unwrap()).unwrap();
+    assert_eq!(config.epoch.get(), 2);
+    config.epoch = skys3_types::Epoch::new(3);
+    config.learners = vec![NodeId::new(primary.as_str()).unwrap()];
+    config.proposal_id = ProposalId::new("test-learner").unwrap();
+    fake.put(&register, &config.to_json().unwrap());
+    eventually(
+        "the restarted node holds a replica as learner or member",
+        || async {
+            let entry = shard_on(restarted, "replicated", 0).await;
+            entry["source"] == "replica"
+                && (entry["role"] == "learner" || entry["role"] == "member")
+        },
+    )
+    .await;
+    eventually("the learner is promoted to member", || async {
+        let entry = shard_on(restarted, "replicated", 0).await;
+        entry["role"] == "member" && entry["members"].as_array().unwrap().len() == 3
+    })
+    .await;
+    let client = support::client(&node(&nodes, stopped));
+    assert!(reads(&client, "replicated", &key, &data).await);
+    for node in nodes.into_iter().flatten() {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_nodes_data_directory_does_not_join_a_cluster() {
+    let root = tempfile::tempdir().unwrap();
+    let pki = Pki::new(root.path());
+    let fake = Fake::start(None).await;
+    let dir = root.path().join("n1");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A single node, whose shard report is its own replicas.
+    let single = config_text(&dir, "127.0.0.1:0", "127.0.0.1:0", "")
+        .replace("[node]\n", "[node]\nnode_id = \"n1\"\n");
+    let node = Node::start(single.parse().unwrap()).await.unwrap();
+    let client = support::client(&format!("http://{}", node.gateway_addr()));
+    client.create_bucket().bucket("alone").send().await.unwrap();
+    let answer = shards_of(&node).await;
+    let shards = answer["shards"].as_array().unwrap();
+    assert_eq!(shards.len(), 4, "{answer}");
+    for entry in shards {
+        assert_eq!(entry["source"], "replica", "{entry}");
+        assert_eq!(entry["role"], "primary", "{entry}");
+        assert_eq!(entry["serving"], true, "{entry}");
+        assert_eq!(entry["members"], serde_json::json!(["n1"]), "{entry}");
+    }
+    assert!(answer.get("routing").is_none(), "{answer}");
+    node.shutdown().await.unwrap();
+
+    // Its data directory holds a bucket's shards: it does not start as a
+    // node of several.
+    let text = node_config(&dir, &pki, &etcd(&fake), "n1", "n1", free_port(), 256);
+    let error = Node::start(text.parse().unwrap()).await.unwrap_err();
+    let message = error.to_string();
+    assert!(matches!(error, StartError::DataDir(_)), "{message}");
+    assert!(message.contains("served as a single node"), "{message}");
+    assert!(
+        message.contains("Moving a single node into a cluster"),
+        "{message}"
+    );
+    assert!(fake.get(&format!("{CLUSTER}/nodes/n1.json")).is_none());
+
+    // A data directory that holds no bucket's shards may become a node of
+    // several (over the same store), and keeps serving as one.
+    let fresh = root.path().join("n2");
+    std::fs::create_dir_all(&fresh).unwrap();
+    let single = config_text(&fresh, "127.0.0.1:0", "127.0.0.1:0", "")
+        .replace("[node]\n", "[node]\nnode_id = \"n2\"\n")
+        .replace("backend = \"file\"", &etcd(&fake));
+    let node = Node::start(single.parse().unwrap()).await.unwrap();
+    node.shutdown().await.unwrap();
+    let solo = "\n[buckets.solo]\nreplicas = 1\nmin_write_replicas = 1\n";
+    let text = node_config(&fresh, &pki, &etcd(&fake), "n2", "n2", free_port(), 256) + solo;
+    let node = Node::start(text.parse().unwrap()).await.unwrap();
+    let client = support::client(&format!("http://{}", node.gateway_addr()));
+    client.create_bucket().bucket("solo").send().await.unwrap();
+    eventually("the node opens its replicas of the bucket", || async {
+        let answer = shards_of(&node).await;
+        let shards = answer["shards"].as_array().unwrap().clone();
+        !shards.is_empty() && shards.iter().all(|entry| entry["source"] == "replica")
+    })
+    .await;
+    node.shutdown().await.unwrap();
+
+    // Once it holds a bucket's shards, it does not start as a single node.
+    let error = Node::start(single.parse().unwrap()).await.unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("served as one node of several"),
+        "{message}"
     );
 }

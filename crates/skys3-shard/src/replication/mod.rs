@@ -82,8 +82,8 @@ use std::time::Duration;
 use skys3_control::ProposalIds;
 use skys3_io::{Clock, Disk, MonoTime};
 use skys3_log::ShardRef;
-use skys3_net::{Frame, Listener, Network, Receiver, Sender, Transport, TransportError};
-use skys3_types::{Epoch, NodeAddress, NodeId, Seq, ShardConfig};
+use skys3_net::{Frame, Listener, Network, Peers, Receiver, Sender, Transport, TransportError};
+use skys3_types::{Epoch, NodeId, Seq, ShardConfig};
 
 pub use self::exposure::{Exposure, ReplicationMetrics};
 pub use self::learners::Backfill;
@@ -184,7 +184,7 @@ struct Inner<N: Network, D: Disk> {
     node: NodeId,
     set: ShardSet<D>,
     transport: Transport<N>,
-    peers: BTreeMap<NodeId, NodeAddress>,
+    peers: Peers,
     clock: Arc<dyn Clock>,
     config: ReplicationConfig,
     /// The grace of each shard this node is a member of, in this life.
@@ -236,14 +236,15 @@ impl<N: Network, D: Disk> fmt::Debug for Replication<N, D> {
 
 impl<N: Network, D: Disk> Replication<N, D> {
     /// The replication service of node `node`, whose replicas are in `set`,
-    /// reaching the other nodes at `peers` through `transport`, and timing
-    /// leases and grace on `clock`.
+    /// reaching the other nodes at the addresses `peers` holds when it
+    /// connects to them, through `transport`, and timing leases and grace
+    /// on `clock`.
     #[must_use]
     pub fn new(
         node: NodeId,
         set: ShardSet<D>,
         transport: Transport<N>,
-        peers: BTreeMap<NodeId, NodeAddress>,
+        peers: impl Into<Peers>,
         clock: Arc<dyn Clock>,
         config: ReplicationConfig,
     ) -> Self {
@@ -252,7 +253,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 node,
                 set,
                 transport,
-                peers,
+                peers: peers.into(),
                 clock,
                 config,
                 graces: Mutex::default(),
@@ -403,6 +404,8 @@ impl<N: Network, D: Disk> Replication<N, D> {
             // Links to the learners a later configuration adds (§6.7), and
             // again to a peer whose link ended, as a learner's does when it
             // is removed and added back.
+            // A peer whose address was not known yet gets its link once
+            // the address is (`Peers`), tried every `link_timeout`.
             let (replication, shard, leader) = linking;
             let mut peers = leader.peers();
             let interval = replication.inner.config.link_timeout;
@@ -410,7 +413,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 match tokio::time::timeout(interval, peers.changed()).await {
                     Ok(Ok(())) => replication.link_peers(&shard, &leader, &mut links),
                     Ok(Err(_)) => return,
-                    Err(_) => {}
+                    Err(_) => replication.link_unaddressed(&shard, &leader, &mut links),
                 }
             }
         });
@@ -442,27 +445,57 @@ impl<N: Network, D: Disk> Replication<N, D> {
         leader: &Arc<Leader>,
         links: &mut BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
     ) {
-        let inner = &self.inner;
         let peers = leader.peers().borrow().clone();
         for peer in peers {
             if links.get(&peer).is_some_and(|link| !link.is_finished()) {
                 continue;
             }
-            let Some(address) = inner.peers.get(&peer) else {
-                tracing::warn!(shard = %leader.shard(), %peer, "no address for a member or learner");
-                continue;
-            };
-            let link = primary::Link {
-                shard: shard.clone(),
-                leader: Arc::clone(leader),
-                member: peer.clone(),
-                address: address.clone(),
-                transport: inner.transport.clone(),
-                config: inner.config,
-                watched: inner.removal.get().is_some(),
-            };
-            links.insert(peer, tokio::spawn(link.run()));
+            if !self.link(shard, leader, &peer, links) {
+                tracing::warn!(shard = %leader.shard(), %peer, "no address for a member or learner yet");
+            }
         }
+    }
+
+    /// Starts a link to each member and learner of `leader` that never had
+    /// one in `links` because its address was not known, if it is now.
+    fn link_unaddressed(
+        &self,
+        shard: &Shard<D>,
+        leader: &Arc<Leader>,
+        links: &mut BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
+    ) {
+        let peers = leader.peers().borrow().clone();
+        for peer in peers {
+            if !links.contains_key(&peer) && self.link(shard, leader, &peer, links) {
+                tracing::info!(shard = %leader.shard(), %peer, "linked a member or learner whose address is now known");
+            }
+        }
+    }
+
+    /// Starts a link to `peer`, a member or learner of `leader`, into
+    /// `links`, if its address is known, and returns whether it did.
+    fn link(
+        &self,
+        shard: &Shard<D>,
+        leader: &Arc<Leader>,
+        peer: &NodeId,
+        links: &mut BTreeMap<NodeId, tokio::task::JoinHandle<()>>,
+    ) -> bool {
+        let inner = &self.inner;
+        let Some(address) = inner.peers.get(peer) else {
+            return false;
+        };
+        let link = primary::Link {
+            shard: shard.clone(),
+            leader: Arc::clone(leader),
+            member: peer.clone(),
+            address,
+            transport: inner.transport.clone(),
+            config: inner.config,
+            watched: inner.removal.get().is_some(),
+        };
+        links.insert(peer.clone(), tokio::spawn(link.run()));
+        true
     }
 
     /// Hands the shard off to its member `to` (§5.4): this node's replica,

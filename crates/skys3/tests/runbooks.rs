@@ -845,6 +845,7 @@ impl FlushRig {
             health: Health::new(),
             flush: service.clone(),
             cluster: None,
+            replicated: None,
         };
         let rig = Self {
             store,
