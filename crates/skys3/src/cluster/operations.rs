@@ -125,9 +125,10 @@ fn holdings<'a>(shards: impl Iterator<Item = &'a ShardConfig>) -> BTreeMap<NodeI
 
 /// The member of `config` other than its primary that a handoff goes to
 /// when the caller names none: one whose node is registered, neither
-/// draining nor departing, and not judged otherwise by `judged` (the
-/// coordinator's registry), leading the fewest shards, the lowest node ID
-/// among equals.
+/// draining nor departing, and judged live by `judged` (the coordinator's
+/// registry; a node it does not judge is not chosen, since a handoff to a
+/// silent member stops the shard until another's takeover), leading the
+/// fewest shards, the lowest node ID among equals.
 fn choose_target(
     config: &ShardConfig,
     nodes: &BTreeMap<NodeId, NodeRegistration>,
@@ -139,7 +140,7 @@ fn choose_target(
         .iter()
         .filter(|member| **member != config.primary)
         .filter(|member| nodes.get(*member).is_some_and(|node| !node.is_leaving()))
-        .filter(|member| judged(member).is_none_or(|state| state == NodeState::Live))
+        .filter(|member| judged(member) == Some(NodeState::Live))
         .min_by_key(|member| (led.get(*member).map_or(0, |held| held.primaries), *member))
         .cloned()
 }
@@ -300,6 +301,27 @@ impl ClusterOperations {
         (StatusCode::OK, answer)
     }
 
+    /// The refusal of a node that neither leads the shard nor coordinates,
+    /// naming both.
+    async fn bystander(&self, config: &ShardConfig) -> Answer {
+        let holder = read_with_retries(&self.store, &TypedKey::coordinator_lease(), &self.retry)
+            .await
+            .ok()
+            .flatten()
+            .map(|lease| lease.value.holder);
+        let primary = &config.primary;
+        let mut answer = json!({
+            "error": format!(
+                "this node neither leads the shard nor is coordinator: ask the primary's \
+                 ({primary}) or the coordinator's admin API"
+            ),
+            "primary": primary.as_str(),
+            "coordinator": holder.as_ref().map(NodeId::as_str),
+        });
+        answer["epoch"] = json!(config.epoch.get());
+        (StatusCode::CONFLICT, answer)
+    }
+
     async fn hand_off(
         &self,
         bucket: &BucketDocument,
@@ -344,6 +366,18 @@ impl ClusterOperations {
                 );
             }
             Some(to) => to,
+            None if !self.coordinator.is_coordinator() => {
+                // Only the coordinator's registry knows which members are
+                // live: its primary asks the caller to name the member.
+                if config.primary != self.node {
+                    return self.bystander(&config).await;
+                }
+                return error(
+                    StatusCode::CONFLICT,
+                    "only the coordinator, which knows which members are live, chooses the \
+                     member: name one ({\"to\": \"<node-id>\"}) or ask the coordinator",
+                );
+            }
             None => {
                 let mut scan = ClusterScan::new();
                 if let Err(error) = scan.refresh(&self.store).await {
@@ -355,7 +389,7 @@ impl ClusterOperations {
                     return error(
                         StatusCode::CONFLICT,
                         format!(
-                            "the shard has no other member to hand off to in epoch {}",
+                            "the shard has no other live member to hand off to in epoch {}",
                             config.epoch
                         ),
                     );
@@ -390,22 +424,7 @@ impl ClusterOperations {
                 }
             }
         } else {
-            let holder =
-                read_with_retries(&self.store, &TypedKey::coordinator_lease(), &self.retry)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|lease| lease.value.holder);
-            let mut answer = json!({
-                "error": format!(
-                    "this node neither leads the shard nor is coordinator: ask the primary's \
-                     ({primary}) or the coordinator's admin API"
-                ),
-                "primary": primary.as_str(),
-                "coordinator": holder.as_ref().map(NodeId::as_str),
-            });
-            answer["epoch"] = json!(config.epoch.get());
-            return (StatusCode::CONFLICT, answer);
+            return self.bystander(&config).await;
         };
         tracing::info!(bucket = %bucket.name, %shard, %primary, %to, via, "started a handoff an operator asked for");
         let answer = json!({
@@ -543,18 +562,21 @@ mod tests {
             }
         );
         // c and d lead one shard each; c sorts first.
-        assert_eq!(
-            choose_target(&shard, &nodes, &led, |_| None),
-            Some(node("c"))
-        );
+        let live = |_: &NodeId| Some(NodeState::Live);
+        assert_eq!(choose_target(&shard, &nodes, &led, live), Some(node("c")));
+        // Without the coordinator's judgement, no member is chosen.
+        assert_eq!(choose_target(&shard, &nodes, &led, |_| None), None);
         // A draining node, one the coordinator suspects, and one that is
         // not registered are passed over.
         nodes.get_mut(&node("c")).unwrap().draining = true;
-        assert_eq!(
-            choose_target(&shard, &nodes, &led, |_| None),
-            Some(node("d"))
-        );
-        let suspect = |name: &NodeId| (*name == node("d")).then_some(NodeState::Suspect);
+        assert_eq!(choose_target(&shard, &nodes, &led, live), Some(node("d")));
+        let suspect = |name: &NodeId| {
+            Some(if *name == node("d") {
+                NodeState::Suspect
+            } else {
+                NodeState::Live
+            })
+        };
         assert_eq!(
             choose_target(&shard, &nodes, &led, suspect),
             Some(node("b"))
@@ -563,7 +585,7 @@ mod tests {
         assert_eq!(choose_target(&shard, &nodes, &led, suspect), None);
         // A shard led alone has nobody to hand off to.
         assert_eq!(
-            choose_target(&config("a", &["a"]), &nodes, &led, |_| None),
+            choose_target(&config("a", &["a"]), &nodes, &led, live),
             None
         );
     }
