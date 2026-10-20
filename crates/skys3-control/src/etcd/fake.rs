@@ -6,6 +6,10 @@
 //! every write, and implements the requests the backend sends: `Range`
 //! (of a key or a range, with a limit), `Txn` with one comparison, and
 //! `Watch` of one key. Faults are queued for the next requests.
+//!
+//! With the `test-util` feature it is public as `skys3_control::etcd_fake`,
+//! so that the node binary's tests run it with an etcd control store, over
+//! mutual TLS if the server configuration asks for client certificates.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
@@ -36,7 +40,7 @@ use super::proto::{
 
 /// What the fake does with the next unary request.
 #[derive(Debug, Clone)]
-pub(super) enum Fault {
+pub enum Fault {
     /// Answers normally.
     Pass,
     /// Answers with this gRPC status in the headers, applying nothing.
@@ -57,7 +61,7 @@ pub(super) enum Fault {
 
 /// What the fake does with the next watch.
 #[derive(Debug, Clone)]
-pub(super) enum WatchFault {
+pub enum WatchFault {
     /// Confirms it, then cancels it as compacted.
     CompactedAfterCreate,
     /// Confirms it, then cancels it.
@@ -84,7 +88,7 @@ struct State {
 }
 
 /// A fake etcd member listening on a local port.
-pub(super) struct Fake {
+pub struct Fake {
     state: Arc<Mutex<State>>,
     addr: SocketAddr,
     task: JoinHandle<()>,
@@ -120,7 +124,11 @@ fn trailers(code: u32) -> Frame<Bytes> {
 
 impl Fake {
     /// Starts a fake on a free local port, with TLS if `tls` is given.
-    pub(super) async fn start(tls: Option<Arc<rustls::ServerConfig>>) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// If no local port can be bound.
+    pub async fn start(tls: Option<Arc<rustls::ServerConfig>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let state = Arc::new(Mutex::new(State::default()));
@@ -159,32 +167,40 @@ impl Fake {
     }
 
     /// The fake's client URL.
-    pub(super) fn url(&self, scheme: &str) -> String {
+    pub fn url(&self, scheme: &str) -> String {
         format!("{scheme}://localhost:{}", self.addr.port())
     }
 
     /// Queues faults for the next unary requests.
-    pub(super) fn fail(&self, faults: impl IntoIterator<Item = Fault>) {
+    pub fn fail(&self, faults: impl IntoIterator<Item = Fault>) {
         self.state().faults.extend(faults);
     }
 
     /// Queues a fault for the next watch.
-    pub(super) fn fail_watch(&self, fault: WatchFault) {
+    pub fn fail_watch(&self, fault: WatchFault) {
         self.state().watch_faults.push_back(fault);
     }
 
     /// The watches opened so far.
-    pub(super) fn watches(&self) -> usize {
+    pub fn watches(&self) -> usize {
         self.state().watches
     }
 
     /// The unary requests received so far.
-    pub(super) fn requests(&self) -> usize {
+    pub fn requests(&self) -> usize {
         self.state().requests
     }
 
+    /// The value of a key, read directly.
+    pub fn get(&self, key: &str) -> Option<Bytes> {
+        self.state()
+            .kvs
+            .get(key.as_bytes())
+            .map(|kv| kv.value.clone())
+    }
+
     /// Writes a key directly, as another client would.
-    pub(super) fn put(&self, key: &str, value: &[u8]) {
+    pub fn put(&self, key: &str, value: &[u8]) {
         let mut state = self.state();
         state.revision += 1;
         let revision = state.revision;

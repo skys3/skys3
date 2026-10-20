@@ -33,11 +33,16 @@
 //!
 //! **Failures.** After a failed write, the file on disk may hold either
 //! value, so the store refuses every later request until it is reopened,
-//! as the log takes a disk out of service after a failed sync.
+//! as the log takes a disk out of service after a failed sync;
+//! [`FileControlStore::failed`] tells its user to do so.
+//!
+//! **Bounds.** Opening the store refuses a register file longer than
+//! [`MAX_REGISTER_BYTES`](crate::MAX_REGISTER_BYTES) from its length,
+//! before reading it.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -51,7 +56,8 @@ use tokio::sync::watch;
 use crate::feed::ChangeFeed;
 use crate::key::{KeyPrefix, RegisterKey, RegisterKind};
 use crate::store::{
-    ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+    ControlError, ControlStore, DeleteOutcome, Expected, MAX_REGISTER_BYTES, PutOutcome, Version,
+    Versioned, check_register_len,
 };
 
 /// The lock file in the root directory.
@@ -165,6 +171,14 @@ impl FileControlStore {
     pub fn config(&self) -> &FileStoreConfig {
         &self.shared.config
     }
+
+    /// Whether a write failed, so the store refuses every request until it
+    /// is opened again. The directory's lock is released once the last
+    /// clone is dropped.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.shared.failed.load(Ordering::Acquire)
+    }
 }
 
 impl Shared {
@@ -251,6 +265,7 @@ impl ControlStore for FileControlStore {
         expected: Expected,
         value: Bytes,
     ) -> Result<PutOutcome, ControlError> {
+        check_register_len(key, value.len() as u64)?;
         let shared = Arc::clone(&self.shared);
         let key = key.clone();
         // The job runs to completion even if this future is dropped, and
@@ -326,7 +341,15 @@ fn load_dir(
             load_dir(&entry.path(), &format!("{path}/"), registers)?;
         } else {
             let key = RegisterKey::new(path)?;
-            let value = Bytes::from(fs::read(entry.path())?);
+            let file = File::open(entry.path())?;
+            check_register_len(&key, file.metadata()?.len())?;
+            // A file that grows after the check is still read only one
+            // byte past the bound.
+            let mut value = Vec::new();
+            file.take(MAX_REGISTER_BYTES as u64 + 1)
+                .read_to_end(&mut value)?;
+            check_register_len(&key, value.len() as u64)?;
+            let value = Bytes::from(value);
             let version = content_version(&value);
             registers.insert(key, Versioned { value, version });
         }
@@ -517,11 +540,13 @@ mod tests {
             .unwrap();
         // A file where the write needs a directory.
         fs::write(dir.path().join("buckets"), b"").unwrap();
+        assert!(!store.failed());
         let error = store
             .put_if(&key("buckets/b.json"), Expected::Absent, Bytes::new())
             .await
             .unwrap_err();
         assert!(matches!(error, ControlError::Io(_)), "{error}");
+        assert!(store.failed() && store.clone().failed());
         for error in [
             store.get(&key("x")).await.unwrap_err(),
             store.list(&KeyPrefix::root()).await.unwrap_err(),
@@ -533,6 +558,40 @@ mod tests {
         ] {
             assert!(error.to_string().contains("reopen"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn registers_over_the_bound_are_neither_written_nor_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileControlStore::open(config(dir.path(), "node-1"), pool())
+            .await
+            .unwrap();
+        let large = Bytes::from(vec![b' '; MAX_REGISTER_BYTES + 1]);
+        let error = store
+            .put_if(&key("buckets/b.json"), Expected::Absent, large.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::TooLarge { .. }), "{error}");
+        assert!(!store.failed(), "a refused write is not a failed one");
+        assert!(!dir.path().join("buckets/b.json").exists());
+        drop(store);
+
+        // Written behind the store's back.
+        fs::create_dir_all(dir.path().join("buckets")).unwrap();
+        fs::write(dir.path().join("buckets/b.json"), &large).unwrap();
+        let error = FileControlStore::open(config(dir.path(), "node-1"), pool())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "register buckets/b.json is 1048577 bytes, over the 1048576-byte limit"
+        );
+        fs::write(dir.path().join("buckets/b.json"), &large[1..]).unwrap();
+        let store = FileControlStore::open(config(dir.path(), "node-1"), pool())
+            .await
+            .unwrap();
+        let read = store.get(&key("buckets/b.json")).await.unwrap().unwrap();
+        assert_eq!(read.value.len(), MAX_REGISTER_BYTES);
     }
 
     #[tokio::test]

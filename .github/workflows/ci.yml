@@ -429,9 +429,15 @@ jobs:
   # tests/e2e/minio.sh builds it from source while the node compiles, once
   # per version: the cache keeps it. The suite's CA goes into the system
   # trust store, which the node's OIDC fetcher reads, and the peering
-  # scenario drops UDP with iptables through sudo. When the suite fails,
-  # its directory (logs, configurations, and data directories) is
-  # uploaded. The job also checks the alerting rules and runs their unit
+  # scenario drops UDP with iptables through sudo. Beside the full suite
+  # over the file control store, the single-node scenarios run again over
+  # etcd with mutual TLS (the pinned release tests/e2e/etcd.sh downloads)
+  # and over an S3 control bucket of a second SkyS3 cluster (plan M8-03;
+  # MinIO fails the startup probe, which the suite checks), each on ports
+  # and in a directory of its own (tests/e2e/control-stores.sh); they
+  # finish within the peering scenario's five minutes. When the suite
+  # fails, its directories (logs, configurations, and data directories)
+  # are uploaded. The job also checks the alerting rules and runs their unit
   # tests with promtool from a pinned Prometheus release, which takes
   # seconds (scripts/ci/promtool.sh).
   e2e:
@@ -492,19 +498,24 @@ jobs:
           sudo update-ca-certificates
           aws --version
 
+      - name: Download etcd
+        run: echo "SKYS3_E2E_ETCD=$(bash tests/e2e/etcd.sh)" >> "$GITHUB_ENV"
+        env:
+          SKYS3_E2E_CACHE: ${{ runner.temp }}/etcd
+
       - name: Run the suite
-        run: tests/e2e/run.sh
+        run: tests/e2e/control-stores.sh
         env:
           SKYS3_E2E_BINARY: target/e2e/skys3
           SKYS3_E2E_PKI: ${{ runner.temp }}/pki
           SKYS3_E2E_SYSTEM_TRUST: 1
 
-      - name: Upload the suite's directory
+      - name: Upload the suite's directories
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: e2e-run
-          path: target/e2e-run/
+          path: target/e2e-run*/
           if-no-files-found: ignore
           retention-days: 7
 

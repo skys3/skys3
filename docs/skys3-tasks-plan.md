@@ -1074,7 +1074,7 @@ This section is unnumbered so that sections 14 and 15, which other documents cit
 - A backend enum replaces `NodeStore<FileControlStore>`. `open_control` runs the startup probe and keeps the local copies.
 - Security findings: **T3**, `[control_store] etcd_tls_ca_file`, `etcd_tls_cert_file`, and `etcd_tls_key_file` build `EtcdStoreConfig::tls`, and `http://` is refused except on loopback; **T4**, a `MAX_REGISTER_BYTES` bound; **T8**, a versioning warning and gauge; **K1**, a failed file store is reopened.
 - Until M8-05b, a node refuses to start if `nodes/` holds another node's registration.
-- **Done when:** the single-node suite passes on etcd over mutual TLS and on MinIO as an S3 control store, and the refusal is tested.
+- **Done when:** the single-node suite passes on etcd over mutual TLS and on an S3 control store that passes the startup probe, and the refusal is tested. MinIO can't be that store: it ignores `If-Match` on `DeleteObject`, so the probe refuses it, and the suite checks that refusal.
 
 #### M8-04 Transport and node registration in the binary
 
@@ -1161,7 +1161,7 @@ The design leaves these points open. Each named PR decides the point and records
 | The peer descriptor (§7.8): where a destination's S3 endpoint serves it, what signs it, and how the source verifies it | M6-07: the reserved key `.skys3/peer-descriptor` of the receiving bucket, through the target's own S3 endpoint; signed by the destination node's `[transport]` key, with its chain, for an hour; verified against the named peer's trust bundle |
 | How a destination accepts a peer's write identity over S3 REST, which a SkyS3 gateway refuses from clients (§7.2, §7.8) | M6-07: requests signed with an access key listed in the peer's `s3_access_key_ids` may carry identities of that peer's bucket pairs |
 | Upgrade rules for on-disk and wire format versions | M7-09, with version fields present from M1-01 |
-| Gating the cluster: a `[cluster] multi_node` flag, or inferred from `[transport]`. `file` is never allowed with more than one node. | M8-03, M8-04 |
+| Gating the cluster: a `[cluster] multi_node` flag, or inferred from `[transport]`. `file` is never allowed with more than one node. | M8-03: an explicit `[cluster] multi_node` flag, off by default, which M8-04 adds; not inferred from `[transport]`, which single-node clusters also configure to peer. `backend = "file"` is never allowed with it. Until M8-05b a node refuses an etcd or S3 store whose `nodes/` registers another node (design §6.2) |
 | New keys: `[transport] advertise`, `[node] zone` and `rack`, and the key that caps in-flight handshakes | M8-04 |
 | How operators manage the identity registers: a CLI or the admin API, and how they authenticate | M8-01: `skys3 control identity put` and `delete`, which reach the control store with the nodes' configuration and credentials, so the store's own access control is the only gate; no admin API route (design §11) |
 | `replicas` above the node count, and migrating `LocalShards` data directories | M8-05b |

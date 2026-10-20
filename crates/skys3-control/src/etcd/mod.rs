@@ -10,8 +10,8 @@
 //! the workspace, and it brings about 25 more crates, among them a second
 //! `base64`, `hashbrown`, and `foldhash`.
 
-#[cfg(test)]
-mod fake;
+#[cfg(any(test, feature = "test-util"))]
+pub mod fake;
 #[cfg(test)]
 mod fake_tests;
 pub(crate) mod grpc;
@@ -35,6 +35,7 @@ use crate::feed::ChangeFeed;
 use crate::key::{KeyPrefix, RegisterKey};
 use crate::store::{
     ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+    check_register_len,
 };
 
 /// Where an [`EtcdControlStore`] keeps its registers, and how it reaches
@@ -387,6 +388,7 @@ impl ControlStore for EtcdControlStore {
                 kv.mod_revision
             )));
         }
+        check_register_len(key, kv.value.len() as u64)?;
         Ok(Some(Versioned {
             value: kv.value,
             version: version_of(kv.mod_revision),
@@ -399,6 +401,7 @@ impl ControlStore for EtcdControlStore {
         expected: Expected,
         value: Bytes,
     ) -> Result<PutOutcome, ControlError> {
+        check_register_len(key, value.len() as u64)?;
         let etcd_key = Bytes::from(self.etcd_key(key));
         let (target, target_union) = match &expected {
             Expected::Absent => (CompareTarget::Create, TargetUnion::CreateRevision(0)),
