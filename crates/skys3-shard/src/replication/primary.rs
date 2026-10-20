@@ -187,7 +187,11 @@ impl<N: Network, D: Disk> Link<N, D> {
             let mut records = match self.leader.records_after(cursor, BATCH) {
                 Pending::Ready(records) => records,
                 Pending::InLog(through) => {
-                    let records = match self.shard.read_tail(cursor, through).await {
+                    let read = self.shard.read_tail(cursor, through);
+                    let records = match self
+                        .beaconing(sender, epoch, &mut last_beacon, read)
+                        .await?
+                    {
                         Ok(records) => records,
                         Err(error) => {
                             // A learner behind what the log still holds
@@ -198,22 +202,13 @@ impl<N: Network, D: Disk> Link<N, D> {
                             return Err(error.into());
                         }
                     };
-                    // Sent as read: a learner outside the acknowledgement
-                    // set lacks records that commit meanwhile, and the next
-                    // commit may drop them from memory again (§6.4).
-                    let next = cursor.get().saturating_add(1);
-                    let contiguous = records
-                        .iter()
-                        .zip(next..)
-                        .take_while(|((position, _), seq)| position.seq.get() == *seq)
-                        .count();
-                    if contiguous == 0 {
-                        self.leader.restore(cursor, records);
-                        continue;
-                    }
+                    // Sent as read, every record after `cursor` through
+                    // `through`: a learner outside the acknowledgement set
+                    // lacks records that commit meanwhile, and a commit
+                    // may drop them from memory again before the link
+                    // gets back to the buffer (§6.4).
                     records
                         .into_iter()
-                        .take(contiguous)
                         .map(|(position, bytes)| Outgoing {
                             seq: position.seq,
                             epoch: position.epoch,
@@ -303,6 +298,43 @@ impl<N: Network, D: Disk> Link<N, D> {
                     .send(&wire::frame(MessageKind::Append, &append, record.bytes))
                     .await?;
                 cursor = record.seq;
+            }
+        }
+    }
+
+    /// Awaits `work`, sending the member a beacon at least as often as
+    /// [`ReplicationConfig::beacon_every`] says meanwhile, as the link does
+    /// while it waits for records. Reading the log back for a member or
+    /// learner that is behind scans every segment, which on a large log
+    /// takes longer than [`ReplicationConfig::link_timeout`]: without
+    /// beacons, both ends gave the session up, and the next one read the
+    /// log again, so a re-admitted learner never caught up (§6.7; found by
+    /// the kill, partition, and peering suite, plan M8-08).
+    async fn beaconing<S: AsyncRead + AsyncWrite + Unpin, T>(
+        &self,
+        sender: &mut Sender<S>,
+        epoch: u64,
+        last_beacon: &mut Option<Instant>,
+        work: impl Future<Output = T>,
+    ) -> Result<T, LinkError> {
+        let mut work = std::pin::pin!(work);
+        loop {
+            let every = self.config.beacon_every(true);
+            let due = last_beacon.map_or_else(Instant::now, |at| at + every);
+            tokio::select! {
+                biased;
+                done = &mut work => return Ok(done),
+                () = tokio::time::sleep_until(due) => {
+                    let beacon = Beacon {
+                        epoch,
+                        commit: self.leader.commit().get(),
+                        lease: self.stamp(),
+                    };
+                    sender
+                        .send(&wire::frame(MessageKind::Beacon, &beacon, Bytes::new()))
+                        .await?;
+                    *last_beacon = Some(Instant::now());
+                }
             }
         }
     }
