@@ -9096,6 +9096,76 @@ of this file. A task with nothing unexpected keeps "None."
   touches `skys3-gateway`: it is imported under the same `cfg` as its
   users.
 
+### M8-03 Control stores in the binary
+
+- **MinIO cannot be an S3 control store.** The task asked for the
+  single-node suite over MinIO as the S3 control store, but the node
+  refuses it at startup: the probe's delete at a stale version was
+  applied. MinIO's community server (the build M8-01 uses) ignores
+  `If-Match` on `DeleteObject` and deletes the object whatever its ETag,
+  which a `curl` request against it confirmed, versioned bucket or not.
+  This is the case design §6.1 refuses with no fallback. The suite now
+  checks that refusal (a node over a MinIO bucket exits with the probe's
+  message), and runs its S3 leg against a bucket of a second single-node
+  SkyS3 cluster, `ctl`, over the file store, which passes the probe.
+- **The three control stores run side by side.** `tests/e2e/control-stores.sh`,
+  which CI's e2e job now runs, starts `run.sh` three times on ports and
+  directories of their own: every scenario over the file store, and the
+  six single-node scenarios over etcd (one member, mutual TLS, the pinned
+  v3.6.10 GitHub release whose SHA-256 `tests/e2e/etcd.sh` checks, the
+  version of CI's etcd job; not the image, so that it runs as a process
+  with the PKI's certificates) and over S3. Locally, with the AWS CLI from
+  its image and the Docker daemon started for the run and stopped after,
+  the three passed together in 5 m 43 s; the single-node runs took about
+  5 minutes each beside the 327-second peering scenario, slowed by running
+  three at once (each passed alone in 2 m 37 s, etcd, and 2 m 55 s, S3).
+  CI's runners call the CLI natively, so the suite step should stay near
+  the peering scenario's length and the job within its 15 minutes; the
+  first CI run will tell.
+- **A shared loopback is one failure scope.** MinIO and the `ctl`
+  cluster both listen on 127.0.0.1, so every write_back CreateBucket of
+  the S3 leg was refused (`400`, the target shares the control store's
+  failure scope) until the suite set `allow_correlated_control_store`.
+- **The single-node guard waits for registrations.** A node refuses an
+  etcd or S3 store whose `nodes/` holds another node's registration, but
+  nothing in this build writes `nodes/` (node registration arrives with
+  M8-04), so two nodes of this build on one prefix are not caught yet; the
+  guard catches them once nodes register. Until then the configuration
+  reference and the runbooks say one store (or prefix) per node.
+- **A shared store's first sync reclaims nothing.** The file store's
+  owner record tells a node the registers are its own; an etcd or S3
+  store has none, so a node that has never synced from it treats the
+  registers it finds as not its own and reclaims no shards on its first
+  sync (`claimed` is false on a first open).
+- **An etcd CA file is optional.** With `https://` endpoints and no
+  `etcd_tls_ca_file`, the node trusts the system roots (as for OIDC),
+  which keeps the design's example valid. `http://` is refused except on
+  loopback, so tests that used `http://e:2379` now use `localhost`.
+- **Bounded reads need a ranged GET on S3.** The object-store client
+  buffers a whole body, so `S3ControlStore` asks for bytes 0 to
+  `MAX_REGISTER_BYTES` and refuses any object whose size is larger, before
+  anything over the bound is read. An empty object answers a ranged GET
+  with `416 InvalidRange`, which is mapped to a refused (empty) register.
+- **The versioning gauge is 0 on SkyS3.** SkyS3 keeps no versions and
+  answers GetBucketVersioning with no status, so the e2e S3 leg checks the
+  warning and `skys3_control_store_versioning` 0. The read runs in the
+  background after startup, so a slow or refused read never delays it.
+- **A detached file store changed the outage drill.** With K1 fixed, the
+  first CreateBucket after the control volume goes away still answers
+  `500`, but the node then drops the failed store, serves its copy (`live`
+  0, `503` for bucket changes), and reopens the store by itself when the
+  volume returns. `runbooks::drill_control_store_outage` and the runbook
+  now say so; the `500` stays an open point (K2).
+- **Gating several nodes: an explicit flag.** Plan §14 decision 1 is
+  recorded as an explicit `[cluster] multi_node` flag, off by default,
+  added by M8-04, not inferred from `[transport]` (single-node clusters
+  configure it to peer); `backend = "file"` is never allowed with it.
+- **Not done here.** `skys3 control rebuild` still writes only a file
+  store, and no metric measures control-store round trips; both are
+  runbook open points.
+- **The AWS SDK's GetBucketVersioning path ends with `/`.** The mock test
+  expected `/bucket` and got `/bucket/`.
+
 ### M8-05a Replicated shards as library code
 
 - **The plan's home could not hold it.** The plan put the code in a

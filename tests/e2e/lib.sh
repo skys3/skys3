@@ -8,6 +8,8 @@
 #   E2E_AWS        how to run the AWS CLI: `aws`, or `docker` for its image
 #   E2E_PORT       the base of every port the suite listens on
 #   E2E_FAULT      a seeded fault, or empty (run.sh)
+#   E2E_CONTROL    the single-node cluster's control store: file, etcd,
+#                  or s3 (run.sh)
 #   MINIO_URL, MINIO_KEY, MINIO_SECRET
 #                  the MinIO server every write_back bucket flushes to
 #   N1_S3, N1_ADMIN, N1_KEY, N1_SECRET
