@@ -30,14 +30,15 @@
 # The clusters and nodes are those of PKI_NODES, `cluster/node` pairs
 # separated by spaces (default: the single-node cluster, the two pairs of
 # peered clusters, the three nodes of cluster c3 of the suite, the three
-# of cluster rc of the replication scenario, and the four of cluster cc
-# of the coordinator scenario). Everything is EC
+# of cluster rc of the replication scenario, the four of cluster cc of
+# the coordinator scenario, and the four of cluster ec of the
+# erasure-coding scenario). Everything is EC
 # P-256 except the token key, and valid for two days. Existing files are
 # kept, so a rerun reuses them.
 set -euo pipefail
 
 dir=${1:?usage: pki.sh <dir>}
-nodes=${PKI_NODES:-"e2e/n1 pa/pa1 pb/pb1 ra/ra1 rb/rb1 c3/c1 c3/c2 c3/c3 rc/r1 rc/r2 rc/r3 cc/cc1 cc/cc2 cc/cc3 cc/cc4"}
+nodes=${PKI_NODES:-"e2e/n1 pa/pa1 pb/pb1 ra/ra1 rb/rb1 c3/c1 c3/c2 c3/c3 rc/r1 rc/r2 rc/r3 cc/cc1 cc/cc2 cc/cc3 cc/cc4 ec/ec1 ec/ec2 ec/ec3 ec/ec4"}
 mkdir -p "$dir"
 cd "$dir"
 
