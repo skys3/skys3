@@ -1002,9 +1002,8 @@ async fn life(world: &Arc<World>, index: usize) -> Result<(), BoxError> {
 
 /// Accepts links on the node's transport port: fragment writes, reads,
 /// holds, and releases go to the fragment server, orphan queries to the
-/// judges, requests a
-/// gateway forwards to the node's shards, and everything else to
-/// replication.
+/// judges, requests a gateway forwards to the node's shards, and
+/// everything else to replication.
 async fn serve(
     listener: Listener<TurmoilNetwork>,
     services: (

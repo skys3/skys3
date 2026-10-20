@@ -134,6 +134,7 @@ fn crashes_during_repairs_keep_k_fragments_readable() {
         .expect("kinds");
         let crash = RepairCrash {
             point,
+            delay: Duration::ZERO,
             target,
             kind,
             downtime: Duration::from_millis(context.rng().random_range(200..2000)),
@@ -197,6 +198,7 @@ fn relocating_a_fragment_before_it_is_durable_is_caught() {
         if let Some(repair) = &mut config.repair {
             repair.crash = Some(RepairCrash {
                 point: RepairPoint::Placed,
+                delay: Duration::ZERO,
                 target: RepairTarget::NewHolder,
                 kind: CrashKind::PowerAtNextSync,
                 downtime: Duration::from_millis(500),

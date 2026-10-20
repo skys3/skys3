@@ -8625,6 +8625,117 @@ of this file. A task with nothing unexpected keeps "None."
   on a node whose shard still has a live primary elsewhere (the drill
   assumes none).
 
+### M5-12 Erasure-coding simulation suite
+
+- **What existed, and what the suite adds.** The coding cluster
+  (`skys3_cluster_sim::coding`) already crashed each of six encoding steps
+  at five targets with one drawn kind (seed 0 at CI), raced orphan
+  reclamation with publication, read degraded objects with up to `m`
+  random lossy nodes at 3+2, crashed repairs at a drawn step, and drained
+  nodes while losses struck; `skys3-ec`'s own tests decode every erasure
+  pattern in memory, and its simulation target runs release and fragment
+  compaction without a cluster. Missing were: loss combinations at the
+  cluster level, `m + 1` failing cleanly, other layouts than 3+2, the
+  replica drop as a crash step, every crash kind at every step, the
+  release path (releasers, holds, sweeps, `EC_RELEASE`) in any cluster
+  run, a check that released fragments ever go, overwrites and deletes
+  racing repairs, a holder lost in the middle of a drain, and the
+  unrepaired-fragment metrics. The new scenarios are in
+  `tests/simulation/ec_suite.rs`; the harness grew `release.rs`,
+  `combinations.rs`, and `races.rs`.
+- **Released fragments now have to go.** The coding cluster never ran
+  M5-07's release, and a run settled with any fragment of an attempt that
+  once published still on its node. With `CodingConfig::release`, every
+  node keeps holds and sweeps them, each replica that leads runs a
+  `Releaser`, orphan reclamation releases through the holds, and a run
+  settles only once every fragment a node that is up holds is named by a
+  member's layout, of any key; fragments that outlive their layouts for
+  15 s once everything else settled fail the run. Every crash, race, and
+  healing scenario runs this way, so "no fragment leaks forever" is
+  checked after each of them.
+- **Loss combinations read through the gateways.** Each round makes
+  fragments unreadable at the gateways' fragment sources: the same
+  indices of every stripe, or every fragment some nodes hold, and a
+  client reads every object whole through one node's gateway per round,
+  with the hot caches off so every GET reads fragments. The rounds are
+  enumerated in a fixed order (the empty set, then every set of 1 to
+  `m + 1` indices, then every set of 1 to `m + 1` of the six nodes), so
+  every run reads all of them and every CI seed covers every
+  combination: 7 + 21 sets at 2+1, 26 + 41 at 3+2, and 42 + 41 at 4+2. A
+  stripe of 4+2 spans all six nodes, so a lost holder there costs every
+  stripe a fragment. In-memory decoding of every pattern stays with
+  `skys3-ec`'s tests.
+- **The replica drop is a crash point of its own.** `CrashPoint::
+  ReplicaDropped` is reached when the driver first sees a member that no
+  longer locates a coded version's bytes, so a kill or a power cut lands
+  in the members' compaction. It is not in `CrashPoint::ALL`, which the
+  M5-04 and M5-05 scenarios iterate and draw from, so their seeds keep
+  what they test.
+- **Crash kinds rotate over seeds.** The two crash matrices strike every
+  step (seven of encoding; six of repair, each at the primary and the new
+  or old holder) with the kind `[Kill, PowerLoss, PowerAtNextSync][seed %
+  3]`, so three consecutive seeds strike every step with every kind. They
+  declare a cost that makes CI's 256 seeds run seeds 0 to 2, and the
+  nightly 1,024 run twelve.
+- **A planned power cut that never came struck the final check.** A cut
+  armed at the next sync of a member at the replica drop, whose node never
+  synced again before the run settled, fired in the recovery outside the
+  simulation (seed 2: "n2 does not recover: simulated power loss during a
+  sync"). Every cut still planned is now dropped at the run's final power
+  loss, which comes first.
+- **Rebuilt in place, not relocated (found, safe).** At 4+2 on six nodes a
+  node that lost its disk is the only one that can take its stripes'
+  rebuilt fragments, and its new disk hands out the old IDs again in the
+  same order, so each rebuilt fragment takes the lost one's ID. I expected
+  the relocation's release to take the live fragment back; instead the log
+  refuses an `EC_RELOCATE` that moves a fragment to where it was ("a move
+  leaves its fragment where it was"), so the repair is given up, while the
+  layout's location now holds the fragment under the header it names and
+  the next pass finds the stripe whole. Nothing is lost or released, but
+  `skys3_repaired_fragments` and `skys3_repair_duration_seconds` do not
+  count such repairs. The healing scenario covers it; recorded in §8.6.
+- **The encoder places fragments on a lost node (found, left open).** In
+  the first overwrite race the new version took 22 s to code after a
+  holder was lost for good: the harness's topology kept listing the node
+  live, and every stripe placed there waited for its write to time out
+  before a re-plan. The registry marks a silent node `Suspect`, which
+  placement ranks after live nodes, so the harness now does at the loss.
+  The encoder itself tracks no silent nodes, as the repairer does, so
+  until the registry marks a node suspect each encoding pays a write
+  timeout per stripe placed on it.
+- **A node lost for good must be outside the shard.** The harness has no
+  takeover in repair runs, so a lost member never lets the run settle.
+  `CrashKind::Lose` in a move crash strikes only a node outside the
+  shard, and a run that loses its drained node drains one of `n3` to
+  `n5`.
+- **The quiet time.** `RepairConfig::quiet` keeps a run going once every
+  stripe is whole; no repair may start within it, and no move in its
+  second half. It must stay off where readers make copies, which are
+  coded and moved later: switched on everywhere at first, it failed two
+  M5-09 scenarios for moves of `copy-0-19`.
+- **Seeded bugs, all caught at every CI seed.** `ReadBug::FillMissing`
+  decodes a stripe short of `k` fragments with zeros (caught by the `m +
+  1` rounds, seeds 0 to 2); `JudgeBug::InProgressReferenced` calls the
+  fragments of attempts in progress referenced, so a node keeps those of
+  an attempt the primary's death abandoned for good (caught as a leak,
+  seeds 0 and 1, and in a repair killed 150 ms after placing a rebuilt
+  fragment whose acknowledgement is held back, seeds 0 and 1; a kill at
+  `Written` came too late, as the `EC_RELOCATE` was appended in the same
+  step and committed after the restart, so `RepairCrash` gained a
+  `delay`); `SeededBug::ReleaseRelocatedTarget` releases the
+  fragments an `EC_RELOCATE` moves to (caught in the overwrite race,
+  seeds 0 to 3); `RepairBug::LeaveDepartingToMoves` never checks a
+  departing node, so a drained node lost mid-drain keeps its fragments
+  unrepaired (seed 0); `RepairBug::TrustSilent` never counts a silent
+  node's fragments lost (seeds 0 and 1). Each is run clean first, which
+  must pass.
+- **Seeds and cost.** TIMES
+- **Left open.** The node binary still runs none of this (M8-07a,
+  M8-07b). The encoder's placement on silent nodes, above. In-place
+  repairs go uncounted by the repair metrics. The crash matrices strike
+  one step per run; enumerating every sync of a cluster run, as M1-14 does
+  for one node, would take hundreds of runs a seed.
+
 ## M7 Hardening
 
 ### M7-03 Fuzzing campaign

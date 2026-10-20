@@ -70,7 +70,9 @@ pub struct RepairConfig {
     pub bug: Option<RepairBug>,
     /// How long the run goes on once every stripe is whole again, for the
     /// check that the repairers then leave the stripes alone: no repair
-    /// starts within it, and no move in its second half.
+    /// starts within it, and no move in its second half. For runs whose
+    /// objects stop changing: no readers' copies, which are coded and
+    /// moved later. Zero checks nothing.
     pub quiet: Duration,
     /// How many objects, the first in key order, are retagged through
     /// `n0`'s gateway once every object is coded and before the losses: a
@@ -163,12 +165,15 @@ pub enum RepairTarget {
     OldHolder,
 }
 
-/// A crash during the repairs: `kind` strikes `target` at `point`, which
-/// restarts `downtime` later.
+/// A crash during the repairs: `kind` strikes `target` `delay` after
+/// `point`, and it restarts `downtime` later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairCrash {
     /// The step.
     pub point: RepairPoint,
+    /// How long after the step; a power cut armed for a new holder's next
+    /// sync is armed at once.
+    pub delay: Duration,
     /// The node.
     pub target: RepairTarget,
     /// How.
@@ -439,17 +444,19 @@ impl Driver<'_> {
         }
         let (unrepaired, _) = self.unrepaired();
         self.repair.peak_unrepaired = self.repair.peak_unrepaired.max(unrepaired);
-        let events = lock(&self.world.repair.events).len();
+        // Without a quiet time, the run may go on for its readers, whose
+        // copies are coded and moved later: nothing is checked.
+        let quiet = (!config.quiet.is_zero()).then(|| lock(&self.world.repair.events).len());
         match self.repair.whole_at {
             Some(whole_at) => {
                 if self.repair.half_from.is_none() && now >= whole_at + config.quiet / 2 {
-                    self.repair.half_from = Some(events);
+                    self.repair.half_from = quiet;
                 }
             }
             None => match self.whole().and_then(|()| self.rebalanced()) {
                 Ok(()) => {
                     self.repair.whole_at = Some(now);
-                    self.repair.quiet_from = Some(events);
+                    self.repair.quiet_from = quiet;
                 }
                 Err(why) => self.repair.unfinished = why,
             },
@@ -634,13 +641,13 @@ impl Driver<'_> {
                 .push((slot.id.to_string(), CrashKind::PowerAtNextSync));
             return;
         }
-        let crash = Crash {
-            delay: Duration::ZERO,
+        let strike = Crash {
+            delay: crash.delay,
             target: CrashTarget::Primary,
             kind: crash.kind,
             downtime: crash.downtime,
         };
-        self.due.push((now, node, crash));
+        self.due.push((now + crash.delay, node, strike));
     }
 
     /// Strikes a crash at [`RepairPoint::Released`] once a node noted a
@@ -661,13 +668,13 @@ impl Driver<'_> {
         let Some(node) = node.filter(|node| !self.world.lost[*node].load(Ordering::SeqCst)) else {
             return;
         };
-        let crash = Crash {
-            delay: Duration::ZERO,
+        let strike = Crash {
+            delay: crash.delay,
             target: CrashTarget::Primary,
             kind: crash.kind,
             downtime: crash.downtime,
         };
-        self.due.push((now, node, crash));
+        self.due.push((now + crash.delay, node, strike));
     }
 
     /// Checks that every member's layout of every object names `k + m`

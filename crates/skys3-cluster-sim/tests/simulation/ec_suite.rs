@@ -292,6 +292,7 @@ fn crashes_of_each_kind_at_each_repair_step_lose_and_leak_nothing() {
             let mut config = repairing(vec![Loss::Disk]);
             let crash = RepairCrash {
                 point,
+                delay: Duration::ZERO,
                 target,
                 kind,
                 downtime: Duration::from_millis(context.rng().random_range(200..2000)),
@@ -307,6 +308,36 @@ fn crashes_of_each_kind_at_each_repair_step_lose_and_leak_nothing() {
             }
         }
         Ok(())
+    });
+}
+
+#[test]
+fn keeping_a_crashed_repair_s_fragments_for_good_is_caught() {
+    Runner::with_cost(1, 3 * REPAIR_COST).run(|context| {
+        // Each rebuilt fragment is durable 300 ms before the repairer
+        // learns so, and its node asks about it meanwhile; the primary dies
+        // 150 ms after placing the first, which abandons that repair.
+        let mut config = repairing(vec![Loss::Disk]);
+        if let Some(repair) = &mut config.repair {
+            repair.ack_delay = Duration::from_millis(300);
+            repair.crash = Some(RepairCrash {
+                point: RepairPoint::Placed,
+                delay: Duration::from_millis(150),
+                target: RepairTarget::Primary,
+                kind: CrashKind::Kill,
+                downtime: Duration::from_millis(500),
+            });
+        }
+        let bugged = CodingConfig {
+            orphans: reclaiming(Duration::ZERO, Some(JudgeBug::InProgressReferenced)),
+            ..config.clone()
+        };
+        caught(
+            context,
+            &config,
+            |config| *config = bugged,
+            &["which no member's layout names"],
+        )
     });
 }
 
