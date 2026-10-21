@@ -769,6 +769,138 @@ async fn a_lost_answer_drops_the_nodes_idle_connections() {
     assert_eq!(*accepted.borrow(), before + 1);
 }
 
+/// A gateway of node 5 whose map names node 4 the primary of shard 0 in
+/// epoch 3, and whose requests may take `timeout`. Node 4 is a stub that
+/// answers the `n`th request it gets, from 0, with `answer(n, request)`;
+/// the counter counts them.
+async fn stubbed(
+    cluster: &Cluster,
+    timeout: Duration,
+    answer: impl Fn(usize, &Request) -> Reply + Send + Sync + 'static,
+) -> (Routed, MemoryShards, Arc<std::sync::atomic::AtomicUsize>) {
+    let transport = cluster.pki.transport(&node(4));
+    let listener = transport
+        .bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address: NodeAddress = listener.local_addr().unwrap().to_string().parse().unwrap();
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (count, answer) = (Arc::clone(&asked), Arc::new(answer));
+    tokio::spawn(async move {
+        while let Ok(incoming) = listener.accept().await {
+            let (count, answer) = (Arc::clone(&count), Arc::clone(&answer));
+            tokio::spawn(async move {
+                let Ok(mut connection) = incoming.handshake().await else {
+                    return;
+                };
+                while let Ok(Some(frame)) = connection.recv().await {
+                    let (_, _, request) = wire::decode_request(&frame).unwrap();
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let reply = answer(n, &request);
+                    let answer = wire::reply_frame(&reply, frame.header.request_id);
+                    if connection.send(&answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let shards = MemoryShards::open_as(SimDisk::new(5), node(5))
+        .await
+        .unwrap();
+    let set = shards.local().set().clone();
+    let gateway = RoutedShards::new(
+        node(5),
+        shards.local().clone(),
+        set,
+        ShardMap::in_memory(),
+        cluster.pki.transport(&node(5)),
+        BTreeMap::from([(node(4), address)]),
+        cluster.store.clone(),
+    )
+    .with_config(
+        RoutingConfig {
+            request_timeout: timeout,
+            ..timing()
+        },
+        RetryPolicy::default(),
+    );
+    gateway.map().learn(config(0, 3, &[4])).await;
+    (gateway, shards, asked)
+}
+
+/// A refusal as a replica's error crosses the wire, as `reason` says.
+fn unavailable(reason: &str) -> Reply {
+    Reply::Refused(ShardError::Unavailable {
+        shard: shard(0),
+        reason: format!("shard {} is unavailable: {reason}", shard(0)),
+    })
+}
+
+/// What a serving primary answers `request` with.
+fn served(request: &Request) -> Reply {
+    let response = match request {
+        Request::Write { .. } => Response::Written(Ok(EpochSeq::new(Epoch::new(3), Seq::new(1)))),
+        _ => Response::Entry(None),
+    };
+    Reply::Served {
+        response,
+        epoch: Epoch::new(3),
+        hint: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_waits_while_its_shard_moves_to_a_new_primary() {
+    let cluster = Cluster::start(timing()).await;
+    // The primary steps down for a planned handoff, then a new one brings
+    // its members up to its log, then serves (§5.4): each refusal comes
+    // before anything is sequenced, so reads and writes alike ask again.
+    let (gateway, _shards, asked) = stubbed(&cluster, WAIT / 4, |n, request| match n % 6 {
+        0..=2 => unavailable(skys3_shard::STEPPED_DOWN),
+        3 | 4 => unavailable(skys3_shard::RECONCILING),
+        _ => served(request),
+    })
+    .await;
+    assert_eq!(timed(gateway.entry(&shard(0), "k")).await.unwrap(), None);
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 6);
+    let write = RecordBody::Delete(Delete { key: "k".into() });
+    let written = timed(gateway.write(&shard(0), write, Precondition::None)).await;
+    assert_eq!(
+        written.unwrap().unwrap(),
+        EpochSeq::new(Epoch::new(3), Seq::new(1))
+    );
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 12);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_waits_for_a_new_primary_only_within_its_timeout() {
+    let cluster = Cluster::start(timing()).await;
+    let (gateway, _shards, asked) = stubbed(&cluster, timing().request_timeout, |_, _| {
+        unavailable(skys3_shard::STEPPED_DOWN)
+    })
+    .await;
+    let started = tokio::time::Instant::now();
+    let error = timed(gateway.entry(&shard(0), "k")).await.unwrap_err();
+    assert!(
+        error.to_string().contains(skys3_shard::STEPPED_DOWN),
+        "{error}"
+    );
+    let waited = started.elapsed();
+    assert!(waited < timing().request_timeout * 2, "{waited:?}");
+    assert!(asked.load(std::sync::atomic::Ordering::SeqCst) > 1);
+
+    // Any other refusal reaches the caller at once.
+    let cluster = Cluster::start(timing()).await;
+    let (gateway, _shards, asked) = stubbed(&cluster, WAIT / 4, |_, _| {
+        unavailable("too few members acknowledge")
+    })
+    .await;
+    let error = timed(gateway.entry(&shard(0), "k")).await.unwrap_err();
+    assert!(error.to_string().contains("too few members"), "{error}");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn the_map_only_moves_forward_and_survives_a_restart() {
     let disk = SimDisk::new(3);
