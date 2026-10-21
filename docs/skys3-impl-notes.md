@@ -10080,3 +10080,92 @@ of this file. A task with nothing unexpected keeps "None."
   node off (510 to 596 packets dropped, the clients still connecting,
   another primary named after 6.4 to 6.7 s, healed after 0.9 to 1.3 s).
   The peered keys arrived over QUIC in every run.
+
+### M8-07b Repair and fragment moves in the binary
+
+- **Where the repairer runs.** Beside each replica's encoder in
+  `NodeCoding::start_replica`, as M8-07a left room for, sharing the
+  replica's `Attempts`; every repairer of the node shares one
+  `RepairBandwidth` of `repair_bytes_per_second_per_node` and one
+  `RepairMetrics`, now exported. The library's repairer already works only
+  while its replica leads and serves, so nothing else gates it. Drain
+  moves needed no code of their own: a draining registration is
+  `Departing` in the planner's topology (M8-07a), and `FragmentPlanner::
+  moves` moves fragments off a listed node that is not eligible (M5-09).
+- **The pass interval (decided).** `RepairSettings::from_config` had a
+  fixed 30 s pass, and nothing called it. A test or the e2e job cannot
+  wait for 30 s passes, and a new key was not worth it: a pass now comes
+  every tenth of `fragment_repair_after_seconds`, from 1 to 30 s, so a
+  silent node is found lost at most a tenth late, and the default (600 s)
+  keeps 30 s. Moves follow the same pace, 16 a shard per pass. Recorded in
+  §8.4 ("In the node binary, as built"), §8.6, and the config reference.
+- **A closed replica left its backlog counted (found, fixed).**
+  `RepairMetrics` keeps each shard's lost fragments until a pass of a
+  replica that no longer leads clears them. A repairer aborted with its
+  replica (closed, dropped from the node, or the node stopping) never
+  passes again, so `skys3_unrepaired_fragments` and
+  `skys3_oldest_unrepaired_age_seconds` would stay up on that node for
+  good, and `SkyS3FragmentsUnrepaired` fire for a loss its successor had
+  repaired. A new `RepairMetrics::forget` runs when the node drops a
+  replica's coding.
+- **Liveness (decided).** The repairer needs none beyond its own checks:
+  §8.6 already counts a node silent for `fragment_repair_after_seconds`
+  lost, and a check is the probe. The coordinator's registry, which
+  M8-06's handoff target uses, could not serve the encoders and moves
+  either: heartbeats go only to the coordinator, so only its registry
+  knows anything, while primaries run on every node (the handoff target is
+  chosen on the coordinator, where the registry is). The placement
+  weakness M8-07a and M5-12 left open is fixed node-locally instead
+  (`cluster/coding/liveness.rs`): a node that leaves one of the node's
+  fragment writes or reads unanswered (no connection, no answer in time),
+  the repairers' checks included, is `Suspect` in the planner's topology
+  for a minute unless it answers meanwhile; a refusal or a "not held" is
+  an answer. Placement already ranks suspects after live nodes and moves
+  never target them, so an encoder pays one failed write a minute for a
+  node that is down instead of one per stripe. The minute bounds how long
+  a node back from a restart, which nothing else may write to while
+  suspect, waits for new fragments. Recorded in §8.4.
+- **When a drain is done (decided).** No node knows another's fragments:
+  heartbeats carry nothing, and M5-09 keeps no cluster-wide count. So the
+  drained node reports its own: `GET /v1/cluster` gained `fragments`,
+  `held` (its stores' fragments) and `unreleased` (those no primary has
+  released), `null` without `[ec]`. Once `unreleased` is 0, no layout
+  names a fragment it holds; runbook "Draining a node" step 3 now waits
+  for it. Nothing in the coordinator ends a drain, so "finishes" is the
+  operator's step, as for shards. The releaser's 10 s interval dominates:
+  the e2e drain took 13 s for one 2 s move. Orphans count until
+  `fragment_orphan_after_seconds`, and so do releases a restart forgot
+  (holds are in memory, M5-07) until orphan reclamation finds them.
+- **A shared read client panicked.** The first build cloned the
+  gateway's `FragmentReadClient` for the repairers before
+  `with_holds`, which panics on a client already shared ("the client is
+  not shared yet"). The repairers now get a client of their own, without
+  holds, as the simulation's do.
+- **Moves were silent in the log.** `Repairer::run` logged only passes
+  that found a loss, so a drain left no trace; it now logs passes that
+  moved or failed to move a fragment too. A log-only change in code the
+  simulation drives.
+- **`SkyS3FragmentsUnrepaired` gets a promtool case.** No test can leave a
+  loss unrepaired for an hour, so the e2e scenario shows the gauges the
+  alert reads return to 0, and `deploy/prometheus/skys3-alerts.test.yml`
+  fires and clears the alert from synthetic series (checked locally with
+  `scripts/ci/promtool.sh`).
+- **The e2e scenario's cost.** `erasure-coding` gained a drain and a loss
+  for good and ran in 44 s locally (21 to 24 s before): the drained
+  holder reported no unreleased fragment 13 s after the drain, and the
+  holder killed for good was counted lost after 11 s and rebuilt on the
+  survivors after 13 s. `fragment_repair_after_seconds = 10` keeps the
+  restarts of the existing phase (1 to 2 s each) clear of repairs, and the
+  8 MiB/s cap keeps the loss counted for about 3 s, which the scenario's
+  0.5 s polls see. The etcd leg stays within the peering scenario's five
+  minutes, and the job within its 15.
+- **Tests.** `skys3/tests/coding.rs` gained
+  `a_drained_holder_is_emptied_and_a_lost_one_repaired` (21 s; the file
+  27 to 28 s, three runs in three); `liveness.rs` has unit tests of the
+  suspicion, the writer, and the source; `coordinator.rs` checks
+  `fragments` is `null` without `[ec]`.
+- **Not added to the nightly suite.** M8-08's chaos cluster runs without
+  `[ec]` and writes small objects; an EC repair step needs the flag on
+  every node, objects past `ec_min_object_bytes`, a holder found from
+  `GET /v1/cluster` and killed for good, and a check of the repair
+  metrics, which is more than a small step. Left open.

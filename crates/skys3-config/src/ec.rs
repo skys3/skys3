@@ -20,8 +20,9 @@ pub struct EcConfig {
     /// `enabled`: whether the node runs erasure coding (plan M8-07a): its
     /// fragment stores, the fragment server on the transport, an encoder
     /// for each shard of a `local` bucket it leads, coded reads in its
-    /// gateway, and orphan reclamation. Needs `[cluster] multi_node`. A
-    /// gate that plan M8-09 removes.
+    /// gateway, orphan reclamation, and repair and fragment moves on the
+    /// shards it leads (plan M8-07b). Needs `[cluster] multi_node`. A gate
+    /// that plan M8-09 removes.
     pub enabled: bool,
     /// `parity_fragments`: `m`, the parity fragments per stripe (§8.3).
     pub parity_fragments: u32,

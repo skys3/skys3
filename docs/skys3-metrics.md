@@ -234,16 +234,19 @@ Design sections 8.3, 8.6, and 16.3. Each shard primary's repairer finds the
 fragments its coded objects lost, rebuilds them on other nodes, and relocates
 them with `EC_RELOCATE`; once nothing is lost, it moves fragments the same
 way (M5-09). A node's repairers share its metrics, over every
-shard it leads; the gauges change at each repair pass.
+shard it leads; the gauges change at each repair pass, which comes every
+tenth of `fragment_repair_after_seconds` (1 to 30 s). A replica that
+closes takes its shard's count out of the gauges; the shard's next primary
+counts what is still lost. The node binary runs the repairers since M8-07b.
 
 | Name | Type | Labels | Design | Status | Description |
 |---|---|---|---|---|---|
-| `skys3_repaired_fragments_total` | counter | none | §8.6 | defined (M5-08) | Fragments this node's shard primaries rebuilt on another node and relocated with a committed `EC_RELOCATE`. |
-| `skys3_moved_fragments_total` | counter | none | §8.3 | defined (M5-09) | Fragments this node's shard primaries moved to another node, to drain a node, respect a failure domain's cap, or balance the nodes, with a committed `EC_RELOCATE` (design section 8.3). |
-| `skys3_repair_bytes_total` | counter | none | §8.6 | defined (M5-08) | Bytes this node's repairs and fragment moves read and wrote: what `repair_bytes_per_second_per_node` caps. |
-| `skys3_repair_duration_seconds` | histogram | none | §8.6, §16.3 | defined (M5-08) | The repair time: for each fragment repaired, the time from when its shard primary found it lost to when its `EC_RELOCATE` committed. Buckets from 1 s, doubling, to about 3 days. |
-| `skys3_unrepaired_fragments` | gauge | none | §8.6 | defined (M5-08) | Fragments the shards this node leads know lost and have not repaired yet. |
-| `skys3_oldest_unrepaired_age_seconds` | gauge | none | §8.6 | defined (M5-08) | How long the oldest of those fragments has been known lost; 0 when there is none. |
+| `skys3_repaired_fragments_total` | counter | none | §8.6 | exported (M8-07b) | Fragments this node's shard primaries rebuilt on another node and relocated with a committed `EC_RELOCATE`. |
+| `skys3_moved_fragments_total` | counter | none | §8.3 | exported (M8-07b) | Fragments this node's shard primaries moved to another node, to drain a node, respect a failure domain's cap, or balance the nodes, with a committed `EC_RELOCATE` (design section 8.3). |
+| `skys3_repair_bytes_total` | counter | none | §8.6 | exported (M8-07b) | Bytes this node's repairs and fragment moves read and wrote: what `repair_bytes_per_second_per_node` caps. |
+| `skys3_repair_duration_seconds` | histogram | none | §8.6, §16.3 | exported (M8-07b) | The repair time: for each fragment repaired, the time from when its shard primary found it lost to when its `EC_RELOCATE` committed. Buckets from 1 s, doubling, to about 3 days. |
+| `skys3_unrepaired_fragments` | gauge | none | §8.6 | exported (M8-07b) | Fragments the shards this node leads know lost and have not repaired yet. |
+| `skys3_oldest_unrepaired_age_seconds` | gauge | none | §8.6 | exported (M8-07b) | How long the oldest of those fragments has been known lost; 0 when there is none. |
 
 ### 3.10 Coordinator and placement
 
@@ -348,8 +351,9 @@ The tests parse the file, check each rule's fields against this table, and
 check that each expression reads only metrics listed here. CI's `e2e` job also
 runs `promtool check rules` on the file and `promtool test rules` on
 [`deploy/prometheus/skys3-alerts.test.yml`](../deploy/prometheus/skys3-alerts.test.yml),
-whose cases fire alerts from synthetic series (`SkyS3FlushRefused` so far),
-with promtool from a pinned Prometheus release whose checksum it verifies
+whose cases fire alerts from synthetic series (`SkyS3FlushRefused` and
+`SkyS3FragmentsUnrepaired` so far), with promtool from a pinned Prometheus
+release whose checksum it verifies
 ([`scripts/ci/promtool.sh`](../scripts/ci/promtool.sh), which runs on any
 linux-amd64 host). A new rule should get a case there.
 
@@ -397,7 +401,7 @@ on, or cannot be shown yet; the notes say why.
 | Two of three members dead | `up`, `skys3_under_replicated_bytes`, `skys3_oldest_under_replicated_age_seconds` | `SkyS3NodeDown`, `SkyS3UnderReplicated`, `SkyS3UnderReplicatedLong` | The shard refuses client writes until a learner catches up; no metric counts those refusals. |
 | Whole cluster loses power | `up`, `skys3_control_store_live`, `skys3_control_store_last_success_timestamp_seconds` | `SkyS3NodeDown`, `SkyS3ControlStoreUnreachable` | Every node is down, then replays its logs. A node that restarts while the control store is unreachable serves its local copy and reports `skys3_control_store_live` 0. |
 | Every member of a shard permanently lost | `up`, `skys3_oldest_dirty_age_seconds`, `skys3_dirty_bytes`, `skys3_oldest_under_replicated_age_seconds` | `SkyS3NodeDown`, `SkyS3DirtyDataOld`, `SkyS3UnderReplicatedLong` | The dirty bytes and dirty age before the loss show the writes at risk in a `write_back` bucket, but not all its deletes (a tombstone counts 0 bytes and, after a restart, its age runs from the restart), nor what a `local` bucket without a backup risked. The lost keys are reported from the latest index snapshot (design section 6.9), not by a metric, and no command runs that report yet. |
-| Node holding EC fragments lost | `up`, `skys3_fragment_reads_total`, `skys3_unrepaired_fragments`, `skys3_oldest_unrepaired_age_seconds`, `skys3_repaired_fragments_total`, `skys3_repair_duration_seconds` | `SkyS3NodeDown`, `SkyS3FragmentsUnrepaired` | Degraded reads go on and read parity fragments (`fragment="parity"`); the repair metrics show the rebuild's progress, once the binary runs repair (M8-07b). |
+| Node holding EC fragments lost | `up`, `skys3_fragment_reads_total`, `skys3_unrepaired_fragments`, `skys3_oldest_unrepaired_age_seconds`, `skys3_repaired_fragments_total`, `skys3_repair_duration_seconds` | `SkyS3NodeDown`, `SkyS3FragmentsUnrepaired` | Degraded reads go on and read parity fragments (`fragment="parity"`); the shard primaries count the node's fragments lost after `fragment_repair_after_seconds` and rebuild them on other nodes, and the repair metrics show the rebuild's progress (M8-07b). |
 | Node fails while the control store is unreachable | `up`, `skys3_control_store_last_success_timestamp_seconds`, `skys3_control_store_live` | `SkyS3NodeDown`, `SkyS3ControlStoreUnreachable` | Both alerts at once mean that the failed node's shards take no writes until the store returns. |
 | Remote target unreachable | `skys3_flush_lag_seconds`, `skys3_flush_retries_total`, `skys3_oldest_dirty_age_seconds`, `skys3_dirty_bytes`, `skys3_dirty_budget_bytes`, `skys3_admission_refusals_total` | `SkyS3FlushStalled`, `SkyS3DirtyDataOld`, `SkyS3DirtyBudgetNearlyFull`, `SkyS3WritesRefusedOverBudget` | Writes go on until the budget is used up. Reads of evicted data fail: `skys3_fills_total` stops growing, and the gateway exports no error rate yet. |
 | Remote target refuses the flushes (`401` or `403`, or a SkyS3 peer's `refused`) | `skys3_flush_refused_keys`, `skys3_flush_refusals_total`, `skys3_flush_retries_total`, `skys3_flush_lag_seconds`, `skys3_peer_s3_refusals_total` | `SkyS3FlushRefused`, `SkyS3FlushStalled`, `SkyS3DirtyDataOld` | The code names the cause at the source; a SkyS3 destination counts what it refuses of a peer's by reason. The bucket's flush status names the latest refusal and its target. |
