@@ -10169,3 +10169,16 @@ of this file. A task with nothing unexpected keeps "None."
   every node, objects past `ec_min_object_bytes`, a holder found from
   `GET /v1/cluster` and killed for good, and a check of the repair
   metrics, which is more than a small step. Left open.
+- **Simulations.** The change touches code the cluster simulation drives
+  only in `Repairer::run`'s log condition, and adds no scenario, so it
+  adds nothing to CI's simulation job. All 224 simulation tests passed at
+  256 seeds through `scripts/ci/simulation.sh`, in 118 minutes with the
+  build on 4 CPUs shared with another agent's runs (load 6 to 9; the tests'
+  own times sum to 7.4 CPU-hours, 1.4 of them the 47 erasure-coding
+  scenarios).
+- **Open points.** The nightly suite has no EC step (above). A drain's end
+  is the drained node's own report: no node or metric tells across the
+  cluster which nodes still hold fragments to move. Suspicion is per node
+  and kept in memory, so each node learns a silent node on its own, at
+  the cost of one failed write or check. `SkyS3FragmentsUnrepaired` is
+  checked by its promtool case only.
