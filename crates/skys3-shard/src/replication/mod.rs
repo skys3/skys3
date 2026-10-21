@@ -73,7 +73,7 @@ mod takeover;
 mod tests;
 pub mod wire;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -197,8 +197,9 @@ struct Inner<N: Network, D: Disk> {
     backfill: OnceLock<Arc<dyn Backfill>>,
     /// Whether members take over from a silent primary.
     takeover: AtomicBool,
-    /// The shards whose members watch their primary in this life.
-    candidates: Mutex<BTreeSet<ShardRef>>,
+    /// The shards whose members watch their primary in this life, and the
+    /// replica each watch holds.
+    candidates: Mutex<BTreeMap<ShardRef, Shard<D>>>,
     /// Since when each under-replicated shard this node leads has been so,
     /// as far as this life saw.
     under: Arc<Mutex<BTreeMap<ShardRef, MonoTime>>>,
@@ -592,8 +593,17 @@ impl<N: Network, D: Disk> Replication<N, D> {
     }
 
     /// Starts a member's watch over its primary, to take over once the
-    /// primary goes silent (§6.5), if the node's members take over and the
-    /// watch does not run already.
+    /// primary goes silent (§6.5), if the node's members take over and no
+    /// watch over this replica runs already.
+    ///
+    /// A watch holds one replica. One the node opened again in its place,
+    /// as a learner it was re-admitted as (§6.7), gets a watch of its own
+    /// once it is a member: the old watch ends when it next wakes, its
+    /// replica stopped. Until then it waits on the shard's grace, which
+    /// the new replica's grants renew, so a new replica that waited for it
+    /// was never watched. Removed again while up, it then never learned
+    /// of it, and stayed open as a member of the configuration before
+    /// (found by the kill, partition, and peering suite, plan M8-08).
     fn watch_primary(&self, shard: &Shard<D>, grace: Arc<Grace>) {
         let inner = &self.inner;
         let Some(removal) = inner.removal.get() else {
@@ -603,8 +613,13 @@ impl<N: Network, D: Disk> Replication<N, D> {
             return;
         }
         let key = shard.shard().clone();
-        if !lock(&inner.candidates).insert(key.clone()) {
-            return;
+        {
+            let mut candidates = lock(&inner.candidates);
+            let watched = candidates.get(&key);
+            if watched.is_some_and(|watched| watched.is_same_replica(shard)) {
+                return;
+            }
+            candidates.insert(key.clone(), shard.clone());
         }
         let candidate = takeover::Candidate {
             replication: self.clone(),
@@ -612,10 +627,16 @@ impl<N: Network, D: Disk> Replication<N, D> {
             grace,
             removal: Arc::clone(removal),
         };
-        let candidates = self.clone();
+        let (candidates, watched) = (self.clone(), shard.clone());
         tokio::spawn(async move {
             candidate.run().await;
-            lock(&candidates.inner.candidates).remove(&key);
+            let mut candidates = lock(&candidates.inner.candidates);
+            if candidates
+                .get(&key)
+                .is_some_and(|held| held.is_same_replica(&watched))
+            {
+                candidates.remove(&key);
+            }
         });
     }
 
