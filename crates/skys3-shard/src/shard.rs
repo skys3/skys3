@@ -375,6 +375,23 @@ impl<D: Disk> Shard<D> {
     pub(crate) fn is_same_replica(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
+
+    /// Runs `act` if the replica runs, under the lock that stopping it
+    /// takes, so that `act` happens before the replica stops or not at all,
+    /// and returns what it returned, or `None` if the replica stopped.
+    /// A replica the node opens in a stopped one's place, as a learner it
+    /// is re-admitted as (§6.7), shares the shard's grace and takeover
+    /// record, so what acts on them for this replica must do so only while
+    /// no such replica can exist.
+    pub(crate) fn while_running<T>(&self, act: impl FnOnce() -> T) -> Option<T> {
+        let sequencer = self.sequencer();
+        if sequencer.stopped.is_some() {
+            return None;
+        }
+        let acted = act();
+        drop(sequencer);
+        Some(acted)
+    }
 }
 
 impl<D: Disk> fmt::Debug for Shard<D> {
@@ -1359,12 +1376,16 @@ impl<D: Disk> Shard<D> {
     /// shard over (§6.3, §6.5): a member that opens again before `config`'s
     /// epoch acknowledges nothing in its epoch until it learns the outcome
     /// ([`Shard::outstanding_takeover`]).
+    ///
+    /// A stopped replica records nothing ([`Shard::while_running`]): the
+    /// record is the shard's, and a replica the node opened in its place
+    /// may record a proposal of its own.
     pub(crate) async fn record_takeover(&self, config: &ShardConfig) -> Result<(), ShardError> {
         let (index, stored) = (Arc::clone(&self.inner.index), config.clone());
-        run(&self.inner.pool, self.shard(), move || {
-            index.store_takeover(&stored)
-        })
-        .await?;
+        let stored = self
+            .while_running(|| self.inner.pool.run(move || index.store_takeover(&stored)))
+            .ok_or_else(|| self.unavailable("the replica stopped"))?;
+        pooled(self.shard(), stored.await)?;
         self.sequencer().takeover = Some(config.clone());
         Ok(())
     }
@@ -1373,13 +1394,17 @@ impl<D: Disk> Shard<D> {
     /// proposal lost. Returns whether it did: while the record stays, the
     /// member must grant nothing, since a restart would send the proposal
     /// again.
+    ///
+    /// A stopped replica forgets nothing, and returns `false`, as
+    /// [`Shard::record_takeover`] records nothing.
     pub(crate) async fn forget_takeover(&self) -> bool {
         let (index, key) = (Arc::clone(&self.inner.index), self.shard().clone());
-        let forgotten = run(&self.inner.pool, self.shard(), move || {
-            index.forget_takeover(&key)
-        })
-        .await;
-        match forgotten {
+        let Some(forgotten) =
+            self.while_running(|| self.inner.pool.run(move || index.forget_takeover(&key)))
+        else {
+            return false;
+        };
+        match pooled(self.shard(), forgotten.await) {
             Ok(()) => {
                 self.sequencer().takeover = None;
                 true
@@ -3169,7 +3194,15 @@ pub(crate) async fn run<T: Send + 'static>(
     shard: &ShardRef,
     job: impl FnOnce() -> Result<T, IndexError> + Send + 'static,
 ) -> Result<T, ShardError> {
-    match pool.run(job).await {
+    pooled(shard, pool.run(job).await)
+}
+
+/// What an index job run on a pool returned, as [`run`] returns it.
+fn pooled<T>(
+    shard: &ShardRef,
+    ran: Result<Result<T, IndexError>, skys3_io::PoolClosed>,
+) -> Result<T, ShardError> {
+    match ran {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(ShardError::unavailable(shard, error)),
         Err(error) => Err(ShardError::unavailable(shard, error)),
