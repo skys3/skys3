@@ -1,13 +1,10 @@
-//! Nodes with `[cluster] multi_node = true` (plan M8-04; design §6.2,
-//! §6.7, §12), on the in-process stand-in for etcd: they register, send
-//! heartbeats to the coordinator the lease names, and take pushed
-//! generations over the intra-cluster transport; a node refuses a peer
-//! from another CA or another cluster, caps its in-flight handshakes, and
-//! does not start over another data directory's registration of its ID.
-//!
-//! No node runs an elector in this build (plan M8-06), so a stand-in plays
-//! the coordinator: it holds `coordinator.lease`, is registered, and
-//! answers heartbeats as coordinator.
+//! Nodes of a cluster (plan M8-04; design §6.2, §6.7, §12), on the
+//! in-process stand-in for etcd: they register, elect a coordinator, send
+//! it heartbeats, and take pushed generations over the intra-cluster
+//! transport; a node refuses a peer from another CA or another cluster,
+//! caps its in-flight handshakes, and does not start over another data
+//! directory's registration of its ID. Replication, routing, takeover, and
+//! re-admission (plan M8-05b) run on them too.
 
 mod support;
 
@@ -19,24 +16,17 @@ use std::time::Duration;
 
 use rustls::pki_types::{PrivateKeyDer, ServerName};
 use skys3::{Node, NodeError, StartError};
-use skys3_control::Version;
 use skys3_control::etcd_fake::Fake;
-use skys3_coord::{
-    AdminEndpoint, ControlChanged, ControlHints, Heartbeat, HeartbeatAck, Leadership, NodeRegistry,
-    RegistryConfig,
-};
-use skys3_io::{Clock, MonoTime, MonotonicClock};
+use skys3_coord::{ControlChanged, Heartbeat, HeartbeatAck};
 use skys3_net::{ALPN_PROTOCOL, Frame, Header, MessageKind, TokioNetwork, Transport};
 use skys3_types::{
-    CoordinatorLease, Generation, Label, NodeAddress, NodeId, NodeRegistration, ProposalId,
-    RegisterDocument,
+    Generation, Label, NodeAddress, NodeId, NodeRegistration, ProposalId, RegisterDocument,
 };
 use support::cluster::{CLUSTER, Leaf, Pki, WAIT, etcd, node_config};
 use support::process::free_port;
 use support::{admin_json, config_text, eventually, http_get};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
 
 /// The admin API's `cluster` object of `node`.
 async fn cluster_state(node: &Node) -> serde_json::Value {
@@ -57,56 +47,21 @@ fn transport_handshakes(outcome: &str) -> String {
     format!("skys3_handshakes_total{{listener=\"transport\",outcome=\"{outcome}\"}}")
 }
 
-/// The stand-in coordinator `coord`: registered, named by the lease, and
-/// answering heartbeats as coordinator. Returns its transport.
-async fn coordinator(pki: &Pki, fake: &Fake) -> Transport<TokioNetwork> {
+/// The transport of `tool`, a node certificate of the cluster that no node
+/// registers, to send nodes admin messages with.
+fn tool_transport(pki: &Pki) -> Transport<TokioNetwork> {
     let credentials = pki
         .cluster
-        .node(CLUSTER, "coord")
+        .node(CLUSTER, "tool")
         .credentials(CLUSTER, &pki.cluster);
-    let transport = Transport::new(TokioNetwork, &credentials);
-    let listener = transport
-        .bind("127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let address: NodeAddress = listener.local_addr().unwrap().to_string().parse().unwrap();
-    let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
-    let registry = NodeRegistry::new(
-        Arc::clone(&clock),
-        RegistryConfig::new(Duration::from_secs(3600)),
-    );
-    let (_, leadership) = watch::channel(Leadership::Coordinator {
-        version: Version::new("held"),
-        until: MonoTime::MAX,
-    });
-    let endpoint =
-        AdminEndpoint::new(ControlHints::new()).with_heartbeats(registry, leadership, clock);
-    tokio::spawn(async move { endpoint.serve(listener).await });
-    let coord = NodeId::new("coord").unwrap();
-    let lease = CoordinatorLease {
-        holder: coord.clone(),
-        proposal_id: ProposalId::new("lease-1").unwrap(),
-    };
-    let registration = NodeRegistration {
-        node_id: coord,
-        address,
-        zone: None,
-        rack: None,
-        disks: Vec::new(),
-        instance_id: None,
-        departing: false,
-        draining: false,
-        proposal_id: ProposalId::new("coord-1").unwrap(),
-    };
-    fake.put(
-        &format!("{CLUSTER}/coordinator.lease"),
-        &lease.to_json().unwrap(),
-    );
-    fake.put(
-        &format!("{CLUSTER}/nodes/coord.json"),
-        &registration.to_json().unwrap(),
-    );
-    transport
+    Transport::new(TokioNetwork, &credentials)
+}
+
+/// The node `coordinator.lease` names, as `node`'s `GET /v1/cluster`
+/// reports it, if any.
+async fn lease_holder(node: &Node) -> Option<String> {
+    let view = admin_json(&node.admin_addr().to_string(), "/v1/cluster").await;
+    view["coordinator"]["holder"].as_str().map(str::to_owned)
 }
 
 /// Connects to the transport of `node` (`id`) at `port` as `transport`'s
@@ -172,7 +127,7 @@ async fn three_nodes_register_heartbeat_and_take_pushes() {
     let pki = Pki::new(root.path());
     let fake = Fake::start(None).await;
     let store = etcd(&fake);
-    let coord = coordinator(&pki, &fake).await;
+    let tool = tool_transport(&pki);
 
     let mut nodes = Vec::new();
     let mut ports = Vec::new();
@@ -184,6 +139,20 @@ async fn three_nodes_register_heartbeat_and_take_pushes() {
         nodes.push(Node::start(text.parse().unwrap()).await.unwrap());
         ports.push(port);
     }
+
+    // One of them is elected: every node may be (plan M8-09).
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let holder = loop {
+        if let Some(holder) = lease_holder(&nodes[0]).await {
+            break holder;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no node holds the coordinator lease"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(["n1", "n2", "n3"].contains(&holder.as_str()), "{holder}");
 
     // Each registers what its configuration and data directory say, and
     // heartbeats to the coordinator the lease names.
@@ -210,7 +179,7 @@ async fn three_nodes_register_heartbeat_and_take_pushes() {
         eventually("the node heartbeats to the coordinator", || async {
             let state = cluster_state(node).await;
             state["heartbeats"]["delivered"].as_u64() >= Some(1)
-                && state["heartbeats"]["coordinator"] == "coord"
+                && state["heartbeats"]["coordinator"] == holder.as_str()
         })
         .await;
         let state = cluster_state(node).await;
@@ -220,21 +189,24 @@ async fn three_nodes_register_heartbeat_and_take_pushes() {
         assert_eq!(state["transport"]["listen"], format!("127.0.0.1:{port}"));
         assert_eq!(state["transport"]["advertise"], format!("127.0.0.1:{port}"));
         assert_eq!(state["transport"]["max_inflight_handshakes"], 256);
-        assert_eq!(state["pushed_generation"], serde_json::Value::Null);
     }
 
-    // A node answers a heartbeat itself: it is not the coordinator.
-    let answer = ask(&coord, "n2", ports[1], &Heartbeat::frame(7)).await;
-    let ack = HeartbeatAck::from_frame(&answer, 7).unwrap();
-    assert!(!ack.coordinator, "{ack:?}");
+    // The lease holder answers a heartbeat as coordinator, and any other
+    // node as a node that does not coordinate.
+    for (i, port) in ports.iter().enumerate() {
+        let id = format!("n{}", i + 1);
+        let answer = ask(&tool, &id, *port, &Heartbeat::frame(7)).await;
+        let ack = HeartbeatAck::from_frame(&answer, 7).unwrap();
+        assert_eq!(ack.coordinator, id == holder, "{id}: {ack:?}");
+    }
 
     // A pushed generation reaches the node's hints, and costs a read of
     // `cluster.json` even when no change stands behind it.
     let pushed = Generation::new(1000);
-    let reply = ask(&coord, "n1", ports[0], &ControlChanged::frame(pushed, 9)).await;
+    let reply = ask(&tool, "n1", ports[0], &ControlChanged::frame(pushed, 9)).await;
     assert_eq!(reply.header.request_id, 9);
     eventually("the push is recorded", || async {
-        cluster_state(&nodes[0]).await["pushed_generation"] == 1000
+        cluster_state(&nodes[0]).await["pushed_generation"].as_u64() >= Some(1000)
     })
     .await;
 
@@ -277,16 +249,17 @@ async fn three_nodes_register_heartbeat_and_take_pushes() {
     };
     assert!(message.contains("names node n2"), "{message}");
 
-    // Without multi_node, the single-node guard still refuses the store.
+    // Every node over the store is a node of the cluster: one without the
+    // transport's certificates does not load (plan M8-09).
     let single = root.path().join("single");
     std::fs::create_dir_all(&single).unwrap();
     let text = config_text(&single, "127.0.0.1:0", "127.0.0.1:0", "")
         .replace("backend = \"file\"", &store);
-    let error = Node::start(text.parse().unwrap()).await.unwrap_err();
-    let StartError::ControlStore(message) = &error else {
-        panic!("{error}");
-    };
-    assert!(message.contains("one node per control store"), "{message}");
+    let error = text.parse::<skys3_config::Config>().unwrap_err();
+    assert!(
+        error.to_string().contains("transport.tls_cert_file"),
+        "{error}"
+    );
 
     for node in nodes {
         node.shutdown().await.unwrap();
@@ -347,9 +320,9 @@ async fn the_transport_refuses_strangers_and_caps_its_handshakes() {
     .await;
     assert!(present(&pki, port, &pki.cluster.node(CLUSTER, "n3")).await);
 
-    // A node's connection whose first frame is of erasure coding, which
-    // this build serves nothing of, is closed, as is one that ends before
-    // its first frame, and the listener goes on.
+    // A node's connection whose first frame no service takes, a reply, is
+    // closed, as is one that ends before its first frame, and the listener
+    // goes on.
     let peer = pki
         .cluster
         .node(CLUSTER, "n2")
@@ -358,12 +331,12 @@ async fn the_transport_refuses_strangers_and_caps_its_handshakes() {
     let address: NodeAddress = format!("127.0.0.1:{port}").parse().unwrap();
     let n1 = NodeId::new("n1").unwrap();
     let mut connection = transport.connect(&n1, &address).await.unwrap();
-    let fragment = Frame::new(Header::new(MessageKind::FragmentWrite), Vec::new());
-    connection.send(&fragment).await.unwrap();
+    let reply = Frame::new(Header::new(MessageKind::ForwardReply), Vec::new());
+    connection.send(&reply).await.unwrap();
     let answer = tokio::time::timeout(WAIT, connection.recv()).await.unwrap();
     assert!(
         matches!(answer, Ok(None) | Err(_)),
-        "an answer to FragmentWrite"
+        "an answer to ForwardReply"
     );
     drop(transport.connect(&n1, &address).await.unwrap());
     eventually("both connections were let in", || async {
@@ -496,7 +469,8 @@ async fn a_claim_found_after_starting_from_the_copy_stops_the_node() {
 }
 
 /// Replication timing short enough for a test: a member takes over about
-/// two seconds after its primary stops.
+/// two seconds after its primary stops, and the coordinator (with its
+/// two-second lease) removes a member a second after another.
 const FAST_REPLICATION: &str = "
 [replication]
 lease_renew_interval_ms = 200
@@ -504,6 +478,7 @@ primary_lease_ms = 1000
 primary_grace_ms = 1600
 member_suspect_after_ms = 1000
 replica_ack_timeout_ms = 2500
+removal_interval_seconds = 1
 
 [buckets.wide]
 replicas = 4
@@ -520,7 +495,10 @@ fn replicated_config(
 ) -> skys3_config::Config {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let text = node_config(&dir, pki, store, name, name, port, 256) + FAST_REPLICATION;
+    let text = node_config(&dir, pki, store, name, name, port, 256).replace(
+        "config_poll_interval_seconds = 1",
+        "config_poll_interval_seconds = 1\ncoordinator_lease_seconds = 2",
+    ) + FAST_REPLICATION;
     text.parse().unwrap()
 }
 
@@ -634,7 +612,9 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
         .await;
     }
     let first = shard_on(nodes[0].as_ref().unwrap(), "replicated", 0).await;
-    assert_eq!(first["epoch"], 1, "{first}");
+    // The coordinator may already have handed the shard off to balance
+    // primaries, which moves its epoch on.
+    let first_epoch = first["epoch"].as_u64().unwrap();
     assert_eq!(first["learners"], serde_json::json!([]), "{first}");
     let bucket_id = first["bucket_id"].as_str().unwrap().to_owned();
     let primaries: std::collections::BTreeSet<String> = {
@@ -764,7 +744,7 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
         "writes resumed after {resumed:?}"
     );
     let after = shard_on(nodes[alive].as_ref().unwrap(), "replicated", 0).await;
-    assert_eq!(after["epoch"], 2, "{after}");
+    assert!(after["epoch"].as_u64() > Some(first_epoch), "{after}");
     assert_ne!(after["primary"], primary.as_str(), "{after}");
     assert_eq!(after["members"].as_array().unwrap().len(), 2, "{after}");
     // Shard 0 serves again; a shard the stopped node also led may still be
@@ -776,23 +756,13 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
         );
     }
 
-    // Restarted, the old primary keeps no replica of the shard, whose
-    // register no longer names it.
+    // Restarted, the old primary is re-admitted: the coordinator adds it
+    // back as a learner, now or already while it was down, since it is the
+    // only node the shard can take (plan M8-06), and the shard's new
+    // primary backfills it and promotes it to member.
     let config = replicated_config(root.path(), &pki, &store, &primary, ports[stopped]);
     nodes[stopped] = Some(Node::start(config).await.unwrap());
     let restarted = nodes[stopped].as_ref().unwrap();
-    let entry = shard_on(restarted, "replicated", 0).await;
-    assert_ne!(entry["source"], "replica", "{entry}");
-    // The coordinator (plan M8-06) adds it back as a learner; here the
-    // test plays it. The restarted node follows the register, its new
-    // primary backfills it and promotes it to member.
-    let register = format!("{CLUSTER}/shards/{bucket_id}/0.json");
-    let mut config = skys3_types::ShardConfig::from_json(&fake.get(&register).unwrap()).unwrap();
-    assert_eq!(config.epoch.get(), 2);
-    config.epoch = skys3_types::Epoch::new(3);
-    config.learners = vec![NodeId::new(primary.as_str()).unwrap()];
-    config.proposal_id = ProposalId::new("test-learner").unwrap();
-    fake.put(&register, &config.to_json().unwrap());
     eventually(
         "the restarted node holds a replica as learner or member",
         || async {
@@ -853,15 +823,13 @@ async fn a_single_nodes_data_directory_does_not_join_a_cluster() {
     );
     assert!(fake.get(&format!("{CLUSTER}/nodes/n1.json")).is_none());
 
-    // A data directory that holds no bucket's shards may become a node of
-    // several (over the same store), and keeps serving as one.
+    // A node of a cluster serves as one; whether a data directory that
+    // holds no bucket's shards may change modes is `datadir`'s unit test,
+    // since a node changes control stores with it, and so its copy.
     let fresh = root.path().join("n2");
     std::fs::create_dir_all(&fresh).unwrap();
     let single = config_text(&fresh, "127.0.0.1:0", "127.0.0.1:0", "")
-        .replace("[node]\n", "[node]\nnode_id = \"n2\"\n")
-        .replace("backend = \"file\"", &etcd(&fake));
-    let node = Node::start(single.parse().unwrap()).await.unwrap();
-    node.shutdown().await.unwrap();
+        .replace("[node]\n", "[node]\nnode_id = \"n2\"\n");
     let solo = "\n[buckets.solo]\nreplicas = 1\nmin_write_replicas = 1\n";
     let text = node_config(&fresh, &pki, &etcd(&fake), "n2", "n2", free_port(), 256) + solo;
     let node = Node::start(text.parse().unwrap()).await.unwrap();
@@ -879,7 +847,8 @@ async fn a_single_nodes_data_directory_does_not_join_a_cluster() {
     let error = Node::start(single.parse().unwrap()).await.unwrap_err();
     let message = error.to_string();
     assert!(
-        message.contains("served as one node of several"),
+        message.contains("served as one of a cluster's nodes"),
         "{message}"
     );
+    assert!(message.contains("file control store"), "{message}");
 }

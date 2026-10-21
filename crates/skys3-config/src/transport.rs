@@ -30,9 +30,10 @@ pub(crate) fn check_handshake_cap(checker: &mut Checker, key: &str, cap: u32) {
 /// `[transport]`: where the node accepts connections from other nodes, and
 /// the files of its identity in the operator's PKI.
 ///
-/// The three files are set together or not at all. The node binds the
-/// listener only with `[cluster] multi_node = true`, which requires them;
-/// peering (`[peering.peers]`) presents the same certificate.
+/// The three files are set together or not at all. A node of a cluster,
+/// over an etcd or S3 control store, binds the listener and requires them;
+/// a single node, over the file store, binds none. Peering
+/// (`[peering.peers]`) presents the same certificate.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TransportConfig {
@@ -96,8 +97,8 @@ impl TransportConfig {
 
     /// The address the node registers for other nodes to reach its
     /// listener at: `advertise`, or else `listen` if it is neither a
-    /// wildcard address nor port 0. `None` otherwise, which
-    /// `[cluster] multi_node = true` does not allow.
+    /// wildcard address nor port 0. `None` otherwise, which a node of a
+    /// cluster does not allow.
     #[must_use]
     pub fn advertised(&self) -> Option<NodeAddress> {
         if let Some(advertise) = &self.advertise {
@@ -141,16 +142,17 @@ impl TransportConfig {
         }
     }
 
-    /// The rules `[cluster] multi_node = true` adds: the node's
-    /// certificates, and an address to register.
-    pub(crate) fn check_multi_node(&self, checker: &mut Checker) {
+    /// The rules of a node of a cluster, over an etcd or S3 control store:
+    /// the node's certificates, and an address to register.
+    pub(crate) fn check_cluster_node(&self, checker: &mut Checker) {
         let files = self.file_keys();
         if files.iter().all(|(_, file)| file.is_none()) {
             for (key, _) in files {
                 checker.report(
                     key,
-                    "is required with [cluster] multi_node = true: nodes authenticate each other \
-                     with their certificates",
+                    "is required with an etcd or S3 control store, whose nodes form a cluster \
+                     and authenticate each other with their certificates; a single node uses \
+                     backend = \"file\"",
                 );
             }
         }
@@ -158,8 +160,9 @@ impl TransportConfig {
             checker.report(
                 "transport.advertise",
                 format!(
-                    "is required with [cluster] multi_node = true while listen ({}) is a \
-                     wildcard address or port 0: other nodes must know where to reach this node",
+                    "is required with an etcd or S3 control store while listen ({}) is a \
+                     wildcard address or port 0: the cluster's other nodes must know where to \
+                     reach this node",
                     self.listen
                 ),
             );

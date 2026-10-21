@@ -645,7 +645,7 @@ mod tests {
     /// from `source`.
     fn settings(source: Option<&str>) -> GatewayConfig {
         let config: Config = "[cluster]\ncluster_id = \"prod-eu\"\n[control_store]\n\
-                              etcd_endpoints = [\"https://etcd.invalid:2379\"]\n"
+                              backend = \"file\"\n"
             .parse()
             .unwrap();
         let mut config = GatewayConfig::new(&config);

@@ -125,7 +125,7 @@ fn bucket() -> BucketDocument {
 fn buckets(transport: &str) -> BucketsConfig {
     let text = format!(
         "[cluster]\ncluster_id = \"c-test\"\n\
-         [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+         [control_store]\nbackend = \"file\"\n\
          [buckets.photos]\ntarget_transport = \"{transport}\"\n"
     );
     text.parse::<Config>().unwrap().buckets().clone()

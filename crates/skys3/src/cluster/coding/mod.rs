@@ -1,7 +1,8 @@
-//! Erasure coding on a node (design §8.2–§8.7; plans M8-07a, M8-07b): with
-//! `[ec] enabled = true` and `[cluster] multi_node = true`, the node runs
-//! what the coding simulation runs on each of its nodes, through the same
-//! library code (`skys3_ec`).
+//! Erasure coding on a node (design §8.2–§8.7; plans M8-07a, M8-07b):
+//! every node of a cluster runs what the coding simulation runs on each of
+//! its nodes, through the same library code (`skys3_ec`). Whether an object
+//! is coded is the `[ec]` policy's: a stripe needs `min_eligible_nodes`
+//! eligible nodes, so a smaller cluster keeps every object replicated.
 //!
 //! - **Fragment stores.** One [`FragmentStore`] per disk of `[node]
 //!   disks`, in the disk's own directory beside its log segments (design
