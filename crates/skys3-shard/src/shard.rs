@@ -1396,12 +1396,21 @@ impl<D: Disk> Shard<D> {
     /// again.
     ///
     /// A stopped replica forgets nothing, and returns `false`, as
-    /// [`Shard::record_takeover`] records nothing.
+    /// [`Shard::record_takeover`] records nothing. The index removes only
+    /// this replica's proposal ([`Index::forget_takeover`]): stopping a
+    /// replica does not wait for the index jobs it queued, so one may
+    /// still commit after the node opened another replica in its place,
+    /// which may have recorded a proposal of its own.
     pub(crate) async fn forget_takeover(&self) -> bool {
-        let (index, key) = (Arc::clone(&self.inner.index), self.shard().clone());
-        let Some(forgotten) =
-            self.while_running(|| self.inner.pool.run(move || index.forget_takeover(&key)))
-        else {
+        let Some(proposed) = self.sequencer().takeover.clone() else {
+            return true;
+        };
+        let index = Arc::clone(&self.inner.index);
+        let Some(forgotten) = self.while_running(|| {
+            self.inner
+                .pool
+                .run(move || index.forget_takeover(&proposed))
+        }) else {
             return false;
         };
         match pooled(self.shard(), forgotten.await) {
