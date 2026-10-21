@@ -9943,6 +9943,10 @@ of this file. A task with nothing unexpected keeps "None."
   `ec/ec4`. Running the suite locally needs an `aws` on `PATH` even for
   scenarios that use only curl (`run.sh` checks for it); a stub was
   enough.
+- **Simulations.** The change touches code the cluster simulation
+  drives (the erasure-coding clients and compaction), and no scenario
+  was added: all 224 simulation tests passed at 256 seeds, in 103
+  minutes on 4 CPUs with the build.
 - **Extension point for M8-07b.** The repairer belongs beside the
   encoder in `NodeCoding::start_replica`, sharing the replica's
   `Attempts`, with one `RepairBandwidth` per node; drain moves run in it.
