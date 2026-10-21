@@ -279,6 +279,8 @@ async fn a_coordinator_is_elected_hands_off_and_is_succeeded() {
     let other = (coordinator + 1) % 3;
     let view = cluster.view(other).await;
     assert_eq!(view["placement"], Value::Null, "{view}");
+    // Every node may be elected: the field stays, always true.
+    assert_eq!(view["coordinator"]["candidate"], true, "{view}");
     assert_eq!(view["nodes"].as_array().unwrap().len(), 3, "{view}");
     // Every node runs erasure coding, but three nodes are fewer than
     // `min_eligible_nodes` (5 by default): its fragment stores hold none.

@@ -20,11 +20,15 @@
 # - a flood of 1,000 connections that never finish a handshake (threat
 #   T7) against c3, whose `[transport] max_inflight_handshakes` is 4:
 #   the in-flight gauge never passes 4, the node's resident memory grows
-#   by less than 32 MiB, and a node gets in once the flood ends.
+#   by less than 32 MiB, and a node gets in once the flood ends;
+# - the runbook "Moving a single node into a cluster": a single node's data
+#   directory that holds a bucket does not start over the cluster's store
+#   and is left as it was, and the bucket's objects, copied with two
+#   `aws s3 sync`s, list and read back through every node of the cluster.
 #
 # It runs only over etcd (`# e2e: etcd`: the default with
 # SKYS3_E2E_CONTROL=etcd, beside the single-node scenarios), takes about
-# a minute, and uses the ports E2E_PORT+90 to E2E_PORT+98.
+# a minute, and uses the ports E2E_PORT+88 to E2E_PORT+98.
 # e2e: etcd
 set -euo pipefail
 . "$E2E_HERE/lib.sh"
@@ -103,7 +107,7 @@ tls_ca_file = "$bundle"
 
 [storage]
 disk_min_free_bytes = 0
-
+$common
 [admin]
 listen = "$admin"
 
@@ -111,6 +115,23 @@ listen = "$admin"
 filter = "info"
 EOF
 }
+
+# What every node here shares: local buckets by default, and a static
+# credential that may do anything.
+key=AKIASKYS3E2ECLUSTER secret=skys3-e2e-cluster-secret-0123456789
+printf '%s' "$secret" >"$work/secret"
+common="
+[buckets.defaults]
+mode = \"local\"
+
+[identity]
+sts_web_identity = false
+
+[identity.static_credentials.admin]
+access_key_id = \"$key\"
+secret_access_key_file = \"$work/secret\"
+policy = '{\"Version\": \"2012-10-17\", \"Statement\": {\"Effect\": \"Allow\", \"Action\": \"*\", \"Resource\": \"*\"}}'
+"
 
 # refused_start <name> <text>: the node of $E2E_DIR/<name> exits non-zero
 # at startup, and its log says <text>.
@@ -289,6 +310,90 @@ result=$(present "$c3_port" c3-c1 30)
     fail "c3 refused c1 after the flood: $result"
 }
 log "flood: $opened connections established, at most $most handshakes in flight, RSS $((before / 1024)) -> $((peak / 1024)) MiB, timed out $(count "$c3_admin" "$handshakes=\"timed_out\"}"); c1's probe took $((SECONDS - started))s after the drain, 5 of them checking it was kept"
+
+# --- Moving a single node into the cluster ----------------------------------
+
+# The runbook "Moving a single node into a cluster": node c1 of a single
+# node, over the file control store, holds a local bucket. Its data
+# directory does not start over the cluster's store, and is left as it
+# was; the bucket moves with two `aws s3 sync`s through a scratch
+# directory (steps 1, 3, and 4), and every cluster node lists and reads
+# every object.
+single=$E2E_DIR/c-single
+single_s3=http://127.0.0.1:$((E2E_PORT + 88))
+configure_single() {
+    mkdir -p "$single"
+    echo "127.0.0.1:$((E2E_PORT + 89))" >"$single/admin"
+    cat >"$single/skys3.toml" <<EOF
+[cluster]
+cluster_id = "c3"
+
+[node]
+node_id = "c1"
+data_dir = "$single/data"
+
+[gateway]
+listen = "127.0.0.1:$((E2E_PORT + 88))"
+
+[control_store]
+backend = "file"
+
+[storage]
+disk_min_free_bytes = 0
+$common
+[admin]
+listen = "127.0.0.1:$((E2E_PORT + 89))"
+
+[logging]
+filter = "info"
+EOF
+}
+# s3 <endpoint> <args...>: the AWS CLI against a node with the credential.
+s3() {
+    local endpoint=$1
+    shift
+    AWS_ACCESS_KEY_ID=$key AWS_SECRET_ACCESS_KEY=$secret AWS_MAX_ATTEMPTS=10 \
+        aws --endpoint-url "$endpoint" "$@"
+}
+configure_single
+node_start c-single
+create_bucket "$single_s3" "$key" "$secret" moved
+mkdir -p "$work/objects" "$work/scratch"
+for i in 1 2 3 4 5; do
+    random_file "$work/objects/object-$i" $((i * 65536))
+done
+s3 "$single_s3" s3 sync --only-show-errors "$work/objects" s3://moved/ ||
+    fail "the single node did not take the objects"
+node_stop c-single
+before=$(find "$single/data" -type f -printf '%P %s\n' | sort | sha256sum)
+# Over the cluster's etcd store, as c1 with its certificate.
+configure c-single c1 c1 0 256
+refused_start c-single "that it served as a single node"
+grep -q 'Moving a single node into a cluster' "$E2E_DIR/logs/c-single.log" ||
+    fail "the refusal does not name the runbook"
+after=$(find "$single/data" -type f -printf '%P %s\n' | sort | sha256sum)
+[ "$before" = "$after" ] || fail "the refused start changed the single node's data directory"
+# Steps 3 and 4: the bucket on the cluster, and the objects copied.
+configure_single
+node_start c-single
+c1_s3=http://127.0.0.1:$((E2E_PORT + 90))
+create_bucket "$c1_s3" "$key" "$secret" moved
+moved_at=$SECONDS
+s3 "$single_s3" s3 sync --only-show-errors s3://moved/ "$work/scratch" ||
+    fail "the copy from the single node failed"
+s3 "$c1_s3" s3 sync --only-show-errors "$work/scratch" s3://moved/ ||
+    fail "the copy to the cluster failed"
+for i in 1 2 3; do
+    endpoint=http://127.0.0.1:$((E2E_PORT + offsets[i]))
+    listed=$(s3 "$endpoint" s3api list-objects-v2 --bucket moved --query 'length(Contents)' --output text)
+    [ "$listed" = 5 ] || fail "c$i lists $listed objects of the moved bucket"
+    rm -rf "$work/read-c$i"
+    s3 "$endpoint" s3 sync --only-show-errors s3://moved/ "$work/read-c$i" ||
+        fail "reading the moved bucket through c$i failed"
+    diff -r "$work/objects" "$work/read-c$i" >/dev/null || fail "c$i reads other bytes"
+done
+log "moved a single node's bucket into the cluster in $((SECONDS - moved_at)) s: its directory is refused over etcd and left as it was, and every node lists and reads the 5 objects"
+node_stop c-single
 
 for i in 1 2 3; do
     node_stop "c$i"

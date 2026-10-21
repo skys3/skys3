@@ -305,6 +305,9 @@ impl ClusterOperations {
                 "holder": lease.as_ref().map(|lease| lease.value.holder.as_str()),
                 "lease_version": lease.as_ref().map(|lease| lease.version.as_str()),
                 "this_node": self.coordinator.is_coordinator(),
+                // Every node of a cluster may be elected since plan M8-09;
+                // kept, as answers only ever gain fields (§12).
+                "candidate": true,
             },
             "nodes": nodes,
             "shards": scan.shards().count(),

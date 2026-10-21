@@ -569,11 +569,11 @@ struct OpenedControl {
 }
 
 /// Opens the control store with `opener` (the startup probe of an S3
-/// store, and the single-node guard), bootstraps `cluster.json` if this
-/// node never synced, and syncs the copy kept in the index. If the store
-/// cannot be opened or does not answer, or looks reset, a node with a copy
-/// runs from it (§6.2); a store that belongs to another node, registers
-/// one, or fails the probe is refused.
+/// store), bootstraps `cluster.json` if this node never synced, and syncs
+/// the copy kept in the index. If the store cannot be opened or does not
+/// answer, or looks reset, a node with a copy runs from it (§6.2); a file
+/// store that belongs to another node, or a store that fails the probe, is
+/// refused.
 async fn open_control(
     config: &Config,
     opener: &Opener,
@@ -719,8 +719,7 @@ struct Opened {
 /// 2. Recover each disk's log (torn tails cut, damage refused), open the
 ///    index, and replay every record after its shard's checkpoint.
 /// 3. Open the control store `[control_store]` names, probing an S3 store
-///    first and refusing an etcd or S3 store that registers another node
-///    ([`crate::control::backend`]); bootstrap `cluster.json`; and sync the
+///    first ([`crate::control::backend`]); bootstrap `cluster.json`; and sync the
 ///    local copy of bucket bindings and identity configuration. If the
 ///    store does not answer, run from the copy kept in the index
 ///    ([`crate::control`]).
@@ -1527,11 +1526,10 @@ async fn close_index(index: Arc<Index>) {
 /// M8-05b; [`Config::multi_node`]), and records the mode if the directory
 /// holds no bucket's shards yet. A single node serves each shard alone in
 /// epoch 1, and a node of a cluster opens the replicas the shard registers
-/// name: a
-/// replica opened one way cannot be served the other, so a data directory
-/// that holds a bucket's shards keeps the mode it served them in. Moving a
-/// single node's buckets into a cluster goes through the buckets' targets
-/// or an S3 copy (runbook "Moving a single node into a cluster").
+/// name: a replica opened one way cannot be served the other, so a data
+/// directory that holds a bucket's shards keeps the mode it served them in.
+/// Moving a single node's buckets into a cluster goes through the buckets'
+/// targets or an S3 copy (runbook "Moving a single node into a cluster").
 ///
 /// # Errors
 ///

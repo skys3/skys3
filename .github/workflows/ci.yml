@@ -434,16 +434,18 @@ jobs:
   # per version: the cache keeps it. The suite's CA goes into the system
   # trust store, which the node's OIDC fetcher reads, and the peering
   # scenario drops UDP with iptables through sudo. Beside the full suite
-  # over the file control store, the single-node scenarios run again over
-  # etcd with mutual TLS (the pinned release tests/e2e/etcd.sh downloads)
-  # and over an S3 control bucket of a second SkyS3 cluster (plan M8-03;
-  # MinIO fails the startup probe, which the suite checks), each on ports
-  # and in a directory of its own (tests/e2e/control-stores.sh); they
-  # finish within the peering scenario's five minutes. The etcd leg also
-  # runs the three-node cluster scenario (plan M8-04: registration,
-  # heartbeats, refused strangers, and a handshake flood), about a minute
-  # beside its single-node scenarios, and the replication and coordinator
-  # scenarios (plans M8-05b and M8-06), beside them too. When the suite
+  # over the file control store, where node n1 is a single node, its
+  # scenarios run again over etcd with mutual TLS (the pinned release
+  # tests/e2e/etcd.sh downloads) and over an S3 control bucket of a second
+  # SkyS3 cluster (plan M8-03; MinIO fails the startup probe, which the
+  # suite checks), where n1 is a one-node cluster (plan M8-09), each on
+  # ports and in a directory of its own (tests/e2e/control-stores.sh);
+  # they finish within the peering scenario's five minutes. The etcd leg
+  # also runs the three-node cluster scenario (plan M8-04: registration,
+  # heartbeats, refused strangers, a handshake flood, and a single node's
+  # bucket moved into the cluster), about two minutes, and the
+  # replication, coordinator, and erasure-coding scenarios (plans M8-05b,
+  # M8-06, and M8-07a), beside them. When the suite
   # fails, its directories (logs, configurations, and data directories)
   # are uploaded. The job also checks the alerting rules and runs their unit
   # tests with promtool from a pinned Prometheus release, which takes

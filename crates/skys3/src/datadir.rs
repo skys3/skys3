@@ -117,9 +117,9 @@ struct NodeFile {
     instance_id: String,
     disks: Vec<RecordedDisk>,
     /// Whether the node's replicas follow shard registers, as one node of
-    /// a cluster (an etcd or S3 control store), rather than serving every shard
-    /// alone. Absent, and false, in files of single nodes and of builds
-    /// before plan M8-05b.
+    /// a cluster (an etcd or S3 control store), rather than serving every
+    /// shard alone. Absent, and false, in files of single nodes and of
+    /// builds before plan M8-05b.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     multi_node: bool,
 }
