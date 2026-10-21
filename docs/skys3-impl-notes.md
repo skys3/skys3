@@ -10038,7 +10038,7 @@ of this file. A task with nothing unexpected keeps "None."
   than the link timeout (1 s), so the session timed out and the next one
   read the log again, for good; it now beacons while it reads
   (`primary.rs`).
-- **A fourth bug, left to a follow-up fix.** A re-admitted learner whose
+- **A fourth bug, fixed in the next PR.** A re-admitted learner whose
   log reconciliation cannot place (its lineage and the primary's share
   no known epoch, §6.6) asks the primary to verify its last record's
   epoch. Both ends look that epoch up with `record_epoch`, which off the
@@ -10048,7 +10048,13 @@ of this file. A task with nothing unexpected keeps "None."
   run with seed 42 a node restarted in a kill loop had four such
   learners for 13 minutes, one session each every 1.5 to 2 s, at 136%
   CPU: its admin API stopped answering, and the shards it served lacked
-  leases (`503` at read-back). No acknowledged write was lost.
+  leases (`503` at read-back). No acknowledged write was lost. The fix
+  (`claude/fix-learner-log-verification`) keeps the session alive at
+  both ends while they read: the learner sends empty, unfinished
+  answers to the `Sync`, and the primary beacons before its verdict
+  (design §6.6; tests in `replication/tests/verify.rs`). A cheaper
+  lookup was not possible from what the shard keeps: the index holds
+  only the applied position, not the epochs of earlier records.
 - **The peer probe over S3 REST.** Before QUIC discovery, a source's
   capability probe over S3 REST to `inbound`, a bucket with
   `peer_source`, was refused for lacking `x-skys3-apply-by` (§7.8); once

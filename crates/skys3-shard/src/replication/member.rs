@@ -1,6 +1,7 @@
 //! A member's end of a link from its shard's primary.
 
 use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_io::Disk;
@@ -55,7 +56,9 @@ where
         Reconcile::Diverged(why) if learner => {
             tracing::info!(shard = %shard.shard(), %why, "asking the primary to verify the learner's log");
             let last = *shard.durable().borrow();
-            unverified = Some(shard.record_epoch(last).await);
+            let named = shard.record_epoch(last);
+            let every = config.beacon_every(true);
+            unverified = Some(answering(&mut sender, epoch, every, named).await?);
             false
         }
         Reconcile::Truncate { after, epoch: at } => {
@@ -100,7 +103,14 @@ where
         ))
         .await?;
     if learner {
-        let frame = recv(&mut receiver, config.link_timeout).await?;
+        // The primary may read its log back to verify the learner's, and
+        // beacons meanwhile (§6.6).
+        let frame = loop {
+            let frame = recv(&mut receiver, config.link_timeout).await?;
+            if frame.header.kind != MessageKind::Beacon {
+                break frame;
+            }
+        };
         let verdict: Backfill =
             wire::body(&frame, MessageKind::Backfill).map_err(LinkError::Protocol)?;
         if !verdict.keep {
@@ -159,6 +169,37 @@ async fn refuse<S: AsyncRead + AsyncWrite + Unpin>(
         .send(&wire::frame(MessageKind::SyncAck, &answer, Bytes::new()))
         .await?;
     Err(LinkError::Protocol(refused))
+}
+
+/// Awaits `work`, a learner's lookup of its last record's epoch, sending
+/// the primary an empty, unfinished `SyncAck` every `every` meanwhile. The
+/// lookup may read the log back, a scan of every segment, and the primary
+/// waits at most the link timeout for each frame of the answer: without
+/// them, a learner with a large log was never verified, as every session
+/// timed out during its scan and the next one scanned again (§6.6; found
+/// by the kill, partition, and peering suite, plan M8-08).
+async fn answering<S: AsyncRead + AsyncWrite + Unpin, T>(
+    sender: &mut Sender<S>,
+    epoch: Epoch,
+    every: Duration,
+    work: impl Future<Output = T>,
+) -> Result<T, LinkError> {
+    let mut work = std::pin::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            done = &mut work => return Ok(done),
+            () = tokio::time::sleep(every) => {
+                let pending = SyncAck {
+                    epoch: epoch.get(),
+                    ..SyncAck::default()
+                };
+                sender
+                    .send(&wire::frame(MessageKind::SyncAck, &pending, Bytes::new()))
+                    .await?;
+            }
+        }
+    }
 }
 
 /// Finds the shard a `Sync` names, which must be open on this node as a
