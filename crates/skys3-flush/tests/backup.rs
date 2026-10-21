@@ -49,7 +49,7 @@ impl World {
     async fn new(store: SimS3, ack: &str, timeout: Duration) -> World {
         let config: Config = format!(
             "[cluster]\ncluster_id = \"c-test\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [buckets.photos]\nmode = \"local\"\n\
              backup_target = \"https://s3.example/remote/{PREFIX}\"\n\
              backup_ack = \"{ack}\"\n\

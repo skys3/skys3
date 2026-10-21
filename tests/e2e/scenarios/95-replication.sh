@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Replication and routing across three nodes (plan M8-05b, design sections
-# 5, 6.3 to 6.6, and 7.1): nodes r1, r2, and r3 of cluster rc, with
-# `[cluster] multi_node = true`, share the etcd control store over mutual
-# TLS (under the prefix `rc/`) and reach each other over the transport
+# 5, 6.3 to 6.6, and 7.1): nodes r1, r2, and r3 of cluster rc share the
+# etcd control store over mutual TLS (under the prefix `rc/`), which makes
+# them nodes of one cluster, and reach each other over the transport
 # with mutual TLS. A write_back bucket with 4 shards of 3 members each
 # flushes to a versioned MinIO bucket. The scenario checks:
 #
@@ -18,8 +18,8 @@
 #   from MinIO whichever node's gateway asks, and is flushed exactly once: once the bucket is
 #   flushed, MinIO holds exactly one version of each key the writer
 #   wrote, acknowledged or not, with its bytes, and every acknowledged key;
-# - that the restarted node rejoins as a learner: the coordinator (any node
-#   may be elected, `[cluster] coordinator = true`, plan M8-06) adds it
+# - that the restarted node rejoins as a learner: the coordinator (every
+#   node may be elected, plans M8-06 and M8-09) adds it
 #   back to every shard that lost it, the only node it can, while it is
 #   still down; once it is back, the shard's primary backfills it and
 #   promotes it to member, and the restarted node serves reads of every
@@ -54,8 +54,6 @@ configure() {
     cat >"$dir/skys3.toml" <<EOF
 [cluster]
 cluster_id = "rc"
-multi_node = true
-coordinator = true
 
 [node]
 node_id = "$node"

@@ -109,7 +109,7 @@ fn the_design_example_loads_unchanged() {
 }
 
 /// The example's values are the defaults, so a configuration with only the
-/// required keys resolves to the same settings.
+/// required keys, a single node's, resolves to the same settings.
 #[test]
 fn the_defaults_are_the_design_example_values() {
     let example: Config = design_example().parse().unwrap();
@@ -117,7 +117,7 @@ fn the_defaults_are_the_design_example_values() {
         [cluster]
         cluster_id = "skys3-prod-a"
         [control_store]
-        etcd_endpoints = ["https://etcd-1.example.internal:2379"]
+        backend = "file"
     "#
     .parse()
     .unwrap();
@@ -147,10 +147,10 @@ fn the_defaults_are_the_design_example_values() {
     assert_eq!(minimal.identity(), &identity);
 
     assert_eq!(minimal.node().node_id, None);
-    assert!(!minimal.cluster().multi_node);
-    assert!(!example.cluster().multi_node);
-    assert!(!minimal.cluster().coordinator);
-    assert!(!example.cluster().coordinator);
+    // The example's etcd store makes it a node of a cluster; the file
+    // store, a single node.
+    assert!(!minimal.multi_node());
+    assert!(example.multi_node());
     assert_eq!(
         minimal.transport().max_inflight_handshakes,
         example.transport().max_inflight_handshakes
@@ -183,8 +183,6 @@ const EVERY_KEY: &str = r#"
 [cluster]
 cluster_id = "c1"
 failure_domain = "zone"
-multi_node = true
-coordinator = true
 
 [node]
 node_id = "node-7"
@@ -265,7 +263,6 @@ reconcile_requests_per_second = 25
 target_region = "auto"
 
 [ec]
-enabled = true
 parity_fragments = 3
 max_data_fragments = 6
 min_eligible_nodes = 7
@@ -384,8 +381,7 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.control_store().coordinator_lease().as_secs(), 12);
     assert_eq!(config.control_store().config_poll_interval().as_secs(), 20);
     assert_eq!(config.transport().listen.port(), 7401);
-    assert!(config.cluster().multi_node);
-    assert!(config.cluster().coordinator);
+    assert!(config.multi_node());
     let replication = config.replication();
     assert_eq!(replication.removal_interval().as_secs(), 5);
     assert_eq!(replication.rebalance_max_moves, 8);
@@ -402,7 +398,6 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(tls.ca, std::path::Path::new("/etc/skys3/ca.crt"));
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
     assert_eq!(config.ec().fragment_repair_after().as_secs(), 900);
-    assert!(config.ec().enabled);
     let node = config.node();
     assert_eq!(node.node_id.as_ref().unwrap().as_str(), "node-7");
     assert_eq!(node.data_dir, std::path::Path::new("/data/skys3"));

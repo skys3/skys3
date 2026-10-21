@@ -411,8 +411,6 @@ config_poll_interval_seconds = 1
         rack = f'rack = "{SOURCE_NODES[node][1]}"' if cluster == SOURCE else ""
         return f"""[cluster]
 cluster_id = "{cluster}"
-multi_node = true
-coordinator = true
 {domain}
 
 [node]

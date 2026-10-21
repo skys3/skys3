@@ -99,7 +99,7 @@ fn timings_follow_the_lease_and_the_drift_bound() {
     );
 
     let text = "[cluster]\ncluster_id = \"prod\"\n\
-                [control_store]\netcd_endpoints = [\"https://etcd:2379\"]\n";
+                [control_store]\nbackend = \"file\"\n";
     let config: skys3_config::Config = text.parse().unwrap();
     let lease = LeaseConfig::from_config(&config).unwrap();
     assert_eq!(lease.lease(), Duration::from_secs(10));

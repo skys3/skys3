@@ -260,6 +260,12 @@ endpoint = "$MINIO_URL"
 bucket = "minio-control"
 profile = "minio-control"
 
+[transport]
+listen = "127.0.0.1:$((E2E_PORT + 87))"
+tls_cert_file = "$pki/minio-control-m1.pem"
+tls_key_file = "$pki/minio-control-m1.key"
+tls_ca_file = "$pki/minio-control-ca.pem"
+
 [storage]
 disk_min_free_bytes = 0
 
@@ -323,6 +329,18 @@ profile = \"skys3-control\"
 allow_correlated_control_store = true"
     ;;
 esac
+# Over etcd or S3, n1 is the only node of a cluster (plan M8-09): it binds
+# the intra-cluster transport, registers, holds the coordinator lease, and
+# serves its buckets as replicated shards of one member. Over the file
+# store it is a single node, which binds no transport.
+transport=""
+if [ "$E2E_CONTROL" != file ]; then
+    transport="[transport]
+listen = \"127.0.0.1:$((E2E_PORT + 2))\"
+tls_cert_file = \"$pki/e2e-n1.pem\"
+tls_key_file = \"$pki/e2e-n1.key\"
+tls_ca_file = \"$pki/e2e-ca.pem\""
+fi
 
 # --- The single-node cluster ------------------------------------------------
 
@@ -347,6 +365,8 @@ tls_key_file = "$pki/gateway.key"
 [control_store]
 $control_store
 config_poll_interval_seconds = 1
+
+$transport
 
 [storage]
 index_checkpoint_interval_seconds = 2

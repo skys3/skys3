@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 # Three nodes of one cluster (plan M8-04, design sections 6.7 and 12):
-# nodes c1, c2, and c3 of cluster c3, with `[cluster] multi_node = true`,
-# share the etcd control store over mutual TLS (under its own prefix,
-# `c3/`, beside the single-node cluster's) and authenticate each other
-# over the intra-cluster transport with mutual TLS. The scenario checks:
+# nodes c1, c2, and c3 of cluster c3 share the etcd control store over
+# mutual TLS (under its own prefix, `c3/`, beside the single-node
+# cluster's), which makes them nodes of one cluster, and authenticate each
+# other over the intra-cluster transport with mutual TLS. The scenario
+# checks:
 #
-# - that a multi-node configuration over the file control store does not
-#   load;
+# - that a configuration that still sets `[cluster] multi_node`, a flag
+#   plan M8-09 removed, does not load, and says why;
 # - each node's registration in etcd (address, zone, rack, disks, data
 #   directory) and in its admin API's `cluster` object;
-# - heartbeats: no node of this cluster may be elected (`[cluster]
-#   coordinator` is off; the coordinator scenario runs one), so the
-#   scenario writes `coordinator.lease` naming c1, as a coordinator would,
-#   and c2 and c3 send c1 heartbeats over the transport, which c1 answers
-#   as a follower;
+# - heartbeats: one node is elected coordinator (every node may be), and
+#   the other two send it heartbeats over the transport, which it answers
+#   as coordinator;
 # - that the transport refuses a certificate from a CA the nodes do not
 #   trust and one of another cluster whose CA they do trust (pb's), and
 #   that a node does not start with another data directory's node ID, or
@@ -52,11 +51,8 @@ b64() { printf '%s' "$1" | base64 -w0; }
 etcd_get() {
     etcd_call /v3/kv/range "{\"key\": \"$(b64 "$1")\"}" | jq -r '.kvs[0].value // empty | @base64d'
 }
-etcd_put() {
-    etcd_call /v3/kv/put "{\"key\": \"$(b64 "$1")\", \"value\": \"$(b64 "$2")\"}" >/dev/null
-}
 
-# configure <name> <node id> <certificate> <port offset> <cap> [<backend>]:
+# configure <name> <node id> <certificate> <port offset> <cap>:
 # the directory $E2E_DIR/<name> and the configuration of node <node id>,
 # with the certificate c3-<certificate>, its gateway at E2E_PORT+<offset>,
 # its admin listener one port up and its transport two, and at most <cap>
@@ -78,13 +74,11 @@ etcd_endpoints = [\"$E2E_ETCD_URL\"]
 etcd_tls_ca_file = \"$pki/e2e-ca.pem\"
 etcd_tls_cert_file = \"$pki/etcd-client.pem\"
 etcd_tls_key_file = \"$pki/etcd-client.key\""
-    [ -n "${6:-}" ] && store="backend = \"$6\""
     mkdir -p "$dir"
     echo "$admin" >"$dir/admin"
     cat >"$dir/skys3.toml" <<EOF
 [cluster]
 cluster_id = "c3"
-multi_node = true
 
 [node]
 node_id = "$node"
@@ -147,13 +141,16 @@ present() {
 
 # --- Configuration ----------------------------------------------------------
 
-configure c-file c1 c1 0 256 file
-if timeout 30 "$E2E_BINARY" --config "$E2E_DIR/c-file/skys3.toml" >"$E2E_DIR/logs/c-file.log" 2>&1; then
-    fail "a multi-node configuration over the file control store started"
+# The flags that gated the cluster until plan M8-09 are gone: a
+# configuration that still sets one does not load, and says why.
+configure c-old c1 c1 0 256
+sed -i 's/^cluster_id = "c3"$/cluster_id = "c3"\nmulti_node = true/' "$E2E_DIR/c-old/skys3.toml"
+if timeout 30 "$E2E_BINARY" --config "$E2E_DIR/c-old/skys3.toml" >"$E2E_DIR/logs/c-old.log" 2>&1; then
+    fail "a configuration with [cluster] multi_node started"
 fi
-grep -q 'serves one node' "$E2E_DIR/logs/c-file.log" ||
-    fail "the file store configuration failed otherwise: $(tail -n 5 "$E2E_DIR/logs/c-file.log")"
-log "multi_node over the file control store does not load"
+grep -q 'cluster.multi_node: was removed' "$E2E_DIR/logs/c-old.log" ||
+    fail "the configuration with multi_node failed otherwise: $(tail -n 5 "$E2E_DIR/logs/c-old.log")"
+log "a removed key does not load: $(grep -o 'cluster.multi_node: was removed[^;]*' "$E2E_DIR/logs/c-old.log" | head -n 1)"
 
 # --- Registration -----------------------------------------------------------
 
@@ -182,21 +179,34 @@ for i in 1 2 3; do
 done
 log "registrations: $(etcd_get c3/nodes/c2.json | jq -c '{address, zone, rack, instance_id}') (c2)"
 
-# --- Heartbeats -------------------------------------------------------------
+# --- Coordinator and heartbeats ---------------------------------------------
 
+# Every node may be elected (plan M8-09): one holds coordinator.lease, and
+# the other two send it heartbeats over the transport, which it answers as
+# coordinator.
 c1_admin=$(cat "$E2E_DIR/c1/admin")
-etcd_put c3/coordinator.lease '{"holder": "c1", "proposal_id": "e2e-lease-1"}'
-# answered <name>: whether the node's heartbeats reach c1 and are answered,
-# by a node that does not coordinate.
-answered() {
+holder() { etcd_get c3/coordinator.lease | jq -r '.holder // empty'; }
+elected() { [ -n "$(holder)" ]; }
+eventually 60 "a node holds the coordinator lease" elected
+leader=$(holder)
+case "$leader" in
+c1 | c2 | c3) ;;
+*) fail "the coordinator lease names $leader" ;;
+esac
+# delivered <name>: whether the node's heartbeats reach the coordinator.
+delivered() {
     admin "$(cat "$E2E_DIR/$1/admin")" /v1/health |
-        jq -e '.cluster.heartbeats.answered >= 2 and .cluster.heartbeats.delivered == 0'
+        jq -e --arg leader "$leader" \
+            '.cluster.heartbeats.delivered >= 2 and .cluster.heartbeats.coordinator == $leader'
 }
-eventually 60 "c2's heartbeats reach c1" answered c2
-eventually 60 "c3's heartbeats reach c1" answered c3
-completed=$(count "$c1_admin" "$handshakes=\"completed\"}")
-[ "$completed" -ge 2 ] || fail "c1 completed $completed transport handshakes"
-log "heartbeats: c2 $(admin "$(cat "$E2E_DIR/c2/admin")" /v1/health | jq -c .cluster.heartbeats), c1 completed $completed handshakes"
+for i in 1 2 3; do
+    [ "c$i" = "$leader" ] && continue
+    eventually 60 "c$i's heartbeats reach $leader" delivered "c$i"
+done
+leader_admin=$(cat "$E2E_DIR/$leader/admin")
+completed=$(count "$leader_admin" "$handshakes=\"completed\"}")
+[ "$completed" -ge 2 ] || fail "$leader completed $completed transport handshakes"
+log "coordinator $leader; heartbeats: $(admin "$(cat "$E2E_DIR/c$(((${leader#c} % 3) + 1))/admin")" /v1/health | jq -c .cluster.heartbeats), $leader completed $completed handshakes"
 
 # --- Strangers --------------------------------------------------------------
 

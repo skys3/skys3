@@ -13,7 +13,9 @@
 //! 1. **Parsing.** The text must be TOML, every value must have its key's
 //!    type, and every key must be known: a misspelled key is an error, never
 //!    silently ignored. Parsing stops at the first problem and reports it
-//!    with its key and line ([`ConfigError::Parse`]).
+//!    with its key and line ([`ConfigError::Parse`]). A key that earlier
+//!    builds read and this one removed, such as `[cluster] multi_node`, is
+//!    refused before that, with why it is gone ([`ConfigError::Invalid`]).
 //! 2. **Validation.** Every rule is checked, and all broken rules are
 //!    reported together, each at its dotted key path
 //!    ([`ConfigError::Invalid`]).
@@ -32,10 +34,18 @@
 //!
 //!     [control_store]
 //!     etcd_endpoints = ["https://etcd-1.example.internal:2379"]
+//!
+//!     [transport]
+//!     listen = "10.0.0.5:7400"
+//!     tls_cert_file = "/etc/skys3/node.crt"
+//!     tls_key_file = "/etc/skys3/node.key"
+//!     tls_ca_file = "/etc/skys3/cluster-ca.crt"
 //! "#
 //! .parse()?;
 //! assert_eq!(config.control_store().prefix, "skys3-prod-a/");
 //! assert_eq!(config.replication().primary_lease().as_secs(), 4);
+//! // Over etcd, the node is one of the cluster's nodes.
+//! assert!(config.multi_node());
 //! # Ok::<(), skys3_config::ConfigError>(())
 //! ```
 
@@ -72,6 +82,7 @@ mod flush;
 mod identity;
 mod node;
 mod peering;
+mod removed;
 mod replication;
 mod storage;
 mod target;
@@ -195,6 +206,11 @@ impl Config {
     /// wrong type, a missing `[cluster]` or `cluster_id`, or an unknown key,
     /// and [`ConfigError::Invalid`] with every broken rule.
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
+        // A removed key is refused with its reason, before the strict
+        // parse would call it unknown.
+        let mut removed = Checker::default();
+        removed::check(text, &mut removed);
+        removed.finish()?;
         let raw: RawConfig = toml::from_str(text)?;
         Ok(Self::validate(raw)?)
     }
@@ -219,19 +235,11 @@ impl Config {
         raw.peering.check(cluster_id, &raw.transport, &mut checker);
         raw.identity.check(&mut checker);
         raw.admin.check(&mut checker);
-        if raw.cluster.multi_node {
-            check_multi_node(&control_store, &raw.transport, &mut checker);
+        if control_store.backend.is_shared() {
+            // A node of a cluster authenticates the others on the transport
+            // and registers where they reach it.
+            raw.transport.check_cluster_node(&mut checker);
         }
-        // Fragments travel on the transport, and a stripe spans nodes.
-        checker.require(
-            raw.cluster.multi_node || !raw.ec.enabled,
-            "ec.enabled",
-            || {
-                "is true; erasure coding places fragments on several nodes and moves them on \
-                 the intra-cluster transport, so it needs [cluster] multi_node = true"
-                    .to_owned()
-            },
-        );
         check_control_store_independence(&control_store, &named_buckets, &mut checker);
         check_peer_sources(&raw.peering, &named_buckets, &mut checker);
         check_stripes(
@@ -273,6 +281,18 @@ impl Config {
     #[must_use]
     pub fn cluster(&self) -> &ClusterConfig {
         &self.cluster
+    }
+
+    /// Whether the node is one of a cluster's nodes, which may be the only
+    /// one: true over an etcd or S3 control store, which the nodes share,
+    /// and false over the file store, which serves a single node
+    /// ([`ControlStoreBackend::is_shared`], §6.2). A node of a cluster
+    /// binds the intra-cluster transport, registers, replicates its shards,
+    /// may be elected coordinator, and runs erasure coding; a single node
+    /// serves every shard alone.
+    #[must_use]
+    pub fn multi_node(&self) -> bool {
+        self.control_store.backend.is_shared()
     }
 
     /// `[node]`.
@@ -366,26 +386,6 @@ impl FromStr for Config {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         Self::from_toml_str(text)
     }
-}
-
-/// The rules of `[cluster] multi_node = true` (§6.2, §6.7): a control store
-/// several nodes can share, never the file store, and the transport the
-/// nodes authenticate each other over, at an address they can reach.
-fn check_multi_node(
-    control_store: &ControlStoreConfig,
-    transport: &TransportConfig,
-    checker: &mut Checker,
-) {
-    checker.require(
-        !matches!(control_store.backend, ControlStoreBackend::File { .. }),
-        "control_store.backend",
-        || {
-            "is \"file\", which serves one node; [cluster] multi_node = true needs \"etcd\" or \
-             \"s3\""
-                .to_owned()
-        },
-    );
-    transport.check_multi_node(checker);
 }
 
 /// Refuses an S3 control store that a bucket's backup or snapshot target

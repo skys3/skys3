@@ -397,7 +397,7 @@ mod tests {
         let path = |name: String| dir.join(name).display().to_string();
         format!(
             "[cluster]\ncluster_id = \"{cluster}\"\n\
-             [control_store]\netcd_endpoints = [\"http://localhost:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [transport]\ntls_cert_file = \"{}\"\ntls_key_file = \"{}\"\n\
              tls_ca_file = \"{}\"\n\
              [peering]\nquic_listen = \"127.0.0.1:0\"\npeer_connect_timeout_ms = 5000\n{extra}\n\
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn a_node_without_peers_has_no_endpoint() {
         let config: Config = "[cluster]\ncluster_id = \"a\"\n\
-                              [control_store]\netcd_endpoints = [\"http://localhost:2379\"]"
+                              [control_store]\nbackend = \"file\""
             .parse()
             .unwrap();
         let wall = Arc::new(ManualWallClock::new(Duration::ZERO));

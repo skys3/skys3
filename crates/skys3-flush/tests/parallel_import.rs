@@ -176,7 +176,7 @@ fn a_restart_mid_import_resumes_every_range() {
         let store = remote(92, &keys).await;
         // Four streams from the bucket's settings, at 40 keys a second.
         let config: skys3_config::Config = "[cluster]\ncluster_id = \"c-test\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [buckets.photos]\nimport_parallel_streams = 4"
             .parse()
             .unwrap();

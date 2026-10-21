@@ -806,7 +806,7 @@ impl FlushRig {
         let registry = MetricsRegistry::new();
         let config: Config = format!(
             "[cluster]\ncluster_id = \"{CLUSTER}\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.example:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [buckets.photos]\nmode = \"write_back\"\n{table}\n"
         )
         .parse()

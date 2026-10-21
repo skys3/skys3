@@ -501,7 +501,7 @@ impl World {
 
         let snapshots = SimS3::new(seed, SimS3Config::default());
         let settings: Config = "[cluster]\ncluster_id = \"c-drill\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [buckets.drill]\nmode = \"local\"\n\
              index_snapshot_interval_seconds = 1\n\
              snapshot_target = \"https://s3.example/remote/snaps/\"\n"

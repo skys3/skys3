@@ -2144,7 +2144,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
             .unwrap_or_default();
         Ok(format!(
             "[cluster]\ncluster_id = \"{cluster}\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [flush]\nack_policy = \"{ack_policy}\"\n{conflict_policy}\
              {defaults}{snapshot_defaults}{backups}{snapshot_tables}{conflict_tables}{origin}"
         )

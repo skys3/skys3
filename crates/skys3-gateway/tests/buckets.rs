@@ -145,7 +145,9 @@ async fn modes_and_targets_come_from_headers_or_configuration() {
 async fn a_target_in_the_control_stores_failure_scope_is_refused() {
     let config = config(
         "[control_store]\nbackend = \"s3\"\nendpoint = \"https://s3.us-west-2.amazonaws.com\"\n\
-         bucket = \"control\"\n",
+         bucket = \"control\"\n\
+         [transport]\nlisten = \"127.0.0.1:7400\"\ntls_cert_file = \"node.pem\"\n\
+         tls_key_file = \"node.key\"\ntls_ca_file = \"ca.pem\"\n",
     );
     let setup = setup_with(config).await;
     let answer = setup

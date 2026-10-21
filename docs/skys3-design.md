@@ -1679,8 +1679,6 @@ The [configuration reference](skys3-config.md) lists every key with its type, de
 [cluster]
 cluster_id = "skys3-prod-a"
 failure_domain = "node"       # "node", "rack", or "zone"; nodes carry rack and zone labels
-multi_node = false            # true: one of several nodes (transport, registration); never with backend = "file"
-coordinator = false           # true: the node may be elected coordinator (section 6.7); needs multi_node
 
 [node]
 node_id = "node-a1"           # optional; generated and kept in data_dir when unset
@@ -1696,7 +1694,7 @@ tls_key_file = "/etc/skys3/tls/server.key"
 max_inflight_handshakes = 256 # TLS handshakes at once; more connections wait (section 12)
 
 [control_store]
-backend = "etcd"              # "etcd" (production default), "s3" (AWS S3, R2, other probed stores), or "file" (single node)
+backend = "etcd"              # "etcd" (production default) or "s3" (AWS S3, R2, other probed stores): a node of a cluster; "file": a single node
 etcd_endpoints = ["https://etcd-1.example.internal:2379", "https://etcd-2.example.internal:2379", "https://etcd-3.example.internal:2379"]   # http:// only on loopback (section 12)
 etcd_tls_ca_file = "/etc/skys3/etcd-ca.crt"     # verifies etcd's certificates; the system roots when unset
 etcd_tls_cert_file = "/etc/skys3/etcd-client.crt"   # with etcd_tls_key_file: the client certificate etcd's --client-cert-auth checks
@@ -1712,7 +1710,7 @@ allow_correlated_control_store = false
 coordinator_lease_seconds = 10
 config_poll_interval_seconds = 30
 
-[transport]                   # intra-cluster mutual TLS (section 12)
+[transport]                   # intra-cluster mutual TLS (section 12); required with an etcd or S3 control store
 listen = "0.0.0.0:7400"
 advertise = "node-a1.example.internal:7400"   # registered for other nodes; defaults to a specific listen address
 max_inflight_handshakes = 256 # TLS handshakes at once; more connections wait
@@ -1767,10 +1765,9 @@ reconcile_requests_per_second = 10    # per bucket and node: the reconciliation 
 target_region = "us-east-1"    # the region requests to write_back targets are signed for
 
 [ec]
-enabled = false               # true: fragment stores, encoders, coded reads (section 8); needs multi_node
 parity_fragments = 2
 max_data_fragments = 8
-min_eligible_nodes = 5
+min_eligible_nodes = 5         # every node of a cluster codes; with fewer eligible nodes, objects stay replicated (section 8.2)
 fragment_release_delay_seconds = 60
 fragment_orphan_after_seconds = 3600
 fragment_repair_after_seconds = 600

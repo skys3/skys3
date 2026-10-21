@@ -1,8 +1,9 @@
 //! A node on each control-store backend (design §6.1, §6.2, §12): etcd
 //! over mutual TLS, against the in-process stand-in for etcd; an S3 store,
-//! another SkyS3 node's bucket, which passes the startup probe; the
-//! single-node guard; `skys3 control identity` against a shared store
-//! while the node runs; and a file store reopened after a failed write.
+//! another SkyS3 node's bucket, which passes the startup probe; `skys3
+//! control identity` against a shared store while the node runs; and a
+//! file store reopened after a failed write. Over etcd or S3 the node is
+//! the only node of a cluster (plan M8-09).
 
 mod support;
 
@@ -13,24 +14,81 @@ use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, 
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::server::WebPkiClientVerifier;
+use skys3::Node;
 use skys3::identity::{self, IdentityFile, Request};
-use skys3::{Node, StartError};
 use skys3_config::Config;
 use skys3_control::etcd_fake::Fake;
-use support::process::{Process, fresh_addresses};
-use support::{admin_json, client, config_text, eventually, get, http_get, put};
+use support::cluster::{Pki, node_config};
+use support::process::{Process, free_port, fresh_addresses};
+use support::{admin_json, client, config_text, eventually, get, http_get};
 
-/// `config_text` with the file control store replaced by `backend`, the
-/// lines of another `[control_store]` backend.
-fn config_with(dir: &Path, gateway: &str, admin: &str, backend: &str) -> String {
-    config_text(dir, gateway, admin, "").replace("backend = \"file\"", backend)
+/// The node of a cluster of one in a test's directory: its PKI and its
+/// transport's port, kept across restarts.
+struct Member {
+    pki: Pki,
+    port: u16,
 }
 
-/// Starts a node in `dir` on ephemeral ports with the control store
-/// `backend`.
-async fn start(dir: &Path, backend: &str) -> Result<Node, StartError> {
-    let text = config_with(dir, "127.0.0.1:0", "127.0.0.1:0", backend);
-    Node::start(text.parse().unwrap()).await
+impl Member {
+    fn new(dir: &Path) -> Self {
+        Self {
+            pki: Pki::new(dir),
+            port: free_port(),
+        }
+    }
+
+    /// The configuration of node `n1` in `dir`, over the shared store
+    /// `backend` (the lines of its `[control_store]`), with its gateway
+    /// and admin listener at `gateway` and `admin`, and buckets of one
+    /// replica, which a cluster of one node can place.
+    fn config(&self, dir: &Path, (gateway, admin): (&str, &str), backend: &str) -> String {
+        node_config(dir, &self.pki, backend, "n1", "n1", self.port, 256)
+            .replacen(
+                "listen = \"127.0.0.1:0\"",
+                &format!("listen = \"{gateway}\""),
+                1,
+            )
+            .replacen(
+                "listen = \"127.0.0.1:0\"",
+                &format!("listen = \"{admin}\""),
+                1,
+            )
+            .replace(
+                "shards_per_bucket = 4",
+                "shards_per_bucket = 4\nreplicas = 1\nmin_write_replicas = 1",
+            )
+    }
+
+    /// Starts the node in `dir` on ephemeral ports over `backend`.
+    async fn start(&self, dir: &Path, backend: &str) -> Node {
+        let text = self.config(dir, ("127.0.0.1:0", "127.0.0.1:0"), backend);
+        Node::start(text.parse().unwrap()).await.unwrap()
+    }
+}
+
+/// Uploads `data` as `bucket/key` once the bucket's shard serves: a node of
+/// a cluster opens the replicas of a new bucket at its next pass over the
+/// registers, and its shards serve once they lead.
+async fn put_once_served(client: &aws_sdk_s3::Client, bucket: &str, key: &str, data: &[u8]) {
+    let mut attempts = 0;
+    while let Err(error) = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(data.to_vec().into())
+        .send()
+        .await
+    {
+        attempts += 1;
+        assert!(attempts < 300, "PUT {bucket}/{key}: {error:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// A single node in `dir` over the file control store, on ephemeral ports.
+async fn start_single(dir: &Path) -> Node {
+    let text = config_text(dir, "127.0.0.1:0", "127.0.0.1:0", "");
+    Node::start(text.parse().unwrap()).await.unwrap()
 }
 
 fn endpoint(node: &Node) -> String {
@@ -123,22 +181,24 @@ fn identity_file() -> IdentityFile {
 async fn a_node_runs_on_etcd_over_mutual_tls() {
     let dir = tempfile::tempdir().unwrap();
     let (server, tls) = mutual_tls(dir.path());
+    let member = Member::new(dir.path());
     let fake = Fake::start(Some(server)).await;
     let backend = format!(
         "backend = \"etcd\"\netcd_endpoints = [\"{}\"]\n{tls}",
         fake.url("https")
     );
-    let node = start(dir.path(), &backend).await.unwrap();
+    let node = member.start(dir.path(), &backend).await;
     assert_eq!(control_state(&node).await["live"], true);
     let s3 = client(&endpoint(&node));
     s3.create_bucket().bucket("data").send().await.unwrap();
-    put(&s3, "data", "k", b"on etcd").await;
+    put_once_served(&s3, "data", "k", b"on etcd").await;
     assert!(fake.get("node-test/cluster.json").is_some());
     assert!(fake.get("node-test/buckets/data.json").is_some());
 
     // The store is shared, so the identity command runs beside the node,
     // which follows the change.
-    let config: Config = config_with(dir.path(), "127.0.0.1:0", "127.0.0.1:0", &backend)
+    let config: Config = member
+        .config(dir.path(), ("127.0.0.1:0", "127.0.0.1:0"), &backend)
         .parse()
         .unwrap();
     let applied = identity::run(&config, &Request::Put(identity_file()))
@@ -153,7 +213,7 @@ async fn a_node_runs_on_etcd_over_mutual_tls() {
     node.shutdown().await.unwrap();
 
     // A restart finds everything on etcd.
-    let node = start(dir.path(), &backend).await.unwrap();
+    let node = member.start(dir.path(), &backend).await;
     let s3 = client(&endpoint(&node));
     assert_eq!(get(&s3, "data", "k").await, b"on etcd");
     node.shutdown().await.unwrap();
@@ -165,39 +225,12 @@ async fn a_node_runs_on_etcd_over_mutual_tls() {
         .filter(|line| !line.starts_with("etcd_tls_cert_file") && !line.starts_with("etcd_tls_key"))
         .collect::<Vec<_>>()
         .join("\n");
-    let node = start(dir.path(), &without).await.unwrap();
+    let node = member.start(dir.path(), &without).await;
     assert_eq!(control_state(&node).await["live"], false);
     assert_eq!(control_state(&node).await["generation"], generation);
     let s3 = client(&endpoint(&node));
     assert_eq!(get(&s3, "data", "k").await, b"on etcd");
     node.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_node_refuses_a_store_that_registers_another_node() {
-    let dir = tempfile::tempdir().unwrap();
-    let fake = Fake::start(None).await;
-    let backend = format!(
-        "backend = \"etcd\"\netcd_endpoints = [\"{}\"]",
-        fake.url("http")
-    );
-    // A node on its own store starts, and leaves no registration in this
-    // build.
-    let node = start(dir.path(), &backend).await.unwrap();
-    node.shutdown().await.unwrap();
-
-    fake.put("node-test/nodes/node-elsewhere.json", b"{}");
-    let error = start(dir.path(), &backend).await.unwrap_err();
-    let StartError::ControlStore(message) = &error else {
-        panic!("{error}");
-    };
-    assert!(message.contains("node-elsewhere"), "{message}");
-    assert!(message.contains("one node per control store"), "{message}");
-    assert!(message.contains("[control_store] prefix"), "{message}");
-    // So does one that never ran.
-    let fresh = tempfile::tempdir().unwrap();
-    let error = start(fresh.path(), &backend).await.unwrap_err();
-    assert!(matches!(error, StartError::ControlStore(_)), "{error}");
 }
 
 /// Another SkyS3 node serves the control bucket: its gateway honors
@@ -225,7 +258,9 @@ async fn a_node_runs_on_an_s3_store_that_passes_the_probe() {
         endpoint(&store)
     );
     let config = dir.path().join("skys3.toml");
-    std::fs::write(&config, config_with(dir.path(), &gateway, &admin, &backend)).unwrap();
+    let member = Member::new(dir.path());
+    let text = member.config(dir.path(), (&gateway, &admin), &backend);
+    std::fs::write(&config, text).unwrap();
     let missing = dir.path().join("missing");
     let env = [
         ("AWS_ACCESS_KEY_ID", Path::new(support::ACCESS_KEY)),
@@ -238,7 +273,7 @@ async fn a_node_runs_on_an_s3_store_that_passes_the_probe() {
     let node = Process::start_with_env(&config, &log, &env).await;
     let s3 = node.s3();
     s3.create_bucket().bucket("data").send().await.unwrap();
-    put(&s3, "data", "k", b"on s3").await;
+    put_once_served(&s3, "data", "k", b"on s3").await;
     for key in ["c1/cluster.json", "c1/buckets/data.json"] {
         objects
             .head_object()
@@ -280,7 +315,7 @@ async fn a_node_runs_on_an_s3_store_that_passes_the_probe() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_file_store_is_opened_again() {
     let dir = tempfile::tempdir().unwrap();
-    let node = start(dir.path(), "backend = \"file\"").await.unwrap();
+    let node = start_single(dir.path()).await;
     let s3 = client(&endpoint(&node));
     s3.create_bucket().bucket("first").send().await.unwrap();
     // A directory where the next register write puts its temporary file:

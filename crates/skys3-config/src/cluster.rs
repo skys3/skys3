@@ -24,6 +24,9 @@ pub enum FailureDomain {
 }
 
 /// `[cluster]`: the cluster's identity and placement level.
+///
+/// Whether the node is one of a cluster's nodes is not a key of its own:
+/// it follows the control store ([`ControlStoreBackend::is_shared`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfig {
     /// `cluster_id`: the cluster's ID, which appears in every write
@@ -31,17 +34,6 @@ pub struct ClusterConfig {
     pub cluster_id: ClusterId,
     /// `failure_domain`: the level placement must respect.
     pub failure_domain: FailureDomain,
-    /// `multi_node`: whether the node runs as one of several nodes of the
-    /// cluster (§6.2): it binds the intra-cluster transport, registers in
-    /// `nodes/`, sends heartbeats, and receives pushed generations. Off by
-    /// default, until the cluster is complete in the binary (plan M8-09).
-    pub multi_node: bool,
-    /// `coordinator`: whether the node may be elected coordinator (§6.7):
-    /// it contends for `coordinator.lease` and, while it holds the lease,
-    /// places, replaces, and rebalances shards. A node without it never
-    /// contends, and follows whichever node holds the lease. Needs
-    /// `multi_node`; off by default, until plan M8-09.
-    pub coordinator: bool,
 }
 
 /// `[cluster]` as written.
@@ -51,28 +43,14 @@ pub(crate) struct RawCluster {
     cluster_id: String,
     #[serde(default)]
     failure_domain: FailureDomain,
-    #[serde(default)]
-    pub(crate) multi_node: bool,
-    #[serde(default)]
-    coordinator: bool,
 }
 
 impl RawCluster {
     pub(crate) fn resolve(&self, checker: &mut Checker) -> Option<ClusterConfig> {
-        checker.require(
-            self.multi_node || !self.coordinator,
-            "cluster.coordinator",
-            || {
-                "needs [cluster] multi_node = true: a single node has nothing to coordinate"
-                    .to_owned()
-            },
-        );
         match ClusterId::new(self.cluster_id.as_str()) {
             Ok(cluster_id) => Some(ClusterConfig {
                 cluster_id,
                 failure_domain: self.failure_domain,
-                multi_node: self.multi_node,
-                coordinator: self.coordinator,
             }),
             Err(error) => {
                 checker.report("cluster.cluster_id", error);
@@ -123,6 +101,20 @@ pub enum ControlStoreBackend {
         /// `<data_dir>/control`.
         directory: PathBuf,
     },
+}
+
+impl ControlStoreBackend {
+    /// Whether the nodes of a cluster share the store: etcd and S3 (§6.1).
+    /// A node over a shared store is one of the cluster's nodes, even while
+    /// it is the only one: it binds the intra-cluster transport, registers,
+    /// replicates its shards across the nodes their registers name, may be
+    /// elected coordinator, and runs erasure coding (§6.2, §6.7, §8). A
+    /// node over the file store, which serves one node, is a single node
+    /// that serves every shard alone.
+    #[must_use]
+    pub fn is_shared(&self) -> bool {
+        !matches!(self, Self::File { .. })
+    }
 }
 
 /// How a node reaches `https://` etcd endpoints (§12): the CA that
