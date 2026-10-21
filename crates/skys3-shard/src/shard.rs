@@ -368,6 +368,15 @@ impl<D: Disk> Clone for Shard<D> {
     }
 }
 
+impl<D: Disk> Shard<D> {
+    /// Whether `other` is a handle to this replica, not to another one the
+    /// node opened for the shard since, as it does for a learner it is
+    /// re-admitted as (§6.7).
+    pub(crate) fn is_same_replica(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
 impl<D: Disk> fmt::Debug for Shard<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Shard")

@@ -336,3 +336,77 @@ async fn removed_while_up() {
     primary.commit(put("c", 10)).await.unwrap();
     assert_eq!(nodes[1].shard.role(), Role::Member);
 }
+
+#[test]
+fn a_member_readmitted_and_removed_again_stops_once_its_grace_passes() {
+    run(readmitted_and_removed_again());
+}
+
+/// Node 3 is removed and added back as a learner in one change while it
+/// is up, as a coordinator's rebalancing does, before its grace passes:
+/// its replica stops and opens again as a learner, which the primary
+/// promotes. Removed again while up, the new replica stops once its grace
+/// passes, as the first would have: the watch over the primary follows
+/// the replica the node holds now, not the one it watched before, whose
+/// grace the new replica kept renewing (found by the kill, partition, and
+/// peering suite, plan M8-08).
+async fn readmitted_and_removed_again() {
+    let pki = Pki::new();
+    let store = MemoryControlStore::new();
+    // Node 3's grace outlasts its readmission by far.
+    let grace = ms(2000);
+    let timing = |n: u8| {
+        let timing = patient(n);
+        if n == 3 {
+            ReplicationConfig {
+                primary_grace: grace,
+                ..timing
+            }
+        } else {
+            timing
+        }
+    };
+    let nodes = cluster(&pki, 3, &initial(), &store, timing).await;
+    let primary = &nodes[0].shard;
+    until(|| primary.is_serving() && primary.leader().unwrap().holds_leases()).await;
+    primary.commit(put("a", 10)).await.unwrap();
+
+    let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
+    let readmitted = ShardConfig {
+        epoch: Epoch::new(2),
+        members: vec![node(1), node(2)],
+        learners: vec![node(3)],
+        proposal_id: ProposalId::new("readmit-3").unwrap(),
+        ..initial()
+    };
+    assert_eq!(
+        registers.replace(&initial(), &readmitted).await.unwrap(),
+        Replaced::Accepted
+    );
+    let learner = nodes[2].replication.open(&readmitted).await.unwrap();
+    assert_eq!(learner.role(), Role::Learner);
+    assert!(nodes[2].shard.is_stopped());
+    nodes[0].replication.open(&readmitted).await.unwrap();
+    // The primary promotes the learner.
+    until(|| learner.role() == Role::Member && learner.config().members.len() == 3).await;
+    let promoted = learner.config();
+    assert_eq!(register(&store).await, promoted);
+
+    let removed = ShardConfig {
+        epoch: promoted.epoch.checked_next().unwrap(),
+        members: vec![node(1), node(2)],
+        proposal_id: ProposalId::new("remove-3").unwrap(),
+        ..promoted.clone()
+    };
+    assert_eq!(
+        registers.replace(&promoted, &removed).await.unwrap(),
+        Replaced::Accepted
+    );
+    nodes[0].replication.open(&removed).await.unwrap();
+    primary.commit(put("b", 10)).await.unwrap();
+    let started = Instant::now();
+    until(|| learner.is_stopped()).await;
+    assert!(started.elapsed() < grace * 3, "{:?}", started.elapsed());
+    assert_eq!(learner.config(), removed);
+    primary.commit(put("c", 10)).await.unwrap();
+}
