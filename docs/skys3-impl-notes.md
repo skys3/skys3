@@ -9767,6 +9767,22 @@ of this file. A task with nothing unexpected keeps "None."
   including those a primary had just filled for another node's gateway.
   The scenario sets `reserve_fraction = 0.0`, as the single-node cluster
   does.
+- **A request failed while its shard moved (fixed later in the stack).**
+  Design §6.7 says a write waits while its shard is handed off, from the
+  step-down until the new primary serves, but the gateway returned the
+  first refusal it got: the old primary's `503` once it stepped down,
+  until its register poll (every `lease_renew_interval`) found its
+  successor, then the new primary's `503` until it had brought its
+  members up to its log. M8-06's e2e coordinator scenario lost a write
+  to it whose 3 attempts over 3 s all fell in that window (rebalancing
+  handoffs after the restarted coordinator came back), and the kill,
+  partition, and peering suite measured the old primary's window at
+  about 0.9 s. A routed call now asks again on those two refusals, with
+  pauses from 20 to 200 ms and a read of the register in between, for
+  at most `request_timeout`; both come before the primary sequences
+  anything, so a write is not applied twice. The gateway tells them by
+  their text (`skys3_shard::STEPPED_DOWN`, `RECONCILING`), which crosses
+  the forward wire as it is, so no wire change was needed.
 - **Open points.** STS sessions stay node-local (a session issued by one
   node is unknown to the others); a node does not follow a peer's address
   change on a link that is already up; `nodes/` is not in the local copy,
@@ -9843,6 +9859,20 @@ of this file. A task with nothing unexpected keeps "None."
   the node restarted, each was dead, and every write that drew one failed
   as "may have applied it", up to 8 in a row, beyond any SDK's retries.
   A lost answer now drops the node's idle connections.
+- **A re-admitted member removed again stayed open (fixed later in the
+  stack).** Fix (2) relies on the member's watch over its primary, which
+  held one replica object. A node removed and added back as a learner
+  before its grace passed (a restart and the primary's removal, then the
+  coordinator's repair, within seconds) stopped that replica and opened
+  a new one, but the old watch kept its slot, waiting on the shard's
+  grace, which the new replica's grants renewed; promoted, the new
+  replica started no watch of its own. Removed again while up, by the
+  next rebalancing move, it never proposed the takeover that tells it so,
+  and stayed a member of the configuration before for good, holding the
+  kill, partition, and peering suite's convergence check (M8-08, seed 42,
+  chaos/1 at `53.6213` beside `54.6614`). A watch now belongs to its
+  replica: a replica opened in another's place gets its own once it is a
+  member, and the old one ends when it next wakes.
 - **curl does not retry into a pipe.** `--retry` with `-o /dev/null`, or
   with the body on standard output, gives up after the first attempt with
   exit 23 (curl 8.5), as it cannot truncate what it wrote; the scenarios

@@ -368,6 +368,32 @@ impl<D: Disk> Clone for Shard<D> {
     }
 }
 
+impl<D: Disk> Shard<D> {
+    /// Whether `other` is a handle to this replica, not to another one the
+    /// node opened for the shard since, as it does for a learner it is
+    /// re-admitted as (§6.7).
+    pub(crate) fn is_same_replica(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Runs `act` if the replica runs, under the lock that stopping it
+    /// takes, so that `act` happens before the replica stops or not at all,
+    /// and returns what it returned, or `None` if the replica stopped.
+    /// A replica the node opens in a stopped one's place, as a learner it
+    /// is re-admitted as (§6.7), shares the shard's grace and takeover
+    /// record, so what acts on them for this replica must do so only while
+    /// no such replica can exist.
+    pub(crate) fn while_running<T>(&self, act: impl FnOnce() -> T) -> Option<T> {
+        let sequencer = self.sequencer();
+        if sequencer.stopped.is_some() {
+            return None;
+        }
+        let acted = act();
+        drop(sequencer);
+        Some(acted)
+    }
+}
+
 impl<D: Disk> fmt::Debug for Shard<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Shard")
@@ -1350,12 +1376,16 @@ impl<D: Disk> Shard<D> {
     /// shard over (§6.3, §6.5): a member that opens again before `config`'s
     /// epoch acknowledges nothing in its epoch until it learns the outcome
     /// ([`Shard::outstanding_takeover`]).
+    ///
+    /// A stopped replica records nothing ([`Shard::while_running`]): the
+    /// record is the shard's, and a replica the node opened in its place
+    /// may record a proposal of its own.
     pub(crate) async fn record_takeover(&self, config: &ShardConfig) -> Result<(), ShardError> {
         let (index, stored) = (Arc::clone(&self.inner.index), config.clone());
-        run(&self.inner.pool, self.shard(), move || {
-            index.store_takeover(&stored)
-        })
-        .await?;
+        let stored = self
+            .while_running(|| self.inner.pool.run(move || index.store_takeover(&stored)))
+            .ok_or_else(|| self.unavailable("the replica stopped"))?;
+        pooled(self.shard(), stored.await)?;
         self.sequencer().takeover = Some(config.clone());
         Ok(())
     }
@@ -1364,13 +1394,26 @@ impl<D: Disk> Shard<D> {
     /// proposal lost. Returns whether it did: while the record stays, the
     /// member must grant nothing, since a restart would send the proposal
     /// again.
+    ///
+    /// A stopped replica forgets nothing, and returns `false`, as
+    /// [`Shard::record_takeover`] records nothing. The index removes only
+    /// this replica's proposal ([`Index::forget_takeover`]): stopping a
+    /// replica does not wait for the index jobs it queued, so one may
+    /// still commit after the node opened another replica in its place,
+    /// which may have recorded a proposal of its own.
     pub(crate) async fn forget_takeover(&self) -> bool {
-        let (index, key) = (Arc::clone(&self.inner.index), self.shard().clone());
-        let forgotten = run(&self.inner.pool, self.shard(), move || {
-            index.forget_takeover(&key)
-        })
-        .await;
-        match forgotten {
+        let Some(proposed) = self.sequencer().takeover.clone() else {
+            return true;
+        };
+        let index = Arc::clone(&self.inner.index);
+        let Some(forgotten) = self.while_running(|| {
+            self.inner
+                .pool
+                .run(move || index.forget_takeover(&proposed))
+        }) else {
+            return false;
+        };
+        match pooled(self.shard(), forgotten.await) {
             Ok(()) => {
                 self.sequencer().takeover = None;
                 true
@@ -2816,8 +2859,17 @@ impl<D: Disk> Shard<D> {
     }
 }
 
-/// Why a primary that stepped down for a planned handoff refuses requests.
-const STEPPED_DOWN: &str = "the primary stepped down for a planned handoff";
+/// Why a primary that stepped down for a planned handoff refuses requests,
+/// before it sequences anything (§5.4). Its shard moves to the member it
+/// stepped down to, which a moment later serves: a gateway asks again
+/// within the request.
+pub const STEPPED_DOWN: &str = "the primary stepped down for a planned handoff";
+
+/// Why a primary refuses requests, before it sequences anything, until its
+/// links have brought every member up to its log (§6.6), as a new primary
+/// does after a takeover or a handoff: a gateway asks again within the
+/// request.
+pub const RECONCILING: &str = "the primary is bringing its members up to its log";
 
 /// A read of the index in progress ([`Shard::admit_read`]).
 pub(crate) struct ReadPermit<'a>(&'a watch::Sender<usize>);
@@ -2876,10 +2928,7 @@ impl Sequencer {
                 primary: self.config.primary.clone(),
                 epoch: self.config.epoch,
             }),
-            _ if !self.serving => Err(ShardError::unavailable(
-                shard,
-                "the primary is bringing its members up to its log",
-            )),
+            _ if !self.serving => Err(ShardError::unavailable(shard, RECONCILING)),
             _ => Ok(()),
         }
     }
@@ -3160,7 +3209,15 @@ pub(crate) async fn run<T: Send + 'static>(
     shard: &ShardRef,
     job: impl FnOnce() -> Result<T, IndexError> + Send + 'static,
 ) -> Result<T, ShardError> {
-    match pool.run(job).await {
+    pooled(shard, pool.run(job).await)
+}
+
+/// What an index job run on a pool returned, as [`run`] returns it.
+fn pooled<T>(
+    shard: &ShardRef,
+    ran: Result<Result<T, IndexError>, skys3_io::PoolClosed>,
+) -> Result<T, ShardError> {
+    match ran {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(ShardError::unavailable(shard, error)),
         Err(error) => Err(ShardError::unavailable(shard, error)),
