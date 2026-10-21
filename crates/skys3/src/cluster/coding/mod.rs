@@ -305,9 +305,6 @@ impl CodingServices {
 struct ReplicaCoding {
     shard: Shard<RealDisk>,
     tasks: Vec<JoinHandle<()>>,
-    /// The node's repair metrics, which forget the replica's backlog with
-    /// it.
-    repairs: RepairMetrics,
 }
 
 impl ReplicaCoding {
@@ -319,13 +316,33 @@ impl ReplicaCoding {
 
 impl Drop for ReplicaCoding {
     fn drop(&mut self) {
+        // Only asks for cancellation: a task polled on another worker
+        // finishes that poll first, which is why the repairer's backlog is
+        // forgotten by its own task ([`finally`]), not here.
         for task in &self.tasks {
             task.abort();
         }
-        // A repairer stopped in a pass leaves the fragments it knew lost
-        // counted; the shard's next primary finds them again.
-        self.repairs.forget(self.shard.shard());
     }
+}
+
+/// `future`, then `cleanup` once `future` is dropped, whether it completed
+/// or its task was aborted. A task's future is dropped only after its last
+/// poll, so `cleanup` runs after anything that poll did, even when the
+/// abort was asked for while another worker polled it.
+async fn finally<F: Future>(future: F, cleanup: impl FnOnce()) -> F::Output {
+    /// Runs its closure when dropped.
+    struct Cleanup<C: FnOnce()>(Option<C>);
+
+    impl<C: FnOnce()> Drop for Cleanup<C> {
+        fn drop(&mut self) {
+            if let Some(cleanup) = self.0.take() {
+                cleanup();
+            }
+        }
+    }
+
+    let _cleanup = Cleanup(Some(cleanup));
+    future.await
 }
 
 /// Erasure coding on a node (see the [module](self) docs).
@@ -618,14 +635,18 @@ impl NodeCoding {
             ReleaseSettings::default(),
         );
         tracing::debug!(%shard, "erasure coding runs on a replica");
+        // A repairer stopped in a pass leaves the fragments it knew lost
+        // counted; its task forgets them once it is gone, after its last
+        // update, and the shard's next primary finds them again.
+        let repairs = self.repairs.clone();
+        let repairing = finally(repairer.run(), move || repairs.forget(&shard));
         ReplicaCoding {
             shard: replica,
             tasks: vec![
                 tokio::spawn(encoder.run(scan_interval(settings))),
-                tokio::spawn(repairer.run()),
+                tokio::spawn(repairing),
                 tokio::spawn(releaser.run()),
             ],
-            repairs: self.repairs.clone(),
         }
     }
 
@@ -703,4 +724,67 @@ fn primaries(map: ShardMap, registrations: Registrations) -> PrimariesOf {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Plain inserts and removals, which a panic cannot leave half done.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::mpsc;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    /// A future whose first poll reports that it started, blocks its
+    /// worker until told to go on, then records an update, as a repair
+    /// pass's backlog update would, and stays pending.
+    struct BlockingPoll {
+        started: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Future for BlockingPoll {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            self.started.send(()).unwrap();
+            self.go.recv().unwrap();
+            lock(&self.log).push("update");
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cleanup_runs_after_the_last_poll_of_an_aborted_task() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (started, polling) = mpsc::channel();
+        let (go, waiting) = mpsc::channel();
+        let polled = BlockingPoll {
+            started,
+            go: waiting,
+            log: Arc::clone(&log),
+        };
+        let cleaned = Arc::clone(&log);
+        let task = tokio::spawn(finally(polled, move || lock(&cleaned).push("forget")));
+        // The task is in the middle of a poll on a worker when it is
+        // aborted, as a repairer in a pass is when its replica's coding is
+        // dropped.
+        polling.recv().unwrap();
+        task.abort();
+        // A cleanup run when the abort is asked for, as the replica's drop
+        // ran it, would land here, before the poll's update.
+        assert!(lock(&log).is_empty());
+        go.send(()).unwrap();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(*lock(&log), ["update", "forget"]);
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_runs_once_the_future_completes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cleaned = Arc::clone(&log);
+        let done = finally(async { 7 }, move || lock(&cleaned).push("forget")).await;
+        assert_eq!(done, 7);
+        assert_eq!(*lock(&log), ["forget"]);
+    }
 }

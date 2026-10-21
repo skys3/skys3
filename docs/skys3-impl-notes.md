@@ -10136,8 +10136,20 @@ of this file. A task with nothing unexpected keeps "None."
   passes again, so `skys3_unrepaired_fragments` and
   `skys3_oldest_unrepaired_age_seconds` would stay up on that node for
   good, and `SkyS3FragmentsUnrepaired` fire for a loss its successor had
-  repaired. A new `RepairMetrics::forget` runs when the node drops a
-  replica's coding.
+  repaired. A new `RepairMetrics::forget` clears the shard's entry when
+  the node drops a replica's coding. Review found the first version racy:
+  the replica's `Drop` aborted the repairer's task and forgot at once, but
+  `abort` only asks for cancellation, so a repairer in the middle of a
+  poll on another worker could record its backlog after the forget,
+  restoring the entry for good. The forget is now a guard the repair task
+  owns (`finally` in `cluster/coding/mod.rs`), which runs when the
+  runtime drops the task's future, after its last poll. A per-replica
+  generation in `RepairMetrics` would also do, but needs a library API
+  and a rule for late updates; the guard ties the forget to the only
+  writer's end. A successor replica's repairer that records before the
+  old task's guard runs loses that entry only until its next pass. The
+  unit test blocks a poll on one worker, aborts the task, and checks that
+  the cleanup comes after the poll's update.
 - **Liveness (decided).** The repairer needs none beyond its own checks:
   §8.6 already counts a node silent for `fragment_repair_after_seconds`
   lost, and a check is the probe. The coordinator's registry, which
