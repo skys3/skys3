@@ -9975,3 +9975,102 @@ of this file. A task with nothing unexpected keeps "None."
   and release times are in memory, so a restart only delays
   reclamation; the restore drill's endpoint and header listing are still
   missing; a rolling restart that turns the flag on was not drilled.
+
+### M8-08 Multi-node kill, partition, and peering suite
+
+- **One namespace per process.** `tests/e2e/chaos/` runs every node and
+  etcd member in a network namespace of its own (`skc-<name>`, a veth on
+  the bridge `skc0`, 10.77.0.0/24), with the driver and the client
+  workload on the host side (10.77.0.1). Each process then has an
+  address of its own, so iptables in its namespace partitions it, and
+  netem on its `eth0` delays and drops what it sends, without touching
+  the others; the loopback-and-ports layout of the PR suite allows
+  neither. A partition in `cluster` mode drops what the node exchanges
+  with the subnet but returns the host's packets first, so the clients
+  still reach it (one `-s` per rule: iptables refuses a second, which
+  failed every such partition until `net.sh check` applied every fault
+  rule in a probe namespace); `full` drops everything on its `eth0`.
+  Docker's `FORWARD` policy (DROP) sees bridged frames once
+  `br_netfilter` is loaded, as on GitHub's runners, so `net.sh up`
+  accepts `skc0` to `skc0` first.
+- **The client is stdlib Python.** It signs SigV4 itself (with
+  `UNSIGNED-PAYLOAD`), so the job needs nothing beyond `python3`; it
+  retries 5xx answers and lost answers as the AWS SDKs' standard mode
+  does (3 attempts, up to 1 s and then 2 s apart, a new node each time).
+  The first version waited a tenth of that, and a planned handoff's
+  moment of `503`s (§5.4: the old primary answers `503` until the
+  register names the new configuration, about 0.9 s here while gateways
+  still route to it) failed requests an SDK rides out. The final
+  read-back reads a key whose shard answers 5xx again until one 120 s
+  deadline, as rebalancing may still hand shards off after the faults
+  heal.
+- **What a node knows.** `GET /v1/shards` lists only the shards a node
+  holds or routed to, so no node knows every configuration: the driver
+  judges each shard by the newest configuration among the replicas that
+  report one, and requires its members to serve that epoch. The entries
+  now carry `applied`, the replica's applied position, which is what
+  "replicas converge" compares.
+- **Failover time** runs from when a fault strikes the primary (the
+  `SIGKILL` sent, or the partition's rules in place) to the first
+  acknowledged write on its shard that started after that. The first
+  version dated it from the step's start, 0.2 s before the kill, and
+  counted the writes the doomed primary still acknowledged meanwhile:
+  most of its sub-second samples. On the development machine a killed
+  primary's shard took writes again after about 6.7 s, `primary_grace`
+  (6 s) plus a takeover. A primary partitioned from the cluster was
+  replaced as soon (the other nodes named another after 6.4 to 6.7 s),
+  but its shard took writes again only after 13 to 15 s: why the
+  gateways took longer than the takeover was not looked into. The
+  slowest samples (up to 48 s) followed kill loops that struck a shard's
+  successive primaries.
+- **Three bugs the suite found, fixed here, each with a test.** (1) A
+  primary dropped each record from memory as it committed, so under
+  steady writes a learner outside the acknowledgement set chased the
+  commits through the log and joined only when writes paused (57 and
+  75 s after its backfill was complete). The buffer now keeps the
+  committed records such a learner lacks, up to
+  `LEARNER_BUFFER_BYTES` (16 MiB) per shard, held only while a learner
+  lags; past that it reads the log as before (`leader.rs`). (2) A node's
+  bucket status counted its stopped replicas, so a drained node reported
+  `unflushed` above 0 for good; they are now left out and counted as
+  `shards_stopped` (`admin.rs`). (3) A link reading the log back for a
+  member or learner behind its primary's memory sent nothing for longer
+  than the link timeout (1 s), so the session timed out and the next one
+  read the log again, for good; it now beacons while it reads
+  (`primary.rs`).
+- **A fourth bug, left to a follow-up fix.** A re-admitted learner whose
+  log reconciliation cannot place (its lineage and the primary's share
+  no known epoch, §6.6) asks the primary to verify its last record's
+  epoch. Both ends look that epoch up with `record_epoch`, which off the
+  known lineage reads the log back, a scan of every segment (350 to
+  560 MB per node in the run), while the other end waits one link
+  timeout: the session ends, and the next one scans again. In a 15-minute
+  run with seed 42 a node restarted in a kill loop had four such
+  learners for 13 minutes, one session each every 1.5 to 2 s, at 136%
+  CPU: its admin API stopped answering, and the shards it served lacked
+  leases (`503` at read-back). No acknowledged write was lost.
+- **The peer probe over S3 REST.** Before QUIC discovery, a source's
+  capability probe over S3 REST to `inbound`, a bucket with
+  `peer_source`, was refused for lacking `x-skys3-apply-by` (§7.8); once
+  discovery chose QUIC every flush went over it. A source that must use
+  S3 REST to such a bucket from the start may fail its probe. Not fixed.
+- **Running it without netem.** The development container's kernel has
+  no netem qdisc, so locally `netem` steps drop packets by iptables
+  (`statistic` match) and delay nothing; the nightly job requires netem
+  (`SKYS3_CHAOS_NETEM=require`, loading `sch_netem` first). Delay faults
+  have therefore not run outside CI.
+- **Seven clean nights.** `tests/e2e/chaos/nights.sh`, the job's last
+  step, lists the job's result in the Nightly workflow's scheduled runs
+  on the default branch (runs started by hand do not count) and writes
+  the current streak to the job summary. The M8 exit's count starts with
+  the first scheduled night after this merges, and a failure resets it.
+- **Local runs.** As root on the development container, without netem:
+  seed 42 for 4 minutes (before the fixes: every key read back); seed 42
+  for 15 minutes (found bug 3); seed 42 for 15 minutes with the fixes
+  (every fault healed, 51,390 writes acknowledged, every key read back,
+  until the `cluster` partition failed on the iptables rule above); seed
+  42 for 15 minutes again (found the fourth bug); and seed 31337 for 3
+  minutes twice, which passed, with the `cluster` partition cutting its
+  node off (510 to 596 packets dropped, the clients still connecting,
+  another primary named after 6.4 to 6.7 s, healed after 0.9 to 1.3 s).
+  The peered keys arrived over QUIC in every run.
