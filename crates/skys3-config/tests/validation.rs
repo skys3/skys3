@@ -1788,6 +1788,26 @@ fn only_a_node_of_several_may_be_elected_coordinator() {
 }
 
 #[test]
+fn erasure_coding_is_off_by_default_and_needs_several_nodes() {
+    let config = load("").unwrap();
+    assert!(!config.ec().enabled);
+    let config: Config = multi_node(&format!(
+        "[transport]\nlisten = \"10.0.0.5:7400\"\n{NODE_FILES}\n[ec]\nenabled = true"
+    ))
+    .parse()
+    .unwrap();
+    assert!(config.ec().enabled);
+    let text = "[cluster]\ncluster_id = \"c1\"\n[control_store]\nbackend = \"file\"\n\
+                [ec]\nenabled = true";
+    assert_eq!(violated_keys(text), ["ec.enabled"]);
+    let violations = violations_of(text);
+    assert!(
+        violations.to_string().contains("multi_node"),
+        "{violations}"
+    );
+}
+
+#[test]
 fn nodes_carry_valid_zone_and_rack_labels() {
     let config = load("[node]\nzone = \"eu-1a\"\nrack = \"r12\"").unwrap();
     assert_eq!(config.node().zone.as_ref().unwrap().as_str(), "eu-1a");

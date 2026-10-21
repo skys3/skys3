@@ -681,3 +681,82 @@ async fn a_lost_control_store_is_rebuilt_from_the_nodes_copy() {
         "{refused}"
     );
 }
+
+/// The generation in the control store's `cluster.json`.
+fn store_generation(dir: &Path) -> u64 {
+    let text = std::fs::read(dir.join("data/control/cluster.json")).unwrap();
+    let cluster: serde_json::Value = serde_json::from_slice(&text).unwrap();
+    cluster["generation"].as_u64().unwrap()
+}
+
+/// Waits until the node's copy holds the store's generation, which it does
+/// only once a sync of the store succeeded.
+async fn copy_follows(node: &Node, dir: &Path, change: &str) {
+    let admin = node.admin_addr().to_string();
+    let generation = store_generation(dir);
+    eventually(&format!("the copy follows {change}"), || async {
+        let health = admin_json(&admin, "/v1/health").await;
+        health["control_store"]["generation"] == generation
+    })
+    .await;
+}
+
+/// Sets the lifecycle rules of `bucket` to one rule, or removes them.
+async fn set_lifecycle(s3: &aws_sdk_s3::Client, bucket: &str, rule: Option<&str>) {
+    use aws_sdk_s3::types::{
+        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
+        LifecycleRuleFilter,
+    };
+
+    let Some(prefix) = rule else {
+        s3.delete_bucket_lifecycle()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap();
+        return;
+    };
+    let rule = LifecycleRule::builder()
+        .id(prefix)
+        .status(ExpirationStatus::Enabled)
+        .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+        .expiration(LifecycleExpiration::builder().days(30).build())
+        .build()
+        .unwrap();
+    let rules = BucketLifecycleConfiguration::builder()
+        .rules(rule)
+        .build()
+        .unwrap();
+    s3.put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(rules)
+        .send()
+        .await
+        .unwrap();
+}
+
+/// A bucket change rewrites the bucket's register under a new
+/// `proposal_id`. The sync that follows opens the bucket's shards again,
+/// in the configuration they already have, and so succeeds: the copy keeps
+/// following the store, before a restart and after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_copy_follows_bucket_changes_on_a_single_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start(dir.path(), "").await;
+    let s3 = client(&endpoint(&node));
+    s3.create_bucket().bucket("rules").send().await.unwrap();
+    put(&s3, "rules", "tmp/a", b"alpha").await;
+    copy_follows(&node, dir.path(), "the new bucket").await;
+    set_lifecycle(&s3, "rules", Some("tmp/")).await;
+    copy_follows(&node, dir.path(), "a lifecycle configuration").await;
+    set_lifecycle(&s3, "rules", None).await;
+    copy_follows(&node, dir.path(), "its removal").await;
+    node.shutdown().await.unwrap();
+
+    let node = start(dir.path(), "").await;
+    let s3 = client(&endpoint(&node));
+    set_lifecycle(&s3, "rules", Some("logs/")).await;
+    copy_follows(&node, dir.path(), "a change after a restart").await;
+    assert_eq!(get(&s3, "rules", "tmp/a").await, b"alpha");
+    node.shutdown().await.unwrap();
+}

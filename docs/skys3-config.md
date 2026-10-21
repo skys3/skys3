@@ -182,6 +182,7 @@ Erasure coding of `local` buckets (§8).
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
+| `enabled` | boolean | `false` | Whether the node runs erasure coding (design §8, plan M8-07a). Needs `[cluster] multi_node = true`, since a stripe's fragments go to several nodes over the `[transport]`. With it, the node keeps a fragment store on each disk of `[node] disks`, in the same directory as the disk's log segments (`frag-<id>.seg` files, design §10.1); serves fragment writes, reads, holds, releases, and orphan queries on its transport; encodes the objects of the `local` buckets whose shards it leads (§8.2); reads coded objects from their fragments in its gateway (§8.5); releases replaced fragments and reclaims orphans (§8.4, §8.7). Set it on every node: a node without it refuses fragments, so stripes placed there are planned again elsewhere, and its gateway cannot read coded objects. Once objects are coded, do not turn it off (runbook "Turning erasure coding on"). The node does not repair lost fragments or move them off a drained node yet (plan M8-07b). A gate that plan M8-09 removes. |
 | `parity_fragments` | integer | `2` | Positive. `m` in every geometry. |
 | `max_data_fragments` | integer | `8` | Positive, and at most 255 with `parity_fragments`, since a stripe has at most 255 fragments (§8.4). The widest `k`. |
 | `min_eligible_nodes` | integer | `5` | Greater than `parity_fragments`, since a stripe puts at most one fragment on a node. |
