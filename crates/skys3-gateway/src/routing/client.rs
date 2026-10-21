@@ -306,7 +306,9 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     /// out (design §6.7, *Writes during moves*): it asks again, with
     /// pauses that grow from [`MOVE_PAUSE`] to [`MOVE_PAUSE_MAX`], reading
     /// the register meanwhile, which may name the new primary sooner, for
-    /// at most [`RoutingConfig::request_timeout`]. Those refusals come
+    /// at most [`RoutingConfig::request_timeout`] in all: an ask again
+    /// that has not ended by then is given up, as a client's timeout gives
+    /// up a request, and a write may then have been applied. Those refusals come
     /// before the primary sequences anything, so a write asked again is
     /// not applied twice. Without the wait, every write and read that
     /// reached the old primary in that window failed with `503`, for up
@@ -317,8 +319,9 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     async fn call(&self, shard: &ShardRef, request: Request) -> Result<Response, ShardError> {
         let deadline = Instant::now() + self.config.request_timeout;
         let mut pause = MOVE_PAUSE;
+        let mut routed = self.route(shard, &request).await;
         loop {
-            let error = match self.route(shard, &request).await {
+            let error = match routed {
                 Err(error) if between_primaries(&error) => error,
                 routed => return routed,
             };
@@ -327,8 +330,33 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
             }
             let asked = self.inner.map.get(shard).map(|config| config.epoch);
             let _ = tokio::time::timeout_at(deadline, self.read_register(shard, asked)).await;
-            tokio::time::sleep(pause).await;
+            tokio::time::sleep_until((Instant::now() + pause).min(deadline)).await;
+            if Instant::now() >= deadline {
+                return Err(error);
+            }
             pause = (pause * 2).min(MOVE_PAUSE_MAX);
+            // An ask again ends with the call's time, as the client's
+            // timeout would end it: a write cut off may have been applied.
+            routed = tokio::time::timeout_at(deadline, self.route(shard, &request))
+                .await
+                .unwrap_or_else(|_| Err(self.out_of_time(shard, &request)));
+        }
+    }
+
+    /// The error of a call whose request timeout ran out while it asked a
+    /// moving shard again: a write may have been applied by then (§5.2).
+    fn out_of_time(&self, shard: &ShardRef, request: &Request) -> ShardError {
+        let timeout = self.config.request_timeout;
+        let reason = if request.is_read() {
+            format!("no primary served the request within {timeout:?} while the shard moved")
+        } else {
+            format!(
+                "no primary answered within {timeout:?} while the shard moved, and may have applied it"
+            )
+        };
+        ShardError::Unavailable {
+            shard: shard.clone(),
+            reason,
         }
     }
 

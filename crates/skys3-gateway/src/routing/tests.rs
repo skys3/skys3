@@ -771,12 +771,12 @@ async fn a_lost_answer_drops_the_nodes_idle_connections() {
 
 /// A gateway of node 5 whose map names node 4 the primary of shard 0 in
 /// epoch 3, and whose requests may take `timeout`. Node 4 is a stub that
-/// answers the `n`th request it gets, from 0, with `answer(n, request)`;
-/// the counter counts them.
+/// answers the `n`th request it gets, from 0, with `answer(n, request)`,
+/// or not at all if that is `None`; the counter counts them.
 async fn stubbed(
     cluster: &Cluster,
     timeout: Duration,
-    answer: impl Fn(usize, &Request) -> Reply + Send + Sync + 'static,
+    answer: impl Fn(usize, &Request) -> Option<Reply> + Send + Sync + 'static,
 ) -> (Routed, MemoryShards, Arc<std::sync::atomic::AtomicUsize>) {
     let transport = cluster.pki.transport(&node(4));
     let listener = transport
@@ -796,7 +796,10 @@ async fn stubbed(
                 while let Ok(Some(frame)) = connection.recv().await {
                     let (_, _, request) = wire::decode_request(&frame).unwrap();
                     let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let reply = answer(n, &request);
+                    // No answer: the request stays unanswered.
+                    let Some(reply) = answer(n, &request) else {
+                        continue;
+                    };
                     let answer = wire::reply_frame(&reply, frame.header.request_id);
                     if connection.send(&answer).await.is_err() {
                         return;
@@ -857,9 +860,9 @@ async fn a_request_waits_while_its_shard_moves_to_a_new_primary() {
     // its members up to its log, then serves (§5.4): each refusal comes
     // before anything is sequenced, so reads and writes alike ask again.
     let (gateway, _shards, asked) = stubbed(&cluster, WAIT / 4, |n, request| match n % 6 {
-        0..=2 => unavailable(skys3_shard::STEPPED_DOWN),
-        3 | 4 => unavailable(skys3_shard::RECONCILING),
-        _ => served(request),
+        0..=2 => Some(unavailable(skys3_shard::STEPPED_DOWN)),
+        3 | 4 => Some(unavailable(skys3_shard::RECONCILING)),
+        _ => Some(served(request)),
     })
     .await;
     assert_eq!(timed(gateway.entry(&shard(0), "k")).await.unwrap(), None);
@@ -877,7 +880,7 @@ async fn a_request_waits_while_its_shard_moves_to_a_new_primary() {
 async fn a_request_waits_for_a_new_primary_only_within_its_timeout() {
     let cluster = Cluster::start(timing()).await;
     let (gateway, _shards, asked) = stubbed(&cluster, timing().request_timeout, |_, _| {
-        unavailable(skys3_shard::STEPPED_DOWN)
+        Some(unavailable(skys3_shard::STEPPED_DOWN))
     })
     .await;
     let started = tokio::time::Instant::now();
@@ -893,12 +896,55 @@ async fn a_request_waits_for_a_new_primary_only_within_its_timeout() {
     // Any other refusal reaches the caller at once.
     let cluster = Cluster::start(timing()).await;
     let (gateway, _shards, asked) = stubbed(&cluster, WAIT / 4, |_, _| {
-        unavailable("too few members acknowledge")
+        Some(unavailable("too few members acknowledge"))
     })
     .await;
     let error = timed(gateway.entry(&shard(0), "k")).await.unwrap_err();
     assert!(error.to_string().contains("too few members"), "{error}");
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_asks_a_moving_shard_again_only_within_its_timeout() {
+    let timeout = Duration::from_secs(1);
+    let delete = || RecordBody::Delete(Delete { key: "k".into() });
+
+    // A register read that outlasts the request's time: nothing is asked
+    // again after it.
+    let cluster = Cluster::start(timing()).await;
+    let (gateway, _shards, asked) = stubbed(&cluster, timeout, |_, _| {
+        Some(unavailable(skys3_shard::STEPPED_DOWN))
+    })
+    .await;
+    let slow = Fault::before(move || tokio::time::sleep(timeout * 2));
+    cluster.store.script([slow]);
+    let started = tokio::time::Instant::now();
+    let error = timed(gateway.write(&shard(0), delete(), Precondition::None))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(skys3_shard::STEPPED_DOWN),
+        "{error}"
+    );
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let took = started.elapsed();
+    assert!(took < timeout * 3 / 2, "{took:?}");
+
+    // An ask again that gets no answer ends with the request's time, as a
+    // write the client gave up on: it may have been applied.
+    let cluster = Cluster::start(timing()).await;
+    let (gateway, _shards, asked) = stubbed(&cluster, timeout, |n, _| {
+        (n == 0).then(|| unavailable(skys3_shard::STEPPED_DOWN))
+    })
+    .await;
+    let started = tokio::time::Instant::now();
+    let error = timed(gateway.write(&shard(0), delete(), Precondition::None))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("may have applied it"), "{error}");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let took = started.elapsed();
+    assert!(took < timeout * 3 / 2, "{took:?}");
 }
 
 #[tokio::test]
