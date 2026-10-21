@@ -10330,3 +10330,30 @@ of this file. A task with nothing unexpected keeps "None."
     rack's `placement` report; step 2 of "Moving a single node into a
     cluster" (a `write_back` bucket moved through its target); cross-zone
     latency, which no harness here can make.
+- **Security review.** Section 10 of the review re-reads every row first
+  marked *Not applicable yet* (node to node, routing, coordinator and
+  admin messages, fragments, the S3 and etcd control stores, claims 6 and
+  13): each holds, and none depends on a flag any more. T3 (#104), T6
+  (#107), and T7 (#108) are closed, each with the tests that show it in
+  force (`etcd_backend_rules`, `etcd_tls_rules`,
+  `a_node_runs_on_etcd_over_mutual_tls`;
+  `a_coordinator_is_elected_hands_off_and_is_succeeded`, whose intruder
+  node is refused; `the_transport_refuses_strangers_and_caps_its_handshakes`
+  and the e2e flood). Of the other findings, T4, T8, and K1 were fixed in
+  M8-03, and T2 in part; T1, T5, K2, K3, and K4 are still present, each
+  checked in the code. The issues were left as they are.
+- **The e2e run.** All three legs passed locally with the AWS CLI v2 in
+  about six minutes (the peering scenario, 339 s, is the longest): the
+  etcd leg's `cluster` scenario takes 101 s with the new move (37 s of
+  it, mostly the AWS CLI's retries while the new bucket's shards take
+  their leases), and `erasure-coding` 79 s with the rolling restart
+  (20 s). The job's 15 minutes are not at risk.
+- **Open points.** "etcd majority loss" stays undrilled: the harness
+  cannot lose and restore an etcd majority for real. Cross-zone latency
+  is not drilled either; the nightly suite's `netem` delays nodes and etcd
+  members on one bridge. Step 2 of "Moving a single node into a cluster"
+  (a `write_back` bucket through its target) was not drilled. A single
+  node that ran over etcd or S3 before M8-09 does not load without a
+  `[transport]` table, then stops at startup naming its buckets, and must
+  move them; there is no in-place conversion, which is
+  safe only because no release shipped with the flags.
