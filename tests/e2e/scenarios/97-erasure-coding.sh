@@ -197,7 +197,9 @@ log "wrote 16 MiB, SHA-256 $(cat "$work/sha256")"
 holders() {
     local node
     for node in "${nodes[@]}"; do
-        [ "$(value "$node" skys3_fragment_stored_bytes)" != 0 ] && echo "$node"
+        if [ "$(value "$node" skys3_fragment_stored_bytes)" != 0 ]; then
+            echo "$node"
+        fi
     done
 }
 coded() {
