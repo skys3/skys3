@@ -9767,6 +9767,22 @@ of this file. A task with nothing unexpected keeps "None."
   including those a primary had just filled for another node's gateway.
   The scenario sets `reserve_fraction = 0.0`, as the single-node cluster
   does.
+- **A request failed while its shard moved (fixed later in the stack).**
+  Design §6.7 says a write waits while its shard is handed off, from the
+  step-down until the new primary serves, but the gateway returned the
+  first refusal it got: the old primary's `503` once it stepped down,
+  until its register poll (every `lease_renew_interval`) found its
+  successor, then the new primary's `503` until it had brought its
+  members up to its log. M8-06's e2e coordinator scenario lost a write
+  to it whose 3 attempts over 3 s all fell in that window (rebalancing
+  handoffs after the restarted coordinator came back), and the kill,
+  partition, and peering suite measured the old primary's window at
+  about 0.9 s. A routed call now asks again on those two refusals, with
+  pauses from 20 to 200 ms and a read of the register in between, for
+  at most `request_timeout`; both come before the primary sequences
+  anything, so a write is not applied twice. The gateway tells them by
+  their text (`skys3_shard::STEPPED_DOWN`, `RECONCILING`), which crosses
+  the forward wire as it is, so no wire change was needed.
 - **Open points.** STS sessions stay node-local (a session issued by one
   node is unknown to the others); a node does not follow a peer's address
   change on a link that is already up; `nodes/` is not in the local copy,
