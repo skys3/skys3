@@ -48,6 +48,8 @@ exist.
   - [Disk space](#disk-space)
   - [Clock drift](#clock-drift)
   - [Fragment repair](#fragment-repair)
+  - [Fragment holder lost](#fragment-holder-lost)
+  - [Turning erasure coding on](#turning-erasure-coding-on)
 - [6. Control store](#6-control-store)
   - [Control store unreachable](#control-store-unreachable)
   - [Control store latency](#control-store-latency)
@@ -102,9 +104,12 @@ shards across each other, failing over a lost primary on their own (since
 M8-05b). Nodes with `[cluster] coordinator = true` also elect a
 coordinator, which replaces lost members, re-admits returning nodes,
 rebalances, and hands primaries off (since M8-06); the flag is off by
-default, and without it no node coordinates. Encoding and fragment repair
-are built and run in the cluster simulation, but the binary does not run
-them yet. Their metrics are listed
+default, and without it no node coordinates. Nodes with `[ec] enabled =
+true` erasure-code the large objects of `local` buckets, read them from
+their fragments, and release and reclaim fragments (since M8-07a); the
+flag is off by default. Fragment repair and moves are built and run in the
+cluster simulation, but the binary does not run them yet (M8-07b). Their
+metrics are listed
 as defined in the metrics reference, and their alerts cannot fire. The
 runbooks for them describe what to do once the binary runs them, and say
 which of their steps cannot be taken yet. The peer transport (design section 7.8) runs in
@@ -123,7 +128,7 @@ Each row of design section 13, in its order, with the runbooks to follow.
 | Two of three members dead | [Under-replication](#under-replication), [Node down](#node-down) |
 | Whole cluster loses power | [Cluster power loss](#cluster-power-loss) |
 | Every member of a shard permanently lost | [Shard lost](#shard-lost) |
-| Node holding EC fragments lost | [Fragment repair](#fragment-repair), [Node down](#node-down) |
+| Node holding EC fragments lost | [Fragment holder lost](#fragment-holder-lost), [Fragment repair](#fragment-repair), [Node down](#node-down) |
 | Node fails while the control store is unreachable | [Control store unreachable](#control-store-unreachable), [Node down](#node-down) |
 | Remote target unreachable | [Flush stalled](#flush-stalled), [Dirty budget](#dirty-budget), [Dirty data age](#dirty-data-age) |
 | Remote target refuses the flushes (`401` or `403`, or a SkyS3 peer's `refused`) | [Flush refused](#flush-refused), [Flush stalled](#flush-stalled) |
@@ -1087,7 +1092,9 @@ node's `/healthz` does not answer.
 shards it led fail over within about `primary_grace` plus one CAS and
 reconciliation (under 10 seconds by default), and the shards it was a
 member of lose that member ([Under-replication](#under-replication)).
-Fragments it held are rebuilt elsewhere ([Fragment repair](#fragment-repair)).
+Fragments it held are rebuilt elsewhere ([Fragment repair](#fragment-repair)),
+once the binary runs repair; until then reads decode around them
+([Fragment holder lost](#fragment-holder-lost)).
 
 **Diagnosis.**
 
@@ -1308,7 +1315,107 @@ are eligible ([Provisioning](#provisioning)).
 **Verification.** `skys3_unrepaired_fragments` returns to 0.
 
 **Do not.** Do not take another fragment holder down while stripes are
-short. The node binary does not run encoding or repair yet.
+short. The node binary does not run repair yet (plan M8-07b): until it
+does, a lost holder's fragments are not rebuilt, and
+[Fragment holder lost](#fragment-holder-lost) applies.
+
+### Fragment holder lost
+
+**Symptoms.** `SkyS3NodeDown` for a node with `[ec] enabled` whose
+`skys3_fragment_stored_bytes` was above 0. The gateways of the other nodes
+count parity reads in `skys3_fragment_reads_total{fragment="parity"}`, and
+failed fragment reads in `{outcome="failed"}`: their reads of coded objects
+are degraded. `SkyS3FragmentsUnrepaired` does not fire: before plan M8-07b
+the binary runs no repairer, so nothing finds the fragments lost.
+
+**Impact.** Coded objects stay readable while every stripe keeps `k` of
+its fragments: a piece whose fragment was on the node is decoded from `k`
+others, which costs `k` fragment reads instead of one. Nothing rebuilds
+the node's fragments before M8-07b, so a stripe that loses more than
+`parity_fragments` of them, one per node, cannot be read, and a GET of its
+object answers `503` until enough holders return. The node's fragments
+are not lost while its disks survive: once it is back, it serves them
+again. While it is registered and not draining, encoders still plan
+stripes onto it; each such stripe waits for its write to fail and is
+planned again without it, which slows encoding but loses nothing.
+
+**Diagnosis.**
+
+1. Which node is down, and why: [Node down](#node-down).
+2. Whether it held fragments: its last `skys3_fragment_stored_bytes`.
+3. Whether reads are degraded or failing:
+   `rate(skys3_fragment_reads_total{fragment="parity"}[5m])` on the other
+   nodes, and `503` answers to GETs of coded objects.
+
+**Remediation.** Bring the node back with its data directory: its fragment
+stores are recovered at startup, and reads find its fragments again. If it
+cannot return soon, mark it draining (`POST /v1/nodes/<node-id>/drain`,
+[Draining a node](#draining-a-node)), so that encoders place no new
+fragments on it. If its disks are lost for good, its fragments are too,
+and before M8-07b nothing rebuilds them: keep every other holder up, and
+rewrite the objects that matter (read each through another node and PUT
+it again), which gives them a new version, coded on the nodes that are up,
+and releases the old version's fragments. No command lists the objects
+whose stripes used a node.
+
+**Verification.** GETs of coded objects return them through every node;
+with the node back, `skys3_fragment_reads_total{fragment="parity"}` stops
+rising.
+
+**Do not.** Do not take another fragment holder down while one is lost:
+with `parity_fragments = 1`, any stripe that had fragments on both cannot
+be read. Do not wipe the data directory of a node coming back: until
+M8-07b its fragment stores hold the only copy of its fragments. Do not
+turn `[ec] enabled` off to work around a loss: a node without it reads no
+fragments ([Turning erasure coding on](#turning-erasure-coding-on)).
+
+### Turning erasure coding on
+
+**Symptoms.** None: turning erasure coding on is planned work, for a
+cluster whose `local` buckets hold large objects.
+
+**Impact.** The shard primaries of `local` buckets code every object of at
+least `ec_min_object_bytes` once it is `ec_after_seconds` old: they read
+its replica once and write `(k+m)/k` times its size in fragments across
+the nodes, and the members then drop their replicas (design section 8.4),
+so the bytes held fall from `replicas` times the size towards `(k+m)/k`
+times. Healthy reads of coded objects read only data fragments. Before
+plan M8-07b nothing rebuilds a lost holder's fragments
+([Fragment holder lost](#fragment-holder-lost)).
+
+**Procedure.**
+
+1. Check that the cluster has at least `min_eligible_nodes` eligible
+   nodes: registered, not departing or draining, offering capacity, and
+   carrying the labels `[cluster] failure_domain` needs (`GET /v1/cluster`).
+   With fewer, nothing is coded.
+2. Set `[ec] enabled = true`, with the same `[ec]` keys, in every node's
+   configuration; `skys3 --config <file> --check-config` refuses it
+   without `[cluster] multi_node = true`. Each node keeps its fragments in
+   one store per `[node] disks` directory, beside its log segments.
+3. Restart the nodes one at a time, each once the one before reports
+   `ready` in `GET /v1/health`. Until every node runs with the flag, the
+   others close its fragment connections: an encoder places a stripe
+   again without a node that refused its write, and a node that has not
+   restarted yet answers `503` for objects already coded.
+4. Watch `skys3_encoded_objects_total` rise on the primaries and
+   `skys3_fragment_stored_bytes` on the holders.
+
+**Verification.** `skys3_fragment_stored_bytes` is above 0 on at least
+`min_eligible_nodes` nodes; `skys3_encodings_abandoned_total` stays flat;
+the members' log segments shrink as compaction drops the replicas, within
+`fragment_release_delay_seconds` and a checkpoint or two of each `EC_PUBLISH`;
+a GET of a coded object returns it through every node, and
+`skys3_fragment_reads_total{fragment="parity"}` stays at 0 while every
+node is up. A steady rise of `skys3_encodings_abandoned_total` means
+nodes refuse or do not answer fragment writes: a node without the flag,
+or one that is down while still registered.
+
+**Do not.** Do not set the flag on some nodes only, and do not turn it
+off once objects are coded: a node without it reads no fragments, and
+answers `503` for every coded object. Do not turn it on to save space in
+a cluster that cannot afford a lost holder before M8-07b: until then a
+lost holder's fragments are not rebuilt.
 
 ## 6. Control store
 
@@ -1570,7 +1677,9 @@ scenario of the cluster simulation (`crates/skys3-cluster-sim/tests/simulation/`
 | [Disk out of service](#disk-out-of-service) | `runbooks::drill_disk_out_of_service`; `simulation::harness::a_failed_sync_is_fenced_once` | A disk whose directory disappears fails its next segment: `skys3_disks_out_of_service` 1, `/readyz` `503`, the disk `in_service` false with its error, and `cannot fence the disk` logged. A fenced disk stops the next start, naming `out-of-service.json`; with the disk back and the fence removed, every acknowledged write reads back. | The drill cannot fail a sync on a real disk; it removes the disk's directory, and plants the fence a failed sync writes with the node's own function. |
 | [Disk space](#disk-space) | `runbooks::drill_disk_space` | Below `disk_min_free_bytes`, writes get `503 SlowDown` and count as `disk_space` refusals, the log names the place, reads and deletes go on; freeing space admits writes within seconds without a restart. | Nothing. |
 | [Clock drift](#clock-drift) | `simulation::leases::drift_beyond_rho_risks_stale_reads_but_writes_stay_safe` | Drift beyond `ρ` risks stale reads, and writes stay safe, as the runbook's impact says. | The diagnosis and remediation are the host's time service's; nothing in SkyS3 to drill. |
-| [Fragment repair](#fragment-repair) | `simulation::repair::a_lost_holder_is_repaired_while_reads_go_on`; `simulation::fragment_moves::a_drained_node_is_emptied_while_reads_and_losses_go_on` | A lost holder's fragments are rebuilt elsewhere while degraded reads go on. | Not drilled on the binary, which does not run encoding or repair. |
+| [Fragment repair](#fragment-repair) | `simulation::repair::a_lost_holder_is_repaired_while_reads_go_on`; `simulation::fragment_moves::a_drained_node_is_emptied_while_reads_and_losses_go_on` | A lost holder's fragments are rebuilt elsewhere while degraded reads go on. | Not drilled on the binary, which does not run repair before plan M8-07b. |
+| [Fragment holder lost](#fragment-holder-lost) | `coding::objects_are_coded_read_degraded_released_and_orphans_reclaimed`; on the binary, the end-to-end scenario erasure-coding (tests/e2e/scenarios/97-erasure-coding.sh) | With each holder of a 2+1 stripe that does not lead the shard stopped in turn (`kill -9` on the binary), GETs through another node return the same SHA-256, decoded with the parity fragment where the stopped node held a data fragment, and `skys3_fragment_reads_total{fragment="parity"}` rises. | The holders were brought back, not lost for good: nothing rebuilds a lost holder's fragments before M8-07b. |
+| [Turning erasure coding on](#turning-erasure-coding-on) | `coding::objects_are_coded_read_degraded_released_and_orphans_reclaimed`; on the binary, the end-to-end scenario erasure-coding | On 4 nodes with `[ec] enabled`, a large object is coded within seconds: `skys3_encoded_objects_total` 1, three nodes with `skys3_fragment_stored_bytes`, the members' log segments emptied of its bytes, and healthy GETs through every node with no parity read; an `admin` certificate cannot write a fragment, and a stray node's fragment is reclaimed as an orphan. | The members first kept their replicas for an hour: compaction held a coded version's extents for `peer_staging_ttl_seconds` like extents no entry names, fixed in M8-07a. The rolling restart of step 3 was not drilled: the drills start every node with the flag. |
 | [Control store unreachable](#control-store-unreachable) | `runbooks::drill_control_store_outage`; `simulation::removal::without_the_control_store_writes_fail_until_it_returns` | With the store's volume gone under a running node, the first CreateBucket fails a write of the file store and answers `500`; the node then drops the store, `skys3_control_store_live` goes to 0, `skys3_control_store_last_success_timestamp_seconds` stops, the log says `the control store failed; serving the local copy`, the data path goes on, and CreateBucket answers `503`. When the volume returns, the node opens the store again without a restart, and CreateBucket succeeds. In a cluster, a member that fails while the store is down stalls its shards' writes until the store returns. | The first CreateBucket answers `500 InternalError`, not `503` (section 8). Until M8-03 the file store also stayed refused after its volume returned, until the node restarted. |
 | [Control store latency](#control-store-latency) | `simulation::workload::slow_and_lossy_control_store_with_partitions` | Client requests go on under control-store round trips of 100 ms and more. | The round trip is not measured (section 8). |
 | [Identity staleness](#identity-staleness) | `runbooks::drill_control_store_outage`; `sts::a_stale_identity_copy_stops_new_sessions_only` | `skys3_identity_synced_timestamp_seconds` stops during the outage and advances after a restart with the store answering; a stale copy refuses new sessions and keeps issued ones. | The drill cannot age a copy past `identity_max_staleness` (an hour at least) on the binary; the STS test does it on a simulated clock. |

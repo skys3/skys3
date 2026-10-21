@@ -64,7 +64,7 @@ use skys3_shard::AckTimeout;
 use skys3_shard::replication::{
     ControlRegisters, Replication, ReplicationConfig, ReplicationMetrics,
 };
-use skys3_types::{BucketDocument, BucketId, NodeAddress, NodeId, ShardConfig};
+use skys3_types::{BucketDocument, BucketId, NodeId, NodeRegistration, ShardConfig};
 
 use crate::admin::{ReportFuture, ShardsReport, shard_entry};
 use crate::control::backend::Backend;
@@ -98,6 +98,11 @@ pub(crate) fn replication_config(config: &skys3_config::ReplicationConfig) -> Re
         ..ReplicationConfig::default()
     }
 }
+
+/// The node registrations under `nodes/` as a node read them last, with
+/// the version of each: the nodes erasure coding places fragments on and
+/// releases them to (§8.3, §8.7). Clones share them.
+pub(crate) type Registrations = Arc<Mutex<BTreeMap<NodeId, (Version, NodeRegistration)>>>;
 
 /// The buckets a node saw deleted. Bucket IDs are never reused (§4.1), so
 /// the set only grows, by the buckets deleted while the node runs.
@@ -140,8 +145,8 @@ pub(crate) struct ClusterShards {
     peers: Peers,
     store: Backend,
     retry: RetryPolicy,
-    /// Each registration read last: its version and the address it names.
-    registrations: Mutex<BTreeMap<NodeId, (Version, NodeAddress)>>,
+    /// Each registration read last, with its version.
+    registrations: Registrations,
     /// The buckets this node saw deleted.
     deleted: Deleted,
 }
@@ -213,7 +218,7 @@ impl ClusterShards {
             peers,
             store,
             retry,
-            registrations: Mutex::default(),
+            registrations: Registrations::default(),
             deleted,
         })
     }
@@ -232,6 +237,18 @@ impl ClusterShards {
     /// primaries.
     pub(crate) fn replication(&self) -> &NodeReplication {
         self.replicas.replication()
+    }
+
+    /// The addresses of the registered nodes, which the node's clients
+    /// reach them at.
+    pub(crate) fn peers(&self) -> &Peers {
+        &self.peers
+    }
+
+    /// The node registrations as the node read them last, which every
+    /// pass refreshes.
+    pub(crate) fn registrations(&self) -> Registrations {
+        Arc::clone(&self.registrations)
     }
 
     /// The node's end of forwarded requests.
@@ -362,15 +379,15 @@ impl ClusterShards {
             let RegisterKind::Node(node) = key.kind() else {
                 continue;
             };
-            if let Some((seen, address)) = known.get(&node)
+            if let Some((seen, registration)) = known.get(&node)
                 && *seen == version
             {
-                read.insert(node, (version, address.clone()));
+                read.insert(node, (version, registration.clone()));
                 continue;
             }
             match read_with_retries(&self.store, &TypedKey::node(&node), &self.retry).await {
                 Ok(Some(current)) => {
-                    read.insert(node, (current.version, current.value.address));
+                    read.insert(node, (current.version, current.value));
                 }
                 Ok(None) => {}
                 Err(error @ ControlError::InvalidRegister { .. }) => {
@@ -381,7 +398,7 @@ impl ClusterShards {
         }
         let addresses = read
             .iter()
-            .map(|(node, (_, address))| (node.clone(), address.clone()))
+            .map(|(node, (_, registration))| (node.clone(), registration.address.clone()))
             .collect();
         *self
             .registrations

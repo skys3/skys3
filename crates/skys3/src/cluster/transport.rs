@@ -13,8 +13,11 @@
 //! requests, `skys3_coord::AdminEndpoint`); replication links, backfills,
 //! and lease messages from other nodes' primaries, through the node's
 //! replication; and the requests other gateways forward to this node's
-//! replicas (plan M8-05b). A connection whose first frame is of erasure
-//! coding (fragment writes, reads, and releases, plan M8-07a) is closed.
+//! replicas (plan M8-05b). With `[ec] enabled = true`, it serves fragment
+//! writes, reads, holds, and releases, and orphan queries (plan M8-07a);
+//! without it, a connection whose first frame is of erasure coding is
+//! closed, and the sender's write or read fails as for a node that is
+//! down.
 
 use std::time::Duration;
 
@@ -24,6 +27,7 @@ use skys3_obs::{HandshakeLimit, HandshakeOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 
+use super::coding::CodingServices;
 use super::replication::{Forwarded, NodeReplication};
 
 /// How long an authenticated connection may take to send its first frame.
@@ -44,23 +48,9 @@ pub(crate) struct Services {
     pub(crate) replication: NodeReplication,
     /// Requests other gateways forward to this node's replicas.
     pub(crate) forwarded: Forwarded,
-}
-
-/// Whether `kind` opens a connection of erasure coding, which this build
-/// does not serve yet (plan M8-07a).
-fn is_coding(kind: MessageKind) -> bool {
-    matches!(
-        kind,
-        MessageKind::FragmentWrite
-            | MessageKind::FragmentWritten
-            | MessageKind::OrphanQuery
-            | MessageKind::OrphanVerdicts
-            | MessageKind::FragmentRead
-            | MessageKind::FragmentData
-            | MessageKind::FragmentRelease
-            | MessageKind::FragmentHold
-            | MessageKind::FragmentNoted
-    )
+    /// Fragment writes, reads, holds, and releases, and orphan queries,
+    /// with `[ec] enabled = true`.
+    pub(crate) coding: Option<CodingServices>,
 }
 
 impl Services {
@@ -90,7 +80,18 @@ impl Services {
                     tracing::debug!(%peer, %error, "an admin connection ended");
                 }
             }
-            Some(MessageClass::Replication | MessageClass::Lease) if !is_coding(kind) => {
+            Some(MessageClass::Replication) if CodingServices::is_coding(kind) => {
+                match &self.coding {
+                    Some(coding) => coding.serve((receiver, sender), first).await,
+                    None => tracing::info!(
+                        %peer,
+                        ?kind,
+                        "closing a connection of erasure coding, which [ec] enabled = false \
+                         leaves off on this node"
+                    ),
+                }
+            }
+            Some(MessageClass::Replication | MessageClass::Lease) => {
                 self.replication.follow((receiver, sender), first).await;
             }
             Some(MessageClass::Request) if kind == MessageKind::Forward => {
