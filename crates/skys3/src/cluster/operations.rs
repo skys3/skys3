@@ -15,9 +15,11 @@
 //! - `POST` and `DELETE /v1/nodes/<id>/drain`: marks the node's
 //!   registration `draining`, or clears the mark, by a compare-and-swap
 //!   ([`set_draining`]). The coordinator then empties the node as it does
-//!   a departing one. Any node serves it: the control store's credentials,
-//!   which every node holds, are what allows it, as for every
-//!   registration.
+//!   a departing one, and with erasure coding the shard primaries move its
+//!   fragments off (design §8.3). Any node serves it: the control store's
+//!   credentials, which every node holds, are what allows it, as for every
+//!   registration. A node reports in `GET /v1/cluster` the fragments its
+//!   own stores hold, so the drained node tells when it is empty.
 //!
 //! The answers are JSON whose fields are only ever added.
 
@@ -39,6 +41,7 @@ use skys3_io::RealDisk;
 use skys3_net::{TokioNetwork, Transport};
 use skys3_types::{BucketDocument, ClusterId, NodeId, NodeRegistration, ShardConfig, ShardId};
 
+use super::coding::CodingServices;
 use super::coordinator::{CoordinatorView, HANDOFF_TIMEOUT};
 use crate::admin::{ClusterApi, ClusterFuture};
 use crate::control::backend::Backend;
@@ -69,6 +72,9 @@ pub(crate) struct ClusterOperations {
     handoffs: Handoffs<TokioNetwork, RealDisk>,
     /// Asks other nodes' primaries for handoffs, as the coordinator.
     client: HandoffClient<TokioNetwork>,
+    /// With `[ec] enabled`, the node's fragment stores, whose holdings it
+    /// reports.
+    coding: Option<CodingServices>,
 }
 
 impl std::fmt::Debug for ClusterOperations {
@@ -218,7 +224,24 @@ impl ClusterOperations {
             coordinator,
             handoffs,
             client: HandoffClient::new(transport, HANDOFF_TIMEOUT),
+            coding: None,
         }
+    }
+
+    /// Reports what `coding`'s fragment stores hold, on a node with `[ec]
+    /// enabled`.
+    pub(crate) fn with_coding(mut self, coding: Option<CodingServices>) -> Self {
+        self.coding = coding;
+        self
+    }
+
+    /// What this node's fragment stores hold, or `null` without `[ec]
+    /// enabled`.
+    fn fragments(&self) -> Value {
+        self.coding.as_ref().map_or(Value::Null, |coding| {
+            let held = coding.held();
+            json!({ "held": held.fragments, "unreleased": held.unreleased })
+        })
     }
 
     /// The coordinator's latest placement judgement, while this node is
@@ -297,6 +320,7 @@ impl ClusterOperations {
             "nodes": nodes,
             "shards": scan.shards().count(),
             "placement": self.judgement(),
+            "fragments": self.fragments(),
         });
         (StatusCode::OK, answer)
     }

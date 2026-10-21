@@ -284,6 +284,8 @@ async fn a_coordinator_is_elected_hands_off_and_is_succeeded() {
     assert_eq!(view["placement"], Value::Null, "{view}");
     assert_eq!(view["coordinator"]["candidate"], true, "{view}");
     assert_eq!(view["nodes"].as_array().unwrap().len(), 3, "{view}");
+    // Without erasure coding, a node has no fragment stores to report.
+    assert_eq!(view["fragments"], Value::Null, "{view}");
     // The coordinator judges the nodes' health from their heartbeats.
     eventually("the coordinator hears from every node", || async {
         let view = cluster.view(coordinator).await;
