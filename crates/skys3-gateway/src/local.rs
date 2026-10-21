@@ -15,7 +15,7 @@ use skys3_shard::{
     Committed, FlushState, Outcome, ReadId, ReadPlan, Registered, Rejection, Shard, ShardSet,
     StreamedBody,
 };
-use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
+use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ProposalId, ShardConfig};
 
 use crate::conditions::{ConditionFailed, Precondition};
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome};
@@ -81,9 +81,14 @@ impl<D: Disk> LocalShards<D> {
         &self.set
     }
 
-    /// The configuration a shard of `bucket` opens in.
+    /// The configuration `shard` opens in, which depends on nothing but the
+    /// shard and this node. Without a shard register there is no proposal
+    /// to name, so its `proposal_id` is all zeros. The bucket register's
+    /// `proposal_id` changes with every bucket change (§6.1); a
+    /// configuration taken from it would differ from the open replica's in
+    /// the same epoch, which the replica refuses (§5.1).
     #[must_use]
-    pub fn config(&self, shard: &ShardRef, bucket: &BucketDocument) -> ShardConfig {
+    pub fn config(&self, shard: &ShardRef) -> ShardConfig {
         ShardConfig {
             bucket_id: shard.bucket.clone(),
             shard: shard.shard,
@@ -93,7 +98,7 @@ impl<D: Disk> LocalShards<D> {
             learners: Vec::new(),
             min_write_replicas: 1,
             replicas: 1,
-            proposal_id: bucket.proposal_id.clone(),
+            proposal_id: ProposalId::from_u128(0),
         }
     }
 
@@ -171,9 +176,9 @@ fn convert(shard: &ShardRef, error: skys3_shard::ShardError) -> ShardError {
 }
 
 impl<D: Disk> Shards for LocalShards<D> {
-    async fn open(&self, shard: &ShardRef, bucket: &BucketDocument) -> Result<(), ShardError> {
+    async fn open(&self, shard: &ShardRef, _bucket: &BucketDocument) -> Result<(), ShardError> {
         self.set
-            .open(&self.config(shard, bucket))
+            .open(&self.config(shard))
             .await
             .map(drop)
             .map_err(|error| convert(shard, error))
@@ -465,5 +470,24 @@ mod tests {
             ),
             "{converted:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_bucket_register_opens_the_same_configuration() {
+        let shards = crate::stub::MemoryShards::new().await;
+        let local = shards.local();
+        let mut bucket = crate::shard::tests::bucket("b-1", 2);
+        for shard in ShardRef::all(&bucket) {
+            local.open(&shard, &bucket).await.unwrap();
+        }
+        // A bucket change, such as a lifecycle configuration, rewrites the
+        // register under a new `proposal_id`; the node's next sync opens
+        // the bucket's shards again with it.
+        bucket.proposal_id = ProposalId::new("q").unwrap();
+        for shard in ShardRef::all(&bucket) {
+            local.open(&shard, &bucket).await.unwrap();
+            let open = local.find(&shard).await.unwrap();
+            assert_eq!(open.config(), local.config(&shard));
+        }
     }
 }

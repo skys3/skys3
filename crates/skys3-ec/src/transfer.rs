@@ -21,7 +21,6 @@
 //! store made it durable, so an ID in a `FragmentWritten` names a fragment
 //! that survives a power loss. Each write uses a connection of its own.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,9 +29,10 @@ use bytes::{Bytes, BytesMut};
 use prost::Message;
 use skys3_io::Disk;
 use skys3_net::{
-    Frame, Header, Listener, MessageKind, Network, Receiver, Sender, Transport, TransportError,
+    Frame, Header, Listener, MessageKind, Network, Peers, Receiver, Sender, Transport,
+    TransportError,
 };
-use skys3_types::{NodeAddress, NodeId};
+use skys3_types::NodeId;
 
 use crate::fragment::{FragmentHeader, MAX_FRAGMENT_LEN, MAX_HEADER_LEN};
 use crate::{FragmentHolds, FragmentId, FragmentStore};
@@ -120,17 +120,17 @@ pub trait FragmentWriter: Send + Sync + 'static {
 /// own [`FragmentServer`] directly.
 pub struct FragmentClient<N: Network, D: Disk> {
     transport: Transport<N>,
-    peers: BTreeMap<NodeId, NodeAddress>,
+    peers: Peers,
     local: Option<(NodeId, FragmentServer<D>)>,
 }
 
 impl<N: Network, D: Disk> FragmentClient<N, D> {
     /// A client that reaches the nodes at `peers` through `transport`.
     #[must_use]
-    pub fn new(transport: Transport<N>, peers: BTreeMap<NodeId, NodeAddress>) -> Self {
+    pub fn new(transport: Transport<N>, peers: impl Into<Peers>) -> Self {
         Self {
             transport,
-            peers,
+            peers: peers.into(),
             local: None,
         }
     }
@@ -162,7 +162,7 @@ impl<N: Network, D: Disk> FragmentClient<N, D> {
         };
         let connection = self
             .transport
-            .connect(node, address)
+            .connect(node, &address)
             .await
             .map_err(transport)?;
         let (mut receiver, mut sender) = connection.into_split();

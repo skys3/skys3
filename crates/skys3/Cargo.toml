@@ -26,6 +26,7 @@ skys3-cluster.workspace = true
 skys3-config.workspace = true
 skys3-control.workspace = true
 skys3-coord.workspace = true
+skys3-ec.workspace = true
 skys3-flush.workspace = true
 skys3-gateway.workspace = true
 skys3-index.workspace = true
@@ -55,8 +56,6 @@ base64.workspace = true
 md-5.workspace = true
 # The throwaway peer PKI of the peering tests.
 rcgen.workspace = true
-# Repair's metrics, for the metrics reference tests.
-skys3-ec.workspace = true
 # Enables `test-util` for fault injection and the etcd stand-in.
 skys3-control = { workspace = true, features = ["test-util"] }
 # Enables `test-util` for the in-memory shards in unit tests.
