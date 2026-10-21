@@ -10224,3 +10224,109 @@ of this file. A task with nothing unexpected keeps "None."
   and kept in memory, so each node learns a silent node on its own, at
   the cost of one failed write or check. `SkyS3FragmentsUnrepaired` is
   checked by its promtool case only.
+
+### M8-09 Enable the cluster by default
+
+- **What decides single node or cluster (decided).** The control store's
+  backend: a node over etcd or S3 is a node of the cluster that store
+  holds, and a node over the file store is a single node
+  (`Config::multi_node`, `ControlStoreBackend::is_shared`). The plan asked
+  for the remaining choice to come from existing settings or the cluster's
+  size, and the backend already was the one: the file store refuses a
+  second node, and since M8-04 nothing ran on a shared store as a single
+  node except a node that left `multi_node` off, which is what a node of a
+  one-node cluster now is. `[transport]` was not used, for M8-03's reason:
+  single nodes configure it to peer. A node over a shared store needs the
+  three `[transport]` files and a reachable address at load
+  (`TransportConfig::check_cluster_node`, formerly `check_multi_node`),
+  and the single-node guard of M8-03, which refused a shared store that
+  registered another node, is gone with the `Opener`'s fields that fed it.
+- **Removed keys are refused, not deprecated (decided).** A new pre-pass
+  (`skys3-config/src/removed.rs`) reads `[cluster]` and `[ec]` leniently
+  (`IgnoredAny`, so the value's type does not matter) and reports each
+  removed key at its path, `was removed:` with the reason and what to do,
+  before serde's strict parse would report it as an unknown field without
+  either. A warning that ignored the key was rejected: each old value now
+  means something else (`multi_node = false` over etcd was a single node,
+  `coordinator = false` kept a node out of the election, `enabled = false`
+  kept a cluster from coding), so an unchanged file would change what the
+  node runs; a refusal costs one edit and is seen at once. No release
+  shipped with the flags, so no compatibility window was owed. Recorded in
+  design §12 (*Removed gates, as built*), the configuration reference
+  (*Removed keys*), and the plan's §14 row on gating. Tested by
+  `the_removed_gates_are_refused_with_their_reason`,
+  `removed::tests`, and the e2e scenario `cluster` (a `multi_node = true`
+  file does not start and logs the reason).
+- **Coding is turned on by the cluster's size.** With `[ec] enabled` gone,
+  every node of a cluster runs the fragment server, encoders, releasers,
+  repair, and moves (`ClusterServices::start` now takes the coding
+  services, no longer an `Option`), and `min_eligible_nodes` (5 by
+  default) is the switch: a smaller cluster codes nothing. Runbook
+  "Turning erasure coding on" now lowers it and restarts the nodes one at
+  a time. A cluster that reached 5 nodes before M8-09 without the flag
+  starts coding on the upgrade. The other test clusters were checked:
+  the e2e scenarios `cluster`, `replication`, and `coordinator` run 3 or
+  4 nodes, under 5; the nightly suite's cluster `ka` has 5, but writes
+  objects of at most 200 KB, under `ec_min_object_bytes` (4 MiB), so it
+  codes nothing and its runs are unchanged but for idle encoders.
+- **Every node may be elected.** The coordinator runs on every node of a
+  cluster (`NodeCoordinator` is no longer optional, the heartbeater always
+  has the local registry), and `GET /v1/cluster` `coordinator.candidate`
+  is kept, always `true`, since the admin API only ever adds fields (§12).
+  `fragments` is never `null` any more.
+- **Single-node configurations that used etcd (surprise).** Many test and
+  harness configurations, in nine crates, ran a single node over an etcd
+  endpoint that was never contacted, as the shortest valid store; with
+  the guard gone they would have needed transport certificates, so they
+  use `backend = "file"`. The e2e etcd and S3 legs run node n1 as a
+  one-node cluster now, with its own transport certificate (`pki.sh`
+  issues `e2e/n1` and `minio-control/m1`), and the admin scenario checks
+  that n1 holds the coordinator lease there.
+- **Changing a node's store resets its copy (surprise).** The first
+  version of `a_single_nodes_data_directory_does_not_join_a_cluster`
+  started a node over the file store and then moved it to etcd; its copy
+  of control state then belonged to the file store, so the node saw the
+  etcd store as reset and answered `503`. The test now starts the second
+  node over etcd from the start, and the runbook's symptom names the
+  backend rather than the flag.
+- **Tests that relied on a stand-in coordinator.** `cluster.rs` wrote a
+  lease for a fake coordinator, and the replication test wrote a learner
+  into a register by hand; with every node contending, the real holder is
+  read from `GET /v1/cluster` and the re-admission is the coordinator's.
+  The transport test's coding frame now gets a fragment answer, so it
+  probes with a `ForwardReply` instead.
+- **Drill log (on the binary).** Which drill each end-to-end test and the
+  nightly suite exercise, and what M8-09 added; the full table is runbook
+  section 7.
+  - `10-objects`, `20-flush`, `30-import`, `40-reconcile`, `50-sts`,
+    `70-admin`: the single-node and one-node-cluster paths behind "Dirty
+    data age", "Flush stalled", and "Reconciliation differences" (the
+    in-process drills stay the runbooks' named drills).
+  - `60-peering`: "Peer link" and "Peer transport fallback" (UDP dropped,
+    S3 REST, back to QUIC); recorded on the binary in section 7 by this
+    task.
+  - `80-flush-refused`: "Flush refused".
+  - `90-cluster`: "Node ID in use", T6's and T7's transport checks, and,
+    added here, "Moving a single node into a cluster" steps 1, 3, and 4:
+    a single node's directory is refused over etcd, naming the runbook,
+    and left byte for byte as it was; its local bucket moves with two
+    `aws s3 sync`s and lists and reads back through every node.
+  - `95-replication`: "Under-replication", "Node down", "Replacing a node".
+  - `96-coordinator`: "Coordinator", "Handing off a primary", "Draining a
+    node", "Provisioning", "Placement policy".
+  - `97-erasure-coding`: "Fragment holder lost", "Fragment repair",
+    "Draining a node" (fragments), and, added here, "Turning erasure
+    coding on" step 3: four nodes under the default `min_eligible_nodes`
+    code nothing, a rolling restart with 3 (primary last) keeps the object
+    readable, and it is coded seconds later.
+  - The nightly suite (`tests/e2e/chaos`): "Network partition"
+    (`partition`), "Placement policy" (`rack-loss`), "Coordinator"
+    (`coordinator-handoff`, and the kill during n5's join), "Node down"
+    (`kill-primary`, `kill-loop`), "Control store latency" (`netem` on etcd
+    members), "Peer link" (bucket `peered` throughout).
+  - Not drilled, open points: "etcd majority loss" (the suite's etcd has
+    three members but loses one at a time, and a real majority loss and
+    restore from snapshot is not something the harness can fake); a lost
+    rack's `placement` report; step 2 of "Moving a single node into a
+    cluster" (a `write_back` bucket moved through its target); cross-zone
+    latency, which no harness here can make.

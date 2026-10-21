@@ -30,7 +30,11 @@ Loading runs in two stages.
 1. **Parsing.** The file must be TOML, every value must have its key's type, and every key must be known. A misspelled key or section is an error, never silently ignored. Parsing stops at the first problem and names its key and line.
 2. **Validation.** Every rule in this reference is checked, and every broken rule is reported at once, each at its dotted key path, such as `replication.primary_grace_ms` or `buckets.archive.backup_target`.
 
-Only `[cluster]` and its `cluster_id` are required. Every other key has a default, except the control-store endpoints, which the chosen backend requires.
+Only `[cluster]` and its `cluster_id` are required. Every other key has a default, except the control-store endpoints, which the chosen backend requires, and the `[transport]` certificates, which an etcd or S3 control store requires.
+
+**Removed keys.** Three keys that gated parts of the cluster while plan M8 built them are removed (plan M8-09): `[cluster] multi_node`, `[cluster] coordinator`, and `[ec] enabled`. A file that still sets one does not load, whatever its value, and the error names the key, says it was removed, and what replaces it, before any other check runs. They are refused rather than ignored with a warning because each old value now means something else: `multi_node = false` on an etcd store used to make a single node and now cannot, `coordinator = false` used to keep a node out of the election, and `enabled = false` used to keep a cluster from coding. A node that silently changed role on an upgrade would be worse than one that does not start (design §12).
+
+**Single node or cluster.** The control store's `backend` decides (design §6.2, §6.7). With `"file"`, the node is a single node: it serves every shard of its buckets alone, and binds no transport. With `"etcd"` or `"s3"`, the node is one of the cluster's nodes, and the cluster is every node that registers in the store, one or many: it binds the `[transport]` listener, registers in `nodes/<node-id>.json`, sends heartbeats to the coordinator, replicates its buckets' shards across the nodes their registers name, may be elected coordinator, and runs erasure coding once `[ec] min_eligible_nodes` nodes are eligible. It needs the three `[transport]` certificate files and an address other nodes reach it at (`[transport] advertise`, or a `listen` that is neither a wildcard address nor port 0). `GET /v1/health` reports which (`cluster.multi_node`). A data directory that holds a bucket's shards serves them in the mode it took them in, so a single node's directory does not start over an etcd or S3 store, nor a cluster node's over the file store: start it with a new data directory (runbook "Moving a single node into a cluster").
 
 **Conventions.**
 
@@ -46,8 +50,6 @@ Only `[cluster]` and its `cluster_id` are required. Every other key has a defaul
 |---|---|---|---|
 | `cluster_id` | string | required | 1 to 24 bytes of lowercase ASCII letters, digits, and `-`, starting and ending with a letter or digit. The limit keeps every write identity within 96 bytes (§7.2). |
 | `failure_domain` | `"node"`, `"rack"`, or `"zone"` | `"node"` | The level at which shard members and fragments are kept apart (§6.7). |
-| `multi_node` | boolean | `false` | Whether the node runs as one of several nodes of the cluster (design §6.2, §6.7): it binds the `[transport]` listener, registers itself in `nodes/<node-id>.json`, sends the coordinator heartbeats, and receives pushed generations. It needs `backend = "etcd"` or `"s3"`, never `"file"`, which serves one node; the three `[transport]` certificate files; and an address other nodes reach it at (`[transport] advertise`, or a `listen` that is neither a wildcard address nor port 0). Its buckets' shards are replicated across the nodes their registers name, with `replicas` members each, and its gateway routes every request to the shard's primary (plan M8-05b). A data directory that holds a bucket's shards serves them in the mode it was in when it took them, so turning `multi_node` on for a single node that holds buckets, or off for a node of a cluster, is refused at startup: start it with a new data directory (runbook "Moving a single node into a cluster"). Lost members are replaced, and a node a takeover left out re-admitted, only while a node with `coordinator = true` runs. A gate that plan M8-09 removes once the cluster is complete in the binary. |
-| `coordinator` | boolean | `false` | Whether the node may be elected coordinator (design §6.7, plan M8-06): it contends for `coordinator.lease`, and while it holds the lease it judges placement (`GET /v1/cluster`), finishes bucket creations cut short and deletes a deleted bucket's shard registers, replaces lost members, re-admits returning nodes, rebalances shards onto nodes that join, empties drained nodes, and pushes every change to the nodes. A node without it never contends and follows whichever node holds the lease; with no such node running, nothing of the above happens, and replication itself goes on (design §6.7). Set it on at least two nodes, so that another takes over when the coordinator is lost, typically on all. Needs `multi_node = true`. A gate that plan M8-09 removes. |
 
 ## `[node]`
 
@@ -78,7 +80,7 @@ Where the cluster's registers live (§6.1).
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `backend` | `"etcd"`, `"s3"`, or `"file"` | `"etcd"` | `"s3"` covers AWS S3, R2, and other stores that pass the conditional-write probe, which a node runs before it uses the store. `"file"` keeps the registers in a local directory, for a single-node cluster; it refuses to serve a second node, and is never allowed with more than one node. With `[cluster] multi_node = false`, the default, a node serves every shard of its buckets alone, so it refuses to start on an etcd or S3 store whose `nodes/` names another node (design §6.2). Only nodes with `multi_node = true` register, so give each single node a store or `prefix` of its own. With `multi_node = true`, nodes share the store and register in it, and a node refuses to start while `nodes/<node-id>.json` registers its node ID for another data directory. |
+| `backend` | `"etcd"`, `"s3"`, or `"file"` | `"etcd"` | `"s3"` covers AWS S3, R2, and other stores that pass the conditional-write probe, which a node runs before it uses the store. `"file"` keeps the registers in a local directory, for a single node, which serves every shard of its buckets alone; it refuses to serve a second node. With `"etcd"` or `"s3"`, the node is one of the cluster's nodes (see *Single node or cluster* above): the nodes share the store and register in it, so give each cluster a store or `prefix` of its own, and a node refuses to start while `nodes/<node-id>.json` registers its node ID for another data directory. Both need the `[transport]` certificates. |
 | `etcd_endpoints` | array of endpoint URLs | none | Required, and non-empty, for `backend = "etcd"`. Not allowed for the other backends. The client URLs of the etcd members, `https://`, or `http://` on loopback only (`127.0.0.0/8`, `[::1]`, `localhost`): whoever can write the store can reassign shards (design §12). Port 2379 if none is given; a request that goes unanswered moves to the next. |
 | `etcd_tls_ca_file` | path | none | The PEM CA certificates that verify the `https://` endpoints' certificates; without it, the system's root certificates. Not empty. Allowed only with an `https://` endpoint. |
 | `etcd_tls_cert_file` | path | none | The PEM client certificate chain, leaf first, that etcd's `--client-cert-auth` checks. Set together with `etcd_tls_key_file`. Allowed only with an `https://` endpoint. |
@@ -99,22 +101,22 @@ Where the cluster's registers live (§6.1).
 
 ## `[transport]`
 
-The intra-cluster transport: TCP with mutual TLS between the nodes of the cluster (design §12). Certificates come from the operator's PKI. The node certificate names the node with the URI subject alternative name `spiffe://<cluster_id>/node/<node-id>`, and the node's ID is the one its certificate names: a node whose certificate names another node, or another cluster, does not start. The files are read when the node starts. The node binds the listener only with `[cluster] multi_node = true`.
+The intra-cluster transport: TCP with mutual TLS between the nodes of the cluster (design §12). Certificates come from the operator's PKI. The node certificate names the node with the URI subject alternative name `spiffe://<cluster_id>/node/<node-id>`, and the node's ID is the one its certificate names: a node whose certificate names another node, or another cluster, does not start. The files are read when the node starts. The node binds the listener only over an etcd or S3 control store, as one of a cluster's nodes.
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `listen` | socket address | `"0.0.0.0:7400"` | |
-| `advertise` | `host:port` | `listen` | A node address: a DNS name, an IPv4 address, or a bracketed IPv6 address, and a port from 1 to 65535. Where other nodes reach the listener, which the node registers in `nodes/<node-id>.json` (§6.7). Required with `[cluster] multi_node = true` when `listen` is a wildcard address (`0.0.0.0`, `[::]`) or port 0. |
+| `advertise` | `host:port` | `listen` | A node address: a DNS name, an IPv4 address, or a bracketed IPv6 address, and a port from 1 to 65535. Where other nodes reach the listener, which the node registers in `nodes/<node-id>.json` (§6.7). Required over an etcd or S3 control store when `listen` is a wildcard address (`0.0.0.0`, `[::]`) or port 0. |
 | `max_inflight_handshakes` | integer | `256` | From 1 to 65536. How many TLS handshakes the listener runs at once (design §12). Further connections wait in the kernel's accept queue until one finishes, so a flood of connections that never finish a handshake holds at most this many tasks and TLS states, each for up to 10 seconds. |
 | `tls_cert_file` | path | none | The node's certificate chain in PEM, leaf first. Not empty. |
 | `tls_key_file` | path | none | The leaf's private key in PEM (PKCS #8, PKCS #1, or SEC1). Not empty. |
 | `tls_ca_file` | path | none | The CA certificates every peer's chain must lead to, in PEM. Not empty. |
 
-The three files are set together or not at all, and are required with `[cluster] multi_node = true`. Peering (`[peering.peers]`) presents the same certificate.
+The three files are set together or not at all, and are required over an etcd or S3 control store. Peering (`[peering.peers]`) presents the same certificate.
 
 ## `[replication]`
 
-Timeouts, failure detection, and leases (§5.2, §5.4, §6.3–§6.5). `ρ` is `assumed_clock_drift`. A node uses them with `[cluster] multi_node = true` (plan M8-05b); a single node's shards have no other member.
+Timeouts, failure detection, and leases (§5.2, §5.4, §6.3–§6.5). `ρ` is `assumed_clock_drift`. A node uses them over an etcd or S3 control store (plan M8-05b); a single node's shards have no other member.
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
@@ -126,10 +128,10 @@ Timeouts, failure detection, and leases (§5.2, §5.4, §6.3–§6.5). `ρ` is `
 | `primary_grace_ms` | integer | `6000` | At least `primary_lease_ms × (1+ρ)/(1−ρ) + 500`, rounded up (§5.4). The 500 ms margin covers the time between a lease check and the read it admits. With the defaults the bound is 4581. |
 | `assumed_clock_drift` | float | `0.01` | `ρ`, the bound on clock rate drift between nodes. At least 0 and less than 1. |
 | `node_forget_after_hours` | integer | `24` | Positive. When the coordinator forgets an unreachable node, after re-homing its shards (§6.7). |
-| `removal_interval_seconds` | integer | `10` | Positive. The least time between two member removals the coordinator makes, across the cluster, counted from when a removal took effect and from the start of each coordinator's tenure (§6.7, *Replacement*). It paces how fast replacement, rebalancing, and drains shrink shards back to `replicas`. Used with `[cluster] coordinator = true`. |
-| `rebalance_max_moves` | integer | `4` | Positive. The most shard moves one rebalancing batch starts; the next batch starts once all of them completed, so it bounds the backfills rebalancing runs at once (§6.7, *Rebalancing*). Used with `[cluster] coordinator = true`. |
-| `rebalance_handoff_interval_seconds` | integer | `2` | Positive. The least time between two handoffs the coordinator asks for, so that at most one shard's writes wait for a handoff at a time (§6.7). Used with `[cluster] coordinator = true`. |
-| `rebalance_handoff_retry_seconds` | integer | `10` | Positive. How long a handoff the coordinator asked for is given to land before it asks again (§6.7). Used with `[cluster] coordinator = true`. |
+| `removal_interval_seconds` | integer | `10` | Positive. The least time between two member removals the coordinator makes, across the cluster, counted from when a removal took effect and from the start of each coordinator's tenure (§6.7, *Replacement*). It paces how fast replacement, rebalancing, and drains shrink shards back to `replicas`. Used by the coordinator. |
+| `rebalance_max_moves` | integer | `4` | Positive. The most shard moves one rebalancing batch starts; the next batch starts once all of them completed, so it bounds the backfills rebalancing runs at once (§6.7, *Rebalancing*). Used by the coordinator. |
+| `rebalance_handoff_interval_seconds` | integer | `2` | Positive. The least time between two handoffs the coordinator asks for, so that at most one shard's writes wait for a handoff at a time (§6.7). Used by the coordinator. |
+| `rebalance_handoff_retry_seconds` | integer | `10` | Positive. How long a handoff the coordinator asked for is given to land before it asks again (§6.7). Used by the coordinator. |
 
 ## `[storage]`
 
@@ -178,14 +180,13 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 
 ## `[ec]`
 
-Erasure coding of `local` buckets (§8).
+Erasure coding of `local` buckets (§8). Every node of a cluster (an etcd or S3 control store) runs it, plans M8-07a and M8-07b: it keeps a fragment store on each disk of `[node] disks`, in the same directory as the disk's log segments (`frag-<id>.seg` files, design §10.1); serves fragment writes, reads, holds, releases, and orphan queries on its transport; encodes the objects of the `local` buckets whose shards it leads (§8.2); reads coded objects from their fragments in its gateway (§8.5); releases replaced fragments and reclaims orphans (§8.4, §8.7); and, on the shards it leads, rebuilds lost fragments on other nodes and moves fragments off drained nodes and toward each node's share (§8.3, §8.6). A single node codes nothing. Give every node the same `[ec]` keys.
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `enabled` | boolean | `false` | Whether the node runs erasure coding (design §8, plans M8-07a and M8-07b). Needs `[cluster] multi_node = true`, since a stripe's fragments go to several nodes over the `[transport]`. With it, the node keeps a fragment store on each disk of `[node] disks`, in the same directory as the disk's log segments (`frag-<id>.seg` files, design §10.1); serves fragment writes, reads, holds, releases, and orphan queries on its transport; encodes the objects of the `local` buckets whose shards it leads (§8.2); reads coded objects from their fragments in its gateway (§8.5); releases replaced fragments and reclaims orphans (§8.4, §8.7); and, on the shards it leads, rebuilds lost fragments on other nodes and moves fragments off drained nodes and toward each node's share (§8.3, §8.6). Set it on every node: a node without it refuses fragments, so stripes placed there are planned again elsewhere, and its gateway cannot read coded objects. Once objects are coded, do not turn it off (runbook "Turning erasure coding on"). A gate that plan M8-09 removes. |
 | `parity_fragments` | integer | `2` | Positive. `m` in every geometry. |
 | `max_data_fragments` | integer | `8` | Positive, and at most 255 with `parity_fragments`, since a stripe has at most 255 fragments (§8.4). The widest `k`. |
-| `min_eligible_nodes` | integer | `5` | Greater than `parity_fragments`, since a stripe puts at most one fragment on a node. |
+| `min_eligible_nodes` | integer | `5` | Greater than `parity_fragments`, since a stripe puts at most one fragment on a node. A primary codes nothing while fewer nodes are eligible, so a smaller cluster keeps every object replicated; lowering it, down to `parity_fragments + 1`, is how a small cluster turns coding on (runbook "Turning erasure coding on"). |
 | `fragment_release_delay_seconds` | integer | `60` | May be 0 (§8.7). Also how long compaction keeps payload no entry names before it drops it (§10.3). |
 | `fragment_orphan_after_seconds` | integer | `3600` | Positive (§8.4). |
 | `fragment_repair_after_seconds` | integer | `600` | Positive (§8.6). How long a node may leave a shard primary's fragment checks unanswered before the primary rebuilds the node's fragments elsewhere. A node that answers but no longer holds a fragment has it rebuilt at once. A primary's repair passes come every tenth of it, from 1 to 30 seconds, so a loss is found at most a tenth late; each pass that finds nothing lost moves up to 16 fragments of the shard (plan M8-07b). |
@@ -199,7 +200,7 @@ Erasure coding of `local` buckets (§8).
 |---|---|---|---|
 | `mode` | `"write_back"`, `"local"`, or `"read_only"` | `"write_back"` | Fixed at creation (§4.1). |
 | `shards_per_bucket` | integer | `8` | From 1 to 256. Fixed at creation. |
-| `replicas` | integer | `3` | From 1 to 255. With `[cluster] multi_node = true`, a CreateBucket is refused (`400 InvalidRequest`) while the registered nodes span fewer `failure_domain` domains than `replicas` (§6.7); a single node keeps one copy whatever it says. |
+| `replicas` | integer | `3` | From 1 to 255. Over an etcd or S3 control store, a CreateBucket is refused (`400 InvalidRequest`) while the registered nodes span fewer `failure_domain` domains than `replicas` (§6.7); a single node keeps one copy whatever it says. |
 | `min_write_replicas` | integer | `2` | From 1 to `replicas` (§6.4). |
 | `clean_copies` | integer | `1` | From 0 to `replicas` (§9.3). |
 | `import_parallel_streams` | integer | `32` | From 1 to 256. Key ranges a new namespace import lists in parallel, each with its own checkpoint; one rate limit, `import_max_keys_per_second`, covers them all (§9.1). |
