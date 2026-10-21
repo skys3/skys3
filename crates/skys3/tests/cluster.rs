@@ -692,7 +692,16 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
         assert_eq!(listed.key_count(), Some(12));
     }
     // Every member of a shard applies the same records (plan M8-08), and
-    // the writes reached each shard's log.
+    // the writes reached the logs of the shards they went to. Which shards
+    // those are depends on the bucket's ID, drawn at random: one of the 4
+    // shards gets none of the 12 keys in about one run in eight, and stays
+    // at seq 0.
+    let id = skys3_types::BucketId::new(&bucket_id).unwrap();
+    let count = skys3_types::ShardCount::new(4).unwrap();
+    let written_to: std::collections::BTreeSet<u64> = written
+        .iter()
+        .map(|(key, _)| u64::from(skys3_types::shard_for_key(&id, key.as_bytes(), count).get()))
+        .collect();
     eventually(
         "the members of every shard applied the same records",
         || async {
@@ -707,12 +716,13 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
                 }
             }
             applied.len() == 4
-                && applied.values().all(|positions| {
+                && applied.iter().all(|(shard, positions)| {
                     positions.len() == 3
                         && positions.iter().all(|position| *position == positions[0])
-                        && positions[0]
-                            .parse::<skys3_types::EpochSeq>()
-                            .is_ok_and(|position| position.seq.get() > 0)
+                        && (!written_to.contains(shard)
+                            || positions[0]
+                                .parse::<skys3_types::EpochSeq>()
+                                .is_ok_and(|position| position.seq.get() > 0))
                 })
         },
     )
