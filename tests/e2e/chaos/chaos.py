@@ -102,6 +102,10 @@ ALLOW_ALL = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action"
 # `peered` to arrive once the workload stops.
 HEAL_SECONDS = 300
 READ_BACK_PATIENCE_SECONDS = 120
+HANDOFF_SECONDS = 60
+# The fewest acknowledged writes to each bucket a run needs for its checks
+# to mean anything: a few minutes of the workload acknowledge thousands.
+MIN_ACKED_WRITES = 200
 PEER_ARRIVAL_SECONDS = 900
 
 
@@ -568,9 +572,9 @@ s3_access_key_ids = ["{PEER_KEY}"]
     def settled(self, nodes: list[str], expected: dict[str, int]) -> str | None:
         """None when every shard of `expected` (bucket -> shard count) has,
         in the newest configuration any node's replica knows, `replicas`
-        members, all of them up, and no learner, and each member holds a
-        replica of that configuration that serves as primary or member;
-        otherwise what is not yet so. A node knows only the configurations
+        members, all of them up, and no learner, each member holds a
+        replica of that configuration that serves as primary or member, and
+        the primary serves clients; otherwise what is not yet so. A node knows only the configurations
         of the shards it holds or routed to, so no node knows every one."""
         views: dict[str, dict[tuple[str, int], dict]] = {}
         for node in nodes:
@@ -597,6 +601,15 @@ s3_access_key_ids = ["{PEER_KEY}"]
                             or entry["role"] not in ("primary", "member")):
                         state = entry and (entry["epoch"], entry["role"])
                         return f"{member} does not serve {bucket}/{shard} at epoch {newest['epoch']}: {state}"
+                # A primary reports its role as soon as it opens or takes
+                # over, and serves clients only once it has reconciled its
+                # members (`serving`); a stepped-down one never does again.
+                primary = views[newest["primary"]][(bucket, shard)]
+                if (primary["role"] != "primary" or not primary.get("serving")
+                        or primary.get("stepped_down")):
+                    return (f"{newest['primary']}, primary of {bucket}/{shard} at epoch {newest['epoch']}, "
+                            f"does not serve yet (role {primary['role']}, serving {primary.get('serving')}, "
+                            f"stepped down {primary.get('stepped_down')})")
         return None
 
     def wait(self, seconds: float, what: str, check) -> float:
@@ -912,6 +925,30 @@ class Faults:
             raise SuiteError(f"the partition of {victim} dropped no packets")
         return seen
 
+    def ask_handoff(self, bucket: str, shard: int) -> tuple[str, int, dict | None]:
+        """Asks the coordinator to hand `shard` of `bucket` off, until it
+        answers `202`, the handoff started: the step is about losing the
+        coordinator in the middle of a change, so a refused or lost request
+        would test only an ordinary coordinator loss. A `409` (a change of
+        the shard in flight, or a coordinator that just changed), a `503`,
+        or no answer is asked again, of whichever node is coordinator then,
+        for up to HANDOFF_SECONDS; then the step fails. Returns the
+        coordinator, the status, and its answer."""
+        suite = self.suite
+        path = f"/v1/shards/{bucket}/{shard}/handoff"
+        deadline = time.time() + HANDOFF_SECONDS
+        last = "no single coordinator"
+        while time.time() < deadline:
+            coordinator = suite.coordinator(suite.source_up())
+            if coordinator is not None:
+                status, answer = suite.admin.call(suite.address(coordinator), "POST", path)
+                if status == 202:
+                    return coordinator, status, answer
+                last = f"{coordinator} answered {status or 'nothing'}: {answer}"
+            time.sleep(1)
+        raise SuiteError(f"the coordinator did not start a handoff of {bucket}/{shard} "
+                         f"in {HANDOFF_SECONDS} s: {last}")
+
     def primary_of(self, bucket: str, shard: int) -> str:
         primary = self.suite.primaries().get((bucket, shard))
         if primary is None:
@@ -996,12 +1033,7 @@ class Faults:
             for victim in victims:
                 self.restart(victim) if step["how"] == "kill" else self.heal(victim)
         elif kind == "coordinator-handoff":
-            up = suite.source_up()
-            coordinator = suite.coordinator(up)
-            if coordinator is None:
-                raise SuiteError("no single coordinator to ask for a handoff")
-            status, answer = suite.admin.call(
-                suite.address(coordinator), "POST", f"/v1/shards/{step['bucket']}/{step['shard']}/handoff")
+            coordinator, status, answer = self.ask_handoff(step["bucket"], step["shard"])
             done.update(target=coordinator, handoff=status, answer=answer)
             time.sleep(step["kill_after"])
             self.lose(index, kind, [coordinator])
@@ -1264,6 +1296,16 @@ def check(suite: Suite, workload: Workload, faults: Faults, checker: Checker,
                             "stale": len(workload.stale)},
     }
     violations = [f"stale read: {json.dumps(read)}" for read in workload.stale]
+    # Without acknowledged writes the read-back, convergence, and peering
+    # checks below pass with nothing to check.
+    for bucket in (LOCAL_BUCKET, PEERED_BUCKET):
+        count = sum(1 for op in acked if op.bucket == bucket)
+        result["writes"].setdefault("acknowledged_by_bucket", {})[bucket] = count
+        if count < MIN_ACKED_WRITES:
+            error = (f"only {count} writes to {bucket} were acknowledged, "
+                     f"fewer than the {MIN_ACKED_WRITES} the checks need")
+            log(f"FAILED: {error}")
+            failed.append(error)
     result["failover"] = checker.failovers()
 
     def waited(seconds: float, what: str, until) -> float | None:
