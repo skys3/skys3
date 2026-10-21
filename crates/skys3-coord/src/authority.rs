@@ -100,9 +100,12 @@ impl<S: ControlStore> CoordinatorOrAdmin<S> {
             .await
             .map_err(|error| format!("cannot read the coordinator lease: {error}"))?
             .map(|lease| lease.value.holder);
+        // Timed from when the read returned: a read slower than the
+        // interval would otherwise land expired, and every request queued
+        // behind the lock would read again, one after another.
         *last = Some(Reading {
             holder: holder.clone(),
-            at: now,
+            at: self.clock.now(),
         });
         Ok(holder)
     }
@@ -204,6 +207,25 @@ mod tests {
         let refused = authority.permits(&node("n2")).await.unwrap_err();
         assert!(refused.contains("cannot read"), "{refused}");
         authority.permits(&admin).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_read_still_answers_for_an_interval() {
+        let store = FaultyStore::new(MemoryControlStore::new());
+        let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+        let authority = CoordinatorOrAdmin::new(store.clone(), clock);
+        lease(store.inner(), "n1", "p1").await;
+        // The read takes longer than the interval.
+        let slow = Fault::before(|| tokio::time::sleep(Duration::from_millis(1500)));
+        store.script([slow]);
+        let before = store.requests();
+        let n2 = node("n2");
+        let (first, second) = tokio::join!(authority.permits(&n2), authority.permits(&n2));
+        assert!(first.is_err() && second.is_err());
+        for _ in 0..10 {
+            assert!(authority.permits(&node("n2")).await.is_err());
+        }
+        assert_eq!(store.requests(), before + 1);
     }
 
     #[tokio::test(start_paused = true)]
