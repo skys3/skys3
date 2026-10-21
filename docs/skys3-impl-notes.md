@@ -10348,6 +10348,13 @@ of this file. A task with nothing unexpected keeps "None."
   it, mostly the AWS CLI's retries while the new bucket's shards take
   their leases), and `erasure-coding` 79 s with the rolling restart
   (20 s). The job's 15 minutes are not at risk.
+- **Simulations.** The change reaches code the cluster simulation drives
+  only through configuration parsing (the removed-key pre-pass, the
+  validation of shared stores) and the harness's configuration text,
+  which now names the file store; it adds no scenario. All 224
+  simulation tests passed at 256 seeds through `scripts/ci/simulation.sh`
+  in 47 minutes on 4 CPUs (the tests' own times sum to 3.1 CPU-hours),
+  after a container restart cut a first run short at 212 passed.
 - **Open points.** "etcd majority loss" stays undrilled: the harness
   cannot lose and restore an etcd majority for real. Cross-zone latency
   is not drilled either; the nightly suite's `netem` delays nodes and etcd
