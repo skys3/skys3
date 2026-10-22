@@ -114,6 +114,14 @@ pub struct LogStats {
     pub records: u64,
     /// Bytes those group commits wrote.
     pub bytes: u64,
+    /// File syncs those group commits made: one per segment they wrote,
+    /// and one of the directory after a segment was created. A group
+    /// runs its syncs in parallel, so each group is one serial durable
+    /// round however many syncs it makes.
+    pub syncs: u64,
+    /// Time those group commits took to write and sync, from the first
+    /// write to the last sync.
+    pub commit_time: Duration,
 }
 
 impl LogStats {
@@ -130,18 +138,32 @@ impl LogStats {
     }
 }
 
+/// One group commit that succeeded, as [`Counters`] records it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CommitCounts {
+    pub(crate) records: u64,
+    pub(crate) bytes: u64,
+    pub(crate) syncs: u64,
+    pub(crate) time: Duration,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
     group_commits: AtomicU64,
     records: AtomicU64,
     bytes: AtomicU64,
+    syncs: AtomicU64,
+    commit_nanos: AtomicU64,
 }
 
 impl Counters {
-    pub(crate) fn record_commit(&self, records: u64, bytes: u64) {
+    pub(crate) fn record_commit(&self, commit: CommitCounts) {
         self.group_commits.fetch_add(1, Ordering::Relaxed);
-        self.records.fetch_add(records, Ordering::Relaxed);
-        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.records.fetch_add(commit.records, Ordering::Relaxed);
+        self.bytes.fetch_add(commit.bytes, Ordering::Relaxed);
+        self.syncs.fetch_add(commit.syncs, Ordering::Relaxed);
+        let nanos = u64::try_from(commit.time.as_nanos()).unwrap_or(u64::MAX);
+        self.commit_nanos.fetch_add(nanos, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> LogStats {
@@ -149,6 +171,8 @@ impl Counters {
             group_commits: self.group_commits.load(Ordering::Relaxed),
             records: self.records.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
+            syncs: self.syncs.load(Ordering::Relaxed),
+            commit_time: Duration::from_nanos(self.commit_nanos.load(Ordering::Relaxed)),
         }
     }
 }

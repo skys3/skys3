@@ -34,6 +34,7 @@ differ, or if section 6 misses a row of design section 13.
   - [3.10 Coordinator and placement](#310-coordinator-and-placement)
   - [3.11 Fragment release](#311-fragment-release)
   - [3.12 Erasure coding](#312-erasure-coding)
+  - [3.13 Log and group commit](#313-log-and-group-commit)
 - [4. Alerts](#4-alerts)
 - [5. Dashboard](#5-dashboard)
 - [6. Failure matrix coverage](#6-failure-matrix-coverage)
@@ -297,6 +298,25 @@ its gateway.
 | `skys3_encodings_abandoned_total` | counter | none | §8.4 | exported (M8-07a) | Encodings that failed before they appended their `EC_PUBLISH`: a stripe whose fragments could not all be written after every re-plan, a replica that stopped leading, or an object whose bytes could not be read. The object stays replicated, and is encoded again at a later scan. A steady rise means nodes refuse or do not answer fragment writes: see the runbook "Turning erasure coding on". |
 | `skys3_fragment_stored_bytes` | gauge | none | §8.4, §10.1 | exported (M8-07a) | Bytes of fragments this node's fragment stores hold, released ones that are still kept included; refreshed every `index_checkpoint_interval`. |
 | `skys3_fragment_reads_total` | counter | `fragment` (`data`, `parity`), `outcome` (`read`, `failed`) | §8.5 | exported (M8-07a) | Fragment reads this node's gateway made for GETs of coded objects. A healthy read reads only data fragments; parity reads, and failed reads, mean degraded reads that decoded around a missing or damaged fragment (design section 8.5). |
+
+### 3.13 Log and group commit
+
+Design sections 5.3 and 10.4. Each disk's log commits queued records in
+groups: one write per segment and one sync of each file written, run in
+parallel, so a group is one serial durable round. These count the groups of
+every disk of the node since it started, read from the logs' own counters at
+each scrape. Divided by the PUTs a client had acknowledged and summed over a
+shard's members, they give the fsyncs per acknowledged PUT and the records
+per group commit that design section 16.3 measures against section 5.3's
+table (the performance suite, plan M7-06a). Exported by every node (M7-06a).
+
+| Name | Type | Labels | Design | Status | Description |
+|---|---|---|---|---|---|
+| `skys3_log_group_commits_total` | counter | none | §5.3, §10.4 | exported (M7-06a) | Group commits of the node's logs that succeeded. Each is one serial durable round, however many files it synced. |
+| `skys3_log_records_total` | counter | none | §5.3, §10.4 | exported (M7-06a) | Records those group commits made durable: every record kind, so a large PUT's extent records count, and so do markers such as `FLUSHED`. Divided by `skys3_log_group_commits_total`, the records per group commit. |
+| `skys3_log_syncs_total` | counter | none | §5.3, §10.4 | exported (M7-06a) | File syncs those group commits made: one `fdatasync` per segment written (a group writes to at most two, the hot and the bulk segment of section 10.1), and one `fsync` of the disk's directory after a group created a segment. |
+| `skys3_log_written_bytes_total` | counter | none | §10.4 | exported (M7-06a) | Bytes those group commits wrote, compaction's copies included. |
+| `skys3_log_commit_seconds_total` | counter | none | §10.4 | exported (M7-06a) | Time those group commits took, from the first write to the last sync. Divided by `skys3_log_group_commits_total`, the mean time of one durable round on this node's disks. |
 
 ## 4. Alerts
 

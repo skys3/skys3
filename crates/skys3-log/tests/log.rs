@@ -93,6 +93,9 @@ fn appends_read_back_from_their_class_of_segment() {
         assert_eq!(stats.records, 4);
         assert_eq!(stats.group_commits, 4);
         assert_eq!(stats.bytes, locations[2].end() + locations[3].end());
+        // One data sync per group, and a directory sync with each of the
+        // two groups that created a segment.
+        assert_eq!(stats.syncs, 6);
         assert!((stats.records_per_commit() - 1.0).abs() < f64::EPSILON);
         assert!(log.is_in_service());
         assert!(log.failure().is_none());
