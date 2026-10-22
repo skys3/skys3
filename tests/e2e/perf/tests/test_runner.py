@@ -1,5 +1,6 @@
 import copy
 import os
+import types
 import tempfile
 import unittest
 
@@ -7,7 +8,7 @@ from fakes import FakeNode
 from test_schema import result
 
 from skys3perf import report, runner
-from skys3perf.scenarios import SCENARIOS, Context, Skip, longest_gap
+from skys3perf.scenarios import SCENARIOS, Context, Skip, choose_shaper, longest_gap
 from skys3perf.target import Target
 
 
@@ -135,3 +136,16 @@ class Reports(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Shapers(unittest.TestCase):
+    def ctx(self, url, wanted="auto", hook=False):
+        target = types.SimpleNamespace(remote={"url": url}, can_shape=lambda link: hook)
+        return types.SimpleNamespace(params={"flush.shaper": wanted}, target=target)
+
+    def test_the_relay_carries_plain_http_only(self):
+        self.assertEqual(choose_shaper(self.ctx("http://m:9000"), 0), "none")
+        self.assertEqual(choose_shaper(self.ctx("http://m:9000"), 20), "relay")
+        self.assertEqual(choose_shaper(self.ctx("https://m", hook=True), 20), "hook")
+        self.assertTrue(choose_shaper(self.ctx("https://m"), 20).startswith("unavailable"))
+        self.assertTrue(choose_shaper(self.ctx("http://m", "hook"), 20).startswith("unavailable"))

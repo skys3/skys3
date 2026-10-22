@@ -74,7 +74,8 @@ def _client_loop(task: Task, thread: int, out: Ops, lock: threading.Lock) -> Non
     clients = [Client(e, task.credentials, task.ca_file, task.timeout) for e in task.endpoints]
     payload = Payload(task.size, task.seed)
     deadline = time.time() + task.duration if task.duration else None
-    budget = task.max_bytes // max(1, task.threads) if task.max_bytes else 0
+    # A positive budget, however small: 0 would mean no budget at all.
+    budget = max(1, task.max_bytes // max(1, task.threads)) if task.max_bytes else 0
     sent = 0
     n = 0
     while (not task.count or n < task.count) and (deadline is None or time.time() < deadline):
@@ -128,6 +129,21 @@ def split(concurrency: int, processes: int) -> list[int]:
     used = min(concurrency, processes)
     base, extra = divmod(concurrency, used)
     return [base + (1 if i < extra else 0) for i in range(used)]
+
+
+def tasks_for(task: Task, concurrency: int, processes: int) -> list[Task]:
+    """`task` for `concurrency` clients over at most `processes` processes:
+    each process gets its threads and its share of the case's byte budget,
+    in proportion to its threads, so the case sends at most `max_bytes`."""
+    shares = split(concurrency, processes)
+    return [dataclasses.replace(task, threads=threads, index=i,
+                                max_bytes=_share(task.max_bytes, threads, concurrency))
+            for i, threads in enumerate(shares)]
+
+
+def _share(max_bytes: int, threads: int, concurrency: int) -> int:
+    """`threads`' share of `max_bytes` (0: no budget), at least 1 byte."""
+    return max(1, max_bytes * threads // concurrency) if max_bytes else 0
 
 
 @dataclass
@@ -190,9 +206,7 @@ class Generator:
 
     def run(self, task: Task, concurrency: int) -> Outcome:
         """`concurrency` clients doing `task`, over the pool's processes."""
-        shares = split(concurrency, self.processes)
-        tasks = [dataclasses.replace(task, threads=threads, index=i)
-                 for i, threads in enumerate(shares)]
+        tasks = tasks_for(task, concurrency, self.processes)
         results = self.pool.map(run_task, tasks, chunksize=1)
         ops = Ops()
         for result in results:
@@ -200,10 +214,10 @@ class Generator:
         busiest = max((r.cpu_seconds / r.wall_seconds for r in results if r.wall_seconds),
                       default=0.0)
         generator = {
-            "processes": len(shares),
+            "processes": len(tasks),
             "threads": concurrency,
             "cpu_seconds": sum(r.cpu_seconds for r in results),
             "busiest_process_utilization": busiest,
             "may_have_limited": busiest >= BUSY,
         }
-        return Outcome(ops=ops, processes=len(shares), generator=generator)
+        return Outcome(ops=ops, processes=len(tasks), generator=generator)

@@ -21,6 +21,18 @@ class Splitting(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load.split(*bad)
 
+    def test_processes_share_the_byte_budget(self):
+        task = Task(op="put", endpoints=(), credentials=CREDENTIALS, bucket="b", size=10, max_bytes=1000)
+        tasks = load.tasks_for(task, 10, 4)
+        self.assertEqual([t.threads for t in tasks], [3, 3, 2, 2])
+        self.assertEqual([t.max_bytes for t in tasks], [300, 300, 200, 200])
+        self.assertEqual([t.index for t in tasks], [0, 1, 2, 3])
+        # A tiny budget stays a budget in every process, and none stays none.
+        self.assertEqual([t.max_bytes for t in load.tasks_for(
+            Task(op="put", endpoints=(), credentials=CREDENTIALS, bucket="b", max_bytes=2), 8, 4)], [1] * 4)
+        self.assertEqual([t.max_bytes for t in load.tasks_for(
+            Task(op="put", endpoints=(), credentials=CREDENTIALS, bucket="b"), 8, 4)], [0] * 4)
+
 
 class Running(unittest.TestCase):
     def test_a_task_in_this_process(self):

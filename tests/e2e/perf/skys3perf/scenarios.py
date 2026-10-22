@@ -442,7 +442,7 @@ def flush(ctx: Context) -> list[dict]:
     p = ctx.params
     remote = remote_client(ctx)
     url = urllib.parse.urlsplit(ctx.target.remote["url"])
-    upstream = (url.hostname or "127.0.0.1", url.port or 80)
+    upstream = (url.hostname or "127.0.0.1", url.port or (443 if url.scheme == "https" else 80))
     cases = []
     for i, rtt in enumerate(p["flush.rtts_ms"]):
         shaper = choose_shaper(ctx, rtt)
@@ -471,6 +471,10 @@ def choose_shaper(ctx: Context, rtt: float) -> str:
     if wanted in ("auto", "hook") and ctx.target.can_shape("target"):
         return "hook"
     if wanted in ("auto", "relay"):
+        # The relay forwards bytes to a plain-HTTP endpoint it names to
+        # the node; it cannot carry a TLS target's name and certificate.
+        if urllib.parse.urlsplit(ctx.target.remote["url"]).scheme == "https":
+            return "unavailable: the relay carries plain HTTP only; shape an HTTPS target with a hook"
         return "relay"
     return "unavailable: flush.shaper is hook and the target cannot shape its target link"
 
