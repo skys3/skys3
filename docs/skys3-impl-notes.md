@@ -6779,6 +6779,16 @@ of this file. A task with nothing unexpected keeps "None."
   final primary's log. The client forgot uploads by ID alone, but each
   shard numbers its own, so a completion on one key forgot another's
   upload, and the drain never ended; it matches path and ID now.
+- **Fixed: the audit trusted too much (review).** It took the versions
+  in every member's log as committed, so an object published from a
+  write a deposed primary kept but the final primary never committed
+  passed the check that every remote identity names a committed version;
+  and it kept uploads' state by position alone, which shards repeat.
+  Committed versions and uploads' state now come only from the final
+  primary's records that no `TRUNCATE` of its log invalidates
+  (`truncated_by`, as `lifecycle.rs` filters), keyed by shard; other
+  members' logs still serve the `FLUSHED` cross-check. Unit tests in
+  `large_objects.rs`; the scenarios pass at `SKYS3_SIM_SEEDS=256`.
 - **Heavy faults starve the probe.** Half of all Complete answers lost
   kept one node's capability probe failing for 90 s (seed 1), so its
   shards never flushed. The ETag bug scenario loses 40% of them.
