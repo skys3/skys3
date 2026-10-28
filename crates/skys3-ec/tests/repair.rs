@@ -1087,6 +1087,37 @@ fn a_move_that_fails_is_abandoned_and_retried() {
 }
 
 #[test]
+fn a_stripe_whose_move_fails_moves_no_more_in_the_pass() {
+    runtime().block_on(async {
+        // Two departing nodes hold fragments of the same stripes, so a
+        // pass plans two drains of each.
+        let f = Fixture::coded(1, 6, EcConfig::default()).await;
+        let repairer = f.repairer(planner(8, EcConfig::default(), vec![0, 1]), MOVING);
+        // The first move's write fails. The stripe's other move was
+        // planned as if that one had left its node, so it waits for the
+        // next pass to plan the stripe again.
+        *f.nodes.failures.lock().unwrap() = 1;
+        let report = repairer.pass().await;
+        assert!(report.moved > 0, "{report:?}");
+        let events = f.events.lock().unwrap().clone();
+        let started = |event: &&RepairEvent| matches!(event.step, RepairStep::MoveStarted { .. });
+        let first = events.iter().find(started).unwrap();
+        let of_stripe: Vec<_> = events
+            .iter()
+            .filter(started)
+            .filter(|event| (&event.key, event.stripe) == (&first.key, first.stripe))
+            .collect();
+        assert_eq!(of_stripe.len(), 1, "{of_stripe:?}");
+        assert!(events.iter().any(|event| {
+            event.attempt == first.attempt && event.step == RepairStep::Abandoned
+        }));
+        f.settle(&repairer).await;
+        assert_eq!((f.on(0).await, f.on(1).await), (0, 0));
+        f.check_whole().await;
+    });
+}
+
+#[test]
 fn moves_are_fenced_like_repairs() {
     runtime().block_on(async {
         let one = RepairSettings {

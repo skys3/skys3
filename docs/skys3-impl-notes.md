@@ -7240,6 +7240,13 @@ of this file. A task with nothing unexpected keeps "None."
   layout changed. A pass also stops moving from a node it could not read
   or to one it could not write, which would otherwise cost a write
   timeout per planned move.
+- **A stripe whose move did not apply moves no more that pass (found in
+  review).** The planner places each move of a stripe as if the earlier
+  ones had applied, and nothing at commit checks the domain cap, so a
+  failed drain out of a rack followed by a balance move into it could
+  leave the rack with `m + 1` fragments until the next pass. Once a
+  stripe's move fails, is rejected, or is skipped, the pass skips the
+  stripe's other moves (`a_stripe_whose_move_fails_moves_no_more_in_the_pass`).
 - **The harness's balance check had to count the readers' copies
   (found).** `CopyObject` copies are coded too, so the shard holds more
   coded objects than the run wrote; a check over the written keys found
