@@ -6183,6 +6183,15 @@ of this file. A task with nothing unexpected keeps "None."
   run. The window's start, on the nodes' wall clock, maps to the history's
   moments through the moment the driver notes at each step
   (`History::now`, new), two steps early.
+- **Fixed: an inherited identity is matched exactly.** The report held a
+  version if the remote's write identity was at or after the identity
+  the version names. A completed upload or streamed PUT names its
+  start's, which can be older than another write of the key: with that
+  write flushed and the completion not, the remote's identity passed,
+  and a lost object went unreported. The remote must now hold exactly
+  the version's identity, or one later than the version itself.
+  Tested in `tests/snapshots.rs`
+  (`an_inherited_identity_older_than_the_remote_write_is_lost`).
 - **Simulation cost.** `tests/simulation/snapshots.rs`: two scenarios
   (with and without backup targets) under crashes, partitions, message
   loss, control-store faults, and remote faults, `Runner::with_cost(4,
