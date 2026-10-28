@@ -5991,8 +5991,11 @@ of this file. A task with nothing unexpected keeps "None."
   and a move can each leave headers for the same object version, even with
   a different stripe count. `rebuild_layouts` keeps, per fragment index,
   the latest attempt's copy, and per stripe the latest attempt's layout
-  that can be decoded, falling back to an older stripe count when the
-  newest is incomplete. Design §8.4 records the rules.
+  that can be decoded and that later stripes continue to the object's
+  end, so an attempt that moved the stripe boundaries without changing
+  their count cannot hide a complete older one. It falls back to an older
+  stripe count when the newest is incomplete. Design §8.4 records the
+  rules.
 - **The tear window depends on the largest fragment.** A crash can leave
   one group commit plus one record unsynced, and a record can be a 256 MiB
   fragment, so recovery's damage check only looks past that. The store's
