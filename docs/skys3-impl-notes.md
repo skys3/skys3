@@ -7365,7 +7365,10 @@ of this file. A task with nothing unexpected keeps "None."
   whichever of the snapshot entry and the latest attempt's header names
   the later position: a retag after coding moves the entry, a repair
   after a retag writes headers whose write identity names it
-  (`ReindexBug::HeaderTags`, `ReindexBug::OlderAttempt`).
+  (`ReindexBug::HeaderTags`, `ReindexBug::OlderAttempt`). An
+  unrecoverable version's identity is chosen the same way, so a drill
+  whose backup holds the version only from before a retag reports the
+  key lost (found in review: it took the headers' older identity).
 - **Deletes and overwrites after the snapshot.** Their only trace is the
   absence of a newer header, so without a durable home a coded object
   deleted in the window comes back; the window covers it. With a home,
