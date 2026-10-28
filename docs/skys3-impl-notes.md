@@ -6657,7 +6657,9 @@ of this file. A task with nothing unexpected keeps "None."
   `FragmentSource` (one async `read` of a fragment range) and a
   `CodedRead` (the entry's coded layout, the object's size, the range)
   and returns a channel of body pieces, the first read before it
-  returns. Pieces are at most 1 MiB within one data fragment. A failed
+  returns. Pieces are at most 1 MiB within one data fragment, cut one
+  at a time as the read goes: listing a multi-TiB range up front held
+  32 bytes per MiB for the whole read. A failed
   fragment (not held, damaged, CRC32C mismatch, short) is skipped for
   the rest of its stripe and an unreachable node for the rest of the
   read; a degraded piece takes data fragments first, then parity, in
