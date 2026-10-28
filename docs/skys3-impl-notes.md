@@ -6174,6 +6174,17 @@ of this file. A task with nothing unexpected keeps "None."
   Validation (`skys3_types::lifecycle`) runs both in the gateway and in
   `BucketDocument::validate`, which also refuses a configuration on a
   bucket that is not `local`.
+- **Fixed: a change whose answers were lost went unannounced.** A
+  retried PUT or DELETE that found the configuration already in the
+  register returned without bumping the generation, so other nodes kept
+  the old rules, and could go on expiring objects, until an unrelated
+  announcement or the periodic refresh (up to 12 h by default). The
+  equality branch now announces again, as a retried CreateBucket does,
+  so a change that changes nothing, such as deleting no configuration,
+  costs a generation bump; and a swap that may have landed is announced
+  in the background
+  (`settle_later`). Tested in `tests/lifecycle.rs`
+  (`a_change_whose_answers_were_lost_is_announced`).
 - **Only `local` buckets.** A `write_back` (or `write_through`) bucket
   answers PUT with `501 NotImplemented`: its durable home is the remote,
   and expiring the local copy alone would be undone by an import or
