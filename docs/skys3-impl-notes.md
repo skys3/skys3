@@ -6662,7 +6662,9 @@ of this file. A task with nothing unexpected keeps "None."
   the rest of its stripe and an unreachable node for the rest of the
   read; a degraded piece takes data fragments first, then parity, in
   index order. `FragmentReadClient` is the network source, with a local
-  shortcut to the node's own `FragmentServer`.
+  shortcut to the node's own `FragmentServer`, bounded by the same 10 s
+  as a remote answer so a hung local disk reads as an unreachable node
+  and the stripe is decoded around it.
 - **Reads name what they expect.** A fragment ID alone is not enough: a
   fragment reclaimed since the plan (M5-05) or an ID reused on a
   replaced disk would serve another fragment's bytes, which pass their
