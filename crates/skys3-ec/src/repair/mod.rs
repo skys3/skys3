@@ -382,15 +382,14 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         self
     }
 
-    /// Runs a pass every [`RepairSettings::interval`] while this replica
-    /// leads the shard, until the returned future is dropped.
+    /// Runs a pass every [`RepairSettings::interval`] until the returned
+    /// future is dropped. A pass while this replica does not lead the shard
+    /// repairs nothing and clears the shard's backlog.
     pub async fn run(self) {
         loop {
-            if leads(&self.shard) {
-                let report = self.pass().await;
-                if report.lost > 0 {
-                    tracing::info!(shard = %self.shard.shard(), ?report, "a repair pass ended");
-                }
+            let report = self.pass().await;
+            if report.lost > 0 {
+                tracing::info!(shard = %self.shard.shard(), ?report, "a repair pass ended");
             }
             tokio::time::sleep(self.settings.interval).await;
         }

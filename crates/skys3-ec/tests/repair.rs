@@ -683,6 +683,53 @@ fn a_stripe_that_lost_too_much_is_reported_and_one_without_room_waits() {
 }
 
 #[test]
+fn a_replica_that_does_not_lead_clears_its_backlog_as_it_runs() {
+    runtime().block_on(async {
+        // A backlog of three fragments with no node to rebuild them on.
+        let f = Fixture::coded(1, 5, EcConfig::default()).await;
+        f.nodes.silence(4);
+        let leading = f.repairer(planner(5, EcConfig::default(), Vec::new()), SETTINGS);
+        leading.pass().await;
+        tokio::time::sleep(SETTINGS.lost_after).await;
+        leading.pass().await;
+        assert_eq!(f.metrics.unrepaired(), 3);
+
+        // The node's replica of the shard stops leading: a primary that has
+        // not reconciled its members, as one that handed the shard off
+        // serves nothing. Its repairer, sharing the node's metrics, leaves
+        // the backlog to the successor.
+        let config = ShardConfig {
+            members: vec![node(0), node(1)],
+            replicas: 2,
+            ..f.shard.config()
+        };
+        let disk = SimDisk::new(12);
+        let clock = Arc::new(MonotonicClock::new());
+        let (log, _) = SegmentLog::open(disk.mount(), LogConfig::default(), clock)
+            .await
+            .unwrap();
+        let index = Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
+        let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+        let replica = Shard::open_replica(&config, &node(0), log, Arc::new(index), pool)
+            .await
+            .unwrap();
+        assert!(!replica.is_serving());
+        let following = Repairer::new(
+            replica,
+            Arc::clone(&f.nodes) as Arc<dyn FragmentSource>,
+            Arc::clone(&f.nodes),
+            planner(5, EcConfig::default(), Vec::new()),
+            BlockingPool::inline("repair"),
+            SETTINGS,
+        )
+        .with_metrics(f.metrics.clone());
+        let ran = tokio::time::timeout(SETTINGS.interval * 3, following.run()).await;
+        assert!(ran.is_err(), "a repairer runs until dropped");
+        assert_eq!(f.metrics.unrepaired(), 0);
+    });
+}
+
+#[test]
 fn a_failed_write_is_placed_again_elsewhere() {
     runtime().block_on(async {
         let f = Fixture::coded(1, 8, EcConfig::default()).await;
