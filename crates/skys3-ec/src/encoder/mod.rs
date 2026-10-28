@@ -605,9 +605,48 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
             self.emit(key, attempt, EncodeStep::Abandoned);
             return Err(EncodeError::Abandoned(attempt));
         }
-        // The commit runs on a task of its own, so the record is appended
-        // even if this future is dropped, and an observer hears that it is
-        // sequenced before it commits.
+        // The commit and the attempt's bookkeeping run on a task of their
+        // own, so the record is appended, and the attempt settled, even if
+        // this future is dropped.
+        let publishing = Publishing {
+            shard: self.shard.clone(),
+            attempts: self.attempts.clone(),
+            observer: self.observer.clone(),
+            key: key.to_owned(),
+            attempt,
+        };
+        match tokio::spawn(publishing.run(publish)).await {
+            Ok(result) => result,
+            Err(error) => Err(EncodeError::Publish(ShardError::Unavailable {
+                shard: self.shard.shard().clone(),
+                reason: error.to_string(),
+            })),
+        }
+    }
+
+    fn emit(&self, key: &str, attempt: AttemptId, step: EncodeStep) {
+        emit(self.observer.as_ref(), key, attempt, step);
+    }
+}
+
+/// An attempt's publishing record being committed, on a task of its own.
+struct Publishing<D: Disk> {
+    shard: Shard<D>,
+    attempts: Attempts,
+    observer: Option<EncodeObserver>,
+    key: String,
+    attempt: AttemptId,
+}
+
+impl<D: Disk> Publishing<D> {
+    /// Commits `publish` and settles the attempt: forgotten once its
+    /// record commits or is never appended, and publishing, at the
+    /// record's position if known, while the record may commit yet.
+    async fn run(self, publish: EcPublish) -> Result<Encoded, EncodeError> {
+        let (key, attempt) = (self.key.as_str(), self.attempt);
+        let emit = |step| emit(self.observer.as_ref(), key, attempt, step);
+        // The commit runs on a task of its own too, so an observer hears
+        // that the record is sequenced before it commits.
         let before = self.shard.last_sequenced();
         let shard = self.shard.clone();
         let commit =
@@ -617,7 +656,7 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
         }
         let appended = self.shard.last_sequenced() != before;
         if appended {
-            self.emit(key, attempt, EncodeStep::Appended);
+            emit(EncodeStep::Appended);
         }
         let committed = match commit.await {
             Ok(Ok(committed)) => committed,
@@ -632,7 +671,7 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
                     self.attempts.sequenced(attempt, position);
                 } else {
                     self.attempts.finish(attempt);
-                    self.emit(key, attempt, EncodeStep::Abandoned);
+                    emit(EncodeStep::Abandoned);
                 }
                 return Err(EncodeError::Publish(error));
             }
@@ -645,28 +684,24 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
         };
         self.attempts.finish(attempt);
         let published = committed.outcome == Outcome::Applied(Effect::Published);
-        self.emit(
-            key,
-            attempt,
-            EncodeStep::Committed {
-                position: committed.position,
-                published,
-            },
-        );
+        emit(EncodeStep::Committed {
+            position: committed.position,
+            published,
+        });
         Ok(match committed.outcome {
             Outcome::Rejected(rejection) => Encoded::Rejected(rejection),
             _ => Encoded::Published(committed.position),
         })
     }
+}
 
-    fn emit(&self, key: &str, attempt: AttemptId, step: EncodeStep) {
-        if let Some(observer) = &self.observer {
-            observer(&EncodeEvent {
-                key: key.to_owned(),
-                attempt,
-                step,
-            });
-        }
+fn emit(observer: Option<&EncodeObserver>, key: &str, attempt: AttemptId, step: EncodeStep) {
+    if let Some(observer) = observer {
+        observer(&EncodeEvent {
+            key: key.to_owned(),
+            attempt,
+            step,
+        });
     }
 }
 

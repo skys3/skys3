@@ -480,6 +480,40 @@ fn a_version_overwritten_while_it_is_encoded_is_not_coded() {
 }
 
 #[test]
+fn a_publish_whose_caller_is_dropped_still_settles_its_attempt() {
+    runtime().block_on(async {
+        let f = Fixture::new().await;
+        write(&f.shard, "k", &sample(5000, 10), 10).await;
+        let encoder = Arc::new(f.encoder(6));
+        let encoding = tokio::spawn({
+            let encoder = Arc::clone(&encoder);
+            async move { encoder.encode("k").await }
+        });
+        while f.steps().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let attempt = f.events.lock().unwrap()[0].attempt;
+        let publishing = Some(AttemptState::Publishing { position: None });
+        while encoder.attempts().state(attempt) != publishing {
+            tokio::task::yield_now().await;
+        }
+        // The scan is cancelled while the record commits: the record
+        // commits all the same, and its attempt must not stay publishing,
+        // which would hold orphan reclamation's fence for good.
+        encoding.abort();
+        for _ in 0..1000 {
+            if encoder.attempts().state(attempt).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(encoder.attempts().state(attempt), None);
+        let entry = f.shard.entry("k").await.unwrap().unwrap();
+        assert!(entry.object.unwrap().coded.is_some());
+    });
+}
+
+#[test]
 fn an_abandoned_attempt_never_publishes() {
     runtime().block_on(async {
         let f = Fixture::new().await;

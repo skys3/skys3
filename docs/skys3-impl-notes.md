@@ -6229,7 +6229,9 @@ of this file. A task with nothing unexpected keeps "None."
   stripe with `FragmentPlanner`, writes the fragments in parallel through
   the `FragmentWriter` trait, re-plans a stripe without nodes whose writes
   failed (three times), and commits `EC_PUBLISH` on a task of its own so
-  it is appended even if the encoder is dropped. An `EncodeObserver` sees
+  it is appended, and its attempt settled, even if the encoder is
+  dropped: settling it in the caller left a cancelled scan's attempt
+  publishing for good, holding the reclamation fence (found in review). An `EncodeObserver` sees
   each step; the simulation crashes nodes at them.
 - **Stripe size bound.** Configuration validation now rejects an
   `ec_stripe_data_bytes` whose fragments in the narrowest geometry
