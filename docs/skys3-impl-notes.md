@@ -5963,6 +5963,19 @@ of this file. A task with nothing unexpected keeps "None."
   version of the last 4096 keys it discarded and answers such a wait
   `Conflict`; reading the shard's entry instead could not tell an
   adopted stub from a later version's.
+- **Fixed: a wait that reaches a new flusher.** The remembered drops
+  live only in the flusher that made them, and only for 4096 keys: a
+  flusher started after a primary change, or one that had forgotten the
+  drop, answered a wait for the dropped version `Flushed`, and the
+  gateway's retry took that as success. A flusher now answers an
+  untracked key from memory only for a version it tracked itself (after
+  the position the shard had applied when it subscribed) and newer than
+  every drop it forgot. Otherwise it reads the entry: gone, or clean at
+  that very version, proves the flush; anything else, such as an adopted
+  stub, leaves the wait unanswered, so the write gets `503` once its
+  timeout passes, never `200`. Tested in `conflicts.rs`
+  (`a_new_flusher_does_not_answer_a_dropped_version_flushed`) and the
+  flusher state's unit tests.
 - **Admin API shape (decided, design §12).** `GET
   /v1/buckets/<name>/conflicts` and `POST
   /v1/buckets/<name>/conflicts/<policy>/<key>`, with the policy before the
