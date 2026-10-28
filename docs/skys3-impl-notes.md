@@ -6341,6 +6341,14 @@ of this file. A task with nothing unexpected keeps "None."
   `If-Match`, so a change between the HEAD and the read resolves the key
   again instead of caching another version's bytes. A read gives up after
   three rounds with `503`.
+- **Fixed: a version is more than its ETag.** Revalidation compared only
+  the ETag, so an object re-uploaded with the same bytes, or copied onto
+  itself with new metadata, kept serving the old `Content-Type`,
+  metadata, and `Last-Modified` to GETs and HEADs, under either
+  freshness mode. It now compares the ETag, `Last-Modified`, and version
+  ID (`OriginVersion`), all of which the entry already holds, and
+  `ADOPT`s the HEAD's metadata on a mismatch. Tested in `tests/origin.rs`
+  (`a_metadata_only_change_at_the_origin_is_seen_by_the_next_read`).
 - **How the TTL bounds staleness (decided, §9.5).** Each gateway keeps
   what its HEADs saw (`OriginValidations`, in memory, at most 65,536
   keys, oldest first out), timed from when the HEAD was sent, so a read
