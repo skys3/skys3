@@ -11,6 +11,7 @@
 
 mod support;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -525,6 +526,24 @@ fn replicated_config(
 }
 
 /// `GET /v1/shards` of `node`.
+/// Every file under `dir`, by its path, with its bytes.
+fn contents(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut dirs = vec![dir.to_owned()];
+    while let Some(next) = dirs.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                files.insert(path.display().to_string(), bytes);
+            }
+        }
+    }
+    files
+}
+
 async fn shards_of(node: &Node) -> serde_json::Value {
     admin_json(&node.admin_addr().to_string(), "/v1/shards").await
 }
@@ -803,9 +822,11 @@ async fn a_single_nodes_data_directory_does_not_join_a_cluster() {
     }
     assert!(answer.get("routing").is_none(), "{answer}");
     node.shutdown().await.unwrap();
+    let data = dir.join("data");
+    let before = contents(&data);
 
     // Its data directory holds a bucket's shards: it does not start as a
-    // node of several.
+    // node of several, and is left as it was, byte for byte.
     let text = node_config(&dir, &pki, &etcd(&fake), "n1", "n1", free_port(), 256);
     let error = Node::start(text.parse().unwrap()).await.unwrap_err();
     let message = error.to_string();
@@ -816,6 +837,16 @@ async fn a_single_nodes_data_directory_does_not_join_a_cluster() {
         "{message}"
     );
     assert!(fake.get(&format!("{CLUSTER}/nodes/n1.json")).is_none());
+    let after = contents(&data);
+    let changed: BTreeSet<_> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "the refused start changed the data directory: {changed:?}"
+    );
 
     // A data directory that holds no bucket's shards may become a node of
     // several (over the same store), and keeps serving as one.
