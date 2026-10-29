@@ -6,17 +6,22 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use skys3_index::{Entry, EntryState};
-use skys3_io::Disk;
+use skys3_io::{Disk, WallClock};
 use skys3_log::record::Flushed;
 use skys3_log::{RecordBody, ShardRef};
 use skys3_remote::ObjectStore;
 use skys3_shard::{Change, Shard, ShardError};
 use skys3_types::{ETag, EpochSeq, Seq};
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
 use crate::attempt::{Attempt, Conflict, Outcome, Remote};
+use crate::budget::Charge;
 use crate::target::Target;
+
+/// The target a flusher sends to, once its capability probe is done.
+pub(crate) type Ready<S> = watch::Receiver<Option<Arc<Target<S>>>>;
 
 /// How many entries the startup scan reads per index transaction.
 const SCAN_PAGE: usize = 512;
@@ -116,6 +121,8 @@ struct State {
     /// The number of the next error.
     next_error: u64,
     stopped: bool,
+    /// The budget `dirty_bytes` counts against, until the flusher stops.
+    charge: Option<Charge>,
 }
 
 impl State {
@@ -124,7 +131,7 @@ impl State {
     fn changed(&mut self, key: &str, position: EpochSeq, size: Option<u64>, since: Duration) {
         let Some(tracked) = self.keys.get_mut(key) else {
             let size = size.unwrap_or(0);
-            self.dirty_bytes += size;
+            self.set_dirty_bytes(self.dirty_bytes + size);
             self.ready.insert(position, key.to_owned());
             self.pending.insert((since, key.to_owned()));
             let tracked = Tracked {
@@ -143,12 +150,29 @@ impl State {
             return;
         }
         tracked.latest = position;
-        if let Some(size) = size {
-            self.dirty_bytes = self.dirty_bytes - tracked.size + size;
-            tracked.size = size;
-        }
         if tracked.phase == Phase::Flushing {
             tracked.newer_since.get_or_insert(since);
+        }
+        if let Some(size) = size {
+            let old = std::mem::replace(&mut tracked.size, size);
+            self.set_dirty_bytes(self.dirty_bytes - old + size);
+        }
+    }
+
+    /// Sets the dirty bytes, and moves the budget's count with them.
+    fn set_dirty_bytes(&mut self, bytes: u64) {
+        if let Some(charge) = &self.charge {
+            charge.adjust(self.dirty_bytes, bytes);
+        }
+        self.dirty_bytes = bytes;
+    }
+
+    /// Marks the flusher stopped: its dirty bytes no longer count against
+    /// the budget, since a new flusher of the shard counts them again.
+    fn stop(&mut self) {
+        self.stopped = true;
+        if let Some(charge) = self.charge.take() {
+            charge.adjust(self.dirty_bytes, 0);
         }
     }
 
@@ -234,7 +258,7 @@ impl State {
     fn untrack(&mut self, key: &str) {
         self.errors.remove(key);
         if let Some(tracked) = self.keys.remove(key) {
-            self.dirty_bytes -= tracked.size;
+            self.set_dirty_bytes(self.dirty_bytes - tracked.size);
             self.pending.remove(&(tracked.since, key.to_owned()));
         }
     }
@@ -310,9 +334,27 @@ pub struct ShardFlusher {
 impl ShardFlusher {
     /// Starts flushing `shard` to `target` on the current Tokio runtime.
     pub fn spawn<S: ObjectStore, D: Disk>(shard: Shard<D>, target: Arc<Target<S>>) -> Self {
-        let state = Arc::new(Mutex::new(State::default()));
+        let wall = Arc::clone(&target.wall);
+        // The sender may go: the target is ready for good.
+        let (_, ready) = watch::channel(Some(target));
+        Self::start(shard, ready, wall, None)
+    }
+
+    /// Starts tracking `shard`'s dirty keys at once, with their bytes
+    /// counted against `charge`, and flushing them once `ready` holds the
+    /// target. Ages are measured on `wall`.
+    pub(crate) fn start<S: ObjectStore, D: Disk>(
+        shard: Shard<D>,
+        ready: Ready<S>,
+        wall: Arc<dyn WallClock>,
+        charge: Option<Charge>,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(State {
+            charge,
+            ..State::default()
+        }));
         let shard_ref = shard.shard().clone();
-        let task = tokio::spawn(run(shard, target, Arc::clone(&state)));
+        let task = tokio::spawn(run(shard, ready, wall, Arc::clone(&state)));
         Self {
             shard: shard_ref,
             state,
@@ -360,6 +402,7 @@ impl ShardFlusher {
 impl Drop for ShardFlusher {
     fn drop(&mut self) {
         self.task.abort();
+        lock(&self.state).stop();
     }
 }
 
@@ -376,31 +419,39 @@ type Done = (String, EpochSeq, Outcome);
 /// recorded, and whether the shard committed it.
 type Recorded = (String, Seq, Result<(), ShardError>);
 
-/// The flusher's task.
+/// The flusher's task. It tracks the shard's dirty keys from the start,
+/// and flushes them once the target is ready.
 async fn run<S: ObjectStore, D: Disk>(
     shard: Shard<D>,
-    target: Arc<Target<S>>,
+    mut ready: Ready<S>,
+    wall: Arc<dyn WallClock>,
     state: Arc<Mutex<State>>,
 ) {
     let mut changes = shard.subscribe();
-    if scan(&shard, &target, &state).await.is_ok() {
+    if scan(&shard, &*wall, &state).await.is_ok() {
         let mut flushes: JoinSet<Done> = JoinSet::new();
         let mut records: JoinSet<Recorded> = JoinSet::new();
+        // Whether a target may still arrive.
+        let mut awaiting = true;
         loop {
-            dispatch(&shard, &target, &state, &mut flushes);
+            let target = ready.borrow_and_update().clone();
+            if let Some(target) = &target {
+                dispatch(&shard, target, &state, &mut flushes);
+            }
             let release = lock(&state).next_release();
             tokio::select! {
                 change = changes.recv() => match change {
                     Some(Change { key, position, size }) => {
-                        let now = target.wall.now();
+                        let now = wall.now();
                         lock(&state).changed(&key, position, size, now);
                     }
                     // The shard stopped, or another flusher took over.
                     None => break,
                 },
                 Some(done) = flushes.join_next(), if !flushes.is_empty() => {
-                    if let Ok(done) = done {
-                        finish(&shard, &target, &state, &mut records, done);
+                    // A flush runs only once there is a target.
+                    if let (Ok(done), Some(target)) = (done, &target) {
+                        finish(&shard, target, &state, &mut records, done);
                     }
                 }
                 Some(recorded) = records.join_next(), if !records.is_empty() => {
@@ -413,10 +464,13 @@ async fn run<S: ObjectStore, D: Disk>(
                 () = sleep_until(release), if release.is_some() => {
                     lock(&state).release_due(Instant::now());
                 }
+                changed = ready.changed(), if target.is_none() && awaiting => {
+                    awaiting = changed.is_ok();
+                }
             }
         }
     }
-    lock(&state).stopped = true;
+    lock(&state).stop();
 }
 
 async fn sleep_until(at: Option<Instant>) {
@@ -427,15 +481,15 @@ async fn sleep_until(at: Option<Instant>) {
 
 /// Tracks every entry the index holds that is not clean, as the flusher
 /// starts. Changes applied meanwhile wait in the subscription.
-async fn scan<S, D: Disk>(
+async fn scan<D: Disk>(
     shard: &Shard<D>,
-    target: &Target<S>,
+    wall: &dyn WallClock,
     state: &Mutex<State>,
 ) -> Result<(), ShardError> {
     let mut after = None;
     loop {
         let page = shard.entries(after.take(), SCAN_PAGE).await?;
-        let now = target.wall.now();
+        let now = wall.now();
         let mut state = lock(state);
         for (key, entry) in &page {
             if !matches!(entry.state, EntryState::Clean | EntryState::Evicted) {

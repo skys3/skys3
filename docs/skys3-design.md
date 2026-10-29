@@ -692,6 +692,8 @@ A bucket may set `ack_policy = "write_through"`. A PUT then succeeds only after 
 ### 7.6 Backpressure and loss exposure
 
 - A dirty-data budget applies per bucket and per cluster (`max_dirty_bytes`). New writes get `503 SlowDown` when it is exhausted, including during a remote outage.
+- **What counts.** A bucket's dirty bytes are the sizes of the latest versions its flushers have not put at the remote, keys held in conflict included and tombstones counting 0, the same bytes as the `dirty_bytes` metric. A shard's flusher counts them from the moment its shard opens, also while the target's capability probe still fails, so a node restarted during an outage counts what it holds. Admission control checks the budgets before every write that stores bytes or makes a new version (PutObject, CopyObject, the tagging writes, and the multipart writes), before the body is read. Deletes and aborts are always admitted: they add no dirty bytes, and they let clients free space. The check is made when a write arrives and the bytes are counted once it commits, so the writes in flight when a budget fills may overshoot it.
+- **Shares across nodes.** A bucket's shard primaries, and so its flushers, may sit on different nodes, and each node admits writes on its own. Each node therefore enforces a share of each budget in proportion to the shards whose primary it is: `max_dirty_bytes × p ÷ shards_per_bucket` of a bucket's budget, where `p` of its shards have their primary on the node, and of the cluster's budget the same fraction over the shards of every `write_back` bucket. A share is rounded down, but is at least one byte on a node that is primary for any of the shards, so that node admits a write while nothing is dirty. A node that is primary for none of a bucket's shards holds none of its dirty data and does not limit its writes. The shares add up to at most the budget plus a byte per node, the write path sends no message to other nodes, and a partitioned node keeps enforcing its share. The cost is that a node cannot borrow a share another node leaves unused. Hash sharding spreads a bucket's keys evenly over its shards and placement spreads primaries over nodes, so shares match load in most workloads. With every primary on one node, as in a single-node cluster, its share is the whole budget. The node registry (plan M3-02) revisits this: nodes could report their dirty bytes so that shares follow load.
 - Loss exposure (RPO) with `ack_policy = "local"` is the dirty set of any shard whose members are all lost together. The metrics `dirty_bytes`, `oldest_dirty_age`, and `flush_lag_seconds` measure it.
 - Metric names in this document omit the `skys3_` prefix and sometimes the unit. The [metrics reference](skys3-metrics.md) gives the exported names, such as `skys3_oldest_dirty_age_seconds`, and the naming conventions.
 - Flush bandwidth must exceed the ingest rate over time, or the dirty set grows until admission control stops writes. Remote request-rate limits (for example per-prefix limits) are handled with adaptive concurrency and retry with backoff.
@@ -1173,7 +1175,7 @@ SkyS3's own credentials for remote targets and the control store come from `aws-
 | Coordinator dies | Another node takes the lease. Only placement work is delayed. |
 | Primary partitioned from its backups | The primary loses its leases and stops serving. A backup takes over by CAS. |
 | Out-of-band write at the remote | Detected at flush (conflict policy) or at fill (clean entry adopts the remote version). |
-| Disk full or sync failure | No acknowledgement is issued. Admission control engages, and the disk is taken out of service on a sync error. |
+| Disk full or sync failure | No acknowledgement is issued. Admission control engages, and the disk is taken out of service on a sync error. A node checks the free space of its log disks and data directory every second: below `disk_min_free_bytes`, writes that add data to the shards on a disk get `503 SlowDown` (all of them for the data directory), and deletes are still admitted. The margin keeps the disk from filling, since any write error takes it out of service (section 10.4). |
 | Clock rate drift beyond `ρ` | Read linearizability is at risk. Write safety is unaffected. |
 
 ## 14. Illustrative configuration
@@ -1233,6 +1235,7 @@ index_checkpoint_interval_seconds = 10
 compaction_live_threshold = 0.5
 read_registration_ttl_seconds = 30
 read_registration_renew_interval_seconds = 10
+disk_min_free_bytes = 1073741824     # below this, writes get 503 SlowDown (section 13)
 
 [cache]
 hot_cache_bytes_per_node = 68719476736
@@ -1271,6 +1274,7 @@ ec_after_seconds = 600
 backup_ack = "local"
 index_snapshot_interval_seconds = 3600
 target_transport = "auto"     # "auto", "native" (QUIC to a SkyS3 peer), or "s3"
+# max_dirty_bytes = 549755813888   # the bucket's budget (section 7.6); defaults to flush.max_dirty_bytes
 
 [buckets.archive]             # example local bucket, replicated to a peer cluster
 mode = "local"

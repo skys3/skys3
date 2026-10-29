@@ -6,7 +6,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use skys3_flush::{FlushMetrics, FlushService, ProbeStatus};
+use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, ProbeStatus};
 use skys3_io::{ManualWallClock, SimMount, WallClock};
 use skys3_obs::MetricsRegistry;
 use skys3_remote::probe::ConditionalOperation;
@@ -133,6 +133,11 @@ fn flushes_write_back_buckets_under_their_prefix() {
         let gauges = status.gauges(wall.now());
         assert_eq!(gauges.conflicted_keys, 1);
         assert_eq!(gauges.orphaned_uploads, 0);
+        assert_eq!(
+            gauges.dirty_budget,
+            u64::MAX,
+            "the default budget is unlimited"
+        );
         assert_eq!(gauges.dirty_bytes, 4);
         assert_eq!(gauges.flush_lag, 0.0);
         assert_eq!(gauges.oldest_dirty_age, 100.0);
@@ -140,6 +145,7 @@ fn flushes_write_back_buckets_under_their_prefix() {
         let text = registry.encode().unwrap();
         for line in [
             "skys3_dirty_bytes{bucket=\"photos\"} 4",
+            "skys3_dirty_budget_bytes{bucket=\"photos\"} 9223372036854775807",
             "skys3_conflicted_keys{bucket=\"photos\"} 1",
             "skys3_flush_orphaned_uploads{bucket=\"photos\"} 0",
             "skys3_flush_conflicts_total{bucket=\"photos\"} 1",
@@ -171,6 +177,7 @@ fn the_probe_finds_unprotected_operations_and_retries() {
         let registry = MetricsRegistry::new();
         let service = service(&store, &registry);
         let bucket = bucket(BucketMode::WriteBack);
+        node.put("cat.jpg", "meow").await;
 
         service
             .reconcile(std::slice::from_ref(&bucket), &node.set)
@@ -183,7 +190,19 @@ fn the_probe_finds_unprotected_operations_and_retries() {
             tokio::time::sleep(Duration::from_millis(1)).await;
         };
         assert!(failed.contains("500"), "{failed}");
-        assert!(service.status(&bucket.bucket_id).unwrap().shards.is_empty());
+        // The shard's dirty keys are tracked while the probe fails, so
+        // they count against the dirty budget during the outage.
+        let tracked = |service: &FlushService<SimS3, SimMount>| {
+            let status = service.status(&bucket.bucket_id).unwrap();
+            status.shards.len() == 1 && status.shards[0].1.dirty_bytes == 4
+        };
+        while !tracked(&service) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let usage = service.budget().usage(&bucket.bucket_id).unwrap();
+        assert_eq!(usage.dirty, 4);
+        assert_eq!(usage.share, u64::MAX, "the default budget is unlimited");
+        assert!(store.object("team/cat.jpg").is_none());
 
         store.set_faults(SimS3Faults::NONE);
         let probe = reconcile_until_probed(&service, &node, &bucket).await;
@@ -196,6 +215,13 @@ fn the_probe_finds_unprotected_operations_and_retries() {
                 ]
             }
         );
+        // Once the probe is done, the tracked key is flushed.
+        let patience = Patience::new();
+        while service.budget().cluster_usage().dirty > 0 {
+            assert!(!patience.is_exhausted(), "the key was never flushed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(store.object("team/cat.jpg").is_some());
         service.shutdown().await;
         assert!(service.status(&bucket.bucket_id).is_none());
     });
@@ -207,7 +233,8 @@ fn other_buckets_and_closed_shards_are_not_flushed() {
         let node = Node::open(22).await;
         let store = SimS3::new(22, SimS3Config::default());
         let registry = MetricsRegistry::new();
-        let service = service(&store, &registry);
+        let budget = Arc::new(DirtyBudget::new(1000));
+        let service = service(&store, &registry).with_budget(Arc::clone(&budget));
         for mode in [BucketMode::Local, BucketMode::ReadOnly] {
             service.reconcile(&[bucket(mode)], &node.set).await;
             assert!(service.status(&shard_ref().bucket).is_none());
@@ -219,6 +246,18 @@ fn other_buckets_and_closed_shards_are_not_flushed() {
             .reconcile(std::slice::from_ref(&bucket), &node.set)
             .await;
         assert!(service.status(&bucket.bucket_id).unwrap().shards.is_empty());
+        // Without a flusher here, the bucket's writes are not limited, and
+        // its shard still counts in the cluster's share.
+        assert_eq!(budget.check(&bucket.bucket_id), Ok(()));
+        assert_eq!(budget.usage(&bucket.bucket_id), None);
+        assert_eq!(budget.cluster_usage().share, 0);
+        let other = BucketDocument {
+            bucket_id: "b-away".parse().unwrap(),
+            name: BucketName::new("away").unwrap(),
+            ..bucket.clone()
+        };
+        service.reconcile(&[bucket, other.clone()], &node.set).await;
+        assert_eq!(budget.check(&other.bucket_id), Ok(()));
         assert!(format!("{service:?}").contains("FlushService"));
     });
 }

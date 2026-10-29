@@ -20,6 +20,9 @@
 //! - `dirty`, `flushing`, and `dirty_bytes`: keys whose latest change is not
 //!   at the remote (conflicts excluded), those being flushed, and the bytes
 //!   of every version not at the remote;
+//! - `dirty_budget_bytes`: this node's share of the bucket's dirty-data
+//!   budget; new writes get `503 SlowDown` while `dirty_bytes` is at or
+//!   above it (§7.6);
 //! - `oldest_dirty_age_seconds` and `flush_lag_seconds`, as the metrics of
 //!   the same names;
 //! - `conflicts`: each key held in conflict, with the local `seq` and the
@@ -258,6 +261,7 @@ fn flush_status(status: &BucketStatus) -> Value {
         "dirty": shards.clone().map(|shard| shard.dirty).sum::<u64>(),
         "flushing": shards.map(|shard| shard.flushing).sum::<u64>(),
         "dirty_bytes": gauges.dirty_bytes,
+        "dirty_budget_bytes": gauges.dirty_budget,
         "oldest_dirty_age_seconds": gauges.oldest_dirty_age,
         "flush_lag_seconds": gauges.flush_lag,
         "conflicts": conflicts,

@@ -1,10 +1,11 @@
 //! `[buckets.defaults]` and `[buckets.<name>]`: per-bucket settings (§4.1,
-//! §7.2, §7.5, §7.8, §8, §9.1).
+//! §7.2, §7.5, §7.6, §7.8, §8, §9.1).
 //!
 //! Settings resolve in three layers: built-in defaults, then
 //! `[buckets.defaults]`, then the `[buckets.<name>]` table of the bucket with
 //! that S3 name. `ack_policy` and `flush_conflict_policy` take their
-//! defaults from `[flush]` and may be overridden only per bucket.
+//! defaults from `[flush]` and may be overridden only per bucket;
+//! `max_dirty_bytes` defaults to `flush.max_dirty_bytes`.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -75,6 +76,9 @@ pub struct BucketSettings {
     /// `peer_source`: the cluster this bucket receives native replication
     /// from (§7.8).
     pub peer_source: Option<ClusterId>,
+    /// `max_dirty_bytes`: the bucket's dirty-data budget (§7.6); by default
+    /// the cluster's, `flush.max_dirty_bytes`.
+    pub max_dirty_bytes: u64,
 }
 
 crate::durations! {
@@ -124,6 +128,7 @@ pub(crate) struct BucketTable {
     backup_ack: Option<AckPolicy>,
     index_snapshot_interval_seconds: Option<u64>,
     target_transport: Option<TargetTransport>,
+    max_dirty_bytes: Option<u64>,
     ack_policy: Option<AckPolicy>,
     flush_conflict_policy: Option<ConflictPolicy>,
     backup_target: Option<String>,
@@ -145,6 +150,7 @@ struct Defaults {
     backup_ack: AckPolicy,
     index_snapshot_interval_seconds: u64,
     target_transport: TargetTransport,
+    max_dirty_bytes: u64,
     ack_policy: AckPolicy,
     flush_conflict_policy: ConflictPolicy,
 }
@@ -164,6 +170,7 @@ impl Defaults {
             backup_ack: AckPolicy::Local,
             index_snapshot_interval_seconds: 3600,
             target_transport: TargetTransport::Auto,
+            max_dirty_bytes: flush.max_dirty_bytes,
             ack_policy: flush.ack_policy,
             flush_conflict_policy: flush.flush_conflict_policy,
         }
@@ -192,6 +199,7 @@ impl Defaults {
                 .index_snapshot_interval_seconds
                 .unwrap_or(self.index_snapshot_interval_seconds),
             target_transport: table.target_transport.unwrap_or(self.target_transport),
+            max_dirty_bytes: table.max_dirty_bytes.unwrap_or(self.max_dirty_bytes),
             ack_policy: table.ack_policy.unwrap_or(self.ack_policy),
             flush_conflict_policy: table
                 .flush_conflict_policy
@@ -332,6 +340,11 @@ fn settle<'a>(
             table.index_snapshot_interval_seconds.is_some(),
             values.index_snapshot_interval_seconds,
         ),
+        (
+            "max_dirty_bytes",
+            table.max_dirty_bytes.is_some(),
+            values.max_dirty_bytes,
+        ),
     ] {
         if value == 0 {
             valid = false;
@@ -413,6 +426,7 @@ fn settle<'a>(
         backup_target,
         snapshot_target,
         peer_source,
+        max_dirty_bytes: values.max_dirty_bytes,
     })
 }
 

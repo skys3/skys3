@@ -214,6 +214,7 @@ impl<H: Shards> Objects<H> {
     /// an object when the record is sequenced.
     async fn set_tags(&self, bucket: &BucketDocument, key: String, tags: TagSet) -> S3Result<()> {
         let shard = ShardRef::for_key(bucket, &key);
+        self.admit(bucket, &shard)?;
         let record = RecordBody::Tags(Tags { key, tags });
         self.shards
             .write(&shard, record, Precondition::Exists)

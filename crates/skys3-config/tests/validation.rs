@@ -326,6 +326,8 @@ fn durations_and_sizes_must_be_positive() {
         ("buckets.defaults", "ec_min_object_bytes"),
         ("buckets.defaults", "ec_stripe_data_bytes"),
         ("buckets.defaults", "index_snapshot_interval_seconds"),
+        ("buckets.defaults", "max_dirty_bytes"),
+        ("buckets.photos", "max_dirty_bytes"),
     ] {
         let violations = violations_of(&format!("{BASE}\n[{section}]\n{key} = 0"));
         assert!(

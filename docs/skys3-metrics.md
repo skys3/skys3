@@ -75,6 +75,7 @@ planned metric decides its labels and records them here.
 | `skys3_build_info` | info | `version` | exported (M0-06) | Always 1. `version` is the SkyS3 release of the running binary. |
 | `skys3_admin_requests_total` | counter | `endpoint` (`healthz`, `readyz`, `metrics`, `api`, `other`), `code` (HTTP status) | exported (M0-06; `api` from M1-13) | Requests answered by the admin listener. `api` counts the admin API under `/v1/`. `code="401"` counts callers rejected for a missing or wrong token. |
 | `skys3_disks_out_of_service` | gauge | none | exported (M1-13) | Disks an I/O error took out of service since the node started. Each stays out of service until the host restarts (design section 10.4). |
+| `skys3_admission_refusals_total` | counter | `reason` (`bucket_budget`, `cluster_budget`, `disk_space`) | exported (M1-17) | Writes answered `503 SlowDown` by admission control: a dirty-data budget was used up (design section 7.6), or a disk or the data directory had less than `disk_min_free_bytes` free (section 13). |
 | `skys3_control_store_live` | gauge | none | exported (M1-13) | 1 once the control store has answered since the node started; 0 while the node serves its local copy of control state (design section 6.2). |
 
 ### 3.2 Flush and loss exposure
@@ -85,6 +86,7 @@ under `ack_policy = "local"`.
 | Name | Type | Labels | Status | Description |
 |---|---|---|---|---|
 | `skys3_dirty_bytes` | gauge | `bucket` | exported (M1-16) | Bytes of committed versions not yet at the remote target (`dirty_bytes`), from the flushers of the bucket's shards on this node: the size of each dirty key's latest version, tombstones counting 0, keys held in conflict included. |
+| `skys3_dirty_budget_bytes` | gauge | `bucket` | exported (M1-17) | This node's share of the bucket's dirty-data budget (`max_dirty_bytes`, design section 7.6): the budget times the share of the bucket's shards whose primary is on this node. New writes to the bucket get `503 SlowDown` while `skys3_dirty_bytes` is at or above it, or while the node's share of the cluster's budget is used up. |
 | `skys3_oldest_dirty_age_seconds` | gauge | `bucket` | exported (M1-16) | Age of the oldest committed change not yet at the remote (`oldest_dirty_age`), conflicts included: the loss exposure if every member of a shard were lost now. A key's age runs from the first change after its last flush; a key found dirty at startup counts from its `Last-Modified` (a tombstone from the start). 0 when nothing is dirty. |
 | `skys3_flush_lag_seconds` | gauge | `bucket` | exported (M1-16) | Age of the oldest change the flushers are still working on (`flush_lag_seconds`): `oldest_dirty_age` without keys held in conflict, which never drain without an operator. A lag that keeps growing means flushing does not keep up with ingest or the remote is failing. |
 | `skys3_conflicted_keys` | gauge | `bucket` | exported (M1-16) | Keys held in conflict under the `hold` policy: a flush found an out-of-band remote write (design section 7.2). The admin API lists them. |
@@ -93,10 +95,10 @@ under `ack_policy = "local"`.
 | `skys3_flushes_total` | counter | `bucket` | exported (M1-16) | Versions flushed: the remote accepted them, or a retry found them there by their write identity. |
 | `skys3_flush_retries_total` | counter | `bucket` | exported (M1-16) | Flush attempts that failed (`5xx`, `503 SlowDown`, a lost response, another error) and are retried after a backoff. |
 
-The `bucket` label is the bucket's name. A node exports the gauges for every
-`write_back` bucket it knows, counting the shards open on it, and the counters
-once the bucket's target passed its capability probe. A bucket's gauges
-disappear when it is deleted.
+The `bucket` label is the bucket's name. A node exports the gauges and the
+counters for every `write_back` bucket it knows, counting the shards open on
+it, also while the bucket's target has not passed its capability probe. A
+bucket's gauges disappear when it is deleted.
 
 ### 3.3 Replication
 

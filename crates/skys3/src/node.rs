@@ -12,7 +12,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use skys3_config::{Config, ConflictPolicy, ControlStoreBackend, LogFormat};
 use skys3_control::{ChangeStream, ControlStore};
 use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, read_cluster};
-use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
+use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     CredentialError, Gateway, GatewayConfig, GatewayListener, IdSource, LocalShards, ShardRef,
     Shards, SigV4Authenticator, StaticCredentials, StsService,
@@ -33,6 +33,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 use crate::admin::{BucketList, ControlState, NodeAdmin};
+use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
@@ -44,7 +45,8 @@ const DISK_THREADS: usize = 4;
 const INDEX_THREADS: usize = 4;
 /// How often expired sessions are removed.
 const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-/// How often the node checks whether a disk went out of service.
+/// How often the node checks whether a disk went out of service, and the
+/// free space of its disks.
 const DISK_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the flushers follow the node's buckets and shards, and their
 /// gauges are refreshed.
@@ -647,14 +649,17 @@ struct Opened {
 ///    not answer, run from the copy kept in the index ([`crate::control`]).
 /// 4. Build the gateway with SigV4 authentication over static credentials
 ///    and STS sessions, which live in the system bucket
-///    ([`crate::sessions`]), and STS if `sts_web_identity` is on.
+///    ([`crate::sessions`]), STS if `sts_web_identity` is on, and admission
+///    control: writes that add data get `503 SlowDown` while a dirty-data
+///    budget is used up or a disk is low on space (§7.6, §13).
 /// 5. Open every bucket's shards, and drop shards whose bucket no register
 ///    names: those a creation or deletion of unknown outcome left behind
 ///    (§4.1). This needs a copy read from the store itself.
 /// 6. Serve the gateway (HTTPS when `[gateway]` names a certificate) and
 ///    the admin listener, and start the background work: checkpoints,
-///    control-store polling, session expiry, disk fencing, and the
-///    flushers of `write_back` buckets, which probe each target first
+///    control-store polling, session expiry, disk fencing, free-space
+///    checks, and the flushers of `write_back` buckets, which track their
+///    dirty keys at once and flush them once each target's probe succeeds
 ///    (`skys3_flush`).
 ///
 /// [`Node::shutdown`] stops accepting requests, drains those in flight,
@@ -811,9 +816,42 @@ impl Node {
         );
         let auth = SigV4Authenticator::new(lookup, Arc::clone(&wall))
             .with_hashing_pool(pools.hashing.clone());
+        // Admission control (§7.6, §13): the dirty budgets, which the
+        // flushers count against, and free disk space, read once now and
+        // then every second.
+        let budget = Arc::new(
+            DirtyBudget::new(config.flush().max_dirty_bytes).with_buckets(config.buckets().clone()),
+        );
+        let space = Arc::new(DiskSpace::new(config.storage().disk_min_free_bytes));
+        let watched: Vec<Watched> = storage
+            .disks
+            .iter()
+            .zip(&pools.disks)
+            .map(|((disk, _), pool)| {
+                let place = Place::Disk(disk.label.clone());
+                (place, disk.path.clone(), pool.clone())
+            })
+            .chain([(
+                Place::DataDir,
+                data_dir.path().to_owned(),
+                pools.index.clone(),
+            )])
+            .collect();
+        space.refresh(&watched).await;
+        let disk_of = {
+            let shards = storage.shards.clone();
+            Box::new(move |shard: &ShardRef| shards.set().disk_of(&shard.into()).clone())
+        };
+        let admission = NodeAdmission::new(
+            Arc::clone(&budget),
+            Arc::clone(&space),
+            disk_of,
+            &metrics.registry,
+        );
         let mut gateway_config = GatewayConfig::new(&config);
         gateway_config.retry = retry;
         gateway_config.hashing_pool = Some(pools.hashing.clone());
+        gateway_config.admission = Arc::new(admission);
         let ids = IdSource::from_os_rng();
         let mut gateway = Gateway::new(
             gateway_config,
@@ -834,12 +872,15 @@ impl Node {
                     .attempt_timeout(FLUSH_ATTEMPT_TIMEOUT)
                     .build()
             };
-            Arc::new(FlushService::new(
-                cluster.clone(),
-                FlushSettings::from_config(config.flush()),
-                Box::new(connect),
-                FlushMetrics::register(&metrics.registry),
-            ))
+            Arc::new(
+                FlushService::new(
+                    cluster.clone(),
+                    FlushSettings::from_config(config.flush()),
+                    Box::new(connect),
+                    FlushMetrics::register(&metrics.registry),
+                )
+                .with_budget(budget),
+            )
         };
         let shared = Arc::new(Shared {
             config,
@@ -915,6 +956,7 @@ impl Node {
         background.spawn(Arc::clone(&shared).follow_control_store());
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
+        background.spawn(watch_space(space, watched, DISK_WATCH_INTERVAL));
         background.spawn(watch_disks(
             storage.disks,
             pools.index.clone(),

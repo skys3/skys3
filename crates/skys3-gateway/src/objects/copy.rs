@@ -205,6 +205,7 @@ impl<H: Shards> Objects<H> {
             ));
         }
         let shard = ShardRef::for_key(bucket, &input.key);
+        self.admit(bucket, &shard)?;
         if condition != Precondition::None {
             let entry = self
                 .shards

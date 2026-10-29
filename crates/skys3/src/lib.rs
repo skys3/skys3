@@ -21,6 +21,7 @@
 //! - [`tls`]: the gateway's TLS configuration.
 
 pub mod admin;
+mod admission;
 pub mod control;
 pub mod datadir;
 mod node;

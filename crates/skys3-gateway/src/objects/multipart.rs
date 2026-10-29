@@ -217,6 +217,7 @@ impl<H: Shards> Objects<H> {
             input.checksum_type.as_ref(),
         )?;
         let shard = ShardRef::for_key(bucket, &input.key);
+        self.admit(bucket, &shard)?;
         let create = MpuCreate {
             key: input.key.clone(),
             initiated_ms: now_ms(),
@@ -265,6 +266,7 @@ impl<H: Shards> Objects<H> {
             return Err(entity_too_large());
         }
         let shard = ShardRef::for_key(bucket, &input.key);
+        self.admit(bucket, &shard)?;
         let (upload, state, _) =
             open_upload(&self.shards, &shard, &input.key, &input.upload_id, NO_PARTS).await?;
         let required = effective_checksum(&state).algorithm;
@@ -318,6 +320,7 @@ impl<H: Shards> Objects<H> {
         let condition =
             Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         let shard = ShardRef::for_key(bucket, &input.key);
+        self.admit(bucket, &shard)?;
         let every_part = (0, MAX_PARTS as usize);
         let (upload, state, stored) = open_upload(
             &self.shards,
