@@ -10,7 +10,7 @@ use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::ObjectStore;
 use skys3_remote::probe::{ConditionalOperation, ConditionalProbe, ConditionalWrites};
-use skys3_shard::{Shard, ShardSet};
+use skys3_shard::{Role, Shard, ShardSet};
 use skys3_types::{BucketDocument, BucketId, BucketMode, ClusterId, RemoteTarget, ShardId};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -180,7 +180,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     }
 
     /// Starts and stops flushers so that every `write_back` bucket in
-    /// `buckets` with shards open in `set` is flushed, and nothing else.
+    /// `buckets` with shards open in `set` as their primary is flushed, and
+    /// nothing else.
     pub async fn reconcile(&self, buckets: &[BucketDocument], set: &ShardSet<D>) {
         let mut open = Vec::new();
         for bucket in buckets {
@@ -190,8 +191,11 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let mut shards = Vec::new();
             for shard in bucket.shards.shards() {
                 let shard_ref = ShardRef::new(bucket.bucket_id.clone(), shard);
+                // Only a shard's primary flushes it (§7.1): a member
+                // refuses the `FLUSHED` records its primary does not send.
                 if let Some(shard) = set.get(&shard_ref).await
                     && !shard.is_stopped()
+                    && shard.role() != Role::Member
                 {
                     shards.push(shard);
                 }

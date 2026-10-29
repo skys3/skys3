@@ -12,7 +12,10 @@ use skys3_obs::MetricsRegistry;
 use skys3_remote::probe::ConditionalOperation;
 use skys3_sim::SimS3;
 use skys3_sim::s3::{Conditionals, SimS3Config, SimS3Faults};
-use skys3_types::{BucketDocument, BucketMode, BucketName, ProposalId, RemoteTarget, ShardCount};
+use skys3_types::{
+    BucketDocument, BucketMode, BucketName, Epoch, ProposalId, RemoteTarget, ShardConfig,
+    ShardCount,
+};
 use support::{Node, Patience, cluster, identity, runtime, settings, shard_ref};
 
 fn bucket(mode: BucketMode) -> BucketDocument {
@@ -224,6 +227,34 @@ fn the_probe_finds_unprotected_operations_and_retries() {
         assert!(store.object("team/cat.jpg").is_some());
         service.shutdown().await;
         assert!(service.status(&bucket.bucket_id).is_none());
+    });
+}
+
+#[test]
+fn only_a_shards_primary_flushes_it() {
+    runtime().block_on(async {
+        let node = Node::open(23).await;
+        let store = SimS3::new(23, SimS3Config::default());
+        let service = service(&store, &MetricsRegistry::new());
+        let bucket = bucket(BucketMode::WriteBack);
+        // The node's replica becomes a member of a configuration whose
+        // primary is another node.
+        node.set.remove(&shard_ref()).await.unwrap();
+        let member = ShardConfig {
+            epoch: Epoch::new(2),
+            primary: "node-2".parse().unwrap(),
+            members: vec!["node-2".parse().unwrap(), "node-1".parse().unwrap()],
+            replicas: 2,
+            ..support::config()
+        };
+        node.set
+            .open_replica(&member, &"node-1".parse().unwrap())
+            .await
+            .unwrap();
+        service
+            .reconcile(std::slice::from_ref(&bucket), &node.set)
+            .await;
+        assert!(service.status(&bucket.bucket_id).unwrap().shards.is_empty());
     });
 }
 

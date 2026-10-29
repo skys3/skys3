@@ -1,13 +1,15 @@
 //! The client workload of M1: concurrent `PUT`s (small ones stored inline,
 //! larger ones as extents), conditional `PUT`s, multipart uploads, `GET`,
 //! `HEAD`, and `DELETE` on a small set of keys, each sent to the primary of
-//! its shard and recorded in the history.
+//! its shard, or to any node with [`Workload::any_gateway`], and recorded
+//! in the history.
 //!
 //! Each operation is recorded once its request has a connection to the
 //! node, with the node as its server ([`History::call_to`]): a request
 //! that never connected reached no node and is left out, and one that did
 //! can only take effect in the life of the node that accepted it, which
 //! lets the driver end it when that life crashes ([`History::crashed`]).
+//! A request any node may forward has no such server.
 //!
 //! A multipart upload has one part: S3 wants every part but the last to
 //! hold at least 5 MiB, more than a simulated cluster should move. Only
@@ -28,7 +30,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use skys3_gateway::ShardRef;
 use skys3_sim::history::{Call, Condition, History, Outcome, Pending};
-use skys3_types::{BucketDocument, ShardConfig};
+use skys3_types::{BucketDocument, NodeId, ShardConfig};
 
 use crate::s3::{self, NoAnswer};
 
@@ -48,6 +50,12 @@ pub struct Workload {
     pub think_time: Duration,
     /// How long a client waits for an answer.
     pub timeout: Duration,
+    /// Whether clients send each request to a node drawn at random, whose
+    /// gateway routes it to the primary, rather than to the primary
+    /// itself. A forwarded write may still apply after the gateway gave up
+    /// on it or crashed, so writes that fail or reach a node that crashes
+    /// are recorded as unknown.
+    pub any_gateway: bool,
 }
 
 impl Default for Workload {
@@ -59,16 +67,18 @@ impl Default for Workload {
             max_body: 2048,
             think_time: Duration::from_millis(200),
             timeout: Duration::from_secs(2),
+            any_gateway: false,
         }
     }
 }
 
-/// Where the workload sends each key: the bucket documents, and each
-/// shard's configuration, whose primary serves it.
+/// Where the workload sends each key: the bucket documents, each shard's
+/// configuration, whose primary serves it, and every node.
 #[derive(Clone, Debug)]
 pub(crate) struct Routes {
     pub buckets: Vec<BucketDocument>,
     pub placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
+    pub nodes: Vec<NodeId>,
 }
 
 impl Routes {
@@ -235,6 +245,27 @@ impl Client {
         Ok(())
     }
 
+    /// The node to send a request on `key` in `bucket` to: its primary,
+    /// or any node with [`Workload::any_gateway`].
+    fn host(&mut self, bucket: &BucketDocument, key: &str) -> String {
+        if self.workload.any_gateway {
+            let nodes = &self.routes.nodes;
+            nodes[self.rng.random_range(0..nodes.len())].to_string()
+        } else {
+            self.routes.primary(bucket, key)
+        }
+    }
+
+    /// The outcome of a write answered with a server error: failed, or
+    /// unknown if a gateway may have forwarded it.
+    fn write_failed(&self) -> Outcome {
+        if self.workload.any_gateway {
+            Outcome::Unknown
+        } else {
+            Outcome::Failed
+        }
+    }
+
     /// Sends `request` to `host` without recording it.
     async fn send(
         &self,
@@ -270,7 +301,14 @@ impl Client {
                 return None;
             }
         };
-        let pending = self.history.call_to(&self.process, host, key, call);
+        // A request the gateway forwards can take effect in another
+        // node's life, so only one sent to the primary ends with its
+        // receiver's.
+        let pending = if self.workload.any_gateway {
+            self.history.call(&self.process, key, call)
+        } else {
+            self.history.call_to(&self.process, host, key, call)
+        };
         let answer = connection.send(request, timeout).await;
         if let Err(error) = &answer {
             tracing::debug!(process = %self.process, %host, %error, "no answer");
@@ -311,7 +349,7 @@ impl Client {
             value: value.clone(),
             condition: condition.clone(),
         };
-        let host = self.routes.primary(bucket, key);
+        let host = self.host(bucket, key);
         let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
             return Ok(());
         };
@@ -328,7 +366,7 @@ impl Client {
                 StatusCode::NOT_FOUND if matches!(condition, Condition::IfMatch(_)) => {
                     Outcome::ConditionFailed
                 }
-                status if status.is_server_error() => Outcome::Failed,
+                status if status.is_server_error() => self.write_failed(),
                 _ => return Err(unexpected("a PUT", &response)),
             },
             Err(_) => Outcome::Unknown,
@@ -348,7 +386,7 @@ impl Client {
         n: usize,
         condition: Condition,
     ) -> turmoil::Result {
-        let host = self.routes.primary(bucket, key);
+        let host = self.host(bucket, key);
         let path = format!("/{}/{key}", bucket.name);
         let request = Request::post(format!("{path}?uploads")).body(Full::default())?;
         let response = match self.send(&host, request).await {
@@ -403,7 +441,7 @@ impl Client {
                 StatusCode::PRECONDITION_FAILED if condition != Condition::None => {
                     Outcome::ConditionFailed
                 }
-                status if status.is_server_error() => Outcome::Failed,
+                status if status.is_server_error() => self.write_failed(),
                 _ => return Err(unexpected("a CompleteMultipartUpload", &response)),
             },
             Err(_) => Outcome::Unknown,
@@ -425,7 +463,7 @@ impl Client {
             .uri(format!("/{}/{key}", bucket.name))
             .body(Full::new(Bytes::new()))?;
         let name = history_key(bucket, key);
-        let host = self.routes.primary(bucket, key);
+        let host = self.host(bucket, key);
         let Some((pending, answer)) = self.send_recorded(&host, &name, Call::Get, request).await
         else {
             return Ok(false);
@@ -459,7 +497,7 @@ impl Client {
     async fn delete(&mut self, bucket: &BucketDocument, key: &str) -> turmoil::Result {
         let request = Request::delete(format!("/{}/{key}", bucket.name)).body(Full::default())?;
         let name = history_key(bucket, key);
-        let host = self.routes.primary(bucket, key);
+        let host = self.host(bucket, key);
         let Some((pending, answer)) = self
             .send_recorded(&host, &name, Call::Delete, request)
             .await
@@ -469,7 +507,7 @@ impl Client {
         let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK | StatusCode::NO_CONTENT => Outcome::Done,
-                status if status.is_server_error() => Outcome::Failed,
+                status if status.is_server_error() => self.write_failed(),
                 _ => return Err(unexpected("a DELETE", &response)),
             },
             Err(_) => Outcome::Unknown,
