@@ -236,21 +236,19 @@ fn backed_up_large_objects_are_never_partial_at_the_backup() {
     });
 }
 
-/// Runs `target` with `bug` seeded, without node faults and with only
-/// `step_faults` at the remote store, and expects the audit to catch the
-/// bug with a reason that contains `reason`.
+/// Runs `target` with the bug and the remote store's step faults of
+/// `large`, without node faults, and expects the audit to catch the bug
+/// with a reason that contains `reason`.
 fn caught(
     context: &mut SimContext,
     target: Target,
-    bug: LargeObjectBug,
-    step_faults: Vec<(Operation, SimS3Faults)>,
+    large: LargeObjects,
     reason: &str,
 ) -> turmoil::Result {
+    let bug = large.bug;
     let large = LargeObjects {
-        step_faults,
         step_crash_probability: 0.0,
-        bug,
-        ..LargeObjects::default()
+        ..large
     };
     let config = ClusterConfig {
         remote_faults: DELAYS,
@@ -269,33 +267,33 @@ fn caught(
 #[test]
 fn the_audit_catches_a_completion_without_its_last_part() {
     Runner::with_cost(2, COST).run(|context| {
-        caught(
-            context,
-            Target::WriteBack,
-            LargeObjectBug::CompletesWithoutLastPart,
-            Vec::new(),
-            "partial object",
-        )
+        let large = LargeObjects {
+            step_faults: Vec::new(),
+            bug: LargeObjectBug::CompletesWithoutLastPart,
+            ..LargeObjects::default()
+        };
+        caught(context, Target::WriteBack, large, "partial object")
     });
 }
 
 /// Recording the local ETag after a lost Complete answer leaves a
 /// `FLUSHED` whose ETag no remote object of its version had: the MD5 of a
-/// streamed body, not the multipart ETag of its parts.
+/// streamed body, not the multipart ETag of its parts. The remote loses
+/// the answer of every Complete it applies and answers the retry, which
+/// finds the object, so every streamed body flushed shows the bug. Losing
+/// 40% of all Complete answers at random left it to chance: a seed flushes
+/// only a few streamed bodies before newer versions replace them, a lost
+/// answer's retries lost theirs too, and one seed in ten never got there.
 #[test]
 fn the_audit_catches_a_wrong_etag_recorded_after_a_lost_complete() {
     Runner::with_cost(2, COST).run(|context| {
-        let lost = SimS3Faults {
-            lost_response_probability: 0.4,
-            ..DELAYS
+        let large = LargeObjects {
+            step_faults: Vec::new(),
+            lost_completions: true,
+            bug: LargeObjectBug::RecordsLocalEtagAfterLostComplete,
+            ..LargeObjects::default()
         };
-        caught(
-            context,
-            Target::WriteBack,
-            LargeObjectBug::RecordsLocalEtagAfterLostComplete,
-            vec![(Operation::CompleteMultipartUpload, lost)],
-            "records the remote ETag",
-        )
+        caught(context, Target::WriteBack, large, "records the remote ETag")
     });
 }
 
@@ -309,11 +307,15 @@ fn the_audit_catches_remote_uploads_left_open() {
             internal_error_probability: 0.5,
             ..DELAYS
         };
+        let large = LargeObjects {
+            step_faults: vec![(Operation::AbortMultipartUpload, failing)],
+            bug: LargeObjectBug::GivesUpFailedAborts,
+            ..LargeObjects::default()
+        };
         caught(
             context,
             Target::Backup(Backup::Asynchronous),
-            LargeObjectBug::GivesUpFailedAborts,
-            vec![(Operation::AbortMultipartUpload, failing)],
+            large,
             "was never completed or aborted",
         )
     });
