@@ -6877,6 +6877,16 @@ of this file. A task with nothing unexpected keeps "None."
 - **Fuzzing.** A new target, `ec_transfer`, decodes the fragment header
   that starts a write and both message bodies; `log_record` and
   `index_codec` already reach the new record body and values.
+- **A publish test that counted yields (found in the stack's merge-up).**
+  `a_publish_whose_caller_is_dropped_still_settles_its_attempt`, added
+  for the Codex fix that settles an attempt on the detached commit task,
+  gave the commit 1,000 yields to settle. The commit's writes run on
+  blocking threads, so on a busy machine the yields ran out first: 7 of
+  30 runs of the encoder tests failed. It now waits up to 10 s of real
+  time, and passed 40 of 40. M5-08 moved the publish into the shared
+  `attempts::publish`, which the repairer uses too; the merge into M5-08
+  applies the same fix there, with a oneshot telling the caller when the
+  record is sequenced so it can still emit its `Appended` event.
 
 ### M5-05 Orphan fragment reclamation
 
