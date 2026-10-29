@@ -673,28 +673,40 @@ fn augment<'a>(
 
 /// The unrecoverable `version`, described by the headers' `object` or the
 /// snapshot's `entry`: every unrecoverable version is named by one of them.
+/// When both describe it, the one naming the later write identity does: a
+/// retag the snapshot holds moves it past what older headers name.
 fn unrecoverable(
     version: EpochSeq,
     object: Option<&ObjectMeta>,
     entry: Option<&Entry>,
     error: ReindexError,
 ) -> Option<Unrecoverable> {
-    let (identity, size, etag, last_modified_ms) = match (
-        object,
-        entry.and_then(|e| Some((e.version, e.object.as_ref()?))),
-    ) {
-        (Some(meta), _) => (
+    let from_headers = object.map(|meta| {
+        (
             meta.identity,
             meta.size,
             meta.etag.clone(),
             meta.last_modified_ms,
-        ),
-        (None, Some((at, object))) => (
-            object.write_identity.unwrap_or(at),
-            object.size,
-            object.local_etag.clone(),
-            object.last_modified_ms,
-        ),
+        )
+    });
+    let from_entry = entry
+        .and_then(|e| Some((e.version, e.object.as_ref()?)))
+        // Of this version, or the only description there is.
+        .filter(|(at, o)| {
+            object.is_none() || o.coded.as_ref().map_or(*at, |c| c.version) == version
+        })
+        .map(|(at, object)| {
+            (
+                object.write_identity.unwrap_or(at),
+                object.size,
+                object.local_etag.clone(),
+                object.last_modified_ms,
+            )
+        });
+    let (identity, size, etag, last_modified_ms) = match (from_headers, from_entry) {
+        (Some(headers), Some(entry)) if entry.0 > headers.0 => entry,
+        (Some(headers), _) => headers,
+        (None, Some(entry)) => entry,
         (None, None) => return None,
     };
     Some(Unrecoverable {

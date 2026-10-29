@@ -11,6 +11,7 @@ use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_shard::{Committed, Shard, ShardError};
 use skys3_types::{AttemptId, Epoch, EpochSeq};
+use tokio::sync::oneshot;
 
 /// How many attempt numbers one durable reservation takes.
 const ATTEMPT_BLOCK: u64 = 64;
@@ -220,11 +221,12 @@ pub(crate) enum Publication {
 /// Commits `body`, the publishing record of `attempt`, whose fragments
 /// are all durable: only if `attempts` has not abandoned the attempt, and
 /// only while `shard` still sequences in the attempt's epoch (§8.4). Calls
-/// `appended` once the record is sequenced and before it commits.
+/// `appended` once the record is sequenced.
 ///
-/// The commit runs on a task of its own, so the record is appended even if
-/// this future is dropped. The attempt is finished in `attempts` unless
-/// its record may yet commit.
+/// The commit and the attempt's bookkeeping run on a task of their own, so
+/// the record is appended, and the attempt settled, even if this future is
+/// dropped. The attempt is finished in `attempts` unless its record may
+/// yet commit.
 pub(crate) async fn publish<D: Disk>(
     shard: &Shard<D>,
     attempts: &Attempts,
@@ -236,17 +238,48 @@ pub(crate) async fn publish<D: Disk>(
         attempts.finish(attempt);
         return Publication::Abandoned;
     }
+    let (sequenced, on_sequenced) = oneshot::channel();
+    let committing = tokio::spawn(commit(
+        shard.clone(),
+        attempts.clone(),
+        attempt,
+        body,
+        sequenced,
+    ));
+    if on_sequenced.await.is_ok() {
+        appended();
+    }
+    match committing.await {
+        Ok(publication) => publication,
+        Err(error) => Publication::Unconfirmed(ShardError::Unavailable {
+            shard: shard.shard().clone(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// [`publish`]'s task: commits `body` and settles `attempt` in `attempts`,
+/// sending on `sequenced` once the record is sequenced.
+async fn commit<D: Disk>(
+    shard: Shard<D>,
+    attempts: Attempts,
+    attempt: AttemptId,
+    body: RecordBody,
+    sequenced: oneshot::Sender<()>,
+) -> Publication {
     let before = shard.last_sequenced();
     let committer = shard.clone();
     // Only in the attempt's epoch: a later primary may have judged its
-    // fragments orphans (§8.4).
+    // fragments orphans (§8.4). The commit runs on a task of its own too,
+    // so the caller hears that the record is sequenced before it commits.
     let commit = tokio::spawn(async move { committer.commit_in(attempt.epoch, body).await });
     while shard.last_sequenced() == before && !commit.is_finished() {
         tokio::task::yield_now().await;
     }
-    let sequenced = shard.last_sequenced() != before;
-    if sequenced {
-        appended();
+    let appended = shard.last_sequenced() != before;
+    if appended {
+        // The caller may be gone: the attempt is settled all the same.
+        let _ = sequenced.send(());
     }
     match commit.await {
         Ok(Ok(committed)) => {
@@ -258,7 +291,7 @@ pub(crate) async fn publish<D: Disk>(
                 ShardError::NotAcknowledged { position, .. } => *position,
                 _ => None,
             };
-            if sequenced || position.is_some() {
+            if appended || position.is_some() {
                 // The record may commit yet: the attempt stays in progress
                 // until it does.
                 attempts.sequenced(attempt, position);
