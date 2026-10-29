@@ -186,6 +186,16 @@ struct State {
     discards: HashMap<String, EpochSeq>,
     /// The keys of `discards`, oldest first: at most [`MAX_DISCARDS`].
     discard_order: VecDeque<String>,
+    /// The newest version among the drops `discards` no longer holds.
+    forgotten: EpochSeq,
+    /// The position the shard had applied when the flusher subscribed:
+    /// the flusher tracked every version after it, from its change on.
+    since: EpochSeq,
+    /// Write-through waits for versions of untracked keys whose flush
+    /// neither the flusher nor the index can establish
+    /// ([`State::awaited`]). They are never answered: each ask ends
+    /// `Pending`, and the write `503` once its timeout passes.
+    unproven: Vec<FlushWaiter>,
 }
 
 impl State {
@@ -245,6 +255,7 @@ impl State {
         for (_, tracked) in keys {
             tracked.waiters.clear();
         }
+        self.unproven.clear();
         if let Some(charge) = self.charge.take() {
             charge.adjust(self.dirty_bytes, 0);
         }
@@ -388,8 +399,9 @@ impl State {
                 self.discard_order.push_back(key.to_owned());
                 if self.discard_order.len() > MAX_DISCARDS
                     && let Some(oldest) = self.discard_order.pop_front()
+                    && let Some(dropped) = self.discards.remove(&oldest)
                 {
-                    self.discards.remove(&oldest);
+                    self.forgotten = self.forgotten.max(dropped);
                 }
             }
         }
@@ -439,28 +451,48 @@ impl State {
         }
     }
 
-    /// Takes a write-through write's wait for its version (§7.5). The
+    /// Takes a write-through write's wait for its version (§7.5), and
+    /// returns it if the flusher cannot answer it from what it knows. The
     /// shard passes it after the change that stored the version, so an
     /// untracked key has had its latest version, at or after the one
     /// waited for, flushed, unless `discard_local` dropped it: the flush
     /// may have dropped it, and untracked the key, before the wait
-    /// arrived, so the drop is remembered for it.
-    fn awaited(&mut self, waiter: FlushWaiter) {
+    /// arrived, so the drop is remembered for it. The flusher knows which
+    /// only for a version it tracked itself, after [`State::since`], and
+    /// whose drop it would still remember; for any other, an earlier
+    /// flusher's drop leaves no trace here, and the caller asks the index
+    /// ([`prove`]).
+    #[must_use]
+    fn awaited(&mut self, waiter: FlushWaiter) -> Option<FlushWaiter> {
+        let version = waiter.version();
         let dropped = self.discards.get(waiter.key());
-        if dropped.is_some_and(|dropped| waiter.version() <= *dropped) {
-            return waiter.answer(FlushState::Conflict);
+        if dropped.is_some_and(|dropped| version <= *dropped) {
+            waiter.answer(FlushState::Conflict);
+            return None;
         }
         let Some(tracked) = self.keys.get_mut(waiter.key()) else {
-            return waiter.answer(FlushState::Flushed);
+            if version > self.since && version > self.forgotten {
+                waiter.answer(FlushState::Flushed);
+                return None;
+            }
+            return Some(waiter);
         };
         if matches!(tracked.phase, Phase::Conflict(_)) {
             waiter.answer(FlushState::Conflict);
-        } else if tracked.remote >= Some(waiter.version()) {
+        } else if tracked.remote >= Some(version) {
             waiter.answer(FlushState::Flushed);
         } else {
             tracked.waiters.retain(FlushWaiter::is_waited);
             tracked.waiters.push(waiter);
         }
+        None
+    }
+
+    /// Keeps a wait [`prove`] could not answer, unanswered, while it is
+    /// waited on.
+    fn park(&mut self, waiter: FlushWaiter) {
+        self.unproven.retain(FlushWaiter::is_waited);
+        self.unproven.push(waiter);
     }
 
     /// Records `error` as `key`'s latest.
@@ -736,6 +768,7 @@ async fn run<S: ObjectStore, D: Disk>(
     mut resolutions: mpsc::UnboundedReceiver<Resolve>,
 ) {
     let mut changes = shard.subscribe();
+    lock(&state).since = shard.applied();
     // A native target is ready from the start: its bodies are staged at the
     // peer, and no remote multipart upload is ever opened (§7.8).
     let native = ready.get().is_some_and(|target| target.native.is_some());
@@ -819,7 +852,11 @@ async fn run<S: ObjectStore, D: Disk>(
                     resolved(&shard, &state, &mut records, resolve);
                 }
                 change = changes.recv() => match change {
-                    Some(change) => follow(&state, &streams, staged, &*wall, change),
+                    Some(change) => {
+                        if let Some(waiter) = follow(&state, &streams, staged, &*wall, change) {
+                            prove(&shard, &state, waiter).await;
+                        }
+                    }
                     // The shard stopped, or another flusher took over.
                     None => break,
                 },
@@ -836,14 +873,15 @@ async fn run<S: ObjectStore, D: Disk>(
 
 /// Acts on a change the shard applied. With a native target's `bodies`,
 /// streamed bodies are staged at the peer, and multipart uploads are sent
-/// once they complete (§7.8).
+/// once they complete (§7.8). Returns a write-through wait the flusher
+/// could not answer from what it knows ([`State::awaited`]).
 fn follow(
     state: &Mutex<State>,
     streams: &Streams,
     bodies: Option<&Bodies>,
     wall: &dyn WallClock,
     change: Change,
-) {
+) -> Option<FlushWaiter> {
     match (change, bodies) {
         (
             Change::Stored {
@@ -867,7 +905,7 @@ fn follow(
                 streams.reap(&key);
             }
         }
-        (Change::Awaited(waiter), _) => lock(state).awaited(waiter),
+        (Change::Awaited(waiter), _) => return lock(state).awaited(waiter),
         (Change::Streamed(body), Some(bodies)) => bodies.announced(body),
         (Change::Opened { .. } | Change::Part { .. } | Change::Aborted { .. }, Some(_)) => {}
         (Change::Opened { key, upload }, None) => streams.opened(&key, upload),
@@ -882,6 +920,30 @@ fn follow(
         ) => streams.part(upload, number, position),
         (Change::Aborted { upload, .. }, None) => streams.aborted(upload),
         (Change::Streamed(body), None) => streams.announced(body),
+    }
+    None
+}
+
+/// Answers a write-through wait for a version of an untracked key from
+/// the shard's index: the remote holds the version, or a later one, if
+/// the entry is gone, which only a flushed delete does, or clean at that
+/// very version, which only its flush makes it. Any other entry cannot
+/// tell a dropped version from one a later flushed write superseded: the
+/// stub an `ADOPT` leaves (§7.2) looks like a later clean version. Such a
+/// wait is never answered, and the write gets `503`, never `200`.
+async fn prove<D: Disk>(shard: &Shard<D>, state: &Mutex<State>, waiter: FlushWaiter) {
+    match shard.entry(waiter.key()).await {
+        Ok(entry)
+            if entry.as_ref().is_none_or(|entry| {
+                matches!(entry.state, EntryState::Clean | EntryState::Evicted)
+                    && entry.version == waiter.version()
+            }) =>
+        {
+            waiter.answer(FlushState::Flushed);
+        }
+        Ok(_) => lock(state).park(waiter),
+        // Unanswered, the wait ends, and its writer asks again.
+        Err(_) => {}
     }
 }
 
@@ -1219,7 +1281,7 @@ mod tests {
         for policy in [ConflictPolicy::Overwrite, ConflictPolicy::DiscardLocal] {
             let mut state = flushing();
             let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(1));
-            state.awaited(waiter);
+            assert!(state.awaited(waiter).is_none());
             state.conflicted("k", conflict(), policy);
             assert_eq!(phase(&state), Phase::Dirty);
             assert!(state.status().conflicts.is_empty());
@@ -1240,8 +1302,8 @@ mod tests {
         state.changed("k", position(3), Some(5), Duration::from_secs(2));
         let (dropped, mut dropped_wait) = FlushWaiter::new("k".to_owned(), position(1));
         let (later, mut later_wait) = FlushWaiter::new("k".to_owned(), position(3));
-        state.awaited(dropped);
-        state.awaited(later);
+        assert!(state.awaited(dropped).is_none());
+        assert!(state.awaited(later).is_none());
         state.discarded("k", position(1));
         assert_eq!(answer_now(&mut dropped_wait), Some(FlushState::Conflict));
         assert_eq!(answer_now(&mut later_wait), None);
@@ -1258,7 +1320,7 @@ mod tests {
         state.finished("k", position(1));
         assert!(state.keys.is_empty());
         let (dropped, mut dropped_wait) = FlushWaiter::new("k".to_owned(), position(1));
-        state.awaited(dropped);
+        assert!(state.awaited(dropped).is_none());
         assert_eq!(answer_now(&mut dropped_wait), Some(FlushState::Conflict));
 
         // A later version builds on the adopted write and is flushed; a
@@ -1266,7 +1328,7 @@ mod tests {
         // still learns of the conflict.
         state.changed("k", position(2), Some(5), Duration::from_secs(2));
         let (late, mut late_wait) = FlushWaiter::new("k".to_owned(), position(1));
-        state.awaited(late);
+        assert!(state.awaited(late).is_none());
         assert_eq!(answer_now(&mut late_wait), Some(FlushState::Conflict));
         assert_eq!(
             state.take_ready(),
@@ -1274,7 +1336,7 @@ mod tests {
         );
         state.finished("k", position(2));
         let (flushed, mut flushed_wait) = FlushWaiter::new("k".to_owned(), position(2));
-        state.awaited(flushed);
+        assert!(state.awaited(flushed).is_none());
         assert_eq!(answer_now(&mut flushed_wait), Some(FlushState::Flushed));
 
         // A key flushed without a discard, as under `overwrite`, or never
@@ -1282,7 +1344,7 @@ mod tests {
         let mut state = flushing();
         state.finished("k", position(1));
         let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(1));
-        state.awaited(waiter);
+        assert!(state.awaited(waiter).is_none());
         assert_eq!(answer_now(&mut wait), Some(FlushState::Flushed));
     }
 
@@ -1297,6 +1359,33 @@ mod tests {
         assert_eq!(state.discard_order.len(), MAX_DISCARDS);
         assert!(!state.discards.contains_key("k0"));
         assert_eq!(state.discards["k1"], position(2));
+
+        // A wait for a version as old as a forgotten drop cannot be
+        // answered from memory.
+        let (waiter, _wait) = FlushWaiter::new("k0".to_owned(), position(1));
+        assert_eq!(state.awaited(waiter.clone()), Some(waiter));
+        let (newer, mut newer_wait) = FlushWaiter::new("k0".to_owned(), position(2));
+        assert!(state.awaited(newer).is_none());
+        assert_eq!(answer_now(&mut newer_wait), Some(FlushState::Flushed));
+    }
+
+    /// A flusher that started after a version was committed did not track
+    /// it, and cannot tell whether an earlier flusher flushed or dropped
+    /// it: the wait is left to the index.
+    #[test]
+    fn a_wait_for_a_version_from_before_the_flusher_is_not_answered_from_memory() {
+        let mut state = State {
+            since: position(5),
+            ..State::default()
+        };
+        let (waiter, mut wait) = FlushWaiter::new("k".to_owned(), position(5));
+        assert_eq!(state.awaited(waiter.clone()), Some(waiter.clone()));
+        assert_eq!(answer_now(&mut wait), None);
+        state.park(waiter);
+        assert_eq!(state.unproven.len(), 1);
+        let (later, mut later_wait) = FlushWaiter::new("k".to_owned(), position(6));
+        assert!(state.awaited(later).is_none());
+        assert_eq!(answer_now(&mut later_wait), Some(FlushState::Flushed));
     }
 
     #[test]

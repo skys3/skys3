@@ -14,9 +14,12 @@
 //! key ([`Shards::flushed`]). The ask is bounded by [`FLUSH_WAIT_ROUND`]
 //! and repeated until `write_through_timeout_seconds` have passed, and an
 //! ask that fails, such as while a new primary's flusher starts after a
-//! primary change, is repeated after [`RETRY_DELAY`]. A write is never
-//! undone: the client's error says that it is committed in the cluster,
-//! and the flusher keeps sending it.
+//! primary change, is repeated after [`RETRY_DELAY`]. The gateway gives up
+//! on an ask that is not answered within the round and [`ASK_GRACE`], or
+//! by the deadline, and asks again: an unreachable primary must not hold
+//! the write past its timeout, or keep it from asking a new one. A write
+//! is never undone: the client's error says that it is committed in the
+//! cluster, and the flusher keeps sending it.
 //!
 //! - **Not flushed in time** (a remote outage, slow transfers, a primary
 //!   change that outlasts the timeout): `503 SlowDown`.
@@ -39,6 +42,10 @@ pub(crate) const FLUSH_WAIT_ROUND: Duration = Duration::from_secs(5);
 
 /// How long the gateway waits before it asks again after an ask failed.
 pub(crate) const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// How much longer than [`FLUSH_WAIT_ROUND`] the gateway waits for an
+/// ask's answer, so that a primary's `Pending` arrives before it gives up.
+pub(crate) const ASK_GRACE: Duration = Duration::from_secs(1);
 
 /// Which buckets acknowledge writes only once they are flushed, and how
 /// long such a write waits.
@@ -102,17 +109,21 @@ pub(crate) async fn reach_remote<H: Shards>(
         if left.is_zero() {
             return Err(not_flushed(shard, key, timeout));
         }
-        match shards
-            .flushed(shard, key, version, left.min(FLUSH_WAIT_ROUND))
-            .await
-        {
-            Ok(FlushState::Flushed) => return Ok(()),
-            Ok(FlushState::Conflict) => return Err(conflict()),
+        // The routed ask can outlast its wait, by a forward's timeout and
+        // more members: bound all of it.
+        let ask = shards.flushed(shard, key, version, left.min(FLUSH_WAIT_ROUND));
+        match tokio::time::timeout(left.min(FLUSH_WAIT_ROUND + ASK_GRACE), ask).await {
+            Ok(Ok(FlushState::Flushed)) => return Ok(()),
+            Ok(Ok(FlushState::Conflict)) => return Err(conflict()),
             // Not yet: ask again.
-            Ok(_) => {}
-            Err(error) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
                 log_failed_ask(shard, key, &error);
                 tokio::time::sleep(RETRY_DELAY.min(left)).await;
+            }
+            Err(_) => {
+                tracing::debug!(%shard, key,
+                    "a write-through flush ask went unanswered; asking again");
             }
         }
     }
@@ -239,5 +250,29 @@ mod tests {
             .unwrap_err();
         assert_eq!(*error.code(), S3ErrorCode::SlowDown);
         assert_eq!(*conflict().code(), S3ErrorCode::OperationAborted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_ask_does_not_outlast_the_timeout() {
+        let shards = MemoryShards::new().await;
+        let mut document = bucket("b-1", 1);
+        document.mode = BucketMode::WriteBack;
+        let shard = ShardRef::for_key(&document, "k");
+        shards.open(&shard, &document).await.unwrap();
+        let version = EpochSeq::new(Epoch::new(1), Seq::new(1));
+        // The primary does not answer for far longer than the timeout, as
+        // one does that accepts the forward and then falls silent.
+        shards.set_flushed_delay(Duration::from_secs(60));
+        let started = Instant::now();
+        let timeout = Duration::from_secs(2);
+        let error = reach_remote(&shards, &shard, "k", version, timeout)
+            .await
+            .unwrap_err();
+        assert_eq!(*error.code(), S3ErrorCode::SlowDown);
+        assert!(
+            started.elapsed() < timeout + RETRY_DELAY,
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

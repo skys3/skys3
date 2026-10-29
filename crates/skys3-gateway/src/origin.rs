@@ -97,8 +97,8 @@ pub enum OriginHead {
 /// What the origin held at a key when a gateway last asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Seen {
-    /// An object with this ETag.
-    Present(ETag),
+    /// An object of this version.
+    Present(OriginVersion),
     /// No object.
     Missing,
     /// An object the credentials may not read.
@@ -108,9 +108,31 @@ pub(crate) enum Seen {
 impl From<&OriginHead> for Seen {
     fn from(head: &OriginHead) -> Self {
         match head {
-            OriginHead::Found(found) => Self::Present(found.object.local_etag.clone()),
+            OriginHead::Found(found) => Self::Present(OriginVersion::of(found)),
             OriginHead::Missing => Self::Missing,
             OriginHead::Denied => Self::Denied,
+        }
+    }
+}
+
+/// Which version of an object an origin holds. The ETag alone does not
+/// tell: a re-upload of the same bytes, or a copy onto itself that
+/// replaces the metadata, keeps it, but not the `Last-Modified`, nor on a
+/// versioned origin the version ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OriginVersion {
+    pub(crate) etag: ETag,
+    pub(crate) last_modified_ms: u64,
+    pub(crate) version_id: Option<String>,
+}
+
+impl OriginVersion {
+    /// The version of `object`.
+    pub(crate) fn of(object: &RemoteObject) -> Self {
+        Self {
+            etag: object.object.local_etag.clone(),
+            last_modified_ms: object.object.last_modified_ms,
+            version_id: object.version_id.clone(),
         }
     }
 }
@@ -290,8 +312,12 @@ mod tests {
         OriginScope::new(&target, credentials)
     }
 
-    fn etag(n: u8) -> ETag {
-        ETag::new(format!("{n:032x}")).unwrap()
+    fn etag(n: u8) -> OriginVersion {
+        OriginVersion {
+            etag: ETag::new(format!("{n:032x}")).unwrap(),
+            last_modified_ms: 0,
+            version_id: None,
+        }
     }
 
     #[tokio::test(start_paused = true)]
