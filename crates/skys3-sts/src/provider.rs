@@ -7,9 +7,11 @@
 //! control-store reader.
 
 use serde::{Deserialize, Serialize};
+use skys3_types::{InvalidRegister, ProposalId, RegisterDocument};
 use thiserror::Error;
 
 use crate::jwt::Algorithm;
+use crate::validator::VerifiedToken;
 
 /// The path OIDC Discovery appends to an issuer.
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
@@ -74,6 +76,21 @@ impl OidcProvider {
         }
     }
 
+    /// Whether this provider, as it is now, accepts a token another version
+    /// of it validated: the same issuer, an accepted audience and
+    /// algorithm, and an accepted authorized party if it lists any. Claims,
+    /// lifetimes, and signatures do not depend on the provider record.
+    pub fn accepts(&self, token: &VerifiedToken) -> bool {
+        self.issuer == token.issuer
+            && self.audiences.contains(&token.audience)
+            && self.algorithms.contains(&token.algorithm)
+            && (self.authorized_parties.is_empty()
+                || token
+                    .authorized_party
+                    .as_ref()
+                    .is_some_and(|azp| self.authorized_parties.contains(azp)))
+    }
+
     /// Returns the OIDC Discovery URL (OpenID Connect Discovery 1.0 §4).
     pub fn discovery_url(&self) -> String {
         format!("{}{DISCOVERY_PATH}", self.issuer.trim_end_matches('/'))
@@ -99,6 +116,63 @@ impl OidcProvider {
             return Err(ProviderError::NoAlgorithms(issuer()));
         }
         Ok(())
+    }
+}
+
+/// `identity/providers/<name>.json`: the register that allowlists one
+/// [`OidcProvider`] (design §6.1). It holds the provider's fields and the
+/// `proposal_id` every register carries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDocument {
+    /// [`OidcProvider::issuer`].
+    pub issuer: String,
+    /// [`OidcProvider::audiences`].
+    pub audiences: Vec<String>,
+    /// [`OidcProvider::authorized_parties`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_parties: Vec<String>,
+    /// [`OidcProvider::algorithms`].
+    #[serde(default = "default_algorithms")]
+    pub algorithms: Vec<Algorithm>,
+    /// The proposal ID of the write that stored this document.
+    pub proposal_id: ProposalId,
+}
+
+impl ProviderDocument {
+    /// The register document for `provider`.
+    pub fn new(provider: OidcProvider, proposal_id: ProposalId) -> Self {
+        ProviderDocument {
+            issuer: provider.issuer,
+            audiences: provider.audiences,
+            authorized_parties: provider.authorized_parties,
+            algorithms: provider.algorithms,
+            proposal_id,
+        }
+    }
+
+    /// The provider the document allowlists.
+    pub fn provider(&self) -> OidcProvider {
+        OidcProvider {
+            issuer: self.issuer.clone(),
+            audiences: self.audiences.clone(),
+            authorized_parties: self.authorized_parties.clone(),
+            algorithms: self.algorithms.clone(),
+        }
+    }
+}
+
+impl RegisterDocument for ProviderDocument {
+    const KIND: &'static str = "OIDC provider";
+
+    fn proposal_id(&self) -> &ProposalId {
+        &self.proposal_id
+    }
+
+    fn validate(&self) -> Result<(), InvalidRegister> {
+        self.provider()
+            .check()
+            .map_err(|error| InvalidRegister::Document(error.to_string()))
     }
 }
 
@@ -193,6 +267,36 @@ mod tests {
     }
 
     #[test]
+    fn accepts_tokens_it_would_validate() {
+        let token = VerifiedToken {
+            issuer: "https://i".into(),
+            subject: "s".into(),
+            audience: "a".into(),
+            authorized_party: Some("p".into()),
+            expires_at: std::time::Duration::ZERO,
+            algorithm: Algorithm::Rs256,
+            claims: serde_json::Map::new(),
+        };
+        let provider = OidcProvider::new("https://i", ["a"]);
+        assert!(provider.accepts(&token));
+        assert!(!OidcProvider::new("https://j", ["a"]).accepts(&token));
+        assert!(!OidcProvider::new("https://i", ["b"]).accepts(&token));
+        let mut es256 = provider.clone();
+        es256.algorithms = vec![Algorithm::Es256];
+        assert!(!es256.accepts(&token));
+        let mut parties = provider.clone();
+        parties.authorized_parties = vec!["p".into()];
+        assert!(parties.accepts(&token));
+        parties.authorized_parties = vec!["q".into()];
+        assert!(!parties.accepts(&token));
+        let without_azp = VerifiedToken {
+            authorized_party: None,
+            ..token
+        };
+        assert!(!parties.accepts(&without_azp));
+    }
+
+    #[test]
     fn record_schema() {
         let provider: OidcProvider = serde_json::from_str(
             r#"{"issuer":"https://i","audiences":["a"],"authorized_parties":["p"],"algorithms":["ES256","RS256"]}"#,
@@ -207,6 +311,24 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&minimal).unwrap(),
             r#"{"issuer":"https://i","audiences":["a"],"algorithms":["RS256"]}"#
+        );
+
+        let id = ProposalId::from_u128(7);
+        let document = ProviderDocument::new(provider.clone(), id.clone());
+        let json = document.to_json().unwrap();
+        assert_eq!(ProviderDocument::from_json(&json).unwrap(), document);
+        assert_eq!(document.provider(), provider);
+        assert_eq!(document.proposal_id(), &id);
+        let invalid = ProviderDocument::new(OidcProvider::new("https://i", [""]), id);
+        assert!(
+            invalid
+                .to_json()
+                .unwrap_err()
+                .to_string()
+                .contains("audience")
+        );
+        assert!(
+            ProviderDocument::from_json(br#"{"issuer":"https://i","audiences":["a"]}"#).is_err()
         );
 
         for bad in [

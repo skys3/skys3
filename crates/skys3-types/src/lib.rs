@@ -25,11 +25,13 @@
 //! - **Limits** ([`limits`]): size limits that the log record format and
 //!   configuration loading both enforce.
 //! - **Register documents** ([`ShardConfig`], [`BucketDocument`],
-//!   [`NodeRegistration`], [`CoordinatorLease`], [`ClusterDocument`]): the
+//!   [`NodeRegistration`], [`CoordinatorLease`], [`ClusterDocument`],
+//!   [`RoleDocument`]): the
 //!   JSON values of the control-store registers (§6.1), behind the
 //!   [`RegisterDocument`] trait.
 //! - **Policies** ([`policy`]): the subset of the IAM policy language that
-//!   authorizes requests (§11).
+//!   authorizes requests, and the trust policies that say who may assume a
+//!   role ([`policy::trust`]) (§11).
 //!
 //! ```
 //! use skys3_types::{BucketId, ClusterId, EpochSeq, ShardCount, WriteIdentity, shard_for_key};
@@ -59,6 +61,6 @@ pub use position::{Epoch, EpochSeq, Generation, ParseNumberError, Seq};
 pub use register::{
     BucketDocument, BucketMode, ClusterDocument, CoordinatorLease, DiskInfo, InvalidRegister,
     NodeRegistration, RegisterDocument, RegisterError, RemoteTarget, ReplicationError,
-    ReplicationSettings, ShardConfig,
+    ReplicationSettings, RoleDocument, ShardConfig,
 };
 pub use shard::{KeyHash, ShardCount, ShardCountError, ShardId, shard_for_key};

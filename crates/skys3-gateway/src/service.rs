@@ -1,13 +1,13 @@
-//! The request pipeline: limits, authentication, the anonymous-access
-//! gate, rejected features, body bounds, then `s3s` routing, authorization,
-//! and the S3 operations.
+//! The request pipeline: limits, the STS query API, authentication, the
+//! anonymous-access gate, rejected features, body bounds, then `s3s`
+//! routing, authorization, and the S3 operations.
 
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use http::{Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode};
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{Body, BodySizeLimitExceeded, S3Error, s3_error};
 use skys3_control::{ControlError, ControlStore};
@@ -16,7 +16,7 @@ use crate::api::Api;
 use crate::authz::{self, Access, NoSignatures, Permissions};
 use crate::buckets::{Buckets, GatewayConfig, IdSource};
 use crate::features;
-use crate::limits::{BodyKind, RequestLimits};
+use crate::limits::{BodyKind, RequestLimits, Target};
 use crate::shard::Shards;
 use crate::sigv4::{Authenticated, BodyError, Trailers};
 
@@ -39,6 +39,23 @@ pub trait Authenticator: Send + Sync + 'static {
         &self,
         request: Request<Body>,
     ) -> impl Future<Output = Result<Request<Body>, S3Error>> + Send;
+}
+
+/// The STS query API, served on the gateway's listener (design §11).
+///
+/// A `POST` to the service root, `/`, is an STS request: S3 has no
+/// operation there, and the AWS SDKs send STS query requests that way. Once
+/// its head is within the [`RequestLimits`], the gateway hands such a
+/// request to its STS service, before authentication, because
+/// `AssumeRoleWithWebIdentity` is not signed: the caller's web identity
+/// token is its credential. The STS service reads and bounds the body
+/// itself and answers in the STS format.
+pub trait StsService: Send + Sync + 'static {
+    /// Answers one STS request.
+    fn call(
+        &self,
+        request: Request<Body>,
+    ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send + '_>>;
 }
 
 /// An [`Authenticator`] for tests that trusts every request: it takes each
@@ -101,6 +118,7 @@ struct Inner<A> {
     auth: A,
     anonymous: Option<Permissions>,
     catalog: Arc<dyn Catalog>,
+    sts: OnceLock<Arc<dyn StsService>>,
 }
 
 impl<A> Clone for Gateway<A> {
@@ -147,8 +165,19 @@ impl<A: Authenticator> Gateway<A> {
                 auth,
                 anonymous,
                 catalog: buckets,
+                sts: OnceLock::new(),
             }),
         })
+    }
+
+    /// Serves the STS query API with `sts` ([`StsService`]). A gateway
+    /// serves one STS service: once it has one, later calls keep it.
+    #[must_use]
+    pub fn with_sts(self, sts: Arc<dyn StsService>) -> Self {
+        if self.inner.sts.set(sts).is_err() {
+            tracing::warn!("the gateway already serves an STS service; keeping it");
+        }
+        self
     }
 
     /// The request limits.
@@ -180,6 +209,12 @@ impl<A: Authenticator> Gateway<A> {
         let (mut parts, body) = request.into_parts();
         strip_trusted_extensions(&mut parts.extensions);
         let shape = inner.limits.check_head(&parts)?;
+        if shape.target == Target::Service
+            && parts.method == Method::POST
+            && let Some(sts) = inner.sts.get()
+        {
+            return Ok(sts.call(Request::from_parts(parts, body)).await);
+        }
         let request = inner
             .auth
             .authenticate(Request::from_parts(parts, body))

@@ -182,7 +182,7 @@ Anonymous access, static credentials, STS sessions, and OIDC token validation (�
 |---|---|---|---|
 | `anonymous_access` | boolean | `false` | When false, unsigned requests are refused with `403 AccessDenied`. |
 | `anonymous_policy` | string (JSON policy) | none | The policy that authorizes unsigned requests. Required when `anonymous_access` is true, and refused when it is false. |
-| `sts_web_identity` | boolean | `true` | |
+| `sts_web_identity` | boolean | `true` | Whether the gateway serves STS `AssumeRoleWithWebIdentity` (a `POST` to `/` on its listener, §11). |
 | `session_default_seconds` | integer | `3600` | From 900 to 43200 (the AWS STS limits), and at most `session_maximum_seconds`. |
 | `session_maximum_seconds` | integer | `3600` | From 900 to 43200. |
 | `identity_max_staleness_hours` | integer | `24` | Positive (§6.2). |

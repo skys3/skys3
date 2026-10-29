@@ -2,6 +2,7 @@
 //!
 //! This module is hidden from the documentation and is not a stable API.
 
+use crate::endpoint::request::{self, MAX_SESSION_POLICY_BYTES};
 use crate::jwk::{KeySet, MAX_KEYS};
 use crate::jwt::{MAX_TOKEN_BYTES, UnverifiedToken};
 
@@ -41,6 +42,37 @@ pub fn parse_jwks(data: &[u8]) -> Option<usize> {
     Some(keys.len())
 }
 
+/// Parses `data` as an `AssumeRoleWithWebIdentity` request: the query
+/// string up to the first newline, and the form body after it. Returns
+/// whether it parsed.
+///
+/// # Panics
+///
+/// Panics if an accepted request breaks a rule the parser enforces.
+pub fn parse_assume_role(data: &[u8]) -> bool {
+    let (query, body) = match data.iter().position(|b| *b == b'\n') {
+        Some(at) => (&data[..at], &data[at + 1..]),
+        None => (&[][..], data),
+    };
+    let Ok(request) = request::parse(query, body) else {
+        return false;
+    };
+    assert!(skys3_types::RoleDocument::valid_name(&request.role));
+    assert!(request.role_arn.ends_with(&request.role));
+    assert!(request.account.bytes().all(|b| b.is_ascii_digit()));
+    assert!((2..=64).contains(&request.session_name.len()));
+    assert!((4..=MAX_TOKEN_BYTES).contains(&request.token.len()));
+    assert!(
+        request
+            .policy
+            .as_ref()
+            .is_none_or(|policy| (1..=MAX_SESSION_POLICY_BYTES).contains(&policy.len()))
+    );
+    // Parsing is deterministic.
+    assert!(request::parse(query, body).is_ok_and(|again| again == request));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +84,10 @@ mod tests {
         assert!(!parse_token(&[0xff, b'.', b'.']));
         assert_eq!(parse_jwks(br#"{"keys":[{"kty":"oct","k":"AA"}]}"#), Some(0));
         assert_eq!(parse_jwks(b"[]"), None);
+        assert!(parse_assume_role(
+            b"Action=AssumeRoleWithWebIdentity\nVersion=2011-06-15&RoleArn=arn:aws:iam::1:role/r\
+              &RoleSessionName=ci&WebIdentityToken=abcd"
+        ));
+        assert!(!parse_assume_role(b"Action=AssumeRole"));
     }
 }

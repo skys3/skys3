@@ -78,6 +78,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sts_assume_role"
+path = "fuzz_targets/sts_assume_role.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sts_jwks"
 path = "fuzz_targets/sts_jwks.rs"
 test = false
@@ -108,6 +115,13 @@ bench = false
 [[bin]]
 name = "types_policy"
 path = "fuzz_targets/types_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "types_trust_policy"
+path = "fuzz_targets/types_trust_policy.rs"
 test = false
 doc = false
 bench = false

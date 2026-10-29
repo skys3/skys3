@@ -1,6 +1,6 @@
 [package]
 name = "skys3-sts"
-description = "SkyS3 workload identity: OIDC token validation for STS."
+description = "SkyS3 workload identity: OIDC token validation, the STS endpoint, and session credentials."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,10 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Test support: signing keys and token minting (`testkit`).
+test-util = []
 
 [dependencies]
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
@@ -22,14 +26,32 @@ hyper-rustls = { workspace = true, features = ["aws-lc-rs", "http1", "tls12"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs.workspace = true
+s3s.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_urlencoded.workspace = true
+skys3-config.workspace = true
+skys3-control.workspace = true
+skys3-gateway.workspace = true
 skys3-io.workspace = true
+skys3-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
+aws-config = { workspace = true, features = ["test-util"] }
+aws-credential-types.workspace = true
+aws-sdk-s3.workspace = true
+aws-smithy-async = { workspace = true, features = ["rt-tokio"] }
+aws-smithy-http-client.workspace = true
+aws-types.workspace = true
 proptest.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+skys3-control = { workspace = true, features = ["test-util"] }
+skys3-gateway = { workspace = true, features = ["test-util"] }
+# Enables `test-util` for this crate's own tests.
+skys3-sts = { path = ".", features = ["test-util"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
 tokio-rustls.workspace = true

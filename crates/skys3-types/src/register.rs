@@ -9,9 +9,10 @@
 //! | `nodes/<node-id>.json` | [`NodeRegistration`] |
 //! | `buckets/<bucket>.json` | [`BucketDocument`] |
 //! | `shards/<bucket>/<n>.json` | [`ShardConfig`] |
+//! | `identity/roles/<role>.json` | [`RoleDocument`] |
 //!
-//! Identity registers (`identity/`) are defined with the authorization
-//! model.
+//! OIDC provider registers (`identity/providers/<name>.json`) are defined
+//! with the token validator, in `skys3-sts`.
 //!
 //! Each document is a JSON object whose fields are written in declaration
 //! order. Readers reject unknown fields: the format version in
@@ -27,6 +28,9 @@ use std::collections::BTreeSet;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+use crate::policy::trust::TrustPolicy;
+use crate::policy::{Policy, PolicyDocument};
 
 use crate::{
     BucketId, BucketName, ClusterId, Epoch, Generation, Label, NodeAddress, NodeId, ProposalId,
@@ -151,6 +155,13 @@ pub enum InvalidRegister {
     /// A disk ID is listed twice in a node registration.
     #[error("disk {0} is listed twice")]
     DuplicateDisk(Label),
+    /// A role has more policies than [`RoleDocument::MAX_POLICIES`].
+    #[error("the role has {0} policies; at most {max} are allowed", max = RoleDocument::MAX_POLICIES)]
+    TooManyPolicies(usize),
+    /// A document defined outside this crate, such as an OIDC provider
+    /// record, breaks one of its rules.
+    #[error("{0}")]
+    Document(String),
 }
 
 /// Inconsistent replication settings.
@@ -557,6 +568,70 @@ impl RegisterDocument for ShardConfig {
             if !learners.insert(node) {
                 return Err(InvalidRegister::DuplicateNode(node.clone()));
             }
+        }
+        Ok(())
+    }
+}
+
+/// `identity/roles/<role>.json`: a role that STS sessions assume (§6.1,
+/// §11).
+///
+/// The role's name is its register's name. A session of the role is
+/// authorized by `policies`, together, and by the session policy its
+/// caller passed, if any. Policies are JSON documents held in strings, as
+/// IAM's API and the configuration hold them:
+///
+/// ```json
+/// {
+///   "trust_policy": "{\"Version\": \"2012-10-17\", \"Statement\": ...}",
+///   "policies": ["{\"Version\": \"2012-10-17\", \"Statement\": ...}"],
+///   "proposal_id": "01J8Z6K3V2Q4"
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleDocument {
+    /// Who may assume the role ([`crate::policy::trust`]).
+    pub trust_policy: PolicyDocument<TrustPolicy>,
+    /// What the role's sessions may do. A role without policies may do
+    /// nothing.
+    #[serde(default)]
+    pub policies: Vec<PolicyDocument<Policy>>,
+    /// The proposal ID of the write that stored this document.
+    pub proposal_id: ProposalId,
+}
+
+impl RoleDocument {
+    /// The most policies a role may have, which bounds the cost of
+    /// authorizing a request.
+    pub const MAX_POLICIES: usize = 10;
+
+    /// The longest role name.
+    pub const MAX_NAME_LEN: usize = 64;
+
+    /// Whether `name` is a valid role name: 1 to 64 ASCII letters, digits,
+    /// `_`, `-`, and `.`, not starting with `.`. That is the IAM character
+    /// set without `+=,@`, which register keys cannot hold.
+    #[must_use]
+    pub fn valid_name(name: &str) -> bool {
+        (1..=Self::MAX_NAME_LEN).contains(&name.len())
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+    }
+}
+
+impl RegisterDocument for RoleDocument {
+    const KIND: &'static str = "role";
+
+    fn proposal_id(&self) -> &ProposalId {
+        &self.proposal_id
+    }
+
+    fn validate(&self) -> Result<(), InvalidRegister> {
+        if self.policies.len() > Self::MAX_POLICIES {
+            return Err(InvalidRegister::TooManyPolicies(self.policies.len()));
         }
         Ok(())
     }

@@ -403,3 +403,73 @@ fn bucket_modes_use_their_configuration_spelling() {
     }
     assert!(serde_json::from_str::<BucketMode>("\"writeback\"").is_err());
 }
+
+#[test]
+fn role_documents_hold_policies_as_strings() {
+    use skys3_types::RoleDocument;
+    use skys3_types::policy::{Policy, PolicyDocument, RequestContext};
+
+    let trust = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":{"Federated":"idp.example"},"Action":"sts:AssumeRoleWithWebIdentity"}}"#;
+    let allow =
+        r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"s3:*","Resource":"*"}}"#;
+    let json = serde_json::json!({
+        "trust_policy": trust,
+        "policies": [allow],
+        "proposal_id": "01J8Z6K3V2Q4",
+    })
+    .to_string();
+    let role = RoleDocument::from_json(json.as_bytes()).unwrap();
+    assert_eq!(role.trust_policy.text(), trust);
+    assert_eq!(role.policies[0].text(), allow);
+    let request = RequestContext::new("s3:GetObject", "arn:aws:s3:::b/k");
+    assert!(role.policies[0].policy().evaluate(&request).is_allowed());
+    assert_eq!(
+        RoleDocument::from_json(&role.to_json().unwrap()).unwrap(),
+        role
+    );
+    assert_eq!(role.proposal_id().to_string(), "01J8Z6K3V2Q4");
+
+    // Without policies, a role may do nothing.
+    let bare = serde_json::json!({"trust_policy": trust, "proposal_id": "01J8Z6K3V2Q4"});
+    let bare = RoleDocument::from_json(bare.to_string().as_bytes()).unwrap();
+    assert!(bare.policies.is_empty());
+
+    let mut crowded = role.clone();
+    crowded.policies = vec![role.policies[0].clone(); RoleDocument::MAX_POLICIES + 1];
+    let error = crowded.to_json().unwrap_err();
+    assert!(matches!(
+        error,
+        RegisterError::Invalid {
+            source: InvalidRegister::TooManyPolicies(11),
+            ..
+        }
+    ));
+    assert!(error.to_string().contains("at most 10"), "{error}");
+
+    for bad in [
+        serde_json::json!({"trust_policy": allow, "proposal_id": "01J8Z6K3V2Q4"}),
+        serde_json::json!({"trust_policy": trust, "policies": [trust], "proposal_id": "01J8Z6K3V2Q4"}),
+        serde_json::json!({"trust_policy": {"Version": "2012-10-17"}, "proposal_id": "01J8Z6K3V2Q4"}),
+        serde_json::json!({"trust_policy": trust, "proposal_id": "01J8Z6K3V2Q4", "extra": 1}),
+    ] {
+        assert!(
+            RoleDocument::from_json(bad.to_string().as_bytes()).is_err(),
+            "{bad}"
+        );
+    }
+    assert!(PolicyDocument::<Policy>::parse("{}").is_err());
+}
+
+#[test]
+fn role_names_fit_register_keys() {
+    use skys3_types::RoleDocument;
+
+    let longest = "r".repeat(64);
+    for good in ["deployer", "ci.deploy-1", "A_b", &longest] {
+        assert!(RoleDocument::valid_name(good), "{good}");
+    }
+    let too_long = "r".repeat(65);
+    for bad in ["", ".hidden", "a/b", "a+b", "a@b", &too_long] {
+        assert!(!RoleDocument::valid_name(bad), "{bad}");
+    }
+}
