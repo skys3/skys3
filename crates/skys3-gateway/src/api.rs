@@ -3,7 +3,7 @@
 //! `s3s` parses each request into its operation's input and serializes the
 //! output or error; [`Api`] implements the operations. Operations it does
 //! not implement answer `501 NotImplemented`, the default of `s3s`'s
-//! [`S3`] trait. Object operations are in `crate::objects`. The operations that exist only for features SkyS3 rejects
+//! [`S3`] trait. Object operations are in `crate::objects`, listings in `crate::listing`. The operations that exist only for features SkyS3 rejects
 //! (`crate::features`) answer here, after checking that the bucket exists,
 //! as S3 does.
 
@@ -20,7 +20,8 @@ use s3s::dto::{
     GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput, GetObjectOutput,
     GetObjectRetentionInput, GetObjectRetentionOutput, HeadBucketInput, HeadBucketOutput,
     HeadObjectInput, HeadObjectOutput, ListBucketsInput, ListBucketsOutput,
-    ListObjectVersionsInput, ListObjectVersionsOutput, ObjectOwnership, OwnershipControls,
+    ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, ObjectOwnership, OwnershipControls,
     OwnershipControlsRule, PutBucketAclInput, PutBucketAclOutput, PutBucketEncryptionInput,
     PutBucketEncryptionOutput, PutBucketOwnershipControlsInput, PutBucketOwnershipControlsOutput,
     PutBucketVersioningInput, PutBucketVersioningOutput, PutObjectAclInput, PutObjectAclOutput,
@@ -37,6 +38,7 @@ use crate::features::{
     BUCKET_OWNER_ENFORCED, acls_not_supported, missing_object_lock, object_lock_not_implemented,
     ownership_not_implemented, sse_not_implemented, versioning_not_implemented,
 };
+use crate::listing::Listings;
 use crate::objects::Objects;
 use crate::shard::Shards;
 
@@ -47,11 +49,20 @@ const MAX_BUCKETS_PER_PAGE: usize = 10_000;
 pub(crate) struct Api<C, H> {
     buckets: Arc<Buckets<C, H>>,
     objects: Objects<H>,
+    listings: Listings<H>,
 }
 
 impl<C, H> Api<C, H> {
-    pub(crate) fn new(buckets: Arc<Buckets<C, H>>, objects: Objects<H>) -> Self {
-        Self { buckets, objects }
+    pub(crate) fn new(
+        buckets: Arc<Buckets<C, H>>,
+        objects: Objects<H>,
+        listings: Listings<H>,
+    ) -> Self {
+        Self {
+            buckets,
+            objects,
+            listings,
+        }
     }
 }
 
@@ -196,6 +207,22 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let bucket = self.bucket(&req.input.bucket)?;
         ok(self.objects.delete(&bucket, req).await?)
+    }
+
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.listings.list_v2(&bucket, req.input).await?)
+    }
+
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        let bucket = self.bucket(&req.input.bucket)?;
+        ok(self.listings.list_v1(&bucket, req.input).await?)
     }
 
     async fn get_bucket_versioning(

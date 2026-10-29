@@ -43,6 +43,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "gateway_list_token"
+path = "fuzz_targets/gateway_list_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "gateway_request"
 path = "fuzz_targets/gateway_request.rs"
 test = false

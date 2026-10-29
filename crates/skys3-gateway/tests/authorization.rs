@@ -303,6 +303,26 @@ const CASES: &[Case] = &[
         resource: OBJECT,
         allowed: (204, None),
     },
+    Case {
+        operation: "ListObjectsV2",
+        method: Method::GET,
+        uri: "/bucket?list-type=2&prefix=k&delimiter=%2F",
+        headers: &[],
+        body: b"",
+        actions: &["s3:ListBucket"],
+        resource: BUCKET,
+        allowed: (200, None),
+    },
+    Case {
+        operation: "ListObjects",
+        method: Method::GET,
+        uri: "/bucket?marker=k",
+        headers: &[],
+        body: b"",
+        actions: &["s3:ListBucket"],
+        resource: BUCKET,
+        allowed: (200, None),
+    },
 ];
 
 /// The callers each case uses, by access key ID.

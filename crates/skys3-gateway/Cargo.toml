@@ -20,6 +20,7 @@ test-util = ["skys3-control/test-util"]
 [dependencies]
 async-trait.workspace = true
 aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+base64.workspace = true
 bytes.workspace = true
 crc-fast.workspace = true
 http.workspace = true
