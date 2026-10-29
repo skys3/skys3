@@ -226,8 +226,11 @@ async fn holds<S: ObjectStore>(
         (None, None) => true,
         (None, Some(info)) => written(&info).is_some_and(|at| at > entry.version),
         (Some(_), None) => false,
-        (Some(object), Some(info)) => {
-            written(&info).is_some_and(|at| at >= object.write_identity.unwrap_or(entry.version))
-        }
+        // A version that inherits an older write's identity, such as a
+        // completed upload's, is held under exactly that identity: a
+        // write between the two is older than the version, not later.
+        (Some(object), Some(info)) => written(&info).is_some_and(|at| {
+            at == object.write_identity.unwrap_or(entry.version) || at > entry.version
+        }),
     })
 }
