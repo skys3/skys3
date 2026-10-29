@@ -33,7 +33,7 @@ use skys3_types::{
     RegisterDocument,
 };
 use support::cluster::{CLUSTER, Leaf, Pki, WAIT, etcd, node_config};
-use support::process::free_port;
+use support::process::{ADDRESS_IN_USE, START_ATTEMPTS, free_port};
 use support::{admin_json, config_text, eventually, http_get};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -408,6 +408,26 @@ async fn a_node_needs_usable_credentials_and_its_transport_port() {
     assert!(fake.get(&format!("{CLUSTER}/nodes/n1.json")).is_none());
 }
 
+/// Starts node `n1` in `dir`, its transport on a fresh port. Test ports
+/// are free only when chosen ([`free_port`]): a test running in parallel,
+/// or a connection it opens, can take one, also while the node is down
+/// between restarts. A start that finds its port taken is tried again on
+/// another, up to [`START_ATTEMPTS`] times in all, as the binary's are.
+async fn start_n1(dir: &Path, pki: &Pki, store: &str) -> Node {
+    for attempt in 1..=START_ATTEMPTS {
+        let text = node_config(dir, pki, store, "n1", "n1", free_port(), 256);
+        match Node::start(text.parse().unwrap()).await {
+            Ok(node) => return node,
+            Err(StartError::Io { what, source })
+                if what.starts_with("binding the transport")
+                    && source.to_string().contains(ADDRESS_IN_USE)
+                    && attempt < START_ATTEMPTS => {}
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    unreachable!("the last attempt returns or panics")
+}
+
 /// A TCP forwarder to `target` on a port of its own, which refuses every
 /// connection while `up` is false: an etcd that stops and starts answering
 /// at the same address.
@@ -448,10 +468,9 @@ async fn a_claim_found_after_starting_from_the_copy_stops_the_node() {
     let store = format!("backend = \"etcd\"\netcd_endpoints = [\"http://127.0.0.1:{port}\"]");
     let dir = root.path().join("n1");
     std::fs::create_dir_all(&dir).unwrap();
-    let text = node_config(&dir, &pki, &store, "n1", "n1", free_port(), 256);
 
     // A first start registers n1 and leaves a copy of control state.
-    let node = Node::start(text.parse().unwrap()).await.unwrap();
+    let node = start_n1(&dir, &pki, &store).await;
     let key = format!("{CLUSTER}/nodes/n1.json");
     let ours = NodeRegistration::from_json(&fake.get(&key).unwrap()).unwrap();
     let instance = ours.instance_id.clone().unwrap();
@@ -460,7 +479,7 @@ async fn a_claim_found_after_starting_from_the_copy_stops_the_node() {
     // The store does not answer: the node starts from its copy, and its
     // registration waits.
     up.store(false, Ordering::SeqCst);
-    let node = Node::start(text.parse().unwrap()).await.unwrap();
+    let node = start_n1(&dir, &pki, &store).await;
     let state = cluster_state(&node).await;
     assert_eq!(state["registration"]["registered"], false);
     assert_eq!(state["registration"]["claimed_by"], serde_json::Value::Null);
