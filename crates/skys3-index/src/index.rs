@@ -356,6 +356,31 @@ impl Index {
         Ok(result)
     }
 
+    /// Makes a node-local change that no record makes, as
+    /// [`Index::update_local`] does, but in one durable commit, which makes
+    /// every earlier commit durable too, and returns what `update`
+    /// returns.
+    ///
+    /// Compaction moves and drops locations this way before it removes the
+    /// segment that held them (§10.3): replay never restores a location of
+    /// a record at or before its shard's applied position, so the change
+    /// must survive a crash before the old copy goes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `update`'s error, or an [`IndexError`] if redb fails. On an
+    /// error nothing changes.
+    pub fn update_durable<R>(
+        &self,
+        update: impl FnOnce(&mut IndexWriter<'_>) -> Result<R, IndexError>,
+    ) -> Result<R, IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        let result = update(&mut IndexWriter::open(&txn)?)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
     /// Removes everything the index holds for `shard`, in one non-durable
     /// commit: its entries, its record locations, its applied position,
     /// its kept configuration, its step-down (see

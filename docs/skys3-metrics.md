@@ -16,6 +16,7 @@ exports yet is listed as planned, with the PR that owns it.
   - [3.3 Replication](#33-replication)
   - [3.4 Read-through fill](#34-read-through-fill)
   - [3.5 Clean cache](#35-clean-cache)
+  - [3.6 Segment compaction](#36-segment-compaction)
 
 ## 1. Scraping
 
@@ -140,3 +141,16 @@ as cache, and evicts it least recently used first.
 | `skys3_clean_cache_bytes` | gauge | none | exported (M1-21) | Bytes of clean payload this node keeps as cache, over every shard replica on it. |
 | `skys3_clean_cache_limit_bytes` | gauge | none | exported (M1-21) | The most clean payload this node keeps: `cache_max_bytes_per_node`, or the room its disks have under `reserve_fraction` if that is less and every disk's space has been read. |
 | `skys3_clean_cache_evictions_total` | counter | none | exported (M1-21) | Clean payloads this node evicted: least recently used ones over a bound, and copies beyond the bucket's `clean_copies`. |
+
+### 3.6 Segment compaction
+
+Design section 10.3. Compaction reclaims released log segments whose live
+ratio is below `compaction_live_threshold`, after every checkpoint interval.
+
+| Name | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `skys3_compaction_segments_total` | counter | none | exported (M1-22) | Log segments compaction reclaimed. |
+| `skys3_compaction_reclaimed_bytes_total` | counter | none | exported (M1-22) | Bytes of the log segments compaction reclaimed: the size of their files. |
+| `skys3_compaction_copied_bytes_total` | counter | none | exported (M1-22) | Bytes of records compaction copied out of the segments it reclaimed into the active segments: dirty payload, metadata records, each shard's latest `CONFIG`, and clean payload it kept as cache. |
+| `skys3_compaction_evictions_total` | counter | none | exported (M1-22) | Clean payloads compaction evicted instead of copying them. They are not counted in `skys3_clean_cache_evictions_total`. |
+| `skys3_compaction_write_amplification` | gauge | none | exported (M1-22) | Compaction's write amplification since the node started: the bytes its logs wrote, over those written for anything but compaction's copies. 1 while compaction has copied nothing. |

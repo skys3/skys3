@@ -14,9 +14,10 @@ use skys3_types::{Epoch, EpochSeq, Generation, ShardConfig};
 use crate::codec;
 use crate::entry::{ControlEntry, Entry, Part, Upload};
 use crate::error::IndexError;
+use crate::holders::{self, Holders};
 use crate::listing::{self, ListPage, ListQuery};
 
-type Bytes = &'static [u8];
+pub(crate) type Bytes = &'static [u8];
 
 /// Each shard's namespace index, keyed by shard and object key.
 pub(crate) const NAMESPACE: TableDefinition<Bytes, Bytes> = TableDefinition::new("namespace");
@@ -74,7 +75,7 @@ const CONTROL_GENERATION_KEY: &str = "control_generation";
 /// started, in milliseconds since the Unix epoch.
 const CONTROL_SYNCED_AT_KEY: &str = "control_synced_at_ms";
 
-fn entry<T: ReadableTable<Bytes, Bytes>>(
+pub(crate) fn entry<T: ReadableTable<Bytes, Bytes>>(
     table: &T,
     shard: &ShardRef,
     key: &str,
@@ -116,7 +117,7 @@ fn upload<T: ReadableTable<Bytes, Bytes>>(
 
 /// Up to `limit` parts of the upload opened at `upload`, in part order,
 /// after part `after` (0 for the first).
-fn parts<T: ReadableTable<Bytes, Bytes>>(
+pub(crate) fn parts<T: ReadableTable<Bytes, Bytes>>(
     table: &T,
     shard: &ShardRef,
     upload: EpochSeq,
@@ -481,6 +482,16 @@ impl<'txn> IndexWriter<'txn> {
         position: EpochSeq,
     ) -> Result<Option<RecordLocation>, IndexError> {
         location(&self.locations, shard, position)
+    }
+
+    /// Returns what names each record that holds bytes of `key` in `shard`
+    /// on this node, as [`IndexReader::holders`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn holders(&self, shard: &ShardRef, key: &str) -> Result<Holders, IndexError> {
+        holders::holders(&self.namespace, &self.uploads, &self.parts, shard, key)
     }
 
     /// Records where the record at `position` in `shard` is on this node.
@@ -950,6 +961,20 @@ impl IndexReader {
         position: EpochSeq,
     ) -> Result<Option<RecordLocation>, IndexError> {
         location(&self.locations, shard, position)
+    }
+
+    /// Returns what names each record that holds bytes of `key` in `shard`
+    /// on this node: the key's entry, for its own payload or its multipart
+    /// object's parts, and the parts of the key's open uploads, by the
+    /// position of each record. Positions are those of the shard's log;
+    /// whether this node's copy of a record is the one the location map
+    /// names is the caller's to check. Evicted entries name no payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn holders(&self, shard: &ShardRef, key: &str) -> Result<Holders, IndexError> {
+        holders::holders(&self.namespace, &self.uploads, &self.parts, shard, key)
     }
 
     /// Returns the position of the last record applied to `shard`.

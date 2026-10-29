@@ -22,7 +22,9 @@ use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallCloc
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{AdminConfig, AdminError, AdminListener, AdminToken, Health, MetricsRegistry};
 use skys3_remote::aws::{AwsS3, default_credentials};
-use skys3_shard::{CacheMetrics, CacheSettings, CleanCache};
+use skys3_shard::{
+    CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
+};
 use skys3_sts::{
     HttpsFetcher, HttpsFetcherOptions, IdentityCopy, NodeCredentials, OidcValidator, SessionStore,
     StsEndpoint, StsSettings, ValidatorSettings,
@@ -919,6 +921,16 @@ impl Node {
             CacheMetrics::register(&metrics.registry),
         );
         storage.shards.set().use_cache(&cache).await;
+        // Segment compaction (§10.3) after every checkpoint interval: it
+        // reclaims released segments and tells the cache what it evicted.
+        let compactor = Compactor::new(
+            storage.shards.set().clone(),
+            CompactionSettings {
+                live_threshold: config.storage().compaction_live_threshold,
+                unreferenced_ttl: config.peering().peer_staging_ttl(),
+            },
+            CompactionMetrics::register(&metrics.registry),
+        );
         let space = Arc::new(
             DiskSpace::new(config.storage().disk_min_free_bytes).with_cache(cache.clone()),
         );
@@ -1074,6 +1086,7 @@ impl Node {
             let set = storage.shards.set().clone();
             background.spawn(async move { cache.run(set).await });
         }
+        background.spawn(async move { compactor.run(interval).await });
         background.spawn(watch_disks(
             storage.disks,
             pools.index.clone(),

@@ -42,8 +42,8 @@ use skys3_types::EpochSeq;
 
 use crate::machine::{Effect, Outcome};
 
-pub(crate) use ledger::Note;
 pub use ledger::{CacheMetrics, CacheSettings, CacheUsage, CleanCache};
+pub(crate) use ledger::{Hot, Note};
 
 /// Why a cache transition was refused. The entry is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

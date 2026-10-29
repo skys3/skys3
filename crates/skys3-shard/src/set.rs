@@ -112,6 +112,16 @@ impl<D: Disk> ShardSet<D> {
         self.logs.iter().map(|(label, log)| (label, log))
     }
 
+    /// The node's index.
+    pub(crate) fn index(&self) -> &Arc<Index> {
+        &self.index
+    }
+
+    /// The pool index work runs on.
+    pub(crate) fn pool(&self) -> &BlockingPool {
+        &self.pool
+    }
+
     fn placement(&self, shard: &ShardRef) -> usize {
         let hash = KeyHash::of(&shard.bucket, &[shard.shard.get()]).get();
         // The remainder is below the disk count, which is a `usize`.

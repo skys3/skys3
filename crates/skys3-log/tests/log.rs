@@ -6,18 +6,21 @@ mod harness;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use harness::{
     Audit, AuditedMount, delete, extent, inline_put, open, run_workload, runtime, small_config,
 };
-use skys3_io::{BlockingPool, Disk, RealDisk, SegmentFile, SimDisk, SimDiskFaults};
+use skys3_io::{
+    BlockingPool, Clock, Disk, MonoTime, RealDisk, SegmentFile, SimDisk, SimDiskFaults,
+};
 use skys3_log::record::{DecodeError, ErrorClass};
 use skys3_log::segment::file_name;
 use skys3_log::{
-    LogConfig, LogError, LogRecord, RecordLocation, RecoveryError, SegmentClass, SegmentId,
-    SegmentInfo, SegmentLog, SegmentSummary,
+    LogConfig, LogError, LogRecord, RETIRE_GRACE, RecordLocation, RecoveryError, SegmentClass,
+    SegmentId, SegmentInfo, SegmentLog, SegmentScanner, SegmentSummary,
 };
 use tokio::time::Instant;
 
@@ -999,5 +1002,127 @@ fn lazy_records_ride_the_next_group_commit() {
         assert_eq!(alone.offset, eager.end());
         assert_eq!(log.stats().group_commits, 2);
         assert_eq!(log.read(alone).await.unwrap(), delete(0, 3));
+    });
+}
+
+/// A hook a [`HookedClock`] runs on each reading.
+type Hook = Box<dyn Fn() + Send>;
+
+/// The test clock, which runs a hook on every reading while one is set:
+/// a way to look at the log from inside a call at each point where it
+/// reads the clock.
+#[derive(Default)]
+struct HookedClock {
+    hook: Mutex<Option<Hook>>,
+}
+
+impl std::fmt::Debug for HookedClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookedClock").finish_non_exhaustive()
+    }
+}
+
+impl HookedClock {
+    fn set_hook(&self, hook: Option<Hook>) {
+        *self.hook.lock().unwrap() = hook;
+    }
+}
+
+impl Clock for HookedClock {
+    fn now(&self) -> MonoTime {
+        if let Some(hook) = &*self.hook.lock().unwrap() {
+            hook();
+        }
+        harness::clock().now()
+    }
+
+    fn runtime_deadline(&self, deadline: MonoTime) -> Instant {
+        harness::clock().runtime_deadline(deadline)
+    }
+}
+
+/// Appends records until the log has a hot segment besides its last one,
+/// releases it, and returns its id and the records in it.
+async fn released_segment<D: Disk>(log: &SegmentLog<D>) -> (SegmentId, Vec<LogRecord>) {
+    let records: Vec<_> = (1..=6).map(|seq| inline_put(0, seq, 400)).collect();
+    let locations = append_all(log, &records).await;
+    let first = locations[0].segment;
+    assert_ne!(locations[5].segment, first, "the log rolled over");
+    log.release([first]);
+    let held = records
+        .into_iter()
+        .zip(&locations)
+        .filter(|(_, location)| location.segment == first)
+        .map(|(record, _)| record)
+        .collect();
+    (first, held)
+}
+
+async fn scan_records<F: SegmentFile>(mut scanner: SegmentScanner<F>) -> Vec<LogRecord> {
+    let mut records = Vec::new();
+    while let Some(scanned) = scanner.next().await.unwrap() {
+        records.push(scanned.decode().unwrap());
+    }
+    records
+}
+
+#[test]
+fn a_segment_being_retired_is_always_readable() {
+    run(async {
+        let disk = SimDisk::new(10);
+        let clock = Arc::new(HookedClock::default());
+        let (log, _) = SegmentLog::open(disk.mount(), small_config(), clock.clone())
+            .await
+            .unwrap();
+        let (id, held) = released_segment(&log).await;
+        // Retiring reads the clock. At each reading, wherever it falls, the
+        // segment must be found, listed or retired.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        clock.set_hook(Some(Box::new({
+            let (log, seen) = (log.clone(), Arc::clone(&seen));
+            move || seen.lock().unwrap().push(log.scan(id).map(|_| ()))
+        })));
+        log.retire(id).await.unwrap();
+        clock.set_hook(None);
+        let seen = std::mem::take(&mut *seen.lock().unwrap());
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(Result::is_ok), "{seen:?}");
+        assert_eq!(scan_records(log.scan(id).unwrap()).await, held);
+    });
+}
+
+#[test]
+fn listed_segments_stay_scannable_after_they_are_retired() {
+    run(async {
+        let disk = SimDisk::new(11);
+        let (log, _) = open(disk.mount(), small_config()).await.unwrap();
+        let (id, held) = released_segment(&log).await;
+        let listed: Vec<_> = log.segments().iter().map(|s| s.id).collect();
+        let pinned = log.scan_all().unwrap();
+        let scanned: Vec<_> = pinned.iter().map(SegmentScanner::segment).collect();
+        assert_eq!(scanned, listed);
+        log.retire(id).await.unwrap();
+        assert!(!log.segments().iter().any(|s| s.id == id));
+
+        // Within the grace, a scan of a segment listed before finds every
+        // record in it.
+        assert_eq!(scan_records(log.scan(id).unwrap()).await, held);
+        let end = log.scan(id).unwrap().end();
+        assert_eq!(
+            scan_records(log.scan_range(id, 0, end).unwrap()).await,
+            held
+        );
+
+        // After it, only scanners taken before still read the segment.
+        tokio::time::advance(RETIRE_GRACE).await;
+        assert_eq!(log.drop_retired(), 1);
+        assert!(matches!(log.scan(id), Err(LogError::UnknownSegment(s)) if s == id));
+        for scanner in pinned {
+            let segment = scanner.segment();
+            let records = scan_records(scanner).await;
+            if segment == id {
+                assert_eq!(records, held);
+            }
+        }
     });
 }

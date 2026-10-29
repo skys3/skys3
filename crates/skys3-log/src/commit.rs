@@ -66,7 +66,7 @@ struct Active<F> {
 /// failed sync covered is acknowledged later.
 #[derive(Debug)]
 pub(crate) struct Committer<D: Disk> {
-    disk: D,
+    disk: Arc<D>,
     shared: Arc<Shared<D::File>>,
     requests: mpsc::Receiver<Request>,
     clock: Arc<dyn Clock>,
@@ -81,7 +81,7 @@ pub(crate) struct Committer<D: Disk> {
 
 impl<D: Disk> Committer<D> {
     pub(crate) fn new(
-        disk: D,
+        disk: Arc<D>,
         shared: Arc<Shared<D::File>>,
         requests: mpsc::Receiver<Request>,
         clock: Arc<dyn Clock>,
@@ -254,7 +254,7 @@ impl<D: Disk> Committer<D> {
         let [hot, bulk] = buffers;
         let [hot_segment, bulk_segment] = self.active.each_ref();
         let dir_dirty = self.dir_dirty;
-        let disk = &self.disk;
+        let disk = &*self.disk;
         let (hot, bulk, dir) = tokio::join!(
             write_and_sync(hot_segment.as_ref(), hot),
             write_and_sync(bulk_segment.as_ref(), bulk),
@@ -300,6 +300,9 @@ impl<D: Disk> Committer<D> {
         let file = Arc::new(self.disk.create(&file_name(class, id)).await?);
         self.next_id = id.next();
         self.dir_dirty = true;
+        if let Some(previous) = &self.active[index] {
+            self.shared.seal(previous.id, self.clock.now());
+        }
         self.shared.add_segment(id, class, Arc::clone(&file));
         self.active[index] = Some(Active { id, file, len: 0 });
         Ok(())

@@ -81,7 +81,9 @@ mod scan;
 pub mod segment;
 
 pub use config::LogConfig;
-pub use log::{LAZY_MAX_DELAY, LogError, LogStats, MAX_RECORD_LEN, Queued, SegmentLog};
+pub use log::{
+    LAZY_MAX_DELAY, LogError, LogStats, MAX_RECORD_LEN, Queued, RETIRE_GRACE, SegmentLog,
+};
 pub use record::{DecodeError, EncodeError, LogRecord, RecordBody, RecordKind, ShardRef};
 pub use recovery::{RecoveryError, RecoveryReport, TornTail};
 pub use scan::{ScanError, ScannedRecord, SegmentScanner};
