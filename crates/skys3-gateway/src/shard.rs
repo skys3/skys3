@@ -284,6 +284,18 @@ pub enum ShardError {
     /// client writes.
     #[error("shard {0} is sealed while its bucket is deleted")]
     Sealed(ShardRef),
+    /// The shard's members did not acknowledge the write in time (design
+    /// §5.2): clients get `503 SlowDown`. The write may still take effect.
+    #[error("shard {shard} did not acknowledge the write: {reason}")]
+    NotAcknowledged {
+        /// The shard.
+        shard: ShardRef,
+        /// The position the write took, if it got one: it may still commit
+        /// there.
+        position: Option<EpochSeq>,
+        /// Why.
+        reason: String,
+    },
     /// The shard's primary could not serve the request.
     #[error("shard {shard} is unavailable: {reason}")]
     Unavailable {

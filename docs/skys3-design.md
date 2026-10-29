@@ -272,6 +272,10 @@ A failed response means **not acknowledged**, not **not applied**. S3 has the sa
 
 If the member cannot be removed, because the control store is unreachable, requests fail after the timeout in both modes. Section 16.3 measures the p99 cost of each.
 
+The timeout runs from when the primary takes a request until its record is committed and applied, and covers every wait behind the members: a conditional write waiting for an earlier write of its key, and a seal waiting for the writes before it. A request that times out keeps its record's position. In fail-fast mode, once a request has timed out, the primary refuses new writes at once, without sequencing them, until every record sequenced before the timeout is applied. Since a failed write can commit after its answer, a read sent after the failure may miss it and a later read see it; it still takes effect before every write sequenced after it, so before any write sent after the failure was answered.
+
+**Closing a shard** (node shutdown, or removing the shard) waits at most `replica_ack_timeout` for the records sequenced before it to commit, then stops the shard anyway. The records still waiting stay in the log but are not applied, and their writers have timed out by then. The next opening commits them, rolled forward in the primary's epoch (section 5.1), or a new primary discards them (section 6.6). A member whose primary is gone closes the same way. A node that shuts down closes all its shards at once, so it waits about one timeout in all, however many shards lose a member. A shard with a single member has no timeout, since it waits only for its own disk.
+
 ### 5.3 Durable I/O per small PUT
 
 | | Previous proposal, no batching | This design |

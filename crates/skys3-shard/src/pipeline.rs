@@ -163,6 +163,20 @@ impl<W, B> Pipeline<W, B> {
         }
     }
 
+    /// Empties the queue without releasing anything for applying, and
+    /// returns what the writers and the barriers wait on, in queue order.
+    /// Answers for the records it held are ignored from then on.
+    pub(crate) fn abandon(&mut self) -> (Vec<W>, Vec<B>) {
+        let (mut writes, mut barriers) = (Vec::new(), Vec::new());
+        for slot in self.slots.drain(..) {
+            match slot {
+                Slot::Write { reply, .. } => writes.push(reply),
+                Slot::Barrier(reply) => barriers.push(reply),
+            }
+        }
+        (writes, barriers)
+    }
+
     fn committed(&self, position: EpochSeq) -> bool {
         self.limit.is_none_or(|limit| position.seq <= limit)
     }
@@ -277,6 +291,23 @@ mod tests {
         assert_eq!(pipeline.durable_through(), Some(at(3)));
         assert_eq!(applied(pipeline.next()), [3]);
         assert!(matches!(pipeline.next(), Some(Ready::Barrier("after"))));
+    }
+
+    #[test]
+    fn abandoning_hands_back_every_waiter_and_releases_nothing() {
+        let mut pipeline = Pipeline::<u64, &str>::default();
+        pipeline.require_commit(Seq::ZERO);
+        pipeline.sequenced(at(1), 1);
+        pipeline.barrier("first");
+        pipeline.sequenced(at(2), 2);
+        pipeline.resolved(at(1), durable(1));
+        assert!(pipeline.next().is_none());
+        assert_eq!(pipeline.abandon(), (vec![1, 2], vec!["first"]));
+        // Later answers and commits find nothing to release.
+        pipeline.resolved(at(2), durable(2));
+        pipeline.commit_through(Seq::new(2));
+        assert!(pipeline.next().is_none());
+        assert_eq!(pipeline.durable_through(), None);
     }
 
     #[test]

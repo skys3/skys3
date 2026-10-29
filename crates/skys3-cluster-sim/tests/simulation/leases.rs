@@ -15,6 +15,7 @@ use skys3_cluster_sim::{
     Cluster, ClusterConfig, Drift, Endpoint, Fault, FaultPlan, FaultProfile, ReplicatedServices,
     RunError, View, Workload,
 };
+use skys3_shard::AckTimeout;
 use skys3_shard::replication::ReplicationConfig;
 use skys3_sim::history::Outcome;
 use skys3_sim::{Runner, SimContext};
@@ -23,12 +24,17 @@ use crate::COST;
 
 /// The lease timings of these scenarios: shorter than the defaults so that
 /// partitions outlast leases and grace quickly, and within the design's
-/// inequality for `ρ` = 1% ([`timings_keep_the_lease_inequality`]).
+/// inequality for `ρ` = 1% ([`timings_keep_the_lease_inequality`]). A
+/// partition stalls the writes of every shard it cuts a member from, so
+/// writes fail fast: once one has waited 300 ms, the shard refuses writes
+/// at once until the member is back, and clients move on to reads rather
+/// than all waiting out the partition (§5.2).
 fn replication() -> ReplicationConfig {
     ReplicationConfig {
         lease_renew_interval: Duration::from_millis(200),
         primary_lease: Duration::from_millis(800),
         primary_grace: Duration::from_millis(1400),
+        ack_timeout: AckTimeout::fail_fast(Duration::from_millis(300)),
         ..ReplicationConfig::default()
     }
 }
@@ -48,16 +54,14 @@ fn config() -> ClusterConfig {
 }
 
 /// A busy workload: many clients with short pauses, so reads land in every
-/// window a partition opens. A partition stalls the writes of every shard
-/// it cuts a member from, so clients give up on an answer soon and move
-/// on, rather than all waiting out the partition.
+/// window a partition opens. Clients wait the default 2 s for an answer:
+/// stalled writes fail fast instead ([`replication`]).
 fn workload(context: &SimContext) -> Workload {
     Workload {
         clients: 8,
         operations: 120 * context.scale() as usize,
         keys: 6,
         think_time: Duration::from_millis(60),
-        timeout: Duration::from_millis(300),
         ..Workload::default()
     }
 }

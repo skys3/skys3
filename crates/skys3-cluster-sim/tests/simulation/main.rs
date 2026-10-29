@@ -12,7 +12,10 @@
 //!   loss, partitions, and message loss.
 //! - [`leases`]: reads under leases, with partitions and clock drift within
 //!   and beyond the bound `ρ`.
+//! - [`acks`]: writes that time out while a member is cut off, in both
+//!   acknowledgement timeout modes.
 
+mod acks;
 mod crash;
 mod harness;
 mod leases;

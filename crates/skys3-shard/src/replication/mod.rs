@@ -47,6 +47,7 @@ use skys3_log::ShardRef;
 use skys3_net::{Frame, Listener, Network, Receiver, Transport, TransportError};
 use skys3_types::{NodeAddress, NodeId, ShardConfig};
 
+use crate::ack::AckTimeout;
 use crate::error::ShardError;
 use crate::lease::Grace;
 use crate::set::ShardSet;
@@ -81,6 +82,9 @@ pub struct ReplicationConfig {
     /// (§5.4). Configuration loading checks it against `primary_lease`
     /// and the drift bound `ρ`.
     pub primary_grace: Duration,
+    /// `replica_ack_timeout` and its mode: how long a replicated shard's
+    /// requests wait for its members (§5.2, [`Shard::set_ack_timeout`]).
+    pub ack_timeout: AckTimeout,
 }
 
 impl Default for ReplicationConfig {
@@ -93,6 +97,7 @@ impl Default for ReplicationConfig {
             lease_renew_interval: Duration::from_secs(1),
             primary_lease: Duration::from_secs(4),
             primary_grace: Duration::from_secs(6),
+            ack_timeout: AckTimeout::DEFAULT,
         }
     }
 }
@@ -210,7 +215,9 @@ impl<N: Network, D: Disk> Replication<N, D> {
     /// links to the members on the current Tokio runtime, which run until
     /// the shard stops, and its leases. As a member, it starts the shard's
     /// grace, unless it is running: opening counts as granting a lease,
-    /// since this life does not know when the node last granted one.
+    /// since this life does not know when the node last granted one. Either
+    /// way its requests wait for the members at most
+    /// [`ReplicationConfig::ack_timeout`].
     ///
     /// # Errors
     ///
@@ -218,6 +225,7 @@ impl<N: Network, D: Disk> Replication<N, D> {
     pub async fn open(&self, config: &ShardConfig) -> Result<Shard<D>, ShardError> {
         let inner = &self.inner;
         let shard = inner.set.open_replica(config, &inner.node).await?;
+        shard.set_ack_timeout(inner.config.ack_timeout);
         if shard.role() == Role::Member {
             inner.grace_of(shard.shard());
         }

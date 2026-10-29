@@ -69,8 +69,11 @@ pub enum Outcome {
     Read(Option<String>),
     /// The operation failed with an answer that does not rule out an
     /// effect, such as a `503`. A write then took effect at most once,
-    /// between its call and its answer: a node sequences a write before it
-    /// answers, and never after it reported failure (design §5.2).
+    /// after its call and before every write called after its answer: a
+    /// node sequences a write before it answers, never after it reported
+    /// failure, and applies writes in sequence (design §5.2). The write
+    /// may commit after its answer, so a read called after the answer, or
+    /// a conditional write refused on such a read, may still miss it.
     Failed,
     /// No answer arrived, for example because the connection broke or the
     /// client timed out. A write then took effect at most once, at any time

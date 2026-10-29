@@ -89,7 +89,7 @@ mod workload;
 pub use cluster::{Cluster, ClusterConfig, Invariant, Report, RunError, View};
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
-pub use replication::{IoCounts, LeaseCounts, ReplicatedServices, ReplicatedShards};
+pub use replication::{IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards};
 pub use s3::S3_PORT;
 pub use workload::Workload;
 
