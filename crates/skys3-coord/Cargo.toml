@@ -1,0 +1,31 @@
+[package]
+name = "skys3-coord"
+description = "SkyS3 coordinator: the coordinator lease, the change path that announces every control-store change with a new generation, and pushes of new generations to every node."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+prost.workspace = true
+skys3-config.workspace = true
+skys3-control.workspace = true
+skys3-io.workspace = true
+skys3-net.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rcgen.workspace = true
+# `test-util` for the fault-injecting control store.
+skys3-control = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }

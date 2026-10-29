@@ -22,6 +22,7 @@ crc32c = "0.6"
 libfuzzer-sys = "0.4"
 serde_json = "1"
 skys3-control = { path = "../crates/skys3-control" }
+skys3-coord = { path = "../crates/skys3-coord" }
 skys3-gateway = { path = "../crates/skys3-gateway", features = ["test-util"] }
 skys3-index = { path = "../crates/skys3-index" }
 skys3-log = { path = "../crates/skys3-log" }
@@ -35,6 +36,13 @@ tokio = { version = "1", features = ["rt"] }
 [[bin]]
 name = "control_etcd_frame"
 path = "fuzz_targets/control_etcd_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coord_control_changed"
+path = "fuzz_targets/coord_control_changed.rs"
 test = false
 doc = false
 bench = false

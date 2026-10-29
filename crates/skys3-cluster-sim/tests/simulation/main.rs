@@ -14,12 +14,16 @@
 //!   and beyond the bound `ρ`.
 //! - [`acks`]: writes that time out while a member is cut off, in both
 //!   acknowledgement timeout modes.
+//! - [`coordinator`]: the coordinator lease, with a node that wrongly
+//!   believes it is coordinator and with a coordinator cut off from the
+//!   control store, and pushes of every change.
 //! - [`removal`]: primaries removing a member that stops responding, in
 //!   both modes, without the control store, and across a restart.
 //! - [`routing`]: gateways on every node with stale shard maps, routing
 //!   each request to its primary under crashes and partitions.
 
 mod acks;
+mod coordinator;
 mod crash;
 mod harness;
 mod leases;

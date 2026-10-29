@@ -2163,6 +2163,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "skys3-coord"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "prost",
+ "skys3-config",
+ "skys3-control",
+ "skys3-io",
+ "skys3-net",
+ "skys3-types",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "skys3-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -2170,6 +2186,7 @@ dependencies = [
  "libfuzzer-sys",
  "serde_json",
  "skys3-control",
+ "skys3-coord",
  "skys3-gateway",
  "skys3-index",
  "skys3-log",
