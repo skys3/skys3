@@ -594,9 +594,13 @@ async fn a_lost_control_store_is_rebuilt_from_the_nodes_copy() {
         put(&s3, bucket, "a", bucket.as_bytes()).await;
     }
     let admin = node.admin_addr().to_string();
-    let generation = admin_json(&admin, "/v1/health").await["control_store"]["generation"]
-        .as_u64()
-        .unwrap();
+    // The copy follows the creations after they are answered: wait until
+    // it holds both, after the bootstrap's generation 1.
+    let generation = 3_u64;
+    eventually("the copy holds both buckets' generation", || async {
+        admin_json(&admin, "/v1/health").await["control_store"]["generation"] == generation
+    })
+    .await;
     node.shutdown().await.unwrap();
 
     // The control store is lost. A node runs from its copy, and while it

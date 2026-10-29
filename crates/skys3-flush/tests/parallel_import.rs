@@ -225,8 +225,10 @@ fn every_stream_shares_one_rate_limit() {
                 imported as f64 <= 20.0 * elapsed + 1e-6,
                 "{imported} keys after {elapsed} s"
             );
+            // The count above may predate the last page's keys: count again
+            // once the import says it is done.
             if status(&service).checkpoint == ImportCheckpoint::Done {
-                assert_eq!(imported, 40);
+                assert_eq!(indexed(&node).await.len(), 40);
                 break;
             }
             assert!(!patience.is_exhausted(), "{:?}", status(&service));
