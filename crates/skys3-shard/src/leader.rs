@@ -5,12 +5,15 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use bytes::Bytes;
+use skys3_io::{Clock, MonoTime};
 use skys3_log::ShardRef;
 use skys3_types::{NodeId, Seq, ShardConfig};
 use tokio::sync::{mpsc, watch};
 
+use crate::lease::Leases;
 use crate::shard::{Message, Sequencer};
 
 /// A record the primary sends its members: its `seq` and its encoding.
@@ -87,6 +90,12 @@ struct State {
 ///   every record any of them holds beyond the primary's own has been
 ///   rolled forward, and all of it is committed. Members hold no record the
 ///   primary did not sequence, so nothing needs truncating in its epoch.
+/// - **Leases.** The primary serves reads only while it holds a lease from
+///   every member (§5.4). Its links stamp what they send with
+///   [`Leader::lease_stamp`], and each acknowledgement that echoes a stamp
+///   grants a lease until the stamp plus `primary_lease`
+///   ([`Leader::granted`]). Writes need no lease: the commit rule and
+///   epochs fence them.
 pub struct Leader {
     shard: ShardRef,
     members: Vec<NodeId>,
@@ -100,6 +109,9 @@ pub struct Leader {
     /// them in an order chosen at random).
     changes: Vec<watch::Sender<u64>>,
     links: AtomicBool,
+    /// The leases from the members. A leaf lock: nothing else is locked
+    /// while it is held.
+    leases: Mutex<Leases>,
 }
 
 impl fmt::Debug for Leader {
@@ -146,6 +158,7 @@ impl Leader {
             durable,
             state: Mutex::new(state),
             links: AtomicBool::new(false),
+            leases: Mutex::default(),
         }
     }
 
@@ -165,6 +178,42 @@ impl Leader {
     /// starts the links to the members.
     pub fn claim_links(&self) -> bool {
         !self.links.swap(true, Ordering::SeqCst)
+    }
+
+    /// Times the members' leases on `clock`, each lasting `primary_lease`
+    /// from the stamp it acknowledges. Until this is called the primary
+    /// holds no lease, and serves no read.
+    pub fn start_leases(&self, clock: Arc<dyn Clock>, primary_lease: Duration) {
+        self.leases().start(clock, primary_lease);
+    }
+
+    /// The stamp for a beacon or append sent now: the primary's clock
+    /// reading, or `None` before [`Leader::start_leases`].
+    #[must_use]
+    pub fn lease_stamp(&self) -> Option<MonoTime> {
+        self.leases().stamp()
+    }
+
+    /// Records that `member` acknowledged the beacon or append stamped
+    /// `stamp`, which grants a lease until `stamp + primary_lease`.
+    pub fn granted(&self, member: &NodeId, stamp: MonoTime) {
+        if self.members.contains(member) {
+            self.leases().granted(member, stamp);
+        }
+    }
+
+    /// When the lease from `member` ends on the primary's clock, if it ever
+    /// granted one.
+    #[must_use]
+    pub fn lease(&self, member: &NodeId) -> Option<MonoTime> {
+        self.leases().until(member)
+    }
+
+    /// Whether the primary holds a valid lease from every member now, as
+    /// serving a read requires.
+    #[must_use]
+    pub fn holds_leases(&self) -> bool {
+        self.leases().held(&self.members)
     }
 
     /// The commit watermark: every record up to it is durable on every
@@ -307,6 +356,11 @@ impl Leader {
     fn state(&self) -> MutexGuard<'_, State> {
         // Every update leaves the state consistent.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn leases(&self) -> MutexGuard<'_, Leases> {
+        // Every update leaves the leases consistent.
+        self.leases.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

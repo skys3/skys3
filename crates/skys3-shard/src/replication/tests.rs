@@ -1,10 +1,12 @@
 //! A member's end of the protocol over real TCP, driven by a hand-written
-//! primary that also breaks the rules.
+//! primary that also breaks the rules, and a primary's link to a
+//! hand-written member whose log stalls.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -99,10 +101,9 @@ fn config() -> ShardConfig {
     }
 }
 
-/// Node 2, serving links on a loopback port, with the shard open as a
-/// member.
-async fn member(pki: &Pki) -> SocketAddr {
-    let disk = SimDisk::new(9);
+/// A node's shard set on a disk of its own, and its clock.
+async fn shard_set(seed: u64) -> (ShardSet<SimMount>, Arc<MonotonicClock>) {
+    let disk = SimDisk::new(seed);
     let log_config = LogConfig {
         inline_max_bytes: 512,
         segment_bytes: 8192,
@@ -110,28 +111,37 @@ async fn member(pki: &Pki) -> SocketAddr {
         group_commit_max_bytes: 16 * 1024,
     };
     let clock = Arc::new(MonotonicClock::new());
-    let (log, _) = SegmentLog::open(disk.mount(), log_config, clock)
+    let (log, _) = SegmentLog::open(disk.mount(), log_config, Arc::clone(&clock) as _)
         .await
         .unwrap();
     let index = Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
     let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
-    let set = ShardSet::<SimMount>::new(Arc::new(index), log, pool);
+    (ShardSet::new(Arc::new(index), log, pool), clock)
+}
+
+/// Node 2, serving links on a loopback port, with the shard open as a
+/// member.
+async fn member(pki: &Pki) -> (SocketAddr, Replication<TokioNetwork, SimMount>) {
+    let (set, clock) = shard_set(9).await;
     let transport = pki.transport(&node(2));
     let replication = Replication::new(
         node(2),
         set,
         transport.clone(),
         BTreeMap::new(),
+        clock,
         ReplicationConfig::default(),
     );
+    assert!(replication.grace(&shard()).is_none());
     replication.open(&config()).await.unwrap();
     let listener = transport
         .bind("127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { replication.serve(listener).await });
-    address
+    let serving = replication.clone();
+    tokio::spawn(async move { serving.serve(listener).await });
+    (address, replication)
 }
 
 type Link = Connection<TcpStream>;
@@ -191,6 +201,7 @@ async fn append(link: &mut Link, epoch: u64, seq: u64) {
         epoch,
         commit: 0,
         lazy: false,
+        lease: None,
     };
     // A peer that already closed the link refuses the frame; the next
     // receive tells.
@@ -225,8 +236,12 @@ fn a_member_follows_only_its_primary() {
 
 async fn scenario() {
     let pki = Pki::new();
-    let address = member(&pki).await;
+    let (address, replication) = member(&pki).await;
     let config = config();
+    // Opening the shard as a member started its grace.
+    let grace = replication.grace(&shard()).expect("the member's grace");
+    let mut grants = grace.subscribe();
+    grants.borrow_and_update();
 
     // Refusals: a node that is not the primary it names, a shard not
     // open here, an older epoch (R2), and another configuration.
@@ -261,15 +276,23 @@ async fn scenario() {
     assert_eq!((answers[0].0.last, answers[0].0.epoch), (0, 2));
     append(&mut first, 2, 1).await;
     durable_through(&mut first, 1).await;
+    // No stamp came yet, so no acknowledgement granted a lease.
+    assert!(!grants.has_changed().unwrap());
     let beacon = Beacon {
         epoch: 2,
         commit: 1,
+        lease: Some(7_000),
     };
     first
         .send(&wire::frame(MessageKind::Beacon, &beacon, Bytes::new()))
         .await
         .unwrap();
-    assert_eq!(ack(&mut first).await.unwrap().durable, 1);
+    // The answer echoes the stamp, which grants a lease and restarts the
+    // member's grace.
+    let answer = ack(&mut first).await.unwrap();
+    assert_eq!((answer.durable, answer.lease), (1, Some(7_000)));
+    assert!(grants.has_changed().unwrap());
+    assert!(!grace.has_passed());
 
     // A later session ends the earlier one, and gets back the record
     // its primary does not hold.
@@ -299,4 +322,116 @@ async fn scenario() {
         sync(&mut fourth, &config, 1).await.last().unwrap().0.last,
         1
     );
+}
+
+#[test]
+fn beacons_come_well_within_the_link_timeout() {
+    let config = ReplicationConfig::default();
+    assert_eq!(config.beacon_every(true), config.beacon_interval);
+    // The renewal interval equals the link timeout by default: a busy link
+    // beacons four times as often.
+    assert_eq!(config.lease_renew_interval, config.link_timeout);
+    assert_eq!(config.beacon_every(false), config.link_timeout / 4);
+    let slow = ReplicationConfig {
+        beacon_interval: Duration::from_secs(5),
+        lease_renew_interval: Duration::from_millis(100),
+        ..config
+    };
+    assert_eq!(slow.beacon_every(true), slow.link_timeout / 4);
+    assert_eq!(slow.beacon_every(false), Duration::from_millis(100));
+}
+
+/// A member that takes a session, answers every beacon, and acknowledges
+/// no record: its log is stuck behind a slow sync. Counts its sessions.
+async fn stalled_member(pki: &Pki, sessions: Arc<AtomicUsize>) -> SocketAddr {
+    let listener = pki
+        .transport(&node(2))
+        .bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok(incoming) = listener.accept().await {
+            let Ok(mut link) = incoming.handshake().await else {
+                continue;
+            };
+            sessions.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let answer = SyncAck {
+                    last: 0,
+                    done: true,
+                    epoch: 2,
+                    refused: String::new(),
+                };
+                if next(&mut link).await.is_none() {
+                    return;
+                }
+                let frame = wire::frame(MessageKind::SyncAck, &answer, Bytes::new());
+                if link.send(&frame).await.is_err() {
+                    return;
+                }
+                while let Some(frame) = next(&mut link).await {
+                    let Ok(beacon) = wire::body::<Beacon>(&frame, MessageKind::Beacon) else {
+                        // An append: never durable while the log is stuck.
+                        continue;
+                    };
+                    let ack = AppendAck {
+                        durable: 0,
+                        rejected: 0,
+                        lease: beacon.lease,
+                    };
+                    let frame = wire::frame(MessageKind::AppendAck, &ack, Bytes::new());
+                    if link.send(&frame).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+/// A busy primary beacons on its renewal interval, which equals the link
+/// timeout by default. While its member's log acknowledges nothing, the
+/// answers to those beacons were all the link heard, one per timeout, so
+/// the link timed out and reconnected over and over. Beacons now come at
+/// least every quarter of the timeout: through a stall of three timeouts,
+/// the link stays up and the primary keeps its lease.
+#[test]
+fn a_busy_link_whose_member_stalls_stays_up_and_keeps_its_lease() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(WAIT, stalled_link())
+            .await
+            .expect("the test finished in time");
+    });
+}
+
+async fn stalled_link() {
+    let pki = Pki::new();
+    let sessions = Arc::new(AtomicUsize::new(0));
+    let address = stalled_member(&pki, Arc::clone(&sessions)).await;
+    // Idle beacons on the renewal interval too, so the primary beacons as
+    // a busy one does whether or not records flow.
+    let timing = ReplicationConfig {
+        beacon_interval: ReplicationConfig::default().lease_renew_interval,
+        ..ReplicationConfig::default()
+    };
+    let (set, clock) = shard_set(11).await;
+    let peers = BTreeMap::from([(node(2), address.to_string().parse().unwrap())]);
+    let primary = Replication::new(node(1), set, pki.transport(&node(1)), peers, clock, timing);
+    let shard = primary.open(&config()).await.unwrap();
+    let leader = Arc::clone(shard.leader().unwrap());
+    while !leader.holds_leases() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let until = tokio::time::Instant::now() + timing.link_timeout * 3;
+    while tokio::time::Instant::now() < until {
+        assert!(leader.holds_leases(), "the primary lost its lease");
+        assert_eq!(sessions.load(Ordering::SeqCst), 1, "the link reconnected");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
