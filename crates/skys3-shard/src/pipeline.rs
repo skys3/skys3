@@ -9,11 +9,16 @@
 //! position until it is durable and every record before it has been
 //! released, so a small `PUT` is never applied while the extents of an
 //! earlier upload are still in flight.
+//!
+//! On a replicated shard a durable record must also be committed before it
+//! is applied: the queue then releases records only up to a commit limit,
+//! the `seq` every other member has acknowledged as durable on the primary,
+//! or the commit watermark a member learned from its primary (§5.1).
 
 use std::collections::VecDeque;
 
 use skys3_log::{LogRecord, RecordLocation};
-use skys3_types::EpochSeq;
+use skys3_types::{EpochSeq, Seq};
 
 /// A record that is durable, with where it is stored. Boxed, as records
 /// are large next to the rest of a queue slot.
@@ -48,12 +53,16 @@ pub(crate) enum Ready<W, B> {
 #[derive(Debug)]
 pub(crate) struct Pipeline<W, B> {
     slots: VecDeque<Slot<W, B>>,
+    /// The last `seq` a durable record may have to be released, or `None`
+    /// if every durable record may be.
+    limit: Option<Seq>,
 }
 
 impl<W, B> Default for Pipeline<W, B> {
     fn default() -> Self {
         Self {
             slots: VecDeque::new(),
+            limit: None,
         }
     }
 }
@@ -97,9 +106,39 @@ impl<W, B> Pipeline<W, B> {
         }
     }
 
+    /// Raises the commit limit to `limit`; a lower limit changes nothing.
+    pub(crate) fn commit_through(&mut self, limit: Seq) {
+        self.limit = Some(self.limit.map_or(limit, |old| old.max(limit)));
+    }
+
+    /// Makes every durable record wait for the commit limit, which starts
+    /// at `limit`.
+    pub(crate) fn require_commit(&mut self, limit: Seq) {
+        self.limit = Some(limit);
+    }
+
+    /// The position of the last record of the longest run of durable
+    /// records at the front of the queue, committed or not, if the queue
+    /// starts with one.
+    pub(crate) fn durable_through(&self) -> Option<EpochSeq> {
+        self.slots
+            .iter()
+            .filter(|slot| !matches!(slot, Slot::Barrier(_)))
+            .map_while(|slot| match slot {
+                Slot::Write {
+                    position,
+                    result: Some(Ok(_)),
+                    ..
+                } => Some(*position),
+                _ => None,
+            })
+            .last()
+    }
+
     /// Releases what is ready at the front of the queue: a barrier, a
-    /// failed record, or the longest run of durable records. Returns
-    /// `None` while the front record is still in flight.
+    /// failed record, or the longest run of durable, committed records.
+    /// Returns `None` while the front record is still in flight or waits
+    /// for the commit limit.
     pub(crate) fn next(&mut self) -> Option<Ready<W, B>> {
         match self.slots.pop_front()? {
             Slot::Barrier(reply) => Some(Ready::Barrier(reply)),
@@ -109,29 +148,33 @@ impl<W, B> Pipeline<W, B> {
                 ..
             } => Some(Ready::Failed(reply, error)),
             Slot::Write {
+                position,
                 reply,
                 result: Some(Ok(durable)),
-                ..
-            } => {
+            } if self.committed(position) => {
                 let mut batch = vec![(durable, reply)];
                 batch.extend(std::iter::from_fn(|| self.pop_durable()));
                 Some(Ready::Apply(batch))
             }
-            pending @ Slot::Write { result: None, .. } => {
+            pending @ Slot::Write { .. } => {
                 self.slots.push_front(pending);
                 None
             }
         }
     }
 
-    /// Takes the front slot if it is a durable record.
+    fn committed(&self, position: EpochSeq) -> bool {
+        self.limit.is_none_or(|limit| position.seq <= limit)
+    }
+
+    /// Takes the front slot if it is a durable, committed record.
     fn pop_durable(&mut self) -> Option<(Durable, W)> {
         match self.slots.pop_front()? {
             Slot::Write {
+                position,
                 reply,
                 result: Some(Ok(durable)),
-                ..
-            } => Some((durable, reply)),
+            } if self.committed(position) => Some((durable, reply)),
             other => {
                 self.slots.push_front(other);
                 None
@@ -206,6 +249,34 @@ mod tests {
         assert_eq!(applied(pipeline.next()), [1]);
         assert!(matches!(pipeline.next(), Some(Ready::Barrier("second"))));
         assert_eq!(applied(pipeline.next()), [2]);
+    }
+
+    #[test]
+    fn durable_records_wait_for_the_commit_limit() {
+        let mut pipeline = Pipeline::<u64, &str>::default();
+        pipeline.require_commit(Seq::ZERO);
+        for seq in 1..=3 {
+            pipeline.sequenced(at(seq), seq);
+        }
+        assert_eq!(pipeline.durable_through(), None);
+        pipeline.resolved(at(1), durable(1));
+        pipeline.resolved(at(2), durable(2));
+        assert_eq!(pipeline.durable_through(), Some(at(2)));
+        assert!(pipeline.next().is_none());
+        pipeline.commit_through(Seq::new(1));
+        assert_eq!(applied(pipeline.next()), [1]);
+        assert!(pipeline.next().is_none());
+        // A lower limit changes nothing.
+        pipeline.commit_through(Seq::ZERO);
+        assert!(pipeline.next().is_none());
+        pipeline.barrier("after");
+        pipeline.commit_through(Seq::new(3));
+        assert_eq!(applied(pipeline.next()), [2]);
+        assert!(pipeline.next().is_none());
+        pipeline.resolved(at(3), durable(3));
+        assert_eq!(pipeline.durable_through(), Some(at(3)));
+        assert_eq!(applied(pipeline.next()), [3]);
+        assert!(matches!(pipeline.next(), Some(Ready::Barrier("after"))));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The shard runtime's error type.
 
 use skys3_log::ShardRef;
+use skys3_types::{Epoch, NodeId};
 
 /// Why a shard request failed.
 ///
@@ -35,6 +36,18 @@ pub enum ShardError {
         shard: ShardRef,
         /// Why.
         reason: String,
+    },
+    /// This replica is a member, not the shard's primary, so it serves no
+    /// client request (§5.1, step 1). The primary and epoch it knows are a
+    /// redirect hint.
+    #[error("shard {shard} is served by its primary {primary} in epoch {epoch}")]
+    NotPrimary {
+        /// The shard.
+        shard: ShardRef,
+        /// The primary this replica knows.
+        primary: NodeId,
+        /// The epoch of the configuration that names it.
+        epoch: Epoch,
     },
     /// The shard stopped: its disk is out of service, its index failed, or
     /// it was removed. Nothing is acknowledged on it until the node reopens

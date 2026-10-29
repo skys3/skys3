@@ -280,6 +280,37 @@ impl<D: Disk> fmt::Debug for SegmentLog<D> {
     }
 }
 
+/// A record queued for a group commit by [`SegmentLog::queue`], whose
+/// acknowledgement has not been awaited yet. Dropping it does not withdraw
+/// the record.
+#[must_use = "a queued record is acknowledged only through `durable`"]
+pub struct Queued<D: Disk> {
+    log: SegmentLog<D>,
+    acknowledged: oneshot::Receiver<crate::commit::Reply>,
+}
+
+impl<D: Disk> fmt::Debug for Queued<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Queued").finish_non_exhaustive()
+    }
+}
+
+impl<D: Disk> Queued<D> {
+    /// Returns the record's location once it is durable.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::OutOfService`] or [`LogError::Closed`] if the record was
+    /// not made durable.
+    pub async fn durable(self) -> Result<RecordLocation, LogError> {
+        match self.acknowledged.await {
+            Ok(Ok(location)) => Ok(location),
+            Ok(Err(error)) => Err(LogError::OutOfService(error)),
+            Err(_) => Err(self.log.closed()),
+        }
+    }
+}
+
 impl<D: Disk> SegmentLog<D> {
     /// Recovers the log on `disk` and starts its group committer on the
     /// current Tokio runtime. Group-commit delays are measured on `clock`.
@@ -343,11 +374,7 @@ impl<D: Disk> SegmentLog<D> {
     /// [`LogError::OutOfService`] or [`LogError::Closed`] if the record was
     /// not made durable. A record that fails this way is never acknowledged.
     pub async fn append(&self, record: &LogRecord) -> Result<RecordLocation, LogError> {
-        let class = SegmentClass::of(record.kind());
-        self.check_inline(class, record.body.payload().len() as u64)?;
-        let bytes = record.to_bytes()?;
-        self.submit(class, bytes, record.shard.clone(), record.position, false)
-            .await
+        self.queue(record, false).await?.durable().await
     }
 
     /// Appends `record` without starting a group commit for it: it joins
@@ -364,11 +391,7 @@ impl<D: Disk> SegmentLog<D> {
     ///
     /// As [`SegmentLog::append`].
     pub async fn append_lazy(&self, record: &LogRecord) -> Result<RecordLocation, LogError> {
-        let class = SegmentClass::of(record.kind());
-        self.check_inline(class, record.body.payload().len() as u64)?;
-        let bytes = record.to_bytes()?;
-        self.submit(class, bytes, record.shard.clone(), record.position, true)
-            .await
+        self.queue(record, true).await?.durable().await
     }
 
     /// Appends one record that is already encoded, such as one received
@@ -380,6 +403,37 @@ impl<D: Disk> SegmentLog<D> {
     /// whose fixed header and CRC verify, and otherwise as
     /// [`SegmentLog::append`].
     pub async fn append_encoded(&self, bytes: Bytes) -> Result<RecordLocation, LogError> {
+        self.queue_encoded(bytes, false).await?.durable().await
+    }
+
+    /// Encodes `record` and queues it for a group commit, lazily if `lazy`
+    /// (see [`SegmentLog::append_lazy`]), and returns once it is queued.
+    /// [`Queued::durable`] then waits for its acknowledgement.
+    ///
+    /// Records of one class are written in the order they were queued, so a
+    /// caller that awaits each `queue` before the next fixes their order,
+    /// whatever order it awaits their acknowledgements in.
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentLog::append`], for what fails before the record is
+    /// queued.
+    pub async fn queue(&self, record: &LogRecord, lazy: bool) -> Result<Queued<D>, LogError> {
+        let class = SegmentClass::of(record.kind());
+        self.check_inline(class, record.body.payload().len() as u64)?;
+        let bytes = record.to_bytes()?;
+        self.submit(class, bytes, record.shard.clone(), record.position, lazy)
+            .await
+    }
+
+    /// Queues one encoded record for a group commit, like
+    /// [`SegmentLog::queue`].
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentLog::append_encoded`], for what fails before the record
+    /// is queued.
+    pub async fn queue_encoded(&self, bytes: Bytes, lazy: bool) -> Result<Queued<D>, LogError> {
         let header = RecordHeader::decode(&bytes).map_err(LogError::InvalidRecord)?;
         if let Some(extra) = bytes
             .len()
@@ -393,7 +447,7 @@ impl<D: Disk> SegmentLog<D> {
         }
         let class = SegmentClass::of(header.kind);
         self.check_inline(class, header.payload_len.into())?;
-        self.submit(class, bytes, header.shard, header.position, false)
+        self.submit(class, bytes, header.shard, header.position, lazy)
             .await
     }
 
@@ -431,7 +485,7 @@ impl<D: Disk> SegmentLog<D> {
         shard: ShardRef,
         position: EpochSeq,
         lazy: bool,
-    ) -> Result<RecordLocation, LogError> {
+    ) -> Result<Queued<D>, LogError> {
         self.check_in_service()?;
         let (reply, acknowledged) = oneshot::channel();
         let request = Request {
@@ -446,11 +500,10 @@ impl<D: Disk> SegmentLog<D> {
         if self.requests.send(request).await.is_err() {
             return Err(self.closed());
         }
-        match acknowledged.await {
-            Ok(Ok(location)) => Ok(location),
-            Ok(Err(error)) => Err(LogError::OutOfService(error)),
-            Err(_) => Err(self.closed()),
-        }
+        Ok(Queued {
+            log: self.clone(),
+            acknowledged,
+        })
     }
 
     /// Reads and decodes the record at `location`.
