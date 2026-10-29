@@ -48,7 +48,7 @@ use rand::{Rng, SeedableRng};
 use skys3_flush::test_hooks::LargeObjectBug;
 use skys3_gateway::ShardRef;
 use skys3_log::RecordBody;
-use skys3_log::record::RemoteStep;
+use skys3_log::record::{RemoteStep, truncated_by};
 use skys3_remote::GetOutput;
 use skys3_sim::SimS3;
 use skys3_sim::check::Violation;
@@ -400,7 +400,7 @@ impl Versions {
         for (id, key) in remote.uploads() {
             match finals.opened.get(&id.0) {
                 None => audit.unlogged += 1,
-                Some(upload) if finals.open_locally(upload) => {}
+                Some((shard, upload)) if finals.open_locally(shard, upload) => {}
                 Some(_) => {
                     let name = watch.keys.get(&key).map_or(key.as_str(), |(name, _)| name);
                     return fail(
@@ -514,17 +514,19 @@ impl Watch {
 struct Finals {
     /// Each committed version's write identity: its key and local ETag.
     committed: BTreeMap<String, (String, String)>,
-    /// The write identities of the versions at each position of a key.
+    /// The write identities of the versions at each position of a key, in
+    /// any member's log.
     versions: BTreeMap<(ShardRef, String, Seq), BTreeSet<String>>,
-    /// Every `FLUSHED` with a remote ETag: its shard, key, version, and
-    /// ETag.
+    /// Every `FLUSHED` with a remote ETag, in any member's log: its shard,
+    /// key, version, and ETag.
     flushed: Vec<(ShardRef, String, Seq, String)>,
-    /// The local upload each committed remote upload ID streamed.
-    opened: BTreeMap<String, EpochSeq>,
+    /// The local upload, and its shard, each committed remote upload ID
+    /// streamed.
+    opened: BTreeMap<String, (ShardRef, EpochSeq)>,
     /// Local multipart uploads created, and those completed or aborted, as
-    /// the final primary's log holds them.
-    created: BTreeSet<EpochSeq>,
-    closed: BTreeSet<EpochSeq>,
+    /// the final primary's log holds them. Each shard numbers its own.
+    created: BTreeSet<(ShardRef, EpochSeq)>,
+    closed: BTreeSet<(ShardRef, EpochSeq)>,
 }
 
 impl Finals {
@@ -535,10 +537,24 @@ impl Finals {
                 WriteIdentity::new(cluster.clone(), shard.bucket.clone(), shard.shard, position)
                     .to_string()
             };
-            // The uploads' state is the final primary's: a record only
+            // What is committed is the final primary's: a record only
             // another member holds was never committed, as when a primary
-            // crashed before its lazy `PART_FLUSHED` reached the others.
-            let primary = held.primary.iter().map(|record| (true, record));
+            // crashed before its lazy `PART_FLUSHED` reached the others, or
+            // before a write it took reached them, and neither is a record
+            // a `TRUNCATE` of its own log invalidates.
+            let truncates: Vec<EpochSeq> = held
+                .primary
+                .iter()
+                .filter(|record| matches!(record.body, RecordBody::Truncate))
+                .map(|record| record.position)
+                .collect();
+            let primary = held.primary.iter().map(|record| {
+                let position = record.position;
+                (
+                    !truncates.iter().any(|t| truncated_by(*t, position)),
+                    record,
+                )
+            });
             let others = held.others.iter().flatten().map(|record| (false, record));
             for (committed, record) in primary.chain(others) {
                 let position = record.position;
@@ -550,16 +566,16 @@ impl Finals {
                     )),
                     RecordBody::MpuComplete(complete) => {
                         if committed {
-                            finals.closed.insert(complete.upload);
+                            finals.closed.insert((shard.clone(), complete.upload));
                         }
                         Some((&complete.key, complete.upload, &complete.etag))
                     }
                     RecordBody::MpuCreate(_) if committed => {
-                        finals.created.insert(position);
+                        finals.created.insert((shard.clone(), position));
                         None
                     }
                     RecordBody::MpuAbort(abort) if committed => {
-                        finals.closed.insert(abort.upload);
+                        finals.closed.insert((shard.clone(), abort.upload));
                         None
                     }
                     RecordBody::Flushed(flushed) => {
@@ -575,9 +591,10 @@ impl Finals {
                     }
                     RecordBody::PartFlushed(part) => {
                         if committed && part.step == RemoteStep::Opened {
-                            finals
-                                .opened
-                                .insert(part.remote_upload_id.clone(), part.upload);
+                            finals.opened.insert(
+                                part.remote_upload_id.clone(),
+                                (shard.clone(), part.upload),
+                            );
                         }
                         None
                     }
@@ -585,9 +602,11 @@ impl Finals {
                 };
                 if let Some((key, written, etag)) = version {
                     let identity = identity(written);
-                    finals
-                        .committed
-                        .insert(identity.clone(), (key.clone(), etag.to_string()));
+                    if committed {
+                        finals
+                            .committed
+                            .insert(identity.clone(), (key.clone(), etag.to_string()));
+                    }
                     finals
                         .versions
                         .entry((shard.clone(), key.clone(), position.seq))
@@ -603,10 +622,11 @@ impl Finals {
         finals
     }
 
-    /// Whether the local multipart upload opened at `upload` is still
-    /// open: created, and neither completed nor aborted.
-    fn open_locally(&self, upload: &EpochSeq) -> bool {
-        self.created.contains(upload) && !self.closed.contains(upload)
+    /// Whether the local multipart upload opened at `upload` in `shard`
+    /// is still open: created, and neither completed nor aborted.
+    fn open_locally(&self, shard: &ShardRef, upload: &EpochSeq) -> bool {
+        let upload = (shard.clone(), *upload);
+        self.created.contains(&upload) && !self.closed.contains(&upload)
     }
 }
 
@@ -676,4 +696,128 @@ fn busy(flushers: &Flushers, buckets: &[BucketDocument]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use skys3_log::LogRecord;
+    use skys3_log::record::{MpuAbort, MpuCreate, Put, PutData};
+    use skys3_types::{BucketId, ETag, Epoch, ShardId};
+
+    use super::*;
+
+    fn shard(n: u8) -> ShardRef {
+        ShardRef {
+            bucket: BucketId::new("b-sim0").unwrap(),
+            shard: ShardId::new(n),
+        }
+    }
+
+    fn record(shard: &ShardRef, epoch: u64, seq: u64, body: RecordBody) -> LogRecord {
+        LogRecord {
+            shard: skys3_log::ShardRef::new(shard.bucket.clone(), shard.shard),
+            position: EpochSeq::new(Epoch::new(epoch), Seq::new(seq)),
+            body,
+        }
+    }
+
+    fn put(key: &str) -> RecordBody {
+        RecordBody::Put(Put {
+            key: key.to_owned(),
+            size: 1,
+            last_modified_ms: 0,
+            etag: ETag::new("0".repeat(32)).unwrap(),
+            inherited_identity: None,
+            metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksums: BTreeMap::new(),
+            copy_source: None,
+            data: PutData::Inline(Bytes::from_static(b"x")),
+        })
+    }
+
+    fn create() -> RecordBody {
+        RecordBody::MpuCreate(MpuCreate {
+            key: "u".to_owned(),
+            initiated_ms: 0,
+            metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksum: None,
+        })
+    }
+
+    fn at(epoch: u64, seq: u64) -> EpochSeq {
+        EpochSeq::new(Epoch::new(epoch), Seq::new(seq))
+    }
+
+    /// Two shards number their uploads alike: one's abort leaves the
+    /// other's upload at the same position open.
+    #[test]
+    fn uploads_are_told_apart_by_shard() {
+        let (a, b) = (shard(0), shard(1));
+        let logs = BTreeMap::from([
+            (
+                a.clone(),
+                ShardLogs {
+                    primary: vec![record(&a, 1, 1, create())],
+                    others: Vec::new(),
+                },
+            ),
+            (
+                b.clone(),
+                ShardLogs {
+                    primary: vec![
+                        record(&b, 1, 1, create()),
+                        record(
+                            &b,
+                            1,
+                            2,
+                            RecordBody::MpuAbort(MpuAbort {
+                                key: "u".to_owned(),
+                                upload: at(1, 1),
+                            }),
+                        ),
+                    ],
+                    others: Vec::new(),
+                },
+            ),
+        ]);
+        let finals = Finals::read(&ClusterId::new("c").unwrap(), &logs);
+        assert!(finals.open_locally(&a, &at(1, 1)));
+        assert!(!finals.open_locally(&b, &at(1, 1)));
+        assert!(!finals.open_locally(&shard(2), &at(1, 1)));
+    }
+
+    /// Only the final primary's valid records commit a version: not a
+    /// deposed member's, nor one its own `TRUNCATE` invalidates.
+    #[test]
+    fn only_the_final_primarys_valid_writes_are_committed() {
+        let a = shard(0);
+        let logs = BTreeMap::from([(
+            a.clone(),
+            ShardLogs {
+                primary: vec![
+                    record(&a, 1, 1, put("kept")),
+                    record(&a, 1, 2, put("truncated")),
+                    record(&a, 2, 1, RecordBody::Truncate),
+                    record(&a, 2, 2, put("taken over")),
+                ],
+                others: vec![vec![
+                    record(&a, 1, 1, put("kept")),
+                    record(&a, 1, 2, put("truncated")),
+                    record(&a, 1, 3, put("abandoned")),
+                ]],
+            },
+        )]);
+        let cluster = ClusterId::new("c").unwrap();
+        let finals = Finals::read(&cluster, &logs);
+        let keys: BTreeSet<&str> = finals
+            .committed
+            .values()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert_eq!(keys, BTreeSet::from(["kept", "taken over"]));
+        // Every member's versions stay known for the `FLUSHED` audit.
+        assert_eq!(finals.versions.len(), 4);
+    }
 }
