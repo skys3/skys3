@@ -6073,8 +6073,11 @@ of this file. A task with nothing unexpected keeps "None."
   and a move can each leave headers for the same object version, even with
   a different stripe count. `rebuild_layouts` keeps, per fragment index,
   the latest attempt's copy, and per stripe the latest attempt's layout
-  that can be decoded, falling back to an older stripe count when the
-  newest is incomplete. Design §8.4 records the rules.
+  that can be decoded and that later stripes continue to the object's
+  end, so an attempt that moved the stripe boundaries without changing
+  their count cannot hide a complete older one. It falls back to an older
+  stripe count when the newest is incomplete. Design §8.4 records the
+  rules.
 - **The tear window depends on the largest fragment.** A crash can leave
   one group commit plus one record unsynced, and a record can be a 256 MiB
   fragment, so recovery's damage check only looks past that. The store's
@@ -6306,6 +6309,17 @@ of this file. A task with nothing unexpected keeps "None."
   Validation (`skys3_types::lifecycle`) runs both in the gateway and in
   `BucketDocument::validate`, which also refuses a configuration on a
   bucket that is not `local`.
+- **Fixed: a change whose answers were lost went unannounced.** A
+  retried PUT or DELETE that found the configuration already in the
+  register returned without bumping the generation, so other nodes kept
+  the old rules, and could go on expiring objects, until an unrelated
+  announcement or the periodic refresh (up to 12 h by default). The
+  equality branch now announces again, as a retried CreateBucket does,
+  so a change that changes nothing, such as deleting no configuration,
+  costs a generation bump; and a swap that may have landed is announced
+  in the background
+  (`settle_later`). Tested in `tests/lifecycle.rs`
+  (`a_change_whose_answers_were_lost_is_announced`).
 - **Only `local` buckets.** A `write_back` (or `write_through`) bucket
   answers PUT with `501 NotImplemented`: its durable home is the remote,
   and expiring the local copy alone would be undone by an import or
