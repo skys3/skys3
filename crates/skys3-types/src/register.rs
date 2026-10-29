@@ -332,6 +332,11 @@ pub struct NodeRegistration {
     pub rack: Option<Label>,
     /// The node's disks.
     pub disks: Vec<DiskInfo>,
+    /// Whether the coordinator is forgetting the node (§6.7): placement
+    /// assigns it nothing, and the node clears the mark by registering
+    /// again. Written only when set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub departing: bool,
     /// The proposal ID of the write that stored this document.
     pub proposal_id: ProposalId,
 }

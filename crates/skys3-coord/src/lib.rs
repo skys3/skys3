@@ -25,6 +25,15 @@
 //! - [`Coordinator`]: the work loop that, while the node holds the lease,
 //!   asks a [`Placement`] what to change. Placement itself is the work of
 //!   later tasks; [`NoPlacement`] changes nothing.
+//! - [`register`] and [`Heartbeater`]: every node registers itself in
+//!   `nodes/<node-id>.json` when it starts and sends the coordinator
+//!   heartbeats, so a node with valid credentials joins with no other
+//!   action.
+//! - [`NodeRegistry`] and [`Lifecycle`]: the coordinator's view of the
+//!   nodes, with health from heartbeats as advice only. It keeps the
+//!   [`Pusher`]'s nodes current, and forgets a node silent for
+//!   `node_forget_after` once its [`Rehoming`] says no shard names it.
+//! - [`AdminEndpoint`]: serves pushes and heartbeats on a node.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -55,16 +64,30 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+mod admin;
 mod change;
 mod coordinator;
+mod heartbeat;
+mod join;
 mod lease;
 mod push;
+mod registry;
+#[cfg(test)]
+mod testing;
 
+pub use admin::AdminEndpoint;
 pub use change::{
     Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
 };
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
+pub use heartbeat::{
+    Heartbeat, HeartbeatAck, HeartbeatConfig, HeartbeatError, HeartbeatStatus, Heartbeater,
+};
+pub use join::{NodeProfile, Registered, Registration, RegistrationError, register};
 pub use lease::{Elector, Leadership, LeaseConfig, LeaseConfigError};
 pub use push::{
     Announce, ControlChanged, ControlHints, HintError, PUSH_IDLE_TIMEOUT, PushError, Pushed, Pusher,
+};
+pub use registry::{
+    Lifecycle, NodeEntry, NodeRegistry, NodeState, PeerSink, RegistryConfig, Rehoming, ShardScan,
 };
