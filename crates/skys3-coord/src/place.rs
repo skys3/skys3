@@ -33,11 +33,12 @@
 //! - Creating a bucket (plan M3-04) first runs [`Topology::check_bucket`],
 //!   which rejects a policy the cluster cannot satisfy, then
 //!   [`Topology::place_bucket`] for the members and primary of every shard.
-//! - Replacing a lost member (plan M3-05) calls [`Topology::place`] with
-//!   the shard's remaining members in [`ShardRequest::keep`] and the
-//!   departing ones in [`ShardRequest::avoid`]. Once no shard names a
-//!   departing node, the node lifecycle's [`Rehoming`](crate::Rehoming)
-//!   check lets the coordinator forget it.
+//! - Replacing a lost member (plan M3-05, [`Replacement`](crate::Replacement))
+//!   calls [`Topology::place`] with the shard's members and learners that
+//!   count in [`ShardRequest::keep`] and every other node the shard names
+//!   in [`ShardRequest::avoid`]. Once no shard names a departing node, the
+//!   node lifecycle's [`Rehoming`](crate::Rehoming) check lets the
+//!   coordinator forget it.
 //! - Fragment placement (plan M5-03) reuses the same domains, with its own
 //!   per-domain cap.
 
@@ -372,6 +373,14 @@ impl Topology {
         }
         if let Some(candidate) = self.nodes.get_mut(&config.primary) {
             candidate.primaries = candidate.primaries.saturating_add(1);
+        }
+    }
+
+    /// Counts one more shard into `node`'s load, as when it is given a
+    /// learner.
+    pub fn assign(&mut self, node: &NodeId) {
+        if let Some(candidate) = self.nodes.get_mut(node) {
+            candidate.shards = candidate.shards.saturating_add(1);
         }
     }
 

@@ -172,9 +172,14 @@ impl<D: Disk> ShardSet<D> {
             // A node removed from the shard and added back as a learner
             // (§6.7) may still hold the replica of its old role, which no
             // configuration change turns into a learner: that replica
-            // stops, and the node opens again as a learner from its log.
+            // stops, and the node opens again as a learner from its log. So
+            // does a learner that a takeover left out and the coordinator
+            // added again under the new primary, which a learner's replica
+            // cannot follow either.
             let readmitted = node.is_some_and(|node| {
-                config.epoch > held.epoch && config.is_learner(node) && !held.is_learner(node)
+                config.epoch > held.epoch
+                    && config.is_learner(node)
+                    && (!held.is_learner(node) || held.primary != config.primary)
             });
             if readmitted {
                 shard.abandon("the node is re-admitted as a learner").await;

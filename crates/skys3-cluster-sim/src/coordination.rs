@@ -12,6 +12,13 @@
 //! forgets a node silent for `node_forget_after` once no shard register
 //! names it.
 //!
+//! With [`CoordinationConfig::replacement`], the coordinator replaces lost
+//! members (plan M3-05): it adds learners to the shards with fewer than
+//! `replicas` members, which their primaries backfill and promote, and
+//! removes members placement no longer counts. The services it wraps must
+//! have their nodes follow the shard registers
+//! ([`ReplicatedServices::following_registers`](crate::ReplicatedServices::following_registers)).
+//!
 //! The audits check what the scenarios need:
 //!
 //! - every accepted change wrote an epoch nobody else wrote, so two nodes
@@ -39,7 +46,7 @@ use skys3_coord::{
     AdminEndpoint, Announce, Applied, BucketShards, ChangeSet, ControlHints, Coordinator,
     CoordinatorConfig, Elector, HeartbeatConfig, HeartbeatStatus, Heartbeater, Leadership,
     LeaseConfig, Lifecycle, NodeEntry, NodeProfile, NodeRegistry, PeerSink, Placement, Pusher,
-    RegistryConfig,
+    RegistryConfig, Replacement, ReplacementConfig,
 };
 use skys3_io::{Clock, MonoTime, MonotonicClock};
 use skys3_net::TurmoilNetwork;
@@ -97,6 +104,11 @@ pub struct CoordinationConfig {
     /// clusters whose gateways create the buckets
     /// ([`ClusterConfig::create_buckets`](crate::ClusterConfig::create_buckets)).
     pub bucket_shards: Option<FailureDomain>,
+    /// Whether the coordinator replaces lost members ([`Replacement`],
+    /// plan M3-05), at this pace, beside keeping bucket registers matched
+    /// by their shard registers, at the `bucket_shards` level (`node` if
+    /// it is not set).
+    pub replacement: Option<ReplacementConfig>,
 }
 
 impl Default for CoordinationConfig {
@@ -131,6 +143,7 @@ impl Default for CoordinationConfig {
                 retry: lease.retry,
             },
             bucket_shards: None,
+            replacement: None,
         }
     }
 }
@@ -198,6 +211,8 @@ struct Audit {
     /// When each node registered, in each of its lives and again whenever
     /// a coordinator told it that it was not registered.
     registered: BTreeMap<NodeId, Vec<Duration>>,
+    /// How many shard registers coordinators wrote.
+    shard_writes: usize,
 }
 
 /// Node services that add the coordinator of plan M3-01 to `S`.
@@ -442,6 +457,13 @@ impl<S: NodeServices> CoordinatedServices<S> {
             .unwrap_or_default()
     }
 
+    /// How many shard registers coordinators wrote, such as the learners
+    /// and removals of replacement.
+    #[must_use]
+    pub fn shard_writes(&self) -> usize {
+        self.audit().shard_writes
+    }
+
     /// How many generations were announced.
     #[must_use]
     pub fn announcements(&self) -> usize {
@@ -554,9 +576,23 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
         };
         let clock = clock as Arc<dyn Clock>;
         let registry = NodeRegistry::new(Arc::clone(&clock), self.config.registry);
-        let placement = match self.config.bucket_shards {
-            Some(level) => SimPlacement::Buckets(BucketShards::new(registry.clone(), level)),
-            None => SimPlacement::StandIn(EpochPlacement {
+        let placement = match (self.config.bucket_shards, self.config.replacement) {
+            (level, Some(replacement)) => {
+                let level = level.unwrap_or(FailureDomain::Node);
+                let replacing = Replacement::new(
+                    registry.clone(),
+                    level,
+                    Arc::clone(&clock) as Arc<dyn Clock>,
+                    replacement,
+                );
+                SimPlacement::Replacing(Box::new(
+                    BucketShards::new(registry.clone(), level).with_placement(replacing),
+                ))
+            }
+            (Some(level), None) => {
+                SimPlacement::Buckets(BucketShards::new(registry.clone(), level))
+            }
+            (None, None) => SimPlacement::StandIn(EpochPlacement {
                 node: node.clone(),
                 stale,
                 registers: self.config.registers,
@@ -701,12 +737,16 @@ impl<P: Placement> Placement for Observed<P> {
 
     fn applied(&mut self, change: &ChangeSet, applied: &Applied) {
         for (key, version) in &applied.written {
-            if let (RegisterKind::Node(node), None) = (key.kind(), version) {
-                lock(&self.audit).forgotten.push(Forgotten {
-                    at: elapsed(),
-                    by: self.node.clone(),
-                    node,
-                });
+            match (key.kind(), version) {
+                (RegisterKind::Node(node), None) => {
+                    lock(&self.audit).forgotten.push(Forgotten {
+                        at: elapsed(),
+                        by: self.node.clone(),
+                        node,
+                    });
+                }
+                (RegisterKind::Shard(..), _) => lock(&self.audit).shard_writes += 1,
+                _ => {}
             }
         }
         self.lifecycle.applied(change, applied);
@@ -854,10 +894,12 @@ impl Drop for Restore {
     }
 }
 
-/// The coordinator's placement: the stand-in, or bucket and shard creation.
+/// The coordinator's placement: the stand-in, bucket and shard creation,
+/// or both creation and replacement.
 enum SimPlacement {
     StandIn(EpochPlacement),
     Buckets(BucketShards),
+    Replacing(Box<BucketShards<Replacement>>),
 }
 
 impl Placement for SimPlacement {
@@ -865,6 +907,7 @@ impl Placement for SimPlacement {
         match self {
             Self::StandIn(placement) => placement.begin_tenure(),
             Self::Buckets(placement) => placement.begin_tenure(),
+            Self::Replacing(placement) => placement.begin_tenure(),
         }
     }
 
@@ -876,6 +919,7 @@ impl Placement for SimPlacement {
         match self {
             Self::StandIn(placement) => placement.plan(store, proposals).await,
             Self::Buckets(placement) => placement.plan(store, proposals).await,
+            Self::Replacing(placement) => placement.plan(store, proposals).await,
         }
     }
 
@@ -883,6 +927,7 @@ impl Placement for SimPlacement {
         match self {
             Self::StandIn(placement) => placement.applied(change, applied),
             Self::Buckets(placement) => placement.applied(change, applied),
+            Self::Replacing(placement) => placement.applied(change, applied),
         }
     }
 }

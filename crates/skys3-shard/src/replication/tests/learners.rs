@@ -1,6 +1,6 @@
 //! Learners over real TCP (§6.4, §6.7): a primary and a member, and a new
 //! node that the test driver adds as a learner by a compare-and-swap of
-//! the shard's register, as the coordinator will (plan M3-05). Every link
+//! the shard's register, as the coordinator does (plan M3-05). Every link
 //! goes through a proxy the test can cut.
 
 use std::collections::{BTreeMap, VecDeque};
