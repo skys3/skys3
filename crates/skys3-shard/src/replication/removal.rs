@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use skys3_control::{
-    ControlError, ControlStore, Expected, ProposalIds, ProposalOutcome, RetryPolicy, TypedKey,
-    propose_document, read_with_retries,
+    ControlError, ControlStore, Expected, ProposalIds, ProposalOutcome, RegisterKey, RetryPolicy,
+    TypedKey, Versioned, get_with_retries, propose_document, read_with_retries,
 };
 use skys3_io::Disk;
 use skys3_log::ShardRef;
@@ -74,13 +74,34 @@ impl<S: ControlStore> ControlRegisters<S> {
         Self { store, policy }
     }
 
+    /// Reads the register at `key`. A register absent from a store that
+    /// holds no `cluster.json` either was not deleted with its bucket: the
+    /// store was lost or reset, and says nothing about the shard until an
+    /// operator rebuilds it (§6.2, §6.9), so the read fails as
+    /// [`ControlError::NotBootstrapped`] and the replica goes on in its own
+    /// configuration.
+    async fn held(
+        &self,
+        key: &TypedKey<ShardConfig>,
+    ) -> Result<Option<Versioned<ShardConfig>>, ControlError> {
+        let held = read_with_retries(&self.store, key, &self.policy).await?;
+        if held.is_none()
+            && get_with_retries(&self.store, &RegisterKey::cluster(), &self.policy)
+                .await?
+                .is_none()
+        {
+            return Err(ControlError::NotBootstrapped);
+        }
+        Ok(held)
+    }
+
     async fn replace_now(
         &self,
         current: &ShardConfig,
         next: &ShardConfig,
     ) -> Result<Replaced, ControlError> {
         let key = TypedKey::shard(&current.bucket_id, current.shard);
-        let Some(held) = read_with_retries(&self.store, &key, &self.policy).await? else {
+        let Some(held) = self.held(&key).await? else {
             return Ok(Replaced::Holds(None));
         };
         // An earlier attempt landed although its answer was lost.
@@ -94,7 +115,7 @@ impl<S: ControlStore> ControlRegisters<S> {
         match propose_document(&self.store, &key, expected, next, &self.policy).await? {
             ProposalOutcome::Accepted(_) => Ok(Replaced::Accepted),
             ProposalOutcome::Rejected => {
-                let held = read_with_retries(&self.store, &key, &self.policy).await?;
+                let held = self.held(&key).await?;
                 Ok(Replaced::Holds(held.map(|held| held.value)))
             }
         }
@@ -116,7 +137,7 @@ impl<S: ControlStore> ShardRegisters for ControlRegisters<S> {
     ) -> BoxFuture<'a, Result<Option<ShardConfig>, ControlError>> {
         Box::pin(async move {
             let key = TypedKey::shard(&shard.bucket, shard.shard);
-            let held = read_with_retries(&self.store, &key, &self.policy).await?;
+            let held = self.held(&key).await?;
             Ok(held.map(|held| held.value))
         })
     }
@@ -408,11 +429,28 @@ mod tests {
         let registers = ControlRegisters::new(store.clone(), RetryPolicy::default());
         let first = config(1, &[1, 2, 3], "a");
         let second = config(2, &[1, 2], "b");
+        // A store without cluster.json was lost or reset: an absent
+        // register says nothing about the shard.
+        let lost = registers.replace(&first, &second).await.unwrap_err();
+        assert!(matches!(lost, ControlError::NotBootstrapped), "{lost}");
+        let shard = ShardRef::new(first.bucket_id.clone(), first.shard);
+        let lost = registers.read(&shard).await.unwrap_err();
+        assert!(matches!(lost, ControlError::NotBootstrapped), "{lost}");
+        let cluster = skys3_types::ClusterId::new("c").unwrap();
+        skys3_control::bootstrap(
+            &store,
+            &cluster,
+            ProposalIds::seeded(2).next_id(),
+            &RetryPolicy::default(),
+        )
+        .await
+        .unwrap();
         // No register yet.
         assert_eq!(
             registers.replace(&first, &second).await.unwrap(),
             Replaced::Holds(None)
         );
+        assert_eq!(registers.read(&shard).await.unwrap(), None);
         let key = TypedKey::shard(&first.bucket_id, first.shard);
         let created = propose_document(
             &store,

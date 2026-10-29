@@ -26,6 +26,8 @@
 //!   [`S3ControlStore`] over any `skys3-remote` object store, AWS S3 and
 //!   S3-compatible providers, and [`EtcdControlStore`] over an etcd v3
 //!   cluster, the production default.
+//! - [`RebuildPlan`]: the operator's rebuild of a lost store from the
+//!   nodes' exports of their local copies ([`ControlExport`]).
 //! - [`ControlProbe`]: the startup probe that refuses a store whose
 //!   conditional writes, conditional deletes, or reads after writes cannot
 //!   be trusted.
@@ -66,6 +68,7 @@ mod key;
 mod memory;
 mod probe;
 mod propose;
+mod rebuild;
 mod s3;
 mod store;
 
@@ -79,6 +82,10 @@ pub use probe::{ControlProbe, ProbeError, ProbeFailure};
 pub use propose::{
     DeletionOutcome, ProposalIds, ProposalOutcome, RetryPolicy, get_with_retries, proposal_id_of,
     propose, propose_delete, propose_document, read, read_with_retries,
+};
+pub use rebuild::{
+    Applied, ControlExport, EXPORT_FORMAT, ExportedCopy, HeldShard, RebuildError, RebuildNote,
+    RebuildOptions, RebuildPlan,
 };
 pub use s3::{S3Changes, S3ControlStore, S3StoreConfig};
 pub use store::{

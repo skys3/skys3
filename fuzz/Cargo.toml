@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "control_rebuild"
+path = "fuzz_targets/control_rebuild.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "coord_control_changed"
 path = "fuzz_targets/coord_control_changed.rs"
 test = false

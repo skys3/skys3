@@ -42,6 +42,9 @@
 //! - [`restart`]: a whole-cluster restart while the control store is
 //!   unreachable, with shards whose membership changed while a node was
 //!   down: unchanged shards serve again, stale configurations stay fenced.
+//! - [`rebuild`]: the drill of a lost control store: the nodes serve on
+//!   from their local copies, an operator rebuilds the store from their
+//!   exports, and membership changes resume on it.
 //! - [`buckets`]: buckets created through a gateway, with their shards
 //!   placed on the registered nodes, serving reads and writes through
 //!   every node.
@@ -56,6 +59,7 @@ mod harness;
 mod learners;
 mod leases;
 mod rebalancing;
+mod rebuild;
 mod registry;
 mod removal;
 mod replacement;
