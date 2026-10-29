@@ -166,7 +166,7 @@ Erasure coding of `local` buckets (§8).
 | `parity_fragments` | integer | `2` | Positive. `m` in every geometry. |
 | `max_data_fragments` | integer | `8` | Positive. The widest `k`. |
 | `min_eligible_nodes` | integer | `5` | Greater than `parity_fragments`, since a stripe puts at most one fragment on a node. |
-| `fragment_release_delay_seconds` | integer | `60` | May be 0 (§8.7). |
+| `fragment_release_delay_seconds` | integer | `60` | May be 0 (§8.7). Also how long compaction keeps payload no entry names before it drops it (§10.3). |
 | `fragment_orphan_after_seconds` | integer | `3600` | Positive (§8.4). |
 | `repair_bytes_per_second_per_node` | integer | `104857600` (100 MiB/s) | Positive (§8.6). |
 

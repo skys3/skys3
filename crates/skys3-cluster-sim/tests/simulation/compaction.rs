@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use rand::Rng;
 use skys3_cluster_sim::{
-    Cluster, ClusterConfig, FaultPlan, FaultProfile, FaultRates, ReplicatedServices, RunError,
-    View, Workload,
+    Cluster, ClusterConfig, FaultPlan, FaultProfile, FaultRates, ReadRegistration,
+    ReplicatedServices, RunError, View, Workload,
 };
 use skys3_io::SyncCut;
 use skys3_shard::{CacheSettings, CompactionSettings};
@@ -22,7 +22,7 @@ use crate::COST;
 
 /// Three nodes, every shard on all of them, a `write_back` bucket beside a
 /// `local` one, a small clean cache, and compaction with a short TTL for
-/// extents that nothing names.
+/// extents that nothing names and a short release delay for payload.
 fn config() -> ClusterConfig {
     ClusterConfig {
         replicas: 3,
@@ -36,6 +36,10 @@ fn config() -> ClusterConfig {
             live_threshold: 0.6,
             unreferenced_ttl: Duration::from_secs(2),
         }),
+        read_registration: ReadRegistration {
+            release_delay: Duration::from_secs(2),
+            ..ReadRegistration::default()
+        },
         ..ClusterConfig::default()
     }
 }

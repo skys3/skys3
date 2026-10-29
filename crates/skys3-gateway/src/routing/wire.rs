@@ -14,7 +14,8 @@
 //! every position it may name, and the replica sequences it at the next
 //! position of its own log. The reply's header says
 //! whether the replica served the request, and its payload holds the
-//! answer: [`Answer`] for a served request. Both ends decode frames from
+//! answer: [`Answer`] for a served request. A read registration carries
+//! the plan's layout as its payload instead, a [`Layout`]. Both ends decode frames from
 //! authenticated but untrusted peers, so every field is checked before it
 //! is used.
 
@@ -25,8 +26,9 @@ use skys3_index::{Entry, EntryState, ListItem, ListPage, ListQuery};
 use skys3_log::record::ExtentRef;
 use skys3_log::{LogRecord, RecordBody};
 use skys3_net::{Frame, Header, MessageKind};
+use skys3_shard::{ReadPlan, Registered};
 use skys3_types::{
-    BucketId, ClusterId, Epoch, EpochSeq, RegisterDocument, Seq, ShardConfig, ShardId,
+    BucketId, ClusterId, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig, ShardId,
 };
 
 use super::{Reply, Request, Response};
@@ -49,7 +51,10 @@ pub struct Forward {
     #[prost(uint64, tag = "3")]
     pub epoch: u64,
     /// The call.
-    #[prost(oneof = "Op", tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
+    #[prost(
+        oneof = "Op",
+        tags = "4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
+    )]
     pub op: Option<Op>,
 }
 
@@ -86,6 +91,52 @@ pub enum Op {
     /// Lift one seal.
     #[prost(bool, tag = "13")]
     Unseal(bool),
+    /// The read plan of this key.
+    #[prost(string, tag = "14")]
+    Plan(String),
+    /// Register a read of a version, whose plan's layout is the frame's
+    /// payload, a [`Layout`].
+    #[prost(message, tag = "15")]
+    Register(RegisterQuery),
+    /// Renew this registration.
+    #[prost(uint64, tag = "16")]
+    Renew(u64),
+    /// Release this registration.
+    #[prost(uint64, tag = "17")]
+    Release(u64),
+    /// The payload at a position for a registered read.
+    #[prost(message, tag = "18")]
+    Fetch(FetchQuery),
+}
+
+/// A read registration of a key's version.
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisterQuery {
+    /// The key.
+    #[prost(string, tag = "1")]
+    pub key: String,
+    /// The version's position.
+    #[prost(message, optional, tag = "2")]
+    pub version: Option<Position>,
+}
+
+/// A fetch under a registered read.
+#[derive(Clone, PartialEq, Message)]
+pub struct FetchQuery {
+    /// The registration.
+    #[prost(uint64, tag = "1")]
+    pub read: u64,
+    /// The payload's position.
+    #[prost(message, optional, tag = "2")]
+    pub position: Option<Position>,
+}
+
+/// A version's bytes as log positions, in body order.
+#[derive(Clone, PartialEq, Message)]
+pub struct Layout {
+    /// The extents.
+    #[prost(message, repeated, tag = "1")]
+    pub extents: Vec<ExtentAnswer>,
 }
 
 /// A log position.
@@ -230,7 +281,10 @@ pub const OUTCOME_NOT_ACKNOWLEDGED: u32 = 7;
 #[derive(Clone, PartialEq, Message)]
 pub struct Answer {
     /// The answer, by the call it answers.
-    #[prost(oneof = "Result", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(
+        oneof = "Result",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+    )]
     pub result: Option<Result>,
 }
 
@@ -267,6 +321,43 @@ pub enum Result {
     /// The seal was lifted.
     #[prost(bool, tag = "10")]
     Unsealed(bool),
+    /// A read plan.
+    #[prost(message, tag = "11")]
+    Plan(PlanAnswer),
+    /// A read registration, or that the holder does not hold the version.
+    #[prost(message, tag = "12")]
+    Registered(RegisteredAnswer),
+    /// Whether the registration was renewed.
+    #[prost(bool, tag = "13")]
+    Renewed(bool),
+    /// The registration was released.
+    #[prost(bool, tag = "14")]
+    Released(bool),
+}
+
+/// A read plan.
+#[derive(Clone, PartialEq, Message)]
+pub struct PlanAnswer {
+    /// The encoded entry, empty for none.
+    #[prost(bytes = "vec", tag = "1")]
+    pub entry: Vec<u8>,
+    /// The version's layout.
+    #[prost(message, optional, tag = "2")]
+    pub layout: Option<Layout>,
+    /// The holders, by node ID.
+    #[prost(string, repeated, tag = "3")]
+    pub holders: Vec<String>,
+}
+
+/// A read registration.
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisteredAnswer {
+    /// The registration, absent if the holder does not hold the version.
+    #[prost(uint64, optional, tag = "1")]
+    pub read: Option<u64>,
+    /// Where the holder serves the version from.
+    #[prost(message, optional, tag = "2")]
+    pub layout: Option<Layout>,
 }
 
 /// A listing page.
@@ -436,6 +527,24 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
             limit: *limit as u64,
         }),
         Request::Payload(at) => Op::Payload(position(*at)),
+        Request::Plan { key } => Op::Plan(key.clone()),
+        Request::Register {
+            key,
+            version,
+            layout,
+        } => {
+            payload = Bytes::from(layout_of(layout).encode_to_vec());
+            Op::Register(RegisterQuery {
+                key: key.clone(),
+                version: Some(position(*version)),
+            })
+        }
+        Request::Renew(read) => Op::Renew(*read),
+        Request::Release(read) => Op::Release(*read),
+        Request::Fetch { read, position: at } => Op::Fetch(FetchQuery {
+            read: *read,
+            position: Some(position(*at)),
+        }),
         Request::AppendExtent(extent) => {
             payload = record(RecordBody::Extent(extent.clone()))?;
             Op::AppendExtent(true)
@@ -592,9 +701,25 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
         },
         Op::Seal(_) => Request::Seal,
         Op::Unseal(_) => Request::Unseal,
+        Op::Plan(key) => Request::Plan { key },
+        Op::Register(query) => Request::Register {
+            key: query.key,
+            version: epoch_seq(query.version)?,
+            layout: decode_layout(
+                Layout::decode(frame.payload.clone()).map_err(|error| error.to_string())?,
+            )?,
+        },
+        Op::Renew(read) => Request::Renew(read),
+        Op::Release(read) => Request::Release(read),
+        Op::Fetch(query) => Request::Fetch {
+            read: query.read,
+            position: epoch_seq(query.position)?,
+        },
     };
-    if !matches!(request, Request::AppendExtent(_) | Request::Write { .. })
-        && !frame.payload.is_empty()
+    if !matches!(
+        request,
+        Request::AppendExtent(_) | Request::Write { .. } | Request::Register { .. }
+    ) && !frame.payload.is_empty()
     {
         return Err("a request without a record carries a payload".to_owned());
     }
@@ -777,6 +902,24 @@ fn answer(response: &Response) -> std::result::Result<Answer, codec::CodecError>
             unflushed: summary.unflushed,
         }),
         Response::Unsealed => Result::Unsealed(true),
+        Response::Plan(plan) => Result::Plan(PlanAnswer {
+            entry: plan
+                .entry
+                .as_ref()
+                .map(|entry| encoded(codec::encode_entry(entry)))
+                .unwrap_or_default(),
+            layout: Some(layout_of(&plan.layout)),
+            holders: plan.holders.iter().map(ToString::to_string).collect(),
+        }),
+        Response::Registered(registered) => Result::Registered(match registered {
+            Some(registered) => RegisteredAnswer {
+                read: Some(registered.id),
+                layout: Some(layout_of(&registered.layout)),
+            },
+            None => RegisteredAnswer::default(),
+        }),
+        Response::Renewed(renewed) => Result::Renewed(*renewed),
+        Response::Released => Result::Released(true),
     };
     match failed.into_inner() {
         Some(error) => Err(error),
@@ -909,7 +1052,70 @@ fn decode_answer(payload: &Bytes) -> Decoded<Response> {
             unflushed: summary.unflushed,
         }),
         Result::Unsealed(_) => Response::Unsealed,
+        Result::Plan(plan) => {
+            let entry = if plan.entry.is_empty() {
+                None
+            } else {
+                Some(codec::decode_entry(&plan.entry).map_err(codec)?)
+            };
+            let holders = plan
+                .holders
+                .iter()
+                .map(|node| {
+                    node.parse()
+                        .map_err(|error| format!("holder {node}: {error}"))
+                })
+                .collect::<Decoded<Vec<NodeId>>>()?;
+            if entry.is_none() && !holders.is_empty() {
+                return Err("holders of a key with no entry".to_owned());
+            }
+            Response::Plan(ReadPlan {
+                entry,
+                layout: decode_layout(plan.layout.unwrap_or_default())?,
+                holders,
+            })
+        }
+        Result::Registered(registered) => Response::Registered(match registered.read {
+            Some(id) => Some(Registered {
+                id,
+                layout: decode_layout(registered.layout.unwrap_or_default())?,
+            }),
+            None if registered.layout.is_none() => None,
+            None => return Err("a layout without a registration".to_owned()),
+        }),
+        Result::Renewed(renewed) => Response::Renewed(renewed),
+        Result::Released(_) => Response::Released,
     })
+}
+
+/// The wire form of a layout.
+fn layout_of(layout: &[ExtentRef]) -> Layout {
+    Layout {
+        extents: layout
+            .iter()
+            .map(|extent| ExtentAnswer {
+                position: Some(position(extent.position)),
+                len: extent.len,
+            })
+            .collect(),
+    }
+}
+
+/// A layout from its wire form: every extent has a position and bytes.
+fn decode_layout(layout: Layout) -> Decoded<Vec<ExtentRef>> {
+    layout
+        .extents
+        .into_iter()
+        .map(|extent| {
+            if extent.len == 0 {
+                return Err("an empty extent in a layout".to_owned());
+            }
+            Ok(ExtentRef {
+                position: epoch_seq(extent.position)?,
+                len: extent.len,
+            })
+        })
+        .collect()
 }
 
 /// Decodes the body of `frame`, which must be of `kind`.

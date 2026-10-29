@@ -10,7 +10,7 @@ use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{Committed, Outcome, Rejection, Shard, ShardSet};
+use skys3_shard::{Committed, Outcome, ReadId, ReadPlan, Registered, Rejection, Shard, ShardSet};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -92,6 +92,24 @@ impl<D: Disk> LocalShards<D> {
             .check_readable()
             .map_err(|error| convert(shard, error))?;
         Ok(local)
+    }
+
+    /// The replica of `shard` on `holder`, which must be this node, as a
+    /// holder of read payload (§8.7): any replica that runs serves what it
+    /// holds, whatever its role.
+    async fn holding(&self, shard: &ShardRef, holder: &NodeId) -> Result<Shard<D>, ShardError> {
+        self.check_holder(shard, holder)?;
+        self.find(shard).await
+    }
+
+    /// Checks that `holder` is this node. Registrations are the node's and
+    /// outlive its replicas, so renewing and releasing one needs none.
+    fn check_holder(&self, shard: &ShardRef, holder: &NodeId) -> Result<(), ShardError> {
+        if *holder == self.node {
+            Ok(())
+        } else {
+            Err(ShardError::NotFound(shard.clone()))
+        }
     }
 }
 
@@ -228,6 +246,65 @@ impl<D: Disk> Shards for LocalShards<D> {
         let local = self.serving(shard).await?;
         local
             .payload(position)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
+    fn node(&self) -> Option<NodeId> {
+        Some(self.node.clone())
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        let local = self.find(shard).await?;
+        local.plan(key).await.map_err(|error| convert(shard, error))
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        let local = self.holding(shard, holder).await?;
+        local
+            .register_read(self.set.reads(), key, version, layout)
+            .await
+            .map_err(|error| convert(shard, error))
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        self.check_holder(shard, holder)?;
+        Ok(self.set.reads().renew(read))
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        self.check_holder(shard, holder)?;
+        self.set.reads().release(read);
+        Ok(())
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        let local = self.holding(shard, holder).await?;
+        local
+            .read_registered(self.set.reads(), read, position)
             .await
             .map_err(|error| convert(shard, error))
     }

@@ -16,6 +16,7 @@ use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
+use skys3_shard::{ReadId, ReadPlan, Registered};
 use skys3_types::{BucketDocument, BucketId, Epoch, EpochSeq, NodeId, ShardId, shard_for_key};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -235,6 +236,79 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         position: EpochSeq,
     ) -> impl Future<Output = Result<Bytes, ShardError>> + Send;
 
+    /// The read plan of `key` (§9.2): its entry, as [`Shards::entry`]
+    /// returns it, the layout of its version's bytes, and the nodes whose
+    /// replicas should hold them, the primary first. A GET reads the bytes
+    /// from one of them ([`Shards::register`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Shards::entry`].
+    fn plan(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+    ) -> impl Future<Output = Result<ReadPlan, ShardError>> + Send;
+
+    /// Registers a read of `version` of `key`, whose plan gave `layout`,
+    /// with the replica of `shard` on `holder` (§8.7): the holder keeps
+    /// the bytes it serves until the read is released or its registration
+    /// lapses, and answers with where it serves them from. `None` if the
+    /// holder does not hold the version, so the gateway asks another.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] if `holder` has no replica of the shard,
+    /// and [`ShardError::Unavailable`] if it cannot be asked.
+    fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> impl Future<Output = Result<Option<Registered>, ShardError>> + Send;
+
+    /// Renews the registration `read` on `holder` for another TTL. `false`
+    /// if it lapsed: its bytes may be gone.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shards::register`].
+    fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> impl Future<Output = Result<bool, ShardError>> + Send;
+
+    /// Releases the registration `read` on `holder`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shards::register`].
+    fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> impl Future<Output = Result<(), ShardError>> + Send;
+
+    /// The payload at `position` for the registered read `read`, from
+    /// `holder`, as [`Shards::payload`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the registration lapsed, and as
+    /// [`Shards::register`].
+    fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> impl Future<Output = Result<Bytes, ShardError>> + Send;
+
     /// Commits one extent of a large body (§5.1), and returns the reference
     /// a `PUT` names it by, once it is durable and applied. An extent no
     /// `PUT` references is garbage that compaction reclaims (§10.3).
@@ -272,6 +346,13 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         body: RecordBody,
         condition: Precondition,
     ) -> impl Future<Output = Result<Result<EpochSeq, ConditionFailed>, ShardError>> + Send;
+
+    /// The node this gateway runs on, whose replicas it reads a GET's
+    /// bytes from first when they hold them (§9.2), or `None` if it has
+    /// none of its own.
+    fn node(&self) -> Option<NodeId> {
+        None
+    }
 
     /// Commits `writes`, records that each name a different key, each if
     /// its condition holds, as [`Shards::write`] commits each one, and
@@ -378,7 +459,7 @@ impl From<&ShardRef> for skys3_log::ShardRef {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use skys3_types::{BucketMode, ProposalId, ShardCount};
 
     use super::*;

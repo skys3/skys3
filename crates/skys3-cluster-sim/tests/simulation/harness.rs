@@ -12,8 +12,8 @@ use skys3_cluster_sim::{
     NodeEnv, NodeServices, RunError, TRANSPORT_PORT, View, Workload,
 };
 use skys3_gateway::{
-    ConditionFailed, LocalShards, Precondition, ShardError, ShardRef, ShardSummary, Shards,
-    UploadParts,
+    ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError, ShardRef,
+    ShardSummary, Shards, UploadParts,
 };
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::SimMount;
@@ -135,6 +135,55 @@ impl Shards for LosingShards {
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
         self.inner.payload(shard, position).await
+    }
+
+    fn node(&self) -> Option<NodeId> {
+        self.inner.node()
+    }
+
+    async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
+        self.inner.plan(shard, key).await
+    }
+
+    async fn register(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        key: &str,
+        version: EpochSeq,
+        layout: Vec<ExtentRef>,
+    ) -> Result<Option<Registered>, ShardError> {
+        self.inner
+            .register(shard, holder, key, version, layout)
+            .await
+    }
+
+    async fn renew(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<bool, ShardError> {
+        self.inner.renew(shard, holder, read).await
+    }
+
+    async fn release(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+    ) -> Result<(), ShardError> {
+        self.inner.release(shard, holder, read).await
+    }
+
+    async fn fetch(
+        &self,
+        shard: &ShardRef,
+        holder: &NodeId,
+        read: ReadId,
+        position: EpochSeq,
+    ) -> Result<Bytes, ShardError> {
+        self.inner.fetch(shard, holder, read, position).await
     }
 
     async fn append_extent(

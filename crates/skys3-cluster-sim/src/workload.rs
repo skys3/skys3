@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -184,14 +185,17 @@ fn unexpected(what: &str, response: &Response<Bytes>) -> Box<dyn std::error::Err
     .into()
 }
 
-/// Where clients record how long their writes took. Clones share the
-/// record.
+/// Where clients record how long their writes took, and how many of
+/// their `GET`s broke off mid-body. Clones share the record.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Timings(Arc<Mutex<Vec<WriteTiming>>>);
+pub(crate) struct Timings {
+    writes: Arc<Mutex<Vec<WriteTiming>>>,
+    broken: Arc<AtomicUsize>,
+}
 
 impl Timings {
     fn push(&self, timing: WriteTiming) {
-        self.0
+        self.writes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(timing);
@@ -199,7 +203,12 @@ impl Timings {
 
     /// Every write recorded so far, leaving none.
     pub(crate) fn take(&self) -> Vec<WriteTiming> {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        std::mem::take(&mut *self.writes.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// How many `GET`s were answered and then broke off mid-body.
+    pub(crate) fn broken(&self) -> usize {
+        self.broken.load(Ordering::Relaxed)
     }
 }
 
@@ -545,6 +554,12 @@ impl Client {
                 status if status.is_server_error() => Outcome::Failed,
                 _ => return Err(unexpected("a read", &response)),
             },
+            Err(NoAnswer::Broken(_)) => {
+                if let Some(timings) = &self.timings {
+                    timings.broken.fetch_add(1, Ordering::Relaxed);
+                }
+                Outcome::Unknown
+            }
             Err(_) => Outcome::Unknown,
         };
         let definite = matches!(outcome, Outcome::Read(_));

@@ -42,6 +42,7 @@ use skys3_net::{Credentials, Transport, TurmoilNetwork};
 use skys3_obs::MetricsRegistry;
 use skys3_shard::{
     CacheMetrics, CacheSettings, CleanCache, CompactionMetrics, CompactionSettings, Compactor,
+    ReadSettings,
 };
 use skys3_sim::{NodeClock, SimS3};
 use skys3_types::{
@@ -152,6 +153,8 @@ pub(crate) struct NodeSettings {
     pub flush: FlushSettings,
     /// The clean cache each node keeps, if any (§9.3).
     pub clean_cache: Option<CacheSettings>,
+    /// The node's read registrations as a holder (§8.7).
+    pub reads: ReadSettings,
     /// Segment compaction, if nodes run it (§10.3): a pass after each
     /// checkpoint interval.
     pub compaction: Option<CompactionSettings>,
@@ -298,6 +301,7 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
 
+    recovered.shards.set().reads().configure(settings.reads);
     let env = NodeEnv {
         node: slot.id.clone(),
         position: slot.position,

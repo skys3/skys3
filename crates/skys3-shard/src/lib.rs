@@ -28,6 +28,10 @@
 //!   live ratio is low, copying what the index and the shard's members
 //!   still need, and evicting cold clean payload instead of copying it
 //!   (§10.3).
+//! - [`reads`]: read plans, which a primary answers a GET with, and the
+//!   read registrations of a node's replicas as holders of the bytes
+//!   (§8.7, §9.2), which pin payload against compaction while a gateway
+//!   streams it.
 //!
 //! Replication (M2) runs the same state machine on every member; only the
 //! commit rule changes, and a primary serves reads only while every member
@@ -70,6 +74,7 @@ pub mod lineage;
 mod machine;
 mod multipart;
 mod pipeline;
+pub mod reads;
 pub mod replication;
 mod set;
 mod shard;
@@ -83,5 +88,6 @@ pub use error::ShardError;
 pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
+pub use reads::{ReadCounts, ReadId, ReadPlan, ReadSettings, Reads, Registered};
 pub use set::ShardSet;
 pub use shard::{Change, Committed, Role, Shard, ShardSummary};
