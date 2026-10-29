@@ -24,6 +24,14 @@
 //! A `COMMIT` is applied by a [`CommitSink`], which publishes what the
 //! staging holds in one record of the key's shard. A `COMMIT` that commits
 //! consumes the staging of its identity.
+//!
+//! ```text
+//!   BATCH        ->     CommitSink::apply_batch     ->     PUTs and DELETEs, one group commit
+//!                <-     APPLIED per item            <-     per shard
+//! ```
+//!
+//! A `BATCH` skips staging: its items carry their bytes inline, and the
+//! [`CommitSink`] applies them together.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -96,6 +104,13 @@ pub trait CommitSink: Clone + Send + Sync + 'static {
         commit: &Commit,
         staged: Option<&StagedObject>,
     ) -> impl Future<Output = Outcome> + Send;
+
+    /// Applies the items of a `BATCH`, which carry their bytes inline, and
+    /// returns one result per item, in order, for its `APPLIED`. The items
+    /// name distinct keys and distinct write identities. A sink applies
+    /// them together where it can, the items of each shard in one group
+    /// commit, and applies each at most once, as it does a `COMMIT`.
+    fn apply_batch(&self, items: &[Commit]) -> impl Future<Output = Vec<Outcome>> + Send;
 }
 
 /// A [`CommitSink`] that applies nothing: every `COMMIT` is answered
@@ -107,6 +122,11 @@ pub struct NoCommits;
 impl CommitSink for NoCommits {
     async fn apply(&self, _: &Commit, _: Option<&StagedObject>) -> Outcome {
         unavailable("this destination does not apply COMMIT")
+    }
+
+    async fn apply_batch(&self, items: &[Commit]) -> Vec<Outcome> {
+        let refusal = || unavailable("this destination does not apply BATCH");
+        items.iter().map(|_| refusal()).collect()
     }
 }
 
@@ -228,8 +248,9 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     ///   `APPLIED` of the [`CommitSink`]. A commit that commits consumes the
     ///   staging, and so does one that is refused or whose bytes do not
     ///   match: the source stages the object again.
-    /// - `BATCH` items are answered `unavailable`: this destination does
-    ///   not apply them yet.
+    /// - `BATCH` is applied by the [`CommitSink`], with no staging, and
+    ///   each of its items is answered with its own `APPLIED`, in item
+    ///   order.
     ///
     /// Frames in flight when the stream fails still settle into the
     /// staging, so the next `RESUME` reports them.
@@ -326,8 +347,18 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     stream.send(&Message::Applied(applied)).await?;
                 }
                 Message::Batch(batch) => {
-                    for item in batch.items {
-                        stream.send(&not_applied(item.identity)).await?;
+                    let outcomes = self.commits.apply_batch(&batch.items).await;
+                    // A sink that answers too few items leaves the rest to
+                    // the source's retry.
+                    let outcomes = outcomes.into_iter().chain(std::iter::repeat_with(|| {
+                        unavailable("the destination did not answer this item")
+                    }));
+                    for (item, outcome) in batch.items.into_iter().zip(outcomes) {
+                        let applied = Applied {
+                            identity: item.identity,
+                            outcome: bounded(outcome),
+                        };
+                        stream.send(&Message::Applied(applied)).await?;
                     }
                 }
                 // The session refuses every other message from a source
@@ -358,23 +389,19 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
             }
             staged => self.commits.apply(&commit, staged.as_ref()).await,
         };
-        let (outcome, consumed) = match outcome {
-            Outcome::Failed { error, reason } => (
-                Outcome::Failed {
-                    error,
-                    reason: truncated(reason),
-                },
-                matches!(error, ApplyError::Refused | ApplyError::ChecksumMismatch),
-            ),
-            committed @ Outcome::Committed { .. } => (committed, true),
-            failed @ Outcome::PreconditionFailed { .. } => (failed, false),
+        let consumed = match &outcome {
+            Outcome::Failed { error, .. } => {
+                matches!(error, ApplyError::Refused | ApplyError::ChecksumMismatch)
+            }
+            Outcome::Committed { .. } => true,
+            Outcome::PreconditionFailed { .. } => false,
         };
         if consumed {
             self.staging.discard(&commit.identity);
         }
         Applied {
             identity: commit.identity,
-            outcome,
+            outcome: bounded(outcome),
         }
     }
 
@@ -486,6 +513,18 @@ fn truncated(mut reason: String) -> String {
     reason
 }
 
+/// `outcome`, with its reason cut to the [`MAX_REASON_LEN`] bytes a
+/// message carries.
+fn bounded(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Failed { error, reason } => Outcome::Failed {
+            error,
+            reason: truncated(reason),
+        },
+        other => other,
+    }
+}
+
 /// An `unavailable` result: the source retries.
 fn unavailable(reason: &str) -> Outcome {
     Outcome::Failed {
@@ -504,13 +543,4 @@ fn discarded(reason: AbortReason) -> &'static str {
         }
         AbortReason::Expired | AbortReason::Cancelled => "the staging expired or was discarded",
     }
-}
-
-/// The `APPLIED` of a `BATCH` item, which this destination does not apply
-/// yet.
-fn not_applied(identity: WriteIdentity) -> Message {
-    Message::Applied(Applied {
-        identity,
-        outcome: unavailable("this destination does not apply BATCH yet"),
-    })
 }

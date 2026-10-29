@@ -1,8 +1,11 @@
 //! The gateway's part in native replication from peer clusters (design
-//! §7.8): relaying staged frames to the shard primaries, and publishing
-//! what a `COMMIT` names in the shard of its key.
+//! §7.8): relaying staged frames to the shard primaries, publishing what a
+//! `COMMIT` names in the shard of its key, and applying the small objects
+//! of a `BATCH` together.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -108,12 +111,20 @@ impl<S: Shards> ExtentSink for PeerExtents<S> {
 ///   wants, which is also how a replayed delete finds it.
 /// - **Receiving buckets.** A commit applies only to a bucket whose
 ///   `peer_source` is the commit's source cluster.
+/// - **Batches.** The items of a `BATCH` carry their bytes inline and skip
+///   staging. The items of each shard are committed together
+///   ([`Shards::write_all`]), so they share the primary's group commit. A
+///   body up to `inline_max_bytes` goes inline in its `PUT`; a longer one
+///   is committed first as `extent_bytes` `EXTENT` records, as a client's
+///   upload is.
 #[derive(Clone)]
 pub struct PeerCommits<S> {
     shards: S,
     buckets: BucketLookup,
     settings: BucketsConfig,
     cluster: ClusterId,
+    inline_max_bytes: usize,
+    extent_bytes: usize,
 }
 
 impl<S: fmt::Debug> fmt::Debug for PeerCommits<S> {
@@ -135,15 +146,16 @@ impl<S: Shards> PeerCommits<S> {
             buckets,
             settings: config.buckets.clone(),
             cluster: config.cluster_id.clone(),
+            inline_max_bytes: usize::try_from(config.inline_max_bytes).unwrap_or(usize::MAX),
+            extent_bytes: usize::try_from(config.extent_bytes)
+                .unwrap_or(usize::MAX)
+                .max(1),
         }
     }
 
-    /// Applies `commit`; an early answer is the `Err`.
-    async fn publish(
-        &self,
-        commit: &Commit,
-        staged: Option<&StagedObject>,
-    ) -> Result<Outcome, Outcome> {
+    /// The condition `commit` writes under in the shard of its key, if its
+    /// bucket receives from the commit's source; otherwise the refusal.
+    fn condition(&self, commit: &Commit) -> Result<PeerCondition, Outcome> {
         let Some(document) = (self.buckets)(&commit.bucket) else {
             return Err(refused(format!("there is no bucket {}", commit.bucket)));
         };
@@ -154,13 +166,22 @@ impl<S: Shards> PeerCommits<S> {
                 commit.bucket
             )));
         }
-        let shard = ShardRef::for_key(&document, &commit.key);
-        let condition = PeerCondition {
+        Ok(PeerCondition {
             identity: commit.identity.clone(),
             expected: commit.precondition.clone(),
             cluster: self.cluster.clone(),
-            shard: shard.clone(),
-        };
+            shard: ShardRef::for_key(&document, &commit.key),
+        })
+    }
+
+    /// Applies `commit`; an early answer is the `Err`.
+    async fn publish(
+        &self,
+        commit: &Commit,
+        staged: Option<&StagedObject>,
+    ) -> Result<Outcome, Outcome> {
+        let condition = self.condition(commit)?;
+        let shard = condition.shard.clone();
         // What the key holds now answers a replay, and a precondition that
         // fails already, before the staged bytes are needed.
         let entry = self.entry(&shard, &commit.key).await?;
@@ -189,13 +210,186 @@ impl<S: Shards> PeerCommits<S> {
         // copy of the commit applied it, or the key changed since it was
         // read.
         let entry = self.entry(&shard, &commit.key).await?;
-        match self.unapplied(commit, &condition, entry.as_ref()) {
-            Err(outcome) => Ok(outcome),
-            Ok(()) => Err(Outcome::Failed {
+        Ok(self.unmet(commit, &condition, entry.as_ref()))
+    }
+
+    /// The result of `commit`, whose condition failed when the shard
+    /// sequenced its write, from the key's entry `entry` read since.
+    fn unmet(&self, commit: &Commit, condition: &PeerCondition, entry: Option<&Entry>) -> Outcome {
+        match self.unapplied(commit, condition, entry) {
+            Err(outcome) => outcome,
+            Ok(()) => Outcome::Failed {
                 error: ApplyError::Unavailable,
                 reason: "the key changed while the commit was applied".to_owned(),
-            }),
+            },
         }
+    }
+
+    /// Applies the items of a `BATCH`, each shard's items together.
+    async fn apply_items(&self, items: &[Commit]) -> Vec<Outcome> {
+        let mut outcomes: Vec<Option<Outcome>> = items.iter().map(|_| None).collect();
+        let mut by_shard: BTreeMap<ShardRef, Vec<Item>> = BTreeMap::new();
+        for (at, commit) in items.iter().enumerate() {
+            let checked = match &commit.write {
+                Write::Put(Put {
+                    data: PutData::Inline(_),
+                    ..
+                })
+                | Write::Delete => self.condition(commit),
+                Write::Put(_) => Err(refused("a BATCH item carries its bytes inline")),
+            };
+            match checked {
+                Ok(condition) => by_shard
+                    .entry(condition.shard.clone())
+                    .or_default()
+                    .push(Item {
+                        at,
+                        commit: commit.clone(),
+                        condition,
+                    }),
+                Err(outcome) => outcomes[at] = Some(outcome),
+            }
+        }
+        let applied = each(by_shard, |(shard, items)| {
+            let commits = self.clone();
+            async move { commits.apply_shard(&shard, items).await }
+        });
+        for (at, outcome) in applied.await.into_iter().flatten().flatten() {
+            outcomes[at] = Some(outcome);
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.unwrap_or_else(unanswered))
+            .collect()
+    }
+
+    /// Applies `items`, the items of a batch in `shard`, and returns each
+    /// one's result by its index in the batch.
+    async fn apply_shard(&self, shard: &ShardRef, items: Vec<Item>) -> Vec<(usize, Outcome)> {
+        let mut answered = Vec::new();
+        // A delete of a key that has no current version writes nothing, so
+        // a delete reads its key first, as a `COMMIT` does.
+        let deletes = items
+            .iter()
+            .filter(|item| matches!(item.commit.write, Write::Delete));
+        let keys: Vec<_> = deletes.map(|item| item.commit.key.clone()).collect();
+        let mut read = self.entries(shard, keys).await.into_iter();
+        let mut writes = Vec::new();
+        for item in items {
+            if matches!(item.commit.write, Write::Delete) {
+                let early = match read.next().flatten() {
+                    Some(Ok(entry)) => {
+                        self.unapplied(&item.commit, &item.condition, entry.as_ref())
+                    }
+                    Some(Err(error)) => Err(failed(error)),
+                    None => Err(unanswered()),
+                };
+                if let Err(outcome) = early {
+                    answered.push((item.at, outcome));
+                    continue;
+                }
+            }
+            writes.push(item);
+        }
+        // Bodies too long to go inline are committed as extents first:
+        // records of different classes become durable independently, so a
+        // `PUT` follows its extents (§10.4).
+        let bodies = each(writes, |item| {
+            let commits = self.clone();
+            let shard = shard.clone();
+            async move {
+                let body = commits.record(&shard, &item.commit).await;
+                (item, body)
+            }
+        });
+        let mut sequenced = Vec::new();
+        for (item, body) in bodies.await.into_iter().flatten() {
+            match body {
+                Ok(body) => sequenced.push((item, body)),
+                Err(outcome) => answered.push((item.at, outcome)),
+            }
+        }
+        let (items, writes): (Vec<_>, Vec<_>) = sequenced
+            .into_iter()
+            .map(|(item, body)| {
+                let condition = Precondition::Peer(item.condition.clone());
+                (item, (body, condition))
+            })
+            .unzip();
+        let written = self.shards.write_all(shard, writes).await;
+        let mut unmet = Vec::new();
+        for (item, written) in items.into_iter().zip(written) {
+            match written {
+                Ok(Ok(_)) => {
+                    let etag = match &item.commit.write {
+                        Write::Put(put) => Some(put.etag.clone()),
+                        Write::Delete => None,
+                    };
+                    answered.push((item.at, Outcome::Committed { etag }));
+                }
+                Ok(Err(_)) => unmet.push(item),
+                Err(error) => answered.push((item.at, failed(error))),
+            }
+        }
+        // As for a `COMMIT`: another copy applied the item, or the key
+        // changed since it was read.
+        let keys: Vec<_> = unmet.iter().map(|item| item.commit.key.clone()).collect();
+        let read = self.entries(shard, keys).await;
+        for (item, entry) in unmet.into_iter().zip(read) {
+            let outcome = match entry {
+                Some(Ok(entry)) => self.unmet(&item.commit, &item.condition, entry.as_ref()),
+                Some(Err(error)) => failed(error),
+                None => unanswered(),
+            };
+            answered.push((item.at, outcome));
+        }
+        answered
+    }
+
+    /// The entries of `keys` in `shard`, read all at once, in order.
+    async fn entries(
+        &self,
+        shard: &ShardRef,
+        keys: Vec<String>,
+    ) -> Vec<Option<Result<Option<Entry>, ShardError>>> {
+        each(keys, |key| {
+            let (shards, shard) = (self.shards.clone(), shard.clone());
+            async move { shards.entry(&shard, &key).await }
+        })
+        .await
+    }
+
+    /// The record of a batch item in `shard`: a `DELETE`, or a `PUT` with
+    /// its bytes inline or, past `inline_max_bytes`, in extents committed
+    /// first.
+    async fn record(&self, shard: &ShardRef, commit: &Commit) -> Result<RecordBody, Outcome> {
+        let put = match &commit.write {
+            Write::Delete => {
+                return Ok(RecordBody::Delete(Delete {
+                    key: commit.key.clone(),
+                }));
+            }
+            Write::Put(put) => put,
+        };
+        let PutData::Inline(bytes) = &put.data else {
+            return Err(refused("a BATCH item carries its bytes inline"));
+        };
+        let data = if bytes.len() <= self.inline_max_bytes {
+            record::PutData::Inline(bytes.clone())
+        } else {
+            let mut extents = Vec::new();
+            for (n, chunk) in bytes.chunks(self.extent_bytes).enumerate() {
+                let extent = Extent {
+                    key: commit.key.clone(),
+                    offset: (n * self.extent_bytes) as u64,
+                    data: bytes.slice_ref(chunk),
+                };
+                let appended = self.shards.append_extent(shard, extent).await;
+                extents.push(appended.map_err(failed)?);
+            }
+            record::PutData::Extents(extents)
+        };
+        version(commit, put, data).map(RecordBody::Put)
     }
 
     async fn entry(&self, shard: &ShardRef, key: &str) -> Result<Option<Entry>, Outcome> {
@@ -239,6 +433,47 @@ impl<S: Shards> CommitSink for PeerCommits<S> {
             Ok(outcome) | Err(outcome) => outcome,
         }
     }
+
+    async fn apply_batch(&self, items: &[Commit]) -> Vec<Outcome> {
+        self.apply_items(items).await
+    }
+}
+
+/// A batch item on its way to its shard: its index in the batch, and its
+/// condition there.
+struct Item {
+    at: usize,
+    commit: Commit,
+    condition: PeerCondition,
+}
+
+/// Runs `job` on each of `inputs` at once, each on a task of its own, and
+/// returns the outputs in order; `None` for a task that panicked.
+async fn each<T, F>(
+    inputs: impl IntoIterator<Item = T>,
+    job: impl Fn(T) -> F,
+) -> Vec<Option<F::Output>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let tasks: Vec<_> = inputs
+        .into_iter()
+        .map(|input| tokio::spawn(job(input)))
+        .collect();
+    let mut outputs = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        outputs.push(task.await.ok());
+    }
+    outputs
+}
+
+/// The result of an item whose request ended without an answer.
+fn unanswered() -> Outcome {
+    Outcome::Failed {
+        error: ApplyError::Unavailable,
+        reason: "the shard's request ended without an answer".to_owned(),
+    }
 }
 
 /// The `PUT` record that publishes `put`, the write of `commit`, from the
@@ -266,6 +501,12 @@ fn published(
         }
         PutData::Inline(_) => return Err(refused("only BATCH items carry inline bytes")),
     };
+    version(commit, put, data)
+}
+
+/// The `PUT` record of `put`, the write of `commit`, whose bytes are
+/// `data`, with the commit's identity in its metadata.
+fn version(commit: &Commit, put: &Put, data: record::PutData) -> Result<record::Put, Outcome> {
     let mut metadata = put.metadata.clone();
     metadata.insert(IDENTITY_METADATA.to_owned(), commit.identity.to_string());
     let len: usize = metadata
@@ -319,7 +560,10 @@ mod tests {
     use skys3_config::Config;
     use skys3_log::record::Put as PutRecord;
     use skys3_peer::Precondition as Expected;
-    use skys3_types::{BucketId, BucketMode, ETag, ProposalId, ShardCount, WriteIdentity};
+    use skys3_peer::{BatchBuilder, DEFAULT_BATCH_RECORD_BYTES, Refusal};
+    use skys3_types::{
+        BucketId, BucketMode, ETag, EpochSeq, ProposalId, ShardCount, WriteIdentity,
+    };
 
     use super::*;
     use crate::stub::MemoryShards;
@@ -747,6 +991,333 @@ mod tests {
             commits.apply(&commit, Some(&staged)).await,
             Outcome::Committed { .. }
         ));
+    }
+
+    /// A batch item: `put_commit` with `body` inline, or a delete.
+    fn item(seq: u64, key: &str, precondition: Expected, body: Option<&[u8]>) -> Commit {
+        match body {
+            Some(body) => {
+                let mut commit = put_commit(seq, key, precondition, body.len() as u64);
+                if let Write::Put(put) = &mut commit.write {
+                    put.data = PutData::Inline(Bytes::copy_from_slice(body));
+                }
+                commit
+            }
+            None => delete_commit(seq, key, precondition),
+        }
+    }
+
+    /// The bytes of `key`'s current version.
+    async fn body(shards: &MemoryShards, document: &BucketDocument, key: &str) -> Vec<u8> {
+        let shard = ShardRef::for_key(document, key);
+        let entry = shards.entry(&shard, key).await.unwrap().unwrap();
+        match &entry.object.as_ref().unwrap().payload {
+            skys3_index::Payload::Inline(position) => {
+                shards.payload(&shard, *position).await.unwrap().to_vec()
+            }
+            skys3_index::Payload::Extents(extents) => {
+                let mut body = Vec::new();
+                for extent in extents {
+                    body.extend_from_slice(&shards.payload(&shard, extent.position).await.unwrap());
+                }
+                body
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+    }
+
+    /// The group commits of the shards' log so far.
+    fn group_commits(shards: &MemoryShards) -> u64 {
+        let (_, log) = shards.local().set().logs().next().unwrap();
+        log.stats().group_commits
+    }
+
+    #[tokio::test]
+    async fn a_batch_applies_each_shards_items_together() {
+        let (shards, document) = opened().await;
+        let mut config = settings(Some(SOURCE));
+        config.inline_max_bytes = 1024;
+        config.extent_bytes = 1000;
+        let commits = PeerCommits::new(shards.clone(), lookup(&document), &config);
+        let items: Vec<_> = (1..=40)
+            .map(|seq| {
+                let body = format!("object {seq}");
+                item(
+                    seq,
+                    &format!("logs/{seq}"),
+                    Expected::Absent,
+                    Some(body.as_bytes()),
+                )
+            })
+            .collect();
+        let before = (group_commits(&shards), records(&shards).await);
+        let outcomes = commits.apply_batch(&items).await;
+        for (seq, outcome) in (1..).zip(&outcomes) {
+            assert_eq!(
+                *outcome,
+                Outcome::Committed {
+                    etag: Some(etag(u8::try_from(seq).unwrap()))
+                }
+            );
+        }
+        // Forty records in at most one group commit per shard, not one per
+        // object.
+        assert_eq!(records(&shards).await, before.1 + 40);
+        let groups = group_commits(&shards) - before.0;
+        assert!((1..=4).contains(&groups), "{groups} group commits");
+        assert_eq!(body(&shards, &document, "logs/7").await, b"object 7");
+        let shard = ShardRef::for_key(&document, "logs/7");
+        let entry = shards.entry(&shard, "logs/7").await.unwrap().unwrap();
+        let object = entry.object.as_ref().unwrap();
+        assert_eq!(object.metadata[IDENTITY_METADATA], identity(7).to_string());
+        assert_eq!(object.tags["source"], "us");
+
+        // A replay after the APPLIEDs were lost returns the stored results
+        // and writes nothing.
+        assert_eq!(commits.apply_batch(&items).await, outcomes);
+        assert_eq!(records(&shards).await, before.1 + 40);
+
+        // A body past `inline_max_bytes` is committed as extents first.
+        let large: Vec<u8> = (0..2500u32).map(|n| (n % 251) as u8).collect();
+        let next = [
+            item(41, "large", Expected::Absent, Some(&large)),
+            item(42, "logs/1", Expected::Matches(identity(1)), None),
+            item(43, "logs/2", Expected::Absent, None),
+            item(44, "never", Expected::Absent, None),
+            item(45, "logs/3", Expected::Absent, Some(b"again")),
+        ];
+        let outcomes = commits.apply_batch(&next).await;
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Committed {
+                    etag: Some(etag(41))
+                },
+                Outcome::Committed { etag: None },
+                Outcome::PreconditionFailed {
+                    current: Some(identity(2))
+                },
+                Outcome::Committed { etag: None },
+                Outcome::PreconditionFailed {
+                    current: Some(identity(3))
+                },
+            ]
+        );
+        assert_eq!(body(&shards, &document, "large").await, large);
+        let shard = ShardRef::for_key(&document, "large");
+        let entry = shards.entry(&shard, "large").await.unwrap().unwrap();
+        let skys3_index::Payload::Extents(extents) = &entry.object.unwrap().payload else {
+            panic!("expected extents");
+        };
+        assert_eq!(extents.len(), 3);
+        let shard = ShardRef::for_key(&document, "logs/1");
+        let deleted = shards.entry(&shard, "logs/1").await.unwrap().unwrap();
+        assert!(deleted.object.is_none());
+    }
+
+    /// The records the shards of [`document`] have sequenced.
+    async fn records(shards: &MemoryShards) -> u64 {
+        let document = document();
+        let mut total = 0;
+        for shard in ShardRef::all(&document) {
+            let local = shards.local().set().get(&(&shard).into()).await.unwrap();
+            total += local.last_sequenced().get();
+        }
+        total
+    }
+
+    /// The bytes the shards' log has written so far.
+    fn log_bytes(shards: &MemoryShards) -> u64 {
+        let (_, log) = shards.local().set().logs().next().unwrap();
+        log.stats().bytes
+    }
+
+    #[tokio::test]
+    async fn a_built_batch_writes_at_most_its_record_budget() {
+        let (shards, document) = opened().await;
+        let commits = PeerCommits::new(shards.clone(), lookup(&document), &settings(Some(SOURCE)));
+        // 1,024 objects of 8 KiB, every eighth with the most metadata: the
+        // builder splits them so that each batch's records fit one group
+        // commit of the default log.
+        let body = vec![5; 8 << 10];
+        let mut builder = BatchBuilder::new();
+        let mut batches = Vec::new();
+        for seq in 1..=1024 {
+            let mut item = item(seq % 250, &format!("k{seq}"), Expected::Absent, Some(&body));
+            item.identity = identity(seq);
+            if seq % 8 == 0
+                && let Write::Put(put) = &mut item.write
+            {
+                put.metadata = BTreeMap::from([(
+                    "x-amz-meta-big".to_owned(),
+                    "x".repeat(MAX_METADATA_LEN - 200),
+                )]);
+            }
+            if builder.push(&item) == Err(Refusal::Full) {
+                batches.extend(builder.take());
+                builder.push(&item).unwrap();
+            }
+        }
+        batches.extend(builder.take());
+        assert!(batches.len() > 2, "{} batches", batches.len());
+        let cap = skys3_log::LogConfig::default().group_commit_max_bytes;
+        assert_eq!(cap, DEFAULT_BATCH_RECORD_BYTES);
+        for batch in batches {
+            let before = log_bytes(&shards);
+            let outcomes = commits.apply_batch(&batch.items).await;
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|o| matches!(o, Outcome::Committed { .. }))
+            );
+            let written = log_bytes(&shards) - before;
+            assert!(written <= cap, "{written} bytes of records");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_items_that_cannot_apply_are_refused_or_retried() {
+        let (shards, document) = opened().await;
+        let commits = PeerCommits::new(shards.clone(), lookup(&document), &settings(Some(SOURCE)));
+        let unknown = Commit {
+            bucket: "unknown".parse().unwrap(),
+            ..item(1, "a", Expected::Absent, Some(b"a"))
+        };
+        let staged = put_commit(2, "b", Expected::Absent, 4);
+        let outcomes = commits
+            .apply_batch(&[unknown, staged, item(3, "c", Expected::Absent, Some(b"c"))])
+            .await;
+        assert_failed(&outcomes[0], ApplyError::Refused);
+        assert_failed(&outcomes[1], ApplyError::Refused);
+        assert!(matches!(outcomes[2], Outcome::Committed { .. }));
+        let elsewhere = PeerCommits::new(shards.clone(), lookup(&document), &settings(None));
+        let outcomes = elsewhere
+            .apply_batch(&[item(4, "d", Expected::Absent, Some(b"d"))])
+            .await;
+        assert_failed(&outcomes[0], ApplyError::Refused);
+
+        // Shards that cannot serve now: the source sends the items again.
+        shards.set_unavailable(true);
+        let outcomes = commits
+            .apply_batch(&[
+                item(5, "e", Expected::Absent, Some(b"e")),
+                item(6, "c", Expected::Unconditional, None),
+            ])
+            .await;
+        for outcome in &outcomes {
+            assert_failed(outcome, ApplyError::Unavailable);
+        }
+        shards.set_unavailable(false);
+        // A bucket being deleted refuses them for good.
+        let shard = ShardRef::for_key(&document, "f");
+        shards.seal(&shard).await.unwrap();
+        let outcomes = commits
+            .apply_batch(&[item(7, "f", Expected::Absent, Some(b"f"))])
+            .await;
+        assert_failed(&outcomes[0], ApplyError::Refused);
+        // So does metadata with no room for the write identity.
+        shards.unseal(&shard).await.unwrap();
+        let mut full = item(8, "g", Expected::Absent, Some(b"g"));
+        if let Write::Put(put) = &mut full.write {
+            put.metadata = BTreeMap::from([(
+                "x-amz-meta-big".to_owned(),
+                "x".repeat(MAX_METADATA_LEN - 20),
+            )]);
+        }
+        assert_failed(&commits.apply_batch(&[full]).await[0], ApplyError::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_shard_that_does_not_batch_writes_each_item_on_its_own() {
+        /// Shards that take the default [`Shards::write_all`].
+        #[derive(Debug, Clone)]
+        struct OneByOne(MemoryShards);
+
+        impl Shards for OneByOne {
+            async fn open(&self, s: &ShardRef, b: &BucketDocument) -> Result<(), ShardError> {
+                self.0.open(s, b).await
+            }
+            async fn seal(&self, s: &ShardRef) -> Result<crate::ShardSummary, ShardError> {
+                self.0.seal(s).await
+            }
+            async fn unseal(&self, s: &ShardRef) -> Result<(), ShardError> {
+                self.0.unseal(s).await
+            }
+            async fn remove(&self, s: &ShardRef) -> Result<(), ShardError> {
+                self.0.remove(s).await
+            }
+            async fn entry(&self, s: &ShardRef, k: &str) -> Result<Option<Entry>, ShardError> {
+                self.0.entry(s, k).await
+            }
+            async fn list(
+                &self,
+                s: &ShardRef,
+                q: &skys3_index::ListQuery,
+            ) -> Result<skys3_index::ListPage, ShardError> {
+                self.0.list(s, q).await
+            }
+            async fn upload(
+                &self,
+                s: &ShardRef,
+                k: &str,
+                u: EpochSeq,
+                a: u16,
+                l: usize,
+            ) -> Result<Option<crate::UploadParts>, ShardError> {
+                self.0.upload(s, k, u, a, l).await
+            }
+            async fn uploads(
+                &self,
+                s: &ShardRef,
+                p: &str,
+                a: Option<(String, Option<EpochSeq>)>,
+                l: usize,
+            ) -> Result<Vec<(String, EpochSeq, skys3_index::Upload)>, ShardError> {
+                self.0.uploads(s, p, a, l).await
+            }
+            async fn parts(
+                &self,
+                s: &ShardRef,
+                u: EpochSeq,
+                a: u16,
+                l: usize,
+            ) -> Result<Vec<(u16, skys3_index::Part)>, ShardError> {
+                self.0.parts(s, u, a, l).await
+            }
+            async fn payload(&self, s: &ShardRef, p: EpochSeq) -> Result<Bytes, ShardError> {
+                self.0.payload(s, p).await
+            }
+            async fn append_extent(
+                &self,
+                s: &ShardRef,
+                e: Extent,
+            ) -> Result<ExtentRef, ShardError> {
+                self.0.append_extent(s, e).await
+            }
+            async fn write(
+                &self,
+                s: &ShardRef,
+                b: RecordBody,
+                c: Precondition,
+            ) -> Result<Result<EpochSeq, crate::ConditionFailed>, ShardError> {
+                self.0.write(s, b, c).await
+            }
+        }
+
+        let (shards, document) = opened().await;
+        let one_by_one = OneByOne(shards.clone());
+        let commits = PeerCommits::new(one_by_one, lookup(&document), &settings(Some(SOURCE)));
+        let items: Vec<_> = (1..=8)
+            .map(|seq| item(seq, &format!("k{seq}"), Expected::Absent, Some(b"x")))
+            .collect();
+        let outcomes = commits.apply_batch(&items).await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, Outcome::Committed { .. }))
+        );
+        assert_eq!(commits.apply_batch(&items).await, outcomes);
+        assert_eq!(body(&shards, &document, "k8").await, b"x");
     }
 
     #[test]

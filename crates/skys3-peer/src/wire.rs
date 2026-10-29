@@ -478,6 +478,13 @@ fn decode_ranges(wire: WireRanges) -> Result<StagedRanges, MessageError> {
     })
 }
 
+/// The bytes `commit` adds to the header of a `BATCH` as one of its
+/// items.
+pub(crate) fn batch_item_len(commit: &Commit) -> usize {
+    let mut payload = Vec::new();
+    prost::encoding::message::encoded_len(1, &encode_commit(commit, &mut payload))
+}
+
 fn encode_commit(commit: &Commit, payload: &mut Vec<Bytes>) -> WireCommit {
     let precondition = match &commit.precondition {
         Precondition::Absent => WirePrecondition::Absent(true),

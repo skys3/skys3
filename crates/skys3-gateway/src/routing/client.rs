@@ -19,7 +19,9 @@ use tokio::time::Instant;
 
 use super::{ForwardServer, Reply, Request, Response, Served, ShardMap, wire};
 use crate::conditions::{ConditionFailed, Precondition};
-use crate::shard::{ShardError, ShardRef, ShardSummary, Shards, UploadParts};
+use crate::shard::{
+    ShardError, ShardRef, ShardSummary, Shards, UploadParts, WriteOutcome, write_each,
+};
 
 /// How many times one call follows a redirect or reads the shard's
 /// register before it gives up. Each redirect it follows names a newer
@@ -594,5 +596,44 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
             Response::Written(written) => Ok(written),
             _ => Err(mismatched(shard)),
         }
+    }
+
+    /// Sequences the writes together on this node's replica when the map
+    /// names this node the shard's primary, so that they share a group
+    /// commit. Otherwise, and for writes the replica refuses because it no
+    /// longer serves, each write is routed on its own, all at once.
+    async fn write_all(
+        &self,
+        shard: &ShardRef,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> Vec<WriteOutcome> {
+        let inner = &self.inner;
+        let mut written: Vec<Option<WriteOutcome>> = writes.iter().map(|_| None).collect();
+        if let Some(config) = inner.map.get(shard)
+            && config.primary == inner.node
+            && let Some(local) = inner
+                .server
+                .write_all(shard, config.epoch, writes.clone())
+                .await
+        {
+            for (slot, outcome) in written.iter_mut().zip(local) {
+                if !matches!(
+                    outcome,
+                    Err(ShardError::NotPrimary { .. } | ShardError::NotFound(_))
+                ) {
+                    *slot = Some(outcome);
+                }
+            }
+        }
+        let (at, routed): (Vec<_>, Vec<_>) = writes
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| written[*at].is_none())
+            .unzip();
+        let routed = write_each(self.clone(), shard.clone(), routed).await;
+        for (at, outcome) in at.into_iter().zip(routed) {
+            written[at] = Some(outcome);
+        }
+        written.into_iter().flatten().collect()
     }
 }

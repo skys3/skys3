@@ -22,10 +22,10 @@ use skys3_gateway::stub::MemoryShards;
 use skys3_gateway::{BucketLookup, GatewayConfig, PeerCommits, PeerExtents, ShardRef, Shards};
 use skys3_net::{CertificateDer, Credentials, PrivateKeyDer};
 use skys3_peer::{
-    Abort, AbortReason, Applied, ApplyError, Begin, Capabilities, Commit, CommitSink, Data,
-    Destination, EndpointSettings, Message, MessageStream, Outcome, PeerConnection, PeerEndpoint,
-    PeerTls, PeerTrust, Precondition, Put, PutData, StagedObject, Staging, StagingLimits,
-    StagingService, Write,
+    Abort, AbortReason, Applied, ApplyError, Batch, BatchBuilder, Begin, Capabilities, Commit,
+    CommitSink, Data, Destination, EndpointSettings, Message, MessageStream, Outcome,
+    PeerConnection, PeerEndpoint, PeerTls, PeerTrust, Precondition, Put, PutData, StagedObject,
+    Staging, StagingLimits, StagingService, Write, send_batch,
 };
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ETag, Epoch, NodeId, ProposalId,
@@ -364,6 +364,87 @@ async fn commits_publish_staged_objects_once() {
 
     stream.finish().unwrap();
     assert_eq!(bounded(stream.recv()).await.unwrap(), None);
+    connection.close();
+}
+
+/// `commit`, with `body` inline, as a `BATCH` carries it.
+fn inline(seq: u64, key: &str, precondition: Precondition, body: &[u8]) -> Commit {
+    let mut commit = commit(seq, key, precondition, body);
+    if let Write::Put(put) = &mut commit.write {
+        put.data = PutData::Inline(Bytes::copy_from_slice(body));
+    }
+    commit
+}
+
+#[tokio::test]
+async fn a_batch_publishes_small_objects_in_one_round_trip() {
+    let link = Link::start().await;
+    let bodies: Vec<String> = (1..=50).map(|n| format!("small object {n}")).collect();
+    let mut builder = BatchBuilder::new();
+    for (seq, body) in (1..).zip(&bodies) {
+        let item = inline(
+            seq,
+            &format!("small/{seq}"),
+            Precondition::Absent,
+            body.as_bytes(),
+        );
+        builder.push(&item).unwrap();
+    }
+    let batch = builder.take().unwrap();
+    let (connection, mut stream) = link.stream().await;
+    let outcomes = bounded(send_batch(&mut stream, &batch)).await.unwrap();
+    for (body, outcome) in bodies.iter().zip(&outcomes) {
+        let committed = Outcome::Committed {
+            etag: Some(md5_etag(body.as_bytes())),
+        };
+        assert_eq!(outcome.as_ref(), Some(&committed));
+    }
+    // Nothing was staged, and the objects are visible to the
+    // destination's clients, without the write identity.
+    assert!(link.staging.is_empty());
+    let get = link
+        .setup
+        .call(Method::GET, "/archive/small/7", &[], "")
+        .await;
+    get.assert(200, None);
+    assert_eq!(get.body, "small object 7");
+    assert!(get.headers.get("x-amz-meta-skys3-wid").is_none());
+
+    // The batch again, as after lost APPLIEDs, on a stream of its own:
+    // the stored results, and nothing written.
+    let archive = link.setup.register("archive").await.unwrap();
+    let shard = ShardRef::for_key(&archive, "small/7");
+    let before = link.setup.shards.entry(&shard, "small/7").await;
+    let mut stream = bounded(connection.open_stream()).await.unwrap();
+    let replayed = bounded(send_batch(&mut stream, &batch)).await.unwrap();
+    assert_eq!(replayed, outcomes);
+    assert_eq!(link.setup.shards.entry(&shard, "small/7").await, before);
+
+    // The next batch deletes one, and finds another changed.
+    let next = Batch {
+        items: vec![
+            Commit {
+                write: Write::Delete,
+                ..commit(51, "small/1", Precondition::Matches(identity(1)), b"")
+            },
+            inline(52, "small/2", Precondition::Matches(identity(9)), b"newer"),
+        ],
+    };
+    let mut stream = bounded(connection.open_stream()).await.unwrap();
+    let outcomes = bounded(send_batch(&mut stream, &next)).await.unwrap();
+    assert_eq!(
+        outcomes,
+        [
+            Some(Outcome::Committed { etag: None }),
+            Some(Outcome::PreconditionFailed {
+                current: Some(identity(2))
+            })
+        ]
+    );
+    link.setup
+        .call(Method::GET, "/archive/small/1", &[], "")
+        .await
+        .assert(404, Some("NoSuchKey"));
     connection.close();
 }
 

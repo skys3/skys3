@@ -13,7 +13,10 @@ use skys3_types::{Epoch, NodeId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{Reply, Request, Response, wire};
-use crate::shard::{ShardError, ShardRef, Shards};
+use skys3_log::RecordBody;
+
+use crate::conditions::Precondition;
+use crate::shard::{ShardError, ShardRef, Shards, WriteOutcome};
 
 /// How long an accepted connection may take to send its first frame.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -130,6 +133,34 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
             Err(ShardError::NotPrimary { .. }) => Reply::Redirect(replica.config()),
             Err(error) => Reply::Refused(error),
         }
+    }
+
+    /// Commits `writes` on this node's replica of `shard` together, as
+    /// [`Shards::write_all`] does, for a gateway of this node that knows the
+    /// shard's configuration in `epoch`. `None`, with nothing written, if
+    /// the replica does not serve as the primary of that configuration or a
+    /// newer one; a write the replica refuses as it steps down meanwhile
+    /// fails with [`ShardError::NotPrimary`].
+    pub async fn write_all(
+        &self,
+        shard: &ShardRef,
+        epoch: Epoch,
+        writes: Vec<(RecordBody, Precondition)>,
+    ) -> Option<Vec<WriteOutcome>> {
+        let replica = self.inner.set.get(&shard.into()).await?;
+        let config = replica.config();
+        if config.epoch < epoch || replica.check_readable().is_err() {
+            return None;
+        }
+        let written = self.inner.shards.write_all(shard, writes).await;
+        if let Some(observer) = self.inner.observer.get() {
+            observer(&Served {
+                shard: shard.clone(),
+                node: self.inner.node.clone(),
+                epoch: config.epoch,
+            });
+        }
+        Some(written)
     }
 
     async fn execute(&self, shard: &ShardRef, request: Request) -> Result<Response, ShardError> {

@@ -16,10 +16,10 @@ use bytes::Bytes;
 use common::*;
 use skys3_log::record::ExtentRef;
 use skys3_peer::{
-    AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges, Commit, CommitSink, Data,
-    ExtentSink, MAX_REASON_LEN, Message, MessageStream, NoCommits, Outcome, PeerEndpoint,
+    AbortReason, Applied, ApplyError, Batch, BatchBuilder, Begin, ByteRanges, Commit, CommitSink,
+    Data, ExtentSink, MAX_REASON_LEN, Message, MessageStream, NoCommits, Outcome, PeerEndpoint,
     PeerTrust, Precondition, Put, PutData, SinkError, StagedObject, Staging, StagingLimits,
-    StagingService, Write,
+    StagingService, Write, send_batch,
 };
 use skys3_types::{BucketName, ETag, Epoch, EpochSeq, Seq, WriteIdentity};
 
@@ -404,7 +404,7 @@ async fn staging_that_cannot_continue_is_aborted() {
         .await
         .unwrap();
 
-    // COMMIT and BATCH are not applied yet.
+    // Without a commit sink, COMMIT and BATCH are answered `unavailable`.
     let commit = Commit {
         identity: identity(4),
         bucket: BucketName::new(DESTINATION_BUCKET).unwrap(),
@@ -464,13 +464,16 @@ async fn staging_that_cannot_continue_is_aborted() {
 /// A commit's identity and what it found staged.
 type Seen = (WriteIdentity, Option<StagedObject>);
 
-/// Stands in for the shard primaries' side of `COMMIT`: records what each
-/// commit found staged, and answers with the outcome set for its identity,
-/// `committed` by default.
+/// Stands in for the shard primaries' side of `COMMIT` and `BATCH`:
+/// records what each commit found staged and the items of each batch, and
+/// answers with the outcome set for each identity, `committed` by default.
 #[derive(Debug, Clone, Default)]
 struct TestCommits {
     outcomes: Arc<Mutex<BTreeMap<WriteIdentity, Outcome>>>,
     seen: Arc<Mutex<Vec<Seen>>>,
+    batches: Arc<Mutex<Vec<Vec<WriteIdentity>>>>,
+    /// How many items of a batch it answers, if not all.
+    answers: Arc<Mutex<Option<usize>>>,
 }
 
 impl TestCommits {
@@ -499,6 +502,114 @@ impl CommitSink for TestCommits {
             .cloned()
             .unwrap_or(Outcome::Committed { etag: None })
     }
+
+    async fn apply_batch(&self, items: &[Commit]) -> Vec<Outcome> {
+        let identities = items.iter().map(|item| item.identity.clone()).collect();
+        self.batches.lock().unwrap().push(identities);
+        let outcomes = self.outcomes.lock().unwrap();
+        let answers = self.answers.lock().unwrap().unwrap_or(items.len());
+        items
+            .iter()
+            .take(answers)
+            .map(|item| {
+                outcomes
+                    .get(&item.identity)
+                    .cloned()
+                    .unwrap_or(Outcome::Committed { etag: None })
+            })
+            .collect()
+    }
+}
+
+/// A batch item of `key`: a small object, or a delete if `body` is `None`.
+fn batch_item(identity: &WriteIdentity, key: &str, body: Option<&'static [u8]>) -> Commit {
+    let write = body.map_or(Write::Delete, |body| {
+        Write::Put(Put {
+            size: body.len() as u64,
+            etag: ETag::new("5d41402abc4b2a76b9719d911017c592").unwrap(),
+            last_modified_ms: 0,
+            metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksums: BTreeMap::new(),
+            data: PutData::Inline(Bytes::from_static(body)),
+        })
+    });
+    Commit {
+        identity: identity.clone(),
+        bucket: BucketName::new(DESTINATION_BUCKET).unwrap(),
+        key: key.to_owned(),
+        precondition: Precondition::Absent,
+        write,
+    }
+}
+
+#[tokio::test]
+async fn a_batch_is_answered_item_by_item_in_one_round_trip() {
+    let commits = TestCommits::default();
+    let setup = setup_with(TestSink::default(), LIMITS, commits.clone());
+    let failed = Outcome::PreconditionFailed {
+        current: Some(identity(9)),
+    };
+    commits.answer(&identity(2), failed.clone());
+    let long = Outcome::Failed {
+        error: ApplyError::Unavailable,
+        reason: "é".repeat(MAX_REASON_LEN),
+    };
+    commits.answer(&identity(3), long);
+
+    // An item of a bucket pair the source may not write is refused before
+    // the sink sees the batch; the others reach it as one batch.
+    let mut builder = BatchBuilder::new();
+    let items = [
+        batch_item(&identity(1), "a", Some(b"first")),
+        batch_item(&identity(2), "b", Some(b"second")),
+        batch_item(&identity(3), "c", None),
+        batch_item(&"prod-us/b-other/5/42.4".parse().unwrap(), "d", None),
+    ];
+    for item in &items {
+        builder.push(item).unwrap();
+    }
+    let batch = builder.take().unwrap();
+    let (connection, mut stream) = setup.stream().await;
+    let outcomes = send_batch(&mut stream, &batch).bounded().await.unwrap();
+    assert_eq!(outcomes.len(), 4);
+    assert_eq!(outcomes[0], Some(Outcome::Committed { etag: None }));
+    assert_eq!(outcomes[1], Some(failed));
+    let Some(Outcome::Failed { error, reason }) = &outcomes[2] else {
+        panic!("expected a failure, got {:?}", outcomes[2]);
+    };
+    assert_eq!(*error, ApplyError::Unavailable);
+    assert!(reason.len() <= MAX_REASON_LEN, "the reason is cut to fit");
+    assert!(matches!(
+        outcomes[3],
+        Some(Outcome::Failed {
+            error: ApplyError::Refused,
+            ..
+        })
+    ));
+    let batches = commits.batches.lock().unwrap().clone();
+    assert_eq!(batches, [vec![identity(1), identity(2), identity(3)]]);
+    // A batch stages nothing.
+    assert!(setup.staging.is_empty());
+    assert!(commits.seen().is_empty());
+
+    // A sink that answers only some items leaves the rest `unavailable`,
+    // for the source to send again.
+    *commits.answers.lock().unwrap() = Some(1);
+    let batch = Batch {
+        items: items[..2].to_vec(),
+    };
+    let mut stream = connection.open_stream().bounded().await.unwrap();
+    let outcomes = send_batch(&mut stream, &batch).bounded().await.unwrap();
+    assert_eq!(outcomes[0], Some(Outcome::Committed { etag: None }));
+    assert!(matches!(
+        outcomes[1],
+        Some(Outcome::Failed {
+            error: ApplyError::Unavailable,
+            ..
+        })
+    ));
+    connection.close();
 }
 
 fn staged_commit(identity: &WriteIdentity, key: &str, size: u64) -> Message {
