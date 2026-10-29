@@ -175,6 +175,18 @@ of this file. A task with nothing unexpected keeps "None."
   `--test-threads=1`. The runner builds
   `SKYS3_SIM_SEED=<seed> cargo test -p <package> --test <target> -- <test> --exact`
   from these, and a test checks the exact output.
+- **Advisories published after the stack was written (fixed later in the
+  stack).** cargo-deny began reporting RUSTSEC-2026-0386 (tokio),
+  RUSTSEC-2026-0385 (ctutils), and the rustls and rustls-webpki advisories
+  RUSTSEC-2026-0346 to 0349 and 0382 against the locked versions. M5-02
+  updated its lock first, which left every branch below it failing
+  cargo-deny on its next CI run. tokio enters the lock here, so the
+  update to 1.54.1 is made here. rustls 0.23.46 and rustls-webpki 0.103.16
+  (from M1-23) and ctutils 0.4.6 (from M1-15) are updated in the merges
+  that carry this change up, since a merge keeps the upper branch's lock.
+  The new tokio changes every simulation's schedule for a given seed, as
+  it did on M5-02, so seed-sensitive tests may need the same attention
+  on the branches between.
 
 ### M0-05 Simulated S3 store
 
@@ -1360,6 +1372,21 @@ of this file. A task with nothing unexpected keeps "None."
 - **Signals in tests without `unsafe`.** Sending `SIGTERM` needs
   `libc::kill`, which `forbid(unsafe_code)` rules out, so the end-to-end
   test runs `kill -TERM <pid>`; `Child::kill` sends `SIGKILL`.
+- **A reload undid the gateway's own bucket changes (fixed later in the
+  stack).** The control-store sync calls `reload_buckets` whenever the
+  generation moves, including after this gateway's own changes.
+  `Buckets::reload` listed and read every bucket register, then replaced
+  the whole local copy. A change the gateway made while the reload read,
+  such as a new bucket or a lifecycle configuration answered 200, was
+  overwritten by the older value the reload had read. A client's next
+  request then saw the change missing until the following sync. The SDK
+  matrix's s3-tests hit this on a much later PR (#128):
+  `GetBucketLifecycleConfiguration` answered `NoSuchLifecycleConfiguration`
+  right after a successful put. The gateway now counts its own changes,
+  and a reload keeps the local value of every bucket changed after the
+  reload began. `a_reload_keeps_the_changes_made_while_it_read` creates
+  and deletes buckets from a control-store hook between the reload's
+  reads, and fails without the fix.
 - **Left open.** Nodes do not register under `nodes/` yet:
   `NodeRegistration` needs an intra-cluster address, which arrives with
   the transport (M2-02) and the node registry (M3-02). Bucket status scans
@@ -1903,6 +1930,13 @@ of this file. A task with nothing unexpected keeps "None."
   sending anything stopped discovery from listing twelve small folders.
   A level is now charged its listings, then its probes, and abandoned
   only if what it actually needs exceeds the budget.
+- **The shared rate-limit test read its count before the status.**
+  `every_stream_shares_one_rate_limit` counted the indexed keys, then
+  checked whether the import was done, and expected all 40 once it was.
+  When the last page landed between the two reads, it saw 39 keys and a
+  finished import; CI hit this on a later PR. It now counts again after
+  seeing the import done. That still fails if an import ever reports done
+  before its last keys are indexed. 30 of 30 runs passed.
 - **A codec proptest failed on a location, not on an import.** CI on a
   later PR shrank `arbitrary_bytes_decode_canonically` to `[1, 0 × 20]`,
   re-encoded as `[3, 0 × 20]`, and the import codec looked like the cause.
@@ -5016,6 +5050,13 @@ of this file. A task with nothing unexpected keeps "None."
   (`member_suspect_after` is 700 ms); every shard node 3 belonged to
   ended without it. The scenario declares `4 * COST`, so CI's fixed set
   (`SKYS3_SIM_SEEDS=256`) runs 2 seeds, about 55 s.
+- **The node test read the copy's generation too early.** A Coverage run
+  failed `a_lost_control_store_is_rebuilt_from_the_nodes_copy` with the
+  exported copy at generation 3 and health at 2. Health reports the
+  generation of the node's copy, which follows a bucket creation after the
+  client is answered, so it can still lag the second creation when read.
+  The test now waits until the copy reaches generation 3: the bootstrap's
+  1, plus one per bucket.
 - **Left open.**
   - **Rebuilding an etcd or S3 store from the binary**, with the binary's
     multi-node wiring (M2-08b).
