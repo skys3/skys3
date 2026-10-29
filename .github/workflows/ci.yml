@@ -293,6 +293,50 @@ jobs:
         env:
           SKYS3_SIM_SEEDS: 256
 
+  # The etcd control-store backend against a real etcd (plan M2-05): the
+  # conformance suite, the startup probe, paged listings, and watches. The
+  # tests skip themselves when SKYS3_ETCD_ENDPOINTS is unset, as in the
+  # other jobs. The image runs as root in /var/lib/etcd; it has no shell
+  # for a container health check, so the job waits on /health itself.
+  etcd:
+    name: etcd integration
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      etcd:
+        image: gcr.io/etcd-development/etcd:v3.6.10
+        ports:
+          - 2379:2379
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build the etcd tests
+        run: cargo test -p skys3-control --all-features --test etcd --no-run
+
+      - name: Wait for etcd
+        run: |
+          for _ in $(seq 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:2379/health; then exit 0; fi
+            sleep 1
+          done
+          echo "etcd did not become healthy" >&2
+          exit 1
+
+      - name: Run the etcd tests
+        run: cargo test -p skys3-control --all-features --test etcd -- --nocapture
+        env:
+          SKYS3_ETCD_ENDPOINTS: http://127.0.0.1:2379
+
   # A brief cargo-fuzz run of every target in fuzz/, found with `cargo fuzz
   # list` so new targets join automatically. Long runs are nightly (M7-03).
   # A crash fails the job and uploads the input that caused it.
@@ -369,7 +413,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny, simulation, fuzz, model]
+    needs: [changes, rust, docs, coverage, msrv, deny, simulation, etcd, fuzz, model]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results

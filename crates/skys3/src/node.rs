@@ -697,8 +697,9 @@ impl Node {
     pub async fn start(config: Config) -> Result<Self, StartError> {
         let ControlStoreBackend::File { directory } = &config.control_store().backend else {
             return Err(StartError::Unsupported(
-                "this build runs only with [control_store] backend = \"file\"; the etcd and s3 \
-                 backends arrive with replication (plan M2-04, M2-05)"
+                "this build runs only with [control_store] backend = \"file\": until \
+                 replication (plan M2-07, M2-08) each node serves every shard alone, and an etcd \
+                 or s3 store that several nodes share would let two nodes serve one bucket apart"
                     .to_owned(),
             ));
         };
