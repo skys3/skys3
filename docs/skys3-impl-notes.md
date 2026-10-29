@@ -175,6 +175,18 @@ of this file. A task with nothing unexpected keeps "None."
   `--test-threads=1`. The runner builds
   `SKYS3_SIM_SEED=<seed> cargo test -p <package> --test <target> -- <test> --exact`
   from these, and a test checks the exact output.
+- **Advisories published after the stack was written (fixed later in the
+  stack).** cargo-deny began reporting RUSTSEC-2026-0386 (tokio),
+  RUSTSEC-2026-0385 (ctutils), and the rustls and rustls-webpki advisories
+  RUSTSEC-2026-0346 to 0349 and 0382 against the locked versions. M5-02
+  updated its lock first, which left every branch below it failing
+  cargo-deny on its next CI run. tokio enters the lock here, so the
+  update to 1.54.1 is made here. rustls 0.23.46 and rustls-webpki 0.103.16
+  (from M1-23) and ctutils 0.4.6 (from M1-15) are updated in the merges
+  that carry this change up, since a merge keeps the upper branch's lock.
+  The new tokio changes every simulation's schedule for a given seed, as
+  it did on M5-02, so seed-sensitive tests may need the same attention
+  on the branches between.
 
 ### M0-05 Simulated S3 store
 
