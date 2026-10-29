@@ -348,6 +348,28 @@ fn a_newest_version_that_cannot_be_rebuilt_is_unrecoverable_and_not_replaced() {
 }
 
 #[test]
+fn an_unrecoverable_version_retagged_before_the_snapshot_keeps_the_retag() {
+    // Coded at 10, retagged at 15, snapshotted at 20: the one header found
+    // predates the retag.
+    let version = Version::new("photo", 10, 1);
+    let retagged = version.retagged(15, "second");
+    let state = snapshot(20, &[("photo", retagged.coded_entry(1, 11, 0))]);
+    let reindexed = run(Some(&state), vec![version.fragment(1, 0, 0)], &[]);
+    let lost = &reindexed.unrecoverable["photo"];
+    assert!(matches!(
+        lost.error,
+        ReindexError::Rebuild(RebuildError::NotEnoughFragments { .. })
+    ));
+    // A backup that holds the version only as written at 10 lost the
+    // tags acknowledged at 15.
+    assert_eq!((lost.version, lost.identity), (at(10), at(15)));
+
+    // A header of an attempt that read the retag names it too.
+    let reindexed = run(Some(&state), vec![retagged.fragment(2, 0, 0)], &[]);
+    assert_eq!(reindexed.unrecoverable["photo"].identity, at(15));
+}
+
+#[test]
 fn a_coded_entry_whose_fragments_are_gone_is_unrecoverable() {
     let version = Version::new("photo", 10, 1);
     let state = snapshot(20, &[("photo", version.coded_entry(1, 11, 0))]);
