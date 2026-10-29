@@ -9801,6 +9801,12 @@ of this file. A task with nothing unexpected keeps "None."
   resumed 6.3 to 6.4 s after `kill -9` of a primary in every run
   (`primary_grace` is 6 s), against the 10 s the plan asks for; the
   in-process test's shorter timing takes about 2 s.
+- **The writer's node list is renamed into place.** Rewritten with `>`,
+  `$work/live` is empty for a moment, and a writer that read it then
+  would stop silently (`read` fails under `set -e`); the kill check would
+  then time out as if writes had stalled. The scenario writes the list
+  aside and renames it, as the coordinator scenario (M8-06) does, where
+  the race showed in CI.
 - **The scenario depends on the disk's free space unless told not to.**
   The development machine's disk had 2.6% free, below the default
   `reserve_fraction` of 10%, so every clean version was evicted at once,
