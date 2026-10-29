@@ -1,5 +1,7 @@
-//! The etcd backend against a real etcd cluster: the conformance suite,
-//! the startup probe, listings over several pages, and endpoint failover.
+//! The etcd backend against a real etcd cluster: listings over several
+//! pages, endpoint failover, and prompt watches. The conformance suite,
+//! which includes the startup probe over separate connections, runs
+//! against the same cluster in `tests/conformance.rs`.
 //!
 //! Set `SKYS3_ETCD_ENDPOINTS` to the cluster's client URLs, separated by
 //! commas, for example `http://127.0.0.1:2379`. CI's `etcd` job runs an
@@ -11,10 +13,9 @@ use std::future::Future;
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_control::conformance::{self, Backend};
 use skys3_control::{
-    ChangeStream, ControlProbe, ControlStore, EtcdControlStore, EtcdStoreConfig, Expected,
-    KeyPrefix, ProposalIds, PutOutcome, RegisterKey, RetryPolicy, bootstrap, bump_generation,
+    ChangeStream, ControlStore, EtcdControlStore, EtcdStoreConfig, Expected, KeyPrefix,
+    ProposalIds, PutOutcome, RegisterKey, RetryPolicy, bootstrap, bump_generation,
 };
 use skys3_types::Generation;
 use tokio::task::JoinSet;
@@ -42,10 +43,6 @@ fn endpoints(test: &str) -> Option<Vec<String>> {
 /// A store over `endpoints` under a fresh prefix.
 fn store(endpoints: &[String]) -> EtcdControlStore {
     let prefix = format!("skys3-test/{:016x}/", rand::random::<u64>());
-    store_at(endpoints, &prefix)
-}
-
-fn store_at(endpoints: &[String], prefix: &str) -> EtcdControlStore {
     EtcdControlStore::new(EtcdStoreConfig::new(endpoints.to_vec(), prefix)).unwrap()
 }
 
@@ -53,47 +50,6 @@ async fn bounded<T>(test: impl Future<Output = T>) -> T {
     tokio::time::timeout(TEST_TIMEOUT, test)
         .await
         .expect("the test finished in time")
-}
-
-struct Etcd(Vec<String>);
-
-impl Backend for Etcd {
-    type Store = EtcdControlStore;
-
-    async fn store(&mut self) -> EtcdControlStore {
-        store(&self.0)
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_etcd_store_conforms() {
-    let Some(endpoints) = endpoints("the_etcd_store_conforms") else {
-        return;
-    };
-    bounded(async {
-        let mut backend = Etcd(endpoints);
-        conformance::run(&mut backend).await;
-        conformance::racing_creates_have_one_winner(&backend.store().await, 32).await;
-        conformance::increments_are_linearizable(&backend.store().await, 8, 16).await;
-    })
-    .await;
-}
-
-/// Writers on separate connections, as racing nodes have.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_etcd_store_passes_the_probe() {
-    let Some(endpoints) = endpoints("the_etcd_store_passes_the_probe") else {
-        return;
-    };
-    bounded(async {
-        let prefix = format!("skys3-test/{:016x}/", rand::random::<u64>());
-        let writers: Vec<_> = (0..3).map(|_| store_at(&endpoints, &prefix)).collect();
-        let probe = ControlProbe::with_fresh_nonce();
-        probe.run(&writers).await.unwrap();
-        let left = writers[0].list(&KeyPrefix::root()).await.unwrap();
-        assert!(left.is_empty(), "the probe left {left:?}");
-    })
-    .await;
 }
 
 /// A listing longer than a page reads every page at one revision.

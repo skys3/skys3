@@ -66,6 +66,11 @@ impl Backend for Fakes {
             EtcdStoreConfig::new(vec![self.fake.url("http")], format!("s{}/", self.stores));
         EtcdControlStore::new(config).unwrap()
     }
+
+    async fn connect(&mut self, store: &EtcdControlStore) -> EtcdControlStore {
+        let config = EtcdStoreConfig::new(vec![self.fake.url("http")], store.prefix());
+        EtcdControlStore::new(config).unwrap()
+    }
 }
 
 #[tokio::test]
@@ -75,7 +80,7 @@ async fn the_store_conforms_over_the_fake() {
             fake: Fake::start(None).await,
             stores: 0,
         };
-        conformance::run(&mut fakes).await;
+        conformance::run_at(&mut fakes, conformance::Scale::SMALL).await;
     })
     .await;
 }

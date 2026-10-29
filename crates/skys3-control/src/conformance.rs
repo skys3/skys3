@@ -1,39 +1,93 @@
 //! The conformance suite every [`ControlStore`] backend must pass (design
 //! §16.1, plan M2-06).
 //!
-//! A backend's tests implement [`Backend`], which makes fresh, empty
-//! stores, and call [`run`]. Each check is also public, so a backend can
-//! run one alone or at a larger scale. A check panics with a message naming
-//! what failed.
+//! # Plugging in a backend
 //!
-//! The checks cover linearizable `put_if` under concurrency, conditional
-//! deletes, listing, the lost-response rule with faults injected by
-//! [`FaultyStore`] around the backend, cluster
-//! bootstrap and the generation, and change delivery. A backend's own
-//! transport faults, such as a simulated S3 store's, come on top of these.
+//! A backend's tests implement [`Backend`], which makes fresh, empty
+//! stores and, if the backend has connections, more handles to a store's
+//! registers, and call [`run`] or [`run_at`]:
+//!
+//! ```
+//! use skys3_control::MemoryControlStore;
+//! use skys3_control::conformance::{self, Backend, Scale};
+//!
+//! struct Memory;
+//!
+//! impl Backend for Memory {
+//!     type Store = MemoryControlStore;
+//!
+//!     async fn store(&mut self) -> MemoryControlStore {
+//!         MemoryControlStore::new()
+//!     }
+//! }
+//!
+//! # let runtime = tokio::runtime::Builder::new_current_thread()
+//! #     .enable_time()
+//! #     .start_paused(true)
+//! #     .build()?;
+//! # runtime.block_on(async {
+//! conformance::run_at(&mut Memory, Scale::SMALL).await;
+//! # });
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! Every check is also public, so a backend can run one alone, at another
+//! scale, or under faults of its own, such as a simulated S3 store's. A
+//! check panics with a message naming what failed, and [`run_at`] names
+//! each check on standard error before it starts it.
+//!
+//! # What the suite checks
+//!
+//! - One register at a time: [`conditional_writes`],
+//!   [`conditional_deletes`], and [`listing`].
+//! - Linearizable `put_if` under concurrency, with one writer per handle:
+//!   [`racing_creates_have_one_winner`], [`increments_are_linearizable`],
+//!   and [`histories_are_linearizable`], which records concurrent reads
+//!   and conditional writes and checks each register's history against
+//!   real time.
+//! - Retries and the lost-response rule, with faults injected by
+//!   [`FaultyStore`] around the backend: scripted in
+//!   [`lost_responses_resolve`] and [`conflicts_are_retried`] (`409`
+//!   answers), random in [`increments_survive_random_faults`].
+//! - Cluster bootstrap and the generation: [`bootstrap_races_agree`].
+//! - The startup probe at scale: [`probes_pass_repeatedly`], with several
+//!   nodes probing at once, run after run, and
+//!   [`the_probe_passes_under_faults`].
+//! - Change delivery, by watch or by poll: [`changes_follow_the_generation`]
+//!   and [`changes_reach_every_watcher`].
+//!
+//! # Time
 //!
 //! The checks wait on real or simulated time: backoffs between retries,
 //! and a late request in flight. A backend whose requests go to blocking
 //! threads must run them without Tokio's paused clock, which would jump
 //! ahead while the runtime waits for those threads.
 
-use std::collections::BTreeSet;
+mod history;
+mod races;
+
 use std::future::Future;
 use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_types::{ClusterId, Generation, ProposalId};
-use tokio::task::JoinSet;
 
-use crate::cluster::{Bootstrap, FIRST_GENERATION, bootstrap, bump_generation, read_cluster};
+pub use self::races::{
+    bootstrap_races_agree, changes_reach_every_watcher, histories_are_linearizable,
+    increments_are_linearizable, increments_survive_random_faults, probes_pass_repeatedly,
+    racing_creates_have_one_winner, the_probe_passes_under_faults,
+};
+use crate::cluster::{FIRST_GENERATION, bootstrap, bump_generation};
 use crate::faults::{Fault, FaultyStore};
 use crate::key::{KeyPrefix, RegisterKey};
+use crate::probe::ControlProbe;
 use crate::propose::{
     DeletionOutcome, ProposalIds, ProposalOutcome, RetryPolicy, proposal_id_of, propose,
     propose_delete,
 };
 use crate::store::{
-    Change, ChangeStream, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version,
+    Versioned,
 };
 
 /// Makes the stores a conformance run tests.
@@ -43,22 +97,137 @@ pub trait Backend {
 
     /// Returns a new, empty store, independent of every earlier one.
     fn store(&mut self) -> impl Future<Output = Self::Store>;
+
+    /// Returns another handle to `store`'s registers, as another node
+    /// would open it. Racing writers each use their own handle. The
+    /// default clones `store`; a backend whose clones share a connection,
+    /// such as etcd's, opens a new one.
+    fn connect(&mut self, store: &Self::Store) -> impl Future<Output = Self::Store> {
+        std::future::ready(store.clone())
+    }
+}
+
+/// How hard [`run_at`] pushes a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Scale {
+    /// Handles to one store, each with its own racing writer, probing
+    /// node, or change stream. At least 2.
+    pub writers: u64,
+    /// Operations per writer in the concurrent checks. At least 8, so
+    /// that every check gets some.
+    pub operations: u64,
+    /// How many times every node runs the startup probe.
+    pub probe_runs: u32,
+    /// The rounds of each probe.
+    pub probe_rounds: u32,
+}
+
+impl Scale {
+    /// A brief run, for in-process stand-ins on real time such as the
+    /// file store and the fake etcd.
+    pub const SMALL: Self = Self {
+        writers: 3,
+        operations: 8,
+        probe_runs: 1,
+        probe_rounds: 20,
+    };
+
+    /// [`run`]'s scale, also for stores billed per request: full probes.
+    pub const DEFAULT: Self = Self {
+        writers: 4,
+        operations: 16,
+        probe_runs: 2,
+        probe_rounds: ControlProbe::ROUNDS,
+    };
+
+    /// For simulated stores and a local etcd: more writers, longer
+    /// histories, and more probes.
+    pub const LARGE: Self = Self {
+        writers: 8,
+        operations: 48,
+        probe_runs: 4,
+        probe_rounds: ControlProbe::ROUNDS,
+    };
+}
+
+impl Default for Scale {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 /// How long a change stream may take to report an announced write. Polling
 /// backends report within their poll interval.
 const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Runs every check, each on a fresh store.
+/// Runs every check at [`Scale::DEFAULT`].
 pub async fn run<B: Backend>(backend: &mut B) {
+    run_at(backend, Scale::DEFAULT).await;
+}
+
+/// Runs every check at `scale`, each on a fresh store.
+///
+/// # Panics
+///
+/// If a check fails, or `scale` is below its minimums.
+pub async fn run_at<B: Backend>(backend: &mut B, scale: Scale) {
+    assert!(scale.writers >= 2, "the suite races at least two writers");
+    assert!(
+        scale.operations >= 8,
+        "the suite needs 8 operations per writer"
+    );
+    let Scale {
+        writers,
+        operations,
+        probe_runs,
+        probe_rounds,
+    } = scale;
+
+    announce("conditional_writes");
     conditional_writes(&backend.store().await).await;
+    announce("conditional_deletes");
     conditional_deletes(&backend.store().await).await;
+    announce("listing");
     listing(&backend.store().await).await;
-    racing_creates_have_one_winner(&backend.store().await, 8).await;
-    increments_are_linearizable(&backend.store().await, 4, 8).await;
+    announce("conflicts_are_retried");
+    conflicts_are_retried(&backend.store().await).await;
+    announce("lost_responses_resolve");
     lost_responses_resolve(&backend.store().await).await;
-    bootstrap_races_agree(&backend.store().await, 6).await;
+
+    announce("racing_creates_have_one_winner");
+    racing_creates_have_one_winner(&handles(backend, writers).await).await;
+    announce("increments_are_linearizable");
+    increments_are_linearizable(&handles(backend, writers).await, operations / 2).await;
+    announce("histories_are_linearizable");
+    histories_are_linearizable(&handles(backend, writers).await, operations).await;
+    announce("increments_survive_random_faults");
+    increments_survive_random_faults(&handles(backend, writers).await, operations / 4).await;
+    announce("bootstrap_races_agree");
+    bootstrap_races_agree(&handles(backend, writers).await).await;
+
+    announce("probes_pass_repeatedly");
+    probes_pass_repeatedly(&handles(backend, writers).await, probe_runs, probe_rounds).await;
+    announce("the_probe_passes_under_faults");
+    the_probe_passes_under_faults(&handles(backend, writers).await, probe_rounds).await;
+
+    announce("changes_follow_the_generation");
     changes_follow_the_generation(&backend.store().await).await;
+    announce("changes_reach_every_watcher");
+    changes_reach_every_watcher(&handles(backend, writers).await, (operations / 8).max(2)).await;
+}
+
+fn announce(check: &str) {
+    eprintln!("conformance: {check}");
+}
+
+/// A fresh store and `count - 1` more handles to it.
+async fn handles<B: Backend>(backend: &mut B, count: u64) -> Vec<B::Store> {
+    let mut handles = vec![backend.store().await];
+    for _ in 1..count {
+        let handle = backend.connect(&handles[0]).await;
+        handles.push(handle);
+    }
+    handles
 }
 
 /// A register value carrying `proposal` and a counter.
@@ -305,115 +474,6 @@ pub async fn listing<S: ControlStore>(store: &S) {
     }
 }
 
-/// `writers` proposals race to create one register: exactly one is
-/// accepted, and the register holds it.
-pub async fn racing_creates_have_one_winner<S: ControlStore>(store: &S, writers: u64) {
-    let register = key("coordinator.lease");
-    let mut tasks = JoinSet::new();
-    for writer in 0..writers {
-        let (store, register) = (store.clone(), register.clone());
-        tasks.spawn(async move {
-            let proposal = ProposalIds::seeded(100 + writer).next_id();
-            let outcome = propose(
-                &store,
-                &register,
-                Expected::Absent,
-                value(&proposal, writer),
-                &proposal,
-                &RetryPolicy::default(),
-            )
-            .await;
-            (proposal, outcome.unwrap())
-        });
-    }
-    let winners: Vec<_> = tasks
-        .join_all()
-        .await
-        .into_iter()
-        .filter(|(_, outcome)| matches!(outcome, ProposalOutcome::Accepted(_)))
-        .collect();
-    assert_eq!(
-        winners.len(),
-        1,
-        "racing creates had {} winners",
-        winners.len()
-    );
-    let stored = store
-        .get(&register)
-        .await
-        .unwrap()
-        .expect("the register exists");
-    assert_eq!(proposal_id_of(&stored.value).as_ref(), Some(&winners[0].0));
-}
-
-/// `writers` writers each increment a counter register `increments` times
-/// by read and `put_if`: no increment is lost or applied twice.
-pub async fn increments_are_linearizable<S: ControlStore>(
-    store: &S,
-    writers: u64,
-    increments: u64,
-) {
-    let register = key("shards/b-1/0.json");
-    let created = store.put_if(
-        &register,
-        Expected::Absent,
-        value(&ProposalId::from_u128(0), 0),
-    );
-    assert!(matches!(created.await.unwrap(), PutOutcome::Written(_)));
-    let mut tasks = JoinSet::new();
-    for writer in 0..writers {
-        let (store, register) = (store.clone(), register.clone());
-        tasks.spawn(async move {
-            let mut ids = ProposalIds::seeded(200 + writer);
-            let mut applied = Vec::new();
-            while (applied.len() as u64) < increments {
-                let current = store
-                    .get(&register)
-                    .await
-                    .unwrap()
-                    .expect("the counter exists");
-                // Let other writers read the same version.
-                tokio::task::yield_now().await;
-                let next = counter_of(&current) + 1;
-                let proposal = ids.next_id();
-                let outcome = propose(
-                    &store,
-                    &register,
-                    Expected::Version(current.version),
-                    value(&proposal, next),
-                    &proposal,
-                    &RetryPolicy::default(),
-                )
-                .await;
-                if let ProposalOutcome::Accepted(_) = outcome.unwrap() {
-                    applied.push(next);
-                }
-                tokio::task::yield_now().await;
-            }
-            applied
-        });
-    }
-    let applied: Vec<u64> = tasks.join_all().await.into_iter().flatten().collect();
-    let distinct: BTreeSet<u64> = applied.iter().copied().collect();
-    let total = writers * increments;
-    assert_eq!(
-        distinct.len() as u64,
-        total,
-        "an increment was applied twice: {applied:?}"
-    );
-    assert_eq!(
-        distinct,
-        (1..=total).collect(),
-        "increments are not contiguous"
-    );
-    let current = store
-        .get(&register)
-        .await
-        .unwrap()
-        .expect("the counter exists");
-    assert_eq!(counter_of(&current), total, "the counter lost an increment");
-}
-
 /// The lost-response rule and retries, with faults injected around the
 /// backend: every write the proposer is told landed did land, and every
 /// write it is told was rejected is not the register's value.
@@ -510,70 +570,75 @@ pub async fn lost_responses_resolve<S: ControlStore>(store: &S) {
     assert_eq!(proposal_id_of(&stored.value), Some(theirs));
 }
 
-/// `nodes` nodes bootstrap the same cluster at once and then increment
-/// its generation: exactly one creates `cluster.json`, all agree on it,
-/// and the increments count up from it.
-pub async fn bootstrap_races_agree<S: ControlStore>(store: &S, nodes: u64) {
-    let cluster = ClusterId::new("conformance").expect("valid");
-    let mut tasks = JoinSet::new();
-    for node in 0..nodes {
-        let (store, cluster) = (store.clone(), cluster.clone());
-        tasks.spawn(async move {
-            let mut ids = ProposalIds::seeded(300 + node);
-            let policy = RetryPolicy::default();
-            let outcome = bootstrap(&store, &cluster, ids.next_id(), &policy)
-                .await
-                .unwrap();
-            let generation = bump_generation(&store, &cluster, &mut ids, &policy)
-                .await
-                .unwrap();
-            (outcome, generation)
-        });
-    }
-    let results = tasks.join_all().await;
-    let created: Vec<_> = results
-        .iter()
-        .filter_map(|(outcome, _)| match outcome {
-            Bootstrap::Created(cluster) => Some(cluster),
-            Bootstrap::Existing(_) => None,
-        })
-        .collect();
-    assert_eq!(
-        created.len(),
-        1,
-        "{} nodes created cluster.json",
-        created.len()
-    );
-    // Nodes that read cluster.json saw the created document, or a later
-    // increment of it.
-    for (outcome, _) in &results {
-        let found = &outcome.cluster().value;
-        assert_eq!(found.cluster_id, cluster);
-        if found.generation == FIRST_GENERATION {
-            assert_eq!(found, &created[0].value, "nodes disagree");
-        }
-    }
+/// `409 ConditionalRequestConflict` answers to creates, updates, and
+/// deletes are sent again until they land, as design §6.1 says, and are
+/// never taken for a lost race or a lost response; a write whose every
+/// attempt conflicted reports that it applied nothing, and did not.
+pub async fn conflicts_are_retried<S: ControlStore>(store: &S) {
+    let faulty = FaultyStore::new(store.clone());
+    let register = key("buckets/conflicted.json");
+    let mut ids = ProposalIds::seeded(7);
     let policy = RetryPolicy::default();
-    let current = read_cluster(store, &cluster, &policy)
-        .await
-        .unwrap()
-        .value
-        .generation;
-    assert!(
-        current > FIRST_GENERATION && current.get() <= 1 + nodes,
-        "{current}"
-    );
-    for (_, generation) in &results {
-        assert!(
-            *generation > FIRST_GENERATION && *generation <= current,
-            "{generation}"
+    let conflicts = |n| vec![Fault::Conflict; n];
+
+    let mut write = async |faults: Vec<Fault>, expected: Expected, policy: &RetryPolicy| {
+        faulty.script(faults);
+        let proposal = ids.next_id();
+        let value = value(&proposal, 0);
+        let outcome = propose(
+            &faulty,
+            &register,
+            expected,
+            value.clone(),
+            &proposal,
+            policy,
         );
+        (outcome.await, value)
+    };
+    let (created, value1) = write(conflicts(3), Expected::Absent, &policy).await;
+    let Ok(ProposalOutcome::Accepted(v1)) = created else {
+        panic!("a create that conflicted three times: {created:?}");
+    };
+    let (updated, value2) = write(conflicts(2), Expected::Version(v1.clone()), &policy).await;
+    let Ok(ProposalOutcome::Accepted(v2)) = updated else {
+        panic!("an update that conflicted twice: {updated:?}");
+    };
+    assert_ne!(v1, v2);
+    let current = store.get(&register).await.unwrap();
+    assert_eq!(
+        current,
+        Some(Versioned {
+            value: value2,
+            version: v2.clone()
+        }),
+        "conflicting writes landed elsewhere (the first wrote {value1:?})"
+    );
+
+    let short = RetryPolicy {
+        max_attempts: 3,
+        ..policy
+    };
+    let (exhausted, _) = write(conflicts(3), Expected::Version(v2.clone()), &short).await;
+    match exhausted {
+        Err(ControlError::RetriesExhausted {
+            attempts: 3,
+            may_have_applied: false,
+            ..
+        }) => {}
+        other => panic!("three conflicts with three attempts: {other:?}"),
     }
-    let other = ClusterId::new("other").expect("valid");
-    let mismatch = bootstrap(store, &other, ProposalId::from_u128(1), &policy).await;
-    assert!(
-        mismatch.is_err(),
-        "another cluster bootstrapped over this one"
+    let unchanged = store.get(&register).await.unwrap().map(|r| r.version);
+    assert_eq!(unchanged, Some(v2.clone()), "a conflicting write applied");
+
+    faulty.script(conflicts(2));
+    let deleted = propose_delete(&faulty, &register, &v2, &policy).await;
+    assert_eq!(deleted.unwrap(), DeletionOutcome::Deleted);
+    assert_eq!(store.get(&register).await.unwrap(), None);
+    let stats = faulty.stats();
+    assert_eq!(
+        (stats.conflicts, stats.lost_responses),
+        (10, 0),
+        "{stats:?}"
     );
 }
 

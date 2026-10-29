@@ -1,12 +1,12 @@
-//! The startup probe (design §6.1): it passes on stores that honor
-//! conditional writes and deletes and read their own writes, also under
-//! delays, conflicts, and lost responses, and refuses simulated stores with
-//! ignored or rejected preconditions or stale reads.
+//! The startup probe (design §6.1): it passes through the simulated S3
+//! store's own conflicts and lost responses, and refuses simulated stores
+//! with ignored or rejected preconditions or stale reads. The conformance
+//! suite (`tests/conformance.rs`) runs it at scale against every backend,
+//! also with faults injected per writer.
 
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_control::faults::{FaultRates, FaultyStore};
 use skys3_control::{
     ControlError, ControlProbe, ControlStore, DeleteOutcome, Expected, KeyPrefix,
     MemoryControlStore, ProbeFailure, PutOutcome, RegisterKey, RetryPolicy, S3ControlStore,
@@ -51,27 +51,6 @@ fn patient() -> RetryPolicy {
 }
 
 #[tokio::test(start_paused = true)]
-async fn an_aws_like_store_passes_and_is_left_clean() {
-    for versioning in [false, true] {
-        let store = s3(
-            SimS3Config {
-                versioning,
-                ..SimS3Config::default()
-            },
-            SimS3Faults::NONE,
-        );
-        ControlProbe::new(1).run(&writers(&store)).await.unwrap();
-        assert!(
-            store.objects().keys().is_empty(),
-            "{:?}",
-            store.objects().keys()
-        );
-        // Three writes per round, plus each loser's read, plus the deletes.
-        assert!(store.objects().stats().requests > 500);
-    }
-}
-
-#[tokio::test(start_paused = true)]
 async fn racing_writers_pass_through_conflicts_and_lost_responses() {
     let faults = SimS3Faults {
         max_delay: Duration::from_millis(5),
@@ -89,29 +68,6 @@ async fn racing_writers_pass_through_conflicts_and_lost_responses() {
     assert!(stats.lost_responses > 0, "{stats:?}");
     store.objects().set_faults(SimS3Faults::NONE);
     assert!(store.objects().keys().is_empty());
-}
-
-#[tokio::test(start_paused = true)]
-async fn the_probe_runs_on_any_backend_with_faults_per_writer() {
-    let memory = MemoryControlStore::new();
-    let rates = FaultRates {
-        lose_request: 0.04,
-        lose_response: 0.06,
-        late_request: 0.03,
-        conflict: 0.04,
-        unavailable: 0.04,
-        max_delay: Duration::from_millis(3),
-    };
-    let handles: Vec<_> = (0..4)
-        .map(|seed| FaultyStore::seeded(memory.clone(), seed, rates))
-        .collect();
-    let probe = ControlProbe::new(3).with_policy(patient());
-    probe.run(&handles).await.unwrap();
-    // Late requests are all fenced by now.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let lost: u64 = handles.iter().map(|h| h.stats().lost_responses).sum();
-    assert!(lost > 0);
-    assert!(memory.registers().is_empty(), "{:?}", memory.registers());
 }
 
 #[tokio::test(start_paused = true)]
