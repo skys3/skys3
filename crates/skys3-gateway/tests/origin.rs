@@ -545,6 +545,41 @@ async fn under_revalidate_every_origin_change_is_seen_by_the_next_get() {
 }
 
 #[tokio::test]
+async fn a_metadata_only_change_at_the_origin_is_seen_by_the_next_read() {
+    let world = World::new("").await;
+    world.bucket("mirror", "default").await;
+    world.origin.put("k", b"same");
+    let got = world.get("/mirror/k").await;
+    assert_eq!(got.headers["content-type"], "text/plain");
+    let modified = got.headers["last-modified"].clone();
+
+    // The origin's object is copied onto itself with new metadata: its
+    // bytes, and so its ETag, stay.
+    {
+        let mut state = world.origin.lock();
+        let (object, _) = state.objects.get_mut("k").unwrap();
+        object.object.last_modified_ms += 60_000;
+        object
+            .object
+            .metadata
+            .insert("content-type".to_owned(), "application/json".to_owned());
+    }
+    let head = world.head("/mirror/k").await;
+    head.assert(200, None);
+    assert_eq!(head.headers["content-type"], "application/json");
+    assert_ne!(head.headers["last-modified"], modified);
+    let got = world.get("/mirror/k").await;
+    got.assert(200, None);
+    assert_eq!(got.body, "same");
+    assert_eq!(got.headers["etag"], quoted(b"same").as_str());
+    assert_eq!(got.headers["content-type"], "application/json");
+    assert_ne!(got.headers["last-modified"], modified);
+    // Cached now, the new metadata is served again.
+    let again = world.get("/mirror/k").await;
+    assert_eq!(again.headers["content-type"], "application/json");
+}
+
+#[tokio::test]
 async fn an_origin_change_racing_a_get_is_never_served_as_the_old_version() {
     let world = World::new("").await;
     world.bucket("mirror", "default").await;
