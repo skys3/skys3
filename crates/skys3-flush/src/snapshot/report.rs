@@ -267,6 +267,11 @@ pub(super) async fn holds<S: ObjectStore>(
         (None, None) => true,
         (None, Some(found)) => found.written.is_some_and(|at| at > version),
         (Some(_), None) => false,
-        (Some(identity), Some(found)) => found.written.is_some_and(|at| at >= identity),
+        // A version that inherits an older write's identity, such as a
+        // completed upload's, is held under exactly that identity: a
+        // write between the two is older than the version, not later.
+        (Some(identity), Some(found)) => found
+            .written
+            .is_some_and(|at| at == identity || at > version),
     })
 }
