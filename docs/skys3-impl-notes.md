@@ -7040,6 +7040,7 @@ of this file. A task with nothing unexpected keeps "None."
 - **Fuzzing.** A new target, `ec_transfer`, decodes the fragment header
   that starts a write and both message bodies; `log_record` and
   `index_codec` already reach the new record body and values.
+
 ### M5-05 Orphan fragment reclamation
 
 - **The plan's fence had two holes.** Confirming only attempts not in
