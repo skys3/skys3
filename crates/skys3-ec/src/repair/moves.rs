@@ -63,19 +63,33 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
         // Nodes a move of this pass failed to read from or write to: the
         // rest of the pass leaves them be rather than wait on them again.
         let mut failing: BTreeSet<NodeId> = BTreeSet::new();
-        for planned in planned {
+        // Stripes a move of this pass did not apply to. The planner placed
+        // each later move of a stripe as if the earlier ones had applied,
+        // so one into a failure domain an earlier move was to leave could
+        // put it over its cap: the next pass plans the stripe again.
+        let mut unsettled: BTreeSet<(&str, u32)> = BTreeSet::new();
+        for planned in &planned {
             if !leads(&self.shard) {
                 break;
             }
+            let stripe = (planned.key.as_str(), planned.stripe);
+            if unsettled.contains(&stripe) {
+                report.unmoved += 1;
+                continue;
+            }
             if failing.contains(&planned.from.node) || failing.contains(&planned.to) {
                 report.unmoved += 1;
+                unsettled.insert(stripe);
                 continue;
             }
             // The entry as it is now, not as the pass found it: a write or
             // a retag since would reject the move's record.
             let entry = match self.current(&planned.key).await {
                 Ok(Some(entry)) => entry,
-                Ok(None) => continue,
+                Ok(None) => {
+                    unsettled.insert(stripe);
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(shard = %shard, %error, "moves cannot read the index");
                     break;
@@ -86,16 +100,21 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             if located != Some(&planned.from) {
                 // The layout changed since the plan: the next pass plans
                 // again.
+                unsettled.insert(stripe);
                 continue;
             }
-            match self.make_move(pass, &entry, &planned).await {
+            match self.make_move(pass, &entry, planned).await {
                 Ok(true) => {
                     report.moved += 1;
                     self.metrics.moved_fragment();
                 }
-                Ok(false) => report.unmoved += 1,
+                Ok(false) => {
+                    report.unmoved += 1;
+                    unsettled.insert(stripe);
+                }
                 Err(error) => {
                     report.unmoved += 1;
+                    unsettled.insert(stripe);
                     match &error {
                         RepairError::Source(_) => {
                             failing.insert(planned.from.node.clone());

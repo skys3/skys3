@@ -546,7 +546,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         wid.cluster == self.target.cluster && wid.bucket == shard.bucket && wid.shard == shard.shard
     }
 
-    async fn head(&self) -> Result<Option<ObjectInfo>, Failure> {
+    pub(crate) async fn head(&self) -> Result<Option<ObjectInfo>, Failure> {
         match self
             .target
             .store
