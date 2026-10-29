@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -156,7 +156,9 @@ impl Index {
     /// exist.
     ///
     /// A new file's directory entry is synced, so the file survives a
-    /// crash; redb itself syncs only the file.
+    /// crash; redb itself syncs only the file. A file whose creation a
+    /// crash cut short (it lacks redb's magic number, which redb writes
+    /// last) is created again (design §10.2).
     ///
     /// # Errors
     ///
@@ -174,6 +176,14 @@ impl Index {
             Err(error) => return Err(error.into()),
         }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut head = Vec::with_capacity(REDB_MAGIC.len());
+        (&file)
+            .take(REDB_MAGIC.len() as u64)
+            .read_to_end(&mut head)?;
+        if unfinished_creation(&head, file.metadata()?.len()) {
+            file.set_len(0)?;
+            file.sync_all()?;
+        }
         Self::init(builder(config).create_file(file)?)
     }
 
@@ -190,6 +200,14 @@ impl Index {
         config: &IndexConfig,
     ) -> Result<Self, IndexError> {
         let file = mount.open_block_file(name)?;
+        let len = file.len()?;
+        let mut head =
+            vec![0; usize::try_from(len).map_or(REDB_MAGIC.len(), |len| len.min(REDB_MAGIC.len()))];
+        file.read_at(0, &mut head)?;
+        if unfinished_creation(&head, len) {
+            file.set_len(0)?;
+            file.sync()?;
+        }
         Self::init(builder(config).create_with_backend(SimStorage(file))?)
     }
 
@@ -465,6 +483,30 @@ fn builder(config: &IndexConfig) -> redb::Builder {
 
 /// Syncs the directory that holds `path`, so a new file there survives a
 /// crash.
+/// The magic number redb writes at the start of a database file.
+const REDB_MAGIC: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
+
+/// Whether a database file of `len` bytes that begins with `head` is one
+/// whose creation never finished, so it holds no commit and is created
+/// again rather than refused.
+///
+/// redb creates a database in two synced steps: the header without its
+/// magic number, then the magic number. A crash between them, or a torn
+/// write of the second, leaves a file that redb refuses forever as "not a
+/// redb database", which would keep the node from ever starting. After the
+/// magic number is complete, every header write repeats it, so a file
+/// whose first bytes are each zero or the magic number's own byte, without
+/// being the whole magic number, was never created. Anything else is
+/// passed to redb to judge.
+fn unfinished_creation(head: &[u8], len: u64) -> bool {
+    len > 0
+        && head != REDB_MAGIC
+        && head
+            .iter()
+            .zip(REDB_MAGIC)
+            .all(|(&byte, magic)| byte == 0 || byte == magic)
+}
+
 fn sync_parent(path: &Path) -> io::Result<()> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,

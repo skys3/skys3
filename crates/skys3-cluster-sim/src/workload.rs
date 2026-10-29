@@ -3,6 +3,12 @@
 //! `HEAD`, and `DELETE` on a small set of keys, each sent to the primary of
 //! its shard and recorded in the history.
 //!
+//! Each operation is recorded once its request has a connection to the
+//! node, with the node as its server ([`History::call_to`]): a request
+//! that never connected reached no node and is left out, and one that did
+//! can only take effect in the life of the node that accepted it, which
+//! lets the driver end it when that life crashes ([`History::crashed`]).
+//!
 //! A multipart upload has one part: S3 wants every part but the last to
 //! hold at least 5 MiB, more than a simulated cluster should move. Only
 //! its completion is recorded, as a `PUT` of the multipart ETag; an
@@ -21,7 +27,7 @@ use md5::{Digest, Md5};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use skys3_gateway::ShardRef;
-use skys3_sim::history::{Call, Condition, History, Outcome};
+use skys3_sim::history::{Call, Condition, History, Outcome, Pending};
 use skys3_types::{BucketDocument, ShardConfig};
 
 use crate::s3::{self, NoAnswer};
@@ -229,16 +235,47 @@ impl Client {
         Ok(())
     }
 
+    /// Sends `request` to `host` without recording it.
     async fn send(
         &self,
         host: &str,
         request: Request<Full<Bytes>>,
     ) -> Result<Response<Bytes>, NoAnswer> {
-        let answer = s3::send(host, request, self.workload.timeout).await;
+        let timeout = self.workload.timeout;
+        let answer = match s3::connect(host, timeout).await {
+            Ok(connection) => connection.send(request, timeout).await,
+            Err(error) => Err(error),
+        };
         if let Err(error) = &answer {
             tracing::debug!(process = %self.process, %host, %error, "no answer");
         }
         answer
+    }
+
+    /// Sends `request` to `host` and records it as `call` on `key` once it
+    /// has a connection. Returns `None`, recording nothing, if no
+    /// connection was made: the request then reached no node.
+    async fn send_recorded(
+        &self,
+        host: &str,
+        key: &str,
+        call: Call,
+        request: Request<Full<Bytes>>,
+    ) -> Option<(Pending, Result<Response<Bytes>, NoAnswer>)> {
+        let timeout = self.workload.timeout;
+        let connection = match s3::connect(host, timeout).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::debug!(process = %self.process, %host, %error, "no connection");
+                return None;
+            }
+        };
+        let pending = self.history.call_to(&self.process, host, key, call);
+        let answer = connection.send(request, timeout).await;
+        if let Err(error) = &answer {
+            tracing::debug!(process = %self.process, %host, %error, "no answer");
+        }
+        Some((pending, answer))
     }
 
     /// A body no other write uses: the client, the operation, and filler.
@@ -274,8 +311,11 @@ impl Client {
             value: value.clone(),
             condition: condition.clone(),
         };
-        let pending = self.history.call(&self.process, &name, call);
-        let outcome = match self.send(&self.routes.primary(bucket, key), request).await {
+        let host = self.routes.primary(bucket, key);
+        let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            return Ok(());
+        };
+        let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK => {
                     self.seen.insert(name, value);
@@ -351,8 +391,10 @@ impl Client {
             value: value.clone(),
             condition: condition.clone(),
         };
-        let pending = self.history.call(&self.process, &name, call);
-        let outcome = match self.send(&host, request).await {
+        let Some((pending, answer)) = self.send_recorded(&host, &name, call, request).await else {
+            return Ok(());
+        };
+        let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK if String::from_utf8_lossy(response.body()).contains(&value) => {
                     self.seen.insert(name, value);
@@ -383,8 +425,12 @@ impl Client {
             .uri(format!("/{}/{key}", bucket.name))
             .body(Full::new(Bytes::new()))?;
         let name = history_key(bucket, key);
-        let pending = self.history.call(&self.process, &name, Call::Get);
-        let outcome = match self.send(&self.routes.primary(bucket, key), request).await {
+        let host = self.routes.primary(bucket, key);
+        let Some((pending, answer)) = self.send_recorded(&host, &name, Call::Get, request).await
+        else {
+            return Ok(false);
+        };
+        let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK => {
                     let etag = response
@@ -413,8 +459,14 @@ impl Client {
     async fn delete(&mut self, bucket: &BucketDocument, key: &str) -> turmoil::Result {
         let request = Request::delete(format!("/{}/{key}", bucket.name)).body(Full::default())?;
         let name = history_key(bucket, key);
-        let pending = self.history.call(&self.process, &name, Call::Delete);
-        let outcome = match self.send(&self.routes.primary(bucket, key), request).await {
+        let host = self.routes.primary(bucket, key);
+        let Some((pending, answer)) = self
+            .send_recorded(&host, &name, Call::Delete, request)
+            .await
+        else {
+            return Ok(());
+        };
+        let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK | StatusCode::NO_CONTENT => Outcome::Done,
                 status if status.is_server_error() => Outcome::Failed,

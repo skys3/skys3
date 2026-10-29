@@ -6,6 +6,7 @@ use skys3_cluster_sim::{
     Cluster, ClusterConfig, Endpoint, Fault, FaultPlan, FaultProfile, FaultRates, Workload,
 };
 use skys3_sim::history::Outcome;
+use skys3_sim::s3::SimS3Faults;
 use skys3_sim::{Runner, SimContext};
 
 use crate::COST;
@@ -68,7 +69,20 @@ fn m1_workload_without_faults() {
 #[test]
 fn m1_workload_under_random_faults() {
     Runner::with_cost(4, COST / 2).run(|context| {
-        let config = config();
+        // One bucket flushes to a remote store that fails and loses some
+        // requests: every acknowledged write there must be flushed or
+        // still dirty.
+        let config = ClusterConfig {
+            write_back_buckets: 1,
+            remote_faults: SimS3Faults {
+                max_delay: Duration::from_millis(20),
+                internal_error_probability: 0.02,
+                slow_down_probability: 0.02,
+                lost_response_probability: 0.02,
+                ..SimS3Faults::default()
+            },
+            ..config()
+        };
         let workload = workload(context);
         let profile = FaultProfile {
             end: Duration::from_secs(8) * context.scale(),
