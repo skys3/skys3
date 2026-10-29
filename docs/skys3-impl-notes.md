@@ -1165,6 +1165,21 @@ of this file. A task with nothing unexpected keeps "None."
 - **Signals in tests without `unsafe`.** Sending `SIGTERM` needs
   `libc::kill`, which `forbid(unsafe_code)` rules out, so the end-to-end
   test runs `kill -TERM <pid>`; `Child::kill` sends `SIGKILL`.
+- **A reload undid the gateway's own bucket changes (fixed later in the
+  stack).** The control-store sync calls `reload_buckets` whenever the
+  generation moves, including after this gateway's own changes.
+  `Buckets::reload` listed and read every bucket register, then replaced
+  the whole local copy. A change the gateway made while the reload read,
+  such as a new bucket or a lifecycle configuration answered 200, was
+  overwritten by the older value the reload had read. A client's next
+  request then saw the change missing until the following sync. The SDK
+  matrix's s3-tests hit this on a much later PR (#128):
+  `GetBucketLifecycleConfiguration` answered `NoSuchLifecycleConfiguration`
+  right after a successful put. The gateway now counts its own changes,
+  and a reload keeps the local value of every bucket changed after the
+  reload began. `a_reload_keeps_the_changes_made_while_it_read` creates
+  and deletes buckets from a control-store hook between the reload's
+  reads, and fails without the fix.
 - **Left open.** Nodes do not register under `nodes/` yet:
   `NodeRegistration` needs an intra-cluster address, which arrives with
   the transport (M2-02) and the node registry (M3-02). Bucket status scans
