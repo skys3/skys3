@@ -10,8 +10,8 @@ use skys3_index::{Entry, EntryState, ObjectVersion, Payload};
 use skys3_io::Disk;
 use skys3_remote::probe::ConditionalOperation;
 use skys3_remote::{
-    DeleteObject, HeadObject, ObjectInfo, ObjectStore, PutObject, S3Error, S3ErrorKind,
-    UserMetadata, WritePrecondition,
+    CompleteMultipartUpload, DeleteObject, HeadObject, ObjectInfo, ObjectStore, PutObject, S3Error,
+    S3ErrorKind, UserMetadata, WriteOutput, WritePrecondition,
 };
 use skys3_shard::Shard;
 use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
@@ -65,17 +65,13 @@ pub(crate) enum Outcome {
     Settled,
     /// The remote changed out of band.
     Conflict(Conflict),
-    /// The version is a completed multipart upload, which only a remote
-    /// multipart upload with the same part boundaries reproduces (§7.4,
-    /// plan M1-16b). It waits, dirty, for a newer version or that flush.
-    AwaitsMultipart,
     /// A retryable failure: back off and try again.
     Retry(String),
 }
 
 /// What the remote holds at a key after a failed precondition, compared
 /// with the version being flushed.
-enum Found {
+pub(crate) enum Found {
     /// Nothing.
     Missing,
     /// This version: an earlier attempt succeeded and its answer was lost.
@@ -85,6 +81,16 @@ enum Found {
     Supersede(ETag),
     /// A write SkyS3 did not make.
     Foreign(ObjectInfo),
+}
+
+/// The request that writes an object version, sent once per round with the
+/// round's precondition.
+pub(crate) enum Write<'r> {
+    /// A whole object.
+    Put(&'r PutObject),
+    /// The completion of a remote multipart upload whose parts are
+    /// uploaded.
+    Complete(&'r CompleteMultipartUpload),
 }
 
 /// One flush of one key.
@@ -120,7 +126,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         result.unwrap_or_else(|error| Outcome::Retry(error.to_string()))
     }
 
-    fn remote_key(&self) -> String {
+    pub(crate) fn remote_key(&self) -> String {
         format!("{}{}", self.target.prefix, self.key)
     }
 
@@ -128,28 +134,23 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         self.target.writes.operation(operation).is_protected()
     }
 
-    /// Flushes an object version with `PutObject` (§7.2): `If-Match` on
-    /// the known remote ETag, `If-None-Match: *` where the key is known to
-    /// be absent, and a HEAD first where the remote state is unknown.
+    /// Flushes an object version (§7.2): `If-Match` on the known remote
+    /// ETag, `If-None-Match: *` where the key is known to be absent, and a
+    /// HEAD first where the remote state is unknown. A version made of
+    /// parts is sent as a remote multipart upload with the same part
+    /// boundaries, so that the remote ETag is the local one (§7.4); any
+    /// other version with `PutObject`.
     async fn put(
         &self,
         entry: &Entry,
         object: &ObjectVersion,
         known: Option<ETag>,
     ) -> Result<Outcome, Failure> {
-        if matches!(object.payload, Payload::Parts { .. }) {
-            return Ok(Outcome::AwaitsMultipart);
-        }
         let version = entry.version;
         let identity = self
             .target
             .identity(self.shard.shard(), object.write_identity.unwrap_or(version));
-        let request = put_request(self.remote_key(), object, &identity)?;
-        let _permit = self.target.reserve(object.size).await;
-        let body = self.load(object).await?;
-        let request = PutObject { body, ..request };
-        let protected = self.protected(ConditionalOperation::PutObject);
-        let mut expected = match known {
+        let expected = match known {
             Some(etag) => Some(etag),
             None if self.target.import.passed(self.key) => None,
             // Written locally before the import reached the key (§9.1):
@@ -161,31 +162,70 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 Found::Foreign(info) => Some(info.etag),
             },
         };
+        if let Payload::Parts { upload, parts } = &object.payload {
+            return self
+                .put_parts(version, object, *upload, parts, &identity, expected)
+                .await;
+        }
+        let request = put_request(self.remote_key(), object, &identity)?;
+        let _permit = self.target.reserve(object.size).await;
+        let body = self.read(&object.payload, object.size).await?;
+        let request = PutObject { body, ..request };
+        Ok(
+            match self
+                .conditional(Write::Put(&request), &identity, version, expected)
+                .await?
+            {
+                Ok(output) => written(version, output),
+                Err(outcome) => outcome,
+            },
+        )
+    }
+
+    /// Sends `write` conditioned on `expected`, the remote ETag it
+    /// replaces (`None`: the key is absent), unless the target does not
+    /// honor the operation's preconditions. After a failed precondition it
+    /// HEADs the key and follows the §7.2 rule. Returns the store's answer
+    /// to the write, or the outcome the HEAD settled.
+    pub(crate) async fn conditional(
+        &self,
+        write: Write<'_>,
+        identity: &WriteIdentity,
+        version: EpochSeq,
+        mut expected: Option<ETag>,
+    ) -> Result<Result<WriteOutput, Outcome>, Failure> {
+        let protected = self.protected(match write {
+            Write::Put(_) => ConditionalOperation::PutObject,
+            Write::Complete(_) => ConditionalOperation::CompleteMultipartUpload,
+        });
         for _ in 0..MAX_ROUNDS {
             let precondition = match (&expected, protected) {
                 (_, false) => WritePrecondition::None,
                 (Some(etag), true) => WritePrecondition::IfMatch(etag.clone()),
                 (None, true) => WritePrecondition::IfAbsent,
             };
-            let request = request.clone().with_precondition(precondition);
-            let error = match self.target.store.put_object(request).await {
-                Ok(output) => {
-                    let remote = Remote {
-                        seq: version.seq,
-                        etag: Some(output.etag),
-                        version_id: output.version_id.map(|id| id.0),
-                    };
-                    return Ok(Outcome::Flushed {
-                        version,
-                        remote,
-                        record: true,
-                    });
+            let store = &self.target.store;
+            let result = match write {
+                Write::Put(request) => {
+                    store
+                        .put_object(request.clone().with_precondition(precondition))
+                        .await
                 }
+                Write::Complete(request) => {
+                    let request = CompleteMultipartUpload {
+                        precondition,
+                        ..request.clone()
+                    };
+                    store.complete_multipart_upload(request).await
+                }
+            };
+            let error = match result {
+                Ok(output) => return Ok(Ok(output)),
                 Err(error) if failed_precondition(&error) => error,
                 Err(error) => return Err(Failure::Remote(error)),
             };
-            match self.inspect(&identity, version, expected.as_ref()).await? {
-                Found::Mine(info) => return Ok(flushed(version, Some(info), true)),
+            match self.inspect(identity, version, expected.as_ref()).await? {
+                Found::Mine(info) => return Ok(Err(flushed(version, Some(info), true))),
                 Found::Supersede(etag) => expected = Some(etag),
                 // The object the flush conditioned on is gone, perhaps
                 // deleted by an earlier flush whose answer was lost: no
@@ -193,7 +233,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 Found::Missing => expected = None,
                 Found::Foreign(info) => {
                     tracing::debug!(key = self.key, %error, "a flush found a foreign object");
-                    return Ok(Outcome::Conflict(conflict(version, Some(info))));
+                    return Ok(Err(Outcome::Conflict(conflict(version, Some(info)))));
                 }
             }
         }
@@ -256,7 +296,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// HEADs the key and compares what the remote holds with the version
     /// being flushed, whose write identity is `identity`. `expected` is
     /// the ETag the failed request was conditioned on.
-    async fn inspect(
+    pub(crate) async fn inspect(
         &self,
         identity: &WriteIdentity,
         version: EpochSeq,
@@ -307,9 +347,10 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         }
     }
 
-    /// Reads the version's bytes from the local log.
-    async fn load(&self, object: &ObjectVersion) -> Result<Bytes, Failure> {
-        let body = match &object.payload {
+    /// Reads `size` bytes from the local log: those of a version, or of a
+    /// part of one.
+    pub(crate) async fn read(&self, payload: &Payload, size: u64) -> Result<Bytes, Failure> {
+        let body = match payload {
             Payload::Inline(position) => self.shard.payload(*position).await?,
             Payload::Extents(extents) => {
                 let mut body = BytesMut::new();
@@ -323,15 +364,14 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             Payload::None => return Err(Failure::Local("the version has no local bytes".into())),
             Payload::Parts { .. } => {
                 return Err(Failure::Local(
-                    "a multipart object is not sent whole".into(),
+                    "a multipart object is read part by part".into(),
                 ));
             }
         };
-        if body.len() as u64 != object.size {
+        if body.len() as u64 != size {
             return Err(Failure::Local(format!(
-                "the version's bytes are {} long, not {}",
-                body.len(),
-                object.size
+                "the version's bytes are {} long, not {size}",
+                body.len()
             )));
         }
         Ok(body)
@@ -339,7 +379,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
 }
 
 /// Why an attempt must be retried.
-enum Failure {
+pub(crate) enum Failure {
     /// The remote failed.
     Remote(S3Error),
     /// The local shard failed, or the version cannot be sent as it is.
@@ -377,7 +417,20 @@ fn failed_precondition(error: &S3Error) -> bool {
     )
 }
 
-fn flushed(version: EpochSeq, info: Option<ObjectInfo>, record: bool) -> Outcome {
+/// The outcome of a write the remote accepted.
+pub(crate) fn written(version: EpochSeq, output: WriteOutput) -> Outcome {
+    Outcome::Flushed {
+        version,
+        remote: Remote {
+            seq: version.seq,
+            etag: Some(output.etag),
+            version_id: output.version_id.map(|id| id.0),
+        },
+        record: true,
+    }
+}
+
+pub(crate) fn flushed(version: EpochSeq, info: Option<ObjectInfo>, record: bool) -> Outcome {
     let (etag, version_id) = match info {
         Some(info) => (Some(info.etag), info.version_id.map(|id| id.0)),
         None => (None, None),
@@ -407,7 +460,7 @@ fn conflict(version: EpochSeq, info: Option<ObjectInfo>) -> Conflict {
 /// into user metadata, `Content-Type`, and the other standard headers, the
 /// tags, the write identity, and `Content-MD5` where the local ETag is the
 /// body's MD5 (§7.4).
-fn put_request(
+pub(crate) fn put_request(
     key: String,
     object: &ObjectVersion,
     identity: &WriteIdentity,
@@ -438,7 +491,7 @@ fn put_request(
 }
 
 /// The base64 `Content-MD5` of an ETag that is an MD5 digest in hex.
-fn content_md5(etag: &ETag) -> Option<String> {
+pub(crate) fn content_md5(etag: &ETag) -> Option<String> {
     let hex = etag.as_str().as_bytes();
     if hex.len() != 32 {
         return None;
@@ -474,6 +527,7 @@ mod tests {
             (S3ErrorKind::PreconditionFailed, true),
             (S3ErrorKind::NoSuchKey, true),
             (S3ErrorKind::ConditionalRequestConflict, true),
+            (S3ErrorKind::NoSuchUpload, false),
             (S3ErrorKind::InternalError, false),
             (S3ErrorKind::SlowDown, false),
         ] {

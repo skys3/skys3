@@ -42,6 +42,13 @@ pub(super) fn tagging(tags: &BTreeMap<String, String>) -> String {
     out
 }
 
+/// The `Expires` header of a write's standard headers, if it is an HTTP
+/// date; the SDK sends only a parsed one.
+fn expires(headers: &BTreeMap<String, String>) -> Option<DateTime> {
+    let value = headers.get("expires")?;
+    DateTime::from_str(value, DateTimeFormat::HttpDate).ok()
+}
+
 /// `If-None-Match` and `If-Match` header values for a write precondition.
 fn precondition_headers(precondition: &WritePrecondition) -> (Option<String>, Option<String>) {
     match precondition {
@@ -141,12 +148,7 @@ impl ObjectStore for AwsS3 {
             .set_content_disposition(request.headers.get("content-disposition").cloned())
             .set_content_encoding(request.headers.get("content-encoding").cloned())
             .set_content_language(request.headers.get("content-language").cloned())
-            .set_expires(
-                request
-                    .headers
-                    .get("expires")
-                    .and_then(|value| DateTime::from_str(value, DateTimeFormat::HttpDate).ok()),
-            )
+            .set_expires(expires(&request.headers))
             .set_tagging((!request.tags.is_empty()).then(|| tagging(&request.tags)))
             .set_content_md5(request.content_md5)
             .set_if_none_match(if_none_match)
@@ -348,6 +350,12 @@ impl ObjectStore for AwsS3 {
             .key(request.key)
             .set_metadata(metadata_map(&request.metadata))
             .set_content_type(request.content_type)
+            .set_cache_control(request.headers.get("cache-control").cloned())
+            .set_content_disposition(request.headers.get("content-disposition").cloned())
+            .set_content_encoding(request.headers.get("content-encoding").cloned())
+            .set_content_language(request.headers.get("content-language").cloned())
+            .set_expires(expires(&request.headers))
+            .set_tagging((!request.tags.is_empty()).then(|| tagging(&request.tags)))
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;
@@ -368,6 +376,7 @@ impl ObjectStore for AwsS3 {
             .part_number(count(request.part_number))
             .content_length(i64::try_from(request.body.len()).unwrap_or(i64::MAX))
             .body(ByteStream::from(request.body))
+            .set_content_md5(request.content_md5)
             .send()
             .await
             .map_err(|error| map_sdk_error(OP, error))?;

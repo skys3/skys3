@@ -47,6 +47,9 @@ pub struct BucketStatus {
     pub probe: ProbeStatus,
     /// Each open shard's flusher.
     pub shards: Vec<(ShardId, ShardStatus)>,
+    /// Remote multipart uploads that flushes left open and that wait to be
+    /// aborted ([`Target::orphaned_uploads`]).
+    pub orphaned_uploads: u64,
 }
 
 impl BucketStatus {
@@ -60,8 +63,8 @@ impl BucketStatus {
             dirty_bytes: statuses.clone().map(|s| s.dirty_bytes).sum(),
             oldest_dirty_age: age(statuses.clone().filter_map(|s| s.oldest_dirty).min()),
             flush_lag: age(statuses.clone().filter_map(|s| s.oldest_pending).min()),
-            conflicted_keys: statuses.clone().map(|s| s.conflicts.len() as u64).sum(),
-            awaiting_multipart_keys: statuses.map(|s| s.awaiting_multipart.len() as u64).sum(),
+            conflicted_keys: statuses.map(|s| s.conflicts.len() as u64).sum(),
+            orphaned_uploads: self.orphaned_uploads,
         }
     }
 }
@@ -250,6 +253,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .iter()
                 .map(|(id, shard)| (*id, shard.status()))
                 .collect(),
+            orphaned_uploads: flusher
+                .target
+                .as_ref()
+                .map_or(0, |target| target.orphaned_uploads() as u64),
         })
     }
 

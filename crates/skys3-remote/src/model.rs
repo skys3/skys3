@@ -484,6 +484,11 @@ pub struct CreateMultipartUpload {
     pub metadata: UserMetadata,
     /// The completed object's content type.
     pub content_type: Option<String>,
+    /// The completed object's other standard headers, as
+    /// [`PutObject::headers`].
+    pub headers: BTreeMap<String, String>,
+    /// The completed object's tags (`x-amz-tagging`), by tag key.
+    pub tags: BTreeMap<String, String>,
 }
 
 impl CreateMultipartUpload {
@@ -506,6 +511,18 @@ impl CreateMultipartUpload {
         self.content_type = Some(content_type.into());
         self
     }
+
+    /// Sets the standard headers other than `Content-Type`.
+    pub fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Sets the tags.
+    pub fn with_tags(mut self, tags: BTreeMap<String, String>) -> Self {
+        self.tags = tags;
+        self
+    }
 }
 
 /// `UploadPart`.
@@ -520,6 +537,33 @@ pub struct UploadPart {
     pub part_number: u32,
     /// The part's contents.
     pub body: Bytes,
+    /// `Content-MD5`: the base64 MD5 digest of the body, which the store
+    /// verifies.
+    pub content_md5: Option<String>,
+}
+
+impl UploadPart {
+    /// Part `part_number` of `upload_id`, without `Content-MD5`.
+    pub fn new(
+        key: impl Into<String>,
+        upload_id: UploadId,
+        part_number: u32,
+        body: impl Into<Bytes>,
+    ) -> Self {
+        UploadPart {
+            key: key.into(),
+            upload_id,
+            part_number,
+            body: body.into(),
+            content_md5: None,
+        }
+    }
+
+    /// Sets `Content-MD5`.
+    pub fn with_content_md5(mut self, content_md5: impl Into<String>) -> Self {
+        self.content_md5 = Some(content_md5.into());
+        self
+    }
 }
 
 /// One part named in a `CompleteMultipartUpload`.
@@ -765,11 +809,20 @@ mod tests {
         assert_ne!(copy.metadata_directive, MetadataDirective::Copy);
         assert_eq!(copy.precondition, WritePrecondition::IfMatch(etag));
 
+        let headers = BTreeMap::from([("cache-control".to_owned(), "no-cache".to_owned())]);
+        let tags = BTreeMap::from([("team".to_owned(), "a".to_owned())]);
         let create = CreateMultipartUpload::new("k")
             .with_metadata(metadata.clone())
-            .with_content_type("a/b");
+            .with_content_type("a/b")
+            .with_headers(headers.clone())
+            .with_tags(tags.clone());
         assert_eq!(create.metadata, metadata);
         assert_eq!(create.content_type.as_deref(), Some("a/b"));
+        assert_eq!((create.headers, create.tags), (headers, tags));
+
+        let part = UploadPart::new("k", UploadId("u1".into()), 3, "abc").with_content_md5("x");
+        assert_eq!((part.part_number, part.body.len()), (3, 3));
+        assert_eq!(part.content_md5.as_deref(), Some("x"));
 
         let upload = UploadId("u1".into());
         let parts = ListParts::new("k", upload.clone());

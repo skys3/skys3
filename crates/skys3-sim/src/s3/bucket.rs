@@ -32,7 +32,7 @@ struct Stored {
     etag: ETag,
     metadata: UserMetadata,
     content_type: Option<String>,
-    /// Tags, which only a PUT sets here.
+    /// Tags, which a PUT or a multipart upload sets.
     tags: BTreeMap<String, String>,
 }
 
@@ -57,6 +57,7 @@ struct Upload {
     key: String,
     metadata: UserMetadata,
     content_type: Option<String>,
+    tags: BTreeMap<String, String>,
     parts: BTreeMap<u32, Part>,
 }
 
@@ -235,15 +236,7 @@ impl Bucket {
         check_key(&request.key)?;
         self.check_metadata(&request.metadata)?;
         let digest = md5(&request.body);
-        if let Some(expected) = &request.content_md5
-            && *expected != base64_md5(&digest)
-        {
-            return Err(
-                S3Error::new(S3ErrorKind::Other, "Content-MD5 does not match the body")
-                    .with_status(400)
-                    .with_code("BadDigest"),
-            );
-        }
+        check_content_md5(request.content_md5.as_deref(), &digest)?;
         self.check_precondition(&request.key, &request.precondition)?;
         Ok(self.store(
             request.key,
@@ -536,6 +529,7 @@ impl Bucket {
                 key: request.key,
                 metadata: request.metadata,
                 content_type: request.content_type,
+                tags: request.tags,
                 parts: BTreeMap::new(),
             },
         );
@@ -558,6 +552,7 @@ impl Bucket {
             ));
         }
         let md5 = md5(&request.body);
+        check_content_md5(request.content_md5.as_deref(), &md5)?;
         let etag = md5_etag(&md5);
         upload.parts.insert(
             request.part_number,
@@ -642,7 +637,7 @@ impl Bucket {
                 etag,
                 metadata: upload.metadata,
                 content_type: upload.content_type,
-                tags: BTreeMap::new(),
+                tags: upload.tags,
             },
         ))
     }
@@ -752,6 +747,19 @@ fn check_read_conditions(
         ));
     }
     Ok(())
+}
+
+/// Checks a request's `Content-MD5` against its body's digest.
+fn check_content_md5(expected: Option<&str>, digest: &[u8; 16]) -> S3Result<()> {
+    match expected {
+        Some(expected) if expected != base64_md5(digest) => Err(S3Error::new(
+            S3ErrorKind::Other,
+            "Content-MD5 does not match the body",
+        )
+        .with_status(400)
+        .with_code("BadDigest")),
+        _ => Ok(()),
+    }
 }
 
 fn no_such_key(key: &str) -> S3Error {

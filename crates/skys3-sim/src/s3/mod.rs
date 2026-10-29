@@ -54,7 +54,7 @@
 mod bucket;
 mod faults;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -203,6 +203,8 @@ struct State {
     in_flight: BTreeMap<u64, (String, bool)>,
     next_request: u64,
     stats: SimS3Stats,
+    /// Successful requests whose caller never got the answer, by operation.
+    unanswered: HashMap<Operation, u64>,
 }
 
 /// A request's effect on conflict detection.
@@ -233,6 +235,7 @@ impl SimS3 {
                     in_flight: BTreeMap::new(),
                     next_request: 0,
                     stats: SimS3Stats::default(),
+                    unanswered: HashMap::new(),
                 }),
                 config,
             }),
@@ -273,6 +276,19 @@ impl SimS3 {
         self.state().stats
     }
 
+    /// Returns how many requests of `operation` succeeded at the store
+    /// without their caller learning it: the response was lost, or the
+    /// caller stopped waiting for it after the store had applied it. For
+    /// `CreateMultipartUpload`, these are the uploads whose IDs never
+    /// reached the caller.
+    pub fn unanswered(&self, operation: Operation) -> u64 {
+        self.state()
+            .unanswered
+            .get(&operation)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Reads the current object at `key` without a request: no faults and
     /// no delay.
     pub fn object(&self, key: &str) -> Option<GetOutput> {
@@ -283,8 +299,9 @@ impl SimS3 {
     }
 
     /// Returns the tags of the current object at `key`, without a request.
-    /// The store keeps the tags a `PutObject` sets and a copy copies; it
-    /// does not keep the other standard headers of [`PutObject::headers`].
+    /// The store keeps the tags a `PutObject` or a multipart upload sets
+    /// and a copy copies; it does not keep the other standard headers of
+    /// [`PutObject::headers`].
     pub fn tags(&self, key: &str) -> Option<BTreeMap<String, String>> {
         self.state().bucket.tags(key)
     }
@@ -344,6 +361,10 @@ impl SimS3 {
         };
         sleep(plan.request_delay).await;
         let result = self.process(plan, in_flight, tracking.writes, apply);
+        let unanswered = result.is_ok().then(|| Unanswered {
+            store: self,
+            operation,
+        });
         sleep(plan.response_delay).await;
         if plan.fault == Some(Fault::LostResponse) {
             self.state().stats.lost_responses += 1;
@@ -354,6 +375,7 @@ impl SimS3 {
             };
             return Err(S3Error::new(kind, "the response was lost"));
         }
+        std::mem::forget(unanswered);
         result
     }
 
@@ -479,6 +501,25 @@ impl InFlight<'_> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         self.store.state().in_flight.remove(&self.id);
+    }
+}
+
+/// A successful request whose answer has not reached its caller yet.
+/// Dropping it, because the response is lost or the caller gave up,
+/// counts it in [`SimS3::unanswered`].
+struct Unanswered<'a> {
+    store: &'a SimS3,
+    operation: Operation,
+}
+
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        *self
+            .store
+            .state()
+            .unanswered
+            .entry(self.operation)
+            .or_default() += 1;
     }
 }
 

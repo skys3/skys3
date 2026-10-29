@@ -126,14 +126,18 @@ impl Node {
         committed.position.seq.get()
     }
 
-    /// Uploads `parts` of `key` as a multipart upload and completes it;
-    /// returns the `seq` of the `MPU_COMPLETE`.
-    pub async fn multipart(&self, key: &str, parts: &[&str]) -> u64 {
+    /// Uploads `parts` of `key` as a multipart upload, with user metadata,
+    /// standard headers, and a tag, and completes it.
+    pub async fn multipart(&self, key: &str, parts: &[&str]) -> Multipart {
         let create = RecordBody::MpuCreate(MpuCreate {
             key: key.to_owned(),
             initiated_ms: 1_700_000_000_000,
-            metadata: BTreeMap::from([("content-type".to_owned(), "video/mp4".to_owned())]),
-            tags: BTreeMap::new(),
+            metadata: BTreeMap::from([
+                ("content-type".to_owned(), "video/mp4".to_owned()),
+                ("cache-control".to_owned(), "no-cache".to_owned()),
+                ("x-amz-meta-owner".to_owned(), "team-b".to_owned()),
+            ]),
+            tags: BTreeMap::from([("kind".to_owned(), "video".to_owned())]),
             checksum: None,
         });
         let upload = self.shard.commit(create).await.unwrap().position;
@@ -152,18 +156,23 @@ impl Node {
             let position = self.shard.commit(part).await.unwrap().position;
             completed.push(CompletedPart { number, position });
         }
+        let etag = multipart_etag(parts);
         let complete = RecordBody::MpuComplete(MpuComplete {
             key: key.to_owned(),
             upload,
             last_modified_ms: 1_700_000_000_002,
             size: parts.iter().map(|body| body.len() as u64).sum(),
-            etag: ETag::new(format!("{:032x}-{}", upload.seq.get(), parts.len())).unwrap(),
+            etag: etag.clone(),
             checksums: BTreeMap::new(),
             parts: completed,
         });
         let committed = self.shard.commit(complete).await.unwrap();
         assert!(committed.outcome.is_applied(), "{:?}", committed.outcome);
-        committed.position.seq.get()
+        Multipart {
+            upload: upload.seq.get(),
+            complete: committed.position.seq.get(),
+            etag,
+        }
     }
 
     /// Commits a DELETE of `key`.
@@ -200,14 +209,14 @@ impl Node {
             .collect()
     }
 
-    /// Waits until the flusher has nothing left to do but hold conflicts
-    /// and multipart objects, and the index shows only those unclean.
+    /// Waits until the flusher has nothing left to do but hold conflicts,
+    /// and the index shows only those unclean.
     pub async fn settle(&self, flusher: &ShardFlusher) {
         let patience = Patience::new();
         loop {
             let status = flusher.status();
             let unclean = self.unclean().await;
-            let held = status.conflicts.len() + status.awaiting_multipart.len();
+            let held = status.conflicts.len();
             if status.dirty == 0 && unclean.len() == held {
                 return;
             }
@@ -255,22 +264,45 @@ pub fn config() -> ShardConfig {
     }
 }
 
+/// A multipart object [`Node::multipart`] committed.
+pub struct Multipart {
+    /// The `seq` of its `MPU_CREATE`, which its write identity names.
+    pub upload: u64,
+    /// The `seq` of its `MPU_COMPLETE`.
+    pub complete: u64,
+    /// Its multipart ETag.
+    pub etag: ETag,
+}
+
 /// The MD5 ETag of `body`.
 pub fn md5_etag(body: &[u8]) -> ETag {
     use md5::{Digest, Md5};
-    let hex: String = Md5::digest(body)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    ETag::new(hex).unwrap()
+    ETag::new(hex(&Md5::digest(body))).unwrap()
 }
 
-/// A simulated remote that behaves like AWS S3, with versioning if asked.
+/// The ETag of a multipart object of `parts`: the MD5 of the parts' MD5
+/// digests, then `-` and the number of parts (§7.4).
+pub fn multipart_etag(parts: &[&str]) -> ETag {
+    use md5::{Digest, Md5};
+    let digests: Vec<u8> = parts
+        .iter()
+        .flat_map(|part| Md5::digest(part.as_bytes()))
+        .collect();
+    ETag::new(format!("{}-{}", hex(&Md5::digest(digests)), parts.len())).unwrap()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A simulated remote that behaves like AWS S3, with versioning if asked,
+/// and any part size.
 pub fn remote(seed: u64, versioning: bool) -> SimS3 {
     SimS3::new(
         seed,
         SimS3Config {
             versioning,
+            min_part_size: 1,
             ..SimS3Config::default()
         },
     )
