@@ -2083,3 +2083,36 @@ async fn observers_see_every_request_applied_and_the_key_it_left() {
         ]
     );
 }
+
+#[tokio::test]
+async fn chosen_applied_requests_lose_their_answers_and_refused_ones_do_not() {
+    let store = store();
+    store.lose_answers(Some(Arc::new(|applied: &Applied<'_>| {
+        applied.operation == Operation::PutObject && applied.key == Some("lost")
+    })));
+    let error = store
+        .put_object(PutObject::new("lost", "one"))
+        .await
+        .unwrap_err();
+    assert!(error.kind().may_have_applied());
+    // Applied anyway.
+    assert_eq!(body(&store, "lost"), Some(Bytes::from("one")));
+    // A refused request is answered.
+    let refused = PutObject::new("lost", "two").with_precondition(WritePrecondition::IfAbsent);
+    assert_eq!(
+        kind(store.put_object(refused).await),
+        S3ErrorKind::PreconditionFailed
+    );
+    // So is one the function does not pick.
+    store
+        .put_object(PutObject::new("kept", "one"))
+        .await
+        .unwrap();
+    assert_eq!(store.stats().lost_responses, 1);
+    assert_eq!(store.unanswered(Operation::PutObject), 1);
+    store.lose_answers(None);
+    store
+        .put_object(PutObject::new("lost", "three"))
+        .await
+        .unwrap();
+}
