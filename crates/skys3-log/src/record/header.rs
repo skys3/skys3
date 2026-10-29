@@ -5,7 +5,7 @@ use std::fmt;
 use skys3_types::{BucketId, Epoch, EpochSeq, KeyHash, Seq, ShardId};
 
 use super::error::{DecodeError, FieldError, Problem};
-use super::{FORMAT_VERSION, MAGIC, MAX_HEADER_LEN, MAX_PAYLOAD_LEN};
+use super::{FORMAT_VERSION, MAGIC, MAX_HEADER_LEN, MAX_PAYLOAD_LEN, MIN_FORMAT_VERSION};
 
 /// Byte offsets of the fixed header's fields. The layout is documented in
 /// the [module documentation](super).
@@ -234,6 +234,9 @@ impl fmt::Display for ShardRef {
 /// header or the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordHeader {
+    /// The format version the record was written in, from
+    /// [`MIN_FORMAT_VERSION`] to [`FORMAT_VERSION`].
+    pub version: u16,
     /// The record kind. Always a defined kind.
     pub kind: RecordKind,
     /// The shard the record belongs to.
@@ -275,7 +278,7 @@ impl RecordHeader {
             });
         };
         let version = read_u16(fixed, offset::VERSION);
-        if version != FORMAT_VERSION {
+        if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let header_len = read_u32(fixed, offset::HEADER_LEN);
@@ -352,6 +355,7 @@ impl RecordHeader {
             .into());
         };
         Ok(Self {
+            version: read_u16(record, offset::VERSION),
             kind,
             shard,
             position,

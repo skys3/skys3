@@ -1,6 +1,8 @@
 //! Write identities (§7.2) and version identities (§9.2).
 
 use std::fmt;
+use std::fmt::Write as _;
+use std::num::NonZeroU16;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -250,6 +252,41 @@ impl ETag {
             .and_then(Self::new)
     }
 
+    /// The ETag S3 gives an object uploaded in one request, and a part of
+    /// a multipart upload: the MD5 of its bytes in lowercase hex.
+    #[must_use]
+    pub fn from_md5(md5: &[u8; 16]) -> Self {
+        Self(hex(md5))
+    }
+
+    /// The ETag S3 gives a multipart object: `md5_of_part_md5s`, the MD5
+    /// of its parts' MD5 digests concatenated in part order, in lowercase
+    /// hex, then `-` and the number of parts.
+    #[must_use]
+    pub fn multipart(md5_of_part_md5s: &[u8; 16], parts: NonZeroU16) -> Self {
+        Self(format!("{}-{parts}", hex(md5_of_part_md5s)))
+    }
+
+    /// The MD5 digest in the tag, if it is one: 32 hexadecimal digits, as
+    /// [`ETag::from_md5`] makes. A multipart ETag is not a digest of the
+    /// object's bytes, so it has none.
+    #[must_use]
+    pub fn md5(&self) -> Option<[u8; 16]> {
+        let (pairs, []) = self.0.as_bytes().as_chunks::<2>() else {
+            return None;
+        };
+        if pairs.len() != 16 {
+            return None;
+        }
+        let nibble = |digit: u8| char::from(digit).to_digit(16);
+        let mut digest = [0; 16];
+        for (byte, &[high, low]) in digest.iter_mut().zip(pairs) {
+            // Two hex digits fit a byte.
+            *byte = (nibble(high)? << 4 | nibble(low)?) as u8;
+        }
+        Some(digest)
+    }
+
     /// The tag without quotes.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -261,6 +298,16 @@ impl ETag {
     pub fn to_quoted(&self) -> String {
         format!("\"{}\"", self.0)
     }
+}
+
+/// Lowercase hexadecimal, as S3 prints MD5 ETags.
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // Writing to a `String` cannot fail.
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 impl fmt::Display for ETag {
@@ -327,6 +374,36 @@ mod tests {
             ShardId::new(7),
             EpochSeq::new(Epoch::new(3), Seq::new(9)),
         )
+    }
+
+    #[test]
+    fn md5_etags_print_and_parse() {
+        // The MD5 of the empty string.
+        let empty = [
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e,
+        ];
+        let etag = ETag::from_md5(&empty);
+        assert_eq!(etag.as_str(), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(etag.md5(), Some(empty));
+        assert_eq!(
+            ETag::new(etag.as_str().to_uppercase()).unwrap().md5(),
+            Some(empty)
+        );
+        let multipart = ETag::multipart(&empty, NonZeroU16::new(3).unwrap());
+        assert_eq!(multipart.as_str(), "d41d8cd98f00b204e9800998ecf8427e-3");
+        assert_eq!(multipart.md5(), None);
+        for other in [
+            "d41d8cd98f00b204e9800998ecf8427",
+            "g41d8cd98f00b204e9800998ecf8427e",
+        ] {
+            assert_eq!(ETag::new(other).unwrap().md5(), None, "{other}");
+        }
+        // Signs are not hex digits, though `from_str_radix` would take them.
+        assert_eq!(
+            ETag::new("+41d8cd98f00b204e9800998ecf8427e").unwrap().md5(),
+            None
+        );
     }
 
     #[test]

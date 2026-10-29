@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use libfuzzer_sys::fuzz_target;
-use skys3_log::record::{LogRecord, RecordHeader};
+use skys3_log::record::{FORMAT_VERSION, LogRecord, RecordHeader};
 
 fuzz_target!(|data: &[u8]| {
     check(data);
@@ -22,15 +22,22 @@ fuzz_target!(|data: &[u8]| {
     }
 });
 
-/// Decoding must never panic. A record that decodes re-encodes to exactly
-/// the bytes it was read from, and its fixed header agrees with it.
+/// Decoding must never panic. A record of the current version that decodes
+/// re-encodes to exactly the bytes it was read from; one of an older
+/// version re-encodes in the current version to a record that decodes to
+/// the same value. Its fixed header agrees with it.
 fn check(data: &[u8]) {
     let Ok((record, len)) = LogRecord::decode(data) else {
         return;
     };
     let encoded = record.to_bytes().expect("a decoded record encodes");
-    assert_eq!(&encoded[..], &data[..len]);
     let header = RecordHeader::decode(data).expect("a decoded record has a valid header");
+    if header.version == FORMAT_VERSION {
+        assert_eq!(&encoded[..], &data[..len]);
+    } else {
+        let (again, _) = LogRecord::decode(&encoded).expect("a re-encoded record decodes");
+        assert_eq!(again, record);
+    }
     assert_eq!(header.kind, record.kind());
     assert_eq!(header.position, record.position);
     assert_eq!(header.key_hash, record.key_hash());

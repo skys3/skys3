@@ -1,6 +1,6 @@
 [package]
 name = "skys3-types"
-description = "SkyS3 core types: identifiers, epochs and sequence numbers, write and version identities, shard hashing, and control-store register documents."
+description = "SkyS3 core types: identifiers, epochs and sequence numbers, write and version identities, checksums, shard hashing, and control-store register documents."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

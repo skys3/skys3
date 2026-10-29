@@ -1603,11 +1603,13 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "bytes",
+ "crc-fast",
  "http",
  "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "md-5",
  "quick-xml",
  "rand",
  "s3s",
@@ -1697,6 +1699,7 @@ dependencies = [
 name = "skys3-types"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "sha2",

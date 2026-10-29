@@ -6,13 +6,16 @@ use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use aws_lc_rs::digest;
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::request::Parts;
 use http_body::{Frame, SizeHint};
 use s3s::{Body, S3Error, S3ErrorCode, StdError, s3_error};
+use skys3_io::BlockingPool;
+use skys3_types::checksum::ChecksumAlgorithm;
 use skys3_types::limits::MAX_SINGLE_PUT_BYTES;
+
+use crate::checksum::PooledHasher;
 
 use super::chunked::{AwsChunkedBody, ChunkSigner, Decoder, MAX_TRAILERS, Trailers};
 use super::params::decode_signature;
@@ -96,6 +99,7 @@ fn invalid_hash() -> S3Error {
 /// [`Trailers`] extension.
 ///
 /// `signer` checks signed chunks; a request without one cannot have them.
+/// A declared SHA-256 is computed on `pool`, or inline without one.
 ///
 /// # Errors
 ///
@@ -108,10 +112,13 @@ pub(crate) fn wrap(
     body: Body,
     payload: Payload,
     signer: Option<ChunkSigner>,
+    pool: Option<&BlockingPool>,
 ) -> Result<Body, S3Error> {
     let (signed, trailer) = match payload {
         Payload::Unsigned => return Ok(body),
-        Payload::Sha256(expected) => return Ok(Body::http_body(HashedBody::new(body, expected))),
+        Payload::Sha256(expected) => {
+            return Ok(Body::http_body(HashedBody::new(body, expected, pool)));
+        }
         Payload::Chunked { signed, trailer } => (signed, trailer),
     };
     let signer = match (signed, signer) {
@@ -333,18 +340,23 @@ impl fmt::Display for BodyError {
 impl std::error::Error for BodyError {}
 
 /// A body checked against the SHA-256 its request declared, when it ends.
+/// The hashing runs on the authenticator's hashing pool, if it has one.
 struct HashedBody {
     inner: Body,
-    hasher: Option<digest::Context>,
+    hasher: PooledHasher,
     expected: [u8; 32],
+    inner_ended: bool,
+    done: bool,
 }
 
 impl HashedBody {
-    fn new(inner: Body, expected: [u8; 32]) -> Self {
+    fn new(inner: Body, expected: [u8; 32], pool: Option<&BlockingPool>) -> Self {
         Self {
             inner,
-            hasher: Some(digest::Context::new(&digest::SHA256)),
+            hasher: PooledHasher::new([ChecksumAlgorithm::Sha256], pool.cloned()),
             expected,
+            inner_ended: false,
+            done: false,
         }
     }
 }
@@ -358,35 +370,46 @@ impl http_body::Body for HashedBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, StdError>>> {
         let this = self.get_mut();
-        let Some(hasher) = &mut this.hasher else {
+        if this.done {
             return Poll::Ready(None);
-        };
-        match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
-            Some(Ok(frame)) => {
-                if let Some(data) = frame.data_ref() {
-                    hasher.update(data);
+        }
+        if !this.inner_ended {
+            if let Err(closed) = ready!(this.hasher.poll_ready(cx)) {
+                this.done = true;
+                return Poll::Ready(Some(Err(closed.into())));
+            }
+            match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
+                Some(Ok(frame)) => {
+                    if let Some(data) = frame.data_ref() {
+                        this.hasher.push(data.clone());
+                    }
+                    return Poll::Ready(Some(Ok(frame)));
                 }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Some(Err(error)) => {
-                this.hasher = None;
-                Poll::Ready(Some(Err(error)))
-            }
-            None => {
-                let hasher = this.hasher.take().expect("checked above");
-                if hasher.finish().as_ref() == this.expected {
-                    Poll::Ready(None)
-                } else {
-                    let error =
-                        BodyError::new(BodyErrorKind::Sha256Mismatch, "the computed hash differs");
-                    Poll::Ready(Some(Err(error.into())))
+                Some(Err(error)) => {
+                    this.done = true;
+                    return Poll::Ready(Some(Err(error)));
                 }
+                None => this.inner_ended = true,
             }
+        }
+        let digests = ready!(this.hasher.poll_finish(cx));
+        this.done = true;
+        let matches = digests.map(|digests| {
+            digests.get(&ChecksumAlgorithm::Sha256).map(Vec::as_slice) == Some(&this.expected[..])
+        });
+        match matches {
+            Ok(true) => Poll::Ready(None),
+            Ok(false) => {
+                let error =
+                    BodyError::new(BodyErrorKind::Sha256Mismatch, "the computed hash differs");
+                Poll::Ready(Some(Err(error.into())))
+            }
+            Err(closed) => Poll::Ready(Some(Err(closed.into()))),
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.hasher.is_none()
+        self.done
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -459,7 +482,7 @@ mod tests {
             signed: false,
             trailer: true,
         };
-        wrap(&mut head, Body::empty(), payload, None).unwrap();
+        wrap(&mut head, Body::empty(), payload, None, None).unwrap();
         assert_eq!(head.headers["content-length"], "5");
         assert_eq!(head.headers["content-encoding"], "gzip");
         assert!(!head.headers.contains_key(DECODED_LENGTH));
@@ -470,7 +493,7 @@ mod tests {
             signed: false,
             trailer: false,
         };
-        wrap(&mut only, Body::empty(), signed, None).unwrap();
+        wrap(&mut only, Body::empty(), signed, None, None).unwrap();
         assert!(!only.headers.contains_key("content-encoding"));
         assert!(only.extensions.get::<Trailers>().is_none());
     }
@@ -482,7 +505,7 @@ mod tests {
             trailer: true,
         };
         let code = |headers: &[(&str, &str)], payload| {
-            wrap(&mut parts(headers), Body::empty(), payload, None)
+            wrap(&mut parts(headers), Body::empty(), payload, None, None)
                 .unwrap_err()
                 .code()
                 .clone()
@@ -530,38 +553,136 @@ mod tests {
         Ok(body.collect().await?.to_bytes())
     }
 
+    fn pool() -> BlockingPool {
+        BlockingPool::new("test-hash", std::num::NonZeroUsize::new(2).unwrap()).unwrap()
+    }
+
+    /// A body that yields these frames.
+    struct Frames(std::collections::VecDeque<Result<Frame<Bytes>, StdError>>);
+
+    impl http_body::Body for Frames {
+        type Data = Bytes;
+        type Error = StdError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, StdError>>> {
+            Poll::Ready(self.get_mut().0.pop_front())
+        }
+    }
+
+    /// A body of `data` in frames of `frame` bytes.
+    fn framed(data: &[u8], frame: usize) -> Body {
+        let frames = data
+            .chunks(frame)
+            .map(|chunk| Ok(Frame::data(Bytes::copy_from_slice(chunk))))
+            .collect();
+        Body::http_body(Frames(frames))
+    }
+
     #[tokio::test]
     async fn hashed_bodies_are_checked_at_their_end() {
+        let pool = pool();
+        for pool in [None, Some(&pool)] {
+            let mut head = parts(&[]);
+            let good = wrap(
+                &mut head,
+                Body::from(Bytes::from_static(b"abc")),
+                Payload::Sha256(sha256(b"abc")),
+                None,
+                pool,
+            )
+            .unwrap();
+            assert_eq!(read(good).await.unwrap(), "abc");
+            let bad = wrap(
+                &mut head,
+                Body::from(Bytes::from_static(b"abd")),
+                Payload::Sha256(sha256(b"abc")),
+                None,
+                pool,
+            )
+            .unwrap();
+            let error = read(bad).await.unwrap_err();
+            let found = BodyError::find(&*error).unwrap();
+            assert_eq!(found.kind(), BodyErrorKind::Sha256Mismatch);
+            let s3 = found.to_s3_error();
+            assert_eq!(s3.code().as_str(), "XAmzContentSHA256Mismatch");
+            assert_eq!(s3.status_code(), Some(http::StatusCode::BAD_REQUEST));
+            let unsigned = wrap(
+                &mut head,
+                Body::from(Bytes::from_static(b"x")),
+                Payload::Unsigned,
+                None,
+                pool,
+            )
+            .unwrap();
+            assert_eq!(read(unsigned).await.unwrap(), "x");
+        }
+    }
+
+    #[tokio::test]
+    async fn large_bodies_hash_on_the_pool_in_batches() {
+        let pool = pool();
+        let data: Vec<u8> = (0..3 * crate::checksum::HASH_BATCH_BYTES + 12_345)
+            .map(|i| (i % 251) as u8)
+            .collect();
         let mut head = parts(&[]);
-        let good = wrap(
+        let body = wrap(
             &mut head,
-            Body::from(Bytes::from_static(b"abc")),
-            Payload::Sha256(sha256(b"abc")),
+            framed(&data, 10_000),
+            Payload::Sha256(sha256(&data)),
+            None,
+            Some(&pool),
+        )
+        .unwrap();
+        assert_eq!(read(body).await.unwrap(), data);
+        let mut corrupt = data.clone();
+        corrupt[HASH_LAST] ^= 1;
+        let body = wrap(
+            &mut head,
+            framed(&corrupt, 7_777),
+            Payload::Sha256(sha256(&data)),
+            None,
+            Some(&pool),
+        )
+        .unwrap();
+        let error = read(body).await.unwrap_err();
+        assert!(BodyError::find(&*error).is_some());
+    }
+
+    const HASH_LAST: usize = 3 * crate::checksum::HASH_BATCH_BYTES + 12_000;
+
+    #[tokio::test]
+    async fn a_closed_pool_fails_the_body() {
+        let pool = pool();
+        pool.shutdown();
+        let mut head = parts(&[]);
+        let data = vec![1; 2 * crate::checksum::HASH_BATCH_BYTES];
+        let body = wrap(
+            &mut head,
+            framed(&data, 64 * 1024),
+            Payload::Sha256(sha256(&data)),
+            None,
+            Some(&pool),
+        )
+        .unwrap();
+        let error = read(body).await.unwrap_err();
+        assert!(
+            error.downcast_ref::<skys3_io::PoolClosed>().is_some(),
+            "{error}"
+        );
+        // A body whose source fails ends with that failure.
+        let failing: Vec<Result<Frame<Bytes>, StdError>> = vec![Err("lost".into())];
+        let body = wrap(
+            &mut head,
+            Body::http_body(Frames(failing.into())),
+            Payload::Sha256(sha256(b"")),
+            None,
             None,
         )
         .unwrap();
-        assert_eq!(read(good).await.unwrap(), "abc");
-        let bad = wrap(
-            &mut head,
-            Body::from(Bytes::from_static(b"abd")),
-            Payload::Sha256(sha256(b"abc")),
-            None,
-        )
-        .unwrap();
-        let error = read(bad).await.unwrap_err();
-        let found = BodyError::find(&*error).unwrap();
-        assert_eq!(found.kind(), BodyErrorKind::Sha256Mismatch);
-        let s3 = found.to_s3_error();
-        assert_eq!(s3.code().as_str(), "XAmzContentSHA256Mismatch");
-        assert_eq!(s3.status_code(), Some(http::StatusCode::BAD_REQUEST));
-        let unsigned = wrap(
-            &mut head,
-            Body::from(Bytes::from_static(b"x")),
-            Payload::Unsigned,
-            None,
-        )
-        .unwrap();
-        assert_eq!(read(unsigned).await.unwrap(), "x");
+        assert_eq!(read(body).await.unwrap_err().to_string(), "lost");
     }
 
     #[test]
