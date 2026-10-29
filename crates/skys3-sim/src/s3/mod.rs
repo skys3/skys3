@@ -59,7 +59,7 @@ use skys3_remote::{
     AbortMultipartUpload, CompleteMultipartUpload, CopyObject, CreateMultipartUpload, DeleteObject,
     DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
     ListPartsOutput, ObjectInfo, ObjectStore, PutObject, S3Error, S3ErrorKind, S3Result, UploadId,
-    UploadPart, UserMetadata, WriteOutput, WritePrecondition,
+    UploadPart, UserMetadata, VersionId, WriteOutput, WritePrecondition,
 };
 use skys3_types::ETag;
 
@@ -278,6 +278,14 @@ impl SimS3 {
     /// request.
     pub fn keys(&self) -> Vec<String> {
         self.state().bucket.keys()
+    }
+
+    /// Returns every version and delete marker of every key, without a
+    /// request: the key, the version ID (`None` on an unversioned bucket),
+    /// and whether it is a delete marker. Keys are in order, and each key's
+    /// versions oldest first.
+    pub fn versions(&self) -> Vec<(String, Option<VersionId>, bool)> {
+        self.state().bucket.versions()
     }
 
     /// Returns every multipart upload in progress and its key, without a

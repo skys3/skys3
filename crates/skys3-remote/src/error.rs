@@ -67,7 +67,13 @@ pub enum S3ErrorKind {
     /// No response arrived: the request timed out or the connection
     /// dropped. The request may or may not have been applied.
     Timeout,
+    /// The client failed before it sent the request, for example because a
+    /// parameter cannot be encoded or no endpoint could be resolved. Nothing
+    /// was applied, and sending it again fails the same way.
+    NotSent,
     /// Any other status, or a response that could not be understood.
+    /// [`S3Error::status`] and [`S3Error::code`] give what the store
+    /// answered, if anything.
     Other,
 }
 
@@ -94,12 +100,14 @@ impl S3ErrorKind {
             S3ErrorKind::SlowDown => "SlowDown",
             S3ErrorKind::ServiceUnavailable => "ServiceUnavailable",
             S3ErrorKind::Timeout => "Timeout",
+            S3ErrorKind::NotSent => "NotSent",
             S3ErrorKind::Other => "Other",
         }
     }
 
-    /// The HTTP status, or `None` for [`S3ErrorKind::Timeout`] and
-    /// [`S3ErrorKind::Other`], which have no fixed status.
+    /// The HTTP status, or `None` for [`S3ErrorKind::Timeout`],
+    /// [`S3ErrorKind::NotSent`], and [`S3ErrorKind::Other`], which have no
+    /// fixed status.
     pub fn status(self) -> Option<u16> {
         Some(match self {
             S3ErrorKind::NotModified => 304,
@@ -117,7 +125,7 @@ impl S3ErrorKind {
             S3ErrorKind::InternalError => 500,
             S3ErrorKind::NotImplemented => 501,
             S3ErrorKind::SlowDown | S3ErrorKind::ServiceUnavailable => 503,
-            S3ErrorKind::Timeout | S3ErrorKind::Other => return None,
+            S3ErrorKind::Timeout | S3ErrorKind::NotSent | S3ErrorKind::Other => return None,
         })
     }
 
@@ -159,11 +167,21 @@ impl fmt::Display for S3ErrorKind {
 }
 
 /// An error from an [`ObjectStore`](crate::ObjectStore) operation.
+///
+/// Besides its [`S3ErrorKind`], an error from a real store keeps the HTTP
+/// status and error code the store answered with, which may be more precise
+/// than the kind: a `403 AccessDenied` is [`S3ErrorKind::Other`] with status
+/// 403 and code `AccessDenied`, and a `502` from a proxy is
+/// [`S3ErrorKind::InternalError`] with status 502. Callers deciding whether
+/// to retry use [`S3Error::is_transient`] and [`S3Error::may_have_applied`],
+/// which take the status into account.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{kind}: {message}")]
+#[error("{}: {message}", self.describe())]
 pub struct S3Error {
     kind: S3ErrorKind,
     message: String,
+    status: Option<u16>,
+    code: Option<String>,
 }
 
 impl S3Error {
@@ -172,7 +190,22 @@ impl S3Error {
         S3Error {
             kind,
             message: message.into(),
+            status: None,
+            code: None,
         }
+    }
+
+    /// Records the HTTP status the store answered with.
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Records the error code the store answered with, such as
+    /// `AccessDenied`.
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
     }
 
     /// The error's kind.
@@ -183,6 +216,45 @@ impl S3Error {
     /// The human-readable message.
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The HTTP status the store answered with, or else the kind's
+    /// [`S3ErrorKind::status`].
+    pub fn status(&self) -> Option<u16> {
+        self.status.or_else(|| self.kind.status())
+    }
+
+    /// The error code the store answered with, or else the kind's
+    /// [`S3ErrorKind::code`].
+    pub fn code(&self) -> &str {
+        self.code.as_deref().unwrap_or_else(|| self.kind.code())
+    }
+
+    /// Whether the same request may succeed if sent again after a backoff:
+    /// [`S3ErrorKind::is_transient`], and also an [`S3ErrorKind::Other`]
+    /// with a `429 Too Many Requests` or `5xx` status.
+    pub fn is_transient(&self) -> bool {
+        self.kind.is_transient()
+            || (self.kind == S3ErrorKind::Other && matches!(self.status, Some(429 | 500..=599)))
+    }
+
+    /// Whether a write that failed with this error may nevertheless have
+    /// been applied: [`S3ErrorKind::may_have_applied`], except that an
+    /// [`S3ErrorKind::Other`] with a `4xx` status was refused and not
+    /// applied.
+    pub fn may_have_applied(&self) -> bool {
+        match (self.kind, self.status) {
+            (S3ErrorKind::Other, Some(400..=499)) => false,
+            (kind, _) => kind.may_have_applied(),
+        }
+    }
+
+    /// `<status> <code>`, or the code alone without a status.
+    fn describe(&self) -> String {
+        match self.status() {
+            Some(status) => format!("{status} {}", self.code()),
+            None => self.code().to_owned(),
+        }
     }
 }
 
@@ -226,6 +298,7 @@ mod tests {
             (S3ErrorKind::SlowDown, Some(503), true, false),
             (S3ErrorKind::ServiceUnavailable, Some(503), true, false),
             (S3ErrorKind::Timeout, None, true, true),
+            (S3ErrorKind::NotSent, None, false, false),
             (S3ErrorKind::Other, None, false, true),
         ];
         for (kind, status, transient, applied) in kinds {
@@ -233,6 +306,36 @@ mod tests {
             assert_eq!(kind.is_transient(), transient, "{kind:?}");
             assert_eq!(kind.may_have_applied(), applied, "{kind:?}");
             assert_eq!(format!("{kind:?}"), kind.code());
+            let error = S3Error::new(kind, "");
+            assert_eq!(error.status(), status, "{kind:?}");
+            assert_eq!(error.code(), kind.code());
+            assert_eq!(error.is_transient(), transient, "{kind:?}");
+            assert_eq!(error.may_have_applied(), applied, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn responses_refine_the_kind() {
+        let denied = S3Error::new(S3ErrorKind::Other, "denied")
+            .with_status(403)
+            .with_code("AccessDenied");
+        assert_eq!(denied.status(), Some(403));
+        assert_eq!(denied.code(), "AccessDenied");
+        assert_eq!(denied.to_string(), "403 AccessDenied: denied");
+        assert!(!denied.is_transient());
+        assert!(!denied.may_have_applied());
+
+        let gateway = S3Error::new(S3ErrorKind::Other, "bad gateway").with_status(502);
+        assert_eq!(gateway.code(), "Other");
+        assert!(gateway.is_transient());
+        assert!(gateway.may_have_applied());
+
+        let throttled = S3Error::new(S3ErrorKind::Other, "").with_status(429);
+        assert!(throttled.is_transient());
+        assert!(!throttled.may_have_applied());
+
+        let proxy = S3Error::new(S3ErrorKind::InternalError, "").with_status(504);
+        assert_eq!(proxy.to_string(), "504 InternalError: ");
+        assert!(proxy.may_have_applied());
     }
 }

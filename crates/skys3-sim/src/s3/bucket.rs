@@ -582,6 +582,20 @@ impl Bucket {
             .collect()
     }
 
+    /// Returns every version and delete marker of every key, in key order
+    /// and oldest first: the key, the version ID (`None` on an unversioned
+    /// bucket), and whether it is a delete marker.
+    pub(super) fn versions(&self) -> Vec<(String, Option<VersionId>, bool)> {
+        self.keys
+            .iter()
+            .flat_map(|(key, versions)| {
+                versions
+                    .iter()
+                    .map(move |v| (key.clone(), v.id.clone(), v.object.is_none()))
+            })
+            .collect()
+    }
+
     /// Returns every open multipart upload and its key, in upload-ID order.
     pub(super) fn uploads(&self) -> Vec<(UploadId, String)> {
         self.uploads
