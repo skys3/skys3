@@ -1579,7 +1579,7 @@ async fn check_mode_unopened(
     data_dir: &DataDir,
     pool: &BlockingPool,
 ) -> Result<(), StartError> {
-    if data_dir.multi_node() == config.cluster().multi_node {
+    if data_dir.multi_node() == config.multi_node() {
         return Ok(());
     }
     let path = data_dir.path().join(INDEX_FILE);
@@ -1619,7 +1619,7 @@ fn refuse_held(
     data_dir: &DataDir,
     held: BTreeSet<BucketId>,
 ) -> Result<(), StartError> {
-    let multi_node = config.cluster().multi_node;
+    let multi_node = config.multi_node();
     // Every node keeps STS sessions in a system bucket of its own.
     let held: Vec<String> = held
         .into_iter()
