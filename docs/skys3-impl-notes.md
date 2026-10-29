@@ -5157,955 +5157,6 @@ of this file. A task with nothing unexpected keeps "None."
   job. At `SKYS3_SIM_SEEDS=1024`, four seeds of each passed, in 220 s with
   the three scenarios running side by side.
 
-## M6 Native peer transport
-
-### M6-01 Peer protocol messages
-
-- **`DATA` "at an offset" cannot address multipart uploads.** Design §7.8
-  gives `DATA` an offset only. A multipart upload's parts arrive
-  concurrently and in any order, and the final part boundaries are not
-  known until `CompleteMultipartUpload`. A re-uploaded part must also
-  replace the old one. Staged bytes are therefore addressed by *piece* and
-  offset. A piece is the body of a single PUT, or one part, and the source
-  gives it an ID that it never reuses. `COMMIT` lists the pieces of a
-  multipart object with their part numbers, sizes, and MD5s. The decision
-  is recorded in design §7.8.
-- **The precondition needs a third case.** The design gives a `COMMIT`
-  precondition as "the destination's expected current write identity, or
-  absent". `flush_conflict_policy = "overwrite"` needs a write with no
-  condition at all, so the precondition is one of `Absent`, `Matches`, and
-  `Unconditional`.
-- **`RESUME` had no trigger.** The table says that after a reconnect the
-  destination returns its durable ranges, but no message asks for them.
-  The destination now answers every `BEGIN` with a `RESUME`. For new
-  staging the `RESUME` is empty, and a source can stream `DATA` without
-  waiting for it.
-- **`peer_frame_bytes` had no upper bound.** A destination stages each
-  frame as one log record, so the configuration now limits it to the
-  largest record payload (16 MiB), as `extent_bytes` is limited.
-- **The intra-cluster frame was not reusable.** `skys3-net`'s `Frame`
-  keys its header on `MessageKind`, a closed enum whose kinds the
-  transport authorizes per node role. The peer protocol keeps the same
-  layout, two length prefixes, a `prost` header, and a raw payload, but
-  has its own envelope: a protobuf `oneof` of the nine messages, whose
-  field numbers are never reused.
-- **Size.** The plan sizes this task S (under 500 lines). The crate has
-  about 1,300 lines of non-test code, not counting comments. Most of it
-  is the `prost` wire structs and the checked conversions to typed
-  messages.
-- **Batch items could share a write identity (review).** `BATCH`
-  validation refused two items of the same key, but not two items of
-  different keys with the same write identity. Each item's `APPLIED`
-  names it only by its identity, and a destination treats a known
-  identity as a `COMMIT` replay. The second item could therefore get the
-  first one's stored result and never be applied. Validation now
-  refuses repeated identities too, on encode and decode. The proptest
-  batch generator gives each item a distinct identity. A proptest that
-  copies one item's identity onto another, and a rules test, both fail
-  without the check.
-
-### M6-02 QUIC endpoint and connection pool
-
-- **No trust-bundle keys existed.** §7.8 and §12 speak of "a configured
-  trust bundle", but `[peering]` had no certificate keys. The PR adds
-  `[peering.peers.<cluster-id>]`, with `ca_file` and `buckets`, to §14 and
-  the configuration reference. Each peer has its own CA bundle, not one
-  shared file: with a single bundle, a CA that one peer controls could
-  issue a certificate in another peer's SPIFFE trust domain. A node
-  presents its `[transport]` certificate to peers, so a configured peer
-  requires the `[transport]` certificate files.
-- **"Bucket pairs" had no shape.** No peer message names the source
-  bucket. The write identity in `BEGIN`, `COMMIT`, `BATCH` items, and
-  `ABORT` carries the source cluster and bucket ID, so a pair is the
-  source bucket ID and the destination bucket name. The identity's cluster
-  must also be the authenticated peer, or a peer could write in another
-  cluster's name. How a refusal is answered (`ABORT` or `APPLIED`
-  `refused`, with refused batch items dropped from the batch) is recorded
-  in §7.8.
-- **REST flush concurrency does not adapt yet.** The task said to mirror
-  skys3-flush's adaptation, but skys3-flush still uses a fixed
-  `flush_min_concurrency_per_shard`; adaptive concurrency is M4-10. The
-  pool's `AdaptiveLimit` implements the §7.7 rule directly, and M4-10 can
-  reuse it. A pure ratio test of round trip against base read loopback
-  jitter (a base of tens of microseconds) as congestion and never grew,
-  so rising latency also needs 5 ms of absolute growth.
-- **quinn brings second versions of rand and ring's dependencies.**
-  quinn-proto 0.11.19 is on rand 0.10, while proptest, turmoil, and the
-  workspace are on 0.9, so `rand@0.10` and `rand_core@0.10` are skipped in
-  deny.toml. quinn-proto also lists `ring`, but only for
-  `wasm32-unknown-unknown`, so `getrandom@0.2` and `windows-sys@0.52`
-  appear in the lockfile but are never compiled; they are skipped with
-  that reason. With default features off and `rustls-aws-lc-rs`, quinn
-  uses the workspace's `aws-lc-rs` provider, and `cargo tree -i ring`
-  finds nothing for the host.
-- **skys3-net kept the pieces private.** The peer verifier needs the
-  node's certified key, the mapping from `webpki` errors to TLS alerts,
-  and the SPIFFE parsing of certificate URIs. `Credentials::certified_key`,
-  `pki_error`, and `PeerIdentity::from_uri_names` are now public, instead
-  of a second copy in skys3-peer.
-- **0-RTT cannot be attempted against the endpoint directly.** The
-  endpoint issues no session tickets, so a client never has the key to
-  send early data with. The test first gets a ticket under the
-  destination's name from a server that issues them and accepts early
-  data. It then sends a `HELLO` in 0-RTT to the real endpoint. The
-  endpoint refuses the early data, and the connection is never
-  established, because the early `HELLO` never arrives. A last check
-  confirms that a full handshake with the endpoint leaves no ticket. With
-  early data and tickets enabled in the server configuration, the test
-  fails.
-- **quinn sizes stream windows only at setup.** Connection send and
-  receive windows can change at run time, but the per-stream receive
-  window cannot. Stream windows are therefore the cap
-  (`peer_max_inflight_bytes`), and the connection window, sized from the
-  bandwidth-delay product every second, bounds the total. The sizing task
-  holds only a weak handle to the connection. A strong handle would keep
-  a connection that every user had dropped open forever, because
-  keep-alives stop the idle timeout.
-- **No simulation scenario yet.** Plan rule 1.1 runs peer-path code under
-  the simulation harness, but quinn over turmoil needs an
-  `AsyncUdpSocket` adapter for turmoil's UDP. That belongs to M6-08 (peer
-  protocol simulation). This PR tests over loopback, with every network
-  wait bounded at 30 s.
-- **The pool's counters outlived cancelled calls (review).** A caller
-  counted a connection being opened before awaiting the connect, and
-  uncounted it only after the await. A cancelled caller left the slot
-  taken forever, and with a limit of one the destination wedged. A stream
-  also counted only once `open_bi` returned, so concurrent callers could
-  all pick the same idle connection. Both reservations are now made under
-  the pool's lock and held by guards that release them on drop: a
-  connect slot that also wakes waiting callers, and a stream count taken
-  before the stream is opened. Tests cancel a connect mid-handshake and
-  check that a waiting caller takes over, and check that an open waiting
-  for stream credit already counts. Each fails without its fix.
-- **A pool test read the load of the test machine.** The test that grows
-  the pool's limit adapted it from real loopback measurements. On a
-  loaded machine, loopback's smoothed round trip reached 6 to 20 ms
-  against a minimum under 1 ms, which the limit rightly reads as rising
-  latency, so it held at one connection (49 of 200 runs under CPU load).
-  The pool now takes its measurements from a `Meter`, by default the
-  transport's statistics (`TransportMeter`). Tests that adapt the pool use
-  a steady path, so they check the pool's rules and not the machine's
-  scheduling. The rules themselves are unit-tested with samples.
-
-### M6-03 Destination staging, DURABLE, and RESUME
-
-- **The staging index lives on the accepting node, not the primary.**
-  The plan has the primary stage frames and acknowledge durable ranges.
-  The primary does append each frame, as an `EXTENT` record of the key
-  through the shard's normal commit path, and answers only once every
-  member holds it. But the index of what is staged (identity, pieces,
-  durable ranges, extent positions) stays on the node that accepted the
-  stream, which reports `DURABLE` and `RESUME`. Kept on the primary, it
-  would be lost at every primary change (failure, planned handoff, and
-  M3's rebalancing), and the relay would need new forwarding requests.
-  On the accepting node it survives primary changes, because a reported
-  extent is committed and a new primary keeps every committed record
-  (§6.6); and the relay is M2-08's existing `AppendExtent` request
-  (`PeerExtents` over the gateway's `Shards`). The cost: a source that
-  reconnects to a different destination node, or outlives the node,
-  restages the object. Recorded in §7.8.
-- **Compaction would have dropped staged extents.** §10.3 drops
-  `EXTENT` records that no entry references, and a staged extent is
-  unreferenced until its `COMMIT`. §10.3 now keeps them until their
-  segment is older than `peer_staging_ttl_seconds`. Compaction is not
-  implemented yet, so nothing changes in code.
-- **A resent frame can overlap what is held.** After a reconnect the
-  source may frame the missing ranges differently, and frames still in
-  flight from the old connection may land after their bytes are resent.
-  Staged extents must not overlap, or a `COMMIT`'s `PUT` could not list
-  them. The destination stages only the parts of a frame that are
-  neither durable nor in flight, so a frame can become several extents,
-  or none. A piece is capped at `MAX_EXTENTS` extents, the most a `PUT`
-  references; past it the staging is refused.
-- **An inbound stream could not answer while it received.**
-  `InboundStream::recv` is not cancel-safe (a frame is read in several
-  steps), so a loop cannot `select!` between it and finished appends,
-  and `DURABLE`s would wait for the source's next frame. The sending
-  half is now shared (`InboundSender`), so a reporter task sends
-  `DURABLE`s while the stream's loop receives; `InboundStream::finish`
-  became `async`, and two M6-02 tests changed with it.
-- **Quota and TTL had no scope.** The quota counts bytes staged or in
-  flight per source cluster on each destination node; a node cannot see
-  the others' staging. The TTL runs from the staging's last `BEGIN` or
-  `DATA`, not its creation, so a multipart upload that takes days keeps
-  its staging while its parts arrive. Expiry is checked lazily, at most
-  once a minute, as staging is used.
-- **How it is tested.** Quinn under turmoil still needs M6-08's UDP
-  adapter, so the reconnect scenario runs twice below the simulation
-  harness. A proptest drives the staging table as a source with random
-  frame sizes, failed appends, appends still in flight across a
-  reconnect, and several reconnects. It checks that each `RESUME` reports
-  exactly what is durable, that the source resends only the rest, that
-  no byte is staged twice, and that the piece's extents assemble to its
-  body. With trimming against in-flight ranges removed, it fails. A
-  loopback QUIC test then drops a connection with two frames not
-  acknowledged, and checks that the source resends exactly those two
-  frames. `PeerExtents` is tested over real shards on a simulated disk.
-  Every network wait is bounded at 30 s.
-- **`COMMIT` and `BATCH` are answered `unavailable`.** Until M6-04 they
-  get `APPLIED` with `unavailable`, so a source retries.
-  `Staging::staged` and `StagedObject::extents` are the extension point:
-  the extents a `PUT` references for a piece, or `None` if the piece is
-  incomplete. Nothing is wired into the binary yet.
-- **Staging without `DATA` cost no quota (review).** Every `BEGIN` of a
-  new identity allocated an index entry charged nothing, so a source
-  could grow the index without bound before the TTL swept it; tiny
-  frames had the same effect per byte. Each staging is now charged
-  64 KiB (`MIN_STAGING_CHARGE`, the smallest `extent_bytes`) and each
-  staged part at least that much, instead of a separate count limit,
-  so the one quota bounds both bytes and index memory. A `BEGIN` past
-  it is answered `ABORT` (`quota exceeded`), and configuration now
-  requires a quota of at least one staging and one frame. A test that
-  sends only `BEGIN`s fails without the charge.
-- **A late append could change replacement staging (review).** An
-  append matched its staging by identity, piece, and range only. If the
-  staging was discarded or expired and the identity begun again, an old
-  failure removed the new in-flight range, and an old success attached
-  its extent to the new staging. Each staging now has a generation that
-  `admit` returns and `settle` checks. A test that settles an old
-  append into a replacement fails without the check.
-
-### M6-04 COMMIT, APPLIED, and ABORT
-
-- **The stored result is the version itself.** The plan asks where a
-  `COMMIT`'s result is kept so a replay returns it, across primary
-  changes. A separate table of results would need a new record kind, an
-  index table, and a rule for when to drop entries. Instead the `PUT`
-  stores the commit's write identity as `x-amz-meta-skys3-wid`, which is
-  where §7.2 puts it on any remote, and which the gateway already strips
-  from responses and from copies. A `COMMIT` whose identity the current
-  version carries is answered `committed` with that version's ETag, and
-  nothing is written. The log and the index entry every member rebuilds
-  from it hold the answer, so no new state is needed. The result lives as
-  long as the version is current. A replay after a later write can only
-  be a stale copy, because the source flushes one write of a key at a
-  time. Such a copy fails its precondition, or finds its staging consumed
-  and gets `incomplete`. Recorded in §7.8 ("Commits").
-- **A precondition check alone does not stop duplicates.** An
-  `Unconditional` `COMMIT` (the `overwrite` policy) holds whatever is
-  current, so a second copy would apply again. The shard's condition
-  therefore also fails when the current version already carries the
-  commit's identity, and the gateway then reads the entry and answers
-  `committed`. A test races two copies of an unconditional `COMMIT`. It
-  fails without that clause: two records are written. The one remaining
-  hole is a late copy of an unconditional delete, which needs no staging.
-  §7.8 accepts it under `overwrite`.
-- **"Current write identity" was undefined for local writes.** With
-  `peer_local_writes`, a version can come from the destination's own
-  clients and carry no `skys3-wid`. Reporting none would tell the source
-  the key is absent. Such a version reports the identity of its local
-  write instead: this cluster, the bucket, the shard, and the record's
-  position. The forwarded condition therefore carries the destination's
-  cluster ID. The intra-cluster `Condition` message got three fields and
-  three kinds for peer conditions.
-- **Deletes keep no identity.** A tombstone has no metadata, so a
-  replayed delete cannot be recognized by identity. A delete of a key
-  that has no current version writes nothing and is answered
-  `committed`. This matches §7.2's 412 rule for deletes, and makes
-  replayed deletes idempotent.
-- **The destination does not hash staged bytes again.** The sequence
-  diagram had the gateway "check checksums". Re-hashing a 5 GiB object
-  at `COMMIT` would read every extent back. Each frame's CRC32C is checked
-  on arrival and each extent's record checksum on disk, so the final
-  checksums are stored as the source sent them. The diagram now reads
-  "Check ranges and precondition". Nothing in this PR answers
-  `checksum mismatch`. It stays for writes whose bytes the destination
-  has whole, such as `BATCH` items.
-- **The precondition is checked before the staged bytes are needed.** A
-  `COMMIT` whose precondition already fails is answered with the current
-  identity even with no staging, so the source learns of a conflict
-  without restaging the object. The primary checks again when it
-  sequences the record.
-- **Staging is consumed only when the result is final.** `committed`
-  discards the staging. So do `refused` and `checksum mismatch`, which
-  make the source stage again. A precondition failure, `incomplete`, or
-  `unavailable` keeps the staging until its TTL, so the source can commit
-  it again, for example under the precondition the destination named.
-  Before it applies a `COMMIT`, the stream waits for its own frames in
-  flight. A source can therefore send `COMMIT` right after its last
-  `DATA`.
-- **`peer_source` stays in configuration.** It already existed as a
-  `[buckets.<name>]` key (M0-03). The bucket pairs that authorize a peer
-  are configuration too (M6-02). Moving the source into the bucket
-  register would split one setting across two places. The new checks:
-  `peer_source` must name a `[peering.peers]` table, and must not be set
-  on a `read_only` bucket. The new key `peer_local_writes` (default
-  `false`) is allowed only next to a `peer_source`. It is added to §14
-  and the configuration reference.
-- **Multipart `COMMIT`s are answered `unavailable`.** §7.8 says the
-  destination keeps a multipart object's part boundaries. A `PUT` record
-  has no parts. The multipart records cannot be reused either:
-  `MPU_ABORT` and replaced parts release their extents' locations, which
-  the staging still references. Publishing a multipart object in one
-  record needs a `PUT` whose data lists each part's extents. That is a
-  log and index format change, so it is left to a follow-up. A `COMMIT`
-  that carries inline bytes is refused, since only `BATCH` items carry
-  them. `BATCH` is still answered `unavailable` (M6-05).
-- **A primary change is tested without the network.** Quinn under
-  turmoil waits for M6-08. The replay test therefore crashes the
-  destination's disk and recovers its log on another node
-  (`MemoryShards::open_as`). That node opens the shard as primary in
-  epoch 2, as a new primary holds every committed record. A fresh
-  `PeerCommits` with no staging then answers the replay from the log.
-  The loopback QUIC test streams an object and commits it without
-  waiting for `DURABLE`. It replays the `COMMIT` on a new connection,
-  checks a failing precondition, and checks that `ABORT` leaves nothing
-  to publish. Every network wait is bounded at 30 s.
-- **A local tag change kept the peer's identity (review).** A `TAGS`
-  record makes a new version and clears its local write identity, but it
-  kept the stored metadata. A version a peer had published therefore
-  still carried the peer's `skys3-wid` after a local client
-  (`peer_local_writes`) changed its tags. The source's next `COMMIT`,
-  conditioned on that identity, then overwrote the tag change. The
-  flusher treats `TAGS` as a write with its own identity (M1-16b), so
-  `TAGS` now also drops the carried `x-amz-meta-skys3-wid` entry, and the
-  version reports the `TAGS` record's local identity. The entry's name
-  moved to `skys3-log` (`IDENTITY_METADATA`), next to the record limits.
-  A test tags a published object and checks that the next `COMMIT` fails
-  its precondition. Without the fix, it applies.
-- **The identity did not always fit in the record (review).** A `PUT`
-  record holds at most 8 KiB of metadata, and a `COMMIT` could carry all
-  8 KiB. Adding the 116-byte identity entry then refused a valid object
-  for good. §7.2 already reserves the identity's 105 bytes in the 2 KiB
-  user-metadata limit, for remotes. The same is now done for the record
-  limit (`IDENTITY_METADATA_RESERVED`). A client's stored metadata, and a
-  `COMMIT`'s without an identity entry, stay 116 bytes below 8 KiB. A
-  gateway test and a message-rules test each check the new bound, and
-  both fail without it.
-
-### M6-05 Small-object batches
-
-- **No shard call wrote several records at once.** `Shards::write` commits
-  one record, and each conditional write reads its key in its own index
-  transaction. Concurrent writes share a group commit only if they reach
-  the log within `group_commit_max_delay`. `Shard::commit_all_if` now
-  reads the keys of a batch in one transaction and sequences every record
-  whose check passes in one pass of the sequencer, so the records take
-  consecutive positions and are queued for the log back to back. A test
-  commits 30 records within `group_commit_max_bytes` and counts exactly
-  one group commit in the log's statistics.
-  `Shards::write_all` exposes it. By default it sends each write on its
-  own, all at once, and `LocalShards` overrides it.
-- **The forwarding protocol has no batch request.** A forwarded request
-  carries its condition in a frame header, and `skys3-net` limits headers
-  to 64 KiB. The peer conditions of 1,024 items take about 300 KiB. A
-  batch request would need its conditions in the payload and a new answer
-  with one result per item, so it is left out. `RoutedShards::write_all`
-  sequences a batch in process when the map names this node as the
-  primary, through `ForwardServer::write_all`, which observes it like any
-  other request. Otherwise it forwards each write on its own, all at once.
-  Recorded in §7.8 ("Batches").
-- **A batch must look for races before it ends its read (found in
-  testing).** The first version of `commit_all_if` ended its read and only
-  then looked for records of its keys sequenced since the read began.
-  Ending a read forgets the applied writes that no reader still needs, so
-  a racing write could go unnoticed, and two writers each created the
-  same key under `Absent`. A test that races batches against single
-  conditional writes failed in 2 of 15 runs. The batch now looks for
-  races first, as `commit_if` does, and the test passed 40 runs out of 40.
-- **Batch items can be longer than `inline_max_bytes`.** By default
-  `peer_frame_bytes` is 256 KiB and `inline_max_bytes` is 128 KiB, and a
-  record in a hot segment carries at most `inline_max_bytes`. The
-  destination therefore commits a longer body first as `extent_bytes`
-  `EXTENT` records, as it does for a client upload. Such an item's `PUT`
-  follows one group commit later.
-- **Deletes read their key first.** A delete of a key with no current
-  version must write nothing (M6-04), and a condition cannot express "skip
-  without failing". Delete items therefore read their key before they are
-  written, as a `COMMIT` does. Puts skip that read. A replayed put fails
-  the condition's identity clause, and the entry read afterwards supplies
-  its stored result.
-- **Batch items are not hashed again either.** The `BATCH`'s CRC32C
-  covers the bytes in transit, as each `DATA` frame's CRC32C does, so the
-  final checksums are stored as the source sent them. Nothing answers
-  `checksum mismatch` yet.
-- **The round trips are counted, not timed.**
-  `skys3-flush/tests/round_trips.rs` flushes 1,500 small objects over
-  REST to the simulated store, which counts 1,500 requests (1.000 per
-  object, not counting TCP and TLS handshakes). The same objects then go
-  over loopback QUIC to a destination that applies them through
-  `PeerCommits`. Connecting takes 2 round trips (the QUIC handshake and
-  the `HELLO`s), and the two `BATCH`es take 1 each, for 4 in total (0.0027
-  per object). `send_batch` sends the whole batch and finishes its stream
-  before it reads anything, so one round trip per batch follows from its
-  structure. The test asserts exactly 2 plus one per batch. `skys3-flush`
-  gains `skys3-peer`, `skys3-net`, and `rcgen` as dev-dependencies.
-- **Simulation and fuzzing.** Quinn under turmoil still waits for M6-08.
-  Writers in the shard simulation now also commit batches of puts and
-  deletes, some conditional, and the scenario's crash, replay, and
-  in-order checks cover them. At 256 seeds its run time went from 47.8 s
-  to 51.7 s, so no new scenario or cost was added. `BATCH` decoding
-  already has M6-01's `peer_messages` fuzz target, and the builder parses
-  no input, so this PR adds no fuzz target. A proptest packs random items
-  (some with repeated keys or identities) and checks that every batch
-  encodes, decodes, and that no item is lost.
-- **A batch could outgrow one group commit (review).** A `BATCH` may hold
-  16 MiB of inline bytes, but the log closes a group once it holds
-  `group_commit_max_bytes` (4 MiB by default), so a large batch's records
-  of one shard took several syncs. A test confirms it: 100 records of
-  about 57 KiB with a 16 KiB cap take between 2 and 4 group commits.
-  Letting one submission form a single larger group was rejected,
-  because recovery's tear window (`LogConfig::tear_window`, §10.1) relies
-  on no group passing the cap plus one record. The fix is on the source:
-  by default `BatchBuilder` also closes a batch at 4 MiB of estimated
-  records (`DEFAULT_BATCH_RECORD_BYTES`), and `with_record_bytes` sets
-  another budget. Each item counts its bytes in the batch plus 256 bytes,
-  which covers its record header and the destination's identity entry. A
-  gateway test packs 1,024 objects of 8 KiB, some with the most metadata.
-  The builder makes several batches, and each one writes at most 4 MiB of
-  records at the destination. §7.8 now states the guarantee exactly. A shard's records of a
-  batch share one group commit when they fit `group_commit_max_bytes` and
-  reach the queue within `group_commit_max_delay`, and otherwise take one
-  group commit per cap. A destination configured with a smaller cap
-  splits default-size batches.
-
-### M6-06 Source-side flusher integration
-
-- **The transport sits behind a link trait.** `skys3-flush` gains
-  `PeerLink`, which opens a stream of messages, and `PeerTransport`,
-  which `FlushService::with_peer_transport` takes. `ShardLease` (M6-02)
-  implements `PeerLink`; the tests use channels, and the cluster
-  simulation uses TCP over turmoil, since Quinn under turmoil waits for
-  M6-08. `skys3-peer` gains `Inbound` and `Outbound`, so that
-  `StagingService::serve` runs over any stream, and
-  `StreamError::Transport` for those streams' errors. The node binary
-  passes no transport yet, and the destination side is not wired in
-  either, so a `native` target falls back to S3 REST with a warning
-  until M6-07. Recorded in §7.8 ("Source side, as built").
-- **Nothing new is persisted.** M4-04 persists `MPU_FLUSH_OPEN` so that a
-  new primary finds the remote upload. A peer upload needs nothing like
-  it: staging is keyed by the write identity, which the log holds, and
-  the bytes of an identity never change, so every version is staged as
-  piece 0. A flusher after a restart or a takeover sends `BEGIN` and
-  resumes from the `RESUME`. What is never committed expires after
-  `peer_staging_ttl_seconds`.
-- **`FLUSHED` keeps the destination's identity as the remote version ID.**
-  The next version of the key is conditioned on it. An S3 fill would
-  send it as a `versionId`, so `fill.rs` now ignores a remote version ID
-  that parses as a write identity. A key whose identity the entry does
-  not know, such as an imported one, is committed on absence first, and
-  its identity is learned from the failed precondition.
-- **Fixed: an imported key's learned identity was a conflict.** Once the
-  import had passed the key, the identity the failed precondition named,
-  the destination's own, was neither this shard's nor before the import,
-  so every first overwrite or delete of an imported key was held in
-  conflict. The flusher now HEADs the target over S3 and takes that
-  identity as the imported version's when the destination still holds
-  the ETag the entry recorded, once per flush; any other identity is
-  still a conflict. Tested in `tests/native.rs`
-  (`an_imported_version_is_overwritten_by_its_learned_identity`).
-- **Multipart objects go as one piece.** The destination answers a
-  multipart `COMMIT` `unavailable` (M6-04), so the flusher stages a
-  multipart object at flush time as one piece that keeps its multipart
-  ETag. Part boundaries are lost, and objects over 5 GiB
-  (`MAX_PIECE_BYTES`) cannot be sent. That stays open until the
-  destination publishes multipart commits.
-- **Batches fill only under load (found in testing).** The first
-  in-memory test expected six small objects to share batches. With 4
-  batches in flight and a flush concurrency of 4, each object went in a
-  batch of its own. That is the intended behavior: an item waits only
-  while 4 batches are unanswered, so an idle target adds no delay. The
-  test now checks that small objects never open a staging stream. Since
-  the S3 fence (below), a batch holds at most 1 MiB of records and 16
-  are in flight.
-- **The cluster simulation has a peer.** `ClusterConfig::peer` adds a
-  destination cluster of one node. It recovers its shards from a
-  simulated disk in each life, and serves the real `StagingService` and
-  `PeerCommits` over TCP, one connection per stream, 20 ms from every
-  node. The `write_back` buckets and the backups flush to it.
-  `Endpoint::Peer` and `Fault::PeerRestart` cut, hold, and restart it,
-  on top of the usual crashes and takeovers. The audits:
-  - every `FLUSHED` a flusher decides on, which a new test hook
-    (`observe_flushed`) reports before it commits, names an identity the
-    peer answered `committed` or named as current;
-  - each write-through acknowledgement finds the write in the peer's
-    index, or in what the peer last held while it is down;
-  - at the end, after a power loss of the peer too, it holds what every
-    member holds, and no write identity is in two of its `PUT` records.
-- **The seeded bugs need distance (found in testing).**
-  `PeerBug::FlushedOnCommit` records `FLUSHED` once the `COMMIT` is sent,
-  and `PeerBug::AnsweredOnCommit` answers write-through waits then. The
-  second bug is caught only if the client's answer arrives before the
-  `COMMIT` is applied. The peer's 20 ms link guarantees that. Both bugs
-  were caught at every one of 32 seeds.
-- **The replicated backup scenarios do not replay exactly (found in
-  testing).** A replay test of the peer scenario failed with no peer
-  configured. The same test on the base branch failed the same way: its
-  backup scenario, with replicated shards, takeovers, and write-through
-  acknowledgements, also differs between two runs of one seed. M4-13
-  traced this to tokio's own randomness, which takeovers and restarts
-  wake. The peer's replay test therefore runs with one member per shard,
-  and replays exactly at 16 seeds.
-- **Merging M4-13.** Native targets skip the orphan sweep that now runs
-  beside the copy probe: they open no remote multipart upload, so none
-  is ever left open, and they still skip the probe, becoming ready
-  through `Ready::new` before their flushers start. In the flusher's
-  `biased` `select!`, finished body stagings come with the flusher's
-  other tasks, before the shard's changes, so a busy shard cannot starve
-  them. At 256 seeds the peer scenarios took 58.4 s in all after the
-  merge.
-- **Run times at 256 seeds.** `peer::every_committed_change_reaches_the_peer_under_faults`
-  takes 23.1 s, `peer::write_through_writes_are_acknowledged_once_the_peer_applied_them`
-  28.8 s, `peer::a_seed_with_a_peer_replays_exactly` 4.6 s, and the two
-  seeded-bug scenarios about 2 s each, which is about 61 s in all. All
-  but the replay test use `Runner::with_cost(_, COST)`; the replay test,
-  which runs each seed twice, uses twice the cost.
-- **No new fuzz target.** The simulation's TCP framing reads frames with
-  `parse_prefix` and `Message::decode_parts`, which M6-01's
-  `peer_messages` target already fuzzes.
-
-### M6-07 Discovery and fallback
-
-- **The descriptor lives in the receiving bucket.** A destination serves
-  it at the reserved key `.skys3/peer-descriptor` of each bucket that
-  has a `peer_source`, on nodes that set `[peering] quic_advertise`. The
-  source reads it through the target's own S3 store, with a ranged `GET`
-  of at most 64 KiB. This needs no new port, DNS name, or credential,
-  and it reaches the source wherever its flushes do. The gateway answers
-  `GET` and `HEAD` itself, without the shards, and only for the bucket's
-  own `peer_source`; in any other bucket the key is an ordinary key.
-  Recorded in §7.8 and in the plan's §14 table.
-- **It is signed with the node's transport key.** `skys3-peer` gains
-  `PeerDescriptor`, `DescriptorSigner`, and `DescriptorVerifier`. The
-  envelope is protobuf: the body, a TLS 1.3 signature scheme, the
-  signature over `skys3 peer descriptor\0` and the body, and the chain.
-  The verifier reuses `PeerVerifier` for the chain, so the trust domain,
-  the role, and the bundle checks are those of the handshake. It then
-  checks the signature with webpki, the times (5 minutes of skew, at most
-  24 hours of life), the bucket and the source, and the versions. A
-  descriptor lasts an hour, and the node signs a new one after half of
-  that.
-- **A SkyS3 destination refused the fallback's writes (found in M7-05).**
-  A SkyS3 gateway refuses `x-amz-meta-skys3-wid` from clients, so a
-  source that fell back to S3 REST could not flush to it. The decision:
-  `[peering.peers.<id>] s3_access_key_ids` lists the peer's flusher
-  keys. A request signed with one of them may write the buckets that
-  receive from that peer, and may carry an identity that names the peer
-  and one of its bucket pairs. The gateway stores it as `COMMIT` does,
-  so either transport finds an earlier copy of a write. `HEAD` and `GET`
-  show it only to the peer's keys, and every other carrier still gets
-  `400 InvalidArgument`. A key belongs to one peer. Recorded in §7.8,
-  §12, and the plan's §14 table.
-- **Discovery is one task per target.** It is `Waiting`, `Native`
-  (with a link), `PeerS3`, or `PlainS3`. Each change of choice is a
-  generation. `FlushService::reconcile` rebuilds the target and drops its
-  shard flushers, as a restart does. Re-probes back off from 15 s,
-  doubling, to 5 minutes (`DEFAULT_REPROBE_MIN` and `_MAX`). A native
-  flush whose link fails wakes the task, which tries a fresh handshake at
-  once. `native` never falls back any more: M6-06's fallback with a
-  warning is gone, and a node without peers does not flush a `native`
-  target.
-- **The quarantine moved to the shard flushers (found in review).** It
-  first delayed only the target's readiness when it fell back. A takeover
-  on a target that had fallen back long before skipped it, and a
-  `COMMIT` that a deposed primary sent could still be on its way. Each
-  shard flusher on S3 REST to a target that served a descriptor now
-  waits the quarantine (90 s) from its own start. That covers
-  fallbacks, restarts, and takeovers alike. The exactly-once argument is
-  in §7.8.
-- **A new link is a new choice (found in review).** A choice was the
-  same as the last when its kind was, so the link of a handshake that
-  followed a broken one was dropped. The target stayed on QUIC with the
-  dead link, its flushes failing, until a handshake failed and it fell
-  back. Now each new link is a new generation, and the shard flushers
-  restart on it without a quarantine, since every `COMMIT` stays on QUIC
-  as after any native restart. Only a change between QUIC and S3 REST
-  counts as a switch.
-- **The pool counts the shard flushers (found in review).** The node's
-  handshake attached one lease of the pool for a target, which all its
-  shard flushers shared, so a bucket got one shard's connection budget
-  however many shards this node flushed. `PeerLink::set_shards` now
-  tells the link how many shard flushers use it, after each reconcile,
-  and a `ShardLease` can stand for that many shards
-  (`ShardLease::set_shards`), at least one. A link per shard flusher
-  would not fit: the batcher and the uploads share the target's link.
-- **COMMITs carry an apply-by time (found in review).** The quarantine
-  assumed that the destination applies a `COMMIT` only while its
-  connection is open. It did not: each stream ran on a detached task, and
-  a `COMMIT` already read waited in `CommitSink::apply` for its shard as
-  long as that took, after the connection idled out. A write routed to a
-  primary on another node can wait longer still, so no timer on the
-  destination's gateway bounds when a write is sequenced. Now each
-  `COMMIT` and `BATCH` item carries `apply_by_ms`: the source's wall clock
-  as it sends it, plus the commit window (the answer timeout). The shard
-  checks it as it sequences the write, in `LocalShards`' precondition
-  check, on its node's wall clock (`ConditionFailed::Expired`), and the
-  gateway refuses a late arrival at once; both answer `unavailable`. The
-  quarantine is the commit window plus twice a clock tolerance of 30 s
-  (`CLOCK_TOLERANCE`): still 90 s by default. This adds the design's one
-  wall-clock assumption, recorded in §2.3 and §7.8. The destination also
-  aborts a connection's stream tasks when it closes. A unit test stalls a
-  `COMMIT` in front of its shard past its apply-by time and checks that
-  it is not applied; the simulation's audit now ignores a `COMMIT` that
-  arrives after its apply-by time, and its commit window is the
-  destination's idle timeout, so the seeded bug of no quarantine is still
-  caught.
-- **The apply-by time is negotiated (found in review).** A node that did
-  not know `apply_by_ms` ignored it, and a `COMMIT` without one was
-  unbounded, yet both spoke protocol version 1, so the shorter
-  quarantine relied on a field neither end had to send or check. The
-  protocol is now version 2 only (`PROTOCOL_VERSION`,
-  `APPLY_BY_VERSION`): version 1 was never released, so no node keeps
-  it. `Session::check` refuses a `COMMIT` or `BATCH` item without an
-  apply-by time, on send and on receipt (`ProtocolError::NoApplyBy`), so
-  every `COMMIT` of a session is bounded, and the field became required
-  for every sender (`Native` always stamps). The routing wire's condition
-  carries the time for any kind of condition (tag 6), as the destination
-  checks it on whichever node sequences the write. Recorded in §7.8.
-- **S3 writes to a peer are fenced too (found in review).** The reverse
-  switch had no fence: an S3 REST write to a SkyS3 peer carried no
-  apply-by time, so one held in the destination's routing could be
-  sequenced over a `COMMIT` sent after the target returned to QUIC.
-  Now each S3 write that publishes or deletes a version, to a target that
-  served a descriptor, carries `x-skys3-apply-by`
-  (`WriteIdentity::APPLY_BY_HEADER`), signed with the request. The
-  `Stamping` store adds it as the REST window admits the request, and
-  `Target::with_apply_by` turns it on, probes included. The gateway
-  reads it only from the peer's keys (`ApplyBy`) and checks it with the
-  precondition (`Precondition::ApplyBy`), as it checks a `COMMIT`'s; it
-  requires it where that peer reaches the bucket over QUIC too, the
-  bucket's `peer_source` on a node serving the descriptor. A multipart
-  upload's completion carries it, its parts and creation do not. Each
-  shard flusher that starts on QUIC waits the quarantine from the later
-  of its tenure's start (the shard's sequencing epoch, as this node
-  first saw it) and the node's last S3 flush of the target, so a node's
-  start, a takeover, and a `native` target wait as well: 90 s by default
-  before a new flusher's first `COMMIT`. A deadline covers the
-  destination's work, not a body's transfer, so the bytes it covers stay
-  at 1 MiB (`MAX_BOUNDED_BYTES`): a `BATCH` holds at most 1 MiB of
-  records and objects of at most 1 MiB, with 16 batches in flight
-  instead of 4 to keep the throughput; over S3 to a peer, a `PUT` over
-  1 MiB becomes a multipart upload (`put_body_parts`), so its remote
-  ETag is a multipart one, and a copy is sent as an object. The
-  simulation's audit now records each S3 write's apply-by time and
-  fails a `COMMIT` sent while one of its key could still apply; the
-  seeded bug `PeerBug::NoReturnQuarantine` is caught. The replay
-  scenario's UDP block is longer, since the first QUIC flushes now wait
-  out the quarantine.
-- **A refused descriptor that disappears (found in review).** Discovery
-  compared choices other than QUIC by kind only, so a target whose refused
-  descriptor was later removed stayed `PlainS3 { found: true }`: stamped
-  with `x-skys3-apply-by`, its large PUTs sent as multipart uploads, and
-  no server-side copies, after its discovery had ended. A change of
-  `found` is now a new choice, and the target is rebuilt as a plain
-  store. Since that rebuild, and a peer whose descriptor disappears
-  while on QUIC, lead to a plain store without the quarantine, the
-  service records when this node last stopped flushing the target over
-  QUIC (`native_until`), and a shard flusher that starts on S3 REST waits
-  out what is left of the quarantine since then.
-- **A peer writes only the buckets that receive from it (found in
-  review).** The gateway's guard let a peer's key write any bucket with
-  no `peer_source`, and any bucket with `peer_local_writes`, whichever
-  cluster it receives from, as far as the key's permissions allowed. A
-  peer's request now writes objects only in the buckets whose
-  `peer_source` is that peer (`403 AccessDenied` elsewhere);
-  `peer_local_writes` opens a bucket to this cluster's clients only. The
-  design was silent on buckets that receive from no peer; the stricter
-  rule was chosen. Recorded in §7.8 and §12.
-- **A stalled-commit test was flaky.** The gate of
-  `a_commit_that_stalls_past_its_apply_by_time_never_applies` released
-  its permits back, so a later poll could pass early. It now forgets
-  them.
-- **The descriptor key is reserved (found in review).** Only `GET` and
-  `HEAD` knew the key. A client could write it in a source bucket, the
-  peer would store that version, and every read there would answer the
-  descriptor instead. Now every gateway refuses writes of the key in
-  every bucket with `400 InvalidArgument`, from clients and peers, over
-  S3 or in a `COMMIT` or `BATCH` item, and a multi-object delete refuses
-  that key alone. A namespace import skips a remote object at the key, so
-  it is never filled. Recorded in §7.2 and §7.8.
-- **A peer's copy carries its identity (found in review).** CopyObject
-  checked `REPLACE` metadata as a client's, so a peer's server-side copy
-  with its `x-amz-meta-skys3-wid` was refused with `400
-  InvalidArgument`, and the flusher fell back to uploading the bytes.
-  The copy now takes its carrier from the request, as PUT and multipart
-  uploads do.
-- **The node binary peers.** `NodePeering` binds the QUIC endpoint when
-  peers are configured. It serves `StagingService` with `PeerCommits`
-  over the node's shards, adapts the pool every second, and signs the
-  descriptors. Its handshake opens a fresh connection with `HELLO`s to
-  each resolved address, closes it, and hands the flushers a pool link.
-  The admin bucket status gains `flush.transport`. The gauge
-  `skys3_flush_transport{bucket, transport}` exists for verified peers
-  and `native` targets. The alert `SkyS3PeerTransportFallback` fires
-  after 30 minutes on S3, and the dashboard has a panel for it.
-- **The simulation falls back to the peer's real gateway.** The
-  destination now runs `Gateway` over a `MemoryControlStore` beside its
-  native service. Its authenticator takes the access key from a header,
-  and its descriptors are signed in the simulation on simulated wall
-  time. The nodes reach the gateway through a relay host, so faults on
-  the node-to-peer links block only the native path. `PeerS3` is a small
-  HTTP S3 client over turmoil, and `SimStore` lets one flush service mix
-  it with `SimS3`. The destination's PKI is Ed25519 with fixed serials,
-  so descriptors and chains have the same size in every run. The
-  existing M6-06 scenarios also read their descriptor through the
-  gateway now.
-- **The destination idles streams out.** A sim stream that sends nothing
-  for `Peer::idle` ends, as a QUIC connection does after its idle
-  timeout. Without this, a held `COMMIT` could arrive any time later, and
-  no quarantine would bound it.
-- **UDP blocks are a fault of their own (found in testing).** Blocks
-  built from per-node partitions ended early when an overlapping
-  partition healed the same link. `Fault::UdpBlock` cuts or holds every
-  node-to-peer link, and blocks the link again whenever another heal
-  repairs it. Overlapping blocks extend each other.
-- **Random holds rarely caught a `COMMIT` (found in testing).** Each sim
-  stream has its own TCP connection, so a hold that starts before the
-  connect holds the SYN, and no `COMMIT` is ever sent. The missing
-  quarantine went unnoticed on 3 of 4 seeds. `Peer::aimed` starts a held
-  block as a node sends a `COMMIT`, which catches it on the wire. The
-  main scenario aims two such blocks, ending before or after the idle
-  timeout, besides two drawn blocks of 8 to 12 s.
-- **The clients must outlast the blocks (found in testing).** On one
-  seed in 32 extra ones, the drawn blocks ended late and an aimed hold
-  began as the first `COMMIT` after them was sent. The clients stopped
-  writing before the nodes were back on QUIC, so no `COMMIT` reached the
-  peer. The drawn blocks now start within the first 3 s, and the clients
-  send 200 operations each, which keeps them writing for about 25 s.
-- **Multipart flushes over S3 (found in testing).** The flushers' 512-byte
-  parts got `EntityTooSmall`, so the destination's gateway takes parts of
-  any size, as the nodes' do. The peer's ETag of a streamed `PUT` sent
-  as a multipart upload is not the client's. The final audit reads such
-  objects back through a gateway and compares their MD5, as it does for
-  the remote store. The descriptor also lacked an ETag, which S3 clients
-  require, so the gateway now answers it with the MD5 of its bytes.
-- **The audits.**
-  - Exactly once: the M6-06 final audit, now over both transports.
-  - No `COMMIT` reaches the peer after an S3 write of its key that was
-    acknowledged after the `COMMIT` was sent.
-  - No `COMMIT` reaches a peer whose descriptor is forged or expired.
-  - Sampled every 250 ms, each live node's metric matches its status,
-    and every change of transport increments `switches`.
-  - After healing, every peer target is back on QUIC within 30 s.
-- **Seeded bugs.** `PeerBug::UnverifiedDescriptor` decodes the
-  descriptor without checking it, and `PeerBug::NoQuarantine` flushes over
-  S3 at once.
-- **Seeds and run times at 256 seeds.** With `SKYS3_SIM_SEEDS=256`, a
-  scenario at `COST` runs seeds 0 to 7 and one at twice that seeds 0 to
-  3. On toolchain 1.98.1:
-  - `discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`,
-    2 × `COST`, seeds 0 to 3: 46.8 s.
-  - `discovery::a_seed_with_udp_blocked_replays_exactly`, 2 × `COST`,
-    seeds 0 to 3, each run twice: 20.5 s.
-  - `discovery::forged_and_expired_descriptors_are_refused`, `COST`,
-    seeds 0 to 7: 32.2 s.
-  - `discovery::the_audit_catches_an_unverified_descriptor`, `COST`,
-    seeds 0 to 7: 2.4 s.
-  - `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`,
-    2 × `COST`, seeds 0 to 3: 21.6 s.
-  - That is 123.4 s for M6-07. The M6-06 scenarios now take 62.1 s in
-    all (23.1, 29.7, 5.1, 2.0, and 2.2 s), about as before.
-  - Beyond CI's seeds, the main scenario passed 64 more (100 to 131 and
-    300 to 331). Forged and expired descriptors were refused on seeds
-    100 to 131. Both seeded bugs were caught on all of seeds 100 to 131.
-  - The 256-seed `harness` run passes too.
-- **Fuzz target.** `peer_descriptor` decodes arbitrary bytes as a
-  descriptor and checks the decoder's invariants. A verifier that trusts
-  nobody refuses every input.
-
-### M6-08 Peer protocol simulation
-
-- **The simulation runs real QUIC.** M6-06 put a TCP stream model under
-  the peer scenarios. It is gone: the nodes and the destination now run
-  Quinn over turmoil's UDP. `skys3-cluster-sim`'s `quic` module adapts a
-  turmoil `UdpSocket` to Quinn's `AsyncUdpSocket`. It reports that it
-  may fragment, so Quinn skips MTU discovery. The nodes use the node
-  binary's `PeerEndpoint`, handshake, and `ConnectionPool`, and the
-  destination runs the real `StagingService` and `PeerCommits`. Holds,
-  partitions, message loss, and peer restarts now lose datagrams and
-  stall connections until their idle timeout (`Peer::idle`), as on a
-  real network. Recorded in §16.1.
-- **Seeded endpoints make QUIC replay.** `PeerEndpoint::with_socket`
-  takes any socket and an optional seed. With a seed, Quinn's
-  `rng_seed`, the connection IDs, the initial destination IDs, and the
-  keys of stateless resets and tokens all come from it (SplitMix64 and
-  `aws-lc-rs` keys from fixed bytes). TLS still draws its own key shares
-  and randoms. That changes bytes on the wire but not their sizes, and
-  the simulation's PKI is Ed25519 for that reason, so a seed replays.
-  Quinn uses the Tokio runtime's clock, which is the simulation's paused
-  clock. `EndpointSettings` gains `idle_timeout`, with keep-alives at a
-  sixth of it. The node binary passes neither a seed nor a socket and
-  is unchanged.
-- **Determinism findings.** The QUIC adapter test, the new
-  `peer_protocol::a_seed_with_protocol_faults_replays_exactly`,
-  `peer::a_seed_with_a_peer_replays_exactly`, and
-  `discovery::a_seed_with_udp_blocked_replays_exactly` all replay
-  exactly. As in M6-06, the replay tests use one member per shard,
-  because tokio's own unseeded randomness makes replicated takeovers
-  differ between runs. CI's flags are unchanged. The destination's
-  fault draws come from a `SmallRng` forked from the run's seed, and
-  every map it keeps is a `BTreeMap`.
-- **Protocol faults at the destination.** `Peer::faults`
-  (`ProtocolFaults`) wraps each stream the destination serves in a tap.
-  The tap can:
-  - lose `BEGIN`, `DATA`, `COMMIT`, and `BATCH` frames, or `RESUME`,
-    `DURABLE`, and `APPLIED` answers;
-  - close the connection as a `DATA` frame arrives, after a `DURABLE`,
-    or with an `APPLIED` in flight;
-  - make a `COMMIT` arrive late.
-  Aimed faults (`AimedBlocks::scope`) hold a `COMMIT`'s UDP path, hold
-  its sender's link, or depose its sender by holding its link and
-  crashing it.
-- **Audits added.** Each tap checks its stream:
-  - no `DATA` resends bytes the stream's `RESUME` reported durable;
-  - every `APPLIED` for the identity the key's current version carries
-    says `committed` with that version's ETag, for replays and for a
-    deposed primary's copy alike, or `unavailable`, which claims nothing;
-  - a `COMMIT` that arrived while its staging covered the whole object is
-    never answered `incomplete`, unless its source aborted it;
-  - a `COMMIT` that arrived past the commit window of its identity's
-    latest send is never answered `committed`. Its apply-by time passed,
-    whichever send it is, and `PeerCommits` checks that before it looks
-    for a stored result.
-  At the end, the staging left over must expire and give back its whole
-  quota charge. `PeerAudit` counts the faults that struck and what the
-  sources did, so that each scenario can show its faults happened.
-- **Scenarios.** `peer_protocol` runs three replicated nodes with
-  takeovers, under the M6-06 cluster faults plus:
-  - `lost_messages_are_retried_and_each_write_applies_once`: loses 5 %
-    of messages either way, for staged objects and batches, over 20
-    keys.
-  - `reconnects_mid_transfer_resend_only_what_is_not_durable`: drops 6 %
-    of connections mid-transfer, with 128-byte frames, and checks that
-    `RESUME`s reported durable bytes that were not resent.
-  - `duplicate_commits_apply_once_and_are_answered_alike`: replays after
-    lost `APPLIED`s (4 % loss), and deposes a `COMMIT`'s sender once the
-    `COMMIT` reached the destination, so that its successor sends it
-    too. At least one seed of each run must have a `COMMIT` from two
-    nodes.
-  - `staging_that_expires_before_its_commit_is_staged_again`: a 400 ms
-    TTL, late `COMMIT`s, and held senders.
-  - `commits_that_arrive_past_their_window_are_refused`: a 1.5 s commit
-    window, with one `COMMIT` in two arriving 2.5 s late. At one in
-    three, seed 109 saw no overdue `COMMIT`: a peer restart killed all
-    five late ones, and every later write went in a batch.
-  - `a_seed_with_protocol_faults_replays_exactly`.
-- **Seeded bugs.** All three were added in `skys3-flush`, and each one is
-  caught on every seed tried:
-  - `PeerBug::ResendDurable` ignores the `RESUME`.
-  - `PeerBug::ExpiredAsCommitted` takes an `incomplete` answer or expired
-    staging for a commit. The `FLUSHED` audit catches it.
-  - `PeerBug::NoCommitWindow` stamps each `COMMIT`'s apply-by time a day
-    past the commit window. It was added after M6-07's apply-by merge.
-    It first sent no apply-by time at all, which M6-07's protocol
-    version 2 now refuses on send.
-- **Product change: staging stays while its `COMMIT` applies.**
-  `Staging::pin` and `Staging::unpin` keep staging that was live when its
-  `COMMIT` arrived from expiring while the `COMMIT` waits for the
-  stream's frames in flight and applies. `Staging::expire` skips pinned
-  staging. The destination holds the pin in a guard, so a stream task
-  aborted when its connection closes releases it. Before this, an append
-  that outlived the TTL could expire the staging under its own `COMMIT`.
-  No simulation run hit that; the race was found by reading the code
-  while writing the expiry audit. A unit test covers it. Recorded in
-  §7.8 ("Expiry"). No other product bug turned up.
-- **A closed connection takes held COMMITs with it (found in testing).**
-  Under QUIC, `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`
-  let `PeerBug::NoQuarantine` through on 3 of 12 seeds. The fault held
-  the link only once the `COMMIT` reached the destination's side.
-  Falling back, the source closed its connection, and the held `COMMIT`
-  died with it. Aimed faults now hold the sender's link as the `COMMIT`
-  is sent. The bug scenario uses `AimedBlocks::late`: the destination
-  takes the `COMMIT` and applies it after four fifths of the hold, while
-  the links are held and before it can hear the close. With that, the
-  bug is caught on seeds 0 to 11, and the correct cluster passes the
-  same faults.
-- **Deposing by partition never duplicated a COMMIT (found in
-  testing).** A partitioned primary was re-elected and its keys were
-  rewritten, so no `COMMIT` came from two nodes. `AimScope::Deposed`
-  crashes the sender while its link is held, and the scenario writes 40
-  keys, so that the successor flushes the same write.
-- **The expiry scenario needed a sweeper and late COMMITs (found in
-  testing).** Staging expires lazily, so on some seeds nothing expired.
-  The simulated destination now sweeps every TTL, and one `COMMIT` in
-  two arrives a second late. The first version of the covered-stream
-  audit also flagged staging that had expired before its `COMMIT`
-  arrived; it now counts only staging that is still there on arrival.
-- **Merging M6-07's apply-by time.** The simulated destination records
-  each `COMMIT` with its apply-by time, so the quarantine audit ignores
-  `COMMIT`s that arrive too late to apply. The nodes' transports take
-  the commit window. The tapped accept loop keeps each connection's
-  streams in a `JoinSet`, as `serve_connection` now does.
-- **A late replay is answered `unavailable` (found in testing).** The
-  first run of the overdue scenario at 256 seeds failed on seed 5. A
-  replay of an applied write arrived past its apply-by time and was
-  answered `unavailable`, and the consistency audit wanted `committed`.
-  `PeerCommits` checks the apply-by time before it looks for the stored
-  result, and §7.8 makes every such refusal `unavailable` for the source
-  to retry. That is correct, so the audit now accepts `unavailable` too.
-- **Merging M6-07's QUIC start wait.** M6-07 then required an apply-by
-  time on every `COMMIT`, and made each shard flusher that starts on
-  QUIC wait the quarantine before its first `COMMIT`.
-  - `PeerBug::NoApplyBy` became `PeerBug::NoCommitWindow`.
-  - With the default 8 s commit window and 2 s answer timeout, the wait
-    is 12 s. The peer protocol scenarios then flushed only about a dozen
-    `COMMIT`s per run, mostly after the cluster faults, and on some seeds
-    no protocol fault struck. Their peer now has a 3 s commit window and
-    a 1 s answer timeout, so the wait is 5 s. The loss and drop rates
-    grew, and so did the traffic: 20 keys for lost
-    messages, and 128-byte frames for reconnects and for
-    `PeerBug::ResendDurable`.
-  - The main discovery scenario failed on seed 2: it wrote nothing over
-    S3. Over QUIC, a held connection fails only at its idle timeout, and
-    a flusher then waits the quarantine on S3 REST. Its UDP blocks now
-    last 11 to 14 s instead of 8 to 12 s, and it passes seeds 0 to 15.
-    Both of M6-07's quarantine bugs are still caught on seeds 0 to 11.
-- **The duplicate scenario now asserts a COMMIT from two nodes (found
-  in review).** It asserted only `replayed > 0`, which same-node
-  retries after lost answers satisfy. `from_two_nodes` was 0 on every
-  seed after the start-wait merge, for two reasons:
-  - Aimed faults start only while the clients write. The clients
-    finished at about 5 s, before the 12 s start wait let any `COMMIT`
-    out, so every aim was released.
-  - A sender deposed for 3 s regained its shard before its successor's
-    start wait ended, and sent the `COMMIT` again itself.
-  The scenario now aims in late mode: the fault starts once the `COMMIT`
-  reaches the destination, which applies it 1.2 s later. Its peer has a
-  2 s commit window and a 0.5 s answer timeout, so the start wait is
-  3 s. The clients pause up to 300 ms between requests and still write
-  when the aims fall due. A deposed sender stays down for 6 s.
-  - Some seeds still get no `COMMIT` from two nodes: no other node takes
-    the deposed shard over while its sender is down. So each seed must
-    replay a `COMMIT`, and at least one seed of each run must have one
-    from two nodes. The test prints the counts by seed.
-  - At 256 seeds (seeds 0 to 7) the counts are 4, 0, 2, 3, 2, 3, 0 and
-    3. Seeds 100 to 115 had one on all but 100 and 111.
-  - A dedicated scenario would have cost a full run more; this one cost
-    no more than before. The seeded bugs do not use this path.
-- **Seeds and run times at 256 seeds.** Every new scenario uses
-  `Runner::with_cost`. With `SKYS3_SIM_SEEDS=256`, one at `COST` runs
-  seeds 0 to 7, and one at twice that runs seeds 0 to 3; the replay
-  test runs each of its seeds twice. On toolchain 1.98.1, after the
-  start-wait merge:
-  - At `COST`: `lost_messages_are_retried_and_each_write_applies_once`
-    29.9 s, `reconnects_mid_transfer_resend_only_what_is_not_durable`
-    27.2 s, `duplicate_commits_apply_once_and_are_answered_alike`
-    40.7 s, `staging_that_expires_before_its_commit_is_staged_again`
-    29.2 s, and `commits_that_arrive_past_their_window_are_refused`
-    32.4 s.
-  - At twice `COST`: `a_seed_with_protocol_faults_replays_exactly`
-    8.7 s, and the seeded-bug scenarios
-    `the_audit_catches_durable_ranges_sent_again` 10.2 s,
-    `the_audit_catches_expired_staging_taken_for_a_commit` 11.9 s, and
-    `the_audit_catches_commits_applied_past_their_window` 11.1 s. The
-    start wait delays each bug's first chance to show, so these went to
-    twice `COST`, as M6-07's bug scenarios are.
-  - That is 201.3 s for M6-08, over the 3 minutes planned. Before the
-    start wait it was 185.1 s.
-  - The M6-06 scenarios now take 122.1 s (29.0, 12.1, 35.2, 22.7, and
-    23.1 s): the start wait slows their seeded bugs too. Over TCP before
-    the wait they took 62.1 s. The M6-07 scenarios take 178.6 s (44.9,
-    19.4, 30.0, 14.4, 33.4, and 36.5 s).
-  - Beyond CI's seeds, after the start-wait merge, every M6-08 scenario
-    and seeded bug passed seeds 0 to 15 and 100 to 115. Before it, with
-    each bug taken out, the scenarios of `PeerBug::NoQuarantine` and
-    `PeerBug::NoCommitWindow` passed seeds 0 to 7, so the correct cluster
-    passes the same faults.
-  - The 256-seed `harness` run passes too.
-- **No new fuzz target.** The simulation adds no parser. Frames travel
-  through `skys3-peer`'s own wire code, which `peer_messages` already
-  fuzzes.
-
 ## M4 Large objects
 
 ### M4-01 Write identity for streamed single PUTs
@@ -8692,6 +7743,955 @@ of this file. A task with nothing unexpected keeps "None."
   on a node whose shard still has a live primary elsewhere (the drill
   assumes none).
 
+## M6 Native peer transport
+
+### M6-01 Peer protocol messages
+
+- **`DATA` "at an offset" cannot address multipart uploads.** Design §7.8
+  gives `DATA` an offset only. A multipart upload's parts arrive
+  concurrently and in any order, and the final part boundaries are not
+  known until `CompleteMultipartUpload`. A re-uploaded part must also
+  replace the old one. Staged bytes are therefore addressed by *piece* and
+  offset. A piece is the body of a single PUT, or one part, and the source
+  gives it an ID that it never reuses. `COMMIT` lists the pieces of a
+  multipart object with their part numbers, sizes, and MD5s. The decision
+  is recorded in design §7.8.
+- **The precondition needs a third case.** The design gives a `COMMIT`
+  precondition as "the destination's expected current write identity, or
+  absent". `flush_conflict_policy = "overwrite"` needs a write with no
+  condition at all, so the precondition is one of `Absent`, `Matches`, and
+  `Unconditional`.
+- **`RESUME` had no trigger.** The table says that after a reconnect the
+  destination returns its durable ranges, but no message asks for them.
+  The destination now answers every `BEGIN` with a `RESUME`. For new
+  staging the `RESUME` is empty, and a source can stream `DATA` without
+  waiting for it.
+- **`peer_frame_bytes` had no upper bound.** A destination stages each
+  frame as one log record, so the configuration now limits it to the
+  largest record payload (16 MiB), as `extent_bytes` is limited.
+- **The intra-cluster frame was not reusable.** `skys3-net`'s `Frame`
+  keys its header on `MessageKind`, a closed enum whose kinds the
+  transport authorizes per node role. The peer protocol keeps the same
+  layout, two length prefixes, a `prost` header, and a raw payload, but
+  has its own envelope: a protobuf `oneof` of the nine messages, whose
+  field numbers are never reused.
+- **Size.** The plan sizes this task S (under 500 lines). The crate has
+  about 1,300 lines of non-test code, not counting comments. Most of it
+  is the `prost` wire structs and the checked conversions to typed
+  messages.
+- **Batch items could share a write identity (review).** `BATCH`
+  validation refused two items of the same key, but not two items of
+  different keys with the same write identity. Each item's `APPLIED`
+  names it only by its identity, and a destination treats a known
+  identity as a `COMMIT` replay. The second item could therefore get the
+  first one's stored result and never be applied. Validation now
+  refuses repeated identities too, on encode and decode. The proptest
+  batch generator gives each item a distinct identity. A proptest that
+  copies one item's identity onto another, and a rules test, both fail
+  without the check.
+
+### M6-02 QUIC endpoint and connection pool
+
+- **No trust-bundle keys existed.** §7.8 and §12 speak of "a configured
+  trust bundle", but `[peering]` had no certificate keys. The PR adds
+  `[peering.peers.<cluster-id>]`, with `ca_file` and `buckets`, to §14 and
+  the configuration reference. Each peer has its own CA bundle, not one
+  shared file: with a single bundle, a CA that one peer controls could
+  issue a certificate in another peer's SPIFFE trust domain. A node
+  presents its `[transport]` certificate to peers, so a configured peer
+  requires the `[transport]` certificate files.
+- **"Bucket pairs" had no shape.** No peer message names the source
+  bucket. The write identity in `BEGIN`, `COMMIT`, `BATCH` items, and
+  `ABORT` carries the source cluster and bucket ID, so a pair is the
+  source bucket ID and the destination bucket name. The identity's cluster
+  must also be the authenticated peer, or a peer could write in another
+  cluster's name. How a refusal is answered (`ABORT` or `APPLIED`
+  `refused`, with refused batch items dropped from the batch) is recorded
+  in §7.8.
+- **REST flush concurrency does not adapt yet.** The task said to mirror
+  skys3-flush's adaptation, but skys3-flush still uses a fixed
+  `flush_min_concurrency_per_shard`; adaptive concurrency is M4-10. The
+  pool's `AdaptiveLimit` implements the §7.7 rule directly, and M4-10 can
+  reuse it. A pure ratio test of round trip against base read loopback
+  jitter (a base of tens of microseconds) as congestion and never grew,
+  so rising latency also needs 5 ms of absolute growth.
+- **quinn brings second versions of rand and ring's dependencies.**
+  quinn-proto 0.11.19 is on rand 0.10, while proptest, turmoil, and the
+  workspace are on 0.9, so `rand@0.10` and `rand_core@0.10` are skipped in
+  deny.toml. quinn-proto also lists `ring`, but only for
+  `wasm32-unknown-unknown`, so `getrandom@0.2` and `windows-sys@0.52`
+  appear in the lockfile but are never compiled; they are skipped with
+  that reason. With default features off and `rustls-aws-lc-rs`, quinn
+  uses the workspace's `aws-lc-rs` provider, and `cargo tree -i ring`
+  finds nothing for the host.
+- **skys3-net kept the pieces private.** The peer verifier needs the
+  node's certified key, the mapping from `webpki` errors to TLS alerts,
+  and the SPIFFE parsing of certificate URIs. `Credentials::certified_key`,
+  `pki_error`, and `PeerIdentity::from_uri_names` are now public, instead
+  of a second copy in skys3-peer.
+- **0-RTT cannot be attempted against the endpoint directly.** The
+  endpoint issues no session tickets, so a client never has the key to
+  send early data with. The test first gets a ticket under the
+  destination's name from a server that issues them and accepts early
+  data. It then sends a `HELLO` in 0-RTT to the real endpoint. The
+  endpoint refuses the early data, and the connection is never
+  established, because the early `HELLO` never arrives. A last check
+  confirms that a full handshake with the endpoint leaves no ticket. With
+  early data and tickets enabled in the server configuration, the test
+  fails.
+- **quinn sizes stream windows only at setup.** Connection send and
+  receive windows can change at run time, but the per-stream receive
+  window cannot. Stream windows are therefore the cap
+  (`peer_max_inflight_bytes`), and the connection window, sized from the
+  bandwidth-delay product every second, bounds the total. The sizing task
+  holds only a weak handle to the connection. A strong handle would keep
+  a connection that every user had dropped open forever, because
+  keep-alives stop the idle timeout.
+- **No simulation scenario yet.** Plan rule 1.1 runs peer-path code under
+  the simulation harness, but quinn over turmoil needs an
+  `AsyncUdpSocket` adapter for turmoil's UDP. That belongs to M6-08 (peer
+  protocol simulation). This PR tests over loopback, with every network
+  wait bounded at 30 s.
+- **The pool's counters outlived cancelled calls (review).** A caller
+  counted a connection being opened before awaiting the connect, and
+  uncounted it only after the await. A cancelled caller left the slot
+  taken forever, and with a limit of one the destination wedged. A stream
+  also counted only once `open_bi` returned, so concurrent callers could
+  all pick the same idle connection. Both reservations are now made under
+  the pool's lock and held by guards that release them on drop: a
+  connect slot that also wakes waiting callers, and a stream count taken
+  before the stream is opened. Tests cancel a connect mid-handshake and
+  check that a waiting caller takes over, and check that an open waiting
+  for stream credit already counts. Each fails without its fix.
+- **A pool test read the load of the test machine.** The test that grows
+  the pool's limit adapted it from real loopback measurements. On a
+  loaded machine, loopback's smoothed round trip reached 6 to 20 ms
+  against a minimum under 1 ms, which the limit rightly reads as rising
+  latency, so it held at one connection (49 of 200 runs under CPU load).
+  The pool now takes its measurements from a `Meter`, by default the
+  transport's statistics (`TransportMeter`). Tests that adapt the pool use
+  a steady path, so they check the pool's rules and not the machine's
+  scheduling. The rules themselves are unit-tested with samples.
+
+### M6-03 Destination staging, DURABLE, and RESUME
+
+- **The staging index lives on the accepting node, not the primary.**
+  The plan has the primary stage frames and acknowledge durable ranges.
+  The primary does append each frame, as an `EXTENT` record of the key
+  through the shard's normal commit path, and answers only once every
+  member holds it. But the index of what is staged (identity, pieces,
+  durable ranges, extent positions) stays on the node that accepted the
+  stream, which reports `DURABLE` and `RESUME`. Kept on the primary, it
+  would be lost at every primary change (failure, planned handoff, and
+  M3's rebalancing), and the relay would need new forwarding requests.
+  On the accepting node it survives primary changes, because a reported
+  extent is committed and a new primary keeps every committed record
+  (§6.6); and the relay is M2-08's existing `AppendExtent` request
+  (`PeerExtents` over the gateway's `Shards`). The cost: a source that
+  reconnects to a different destination node, or outlives the node,
+  restages the object. Recorded in §7.8.
+- **Compaction would have dropped staged extents.** §10.3 drops
+  `EXTENT` records that no entry references, and a staged extent is
+  unreferenced until its `COMMIT`. §10.3 now keeps them until their
+  segment is older than `peer_staging_ttl_seconds`. Compaction is not
+  implemented yet, so nothing changes in code.
+- **A resent frame can overlap what is held.** After a reconnect the
+  source may frame the missing ranges differently, and frames still in
+  flight from the old connection may land after their bytes are resent.
+  Staged extents must not overlap, or a `COMMIT`'s `PUT` could not list
+  them. The destination stages only the parts of a frame that are
+  neither durable nor in flight, so a frame can become several extents,
+  or none. A piece is capped at `MAX_EXTENTS` extents, the most a `PUT`
+  references; past it the staging is refused.
+- **An inbound stream could not answer while it received.**
+  `InboundStream::recv` is not cancel-safe (a frame is read in several
+  steps), so a loop cannot `select!` between it and finished appends,
+  and `DURABLE`s would wait for the source's next frame. The sending
+  half is now shared (`InboundSender`), so a reporter task sends
+  `DURABLE`s while the stream's loop receives; `InboundStream::finish`
+  became `async`, and two M6-02 tests changed with it.
+- **Quota and TTL had no scope.** The quota counts bytes staged or in
+  flight per source cluster on each destination node; a node cannot see
+  the others' staging. The TTL runs from the staging's last `BEGIN` or
+  `DATA`, not its creation, so a multipart upload that takes days keeps
+  its staging while its parts arrive. Expiry is checked lazily, at most
+  once a minute, as staging is used.
+- **How it is tested.** Quinn under turmoil still needs M6-08's UDP
+  adapter, so the reconnect scenario runs twice below the simulation
+  harness. A proptest drives the staging table as a source with random
+  frame sizes, failed appends, appends still in flight across a
+  reconnect, and several reconnects. It checks that each `RESUME` reports
+  exactly what is durable, that the source resends only the rest, that
+  no byte is staged twice, and that the piece's extents assemble to its
+  body. With trimming against in-flight ranges removed, it fails. A
+  loopback QUIC test then drops a connection with two frames not
+  acknowledged, and checks that the source resends exactly those two
+  frames. `PeerExtents` is tested over real shards on a simulated disk.
+  Every network wait is bounded at 30 s.
+- **`COMMIT` and `BATCH` are answered `unavailable`.** Until M6-04 they
+  get `APPLIED` with `unavailable`, so a source retries.
+  `Staging::staged` and `StagedObject::extents` are the extension point:
+  the extents a `PUT` references for a piece, or `None` if the piece is
+  incomplete. Nothing is wired into the binary yet.
+- **Staging without `DATA` cost no quota (review).** Every `BEGIN` of a
+  new identity allocated an index entry charged nothing, so a source
+  could grow the index without bound before the TTL swept it; tiny
+  frames had the same effect per byte. Each staging is now charged
+  64 KiB (`MIN_STAGING_CHARGE`, the smallest `extent_bytes`) and each
+  staged part at least that much, instead of a separate count limit,
+  so the one quota bounds both bytes and index memory. A `BEGIN` past
+  it is answered `ABORT` (`quota exceeded`), and configuration now
+  requires a quota of at least one staging and one frame. A test that
+  sends only `BEGIN`s fails without the charge.
+- **A late append could change replacement staging (review).** An
+  append matched its staging by identity, piece, and range only. If the
+  staging was discarded or expired and the identity begun again, an old
+  failure removed the new in-flight range, and an old success attached
+  its extent to the new staging. Each staging now has a generation that
+  `admit` returns and `settle` checks. A test that settles an old
+  append into a replacement fails without the check.
+
+### M6-04 COMMIT, APPLIED, and ABORT
+
+- **The stored result is the version itself.** The plan asks where a
+  `COMMIT`'s result is kept so a replay returns it, across primary
+  changes. A separate table of results would need a new record kind, an
+  index table, and a rule for when to drop entries. Instead the `PUT`
+  stores the commit's write identity as `x-amz-meta-skys3-wid`, which is
+  where §7.2 puts it on any remote, and which the gateway already strips
+  from responses and from copies. A `COMMIT` whose identity the current
+  version carries is answered `committed` with that version's ETag, and
+  nothing is written. The log and the index entry every member rebuilds
+  from it hold the answer, so no new state is needed. The result lives as
+  long as the version is current. A replay after a later write can only
+  be a stale copy, because the source flushes one write of a key at a
+  time. Such a copy fails its precondition, or finds its staging consumed
+  and gets `incomplete`. Recorded in §7.8 ("Commits").
+- **A precondition check alone does not stop duplicates.** An
+  `Unconditional` `COMMIT` (the `overwrite` policy) holds whatever is
+  current, so a second copy would apply again. The shard's condition
+  therefore also fails when the current version already carries the
+  commit's identity, and the gateway then reads the entry and answers
+  `committed`. A test races two copies of an unconditional `COMMIT`. It
+  fails without that clause: two records are written. The one remaining
+  hole is a late copy of an unconditional delete, which needs no staging.
+  §7.8 accepts it under `overwrite`.
+- **"Current write identity" was undefined for local writes.** With
+  `peer_local_writes`, a version can come from the destination's own
+  clients and carry no `skys3-wid`. Reporting none would tell the source
+  the key is absent. Such a version reports the identity of its local
+  write instead: this cluster, the bucket, the shard, and the record's
+  position. The forwarded condition therefore carries the destination's
+  cluster ID. The intra-cluster `Condition` message got three fields and
+  three kinds for peer conditions.
+- **Deletes keep no identity.** A tombstone has no metadata, so a
+  replayed delete cannot be recognized by identity. A delete of a key
+  that has no current version writes nothing and is answered
+  `committed`. This matches §7.2's 412 rule for deletes, and makes
+  replayed deletes idempotent.
+- **The destination does not hash staged bytes again.** The sequence
+  diagram had the gateway "check checksums". Re-hashing a 5 GiB object
+  at `COMMIT` would read every extent back. Each frame's CRC32C is checked
+  on arrival and each extent's record checksum on disk, so the final
+  checksums are stored as the source sent them. The diagram now reads
+  "Check ranges and precondition". Nothing in this PR answers
+  `checksum mismatch`. It stays for writes whose bytes the destination
+  has whole, such as `BATCH` items.
+- **The precondition is checked before the staged bytes are needed.** A
+  `COMMIT` whose precondition already fails is answered with the current
+  identity even with no staging, so the source learns of a conflict
+  without restaging the object. The primary checks again when it
+  sequences the record.
+- **Staging is consumed only when the result is final.** `committed`
+  discards the staging. So do `refused` and `checksum mismatch`, which
+  make the source stage again. A precondition failure, `incomplete`, or
+  `unavailable` keeps the staging until its TTL, so the source can commit
+  it again, for example under the precondition the destination named.
+  Before it applies a `COMMIT`, the stream waits for its own frames in
+  flight. A source can therefore send `COMMIT` right after its last
+  `DATA`.
+- **`peer_source` stays in configuration.** It already existed as a
+  `[buckets.<name>]` key (M0-03). The bucket pairs that authorize a peer
+  are configuration too (M6-02). Moving the source into the bucket
+  register would split one setting across two places. The new checks:
+  `peer_source` must name a `[peering.peers]` table, and must not be set
+  on a `read_only` bucket. The new key `peer_local_writes` (default
+  `false`) is allowed only next to a `peer_source`. It is added to §14
+  and the configuration reference.
+- **Multipart `COMMIT`s are answered `unavailable`.** §7.8 says the
+  destination keeps a multipart object's part boundaries. A `PUT` record
+  has no parts. The multipart records cannot be reused either:
+  `MPU_ABORT` and replaced parts release their extents' locations, which
+  the staging still references. Publishing a multipart object in one
+  record needs a `PUT` whose data lists each part's extents. That is a
+  log and index format change, so it is left to a follow-up. A `COMMIT`
+  that carries inline bytes is refused, since only `BATCH` items carry
+  them. `BATCH` is still answered `unavailable` (M6-05).
+- **A primary change is tested without the network.** Quinn under
+  turmoil waits for M6-08. The replay test therefore crashes the
+  destination's disk and recovers its log on another node
+  (`MemoryShards::open_as`). That node opens the shard as primary in
+  epoch 2, as a new primary holds every committed record. A fresh
+  `PeerCommits` with no staging then answers the replay from the log.
+  The loopback QUIC test streams an object and commits it without
+  waiting for `DURABLE`. It replays the `COMMIT` on a new connection,
+  checks a failing precondition, and checks that `ABORT` leaves nothing
+  to publish. Every network wait is bounded at 30 s.
+- **A local tag change kept the peer's identity (review).** A `TAGS`
+  record makes a new version and clears its local write identity, but it
+  kept the stored metadata. A version a peer had published therefore
+  still carried the peer's `skys3-wid` after a local client
+  (`peer_local_writes`) changed its tags. The source's next `COMMIT`,
+  conditioned on that identity, then overwrote the tag change. The
+  flusher treats `TAGS` as a write with its own identity (M1-16b), so
+  `TAGS` now also drops the carried `x-amz-meta-skys3-wid` entry, and the
+  version reports the `TAGS` record's local identity. The entry's name
+  moved to `skys3-log` (`IDENTITY_METADATA`), next to the record limits.
+  A test tags a published object and checks that the next `COMMIT` fails
+  its precondition. Without the fix, it applies.
+- **The identity did not always fit in the record (review).** A `PUT`
+  record holds at most 8 KiB of metadata, and a `COMMIT` could carry all
+  8 KiB. Adding the 116-byte identity entry then refused a valid object
+  for good. §7.2 already reserves the identity's 105 bytes in the 2 KiB
+  user-metadata limit, for remotes. The same is now done for the record
+  limit (`IDENTITY_METADATA_RESERVED`). A client's stored metadata, and a
+  `COMMIT`'s without an identity entry, stay 116 bytes below 8 KiB. A
+  gateway test and a message-rules test each check the new bound, and
+  both fail without it.
+
+### M6-05 Small-object batches
+
+- **No shard call wrote several records at once.** `Shards::write` commits
+  one record, and each conditional write reads its key in its own index
+  transaction. Concurrent writes share a group commit only if they reach
+  the log within `group_commit_max_delay`. `Shard::commit_all_if` now
+  reads the keys of a batch in one transaction and sequences every record
+  whose check passes in one pass of the sequencer, so the records take
+  consecutive positions and are queued for the log back to back. A test
+  commits 30 records within `group_commit_max_bytes` and counts exactly
+  one group commit in the log's statistics.
+  `Shards::write_all` exposes it. By default it sends each write on its
+  own, all at once, and `LocalShards` overrides it.
+- **The forwarding protocol has no batch request.** A forwarded request
+  carries its condition in a frame header, and `skys3-net` limits headers
+  to 64 KiB. The peer conditions of 1,024 items take about 300 KiB. A
+  batch request would need its conditions in the payload and a new answer
+  with one result per item, so it is left out. `RoutedShards::write_all`
+  sequences a batch in process when the map names this node as the
+  primary, through `ForwardServer::write_all`, which observes it like any
+  other request. Otherwise it forwards each write on its own, all at once.
+  Recorded in §7.8 ("Batches").
+- **A batch must look for races before it ends its read (found in
+  testing).** The first version of `commit_all_if` ended its read and only
+  then looked for records of its keys sequenced since the read began.
+  Ending a read forgets the applied writes that no reader still needs, so
+  a racing write could go unnoticed, and two writers each created the
+  same key under `Absent`. A test that races batches against single
+  conditional writes failed in 2 of 15 runs. The batch now looks for
+  races first, as `commit_if` does, and the test passed 40 runs out of 40.
+- **Batch items can be longer than `inline_max_bytes`.** By default
+  `peer_frame_bytes` is 256 KiB and `inline_max_bytes` is 128 KiB, and a
+  record in a hot segment carries at most `inline_max_bytes`. The
+  destination therefore commits a longer body first as `extent_bytes`
+  `EXTENT` records, as it does for a client upload. Such an item's `PUT`
+  follows one group commit later.
+- **Deletes read their key first.** A delete of a key with no current
+  version must write nothing (M6-04), and a condition cannot express "skip
+  without failing". Delete items therefore read their key before they are
+  written, as a `COMMIT` does. Puts skip that read. A replayed put fails
+  the condition's identity clause, and the entry read afterwards supplies
+  its stored result.
+- **Batch items are not hashed again either.** The `BATCH`'s CRC32C
+  covers the bytes in transit, as each `DATA` frame's CRC32C does, so the
+  final checksums are stored as the source sent them. Nothing answers
+  `checksum mismatch` yet.
+- **The round trips are counted, not timed.**
+  `skys3-flush/tests/round_trips.rs` flushes 1,500 small objects over
+  REST to the simulated store, which counts 1,500 requests (1.000 per
+  object, not counting TCP and TLS handshakes). The same objects then go
+  over loopback QUIC to a destination that applies them through
+  `PeerCommits`. Connecting takes 2 round trips (the QUIC handshake and
+  the `HELLO`s), and the two `BATCH`es take 1 each, for 4 in total (0.0027
+  per object). `send_batch` sends the whole batch and finishes its stream
+  before it reads anything, so one round trip per batch follows from its
+  structure. The test asserts exactly 2 plus one per batch. `skys3-flush`
+  gains `skys3-peer`, `skys3-net`, and `rcgen` as dev-dependencies.
+- **Simulation and fuzzing.** Quinn under turmoil still waits for M6-08.
+  Writers in the shard simulation now also commit batches of puts and
+  deletes, some conditional, and the scenario's crash, replay, and
+  in-order checks cover them. At 256 seeds its run time went from 47.8 s
+  to 51.7 s, so no new scenario or cost was added. `BATCH` decoding
+  already has M6-01's `peer_messages` fuzz target, and the builder parses
+  no input, so this PR adds no fuzz target. A proptest packs random items
+  (some with repeated keys or identities) and checks that every batch
+  encodes, decodes, and that no item is lost.
+- **A batch could outgrow one group commit (review).** A `BATCH` may hold
+  16 MiB of inline bytes, but the log closes a group once it holds
+  `group_commit_max_bytes` (4 MiB by default), so a large batch's records
+  of one shard took several syncs. A test confirms it: 100 records of
+  about 57 KiB with a 16 KiB cap take between 2 and 4 group commits.
+  Letting one submission form a single larger group was rejected,
+  because recovery's tear window (`LogConfig::tear_window`, §10.1) relies
+  on no group passing the cap plus one record. The fix is on the source:
+  by default `BatchBuilder` also closes a batch at 4 MiB of estimated
+  records (`DEFAULT_BATCH_RECORD_BYTES`), and `with_record_bytes` sets
+  another budget. Each item counts its bytes in the batch plus 256 bytes,
+  which covers its record header and the destination's identity entry. A
+  gateway test packs 1,024 objects of 8 KiB, some with the most metadata.
+  The builder makes several batches, and each one writes at most 4 MiB of
+  records at the destination. §7.8 now states the guarantee exactly. A shard's records of a
+  batch share one group commit when they fit `group_commit_max_bytes` and
+  reach the queue within `group_commit_max_delay`, and otherwise take one
+  group commit per cap. A destination configured with a smaller cap
+  splits default-size batches.
+
+### M6-06 Source-side flusher integration
+
+- **The transport sits behind a link trait.** `skys3-flush` gains
+  `PeerLink`, which opens a stream of messages, and `PeerTransport`,
+  which `FlushService::with_peer_transport` takes. `ShardLease` (M6-02)
+  implements `PeerLink`; the tests use channels, and the cluster
+  simulation uses TCP over turmoil, since Quinn under turmoil waits for
+  M6-08. `skys3-peer` gains `Inbound` and `Outbound`, so that
+  `StagingService::serve` runs over any stream, and
+  `StreamError::Transport` for those streams' errors. The node binary
+  passes no transport yet, and the destination side is not wired in
+  either, so a `native` target falls back to S3 REST with a warning
+  until M6-07. Recorded in §7.8 ("Source side, as built").
+- **Nothing new is persisted.** M4-04 persists `MPU_FLUSH_OPEN` so that a
+  new primary finds the remote upload. A peer upload needs nothing like
+  it: staging is keyed by the write identity, which the log holds, and
+  the bytes of an identity never change, so every version is staged as
+  piece 0. A flusher after a restart or a takeover sends `BEGIN` and
+  resumes from the `RESUME`. What is never committed expires after
+  `peer_staging_ttl_seconds`.
+- **`FLUSHED` keeps the destination's identity as the remote version ID.**
+  The next version of the key is conditioned on it. An S3 fill would
+  send it as a `versionId`, so `fill.rs` now ignores a remote version ID
+  that parses as a write identity. A key whose identity the entry does
+  not know, such as an imported one, is committed on absence first, and
+  its identity is learned from the failed precondition.
+- **Fixed: an imported key's learned identity was a conflict.** Once the
+  import had passed the key, the identity the failed precondition named,
+  the destination's own, was neither this shard's nor before the import,
+  so every first overwrite or delete of an imported key was held in
+  conflict. The flusher now HEADs the target over S3 and takes that
+  identity as the imported version's when the destination still holds
+  the ETag the entry recorded, once per flush; any other identity is
+  still a conflict. Tested in `tests/native.rs`
+  (`an_imported_version_is_overwritten_by_its_learned_identity`).
+- **Multipart objects go as one piece.** The destination answers a
+  multipart `COMMIT` `unavailable` (M6-04), so the flusher stages a
+  multipart object at flush time as one piece that keeps its multipart
+  ETag. Part boundaries are lost, and objects over 5 GiB
+  (`MAX_PIECE_BYTES`) cannot be sent. That stays open until the
+  destination publishes multipart commits.
+- **Batches fill only under load (found in testing).** The first
+  in-memory test expected six small objects to share batches. With 4
+  batches in flight and a flush concurrency of 4, each object went in a
+  batch of its own. That is the intended behavior: an item waits only
+  while 4 batches are unanswered, so an idle target adds no delay. The
+  test now checks that small objects never open a staging stream. Since
+  the S3 fence (below), a batch holds at most 1 MiB of records and 16
+  are in flight.
+- **The cluster simulation has a peer.** `ClusterConfig::peer` adds a
+  destination cluster of one node. It recovers its shards from a
+  simulated disk in each life, and serves the real `StagingService` and
+  `PeerCommits` over TCP, one connection per stream, 20 ms from every
+  node. The `write_back` buckets and the backups flush to it.
+  `Endpoint::Peer` and `Fault::PeerRestart` cut, hold, and restart it,
+  on top of the usual crashes and takeovers. The audits:
+  - every `FLUSHED` a flusher decides on, which a new test hook
+    (`observe_flushed`) reports before it commits, names an identity the
+    peer answered `committed` or named as current;
+  - each write-through acknowledgement finds the write in the peer's
+    index, or in what the peer last held while it is down;
+  - at the end, after a power loss of the peer too, it holds what every
+    member holds, and no write identity is in two of its `PUT` records.
+- **The seeded bugs need distance (found in testing).**
+  `PeerBug::FlushedOnCommit` records `FLUSHED` once the `COMMIT` is sent,
+  and `PeerBug::AnsweredOnCommit` answers write-through waits then. The
+  second bug is caught only if the client's answer arrives before the
+  `COMMIT` is applied. The peer's 20 ms link guarantees that. Both bugs
+  were caught at every one of 32 seeds.
+- **The replicated backup scenarios do not replay exactly (found in
+  testing).** A replay test of the peer scenario failed with no peer
+  configured. The same test on the base branch failed the same way: its
+  backup scenario, with replicated shards, takeovers, and write-through
+  acknowledgements, also differs between two runs of one seed. M4-13
+  traced this to tokio's own randomness, which takeovers and restarts
+  wake. The peer's replay test therefore runs with one member per shard,
+  and replays exactly at 16 seeds.
+- **Merging M4-13.** Native targets skip the orphan sweep that now runs
+  beside the copy probe: they open no remote multipart upload, so none
+  is ever left open, and they still skip the probe, becoming ready
+  through `Ready::new` before their flushers start. In the flusher's
+  `biased` `select!`, finished body stagings come with the flusher's
+  other tasks, before the shard's changes, so a busy shard cannot starve
+  them. At 256 seeds the peer scenarios took 58.4 s in all after the
+  merge.
+- **Run times at 256 seeds.** `peer::every_committed_change_reaches_the_peer_under_faults`
+  takes 23.1 s, `peer::write_through_writes_are_acknowledged_once_the_peer_applied_them`
+  28.8 s, `peer::a_seed_with_a_peer_replays_exactly` 4.6 s, and the two
+  seeded-bug scenarios about 2 s each, which is about 61 s in all. All
+  but the replay test use `Runner::with_cost(_, COST)`; the replay test,
+  which runs each seed twice, uses twice the cost.
+- **No new fuzz target.** The simulation's TCP framing reads frames with
+  `parse_prefix` and `Message::decode_parts`, which M6-01's
+  `peer_messages` target already fuzzes.
+
+### M6-07 Discovery and fallback
+
+- **The descriptor lives in the receiving bucket.** A destination serves
+  it at the reserved key `.skys3/peer-descriptor` of each bucket that
+  has a `peer_source`, on nodes that set `[peering] quic_advertise`. The
+  source reads it through the target's own S3 store, with a ranged `GET`
+  of at most 64 KiB. This needs no new port, DNS name, or credential,
+  and it reaches the source wherever its flushes do. The gateway answers
+  `GET` and `HEAD` itself, without the shards, and only for the bucket's
+  own `peer_source`; in any other bucket the key is an ordinary key.
+  Recorded in §7.8 and in the plan's §14 table.
+- **It is signed with the node's transport key.** `skys3-peer` gains
+  `PeerDescriptor`, `DescriptorSigner`, and `DescriptorVerifier`. The
+  envelope is protobuf: the body, a TLS 1.3 signature scheme, the
+  signature over `skys3 peer descriptor\0` and the body, and the chain.
+  The verifier reuses `PeerVerifier` for the chain, so the trust domain,
+  the role, and the bundle checks are those of the handshake. It then
+  checks the signature with webpki, the times (5 minutes of skew, at most
+  24 hours of life), the bucket and the source, and the versions. A
+  descriptor lasts an hour, and the node signs a new one after half of
+  that.
+- **A SkyS3 destination refused the fallback's writes (found in M7-05).**
+  A SkyS3 gateway refuses `x-amz-meta-skys3-wid` from clients, so a
+  source that fell back to S3 REST could not flush to it. The decision:
+  `[peering.peers.<id>] s3_access_key_ids` lists the peer's flusher
+  keys. A request signed with one of them may write the buckets that
+  receive from that peer, and may carry an identity that names the peer
+  and one of its bucket pairs. The gateway stores it as `COMMIT` does,
+  so either transport finds an earlier copy of a write. `HEAD` and `GET`
+  show it only to the peer's keys, and every other carrier still gets
+  `400 InvalidArgument`. A key belongs to one peer. Recorded in §7.8,
+  §12, and the plan's §14 table.
+- **Discovery is one task per target.** It is `Waiting`, `Native`
+  (with a link), `PeerS3`, or `PlainS3`. Each change of choice is a
+  generation. `FlushService::reconcile` rebuilds the target and drops its
+  shard flushers, as a restart does. Re-probes back off from 15 s,
+  doubling, to 5 minutes (`DEFAULT_REPROBE_MIN` and `_MAX`). A native
+  flush whose link fails wakes the task, which tries a fresh handshake at
+  once. `native` never falls back any more: M6-06's fallback with a
+  warning is gone, and a node without peers does not flush a `native`
+  target.
+- **The quarantine moved to the shard flushers (found in review).** It
+  first delayed only the target's readiness when it fell back. A takeover
+  on a target that had fallen back long before skipped it, and a
+  `COMMIT` that a deposed primary sent could still be on its way. Each
+  shard flusher on S3 REST to a target that served a descriptor now
+  waits the quarantine (90 s) from its own start. That covers
+  fallbacks, restarts, and takeovers alike. The exactly-once argument is
+  in §7.8.
+- **A new link is a new choice (found in review).** A choice was the
+  same as the last when its kind was, so the link of a handshake that
+  followed a broken one was dropped. The target stayed on QUIC with the
+  dead link, its flushes failing, until a handshake failed and it fell
+  back. Now each new link is a new generation, and the shard flushers
+  restart on it without a quarantine, since every `COMMIT` stays on QUIC
+  as after any native restart. Only a change between QUIC and S3 REST
+  counts as a switch.
+- **The pool counts the shard flushers (found in review).** The node's
+  handshake attached one lease of the pool for a target, which all its
+  shard flushers shared, so a bucket got one shard's connection budget
+  however many shards this node flushed. `PeerLink::set_shards` now
+  tells the link how many shard flushers use it, after each reconcile,
+  and a `ShardLease` can stand for that many shards
+  (`ShardLease::set_shards`), at least one. A link per shard flusher
+  would not fit: the batcher and the uploads share the target's link.
+- **COMMITs carry an apply-by time (found in review).** The quarantine
+  assumed that the destination applies a `COMMIT` only while its
+  connection is open. It did not: each stream ran on a detached task, and
+  a `COMMIT` already read waited in `CommitSink::apply` for its shard as
+  long as that took, after the connection idled out. A write routed to a
+  primary on another node can wait longer still, so no timer on the
+  destination's gateway bounds when a write is sequenced. Now each
+  `COMMIT` and `BATCH` item carries `apply_by_ms`: the source's wall clock
+  as it sends it, plus the commit window (the answer timeout). The shard
+  checks it as it sequences the write, in `LocalShards`' precondition
+  check, on its node's wall clock (`ConditionFailed::Expired`), and the
+  gateway refuses a late arrival at once; both answer `unavailable`. The
+  quarantine is the commit window plus twice a clock tolerance of 30 s
+  (`CLOCK_TOLERANCE`): still 90 s by default. This adds the design's one
+  wall-clock assumption, recorded in §2.3 and §7.8. The destination also
+  aborts a connection's stream tasks when it closes. A unit test stalls a
+  `COMMIT` in front of its shard past its apply-by time and checks that
+  it is not applied; the simulation's audit now ignores a `COMMIT` that
+  arrives after its apply-by time, and its commit window is the
+  destination's idle timeout, so the seeded bug of no quarantine is still
+  caught.
+- **The apply-by time is negotiated (found in review).** A node that did
+  not know `apply_by_ms` ignored it, and a `COMMIT` without one was
+  unbounded, yet both spoke protocol version 1, so the shorter
+  quarantine relied on a field neither end had to send or check. The
+  protocol is now version 2 only (`PROTOCOL_VERSION`,
+  `APPLY_BY_VERSION`): version 1 was never released, so no node keeps
+  it. `Session::check` refuses a `COMMIT` or `BATCH` item without an
+  apply-by time, on send and on receipt (`ProtocolError::NoApplyBy`), so
+  every `COMMIT` of a session is bounded, and the field became required
+  for every sender (`Native` always stamps). The routing wire's condition
+  carries the time for any kind of condition (tag 6), as the destination
+  checks it on whichever node sequences the write. Recorded in §7.8.
+- **S3 writes to a peer are fenced too (found in review).** The reverse
+  switch had no fence: an S3 REST write to a SkyS3 peer carried no
+  apply-by time, so one held in the destination's routing could be
+  sequenced over a `COMMIT` sent after the target returned to QUIC.
+  Now each S3 write that publishes or deletes a version, to a target that
+  served a descriptor, carries `x-skys3-apply-by`
+  (`WriteIdentity::APPLY_BY_HEADER`), signed with the request. The
+  `Stamping` store adds it as the REST window admits the request, and
+  `Target::with_apply_by` turns it on, probes included. The gateway
+  reads it only from the peer's keys (`ApplyBy`) and checks it with the
+  precondition (`Precondition::ApplyBy`), as it checks a `COMMIT`'s; it
+  requires it where that peer reaches the bucket over QUIC too, the
+  bucket's `peer_source` on a node serving the descriptor. A multipart
+  upload's completion carries it, its parts and creation do not. Each
+  shard flusher that starts on QUIC waits the quarantine from the later
+  of its tenure's start (the shard's sequencing epoch, as this node
+  first saw it) and the node's last S3 flush of the target, so a node's
+  start, a takeover, and a `native` target wait as well: 90 s by default
+  before a new flusher's first `COMMIT`. A deadline covers the
+  destination's work, not a body's transfer, so the bytes it covers stay
+  at 1 MiB (`MAX_BOUNDED_BYTES`): a `BATCH` holds at most 1 MiB of
+  records and objects of at most 1 MiB, with 16 batches in flight
+  instead of 4 to keep the throughput; over S3 to a peer, a `PUT` over
+  1 MiB becomes a multipart upload (`put_body_parts`), so its remote
+  ETag is a multipart one, and a copy is sent as an object. The
+  simulation's audit now records each S3 write's apply-by time and
+  fails a `COMMIT` sent while one of its key could still apply; the
+  seeded bug `PeerBug::NoReturnQuarantine` is caught. The replay
+  scenario's UDP block is longer, since the first QUIC flushes now wait
+  out the quarantine.
+- **A refused descriptor that disappears (found in review).** Discovery
+  compared choices other than QUIC by kind only, so a target whose refused
+  descriptor was later removed stayed `PlainS3 { found: true }`: stamped
+  with `x-skys3-apply-by`, its large PUTs sent as multipart uploads, and
+  no server-side copies, after its discovery had ended. A change of
+  `found` is now a new choice, and the target is rebuilt as a plain
+  store. Since that rebuild, and a peer whose descriptor disappears
+  while on QUIC, lead to a plain store without the quarantine, the
+  service records when this node last stopped flushing the target over
+  QUIC (`native_until`), and a shard flusher that starts on S3 REST waits
+  out what is left of the quarantine since then.
+- **A peer writes only the buckets that receive from it (found in
+  review).** The gateway's guard let a peer's key write any bucket with
+  no `peer_source`, and any bucket with `peer_local_writes`, whichever
+  cluster it receives from, as far as the key's permissions allowed. A
+  peer's request now writes objects only in the buckets whose
+  `peer_source` is that peer (`403 AccessDenied` elsewhere);
+  `peer_local_writes` opens a bucket to this cluster's clients only. The
+  design was silent on buckets that receive from no peer; the stricter
+  rule was chosen. Recorded in §7.8 and §12.
+- **A stalled-commit test was flaky.** The gate of
+  `a_commit_that_stalls_past_its_apply_by_time_never_applies` released
+  its permits back, so a later poll could pass early. It now forgets
+  them.
+- **The descriptor key is reserved (found in review).** Only `GET` and
+  `HEAD` knew the key. A client could write it in a source bucket, the
+  peer would store that version, and every read there would answer the
+  descriptor instead. Now every gateway refuses writes of the key in
+  every bucket with `400 InvalidArgument`, from clients and peers, over
+  S3 or in a `COMMIT` or `BATCH` item, and a multi-object delete refuses
+  that key alone. A namespace import skips a remote object at the key, so
+  it is never filled. Recorded in §7.2 and §7.8.
+- **A peer's copy carries its identity (found in review).** CopyObject
+  checked `REPLACE` metadata as a client's, so a peer's server-side copy
+  with its `x-amz-meta-skys3-wid` was refused with `400
+  InvalidArgument`, and the flusher fell back to uploading the bytes.
+  The copy now takes its carrier from the request, as PUT and multipart
+  uploads do.
+- **The node binary peers.** `NodePeering` binds the QUIC endpoint when
+  peers are configured. It serves `StagingService` with `PeerCommits`
+  over the node's shards, adapts the pool every second, and signs the
+  descriptors. Its handshake opens a fresh connection with `HELLO`s to
+  each resolved address, closes it, and hands the flushers a pool link.
+  The admin bucket status gains `flush.transport`. The gauge
+  `skys3_flush_transport{bucket, transport}` exists for verified peers
+  and `native` targets. The alert `SkyS3PeerTransportFallback` fires
+  after 30 minutes on S3, and the dashboard has a panel for it.
+- **The simulation falls back to the peer's real gateway.** The
+  destination now runs `Gateway` over a `MemoryControlStore` beside its
+  native service. Its authenticator takes the access key from a header,
+  and its descriptors are signed in the simulation on simulated wall
+  time. The nodes reach the gateway through a relay host, so faults on
+  the node-to-peer links block only the native path. `PeerS3` is a small
+  HTTP S3 client over turmoil, and `SimStore` lets one flush service mix
+  it with `SimS3`. The destination's PKI is Ed25519 with fixed serials,
+  so descriptors and chains have the same size in every run. The
+  existing M6-06 scenarios also read their descriptor through the
+  gateway now.
+- **The destination idles streams out.** A sim stream that sends nothing
+  for `Peer::idle` ends, as a QUIC connection does after its idle
+  timeout. Without this, a held `COMMIT` could arrive any time later, and
+  no quarantine would bound it.
+- **UDP blocks are a fault of their own (found in testing).** Blocks
+  built from per-node partitions ended early when an overlapping
+  partition healed the same link. `Fault::UdpBlock` cuts or holds every
+  node-to-peer link, and blocks the link again whenever another heal
+  repairs it. Overlapping blocks extend each other.
+- **Random holds rarely caught a `COMMIT` (found in testing).** Each sim
+  stream has its own TCP connection, so a hold that starts before the
+  connect holds the SYN, and no `COMMIT` is ever sent. The missing
+  quarantine went unnoticed on 3 of 4 seeds. `Peer::aimed` starts a held
+  block as a node sends a `COMMIT`, which catches it on the wire. The
+  main scenario aims two such blocks, ending before or after the idle
+  timeout, besides two drawn blocks of 8 to 12 s.
+- **The clients must outlast the blocks (found in testing).** On one
+  seed in 32 extra ones, the drawn blocks ended late and an aimed hold
+  began as the first `COMMIT` after them was sent. The clients stopped
+  writing before the nodes were back on QUIC, so no `COMMIT` reached the
+  peer. The drawn blocks now start within the first 3 s, and the clients
+  send 200 operations each, which keeps them writing for about 25 s.
+- **Multipart flushes over S3 (found in testing).** The flushers' 512-byte
+  parts got `EntityTooSmall`, so the destination's gateway takes parts of
+  any size, as the nodes' do. The peer's ETag of a streamed `PUT` sent
+  as a multipart upload is not the client's. The final audit reads such
+  objects back through a gateway and compares their MD5, as it does for
+  the remote store. The descriptor also lacked an ETag, which S3 clients
+  require, so the gateway now answers it with the MD5 of its bytes.
+- **The audits.**
+  - Exactly once: the M6-06 final audit, now over both transports.
+  - No `COMMIT` reaches the peer after an S3 write of its key that was
+    acknowledged after the `COMMIT` was sent.
+  - No `COMMIT` reaches a peer whose descriptor is forged or expired.
+  - Sampled every 250 ms, each live node's metric matches its status,
+    and every change of transport increments `switches`.
+  - After healing, every peer target is back on QUIC within 30 s.
+- **Seeded bugs.** `PeerBug::UnverifiedDescriptor` decodes the
+  descriptor without checking it, and `PeerBug::NoQuarantine` flushes over
+  S3 at once.
+- **Seeds and run times at 256 seeds.** With `SKYS3_SIM_SEEDS=256`, a
+  scenario at `COST` runs seeds 0 to 7 and one at twice that seeds 0 to
+  3. On toolchain 1.98.1:
+  - `discovery::with_udp_blocked_flushing_goes_on_over_s3_and_returns_to_quic`,
+    2 × `COST`, seeds 0 to 3: 46.8 s.
+  - `discovery::a_seed_with_udp_blocked_replays_exactly`, 2 × `COST`,
+    seeds 0 to 3, each run twice: 20.5 s.
+  - `discovery::forged_and_expired_descriptors_are_refused`, `COST`,
+    seeds 0 to 7: 32.2 s.
+  - `discovery::the_audit_catches_an_unverified_descriptor`, `COST`,
+    seeds 0 to 7: 2.4 s.
+  - `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`,
+    2 × `COST`, seeds 0 to 3: 21.6 s.
+  - That is 123.4 s for M6-07. The M6-06 scenarios now take 62.1 s in
+    all (23.1, 29.7, 5.1, 2.0, and 2.2 s), about as before.
+  - Beyond CI's seeds, the main scenario passed 64 more (100 to 131 and
+    300 to 331). Forged and expired descriptors were refused on seeds
+    100 to 131. Both seeded bugs were caught on all of seeds 100 to 131.
+  - The 256-seed `harness` run passes too.
+- **Fuzz target.** `peer_descriptor` decodes arbitrary bytes as a
+  descriptor and checks the decoder's invariants. A verifier that trusts
+  nobody refuses every input.
+
+### M6-08 Peer protocol simulation
+
+- **The simulation runs real QUIC.** M6-06 put a TCP stream model under
+  the peer scenarios. It is gone: the nodes and the destination now run
+  Quinn over turmoil's UDP. `skys3-cluster-sim`'s `quic` module adapts a
+  turmoil `UdpSocket` to Quinn's `AsyncUdpSocket`. It reports that it
+  may fragment, so Quinn skips MTU discovery. The nodes use the node
+  binary's `PeerEndpoint`, handshake, and `ConnectionPool`, and the
+  destination runs the real `StagingService` and `PeerCommits`. Holds,
+  partitions, message loss, and peer restarts now lose datagrams and
+  stall connections until their idle timeout (`Peer::idle`), as on a
+  real network. Recorded in §16.1.
+- **Seeded endpoints make QUIC replay.** `PeerEndpoint::with_socket`
+  takes any socket and an optional seed. With a seed, Quinn's
+  `rng_seed`, the connection IDs, the initial destination IDs, and the
+  keys of stateless resets and tokens all come from it (SplitMix64 and
+  `aws-lc-rs` keys from fixed bytes). TLS still draws its own key shares
+  and randoms. That changes bytes on the wire but not their sizes, and
+  the simulation's PKI is Ed25519 for that reason, so a seed replays.
+  Quinn uses the Tokio runtime's clock, which is the simulation's paused
+  clock. `EndpointSettings` gains `idle_timeout`, with keep-alives at a
+  sixth of it. The node binary passes neither a seed nor a socket and
+  is unchanged.
+- **Determinism findings.** The QUIC adapter test, the new
+  `peer_protocol::a_seed_with_protocol_faults_replays_exactly`,
+  `peer::a_seed_with_a_peer_replays_exactly`, and
+  `discovery::a_seed_with_udp_blocked_replays_exactly` all replay
+  exactly. As in M6-06, the replay tests use one member per shard,
+  because tokio's own unseeded randomness makes replicated takeovers
+  differ between runs. CI's flags are unchanged. The destination's
+  fault draws come from a `SmallRng` forked from the run's seed, and
+  every map it keeps is a `BTreeMap`.
+- **Protocol faults at the destination.** `Peer::faults`
+  (`ProtocolFaults`) wraps each stream the destination serves in a tap.
+  The tap can:
+  - lose `BEGIN`, `DATA`, `COMMIT`, and `BATCH` frames, or `RESUME`,
+    `DURABLE`, and `APPLIED` answers;
+  - close the connection as a `DATA` frame arrives, after a `DURABLE`,
+    or with an `APPLIED` in flight;
+  - make a `COMMIT` arrive late.
+  Aimed faults (`AimedBlocks::scope`) hold a `COMMIT`'s UDP path, hold
+  its sender's link, or depose its sender by holding its link and
+  crashing it.
+- **Audits added.** Each tap checks its stream:
+  - no `DATA` resends bytes the stream's `RESUME` reported durable;
+  - every `APPLIED` for the identity the key's current version carries
+    says `committed` with that version's ETag, for replays and for a
+    deposed primary's copy alike, or `unavailable`, which claims nothing;
+  - a `COMMIT` that arrived while its staging covered the whole object is
+    never answered `incomplete`, unless its source aborted it;
+  - a `COMMIT` that arrived past the commit window of its identity's
+    latest send is never answered `committed`. Its apply-by time passed,
+    whichever send it is, and `PeerCommits` checks that before it looks
+    for a stored result.
+  At the end, the staging left over must expire and give back its whole
+  quota charge. `PeerAudit` counts the faults that struck and what the
+  sources did, so that each scenario can show its faults happened.
+- **Scenarios.** `peer_protocol` runs three replicated nodes with
+  takeovers, under the M6-06 cluster faults plus:
+  - `lost_messages_are_retried_and_each_write_applies_once`: loses 5 %
+    of messages either way, for staged objects and batches, over 20
+    keys.
+  - `reconnects_mid_transfer_resend_only_what_is_not_durable`: drops 6 %
+    of connections mid-transfer, with 128-byte frames, and checks that
+    `RESUME`s reported durable bytes that were not resent.
+  - `duplicate_commits_apply_once_and_are_answered_alike`: replays after
+    lost `APPLIED`s (4 % loss), and deposes a `COMMIT`'s sender once the
+    `COMMIT` reached the destination, so that its successor sends it
+    too. At least one seed of each run must have a `COMMIT` from two
+    nodes.
+  - `staging_that_expires_before_its_commit_is_staged_again`: a 400 ms
+    TTL, late `COMMIT`s, and held senders.
+  - `commits_that_arrive_past_their_window_are_refused`: a 1.5 s commit
+    window, with one `COMMIT` in two arriving 2.5 s late. At one in
+    three, seed 109 saw no overdue `COMMIT`: a peer restart killed all
+    five late ones, and every later write went in a batch.
+  - `a_seed_with_protocol_faults_replays_exactly`.
+- **Seeded bugs.** All three were added in `skys3-flush`, and each one is
+  caught on every seed tried:
+  - `PeerBug::ResendDurable` ignores the `RESUME`.
+  - `PeerBug::ExpiredAsCommitted` takes an `incomplete` answer or expired
+    staging for a commit. The `FLUSHED` audit catches it.
+  - `PeerBug::NoCommitWindow` stamps each `COMMIT`'s apply-by time a day
+    past the commit window. It was added after M6-07's apply-by merge.
+    It first sent no apply-by time at all, which M6-07's protocol
+    version 2 now refuses on send.
+- **Product change: staging stays while its `COMMIT` applies.**
+  `Staging::pin` and `Staging::unpin` keep staging that was live when its
+  `COMMIT` arrived from expiring while the `COMMIT` waits for the
+  stream's frames in flight and applies. `Staging::expire` skips pinned
+  staging. The destination holds the pin in a guard, so a stream task
+  aborted when its connection closes releases it. Before this, an append
+  that outlived the TTL could expire the staging under its own `COMMIT`.
+  No simulation run hit that; the race was found by reading the code
+  while writing the expiry audit. A unit test covers it. Recorded in
+  §7.8 ("Expiry"). No other product bug turned up.
+- **A closed connection takes held COMMITs with it (found in testing).**
+  Under QUIC, `discovery::the_audit_catches_a_key_flushed_over_s3_while_its_commit_is_outstanding`
+  let `PeerBug::NoQuarantine` through on 3 of 12 seeds. The fault held
+  the link only once the `COMMIT` reached the destination's side.
+  Falling back, the source closed its connection, and the held `COMMIT`
+  died with it. Aimed faults now hold the sender's link as the `COMMIT`
+  is sent. The bug scenario uses `AimedBlocks::late`: the destination
+  takes the `COMMIT` and applies it after four fifths of the hold, while
+  the links are held and before it can hear the close. With that, the
+  bug is caught on seeds 0 to 11, and the correct cluster passes the
+  same faults.
+- **Deposing by partition never duplicated a COMMIT (found in
+  testing).** A partitioned primary was re-elected and its keys were
+  rewritten, so no `COMMIT` came from two nodes. `AimScope::Deposed`
+  crashes the sender while its link is held, and the scenario writes 40
+  keys, so that the successor flushes the same write.
+- **The expiry scenario needed a sweeper and late COMMITs (found in
+  testing).** Staging expires lazily, so on some seeds nothing expired.
+  The simulated destination now sweeps every TTL, and one `COMMIT` in
+  two arrives a second late. The first version of the covered-stream
+  audit also flagged staging that had expired before its `COMMIT`
+  arrived; it now counts only staging that is still there on arrival.
+- **Merging M6-07's apply-by time.** The simulated destination records
+  each `COMMIT` with its apply-by time, so the quarantine audit ignores
+  `COMMIT`s that arrive too late to apply. The nodes' transports take
+  the commit window. The tapped accept loop keeps each connection's
+  streams in a `JoinSet`, as `serve_connection` now does.
+- **A late replay is answered `unavailable` (found in testing).** The
+  first run of the overdue scenario at 256 seeds failed on seed 5. A
+  replay of an applied write arrived past its apply-by time and was
+  answered `unavailable`, and the consistency audit wanted `committed`.
+  `PeerCommits` checks the apply-by time before it looks for the stored
+  result, and §7.8 makes every such refusal `unavailable` for the source
+  to retry. That is correct, so the audit now accepts `unavailable` too.
+- **Merging M6-07's QUIC start wait.** M6-07 then required an apply-by
+  time on every `COMMIT`, and made each shard flusher that starts on
+  QUIC wait the quarantine before its first `COMMIT`.
+  - `PeerBug::NoApplyBy` became `PeerBug::NoCommitWindow`.
+  - With the default 8 s commit window and 2 s answer timeout, the wait
+    is 12 s. The peer protocol scenarios then flushed only about a dozen
+    `COMMIT`s per run, mostly after the cluster faults, and on some seeds
+    no protocol fault struck. Their peer now has a 3 s commit window and
+    a 1 s answer timeout, so the wait is 5 s. The loss and drop rates
+    grew, and so did the traffic: 20 keys for lost
+    messages, and 128-byte frames for reconnects and for
+    `PeerBug::ResendDurable`.
+  - The main discovery scenario failed on seed 2: it wrote nothing over
+    S3. Over QUIC, a held connection fails only at its idle timeout, and
+    a flusher then waits the quarantine on S3 REST. Its UDP blocks now
+    last 11 to 14 s instead of 8 to 12 s, and it passes seeds 0 to 15.
+    Both of M6-07's quarantine bugs are still caught on seeds 0 to 11.
+- **The duplicate scenario now asserts a COMMIT from two nodes (found
+  in review).** It asserted only `replayed > 0`, which same-node
+  retries after lost answers satisfy. `from_two_nodes` was 0 on every
+  seed after the start-wait merge, for two reasons:
+  - Aimed faults start only while the clients write. The clients
+    finished at about 5 s, before the 12 s start wait let any `COMMIT`
+    out, so every aim was released.
+  - A sender deposed for 3 s regained its shard before its successor's
+    start wait ended, and sent the `COMMIT` again itself.
+  The scenario now aims in late mode: the fault starts once the `COMMIT`
+  reaches the destination, which applies it 1.2 s later. Its peer has a
+  2 s commit window and a 0.5 s answer timeout, so the start wait is
+  3 s. The clients pause up to 300 ms between requests and still write
+  when the aims fall due. A deposed sender stays down for 6 s.
+  - Some seeds still get no `COMMIT` from two nodes: no other node takes
+    the deposed shard over while its sender is down. So each seed must
+    replay a `COMMIT`, and at least one seed of each run must have one
+    from two nodes. The test prints the counts by seed.
+  - At 256 seeds (seeds 0 to 7) the counts are 4, 0, 2, 3, 2, 3, 0 and
+    3. Seeds 100 to 115 had one on all but 100 and 111.
+  - A dedicated scenario would have cost a full run more; this one cost
+    no more than before. The seeded bugs do not use this path.
+- **Seeds and run times at 256 seeds.** Every new scenario uses
+  `Runner::with_cost`. With `SKYS3_SIM_SEEDS=256`, one at `COST` runs
+  seeds 0 to 7, and one at twice that runs seeds 0 to 3; the replay
+  test runs each of its seeds twice. On toolchain 1.98.1, after the
+  start-wait merge:
+  - At `COST`: `lost_messages_are_retried_and_each_write_applies_once`
+    29.9 s, `reconnects_mid_transfer_resend_only_what_is_not_durable`
+    27.2 s, `duplicate_commits_apply_once_and_are_answered_alike`
+    40.7 s, `staging_that_expires_before_its_commit_is_staged_again`
+    29.2 s, and `commits_that_arrive_past_their_window_are_refused`
+    32.4 s.
+  - At twice `COST`: `a_seed_with_protocol_faults_replays_exactly`
+    8.7 s, and the seeded-bug scenarios
+    `the_audit_catches_durable_ranges_sent_again` 10.2 s,
+    `the_audit_catches_expired_staging_taken_for_a_commit` 11.9 s, and
+    `the_audit_catches_commits_applied_past_their_window` 11.1 s. The
+    start wait delays each bug's first chance to show, so these went to
+    twice `COST`, as M6-07's bug scenarios are.
+  - That is 201.3 s for M6-08, over the 3 minutes planned. Before the
+    start wait it was 185.1 s.
+  - The M6-06 scenarios now take 122.1 s (29.0, 12.1, 35.2, 22.7, and
+    23.1 s): the start wait slows their seeded bugs too. Over TCP before
+    the wait they took 62.1 s. The M6-07 scenarios take 178.6 s (44.9,
+    19.4, 30.0, 14.4, 33.4, and 36.5 s).
+  - Beyond CI's seeds, after the start-wait merge, every M6-08 scenario
+    and seeded bug passed seeds 0 to 15 and 100 to 115. Before it, with
+    each bug taken out, the scenarios of `PeerBug::NoQuarantine` and
+    `PeerBug::NoCommitWindow` passed seeds 0 to 7, so the correct cluster
+    passes the same faults.
+  - The 256-seed `harness` run passes too.
+- **No new fuzz target.** The simulation adds no parser. Frames travel
+  through `skys3-peer`'s own wire code, which `peer_messages` already
+  fuzzes.
+
 ## M7 Hardening
 
 ### M7-03 Fuzzing campaign
@@ -8906,6 +8906,12 @@ of this file. A task with nothing unexpected keeps "None."
   in order, that every runbook has its parts and a drill row, that every
   drill names a test function that exists, and that every metric the
   runbooks name is in the metrics reference.
+- **The disk drill read the log before the fence attempt.** CI failed
+  `drill_disk_out_of_service` on the "cannot fence the disk" check. The
+  node counts the disk out of service and clears readiness first, then
+  tries to write the fence on the blocking pool and logs the failure, so
+  a test that waits for the gauge can read `node.log` before that line.
+  The drill now waits for the line.
 
 ### M7-07 Reconciliation scan
 
