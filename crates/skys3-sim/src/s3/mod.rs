@@ -53,6 +53,10 @@
 //!   each request it applied, with the operation, its source, and for a
 //!   write the key's current object, so that a test can audit every state
 //!   the store passes through, including those no read would see.
+//! - **Chosen lost answers** ([`SimS3::lose_answers`]): a function that
+//!   picks, among the requests the store applied, those whose answers it
+//!   loses, such as every `CompleteMultipartUpload` of some keys, while
+//!   it answers the requests it refused.
 //!
 //! None of these changes what a store does until it is used, so seeds
 //! recorded before them replay unchanged.
@@ -275,6 +279,10 @@ pub struct Applied<'a> {
 /// What [`SimS3::observe`] calls after each request the store applied.
 pub type Observer = Arc<dyn Fn(&Applied<'_>) + Send + Sync>;
 
+/// What [`SimS3::lose_answers`] asks of each request the store applied:
+/// whether to lose its answer.
+pub type AnswerLoss = Arc<dyn Fn(&Applied<'_>) -> bool + Send + Sync>;
+
 /// A simulated S3 bucket.
 ///
 /// Clones share the bucket, so one store can be handed to every node of a
@@ -319,6 +327,8 @@ struct State {
     sources: BTreeMap<String, SourceLink>,
     /// What is called after each request the store applied.
     observer: Option<Observed>,
+    /// What picks the applied requests whose answers are lost.
+    losing: Option<Losing>,
 }
 
 /// The observer of a store, which `Debug` shows by its presence alone.
@@ -328,6 +338,17 @@ struct Observed(Observer);
 impl std::fmt::Debug for Observed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Observer")
+    }
+}
+
+/// The [`AnswerLoss`] of a store, which `Debug` shows by its presence
+/// alone.
+#[derive(Clone)]
+struct Losing(AnswerLoss);
+
+impl std::fmt::Debug for Losing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnswerLoss")
     }
 }
 
@@ -347,6 +368,7 @@ impl State {
             stamped: Vec::new(),
             sources: BTreeMap::new(),
             observer: None,
+            losing: None,
         }
     }
 
@@ -486,6 +508,16 @@ impl SimS3 {
     /// lost, outside the store's lock; it must not wait for the store.
     pub fn observe(&self, observer: Option<Observer>) {
         self.state().observer = observer.map(Observed);
+    }
+
+    /// Loses the answer of each request the store applies from now on for
+    /// which `lose` returns true, as [`Fault::LostResponse`] does, in place
+    /// of any earlier function, or with `None` stops. The store answers
+    /// every request it refused, unless a random or scripted fault loses
+    /// the answer. `lose` is called after the observer, outside the store's
+    /// lock; it must not wait for the store.
+    pub fn lose_answers(&self, lose: Option<AnswerLoss>) {
+        self.state().losing = lose.map(Losing);
     }
 
     /// Refuses, or with `denied` false allows again, reads of `key` made
@@ -697,11 +729,12 @@ impl SimS3 {
             state.stats.cut_off += u64::from(down);
             down
         };
-        let result = if cut {
-            Err(S3Error::new(
+        let (result, chosen) = if cut {
+            let lost = S3Error::new(
                 S3ErrorKind::Timeout,
                 "the request was lost: the link to the store is down",
-            ))
+            );
+            (Err(lost), false)
         } else {
             self.process(operation, plan, in_flight, tracking.writes, apply)
         };
@@ -713,7 +746,7 @@ impl SimS3 {
         let delivery = self.state().link.delivery(Instant::now(), bytes);
         sleep_until(delivery).await;
         sleep(plan.response_delay).await;
-        if plan.fault == Some(Fault::LostResponse) {
+        if chosen || plan.fault == Some(Fault::LostResponse) {
             self.state().stats.lost_responses += 1;
             let kind = if plan.lost_as_timeout {
                 S3ErrorKind::Timeout
@@ -739,7 +772,8 @@ impl SimS3 {
 
     /// The store's side of a request: ends its conflict window, and applies it
     /// unless a fault or a conflict stops it. Tells the observer, if any, of
-    /// a request it applied.
+    /// a request it applied. Returns the result, and whether the store's
+    /// [`AnswerLoss`] chose to lose its answer.
     fn process<T>(
         &self,
         operation: Operation,
@@ -747,7 +781,7 @@ impl SimS3 {
         in_flight: Option<InFlight<'_>>,
         writes: Option<&str>,
         apply: impl FnOnce(&mut Bucket, bool) -> S3Result<T>,
-    ) -> S3Result<T> {
+    ) -> (S3Result<T>, bool) {
         let mut state = self.state();
         let conflicted = in_flight.is_some_and(|in_flight| in_flight.finish(&mut state));
         let limited = !state.link.admit(Instant::now());
@@ -787,7 +821,7 @@ impl SimS3 {
             _ => None,
         };
         if let Some((kind, message)) = injected {
-            return Err(S3Error::new(kind, message));
+            return (Err(S3Error::new(kind, message)), false);
         }
         let result = match writes {
             Some(key) => state
@@ -804,18 +838,26 @@ impl SimS3 {
             state.applied.push((operation, key.to_owned()));
         }
         let observer = state.observer.clone().filter(|_| result.is_ok());
-        if let Some(Observed(observer)) = observer {
+        let losing = state.losing.clone().filter(|_| result.is_ok());
+        let mut chosen = false;
+        if observer.is_some() || losing.is_some() {
             let current =
                 writes.and_then(|key| state.bucket.get_object(&GetObject::new(key), false).ok());
             drop(state);
-            observer(&Applied {
+            let applied = Applied {
                 operation,
                 source: self.source.as_deref(),
                 key: writes,
                 current: current.as_ref(),
-            });
+            };
+            if let Some(Observed(observer)) = observer {
+                observer(&applied);
+            }
+            if let Some(Losing(lose)) = losing {
+                chosen = lose(&applied);
+            }
         }
-        result
+        (result, chosen)
     }
 
     /// Applies `support` to a precondition that is `present` on a request:
