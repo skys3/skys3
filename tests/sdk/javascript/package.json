@@ -1,0 +1,16 @@
+{
+  "name": "skys3-sdk-matrix",
+  "private": true,
+  "description": "The SDK matrix's JavaScript client: the AWS SDK for JavaScript v3 against SkyS3.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1146.0",
+    "@aws-sdk/credential-providers": "3.1146.0",
+    "@aws-sdk/lib-storage": "3.1146.0",
+    "@aws-sdk/s3-request-presigner": "3.1146.0",
+    "@smithy/property-provider": "4.5.2"
+  }
+}

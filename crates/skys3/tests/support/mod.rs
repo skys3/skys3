@@ -1,9 +1,10 @@
 //! Shared helpers: node configurations in a temporary directory, an S3
-//! client, plain HTTP requests to the admin listener, and the binary as a
-//! child process ([`process`]).
+//! client, plain HTTP requests to the admin listener, the binary as a
+//! child process ([`process`]), and an OIDC issuer ([`issuer`]).
 
 #![allow(dead_code)]
 
+pub mod issuer;
 pub mod process;
 
 use std::path::{Path, PathBuf};
