@@ -562,3 +562,72 @@ async fn a_later_write_of_the_shard_at_the_destination_is_never_replaced() {
     assert_eq!(old.entry("k").await.unwrap().state, EntryState::Dirty);
     flusher.stop().await;
 }
+
+/// An imported key's entry knows the destination's ETag but not its
+/// identity: the identity the first failed precondition names is taken as
+/// the imported version's while the destination still holds its ETag, and
+/// is a conflict once it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_version_is_overwritten_by_its_learned_identity() {
+    use std::sync::Arc;
+
+    use skys3_log::RecordBody;
+    use skys3_log::record::Import;
+    use skys3_remote::{ObjectStore, PutObject};
+
+    let destination = Destination::start(true).await;
+    let node = Node::open(14).await;
+    let store = Arc::new(support::remote(14, false));
+    for key in ["k", "j"] {
+        // Written by the destination's own clients, empty, and imported.
+        destination
+            .shards
+            .put(
+                &destination.bucket,
+                key,
+                skys3_gateway::stub::EntryState::Clean,
+            )
+            .await
+            .unwrap();
+        store.put_object(PutObject::new(key, "")).await.unwrap();
+        // The import of "j" saw another version than the destination holds.
+        let body: &[u8] = if key == "k" { b"" } else { b"older" };
+        let import = Import {
+            key: key.to_owned(),
+            size: body.len() as u64,
+            last_modified_ms: 1_700_000_000_000,
+            etag: md5_etag(body),
+            storage_class: None,
+        };
+        node.shard.commit(RecordBody::Import(import)).await.unwrap();
+    }
+    let seq = node.put("k", "mine").await;
+    node.put("j", "mine too").await;
+    let target = destination.target_over(store, support::settings(), FRAME);
+    let flusher = node.flusher(&target);
+    let patience = Patience::new();
+    let conflict = loop {
+        if let Some(conflict) = flusher.status().conflicts.pop() {
+            break conflict;
+        }
+        assert!(!patience.is_exhausted(), "no conflict");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!(conflict.key, "j");
+    until("k flushed", || flusher.status().dirty == 0).await;
+    flusher.stop().await;
+
+    assert_eq!(destination.bytes("k").await.unwrap(), "mine".as_bytes());
+    let found: Vec<_> = preconditions(&destination.seen())
+        .into_iter()
+        .filter(|(identity, _)| *identity == support::identity(seq))
+        .map(|(_, precondition)| precondition)
+        .collect();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0], Precondition::Absent);
+    assert!(
+        matches!(&found[1], Precondition::Matches(wid) if wid.to_string().starts_with("dest/")),
+        "{found:?}"
+    );
+    assert_eq!(destination.bytes("j").await.unwrap().len(), 0);
+}
