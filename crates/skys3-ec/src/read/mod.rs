@@ -229,7 +229,11 @@ pub async fn read_coded(
     source: Arc<dyn FragmentSource>,
     read: CodedRead,
 ) -> Result<CodedBody, CodedReadError> {
-    let pieces = pieces(&read)?;
+    check_layout(&read)?;
+    let mut pieces = Pieces {
+        stripe: 0,
+        at: read.range.start,
+    };
     let mut reader = Reader {
         source,
         stripe_count: read.stripes.len() as u32,
@@ -237,8 +241,7 @@ pub async fn read_coded(
         bad: BTreeSet::new(),
         unreachable: BTreeSet::new(),
     };
-    let mut pieces = pieces.into_iter();
-    let first = match pieces.next() {
+    let first = match pieces.next(&reader.read)? {
         Some(piece) => Some(reader.piece(&piece).await?),
         None => None,
     };
@@ -248,8 +251,13 @@ pub async fn read_coded(
         if sender.send(Ok(first)).await.is_err() {
             return;
         }
-        for piece in pieces {
-            let read = reader.piece(&piece).await.map_err(io::Error::other);
+        loop {
+            let read = match pieces.next(&reader.read) {
+                Ok(Some(piece)) => reader.piece(&piece).await,
+                Ok(None) => return,
+                Err(error) => Err(error),
+            };
+            let read = read.map_err(io::Error::other);
             let failed = read.is_err();
             if sender.send(read).await.is_err() || failed {
                 return;
@@ -268,9 +276,10 @@ struct Piece {
     within: Range<u64>,
 }
 
-/// The pieces of `read`'s range, in order, after checking that its stripes
-/// cover the object exactly once and the range lies within it.
-fn pieces(read: &CodedRead) -> Result<Vec<Piece>, CodedReadError> {
+/// Checks that `read`'s stripes cover the object exactly once, that the
+/// range lies within it, and that the codecs of the stripes it touches
+/// accept them, so its pieces can be cut as the read goes.
+fn check_layout(read: &CodedRead) -> Result<(), CodedReadError> {
     let range = &read.range;
     if range.start > range.end || range.end > read.size {
         return Err(CodedReadError::Layout(format!(
@@ -278,7 +287,6 @@ fn pieces(read: &CodedRead) -> Result<Vec<Piece>, CodedReadError> {
             read.size
         )));
     }
-    let mut pieces = Vec::new();
     let mut end = 0;
     for (n, stripe) in read.stripes.iter().enumerate() {
         if stripe.number() as usize != n || stripe.offset() != end {
@@ -289,33 +297,8 @@ fn pieces(read: &CodedRead) -> Result<Vec<Piece>, CodedReadError> {
             )));
         }
         end = stripe.end();
-        let start = range.start.max(stripe.offset());
-        let stop = range.end.min(stripe.end());
-        if start >= stop {
-            continue;
-        }
-        let codec = codec_of(stripe)?;
-        let fragment_len = codec
-            .fragment_len(stripe.geometry(), stripe.data_len())
-            .map_err(|source| CodedReadError::Codec {
-                stripe: stripe.number(),
-                source,
-            })?;
-        // Offsets within the stripe's data, which data fragment `i` holds
-        // from `i * fragment_len`.
-        let mut at = start - stripe.offset();
-        let stop = stop - stripe.offset();
-        while at < stop {
-            let fragment = at / fragment_len;
-            let within = at % fragment_len;
-            let len = (fragment_len - within).min(stop - at).min(PIECE_LEN);
-            pieces.push(Piece {
-                stripe: n,
-                // Below `k`, at most 255.
-                fragment: fragment as usize,
-                within: within..within + len,
-            });
-            at += len;
+        if range.start.max(stripe.offset()) < range.end.min(stripe.end()) {
+            fragment_len(stripe)?;
         }
     }
     if end != read.size {
@@ -324,7 +307,56 @@ fn pieces(read: &CodedRead) -> Result<Vec<Piece>, CodedReadError> {
             read.size
         )));
     }
-    Ok(pieces)
+    Ok(())
+}
+
+/// The pieces of a read's range, in order, cut one at a time so a long
+/// read holds none ahead of the one it fetches.
+#[derive(Debug)]
+struct Pieces {
+    /// The stripe that holds byte `at`, or one before it.
+    stripe: usize,
+    /// The object byte the next piece starts at.
+    at: u64,
+}
+
+impl Pieces {
+    /// The next piece of `read`, which [`check_layout`] accepted, or
+    /// `None` at the end of its range.
+    fn next(&mut self, read: &CodedRead) -> Result<Option<Piece>, CodedReadError> {
+        while self.at < read.range.end {
+            let stripe = &read.stripes[self.stripe];
+            if self.at >= stripe.end() {
+                self.stripe += 1;
+                continue;
+            }
+            let fragment_len = fragment_len(stripe)?;
+            // Offsets within the stripe's data, which data fragment `i`
+            // holds from `i * fragment_len`.
+            let at = self.at - stripe.offset();
+            let stop = read.range.end.min(stripe.end()) - stripe.offset();
+            let within = at % fragment_len;
+            let len = (fragment_len - within).min(stop - at).min(PIECE_LEN);
+            self.at += len;
+            return Ok(Some(Piece {
+                stripe: self.stripe,
+                // Below `k`, at most 255.
+                fragment: (at / fragment_len) as usize,
+                within: within..within + len,
+            }));
+        }
+        Ok(None)
+    }
+}
+
+/// The length of each of `stripe`'s fragments.
+fn fragment_len(stripe: &CodedStripe) -> Result<u64, CodedReadError> {
+    codec_of(stripe)?
+        .fragment_len(stripe.geometry(), stripe.data_len())
+        .map_err(|source| CodedReadError::Codec {
+            stripe: stripe.number(),
+            source,
+        })
 }
 
 fn codec_of(stripe: &CodedStripe) -> Result<&'static dyn EcCodec, CodedReadError> {
