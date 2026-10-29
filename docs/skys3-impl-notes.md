@@ -9680,6 +9680,18 @@ of this file. A task with nothing unexpected keeps "None."
   taking 314 s. Under a CPU hog on every core, the scenario passed all seven
   runs (two batches), a node getting in within a second of the drain;
   the whole `control-stores.sh` passed again in 5 m 12 s.
+- **A restart lost its transport port (CI).** On a later branch of the
+  stack, `a_claim_found_after_starting_from_the_copy_stops_the_node`
+  failed once with `binding the transport to 127.0.0.1:42805 ... Address
+  already in use`: the restart from the copy bound the port the first
+  start had used, and in the moment the node was down another test of the
+  same binary, or a connection it opened (the port is in the kernel's
+  ephemeral range, as `free_port` takes it from there), held it. The test
+  now starts the node through `start_n1`, which picks a fresh port for
+  each start and tries again on another when the bind finds it taken, up
+  to `START_ATTEMPTS` times, as `Process::start` already does for the
+  binary. A different port on restart changes nothing the test checks:
+  the claim is told by the instance ID, not the address.
 - **Not done here.** Handoff commands are refused on the node's transport
   (no handoff sink until the binary serves shards across nodes, M8-05b),
   and replication and forwarded requests are closed after their first
