@@ -50,14 +50,20 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 self.target.identity(self.shard.shard(), version),
             ),
         };
-        let mut precondition = match (self.resolution, known) {
-            (Some(ConflictPolicy::Overwrite), _) => Precondition::Unconditional,
-            (_, (None, _)) => Precondition::Absent,
-            // An identity the entry does not know, as for an imported key,
-            // is learned from the first failed precondition.
-            (_, (Some(_), identity)) => identity
-                .and_then(|text| text.parse::<WriteIdentity>().ok())
-                .map_or(Precondition::Absent, Precondition::Matches),
+        let (known_etag, known_identity) = known;
+        let known_identity = known_identity.and_then(|text| text.parse::<WriteIdentity>().ok());
+        let overwrite = self.resolution == Some(ConflictPolicy::Overwrite);
+        // The ETag of a version the destination held whose identity the
+        // entry does not know, as for an imported key: the identity is
+        // learned from the first failed precondition, and taken as that
+        // version's if the destination still holds the ETag.
+        let mut unidentified = known_etag
+            .clone()
+            .filter(|_| known_identity.is_none() && !overwrite);
+        let mut precondition = match (known_etag, known_identity) {
+            _ if overwrite => Precondition::Unconditional,
+            (None, _) | (Some(_), None) => Precondition::Absent,
+            (Some(_), Some(identity)) => Precondition::Matches(identity),
         };
         for _ in 0..MAX_ROUNDS {
             let commit = Commit {
@@ -105,12 +111,22 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 Some(current) if self.wrote_before(&current, version) || !passed => {
                     Precondition::Matches(current)
                 }
+                // The version the entry knows by its ETag alone, if the
+                // destination still holds that ETag, as a HEAD tells;
+                // otherwise a write the shard did not make.
                 Some(current) => {
-                    return Ok(Outcome::Conflict(Conflict {
-                        seq: version.seq,
-                        remote_etag: None,
-                        remote_identity: Some(current.to_string()),
-                    }));
+                    let baseline = match unidentified.take() {
+                        Some(etag) => self.head().await?.is_some_and(|info| info.etag == etag),
+                        None => false,
+                    };
+                    if !baseline {
+                        return Ok(Outcome::Conflict(Conflict {
+                            seq: version.seq,
+                            remote_etag: None,
+                            remote_identity: Some(current.to_string()),
+                        }));
+                    }
+                    Precondition::Matches(current)
                 }
             };
         }

@@ -6,7 +6,8 @@
 //! a restarted node does. Helpers commit entries in a given state
 //! ([`MemoryShards::put`]), flush a bucket ([`MemoryShards::flush`]), and
 //! make every request fail ([`MemoryShards::set_unavailable`]), and slow
-//! holder fetches down ([`MemoryShards::set_fetch_delay`]).
+//! holder fetches ([`MemoryShards::set_fetch_delay`]) and flush asks
+//! ([`MemoryShards::set_flushed_delay`]) down.
 //! [`MemoryShards::seen_from`] puts the gateway on another node, which
 //! reads every GET's bytes from this one as a holder.
 
@@ -56,6 +57,9 @@ pub struct MemoryShards {
     /// How long each holder fetch waits before the holder serves it, in
     /// milliseconds.
     fetch_delay_ms: Arc<AtomicU64>,
+    /// How long each flush ask waits before the shard answers it, in
+    /// milliseconds.
+    flushed_delay_ms: Arc<AtomicU64>,
     /// The node a gateway over these shards runs on, if not theirs.
     gateway_node: Option<NodeId>,
 }
@@ -111,6 +115,7 @@ impl MemoryShards {
             local: LocalShards::new(ShardSet::new(index, log, pool), node),
             unavailable: Arc::default(),
             fetch_delay_ms: Arc::default(),
+            flushed_delay_ms: Arc::default(),
             gateway_node: None,
         })
     }
@@ -261,6 +266,14 @@ impl MemoryShards {
     pub fn set_fetch_delay(&self, delay: Duration) {
         let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.fetch_delay_ms.store(millis, Ordering::SeqCst);
+    }
+
+    /// Makes each later flush ask ([`Shards::flushed`]) wait `delay` before
+    /// the shard takes it, as an ask of an unreachable primary does until
+    /// its forward times out. Whole milliseconds count.
+    pub fn set_flushed_delay(&self, delay: Duration) {
+        let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        self.flushed_delay_ms.store(millis, Ordering::SeqCst);
     }
 
     fn check(&self, shard: &ShardRef) -> Result<(), ShardError> {
@@ -441,6 +454,10 @@ impl Shards for MemoryShards {
         wait: Duration,
     ) -> Result<FlushState, ShardError> {
         self.check(shard)?;
+        let delay = self.flushed_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         self.local.flushed(shard, key, version, wait).await
     }
 

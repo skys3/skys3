@@ -46,7 +46,8 @@ pub const MAX_READ_LEN: u64 = 8 << 20;
 /// How long the client waits for a connection to a node.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How long the client waits for a node's answer to a read.
+/// How long the client waits for a node's answer to a read, or for its
+/// own store's.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a connection stays open with no read on it, at either end.
@@ -407,10 +408,16 @@ impl<N: Network, D: Disk> FragmentSource for FragmentReadClient<N, D> {
             if request.node == self.inner.node
                 && let Some(local) = &self.inner.local
             {
-                return local
-                    .read(request.fragment, &request.identity, request.range)
-                    .await
-                    .map_err(|error| error.on(&request.node));
+                // A hung disk is bounded as a node that does not answer is,
+                // so the reader decodes around the fragment.
+                let reading = local.read(request.fragment, &request.identity, request.range);
+                return match tokio::time::timeout(ANSWER_TIMEOUT, reading).await {
+                    Ok(read) => read.map_err(|error| error.on(&request.node)),
+                    Err(_) => Err(FragmentReadError::Unreachable {
+                        node: request.node,
+                        reason: "the local read did not finish in time".to_owned(),
+                    }),
+                };
             }
             self.ask(&request).await
         })
