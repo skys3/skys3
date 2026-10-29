@@ -6,7 +6,9 @@
 //! uploads of several parts with UploadPartCopy, re-uploaded and dropped
 //! parts, aborts), every multipart step, `PutObject`, and `CopyObject` at
 //! the remote store fails or loses its answer more often
-//! ([`LargeObjects::step_faults`]),
+//! ([`LargeObjects::step_faults`]) or loses the answer of every
+//! completion of a client's key it applies
+//! ([`LargeObjects::lost_completions`]),
 //! a node may crash right after the remote applied one of its steps
 //! ([`LargeObjects::step_crash_probability`]), and the run audits the
 //! remote store:
@@ -69,6 +71,12 @@ pub struct LargeObjects {
     /// the remote store, in place of
     /// [`ClusterConfig::remote_faults`](crate::ClusterConfig::remote_faults).
     pub step_faults: Vec<(Operation, SimS3Faults)>,
+    /// Whether the remote store loses the answer of every
+    /// `CompleteMultipartUpload` of an audited key that it applies, and
+    /// answers every one it refuses unless a step fault loses it: every
+    /// flush that completes an upload learns from a later request that it
+    /// did.
+    pub lost_completions: bool,
     /// The probability that a node crashes, with or without power loss,
     /// right after the remote store applied one of its multipart steps,
     /// `PutObject`s, or `CopyObject`s: before it learns the answer, or
@@ -124,6 +132,7 @@ impl Default for LargeObjects {
                 lost_response_probability: 0.04,
                 ..SimS3Faults::NONE
             }),
+            lost_completions: false,
             step_crash_probability: 0.025,
             step_crashes: 4,
             streaming: true,
@@ -261,6 +270,15 @@ impl Versions {
         remote.observe(Some(Arc::new(move |applied: &Applied<'_>| {
             versions.applied(applied);
         })));
+        if config.lost_completions {
+            let versions = self.clone();
+            remote.lose_answers(Some(Arc::new(move |applied: &Applied<'_>| {
+                applied.operation == Operation::CompleteMultipartUpload
+                    && applied
+                        .key
+                        .is_some_and(|key| versions.watch().keys.contains_key(key))
+            })));
+        }
     }
 
     /// Registers the version operation `op` may make.
