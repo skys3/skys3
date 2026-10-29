@@ -41,7 +41,9 @@ pub type RoutingShards =
 /// An audit records every request a replica served, as the replica
 /// serves it, so a request whose answer is lost is recorded too, and
 /// [`RoutedServices::check_served`] finds any that the shard's primary in
-/// the current configuration did not serve.
+/// the current configuration did not serve. The current configuration is
+/// the register's: a primary that removed a member (plan M2-11) serves in
+/// a later epoch than the placement's.
 #[derive(Clone)]
 pub struct RoutedServices {
     replicated: ReplicatedServices,
@@ -120,7 +122,9 @@ impl RoutedServices {
 
     /// Checks that every request a replica served was served by the
     /// primary of its shard's current configuration, in that
-    /// configuration's epoch, whether or not its answer arrived.
+    /// configuration's epoch or, while a removal's compare-and-swap has
+    /// landed unseen, an earlier one since the placement's (removals keep
+    /// the primary), whether or not its answer arrived.
     ///
     /// # Errors
     ///
@@ -203,7 +207,11 @@ impl NodeServices for RoutedServices {
             map.learn(config).await;
         }
         let replication = local.replication.clone();
-        let (audit, placement) = (Arc::clone(&self.audit), Arc::clone(&env.placement));
+        let (audit, placement, registers) = (
+            Arc::clone(&self.audit),
+            Arc::clone(&env.placement),
+            local.clone(),
+        );
         let shards = RoutedShards::new(
             env.node,
             local,
@@ -217,8 +225,14 @@ impl NodeServices for RoutedServices {
         .with_observer(move |served| {
             let mut audit = audit.lock().unwrap_or_else(PoisonError::into_inner);
             audit.served += 1;
-            let current = &placement[&served.shard];
-            if served.node != current.primary || served.epoch != current.epoch {
+            let placed = &placement[&served.shard];
+            let current = registers
+                .current(&served.shard)
+                .unwrap_or_else(|| placed.clone());
+            if served.node != current.primary
+                || served.epoch > current.epoch
+                || served.epoch < placed.epoch
+            {
                 audit.wrong.push(format!(
                     "{} served a request on shard {} in epoch {}, but its primary is {} in \
                      epoch {}",

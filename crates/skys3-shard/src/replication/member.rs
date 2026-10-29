@@ -60,6 +60,8 @@ where
             sender.send(&frame).await?;
         }
     }
+    // A newer configuration's CONFIG record goes where the primary's is.
+    shard.follow(Epoch::new(request.sequencing), primary_last)?;
     sender
         .send(&wire::frame(
             MessageKind::SyncAck,
@@ -103,8 +105,10 @@ where
 }
 
 /// Finds the shard a `Sync` names, which must be open on this node as a
-/// member, and checks that the peer is its primary in its epoch. A refusal
-/// carries the member's epoch, if it knows the shard, and why.
+/// member, and checks that the peer is its primary in its epoch. A newer
+/// configuration that keeps the primary and this member is adopted
+/// ([`Shard::reconfigure`]): its primary removed other members (§6.4). A
+/// refusal carries the member's epoch, if it knows the shard, and why.
 async fn accept<D: Disk>(
     request: &Sync,
     peer: &PeerIdentity,
@@ -129,13 +133,16 @@ async fn accept<D: Disk>(
     if theirs.epoch < ours.epoch {
         return refuse(ours.epoch, "the primary's epoch is older than the member's");
     }
-    if theirs != ours {
+    if theirs.epoch == ours.epoch && theirs != ours {
         return refuse(
             ours.epoch,
             "the primary's configuration differs from the member's",
         );
     }
-    Ok((replica, ours.epoch))
+    if let Err(error) = replica.reconfigure(&theirs).await {
+        return refuse(ours.epoch, &error.to_string());
+    }
+    Ok((replica, theirs.epoch))
 }
 
 /// Why following a primary stopped.

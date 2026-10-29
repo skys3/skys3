@@ -28,6 +28,8 @@ use skys3_types::{
 };
 use tokio::net::TcpStream;
 
+mod removal;
+
 use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
 use super::{Replication, ReplicationConfig};
 use crate::set::ShardSet;
@@ -167,6 +169,7 @@ async fn sync(link: &mut Link, config: &ShardConfig, primary_last: u64) -> Vec<(
     let request = Sync {
         config: config.to_json().unwrap(),
         primary_last,
+        sequencing: config.epoch.get(),
     };
     link.send(&wire::frame(MessageKind::Sync, &request, Bytes::new()))
         .await

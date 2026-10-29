@@ -6,7 +6,7 @@ use bytes::Bytes;
 use skys3_io::{Disk, MonoTime};
 use skys3_log::LogRecord;
 use skys3_net::{MessageKind, Network, Receiver, Sender, Transport};
-use skys3_types::{NodeAddress, NodeId, RegisterDocument, Seq};
+use skys3_types::{Epoch, NodeAddress, NodeId, RegisterDocument, Seq, ShardConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
@@ -27,48 +27,75 @@ pub(super) struct Link<N: Network, D: Disk> {
     pub config: ReplicationConfig,
 }
 
+/// What a session told the member: the primary's configuration, and the
+/// epoch it sequenced in. A change of either opens a new session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Session {
+    config: ShardConfig,
+    sequencing: Epoch,
+}
+
 impl<N: Network, D: Disk> Link<N, D> {
-    /// Keeps the link up until the shard stops.
+    /// Keeps the link up until the shard stops, or its configuration
+    /// leaves the member out (§6.4).
     pub(super) async fn run(self) {
-        while !self.shard.is_stopped() {
-            if let Err(error) = self.connect().await {
-                tracing::debug!(
+        while !self.shard.is_stopped() && self.shard.config().is_member(&self.member) {
+            match self.connect().await {
+                // A new session, at once.
+                Err(LinkError::Reconfigured) => continue,
+                Err(error) => tracing::debug!(
                     shard = %self.leader.shard(),
                     member = %self.member,
                     %error,
                     "a replication link dropped",
-                );
+                ),
+                Ok(()) => {}
             }
             tokio::time::sleep(self.config.reconnect_delay).await;
         }
     }
 
-    /// Connects, opens a session, and replicates until the link fails.
+    /// Connects, opens a session, and replicates until the link fails or
+    /// the primary changes its configuration.
     async fn connect(&self) -> Result<(), LinkError> {
         let connection = self.transport.connect(&self.member, &self.address).await?;
         let (mut receiver, mut sender) = connection.into_split();
-        let last = self.sync(&mut receiver, &mut sender).await?;
+        let (session, last) = self.sync(&mut receiver, &mut sender).await?;
         self.leader.synced(&self.member, last);
+        // The CONFIG record of a new configuration may have waited for
+        // this member's report (§5.1).
+        self.shard.align();
         tokio::select! {
             biased;
-            sent = self.send(&mut sender, last) => sent,
+            sent = self.send(&mut sender, last, &session) => sent,
             heard = self.hear(&mut receiver) => heard,
         }
     }
 
+    /// The session the primary opens now.
+    fn session(&self) -> Session {
+        Session {
+            config: self.shard.config(),
+            sequencing: self.shard.sequencing(),
+        }
+    }
+
     /// Opens a session: rolls forward the records the member holds past
-    /// the primary's log, and returns the member's last `seq`.
+    /// the primary's log, and returns the session and the member's last
+    /// `seq`.
     async fn sync<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         receiver: &mut Receiver<S>,
         sender: &mut Sender<S>,
-    ) -> Result<Seq, LinkError> {
-        let config = self.shard.config();
+    ) -> Result<(Session, Seq), LinkError> {
+        let session = self.session();
+        let config = &session.config;
         let request = Sync {
             config: config
                 .to_json()
                 .map_err(|error| LinkError::Protocol(error.to_string()))?,
             primary_last: self.shard.last_sequenced().get(),
+            sequencing: session.sequencing.get(),
         };
         sender
             .send(&wire::frame(MessageKind::Sync, &request, Bytes::new()))
@@ -90,7 +117,7 @@ impl<N: Network, D: Disk> Link<N, D> {
                     .receive(None, config.epoch, record, frame.payload, false)?;
             }
             if answer.done {
-                return Ok(Seq::new(answer.last));
+                return Ok((session, Seq::new(answer.last)));
             }
         }
     }
@@ -99,13 +126,17 @@ impl<N: Network, D: Disk> Link<N, D> {
     /// it, and beacons with the commit watermark in between, at least as
     /// often as [`ReplicationConfig::beacon_every`] says, so the member
     /// renews the primary's lease, and the link stays up, even while its
-    /// log is slow to sync (§5.4).
+    /// log is slow to sync (§5.4). Returns [`LinkError::Reconfigured`] once
+    /// the primary's configuration, or the epoch it sequences in, is no
+    /// longer the session's: the member needs a new session to follow
+    /// (§5.1).
     async fn send<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         sender: &mut Sender<S>,
         mut cursor: Seq,
+        session: &Session,
     ) -> Result<(), LinkError> {
-        let epoch = self.shard.config().epoch.get();
+        let epoch = session.config.epoch.get();
         let mut changes = self
             .leader
             .subscribe(&self.member)
@@ -113,6 +144,9 @@ impl<N: Network, D: Disk> Link<N, D> {
         let mut last_beacon: Option<Instant> = None;
         loop {
             changes.borrow_and_update();
+            if self.session() != *session {
+                return Err(LinkError::Reconfigured);
+            }
             let records = match self.leader.records_after(cursor, BATCH) {
                 Pending::Ready(records) => records,
                 Pending::InLog(through) => {
@@ -145,6 +179,9 @@ impl<N: Network, D: Disk> Link<N, D> {
                 continue;
             }
             for record in records {
+                if record.epoch > session.sequencing {
+                    return Err(LinkError::Reconfigured);
+                }
                 let append = Append {
                     epoch,
                     commit: self.leader.commit().get(),

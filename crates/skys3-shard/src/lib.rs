@@ -24,7 +24,8 @@
 //! commit rule changes, and a primary serves reads only while every member
 //! grants it a lease ([`Grace`] is a member's side of that, §5.4). An
 //! [`AckTimeout`] bounds how long a replicated shard waits for its members
-//! (§5.2).
+//! (§5.2), and a primary removes a member that stops responding by a
+//! compare-and-swap of the shard's register ([`replication`], §6.4).
 //!
 //! ```
 //! use skys3_index::{Index, IndexConfig};

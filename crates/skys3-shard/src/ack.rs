@@ -10,8 +10,8 @@
 //!
 //! A write that times out fails with [`ShardError::NotAcknowledged`]:
 //! **not acknowledged**, which is not the same as not applied. Its record
-//! keeps its position, and commits once the member catches up (or, from
-//! plan M2-11, once the member is removed), so it may become visible after
+//! keeps its position, and commits once the member catches up or is
+//! removed (§6.4), so it may become visible after
 //! its writer was told it failed. Every record sequenced after it commits
 //! after it, so it never takes effect over a write that was sequenced
 //! later, such as any write sent after the failure was answered.
@@ -27,8 +27,8 @@ use std::time::Duration;
 #[non_exhaustive]
 pub enum AckMode {
     /// Requests wait up to the timeout, which outlasts the removal of a
-    /// failed member (plan M2-11), so they complete once the remaining
-    /// members acknowledge: added latency rather than errors.
+    /// failed member (§6.4), so they complete once the remaining members
+    /// acknowledge: added latency rather than errors.
     #[default]
     WaitThrough,
     /// Requests wait up to the timeout, and once one has timed out the
