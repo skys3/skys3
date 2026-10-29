@@ -6526,6 +6526,19 @@ of this file. A task with nothing unexpected keeps "None."
     **seed 0**.
 - **No format changes.** No record, index, or wire format changed; the
   probe result and the admin status gained fields.
+- **The copy audit was stricter than the system (found in the stack's
+  merge-up after the Codex review fixes).** The tokio 1.54 update in #79
+  changed every seed's schedule, and seed 1 of
+  `the_audit_catches_copies_without_their_identity` then ended with one
+  member's entry of a copy clean and two dirty at the same version. The
+  audit required the members to agree on state as well as version, so it
+  stopped there and never reached the seeded bug. That state is correct:
+  a version's `FLUSHED` record rides a later group commit (§7.1), which
+  the final power loss may cut on some members only. The audit now
+  compares versions only and checks each member's entry against the
+  remote store, which already allows a dirty entry whose version the
+  remote holds. M4-13 had made the same change in af73576; this brings
+  it to M4-07's own PR.
 - **Left open.** A copy of a source in another remote bucket is
   uploaded; S3 could copy across buckets the credentials can read, but
   that would need a probe per pair. A server-side copy's entry records
@@ -7121,6 +7134,24 @@ of this file. A task with nothing unexpected keeps "None."
   (a clean one must record the remote's ETag). The seeded bug of given-up
   aborts fails half the aborts instead of a quarter: a seed ends a dozen
   or so streamed uploads, and seed 0 after the merge failed none.
+- **The wrong-ETag bug was left to chance.** Its scenario lost 40% of
+  all Complete answers at random. The bug shows only when a streamed
+  PUT's Complete applies unanswered and a retry is answered before the
+  key's next version replaces it, and the probe's Completes lost their
+  answers too, which held flushing back to three to six streamed bodies
+  a seed. After the stack's tokio 1.54 bump and M7-03's review fixes
+  moved every seed, seed 3 at `SKYS3_SIM_SEEDS=256` (seeds 0 to 7: the
+  runner divides by the cost, 32) had one Complete applied unanswered,
+  its three retries' refusals lost as well, and then the next version,
+  so no retry recorded a `FLUSHED`; seeds 3, 8, and 26 of 0 to 63
+  missed it. Losing more answers starved the flushers instead.
+  `SimS3::lose_answers` now takes a function that picks applied requests
+  whose answers are lost, refused ones being answered, and
+  `LargeObjects::lost_completions` loses every applied Complete of an
+  audited key, not the probe's: every streamed flush then learns from
+  its retry that the object landed, and seeds 0 to 127 all catch the
+  bug. With no bug seeded, the same faults pass seeds 0 to 31, with 14
+  to 31 streamed objects a seed.
 - **A real bug: uploads left open with no later flush.** An upload whose
   abort failed, or whose flush was cancelled, was aborted only before
   the target's next multipart flush. When the key's next version was a
@@ -7165,7 +7196,8 @@ of this file. A task with nothing unexpected keeps "None."
   `large_objects.rs`; the scenarios pass at `SKYS3_SIM_SEEDS=256`.
 - **Heavy faults starve the probe.** Half of all Complete answers lost
   kept one node's capability probe failing for 90 s (seed 1), so its
-  shards never flushed. The ETag bug scenario loses 40% of them.
+  shards never flushed. The ETag bug scenario loses only the answers
+  of the Completes of audited keys that the store applies.
 - **Results.** At `SKYS3_SIM_SEEDS=256`, eight seeds of each scenario,
   with 4 to 11 faults a seed, every seed with four aimed crashes:
   `write_back` 36 s (single PUTs 5 to 23, streamed 0 to 11 with a
@@ -7177,9 +7209,9 @@ of this file. A task with nothing unexpected keeps "None."
 - **Seeded bugs** (`test_hooks::seed_large_object_bug`), each caught at
   seeds 0 to 7: `CompletesWithoutLastPart` as the truncated object
   appears (4 s for eight seeds); `RecordsLocalEtagAfterLostComplete`
-  at the final audit (54 s), and at 31 of seeds 0 to 31 (seed 26
-  streamed two objects); `GivesUpFailedAborts` with a quarter of aborts
-  failing (47 s).
+  at the final audit (45 s; at every seed of 0 to 127 since every
+  applied Complete of a client's key loses its answer, see above);
+  `GivesUpFailedAborts` with a quarter of aborts failing (47 s).
 - **Left open.** Crash replay needs `tokio_unstable` in simulation
   builds, a workspace-wide flag left for a decision. The lifecycle rule
   that ends uncommitted uploads is counted, not simulated. Aimed crashes
@@ -7487,6 +7519,16 @@ of this file. A task with nothing unexpected keeps "None."
 - **Fuzzing.** A new target, `ec_transfer`, decodes the fragment header
   that starts a write and both message bodies; `log_record` and
   `index_codec` already reach the new record body and values.
+- **A publish test that counted yields (found in the stack's merge-up).**
+  `a_publish_whose_caller_is_dropped_still_settles_its_attempt`, added
+  for the Codex fix that settles an attempt on the detached commit task,
+  gave the commit 1,000 yields to settle. The commit's writes run on
+  blocking threads, so on a busy machine the yields ran out first: 7 of
+  30 runs of the encoder tests failed. It now waits up to 10 s of real
+  time, and passed 40 of 40. M5-08 moved the publish into the shared
+  `attempts::publish`, which the repairer uses too; the merge into M5-08
+  applies the same fix there, with a oneshot telling the caller when the
+  record is sequenced so it can still emit its `Appended` event.
 
 ### M5-05 Orphan fragment reclamation
 
