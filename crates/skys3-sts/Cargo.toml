@@ -24,6 +24,7 @@ rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+skys3-io.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true

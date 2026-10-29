@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub mod signing;
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -16,7 +18,7 @@ use skys3_control::{
 };
 use skys3_gateway::stub::MemoryShards;
 use skys3_gateway::{
-    Gateway, GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER, Unauthenticated,
+    Authenticator, Gateway, GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER, Unauthenticated,
 };
 use skys3_types::{BucketDocument, BucketName, Generation};
 
@@ -101,6 +103,28 @@ pub async fn setup_with(config: GatewayConfig) -> Setup {
         memory,
         shards,
     }
+}
+
+/// A gateway over fresh in-memory state that authenticates with `auth`.
+pub async fn gateway_with<A: Authenticator>(config: GatewayConfig, auth: A) -> Gateway<A> {
+    let memory = MemoryControlStore::new();
+    bootstrap(
+        &memory,
+        &config.cluster_id,
+        ProposalIds::seeded(1).next_id(),
+        &RetryPolicy::default(),
+    )
+    .await
+    .unwrap();
+    Gateway::new(
+        config,
+        memory,
+        MemoryShards::new(),
+        IdSource::seeded(7),
+        auth,
+    )
+    .await
+    .unwrap()
 }
 
 impl Setup {

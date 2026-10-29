@@ -1,11 +1,11 @@
-//! Wall-clock time for token lifetimes and key caching.
+//! Wall-clock time, for timestamps that other parties set.
 //!
-//! JWT lifetimes (`exp`, `nbf`, `iat`) are Unix timestamps set by the
-//! issuer, so they are compared with the node's wall clock, not with the
-//! monotonic `skys3_io::Clock` used for leases. The validator reads time
-//! only through [`WallClock`], so tests and the simulation control it. Key
-//! cache ages use the same clock: they are hours long, and a clock step
-//! only makes a refresh happen early.
+//! Leases and timers use the monotonic [`Clock`](crate::Clock), and never
+//! compare readings across nodes. Some times are set by others, as Unix
+//! times: the `exp` and `nbf` claims of an OIDC token, and the
+//! `x-amz-date` of a SigV4 request. Those are compared with the node's wall
+//! clock, which code reads only through [`WallClock`], so tests and the
+//! simulation control it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -24,12 +24,12 @@ pub trait WallClock: fmt::Debug + Send + Sync + 'static {
 
 /// The operating system's wall clock.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct SystemClock;
+pub struct SystemWallClock;
 
-impl WallClock for SystemClock {
+impl WallClock for SystemWallClock {
     fn now(&self) -> Duration {
         // A clock set before 1970 reads as the epoch, which makes every
-        // token look expired: a safe failure.
+        // token and signature look expired: a safe failure.
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
@@ -40,11 +40,11 @@ impl WallClock for SystemClock {
 ///
 /// Clones share the same reading.
 #[derive(Clone, Debug, Default)]
-pub struct ManualClock {
+pub struct ManualWallClock {
     nanos: Arc<AtomicU64>,
 }
 
-impl ManualClock {
+impl ManualWallClock {
     /// Returns a clock that reads `since_epoch`.
     pub fn new(since_epoch: Duration) -> Self {
         let clock = Self::default();
@@ -64,7 +64,7 @@ impl ManualClock {
     }
 }
 
-impl WallClock for ManualClock {
+impl WallClock for ManualWallClock {
     fn now(&self) -> Duration {
         Duration::from_nanos(self.nanos.load(Ordering::SeqCst))
     }
@@ -76,12 +76,12 @@ mod tests {
 
     #[test]
     fn system_clock_is_after_2020() {
-        assert!(SystemClock.now() > Duration::from_secs(1_577_836_800));
+        assert!(SystemWallClock.now() > Duration::from_secs(1_577_836_800));
     }
 
     #[test]
     fn manual_clock_moves_when_told() {
-        let clock = ManualClock::new(Duration::from_secs(100));
+        let clock = ManualWallClock::new(Duration::from_secs(100));
         let shared = clock.clone();
         clock.advance(Duration::from_secs(5));
         assert_eq!(shared.now(), Duration::from_secs(105));

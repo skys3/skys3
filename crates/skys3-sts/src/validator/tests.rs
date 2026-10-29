@@ -6,9 +6,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::clock::ManualClock;
 use crate::fetch::MemoryFetcher;
 use crate::testkit::{TestKey, b64, jwks};
+use skys3_io::ManualWallClock;
 
 const ISSUER: &str = "https://idp.example";
 const DISCOVERY: &str = "https://idp.example/.well-known/openid-configuration";
@@ -18,7 +18,7 @@ const NOW: u64 = 1_800_000_000;
 
 struct Fixture {
     validator: OidcValidator<MemoryFetcher>,
-    clock: ManualClock,
+    clock: ManualWallClock,
 }
 
 impl Fixture {
@@ -30,7 +30,7 @@ impl Fixture {
         let fetcher = MemoryFetcher::new();
         fetcher.insert(DISCOVERY, discovery(ISSUER));
         fetcher.insert(JWKS, jwks(keys));
-        let clock = ManualClock::new(Duration::from_secs(NOW));
+        let clock = ManualWallClock::new(Duration::from_secs(NOW));
         let validator = OidcValidator::new(
             fetcher,
             Arc::new(clock.clone()),
@@ -522,7 +522,7 @@ async fn the_size_limit_does_not_depend_on_the_fetcher() {
     };
     let validator = OidcValidator::new(
         Unbounded(inner),
-        Arc::new(ManualClock::new(Duration::from_secs(NOW))),
+        Arc::new(ManualWallClock::new(Duration::from_secs(NOW))),
         settings,
     );
     validator.set_providers([provider()]).unwrap();

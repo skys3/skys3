@@ -1,0 +1,17 @@
+AWS SigV4 signing test suite (vendored subset)
+
+Source: the aws-c-auth test suite, tests/aws-signing-test-suite/v4, version
+v0.9.0 (https://github.com/awslabs/aws-c-auth), as redistributed in the
+aws-sigv4 crate 1.6.0 (https://crates.io/crates/aws-sigv4).
+
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+Licensed under the Apache License, Version 2.0; see LICENSE in this
+directory.
+
+The files are unmodified. Only the vectors whose rules S3 shares are
+included (31 of 40): the path-normalization ("-normalized" with dot
+segments or repeated slashes) and double-encoding vectors apply to other
+AWS services, and get-header-value-multiline uses header folding, which
+HTTP/1.1 forbids. Of each vector, context.json and the header- and
+query-signed requests with their canonical requests and strings to sign
+are kept. src/sigv4/vectors.rs runs them.

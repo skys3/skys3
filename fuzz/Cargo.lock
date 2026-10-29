@@ -1601,8 +1601,10 @@ name = "skys3-gateway"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "bytes",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1612,6 +1614,7 @@ dependencies = [
  "serde_urlencoded",
  "skys3-config",
  "skys3-control",
+ "skys3-io",
  "skys3-types",
  "thiserror",
  "tokio",
@@ -1684,6 +1687,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "skys3-io",
  "thiserror",
  "tokio",
  "tracing",

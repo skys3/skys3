@@ -5,7 +5,8 @@
 //! Section numbers (§) refer to the [SkyS3 design](https://github.com/skys3/skys3/blob/main/docs/skys3-design.md).
 //!
 //! - [`Gateway`]: the hyper service. Each request passes the
-//!   [`RequestLimits`], an [`Authenticator`], the checks that reject
+//!   [`RequestLimits`], an [`Authenticator`] such as the
+//!   [`SigV4Authenticator`], the checks that reject
 //!   features SkyS3 does not support (SSE, Object Lock, versioning, ACLs
 //!   other than bucket-owner-enforced), and bounds on XML bodies, before
 //!   `s3s` parses it and calls the S3 operation.
@@ -19,13 +20,19 @@
 //!   and routing of each key to its shard with the frozen hash. On a single
 //!   node every shard is local.
 //!
-//! The gateway serves path-style requests. Authentication arrives with
-//! SigV4 (plan M1-07a); until then nothing outside tests constructs a
-//! gateway, and the node binary does not serve one.
+//! - [`sigv4`]: SigV4 authentication with the `Authorization` header or a
+//!   presigned URL, session tokens, and `aws-chunked` bodies with signed
+//!   chunks and trailers. It finds credentials through a
+//!   [`CredentialLookup`] and records the caller in an [`Authenticated`]
+//!   request extension.
+//!
+//! The gateway serves path-style requests. Authorization arrives with plan
+//! M1-07b; until then nothing outside tests constructs a gateway, and the
+//! node binary does not serve one.
 //!
 //! With the `test-util` feature, `stub` provides an in-memory [`Shards`]
-//! implementation and `Unauthenticated` an authenticator that lets every
-//! request through.
+//! implementation, `Unauthenticated` an authenticator that lets every
+//! request through, and `sigv4::MemoryCredentials` a fixed set of keys.
 //!
 //! ```
 //! use skys3_control::{MemoryControlStore, ProposalIds, RetryPolicy, bootstrap};
@@ -66,6 +73,7 @@ mod limits;
 mod listener;
 mod service;
 mod shard;
+pub mod sigv4;
 #[cfg(any(test, feature = "test-util"))]
 pub mod stub;
 
@@ -76,3 +84,7 @@ pub use listener::GatewayListener;
 pub use service::Unauthenticated;
 pub use service::{Authenticator, Gateway};
 pub use shard::{ShardError, ShardRef, ShardSummary, Shards};
+pub use sigv4::{
+    Authenticated, BodyError, CredentialLookup, LookupError, SecretAccessKey, SigV4Authenticator,
+    SigningCredential, Trailers,
+};

@@ -14,7 +14,10 @@
 //!   each issuer's keys.
 //! - [`DocumentFetcher`] fetches discovery documents and key sets:
 //!   [`HttpsFetcher`] on a node, [`MemoryFetcher`] in tests.
-//! - [`WallClock`] is the time source for token lifetimes.
+//! - [`WallClock`] (from `skys3-io`) is the time source for token
+//!   lifetimes and key-cache ages: JWT lifetimes are Unix times set by the
+//!   issuer, so they are compared with the node's wall clock, not its
+//!   monotonic clock. A clock step only makes a key refresh happen early.
 //!
 //! Signatures are verified with `aws-lc-rs`, the provider rustls uses, and
 //! only asymmetric algorithms exist: `none` and HMAC tokens are rejected
@@ -26,14 +29,14 @@
 //! use std::sync::Arc;
 //!
 //! use skys3_sts::{
-//!     MemoryFetcher, OidcProvider, OidcValidator, SystemClock, ValidationError,
+//!     MemoryFetcher, OidcProvider, OidcValidator, SystemWallClock, ValidationError,
 //!     ValidatorSettings,
 //! };
 //!
 //! # tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(async {
 //! let validator = OidcValidator::new(
 //!     MemoryFetcher::new(),
-//!     Arc::new(SystemClock),
+//!     Arc::new(SystemWallClock),
 //!     ValidatorSettings::default(),
 //! );
 //! validator.set_providers([OidcProvider::new(
@@ -51,7 +54,6 @@
 //! # }).unwrap();
 //! ```
 
-pub mod clock;
 pub mod fetch;
 #[doc(hidden)]
 pub mod fuzzing;
@@ -63,11 +65,11 @@ pub mod provider;
 mod testkit;
 pub mod validator;
 
-pub use clock::{ManualClock, SystemClock, WallClock};
 pub use fetch::{DocumentFetcher, FetchError, MemoryFetcher};
 pub use http::{HttpsFetcher, HttpsFetcherError, HttpsFetcherOptions};
 pub use jwt::Algorithm;
 pub use provider::{OidcProvider, ProviderError};
+pub use skys3_io::{ManualWallClock, SystemWallClock, WallClock};
 pub use validator::{
     KeySourceError, OidcValidator, ValidationError, ValidatorSettings, VerifiedToken,
 };
