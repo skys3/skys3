@@ -18,14 +18,14 @@ use skys3_control::{
 };
 use skys3_gateway::stub::MemoryShards;
 use skys3_gateway::{
-    Authenticator, Gateway, GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER, Unauthenticated,
+    Authenticator, Gateway, GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER, TrustAll,
 };
 use skys3_types::{BucketDocument, BucketName, Generation};
 
 pub type Store = FaultyStore<MemoryControlStore>;
 
 pub struct Setup {
-    pub gateway: Gateway<Unauthenticated>,
+    pub gateway: Gateway<TrustAll>,
     pub store: Store,
     pub memory: MemoryControlStore,
     pub shards: MemoryShards,
@@ -93,7 +93,7 @@ pub async fn setup_with(config: GatewayConfig) -> Setup {
         store.clone(),
         shards.clone(),
         IdSource::seeded(7),
-        Unauthenticated,
+        TrustAll,
     )
     .await
     .unwrap();

@@ -8,7 +8,7 @@ use http::Method;
 use skys3_control::faults::Fault;
 use skys3_control::{ControlStore, Expected, PutOutcome, RegisterKey, TypedKey};
 use skys3_gateway::stub::EntryState;
-use skys3_gateway::{Gateway, IdSource, ShardError, ShardRef, Shards, Unauthenticated};
+use skys3_gateway::{Gateway, IdSource, ShardError, ShardRef, Shards, TrustAll};
 use skys3_types::{BucketMode, RegisterDocument};
 
 #[tokio::test]
@@ -295,7 +295,7 @@ async fn a_deletion_whose_answers_were_lost_is_finished_on_retry() {
         setup.memory.clone(),
         setup.shards.clone(),
         IdSource::seeded(8),
-        Unauthenticated,
+        TrustAll,
     )
     .await
     .unwrap();
@@ -650,7 +650,7 @@ async fn gateways_share_buckets_through_the_control_store() {
         setup.memory.clone(),
         setup.shards.clone(),
         IdSource::seeded(8),
-        Unauthenticated,
+        TrustAll,
     )
     .await
     .unwrap();
@@ -672,7 +672,7 @@ async fn gateways_share_buckets_through_the_control_store() {
         setup.memory.clone(),
         setup.shards.clone(),
         IdSource::seeded(9),
-        Unauthenticated,
+        TrustAll,
     )
     .await;
     assert!(loaded.is_err());

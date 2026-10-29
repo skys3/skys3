@@ -176,16 +176,25 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 
 ## `[identity]`
 
-Anonymous access, STS sessions, and OIDC token validation (§11).
+Anonymous access, static credentials, STS sessions, and OIDC token validation (§11). Policies are JSON documents in a TOML string, in the policy language subset of design §11; a policy outside the subset is a parsing error.
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `anonymous_access` | boolean | `false` | |
+| `anonymous_access` | boolean | `false` | When false, unsigned requests are refused with `403 AccessDenied`. |
+| `anonymous_policy` | string (JSON policy) | none | The policy that authorizes unsigned requests. Required when `anonymous_access` is true, and refused when it is false. |
 | `sts_web_identity` | boolean | `true` | |
 | `session_default_seconds` | integer | `3600` | From 900 to 43200 (the AWS STS limits), and at most `session_maximum_seconds`. |
 | `session_maximum_seconds` | integer | `3600` | From 900 to 43200. |
 | `identity_max_staleness_hours` | integer | `24` | Positive (§6.2). |
 | `oidc_clock_skew_seconds` | integer | `60` | At most 300. The leeway for a token's `exp`, `nbf`, and `iat` (§11). |
+
+Each `[identity.static_credentials.<name>]` table is one static access key, for bootstrap and service accounts. The name identifies the principal: 1 to 64 ASCII letters, digits, and `+=,.@_-`. Every key is required.
+
+| Key | Type | Rules |
+|---|---|---|
+| `access_key_id` | string | 16 to 128 ASCII letters and digits, unique among static credentials. |
+| `secret_access_key_file` | path | Not empty. A file holding the secret access key, read when the gateway starts: 32 to 128 visible ASCII characters, optionally followed by a line ending. |
+| `policy` | string (JSON policy) | The policy that authorizes the credential's requests. |
 
 ## `[admin]`
 

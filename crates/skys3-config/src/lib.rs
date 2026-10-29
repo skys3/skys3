@@ -81,7 +81,7 @@ pub use cluster::{ClusterConfig, ControlStoreBackend, ControlStoreConfig, Failur
 pub use ec::EcConfig;
 pub use error::{ConfigError, Violation, Violations};
 pub use flush::{AckPolicy, ConflictPolicy, FlushConfig};
-pub use identity::IdentityConfig;
+pub use identity::{IdentityConfig, StaticCredentialConfig};
 pub use peering::{CongestionControl, PeeringConfig};
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};

@@ -28,6 +28,8 @@
 //!   [`NodeRegistration`], [`CoordinatorLease`], [`ClusterDocument`]): the
 //!   JSON values of the control-store registers (§6.1), behind the
 //!   [`RegisterDocument`] trait.
+//! - **Policies** ([`policy`]): the subset of the IAM policy language that
+//!   authorizes requests (§11).
 //!
 //! ```
 //! use skys3_types::{BucketId, ClusterId, EpochSeq, ShardCount, WriteIdentity, shard_for_key};
@@ -45,6 +47,7 @@ pub mod checksum;
 mod id;
 mod identity;
 pub mod limits;
+pub mod policy;
 mod position;
 mod register;
 pub mod shard;
