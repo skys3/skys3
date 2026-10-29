@@ -530,4 +530,17 @@ async fn rejoining() {
     let same = set.open_replica(&another, &node(2)).await.unwrap();
     assert!(!again.is_stopped());
     assert!(same.durable().same_channel(&again.durable()));
+
+    // Dropped, and added again under the same primary once node 4, which
+    // the replica never knew as a learner, became a member: it opens again.
+    let grown = ShardConfig {
+        epoch: Epoch::new(9),
+        members: vec![node(3), node(4), node(5)],
+        learners: vec![node(2)],
+        ..another
+    };
+    let reopened = set.open_replica(&grown, &node(2)).await.unwrap();
+    assert!(same.is_stopped());
+    assert_eq!(reopened.role(), Role::Learner);
+    assert_eq!(reopened.config(), grown);
 }

@@ -35,7 +35,7 @@ use crate::node::{
 };
 use crate::pki::Pki;
 use crate::replication::register;
-use crate::workload::{Client, Routes, Workload};
+use crate::workload::{Client, Routes, Timings, Workload};
 
 /// The shape of a simulated cluster.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +85,12 @@ pub struct ClusterConfig {
     /// placement. The nodes must register themselves
     /// ([`CoordinatedServices`](crate::CoordinatedServices)).
     pub create_buckets: bool,
+    /// How many of the nodes, the last ones, join the cluster later: they
+    /// hold no shard in the static placement, and their hosts stay down,
+    /// with empty disks, until a [`Fault::Join`] starts them. Placement
+    /// then gives them their share (plan M3-06). The workload starts
+    /// without them.
+    pub joining: usize,
 }
 
 impl Default for ClusterConfig {
@@ -114,6 +120,7 @@ impl Default for ClusterConfig {
             latency: (Duration::from_millis(1), Duration::from_millis(5)),
             remote_faults: SimS3Faults::default(),
             create_buckets: false,
+            joining: 0,
         }
     }
 }
@@ -174,6 +181,29 @@ pub struct Report {
     /// Power-loss restarts the driver forced on nodes whose sync failed
     /// and that had not been restarted otherwise.
     pub fences: usize,
+    /// When the clients started, in simulated time since the run began:
+    /// the time the fault plan counts from.
+    pub started: Duration,
+    /// Every write a client sent and got an answer to, or gave up on, in
+    /// the order they ended: how long each took, end to end.
+    pub writes: Vec<WriteTiming>,
+}
+
+/// One client write, timed end to end in simulated time: a `PUT`, the
+/// completion of a multipart upload, or a `DELETE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteTiming {
+    /// The shard of the key written.
+    pub shard: ShardRef,
+    /// When the client sent it, in simulated time since the run began.
+    pub sent: Duration,
+    /// How long until its answer arrived, or until the client gave up,
+    /// connecting included: a write that never connected is recorded
+    /// with the time the client spent trying.
+    pub took: Duration,
+    /// Whether it was acknowledged, or refused for its condition: whether
+    /// the shard answered it definitely.
+    pub answered: bool,
 }
 
 impl Report {
@@ -432,6 +462,13 @@ impl<S: NodeServices> Cluster<S> {
                 }
             });
         }
+        let joining = self.config.nodes.saturating_sub(self.config.joining).max(1);
+        let mut down = vec![None; world.slots.len()];
+        for (index, slot) in world.slots.iter().enumerate().skip(joining) {
+            // Held back until it joins: its software never ran.
+            sim.crash(slot.host.as_str());
+            down[index] = Some(Duration::MAX);
+        }
         let mut driver = Driver {
             world: &world,
             history: history.clone(),
@@ -439,7 +476,7 @@ impl<S: NodeServices> Cluster<S> {
             plan: plan.faults().iter().cloned().collect(),
             origin: None,
             heals: Vec::new(),
-            down: vec![None; world.slots.len()],
+            down,
             fenced: vec![false; world.slots.len()],
             life: vec![0; world.slots.len()],
             in_force: InForce::default(),
@@ -451,7 +488,8 @@ impl<S: NodeServices> Cluster<S> {
         while !(world
             .slots
             .iter()
-            .all(|slot| slot.ready.load(Ordering::SeqCst))
+            .zip(&driver.down)
+            .all(|(slot, down)| slot.ready.load(Ordering::SeqCst) || *down == Some(Duration::MAX))
             && self.services.ready())
         {
             if sim.elapsed() > STARTUP_LIMIT {
@@ -466,6 +504,7 @@ impl<S: NodeServices> Cluster<S> {
             world.routes.clone()
         };
         driver.origin = Some(sim.elapsed());
+        let writes = Timings::default();
         for index in 0..workload.clients {
             let client = Client::new(
                 client_host(index),
@@ -473,7 +512,8 @@ impl<S: NodeServices> Cluster<S> {
                 history.clone(),
                 workload.clone(),
                 context.fork_seed(),
-            );
+            )
+            .with_timings(writes.clone());
             sim.client(client_host(index), client.run());
         }
         self.drive(&mut sim, &mut driver, &history, false)?;
@@ -531,6 +571,8 @@ impl<S: NodeServices> Cluster<S> {
                 .filter(|survivor| matches!(survivor.flushed, Some(Some(_))))
                 .count(),
             fences: driver.fences,
+            started: driver.origin.unwrap_or_default(),
+            writes: writes.take(),
         })
     }
 
@@ -666,7 +708,9 @@ impl<S: NodeServices> World<S> {
             .map(|n| NodeId::new(format!("node-{n}")))
             .collect::<Result<_, _>>()?;
         let mut ids = ProposalIds::seeded(context.fork_seed());
-        let (buckets, mut placement) = registers(config, &node_ids, &mut ids)?;
+        // Nodes that join later hold nothing at first.
+        let initial = &node_ids[..config.nodes.saturating_sub(config.joining).max(1)];
+        let (buckets, mut placement) = registers(config, initial, &mut ids)?;
         if config.create_buckets {
             // The gateways create the buckets, and their placement.
             placement.clear();
@@ -727,7 +771,10 @@ impl<S: NodeServices> World<S> {
             routes: Routes {
                 buckets,
                 placement,
-                nodes: node_ids,
+                // Clients and the bucket creator address only the nodes in
+                // the cluster from the start: one that joins later is down
+                // until then, and no client knows of it.
+                nodes: node_ids[..config.nodes.saturating_sub(config.joining).max(1)].to_vec(),
             },
             base_control: control.faults(),
             control,
@@ -1116,6 +1163,12 @@ impl<S: NodeServices> Driver<'_, S> {
                 let life = self.life[node];
                 self.heals
                     .push((now + FENCE_DELAY, Heal::Fence { node, life }));
+            }
+            Fault::Join { node } => {
+                // It starts at the next advance, once.
+                if self.down[node] == Some(Duration::MAX) {
+                    self.down[node] = Some(now);
+                }
             }
             Fault::MessageLoss { .. }
             | Fault::ControlOutage { .. }

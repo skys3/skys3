@@ -33,6 +33,7 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::admin::AdminEndpoint;
+use crate::handoff::HandoffError;
 use crate::heartbeat::HeartbeatError;
 
 /// The body of a [`MessageKind::ControlChanged`] frame. Its payload is
@@ -137,6 +138,9 @@ pub enum PushError {
     /// The peer sent a malformed heartbeat.
     #[error(transparent)]
     Heartbeat(#[from] HeartbeatError),
+    /// The peer sent a malformed handoff request.
+    #[error(transparent)]
+    Handoff(#[from] HandoffError),
     /// The peer sent a frame of a kind the endpoint does not serve.
     #[error("unexpected {0:?} frame on an admin connection")]
     Unexpected(MessageKind),
