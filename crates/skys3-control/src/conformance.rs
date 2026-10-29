@@ -6,8 +6,8 @@
 //! run one alone or at a larger scale. A check panics with a message naming
 //! what failed.
 //!
-//! The checks cover linearizable `put_if` under concurrency, listing, the
-//! lost-response rule with faults injected by
+//! The checks cover linearizable `put_if` under concurrency, conditional
+//! deletes, listing, the lost-response rule with faults injected by
 //! [`FaultyStore`] around the backend, cluster
 //! bootstrap and the generation, and change delivery. A backend's own
 //! transport faults, such as a simulated S3 store's, come on top of these.
@@ -28,8 +28,13 @@ use tokio::task::JoinSet;
 use crate::cluster::{Bootstrap, FIRST_GENERATION, bootstrap, bump_generation, read_cluster};
 use crate::faults::{Fault, FaultyStore};
 use crate::key::{KeyPrefix, RegisterKey};
-use crate::propose::{ProposalIds, ProposalOutcome, RetryPolicy, proposal_id_of, propose};
-use crate::store::{Change, ChangeStream, ControlStore, Expected, PutOutcome, Versioned};
+use crate::propose::{
+    DeletionOutcome, ProposalIds, ProposalOutcome, RetryPolicy, proposal_id_of, propose,
+    propose_delete,
+};
+use crate::store::{
+    Change, ChangeStream, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+};
 
 /// Makes the stores a conformance run tests.
 pub trait Backend {
@@ -47,6 +52,7 @@ const REPORT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Runs every check, each on a fresh store.
 pub async fn run<B: Backend>(backend: &mut B) {
     conditional_writes(&backend.store().await).await;
+    conditional_deletes(&backend.store().await).await;
     listing(&backend.store().await).await;
     racing_creates_have_one_winner(&backend.store().await, 8).await;
     increments_are_linearizable(&backend.store().await, 4, 8).await;
@@ -147,6 +153,107 @@ pub async fn conditional_writes<S: ControlStore>(store: &S) {
             version: v2
         })
     );
+}
+
+/// `delete_if` removes a register only at its current version; a register
+/// created again gets a version no stale or late delete matches; lost
+/// delete answers resolve by re-reading; and change streams report the
+/// removal.
+pub async fn conditional_deletes<S: ControlStore>(store: &S) {
+    let register = key("buckets/deleted.json");
+    let mut ids = ProposalIds::seeded(6);
+    let create = async |ids: &mut ProposalIds| -> Version {
+        match store
+            .put_if(&register, Expected::Absent, value(&ids.next_id(), 0))
+            .await
+            .unwrap()
+        {
+            PutOutcome::Written(version) => version,
+            PutOutcome::PreconditionFailed => panic!("creating an absent register failed"),
+        }
+    };
+    let absent = store.delete_if(&register, &Version::new("none")).await;
+    assert_eq!(
+        absent.unwrap(),
+        DeleteOutcome::PreconditionFailed,
+        "deleted an absent register"
+    );
+    let v1 = create(&mut ids).await;
+    let PutOutcome::Written(v2) = store
+        .put_if(
+            &register,
+            Expected::Version(v1.clone()),
+            value(&ids.next_id(), 1),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("an update at the current version failed its precondition");
+    };
+    let stale = store.delete_if(&register, &v1).await.unwrap();
+    assert_eq!(
+        stale,
+        DeleteOutcome::PreconditionFailed,
+        "a stale delete applied"
+    );
+    let deleted = store.delete_if(&register, &v2).await.unwrap();
+    assert_eq!(deleted, DeleteOutcome::Deleted);
+    assert_eq!(store.get(&register).await.unwrap(), None, "still readable");
+    assert!(
+        store.list(&KeyPrefix::buckets()).await.unwrap().is_empty(),
+        "a deleted register is listed"
+    );
+    let again = store.delete_if(&register, &v2).await.unwrap();
+    assert_eq!(again, DeleteOutcome::PreconditionFailed, "deleted twice");
+
+    // A register created again is out of reach of every earlier version.
+    let v3 = create(&mut ids).await;
+    for old in [&v1, &v2] {
+        assert_ne!(&v3, old, "a recreated register reused a version");
+        let late = store.delete_if(&register, old).await.unwrap();
+        assert_eq!(
+            late,
+            DeleteOutcome::PreconditionFailed,
+            "a late delete applied"
+        );
+    }
+
+    // Lost and late answers.
+    let faulty = FaultyStore::new(store.clone());
+    let policy = RetryPolicy::default();
+    faulty.script([Fault::LoseResponse]);
+    let outcome = propose_delete(&faulty, &register, &v3, &policy).await;
+    assert_eq!(outcome.unwrap(), DeletionOutcome::Deleted, "lost answer");
+    let v4 = create(&mut ids).await;
+    faulty.script([Fault::LateRequest(Duration::from_millis(50))]);
+    let outcome = propose_delete(&faulty, &register, &v4, &policy).await;
+    assert_eq!(outcome.unwrap(), DeletionOutcome::Deleted, "late request");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(store.get(&register).await.unwrap(), None);
+
+    // Change streams report the removal.
+    let cluster = ClusterId::new("conformance").expect("valid");
+    bootstrap(store, &cluster, ids.next_id(), &policy)
+        .await
+        .unwrap();
+    let v5 = create(&mut ids).await;
+    let generation = bump_generation(store, &cluster, &mut ids, &policy)
+        .await
+        .unwrap();
+    let mut changes = store.changes(Generation::ZERO).await.unwrap();
+    let first = next(&mut changes).await;
+    assert_eq!(first.registers, [(register.clone(), Some(v5.clone()))]);
+    let deleted = store.delete_if(&register, &v5).await.unwrap();
+    assert_eq!(deleted, DeleteOutcome::Deleted);
+    let after = bump_generation(store, &cluster, &mut ids, &policy)
+        .await
+        .unwrap();
+    let mut change = next(&mut changes).await;
+    while change.generation < after {
+        change = next(&mut changes).await;
+    }
+    assert!(after > generation);
+    assert_eq!(change.registers, [(register, None)], "removal not reported");
 }
 
 /// `list` returns exactly the registers under a prefix, in key order,

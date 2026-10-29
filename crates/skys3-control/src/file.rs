@@ -23,6 +23,10 @@
 //! are answered from an in-memory copy of every register, loaded when the
 //! store is opened and updated after each durable write.
 //!
+//! A delete removes the register's file and `fsync`s its directory.
+//! Directories are never removed, so a later write into them needs no
+//! directory creation.
+//!
 //! **One node.** The store serves the node it was opened for. It refuses to
 //! open once another node is registered in `nodes/`, and refuses another
 //! node's registration.
@@ -46,7 +50,9 @@ use tokio::sync::watch;
 
 use crate::feed::ChangeFeed;
 use crate::key::{KeyPrefix, RegisterKey, RegisterKind};
-use crate::store::{ControlError, ControlStore, Expected, PutOutcome, Version, Versioned};
+use crate::store::{
+    ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version, Versioned,
+};
 
 /// The lock file in the root directory.
 const LOCK_FILE: &str = ".lock";
@@ -209,6 +215,26 @@ impl Shared {
         self.written.send_replace(());
         Ok(PutOutcome::Written(version))
     }
+
+    /// Runs on a pool thread.
+    fn delete(&self, key: &RegisterKey, expected: &Version) -> Result<DeleteOutcome, ControlError> {
+        let _writer = lock(&self.writer);
+        self.check()?;
+        if lock(&self.registers)
+            .get(key)
+            .map(|current| &current.version)
+            != Some(expected)
+        {
+            return Ok(DeleteOutcome::PreconditionFailed);
+        }
+        if let Err(error) = remove_durably(&self.config.root, key) {
+            self.failed.store(true, Ordering::Release);
+            return Err(error.into());
+        }
+        lock(&self.registers).remove(key);
+        self.written.send_replace(());
+        Ok(DeleteOutcome::Deleted)
+    }
 }
 
 impl ControlStore for FileControlStore {
@@ -233,6 +259,21 @@ impl ControlStore for FileControlStore {
         self.shared
             .pool
             .run(move || shared.put(&key, &expected, value))
+            .await
+            .map_err(io::Error::from)?
+    }
+
+    async fn delete_if(
+        &self,
+        key: &RegisterKey,
+        expected: &Version,
+    ) -> Result<DeleteOutcome, ControlError> {
+        let shared = Arc::clone(&self.shared);
+        let (key, expected) = (key.clone(), expected.clone());
+        // Like `put_if`, the job finishes even if this future is dropped.
+        self.shared
+            .pool
+            .run(move || shared.delete(&key, &expected))
             .await
             .map_err(io::Error::from)?
     }
@@ -326,6 +367,14 @@ fn write_durably(root: &Path, key: &RegisterKey, value: &[u8]) -> io::Result<()>
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Removes the register file for `key` under `root` and `fsync`s its
+/// directory.
+fn remove_durably(root: &Path, key: &RegisterKey) -> io::Result<()> {
+    let path = root.join(key.as_str());
+    fs::remove_file(&path)?;
+    sync_dir(path.parent().unwrap_or(root))
 }
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -487,6 +536,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deletes_remove_files_and_survive_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileControlStore::open(config(dir.path(), "node-1"), pool())
+            .await
+            .unwrap();
+        let PutOutcome::Written(version) = put(&store, "buckets/b.json", "{}").await else {
+            panic!("the first write failed");
+        };
+        let stale = Version::new("stale");
+        let missing = store.delete_if(&key("buckets/c.json"), &version).await;
+        assert_eq!(missing.unwrap(), DeleteOutcome::PreconditionFailed);
+        let outcome = store.delete_if(&key("buckets/b.json"), &stale).await;
+        assert_eq!(outcome.unwrap(), DeleteOutcome::PreconditionFailed);
+        let outcome = store.delete_if(&key("buckets/b.json"), &version).await;
+        assert_eq!(outcome.unwrap(), DeleteOutcome::Deleted);
+        assert!(!dir.path().join("buckets/b.json").exists());
+        assert!(store.get(&key("buckets/b.json")).await.unwrap().is_none());
+        drop(store);
+        let store = FileControlStore::open(config(dir.path(), "node-1"), pool())
+            .await
+            .unwrap();
+        assert!(store.list(&KeyPrefix::buckets()).await.unwrap().is_empty());
+        // The emptied directory takes new registers.
+        assert!(matches!(
+            put(&store, "buckets/b.json", "{}").await,
+            PutOutcome::Written(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_takes_the_store_out_of_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileControlStore::open(config(dir.path(), "node-1"), pool())
+            .await
+            .unwrap();
+        let PutOutcome::Written(version) = put(&store, "buckets/b.json", "{}").await else {
+            panic!("the first write failed");
+        };
+        // Removed behind the store's back.
+        fs::remove_file(dir.path().join("buckets/b.json")).unwrap();
+        let error = store
+            .delete_if(&key("buckets/b.json"), &version)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::Io(_)), "{error}");
+        let error = store.get(&key("buckets/b.json")).await.unwrap_err();
+        assert!(error.to_string().contains("reopen"), "{error}");
+    }
+
+    #[tokio::test]
     async fn a_shut_down_pool_fails_requests() {
         let dir = tempfile::tempdir().unwrap();
         let pool = pool();
@@ -496,6 +595,11 @@ mod tests {
         pool.shutdown();
         let error = store
             .put_if(&key("x"), Expected::Absent, Bytes::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ControlError::Io(_)), "{error}");
+        let error = store
+            .delete_if(&key("x"), &Version::new("1"))
             .await
             .unwrap_err();
         assert!(matches!(error, ControlError::Io(_)), "{error}");

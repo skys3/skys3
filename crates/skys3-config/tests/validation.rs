@@ -788,3 +788,28 @@ fn correlated_ip_endpoints_are_compared_as_addresses() {
         .parse::<Config>()
         .unwrap();
 }
+
+#[test]
+fn attached_targets_must_not_share_the_control_stores_scope() {
+    let config = |body: &str| {
+        control_store(body)
+            .parse::<Config>()
+            .unwrap()
+            .control_store()
+            .clone()
+    };
+    let s3 = |allow: bool| {
+        config(&format!(
+            "backend = \"s3\"\nendpoint = \"https://bucket.s3.us-west-2.amazonaws.com\"\n\
+             bucket = \"ctl\"\nallow_correlated_control_store = {allow}"
+        ))
+    };
+    let target = skys3_config::parse_target("https://s3.us-west-2.amazonaws.com/data").unwrap();
+    let error = s3(false).check_target_independence(&target).unwrap_err();
+    assert!(error.contains("aws:us-west-2"), "{error}");
+    s3(true).check_target_independence(&target).unwrap();
+    let elsewhere = skys3_config::parse_target("https://s3.eu-west-1.amazonaws.com/d").unwrap();
+    s3(false).check_target_independence(&elsewhere).unwrap();
+    let etcd = config("etcd_endpoints = [\"https://s3.us-west-2.amazonaws.com\"]");
+    etcd.check_target_independence(&target).unwrap();
+}

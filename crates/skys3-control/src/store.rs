@@ -75,6 +75,17 @@ pub enum PutOutcome {
     PreconditionFailed,
 }
 
+/// What a [`ControlStore::delete_if`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum DeleteOutcome {
+    /// The register was at the expected version and is gone.
+    Deleted,
+    /// The register was not at the expected version, or did not exist,
+    /// and nothing was deleted (`412 Precondition Failed`).
+    PreconditionFailed,
+}
+
 /// One report of a [`ChangeStream`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
@@ -166,6 +177,23 @@ pub trait ControlStore: fmt::Debug + Clone + Send + Sync + 'static {
         expected: Expected,
         value: Bytes,
     ) -> impl Future<Output = Result<PutOutcome, ControlError>> + Send;
+
+    /// Deletes the register only if it is still at `expected`.
+    ///
+    /// A deleted register carries no `proposal_id`, so
+    /// [`propose_delete`](crate::propose_delete) resolves lost answers by
+    /// re-reading: an absent register counts as deleted.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlStore::put_if`]: a [`ControlError::Indeterminate`] delete
+    /// may still be applied later, but only while the register is at
+    /// `expected`, so it never removes a newer value.
+    fn delete_if(
+        &self,
+        key: &RegisterKey,
+        expected: &Version,
+    ) -> impl Future<Output = Result<DeleteOutcome, ControlError>> + Send;
 
     /// Lists the registers under `prefix` with their versions, in key
     /// order.

@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use skys3_types::ClusterId;
+use skys3_types::{ClusterId, RemoteTarget};
 
 use crate::error::Checker;
 use crate::target;
@@ -98,6 +98,36 @@ pub struct ControlStoreConfig {
     pub coordinator_lease_seconds: u64,
     /// `config_poll_interval_seconds`.
     pub config_poll_interval_seconds: u64,
+}
+
+impl ControlStoreConfig {
+    /// Checks that a data target does not share the control store's
+    /// failure scope (§6.1), as attaching a bucket requires: the target's
+    /// endpoint must not have the host name or IP address of an S3 control
+    /// store's endpoint, nor be an AWS S3 endpoint in the same region,
+    /// unless `allow_correlated_control_store` is set. An etcd control
+    /// store is never correlated with a target.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the shared scope.
+    pub fn check_target_independence(&self, target: &RemoteTarget) -> Result<(), String> {
+        let ControlStoreBackend::S3 { endpoint, .. } = &self.backend else {
+            return Ok(());
+        };
+        if self.allow_correlated_control_store {
+            return Ok(());
+        }
+        match target::failure_scope(endpoint) {
+            Some(scope) if target::failure_scope(&target.endpoint).as_ref() == Some(&scope) => {
+                Err(format!(
+                    "the target shares its failure scope ({scope}) with the control store; \
+                     one outage would stop both flushing and membership changes (§6.1)"
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 crate::durations! {

@@ -4,8 +4,8 @@
 //!
 //! Section numbers (§) refer to the [SkyS3 design](https://github.com/skys3/skys3/blob/main/docs/skys3-design.md).
 //!
-//! - [`ControlStore`]: the backend interface, `get`, `put_if`, `list`, and
-//!   `changes`. Backends answer each request once; everything above them
+//! - [`ControlStore`]: the backend interface, `get`, `put_if`,
+//!   `delete_if`, `list`, and `changes`. Backends answer each request once; everything above them
 //!   is shared.
 //! - [`RegisterKey`], [`KeyPrefix`], [`TypedKey`]: the register layout
 //!   (`cluster.json`, `coordinator.lease`, `nodes/`, `buckets/`, `shards/`,
@@ -14,7 +14,8 @@
 //!   the lost-response rule: after an unanswered write whose retry fails
 //!   its precondition, re-read and look for one's own `proposal_id`.
 //!   [`read`] and [`propose_document`] read and write the typed documents
-//!   of `skys3-types`.
+//!   of `skys3-types`, and [`propose_delete`] deletes a register under the
+//!   same rules.
 //! - [`bootstrap`] and [`bump_generation`]: creating `cluster.json` with
 //!   `If-None-Match: *`, and the generation counter that announces
 //!   changes.
@@ -64,9 +65,10 @@ pub use file::{FileControlStore, FileStoreConfig};
 pub use key::{KeyError, KeyPrefix, RegisterKey, RegisterKind, TypedKey};
 pub use memory::MemoryControlStore;
 pub use propose::{
-    ProposalIds, ProposalOutcome, RetryPolicy, proposal_id_of, propose, propose_document, read,
-    read_with_retries,
+    DeletionOutcome, ProposalIds, ProposalOutcome, RetryPolicy, proposal_id_of, propose,
+    propose_delete, propose_document, read, read_with_retries,
 };
 pub use store::{
-    Change, ChangeStream, ControlError, ControlStore, Expected, PutOutcome, Version, Versioned,
+    Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version,
+    Versioned,
 };

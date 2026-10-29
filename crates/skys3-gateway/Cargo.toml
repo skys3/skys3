@@ -1,0 +1,42 @@
+[package]
+name = "skys3-gateway"
+description = "SkyS3 S3 gateway: the S3 API on s3s and hyper, request limits, key-to-shard routing, and bucket operations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Test support: the in-memory shard stub (`stub`), an authenticator that
+# lets every request through, and the fuzzing entry points.
+test-util = ["skys3-control/test-util"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["http1", "server", "server-graceful", "tokio"] }
+quick-xml.workspace = true
+rand.workspace = true
+s3s.workspace = true
+serde_urlencoded.workspace = true
+skys3-config.workspace = true
+skys3-control.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+hyper = { workspace = true, features = ["client", "http1"] }
+proptest.workspace = true
+# Enables `test-util` for this crate's own tests.
+skys3-gateway = { path = ".", features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "test-util", "time"] }

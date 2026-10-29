@@ -85,6 +85,7 @@ pub use identity::IdentityConfig;
 pub use peering::{CongestionControl, PeeringConfig};
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};
+pub use target::parse_target;
 
 use buckets::BucketTable;
 use cluster::{RawCluster, RawControlStore};
