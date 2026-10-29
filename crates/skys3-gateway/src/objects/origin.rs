@@ -14,7 +14,8 @@
 //!
 //! **The cache.** The key's entry in its shard caches the origin's version
 //! as the entries of a `write_back` bucket cache its remote's: a read
-//! serves the entry if it holds the ETag the origin answered, from its
+//! serves the entry if it holds the version the origin answered, its ETag,
+//! `Last-Modified`, and version ID ([`OriginVersion`]), from its
 //! holders or the hot cache, or by a fill when it is evicted (§9.2). An
 //! entry that holds another version, or none, is brought up to date by the
 //! GET: an `IMPORT` creates the stub of a key that has no entry, and an
@@ -50,7 +51,7 @@ use super::namespace::{Lookup, local, unloaded};
 use super::{Found, Objects, download};
 use crate::buckets::shard_error;
 use crate::conditions::{Precondition, no_such_key};
-use crate::origin::{OriginHead, Seen};
+use crate::origin::{OriginHead, OriginVersion, Seen};
 use crate::remote::{RemoteError, RemoteObject, RemoteReads};
 use crate::shard::{ShardRef, Shards};
 
@@ -99,9 +100,9 @@ impl<H: Shards> Objects<H> {
         match known {
             Some(Seen::Missing) => return Err(no_such_key()),
             Some(Seen::Denied) => return Err(denied()),
-            Some(Seen::Present(etag)) => {
+            Some(Seen::Present(version)) => {
                 let plan = self.read_plan(shard, key, planned).await?;
-                if serves(plan.entry.as_ref(), &etag) {
+                if serves(plan.entry.as_ref(), &version) {
                     return local(plan);
                 }
             }
@@ -127,9 +128,9 @@ impl<H: Shards> Objects<H> {
                 OriginHead::Missing => return Err(no_such_key()),
                 OriginHead::Denied => return Err(denied()),
             };
-            let etag = found.object.local_etag.clone();
+            let version = OriginVersion::of(&found);
             let plan = self.read_plan(shard, key, planned).await?;
-            if serves(plan.entry.as_ref(), &etag) {
+            if serves(plan.entry.as_ref(), &version) {
                 return local(plan);
             }
             if !planned {
@@ -144,7 +145,7 @@ impl<H: Shards> Objects<H> {
             }
             self.cache_origin(shard, key, plan.entry, found).await?;
             let plan = self.read_plan(shard, key, true).await?;
-            if serves(plan.entry.as_ref(), &etag) {
+            if serves(plan.entry.as_ref(), &version) {
                 return local(plan);
             }
             tracing::debug!(%shard, key, "another read cached another version; asking again");
@@ -310,14 +311,15 @@ fn cached(entry: &Entry) -> bool {
         && !unloaded(entry)
 }
 
-/// Whether `entry` caches the origin's version whose ETag is `etag`.
-fn serves(entry: Option<&Entry>, etag: &ETag) -> bool {
+/// Whether `entry` caches the origin's `version`, with its metadata.
+fn serves(entry: Option<&Entry>, version: &OriginVersion) -> bool {
     entry.is_some_and(|entry| {
         cached(entry)
-            && entry
-                .object
-                .as_ref()
-                .is_some_and(|object| object.local_etag == *etag)
+            && entry.remote_version_id == version.version_id
+            && entry.object.as_ref().is_some_and(|object| {
+                object.local_etag == version.etag
+                    && object.last_modified_ms == version.last_modified_ms
+            })
     })
 }
 
