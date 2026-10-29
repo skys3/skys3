@@ -32,9 +32,10 @@
 //! - `errors`: the latest flush error of each shard that has one, until
 //!   a later attempt gets its key past it;
 //! - `import`: the namespace import (§9.1): `state` (`running` or `done`),
-//!   `after`, the last key imported while it runs, `imported`, the
-//!   `IMPORT` records committed since the node started, and `error`, its
-//!   last error until it gets past it.
+//!   `after`, the last key it has imported without a gap while it runs,
+//!   `ranges` and `ranges_done`, the key ranges it lists in parallel and
+//!   those done, `imported`, the `IMPORT` records committed since the node
+//!   started, and `error`, its last error until it gets past it.
 //!
 //! Placement (M3-03) adds shard members, and M4-06 its own fields.
 
@@ -281,6 +282,8 @@ fn flush_status(status: &BucketStatus) -> Value {
                 ImportCheckpoint::Running { after } => after.clone(),
                 ImportCheckpoint::Done => None,
             },
+            "ranges": status.import.ranges.ranges().len(),
+            "ranges_done": status.import.ranges.done(),
             "imported": status.import.imported,
             "error": status.import.error,
         }),

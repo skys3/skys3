@@ -27,6 +27,9 @@ struct Remote(Mutex<State>);
 #[derive(Debug, Default)]
 struct State {
     import: Option<ImportCheckpoint>,
+    /// Keys after the first and up to the second that a range listed in
+    /// parallel has passed ahead of the import's position.
+    ahead: Option<(String, String)>,
     objects: BTreeMap<String, (RemoteObject, Bytes)>,
     failing: bool,
     heads: usize,
@@ -87,6 +90,16 @@ impl Remote {
 impl RemoteReads for Remote {
     fn import(&self, _bucket: &BucketId) -> Option<ImportCheckpoint> {
         self.lock().import.clone()
+    }
+
+    fn passed(&self, _bucket: &BucketId, key: &str) -> bool {
+        let state = self.lock();
+        let ahead = state.ahead.as_ref();
+        state
+            .import
+            .as_ref()
+            .is_none_or(|import| import.passed(key))
+            || ahead.is_some_and(|(start, end)| key > start.as_str() && key <= end.as_str())
     }
 
     fn head<'a>(
@@ -513,4 +526,47 @@ async fn a_stopped_shard_never_falls_through_to_the_remote() {
         .await;
     list.assert(503, Some("ServiceUnavailable"));
     assert_eq!(remote.lock().heads, 0, "nothing was read from the remote");
+}
+
+#[tokio::test]
+async fn keys_a_later_range_has_passed_are_read_from_the_index_alone() {
+    let remote = Arc::new(Remote::default());
+    let (setup, bucket) = setup(&remote).await;
+    // The first range has passed nothing yet; a later one has passed
+    // every key after `m` up to `m/9`.
+    remote.running(None);
+    remote.lock().ahead = Some(("m".to_owned(), "m/9".to_owned()));
+    for key in ["a", "m/2", "z"] {
+        remote.put(key, "remote");
+    }
+    let etag = remote.put("m/1", "remote");
+    import(&setup, &bucket, "m/1", &etag).await;
+    // `m/2` came after its range passed it: as once the import is done,
+    // neither a read nor a listing sees it.
+    let head = setup.call(Method::HEAD, "/photos/m/2", &[], "").await;
+    assert_eq!(head.status, 404);
+    assert_eq!(remote.lock().heads, 0);
+    setup
+        .call(Method::HEAD, "/photos/a", &[], "")
+        .await
+        .assert(200, None);
+    let all = setup
+        .call(Method::GET, "/photos?list-type=2", &[], "")
+        .await;
+    assert_eq!(listed(&all.body), ["a", "m/1", "z"]);
+    let rolled = setup
+        .call(Method::GET, "/photos?list-type=2&delimiter=/", &[], "")
+        .await;
+    assert_eq!(listed(&rolled.body), ["a", "m/", "z"]);
+
+    // Once `m/1` is deleted, no key under `m/` lists, so neither does
+    // the prefix the remote still has.
+    setup
+        .call(Method::DELETE, "/photos/m/1", &[], "")
+        .await
+        .assert(204, None);
+    let rolled = setup
+        .call(Method::GET, "/photos?list-type=2&delimiter=/", &[], "")
+        .await;
+    assert_eq!(listed(&rolled.body), ["a", "z"]);
 }

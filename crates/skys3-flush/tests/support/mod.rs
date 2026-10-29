@@ -88,6 +88,17 @@ pub struct Node {
 impl Node {
     /// Opens a node on a new simulated disk, seeded with `seed`.
     pub async fn open(seed: u64) -> Node {
+        Self::open_with(seed, BlockingPool::new("index", NonZeroUsize::MIN).unwrap()).await
+    }
+
+    /// Opens a node whose index runs on the caller's thread, so that a
+    /// paused clock never advances while the index works: simulated
+    /// durations then depend on the remote's delays only.
+    pub async fn open_inline(seed: u64) -> Node {
+        Self::open_with(seed, BlockingPool::inline("index")).await
+    }
+
+    async fn open_with(seed: u64, pool: BlockingPool) -> Node {
         let disk = SimDisk::new(seed);
         let mount = disk.mount();
         let log_config = LogConfig {
@@ -104,7 +115,6 @@ impl Node {
             cache_bytes: 1 << 20,
         };
         let index = Arc::new(Index::open_sim(&mount, "index.redb", &index_config).unwrap());
-        let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
         let set = ShardSet::new(index, log, pool.clone());
         let shard = set.open(&config()).await.unwrap();
         Node {

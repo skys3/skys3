@@ -64,6 +64,10 @@ pub struct FlushSettings {
     /// S3's 1,000 ([`IMPORT_PAGE_KEYS`](crate::IMPORT_PAGE_KEYS)): each
     /// page ends with a checkpoint.
     pub import_page_keys: u32,
+    /// The listing streams of a bucket's import, unless the service has
+    /// the bucket's `import_parallel_streams`
+    /// ([`FlushService::with_buckets`](crate::FlushService::with_buckets)).
+    pub import_streams: usize,
     /// The first delay before a key is retried after a failure.
     pub min_backoff: Duration,
     /// The longest delay between retries of a key; delays double up to it.
@@ -101,6 +105,7 @@ impl Default for FlushSettings {
             max_inflight_bytes: 1 << 30,
             import_keys_per_second: FlushConfig::default().import_max_keys_per_second,
             import_page_keys: crate::IMPORT_PAGE_KEYS,
+            import_streams: 1,
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
         }

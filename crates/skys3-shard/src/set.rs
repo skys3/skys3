@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use skys3_index::{ImportCheckpoint, Index, IndexError};
+use skys3_index::{ImportRanges, Index, IndexError};
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::{SegmentLog, ShardRef};
 use skys3_types::{BucketId, KeyHash, Label, NodeId, ShardConfig};
@@ -176,36 +176,34 @@ impl<D: Disk> ShardSet<D> {
         }
     }
 
-    /// The namespace import checkpoint of `bucket` on this node (§9.1),
-    /// read on the index's pool.
+    /// The namespace import ranges of `bucket` on this node and their
+    /// checkpoints (§9.1), read on the index's pool.
     ///
     /// # Errors
     ///
     /// An [`IndexError`] if the index fails.
-    pub async fn import_checkpoint(
+    pub async fn import_ranges(
         &self,
         bucket: &BucketId,
-    ) -> Result<Option<ImportCheckpoint>, IndexError> {
+    ) -> Result<Option<ImportRanges>, IndexError> {
         let (index, bucket) = (Arc::clone(&self.index), bucket.clone());
-        self.pool
-            .run(move || index.import_checkpoint(&bucket))
-            .await?
+        self.pool.run(move || index.import_ranges(&bucket)).await?
     }
 
-    /// Stores the namespace import checkpoint of `bucket` durably, or
-    /// removes it, on the index's pool ([`Index::set_import_checkpoint`]).
+    /// Stores the namespace import ranges of `bucket` durably, or removes
+    /// them, on the index's pool ([`Index::set_import_ranges`]).
     ///
     /// # Errors
     ///
     /// An [`IndexError`] if the index fails; nothing changes then.
-    pub async fn set_import_checkpoint(
+    pub async fn set_import_ranges(
         &self,
         bucket: &BucketId,
-        checkpoint: Option<ImportCheckpoint>,
+        import: Option<ImportRanges>,
     ) -> Result<(), IndexError> {
         let (index, bucket) = (Arc::clone(&self.index), bucket.clone());
         self.pool
-            .run(move || index.set_import_checkpoint(&bucket, checkpoint.as_ref()))
+            .run(move || index.set_import_ranges(&bucket, import.as_ref()))
             .await?
     }
 

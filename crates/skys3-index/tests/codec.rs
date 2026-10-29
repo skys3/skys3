@@ -7,8 +7,8 @@ use proptest::option;
 use proptest::prelude::*;
 use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 use skys3_index::{
-    ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
-    Upload,
+    ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges, ObjectPart,
+    ObjectVersion, Part, Payload, Upload,
 };
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, ShardRef,
@@ -188,6 +188,8 @@ proptest! {
         value in vec(any::<u8>(), 0..64),
         segment in any::<u64>(),
         after in proptest::option::of(text(40)),
+        splits in vec(text(8), 0..6),
+        done in vec(any::<bool>(), 7),
     ) {
         let bytes = codec::encode_summary(&summary).unwrap();
         prop_assert_eq!(codec::decode_summary(&bytes).unwrap(), summary);
@@ -204,7 +206,17 @@ proptest! {
         let bytes = codec::encode_control(&control).unwrap();
         prop_assert_eq!(codec::decode_control(&bytes).unwrap(), control);
 
-        for import in [ImportCheckpoint::Running { after }, ImportCheckpoint::Done] {
+        let mut ranges = ImportRanges::split(after.clone(), splits);
+        for (index, done) in done.into_iter().enumerate().take(ranges.ranges().len()) {
+            if done {
+                ranges.set(index, ImportCheckpoint::Done);
+            }
+        }
+        for import in [
+            ImportCheckpoint::Running { after }.into(),
+            ImportCheckpoint::Done.into(),
+            ranges,
+        ] {
             let bytes = codec::encode_import(&import).unwrap();
             prop_assert_eq!(codec::decode_import(&bytes).unwrap(), import);
         }
@@ -216,26 +228,32 @@ proptest! {
     }
 
     /// Decoders never panic, and whatever decodes re-encodes to the same
-    /// bytes.
+    /// bytes: every key, and every value of the current format. A value of
+    /// an older format re-encodes in the current one, to the same value.
     #[test]
     fn arbitrary_bytes_decode_canonically(mut bytes in vec(any::<u8>(), 0..200), format in any::<bool>()) {
         if format && !bytes.is_empty() {
             bytes[0] = VALUE_FORMAT;
         }
         if let Ok(entry) = codec::decode_entry(&bytes) {
-            prop_assert_eq!(codec::encode_entry(&entry).unwrap(), bytes.clone());
+            let encoded = codec::encode_entry(&entry).unwrap();
+            same(&bytes, &encoded, &entry, |b| codec::decode_entry(b).ok())?;
         }
         if let Ok(summary) = codec::decode_summary(&bytes) {
-            prop_assert_eq!(codec::encode_summary(&summary).unwrap(), bytes.clone());
+            let encoded = codec::encode_summary(&summary).unwrap();
+            same(&bytes, &encoded, &summary, |b| codec::decode_summary(b).ok())?;
         }
         if let Ok(control) = codec::decode_control(&bytes) {
-            prop_assert_eq!(codec::encode_control(&control).unwrap(), bytes.clone());
+            let encoded = codec::encode_control(&control).unwrap();
+            same(&bytes, &encoded, &control, |b| codec::decode_control(b).ok())?;
         }
         if let Ok(location) = codec::decode_location(&bytes) {
-            prop_assert_eq!(codec::encode_location(&location), bytes.clone());
+            let encoded = codec::encode_location(&location);
+            same(&bytes, &encoded, &location, |b| codec::decode_location(b).ok())?;
         }
         if let Ok(import) = codec::decode_import(&bytes) {
-            prop_assert_eq!(codec::encode_import(&import).unwrap(), bytes.clone());
+            let encoded = codec::encode_import(&import).unwrap();
+            same(&bytes, &encoded, &import, |b| codec::decode_import(b).ok())?;
         }
         if let Ok((shard, key)) = codec::decode_entry_key(&bytes) {
             prop_assert_eq!(codec::entry_key(&shard, &key), bytes.clone());
@@ -243,6 +261,50 @@ proptest! {
         if let Ok((disk, segment)) = codec::decode_coverage_key(&bytes) {
             prop_assert_eq!(codec::coverage_key(&disk, segment), bytes.clone());
         }
+    }
+}
+
+/// Checks that `decoded`, read from the value `bytes`, re-encoded as
+/// `encoded`: exactly `bytes` if they are in the current format, and
+/// otherwise a value of the current format that decodes to the same.
+fn same<T: PartialEq + std::fmt::Debug>(
+    bytes: &[u8],
+    encoded: &[u8],
+    decoded: &T,
+    decode: impl Fn(&[u8]) -> Option<T>,
+) -> Result<(), TestCaseError> {
+    if bytes.first() == Some(&VALUE_FORMAT) {
+        prop_assert_eq!(encoded, bytes);
+    } else {
+        prop_assert_eq!(encoded.first(), Some(&VALUE_FORMAT));
+        let again = decode(encoded);
+        prop_assert_eq!(again.as_ref(), Some(decoded));
+    }
+    Ok(())
+}
+
+/// The case `arbitrary_bytes_decode_canonically` once failed on: a
+/// location of format 1, which is any 20 bytes behind the format byte, and
+/// re-encodes in the current format. No import decodes from it.
+#[test]
+fn an_older_format_value_re_encodes_in_the_current_one() {
+    let mut bytes = vec![0; 21];
+    bytes[0] = MIN_VALUE_FORMAT;
+    let location = codec::decode_location(&bytes).unwrap();
+    let encoded = codec::encode_location(&location);
+    assert_eq!(encoded[0], VALUE_FORMAT);
+    assert_eq!(encoded[1..], bytes[1..]);
+    assert_eq!(codec::decode_location(&encoded).unwrap(), location);
+    assert!(codec::decode_import(&bytes).is_err());
+
+    // An import checkpoint of an older format, done or running.
+    for (old, current) in [
+        (vec![MIN_VALUE_FORMAT, 1], vec![VALUE_FORMAT, 1]),
+        (vec![MIN_VALUE_FORMAT, 0, 0], vec![VALUE_FORMAT, 0, 0]),
+    ] {
+        let import = codec::decode_import(&old).unwrap();
+        assert_eq!(codec::encode_import(&import).unwrap(), current);
+        assert_eq!(codec::decode_import(&current).unwrap(), import);
     }
 }
 
@@ -714,9 +776,9 @@ fn multipart_values_are_validated() {
 }
 
 #[test]
-fn import_checkpoints_reject_unknown_states() {
-    let mut bytes = codec::encode_import(&ImportCheckpoint::Done).unwrap();
-    bytes[1] = 2;
+fn import_ranges_reject_unknown_states_and_disorder() {
+    let mut bytes = codec::encode_import(&ImportCheckpoint::Done.into()).unwrap();
+    bytes[1] = 3;
     assert_eq!(
         codec::decode_import(&bytes).unwrap_err().field(),
         "import.state"
@@ -725,9 +787,86 @@ fn import_checkpoints_reject_unknown_states() {
         after: Some("k".repeat(1025)),
     };
     assert_eq!(
-        codec::encode_import(&long).unwrap_err().field(),
+        codec::encode_import(&long.into()).unwrap_err().field(),
         "import.after"
     );
+
+    // Tag 2 needs two ranges or more, in order, with each checkpoint in
+    // its range.
+    let split = ImportRanges::split(None, ["m".to_owned()]);
+    let bytes = codec::encode_import(&split).unwrap();
+    assert_eq!(bytes[1..4], [2, 2, 0]);
+    let mut one = bytes.clone();
+    one[2] = 1;
+    assert_eq!(
+        codec::decode_import(&one).unwrap_err().field(),
+        "import.ranges"
+    );
+    let mut many = bytes.clone();
+    many[2] = 200;
+    assert_eq!(
+        codec::decode_import(&many).unwrap_err().field(),
+        "import.ranges"
+    );
+    let unordered = [
+        ImportRange {
+            end: Some("m".to_owned()),
+            checkpoint: ImportCheckpoint::Done,
+        },
+        ImportRange {
+            end: Some("c".to_owned()),
+            checkpoint: ImportCheckpoint::Done,
+        },
+        ImportRange {
+            end: None,
+            checkpoint: ImportCheckpoint::Done,
+        },
+    ];
+    assert!(ImportRanges::from_ranges(unordered.to_vec()).is_none());
+    let outside = |after: &str| {
+        vec![
+            ImportRange {
+                end: Some("m".to_owned()),
+                checkpoint: ImportCheckpoint::Done,
+            },
+            ImportRange {
+                end: Some("t".to_owned()),
+                checkpoint: ImportCheckpoint::Running {
+                    after: Some(after.to_owned()),
+                },
+            },
+            ImportRange {
+                end: None,
+                checkpoint: ImportCheckpoint::Done,
+            },
+        ]
+    };
+    assert!(ImportRanges::from_ranges(outside("a")).is_none());
+    assert!(ImportRanges::from_ranges(outside("u")).is_none());
+    assert!(ImportRanges::from_ranges(outside("p")).is_some());
+    assert!(ImportRanges::from_ranges(Vec::new()).is_none());
+    assert!(ImportRanges::from_ranges(unordered[2..].to_vec()).is_some());
+    assert!(ImportRanges::from_ranges(unordered[..1].to_vec()).is_none());
+    // A range out of order fails to decode.
+    let mut swapped =
+        codec::encode_import(&ImportRanges::split(None, ["c".to_owned(), "m".to_owned()])).unwrap();
+    let at = swapped.iter().position(|b| *b == b'c').unwrap();
+    swapped[at] = b'z';
+    assert_eq!(
+        codec::decode_import(&swapped).unwrap_err().field(),
+        "import.ranges"
+    );
+
+    // A checkpoint a single-stream import stored is one range.
+    let stored = [VALUE_FORMAT, 0, 1, 1, 0, b'm'];
+    let ranges = codec::decode_import(&stored).unwrap();
+    assert_eq!(
+        ranges.position(),
+        ImportCheckpoint::Running {
+            after: Some("m".to_owned())
+        }
+    );
+    assert_eq!(codec::encode_import(&ranges).unwrap(), stored);
 
     assert!(ImportCheckpoint::Done.passed("z"));
     let running = ImportCheckpoint::Running {

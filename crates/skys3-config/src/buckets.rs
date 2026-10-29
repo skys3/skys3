@@ -21,6 +21,11 @@ use crate::flush::{AckPolicy, ConflictPolicy, FlushConfig};
 use crate::storage::MIB;
 use crate::target;
 
+/// The most listing streams a namespace import runs
+/// (`import_parallel_streams`, §9.1): the most key ranges its checkpoint
+/// holds.
+pub const MAX_IMPORT_PARALLEL_STREAMS: u32 = 256;
+
 /// Where a bucket's flusher sends data to a target (§7.8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -351,6 +356,16 @@ fn settle<'a>(
             if set {
                 checker.nonzero(&key(name), value);
             }
+        }
+    }
+
+    if values.import_parallel_streams > MAX_IMPORT_PARALLEL_STREAMS {
+        valid = false;
+        if table.import_parallel_streams.is_some() {
+            checker.report(
+                key("import_parallel_streams"),
+                format!("must be at most {MAX_IMPORT_PARALLEL_STREAMS}"),
+            );
         }
     }
 

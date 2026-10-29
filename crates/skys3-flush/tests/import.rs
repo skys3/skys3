@@ -116,8 +116,8 @@ fn an_attached_bucket_imports_its_remote_namespace_once() {
             })
             .collect();
         assert_eq!(imported, etags);
-        let checkpoint = node.set.import_checkpoint(&bucket().bucket_id).await;
-        assert_eq!(checkpoint.unwrap(), Some(ImportCheckpoint::Done));
+        let checkpoint = node.set.import_ranges(&bucket().bucket_id).await;
+        assert_eq!(checkpoint.unwrap(), Some(ImportCheckpoint::Done.into()));
 
         // A restarted node finds the import done and lists nothing.
         service.shutdown().await;
@@ -144,7 +144,7 @@ fn an_import_resumes_from_its_checkpoint_at_its_rate() {
             after: Some("k09".to_owned()),
         };
         node.set
-            .set_import_checkpoint(&bucket().bucket_id, Some(after))
+            .set_import_ranges(&bucket().bucket_id, Some(after.into()))
             .await
             .unwrap();
         // 30 keys in pages of 10, at 10 keys a second: each page waits.

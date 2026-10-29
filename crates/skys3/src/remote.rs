@@ -40,6 +40,12 @@ impl<S: ObjectStore, D: Disk> RemoteReads for NodeRemote<S, D> {
         self.0.remote(bucket).map(|reader| reader.import())
     }
 
+    fn passed(&self, bucket: &BucketId, key: &str) -> bool {
+        self.0
+            .remote(bucket)
+            .is_none_or(|reader| reader.passed(key))
+    }
+
     fn head<'a>(
         &'a self,
         bucket: &'a BucketId,

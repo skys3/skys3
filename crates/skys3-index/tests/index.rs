@@ -9,8 +9,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_config::StorageConfig;
 use skys3_index::{
-    Applier, ControlEntry, Entry, EntryState, ImportCheckpoint, Index, IndexConfig, IndexError,
-    IndexWriter, LogState, codec,
+    Applier, ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRanges, Index, IndexConfig,
+    IndexError, IndexWriter, LogState, codec,
 };
 use skys3_io::{SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_log::record::{Delete, RecordBody};
@@ -171,27 +171,24 @@ fn import_checkpoints_are_durable_and_an_older_index_gets_their_table() {
         txn.commit().unwrap();
     }
     let bucket = BucketId::new("b-import").unwrap();
-    let running = ImportCheckpoint::Running {
+    let running = ImportRanges::from(ImportCheckpoint::Running {
         after: Some("photos/cat.jpg".to_owned()),
-    };
+    });
     {
         let index = Index::open(&path, &IndexConfig::default()).unwrap();
-        assert_eq!(index.import_checkpoint(&bucket).unwrap(), None);
-        index
-            .set_import_checkpoint(&bucket, Some(&running))
-            .unwrap();
+        assert_eq!(index.import_ranges(&bucket).unwrap(), None);
+        index.set_import_ranges(&bucket, Some(&running)).unwrap();
     }
     let index = Index::open(&path, &IndexConfig::default()).unwrap();
-    assert_eq!(index.import_checkpoint(&bucket).unwrap(), Some(running));
-    index
-        .set_import_checkpoint(&bucket, Some(&ImportCheckpoint::Done))
-        .unwrap();
-    assert_eq!(
-        index.import_checkpoint(&bucket).unwrap(),
-        Some(ImportCheckpoint::Done)
-    );
-    index.set_import_checkpoint(&bucket, None).unwrap();
-    assert_eq!(index.import_checkpoint(&bucket).unwrap(), None);
+    assert_eq!(index.import_ranges(&bucket).unwrap(), Some(running));
+    let split = ImportRanges::split(None, ["m".to_owned(), "t".to_owned()]);
+    index.set_import_ranges(&bucket, Some(&split)).unwrap();
+    assert_eq!(index.import_ranges(&bucket).unwrap(), Some(split));
+    let done = ImportRanges::from(ImportCheckpoint::Done);
+    index.set_import_ranges(&bucket, Some(&done)).unwrap();
+    assert_eq!(index.import_ranges(&bucket).unwrap(), Some(done));
+    index.set_import_ranges(&bucket, None).unwrap();
+    assert_eq!(index.import_ranges(&bucket).unwrap(), None);
 }
 
 #[test]

@@ -1,9 +1,11 @@
 //! The namespace import racing client writes (design §9.1, §16.1).
 //!
 //! Each seed attaches a bucket whose remote prefix already holds objects,
-//! and runs the import, in small pages at a limited rate, while clients PUT
-//! and DELETE the same keys and keys the remote does not have, and the
-//! flusher sends their writes to the remote. The remote delays requests,
+//! and runs the import, in small pages at a limited rate, with one to four
+//! streams listing key ranges in parallel, while clients PUT and DELETE the
+//! same keys and keys the remote does not have, and the flusher sends their
+//! writes to the remote. On some seeds the node restarts its flush service
+//! midway, and the import resumes every range from its checkpoint. The remote delays requests,
 //! loses requests and responses, and answers `500` and `503 SlowDown`;
 //! sometimes it is versioned. Once the writes stop, the remote heals, the
 //! import is done, and the flush has drained, the checks are:
@@ -82,8 +84,11 @@ pub fn scenario(context: &mut SimContext) -> Outcome {
     let settings = FlushSettings {
         import_page_keys: rng.random_range(1..8),
         import_keys_per_second: rng.random_range(20..400),
+        import_streams: rng.random_range(1..=4),
         ..settings()
     };
+    let ops = rng.random_range(20..80);
+    let restart_at = rng.random_bool(0.5).then(|| rng.random_range(0..ops));
     runtime().block_on(async move {
         let node = Node::open(seed).await;
         // What the remote held before the attach.
@@ -93,20 +98,28 @@ pub fn scenario(context: &mut SimContext) -> Outcome {
             let request = PutObject::new(format!("{PREFIX}{key}"), format!("remote {key}"));
             remote.insert(key, store.put_object(request).await?.etag);
         }
-        let connect = store.clone();
-        let service: FlushService<SimS3, _> = FlushService::new(
-            cluster(),
-            settings,
-            Box::new(move |_: &RemoteTarget| connect.clone()),
-            FlushMetrics::register(&MetricsRegistry::new()),
-        );
+        let start = || {
+            let connect = store.clone();
+            FlushService::<SimS3, _>::new(
+                cluster(),
+                settings.clone(),
+                Box::new(move |_: &RemoteTarget| connect.clone()),
+                FlushMetrics::register(&MetricsRegistry::new()),
+            )
+        };
+        let mut service = start();
         service.reconcile(&[bucket()], &node.set).await;
         store.set_faults(FAULTS);
 
         // The latest acknowledged write of each key: its body, or `None`
         // after a delete.
         let mut latest: BTreeMap<String, Option<String>> = BTreeMap::new();
-        for op in 0..rng.random_range(20..80) {
+        for op in 0..ops {
+            if restart_at == Some(op) {
+                service.shutdown().await;
+                service = start();
+                service.reconcile(&[bucket()], &node.set).await;
+            }
             let key = format!("k{:02}", rng.random_range(0..REMOTE_KEYS + LOCAL_KEYS));
             if rng.random_bool(0.55) {
                 let body = format!("{key} v{op}");

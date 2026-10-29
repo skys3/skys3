@@ -864,7 +864,8 @@ impl Node {
                     Box::new(connect),
                     FlushMetrics::register(&metrics.registry),
                 )
-                .with_budget(budget),
+                .with_budget(budget)
+                .with_buckets(config.buckets().clone()),
             )
         };
         let mut gateway_config = GatewayConfig::new(&config);
