@@ -1903,6 +1903,13 @@ of this file. A task with nothing unexpected keeps "None."
   sending anything stopped discovery from listing twelve small folders.
   A level is now charged its listings, then its probes, and abandoned
   only if what it actually needs exceeds the budget.
+- **The shared rate-limit test read its count before the status.**
+  `every_stream_shares_one_rate_limit` counted the indexed keys, then
+  checked whether the import was done, and expected all 40 once it was.
+  When the last page landed between the two reads, it saw 39 keys and a
+  finished import; CI hit this on a later PR. It now counts again after
+  seeing the import done. That still fails if an import ever reports done
+  before its last keys are indexed. 30 of 30 runs passed.
 - **A codec proptest failed on a location, not on an import.** CI on a
   later PR shrank `arbitrary_bytes_decode_canonically` to `[1, 0 × 20]`,
   re-encoded as `[3, 0 × 20]`, and the import codec looked like the cause.
