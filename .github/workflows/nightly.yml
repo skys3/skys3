@@ -32,3 +32,35 @@ jobs:
         run: spec/check.sh all nightly
         env:
           TLC_JAVA_OPTS: -Xmx10g
+
+  # Every simulation target (crates/skys3-sim/src/lib.rs) with seeds that
+  # change every night and longer runs (SKYS3_SIM_SCALE), in release mode
+  # with debug assertions and overflow checks kept. A failing seed prints
+  # the command that replays it; it then becomes a regression test that
+  # runs that seed with `Runner::with_seeds` (plan section 5).
+  simulation:
+    name: Simulation with random seeds and long runs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+      CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Draw the first seed
+        run: |
+          first="$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')"
+          echo "First seed: $first"
+          echo "SKYS3_SIM_FIRST_SEED=$first" >> "$GITHUB_ENV"
+
+      - name: Run simulation scenarios
+        run: cargo test --release --workspace --all-features --test simulation
+        env:
+          SKYS3_SIM_SEEDS: 1024
+          SKYS3_SIM_SCALE: 4

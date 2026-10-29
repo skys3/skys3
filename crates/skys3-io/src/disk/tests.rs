@@ -444,6 +444,36 @@ async fn handles_from_before_a_crash_are_stale() {
     assert_eq!(old_mount.disk().crashes(), 1);
 }
 
+#[tokio::test]
+async fn a_killed_process_leaves_the_page_cache_but_not_its_handles() {
+    let disk = SimDisk::new(8);
+    let old_mount = disk.mount();
+    let old_file = old_mount.create("seg").await.unwrap();
+    old_file.append(Bytes::from_static(b"abc")).await.unwrap();
+    // Removed but still open: only the handle keeps it.
+    let orphan = old_mount.create("orphan").await.unwrap();
+    orphan.append(Bytes::from_static(b"zz")).await.unwrap();
+    old_mount.remove("orphan").await.unwrap();
+    let used = disk.used_bytes();
+    disk.kill();
+
+    assert!(old_file.append(Bytes::from_static(b"x")).await.is_err());
+    assert!(old_mount.list().await.is_err());
+    assert_eq!(disk.used_bytes(), used - 2);
+    drop((old_file, orphan));
+    // Nothing was synced, yet the next process reads what was written.
+    let mount = disk.mount();
+    assert_eq!(mount.list().await.unwrap(), ["seg"]);
+    let file = mount.open("seg").await.unwrap();
+    assert_eq!(read_all(&file).await, b"abc");
+    file.sync_data().await.unwrap();
+    mount.sync_dir().await.unwrap();
+    disk.crash();
+    let file = disk.mount().open("seg").await.unwrap();
+    assert_eq!(read_all(&file).await, b"abc");
+    assert_eq!(disk.crashes(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Simulated disk: faults.
 // ---------------------------------------------------------------------------

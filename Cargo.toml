@@ -51,6 +51,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_urlencoded = "0.7.1"
 sha2 = { version = "0.11.0", default-features = false }
+skys3 = { path = "crates/skys3" }
 skys3-config = { path = "crates/skys3-config" }
 skys3-control = { path = "crates/skys3-control" }
 skys3-flush = { path = "crates/skys3-flush" }

@@ -14,6 +14,8 @@
 //! - [`control`]: the node's durable copy of bucket bindings and identity
 //!   configuration, and the control store served from it while the store
 //!   does not answer.
+//! - [`storage`]: recovery of the storage engine, the part of startup the
+//!   cluster simulation shares with the node.
 //! - [`sessions`]: STS session records in the internal system bucket.
 //! - [`admin`]: the admin API under `/v1/`: health and bucket status.
 //! - [`tls`]: the gateway's TLS configuration.
@@ -23,6 +25,7 @@ pub mod control;
 pub mod datadir;
 mod node;
 pub mod sessions;
+pub mod storage;
 pub mod tls;
 
 pub use node::{Node, NodeError, StartError, log_config};

@@ -10,9 +10,14 @@
 //! Environment variables:
 //!
 //! - `SKYS3_SIM_SEED=<seed>` runs only that seed, to replay a failure.
-//! - `SKYS3_SIM_SEEDS=<count>` runs seeds `0..count` instead of the
+//! - `SKYS3_SIM_SEEDS=<count>` runs `count` seeds instead of the
 //!   scenario's default count. CI's simulation job uses it for a larger fixed
 //!   set.
+//! - `SKYS3_SIM_FIRST_SEED=<seed>` starts the seeds at `seed` instead of 0.
+//!   The nightly job draws it at random, so each night runs new seeds.
+//! - `SKYS3_SIM_SCALE=<factor>` asks scenarios that support it for longer
+//!   runs, such as more operations per client ([`SimContext::scale`]). The
+//!   replay command repeats it.
 
 use std::any::Any;
 use std::env;
@@ -34,6 +39,12 @@ pub const SEED_ENV: &str = "SKYS3_SIM_SEED";
 /// The variable that sets how many seeds to run.
 pub const SEEDS_ENV: &str = "SKYS3_SIM_SEEDS";
 
+/// The variable that sets the first seed of a range.
+pub const FIRST_SEED_ENV: &str = "SKYS3_SIM_FIRST_SEED";
+
+/// The variable that scales the length of scenarios that support it.
+pub const SCALE_ENV: &str = "SKYS3_SIM_SCALE";
+
 /// The number of seeds a scenario runs by default.
 pub const DEFAULT_SEED_COUNT: u64 = 8;
 
@@ -47,8 +58,8 @@ pub enum SeedSet {
 }
 
 impl SeedSet {
-    /// Reads the seed set from [`SEED_ENV`] and [`SEEDS_ENV`], running seeds
-    /// `0..default_count` if neither is set.
+    /// Reads the seed set from [`SEED_ENV`], [`SEEDS_ENV`], and
+    /// [`FIRST_SEED_ENV`], running seeds `0..default_count` if none is set.
     ///
     /// # Errors
     ///
@@ -56,7 +67,11 @@ impl SeedSet {
     pub fn from_env(default_count: u64) -> Result<SeedSet, SeedSetError> {
         let seed = env::var(SEED_ENV).ok();
         let count = env::var(SEEDS_ENV).ok();
-        Self::parse(seed.as_deref(), count.as_deref(), default_count)
+        let set = Self::parse(seed.as_deref(), count.as_deref(), default_count)?;
+        match env::var(FIRST_SEED_ENV) {
+            Ok(first) => Ok(set.starting_at(parse_number(FIRST_SEED_ENV, &first)?)),
+            Err(_) => Ok(set),
+        }
     }
 
     /// Builds the seed set from the values of [`SEED_ENV`] and
@@ -70,20 +85,40 @@ impl SeedSet {
         count: Option<&str>,
         default_count: u64,
     ) -> Result<SeedSet, SeedSetError> {
-        let parse = |variable: &'static str, value: &str| {
-            value.trim().parse::<u64>().map_err(|_| SeedSetError {
-                variable,
-                value: value.to_owned(),
-            })
-        };
         if let Some(seed) = seed {
-            return Ok(SeedSet::One(parse(SEED_ENV, seed)?));
+            return Ok(SeedSet::One(parse_number(SEED_ENV, seed)?));
         }
         let count = match count {
-            Some(count) => parse(SEEDS_ENV, count)?,
+            Some(count) => parse_number(SEEDS_ENV, count)?,
             None => default_count,
         };
         Ok(SeedSet::Range(0..count))
+    }
+
+    /// Keeps the first `1 / cost` of a range of seeds, at least one. A
+    /// single seed stays as it is.
+    #[must_use]
+    pub fn divided_by(self, cost: u64) -> SeedSet {
+        match self {
+            SeedSet::One(seed) => SeedSet::One(seed),
+            SeedSet::Range(range) => {
+                let count = ((range.end - range.start) / cost.max(1)).max(1);
+                SeedSet::Range(range.start..range.start.saturating_add(count))
+            }
+        }
+    }
+
+    /// Moves a range of seeds to start at `first`, keeping its length. A
+    /// single seed stays as it is.
+    #[must_use]
+    pub fn starting_at(self, first: u64) -> SeedSet {
+        match self {
+            SeedSet::One(seed) => SeedSet::One(seed),
+            SeedSet::Range(range) => {
+                let end = first.saturating_add(range.end - range.start);
+                SeedSet::Range(first..end)
+            }
+        }
     }
 
     /// Returns the seeds in order.
@@ -93,6 +128,13 @@ impl SeedSet {
             SeedSet::Range(ref range) => range.clone(),
         }
     }
+}
+
+fn parse_number(variable: &'static str, value: &str) -> Result<u64, SeedSetError> {
+    value.trim().parse::<u64>().map_err(|_| SeedSetError {
+        variable,
+        value: value.to_owned(),
+    })
 }
 
 /// A seed variable that is not a number.
@@ -121,14 +163,21 @@ impl std::error::Error for SeedSetError {}
 #[derive(Debug)]
 pub struct SimContext {
     seed: u64,
+    scale: u32,
     rng: SmallRng,
 }
 
 impl SimContext {
-    /// Returns a context for `seed`.
+    /// Returns a context for `seed`, at scale 1.
     pub fn new(seed: u64) -> Self {
+        Self::with_scale(seed, 1)
+    }
+
+    /// Returns a context for `seed` at `scale`.
+    pub fn with_scale(seed: u64, scale: u32) -> Self {
         SimContext {
             seed,
+            scale: scale.max(1),
             rng: SmallRng::seed_from_u64(seed),
         }
     }
@@ -136,6 +185,12 @@ impl SimContext {
     /// Returns the seed.
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Returns how much longer than usual the scenario should run, at
+    /// least 1: [`SCALE_ENV`], which the nightly job raises.
+    pub fn scale(&self) -> u32 {
+        self.scale
     }
 
     /// Returns the scenario's random generator.
@@ -210,6 +265,7 @@ impl NodeClock {
 #[derive(Clone, Debug)]
 pub struct Runner {
     seeds: SeedSet,
+    scale: u32,
 }
 
 impl Runner {
@@ -230,15 +286,43 @@ impl Runner {
     ///
     /// Panics if a seed variable is set but is not a number.
     pub fn with_default_seed_count(count: u64) -> Self {
-        match SeedSet::from_env(count) {
-            Ok(seeds) => Runner { seeds },
+        let scale = env::var(SCALE_ENV).ok();
+        let scale = scale_from(scale.as_deref()).and_then(|scale| {
+            let seeds = SeedSet::from_env(count)?;
+            Ok(Runner { seeds, scale })
+        });
+        match scale {
+            Ok(runner) => runner,
             Err(error) => panic!("{error}"),
         }
     }
 
-    /// Returns a runner for exactly `seeds`, ignoring the environment.
+    /// Returns a runner for a scenario whose seeds each cost about `cost`
+    /// typical ones, such as a whole cluster: when [`SEEDS_ENV`] asks for a
+    /// count, it runs that count divided by `cost`, at least one, so a seed
+    /// set sized for typical scenarios keeps its time budget. Otherwise it
+    /// runs as [`Runner::with_default_seed_count`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a seed variable is set but is not a number.
+    pub fn with_cost(default_count: u64, cost: u64) -> Self {
+        let mut runner = Self::with_default_seed_count(default_count);
+        if env::var(SEEDS_ENV).is_ok() {
+            runner.seeds = runner.seeds.divided_by(cost);
+        }
+        runner
+    }
+
+    /// Returns a runner for exactly `seeds` at scale 1, ignoring the
+    /// environment.
     pub fn with_seeds(seeds: SeedSet) -> Self {
-        Runner { seeds }
+        Runner { seeds, scale: 1 }
+    }
+
+    /// Returns the scale the runner gives its scenarios.
+    pub fn scale(&self) -> u32 {
+        self.scale
     }
 
     /// Returns the seeds this runner runs.
@@ -258,7 +342,7 @@ impl Runner {
         F: FnMut(&mut SimContext) -> turmoil::Result,
     {
         for seed in self.seeds.seeds() {
-            let mut context = SimContext::new(seed);
+            let mut context = SimContext::with_scale(seed, self.scale);
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| scenario(&mut context)));
             let failure = match outcome {
                 Ok(Ok(())) => continue,
@@ -277,6 +361,18 @@ impl Default for Runner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The scale from the value of [`SCALE_ENV`]: 1 if unset.
+fn scale_from(value: Option<&str>) -> Result<u32, SeedSetError> {
+    let Some(value) = value else {
+        return Ok(1);
+    };
+    let scale = parse_number(SCALE_ENV, value)?;
+    u32::try_from(scale.max(1)).map_err(|_| SeedSetError {
+        variable: SCALE_ENV,
+        value: value.to_owned(),
+    })
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> &str {
@@ -306,7 +402,12 @@ pub fn replay_command(seed: u64) -> String {
         .filter(|name| *name != "main")
         .map(str::to_owned);
 
-    let mut command = format!("{SEED_ENV}={seed} cargo test");
+    let scale = env::var(SCALE_ENV)
+        .ok()
+        .and_then(|value| scale_from(Some(&value)).ok())
+        .filter(|&scale| scale > 1)
+        .map(|scale| format!("{SCALE_ENV}={scale} "));
+    let mut command = format!("{}{SEED_ENV}={seed} cargo test", scale.unwrap_or_default());
     if let Some(package) = &package {
         command.push_str(&format!(" -p {package}"));
     }
@@ -370,6 +471,39 @@ mod tests {
             error.to_string(),
             "SKYS3_SIM_SEEDS must be an unsigned integer, not \"-1\""
         );
+
+        assert_eq!(
+            SeedSet::Range(0..4).starting_at(1000),
+            SeedSet::Range(1000..1004)
+        );
+        assert_eq!(
+            SeedSet::Range(0..4).starting_at(u64::MAX - 1),
+            SeedSet::Range(u64::MAX - 1..u64::MAX)
+        );
+        assert_eq!(SeedSet::One(7).starting_at(1000), SeedSet::One(7));
+        assert_eq!(
+            SeedSet::Range(10..266).divided_by(16),
+            SeedSet::Range(10..26)
+        );
+        assert_eq!(SeedSet::Range(0..8).divided_by(16), SeedSet::Range(0..1));
+        assert_eq!(SeedSet::Range(0..8).divided_by(0), SeedSet::Range(0..8));
+        assert_eq!(SeedSet::One(7).divided_by(16), SeedSet::One(7));
+    }
+
+    #[test]
+    fn scales_from_the_variable() {
+        assert_eq!(scale_from(None), Ok(1));
+        assert_eq!(scale_from(Some("0")), Ok(1));
+        assert_eq!(scale_from(Some(" 8 ")), Ok(8));
+        let error = scale_from(Some("long")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "SKYS3_SIM_SCALE must be an unsigned integer, not \"long\""
+        );
+        assert!(scale_from(Some("99999999999")).is_err());
+        assert_eq!(SimContext::with_scale(1, 0).scale(), 1);
+        assert_eq!(SimContext::new(1).scale(), 1);
+        assert_eq!(Runner::with_seeds(SeedSet::One(1)).scale(), 1);
     }
 
     #[test]
@@ -380,6 +514,15 @@ mod tests {
         assert_eq!(Runner::with_default_seed_count(3).seeds(), &expected);
         let expected = SeedSet::from_env(DEFAULT_SEED_COUNT).unwrap();
         assert_eq!(Runner::default().seeds(), &expected);
+        let expected = match env::var(SEEDS_ENV) {
+            Ok(_) => SeedSet::from_env(3).unwrap().divided_by(4),
+            Err(_) => SeedSet::from_env(3).unwrap(),
+        };
+        assert_eq!(Runner::with_cost(3, 4).seeds(), &expected);
+        assert_eq!(
+            Runner::with_cost(3, 4).scale(),
+            scale_from(env::var(SCALE_ENV).ok().as_deref()).unwrap()
+        );
     }
 
     #[test]

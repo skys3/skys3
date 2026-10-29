@@ -1336,7 +1336,7 @@ format = "text"               # "text" or "json"
 - Include the peer protocol: lost `DURABLE` and `APPLIED` messages, reconnects mid-transfer, duplicate `COMMIT`s, and staging expiry.
 - Include control-store faults: long outages, 100 ms and higher round trips, lost CAS responses, and whole-cluster restarts while the control store is unreachable. Nodes must resume from their `CONFIG` records, and stale configurations must stay fenced.
 - Restore drills: rebuild a shard's index from its latest snapshot plus fragment headers, and compare the lost-key report with the known ground truth.
-- Check histories for linearizability per key at the primary. Check that every acknowledged write is either flushed, or present on a surviving member, or reported lost.
+- Check histories for linearizability per key at the primary. Check that every acknowledged write is either flushed, or present on a surviving member, or reported lost. A write answered with a 5xx takes effect at most once, before its answer, since a failed write never takes effect over a later one (section 5.2); a write without an answer, after a timeout or a broken connection, may take effect at any time after its call, or never. Members are read after every node has lost power and recovered, and an acknowledged write counts as present if a member holds it or a write that did not end before it began. The cluster harness runs each node's own startup recovery, writes a static placement to the `shards/` registers, sends each key to its shard's primary, and reads every key back once the faults have healed.
 
 ### 16.2 Compatibility
 

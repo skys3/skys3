@@ -114,7 +114,8 @@ crates/
   skys3-gateway/        S3 on s3s, SigV4, routing, listing merge (§9, §11)
   skys3-sts/            OIDC validation and STS (§11)
   skys3-peer/           QUIC peer protocol (§7.8)
-  skys3-sim/            simulated S3 store, cluster harness, history checkers (§16.1)
+  skys3-sim/            seeded runner, simulated S3 store, history checkers (§16.1)
+  skys3-cluster-sim/    cluster simulation harness: real nodes, faults, workload (§16.1)
 spec/                   protocol model
 tests/                  SDK matrix, s3-tests subset, provider and fault-injection tests
 bench/                  performance suite (§16.3)
