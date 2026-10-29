@@ -21,19 +21,19 @@ use crate::shard::{Role, Shard};
 
 /// One node of the test cluster, and the proxies its links to each other
 /// node go through.
-struct Node {
-    replication: Replication<TokioNetwork, SimMount>,
-    shard: Shard<SimMount>,
+pub(super) struct Node {
+    pub(super) replication: Replication<TokioNetwork, SimMount>,
+    pub(super) shard: Shard<SimMount>,
     proxies: BTreeMap<NodeId, Proxy>,
 }
 
 impl Node {
     /// Cuts the links from this node to `to`.
-    fn cut(&self, to: u8) {
+    pub(super) fn cut(&self, to: u8) {
         self.proxies[&node(to)].cut();
     }
 
-    fn heal(&self, to: u8) {
+    pub(super) fn heal(&self, to: u8) {
         self.proxies[&node(to)].heal();
     }
 }
@@ -41,7 +41,7 @@ impl Node {
 /// Starts nodes 1 to `count` with the shard open in `config`, each
 /// reaching the others through proxies of its own, with the register in
 /// `store` and its timings from `timing`, which may differ per node.
-async fn cluster(
+pub(super) async fn cluster(
     pki: &Pki,
     count: u8,
     config: &ShardConfig,
@@ -106,7 +106,7 @@ async fn cluster(
 /// members only long after their grace passes, so that it does not remove
 /// them before they take over: a primary cut off from its members but not
 /// from the control store removes them first (§6.4).
-fn patient(n: u8) -> ReplicationConfig {
+pub(super) fn patient(n: u8) -> ReplicationConfig {
     let timing = timing();
     if n == 1 {
         ReplicationConfig {
@@ -118,7 +118,7 @@ fn patient(n: u8) -> ReplicationConfig {
     }
 }
 
-fn run(scenario: impl Future<Output = ()>) {
+pub(super) fn run(scenario: impl Future<Output = ()>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -132,7 +132,7 @@ fn run(scenario: impl Future<Output = ()>) {
 
 /// The node whose replica serves as primary in an epoch after the first,
 /// once there is one.
-async fn new_primary(nodes: &[Node]) -> usize {
+pub(super) async fn new_primary(nodes: &[Node]) -> usize {
     loop {
         let serving = nodes.iter().position(|n| {
             n.shard.role() == Role::Primary

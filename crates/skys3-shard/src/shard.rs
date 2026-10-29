@@ -167,6 +167,9 @@ pub(crate) struct Sequencer {
     /// Whether the replica stopped as a primary that learned another one
     /// took over (§6.5): it then redirects to the configuration it learned.
     deposed: bool,
+    /// The epoch in which the replica stepped down as primary for a
+    /// planned handoff (§5.4): it serves nothing from then on.
+    pub(crate) stepped_down: Option<Epoch>,
     /// The epochs of the records the replica's log holds (§6.6).
     lineage: Lineage,
     /// The position of the latest record sequenced for each key, other than
@@ -199,6 +202,9 @@ struct Inner<D: Disk> {
     durable: watch::Receiver<Seq>,
     /// The primary's replication state, once the replica is a primary.
     leader: Arc<OnceLock<Arc<Leader>>>,
+    /// How many reads of the index are in progress, admitted while the
+    /// replica served reads.
+    reads: watch::Sender<usize>,
 }
 
 /// One shard replica on this node: the shard's only member, its primary,
@@ -302,6 +308,10 @@ impl<D: Disk> Shard<D> {
     /// show it ([`Shard::follow`]), a primary once every member has reported
     /// its log ([`Shard::align`]).
     ///
+    /// A primary that stepped down in `config`'s epoch for a planned
+    /// handoff, in an earlier life too, opens stopped: it never serves in
+    /// that epoch again (§5.4, [`Shard::stepped_down`]).
+    ///
     /// # Errors
     ///
     /// As [`Shard::open`], and [`ShardError::Configuration`] if `node` is
@@ -325,11 +335,20 @@ impl<D: Disk> Shard<D> {
     ) -> Result<Self, ShardError> {
         let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
         let role = check_config(&shard, config, node)?;
-        let applied = {
+        let (applied, stepped_down) = {
             let (index, key) = (Arc::clone(&index), shard.clone());
-            run(&pool, &shard, move || index.read()?.applied(&key)).await?
+            run(&pool, &shard, move || {
+                let read = index.read()?;
+                Ok((read.applied(&key)?, read.step_down(&key)?))
+            })
+            .await?
         };
         let epoch = config.epoch;
+        // A primary that stepped down in this epoch never serves in it
+        // again, even after a restart: its step-down message may still
+        // reach the candidate (§5.4).
+        let stepped_down =
+            stepped_down.filter(|stepped| role == Role::Primary && *stepped == epoch);
         // A replicated replica that holds records of an older epoch cannot
         // tell alone where the new epoch starts: a member learns it from
         // its primary's session, and a primary appends its `CONFIG` record
@@ -377,8 +396,9 @@ impl<D: Disk> Shard<D> {
             config: config.clone(),
             node: node.cloned(),
             adopt_after: None,
-            stopped: None,
+            stopped: stepped_down.map(|_| STEPPED_DOWN.to_owned()),
             deposed: false,
+            stepped_down,
             lineage: Lineage::new(last),
             writes: BTreeMap::new(),
             readers: BTreeMap::new(),
@@ -434,6 +454,7 @@ impl<D: Disk> Shard<D> {
                 appender,
                 durable,
                 leader,
+                reads: watch::Sender::new(0),
             }),
         })
     }
@@ -1014,6 +1035,80 @@ impl<D: Disk> Shard<D> {
         Err(self.unavailable(&failed))
     }
 
+    /// Steps down as the primary for a planned handoff to the member `to`
+    /// (§5.4), and returns the epoch it steps down in and the last `seq` it
+    /// sequenced: what the step-down message tells the candidate.
+    ///
+    /// The replica stops serving reads and writes at once, and stops
+    /// renewing its leases. Reads it admitted before finish, and the
+    /// writes it sequenced commit as far as the members acknowledge them
+    /// within the shard's [`AckTimeout`], so their writers are answered.
+    /// It then records the step-down durably, as it must never serve in
+    /// this epoch again, even after a restart (see [`Shard::open`]), and
+    /// only then owes the candidate the message, which the link to `to`
+    /// sends after the last record ([`Leader`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Configuration`] if the replica is not a primary that
+    /// leads the shard, or `to` is not another member of it;
+    /// [`ShardError::Unavailable`] if the shard stopped, or the step-down
+    /// could not be recorded: the replica then serves nothing and owes no
+    /// message, so the members take over once their grace passes.
+    pub(crate) async fn step_down(&self, to: &NodeId) -> Result<(Epoch, Seq), ShardError> {
+        let shard = self.shard();
+        let (epoch, barrier) = {
+            let mut sequencer = self.sequencer();
+            sequencer.check_running(shard)?;
+            let config = &sequencer.config;
+            if sequencer.role != Role::Primary || sequencer.stepped_down.is_some() {
+                return Err(ShardError::configuration(
+                    shard,
+                    "only a primary that leads the shard hands it off",
+                ));
+            }
+            if *to == config.primary || !config.is_member(to) {
+                return Err(ShardError::configuration(
+                    shard,
+                    format!("{to} is not another member of the shard"),
+                ));
+            }
+            let epoch = config.epoch;
+            sequencer.stepped_down = Some(epoch);
+            sequencer.serving = false;
+            (epoch, self.barrier())
+        };
+        let Some(leader) = self.leader() else {
+            unreachable!("a primary has a leader");
+        };
+        leader.stop_leases();
+        let mut reads = self.inner.reads.subscribe();
+        // The sender lives as long as the shard.
+        let _ = reads.wait_for(|reads| *reads == 0).await;
+        if let Err(error) = self.within_ack(barrier).await {
+            tracing::info!(%shard, %error, "handing off before every write committed");
+        }
+        let last = self.sequencer().last_sequenced().seq;
+        let (index, key) = (Arc::clone(&self.inner.index), shard.clone());
+        let stored = run(&self.inner.pool, shard, move || {
+            index.store_step_down(&key, epoch)
+        })
+        .await;
+        if let Err(error) = stored {
+            self.depose("the step-down could not be recorded", None);
+            return Err(error);
+        }
+        leader.owe_step_down(to.clone(), epoch, last);
+        Ok((epoch, last))
+    }
+
+    /// The epoch in which the replica stepped down as primary for a
+    /// planned handoff, in this life or, durably, an earlier one (§5.4).
+    #[must_use]
+    pub fn stepped_down(&self) -> Option<Epoch> {
+        self.sequencer().stepped_down
+    }
+
     /// Makes this member the primary of `config`, which it proposed over
     /// its current configuration `over` and the shard's register accepted
     /// (§6.5). It appends `config`'s `CONFIG` record after every record it
@@ -1228,7 +1323,7 @@ impl<D: Disk> Shard<D> {
     /// [`ShardError::Unavailable`] if the index fails, and as
     /// [`Shard::check_readable`].
     pub async fn entry(&self, key: &str) -> Result<Option<Entry>, ShardError> {
-        self.check_readable()?;
+        let _read = self.admit_read()?;
         let (index, shard, key) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
@@ -1248,7 +1343,7 @@ impl<D: Disk> Shard<D> {
     /// [`ShardError::Unavailable`] if the index fails, and as
     /// [`Shard::check_readable`].
     pub async fn list(&self, query: ListQuery) -> Result<ListPage, ShardError> {
-        self.check_readable()?;
+        let _read = self.admit_read()?;
         let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
             index.read()?.list(&shard, &query)
@@ -1273,7 +1368,7 @@ impl<D: Disk> Shard<D> {
         after: u16,
         limit: usize,
     ) -> Result<Option<(Upload, Vec<(u16, Part)>)>, ShardError> {
-        self.check_readable()?;
+        let _read = self.admit_read()?;
         let (index, shard, key) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
@@ -1308,7 +1403,7 @@ impl<D: Disk> Shard<D> {
         after: Option<(String, Option<EpochSeq>)>,
         limit: usize,
     ) -> Result<Vec<(String, EpochSeq, Upload)>, ShardError> {
-        self.check_readable()?;
+        let _read = self.admit_read()?;
         let (index, shard, prefix) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
@@ -1335,7 +1430,7 @@ impl<D: Disk> Shard<D> {
         after: u16,
         limit: usize,
     ) -> Result<Vec<(u16, Part)>, ShardError> {
-        self.check_readable()?;
+        let _read = self.admit_read()?;
         let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
             index.read()?.parts(&shard, upload, after, limit)
@@ -1756,12 +1851,42 @@ impl<D: Disk> Shard<D> {
         }
     }
 
+    /// Admits a read of the index, as [`Shard::check_readable`] allows,
+    /// and counts it until the returned permit drops, so that a primary
+    /// stepping down knows when the reads it admitted are over (§5.4).
+    ///
+    /// The final check and the count happen under one hold of the
+    /// sequencer's lock, which [`Shard::step_down`] takes to stop admitting
+    /// reads: a read is either refused or counted before the step-down
+    /// looks at the count, never admitted in between.
+    pub(crate) fn admit_read(&self) -> Result<ReadPermit<'_>, ShardError> {
+        self.check_readable()?;
+        let sequencer = self.sequencer();
+        // A step-down may have come since.
+        sequencer.check_serving(self.shard())?;
+        self.inner.reads.send_modify(|reads| *reads += 1);
+        drop(sequencer);
+        Ok(ReadPermit(&self.inner.reads))
+    }
+
     fn sequencer(&self) -> MutexGuard<'_, Sequencer> {
         lock(&self.inner.sequencer)
     }
 
     fn unavailable(&self, reason: &str) -> ShardError {
         ShardError::unavailable(self.shard(), reason)
+    }
+}
+
+/// Why a primary that stepped down for a planned handoff refuses requests.
+const STEPPED_DOWN: &str = "the primary stepped down for a planned handoff";
+
+/// A read of the index in progress ([`Shard::admit_read`]).
+pub(crate) struct ReadPermit<'a>(&'a watch::Sender<usize>);
+
+impl Drop for ReadPermit<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|reads| *reads -= 1);
     }
 }
 
@@ -1811,6 +1936,9 @@ impl Sequencer {
                 primary: self.config.primary.clone(),
                 epoch: self.config.epoch,
             });
+        }
+        if self.stepped_down.is_some() {
+            return Err(ShardError::unavailable(shard, STEPPED_DOWN));
         }
         self.check_running(shard)?;
         self.check_role(shard)

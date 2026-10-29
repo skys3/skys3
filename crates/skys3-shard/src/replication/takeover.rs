@@ -19,7 +19,8 @@ use crate::shard::{Role, Shard};
 /// the shortest delay.
 const LONGEST_LEAD: u32 = 8;
 
-/// A member's watch over its primary, ready to take over (§6.5).
+/// A member's watch over its primary, ready to take over (§6.5), and to
+/// take a planned handoff (§5.4).
 ///
 /// Once `primary_grace` has passed since the member last granted the
 /// primary a lease, every lease it granted has expired, so the old primary
@@ -40,6 +41,12 @@ const LONGEST_LEAD: u32 = 8;
 /// grants nothing and acknowledges nothing, and asks the register again.
 /// A node that restarts learns the outcome from the register before it
 /// opens the shard again, so the proposal needs no record of its own.
+///
+/// A planned handoff takes the same path from the compare-and-swap on:
+/// the old primary has stepped down durably, so its leases no longer
+/// matter, and the member it stepped down to proposes as soon as it holds
+/// the old primary's last record ([`Grace::step_down`]). If the step-down
+/// message is lost, the member waits out its grace as after silence.
 pub(super) struct Candidate<N: Network, D: Disk> {
     pub replication: Replication<N, D>,
     pub shard: Shard<D>,
@@ -60,14 +67,23 @@ enum Proposed {
 
 impl<N: Network, D: Disk> Candidate<N, D> {
     /// Watches until the member takes over, or its replica stops or is no
-    /// longer a member.
+    /// longer a member. A primary that steps down to this member for a
+    /// planned handoff lets it propose at once, without the grace or the
+    /// delay (§5.4).
     pub(super) async fn run(self) {
         loop {
-            self.grace.passed().await;
+            let epoch = self.shard.config().epoch;
+            let handed = tokio::select! {
+                biased;
+                () = self.grace.stepped_down_since(epoch) => true,
+                () = self.grace.passed() => false,
+            };
             if !self.is_member() {
                 return;
             }
-            tokio::time::sleep(self.delay()).await;
+            if !handed {
+                tokio::time::sleep(self.delay()).await;
+            }
             // A grant in between means the primary is back.
             if !self.is_member() || !self.grace.stop_if_passed(self.shard.config().epoch) {
                 continue;

@@ -9,8 +9,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_config::StorageConfig;
 use skys3_index::{
-    Applier, ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRanges, Index, IndexConfig,
-    IndexError, IndexWriter, LogState, codec,
+    Applier, ControlEntry, Entry, EntryState, FORMAT_VERSION, ImportCheckpoint, ImportRanges,
+    Index, IndexConfig, IndexError, IndexWriter, LogState, codec,
 };
 use skys3_io::{SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_log::record::{Delete, RecordBody};
@@ -130,7 +130,7 @@ fn rejects_an_index_of_another_format() {
         {
             let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
             let mut table = txn.open_table(meta).unwrap();
-            table.insert("format_version", 4).unwrap();
+            table.insert("format_version", FORMAT_VERSION + 1).unwrap();
         }
         txn.commit().unwrap();
     }
@@ -139,9 +139,9 @@ fn rejects_an_index_of_another_format() {
         matches!(
             error,
             IndexError::UnsupportedFormat {
-                found: 4,
-                supported: 3
-            }
+                found,
+                supported: FORMAT_VERSION
+            } if found == FORMAT_VERSION + 1
         ),
         "{error}"
     );
@@ -390,6 +390,26 @@ fn the_shard_map_is_durable_at_once() {
     wrong[json_start] = b'[';
     let error = codec::decode_route(&wrong).unwrap_err();
     assert_eq!(error.field(), "shard_map.config");
+}
+
+#[test]
+fn step_downs_are_durable_at_once_and_go_with_their_shard() {
+    let disk = SimDisk::new(2);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    assert_eq!(index.read().unwrap().step_down(&shard(0)).unwrap(), None);
+    index.store_step_down(&shard(0), Epoch::new(3)).unwrap();
+    index.store_step_down(&shard(0), Epoch::new(4)).unwrap();
+    index.store_step_down(&shard(1), Epoch::new(2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.step_down(&shard(0)).unwrap(), Some(Epoch::new(4)));
+    assert_eq!(read.step_down(&shard(1)).unwrap(), Some(Epoch::new(2)));
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().step_down(&shard(1)).unwrap(), None);
 }
 
 #[test]

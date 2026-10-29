@@ -15,6 +15,7 @@
 //!   Beacon(epoch, commit, lease)          ->
 //!                                          <- AppendAck(durable, lease) as durability grows, and per beacon
 //!                                          <- AppendAck(rejected)      an append from an older epoch (R2)
+//!   StepDown(epoch, last)                 ->                           to the candidate of a planned handoff, last
 //! ```
 //!
 //! `lease` is a lease stamp (§5.4): the primary's clock reading when it sent
@@ -183,6 +184,21 @@ pub struct AppendAck {
     pub lease: Option<u64>,
 }
 
+/// Old primary to the candidate of a planned handoff (§5.4), on the
+/// candidate's link after the last record: the primary has stopped
+/// serving and renewing its leases in `epoch` for good, and holds records
+/// up to `last`. The candidate may propose itself over `epoch` at once,
+/// once it holds them too. It is not answered.
+#[derive(Clone, Copy, PartialEq, Eq, Message)]
+pub struct StepDown {
+    /// The epoch the primary stepped down in.
+    #[prost(uint64, tag = "1")]
+    pub epoch: u64,
+    /// The last `seq` the primary holds.
+    #[prost(uint64, tag = "2")]
+    pub last: u64,
+}
+
 /// A frame of `kind` with `body` and `payload`.
 #[must_use]
 pub fn frame(kind: MessageKind, body: &impl Message, payload: Bytes) -> Frame {
@@ -224,12 +240,13 @@ mod tests {
                 let _ = sync.configuration();
             }
             for kind in [MessageKind::SyncAck, MessageKind::Append, MessageKind::AppendAck,
-                         MessageKind::Beacon] {
+                         MessageKind::Beacon, MessageKind::StepDown] {
                 let frame = Frame::new(Header::new(kind).with_body(body.clone()), "");
                 let _ = super::body::<SyncAck>(&frame, kind);
                 let _ = super::body::<Append>(&frame, kind);
                 let _ = super::body::<AppendAck>(&frame, kind);
                 let _ = super::body::<Beacon>(&frame, kind);
+                let _ = super::body::<StepDown>(&frame, kind);
             }
             let append = Append { epoch, commit, lazy, lease };
             let sent = super::frame(MessageKind::Append, &append, Bytes::new());
@@ -237,6 +254,9 @@ mod tests {
             let beacon = Beacon { epoch, commit, lease };
             let sent = super::frame(MessageKind::Beacon, &beacon, Bytes::new());
             prop_assert_eq!(super::body::<Beacon>(&sent, MessageKind::Beacon), Ok(beacon));
+            let step_down = StepDown { epoch, last: commit };
+            let sent = super::frame(MessageKind::StepDown, &step_down, Bytes::new());
+            prop_assert_eq!(super::body::<StepDown>(&sent, MessageKind::StepDown), Ok(step_down));
         }
     }
 

@@ -58,6 +58,13 @@ impl Leases {
         self.timing = Some((clock, primary_lease));
     }
 
+    /// Stops timing leases for good, as a primary that steps down does
+    /// (§5.4): it stamps nothing more, and holds no lease.
+    pub(crate) fn stop(&mut self) {
+        self.timing = None;
+        self.until.clear();
+    }
+
     /// The stamp for a beacon sent now, or `None` before [`Leases::start`].
     pub(crate) fn stamp(&self) -> Option<MonoTime> {
         self.timing.as_ref().map(|(clock, _)| clock.now())
@@ -106,6 +113,12 @@ impl Leases {
 /// epoch, or an older one, cannot resume it ([`Grace::resume_for`]) while
 /// the proposal may still land, and a candidate that was resumed proposes
 /// nothing more ([`Grace::propose_over`]).
+///
+/// A primary that steps down for a planned handoff tells the member so
+/// ([`Grace::step_down`]): the member may then stop and propose itself
+/// over that epoch at once, without waiting for the grace to pass
+/// (§5.4). The step-down counts only for the epoch it names, and once: a
+/// member that resumes granting waits for the grace again.
 pub struct Grace {
     clock: Arc<dyn Clock>,
     grace: Duration,
@@ -113,6 +126,9 @@ pub struct Grace {
     /// The epoch the member proposes over, once it stopped granting to
     /// propose itself.
     stopped: Mutex<Option<Epoch>>,
+    /// The newest epoch whose primary stepped down to this member, until
+    /// the member resumes granting.
+    released: watch::Sender<Option<Epoch>>,
 }
 
 impl fmt::Debug for Grace {
@@ -134,6 +150,7 @@ impl Grace {
             grace: primary_grace,
             granted: watch::Sender::new(now),
             stopped: Mutex::new(None),
+            released: watch::Sender::new(None),
         }
     }
 
@@ -159,14 +176,52 @@ impl Grace {
     }
 
     /// Stops granting leases, and acknowledging appends, if the grace has
-    /// passed: the member may then propose itself as primary over its
-    /// configuration in `epoch` (R1). Returns whether it is stopped.
+    /// passed, or the primary of `epoch` stepped down to this member: the
+    /// member may then propose itself as primary over its configuration
+    /// in `epoch` (R1). Returns whether it is stopped.
     pub fn stop_if_passed(&self, epoch: Epoch) -> bool {
         let mut stopped = self.lock();
-        if stopped.is_none() && self.has_passed() {
+        if stopped.is_none() && (self.has_passed() || self.stepped_down() == Some(epoch)) {
             *stopped = Some(epoch);
         }
         stopped.is_some()
+    }
+
+    /// Records that the primary of `epoch` stepped down to this member for
+    /// a planned handoff (§5.4), having stopped serving and renewing its
+    /// leases for good: the member may propose itself over that epoch
+    /// without waiting for the grace to pass.
+    pub fn step_down(&self, epoch: Epoch) {
+        self.released.send_if_modified(|released| {
+            let newer = released.is_none_or(|released| released < epoch);
+            if newer {
+                *released = Some(epoch);
+            }
+            newer
+        });
+    }
+
+    /// The newest epoch whose primary stepped down to this member, unless
+    /// the member resumed granting since.
+    #[must_use]
+    pub fn stepped_down(&self) -> Option<Epoch> {
+        *self.released.borrow()
+    }
+
+    /// Waits until the primary of `epoch`, or of a later one, steps down
+    /// to this member.
+    pub async fn stepped_down_since(&self, epoch: Epoch) {
+        let mut released = self.released.subscribe();
+        // The sender lives as long as `self`.
+        let _ = released
+            .wait_for(|released| released.is_some_and(|released| released >= epoch))
+            .await;
+    }
+
+    /// A receiver that sees [`Grace::stepped_down`] as it changes.
+    #[must_use]
+    pub fn subscribe_step_downs(&self) -> watch::Receiver<Option<Epoch>> {
+        self.released.subscribe()
     }
 
     /// Whether the member stopped granting to propose itself.
@@ -207,6 +262,7 @@ impl Grace {
         }
         if stopped.take().is_some() || new_primary {
             self.record_grant();
+            self.forget_step_down();
         }
         true
     }
@@ -218,7 +274,14 @@ impl Grace {
     pub fn resume(&self) {
         if self.lock().take().is_some() {
             self.record_grant();
+            self.forget_step_down();
         }
+    }
+
+    /// Forgets a step-down once the member grants again: it counts once.
+    fn forget_step_down(&self) {
+        self.released
+            .send_if_modified(|released| released.take().is_some());
     }
 
     /// Waits until the grace has passed.
@@ -386,5 +449,37 @@ mod tests {
         assert!(granted.has_changed().unwrap());
         assert!(!grace.has_passed());
         assert!(!grace.stop_if_passed(epoch(7)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_step_down_lets_the_member_stop_at_once_in_its_epoch() {
+        let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+        let grace = Grace::new(Arc::clone(&clock), ms(600));
+        let epoch = Epoch::new;
+        let mut step_downs = grace.subscribe_step_downs();
+        assert_eq!(grace.stepped_down(), None);
+        grace.step_down(epoch(4));
+        assert!(step_downs.has_changed().unwrap());
+        // An older one changes nothing.
+        step_downs.borrow_and_update();
+        grace.step_down(epoch(3));
+        assert!(!step_downs.has_changed().unwrap());
+        assert_eq!(grace.stepped_down(), Some(epoch(4)));
+        grace.stepped_down_since(epoch(4)).await;
+        // It counts only for the epoch it names.
+        assert!(!grace.stop_if_passed(epoch(5)));
+        assert!(grace.stop_if_passed(epoch(4)));
+        assert!(!grace.grant());
+        // A member that resumes granting forgets it, and waits for its
+        // grace again.
+        grace.resume();
+        assert_eq!(grace.stepped_down(), None);
+        assert!(!grace.stop_if_passed(epoch(4)));
+        grace.step_down(epoch(5));
+        assert!(grace.stop_if_passed(epoch(5)));
+        assert!(grace.resume_for(epoch(6), true));
+        assert_eq!(grace.stepped_down(), None);
+        let waiting = tokio::time::timeout(ms(10), grace.stepped_down_since(epoch(6)));
+        assert!(waiting.await.is_err());
     }
 }

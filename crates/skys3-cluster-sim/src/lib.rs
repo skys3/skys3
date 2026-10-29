@@ -101,7 +101,9 @@ pub use coordination::{
 };
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
-pub use replication::{IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards};
+pub use replication::{
+    HandoffCounts, IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards,
+};
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
 pub use workload::Workload;

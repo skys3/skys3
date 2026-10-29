@@ -199,7 +199,8 @@ impl<D: Disk> Watchdog<D> {
             tokio::select! {
                 biased;
                 changed = rejections.changed() => {
-                    if changed.is_ok() {
+                    // A handoff in progress reads the register itself.
+                    if changed.is_ok() && let Ok(_changing) = self.leader.changing().try_lock() {
                         self.check_register().await;
                     }
                     continue;
@@ -227,7 +228,12 @@ impl<D: Disk> Watchdog<D> {
                 }
             }
             sequenced = self.shard.last_sequenced();
-            if !suspects.is_empty() {
+            // A primary that steps down removes no one: the candidate
+            // proposes over the configuration it stepped down in (§5.4).
+            if !suspects.is_empty()
+                && self.shard.stepped_down().is_none()
+                && let Ok(_changing) = self.leader.changing().try_lock()
+            {
                 self.remove(&suspects).await;
             }
         }

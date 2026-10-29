@@ -9,7 +9,7 @@ use std::time::Duration;
 use redb::{ReadOnlyTable, ReadableTable, Table, TableDefinition};
 use skys3_log::RecordLocation;
 use skys3_log::record::ShardRef;
-use skys3_types::{EpochSeq, Generation, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, Generation, ShardConfig};
 
 use crate::codec;
 use crate::entry::{ControlEntry, Entry, Part, Upload};
@@ -40,6 +40,11 @@ pub(crate) const IMPORTS: TableDefinition<&str, Bytes> = TableDefinition::new("i
 /// so a build that does not know the table loses nothing by ignoring it,
 /// and the table needs no new format version.
 pub(crate) const SHARD_MAP: TableDefinition<Bytes, Bytes> = TableDefinition::new("shard_map");
+/// The epoch in which this node's replica of each shard stepped down as
+/// primary for a planned handoff (§5.4), keyed by shard. Unlike the shard
+/// map it is not a cache: a build that ignored it could serve again in
+/// that epoch, so it came with a new format version.
+pub(crate) const STEP_DOWNS: TableDefinition<Bytes, u64> = TableDefinition::new("step_downs");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -575,6 +580,7 @@ pub struct IndexReader {
     parts: ReadOnlyTable<Bytes, Bytes>,
     control: ReadOnlyTable<&'static str, Bytes>,
     shard_map: ReadOnlyTable<Bytes, Bytes>,
+    step_downs: ReadOnlyTable<Bytes, u64>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
 
@@ -588,8 +594,20 @@ impl IndexReader {
             parts: txn.open_table(PARTS)?,
             control: txn.open_table(CONTROL)?,
             shard_map: txn.open_table(SHARD_MAP)?,
+            step_downs: txn.open_table(STEP_DOWNS)?,
             meta: txn.open_table(META)?,
         })
+    }
+
+    /// Returns the epoch in which this node's replica of `shard` stepped
+    /// down as primary for a planned handoff (§5.4), if it ever did.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading fails.
+    pub fn step_down(&self, shard: &ShardRef) -> Result<Option<Epoch>, IndexError> {
+        let value = self.step_downs.get(codec::shard_key(shard).as_slice())?;
+        Ok(value.map(|epoch| Epoch::new(epoch.value())))
     }
 
     /// Returns the gateway's shard map: the configuration kept for each

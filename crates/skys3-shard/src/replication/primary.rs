@@ -10,7 +10,7 @@ use skys3_types::{Epoch, NodeAddress, NodeId, RegisterDocument, Seq, ShardConfig
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
-use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
+use super::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
 use super::{LinkError, ReplicationConfig, recv};
 use crate::leader::{Leader, Pending};
 use crate::shard::Shard;
@@ -39,10 +39,14 @@ struct Session {
 }
 
 impl<N: Network, D: Disk> Link<N, D> {
-    /// Keeps the link up until the shard stops, or its configuration
-    /// leaves the member out (§6.4).
+    /// Keeps the link up until the shard stops, its configuration leaves
+    /// the member out (§6.4), or the primary steps down for a planned
+    /// handoff and owes the member nothing (§5.4).
     pub(super) async fn run(self) {
-        while !self.shard.is_stopped() && self.shard.config().is_member(&self.member) {
+        while !self.shard.is_stopped()
+            && self.shard.config().is_member(&self.member)
+            && !self.leader.handed_off(&self.member)
+        {
             match self.connect().await {
                 // A new session, at once.
                 Err(LinkError::Reconfigured) => continue,
@@ -164,6 +168,31 @@ impl<N: Network, D: Disk> Link<N, D> {
             };
             if records.is_empty() && self.shard.is_stopped() {
                 return Ok(());
+            }
+            // A planned handoff: the member holds every record now. The
+            // candidate gets the step-down message, and every link ends,
+            // so that no beacon renews a member's grace any more (§5.4).
+            if records.is_empty() && self.leader.handed_off(&self.member) {
+                return Ok(());
+            }
+            if records.is_empty()
+                && let Some((epoch, last)) = self.leader.step_down_owed(&self.member)
+            {
+                let step_down = StepDown {
+                    epoch: epoch.get(),
+                    last: last.get(),
+                };
+                sender
+                    .send(&wire::frame(
+                        MessageKind::StepDown,
+                        &step_down,
+                        Bytes::new(),
+                    ))
+                    .await?;
+                self.leader.step_down_sent();
+                // The member ends the session once it stops acknowledging
+                // to propose itself; until then the link hears it out.
+                return std::future::pending().await;
             }
             let interval = self.config.beacon_every(records.is_empty());
             if last_beacon.is_none_or(|at| Instant::now() >= at + interval) {

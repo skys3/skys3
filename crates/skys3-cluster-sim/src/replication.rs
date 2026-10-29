@@ -3,7 +3,8 @@
 //! commits (M2-07) and reads under leases (M2-09). Writes wait for the
 //! members at most the configured acknowledgement timeout (M2-10), and
 //! primaries remove members that stop responding (M2-11). Members can take
-//! over from a primary that stays silent (M2-12).
+//! over from a primary that stays silent (M2-12), and primaries hand
+//! their shards off to members now and then (M2-13).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -52,7 +53,11 @@ use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
 /// stale, since that member could have taken over and acknowledged writes
 /// the read misses ([`ReplicatedServices::check_reads`]). Within the drift
 /// bound `ρ` no such read exists; beyond it, some do
-/// ([`ReplicatedServices::leases`]).
+/// ([`ReplicatedServices::leases`]). A planned handoff lets a member
+/// propose without waiting for its grace (§5.4), so a read is also checked
+/// against the step-downs members received: one served after a member of
+/// its shard learned that the primary of the read's epoch stepped down
+/// could miss writes of the new primary.
 #[derive(Clone, Default)]
 pub struct ReplicatedServices {
     config: ReplicationConfig,
@@ -64,7 +69,18 @@ pub struct ReplicatedServices {
     members_read: bool,
     /// Whether members take over from a silent primary (plan M2-12).
     takeover: bool,
+    /// How often primaries hand a shard off, and until when (plan M2-13).
+    handoffs: Option<Handoffs>,
+    /// A seeded bug: a primary that stepped down still answers reads.
+    stepped_down_read: bool,
     audit: Arc<Mutex<Audit>>,
+}
+
+/// When primaries hand their shards off ([`ReplicatedServices::with_handoffs`]).
+#[derive(Clone, Copy, Debug)]
+struct Handoffs {
+    every: Duration,
+    until: Duration,
 }
 
 /// How the services' register writes retry.
@@ -121,6 +137,24 @@ struct Audit {
     /// Writes acknowledged in an epoch in which another node acknowledged
     /// writes.
     rivals: Vec<String>,
+    /// The newest step-down each member of each shard received, with the
+    /// epoch it names, in simulated time since the run began (§5.4).
+    step_downs: BTreeMap<(NodeId, ShardRef), (Epoch, Duration)>,
+    /// Planned handoffs over the run.
+    handoffs: HandoffCounts,
+}
+
+/// Planned handoffs over a run (§5.4), as the services counted them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HandoffCounts {
+    /// Handoffs a primary began.
+    pub begun: usize,
+    /// Those whose step-down message the primary sent. The others, and
+    /// those whose message was lost on the way, fall back to the members'
+    /// grace.
+    pub sent: usize,
+    /// Step-downs a member received and acted on.
+    pub received: usize,
 }
 
 /// Writes that were not acknowledged in time over a run (§5.2), as the
@@ -213,6 +247,40 @@ impl ReplicatedServices {
         }
     }
 
+    /// The same services, whose primaries hand a shard off to one of its
+    /// members every `every` of simulated time, until `until` (§5.4): each
+    /// node's primaries take turns, one shard per round, and the member
+    /// each hands off to rotates. A handoff leaves the old primary out of
+    /// the next configuration, so a shard of `n` members is handed off at
+    /// most `n − 1` times. Members take over too
+    /// ([`ReplicatedServices::with_takeover`]), which falls back to the
+    /// grace when a step-down is lost.
+    #[must_use]
+    pub fn with_handoffs(self, every: Duration, until: Duration) -> Self {
+        Self {
+            handoffs: Some(Handoffs { every, until }),
+            ..self.with_takeover()
+        }
+    }
+
+    /// The same services with a seeded bug for the lease audit to catch: a
+    /// primary that stepped down for a planned handoff still answers reads
+    /// from its own index, though the member it stepped down to may have
+    /// taken over and acknowledged writes since.
+    #[must_use]
+    pub fn stepped_down_serving_reads(self) -> Self {
+        Self {
+            stepped_down_read: true,
+            ..self
+        }
+    }
+
+    /// The planned handoffs so far.
+    #[must_use]
+    pub fn handoffs(&self) -> HandoffCounts {
+        self.audit().handoffs
+    }
+
     /// The shards that a node other than their first primary serves as
     /// primary now: those a member took over.
     #[must_use]
@@ -293,9 +361,10 @@ impl ReplicatedServices {
 
     /// Checks every read a primary served against its members' grace: none
     /// was served once some member's `primary_grace` had passed since it
-    /// last granted the primary a lease. Such a member could have taken
-    /// over, and the read could then miss a write the new primary
-    /// acknowledged (§5.4, §6.8).
+    /// last granted the primary a lease, nor once some member had received
+    /// the step-down of the primary of the read's epoch. Such a member
+    /// could have taken over, and the read could then miss a write the new
+    /// primary acknowledged (§5.4, §6.8).
     ///
     /// # Errors
     ///
@@ -406,17 +475,19 @@ impl NodeServices for ReplicatedServices {
     type Shards = ReplicatedShards;
 
     /// Ready once every primary opened so far serves, and every member
-    /// granted it a lease. The I/O counts start then.
+    /// granted it a lease, unless it stopped for good, as a primary that
+    /// handed its shard off does. The I/O counts start then.
     fn ready(&self) -> bool {
         let mut audit = self.audit();
         let ready = audit.replicas.iter().all(|(_, _, replica)| {
-            replica.leader().is_none_or(|leader| {
-                replica.is_serving()
-                    && leader
-                        .members()
-                        .iter()
-                        .all(|member| leader.lease(member).is_some())
-            })
+            replica.stepped_down().is_some()
+                || replica.leader().is_none_or(|leader| {
+                    replica.is_serving()
+                        && leader
+                            .members()
+                            .iter()
+                            .all(|member| leader.lease(member).is_some())
+                })
         });
         if ready && audit.baseline.is_none() {
             audit.baseline = Some(audit.io());
@@ -463,6 +534,16 @@ impl ReplicatedServices {
             .transport
             .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
             .await?;
+        if let Some(handoffs) = self.handoffs {
+            let driver = HandoffDriver {
+                replication: replication.clone(),
+                node: env.node.clone(),
+                position: env.position,
+                handoffs,
+                audit: Arc::clone(&self.audit),
+            };
+            tokio::spawn(driver.run());
+        }
         let shards = ReplicatedShards {
             local: env.shards.clone(),
             replication,
@@ -473,10 +554,63 @@ impl ReplicatedServices {
             alone: self.alone,
             resubmit: self.resubmit,
             members_read: self.members_read,
+            stepped_down_read: self.stepped_down_read,
             audit: Arc::clone(&self.audit),
             followed: Arc::default(),
         };
         Ok((shards, listener))
+    }
+}
+
+/// A node's primaries handing their shards off now and then, in one life
+/// ([`ReplicatedServices::with_handoffs`]).
+struct HandoffDriver {
+    replication: Replication<TurmoilNetwork, SimMount>,
+    node: NodeId,
+    position: usize,
+    handoffs: Handoffs,
+    audit: Arc<Mutex<Audit>>,
+}
+
+impl HandoffDriver {
+    async fn run(self) {
+        let every = self.handoffs.every;
+        // Nodes take turns within each round.
+        let offset = every / 4 * u32::try_from(self.position % 4).unwrap_or(0);
+        tokio::time::sleep(offset).await;
+        for round in 0.. {
+            tokio::time::sleep(every).await;
+            if turmoil::sim_elapsed().unwrap_or_default() >= self.handoffs.until {
+                return;
+            }
+            self.hand_off_one(round).await;
+        }
+    }
+
+    /// Hands off the first shard this node serves as primary that has
+    /// another member, to the member `round` picks.
+    async fn hand_off_one(&self, round: usize) {
+        let set = self.replication.set();
+        for shard in set.shards().await {
+            let Some(replica) = set.get(&shard).await else {
+                continue;
+            };
+            if replica.role() != Role::Primary || !replica.is_serving() {
+                continue;
+            }
+            let config = replica.config();
+            let others: Vec<&NodeId> = config.members.iter().filter(|m| **m != self.node).collect();
+            let Some(&to) = others.get(round % others.len().max(1)) else {
+                continue;
+            };
+            lock(&self.audit).handoffs.begun += 1;
+            match self.replication.hand_off(&shard, to).await {
+                Ok(handed) if handed.sent => lock(&self.audit).handoffs.sent += 1,
+                Ok(_) => {}
+                Err(error) => tracing::debug!(%shard, %error, "a handoff failed"),
+            }
+            return;
+        }
     }
 }
 
@@ -497,6 +631,7 @@ pub struct ReplicatedShards {
     alone: bool,
     resubmit: bool,
     members_read: bool,
+    stepped_down_read: bool,
     audit: Arc<Mutex<Audit>>,
     /// The shards whose grace this life follows.
     followed: Arc<Mutex<BTreeSet<ShardRef>>>,
@@ -585,6 +720,23 @@ impl ReplicatedShards {
         let (clock, audit) = (Arc::clone(&self.clock), Arc::clone(&self.audit));
         let key = (self.node.clone(), shard.clone());
         let mut granted = grace.subscribe();
+        let mut step_downs = grace.subscribe_step_downs();
+        let released = (Arc::clone(&audit), key.clone());
+        tokio::spawn(async move {
+            let (audit, key) = released;
+            loop {
+                let stepped = *step_downs.borrow_and_update();
+                if let Some(epoch) = stepped {
+                    let now = turmoil::sim_elapsed().unwrap_or_default();
+                    let mut audit = lock(&audit);
+                    audit.handoffs.received += 1;
+                    audit.step_downs.insert(key.clone(), (epoch, now));
+                }
+                if step_downs.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
         tokio::spawn(async move {
             loop {
                 granted.borrow_and_update();
@@ -615,6 +767,25 @@ impl ReplicatedShards {
             return;
         }
         audit.leases.served += 1;
+        // A member that received the step-down of the primary of the
+        // epoch the read's index state is in may have taken over since.
+        let epoch = replica.applied().epoch;
+        let stale: Vec<String> = audit
+            .step_downs
+            .iter()
+            .filter(|((member, of), (stepped, at))| {
+                of == shard && *member != self.node && *stepped >= epoch && *at <= now
+            })
+            .map(|((member, _), (stepped, at))| {
+                format!(
+                    "{} served a read of shard {shard} in epoch {epoch} at {now:?}, but its \
+                     primary had stepped down to {member} in epoch {stepped} at {at:?}",
+                    self.node
+                )
+            })
+            .collect();
+        audit.leases.stale += stale.len() as u64;
+        audit.stale.extend(stale);
         for member in leader.members() {
             let Some(&passed) = audit.graces.get(&(member.clone(), shard.clone())) else {
                 continue;
@@ -693,6 +864,22 @@ impl Shards for ReplicatedShards {
                 shard: shard.clone(),
                 reason: error.to_string(),
             });
+        }
+        if self.stepped_down_read
+            && let Some(replica) = self.local.set().get(&shard.into()).await
+            && replica.stepped_down().is_some()
+        {
+            // The seeded bug: a primary that stepped down reads its index.
+            let read = replica
+                .index()
+                .read()
+                .and_then(|r| r.entry(&shard.into(), key))
+                .map_err(|error| ShardError::Unavailable {
+                    shard: shard.clone(),
+                    reason: error.to_string(),
+                });
+            self.audit_read(shard, &read).await;
+            return read;
         }
         let entry = self.local.entry(shard, key).await;
         self.audit_read(shard, &entry).await;

@@ -1,7 +1,7 @@
 //! Fuzzes the replication messages a member or a primary decodes from an
 //! authenticated but untrusted peer (design §5.1, §6.6, §12): every body,
-//! the configuration and the lineage a `Sync` carries, and the record of an
-//! `Append` or a `SyncAck`.
+//! the configuration and the lineage a `Sync` carries, the record of an
+//! `Append` or a `SyncAck`, and a planned handoff's `StepDown` (§5.4).
 
 #![no_main]
 #![forbid(unsafe_code)]
@@ -9,7 +9,7 @@
 use libfuzzer_sys::fuzz_target;
 use skys3_log::LogRecord;
 use skys3_net::{Frame, Header, MessageKind};
-use skys3_shard::replication::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
+use skys3_shard::replication::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
 use skys3_shard::lineage::Lineage;
 use skys3_types::{Epoch, EpochSeq, RegisterDocument, Seq};
 
@@ -21,6 +21,7 @@ fuzz_target!(|data: &[u8]| {
         MessageKind::Append,
         MessageKind::AppendAck,
         MessageKind::Beacon,
+        MessageKind::StepDown,
     ] {
         let mut frame = Frame::new(Header::new(kind).with_body(data.to_vec()), data.to_vec());
         check(&frame);
@@ -77,6 +78,12 @@ fn check(frame: &Frame) {
         }
         MessageKind::Beacon => {
             let _ = wire::body::<Beacon>(frame, MessageKind::Beacon);
+        }
+        MessageKind::StepDown => {
+            if let Ok(step_down) = wire::body::<StepDown>(frame, MessageKind::StepDown) {
+                let again = wire::frame(MessageKind::StepDown, &step_down, Default::default());
+                assert_eq!(wire::body(&again, MessageKind::StepDown), Ok(step_down));
+            }
         }
         _ => assert!(wire::body::<Beacon>(frame, MessageKind::Beacon).is_err()),
     }
