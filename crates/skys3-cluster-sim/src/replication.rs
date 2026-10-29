@@ -3,8 +3,9 @@
 //! commits (M2-07) and reads under leases (M2-09). Writes wait for the
 //! members at most the configured acknowledgement timeout (M2-10), and
 //! primaries remove members that stop responding (M2-11). Members can take
-//! over from a primary that stays silent (M2-12), and primaries hand
-//! their shards off to members now and then (M2-13).
+//! over from a primary that stays silent (M2-12), primaries hand
+//! their shards off to members now and then (M2-13), and a test driver adds
+//! learners that primaries promote (M2-14, in [`crate::learners`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -27,6 +28,7 @@ use skys3_shard::{Grace, Role, Shard};
 use skys3_sim::SimS3;
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
 
+use crate::learners::{Audited, LearnerAudit, LearnerDriver, LearnerPlan};
 use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
 
 /// Replicated node services: every node opens its replica of each shard
@@ -73,7 +75,9 @@ pub struct ReplicatedServices {
     handoffs: Option<Handoffs>,
     /// A seeded bug: a primary that stepped down still answers reads.
     stepped_down_read: bool,
-    audit: Arc<Mutex<Audit>>,
+    /// When the test driver adds learners, if it does (plan M2-14).
+    pub(crate) learners: Option<LearnerPlan>,
+    pub(crate) audit: Arc<Mutex<Audit>>,
 }
 
 /// When primaries hand their shards off ([`ReplicatedServices::with_handoffs`]).
@@ -84,7 +88,7 @@ struct Handoffs {
 }
 
 /// How the services' register writes retry.
-const REGISTER_RETRY: RetryPolicy = RetryPolicy {
+pub(crate) const REGISTER_RETRY: RetryPolicy = RetryPolicy {
     max_attempts: 5,
     initial_backoff: Duration::from_millis(20),
     max_backoff: Duration::from_millis(200),
@@ -113,8 +117,8 @@ impl fmt::Debug for ReplicatedServices {
 
 /// Every replica and log of every life of every node.
 #[derive(Default)]
-struct Audit {
-    replicas: Vec<(NodeId, ShardConfig, Shard<SimMount>)>,
+pub(crate) struct Audit {
+    pub(crate) replicas: Vec<(NodeId, ShardConfig, Shard<SimMount>)>,
     logs: Vec<SegmentLog<SimMount>>,
     /// Acknowledged writes that some member did not hold durably.
     early: Vec<String>,
@@ -142,6 +146,10 @@ struct Audit {
     step_downs: BTreeMap<(NodeId, ShardRef), (Epoch, Duration)>,
     /// Planned handoffs over the run.
     handoffs: HandoffCounts,
+    /// Learners and promotions over the run (plan M2-14).
+    pub(crate) learners: LearnerAudit,
+    /// The control store without faults, for reading registers.
+    pub(crate) store: Option<S3ControlStore<SimS3>>,
 }
 
 /// Planned handoffs over a run (§5.4), as the services counted them.
@@ -434,7 +442,7 @@ impl ReplicatedServices {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -459,7 +467,7 @@ impl Audit {
     }
 
     /// The last `seq` `node` ever held durably in the shard of `config`.
-    fn durable(&self, node: &NodeId, config: &ShardConfig) -> Seq {
+    pub(crate) fn durable(&self, node: &NodeId, config: &ShardConfig) -> Seq {
         self.replicas
             .iter()
             .filter(|(n, c, _)| {
@@ -525,7 +533,14 @@ impl ReplicatedServices {
         let store = env.control.store();
         if let Some(store) = &store {
             let registers = ControlRegisters::new(store.clone(), REGISTER_RETRY);
-            replication = replication.with_removal(registers, ProposalIds::seeded(env.seed));
+            let ids = ProposalIds::seeded(env.seed);
+            replication = if self.learners.is_some() {
+                let audit = Arc::clone(&self.audit);
+                lock(&audit).store = Some(store.inner().clone());
+                replication.with_removal(Audited { registers, audit }, ids)
+            } else {
+                replication.with_removal(registers, ids)
+            };
             if self.takeover {
                 replication = replication.with_takeover();
             }
@@ -547,7 +562,7 @@ impl ReplicatedServices {
         let shards = ReplicatedShards {
             local: env.shards.clone(),
             replication,
-            registers: store.map(|store| store.inner().clone()),
+            registers: store.as_ref().map(|store| store.inner().clone()),
             placement: Arc::clone(&env.placement),
             node: env.node.clone(),
             clock: Arc::clone(&env.clock),
@@ -558,6 +573,20 @@ impl ReplicatedServices {
             audit: Arc::clone(&self.audit),
             followed: Arc::default(),
         };
+        if let (Some(plan), Some(store)) = (self.learners, store) {
+            let mut nodes: Vec<NodeId> = env.peers.keys().cloned().collect();
+            nodes.push(env.node.clone());
+            nodes.sort();
+            let driver = LearnerDriver {
+                shards: shards.clone(),
+                registers: store.inner().clone(),
+                store,
+                nodes,
+                plan,
+                ids: ProposalIds::seeded(env.seed ^ 0x4c45_4152),
+            };
+            tokio::spawn(driver.run());
+        }
         Ok((shards, listener))
     }
 }
@@ -624,15 +653,15 @@ pub struct ReplicatedShards {
     /// The control store without the node's faults, for reading registers.
     registers: Option<S3ControlStore<SimS3>>,
     /// The placement the harness wrote, epoch 1 of every shard.
-    placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
-    node: NodeId,
+    pub(crate) placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
+    pub(crate) node: NodeId,
     /// The node's clock in this life.
     clock: Arc<MonotonicClock>,
     alone: bool,
     resubmit: bool,
     members_read: bool,
     stepped_down_read: bool,
-    audit: Arc<Mutex<Audit>>,
+    pub(crate) audit: Arc<Mutex<Audit>>,
     /// The shards whose grace this life follows.
     followed: Arc<Mutex<BTreeSet<ShardRef>>>,
 }
@@ -667,6 +696,37 @@ impl ReplicatedShards {
                     && config.shard == shard.shard
                     && replica.leader().is_some()
             })
+    }
+
+    /// Opens this node's replica of `shard` in `config`, or brings the open
+    /// one up to it, and audits it.
+    pub(crate) async fn open_config(
+        &self,
+        shard: &ShardRef,
+        config: &ShardConfig,
+    ) -> Result<(), ShardError> {
+        let replica =
+            self.replication
+                .open(config)
+                .await
+                .map_err(|error| ShardError::Unavailable {
+                    shard: shard.clone(),
+                    reason: error.to_string(),
+                })?;
+        if let Some(grace) = self.replication.grace(replica.shard()) {
+            self.follow_grace(shard, grace);
+        }
+        let mut audit = lock(&self.audit);
+        if !audit
+            .replicas
+            .iter()
+            .any(|(_, _, open)| open.durable().same_channel(&replica.durable()))
+        {
+            audit
+                .replicas
+                .push((self.node.clone(), config.clone(), replica));
+        }
+        Ok(())
     }
 
     /// Records an acknowledgement of `position` that some member of the
@@ -811,30 +871,14 @@ impl Shards for ReplicatedShards {
         if self.replication.set().get(&shard.into()).await.is_some() {
             return Ok(());
         }
-        let Some(config) = self.current(shard).filter(|c| c.is_member(&self.node)) else {
+        let Some(config) = self
+            .current(shard)
+            .filter(|c| c.is_member(&self.node) || c.is_learner(&self.node))
+        else {
             // Another node's shard, or one this node was removed from.
             return Ok(());
         };
-        let replica =
-            self.replication
-                .open(&config)
-                .await
-                .map_err(|error| ShardError::Unavailable {
-                    shard: shard.clone(),
-                    reason: error.to_string(),
-                })?;
-        if let Some(grace) = self.replication.grace(replica.shard()) {
-            self.follow_grace(shard, grace);
-        }
-        let mut audit = lock(&self.audit);
-        if !audit
-            .replicas
-            .iter()
-            .any(|(_, _, open)| open.durable().same_channel(&replica.durable()))
-        {
-            audit.replicas.push((self.node.clone(), config, replica));
-        }
-        Ok(())
+        self.open_config(shard, &config).await
     }
 
     async fn seal(&self, shard: &ShardRef) -> Result<ShardSummary, ShardError> {
@@ -969,6 +1013,9 @@ impl Shards for ReplicatedShards {
         if let Ok(position) = written {
             let mut audit = lock(&self.audit);
             audit.slowest = audit.slowest.max(took);
+            if audit.store.is_some() {
+                audit.learners.writes.push((started, took));
+            }
             drop(audit);
 
             self.audit_acknowledged(shard, position);

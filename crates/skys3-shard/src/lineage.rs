@@ -206,6 +206,10 @@ impl Lineage {
     #[must_use]
     pub fn reconcile(&self, primary: &Self, epoch: Epoch, applied: Seq) -> Reconcile {
         let last = self.last().seq;
+        // A log that holds no record, a new learner's, is a prefix of any.
+        if last == Seq::ZERO {
+            return Reconcile::Keep;
+        }
         let Some(matched) = self.matched(primary) else {
             return Reconcile::Diverged(format!(
                 "its log ({self:?}) shares no known epoch with the primary's ({primary:?})"
@@ -340,6 +344,17 @@ mod tests {
         assert_eq!(
             ahead.reconcile(&primary, Epoch::new(3), Seq::new(5)),
             Reconcile::RollForward
+        );
+    }
+
+    #[test]
+    fn a_log_that_holds_nothing_is_a_prefix_of_any() {
+        let primary = lineage((4, 20), &[(4, 22)]);
+        let empty = Lineage::new(at(0, 0));
+        assert_eq!(empty.matched(&primary), None);
+        assert_eq!(
+            empty.reconcile(&primary, Epoch::new(5), Seq::ZERO),
+            Reconcile::Keep
         );
     }
 

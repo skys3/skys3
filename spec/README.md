@@ -71,9 +71,9 @@ a third member and a spare.
 | Profile | Model (overrides of the base values) | Distinct states | Time on 4 cores |
 |---|---|---:|---:|
 | `pr` | `Members=3` | 1,214,333 | 1 min 48 s |
-| `pr` | (none) | 372,452 | 37 s |
-| `pr` | `Nodes=2 Members=2 MaxEpoch=4 MaxRestarts=1` | 617,749 | 26 s |
-| `pr` | `Nodes=2 Members=1 MaxEpoch=4 MaxWrites=2 MaxRestarts=1` | 433,805 | 14 s |
+| `pr` | (none) | 392,462 | 37 s |
+| `pr` | `Nodes=2 Members=2 MaxEpoch=4 MaxRestarts=1` | 626,055 | 26 s |
+| `pr` | `Nodes=2 Members=1 MaxEpoch=4 MaxWrites=2 MaxRestarts=1` | 439,476 | 14 s |
 | `nightly` | `Members=3 MaxRestarts=1` | 9,678,448 | 22 min |
 | `nightly` | `MaxEpoch=4` | 6,159,012 | 9 min |
 | `nightly` | `MaxRestarts=1` | 3,688,860 | 4 min |
@@ -147,7 +147,12 @@ cannot measure a small shortfall.
 - **Control store.** A compare-and-swap is atomic. A proposer learns the
   outcome only when it later adopts a newer configuration, so a lost
   response is a delayed adoption; the lost-response rule of section 6.1 is
-  assumed.
+  assumed. A promotion is two actions, as in the implementation (plan
+  M2-14): `Promote` records the proposal, and `SendPromotion` sends its
+  CAS, any number of times, also after a restart. A CAS that fails
+  because the register moved on is a `SendPromotion` that is no longer
+  enabled; the primary then waits for the learner until it adopts a
+  configuration at or past the proposal's epoch.
 - **Gateways.** Any node that believes it is the serving primary may be
   asked to serve a read, which is what a gateway with an arbitrarily stale
   shard map can do. The epoch a gateway sends can only make a node reject a
@@ -182,6 +187,7 @@ The whole set runs in about two minutes on four cores.
 | `blind_register_write` | The register CAS: write without comparing the version (6.1) | `OneCommitterPerEpoch` | |
 | `truncate_by_seq_only` | Reconciliation and re-admission compare `(epoch, seq)`: compare `seq` only (6.6, 6.7) | `CommittedRecordsSurvive` | `Nodes=2 MaxEpoch=4 MaxWrites=2` |
 | `drop_promoting_learner` | Keep waiting for a learner while its promotion CAS is outstanding (6.7) | `CommittedRecordsSurvive` | |
+| `abandon_unsettled_promotion` | Stop waiting for a promoted learner only on adopting a configuration at or past the proposal's epoch, not on a failed or unanswered CAS (6.7) | `CommittedRecordsSurvive` | |
 | `promotion_without_learner_lease` | Need the learner's lease while its promotion is outstanding (5.4, 6.7) | `ReadsLinearizable` | `Nodes=2 Members=1 MaxEpoch=4` |
 | `restart_forgets_grace` | Count a restart as a lease grant (5.4) | `ReadsLinearizable` | `MaxRestarts=1` |
 | `restart_forgets_proposal` | Keep an outstanding proposal across a restart (6.3) | `ReadsLinearizable` | `MaxRestarts=1` |
@@ -204,8 +210,8 @@ in `docs/skys3-design.md`:
   Seeded bug `restart_forgets_grace`.
 - **Durable proposals (section 6.3).** A node records a proposal before the
   CAS and, until it learns the outcome, across restarts too, acts as if the
-  CAS succeeded. Seeded bugs `restart_forgets_proposal` and
-  `drop_promoting_learner`.
+  CAS succeeded. Seeded bugs `restart_forgets_proposal`,
+  `drop_promoting_learner`, and `abandon_unsettled_promotion`.
 - **Leases during promotion (sections 5.4 and 6.7).** Learners in the
   acknowledgement set grant leases, and a primary with an outstanding
   promotion needs the learner's lease to serve reads. Without it, a

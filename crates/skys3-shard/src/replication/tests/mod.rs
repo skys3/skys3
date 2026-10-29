@@ -29,6 +29,7 @@ use skys3_types::{
 use tokio::net::TcpStream;
 
 mod handoff;
+mod learners;
 mod removal;
 mod takeover;
 

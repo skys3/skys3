@@ -215,12 +215,12 @@ fn a_member_switches_epochs_where_its_primary_did() {
         let without = configuration(2, &[1, 3]);
         let reason = configuration_error(member.reconfigure(&without).await);
         assert!(reason.contains("not a member"), "{reason}");
-        let learners = ShardConfig {
-            learners: vec![node(4)],
-            ..configuration(2, &[1, 2])
+        let demoted = ShardConfig {
+            learners: vec![node(2)],
+            ..configuration(2, &[1, 3])
         };
-        let reason = configuration_error(member.reconfigure(&learners).await);
-        assert!(reason.contains("learners"), "{reason}");
+        let reason = configuration_error(member.reconfigure(&demoted).await);
+        assert!(reason.contains("does not become a learner"), "{reason}");
 
         // A newer configuration is recorded; the member still takes the
         // earlier epoch's tail, in sessions of the new one only (R2).
@@ -391,5 +391,208 @@ fn a_shard_alone_reconfigures_as_before() {
         alone.commit(put("b", 10, 1)).await.unwrap();
         alone.commit(put("c", 32, 1)).await.unwrap();
         assert_eq!(alone.stored_bytes().await.unwrap(), 42);
+    });
+}
+
+/// Nodes 1 and 2 members, node 3 a learner, in `epoch`; writes need three
+/// copies.
+fn learning(epoch: u64) -> ShardConfig {
+    ShardConfig {
+        learners: vec![node(3)],
+        min_write_replicas: 3,
+        ..configuration(epoch, &[1, 2])
+    }
+}
+
+/// Node 3 promoted to member, in `epoch`.
+fn promoted(epoch: u64) -> ShardConfig {
+    ShardConfig {
+        min_write_replicas: 3,
+        ..configuration(epoch, &[1, 2, 3])
+    }
+}
+
+#[test]
+fn a_learner_holds_up_commits_only_in_the_acknowledgement_set() {
+    runtime().block_on(async {
+        let replica = Replica::new(8).await;
+        let primary = replica.open(&learning(1), &node(1)).await;
+        let leader = Arc::clone(primary.leader().unwrap());
+        assert_eq!(leader.learners(), [node(3)]);
+        assert!(leader.is_learner(&node(3)) && !leader.is_member(&node(3)));
+        assert_eq!(*leader.peers().borrow(), [node(2), node(3)]);
+        leader.synced(&node(2), Seq::ZERO);
+        until(|| primary.is_serving()).await;
+
+        // Two acknowledging copies are too few, until the learner joins.
+        let refused = primary.commit(put("a", 10, 1)).await;
+        assert!(
+            matches!(refused, Err(ShardError::UnderReplicated { copies: 2, .. })),
+            "{refused:?}"
+        );
+        leader.synced(&node(3), Seq::ZERO);
+        assert!(leader.join(&node(3)));
+        assert!(!leader.join(&node(3)));
+        assert!(!leader.join(&node(4)));
+        assert_eq!(leader.acking(), [node(3)]);
+        let writer = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.commit(put("a", 10, 1)).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(1)).await;
+        leader.acknowledged(&node(2), Seq::new(1));
+        primary.settle().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !writer.is_finished(),
+            "the write did not wait for the learner"
+        );
+        leader.acknowledged(&node(3), Seq::new(1));
+        assert_eq!(writer.await.unwrap().unwrap().position, position(1, 1));
+
+        // Dropped, it holds up nothing, and writes are refused again.
+        assert!(leader.drop_learner(&node(3)));
+        assert!(!leader.drop_learner(&node(3)));
+        let refused = primary.commit(put("b", 10, 1)).await;
+        assert!(matches!(refused, Err(ShardError::UnderReplicated { .. })));
+        assert!(leader.join(&node(3)));
+
+        // R3: a promotion needs the backfill, and a configuration that makes
+        // the learner a member. One promotion at a time.
+        let refusal = leader.begin_promotion(&node(3), &promoted(2)).unwrap_err();
+        assert!(refusal.contains("backfill"), "{refusal}");
+        leader.backfilled(&node(3));
+        leader.backfilled(&node(4));
+        assert!(leader.is_backfilled(&node(3)) && !leader.is_backfilled(&node(4)));
+        let refusal = leader.begin_promotion(&node(3), &learning(2)).unwrap_err();
+        assert!(refusal.contains("does not make"), "{refusal}");
+        let refusal = leader.begin_promotion(&node(2), &promoted(2)).unwrap_err();
+        assert!(refusal.contains("acknowledgement set"), "{refusal}");
+        leader.begin_promotion(&node(3), &promoted(2)).unwrap();
+        assert_eq!(leader.promoting(), Some(promoted(2)));
+        let refusal = leader.begin_promotion(&node(3), &promoted(2)).unwrap_err();
+        assert!(refusal.contains("another"), "{refusal}");
+
+        // Until the outcome is known, the learner stays in the set, and
+        // reads need its lease too (§5.4).
+        assert!(!leader.drop_learner(&node(3)));
+        let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
+        leader.start_leases(clock, Duration::from_secs(60));
+        let stamp = leader.lease_stamp().unwrap();
+        leader.granted(&node(2), stamp);
+        assert!(!leader.holds_leases());
+        leader.granted(&node(3), stamp);
+        assert!(leader.holds_leases());
+
+        // The register accepted it: once its CONFIG record is durable, the
+        // learner is a member, and the promotion is settled.
+        primary.reconfigure(&promoted(2)).await.unwrap();
+        until(|| leader.promoting().is_none()).await;
+        assert_eq!(leader.members(), [node(2), node(3)]);
+        assert!(leader.learners().is_empty() && leader.acking().is_empty());
+        primary.check_readable().unwrap();
+    });
+}
+
+/// The single survivor's repair (§6.5): the primary is the only member,
+/// and a learner brings the shard back to two copies. Commits the primary
+/// made alone authorize nothing past them.
+#[test]
+fn a_single_survivor_waits_for_its_learner_once_it_joins() {
+    runtime().block_on(async {
+        let replica = Replica::new(10).await;
+        let survivor = ShardConfig {
+            learners: vec![node(3)],
+            ..configuration(1, &[1])
+        };
+        let primary = replica.open(&survivor, &node(1)).await;
+        let leader = Arc::clone(primary.leader().unwrap());
+        leader.synced(&node(3), Seq::ZERO);
+        until(|| primary.is_serving()).await;
+        let refused = primary.commit(put("a", 10, 1)).await;
+        assert!(
+            matches!(refused, Err(ShardError::UnderReplicated { copies: 1, .. })),
+            "{refused:?}"
+        );
+        // Alone, the primary commits what it holds.
+        primary.commit(flushed("a", 1, true)).await.unwrap();
+        assert_eq!(leader.commit(), Seq::new(1));
+
+        leader.acknowledged(&node(3), Seq::new(1));
+        assert!(leader.join(&node(3)));
+        let writer = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.commit(put("b", 10, 1)).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(2)).await;
+        primary.settle().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !writer.is_finished(),
+            "the write did not wait for the learner"
+        );
+        assert_eq!(leader.commit(), Seq::new(1));
+        leader.acknowledged(&node(3), Seq::new(2));
+        assert_eq!(writer.await.unwrap().unwrap().position, position(1, 2));
+
+        // R3 can be met.
+        leader.backfilled(&node(3));
+        let promotion = ShardConfig {
+            learners: Vec::new(),
+            ..configuration(2, &[1, 3])
+        };
+        leader.begin_promotion(&node(3), &promotion).unwrap();
+    });
+}
+
+#[test]
+fn a_primary_that_recorded_a_promotion_waits_for_its_learner_after_a_restart() {
+    runtime().block_on(async {
+        let replica = Replica::new(9).await;
+        replica.index.store_promotion(&promoted(2)).unwrap();
+        let primary = replica.open(&learning(1), &node(1)).await;
+        let leader = Arc::clone(primary.leader().unwrap());
+        assert_eq!(leader.promoting(), Some(promoted(2)));
+        leader.synced(&node(2), Seq::ZERO);
+        leader.synced(&node(3), Seq::ZERO);
+        until(|| primary.is_serving()).await;
+
+        // Commits wait for the learner, though it is not in the
+        // acknowledgement set, which it never leaves until the outcome is
+        // known.
+        assert!(leader.acking().is_empty());
+        let writer = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.commit(flushed("a", 1, true)).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(1)).await;
+        leader.acknowledged(&node(2), Seq::new(1));
+        primary.settle().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !writer.is_finished(),
+            "the write did not wait for the learner"
+        );
+        assert!(!leader.drop_learner(&node(3)));
+        leader.acknowledged(&node(3), Seq::new(1));
+        writer.await.unwrap().unwrap();
+
+        // The register moved past it another way: the learner was removed.
+        let removed = ShardConfig {
+            learners: Vec::new(),
+            ..learning(2)
+        };
+        primary.reconfigure(&removed).await.unwrap();
+        until(|| leader.promoting().is_none() && leader.learners().is_empty()).await;
+        assert_eq!(*leader.peers().borrow(), [node(2)]);
+
+        // A promotion whose epoch the configuration reached is settled.
+        let other = ShardConfig {
+            shard: skys3_types::ShardId::new(1),
+            ..promoted(2)
+        };
+        replica.index.store_promotion(&other).unwrap();
+        let reopened = replica.open(&other, &node(1)).await;
+        assert_eq!(reopened.leader().unwrap().promoting(), None);
     });
 }

@@ -60,7 +60,8 @@
 //! Protocols plug in as [`NodeServices`]: started in each life of each
 //! node with its recovered storage, clock, transport, and the placement,
 //! they return the shards the gateway calls. [`ReplicatedServices`] is
-//! replication (plan M2-07), [`RoutedServices`] adds gateways that route
+//! replication (plan M2-07), with learners and their promotion
+//! ([`ReplicatedServices::with_learners`], plan M2-14), [`RoutedServices`] adds gateways that route
 //! by their shard maps (plan M2-08), and later protocols extend them.
 //! [`CoordinatedServices`] wraps any services with the coordinator lease
 //! and change propagation (plan M3-01). Their failure
@@ -88,6 +89,7 @@ mod cluster;
 mod coordination;
 mod creation;
 mod faults;
+mod learners;
 mod node;
 mod pki;
 mod replication;
@@ -100,6 +102,7 @@ pub use coordination::{
     Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,
 };
 pub use faults::{Endpoint, Fault, FaultPlan, FaultProfile, ScheduledFault};
+pub use learners::LearnerCounts;
 pub use node::{BoxError, ControlHandle, LocalServices, NodeEnv, NodeServices, TRANSPORT_PORT};
 pub use replication::{
     HandoffCounts, IoCounts, LateWrites, LeaseCounts, ReplicatedServices, ReplicatedShards,

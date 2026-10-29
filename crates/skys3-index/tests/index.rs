@@ -413,6 +413,26 @@ fn step_downs_are_durable_at_once_and_go_with_their_shard() {
 }
 
 #[test]
+fn promotions_are_durable_at_once_and_go_with_their_shard() {
+    let disk = SimDisk::new(3);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    assert_eq!(index.read().unwrap().promotion(&shard(0)).unwrap(), None);
+    index.store_promotion(&route(0, 3)).unwrap();
+    index.store_promotion(&route(0, 4)).unwrap();
+    index.store_promotion(&route(1, 2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.promotion(&shard(0)).unwrap(), Some(route(0, 4)));
+    assert_eq!(read.promotion(&shard(1)).unwrap(), Some(route(1, 2)));
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().promotion(&shard(1)).unwrap(), None);
+}
+
+#[test]
 fn an_index_from_before_the_shard_map_gains_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.redb");

@@ -63,6 +63,7 @@ commit_on_majority CommittedRecordsSurvive
 blind_register_write OneCommitterPerEpoch
 truncate_by_seq_only CommittedRecordsSurvive Nodes=2 MaxEpoch=4 MaxWrites=2
 drop_promoting_learner CommittedRecordsSurvive
+abandon_unsettled_promotion CommittedRecordsSurvive
 promotion_without_learner_lease ReadsLinearizable Nodes=2 Members=1 MaxEpoch=4
 restart_forgets_grace ReadsLinearizable MaxRestarts=1
 restart_forgets_proposal ReadsLinearizable MaxRestarts=1

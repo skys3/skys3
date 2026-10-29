@@ -27,6 +27,9 @@
 //! - [`handoff`]: primaries handing their shards off to members while
 //!   gateways with stale shard maps read through them, with lost
 //!   step-downs, crashes, and drift.
+//! - [`learners`]: learners added to every shard and promoted to member
+//!   while writes go on, under slow and faulty control stores, crashes,
+//!   and partitions, with rule R3 checked after every step.
 //! - [`registry`]: nodes that join with nothing but their credentials, and
 //!   a coordinator that forgets a silent node only once no shard names it.
 //! - [`buckets`]: buckets created through a gateway, with their shards
@@ -39,6 +42,7 @@ mod coordinator;
 mod crash;
 mod handoff;
 mod harness;
+mod learners;
 mod leases;
 mod registry;
 mod removal;

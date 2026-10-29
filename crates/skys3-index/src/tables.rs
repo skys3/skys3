@@ -45,6 +45,12 @@ pub(crate) const SHARD_MAP: TableDefinition<Bytes, Bytes> = TableDefinition::new
 /// map it is not a cache: a build that ignored it could serve again in
 /// that epoch, so it came with a new format version.
 pub(crate) const STEP_DOWNS: TableDefinition<Bytes, u64> = TableDefinition::new("step_downs");
+/// The promotion of a learner that this node's replica of each shard
+/// proposed as primary and has not seen the outcome of (§6.3, §6.7): the
+/// configuration it proposed, keyed by shard. A build that ignored it
+/// could stop waiting for a learner the register has made a member, so it
+/// came with a new format version.
+pub(crate) const PROMOTIONS: TableDefinition<Bytes, Bytes> = TableDefinition::new("promotions");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -581,6 +587,7 @@ pub struct IndexReader {
     control: ReadOnlyTable<&'static str, Bytes>,
     shard_map: ReadOnlyTable<Bytes, Bytes>,
     step_downs: ReadOnlyTable<Bytes, u64>,
+    promotions: ReadOnlyTable<Bytes, Bytes>,
     meta: ReadOnlyTable<&'static str, u64>,
 }
 
@@ -595,6 +602,7 @@ impl IndexReader {
             control: txn.open_table(CONTROL)?,
             shard_map: txn.open_table(SHARD_MAP)?,
             step_downs: txn.open_table(STEP_DOWNS)?,
+            promotions: txn.open_table(PROMOTIONS)?,
             meta: txn.open_table(META)?,
         })
     }
@@ -608,6 +616,22 @@ impl IndexReader {
     pub fn step_down(&self, shard: &ShardRef) -> Result<Option<Epoch>, IndexError> {
         let value = self.step_downs.get(codec::shard_key(shard).as_slice())?;
         Ok(value.map(|epoch| Epoch::new(epoch.value())))
+    }
+
+    /// Returns the configuration this node's replica of `shard` last
+    /// proposed to promote a learner in, as primary, if it recorded one
+    /// (see [`Index::store_promotion`](crate::Index::store_promotion)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if reading or decoding fails.
+    pub fn promotion(&self, shard: &ShardRef) -> Result<Option<ShardConfig>, IndexError> {
+        let Some(value) = self.promotions.get(codec::shard_key(shard).as_slice())? else {
+            return Ok(None);
+        };
+        codec::decode_route(value.value())
+            .map(Some)
+            .map_err(IndexError::codec("promotions"))
     }
 
     /// Returns the gateway's shard map: the configuration kept for each

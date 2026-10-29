@@ -10,7 +10,7 @@ use skys3_io::{BlockingPool, SimDisk, SimMount};
 use skys3_log::record::ExtentRef;
 use skys3_log::{RecordBody, RecordKind, SegmentLog};
 use skys3_shard::{
-    Committed, Effect, Outcome, Shard, ShardError, ShardSet, ShardSummary, StateMachine,
+    Committed, Effect, Outcome, Role, Shard, ShardError, ShardSet, ShardSummary, StateMachine,
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
@@ -450,6 +450,30 @@ fn the_node_opens_seals_and_removes_shards() {
         // A removed shard opens afresh.
         let reopened = set.open(&config(&shard(0), 1)).await.unwrap();
         assert_eq!(reopened.applied(), at(0));
+    });
+}
+
+#[test]
+fn a_replica_alone_given_learners_opens_again_as_their_primary() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let set = node.set();
+        let one: NodeId = "node-1".parse().unwrap();
+        let alone = set.open_replica(&config(&shard(0), 1), &one).await.unwrap();
+        assert_eq!(alone.role(), Role::Alone);
+        alone.commit(put("a", 1, 1)).await.unwrap();
+        let mut learning = config(&shard(0), 2);
+        learning.learners.push("node-2".parse().unwrap());
+        let primary = set.open_replica(&learning, &one).await.unwrap();
+        assert!(alone.is_stopped());
+        assert_eq!(primary.role(), Role::Primary);
+        assert_eq!(primary.config(), learning);
+        assert_eq!(primary.applied(), EpochSeq::new(Epoch::new(2), Seq::new(1)));
+        let leader = primary.leader().unwrap();
+        assert_eq!(leader.learners(), ["node-2".parse::<NodeId>().unwrap()]);
+        // It serves at once: it has no other member to reconcile.
+        leader.synced(&"node-2".parse().unwrap(), Seq::ZERO);
+        assert!(primary.is_serving());
     });
 }
 

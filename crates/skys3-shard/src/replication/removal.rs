@@ -19,7 +19,7 @@ use skys3_log::ShardRef;
 use skys3_types::{NodeId, ProposalId, Seq, ShardConfig};
 use tokio::time::Instant;
 
-use super::ReplicationConfig;
+use super::{Backfill, ReplicationConfig};
 use crate::leader::Leader;
 use crate::shard::Shard;
 
@@ -146,11 +146,18 @@ impl Removal {
 
 /// What the watchdog last saw of a member.
 #[derive(Debug, Clone, Copy)]
-struct Seen {
-    acked: Seq,
-    heard: u64,
+pub(super) struct Seen {
+    pub(super) acked: Seq,
+    pub(super) heard: u64,
     /// When the member last responded.
     responded: Instant,
+}
+
+impl Seen {
+    /// How long the member or learner has not responded, at `now`.
+    pub(super) fn silent(&self, now: Instant) -> Duration {
+        now.duration_since(self.responded)
+    }
 }
 
 /// A primary's watch over its members (§6.4).
@@ -170,6 +177,9 @@ struct Seen {
 /// another primary, or no longer exists, deposes this one: it stops
 /// (§6.5). So does a member's refusal of an append for a newer epoch, once
 /// the register confirms it: the watchdog reads the register then.
+///
+/// The watchdog also tends the primary's learners, by the same measure of
+/// responding, and promotes them (§6.4, §6.7; see the `learners` module).
 pub(super) struct Watchdog<D: Disk> {
     pub shard: Shard<D>,
     pub leader: Arc<Leader>,
@@ -178,6 +188,9 @@ pub(super) struct Watchdog<D: Disk> {
     pub config: ReplicationConfig,
     /// Called with each configuration the primary adopts.
     pub adopted: Box<dyn Fn(&ShardConfig) + Send + Sync>,
+    /// What backfills the learners, if anything beyond the live stream
+    /// does.
+    pub backfill: Option<Arc<dyn Backfill>>,
 }
 
 impl<D: Disk> Watchdog<D> {
@@ -195,6 +208,7 @@ impl<D: Disk> Watchdog<D> {
         let mut seen: BTreeMap<NodeId, Seen> = BTreeMap::new();
         let mut sequenced = self.shard.last_sequenced();
         let mut rejections = self.leader.rejections();
+        let backfilling = Arc::default();
         while !self.shard.is_stopped() {
             tokio::select! {
                 biased;
@@ -208,35 +222,55 @@ impl<D: Disk> Watchdog<D> {
                 () = tokio::time::sleep(interval) => {}
             }
             let now = Instant::now();
-            let mut suspects = Vec::new();
-            for member in self.leader.members() {
-                let Some((acked, heard)) = self.leader.heard(&member) else {
-                    continue;
-                };
-                let seen = seen.entry(member.clone()).or_insert(Seen {
-                    acked,
-                    heard,
-                    responded: now,
-                });
-                if acked > seen.acked || (heard > seen.heard && acked >= sequenced) {
-                    seen.responded = now;
-                }
-                seen.acked = acked;
-                seen.heard = heard;
-                if now.duration_since(seen.responded) >= self.config.member_suspect_after {
-                    suspects.push(member);
-                }
-            }
+            let suspects: Vec<NodeId> = self
+                .leader
+                .members()
+                .into_iter()
+                .filter(|member| {
+                    self.observe(&mut seen, member, now, sequenced)
+                        .is_some_and(|seen| seen.silent(now) >= self.config.member_suspect_after)
+                })
+                .collect();
+            self.tend_learners(&mut seen, now, sequenced, &backfilling);
             sequenced = self.shard.last_sequenced();
-            // A primary that steps down removes no one: the candidate
-            // proposes over the configuration it stepped down in (§5.4).
-            if !suspects.is_empty()
-                && self.shard.stepped_down().is_none()
-                && let Ok(_changing) = self.leader.changing().try_lock()
-            {
-                self.remove(&suspects).await;
+            // A primary that steps down removes and promotes no one: the
+            // candidate proposes over the configuration it stepped down in
+            // (§5.4).
+            if self.shard.stepped_down().is_some() {
+                continue;
+            }
+            if let Ok(_changing) = self.leader.changing().try_lock() {
+                if suspects.is_empty() {
+                    self.promote().await;
+                } else {
+                    self.remove(&suspects).await;
+                }
             }
         }
+    }
+
+    /// Updates what the watchdog saw of `node`, a member or a learner, at
+    /// `now`, when the primary had sequenced up to `sequenced` a check ago,
+    /// and returns it, unless the primary does not link to `node`.
+    pub(super) fn observe<'a>(
+        &self,
+        seen: &'a mut BTreeMap<NodeId, Seen>,
+        node: &NodeId,
+        now: Instant,
+        sequenced: Seq,
+    ) -> Option<&'a Seen> {
+        let (acked, heard) = self.leader.heard(node)?;
+        let seen = seen.entry(node.clone()).or_insert(Seen {
+            acked,
+            heard,
+            responded: now,
+        });
+        if acked > seen.acked || (heard > seen.heard && acked >= sequenced) {
+            seen.responded = now;
+        }
+        seen.acked = acked;
+        seen.heard = heard;
+        Some(seen)
     }
 
     /// Replaces the shard's register with the next configuration, without
@@ -286,11 +320,12 @@ impl<D: Disk> Watchdog<D> {
     }
 
     /// Acts on `held`, what the shard's register holds while this primary
-    /// is in `current`: adopts a removal of members (the coordinator's, or
-    /// an earlier proposal of this primary that landed unseen), and stops
-    /// as deposed if the register names another primary or is gone. It
-    /// then redirects to the register's configuration.
-    fn follow(&self, current: &ShardConfig, held: Option<&ShardConfig>) {
+    /// is in `current`: adopts a change that keeps it primary and adds no
+    /// member that was not a learner (the coordinator's removals and
+    /// learners, or an earlier proposal of this primary that landed
+    /// unseen), and stops as deposed if the register names another primary
+    /// or is gone. It then redirects to the register's configuration.
+    pub(super) fn follow(&self, current: &ShardConfig, held: Option<&ShardConfig>) {
         let shard = self.shard.shard();
         match held {
             Some(held) if self.can_adopt(current, held) => self.adopt(held),
@@ -308,17 +343,21 @@ impl<D: Disk> Watchdog<D> {
     }
 
     /// Whether the primary can adopt `held` over `current`: a newer epoch
-    /// with the same primary, and only members of `current`.
+    /// with the same primary, whose members were members or learners of
+    /// `current`. A learner made a member by a promotion the primary did
+    /// not propose holds up commits from then on, as a member does.
     fn can_adopt(&self, current: &ShardConfig, held: &ShardConfig) -> bool {
         held.epoch > current.epoch
             && held.primary == self.node
-            && held.learners.is_empty()
-            && held.members.iter().all(|member| current.is_member(member))
+            && held
+                .members
+                .iter()
+                .all(|member| current.is_member(member) || current.is_learner(member))
     }
 
     /// Adopts `config` without waiting for its `CONFIG` record to commit,
     /// which another late member may hold up.
-    fn adopt(&self, config: &ShardConfig) {
+    pub(super) fn adopt(&self, config: &ShardConfig) {
         match self.shard.begin_reconfigure(config) {
             Ok(reply) => {
                 drop(reply);
