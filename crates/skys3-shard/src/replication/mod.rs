@@ -48,13 +48,15 @@ mod exposure;
 mod member;
 mod primary;
 mod removal;
+mod takeover;
 #[cfg(test)]
 mod tests;
 pub mod wire;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use skys3_control::ProposalIds;
@@ -107,6 +109,12 @@ pub struct ReplicationConfig {
     /// before its primary removes it (§6.4), once the node removes members
     /// at all ([`Replication::with_removal`]).
     pub member_suspect_after: Duration,
+    /// The longest a member waits, once `primary_grace` has passed, before
+    /// it proposes itself as primary (§6.5): the delay shrinks to an
+    /// eighth of this as the member holds more records past what it
+    /// applied, so the member with the longest log usually proposes first,
+    /// and up to a quarter more spreads members with equal logs apart.
+    pub takeover_delay: Duration,
 }
 
 impl Default for ReplicationConfig {
@@ -121,6 +129,7 @@ impl Default for ReplicationConfig {
             primary_grace: Duration::from_secs(6),
             ack_timeout: AckTimeout::DEFAULT,
             member_suspect_after: Duration::from_secs(3),
+            takeover_delay: Duration::from_millis(400),
         }
     }
 }
@@ -158,8 +167,13 @@ struct Inner<N: Network, D: Disk> {
     config: ReplicationConfig,
     /// The grace of each shard this node is a member of, in this life.
     graces: Mutex<BTreeMap<ShardRef, Arc<Grace>>>,
-    /// What primaries remove members through, if they do.
+    /// What primaries remove members through, and members take over
+    /// through, if they do.
     removal: OnceLock<Arc<removal::Removal>>,
+    /// Whether members take over from a silent primary.
+    takeover: AtomicBool,
+    /// The shards whose members watch their primary in this life.
+    candidates: Mutex<BTreeSet<ShardRef>>,
     /// Since when each under-replicated shard this node leads has been so,
     /// as far as this life saw.
     under: Arc<Mutex<BTreeMap<ShardRef, MonoTime>>>,
@@ -218,6 +232,8 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 config,
                 graces: Mutex::default(),
                 removal: OnceLock::new(),
+                takeover: AtomicBool::new(false),
+                candidates: Mutex::default(),
                 under: Arc::default(),
             }),
         }
@@ -236,6 +252,17 @@ impl<N: Network, D: Disk> Replication<N, D> {
             ids: Mutex::new(ids),
         };
         let _ = self.inner.removal.set(Arc::new(removal));
+        self
+    }
+
+    /// Lets this node's members take over from a primary that stays silent
+    /// for `primary_grace` (§5.4, §6.5), by replacing their shard's
+    /// register through the registers [`Replication::with_removal`] gave:
+    /// without them, it changes nothing. Members opened from then on watch
+    /// their primary.
+    #[must_use]
+    pub fn with_takeover(self) -> Self {
+        self.inner.takeover.store(true, Ordering::SeqCst);
         self
     }
 
@@ -275,41 +302,83 @@ impl<N: Network, D: Disk> Replication<N, D> {
         let shard = inner.set.open_replica(config, &inner.node).await?;
         shard.set_ack_timeout(inner.config.ack_timeout);
         if shard.role() == Role::Member {
-            inner.grace_of(shard.shard());
+            let grace = inner.grace_of(shard.shard());
+            self.watch_primary(&shard, grace);
         }
-        if let Some(leader) = shard.leader().filter(|leader| leader.claim_links()) {
-            leader.start_leases(Arc::clone(&inner.clock), inner.config.primary_lease);
-            if let Some(removal) = inner.removal.get() {
-                let watchdog = removal::Watchdog {
-                    shard: shard.clone(),
-                    leader: Arc::clone(leader),
-                    node: inner.node.clone(),
-                    removal: Arc::clone(removal),
-                    config: inner.config,
-                    adopted: self.on_adopted(),
-                };
-                tokio::spawn(watchdog.run());
-            }
-            for member in leader.members() {
-                let Some(address) = inner.peers.get(&member) else {
-                    tracing::warn!(shard = %leader.shard(), %member, "no address for a member");
-                    continue;
-                };
-                let link = primary::Link {
-                    shard: shard.clone(),
-                    leader: Arc::clone(leader),
-                    member,
-                    address: address.clone(),
-                    transport: inner.transport.clone(),
-                    config: inner.config,
-                };
-                tokio::spawn(link.run());
-            }
-        }
-        if shard.role() != Role::Member && is_under_replicated(&shard.config()) {
+        self.start_primary(&shard);
+        if shard.role() == Role::Alone && is_under_replicated(&shard.config()) {
             self.on_adopted()(&shard.config());
         }
         Ok(shard)
+    }
+
+    /// Starts a primary's links to its members, its leases, and, if the
+    /// node removes members, the watch over them, unless they run already.
+    fn start_primary(&self, shard: &Shard<D>) {
+        let inner = &self.inner;
+        let Some(leader) = shard.leader().filter(|leader| leader.claim_links()) else {
+            return;
+        };
+        leader.start_leases(Arc::clone(&inner.clock), inner.config.primary_lease);
+        let removal = inner.removal.get();
+        if let Some(removal) = removal {
+            let watchdog = removal::Watchdog {
+                shard: shard.clone(),
+                leader: Arc::clone(leader),
+                node: inner.node.clone(),
+                removal: Arc::clone(removal),
+                config: inner.config,
+                adopted: self.on_adopted(),
+            };
+            tokio::spawn(watchdog.run());
+        }
+        for member in leader.members() {
+            let Some(address) = inner.peers.get(&member) else {
+                tracing::warn!(shard = %leader.shard(), %member, "no address for a member");
+                continue;
+            };
+            let link = primary::Link {
+                shard: shard.clone(),
+                leader: Arc::clone(leader),
+                member,
+                address: address.clone(),
+                transport: inner.transport.clone(),
+                config: inner.config,
+                watched: removal.is_some(),
+            };
+            tokio::spawn(link.run());
+        }
+        if is_under_replicated(&shard.config()) {
+            self.on_adopted()(&shard.config());
+        }
+    }
+
+    /// Starts a member's watch over its primary, to take over once the
+    /// primary goes silent (§6.5), if the node's members take over and the
+    /// watch does not run already.
+    fn watch_primary(&self, shard: &Shard<D>, grace: Arc<Grace>) {
+        let inner = &self.inner;
+        let Some(removal) = inner.removal.get() else {
+            return;
+        };
+        if !inner.takeover.load(Ordering::SeqCst) {
+            return;
+        }
+        let key = shard.shard().clone();
+        if !lock(&inner.candidates).insert(key.clone()) {
+            return;
+        }
+        let candidate = takeover::Candidate {
+            replication: self.clone(),
+            shard: shard.clone(),
+            grace,
+            removal: Arc::clone(removal),
+        };
+        let candidates = self.clone();
+        tokio::spawn(async move {
+            candidate.run().await;
+            lock(&candidates.inner.candidates).remove(&key);
+        });
     }
 
     /// What the watchdog of a primary calls with each configuration it
@@ -342,7 +411,10 @@ impl<N: Network, D: Disk> Replication<N, D> {
                 continue;
             };
             let config = replica.config();
-            if replica.role() == Role::Member || !is_under_replicated(&config) {
+            if replica.role() == Role::Member
+                || replica.is_stopped()
+                || !is_under_replicated(&config)
+            {
                 continue;
             }
             match replica.stored_bytes().await {
@@ -418,6 +490,11 @@ impl<N: Network, D: Disk> Replication<N, D> {
             tracing::debug!(%error, "a replication link to a primary ended");
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // Every update leaves the value consistent.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Whether `config` has fewer members than its `replicas` (§6.4).

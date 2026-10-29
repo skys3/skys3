@@ -2,7 +2,8 @@
 //! placement (plan M2-07), with the audits the replication scenarios check:
 //! commits (M2-07) and reads under leases (M2-09). Writes wait for the
 //! members at most the configured acknowledgement timeout (M2-10), and
-//! primaries remove members that stop responding (M2-11).
+//! primaries remove members that stop responding (M2-11). Members can take
+//! over from a primary that stays silent (M2-12).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,7 +24,7 @@ use skys3_net::{Listener, TurmoilNetwork};
 use skys3_shard::replication::{ControlRegisters, Replication, ReplicationConfig};
 use skys3_shard::{Grace, Role, Shard};
 use skys3_sim::SimS3;
-use skys3_types::{BucketDocument, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
+use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
 
 use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
 
@@ -61,6 +62,8 @@ pub struct ReplicatedServices {
     resubmit: bool,
     /// A seeded bug: members answer reads from their own index.
     members_read: bool,
+    /// Whether members take over from a silent primary (plan M2-12).
+    takeover: bool,
     audit: Arc<Mutex<Audit>>,
 }
 
@@ -113,6 +116,11 @@ struct Audit {
     late: Vec<(ShardRef, EpochSeq)>,
     /// The longest a write took to be acknowledged, in simulated time.
     slowest: Duration,
+    /// The node that acknowledged writes in each epoch of each shard.
+    committers: BTreeMap<(ShardRef, Epoch), NodeId>,
+    /// Writes acknowledged in an epoch in which another node acknowledged
+    /// writes.
+    rivals: Vec<String>,
 }
 
 /// Writes that were not acknowledged in time over a run (§5.2), as the
@@ -194,18 +202,60 @@ impl ReplicatedServices {
         }
     }
 
+    /// The same services, whose members take over from a primary they
+    /// have not heard from for `primary_grace` (§6.5). Takeovers need the
+    /// control store.
+    #[must_use]
+    pub fn with_takeover(self) -> Self {
+        Self {
+            takeover: true,
+            ..self
+        }
+    }
+
+    /// The shards that a node other than their first primary serves as
+    /// primary now: those a member took over.
+    #[must_use]
+    pub fn taken_over(&self) -> BTreeSet<ShardRef> {
+        let audit = self.audit();
+        let mut first = BTreeMap::new();
+        for (_, config, replica) in &audit.replicas {
+            first
+                .entry(replica.shard().clone())
+                .or_insert_with(|| config.primary.clone());
+        }
+        audit
+            .replicas
+            .iter()
+            .filter(|(node, _, replica)| {
+                first.get(replica.shard()) != Some(node)
+                    && replica.role() == Role::Primary
+                    && replica.is_serving()
+                    && !replica.is_stopped()
+            })
+            .map(|(_, _, replica)| ShardRef {
+                bucket: replica.shard().bucket.clone(),
+                shard: replica.shard().shard,
+            })
+            .collect()
+    }
+
     /// Checks the commit rule against what members really hold: no primary
     /// has committed a record, nor acknowledged a write, that some member
     /// of its shard did not hold durably then. A replica's durable run only
-    /// grows, also across restarts, so comparing with every life's replicas
-    /// is exact.
+    /// grows across restarts, and shrinks only where a takeover truncates
+    /// records that were never committed (§6.6), so comparing with the
+    /// longest of every life's runs misses nothing committed. It also
+    /// checks that no two nodes acknowledged writes in the same epoch of a
+    /// shard: one committing primary per epoch (§6.8).
     ///
     /// # Errors
     ///
-    /// What was committed or acknowledged too early.
+    /// What was committed or acknowledged too early, or by a second node
+    /// in an epoch.
     pub fn check_commits(&self) -> Result<(), String> {
         let audit = self.audit();
-        if let Some(early) = audit.early.first() {
+        if let Some(early) = audit.early.first().or(audit.rivals.first()) {
             return Err(early.clone());
         }
         for (node, config, replica) in &audit.replicas {
@@ -405,6 +455,9 @@ impl ReplicatedServices {
         if let Some(store) = &store {
             let registers = ControlRegisters::new(store.clone(), REGISTER_RETRY);
             replication = replication.with_removal(registers, ProposalIds::seeded(env.seed));
+            if self.takeover {
+                replication = replication.with_takeover();
+            }
         }
         let listener = env
             .transport
@@ -467,12 +520,43 @@ impl ReplicatedShards {
             .or_else(|| self.placement.get(shard).cloned())
     }
 
+    /// Whether this node's replica of `shard` has led it as primary in
+    /// this life or an earlier one.
+    pub(crate) fn has_led(&self, shard: &ShardRef) -> bool {
+        lock(&self.audit)
+            .replicas
+            .iter()
+            .any(|(node, config, replica)| {
+                *node == self.node
+                    && config.bucket_id == shard.bucket
+                    && config.shard == shard.shard
+                    && replica.leader().is_some()
+            })
+    }
+
     /// Records an acknowledgement of `position` that some member of the
     /// shard did not hold durably. The members are those of the register
     /// now: a removal takes effect only once its compare-and-swap landed,
     /// and only removes members, so every member it names must hold every
     /// write acknowledged so far.
     fn audit_acknowledged(&self, shard: &ShardRef, position: EpochSeq) {
+        let mut audit = lock(&self.audit);
+        let key = (shard.clone(), position.epoch);
+        match audit.committers.get(&key) {
+            Some(other) if *other != self.node => {
+                let rival = format!(
+                    "{} acknowledged the write at {position} of shard {shard}, but {other} \
+                     acknowledged writes in epoch {} too",
+                    self.node, position.epoch
+                );
+                audit.rivals.push(rival);
+            }
+            Some(_) => {}
+            None => {
+                audit.committers.insert(key, self.node.clone());
+            }
+        }
+        drop(audit);
         let Some(config) = self.current(shard) else {
             return;
         };

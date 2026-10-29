@@ -29,9 +29,11 @@ use skys3_types::{
 use tokio::net::TcpStream;
 
 mod removal;
+mod takeover;
 
 use super::wire::{self, Append, AppendAck, Beacon, Sync, SyncAck};
 use super::{Replication, ReplicationConfig};
+use crate::lineage::Lineage;
 use crate::set::ShardSet;
 
 /// Every wait in these tests.
@@ -166,11 +168,15 @@ async fn next(link: &mut Link) -> Option<Frame> {
 
 /// Sends a `Sync` of `config` and returns the answers up to the last.
 async fn sync(link: &mut Link, config: &ShardConfig, primary_last: u64) -> Vec<(SyncAck, Bytes)> {
+    // A primary that holds records of its own epoch up to `primary_last`.
+    let lineage = Lineage::new(EpochSeq::new(config.epoch, Seq::new(primary_last)));
     let request = Sync {
         config: config.to_json().unwrap(),
         primary_last,
         sequencing: config.epoch.get(),
-    };
+        ..Sync::default()
+    }
+    .with_lineage(&lineage);
     link.send(&wire::frame(MessageKind::Sync, &request, Bytes::new()))
         .await
         .unwrap();

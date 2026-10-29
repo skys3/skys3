@@ -35,6 +35,13 @@ enum Slot<W, B> {
     },
     /// Released once every record queued before it is released.
     Barrier(B),
+    /// A record that is never applied, a `TRUNCATE` (§6.6): nothing after
+    /// it is released, or counts as durable, until it is durable. If it
+    /// fails, the shard stops.
+    Marker {
+        position: EpochSeq,
+        result: Option<Result<(), String>>,
+    },
 }
 
 /// What the queue releases, in queue order.
@@ -74,7 +81,7 @@ impl<W, B> Pipeline<W, B> {
         debug_assert!(
             self.slots.iter().rev().find_map(|slot| match slot {
                 Slot::Write { position, .. } => Some(*position),
-                Slot::Barrier(_) => None,
+                Slot::Barrier(_) | Slot::Marker { .. } => None,
             }) < Some(position),
             "positions are queued in order"
         );
@@ -88,6 +95,29 @@ impl<W, B> Pipeline<W, B> {
     /// Queues a barrier.
     pub(crate) fn barrier(&mut self, reply: B) {
         self.slots.push_back(Slot::Barrier(reply));
+    }
+
+    /// Queues a marker at `position`: a record that is never applied.
+    pub(crate) fn marked(&mut self, position: EpochSeq) {
+        self.slots.push_back(Slot::Marker {
+            position,
+            result: None,
+        });
+    }
+
+    /// Records whether the marker at `position` became durable. A marker
+    /// that is not queued is ignored.
+    pub(crate) fn marker_resolved(&mut self, position: EpochSeq, outcome: Result<(), String>) {
+        let slot = self.slots.iter_mut().find_map(|slot| match slot {
+            Slot::Marker {
+                position: queued,
+                result: result @ None,
+            } if *queued == position => Some(result),
+            _ => None,
+        });
+        if let Some(slot) = slot {
+            *slot = Some(outcome);
+        }
     }
 
     /// Records whether the record at `position` became durable. A position
@@ -123,7 +153,16 @@ impl<W, B> Pipeline<W, B> {
     pub(crate) fn durable_through(&self) -> Option<EpochSeq> {
         self.slots
             .iter()
-            .filter(|slot| !matches!(slot, Slot::Barrier(_)))
+            .filter(|slot| {
+                !matches!(
+                    slot,
+                    Slot::Barrier(_)
+                        | Slot::Marker {
+                            result: Some(Ok(())),
+                            ..
+                        }
+                )
+            })
             .map_while(|slot| match slot {
                 Slot::Write {
                     position,
@@ -137,11 +176,16 @@ impl<W, B> Pipeline<W, B> {
 
     /// Releases what is ready at the front of the queue: a barrier, a
     /// failed record, or the longest run of durable, committed records.
-    /// Returns `None` while the front record is still in flight or waits
-    /// for the commit limit.
+    /// Returns `None` while the front record or marker is still in flight,
+    /// or the front record waits for the commit limit. A resolved marker is
+    /// passed over: one that failed has stopped the shard, which then
+    /// applies nothing more.
     pub(crate) fn next(&mut self) -> Option<Ready<W, B>> {
         match self.slots.pop_front()? {
             Slot::Barrier(reply) => Some(Ready::Barrier(reply)),
+            Slot::Marker {
+                result: Some(_), ..
+            } => self.next(),
             Slot::Write {
                 reply,
                 result: Some(Err(error)),
@@ -156,7 +200,7 @@ impl<W, B> Pipeline<W, B> {
                 batch.extend(std::iter::from_fn(|| self.pop_durable()));
                 Some(Ready::Apply(batch))
             }
-            pending @ Slot::Write { .. } => {
+            pending @ (Slot::Write { .. } | Slot::Marker { .. }) => {
                 self.slots.push_front(pending);
                 None
             }
@@ -172,9 +216,22 @@ impl<W, B> Pipeline<W, B> {
             match slot {
                 Slot::Write { reply, .. } => writes.push(reply),
                 Slot::Barrier(reply) => barriers.push(reply),
+                Slot::Marker { .. } => {}
             }
         }
         (writes, barriers)
+    }
+
+    /// Drops the records after `after`, which a member truncated to
+    /// reconcile with a new primary (§6.6), without releasing or answering
+    /// them, and lowers the commit limit to `after`: a watermark of the
+    /// earlier primary says nothing of the records that take their place.
+    pub(crate) fn truncate(&mut self, after: Seq) {
+        self.slots.retain(|slot| match slot {
+            Slot::Write { position, .. } => position.seq <= after,
+            Slot::Barrier(_) | Slot::Marker { .. } => true,
+        });
+        self.limit = self.limit.map(|limit| limit.min(after));
     }
 
     fn committed(&self, position: EpochSeq) -> bool {
@@ -228,6 +285,61 @@ mod tests {
             Some(Ready::Apply(batch)) => batch.into_iter().map(|(_, reply)| reply).collect(),
             other => panic!("expected records to apply, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_truncated_tail_is_dropped_and_waits_for_a_new_watermark() {
+        let mut pipeline = Pipeline::<u64, &str>::default();
+        pipeline.require_commit(Seq::new(3));
+        for seq in 1..=3 {
+            pipeline.sequenced(at(seq), seq);
+            pipeline.resolved(at(seq), durable(seq));
+        }
+        pipeline.barrier("after");
+        pipeline.truncate(Seq::new(1));
+        assert_eq!(applied(pipeline.next()), [1]);
+        assert!(matches!(pipeline.next(), Some(Ready::Barrier("after"))));
+        // A record taken in place of a truncated one waits for a watermark
+        // that covers it.
+        pipeline.sequenced(at(2), 20);
+        pipeline.resolved(at(2), durable(2));
+        assert!(pipeline.next().is_none());
+        pipeline.commit_through(Seq::new(2));
+        assert_eq!(applied(pipeline.next()), [20]);
+    }
+
+    #[test]
+    fn nothing_after_a_marker_counts_until_it_is_durable() {
+        let mut pipeline = Pipeline::<u64, &str>::default();
+        pipeline.sequenced(at(1), 1);
+        pipeline.resolved(at(1), durable(1));
+        let marker = EpochSeq::new(Epoch::new(2), Seq::new(1));
+        pipeline.marked(marker);
+        pipeline.sequenced(at(2), 2);
+        pipeline.resolved(at(2), durable(2));
+        // The record after the marker is durable, but neither released nor
+        // counted as durable while the marker is in flight.
+        assert_eq!(applied(pipeline.next()), [1]);
+        assert!(pipeline.next().is_none());
+        assert_eq!(pipeline.durable_through(), None);
+        // A failed marker counts for nothing either; one that is durable is
+        // passed over.
+        pipeline.marker_resolved(marker, Err("disk out of service".into()));
+        assert_eq!(pipeline.durable_through(), None);
+        let mut ok = Pipeline::<u64, &str>::default();
+        ok.marked(marker);
+        ok.sequenced(at(2), 2);
+        ok.resolved(at(2), durable(2));
+        // An unknown marker is ignored.
+        ok.marker_resolved(at(9), Ok(()));
+        assert!(ok.next().is_none());
+        ok.marker_resolved(marker, Ok(()));
+        assert_eq!(ok.durable_through(), Some(at(2)));
+        assert_eq!(applied(ok.next()), [2]);
+        // Abandoning and truncating keep no record of a marker.
+        ok.marked(marker);
+        ok.truncate(Seq::new(1));
+        assert_eq!(ok.abandon(), (vec![], vec![]));
     }
 
     #[test]

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use skys3_io::{BlockingPool, Disk};
-use skys3_log::record::ShardRef;
-use skys3_log::{LogError, RecordLocation, SegmentId, SegmentLog, SegmentSummary};
+use skys3_log::record::{ShardRef, truncated_by};
+use skys3_log::{LogError, RecordKind, RecordLocation, SegmentId, SegmentLog, SegmentSummary};
 use skys3_types::{EpochSeq, Label};
 use tokio::time::MissedTickBehavior;
 
@@ -21,6 +21,9 @@ const REPLAY_BATCH: usize = 256;
 /// the disk, log, and location that hold it.
 type Pending<'a, D> =
     BTreeMap<ShardRef, Vec<(EpochSeq, &'a Label, &'a SegmentLog<D>, RecordLocation)>>;
+
+/// The positions of the `TRUNCATE` records replay found, by shard.
+type Truncates = BTreeMap<ShardRef, Vec<EpochSeq>>;
 
 /// What a replay did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -75,6 +78,10 @@ impl<D: Disk> Checkpointer<D> {
     /// at or before every shard's applied position, decodes every record it
     /// applies, and applies each shard's records in position order across
     /// every disk, so a shard whose records span disks replays correctly.
+    /// A record that a `TRUNCATE` of its shard invalidates
+    /// ([`truncated_by`]) is not applied. The `TRUNCATE` itself is, in
+    /// position order: it changes no entry, and every record it leaves
+    /// valid sorts before it (§6.6).
     ///
     /// # Errors
     ///
@@ -96,11 +103,23 @@ impl<D: Disk> Checkpointer<D> {
         // shard's record advances its applied position, which would hide
         // an earlier record of the shard on a disk not yet scanned.
         let mut pending: Pending<'_, D> = BTreeMap::new();
+        let mut truncates = Truncates::new();
         for (disk, log) in &self.logs {
-            self.scan(disk, log, &applied, &mut pending, &mut report)
-                .await?;
+            self.scan(
+                disk,
+                log,
+                &applied,
+                (&mut pending, &mut truncates),
+                &mut report,
+            )
+            .await?;
         }
-        for mut records in pending.into_values() {
+        for (shard, mut records) in pending {
+            if let Some(truncates) = truncates.get(&shard) {
+                records.retain(|(position, ..)| {
+                    !truncates.iter().any(|t| truncated_by(*t, *position))
+                });
+            }
             // A shard's extents are in bulk segments and its other records
             // in hot ones, possibly on several disks, so the scans find them
             // in segment order, not position order. A record found on two
@@ -130,7 +149,7 @@ impl<D: Disk> Checkpointer<D> {
         disk: &'a Label,
         log: &'a SegmentLog<D>,
         applied: &BTreeMap<ShardRef, EpochSeq>,
-        pending: &mut Pending<'a, D>,
+        (pending, truncates): (&mut Pending<'a, D>, &mut Truncates),
         report: &mut ReplayReport,
     ) -> Result<(), IndexError> {
         let known = self.index.coverage_of(disk);
@@ -159,6 +178,12 @@ impl<D: Disk> Checkpointer<D> {
                 scanned.add(&header.shard, header.position, record.location.end());
                 let done = applied.get(&header.shard);
                 if done.is_none_or(|done| header.position > *done) {
+                    // A TRUNCATE at or before the applied position only
+                    // invalidates records before it too.
+                    if header.kind == RecordKind::Truncate {
+                        let shard = truncates.entry(header.shard.clone()).or_default();
+                        shard.push(header.position);
+                    }
                     pending.entry(header.shard.clone()).or_default().push((
                         header.position,
                         disk,

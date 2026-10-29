@@ -32,6 +32,7 @@ struct Replica {
     log: SegmentLog<SimMount>,
     index: Arc<Index>,
     pool: BlockingPool,
+    disk: SimDisk,
 }
 
 impl Replica {
@@ -41,6 +42,7 @@ impl Replica {
             log: open_log(disk.mount()).await,
             index: Arc::new(Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap()),
             pool: pool(),
+            disk,
         }
     }
 
@@ -490,5 +492,43 @@ fn a_primary_reads_only_under_every_members_lease() {
         leader.acknowledged(&node(3), Seq::new(2));
         let committed = conditional.await.unwrap().unwrap().unwrap();
         assert_eq!(committed.position, at(2));
+    });
+}
+
+/// A `TRUNCATE` that does not become durable stops the member: it must not
+/// take records in place of the truncated ones without it (§6.6).
+#[test]
+fn a_truncate_that_fails_to_sync_stops_the_member() {
+    runtime().block_on(async {
+        let replica = Replica::new().await;
+        let member = replica.open(&replicated(), &node(2)).await.unwrap();
+        let session = member.begin_session();
+        let epoch = Epoch::new(1);
+        for (seq, key) in [(1, "a"), (2, "b"), (3, "c")] {
+            let (record, bytes) = encoded(seq, delete(key));
+            assert_eq!(
+                member.receive(Some(session), epoch, record, bytes, false),
+                Ok(true)
+            );
+        }
+        member.settle().await;
+        assert_eq!(*member.durable().borrow(), Seq::new(3));
+
+        replica.disk.fail_next_syncs(1);
+        let truncated = member.truncate(Seq::new(1), Epoch::new(2)).await;
+        let Err(ShardError::Unavailable { reason, .. }) = truncated else {
+            panic!("expected the member to stop, got {truncated:?}");
+        };
+        assert!(reason.contains("TRUNCATE"), "{reason}");
+        assert!(member.is_stopped());
+        // No record takes a truncated one's place, and nothing is applied.
+        let replacement = record(EpochSeq::new(Epoch::new(2), Seq::new(2)), delete("x"));
+        let bytes = replacement.to_bytes().unwrap();
+        let taken = member.receive(Some(session), Epoch::new(2), replacement, bytes, false);
+        assert!(
+            matches!(taken, Err(ShardError::Unavailable { .. })),
+            "{taken:?}"
+        );
+        assert_eq!(member.applied(), at(0));
     });
 }
