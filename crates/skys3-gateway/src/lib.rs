@@ -27,7 +27,9 @@
 //!   larger one as `EXTENT` records while it arrives, and a PUT is answered
 //!   only once its record is durable and applied. A GET of an evicted
 //!   version of a `write_back` bucket reads it through a read-through fill
-//!   from the bucket's remote target ([`Fills`]). User metadata is limited
+//!   from the bucket's remote target ([`Fills`]). Objects read from other
+//!   nodes stay in the node's [`HotCache`], which serves later GETs of the
+//!   same version. User metadata is limited
 //!   to [`MAX_USER_METADATA_BYTES`]. DeleteObjects deletes up to
 //!   [`MAX_DELETE_KEYS`] keys, each authorized on its own. CopyObject copies
 //!   the source's bytes into the destination's shard and commits a `PUT`
@@ -133,6 +135,7 @@ mod fill;
 #[cfg(feature = "test-util")]
 #[doc(hidden)]
 pub mod fuzzing;
+mod hot_cache;
 mod limits;
 mod listener;
 mod listing;
@@ -153,6 +156,7 @@ pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, ShardPlacement, TARGET_H
 pub use conditions::{ConditionFailed, PeerCondition, Precondition, current_identity};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
 pub use fill::{FillBody, FillError, Fills};
+pub use hot_cache::{HotCache, HotCacheMetrics, HotCacheUsage};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};
 pub use listener::GatewayListener;
 pub use listing::{ListTokenKeys, MAX_KEYS, ShortTokenKey};

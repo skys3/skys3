@@ -101,8 +101,8 @@ mod s3;
 mod workload;
 
 pub use cluster::{
-    Cluster, ClusterConfig, Invariant, ReadRegistration, Rebuild, Report, RunError, View,
-    WriteTiming,
+    Cluster, ClusterConfig, HotCaches, Invariant, ReadRegistration, Rebuild, Report, RunError,
+    View, WriteTiming,
 };
 pub use coordination::{
     Change, CoordinatedServices, CoordinationConfig, Forgotten, PUSH_PORT, PushDelays, RegistryView,

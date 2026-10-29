@@ -59,6 +59,10 @@
 //! - [`reads`]: `GET`s through any node read their bytes from the holders
 //!   their read plans name while overwrites and evictions race them, and
 //!   fail mid-stream when their registration lapses.
+//! - [`hot_cache`]: every gateway serves `GET`s of hot objects from its
+//!   hot cache, only for the version the read plan names, while
+//!   overwrites, evictions, compaction, crashes, and message loss race
+//!   them.
 
 mod acks;
 mod backfill;
@@ -69,6 +73,7 @@ mod coordinator;
 mod crash;
 mod handoff;
 mod harness;
+mod hot_cache;
 mod learners;
 mod leases;
 mod reads;

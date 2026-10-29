@@ -39,7 +39,9 @@
 //! primary names in the read plan (§9.2), the gateway's own node first,
 //! under a registration that keeps them on the holder while they stream
 //! (`holders`); when no holder still has the version, the read resolves
-//! the key again. A GET of an evicted version of a `write_back`
+//! the key again. Before it asks a holder, a GET looks the version up in
+//! the node's [`HotCache`], and a whole object read from another node's
+//! holder fills it. A GET of an evicted version of a `write_back`
 //! bucket reads it through a fill from the remote ([`Fills`]); when the fill
 //! finds the remote changed and adopts its version, the read resolves the
 //! key again, at most [`MAX_FILL_ROUNDS`] times.
@@ -76,12 +78,13 @@ use crate::buckets::{GatewayConfig, shard_error};
 use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
 use crate::fill::{FillError, Fills};
+use crate::hot_cache::{HotCache, ObjectName, VersionName};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
 pub(crate) use copy::copy_source;
 pub use delete::MAX_DELETE_KEYS;
-use holders::HolderReads;
+use holders::{HolderReads, Keep};
 pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};
@@ -243,6 +246,7 @@ pub(crate) struct Objects<H> {
     admission: Arc<dyn Admission>,
     remote: Option<Arc<dyn RemoteReads>>,
     holders: HolderReads,
+    hot_cache: HotCache,
 }
 
 impl<H: Shards> Objects<H> {
@@ -256,6 +260,7 @@ impl<H: Shards> Objects<H> {
             admission: Arc::clone(&config.admission),
             remote: config.remote.clone(),
             holders: HolderReads::new(config.read_registration_renew_interval),
+            hot_cache: config.hot_cache.clone(),
         }
     }
 
@@ -413,13 +418,16 @@ impl<H: Shards> Objects<H> {
                 let body = self.read_remote(bucket, &input.key, &found).await?;
                 break (found, body);
             }
+            if let Some(body) = self.read_hot(bucket, &input.key, &found) {
+                break (found, body);
+            }
             if !found.evicted {
                 if found.holders.is_empty() {
                     // A version whose bytes no replica holds, as a copy
                     // of an evicted object.
                     return Err(download::not_cached());
                 }
-                match self.read_held(&input.key, &found).await {
+                match self.read_held(bucket, &input.key, &found).await {
                     Some(body) => break (found, body),
                     // No holder still has the version: it was replaced or
                     // evicted since the plan, so the key is resolved again.
@@ -482,14 +490,45 @@ impl<H: Shards> Objects<H> {
         Ok(output)
     }
 
+    /// The bytes of `found`, a version of `key`, from the hot cache, if it
+    /// holds that version (§9.2).
+    fn read_hot(&self, bucket: &BucketDocument, key: &str, found: &Found) -> Option<StreamingBlob> {
+        if found.bytes.is_empty() {
+            return None;
+        }
+        let (object, version) = hot_names(bucket, key, found);
+        let data = self.hot_cache.get(&object, &version, found.bytes.clone())?;
+        Some(StreamingBlob::from_bytes(data))
+    }
+
     /// The bytes of `found`, a version of `key`, from the first of the
     /// plan's holders that still holds it (§9.2), or `None` if none does.
-    async fn read_held(&self, key: &str, found: &Found) -> Option<StreamingBlob> {
+    /// A read of the whole object from another node's holder fills the hot
+    /// cache, if it admits the object.
+    async fn read_held(
+        &self,
+        bucket: &BucketDocument,
+        key: &str,
+        found: &Found,
+    ) -> Option<StreamingBlob> {
         if found.bytes.is_empty() {
             return Some(empty_blob());
         }
         let local = self.shards.node();
+        let whole = found.bytes == (0..found.object.size);
         for holder in self.holders.order(&found.holders, local.as_ref()) {
+            let keep = (whole
+                && Some(&holder) != local.as_ref()
+                && self.hot_cache.admits(found.object.size))
+            .then(|| {
+                let (object, version) = hot_names(bucket, key, found);
+                Keep {
+                    cache: self.hot_cache.clone(),
+                    object,
+                    version,
+                    size: found.object.size,
+                }
+            });
             let opened = self
                 .holders
                 .open(
@@ -499,6 +538,7 @@ impl<H: Shards> Objects<H> {
                     found.version,
                     found.layout.clone(),
                     found.bytes.clone(),
+                    keep,
                 )
                 .await;
             match opened {
@@ -563,6 +603,20 @@ impl<H: Shards> Objects<H> {
         selected.holders = found.holders;
         Ok(selected)
     }
+}
+
+/// The names the hot cache keeps `found`, a version of `key` in `bucket`,
+/// under: the bucket and key, and the version's position and ETag.
+fn hot_names(bucket: &BucketDocument, key: &str, found: &Found) -> (ObjectName, VersionName) {
+    let object = ObjectName {
+        bucket: bucket.bucket_id.clone(),
+        key: key.to_owned(),
+    };
+    let version = VersionName {
+        position: found.version,
+        etag: found.object.local_etag.clone(),
+    };
+    (object, version)
 }
 
 /// Selects the bytes of `object` a read serves: a `Range`, a part, or the
