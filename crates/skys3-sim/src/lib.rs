@@ -7,10 +7,12 @@
 //!
 //! - [`runner`]: runs a scenario over a fixed set of seeds and, on failure,
 //!   reports the seed and the command that replays it.
+//! - [`s3`]: the simulated S3 store, which implements `skys3-remote`'s
+//!   `ObjectStore` for remote targets and the S3 control store, with
+//!   conditional writes, provider profiles, and seeded faults.
 //!
-//! Later parts of the plan add the simulated S3 store (M0-05), and the
-//! cluster harness and history checkers (M2-03), as modules beside the
-//! runner.
+//! The cluster harness and history checkers (plan M2-03) are added later as
+//! modules beside these.
 //!
 //! # Conventions
 //!
@@ -40,5 +42,7 @@
 //! ```
 
 pub mod runner;
+pub mod s3;
 
 pub use runner::{NodeClock, Runner, SeedSet, SimContext};
+pub use s3::SimS3;

@@ -1,0 +1,20 @@
+[package]
+name = "skys3-remote"
+description = "SkyS3 remote targets: the object-store interface to S3-compatible stores, and later its client and capability probe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

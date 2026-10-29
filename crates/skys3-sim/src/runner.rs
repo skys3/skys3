@@ -26,6 +26,8 @@ use rand::rngs::SmallRng;
 use rand::{Rng, RngCore, SeedableRng};
 use skys3_io::{Drift, MonoTime, MonotonicClock, SimDisk, SimDiskFaults};
 
+use crate::s3::{SimS3, SimS3Config};
+
 /// The variable that selects a single seed to replay.
 pub const SEED_ENV: &str = "SKYS3_SIM_SEED";
 
@@ -163,6 +165,12 @@ impl SimContext {
     /// context.
     pub fn disk_with_faults(&mut self, faults: SimDiskFaults) -> SimDisk {
         SimDisk::with_faults(self.fork_seed(), faults)
+    }
+
+    /// Returns an empty simulated S3 bucket whose faults are seeded from
+    /// this context.
+    pub fn s3(&mut self, config: SimS3Config) -> SimS3 {
+        SimS3::new(self.fork_seed(), config)
     }
 
     /// Returns the clock of a new node: a drift drawn uniformly within
@@ -471,6 +479,8 @@ mod tests {
             ..SimDiskFaults::default()
         };
         assert_eq!(context.disk_with_faults(faults.clone()).faults(), faults);
+        let store = context.s3(SimS3Config::default());
+        assert_eq!(store.config(), &SimS3Config::default());
 
         let mut sim = context.builder().build();
         let node = context.node_clock(Drift::NONE);

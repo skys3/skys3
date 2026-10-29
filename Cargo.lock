@@ -147,6 +147,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -404,12 +414,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "skys3-remote"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "proptest",
+ "skys3-types",
+ "thiserror",
+]
+
+[[package]]
 name = "skys3-sim"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "md-5",
+ "proptest",
  "rand",
  "skys3-io",
+ "skys3-remote",
+ "skys3-types",
  "tokio",
  "turmoil",
 ]
