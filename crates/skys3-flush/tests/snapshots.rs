@@ -193,6 +193,35 @@ fn a_write_back_snapshot_holds_what_the_remote_lacks() {
     });
 }
 
+/// A version that inherits the identity of a write older than another
+/// write of its key, as a completed upload inherits its creation's, is
+/// lost if the remote holds only that other write.
+#[test]
+fn an_inherited_identity_older_than_the_remote_write_is_lost() {
+    runtime().block_on(async {
+        let store = support::remote(9, false);
+        let node = Node::open_inline(9).await;
+        let document = bucket(BucketMode::WriteBack);
+        let service = service(&store, BucketMode::WriteBack);
+        let begun = node.put("begun", "an upload's start").await;
+        node.put("k", "between").await;
+        let flusher = node.flusher(&target(&store));
+        node.settle(&flusher).await;
+        flusher.stop().await;
+        node.complete("k", "completed", begun).await;
+
+        written(&service, &node, &document, 1).await;
+        service.shutdown().await;
+        assert_eq!(lost(&report(&store, Some(DATA)).await), ["k"]);
+
+        // Once flushed under its inherited identity, it is held.
+        let flusher = node.flusher(&target(&store));
+        node.settle(&flusher).await;
+        flusher.stop().await;
+        assert!(report(&store, Some(DATA)).await.lost.is_empty());
+    });
+}
+
 #[test]
 fn a_local_snapshot_restores_the_whole_index_from_its_deltas() {
     runtime().block_on(async {
