@@ -7,7 +7,7 @@ pub mod pki;
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use skys3_ec::fragment::{FragmentHeader, ObjectMeta, PartSize, StripeInfo};
@@ -118,7 +118,8 @@ pub fn fragment(key: &str, len: u64, seed: u64) -> (FragmentHeader, Bytes) {
 
 /// A mount that kills the process (keeping the page cache) at a planned
 /// sync, numbered over data and directory syncs from 0. The killed sync
-/// fails and does not happen.
+/// fails and does not happen. Its reads can also be stalled, as a hung
+/// disk's are.
 #[derive(Clone, Debug)]
 pub struct KillMount {
     mount: SimMount,
@@ -129,6 +130,7 @@ pub struct KillMount {
 struct KillPlan {
     syncs: AtomicU64,
     kill_at: Option<u64>,
+    stalled: AtomicBool,
 }
 
 impl KillPlan {
@@ -150,8 +152,14 @@ impl KillMount {
             plan: Arc::new(KillPlan {
                 syncs: AtomicU64::new(0),
                 kill_at,
+                stalled: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Makes every later read wait forever.
+    pub fn stall_reads(&self) {
+        self.plan.stalled.store(true, Ordering::Relaxed);
     }
 
     /// The syncs so far.
@@ -216,6 +224,9 @@ impl SegmentFile for KillFile {
     }
 
     async fn read_at(&self, offset: u64, len: usize) -> io::Result<Bytes> {
+        if self.plan.stalled.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
         self.file.read_at(offset, len).await
     }
 

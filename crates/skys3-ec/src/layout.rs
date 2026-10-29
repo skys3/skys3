@@ -15,9 +15,10 @@
 //! interchangeable, because a codec's output is fixed by its ID, geometry,
 //! and data. The rebuild therefore prefers, for each fragment index, the
 //! copy from the latest attempt, and for each stripe the layout of the
-//! latest attempt that has enough fragments to decode.
+//! latest attempt that has enough fragments to decode and that leads on to
+//! stripes covering the rest of the object.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use skys3_log::record::{IDENTITY_METADATA, ShardRef};
 use skys3_types::{CodecId, CodedStripe, EpochSeq, FragmentLocation, Geometry};
@@ -231,7 +232,10 @@ fn rebuild_object(
 
 /// Picks a decodable layout for each of `count` stripes from `fragments`,
 /// which are sorted latest attempt first, and checks that they cover the
-/// object's `size` bytes in order.
+/// object's `size` bytes in order. A stripe's latest decodable layout is
+/// passed over if no decodable layouts of the later stripes continue it to
+/// the object's end, so an abandoned attempt that moved the stripe
+/// boundaries cannot hide a complete older one.
 fn rebuild_stripes<'a>(
     fragments: impl Iterator<Item = &'a FoundFragment>,
     count: u32,
@@ -262,6 +266,18 @@ fn rebuild_stripes<'a>(
             .or_insert_with(|| fragment.location.clone());
     }
 
+    let complete = completions(&candidates, count, size);
+    let leads_on = |number: u32, offset: u64, data_len: u64| {
+        offset.checked_add(data_len).is_some_and(|end| {
+            complete
+                .get(&(number + 1))
+                .is_some_and(|c| c.contains(&end))
+        })
+    };
+    // If no sequence covers the object, pick as if every layout led on, for
+    // the error of the latest attempts.
+    let any = complete.get(&0).is_some_and(|c| c.contains(&0));
+
     let mut stripes = Vec::new();
     let mut next_offset = 0;
     for number in 0..count {
@@ -272,6 +288,9 @@ fn rebuild_stripes<'a>(
         let mut chosen = None;
         for ((_, offset, data_len, geometry, codec), located) in of_stripe {
             if located.len() >= geometry.data_fragments() {
+                if any && (*offset != next_offset || !leads_on(number, *offset, *data_len)) {
+                    continue;
+                }
                 chosen = Some((*offset, *data_len, *geometry, *codec, located));
                 break;
             }
@@ -310,4 +329,35 @@ fn rebuild_stripes<'a>(
         return Err(RebuildError::Gap { stripe: count });
     }
     Ok(stripes)
+}
+
+/// For each stripe number up to `count`, the offsets from which decodable
+/// candidates of it and the later stripes cover the rest of the object's
+/// `size` bytes in order; `count` itself maps to the object's end alone.
+/// Stripes with no such offset are left out.
+fn completions(
+    candidates: &[(StripeKey, BTreeMap<u8, FragmentLocation>)],
+    count: u32,
+    size: u64,
+) -> BTreeMap<u32, BTreeSet<u64>> {
+    let mut complete = BTreeMap::from([(count, BTreeSet::from([size]))]);
+    // Later stripes first, so each stripe's successors are known.
+    let mut later_first: Vec<_> = candidates
+        .iter()
+        .map(|(key, located)| (key, located.len()))
+        .collect();
+    later_first.sort_by_key(|((number, ..), _)| std::cmp::Reverse(*number));
+    for (&(number, offset, data_len, geometry, _), located) in later_first {
+        if number < count
+            && located >= geometry.data_fragments()
+            && offset.checked_add(data_len).is_some_and(|end| {
+                complete
+                    .get(&(number + 1))
+                    .is_some_and(|c| c.contains(&end))
+            })
+        {
+            complete.entry(number).or_default().insert(offset);
+        }
+    }
+    complete
 }
