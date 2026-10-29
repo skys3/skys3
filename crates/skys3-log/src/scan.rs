@@ -65,7 +65,8 @@ pub enum ScanError {
 
 /// Reads the records of one segment from its start, in order.
 ///
-/// A scanner reads the segment's length when it is created and stops there.
+/// A scanner covers a range fixed when it is created: by default from the
+/// segment's start to its length then.
 /// Every record it returns has a verified fixed header and CRC. It stops at
 /// the first bytes that are not such a record and reports them as a
 /// [`ScanError::Decode`] whose offset is where the valid records end.
@@ -83,17 +84,16 @@ pub struct SegmentScanner<F> {
 }
 
 impl<F: SegmentFile> SegmentScanner<F> {
-    /// Scans `file`, which holds segment `segment`, from offset zero to its
-    /// current length.
-    pub(crate) fn new(file: Arc<F>, segment: SegmentId) -> Self {
-        let end = file.len();
+    /// Scans `file`, which holds segment `segment`, from offset `start` to
+    /// offset `end`, at most its length.
+    pub(crate) fn new(file: Arc<F>, segment: SegmentId, start: u64, end: u64) -> Self {
         Self {
             file,
             segment,
-            offset: 0,
+            offset: start,
             end,
             buf: Bytes::new(),
-            buf_start: 0,
+            buf_start: start,
         }
     }
 

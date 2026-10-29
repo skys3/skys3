@@ -936,7 +936,7 @@ Parsing checks lengths before allocating, uses checked arithmetic, and rejects u
 
 - A segment file is named `<class>-<id>.seg`, with the class `hot` or `bulk` and the id as 16 lowercase hex digits. One counter per disk numbers segments of both classes, so ids follow creation order. Records hold no segment header: each record carries its own magic, version, and CRC.
 - `EXTENT` records go to bulk segments and every other kind to hot segments. A record in a hot segment carries at most `inline_max_bytes` of payload. Records of one class are written in the order they were queued. Records of different classes become durable independently, even in one group commit, so a `PUT` is appended only after its extents are acknowledged.
-- A record's location is `(segment id, offset, length)`. The log returns it on acknowledgement, and the location map (section 10.2) stores it for extents.
+- A record's location is `(segment id, offset, length)`. The log returns it on acknowledgement, and the location map (section 10.2) stores it for extents and inline payload.
 - A class starts a new segment only between group commits: before a commit writes to a non-empty segment past `segment_bytes`. So every segment except the last of each class was fully synced before its successor existed, and only the last of each class can have a torn tail. A segment exceeds `segment_bytes` only if one group commit's records for the class do.
 
 **Recovery** scans the last segment of each class and stops at the first bytes that are not a record whose CRC verifies. It acts on the decoding error's class:
@@ -952,11 +952,18 @@ Recovery then syncs those segments and the directory, so every record it leaves 
 A per-node `redb` database[^redb] holds:
 
 - each shard's namespace index, keyed by `(shard, key)`, with state, ETags, checksums, metadata, and payload location,
-- the node-local location map, from extent to `(segment, offset, length)`,
+- the node-local location map, from a record holding payload (an extent or inline data) to `(segment, offset, length)`,
 - each shard's applied `(epoch, seq)`,
 - the node's local copy of control state: the gateway shard map, bucket bindings, identity configuration, and node registry, each tagged with its configuration generation (section 6.2).
 
 Index updates are committed **without fsync** (`Durability::None`). A durable checkpoint runs every `index_checkpoint_interval`. After a crash, redb reverts to the last durable checkpoint, and records after the checkpointed `seq` are replayed from the log. The log is the source of truth, and only log appends are fsynced on the write path. Log segments are released only once they are behind the durable checkpoint.
+
+The `skys3-index` crate's `codec` module specifies the tables and encodings. The rules that the sentences above leave open:
+
+- **Payload by position.** An entry names its payload by log position: the record holding inline data, or the `EXTENT` records. Entries are therefore the same on every replica. The location map resolves a position to `(segment, offset, length)` on this node, for `EXTENT` records and for `PUT` records with inline data.
+- **One apply path.** Live writes and replay apply records through the same function, a shard's records in position order. A record at or before the shard's applied position is skipped, so replay is idempotent. An applied position therefore means that every earlier record of the shard was applied, `EXTENT` records included. Replay applies every durable record past its shard's checkpointed position. It collects each shard's records from every disk of the node, then sorts them by position: a shard's extents and its other records are in segments of different classes, and nothing pins a shard replica's records to one disk. Applying a record before an earlier one on another disk would hide that one behind the applied position. The location map names no disk yet, so the PR that places shard replicas on a node's disks (M1-13) either adds the disk to it or keeps each replica's payload on one disk. A record whose CRC verifies but whose body does not decode is damage (§10.1).
+- **Segment summaries.** The log keeps a summary of each segment: the highest position of each shard among the records it acknowledged there. Each checkpoint folds these into a summary of each segment from offset zero, and stores it in the same durable commit as the applied positions. A segment other than the last of its class is released once its summary covers its whole length and every position in it is at or before its shard's checkpointed position. Replay starts reading a segment where such a summary ends, and otherwise reads it whole. Summaries cover acknowledged records, not applied ones, so a record acknowledged but not yet applied holds its segment back. So does a shard that never applies again, so dropping a shard from a node must also account for its segments.
+- **Control state.** The local copy of control state does not come from the log, so replay cannot restore it. Each change to it commits durably at once.
 
 ### 10.3 Reclaiming space
 

@@ -29,7 +29,7 @@ use std::io;
 use bytes::Bytes;
 
 pub use real::{RealDisk, RealFile};
-pub use sim::{SimDisk, SimDiskFaults, SimFile, SimFileInfo, SimMount};
+pub use sim::{SimBlockFile, SimDisk, SimDiskFaults, SimFile, SimFileInfo, SimMount};
 
 /// The longest file name a disk accepts, in bytes.
 pub const MAX_NAME_LEN: usize = 255;

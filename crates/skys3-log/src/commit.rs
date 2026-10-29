@@ -6,11 +6,13 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use skys3_io::{Clock, Disk, MonoTime, SegmentFile};
+use skys3_types::EpochSeq;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::LogConfig;
 use crate::log::Shared;
+use crate::record::ShardRef;
 use crate::segment::{RecordLocation, SegmentClass, SegmentId, file_name};
 
 /// What the committer tells an appender: the record's location once a sync
@@ -22,6 +24,9 @@ pub(crate) type Reply = Result<RecordLocation, Arc<io::Error>>;
 pub(crate) struct Request {
     pub(crate) class: SegmentClass,
     pub(crate) bytes: Bytes,
+    /// The record's shard and position, for the segment summaries.
+    pub(crate) shard: ShardRef,
+    pub(crate) position: EpochSeq,
     /// When the record was queued, on the log's clock.
     pub(crate) arrival: MonoTime,
     pub(crate) reply: oneshot::Sender<Reply>,
@@ -105,6 +110,11 @@ impl<D: Disk> Committer<D> {
                 Ok(locations) => {
                     let bytes = group.iter().map(|r| r.bytes.len() as u64).sum();
                     self.shared.stats.record_commit(group.len() as u64, bytes);
+                    self.shared.summarize(
+                        group.iter().zip(&locations).map(|(request, location)| {
+                            (&request.shard, request.position, location)
+                        }),
+                    );
                     for (request, location) in group.drain(..).zip(locations) {
                         // The appender may have stopped waiting; the record
                         // is durable either way.

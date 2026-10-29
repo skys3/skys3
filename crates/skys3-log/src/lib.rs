@@ -85,4 +85,4 @@ pub use log::{LogError, LogStats, MAX_RECORD_LEN, SegmentLog};
 pub use record::{DecodeError, EncodeError, LogRecord, RecordBody, RecordKind, ShardRef};
 pub use recovery::{RecoveryError, RecoveryReport, TornTail};
 pub use scan::{ScanError, ScannedRecord, SegmentScanner};
-pub use segment::{RecordLocation, SegmentClass, SegmentId, SegmentInfo};
+pub use segment::{RecordLocation, SegmentClass, SegmentId, SegmentInfo, SegmentSummary};

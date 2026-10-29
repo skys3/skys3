@@ -5,6 +5,11 @@
 //! entries and its durable entries. Syncs copy the first into the second, and
 //! a crash throws away everything not copied, which is the worst case POSIX
 //! allows, except where a torn write keeps part of it.
+//!
+//! The disk also holds random-access block files ([`SimBlockFile`]) for
+//! embedded databases such as the node's index (design §10.2).
+
+mod block;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,6 +21,9 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
 use super::{Disk, SegmentFile, check_name, read_past_end, truncate_extends};
+
+use block::BlockState;
+pub use block::SimBlockFile;
 
 /// Faults a [`SimDisk`] injects. Random choices come from the disk's seeded
 /// generator, so a simulation seed replays them exactly.
@@ -30,7 +38,9 @@ pub struct SimDiskFaults {
 
     /// The probability that a crash tears a file's unsynced writes instead of
     /// dropping them: a random prefix of the unsynced range, possibly all of
-    /// it, reaches stable storage.
+    /// it, reaches stable storage. For a [`SimBlockFile`], each unsynced
+    /// write separately reaches stable storage with this probability, again
+    /// as a random prefix.
     pub torn_write_probability: f64,
 
     /// The disk's capacity in bytes, or `None` for unlimited. Appends past it
@@ -78,6 +88,9 @@ struct DiskState {
     forced_sync_failures: u32,
     rng: SmallRng,
     crashes: u64,
+    /// Block files, by name. They live in their own namespace: segment file
+    /// listings do not show them.
+    blocks: BTreeMap<String, BlockState>,
 }
 
 #[derive(Default)]
@@ -158,6 +171,7 @@ impl SimDisk {
                 forced_sync_failures: 0,
                 rng: SmallRng::seed_from_u64(seed),
                 crashes: 0,
+                blocks: BTreeMap::new(),
             })),
         }
     }
@@ -194,6 +208,7 @@ impl SimDisk {
         state.files = files;
         state.used = used;
         state.entries = state.durable_entries.clone();
+        block::crash(&mut state.blocks, &mut state.rng, torn_probability);
         state.incarnation += 1;
         state.crashes += 1;
     }

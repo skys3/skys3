@@ -21,6 +21,7 @@ cargo-fuzz = true
 crc32c = "0.6"
 libfuzzer-sys = "0.4"
 skys3-gateway = { path = "../crates/skys3-gateway", features = ["test-util"] }
+skys3-index = { path = "../crates/skys3-index" }
 skys3-log = { path = "../crates/skys3-log" }
 skys3-obs = { path = "../crates/skys3-obs" }
 skys3-sts = { path = "../crates/skys3-sts" }
@@ -29,6 +30,13 @@ skys3-types = { path = "../crates/skys3-types" }
 [[bin]]
 name = "gateway_request"
 path = "fuzz_targets/gateway_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_codec"
+path = "fuzz_targets/index_codec.rs"
 test = false
 doc = false
 bench = false
