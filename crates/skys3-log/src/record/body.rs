@@ -11,7 +11,7 @@ use bytes::Bytes;
 use skys3_types::RegisterDocument;
 use skys3_types::checksum::{Checksum, ChecksumAlgorithm, Checksums};
 use skys3_types::{
-    BucketId, ETag, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, VersionIdentity,
+    BucketId, ETag, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, VersionIdentity, WriteIdentity,
 };
 
 use super::error::{FieldError, Problem};
@@ -25,6 +25,17 @@ pub const MAX_KEY_LEN: usize = 1024;
 /// The most bytes of object metadata: the sum of every name and value in a
 /// [`Metadata`] map.
 pub const MAX_METADATA_LEN: usize = 8 * 1024;
+
+/// The stored metadata entry that carries the write identity of a version
+/// another SkyS3 cluster wrote (§7.2, §7.8): `x-amz-meta-skys3-wid`, as on
+/// any remote.
+pub const IDENTITY_METADATA: &str = "x-amz-meta-skys3-wid";
+
+/// The bytes of [`MAX_METADATA_LEN`] that [`IDENTITY_METADATA`] may take,
+/// with the longest identity. The metadata of a client's write, and of a
+/// peer's `COMMIT` without the entry, stays this much below the limit, so
+/// the identity always fits (§7.2).
+pub const IDENTITY_METADATA_RESERVED: usize = IDENTITY_METADATA.len() + WriteIdentity::MAX_LEN;
 
 /// The most tags on an object.
 pub const MAX_TAGS: usize = 50;

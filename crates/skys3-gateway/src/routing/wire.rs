@@ -25,10 +25,12 @@ use skys3_index::{Entry, EntryState, ListItem, ListPage, ListQuery};
 use skys3_log::record::ExtentRef;
 use skys3_log::{LogRecord, RecordBody};
 use skys3_net::{Frame, Header, MessageKind};
-use skys3_types::{BucketId, Epoch, EpochSeq, RegisterDocument, Seq, ShardConfig, ShardId};
+use skys3_types::{
+    BucketId, ClusterId, Epoch, EpochSeq, RegisterDocument, Seq, ShardConfig, ShardId,
+};
 
 use super::{Reply, Request, Response};
-use crate::conditions::{ConditionFailed, Precondition};
+use crate::conditions::{ConditionFailed, PeerCondition, Precondition};
 use crate::shard::{ShardError, ShardRef, ShardSummary};
 
 /// The longest refusal reason a reply carries, in bytes.
@@ -166,12 +168,23 @@ pub struct PartsQuery {
 /// A write's precondition.
 #[derive(Clone, PartialEq, Message)]
 pub struct Condition {
-    /// 0: none, 1: absent, 2: exists, 3: matches `etag`.
+    /// 0: none, 1: absent, 2: exists, 3: matches `etag`; for a peer
+    /// cluster's write (design §7.8), 4: the key has no current identity,
+    /// 5: its current identity is `expected`, 6: unconditional.
     #[prost(uint32, tag = "1")]
     pub kind: u32,
     /// The ETag of a `matches` condition.
     #[prost(string, tag = "2")]
     pub etag: String,
+    /// A peer write's identity.
+    #[prost(string, tag = "3")]
+    pub identity: String,
+    /// The identity a peer write expects, for kind 5.
+    #[prost(string, tag = "4")]
+    pub expected: String,
+    /// The cluster of a peer write's destination: this cluster.
+    #[prost(string, tag = "5")]
+    pub cluster: String,
 }
 
 /// Replica to gateway: whether the replica served a [`Forward`].
@@ -434,6 +447,7 @@ pub fn request_frame(shard: &ShardRef, epoch: Epoch, request: &Request) -> Decod
                 Precondition::Absent => condition_of(1, ""),
                 Precondition::Exists => condition_of(2, ""),
                 Precondition::Matches(etag) => condition_of(3, etag),
+                Precondition::Peer(peer) => peer_condition(peer),
             })
         }
         Request::Seal => Op::Seal(true),
@@ -455,6 +469,54 @@ fn condition_of(kind: u32, etag: &str) -> Condition {
     Condition {
         kind,
         etag: etag.to_owned(),
+        ..Condition::default()
+    }
+}
+
+fn peer_condition(peer: &PeerCondition) -> Condition {
+    let (kind, expected) = match &peer.expected {
+        skys3_peer::Precondition::Absent => (4, String::new()),
+        skys3_peer::Precondition::Matches(expected) => (5, expected.to_string()),
+        skys3_peer::Precondition::Unconditional => (6, String::new()),
+    };
+    Condition {
+        kind,
+        etag: String::new(),
+        identity: peer.identity.to_string(),
+        expected,
+        cluster: peer.cluster.to_string(),
+    }
+}
+
+/// The precondition of a write to `shard`.
+fn decode_condition(condition: Condition, shard: &ShardRef) -> Decoded<Precondition> {
+    let Condition {
+        kind,
+        etag,
+        identity,
+        expected,
+        cluster,
+    } = condition;
+    let plain = identity.is_empty() && expected.is_empty() && cluster.is_empty();
+    let peer = |expected| -> Decoded<Precondition> {
+        Ok(Precondition::Peer(PeerCondition {
+            identity: identity.parse().map_err(|error| format!("{error}"))?,
+            expected,
+            cluster: ClusterId::new(cluster).map_err(|error| error.to_string())?,
+            shard: shard.clone(),
+        }))
+    };
+    match (kind, etag.is_empty(), plain) {
+        (0, true, true) => Ok(Precondition::None),
+        (1, true, true) => Ok(Precondition::Absent),
+        (2, true, true) => Ok(Precondition::Exists),
+        (3, _, true) => Ok(Precondition::Matches(etag)),
+        (4, true, _) if expected.is_empty() => peer(skys3_peer::Precondition::Absent),
+        (5, true, _) => peer(skys3_peer::Precondition::Matches(
+            expected.parse().map_err(|error| format!("{error}"))?,
+        )),
+        (6, true, _) if expected.is_empty() => peer(skys3_peer::Precondition::Unconditional),
+        _ => Err(format!("condition {kind}")),
     }
 }
 
@@ -526,13 +588,7 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
                 | RecordBody::MpuAbort(_)) => body,
                 other => return Err(format!("a write request carries a {:?}", other.kind())),
             },
-            condition: match (condition.kind, condition.etag) {
-                (0, etag) if etag.is_empty() => Precondition::None,
-                (1, etag) if etag.is_empty() => Precondition::Absent,
-                (2, etag) if etag.is_empty() => Precondition::Exists,
-                (3, etag) => Precondition::Matches(etag),
-                (kind, _) => return Err(format!("condition {kind}")),
-            },
+            condition: decode_condition(condition, &shard)?,
         },
         Op::Seal(_) => Request::Seal,
         Op::Unseal(_) => Request::Unseal,

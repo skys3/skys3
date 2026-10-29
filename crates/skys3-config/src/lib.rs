@@ -93,7 +93,7 @@ pub use transport::{TlsFiles, TransportConfig};
 
 use buckets::BucketTable;
 use cluster::{RawCluster, RawControlStore};
-use error::Checker;
+use error::{Checker, key_path};
 use node::RawNode;
 
 /// A duration of `hours` hours, saturating.
@@ -209,6 +209,7 @@ impl Config {
         raw.identity.check(&mut checker);
         raw.admin.check(&mut checker);
         check_control_store_independence(&control_store, &named_buckets, &mut checker);
+        check_peer_sources(&raw.peering, &named_buckets, &mut checker);
         checker.finish()?;
 
         // Each resolver returns `None` only after reporting a violation.
@@ -343,6 +344,24 @@ impl FromStr for Config {
 ///
 /// Write-back targets are bound when a bucket is attached, not here; the
 /// attach path applies the same check to them.
+/// Every `peer_source` must name a configured peer: no other cluster can
+/// connect to send the bucket anything (§7.8, §12).
+fn check_peer_sources(
+    peering: &PeeringConfig,
+    buckets: &BTreeMap<BucketName, BucketSettings>,
+    checker: &mut Checker,
+) {
+    for (name, settings) in buckets {
+        if let Some(source) = &settings.peer_source {
+            checker.require(
+                peering.peers.contains_key(source),
+                &format!("{}.peer_source", key_path("buckets", name.as_str())),
+                || format!("names {source}, which has no [peering.peers.{source}] table"),
+            );
+        }
+    }
+}
+
 fn check_control_store_independence(
     control_store: &ControlStoreConfig,
     buckets: &BTreeMap<BucketName, BucketSettings>,

@@ -22,7 +22,7 @@ use skys3_gateway::{
 use skys3_index::Payload;
 use skys3_io::ManualWallClock;
 use skys3_log::RecordBody;
-use skys3_log::record::{Import, Put, PutData};
+use skys3_log::record::{IDENTITY_METADATA_RESERVED, Import, MAX_METADATA_LEN, Put, PutData};
 use skys3_types::{BucketDocument, ETag};
 
 /// Small bodies go inline, and longer ones in extents of 1,000 bytes.
@@ -526,6 +526,20 @@ async fn user_metadata_is_bounded_and_the_write_identity_reserved() {
         .await
         .assert(400, Some("MetadataTooLarge"));
     assert_eq!(MAX_USER_METADATA_BYTES, 2048 - 105);
+    // All the stored metadata, standard headers too, leaves room for the
+    // write identity a receiving peer cluster stores with the object.
+    let limit = MAX_METADATA_LEN - IDENTITY_METADATA_RESERVED;
+    let name = "content-disposition";
+    let fits = "v".repeat(limit - name.len());
+    setup
+        .put("k", &[(name, &fits)], Bytes::new())
+        .await
+        .assert(200, None);
+    let over = "v".repeat(limit - name.len() + 1);
+    setup
+        .put("k", &[(name, &over)], Bytes::new())
+        .await
+        .assert(400, Some("MetadataTooLarge"));
     setup
         .put("k", &[("x-amz-meta-skys3-wid", "c/b/0/1.2")], Bytes::new())
         .await

@@ -57,7 +57,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
 use skys3_index::{ObjectVersion, Payload};
 use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
-use skys3_log::record::{MAX_METADATA_LEN, Metadata, Put, PutData};
+use skys3_log::record::{IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put, PutData};
 use skys3_types::checksum::ChecksumAlgorithm;
 use skys3_types::{BucketDocument, WriteIdentity};
 
@@ -664,7 +664,10 @@ fn metadata_of(
         metadata.insert(format!("{USER_METADATA_PREFIX}{name}"), value.clone());
     }
     let total: usize = metadata.iter().map(|(n, v)| n.len() + v.len()).sum();
-    if user_bytes > MAX_USER_METADATA_BYTES || total > MAX_METADATA_LEN {
+    // The stored metadata leaves room for a write identity, which a peer
+    // cluster that receives the object stores with it (§7.2, §7.8).
+    let max_total = MAX_METADATA_LEN - IDENTITY_METADATA_RESERVED;
+    if user_bytes > MAX_USER_METADATA_BYTES || total > max_total {
         return Err(s3_error!(
             MetadataTooLarge,
             "Your metadata headers exceed the maximum allowed metadata size: \

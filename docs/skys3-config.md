@@ -198,7 +198,8 @@ Keys allowed only in a `[buckets.<name>]` table:
 | `flush_conflict_policy` | `"hold"`, `"overwrite"`, or `"discard_local"` | `flush.flush_conflict_policy` | §7.2. |
 | `backup_target` | target URL | none | Only for `mode = "local"` (§8.9). |
 | `snapshot_target` | target URL | `backup_target` | Where index snapshots go (§8.9). |
-| `peer_source` | cluster ID | none | The cluster this bucket receives native replication from (§7.8). A valid cluster ID other than this cluster's. |
+| `peer_source` | cluster ID | none | The cluster this bucket receives native replication from (§7.8). A valid cluster ID other than this cluster's, with a `[peering.peers.<cluster-id>]` table. Not for a `read_only` bucket. A `COMMIT` applies only to a bucket whose `peer_source` is its source cluster, and the bucket is read-only to this cluster's own clients: their object writes get `403 AccessDenied`. |
+| `peer_local_writes` | boolean | `false` | Only with `peer_source`. `true` lets this cluster's own clients write the bucket too. Their versions carry this cluster's write identity, so a source `COMMIT` that expects its own fails its precondition (§7.8). |
 
 Rules are reported at the table that sets the offending key, so a bad value in `[buckets.defaults]` is reported once, not again for every bucket that inherits it.
 

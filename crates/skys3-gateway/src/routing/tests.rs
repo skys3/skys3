@@ -33,7 +33,7 @@ use skys3_types::{
 
 use super::*;
 use crate::LocalShards;
-use crate::conditions::{ConditionFailed, Precondition};
+use crate::conditions::{ConditionFailed, PeerCondition, Precondition};
 use crate::shard::{ShardError, ShardRef, Shards};
 use crate::stub::{EntryState, MemoryShards};
 
@@ -702,6 +702,7 @@ fn malformed_requests_are_refused() {
     let condition = wire::Condition {
         kind: 1,
         etag: "x".into(),
+        ..wire::Condition::default()
     };
     assert!(wire::decode_request(&forward(wire::Op::Write(condition), 0)).is_err());
     let query = wire::UploadsQuery {
@@ -734,6 +735,96 @@ fn malformed_requests_are_refused() {
     assert!(wire::decode_request(&frame).is_err());
 }
 
+/// A peer cluster's conditions travel to the primary whole, and a
+/// condition with fields of the other kind is refused.
+#[test]
+fn peer_conditions_round_trip() {
+    let shard = shard(0);
+    let identity = |seq: u64| -> skys3_types::WriteIdentity {
+        format!("prod-us/b-src/5/42.{seq}").parse().unwrap()
+    };
+    let delete = RecordBody::Delete(Delete { key: "k".into() });
+    for expected in [
+        skys3_peer::Precondition::Absent,
+        skys3_peer::Precondition::Matches(identity(1)),
+        skys3_peer::Precondition::Unconditional,
+    ] {
+        let write = Request::Write {
+            body: delete.clone(),
+            condition: Precondition::Peer(PeerCondition {
+                identity: identity(2),
+                expected,
+                cluster: ClusterId::new("prod-eu").unwrap(),
+                shard: shard.clone(),
+            }),
+        };
+        let frame = wire::request_frame(&shard, Epoch::new(1), &write).unwrap();
+        assert_eq!(
+            wire::decode_request(&frame),
+            Ok((shard.clone(), Epoch::new(1), write))
+        );
+    }
+    let record = wire::request_frame(
+        &shard,
+        Epoch::new(1),
+        &Request::Write {
+            body: delete,
+            condition: Precondition::None,
+        },
+    )
+    .unwrap()
+    .payload;
+    let peer = wire::Condition {
+        kind: 4,
+        identity: identity(2).to_string(),
+        cluster: "prod-eu".into(),
+        ..wire::Condition::default()
+    };
+    let malformed = [
+        // A plain condition with a peer's fields.
+        wire::Condition {
+            kind: 1,
+            ..peer.clone()
+        },
+        // An expected identity where none belongs, or a bad one.
+        wire::Condition {
+            expected: identity(1).to_string(),
+            ..peer.clone()
+        },
+        wire::Condition {
+            kind: 5,
+            expected: "not an identity".into(),
+            ..peer.clone()
+        },
+        wire::Condition {
+            identity: "prod-us/b-src".into(),
+            ..peer.clone()
+        },
+        wire::Condition {
+            cluster: "Prod_EU".into(),
+            ..peer.clone()
+        },
+        wire::Condition {
+            etag: "x".into(),
+            ..peer.clone()
+        },
+        wire::Condition { kind: 7, ..peer },
+    ];
+    for condition in malformed {
+        let body = wire::Forward {
+            bucket_id: "b-r".into(),
+            shard: 0,
+            epoch: 1,
+            op: Some(wire::Op::Write(condition.clone())),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::Forward).with_body(prost::Message::encode_to_vec(&body)),
+            record.clone(),
+        );
+        assert!(wire::decode_request(&frame).is_err(), "{condition:?}");
+    }
+}
+
 proptest! {
     /// Whatever a peer sends, decoding never panics, and a request comes
     /// back as it was sent.
@@ -756,6 +847,23 @@ proptest! {
             }),
             Request::Uploads { prefix: key.clone(), after: Some((key.clone(), None)), limit },
             Request::Payload(EpochSeq::new(Epoch::new(epoch), Seq::new(1))),
+            Request::Write {
+                body: RecordBody::Delete(Delete { key: format!("k{key}") }),
+                condition: Precondition::Peer(PeerCondition {
+                    identity: format!("prod-us/b-src/{}/{epoch}.{limit}", limit % 256)
+                        .parse()
+                        .unwrap(),
+                    expected: match limit % 3 {
+                        0 => skys3_peer::Precondition::Absent,
+                        1 => skys3_peer::Precondition::Unconditional,
+                        _ => skys3_peer::Precondition::Matches(
+                            format!("prod-eu/b-r/0/{limit}.{epoch}").parse().unwrap(),
+                        ),
+                    },
+                    cluster: ClusterId::new("prod-eu").unwrap(),
+                    shard: shard(3),
+                }),
+            },
         ];
         for request in requests {
             let frame = wire::request_frame(&shard(3), Epoch::new(epoch), &request).unwrap();
