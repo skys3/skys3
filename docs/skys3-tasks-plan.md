@@ -101,6 +101,7 @@ crates/
   skys3-types/          ids, epochs, seq, write and version identities, key hashing
   skys3-config/         configuration schema (§14) and validation
   skys3-io/             disk, clock, and blocking-pool abstractions, real and simulated
+  skys3-obs/            tracing setup, metrics registry, admin HTTP listener (§12)
   skys3-log/            record format, segments, group commit, recovery (§10.1, §10.4)
   skys3-index/          redb index, checkpoints, local control-state copies (§10.2)
   skys3-shard/          shard state machine, replication, leases, reconciliation (§5, §6.3–6.6)
