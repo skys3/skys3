@@ -187,6 +187,15 @@ impl Grace {
         stopped.is_some()
     }
 
+    /// Stops granting leases, and acknowledging appends, for a proposal
+    /// over `epoch` that this member recorded in an earlier life and whose
+    /// outcome it has not learned (§6.3): the restart counted as a grant,
+    /// and nothing granted since, so the member may send it again.
+    pub fn stop_over(&self, epoch: Epoch) {
+        let mut stopped = self.lock();
+        *stopped = Some(stopped.map_or(epoch, |over| over.max(epoch)));
+    }
+
     /// Records that the primary of `epoch` stepped down to this member for
     /// a planned handoff (§5.4), having stopped serving and renewing its
     /// leases for good: the member may propose itself over that epoch

@@ -433,6 +433,86 @@ fn promotions_are_durable_at_once_and_go_with_their_shard() {
 }
 
 #[test]
+fn takeovers_are_durable_at_once_and_go_with_their_shard() {
+    let disk = SimDisk::new(4);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    assert_eq!(index.read().unwrap().takeover(&shard(0)).unwrap(), None);
+    index.store_takeover(&route(0, 3)).unwrap();
+    index.store_takeover(&route(0, 4)).unwrap();
+    index.store_takeover(&route(1, 2)).unwrap();
+    index.store_takeover(&route(2, 2)).unwrap();
+    index.forget_takeover(&shard(2)).unwrap();
+    disk.crash();
+    drop(index);
+
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.takeover(&shard(0)).unwrap(), Some(route(0, 4)));
+    assert_eq!(read.takeover(&shard(1)).unwrap(), Some(route(1, 2)));
+    assert_eq!(read.takeover(&shard(2)).unwrap(), None);
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().takeover(&shard(1)).unwrap(), None);
+}
+
+/// An applier that keeps the configuration of every `CONFIG` record, as
+/// the shard state machine does.
+struct ConfigApplier;
+
+impl Applier for ConfigApplier {
+    fn apply(
+        &self,
+        index: &mut IndexWriter<'_>,
+        record: &LogRecord,
+        _: RecordLocation,
+    ) -> Result<(), IndexError> {
+        match &record.body {
+            RecordBody::Config(config) => index.put_config(config),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[test]
+fn kept_configurations_follow_the_applied_records_and_go_with_their_shard() {
+    let disk = SimDisk::new(5);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let config = |shard_no: u8, epoch: u64, seq: u64| {
+        let record = LogRecord {
+            shard: shard(shard_no),
+            position: EpochSeq::new(Epoch::new(epoch), Seq::new(seq)),
+            body: RecordBody::Config(route(shard_no, epoch)),
+        };
+        (record, delete(shard_no, seq, "k").1)
+    };
+    assert!(index.read().unwrap().configs().unwrap().is_empty());
+    index
+        .apply(&ConfigApplier, &[config(0, 1, 1), config(1, 1, 1)])
+        .unwrap();
+    index.apply(&ConfigApplier, &[config(0, 2, 5)]).unwrap();
+    // A record applied already changes nothing.
+    index.apply(&ConfigApplier, &[config(0, 1, 1)]).unwrap();
+    let read = index.read().unwrap();
+    assert_eq!(read.config(&shard(0)).unwrap(), Some(route(0, 2)));
+    let kept = read.configs().unwrap();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[&shard(1)], route(1, 1));
+    drop(read);
+    index.remove_shard(&shard(1)).unwrap();
+    assert_eq!(index.read().unwrap().config(&shard(1)).unwrap(), None);
+    // A snapshot install drops it until it finishes.
+    let marker = EpochSeq::new(Epoch::new(3), Seq::MAX);
+    index.begin_install(&shard(0), marker).unwrap();
+    assert_eq!(index.read().unwrap().config(&shard(0)).unwrap(), None);
+    let position = EpochSeq::new(Epoch::new(3), Seq::new(9));
+    index.finish_install(&route(0, 3), position).unwrap();
+    assert_eq!(
+        index.read().unwrap().config(&shard(0)).unwrap(),
+        Some(route(0, 3))
+    );
+}
+
+#[test]
 fn an_index_from_before_the_shard_map_gains_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("index.redb");
@@ -807,7 +887,13 @@ fn a_snapshot_of_a_shard_installs_in_place_of_another_replicas_state() {
             .install_rows(&shard(0), ShardTable::Namespace, rows)
             .unwrap();
     }
-    learner.finish_install(&shard(0), position(6)).unwrap();
+    let config = route(0, 2);
+    assert_eq!(learner.read().unwrap().config(&shard(0)).unwrap(), None);
+    learner.finish_install(&config, position(6)).unwrap();
+    assert_eq!(
+        learner.read().unwrap().config(&shard(0)).unwrap(),
+        Some(config)
+    );
     let location = RecordLocation {
         segment: SegmentId::new(4),
         offset: 0,

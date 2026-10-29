@@ -205,9 +205,14 @@ impl StateMachine {
             RecordBody::Flushed(flushed) => flush(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
-            // A replica's own bookkeeping: the configuration it adopted, or
-            // where reconciliation cut its log (§6.6, M2-12).
-            RecordBody::Config(_) | RecordBody::Truncate => Ok(Effect::Unchanged),
+            // A replica's own bookkeeping: the configuration it adopted,
+            // which the index keeps as the replica's local copy of it
+            // (§6.2), or where reconciliation cut its log (§6.6).
+            RecordBody::Config(config) => {
+                index.put_config(config)?;
+                Ok(Effect::Unchanged)
+            }
+            RecordBody::Truncate => Ok(Effect::Unchanged),
             other => Err(Rejection::Unsupported(other.kind())),
         };
         Ok(match rule {

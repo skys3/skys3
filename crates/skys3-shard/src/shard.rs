@@ -187,6 +187,11 @@ pub(crate) struct Sequencer {
     /// The epoch in which the replica stepped down as primary for a
     /// planned handoff (§5.4): it serves nothing from then on.
     pub(crate) stepped_down: Option<Epoch>,
+    /// The configuration this member last proposed to take the shard over
+    /// in, in this life or, durably, an earlier one (§6.3). It is settled
+    /// once the replica's configuration reaches its epoch, or forgotten
+    /// once the proposal lost.
+    takeover: Option<ShardConfig>,
     /// The epochs of the records the replica's log holds (§6.6).
     lineage: Lineage,
     /// The position of the latest record sequenced for each key, other than
@@ -338,7 +343,15 @@ impl<D: Disk> Shard<D> {
     /// that epoch again (§5.4, [`Shard::stepped_down`]). A primary that
     /// recorded a promotion it proposed in an earlier life, and whose
     /// epoch `config` has not reached, keeps waiting for that learner until
-    /// it learns the outcome (§6.3, [`Leader::promoting`]).
+    /// it learns the outcome (§6.3, [`Leader::promoting`]). Likewise a member
+    /// that recorded a takeover over `config` in an earlier life follows no
+    /// primary of `config`'s epoch until it learns the outcome
+    /// ([`Shard::outstanding_takeover`]).
+    ///
+    /// Each `CONFIG` record the replica applies is kept in the index as
+    /// the shard's configuration on this node, the local copy a restarted
+    /// node opens the replica in while the register cannot be read
+    /// ([`ShardSet::kept_config`](crate::ShardSet::kept_config), §6.2).
     ///
     /// # Errors
     ///
@@ -363,7 +376,7 @@ impl<D: Disk> Shard<D> {
     ) -> Result<Self, ShardError> {
         let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
         let role = check_config(&shard, config, node)?;
-        let (applied, stepped_down, promotion) = {
+        let (applied, stepped_down, promotion, takeover) = {
             let (index, key) = (Arc::clone(&index), shard.clone());
             run(&pool, &shard, move || {
                 let read = index.read()?;
@@ -371,6 +384,7 @@ impl<D: Disk> Shard<D> {
                     read.applied(&key)?,
                     read.step_down(&key)?,
                     read.promotion(&key)?,
+                    read.takeover(&key)?,
                 ))
             })
             .await?
@@ -397,6 +411,13 @@ impl<D: Disk> Shard<D> {
         // reach the candidate (§5.4).
         let stepped_down =
             stepped_down.filter(|stepped| role == Role::Primary && *stepped == epoch);
+        // A takeover this member proposed over `config` in an earlier life,
+        // whose outcome it has not learned: it may have made the node the
+        // primary, so the member acknowledges nothing in this epoch until
+        // it knows (§6.3).
+        let takeover = takeover.filter(|proposed| {
+            role == Role::Member && proposed.epoch > epoch && node == Some(&proposed.primary)
+        });
         // A replicated replica that holds records of an older epoch cannot
         // tell alone where the new epoch starts: a member learns it from
         // its primary's session, and a primary appends its `CONFIG` record
@@ -452,6 +473,7 @@ impl<D: Disk> Shard<D> {
             stopped: stepped_down.map(|_| STEPPED_DOWN.to_owned()),
             deposed: false,
             stepped_down,
+            takeover,
             lineage: Lineage::new(last),
             writes: BTreeMap::new(),
             readers: BTreeMap::new(),
@@ -1178,6 +1200,56 @@ impl<D: Disk> Shard<D> {
             index.store_promotion(&config)
         })
         .await
+    }
+
+    /// Records durably that this member proposes `config` to take the
+    /// shard over (§6.3, §6.5): a member that opens again before `config`'s
+    /// epoch acknowledges nothing in its epoch until it learns the outcome
+    /// ([`Shard::outstanding_takeover`]).
+    pub(crate) async fn record_takeover(&self, config: &ShardConfig) -> Result<(), ShardError> {
+        let (index, stored) = (Arc::clone(&self.inner.index), config.clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.store_takeover(&stored)
+        })
+        .await?;
+        self.sequencer().takeover = Some(config.clone());
+        Ok(())
+    }
+
+    /// Forgets the takeover this member recorded, once it learned that the
+    /// proposal lost. Returns whether it did: while the record stays, the
+    /// member must grant nothing, since a restart would send the proposal
+    /// again.
+    pub(crate) async fn forget_takeover(&self) -> bool {
+        let (index, key) = (Arc::clone(&self.inner.index), self.shard().clone());
+        let forgotten = run(&self.inner.pool, self.shard(), move || {
+            index.forget_takeover(&key)
+        })
+        .await;
+        match forgotten {
+            Ok(()) => {
+                self.sequencer().takeover = None;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(shard = %self.shard(), %error, "cannot forget a takeover that lost");
+                false
+            }
+        }
+    }
+
+    /// The configuration this member proposed to take the shard over in,
+    /// in this life or an earlier one, while its outcome is not settled:
+    /// the replica's configuration has not reached its epoch (§6.3). Until
+    /// the member learns the outcome, it follows no primary in an older
+    /// epoch, since the proposal may have made it the primary.
+    #[must_use]
+    pub fn outstanding_takeover(&self) -> Option<ShardConfig> {
+        let sequencer = self.sequencer();
+        sequencer
+            .takeover
+            .clone()
+            .filter(|proposed| proposed.epoch > sequencer.config.epoch)
     }
 
     /// Makes this member the primary of `config`, which it proposed over
@@ -2238,7 +2310,7 @@ fn lock(sequencer: &Mutex<Sequencer>) -> MutexGuard<'_, Sequencer> {
 }
 
 /// Runs an index job on the pool, reporting failures as the shard's.
-async fn run<T: Send + 'static>(
+pub(crate) async fn run<T: Send + 'static>(
     pool: &BlockingPool,
     shard: &ShardRef,
     job: impl FnOnce() -> Result<T, IndexError> + Send + 'static,

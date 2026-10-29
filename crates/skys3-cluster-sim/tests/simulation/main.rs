@@ -32,6 +32,9 @@
 //!   and partitions, with rule R3 checked after every step.
 //! - [`registry`]: nodes that join with nothing but their credentials, and
 //!   a coordinator that forgets a silent node only once no shard names it.
+//! - [`restart`]: a whole-cluster restart while the control store is
+//!   unreachable, with shards whose membership changed while a node was
+//!   down: unchanged shards serve again, stale configurations stay fenced.
 //! - [`buckets`]: buckets created through a gateway, with their shards
 //!   placed on the registered nodes, serving reads and writes through
 //!   every node.
@@ -48,6 +51,7 @@ mod leases;
 mod registry;
 mod removal;
 mod replication;
+mod restart;
 mod routing;
 mod takeover;
 mod workload;

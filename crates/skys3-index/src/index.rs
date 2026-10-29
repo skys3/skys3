@@ -29,9 +29,11 @@ use crate::tables::{
 /// uploads and parts tables; opening a version 1 index creates them and
 /// marks it version 2, so a build that does not know them refuses it
 /// rather than miss the uploads in it. Version 3 adds the imports table
-/// (§9.1) in the same way, and version 4 the step-downs of planned
-/// handoffs (§5.4).
-pub const FORMAT_VERSION: u64 = 5;
+/// (§9.1) in the same way, version 4 the step-downs of planned handoffs
+/// (§5.4), version 5 the promotions a primary proposed (§6.7), and
+/// version 6 the configuration of each shard's latest `CONFIG` record and
+/// the takeovers a member proposed (§6.2, §6.3).
+pub const FORMAT_VERSION: u64 = 6;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -240,6 +242,8 @@ impl Index {
             txn.open_table(tables::IMPORTS)?;
             txn.open_table(tables::STEP_DOWNS)?;
             txn.open_table(tables::PROMOTIONS)?;
+            txn.open_table(tables::CONFIGS)?;
+            txn.open_table(tables::TAKEOVERS)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -326,8 +330,10 @@ impl Index {
 
     /// Removes everything the index holds for `shard`, in one non-durable
     /// commit: its entries, its record locations, its applied position,
-    /// its step-down (see [`Index::store_step_down`]), and its promotion
-    /// (see [`Index::store_promotion`]). A node drops a shard this way once
+    /// its kept configuration, its step-down (see
+    /// [`Index::store_step_down`]), its promotion (see
+    /// [`Index::store_promotion`]), and its takeover (see
+    /// [`Index::store_takeover`]). A node drops a shard this way once
     /// its bucket is deleted.
     ///
     /// The shard's records stay in the log until their segments are
@@ -346,14 +352,17 @@ impl Index {
             .remove(codec::shard_key(shard).as_slice())?;
         txn.open_table(tables::PROMOTIONS)?
             .remove(codec::shard_key(shard).as_slice())?;
+        txn.open_table(tables::TAKEOVERS)?
+            .remove(codec::shard_key(shard).as_slice())?;
         txn.commit()?;
         Ok(())
     }
 
     /// Starts installing a snapshot of `shard` (§6.7), in one durable
     /// commit: removes what the index holds of the shard, as
-    /// [`Index::remove_shard`] does, except its step-down and promotion,
-    /// and sets its applied position to `marker`. A learner gives the
+    /// [`Index::remove_shard`] does, except its step-down, promotion, and
+    /// takeover, and sets its applied position to `marker`. The shard has
+    /// no kept configuration then until the install finishes. A learner gives the
     /// marker the `seq` [`Seq::MAX`](skys3_types::Seq::MAX), after any
     /// record its log can hold: replay then applies none of the records
     /// the snapshot replaces, even if the install is cut short, and the
@@ -410,17 +419,29 @@ impl Index {
         Ok(())
     }
 
-    /// Finishes installing a snapshot of `shard` whose rows are stored, in
-    /// one durable commit: its applied position becomes `applied`, the
-    /// position the snapshot was taken at.
+    /// Finishes installing a snapshot of the shard of `config` whose rows
+    /// are stored, in one durable commit: its applied position becomes
+    /// `applied`, the position the snapshot was taken at, and `config`, the
+    /// configuration the learner installs it in, becomes the shard's kept
+    /// configuration (§6.2), since the snapshot carries no `CONFIG` record.
     ///
     /// # Errors
     ///
-    /// Returns an [`IndexError`] if redb fails; nothing changes then.
-    pub fn finish_install(&self, shard: &ShardRef, applied: EpochSeq) -> Result<(), IndexError> {
+    /// Returns an [`IndexError`] if the configuration does not encode or
+    /// redb fails; nothing changes then.
+    pub fn finish_install(
+        &self,
+        config: &ShardConfig,
+        applied: EpochSeq,
+    ) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
         let mut txn = self.db.begin_write()?;
         txn.set_durability(Durability::Immediate)?;
-        IndexWriter::open(&txn)?.set_applied(shard, applied)?;
+        {
+            let mut writer = IndexWriter::open(&txn)?;
+            writer.set_applied(&shard, applied)?;
+            writer.put_config(config)?;
+        }
         txn.commit()?;
         Ok(())
     }
@@ -580,6 +601,45 @@ impl Index {
         txn.set_durability(Durability::Immediate)?;
         txn.open_table(tables::PROMOTIONS)?
             .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Records, in one durable commit, that this node's replica of a shard,
+    /// as a member, proposes `config` to take the shard over (§6.3, §6.5),
+    /// before it issues the compare-and-swap: until it learns the outcome,
+    /// across restarts too, it grants no lease and acknowledges no append
+    /// in the epoch it proposes over, since a proposal that landed unseen
+    /// made it the primary. A later proposal replaces the record; one
+    /// whose epoch the replica has reached since is settled, so it is
+    /// ignored rather than removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if encoding or redb fails; nothing changes
+    /// then.
+    pub fn store_takeover(&self, config: &ShardConfig) -> Result<(), IndexError> {
+        let shard = ShardRef::new(config.bucket_id.clone(), config.shard);
+        let value = codec::encode_route(config).map_err(IndexError::codec("takeovers"))?;
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::TAKEOVERS)?
+            .insert(codec::shard_key(&shard).as_slice(), value.as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes the takeover this node's replica of `shard` recorded, in one
+    /// durable commit, once it learned that the proposal lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails; nothing changes then.
+    pub fn forget_takeover(&self, shard: &ShardRef) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.open_table(tables::TAKEOVERS)?
+            .remove(codec::shard_key(shard).as_slice())?;
         txn.commit()?;
         Ok(())
     }

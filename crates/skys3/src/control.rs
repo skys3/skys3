@@ -8,7 +8,9 @@
 //! ([`NodeStore`]), so a node restarts with its buckets and identity
 //! configuration while the store is unreachable. Writes, which only bucket
 //! creation and deletion make, fail as unavailable until then. Each sync
-//! after that replaces the copy.
+//! after that replaces the copy. A sync lists the registers and reads only
+//! those whose version differs from the copy's: a version names one value
+//! (§6.1), so the others are unchanged.
 //!
 //! The file control store is opened through [`open_file_store`], which
 //! records the node and data directory that own it and refuses a store
@@ -70,11 +72,35 @@ impl ControlCopy {
         retry: &RetryPolicy,
         started: Duration,
     ) -> Result<Self, ControlError> {
+        Self::fetch_since(store, cluster, retry, started, None).await
+    }
+
+    /// Reads a new copy of the copied registers from `store`, as
+    /// [`ControlCopy::fetch`] does, but reads only the registers whose
+    /// listed version differs from `previous`, an earlier copy: the value
+    /// of a register at a version it had is the one `previous` holds
+    /// (§6.1). Registers that are gone are left out.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlCopy::fetch`].
+    pub async fn fetch_since<C: ControlStore>(
+        store: &C,
+        cluster: &ClusterId,
+        retry: &RetryPolicy,
+        started: Duration,
+        previous: Option<&Self>,
+    ) -> Result<Self, ControlError> {
         let generation = read_cluster(store, cluster, retry).await?.value.generation;
         let mut registers = BTreeMap::new();
         for prefix in copied() {
-            for (key, _) in retrying(retry, || store.list(&prefix)).await? {
-                if let Some(value) = retrying(retry, || store.get(&key)).await? {
+            for (key, version) in retrying(retry, || store.list(&prefix)).await? {
+                let kept = previous
+                    .and_then(|previous| previous.registers.get(&key))
+                    .filter(|kept| kept.version == version);
+                if let Some(kept) = kept {
+                    registers.insert(key, kept.clone());
+                } else if let Some(value) = retrying(retry, || store.get(&key)).await? {
                     registers.insert(key, value);
                 }
             }
@@ -181,7 +207,7 @@ pub async fn open<C: ControlStore + Clone>(
         if kept.is_none() {
             bootstrap(&store, cluster, proposal, retry).await?;
         }
-        ControlCopy::fetch(&store, cluster, retry, started).await
+        ControlCopy::fetch_since(&store, cluster, retry, started, kept.as_ref()).await
     }
     .await;
     match (fetched, kept) {
@@ -203,8 +229,9 @@ pub async fn open<C: ControlStore + Clone>(
 }
 
 /// Reads a fresh copy of the control state from `store` and keeps it in
-/// `index`, as each sync after startup does. `started` is the wall time
-/// at which the sync started.
+/// `index`, as each sync after startup does, reading only the registers
+/// that changed since the copy `index` keeps ([`ControlCopy::fetch_since`]).
+/// `started` is the wall time at which the sync started.
 ///
 /// # Errors
 ///
@@ -218,10 +245,26 @@ pub async fn refresh<C: ControlStore>(
     pool: &BlockingPool,
     started: Duration,
 ) -> Result<ControlCopy, StartError> {
-    let copy = ControlCopy::fetch(store, cluster, retry, started).await?;
+    let previous = kept_copy(index, pool).await?;
+    let copy = ControlCopy::fetch_since(store, cluster, retry, started, previous.as_ref()).await?;
     let (index, kept) = (Arc::clone(index), copy.clone());
     on_pool(pool, move || kept.save(&index)).await?;
     Ok(copy)
+}
+
+/// Whether the node should sync its copy, whose last sync started at
+/// `synced_at` (time since the Unix epoch), at `now`, although the
+/// generation did not move: once half of `max_staleness` has passed since
+/// that start, or if the clock stepped back before it. STS measures the
+/// identity copy's age from the start of its last sync (§6.2), so a node
+/// whose store answers refreshes the copy well before it goes stale, even
+/// while nothing changes; with only the changed registers read
+/// ([`ControlCopy::fetch_since`]), such a sync costs the listings.
+#[must_use]
+pub fn sync_due(synced_at: Option<Duration>, now: Duration, max_staleness: Duration) -> bool {
+    synced_at
+        .and_then(|at| now.checked_sub(at))
+        .is_none_or(|age| age >= max_staleness / 2)
 }
 
 /// Runs `request` until it succeeds, fails for good, or `policy` is
@@ -713,6 +756,142 @@ mod tests {
         node.go_live();
         assert!(node.is_live());
         assert!(node.get(&key("nodes/n.json")).await.unwrap().is_some());
+    }
+
+    /// A store that counts the reads it serves.
+    #[derive(Clone, Debug)]
+    struct Counting {
+        store: MemoryControlStore,
+        gets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ControlStore for Counting {
+        type Changes = <MemoryControlStore as ControlStore>::Changes;
+
+        async fn get(&self, key: &RegisterKey) -> Result<Option<Versioned>, ControlError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.store.get(key).await
+        }
+
+        async fn put_if(
+            &self,
+            key: &RegisterKey,
+            expected: Expected,
+            value: Bytes,
+        ) -> Result<PutOutcome, ControlError> {
+            self.store.put_if(key, expected, value).await
+        }
+
+        async fn delete_if(
+            &self,
+            key: &RegisterKey,
+            expected: &Version,
+        ) -> Result<DeleteOutcome, ControlError> {
+            self.store.delete_if(key, expected).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &KeyPrefix,
+        ) -> Result<Vec<(RegisterKey, Version)>, ControlError> {
+            self.store.list(prefix).await
+        }
+
+        async fn changes(&self, after: Generation) -> Result<Self::Changes, ControlError> {
+            self.store.changes(after).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_reads_only_the_registers_that_changed() {
+        let (store, cluster) = store_with_registers().await;
+        let counting = Counting {
+            store: store.clone(),
+            gets: Arc::default(),
+        };
+        let gets = || counting.gets.load(std::sync::atomic::Ordering::SeqCst);
+        let retry = RetryPolicy::default();
+        let disk = SimDisk::new(3);
+        let index = Arc::new(
+            Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap(),
+        );
+        let pool = BlockingPool::inline("index");
+        let first = refresh(
+            &counting,
+            &cluster,
+            &retry,
+            &index,
+            &pool,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        // cluster.json, and the two copied registers.
+        assert_eq!(gets(), 3);
+
+        // One register changes, one is added, and one is deleted.
+        let changed = key("identity/roles/r.json");
+        let version = first.registers[&changed].version.clone();
+        let _ = store
+            .put_if(
+                &changed,
+                Expected::Version(version),
+                Bytes::from_static(b"{\"x\":1}"),
+            )
+            .await
+            .unwrap();
+        let added = key("buckets/b.json");
+        let _ = store
+            .put_if(&added, Expected::Absent, Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        let gone = key("buckets/a.json");
+        let version = first.registers[&gone].version.clone();
+        let _ = store.delete_if(&gone, &version).await.unwrap();
+        let second = refresh(
+            &counting,
+            &cluster,
+            &retry,
+            &index,
+            &pool,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gets(), 3 + 3);
+        assert_eq!(
+            second,
+            ControlCopy::fetch(&store, &cluster, &retry, Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        assert_eq!(second.synced_at, Duration::from_secs(2));
+        assert_eq!(ControlCopy::load(&index).unwrap(), Some(second));
+
+        // Nothing changed: only cluster.json is read.
+        refresh(
+            &counting,
+            &cluster,
+            &retry,
+            &index,
+            &pool,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gets(), 3 + 3 + 1);
+    }
+
+    #[test]
+    fn a_sync_is_due_once_half_the_staleness_bound_passed() {
+        let bound = Duration::from_secs(100);
+        let at = Some(Duration::from_secs(1000));
+        assert!(!sync_due(at, Duration::from_secs(1000), bound));
+        assert!(!sync_due(at, Duration::from_secs(1049), bound));
+        assert!(sync_due(at, Duration::from_secs(1050), bound));
+        // A clock that stepped back, and a node that never synced.
+        assert!(sync_due(at, Duration::from_secs(999), bound));
+        assert!(sync_due(None, Duration::from_secs(1000), bound));
     }
 
     #[tokio::test]

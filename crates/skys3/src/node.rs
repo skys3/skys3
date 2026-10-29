@@ -245,6 +245,19 @@ impl Shared {
             .generation
     }
 
+    /// Whether the copy should be synced although no generation moved, so
+    /// that the identity copy, whose age STS measures from its last sync,
+    /// never goes stale while the store answers (§6.2).
+    fn sync_due(&self) -> bool {
+        let synced_at = self
+            .control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .synced_at;
+        let max_staleness = self.config.identity().identity_max_staleness();
+        control::sync_due(synced_at, self.wall.now(), max_staleness)
+    }
+
     /// Reads a fresh copy from the store, keeps it, and serves from the
     /// store from now on: buckets, identity, and the shards of new
     /// buckets.
@@ -267,8 +280,9 @@ impl Shared {
     /// Keeps the node's copy current (§6.2): it waits for the store's
     /// change stream to report a new generation, or at most
     /// `config_poll_interval`, then syncs if the generation in
-    /// `cluster.json` moved. While the node runs from its copy, it tries a
-    /// sync every interval.
+    /// `cluster.json` moved, reading only the registers that changed, or
+    /// if half of `identity_max_staleness` passed since the last sync.
+    /// While the node runs from its copy, it tries a sync every interval.
     async fn follow_control_store(self: Arc<Self>) {
         let interval = self.config.control_store().config_poll_interval();
         let cluster = self.config.cluster().cluster_id.clone();
@@ -305,7 +319,7 @@ impl Shared {
                     continue;
                 }
             };
-            if (moved || !self.store.is_live())
+            if (moved || !self.store.is_live() || self.sync_due())
                 && let Err(error) = self.sync().await
             {
                 tracing::warn!(%error, "cannot sync the control-state copy");

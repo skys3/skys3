@@ -5,7 +5,11 @@
 //! primaries remove members that stop responding (M2-11). Members can take
 //! over from a primary that stays silent (M2-12), primaries hand
 //! their shards off to members now and then (M2-13), and a test driver adds
-//! learners that primaries promote (M2-14, in [`crate::learners`]).
+//! learners that primaries promote (M2-14, in [`crate::learners`]). With
+//! local copies (M2-16), nodes open their replicas the way a restarted
+//! node does: from the register through the node's faulty control store,
+//! or from the configuration of the latest `CONFIG` record while it cannot
+//! be read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -77,6 +81,8 @@ pub struct ReplicatedServices {
     stepped_down_read: bool,
     /// When the test driver adds learners, if it does (plan M2-14).
     pub(crate) learners: Option<LearnerPlan>,
+    /// Whether nodes open replicas from their local copies (plan M2-16).
+    local_copies: bool,
     pub(crate) audit: Arc<Mutex<Audit>>,
 }
 
@@ -150,6 +156,34 @@ pub(crate) struct Audit {
     pub(crate) learners: LearnerAudit,
     /// The control store without faults, for reading registers.
     pub(crate) store: Option<S3ControlStore<SimS3>>,
+    /// When a write to each shard was last acknowledged, in simulated time
+    /// since the run began, and in which epoch.
+    acknowledged: BTreeMap<ShardRef, (Duration, Epoch)>,
+    /// The replica each node opened last of each shard, in its current
+    /// life.
+    current: BTreeMap<(NodeId, ShardRef), Shard<SimMount>>,
+    /// The control store without faults, for the checks of the replicas
+    /// against their registers.
+    registers: Option<S3ControlStore<SimS3>>,
+}
+
+/// A node's replica of a shard in its current life, against the shard's
+/// register ([`ReplicatedServices::replicas_now`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaState {
+    /// The node.
+    pub node: NodeId,
+    /// The shard.
+    pub shard: ShardRef,
+    /// The replica's configuration.
+    pub config: ShardConfig,
+    /// The configuration the shard's register holds, if it holds one.
+    pub register: Option<ShardConfig>,
+    /// The replica's role.
+    pub role: Role,
+    /// Whether it serves as the shard's primary: it reconciled its members
+    /// and has not stopped.
+    pub serving: bool,
 }
 
 /// Planned handoffs over a run (§5.4), as the services counted them.
@@ -281,6 +315,54 @@ impl ReplicatedServices {
             stepped_down_read: true,
             ..self
         }
+    }
+
+    /// The same services, whose nodes open their replicas as a restarted
+    /// node does (§6.2): each in its shard's register, read through the
+    /// node's control store and its faults, or, while the register cannot
+    /// be read, in the configuration of the latest `CONFIG` record the node
+    /// applied ([`Replication::resume`]). Without it, nodes read the
+    /// registers without faults, as a stand-in for the local copies.
+    #[must_use]
+    pub fn with_local_copies(self) -> Self {
+        Self {
+            local_copies: true,
+            ..self
+        }
+    }
+
+    /// Each node's replica of each shard in the node's current life, with
+    /// the register's configuration, in node and shard order. A node that
+    /// is down, or has not opened the shard in this life, has none.
+    #[must_use]
+    pub fn replicas_now(&self, up: &[bool]) -> Vec<ReplicaState> {
+        let audit = self.audit();
+        audit
+            .current
+            .iter()
+            .filter(|((node, _), _)| node_position(node).is_some_and(|n| up.get(n) == Some(&true)))
+            .map(|((node, shard), replica)| ReplicaState {
+                node: node.clone(),
+                shard: shard.clone(),
+                config: replica.config(),
+                register: audit
+                    .registers
+                    .as_ref()
+                    .and_then(|store| register(store, shard)),
+                role: replica.role(),
+                serving: replica.role() != Role::Member
+                    && replica.role() != Role::Learner
+                    && replica.is_serving()
+                    && !replica.is_stopped(),
+            })
+            .collect()
+    }
+
+    /// When each shard last acknowledged a write, in simulated time since
+    /// the run began, and in which epoch.
+    #[must_use]
+    pub fn acknowledged(&self) -> BTreeMap<ShardRef, (Duration, Epoch)> {
+        self.audit().acknowledged.clone()
     }
 
     /// The planned handoffs so far.
@@ -442,6 +524,21 @@ impl ReplicatedServices {
     }
 }
 
+/// The gateway's name of a replica's shard.
+fn gateway_ref(shard: &skys3_log::ShardRef) -> ShardRef {
+    ShardRef {
+        bucket: shard.bucket.clone(),
+        shard: shard.shard,
+    }
+}
+
+/// The position of `node` in the cluster, from 0, from its ID
+/// (`node-<n>`, from 1).
+fn node_position(node: &NodeId) -> Option<usize> {
+    let n: usize = node.as_str().strip_prefix("node-")?.parse().ok()?;
+    n.checked_sub(1)
+}
+
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -519,9 +616,12 @@ impl ReplicatedServices {
         env: &NodeEnv,
     ) -> Result<(ReplicatedShards, Listener<TurmoilNetwork>), BoxError> {
         let set = env.shards.set().clone();
-        self.audit()
-            .logs
-            .extend(set.logs().map(|(_, log)| log.clone()));
+        {
+            let mut audit = self.audit();
+            audit.logs.extend(set.logs().map(|(_, log)| log.clone()));
+            // A new life: the replicas of the last one are gone.
+            audit.current.retain(|(node, _), _| *node != env.node);
+        }
         let mut replication = Replication::new(
             env.node.clone(),
             set,
@@ -532,6 +632,7 @@ impl ReplicatedServices {
         );
         let store = env.control.store();
         if let Some(store) = &store {
+            self.audit().registers = Some(store.inner().clone());
             let registers = ControlRegisters::new(store.clone(), REGISTER_RETRY);
             let ids = ProposalIds::seeded(env.seed);
             replication = if self.learners.is_some() {
@@ -570,9 +671,21 @@ impl ReplicatedServices {
             resubmit: self.resubmit,
             members_read: self.members_read,
             stepped_down_read: self.stepped_down_read,
+            local_copies: self.local_copies,
             audit: Arc::clone(&self.audit),
             followed: Arc::default(),
         };
+        if self.local_copies {
+            // Every replica the node keeps a configuration of, with the
+            // registers read concurrently, as a restarted node does.
+            for (shard, resumed) in shards.replication.resume_kept().await? {
+                match resumed {
+                    Ok(Some(replica)) => shards.audit_opened(&replica),
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%shard, %error, "a replica did not resume"),
+                }
+            }
+        }
         if let (Some(plan), Some(store)) = (self.learners, store) {
             let mut nodes: Vec<NodeId> = env.peers.keys().cloned().collect();
             nodes.push(env.node.clone());
@@ -661,6 +774,7 @@ pub struct ReplicatedShards {
     resubmit: bool,
     members_read: bool,
     stepped_down_read: bool,
+    local_copies: bool,
     pub(crate) audit: Arc<Mutex<Audit>>,
     /// The shards whose grace this life follows.
     followed: Arc<Mutex<BTreeSet<ShardRef>>>,
@@ -713,10 +827,21 @@ impl ReplicatedShards {
                     shard: shard.clone(),
                     reason: error.to_string(),
                 })?;
+        self.audit_opened(&replica);
+        Ok(())
+    }
+
+    /// Audits `replica`, which this node opened, unless it is audited
+    /// already, and follows its grace.
+    fn audit_opened(&self, replica: &Shard<SimMount>) {
+        let shard = &gateway_ref(replica.shard());
         if let Some(grace) = self.replication.grace(replica.shard()) {
             self.follow_grace(shard, grace);
         }
         let mut audit = lock(&self.audit);
+        audit
+            .current
+            .insert((self.node.clone(), shard.clone()), replica.clone());
         if !audit
             .replicas
             .iter()
@@ -724,9 +849,8 @@ impl ReplicatedShards {
         {
             audit
                 .replicas
-                .push((self.node.clone(), config.clone(), replica));
+                .push((self.node.clone(), replica.config(), replica.clone()));
         }
-        Ok(())
     }
 
     /// Audits `replica`, this node's replica of its shard, unless it is
@@ -748,6 +872,8 @@ impl ReplicatedShards {
                 .replicas
                 .retain(|(node, _, old)| *node != self.node || old.shard() != replica.shard());
         }
+        let key = (self.node.clone(), gateway_ref(replica.shard()));
+        audit.current.insert(key, replica.clone());
         audit
             .replicas
             .push((self.node.clone(), replica.config(), replica.clone()));
@@ -760,6 +886,10 @@ impl ReplicatedShards {
     /// write acknowledged so far.
     fn audit_acknowledged(&self, shard: &ShardRef, position: EpochSeq) {
         let mut audit = lock(&self.audit);
+        let now = turmoil::sim_elapsed().unwrap_or_default();
+        audit
+            .acknowledged
+            .insert(shard.clone(), (now, position.epoch));
         let key = (shard.clone(), position.epoch);
         match audit.committers.get(&key) {
             Some(other) if *other != self.node => {
@@ -893,6 +1023,17 @@ impl Shards for ReplicatedShards {
             return self.local.open(shard, bucket).await;
         }
         if self.replication.set().get(&shard.into()).await.is_some() {
+            return Ok(());
+        }
+        if self.local_copies {
+            let resumed = self.replication.resume(&shard.into()).await;
+            let resumed = resumed.map_err(|error| ShardError::Unavailable {
+                shard: shard.clone(),
+                reason: error.to_string(),
+            })?;
+            if let Some(replica) = resumed {
+                self.audit_opened(&replica);
+            }
             return Ok(());
         }
         let Some(config) = self

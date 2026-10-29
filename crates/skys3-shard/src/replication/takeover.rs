@@ -39,8 +39,11 @@ const LONGEST_LEAD: u32 = 8;
 /// adopts it and proposes again over it at once. Until it learns the
 /// outcome, after a lost answer for example, it acts as if it won: it
 /// grants nothing and acknowledges nothing, and asks the register again.
-/// A node that restarts learns the outcome from the register before it
-/// opens the shard again, so the proposal needs no record of its own.
+/// It records the proposal durably before the compare-and-swap (§6.3): a
+/// node that restarts may open its replica from the configuration its log
+/// holds, while the register cannot be read (§6.2), and it then sends the
+/// recorded proposal again, unchanged, granting nothing until it learns
+/// the outcome.
 ///
 /// A planned handoff takes the same path from the compare-and-swap on:
 /// the old primary has stepped down durably, so its leases no longer
@@ -70,23 +73,39 @@ impl<N: Network, D: Disk> Candidate<N, D> {
     /// longer a member. A primary that steps down to this member for a
     /// planned handoff lets it propose at once, without the grace or the
     /// delay (§5.4).
+    /// A proposal recorded in an earlier life whose outcome the member has
+    /// not learned goes first, unchanged (§6.3).
     pub(super) async fn run(self) {
+        let mut again = false;
+        if let Some(proposed) = self.shard.outstanding_takeover() {
+            let over = self.shard.config();
+            self.grace.stop_over(over.epoch);
+            tracing::info!(shard = %self.shard.shard(), epoch = %proposed.epoch,
+                "sending a recorded takeover again");
+            match self.send(&over, &proposed).await {
+                Proposed::Done => return,
+                Proposed::Lost => {}
+                Proposed::Again => again = true,
+            }
+        }
         loop {
-            let epoch = self.shard.config().epoch;
-            let handed = tokio::select! {
-                biased;
-                () = self.grace.stepped_down_since(epoch) => true,
-                () = self.grace.passed() => false,
-            };
-            if !self.is_member() {
-                return;
-            }
-            if !handed {
-                tokio::time::sleep(self.delay()).await;
-            }
-            // A grant in between means the primary is back.
-            if !self.is_member() || !self.grace.stop_if_passed(self.shard.config().epoch) {
-                continue;
+            if !std::mem::take(&mut again) {
+                let epoch = self.shard.config().epoch;
+                let handed = tokio::select! {
+                    biased;
+                    () = self.grace.stepped_down_since(epoch) => true,
+                    () = self.grace.passed() => false,
+                };
+                if !self.is_member() {
+                    return;
+                }
+                if !handed {
+                    tokio::time::sleep(self.delay()).await;
+                }
+                // A grant in between means the primary is back.
+                if !self.is_member() || !self.grace.stop_if_passed(self.shard.config().epoch) {
+                    continue;
+                }
             }
             loop {
                 match self.propose().await {
@@ -129,7 +148,7 @@ impl<N: Network, D: Disk> Candidate<N, D> {
     }
 
     /// Proposes this member as the primary of the next configuration, and
-    /// acts on the outcome.
+    /// acts on the outcome. The proposal is recorded durably first.
     async fn propose(&self) -> Proposed {
         let inner = &self.replication.inner;
         let (node, shard) = (&inner.node, self.shard.shard());
@@ -155,21 +174,34 @@ impl<N: Network, D: Disk> Candidate<N, D> {
             ..over.clone()
         };
         tracing::info!(%shard, %epoch, old = %over.primary, "proposing a takeover");
+        if let Err(error) = self.shard.record_takeover(&next).await {
+            tracing::warn!(%shard, %error, "cannot record a takeover; not proposing it");
+            self.grace.resume();
+            return Proposed::Lost;
+        }
+        self.send(&over, &next).await
+    }
+
+    /// Sends `next`, a proposal over `over`, until the register answers,
+    /// and acts on the outcome. A proposal that lost is forgotten.
+    async fn send(&self, over: &ShardConfig, next: &ShardConfig) -> Proposed {
+        let inner = &self.replication.inner;
+        let shard = self.shard.shard();
         loop {
             // A session of a newer configuration told the member it lost,
             // and it may have granted since: it proposes nothing until its
             // grace passes again (R1).
-            if self.shard.config() != over
+            if self.shard.config() != *over
                 || !self.is_member()
                 || !self.grace.propose_over(over.epoch)
             {
                 return Proposed::Lost;
             }
-            match self.removal.registers.replace(&over, &next).await {
+            match self.removal.registers.replace(over, next).await {
                 Ok(Replaced::Accepted) => {
-                    return match self.shard.take_over(&over, &next).await {
+                    return match self.shard.take_over(over, next).await {
                         Ok(()) => {
-                            tracing::info!(%shard, %epoch, "took over as primary");
+                            tracing::info!(%shard, epoch = %next.epoch, "took over as primary");
                             self.replication.start_primary(&self.shard);
                             Proposed::Done
                         }
@@ -179,12 +211,17 @@ impl<N: Network, D: Disk> Candidate<N, D> {
                         }
                     };
                 }
+                // A record left behind is settled once the member adopts
+                // `held`, and keeps it from granting until then.
                 Ok(Replaced::Holds(Some(held))) if held.epoch > over.epoch => {
-                    return self.follow(&over, &held).await;
+                    self.shard.forget_takeover().await;
+                    return self.follow(over, &held).await;
                 }
                 Ok(Replaced::Holds(held)) => {
                     tracing::warn!(%shard, ?held, "the shard's register is not newer");
-                    self.grace.resume();
+                    if self.shard.forget_takeover().await {
+                        self.grace.resume();
+                    }
                     return Proposed::Lost;
                 }
                 Err(error) => {

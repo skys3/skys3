@@ -204,11 +204,13 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
-    /// Finishes installing a snapshot taken at `at`.
+    /// Finishes installing a snapshot taken at `at`, in the replica's
+    /// configuration, which the index keeps as the shard's configuration
+    /// from then on (§6.2).
     pub(crate) async fn finish_install(&self, at: EpochSeq) -> Result<(), ShardError> {
-        let (index, key) = (Arc::clone(&self.inner.index), self.shard().clone());
+        let (index, config) = (Arc::clone(&self.inner.index), self.config());
         run(&self.inner.pool, self.shard(), move || {
-            index.finish_install(&key, at)
+            index.finish_install(&config, at)
         })
         .await
     }
