@@ -5,13 +5,19 @@
 //! [`shard_for_key`] and sends the request to that shard's primary.
 //! [`Shards`] is the gateway's view of the shard primaries: on a single
 //! node every shard is local, and from M2 on an implementation forwards to
-//! the primaries the shard map names. Object operations (plan M1-09 on) add
-//! their methods to the trait; bucket operations need only the ones here.
+//! the primaries the shard map names. [`LocalShards`](crate::LocalShards)
+//! is the single-node implementation.
 
 use std::fmt;
 use std::future::Future;
 
-use skys3_types::{BucketDocument, BucketId, ShardId, shard_for_key};
+use bytes::Bytes;
+use skys3_index::Entry;
+use skys3_log::RecordBody;
+use skys3_log::record::{Extent, ExtentRef};
+use skys3_types::{BucketDocument, BucketId, EpochSeq, ShardId, shard_for_key};
+
+use crate::conditions::{ConditionFailed, Precondition};
 
 /// One shard of one bucket.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -134,6 +140,65 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
     /// [`ShardError::Unavailable`]; the shard's state is then left for
     /// startup recovery to reclaim.
     fn remove(&self, shard: &ShardRef) -> impl Future<Output = Result<(), ShardError>> + Send;
+
+    /// The entry of `key`: its latest committed version, a delete
+    /// tombstone, or `None` (§9.2). Every write acknowledged before the call
+    /// is in it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] or [`ShardError::Unavailable`].
+    fn entry(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<Entry>, ShardError>> + Send;
+
+    /// The payload of the record at `position`, as an entry's
+    /// [`Payload`](skys3_index::Payload) names it: an `EXTENT`'s bytes, or
+    /// a `PUT`'s inline bytes. A position's payload never changes.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotFound`] or [`ShardError::Unavailable`].
+    fn payload(
+        &self,
+        shard: &ShardRef,
+        position: EpochSeq,
+    ) -> impl Future<Output = Result<Bytes, ShardError>> + Send;
+
+    /// Commits one extent of a large body (§5.1), and returns the reference
+    /// a `PUT` names it by, once it is durable and applied. An extent no
+    /// `PUT` references is garbage that compaction reclaims (§10.3).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Sealed`], and otherwise as [`Shards::entry`].
+    fn append_extent(
+        &self,
+        shard: &ShardRef,
+        extent: Extent,
+    ) -> impl Future<Output = Result<ExtentRef, ShardError>> + Send;
+
+    /// Commits `body`, a record that names a key (a `PUT`, a `DELETE`, or a
+    /// `FLUSHED`), if `condition` holds of the key's entry when the record
+    /// is sequenced, and returns the record's position once it is durable
+    /// and applied. The condition sees every write of the key sequenced
+    /// before the record, acknowledged or not, so conditional writes are
+    /// linearizable. A `PUT` that references extents is accepted only once
+    /// every one is applied.
+    ///
+    /// # Errors
+    ///
+    /// The outer error as [`Shards::append_extent`], and
+    /// [`ShardError::Invalid`] for a record the shard refuses; the inner one
+    /// says why `condition` did not hold, and then nothing was written.
+    fn write(
+        &self,
+        shard: &ShardRef,
+        body: RecordBody,
+        condition: Precondition,
+    ) -> impl Future<Output = Result<Result<EpochSeq, ConditionFailed>, ShardError>> + Send;
 }
 
 /// A shard request that failed.
@@ -155,6 +220,21 @@ pub enum ShardError {
         /// Why.
         reason: String,
     },
+    /// The shard refused a record that breaks a rule of the write path,
+    /// which the gateway should have caught.
+    #[error("shard {shard} refused the record: {reason}")]
+    Invalid {
+        /// The shard.
+        shard: ShardRef,
+        /// Why.
+        reason: String,
+    },
+}
+
+impl From<&ShardRef> for skys3_log::ShardRef {
+    fn from(shard: &ShardRef) -> Self {
+        Self::new(shard.bucket.clone(), shard.shard)
+    }
 }
 
 #[cfg(test)]

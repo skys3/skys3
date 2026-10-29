@@ -178,7 +178,7 @@ impl Node {
         let gateway = Gateway::new(
             gateway_config,
             store.clone(),
-            MemoryShards::new(),
+            MemoryShards::new().await,
             IdSource::seeded(3),
             SigV4Authenticator::new(lookup, wall),
         )

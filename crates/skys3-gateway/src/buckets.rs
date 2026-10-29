@@ -43,6 +43,7 @@ use skys3_control::{
     RegisterKind, RetryPolicy, TypedKey, Version, Versioned, bump_generation, propose_delete,
     propose_document, read, read_with_retries,
 };
+use skys3_io::BlockingPool;
 use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ProposalId};
 
 use crate::authz::Permissions;
@@ -76,11 +77,22 @@ pub struct GatewayConfig {
     /// `anonymous_access` is on, and `None`, which refuses them with
     /// `403 AccessDenied`, when it is off.
     pub anonymous: Option<Permissions>,
+    /// `inline_max_bytes`: an object body up to this size is stored in its
+    /// `PUT` record; a larger one is streamed as `EXTENT` records (§5.1).
+    /// It must not exceed the log's own `inline_max_bytes`.
+    pub inline_max_bytes: u64,
+    /// `extent_bytes`: the size of the `EXTENT` records a large body is
+    /// streamed in.
+    pub extent_bytes: u64,
+    /// The pool that hashes object bodies (§7.4). Without one, bodies are
+    /// hashed on the request's task, which only tests should do; the node
+    /// sets one.
+    pub hashing_pool: Option<BlockingPool>,
 }
 
 impl GatewayConfig {
     /// The gateway settings of a node configuration, with the default
-    /// limits and retries.
+    /// limits and retries, and no hashing pool.
     #[must_use]
     pub fn new(config: &Config) -> Self {
         Self {
@@ -90,6 +102,9 @@ impl GatewayConfig {
             limits: RequestLimits::default(),
             retry: RetryPolicy::default(),
             anonymous: anonymous_permissions(config.identity()),
+            inline_max_bytes: config.storage().inline_max_bytes,
+            extent_bytes: config.storage().extent_bytes,
+            hashing_pool: None,
         }
     }
 }
@@ -607,6 +622,10 @@ pub(crate) fn shard_error(error: ShardError) -> S3Error {
             OperationAborted,
             "The bucket is being deleted; retry once the deletion has finished"
         ),
+        ShardError::Invalid { .. } => {
+            tracing::error!(%error, "a shard refused a record");
+            s3_error!(InternalError)
+        }
         other => {
             tracing::warn!(error = %other, "a shard request failed");
             s3_error!(
@@ -635,7 +654,7 @@ mod tests {
             .unwrap();
         let buckets = Buckets::load(
             MemoryControlStore::new(),
-            MemoryShards::new(),
+            MemoryShards::new().await,
             GatewayConfig::new(&config),
             IdSource::seeded(1),
         )
