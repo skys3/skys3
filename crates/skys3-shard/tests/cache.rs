@@ -167,14 +167,69 @@ fn eviction_drops_a_clean_payload_and_a_fill_restores_it() {
 }
 
 #[test]
-fn a_multipart_object_is_not_evicted() {
+fn a_multipart_object_keeps_its_parts_while_evicted() {
     let (_, index) = new_index();
     step(&index, 1, mpu_create("k"));
-    step(&index, 2, mpu_part("k", at(1), 1, 5, Vec::new()));
-    step(&index, 3, mpu_complete("k", at(1), &[(1, at(2))], 5));
-    step(&index, 4, flushed("k", 3, false));
-    assert_eq!(evict(&index, at(3)), Err(CacheRefusal::Multipart));
-    assert_eq!(entry_state(&index), EntryState::Clean);
+    step(&index, 2, mpu_part("k", at(1), 1, 30, Vec::new()));
+    step(&index, 3, mpu_part("k", at(1), 2, 12, Vec::new()));
+    step(
+        &index,
+        4,
+        mpu_complete("k", at(1), &[(1, at(2)), (2, at(3))], 42),
+    );
+    assert_eq!(
+        evict(&index, at(4)),
+        Err(CacheRefusal::State(EntryState::Dirty))
+    );
+    step(&index, 5, flushed("k", 4, false));
+    let clean = entry(&index, "k").unwrap().object.unwrap().payload;
+    evict(&index, at(4)).unwrap();
+
+    // The stub keeps the part boundaries, and the parts their ETags, but
+    // no bytes.
+    let stub = entry(&index, "k").unwrap();
+    assert_eq!(stub.state, EntryState::Evicted);
+    assert_eq!(stub.object.unwrap().payload, clean);
+    let rows = |index: &Index| index.read().unwrap().parts(&shard(0), at(1), 0, 9).unwrap();
+    let evicted = rows(&index);
+    assert_eq!(evicted.len(), 2);
+    assert_eq!(evicted[0].1.etag, support::etag(1));
+    assert!(
+        evicted
+            .iter()
+            .all(|(_, part)| part.payload == Payload::None)
+    );
+
+    // A fill must give each part extents of its own.
+    let filled = extents(&index, [6, 7]);
+    let straddling = vec![
+        ExtentRef {
+            position: at(6),
+            len: 20,
+        },
+        ExtentRef {
+            position: at(7),
+            len: 22,
+        },
+    ];
+    assert_eq!(fill(&index, at(4), straddling), Err(CacheRefusal::Payload));
+    assert_eq!(rows(&index), evicted);
+    fill(&index, at(4), filled.clone()).unwrap();
+    let entry = entry(&index, "k").unwrap();
+    assert_eq!(entry.state, EntryState::Clean);
+    assert_eq!(entry.object.unwrap().payload, clean);
+    let refilled: Vec<_> = rows(&index)
+        .into_iter()
+        .map(|(_, part)| part.payload)
+        .collect();
+    assert_eq!(
+        refilled,
+        [
+            Payload::Extents(vec![filled[0]]),
+            Payload::Extents(vec![filled[1]])
+        ]
+    );
+    evict(&index, at(4)).unwrap();
 }
 
 #[test]
@@ -277,7 +332,7 @@ fn refusals_describe_themselves() {
         "the entry is Dirty"
     );
     assert_eq!(
-        CacheRefusal::Multipart.to_string(),
-        "multipart objects are not evicted"
+        CacheRefusal::Payload.to_string(),
+        "the payload does not hold the object's bytes"
     );
 }

@@ -15,12 +15,12 @@ use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::truncated_by;
 use skys3_log::record::{Extent, ExtentRef, MpuPart, Put, PutData};
 use skys3_log::{LogRecord, RecordBody, RecordKind, SegmentClass, SegmentLog, ShardRef};
-use skys3_types::{Epoch, EpochSeq, NodeId, Seq, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, Label, NodeId, Seq, ShardConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::ack::{AckMode, AckTimeout};
-use crate::cache::{self, CacheRefusal};
+use crate::cache::{self, CacheRefusal, CleanCache, Link, Note};
 use crate::error::ShardError;
 use crate::leader::Leader;
 use crate::lineage::{Lineage, Reconcile};
@@ -33,6 +33,10 @@ pub(crate) use self::backfill::FillCursor;
 
 /// How many entries a summary reads per index transaction.
 const SUMMARY_PAGE: usize = 1024;
+
+/// How many entries a scan for the clean cache reads per index
+/// transaction.
+const CACHE_PAGE: usize = 1024;
 
 /// A record the shard committed: its position and what applying it did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +237,8 @@ struct Inner<D: Disk> {
     /// How many reads of the index are in progress, admitted while the
     /// replica served reads.
     reads: watch::Sender<usize>,
+    /// The node's clean cache, once the replica reports to it (§9.3).
+    cache: Arc<Link>,
 }
 
 /// One shard replica on this node: the shard's only member, its primary,
@@ -504,6 +510,7 @@ impl<D: Disk> Shard<D> {
         if role != Role::Alone {
             pipeline.require_commit(last.seq);
         }
+        let cache = Arc::new(Link::default());
         let task = PipelineTask {
             shard: shard.clone(),
             index: Arc::clone(&index),
@@ -512,6 +519,7 @@ impl<D: Disk> Shard<D> {
             pipeline,
             durable: durable_tx,
             leader: Arc::clone(&leader),
+            cache: Arc::clone(&cache),
             stopped: None,
         };
         tokio::spawn(task.run(receiver));
@@ -537,6 +545,7 @@ impl<D: Disk> Shard<D> {
                 durable,
                 leader,
                 reads: watch::Sender::new(0),
+                cache,
             }),
         })
     }
@@ -1471,15 +1480,22 @@ impl<D: Disk> Shard<D> {
     /// [`Shard::check_readable`].
     pub async fn entry(&self, key: &str) -> Result<Option<Entry>, ShardError> {
         let _read = self.admit_read()?;
-        let (index, shard, key) = (
+        let (index, shard, owned) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
             key.to_owned(),
         );
-        run(&self.inner.pool, self.shard(), move || {
-            index.read()?.entry(&shard, &key)
+        let entry = run(&self.inner.pool, self.shard(), move || {
+            index.read()?.entry(&shard, &owned)
         })
-        .await
+        .await?;
+        // A read uses the clean payload it may go on to read (§9.3).
+        if let Some(cache) = self.inner.cache.get()
+            && entry.as_ref().is_some_and(|e| e.state == EntryState::Clean)
+        {
+            cache.touch(self.shard(), key);
+        }
+        Ok(entry)
     }
 
     /// One page of the shard's listing (§9.4), as the index holds it: the
@@ -1640,15 +1656,26 @@ impl<D: Disk> Shard<D> {
         payload: Payload,
     ) -> Result<Result<(), CacheRefusal>, ShardError> {
         self.sequencer().check_serving(self.shard())?;
-        self.update_cache(key, move |index, shard, key| {
+        let size = match &payload {
+            Payload::Extents(extents) => extents.iter().map(|extent| u64::from(extent.len)).sum(),
+            _ => 0,
+        };
+        let note = Note::Clean {
+            key: key.to_owned(),
+            version,
+            size,
+            held: true,
+            last_used: None,
+        };
+        self.update_cache(key, note, move |index, shard, key| {
             cache::fill(index, shard, key, version, payload)
         })
         .await
     }
 
     /// Clean → Evicted (§4.2): drops this node's payload of the clean
-    /// version `version` of `key`. See [`cache::evict`]; what to evict and
-    /// when is plan M1-21's.
+    /// version `version` of `key`. See [`cache::evict`]; the node's
+    /// [`CleanCache`] decides what to evict and when.
     ///
     /// Any replica that runs may evict, a member too: the transition only
     /// drops a payload of its own, which no other replica reads.
@@ -1663,16 +1690,21 @@ impl<D: Disk> Shard<D> {
         key: &str,
         version: EpochSeq,
     ) -> Result<Result<(), CacheRefusal>, ShardError> {
-        self.update_cache(key, move |index, shard, key| {
+        let note = Note::Gone {
+            key: key.to_owned(),
+        };
+        self.update_cache(key, note, move |index, shard, key| {
             cache::evict(index, shard, key, version)
         })
         .await
     }
 
-    /// Runs a cache transition of `key` on the index pool.
+    /// Runs a cache transition of `key` on the index pool, and reports
+    /// `note` to the node's clean cache once it is made.
     async fn update_cache(
         &self,
         key: &str,
+        note: Note,
         transition: impl FnOnce(
             &mut IndexWriter<'_>,
             &ShardRef,
@@ -1681,14 +1713,78 @@ impl<D: Disk> Shard<D> {
         + Send
         + 'static,
     ) -> Result<Result<(), CacheRefusal>, ShardError> {
-        self.sequencer().check_running(self.shard())?;
-        let (index, shard, key) = (
+        let rank = {
+            let sequencer = self.sequencer();
+            sequencer.check_running(self.shard())?;
+            sequencer.copy_rank()
+        };
+        let (index, shard, key, link) = (
             Arc::clone(&self.inner.index),
             self.shard().clone(),
             key.to_owned(),
+            Arc::clone(&self.inner.cache),
         );
         run(&self.inner.pool, self.shard(), move || {
-            index.update_local(|writer| transition(writer, &shard, &key))
+            let _order = link.order();
+            let made = index.update_local(|writer| transition(writer, &shard, &key))?;
+            if let (Ok(()), Some(cache)) = (&made, link.get()) {
+                cache.note(&shard, rank, vec![note]);
+            }
+            Ok(made)
+        })
+        .await
+    }
+
+    /// Makes the replica report to `cache`, the clean cache of its node,
+    /// whose records are on `disk` (§9.3): its clean entries are scanned,
+    /// and from then on every entry that becomes clean or stops being so is
+    /// reported. A replica reports to one cache; attaching it again changes
+    /// nothing.
+    pub(crate) fn attach_cache(&self, cache: &CleanCache, disk: &Label) {
+        if self.inner.cache.set(cache) {
+            cache.attach(self.shard(), disk);
+        }
+    }
+
+    /// The replica's rank among the holders of the shard's clean copies
+    /// (§9.3), or `None` if it holds none: the primary first, then the
+    /// other members in the order of the configuration.
+    pub(crate) fn copy_rank(&self) -> Option<u8> {
+        self.sequencer().copy_rank()
+    }
+
+    /// Reports the clean entries of a page of the shard's entries after
+    /// `after` to the node's clean cache, each as used when it was last
+    /// modified, as the cache learns them when the replica opens, and
+    /// returns where the next page starts, or `None` after the last.
+    pub(crate) async fn scan_cache(
+        &self,
+        after: Option<String>,
+    ) -> Result<Option<String>, ShardError> {
+        let rank = self.copy_rank();
+        let (index, shard, link) = (
+            Arc::clone(&self.inner.index),
+            self.shard().clone(),
+            Arc::clone(&self.inner.cache),
+        );
+        run(&self.inner.pool, self.shard(), move || {
+            let _order = link.order();
+            let reader = index.read()?;
+            let page = reader.entries(&shard, after.as_deref(), CACHE_PAGE)?;
+            let next = (page.len() == CACHE_PAGE)
+                .then(|| page.last().map(|(key, _)| key.clone()))
+                .flatten();
+            let mut notes = Vec::new();
+            for (key, entry) in page {
+                if entry.state == EntryState::Clean {
+                    let last_used = entry.object.as_ref().map(|o| o.last_modified_ms);
+                    notes.push(cache::note(&reader, &shard, key, Some(&entry), last_used)?);
+                }
+            }
+            if let Some(cache) = link.get() {
+                cache.note(&shard, rank, notes);
+            }
+            Ok(next)
         })
         .await
     }
@@ -2128,6 +2224,25 @@ impl<D: Disk> Drop for SealGuard<'_, D> {
 }
 
 impl Sequencer {
+    /// See [`Shard::copy_rank`].
+    fn copy_rank(&self) -> Option<u8> {
+        match self.role {
+            Role::Alone | Role::Primary => Some(0),
+            Role::Member => {
+                let node = self.node.as_ref()?;
+                let primary = &self.config.primary;
+                let rank = self
+                    .config
+                    .members
+                    .iter()
+                    .filter(|member| *member != primary)
+                    .position(|member| member == node)?;
+                Some(u8::try_from(rank + 1).unwrap_or(u8::MAX))
+            }
+            Role::Learner => None,
+        }
+    }
+
     fn check_running(&self, shard: &ShardRef) -> Result<(), ShardError> {
         match &self.stopped {
             Some(reason) => Err(ShardError::unavailable(shard, reason)),
@@ -2413,6 +2528,9 @@ struct PipelineTask {
     durable: watch::Sender<Seq>,
     /// A primary's replication state, told of every change.
     leader: Arc<OnceLock<Arc<Leader>>>,
+    /// The node's clean cache, told of every entry that becomes clean or
+    /// stops being so.
+    cache: Arc<Link>,
     /// Why the shard stopped, once a record failed or applying did.
     stopped: Option<ShardError>,
 }
@@ -2525,11 +2643,22 @@ impl PipelineTask {
                     .collect();
                 let mut changes: BTreeMap<EpochSeq, Change> =
                     records.iter().filter_map(|(r, _)| change(r)).collect();
-                let index = Arc::clone(&self.index);
+                let (index, shard, link) = (
+                    Arc::clone(&self.index),
+                    self.shard.clone(),
+                    Arc::clone(&self.cache),
+                );
+                let rank = lock(&self.sequencer).copy_rank();
                 let applied = run(&self.pool, &self.shard, move || {
+                    let _order = link.order();
                     let recorder = Recorder::default();
                     index.apply(&recorder, &records)?;
-                    Ok(recorder.take())
+                    let outcomes = recorder.take();
+                    if let Some(cache) = link.get() {
+                        let notes = cache::notes(&index, &shard, &records, &outcomes)?;
+                        cache.note(&shard, rank, notes);
+                    }
+                    Ok(outcomes)
                 })
                 .await;
                 match applied {

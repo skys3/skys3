@@ -32,8 +32,10 @@ use crate::tables::{
 /// (§9.1) in the same way, version 4 the step-downs of planned handoffs
 /// (§5.4), version 5 the promotions a primary proposed (§6.7), and
 /// version 6 the configuration of each shard's latest `CONFIG` record and
-/// the takeovers a member proposed (§6.2, §6.3).
-pub const FORMAT_VERSION: u64 = 6;
+/// the takeovers a member proposed (§6.2, §6.3). Version 7 changes no
+/// table: a part of a completed upload may hold no bytes, once its object
+/// is evicted (§9.3), which older builds fail to decode.
+pub const FORMAT_VERSION: u64 = 7;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;

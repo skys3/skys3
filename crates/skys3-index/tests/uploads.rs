@@ -134,7 +134,7 @@ fn uploads_and_parts_are_stored_listed_and_removed() {
 }
 
 #[test]
-fn parts_hold_only_inline_or_extent_payloads() {
+fn parts_never_hold_parts() {
     let disk = skys3_io::SimDisk::new(1);
     let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
     struct Put(ShardRef);
@@ -145,7 +145,11 @@ fn parts_hold_only_inline_or_extent_payloads() {
             _: &LogRecord,
             _: RecordLocation,
         ) -> Result<(), IndexError> {
-            index.put_part(&self.0, position(1), 1, &part(2, Payload::None))
+            let nested = Payload::Parts {
+                upload: position(1),
+                parts: Vec::new(),
+            };
+            index.put_part(&self.0, position(1), 1, &part(2, nested))
         }
     }
     let record = LogRecord {

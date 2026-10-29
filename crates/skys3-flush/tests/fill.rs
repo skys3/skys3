@@ -16,7 +16,7 @@ use skys3_index::{Entry, EntryState, Payload};
 use skys3_io::ManualWallClock;
 use skys3_log::RecordBody;
 use skys3_log::record::ExtentRef;
-use skys3_log::record::Import;
+use skys3_log::record::{Flushed, Import};
 use skys3_remote::{
     AbortMultipartUpload, CompleteMultipartUpload, CopyObject, CreateMultipartUpload, DeleteObject,
     DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
@@ -111,6 +111,52 @@ async fn wait_for(node: &Node, key: &str, done: impl Fn(&Entry) -> bool) -> Entr
 /// `len` bytes of a pattern.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+#[test]
+fn an_evicted_multipart_object_is_filled_part_by_part() {
+    runtime().block_on(async {
+        let node = Node::open(2).await;
+        let store = remote(2, false);
+        let counters = Counters::default();
+        let filler = filler(&store, 4, &counters);
+        let completed = node.multipart("k", &["hello", ", world"]).await;
+        let remote_etag = write_remote(&store, "k", "hello, world").await;
+        let flushed = RecordBody::Flushed(Flushed {
+            key: "k".to_owned(),
+            seq: skys3_types::Seq::new(completed.complete),
+            remote_etag: Some(remote_etag),
+            remote_version_id: None,
+        });
+        node.shard.commit(flushed).await.unwrap();
+        let version = node.entry("k").await.unwrap().version;
+        node.shard.evict("k", version).await.unwrap().unwrap();
+
+        // A read of the second part fills the whole object, its extents
+        // ending at the part boundary.
+        let bytes = read(&filler, &node, "k", version, 5..12).await.unwrap();
+        assert_eq!(bytes, b", world");
+        let entry = wait_for(&node, "k", |e| e.state == EntryState::Clean).await;
+        let Payload::Parts { upload, parts } = entry.object.unwrap().payload else {
+            panic!("a multipart object keeps its parts");
+        };
+        assert_eq!(parts.len(), 2);
+        let rows = node.shard.parts(upload, 0, 10).await.unwrap();
+        let mut lens = Vec::new();
+        let mut cached = Vec::new();
+        for (_, part) in rows {
+            let Payload::Extents(extents) = part.payload else {
+                panic!("a filled part holds extents");
+            };
+            lens.push(extents.iter().map(|e| e.len).collect::<Vec<_>>());
+            for extent in extents {
+                cached.extend_from_slice(&node.shard.payload(extent.position).await.unwrap());
+            }
+        }
+        assert_eq!(lens, [vec![4, 1], vec![4, 3]]);
+        assert_eq!(cached, b"hello, world");
+        assert_eq!(counters.fills.get(), 1);
+    });
 }
 
 #[test]

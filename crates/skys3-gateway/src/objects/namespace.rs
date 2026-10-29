@@ -27,6 +27,10 @@ pub(super) struct Lookup {
     /// Whether the object is only at the remote: the key has no entry, and
     /// the import has not reached it.
     pub(super) remote: bool,
+    /// Whether the entry is evicted: its bytes are filled from the remote
+    /// (§9.2). An evicted multipart object keeps its parts, which then
+    /// hold no bytes.
+    pub(super) evicted: bool,
 }
 
 impl<H: Shards> Objects<H> {
@@ -78,6 +82,7 @@ impl<H: Shards> Objects<H> {
                     version: EpochSeq::default(),
                     object: found.object,
                     remote: true,
+                    evicted: false,
                 })
             }
         }
@@ -183,13 +188,14 @@ fn unloaded(entry: &Entry) -> bool {
 
 /// What a read of a local entry serves.
 fn local(entry: Option<Entry>) -> S3Result<Lookup> {
-    let (version, object) = entry
-        .and_then(|entry| Some((entry.version, entry.object?)))
+    let (version, state, object) = entry
+        .and_then(|entry| Some((entry.version, entry.state, entry.object?)))
         .ok_or_else(no_such_key)?;
     Ok(Lookup {
         version,
         object,
         remote: false,
+        evicted: state == EntryState::Evicted,
     })
 }
 

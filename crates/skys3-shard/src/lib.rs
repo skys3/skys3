@@ -21,7 +21,9 @@
 //!   and drops them.
 //! - [`cache`]: the node-local transitions between clean and evicted, which
 //!   no record makes: a read-through fill ([`Shard::fill`]) and eviction
-//!   ([`Shard::evict`]).
+//!   ([`Shard::evict`]); and [`CleanCache`], which keeps clean payload on up
+//!   to `clean_copies` replicas and evicts it least recently used first
+//!   within the node's bounds (§9.3).
 //!
 //! Replication (M2) runs the same state machine on every member; only the
 //! commit rule changes, and a primary serves reads only while every member
@@ -68,7 +70,7 @@ mod set;
 mod shard;
 
 pub use ack::{AckMode, AckTimeout};
-pub use cache::CacheRefusal;
+pub use cache::{CacheMetrics, CacheRefusal, CacheSettings, CacheUsage, CleanCache};
 pub use error::ShardError;
 pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;

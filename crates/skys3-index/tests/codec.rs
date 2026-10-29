@@ -582,6 +582,7 @@ fn part() -> impl Strategy<Value = Part> {
     (
         (position(), any::<u64>(), any::<u64>(), etag(), checksums()),
         prop_oneof![
+            Just(Payload::None),
             position().prop_map(Payload::Inline),
             vec(
                 (position(), 1..=skys3_log::record::MAX_PAYLOAD_LEN)
@@ -710,7 +711,8 @@ fn multipart_values_are_validated() {
             "object.parts"
         );
     }
-    // A part's bytes are inline or in extents.
+    // A part's bytes are inline or in extents, or it has none once its
+    // object is evicted; they are never parts themselves.
     let part = Part {
         position: EpochSeq::new(Epoch::new(1), Seq::new(2)),
         size: 0,
@@ -719,18 +721,24 @@ fn multipart_values_are_validated() {
         checksums: BTreeMap::new(),
         payload: Payload::None,
     };
+    let evicted = codec::encode_part(&part).unwrap();
+    assert_eq!(codec::decode_part(&evicted).unwrap(), part);
+    let nested = Part {
+        payload: Payload::Parts {
+            upload: part.position,
+            parts: Vec::new(),
+        },
+        ..part.clone()
+    };
     assert_eq!(
-        codec::encode_part(&part).unwrap_err().field(),
+        codec::encode_part(&nested).unwrap_err().field(),
         "part.payload"
     );
-    let mut bytes = codec::encode_part(&Part {
-        payload: Payload::Inline(part.position),
-        ..part.clone()
-    })
-    .unwrap();
-    let tag = bytes.len() - 17;
-    bytes.truncate(tag + 1);
-    bytes[tag] = 0;
+    // The evicted part's payload tag, then a parts payload with no parts:
+    // an upload position and a count of 0.
+    let mut bytes = evicted[..evicted.len() - 1].to_vec();
+    bytes.push(3);
+    bytes.extend_from_slice(&[0; 18]);
     assert_eq!(
         codec::decode_part(&bytes).unwrap_err().field(),
         "part.payload"
