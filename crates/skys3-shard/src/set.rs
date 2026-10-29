@@ -8,7 +8,7 @@ use std::sync::Arc;
 use skys3_index::Index;
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::{SegmentLog, ShardRef};
-use skys3_types::ShardConfig;
+use skys3_types::{KeyHash, Label, ShardConfig};
 use tokio::sync::{Mutex, MutexGuard, watch};
 
 use crate::error::ShardError;
@@ -26,15 +26,18 @@ enum Slot<D: Disk> {
 
 type Slots<D> = BTreeMap<ShardRef, Slot<D>>;
 
-/// The shard replicas open on one node, all on one disk's log.
+/// The shard replicas open on one node, over the logs of the node's disks.
 ///
-/// A shard's records must all be in one disk's log, because replay applies
-/// each disk's records in position order separately. Choosing a disk for
-/// each shard on a node with several is left to the node's startup (plan
-/// M1-13).
+/// Each shard replica keeps all its records on one disk: the location map
+/// names no disk, so a replica reads its payload from the log it appends
+/// to (§10.2). The disk is chosen by the hash of the shard's bucket ID and
+/// number among the disks in label order ([`ShardSet::disk_of`]), so it
+/// stays the same across restarts as long as the node keeps the same
+/// disks. A node therefore never starts with a disk added or removed.
 pub struct ShardSet<D: Disk> {
     index: Arc<Index>,
-    log: SegmentLog<D>,
+    /// Each disk's log, in label order; never empty.
+    logs: Vec<(Label, SegmentLog<D>)>,
     pool: BlockingPool,
     shards: Arc<Mutex<Slots<D>>>,
 }
@@ -46,16 +49,50 @@ impl<D: Disk> fmt::Debug for ShardSet<D> {
 }
 
 impl<D: Disk> ShardSet<D> {
-    /// No shards yet, over `index` and the log of the disk that holds them.
-    /// Index I/O runs on `pool`.
+    /// The label [`ShardSet::new`] gives its one disk.
+    pub const SINGLE_DISK: &str = "disk-0";
+
+    /// No shards yet, over `index` and the log of the node's one disk,
+    /// which is labelled [`ShardSet::SINGLE_DISK`]. Index I/O runs on
+    /// `pool`.
     #[must_use]
     pub fn new(index: Arc<Index>, log: SegmentLog<D>, pool: BlockingPool) -> Self {
+        let label = Label::new(Self::SINGLE_DISK).expect("the label is valid");
+        Self::with_disks(index, BTreeMap::from([(label, log)]), pool)
+    }
+
+    /// No shards yet, over `index` and each disk's log, by disk label.
+    ///
+    /// # Panics
+    ///
+    /// If `logs` is empty.
+    #[must_use]
+    pub fn with_disks(
+        index: Arc<Index>,
+        logs: BTreeMap<Label, SegmentLog<D>>,
+        pool: BlockingPool,
+    ) -> Self {
+        assert!(!logs.is_empty(), "a shard set needs at least one disk");
         Self {
             index,
-            log,
+            logs: logs.into_iter().collect(),
             pool,
             shards: Arc::default(),
         }
+    }
+
+    /// The label of the disk that holds `shard`'s records: the shard's
+    /// hash ([`KeyHash`] of its bucket ID and its number as one byte)
+    /// modulo the number of disks, among the disks in label order.
+    #[must_use]
+    pub fn disk_of(&self, shard: &ShardRef) -> &Label {
+        &self.logs[self.placement(shard)].0
+    }
+
+    fn placement(&self, shard: &ShardRef) -> usize {
+        let hash = KeyHash::of(&shard.bucket, &[shard.shard.get()]).get();
+        // The remainder is below the disk count, which is a `usize`.
+        (hash % self.logs.len() as u64) as usize
     }
 
     /// Opens the shard of `config`, or returns it if it is open already.
@@ -80,13 +117,8 @@ impl<D: Disk> ShardSet<D> {
             shard.reconfigure(config).await?;
             return Ok(shard.clone());
         }
-        let shard = Shard::open(
-            config,
-            self.log.clone(),
-            Arc::clone(&self.index),
-            self.pool.clone(),
-        )
-        .await?;
+        let log = self.logs[self.placement(&key)].1.clone();
+        let shard = Shard::open(config, log, Arc::clone(&self.index), self.pool.clone()).await?;
         shards.insert(key, Slot::Open(shard.clone()));
         Ok(shard)
     }
@@ -108,6 +140,35 @@ impl<D: Disk> ShardSet<D> {
             .filter(|(_, slot)| matches!(slot, Slot::Open(_)))
             .map(|(shard, _)| shard.clone())
             .collect()
+    }
+
+    /// Closes every open shard ([`Shard::close`]): each stops once the
+    /// records it sequenced are applied, so nothing is in flight when the
+    /// node checkpoints and exits. The shards stay in the set, closed.
+    ///
+    /// # Errors
+    ///
+    /// The first shard's error; every shard is closed regardless.
+    pub async fn close_all(&self) -> Result<(), ShardError> {
+        let open: Vec<_> = self
+            .shards
+            .lock()
+            .await
+            .values()
+            .filter_map(|slot| match slot {
+                Slot::Open(shard) => Some(shard.clone()),
+                Slot::Removing(_) => None,
+            })
+            .collect();
+        let mut result = Ok(());
+        for shard in open {
+            if let Err(error) = shard.close().await
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
     }
 
     /// Seals `shard`; see [`Shard::seal`].

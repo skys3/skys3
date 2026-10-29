@@ -1,19 +1,22 @@
-//! The gateway's HTTP/1.1 listener.
+//! The gateway's HTTP/1.1 listener, over TCP or TLS.
 
 use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use s3s::Body;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
 
 use crate::service::{Authenticator, Gateway};
 
@@ -34,6 +37,7 @@ const MIN_BUFFER: usize = 8 * 1024;
 pub struct GatewayListener<A> {
     listener: TcpListener,
     gateway: Gateway<A>,
+    tls: Option<TlsAcceptor>,
 }
 
 impl<A: Authenticator> GatewayListener<A> {
@@ -46,7 +50,17 @@ impl<A: Authenticator> GatewayListener<A> {
         Ok(Self {
             listener: TcpListener::bind(listen).await?,
             gateway,
+            tls: None,
         })
+    }
+
+    /// Serves HTTPS with `config` instead of plain HTTP. The handshake runs
+    /// on the connection's task, within the time a client has to send a
+    /// request head, so a slow client never delays others.
+    #[must_use]
+    pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
+        self.tls = Some(TlsAcceptor::from(config));
+        self
     }
 
     /// The bound address, which tells the port when the requested port is
@@ -67,7 +81,11 @@ impl<A: Authenticator> GatewayListener<A> {
     /// bytes than its buffer, sized from the header and URI limits, before
     /// the gateway sees it.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) {
-        let Self { listener, gateway } = self;
+        let Self {
+            listener,
+            gateway,
+            tls,
+        } = self;
         let limits = *gateway.limits();
         let mut builder = http1::Builder::new();
         builder
@@ -96,11 +114,19 @@ impl<A: Authenticator> GatewayListener<A> {
                 let gateway = gateway.clone();
                 async move { Ok::<_, Infallible>(gateway.handle(request.map(Body::from)).await) }
             });
-            let connection =
-                graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
+            let (builder, watcher, tls) = (builder.clone(), graceful.watcher(), tls.clone());
             connections.spawn(async move {
-                if let Err(error) = connection.await {
-                    tracing::debug!(%peer, %error, "a gateway connection ended with an error");
+                let Some(tls) = tls else {
+                    return serve_connection(&builder, watcher, stream, service, peer).await;
+                };
+                match tokio::time::timeout(HEADER_READ_TIMEOUT, tls.accept(stream)).await {
+                    Ok(Ok(stream)) => {
+                        serve_connection(&builder, watcher, stream, service, peer).await
+                    }
+                    Ok(Err(error)) => {
+                        tracing::debug!(%peer, %error, "a TLS handshake with the gateway failed");
+                    }
+                    Err(_) => tracing::debug!(%peer, "a TLS handshake with the gateway timed out"),
                 }
             });
         }
@@ -118,10 +144,34 @@ impl<A: Authenticator> GatewayListener<A> {
     }
 }
 
+/// Serves one connection until it closes or shutdown drains it.
+async fn serve_connection<I, S>(
+    builder: &http1::Builder,
+    watcher: Watcher,
+    io: I,
+    service: S,
+    peer: SocketAddr,
+) where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = http::Response<Body>,
+            Error = Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let connection = watcher.watch(builder.serve_connection(TokioIo::new(io), service));
+    if let Err(error) = connection.await {
+        tracing::debug!(%peer, %error, "a gateway connection ended with an error");
+    }
+}
+
 impl<A> fmt::Debug for GatewayListener<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GatewayListener")
             .field("local_addr", &self.listener.local_addr().ok())
+            .field("tls", &self.tls.is_some())
             .finish_non_exhaustive()
     }
 }

@@ -7,8 +7,9 @@
 //!   metric naming conventions. Every metric is listed in the metrics
 //!   reference, `docs/skys3-metrics.md`.
 //! - [`health`] tracks the readiness of the node's components.
-//! - [`admin`] serves `/metrics`, `/healthz`, and `/readyz`, and decides
-//!   how callers authenticate (design section 12).
+//! - [`admin`] serves `/metrics`, `/healthz`, `/readyz`, and the node's
+//!   [`AdminApi`] under `/v1/`, and decides how callers authenticate
+//!   (design section 12).
 //!
 //! # Example
 //!
@@ -40,7 +41,10 @@ pub mod health;
 pub mod logging;
 pub mod metrics;
 
-pub use admin::{AdminConfig, AdminError, AdminListener, AdminToken, AdminTokenError};
+pub use admin::{
+    AdminApi, AdminConfig, AdminError, AdminListener, AdminResponse, AdminToken, AdminTokenError,
+    ApiFuture,
+};
 pub use health::{Health, Readiness};
 pub use logging::{LogConfig, LogFormat, TracingInitError, init_tracing};
 pub use metrics::MetricsRegistry;

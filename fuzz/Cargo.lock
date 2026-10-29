@@ -2170,6 +2170,7 @@ dependencies = [
  "md-5",
  "quick-xml",
  "rand",
+ "rustls",
  "s3s",
  "secrecy",
  "serde_urlencoded",
@@ -2182,6 +2183,7 @@ dependencies = [
  "skys3-types",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "zeroize",
 ]

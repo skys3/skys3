@@ -633,3 +633,46 @@ fn errors_name_the_shard() {
     );
     let _ = (StateMachine, RecordKind::Put);
 }
+
+#[test]
+fn shards_stay_on_the_disk_their_hash_picks() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let other = SimDisk::new(4);
+        let other_log = open_log(other.mount()).await;
+        let label = |name: &str| skys3_types::Label::new(name).unwrap();
+        let logs = std::collections::BTreeMap::from([
+            (label("disk-a"), node.log.clone()),
+            (label("disk-b"), other_log.clone()),
+        ]);
+        let set = ShardSet::with_disks(Arc::clone(&node.index), logs, node.pool.clone());
+        let mut used = std::collections::BTreeSet::new();
+        for n in 0..16 {
+            let disk = set.disk_of(&shard(n)).clone();
+            assert_eq!(set.disk_of(&shard(n)), &disk, "the choice is stable");
+            let opened = set.open(&config(&shard(n), 1)).await.unwrap();
+            opened.commit(put("k", 1, u64::from(n))).await.unwrap();
+            let log = if disk == label("disk-a") {
+                &node.log
+            } else {
+                &other_log
+            };
+            assert!(
+                log.summaries()
+                    .values()
+                    .any(|summary| summary.positions.contains_key(&shard(n))),
+                "shard {n} wrote to {disk}"
+            );
+            used.insert(disk);
+        }
+        assert_eq!(used.len(), 2, "both disks hold shards");
+        set.close_all().await.unwrap();
+        let closed = set.get(&shard(0)).await.unwrap();
+        assert!(matches!(
+            closed.commit(put("k", 1, 99)).await,
+            Err(ShardError::Unavailable { .. })
+        ));
+        assert_eq!(closed.summary().await.unwrap().objects, 1);
+        set.close_all().await.unwrap_err();
+    });
+}

@@ -70,6 +70,7 @@ mod ec;
 mod error;
 mod flush;
 mod identity;
+mod node;
 mod peering;
 mod replication;
 mod storage;
@@ -83,6 +84,7 @@ pub use ec::EcConfig;
 pub use error::{ConfigError, Violation, Violations};
 pub use flush::{AckPolicy, ConflictPolicy, FlushConfig};
 pub use identity::{IdentityConfig, StaticCredentialConfig};
+pub use node::{GatewayListenConfig, NodeConfig};
 pub use peering::{CongestionControl, PeeringConfig};
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};
@@ -92,6 +94,7 @@ pub use transport::{TlsFiles, TransportConfig};
 use buckets::BucketTable;
 use cluster::{RawCluster, RawControlStore};
 use error::Checker;
+use node::RawNode;
 
 /// A duration of `hours` hours, saturating.
 pub(crate) const fn hours(hours: u64) -> Duration {
@@ -106,6 +109,8 @@ pub(crate) const fn hours(hours: u64) -> Duration {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     cluster: ClusterConfig,
+    node: NodeConfig,
+    gateway: GatewayListenConfig,
     control_store: ControlStoreConfig,
     transport: TransportConfig,
     replication: ReplicationConfig,
@@ -125,6 +130,10 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     cluster: RawCluster,
+    #[serde(default)]
+    node: RawNode,
+    #[serde(default)]
+    gateway: GatewayListenConfig,
     #[serde(default)]
     control_store: RawControlStore,
     #[serde(default)]
@@ -183,7 +192,11 @@ impl Config {
         let mut checker = Checker::default();
         let cluster = raw.cluster.resolve(&mut checker);
         let cluster_id = cluster.as_ref().map(|cluster| &cluster.cluster_id);
-        let control_store = raw.control_store.resolve(cluster_id, &mut checker);
+        let node = raw.node.resolve(&mut checker);
+        raw.gateway.check(&mut checker);
+        let control_store = raw
+            .control_store
+            .resolve(cluster_id, &node.data_dir, &mut checker);
         raw.transport.check(&mut checker);
         raw.replication.check(&mut checker);
         raw.storage.check(&mut checker);
@@ -208,6 +221,8 @@ impl Config {
         };
         Ok(Self {
             cluster,
+            node,
+            gateway: raw.gateway,
             control_store,
             transport: raw.transport,
             replication: raw.replication,
@@ -227,6 +242,18 @@ impl Config {
     #[must_use]
     pub fn cluster(&self) -> &ClusterConfig {
         &self.cluster
+    }
+
+    /// `[node]`.
+    #[must_use]
+    pub fn node(&self) -> &NodeConfig {
+        &self.node
+    }
+
+    /// `[gateway]`.
+    #[must_use]
+    pub fn gateway(&self) -> &GatewayListenConfig {
+        &self.gateway
     }
 
     /// `[control_store]`.

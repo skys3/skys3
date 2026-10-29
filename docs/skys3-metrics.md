@@ -11,7 +11,7 @@ exports yet is listed as planned, with the PR that owns it.
 - [1. Scraping](#1-scraping)
 - [2. Naming conventions](#2-naming-conventions)
 - [3. Metrics](#3-metrics)
-  - [3.1 Process and admin listener](#31-process-and-admin-listener)
+  - [3.1 Process, node, and admin listener](#31-process-node-and-admin-listener)
   - [3.2 Flush and loss exposure](#32-flush-and-loss-exposure)
   - [3.3 Replication](#33-replication)
 
@@ -68,12 +68,14 @@ Status is **exported** once a merged PR registers the metric, and **planned**
 while the design names it and the owning PR has not merged. The owning PR of a
 planned metric decides its labels and records them here.
 
-### 3.1 Process and admin listener
+### 3.1 Process, node, and admin listener
 
 | Name | Type | Labels | Status | Description |
 |---|---|---|---|---|
 | `skys3_build_info` | info | `version` | exported (M0-06) | Always 1. `version` is the SkyS3 release of the running binary. |
-| `skys3_admin_requests_total` | counter | `endpoint` (`healthz`, `readyz`, `metrics`, `other`), `code` (HTTP status) | exported (M0-06) | Requests answered by the admin listener. `code="401"` counts callers rejected for a missing or wrong token. |
+| `skys3_admin_requests_total` | counter | `endpoint` (`healthz`, `readyz`, `metrics`, `api`, `other`), `code` (HTTP status) | exported (M0-06; `api` from M1-13) | Requests answered by the admin listener. `api` counts the admin API under `/v1/`. `code="401"` counts callers rejected for a missing or wrong token. |
+| `skys3_disks_out_of_service` | gauge | none | exported (M1-13) | Disks an I/O error took out of service since the node started. Each stays out of service until the host restarts (design section 10.4). |
+| `skys3_control_store_live` | gauge | none | exported (M1-13) | 1 once the control store has answered since the node started; 0 while the node serves its local copy of control state (design section 6.2). |
 
 ### 3.2 Flush and loss exposure
 

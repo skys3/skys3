@@ -54,8 +54,8 @@
 //!   (trailing checksums included), MD5 ETags, and multipart ETags and
 //!   checksums. PutObject uses it.
 //!
-//! The gateway serves path-style requests. The node binary does not serve
-//! it yet (plan M1-13).
+//! The gateway serves path-style requests, over HTTP or, with
+//! [`GatewayListener::with_tls`], HTTPS. The `skys3` node binary serves it.
 //!
 //! With the `test-util` feature, `stub` provides [`LocalShards`] on a
 //! simulated disk, `TrustAll` an authenticator that takes every request

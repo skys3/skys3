@@ -1,4 +1,4 @@
-//! The admin HTTP listener: health checks, metrics, and later the admin API.
+//! The admin HTTP listener: health checks, metrics, and the admin API.
 //!
 //! # Endpoints
 //!
@@ -7,7 +7,12 @@
 //! | `/healthz` | GET, HEAD   | never                           |
 //! | `/readyz`  | GET, HEAD   | never                           |
 //! | `/metrics` | GET, HEAD   | bearer token, when one is set   |
+//! | `/v1/...`  | the API's   | bearer token, when one is set   |
 //! | any other  |             | bearer token, when one is set   |
+//!
+//! Paths under `/v1/` belong to the admin API, which the node supplies as
+//! an [`AdminApi`] ([`AdminListener::with_api`]); without one they answer
+//! 404.
 //!
 //! `/healthz` answers 200 while the listener serves. `/readyz` answers 200
 //! when every [`Health`] component is ready, and 503 with the names of the
@@ -31,6 +36,7 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -252,6 +258,22 @@ impl std::error::Error for AdminError {
     }
 }
 
+/// An admin listener's answer.
+pub type AdminResponse = Response<Full<Bytes>>;
+
+/// The future of [`AdminApi::call`]: the answer, or `None` for a path the
+/// API does not have.
+pub type ApiFuture<'a> = Pin<Box<dyn Future<Output = Option<AdminResponse>> + Send + 'a>>;
+
+/// The admin API: the routes under `/v1/`, which the node serves through
+/// the admin listener, behind its authentication (design section 12).
+pub trait AdminApi: Send + Sync + 'static {
+    /// Answers `method` on `path`, which starts with `/v1/`, or returns
+    /// `None` for a path the API does not have, which the listener answers
+    /// with 404. The caller is already authenticated.
+    fn call<'a>(&'a self, method: &'a Method, path: &'a str) -> ApiFuture<'a>;
+}
+
 /// The labels of `skys3_admin_requests_total`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EncodeLabelSet)]
 struct RequestLabels {
@@ -266,15 +288,20 @@ enum Endpoint {
     Healthz,
     Readyz,
     Metrics,
+    Api,
     Other,
 }
 
 impl Endpoint {
+    /// The prefix of every admin API path.
+    const API_PREFIX: &'static str = "/v1/";
+
     fn from_path(path: &str) -> Self {
         match path {
             "/healthz" => Self::Healthz,
             "/readyz" => Self::Readyz,
             "/metrics" => Self::Metrics,
+            _ if path.starts_with(Self::API_PREFIX) => Self::Api,
             _ => Self::Other,
         }
     }
@@ -284,6 +311,7 @@ impl Endpoint {
             Self::Healthz => "healthz",
             Self::Readyz => "readyz",
             Self::Metrics => "metrics",
+            Self::Api => "api",
             Self::Other => "other",
         }
     }
@@ -300,13 +328,39 @@ struct AdminState {
     metrics: MetricsRegistry,
     health: Health,
     requests: Family<RequestLabels, Counter>,
+    api: Option<Arc<dyn AdminApi>>,
 }
 
 impl AdminState {
-    /// Answers one request and counts it.
+    /// Answers one request, the admin API's included, and counts it.
+    async fn serve<B>(&self, request: &Request<B>) -> Response<Full<Bytes>> {
+        let path = request.uri().path();
+        let endpoint = Endpoint::from_path(path);
+        if endpoint != Endpoint::Api {
+            return self.respond(request);
+        }
+        let response = if !authorized(self.token.as_ref(), request.headers()) {
+            unauthorized()
+        } else if let Some(api) = &self.api {
+            api.call(request.method(), path)
+                .await
+                .unwrap_or_else(|| text(StatusCode::NOT_FOUND, "not found\n"))
+        } else {
+            text(StatusCode::NOT_FOUND, "not found\n")
+        };
+        self.count(endpoint, request, &response);
+        response
+    }
+
+    /// Answers one request outside the admin API and counts it.
     fn respond<B>(&self, request: &Request<B>) -> Response<Full<Bytes>> {
         let endpoint = Endpoint::from_path(request.uri().path());
         let response = self.route(endpoint, request.method(), request.headers());
+        self.count(endpoint, request, &response);
+        response
+    }
+
+    fn count<B>(&self, endpoint: Endpoint, request: &Request<B>, response: &Response<Full<Bytes>>) {
         self.requests
             .get_or_create(&RequestLabels {
                 endpoint: endpoint.label(),
@@ -319,7 +373,6 @@ impl AdminState {
             status = response.status().as_u16(),
             "admin request"
         );
-        response
     }
 
     fn route(
@@ -329,20 +382,15 @@ impl AdminState {
         headers: &HeaderMap,
     ) -> Response<Full<Bytes>> {
         if endpoint.requires_auth() && !authorized(self.token.as_ref(), headers) {
-            let mut response = text(StatusCode::UNAUTHORIZED, "unauthorized\n");
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static(r#"Bearer realm="skys3-admin""#),
-            );
-            return response;
+            return unauthorized();
         }
-        // Routes of the admin API (plan M1-13) are added here, behind the
-        // same authentication check.
         let handler: fn(&Self) -> Response<Full<Bytes>> = match endpoint {
             Endpoint::Healthz => |_| text(StatusCode::OK, "ok\n"),
             Endpoint::Readyz => Self::readiness,
             Endpoint::Metrics => Self::scrape,
-            Endpoint::Other => return text(StatusCode::NOT_FOUND, "not found\n"),
+            Endpoint::Api | Endpoint::Other => {
+                return text(StatusCode::NOT_FOUND, "not found\n");
+            }
         };
         if method != Method::GET && method != Method::HEAD {
             let mut response = text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
@@ -399,6 +447,16 @@ pub(crate) fn bearer_credentials(value: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(credentials.trim_ascii()).filter(|credentials| !credentials.is_empty())
+}
+
+/// The answer to a request without the bearer token.
+fn unauthorized() -> Response<Full<Bytes>> {
+    let mut response = text(StatusCode::UNAUTHORIZED, "unauthorized\n");
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(r#"Bearer realm="skys3-admin""#),
+    );
+    response
 }
 
 fn text(status: StatusCode, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
@@ -461,9 +519,18 @@ impl AdminListener {
                 metrics,
                 health,
                 requests,
+                api: None,
             }),
             drain_timeout: SHUTDOWN_DRAIN_TIMEOUT,
         })
+    }
+
+    /// Serves `api` under `/v1/`, behind the listener's authentication.
+    #[must_use]
+    pub fn with_api(mut self, api: Arc<dyn AdminApi>) -> Self {
+        let state = Arc::get_mut(&mut self.state).expect("the state is shared only once serving");
+        state.api = Some(api);
+        self
     }
 
     /// Returns the bound address, which tells the port when the configured
@@ -522,8 +589,8 @@ impl AdminListener {
             };
             let state = Arc::clone(&state);
             let service = service_fn(move |request: Request<hyper::body::Incoming>| {
-                let response = state.respond(&request);
-                async move { Ok::<_, Infallible>(response) }
+                let state = Arc::clone(&state);
+                async move { Ok::<_, Infallible>(state.serve(&request).await) }
             });
             let connection =
                 graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
@@ -576,6 +643,7 @@ mod tests {
             metrics: MetricsRegistry::new(),
             health: Health::new(),
             requests: Family::default(),
+            api: None,
         }
     }
 
@@ -828,6 +896,49 @@ mod tests {
         ] {
             assert!(text.contains(line), "missing {line} in {text}");
         }
+    }
+
+    /// An API that knows one path.
+    struct OnePath;
+
+    impl AdminApi for OnePath {
+        fn call<'a>(&'a self, method: &'a Method, path: &'a str) -> ApiFuture<'a> {
+            Box::pin(async move {
+                (path == "/v1/known").then(|| text(StatusCode::OK, method.to_string()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn api_paths_go_to_the_api_behind_the_token() {
+        let mut state = state(Some(TOKEN));
+        state
+            .metrics
+            .register("admin_requests", "Requests.", state.requests.clone());
+        let bearer = format!("Bearer {TOKEN}");
+        let missing = state
+            .serve(&request(Method::GET, "/v1/known", Some(&bearer)))
+            .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND, "no API yet");
+        state.api = Some(Arc::new(OnePath));
+        let denied = state.serve(&request(Method::GET, "/v1/known", None)).await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(denied.headers().contains_key(header::WWW_AUTHENTICATE));
+        let known = state
+            .serve(&request(Method::POST, "/v1/known", Some(&bearer)))
+            .await;
+        assert_eq!(known.status(), StatusCode::OK);
+        let unknown = state
+            .serve(&request(Method::GET, "/v1/unknown", Some(&bearer)))
+            .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let health = state.serve(&request(Method::GET, "/healthz", None)).await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let text = state.metrics.encode().unwrap();
+        assert!(
+            text.contains(r#"skys3_admin_requests_total{endpoint="api",code="200"} 1"#),
+            "{text}"
+        );
     }
 
     /// A client that stops mid-request must not keep its connection, and

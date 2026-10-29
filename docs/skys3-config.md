@@ -8,6 +8,8 @@ Every SkyS3 node reads one TOML file. This reference lists every key with its ty
 
 - [Loading and errors](#loading-and-errors)
 - [`[cluster]`](#cluster)
+- [`[node]`](#node)
+- [`[gateway]`](#gateway)
 - [`[control_store]`](#control_store)
 - [`[transport]`](#transport)
 - [`[replication]`](#replication)
@@ -45,16 +47,37 @@ Only `[cluster]` and its `cluster_id` are required. Every other key has a defaul
 | `cluster_id` | string | required | 1 to 24 bytes of lowercase ASCII letters, digits, and `-`, starting and ending with a letter or digit. The limit keeps every write identity within 96 bytes (§7.2). |
 | `failure_domain` | `"node"`, `"rack"`, or `"zone"` | `"node"` | The level at which shard members and fragments are kept apart (§6.7). |
 
+## `[node]`
+
+This node's identity and its directories (§10).
+
+| Key | Type | Default | Rules |
+|---|---|---|---|
+| `node_id` | string | generated | A node ID: 1 to 63 bytes of lowercase ASCII letters, digits, and `-`, starting and ending with a letter or digit. When unset, the node generates one when it creates its data directory and keeps it. A node whose data directory holds another ID, or another cluster's data, refuses to start. |
+| `data_dir` | path | `"/var/lib/skys3"` | Not empty. Holds the node's identity (`node.json`), its index (`index.redb`), and, by default, the file control store. One process uses it at a time. |
+| `disks` | array of paths | `["<data_dir>/log"]` | 1 to 64 distinct, non-empty directories, one per disk, each holding that disk's log segments. A node keeps the disks it was created with: each shard replica's records stay on one disk, so starting with a disk added or missing is refused. |
+
+## `[gateway]`
+
+The S3 and STS listener (§3, §11).
+
+| Key | Type | Default | Rules |
+|---|---|---|---|
+| `listen` | socket address | `"127.0.0.1:9000"` | |
+| `tls_cert_file` | path | none | A PEM file with the certificate chain, leaf first. With `tls_key_file`, the gateway serves HTTPS (TLS 1.2 and 1.3, `rustls` with `aws-lc-rs`); without both, plain HTTP. Not empty, and set together with `tls_key_file`. |
+| `tls_key_file` | path | none | A PEM file with the private key (PKCS#8, PKCS#1, or SEC1). Not empty, and set together with `tls_cert_file`. |
+
 ## `[control_store]`
 
 Where the cluster's registers live (§6.1).
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `backend` | `"etcd"` or `"s3"` | `"etcd"` | `"s3"` covers AWS S3, R2, and other stores that pass the conditional-write probe. |
-| `etcd_endpoints` | array of endpoint URLs | none | Required, and non-empty, for `backend = "etcd"`. Not allowed for `"s3"`. |
-| `endpoint` | endpoint URL | none | Required for `backend = "s3"`. Not allowed for `"etcd"`. |
-| `bucket` | string | none | The control bucket. Required for `backend = "s3"`: visible ASCII without `/`. Not allowed for `"etcd"`. |
+| `backend` | `"etcd"`, `"s3"`, or `"file"` | `"etcd"` | `"s3"` covers AWS S3, R2, and other stores that pass the conditional-write probe. `"file"` keeps the registers in a local directory, for a single-node cluster; it refuses to serve a second node. Until the etcd and S3 backends land (plan M2-04, M2-05), the node binary runs only with `"file"`. |
+| `etcd_endpoints` | array of endpoint URLs | none | Required, and non-empty, for `backend = "etcd"`. Not allowed for the other backends. |
+| `endpoint` | endpoint URL | none | Required for `backend = "s3"`. Not allowed for the other backends. |
+| `bucket` | string | none | The control bucket. Required for `backend = "s3"`: visible ASCII without `/`. Not allowed for the other backends. |
+| `directory` | path | `"<data_dir>/control"` | Where `backend = "file"` keeps the registers. Not empty. Not allowed for the other backends. The node claims an empty directory by writing `.owner.json`, and refuses one another node or data directory owns. Once a node has synced, it never creates or bootstraps this directory again: if it is missing (for example, an unmounted volume) or has lost its registers, the node runs from its local copy (design §6.2). |
 | `prefix` | string | `"<cluster_id>/"` | The prefix of every register key. At most 512 bytes of visible ASCII, ending with `/` and not starting with it: S3's 1,024-byte key limit less the longest register key. |
 | `allow_correlated_control_store` | boolean | `false` | Accept an S3 control store in the failure scope of a data target (see below). |
 | `coordinator_lease_seconds` | integer | `10` | Positive. The holder renews every third of it (§6.7). |
