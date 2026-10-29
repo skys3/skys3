@@ -67,7 +67,15 @@ impl<N: Network, D: Disk> Link<N, D> {
     async fn connect(&self) -> Result<(), LinkError> {
         let connection = self.transport.connect(&self.member, &self.address).await?;
         let (mut receiver, mut sender) = connection.into_split();
-        let (session, last) = self.sync(&mut receiver, &mut sender).await?;
+        let (session, last, keeps) = self.sync(&mut receiver, &mut sender).await?;
+        // A learner keeps its log, or installs a snapshot and ends the
+        // session (§6.7).
+        if self.leader.is_learner(&self.member) {
+            let link = (&mut receiver, &mut sender);
+            if !self.catch_up(link, &session.config, last, keeps).await? {
+                return Ok(());
+            }
+        }
         self.leader.synced(&self.member, last);
         // The CONFIG record of a new configuration may have waited for
         // this member's report (§5.1).
@@ -96,13 +104,15 @@ impl<N: Network, D: Disk> Link<N, D> {
     }
 
     /// Opens a session: rolls forward the records the member holds past
-    /// the primary's log, and returns the session and the member's last
-    /// `seq`.
+    /// the primary's log, and returns the session, the member's last
+    /// `seq`, and what a learner may keep of its log (§6.7): nothing
+    /// (`None`), what reconciliation kept (the zero epoch), or its log if
+    /// the primary holds a record of this epoch at its last `seq`.
     async fn sync<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         receiver: &mut Receiver<S>,
         sender: &mut Sender<S>,
-    ) -> Result<(Session, Seq), LinkError> {
+    ) -> Result<(Session, Seq, Option<Epoch>), LinkError> {
         let session = self.session();
         let config = &session.config;
         let lineage = self.shard.lineage();
@@ -136,7 +146,14 @@ impl<N: Network, D: Disk> Link<N, D> {
                     .receive(None, config.epoch, record, frame.payload, false)?;
             }
             if answer.done {
-                return Ok((session, Seq::new(answer.last)));
+                // What a learner keeps: nothing, or what the primary
+                // verifies, or what reconciliation kept (§6.7).
+                let keeps = match (answer.fresh, answer.unverified) {
+                    (true, _) => None,
+                    (false, 0) => Some(Epoch::ZERO),
+                    (false, epoch) => Some(Epoch::new(epoch)),
+                };
+                return Ok((session, Seq::new(answer.last), keeps));
             }
         }
     }
@@ -170,7 +187,17 @@ impl<N: Network, D: Disk> Link<N, D> {
             let mut records = match self.leader.records_after(cursor, BATCH) {
                 Pending::Ready(records) => records,
                 Pending::InLog(through) => {
-                    let records = self.shard.read_tail(cursor, through).await?;
+                    let records = match self.shard.read_tail(cursor, through).await {
+                        Ok(records) => records,
+                        Err(error) => {
+                            // A learner behind what the log still holds
+                            // gets a snapshot next (§6.7).
+                            if self.leader.is_learner(&self.member) {
+                                self.leader.needs_snapshot(&self.member);
+                            }
+                            return Err(error.into());
+                        }
+                    };
                     self.leader.restore(cursor, records);
                     continue;
                 }

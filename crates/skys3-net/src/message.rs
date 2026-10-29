@@ -36,7 +36,8 @@ pub enum MessageKind {
     /// Primary to learner: a chunk of the shard's index snapshot or
     /// payload during backfill (§6.4, §6.7). The payload is the chunk.
     Backfill = 5,
-    /// Learner to primary: a backfill chunk is durable.
+    /// Learner to primary: a snapshot is installed, or the payload it
+    /// needs next, until its backfill is complete.
     BackfillAck = 6,
 
     /// Primary to member or learner: a lease beacon sent at a primary-local

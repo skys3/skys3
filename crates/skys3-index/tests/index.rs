@@ -10,7 +10,7 @@ use bytes::Bytes;
 use skys3_config::StorageConfig;
 use skys3_index::{
     Applier, ControlEntry, Entry, EntryState, FORMAT_VERSION, ImportCheckpoint, ImportRanges,
-    Index, IndexConfig, IndexError, IndexWriter, LogState, codec,
+    Index, IndexConfig, IndexError, IndexWriter, LogState, ShardTable, codec,
 };
 use skys3_io::{SimDisk, SimDiskFaults, SimPower, SyncCut};
 use skys3_log::record::{Delete, RecordBody};
@@ -753,4 +753,88 @@ fn a_real_file_without_its_magic_number_is_created_again() {
     let error = Index::open(&path, &IndexConfig::default()).unwrap_err();
     assert!(error.to_string().contains("magic number"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), b"not an index at all");
+}
+
+#[test]
+fn a_snapshot_of_a_shard_installs_in_place_of_another_replicas_state() {
+    let disk = SimDisk::new(17);
+    let primary = Index::open_sim(&disk.mount(), "primary.redb", &index_config()).unwrap();
+    let records: Vec<_> = (1..=6)
+        .map(|seq| delete(0, seq, &format!("k{seq}")))
+        .chain([delete(1, 1, "other")])
+        .collect();
+    primary.apply(&TestApplier, &records).unwrap();
+    let read = primary.read().unwrap();
+    // Pages hold at least one row, then rows up to the byte limit.
+    let first = read
+        .shard_rows(ShardTable::Namespace, &shard(0), None, 1)
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    let rest = read
+        .shard_rows(ShardTable::Namespace, &shard(0), Some(&first[0].0), 1 << 20)
+        .unwrap();
+    assert_eq!(rest.len(), 5);
+    let uploads = read.shard_rows(ShardTable::Uploads, &shard(0), None, 1 << 20);
+    assert!(uploads.unwrap().is_empty());
+
+    // A replica that held the shard and another one.
+    let learner = Index::open_sim(&disk.mount(), "learner.redb", &index_config()).unwrap();
+    learner
+        .apply(&TestApplier, &[delete(0, 1, "old"), delete(1, 1, "kept")])
+        .unwrap();
+    let marker = EpochSeq::new(Epoch::new(2), Seq::MAX);
+    learner.begin_install(&shard(0), marker).unwrap();
+    let applied = learner.read().unwrap().applied(&shard(0)).unwrap();
+    assert_eq!(applied, Some(marker));
+    // Rows of another shard, or that do not decode, are refused whole.
+    let foreign = read
+        .shard_rows(ShardTable::Namespace, &shard(1), None, 1 << 20)
+        .unwrap();
+    let refused = learner.install_rows(&shard(0), ShardTable::Namespace, &foreign);
+    assert!(
+        matches!(refused, Err(IndexError::Snapshot(_))),
+        "{refused:?}"
+    );
+    for table in [ShardTable::Uploads, ShardTable::Parts] {
+        let refused = learner.install_rows(&shard(0), table, &first);
+        assert!(
+            matches!(refused, Err(IndexError::Snapshot(_))),
+            "{refused:?}"
+        );
+    }
+    for rows in [&first, &rest] {
+        learner
+            .install_rows(&shard(0), ShardTable::Namespace, rows)
+            .unwrap();
+    }
+    learner.finish_install(&shard(0), position(6)).unwrap();
+    let location = RecordLocation {
+        segment: SegmentId::new(4),
+        offset: 0,
+        len: 10,
+    };
+    learner
+        .store_locations(&shard(0), &[(position(3), location)])
+        .unwrap();
+
+    let dump = learner.read().unwrap().dump().unwrap();
+    let primary = primary.read().unwrap().dump().unwrap();
+    let of = |dump: &skys3_index::IndexDump, n: u8| -> Vec<Entry> {
+        dump.entries
+            .iter()
+            .filter(|((s, _), _)| *s == shard(n))
+            .map(|(_, entry)| entry.clone())
+            .collect()
+    };
+    assert_eq!(of(&dump, 0), of(&primary, 0));
+    assert_eq!(dump.applied.get(&shard(0)), Some(&position(6)));
+    assert_eq!(
+        dump.locations.get(&(shard(0), position(3))),
+        Some(&location)
+    );
+    // The other shard is untouched.
+    assert_eq!(of(&dump, 1), vec![tombstone(1)]);
+    let parts = ShardTable::Parts;
+    assert_eq!(ShardTable::from_code(parts.code()), Some(parts));
+    assert_eq!(ShardTable::from_code(0), None);
 }

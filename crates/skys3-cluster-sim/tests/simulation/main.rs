@@ -37,6 +37,7 @@
 //!   every node.
 
 mod acks;
+mod backfill;
 mod buckets;
 mod coordinator;
 mod crash;

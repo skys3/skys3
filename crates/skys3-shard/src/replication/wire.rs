@@ -18,6 +18,23 @@
 //!   StepDown(epoch, last)                 ->                           to the candidate of a planned handoff, last
 //! ```
 //!
+//! A learner's session (§6.7) carries one more step after its `SyncAck`:
+//!
+//! ```text
+//!   Backfill(keep)                        ->                           the learner keeps its log
+//!   Backfill(position) + rows*, done      ->                           or a snapshot replaces it
+//!                                          <- BackfillAck              once the snapshot is installed
+//! ```
+//!
+//! and a primary backfills payload over a connection of its own:
+//!
+//! ```text
+//!   Backfill(config)                      ->
+//!                                          <- BackfillAck(needs)       positions whose payload it lacks
+//!   Backfill(position) + record*          ->                           one per position, or missing
+//!                                          <- BackfillAck(complete, applied)
+//! ```
+//!
 //! `lease` is a lease stamp (§5.4): the primary's clock reading when it sent
 //! the frame. An acknowledgement echoes the latest stamp the member received
 //! in the session, which grants the primary a lease until the stamp plus
@@ -35,7 +52,7 @@
 use bytes::Bytes;
 use prost::Message;
 use skys3_net::{Frame, Header, MessageKind};
-use skys3_types::{Epoch, RegisterDocument, Seq, ShardConfig};
+use skys3_types::{Epoch, EpochSeq, RegisterDocument, Seq, ShardConfig};
 
 use crate::lineage::{self, Lineage};
 
@@ -133,6 +150,135 @@ pub struct SyncAck {
     /// Why the member refused the session, if it did.
     #[prost(string, tag = "4")]
     pub refused: String,
+    /// Set by a learner whose log the primary's lineage cannot tell from
+    /// its own (§6.7): it keeps its records only if the primary holds the
+    /// record at `last` in this epoch, and otherwise needs a snapshot.
+    /// 0 if its log is known.
+    #[prost(uint64, tag = "5")]
+    pub unverified: u64,
+    /// Set by a learner that holds nothing it can keep: it needs a
+    /// snapshot (§6.7).
+    #[prost(bool, tag = "6")]
+    pub fresh: bool,
+}
+
+/// Primary to learner, kind `Backfill` (§6.4, §6.7). On a replication link,
+/// right after the learner's `SyncAck`: either `keep`, after which the
+/// session streams the log from the learner's last record, or the chunks
+/// of a snapshot taken at `(epoch, seq)`, the last one `done`, each with
+/// [`SnapshotRows`] as its payload. On a backfill connection: first the
+/// primary's `config`, then one frame per position the learner asked for,
+/// with the record holding the payload there as its payload, or
+/// `missing`.
+#[derive(Clone, PartialEq, Message)]
+pub struct Backfill {
+    /// The primary's configuration, as its register's JSON: the first
+    /// frame of a backfill connection.
+    #[prost(bytes = "vec", tag = "1")]
+    pub config: Vec<u8>,
+    /// The learner keeps its log: no snapshot follows.
+    #[prost(bool, tag = "2")]
+    pub keep: bool,
+    /// The epoch of the snapshot's position, or of the record's.
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    /// The `seq` of the snapshot's position, or of the record's.
+    #[prost(uint64, tag = "4")]
+    pub seq: u64,
+    /// The last chunk of the snapshot.
+    #[prost(bool, tag = "5")]
+    pub done: bool,
+    /// The primary holds no payload at the position: the learner's entry
+    /// is older than the primary's.
+    #[prost(bool, tag = "6")]
+    pub missing: bool,
+}
+
+impl Backfill {
+    /// The position the frame names.
+    #[must_use]
+    pub fn position(&self) -> EpochSeq {
+        EpochSeq::new(Epoch::new(self.epoch), Seq::new(self.seq))
+    }
+}
+
+/// The rows of a snapshot chunk: its payload.
+#[derive(Clone, PartialEq, Message)]
+pub struct SnapshotRows {
+    /// The rows, in table and key order.
+    #[prost(message, repeated, tag = "1")]
+    pub rows: Vec<Row>,
+}
+
+impl SnapshotRows {
+    /// The rows a chunk's payload carries.
+    ///
+    /// # Errors
+    ///
+    /// Why the payload does not decode.
+    pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
+        Self::decode(payload).map_err(|error| error.to_string())
+    }
+
+    /// The rows as a chunk's payload.
+    #[must_use]
+    pub fn to_payload(&self) -> Bytes {
+        Bytes::from(self.encode_to_vec())
+    }
+}
+
+/// One row of a shard's index ([`skys3_index::ShardTable`]), as stored.
+#[derive(Clone, PartialEq, Message)]
+pub struct Row {
+    /// The table's code.
+    #[prost(uint32, tag = "1")]
+    pub table: u32,
+    /// The row's key.
+    #[prost(bytes = "vec", tag = "2")]
+    pub key: Vec<u8>,
+    /// The row's value.
+    #[prost(bytes = "vec", tag = "3")]
+    pub value: Vec<u8>,
+}
+
+/// Learner to primary, kind `BackfillAck`. On a replication link, once it
+/// installed the snapshot, or `refused` it. On a backfill connection, the
+/// positions whose payload it needs next, or `complete` once it holds the
+/// payload of every entry it has, as of its applied position.
+#[derive(Clone, PartialEq, Message)]
+pub struct BackfillAck {
+    /// Positions whose payload the learner needs.
+    #[prost(message, repeated, tag = "1")]
+    pub needs: Vec<Run>,
+    /// The learner holds every payload its entries need.
+    #[prost(bool, tag = "2")]
+    pub complete: bool,
+    /// The epoch of the learner's applied position, with `complete`.
+    #[prost(uint64, tag = "3")]
+    pub applied_epoch: u64,
+    /// The `seq` of the learner's applied position, with `complete`.
+    #[prost(uint64, tag = "4")]
+    pub applied_seq: u64,
+    /// Why the learner refused, if it did.
+    #[prost(string, tag = "5")]
+    pub refused: String,
+}
+
+impl BackfillAck {
+    /// The positions the learner needs: each [`Run`] names one.
+    #[must_use]
+    pub fn positions(&self) -> Vec<EpochSeq> {
+        self.needs
+            .iter()
+            .map(|run| EpochSeq::new(Epoch::new(run.epoch), Seq::new(run.last)))
+            .collect()
+    }
+
+    /// The learner's applied position.
+    #[must_use]
+    pub fn applied(&self) -> EpochSeq {
+        EpochSeq::new(Epoch::new(self.applied_epoch), Seq::new(self.applied_seq))
+    }
 }
 
 /// Primary to member: one record, with the commit watermark.
@@ -240,14 +386,35 @@ mod tests {
                 let _ = sync.configuration();
             }
             for kind in [MessageKind::SyncAck, MessageKind::Append, MessageKind::AppendAck,
-                         MessageKind::Beacon, MessageKind::StepDown] {
+                         MessageKind::Beacon, MessageKind::StepDown, MessageKind::Backfill,
+                         MessageKind::BackfillAck] {
                 let frame = Frame::new(Header::new(kind).with_body(body.clone()), "");
                 let _ = super::body::<SyncAck>(&frame, kind);
                 let _ = super::body::<Append>(&frame, kind);
                 let _ = super::body::<AppendAck>(&frame, kind);
                 let _ = super::body::<Beacon>(&frame, kind);
                 let _ = super::body::<StepDown>(&frame, kind);
+                if let Ok(backfill) = super::body::<Backfill>(&frame, kind) {
+                    let _ = backfill.position();
+                }
+                if let Ok(ack) = super::body::<BackfillAck>(&frame, kind) {
+                    prop_assert_eq!(ack.positions().len(), ack.needs.len());
+                }
             }
+            if let Ok(rows) = SnapshotRows::from_payload(&body) {
+                prop_assert_eq!(SnapshotRows::from_payload(&rows.to_payload()), Ok(rows));
+            }
+            let ack = BackfillAck {
+                needs: vec![Run { epoch, last: commit }],
+                complete: lazy,
+                applied_epoch: commit,
+                applied_seq: epoch,
+                refused: String::new(),
+            };
+            let sent = super::frame(MessageKind::BackfillAck, &ack, Bytes::new());
+            let again: BackfillAck = super::body(&sent, MessageKind::BackfillAck).unwrap();
+            prop_assert_eq!(again.positions(), vec![EpochSeq::new(Epoch::new(epoch), Seq::new(commit))]);
+            prop_assert_eq!(again.applied(), EpochSeq::new(Epoch::new(commit), Seq::new(epoch)));
             let append = Append { epoch, commit, lazy, lease };
             let sent = super::frame(MessageKind::Append, &append, Bytes::new());
             prop_assert_eq!(super::body::<Append>(&sent, MessageKind::Append), Ok(append));

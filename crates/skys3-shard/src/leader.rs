@@ -79,6 +79,12 @@ struct State {
     acking: BTreeSet<NodeId>,
     /// The learners whose backfill is complete (§6.7).
     backfilled: BTreeSet<NodeId>,
+    /// The position of the snapshot last sent to each learner in this
+    /// life: its backfill counts only from there on.
+    snapshots: BTreeMap<NodeId, EpochSeq>,
+    /// The learners whose next session gets a snapshot: the primary's log
+    /// no longer holds the records after theirs.
+    stale: BTreeSet<NodeId>,
     /// The promotion outstanding, if any: commits wait for its learner,
     /// and reads need its lease, until the primary knows the outcome.
     promoting: Option<Promotion>,
@@ -231,6 +237,8 @@ impl Leader {
             learners,
             acking: BTreeSet::new(),
             backfilled: BTreeSet::new(),
+            snapshots: BTreeMap::new(),
+            stale: BTreeSet::new(),
             promoting,
             progress: peers
                 .iter()
@@ -365,6 +373,44 @@ impl Leader {
     #[must_use]
     pub fn is_backfilled(&self, learner: &NodeId) -> bool {
         self.state().backfilled.contains(learner)
+    }
+
+    /// Records that `learner` reported holding the payload of every entry
+    /// it has, at its applied position `applied` (§6.7), and returns
+    /// whether that completes its backfill: it does unless the primary
+    /// sent it a snapshot since, which the report predates.
+    pub(crate) fn fill_complete(&self, learner: &NodeId, applied: EpochSeq) -> bool {
+        let mut state = self.state();
+        let current = state
+            .snapshots
+            .get(learner)
+            .is_none_or(|snapshot| applied >= *snapshot);
+        let complete = current && state.learners.contains(learner);
+        if complete {
+            state.backfilled.insert(learner.clone());
+        }
+        complete
+    }
+
+    /// Records that the primary sends `learner` a snapshot taken at `at`
+    /// in place of its log: its backfill starts over from there.
+    pub(crate) fn snapshot_sent(&self, learner: &NodeId, at: EpochSeq) {
+        let mut state = self.state();
+        state.backfilled.remove(learner);
+        state.stale.remove(learner);
+        state.snapshots.insert(learner.clone(), at);
+    }
+
+    /// Records that the primary's log no longer holds the records after
+    /// `learner`'s last: its next session gets a snapshot.
+    pub(crate) fn needs_snapshot(&self, learner: &NodeId) {
+        self.state().stale.insert(learner.clone());
+    }
+
+    /// Whether `learner`'s next session gets a snapshot because the
+    /// primary's log no longer holds the records after its last.
+    pub(crate) fn wants_snapshot(&self, learner: &NodeId) -> bool {
+        self.state().stale.contains(learner)
     }
 
     /// The configuration of the promotion the primary proposed and does
@@ -724,6 +770,8 @@ impl Leader {
                 learners,
                 acking,
                 backfilled,
+                snapshots,
+                stale,
                 promoting,
                 progress,
                 ..
@@ -742,6 +790,8 @@ impl Leader {
             }
             acking.retain(|node| learners.contains(node));
             backfilled.retain(|node| learners.contains(node));
+            snapshots.retain(|node, _| learners.contains(node));
+            stale.retain(|node| learners.contains(node));
             lock(&self.sequencer).acking = acking.len();
             {
                 let mut changes = self.changes.lock().unwrap_or_else(PoisonError::into_inner);

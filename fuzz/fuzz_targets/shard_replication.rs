@@ -1,15 +1,19 @@
 //! Fuzzes the replication messages a member or a primary decodes from an
 //! authenticated but untrusted peer (design §5.1, §6.6, §12): every body,
 //! the configuration and the lineage a `Sync` carries, the record of an
-//! `Append` or a `SyncAck`, and a planned handoff's `StepDown` (§5.4).
+//! `Append` or a `SyncAck`, a planned handoff's `StepDown` (§5.4), and a
+//! backfill's chunks, rows, and requests (§6.7).
 
 #![no_main]
 #![forbid(unsafe_code)]
 
 use libfuzzer_sys::fuzz_target;
+use skys3_index::ShardTable;
 use skys3_log::LogRecord;
 use skys3_net::{Frame, Header, MessageKind};
-use skys3_shard::replication::wire::{self, Append, AppendAck, Beacon, StepDown, Sync, SyncAck};
+use skys3_shard::replication::wire::{
+    self, Append, AppendAck, Backfill, BackfillAck, Beacon, SnapshotRows, StepDown, Sync, SyncAck,
+};
 use skys3_shard::lineage::Lineage;
 use skys3_types::{Epoch, EpochSeq, RegisterDocument, Seq};
 
@@ -22,6 +26,8 @@ fuzz_target!(|data: &[u8]| {
         MessageKind::AppendAck,
         MessageKind::Beacon,
         MessageKind::StepDown,
+        MessageKind::Backfill,
+        MessageKind::BackfillAck,
     ] {
         let mut frame = Frame::new(Header::new(kind).with_body(data.to_vec()), data.to_vec());
         check(&frame);
@@ -83,6 +89,25 @@ fn check(frame: &Frame) {
             if let Ok(step_down) = wire::body::<StepDown>(frame, MessageKind::StepDown) {
                 let again = wire::frame(MessageKind::StepDown, &step_down, Default::default());
                 assert_eq!(wire::body(&again, MessageKind::StepDown), Ok(step_down));
+            }
+        }
+        MessageKind::Backfill => {
+            if let Ok(backfill) = wire::body::<Backfill>(frame, MessageKind::Backfill) {
+                let _ = backfill.position();
+                if let Ok(chunk) = SnapshotRows::from_payload(&frame.payload) {
+                    for row in &chunk.rows {
+                        let _ = ShardTable::from_code(row.table);
+                    }
+                    let again = SnapshotRows::from_payload(&chunk.to_payload());
+                    assert_eq!(again.as_ref(), Ok(&chunk));
+                }
+                record(frame);
+            }
+        }
+        MessageKind::BackfillAck => {
+            if let Ok(ack) = wire::body::<BackfillAck>(frame, MessageKind::BackfillAck) {
+                assert_eq!(ack.positions().len(), ack.needs.len());
+                let _ = ack.applied();
             }
         }
         _ => assert!(wire::body::<Beacon>(frame, MessageKind::Beacon).is_err()),
