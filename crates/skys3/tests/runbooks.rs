@@ -644,10 +644,15 @@ async fn drill_disk_out_of_service() {
     assert!(failed["error"].is_string(), "{health}");
     assert_eq!(disk_entry(&health, &other)["in_service"], true);
     let label = failed["label"].as_str().unwrap().to_owned();
+    // The fence could not be written into the missing directory. The node
+    // tries to write it after it counts the disk out of service.
+    until(
+        "the node reports the fence it could not write",
+        async || log_text(dir.path()).contains("cannot fence the disk"),
+    )
+    .await;
     let log = log_text(dir.path());
     assert!(log.contains("a disk was taken out of service"), "{log}");
-    // The fence could not be written into the missing directory.
-    assert!(log.contains("cannot fence the disk"), "{log}");
 
     // Remediation: stop the node, bring the disk back, and check it.
     assert!(node.terminate().await.success());

@@ -8140,3 +8140,9 @@ of this file. A task with nothing unexpected keeps "None."
   in order, that every runbook has its parts and a drill row, that every
   drill names a test function that exists, and that every metric the
   runbooks name is in the metrics reference.
+- **The disk drill read the log before the fence attempt.** CI failed
+  `drill_disk_out_of_service` on the "cannot fence the disk" check. The
+  node counts the disk out of service and clears readiness first, then
+  tries to write the fence on the blocking pool and logs the failure, so
+  a test that waits for the gauge can read `node.log` before that line.
+  The drill now waits for the line.
