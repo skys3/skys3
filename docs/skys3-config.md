@@ -210,7 +210,7 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 |---|---|---|---|
 | `quic_listen` | socket address | `"0.0.0.0:7443"` | |
 | `congestion_control` | `"cubic"`, `"new_reno"`, or `"bbr"` | `"cubic"` | BBR is experimental in Quinn. |
-| `peer_frame_bytes` | integer | `262144` (256 KiB) | Positive. |
+| `peer_frame_bytes` | integer | `262144` (256 KiB) | From 1 to 16777216 (16 MiB). The size of a `DATA` frame and the largest object in a `BATCH`; a destination stages each frame as one log record. |
 | `peer_connect_timeout_ms` | integer | `3000` | Positive. |
 | `peer_connections_per_shard` | integer | `64` | Positive. |
 | `peer_max_inflight_bytes` | integer | `268435456` (256 MiB) | At least `peer_frame_bytes`. |

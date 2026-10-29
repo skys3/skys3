@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use serde::Deserialize;
+use skys3_types::limits::MAX_RECORD_PAYLOAD_LEN;
 
 use crate::error::Checker;
 use crate::storage::{KIB, MIB, TIB};
@@ -73,7 +74,18 @@ crate::durations! {
 
 impl PeeringConfig {
     pub(crate) fn check(&self, checker: &mut Checker) {
-        checker.nonzero("peering.peer_frame_bytes", self.peer_frame_bytes);
+        // A destination stages each `DATA` frame as one log record (§7.8).
+        let max_frame = u64::from(MAX_RECORD_PAYLOAD_LEN);
+        checker.require(
+            (1..=max_frame).contains(&self.peer_frame_bytes),
+            "peering.peer_frame_bytes",
+            || {
+                format!(
+                    "is {}; it must be from 1 to {max_frame}, the largest log record payload",
+                    self.peer_frame_bytes
+                )
+            },
+        );
         checker.nonzero(
             "peering.peer_connect_timeout_ms",
             self.peer_connect_timeout_ms,

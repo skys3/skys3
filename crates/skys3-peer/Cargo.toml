@@ -1,0 +1,23 @@
+[package]
+name = "skys3-peer"
+description = "SkyS3 native peer protocol between clusters: messages, framing, and version and capability negotiation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32c.workspace = true
+prost.workspace = true
+skys3-log.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
