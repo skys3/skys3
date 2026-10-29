@@ -12,7 +12,7 @@ use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{Body, BodySizeLimitExceeded, S3Error, s3_error};
 use skys3_control::{ControlError, ControlStore};
 use skys3_io::BlockingPool;
-use skys3_types::BucketDocument;
+use skys3_types::{BucketDocument, BucketName};
 
 use crate::api::Api;
 use crate::authz::{self, Access, NoSignatures, Permissions};
@@ -92,6 +92,7 @@ impl Authenticator for TrustAll {
 trait Catalog: Send + Sync {
     fn reload(&self) -> Pin<Box<dyn Future<Output = Result<(), ControlError>> + Send + '_>>;
     fn list(&self) -> Vec<BucketDocument>;
+    fn get(&self, name: &BucketName) -> Option<BucketDocument>;
 }
 
 impl<C: ControlStore, H: Shards> Catalog for Buckets<C, H> {
@@ -101,6 +102,10 @@ impl<C: ControlStore, H: Shards> Catalog for Buckets<C, H> {
 
     fn list(&self) -> Vec<BucketDocument> {
         Buckets::list(self)
+    }
+
+    fn get(&self, name: &BucketName) -> Option<BucketDocument> {
+        Buckets::get(self, name)
     }
 }
 
@@ -218,6 +223,13 @@ impl<A: Authenticator> Gateway<A> {
     #[must_use]
     pub fn buckets(&self) -> Vec<BucketDocument> {
         self.inner.catalog.list()
+    }
+
+    /// The bucket named `name` in the gateway's local copy, if there is
+    /// one.
+    #[must_use]
+    pub fn bucket(&self, name: &BucketName) -> Option<BucketDocument> {
+        self.inner.catalog.get(name)
     }
 
     /// Answers one request.

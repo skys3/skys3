@@ -2593,6 +2593,7 @@ dependencies = [
  "skys3-io",
  "skys3-log",
  "skys3-net",
+ "skys3-peer",
  "skys3-shard",
  "skys3-types",
  "tempfile",
@@ -2710,6 +2711,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

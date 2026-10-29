@@ -313,6 +313,8 @@ async fn a_deletion_whose_answers_were_lost_is_finished_on_retry() {
     .unwrap();
     let head = || common::request(Method::HEAD, "/photos", &[], "");
     assert_eq!(other.handle(head()).await.status(), 200);
+    let name = "photos".parse().unwrap();
+    assert_eq!(other.bucket(&name), Some(bucket.clone()));
     let before = setup.generation().await;
     // The read passes; the delete lands, and every answer is lost.
     setup.store.script([
@@ -340,6 +342,7 @@ async fn a_deletion_whose_answers_were_lost_is_finished_on_retry() {
     );
     other.reload_buckets().await.unwrap();
     assert_eq!(other.handle(head()).await.status(), 404);
+    assert_eq!(other.bucket(&name), None);
     let again = setup.call(Method::DELETE, "/photos", &[], "").await;
     again.assert(404, Some("NoSuchBucket"));
 }

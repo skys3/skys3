@@ -181,7 +181,7 @@ async fn trusted_peers_negotiate_and_exchange_messages() {
     out.finish().unwrap();
     let (mut sender, mut receiver) = out.split();
     assert!(sender.finish().is_err(), "already finished");
-    inbound.finish().unwrap();
+    inbound.finish().await.unwrap();
     assert_eq!(receiver.recv().bounded().await.unwrap(), None);
     drop((sender, receiver));
     assert_eq!(source.open_streams(), 0);
@@ -392,7 +392,7 @@ async fn exchange(
     let mut inbound = destination.accept_stream().bounded().await.unwrap();
     let verdict = inbound.recv().bounded().await;
     // The destination has nothing more to say.
-    let _ = inbound.finish();
+    let _ = inbound.finish().await;
     let mut replies = Vec::new();
     while let Ok(Some(reply)) = out.recv().bounded().await {
         replies.push(reply);

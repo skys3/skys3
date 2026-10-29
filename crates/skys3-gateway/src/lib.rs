@@ -135,6 +135,7 @@ mod listener;
 mod listing;
 mod local;
 mod objects;
+mod peering;
 mod remote;
 pub mod routing;
 mod service;
@@ -157,6 +158,7 @@ pub use objects::{
     MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
     parse_upload_id, upload_id,
 };
+pub use peering::{BucketLookup, PeerExtents};
 pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;

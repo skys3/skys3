@@ -20,6 +20,13 @@ pub const MAX_RECORD_PAYLOAD_LEN: u32 = 16 * 1024 * 1024;
 /// The smallest `extent_bytes`, in bytes (64 KiB).
 pub const MIN_EXTENT_LEN: u32 = 64 * 1024;
 
+/// The least a peer destination charges against `peer_staging_quota_bytes`
+/// for each staging it opens and each extent it stages (64 KiB, the
+/// smallest `extent_bytes`, design §7.8). The memory its staging index
+/// takes then grows with the quota, as staging in the smallest extents
+/// would, however small the frames a source sends.
+pub const MIN_STAGING_CHARGE: u64 = MIN_EXTENT_LEN as u64;
+
 /// The most extents one `PUT` record references: a
 /// [`MAX_SINGLE_PUT_BYTES`] object in extents of [`MIN_EXTENT_LEN`].
 pub const MAX_EXTENTS_PER_PUT: usize = (MAX_SINGLE_PUT_BYTES / MIN_EXTENT_LEN as u64) as usize;

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
-use skys3_types::limits::MAX_RECORD_PAYLOAD_LEN;
+use skys3_types::limits::{MAX_RECORD_PAYLOAD_LEN, MIN_STAGING_CHARGE};
 use skys3_types::{BucketId, BucketName, ClusterId};
 
 use crate::error::{Checker, key_path};
@@ -179,12 +179,15 @@ impl PeeringConfig {
                 )
             },
         );
+        // One staging and one frame, each charged at least the minimum.
+        let least = MIN_STAGING_CHARGE + self.peer_frame_bytes.max(MIN_STAGING_CHARGE);
         checker.require(
-            self.peer_staging_quota_bytes >= self.peer_frame_bytes,
+            self.peer_staging_quota_bytes >= least,
             "peering.peer_staging_quota_bytes",
             || {
                 format!(
-                    "is {}; it must be at least peer_frame_bytes ({})",
+                    "is {}; it must be at least {least}, what one staging and one frame of \
+                     peer_frame_bytes ({}) are charged",
                     self.peer_staging_quota_bytes, self.peer_frame_bytes
                 )
             },

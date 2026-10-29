@@ -24,6 +24,7 @@ skys3-net.workspace = true
 skys3-types.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

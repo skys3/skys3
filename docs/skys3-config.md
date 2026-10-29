@@ -214,7 +214,7 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 | `peer_connect_timeout_ms` | integer | `3000` | Positive. |
 | `peer_connections_per_shard` | integer | `64` | Positive. |
 | `peer_max_inflight_bytes` | integer | `268435456` (256 MiB) | At least `peer_frame_bytes`. |
-| `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least `peer_frame_bytes`. |
+| `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least 64 KiB plus the larger of `peer_frame_bytes` and 64 KiB: one staging and one frame, each charged at least 64 KiB (design §7.8). |
 | `peer_staging_ttl_seconds` | integer | `86400` | Positive. |
 
 ### `[peering.peers.<cluster-id>]`

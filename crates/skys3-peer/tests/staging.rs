@@ -1,0 +1,456 @@
+//! Staging over loopback QUIC: a destination that relays frames to a sink
+//! standing in for the shard primaries, answers `BEGIN` with `RESUME`,
+//! reports durable ranges, and resumes after a reconnect.
+
+// The tests spell out sets of one range on purpose.
+#![allow(clippy::single_range_in_vec_init)]
+
+mod common;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bytes::Bytes;
+use common::*;
+use skys3_log::record::ExtentRef;
+use skys3_peer::{
+    AbortReason, Applied, ApplyError, Batch, Begin, ByteRanges, Commit, Data, ExtentSink, Message,
+    MessageStream, Outcome, PeerEndpoint, PeerTrust, Precondition, Put, PutData, SinkError,
+    Staging, StagingLimits, StagingService, Write,
+};
+use skys3_types::{BucketName, ETag, Epoch, EpochSeq, Seq, WriteIdentity};
+
+const US: &str = "prod-us";
+const EU: &str = "prod-eu";
+const SOURCE_BUCKET: &str = "b-src";
+const DESTINATION_BUCKET: &str = "archive";
+const FRAME: u64 = 64 << 10;
+
+/// A key whose appends the sink refuses, as for a bucket being deleted.
+const REFUSED_KEY: &str = "refused";
+
+fn identity(seq: u64) -> WriteIdentity {
+    format!("{US}/{SOURCE_BUCKET}/5/42.{seq}").parse().unwrap()
+}
+
+fn begin(identity: &WriteIdentity, key: &str) -> Message {
+    Message::Begin(Begin {
+        identity: identity.clone(),
+        bucket: BucketName::new(DESTINATION_BUCKET).unwrap(),
+        key: key.to_owned(),
+    })
+}
+
+/// The bytes of a piece, different at every offset of a frame.
+fn body(len: u64) -> Bytes {
+    (0..len).map(|at| (at % 253) as u8).collect()
+}
+
+fn frame(body: &Bytes, piece: u64, range: Range<u64>) -> Message {
+    Message::Data(Data {
+        piece,
+        offset: range.start,
+        bytes: body.slice(range.start as usize..range.end as usize),
+    })
+}
+
+/// An append the sink took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Appended {
+    key: String,
+    offset: u64,
+    bytes: Bytes,
+    position: EpochSeq,
+}
+
+/// Stands in for the shard primaries: stores each extent at the next
+/// position, fails the first append at each offset in `fail_once`, and
+/// refuses every append of [`REFUSED_KEY`].
+#[derive(Debug, Clone, Default)]
+struct TestSink {
+    state: Arc<Mutex<SinkState>>,
+}
+
+#[derive(Debug, Default)]
+struct SinkState {
+    fail_once: BTreeSet<u64>,
+    appended: Vec<Appended>,
+    attempts: usize,
+}
+
+impl TestSink {
+    fn failing_once(offsets: impl IntoIterator<Item = u64>) -> Self {
+        let sink = Self::default();
+        sink.state.lock().unwrap().fail_once = offsets.into_iter().collect();
+        sink
+    }
+
+    fn appended(&self) -> Vec<Appended> {
+        self.state.lock().unwrap().appended.clone()
+    }
+
+    fn attempts(&self) -> usize {
+        self.state.lock().unwrap().attempts
+    }
+}
+
+impl ExtentSink for TestSink {
+    async fn append(
+        &self,
+        bucket: &BucketName,
+        key: &str,
+        offset: u64,
+        data: Bytes,
+    ) -> Result<ExtentRef, SinkError> {
+        assert_eq!(bucket.as_str(), DESTINATION_BUCKET);
+        // Let other appends and messages interleave.
+        tokio::task::yield_now().await;
+        let mut state = self.state.lock().unwrap();
+        state.attempts += 1;
+        if key == REFUSED_KEY {
+            return Err(SinkError::Refused("the bucket is being deleted".into()));
+        }
+        if state.fail_once.remove(&offset) {
+            return Err(SinkError::Unavailable("not acknowledged in time".into()));
+        }
+        let position = EpochSeq::new(Epoch::new(1), Seq::new(state.appended.len() as u64 + 1));
+        let len = u32::try_from(data.len()).unwrap();
+        state.appended.push(Appended {
+            key: key.to_owned(),
+            offset,
+            bytes: data,
+            position,
+        });
+        Ok(ExtentRef { position, len })
+    }
+}
+
+/// A source in `prod-us` and a destination in `prod-eu` that serves
+/// staging with `sink`.
+struct Setup {
+    source: PeerEndpoint,
+    destination: PeerEndpoint,
+    staging: Arc<Staging>,
+}
+
+fn setup(sink: TestSink, limits: StagingLimits) -> Setup {
+    let us = Cluster::new(US);
+    let eu = Cluster::new(EU);
+    let mut destination_trust = PeerTrust::new();
+    us.trusted(
+        &mut destination_trust,
+        &[pair(SOURCE_BUCKET, DESTINATION_BUCKET)],
+    );
+    let mut source_trust = PeerTrust::new();
+    eu.trusted(&mut source_trust, &[]);
+    let destination = eu.endpoint("eu-1", destination_trust);
+    let staging = Arc::new(Staging::new(limits));
+    let service = StagingService::new(Arc::clone(&staging), sink);
+    assert!(format!("{service:?}").contains("StagingService"));
+    let accepting = destination.clone();
+    tokio::spawn(async move {
+        while let Some(incoming) = accepting.accept().await {
+            let service = service.clone();
+            tokio::spawn(async move {
+                if let Ok(connection) = incoming.establish().await {
+                    service.serve_connection(connection).await;
+                }
+            });
+        }
+    });
+    Setup {
+        source: us.endpoint("us-1", source_trust),
+        destination,
+        staging,
+    }
+}
+
+const LIMITS: StagingLimits = StagingLimits {
+    quota_bytes: 1 << 30,
+    ttl: Duration::from_secs(3600),
+};
+
+impl Setup {
+    /// A new connection and a stream on it.
+    async fn stream(&self) -> (skys3_peer::PeerConnection, MessageStream) {
+        let to = destination(EU, &self.destination);
+        let connection = self.source.connect(&to).bounded().await.unwrap();
+        let stream = connection.open_stream().bounded().await.unwrap();
+        (connection, stream)
+    }
+}
+
+/// Receives messages until a `DURABLE` reports `want` for `piece`, and
+/// returns every message before it that is not a `DURABLE`.
+async fn durable_until(stream: &mut MessageStream, piece: u64, want: &[Range<u64>]) {
+    loop {
+        match stream.recv().bounded().await.unwrap() {
+            Some(Message::Durable(durable)) => {
+                if durable
+                    .pieces
+                    .get(&piece)
+                    .is_some_and(|ranges| ranges.as_slice() == want)
+                {
+                    return;
+                }
+            }
+            other => panic!("expected DURABLE, got {other:?}"),
+        }
+    }
+}
+
+async fn resume(stream: &mut MessageStream) -> BTreeMap<u64, ByteRanges> {
+    match stream.recv().bounded().await.unwrap() {
+        Some(Message::Resume(resume)) => resume.pieces,
+        other => panic!("expected RESUME, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reconnect_resends_only_the_ranges_not_yet_durable() {
+    // Frames 5 and 6 are not acknowledged the first time.
+    let sink = TestSink::failing_once([5 * FRAME, 6 * FRAME]);
+    let setup = setup(sink.clone(), LIMITS);
+    let id = identity(1);
+    let len = 8 * FRAME;
+    let body = body(len);
+
+    // The first connection streams every frame without waiting for any.
+    let (first, mut stream) = setup.stream().await;
+    stream
+        .send(&begin(&id, "photos/cat.jpg"))
+        .bounded()
+        .await
+        .unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    let (mut sender, mut receiver) = stream.split();
+    let sending = tokio::spawn(async move {
+        let body = self::body(len);
+        for at in (0..len).step_by(FRAME as usize) {
+            sender.send(&frame(&body, 1, at..at + FRAME)).await.unwrap();
+        }
+        sender
+    });
+    // DURABLEs arrive while the frames are sent.
+    let durable = [0..5 * FRAME, 7 * FRAME..len];
+    async {
+        loop {
+            match receiver.recv().await.unwrap() {
+                Some(Message::Durable(report)) if report.pieces[&1].as_slice() == durable => break,
+                Some(Message::Durable(_)) => {}
+                other => panic!("expected DURABLE, got {other:?}"),
+            }
+        }
+    }
+    .bounded()
+    .await;
+    let _sender = sending.bounded().await.unwrap();
+    assert_eq!(sink.attempts(), 8);
+    // The link drops.
+    first.close();
+
+    // After the reconnect, the RESUME holds what is durable, and the
+    // source resends only the rest.
+    let (second, mut stream) = setup.stream().await;
+    stream
+        .send(&begin(&id, "photos/cat.jpg"))
+        .bounded()
+        .await
+        .unwrap();
+    let held = resume(&mut stream).await;
+    assert_eq!(held[&1].as_slice(), durable);
+    let missing = held[&1].missing(len);
+    assert_eq!(missing, [5 * FRAME..7 * FRAME]);
+    for gap in missing {
+        for at in gap.step_by(FRAME as usize) {
+            stream
+                .send(&frame(&body, 1, at..at + FRAME))
+                .bounded()
+                .await
+                .unwrap();
+        }
+    }
+    durable_until(&mut stream, 1, &[0..len]).await;
+    // Eight frames, two of them twice: none that was durable was sent
+    // again.
+    assert_eq!(sink.attempts(), 10);
+    let appended = sink.appended();
+    let offsets: BTreeSet<u64> = appended.iter().map(|a| a.offset).collect();
+    assert_eq!(appended.len(), 8);
+    assert_eq!(offsets.len(), 8);
+    assert!(appended.iter().all(|a| a.key == "photos/cat.jpg"));
+
+    // What a COMMIT will publish: the piece's extents, in order.
+    let staged = setup.staging.staged(&id).unwrap();
+    let extents = staged.extents(1, len).unwrap();
+    let assembled: Vec<u8> = extents
+        .iter()
+        .flat_map(|extent| {
+            let appended = appended.iter().find(|a| a.position == extent.position);
+            appended.unwrap().bytes.to_vec()
+        })
+        .collect();
+    assert_eq!(assembled, body.to_vec());
+
+    // The destination finishes the stream once the source has.
+    stream.finish().unwrap();
+    assert_eq!(stream.recv().bounded().await.unwrap(), None);
+    second.close();
+}
+
+#[tokio::test]
+async fn staging_that_cannot_continue_is_aborted() {
+    let sink = TestSink::default();
+    let setup = setup(
+        sink.clone(),
+        StagingLimits {
+            quota_bytes: 2 * FRAME,
+            ttl: LIMITS.ttl,
+        },
+    );
+    let body = body(4 * FRAME);
+    let (connection, mut stream) = setup.stream().await;
+
+    // A frame that takes the source past its quota discards the staging,
+    // and the stream's later frames go nowhere.
+    let id = identity(1);
+    stream.send(&begin(&id, "k")).bounded().await.unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    durable_until(&mut stream, 1, &[0..FRAME]).await;
+    stream
+        .send(&frame(&body, 1, FRAME..3 * FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    let Some(Message::Abort(abort)) = stream.recv().bounded().await.unwrap() else {
+        panic!("expected ABORT");
+    };
+    assert_eq!(
+        (abort.identity, abort.reason),
+        (id.clone(), AbortReason::QuotaExceeded)
+    );
+    stream
+        .send(&frame(&body, 1, 3 * FRAME..4 * FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    assert!(setup.staging.is_empty());
+    assert_eq!(setup.staging.used(&id.cluster), 0);
+
+    // A BEGIN of a staged identity for another key is refused, and the
+    // staging stays.
+    let other = identity(2);
+    stream.send(&begin(&other, "k")).bounded().await.unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&begin(&other, "elsewhere"))
+        .bounded()
+        .await
+        .unwrap();
+    let Some(Message::Abort(abort)) = stream.recv().bounded().await.unwrap() else {
+        panic!("expected ABORT");
+    };
+    assert_eq!(abort.reason, AbortReason::Refused);
+    assert!(setup.staging.staged(&other).is_some());
+    // The source's ABORT discards it.
+    stream
+        .send(&Message::Abort(skys3_peer::Abort {
+            identity: other.clone(),
+            reason: AbortReason::Cancelled,
+            detail: String::new(),
+        }))
+        .bounded()
+        .await
+        .unwrap();
+
+    // A refused append discards the staging and aborts it.
+    let refused = identity(3);
+    stream
+        .send(&begin(&refused, REFUSED_KEY))
+        .bounded()
+        .await
+        .unwrap();
+    assert!(resume(&mut stream).await.is_empty());
+    stream
+        .send(&frame(&body, 1, 0..FRAME))
+        .bounded()
+        .await
+        .unwrap();
+    let Some(Message::Abort(abort)) = stream.recv().bounded().await.unwrap() else {
+        panic!("expected ABORT");
+    };
+    assert_eq!(
+        (abort.identity, abort.reason),
+        (refused.clone(), AbortReason::Refused)
+    );
+    assert!(abort.detail.contains("being deleted"), "{}", abort.detail);
+    // Its later frames are dropped without an answer.
+    stream
+        .send(&frame(&body, 1, FRAME..2 * FRAME))
+        .bounded()
+        .await
+        .unwrap();
+
+    // COMMIT and BATCH are not applied yet.
+    let commit = Commit {
+        identity: identity(4),
+        bucket: BucketName::new(DESTINATION_BUCKET).unwrap(),
+        key: "k".into(),
+        precondition: Precondition::Absent,
+        write: Write::Delete,
+    };
+    stream
+        .send(&Message::Commit(commit.clone()))
+        .bounded()
+        .await
+        .unwrap();
+    let inline = Commit {
+        identity: identity(5),
+        write: Write::Put(Put {
+            size: 5,
+            etag: ETag::new("5d41402abc4b2a76b9719d911017c592").unwrap(),
+            last_modified_ms: 0,
+            metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksums: BTreeMap::new(),
+            data: PutData::Inline(Bytes::from_static(b"hello")),
+        }),
+        key: "small".into(),
+        ..commit
+    };
+    stream
+        .send(&Message::Batch(Batch {
+            items: vec![inline],
+        }))
+        .bounded()
+        .await
+        .unwrap();
+    for seq in [4, 5] {
+        let Some(Message::Applied(Applied { identity, outcome })) =
+            stream.recv().bounded().await.unwrap()
+        else {
+            panic!("expected APPLIED");
+        };
+        assert_eq!(identity, self::identity(seq));
+        assert!(matches!(
+            outcome,
+            Outcome::Failed {
+                error: ApplyError::Unavailable,
+                ..
+            }
+        ));
+    }
+    stream.finish().unwrap();
+    assert_eq!(stream.recv().bounded().await.unwrap(), None);
+    assert!(setup.staging.is_empty());
+    // Only the frames within the quota reached the sink.
+    assert_eq!(sink.appended().len(), 1);
+    connection.close();
+}
