@@ -5542,6 +5542,15 @@ of this file. A task with nothing unexpected keeps "None."
   that parses as a write identity. A key whose identity the entry does
   not know, such as an imported one, is committed on absence first, and
   its identity is learned from the failed precondition.
+- **Fixed: an imported key's learned identity was a conflict.** Once the
+  import had passed the key, the identity the failed precondition named,
+  the destination's own, was neither this shard's nor before the import,
+  so every first overwrite or delete of an imported key was held in
+  conflict. The flusher now HEADs the target over S3 and takes that
+  identity as the imported version's when the destination still holds
+  the ETag the entry recorded, once per flush; any other identity is
+  still a conflict. Tested in `tests/native.rs`
+  (`an_imported_version_is_overwritten_by_its_learned_identity`).
 - **Multipart objects go as one piece.** The destination answers a
   multipart `COMMIT` `unavailable` (M6-04), so the flusher stages a
   multipart object at flush time as one piece that keeps its multipart
@@ -6719,6 +6728,19 @@ of this file. A task with nothing unexpected keeps "None."
   version of the last 4096 keys it discarded and answers such a wait
   `Conflict`; reading the shard's entry instead could not tell an
   adopted stub from a later version's.
+- **Fixed: a wait that reaches a new flusher.** The remembered drops
+  live only in the flusher that made them, and only for 4096 keys: a
+  flusher started after a primary change, or one that had forgotten the
+  drop, answered a wait for the dropped version `Flushed`, and the
+  gateway's retry took that as success. A flusher now answers an
+  untracked key from memory only for a version it tracked itself (after
+  the position the shard had applied when it subscribed) and newer than
+  every drop it forgot. Otherwise it reads the entry: gone, or clean at
+  that very version, proves the flush; anything else, such as an adopted
+  stub, leaves the wait unanswered, so the write gets `503` once its
+  timeout passes, never `200`. Tested in `conflicts.rs`
+  (`a_new_flusher_does_not_answer_a_dropped_version_flushed`) and the
+  flusher state's unit tests.
 - **Admin API shape (decided, design §12).** `GET
   /v1/buckets/<name>/conflicts` and `POST
   /v1/buckets/<name>/conflicts/<policy>/<key>`, with the policy before the
@@ -7289,6 +7311,15 @@ of this file. A task with nothing unexpected keeps "None."
   run. The window's start, on the nodes' wall clock, maps to the history's
   moments through the moment the driver notes at each step
   (`History::now`, new), two steps early.
+- **Fixed: an inherited identity is matched exactly.** The report held a
+  version if the remote's write identity was at or after the identity
+  the version names. A completed upload or streamed PUT names its
+  start's, which can be older than another write of the key: with that
+  write flushed and the completion not, the remote's identity passed,
+  and a lost object went unreported. The remote must now hold exactly
+  the version's identity, or one later than the version itself.
+  Tested in `tests/snapshots.rs`
+  (`an_inherited_identity_older_than_the_remote_write_is_lost`).
 - **Simulation cost.** `tests/simulation/snapshots.rs`: two scenarios
   (with and without backup targets) under crashes, partitions, message
   loss, control-store faults, and remote faults, `Runner::with_cost(4,
@@ -7336,6 +7367,14 @@ of this file. A task with nothing unexpected keeps "None."
   `If-Match`, so a change between the HEAD and the read resolves the key
   again instead of caching another version's bytes. A read gives up after
   three rounds with `503`.
+- **Fixed: a version is more than its ETag.** Revalidation compared only
+  the ETag, so an object re-uploaded with the same bytes, or copied onto
+  itself with new metadata, kept serving the old `Content-Type`,
+  metadata, and `Last-Modified` to GETs and HEADs, under either
+  freshness mode. It now compares the ETag, `Last-Modified`, and version
+  ID (`OriginVersion`), all of which the entry already holds, and
+  `ADOPT`s the HEAD's metadata on a mismatch. Tested in `tests/origin.rs`
+  (`a_metadata_only_change_at_the_origin_is_seen_by_the_next_read`).
 - **How the TTL bounds staleness (decided, §9.5).** Each gateway keeps
   what its HEADs saw (`OriginValidations`, in memory, at most 65,536
   keys, oldest first out), timed from when the HEAD was sent, so a read
@@ -7535,6 +7574,16 @@ of this file. A task with nothing unexpected keeps "None."
   final primary's log. The client forgot uploads by ID alone, but each
   shard numbers its own, so a completion on one key forgot another's
   upload, and the drain never ended; it matches path and ID now.
+- **Fixed: the audit trusted too much (review).** It took the versions
+  in every member's log as committed, so an object published from a
+  write a deposed primary kept but the final primary never committed
+  passed the check that every remote identity names a committed version;
+  and it kept uploads' state by position alone, which shards repeat.
+  Committed versions and uploads' state now come only from the final
+  primary's records that no `TRUNCATE` of its log invalidates
+  (`truncated_by`, as `lifecycle.rs` filters), keyed by shard; other
+  members' logs still serve the `FLUSHED` cross-check. Unit tests in
+  `large_objects.rs`; the scenarios pass at `SKYS3_SIM_SEEDS=256`.
 - **Heavy faults starve the probe.** Half of all Complete answers lost
   kept one node's capability probe failing for 90 s (seed 1), so its
   shards never flushed. The ETag bug scenario loses 40% of them.
@@ -7635,8 +7684,11 @@ of this file. A task with nothing unexpected keeps "None."
   and a move can each leave headers for the same object version, even with
   a different stripe count. `rebuild_layouts` keeps, per fragment index,
   the latest attempt's copy, and per stripe the latest attempt's layout
-  that can be decoded, falling back to an older stripe count when the
-  newest is incomplete. Design §8.4 records the rules.
+  that can be decoded and that later stripes continue to the object's
+  end, so an attempt that moved the stripe boundaries without changing
+  their count cannot hide a complete older one. It falls back to an older
+  stripe count when the newest is incomplete. Design §8.4 records the
+  rules.
 - **The tear window depends on the largest fragment.** A crash can leave
   one group commit plus one record unsynced, and a record can be a 256 MiB
   fragment, so recovery's damage check only looks past that. The store's
@@ -7791,7 +7843,9 @@ of this file. A task with nothing unexpected keeps "None."
   stripe with `FragmentPlanner`, writes the fragments in parallel through
   the `FragmentWriter` trait, re-plans a stripe without nodes whose writes
   failed (three times), and commits `EC_PUBLISH` on a task of its own so
-  it is appended even if the encoder is dropped. An `EncodeObserver` sees
+  it is appended, and its attempt settled, even if the encoder is
+  dropped: settling it in the caller left a cancelled scan's attempt
+  publishing for good, holding the reclamation fence (found in review). An `EncodeObserver` sees
   each step; the simulation crashes nodes at them.
 - **Stripe size bound.** Configuration validation now rejects an
   `ec_stripe_data_bytes` whose fragments in the narrowest geometry
@@ -8000,12 +8054,16 @@ of this file. A task with nothing unexpected keeps "None."
   `FragmentSource` (one async `read` of a fragment range) and a
   `CodedRead` (the entry's coded layout, the object's size, the range)
   and returns a channel of body pieces, the first read before it
-  returns. Pieces are at most 1 MiB within one data fragment. A failed
+  returns. Pieces are at most 1 MiB within one data fragment, cut one
+  at a time as the read goes: listing a multi-TiB range up front held
+  32 bytes per MiB for the whole read. A failed
   fragment (not held, damaged, CRC32C mismatch, short) is skipped for
   the rest of its stripe and an unreachable node for the rest of the
   read; a degraded piece takes data fragments first, then parity, in
   index order. `FragmentReadClient` is the network source, with a local
-  shortcut to the node's own `FragmentServer`.
+  shortcut to the node's own `FragmentServer`, bounded by the same 10 s
+  as a remote answer so a hung local disk reads as an unreachable node
+  and the stripe is decoded around it.
 - **Reads name what they expect.** A fragment ID alone is not enough: a
   fragment reclaimed since the plan (M5-05) or an ID reused on a
   replaced disk would serve another fragment's bytes, which pass their
@@ -8438,6 +8496,13 @@ of this file. A task with nothing unexpected keeps "None."
   layout changed. A pass also stops moving from a node it could not read
   or to one it could not write, which would otherwise cost a write
   timeout per planned move.
+- **A stripe whose move did not apply moves no more that pass (found in
+  review).** The planner places each move of a stripe as if the earlier
+  ones had applied, and nothing at commit checks the domain cap, so a
+  failed drain out of a rack followed by a balance move into it could
+  leave the rack with `m + 1` fragments until the next pass. Once a
+  stripe's move fails, is rejected, or is skipped, the pass skips the
+  stripe's other moves (`a_stripe_whose_move_fails_moves_no_more_in_the_pass`).
 - **The harness's balance check had to count the readers' copies
   (found).** `CopyObject` copies are coded too, so the shard holds more
   coded objects than the run wrote; a check over the written keys found
@@ -8487,6 +8552,17 @@ of this file. A task with nothing unexpected keeps "None."
   Validation (`skys3_types::lifecycle`) runs both in the gateway and in
   `BucketDocument::validate`, which also refuses a configuration on a
   bucket that is not `local`.
+- **Fixed: a change whose answers were lost went unannounced.** A
+  retried PUT or DELETE that found the configuration already in the
+  register returned without bumping the generation, so other nodes kept
+  the old rules, and could go on expiring objects, until an unrelated
+  announcement or the periodic refresh (up to 12 h by default). The
+  equality branch now announces again, as a retried CreateBucket does,
+  so a change that changes nothing, such as deleting no configuration,
+  costs a generation bump; and a swap that may have landed is announced
+  in the background
+  (`settle_later`). Tested in `tests/lifecycle.rs`
+  (`a_change_whose_answers_were_lost_is_announced`).
 - **Only `local` buckets.** A `write_back` (or `write_through`) bucket
   answers PUT with `501 NotImplemented`: its durable home is the remote,
   and expiring the local copy alone would be undone by an import or
@@ -8579,7 +8655,10 @@ of this file. A task with nothing unexpected keeps "None."
   whichever of the snapshot entry and the latest attempt's header names
   the later position: a retag after coding moves the entry, a repair
   after a retag writes headers whose write identity names it
-  (`ReindexBug::HeaderTags`, `ReindexBug::OlderAttempt`).
+  (`ReindexBug::HeaderTags`, `ReindexBug::OlderAttempt`). An
+  unrecoverable version's identity is chosen the same way, so a drill
+  whose backup holds the version only from before a retag reports the
+  key lost (found in review: it took the headers' older identity).
 - **Deletes and overwrites after the snapshot.** Their only trace is the
   absence of a newer header, so without a durable home a coded object
   deleted in the window comes back; the window covers it. With a home,
