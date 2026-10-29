@@ -438,21 +438,33 @@ pub(crate) fn audit(
         let found = entries
             .get(&(bucket.name.as_str().to_owned(), key.clone()))
             .map_or(&[][..], Vec::as_slice);
+        // The members must agree on the version, but not on whether it is
+        // clean: its `FLUSHED` record rides a later group commit (§7.1),
+        // which the final power loss may cut on some members only. Each
+        // member's entry is checked against the remote store.
         let versions: Vec<_> = found
             .iter()
-            .map(|entry| entry.as_ref().map(|entry| (entry.version, entry.state)))
+            .map(|entry| entry.as_ref().map(|entry| entry.version))
             .collect();
         if versions.windows(2).any(|pair| pair[0] != pair[1]) {
+            let states: Vec<_> = found
+                .iter()
+                .map(|entry| entry.as_ref().map(|entry| (entry.version, entry.state)))
+                .collect();
             return Err(violation(
                 &name,
-                format!("the members disagree: {versions:?}"),
+                format!("the members disagree: {states:?}"),
             ));
         }
-        let Some(Some(entry)) = found.first() else {
-            continue;
-        };
-        check(store, cluster, &bucket, &key, entry).map_err(|reason| violation(&name, reason))?;
-        audited += 1;
+        let mut checked = false;
+        for entry in found.iter().flatten() {
+            check(store, cluster, &bucket, &key, entry)
+                .map_err(|reason| violation(&name, reason))?;
+            checked = true;
+        }
+        if checked {
+            audited += 1;
+        }
     }
     let to_targets = |operation| {
         store
