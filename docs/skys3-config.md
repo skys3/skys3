@@ -82,8 +82,8 @@ The node storage engine (§10) and read registrations (§8.7).
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `inline_max_bytes` | integer | `131072` (128 KiB) | The largest payload stored inline in its record (§5.1). May be 0. |
-| `extent_bytes` | integer | `1048576` (1 MiB) | Positive. The extent records large bodies are streamed in. |
+| `inline_max_bytes` | integer | `131072` (128 KiB) | The largest payload stored inline in its record (§5.1). From 0 to 16777216 (16 MiB), the largest log record payload (§10.1). |
+| `extent_bytes` | integer | `1048576` (1 MiB) | From 65536 (64 KiB) to 16777216 (16 MiB). The extent records large bodies are streamed in. The minimum keeps a 5 GiB object within the extents one `PUT` record references (§10.1). |
 | `segment_bytes` | integer | `268435456` (256 MiB) | Greater than both `extent_bytes` and `inline_max_bytes`. |
 | `group_commit_max_delay_us` | integer | `500` | How long a group commit waits for more records. May be 0. |
 | `group_commit_max_bytes` | integer | `4194304` (4 MiB) | Positive. |

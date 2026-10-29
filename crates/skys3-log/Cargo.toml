@@ -1,0 +1,21 @@
+[package]
+name = "skys3-log"
+description = "SkyS3 node log: the on-disk record format, segments, group commit, and recovery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32c.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

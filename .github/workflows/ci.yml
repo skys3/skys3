@@ -285,6 +285,54 @@ jobs:
         env:
           SKYS3_SIM_SEEDS: 256
 
+  # A brief cargo-fuzz run of every target in fuzz/, found with `cargo fuzz
+  # list` so new targets join automatically. Long runs are nightly (M7-03).
+  # A crash fails the job and uploads the input that caused it.
+  fuzz:
+    name: Fuzz smoke runs
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      FUZZ_SECONDS: 30
+      # The prebuilt cargo-fuzz is a musl binary and defaults `--target`
+      # to its own triple, which has no sanitizer support; name the host.
+      FUZZ_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Cache the fuzz build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      - name: Build every target
+        run: cargo +nightly fuzz build --target "$FUZZ_TARGET"
+
+      - name: Run every target
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::$target"
+            cargo +nightly fuzz run --target "$FUZZ_TARGET" "$target" -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+            echo "::endgroup::"
+          done
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
   # The one check to require in branch protection. A job skipped for a
   # docs-only change satisfies a required check, except a matrix job: it
   # reports under its unexpanded name, so a required `Format, lint, test,
@@ -293,7 +341,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny, simulation]
+    needs: [changes, rust, docs, coverage, msrv, deny, simulation, fuzz]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results

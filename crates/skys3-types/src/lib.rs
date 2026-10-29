@@ -19,6 +19,8 @@
 //! - **Identities** ([`WriteIdentity`], [`VersionIdentity`], [`ETag`]): the
 //!   identity every flushed object carries (§7.2) and the identity of a
 //!   committed version (§9.2).
+//! - **Limits** ([`limits`]): size limits that the log record format and
+//!   configuration loading both enforce.
 //! - **Register documents** ([`ShardConfig`], [`BucketDocument`],
 //!   [`NodeRegistration`], [`CoordinatorLease`], [`ClusterDocument`]): the
 //!   JSON values of the control-store registers (§6.1), behind the
@@ -38,6 +40,7 @@
 mod address;
 mod id;
 mod identity;
+pub mod limits;
 mod position;
 mod register;
 pub mod shard;
