@@ -299,9 +299,21 @@ pub(crate) struct Buckets<C, H> {
     config: GatewayConfig,
     /// The local copy of every bucket register.
     catalog: RwLock<BTreeMap<BucketName, BucketDocument>>,
+    /// This gateway's own changes to the local copy, which a reload that
+    /// read the registers before them must not undo.
+    remembered: Mutex<Remembered>,
     /// Deletions of unknown outcome, oldest first.
     pending: Mutex<VecDeque<PendingDeletion>>,
     ids: Mutex<IdSource>,
+}
+
+/// The changes a gateway made to its local copy, counted.
+#[derive(Debug, Default)]
+struct Remembered {
+    /// How many changes there were.
+    changes: u64,
+    /// The count at each bucket's latest change.
+    at: BTreeMap<BucketName, u64>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -321,6 +333,7 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             shards,
             config,
             catalog: RwLock::default(),
+            remembered: Mutex::default(),
             pending: Mutex::default(),
             ids: Mutex::new(ids),
         };
@@ -329,8 +342,12 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
     }
 
     /// Replaces the local copy with the bucket registers in the control
-    /// store.
+    /// store. A bucket this gateway changed while the registers were read
+    /// keeps its local value: the reload may have read the register before
+    /// the change, and a client that saw the change answered must keep
+    /// seeing it.
     pub(crate) async fn reload(&self) -> Result<(), ControlError> {
+        let since = lock(&self.remembered).changes;
         let mut catalog = BTreeMap::new();
         for (key, _) in self.store.list(&KeyPrefix::buckets()).await? {
             let RegisterKind::Bucket(name) = key.kind() else {
@@ -342,7 +359,19 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                 catalog.insert(name, bucket.value);
             }
         }
-        *self.catalog.write().unwrap_or_else(PoisonError::into_inner) = catalog;
+        let mut current = self.catalog.write().unwrap_or_else(PoisonError::into_inner);
+        let mut remembered = lock(&self.remembered);
+        remembered.at.retain(|name, at| {
+            let later = *at > since;
+            if later {
+                match current.get(name) {
+                    Some(bucket) => catalog.insert(name.clone(), bucket.clone()),
+                    None => catalog.remove(name),
+                };
+            }
+            later
+        });
+        *current = catalog;
         Ok(())
     }
 
@@ -389,6 +418,10 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             Some(bucket) => catalog.insert(name.clone(), bucket),
             None => catalog.remove(name),
         };
+        let mut remembered = lock(&self.remembered);
+        remembered.changes += 1;
+        let at = remembered.changes;
+        remembered.at.insert(name.clone(), at);
     }
 
     /// Creates a bucket. `mode` and `target` are the values of
