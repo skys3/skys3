@@ -1,0 +1,36 @@
+[package]
+name = "skys3-control"
+description = "SkyS3 control store: the ControlStore interface, the register layout, the lost-response rule, cluster bootstrap, change feeds, and the in-memory and file backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Test support for this crate's backends and later ones: fault injection
+# (`faults`) and the backend-agnostic conformance suite (`conformance`).
+test-util = []
+
+[dependencies]
+bytes.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+skys3-io.workspace = true
+skys3-types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+# Enables `test-util` for this crate's own tests.
+skys3-control = { path = ".", features = ["test-util"] }
+skys3-sim.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+turmoil.workspace = true
