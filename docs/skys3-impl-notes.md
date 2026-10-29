@@ -6777,6 +6777,24 @@ of this file. A task with nothing unexpected keeps "None."
   (a clean one must record the remote's ETag). The seeded bug of given-up
   aborts fails half the aborts instead of a quarter: a seed ends a dozen
   or so streamed uploads, and seed 0 after the merge failed none.
+- **The wrong-ETag bug was left to chance.** Its scenario lost 40% of
+  all Complete answers at random. The bug shows only when a streamed
+  PUT's Complete applies unanswered and a retry is answered before the
+  key's next version replaces it, and the probe's Completes lost their
+  answers too, which held flushing back to three to six streamed bodies
+  a seed. After the stack's tokio 1.54 bump and M7-03's review fixes
+  moved every seed, seed 3 at `SKYS3_SIM_SEEDS=256` (seeds 0 to 7: the
+  runner divides by the cost, 32) had one Complete applied unanswered,
+  its three retries' refusals lost as well, and then the next version,
+  so no retry recorded a `FLUSHED`; seeds 3, 8, and 26 of 0 to 63
+  missed it. Losing more answers starved the flushers instead.
+  `SimS3::lose_answers` now takes a function that picks applied requests
+  whose answers are lost, refused ones being answered, and
+  `LargeObjects::lost_completions` loses every applied Complete of an
+  audited key, not the probe's: every streamed flush then learns from
+  its retry that the object landed, and seeds 0 to 127 all catch the
+  bug. With no bug seeded, the same faults pass seeds 0 to 31, with 14
+  to 31 streamed objects a seed.
 - **A real bug: uploads left open with no later flush.** An upload whose
   abort failed, or whose flush was cancelled, was aborted only before
   the target's next multipart flush. When the key's next version was a
@@ -6821,7 +6839,8 @@ of this file. A task with nothing unexpected keeps "None."
   `large_objects.rs`; the scenarios pass at `SKYS3_SIM_SEEDS=256`.
 - **Heavy faults starve the probe.** Half of all Complete answers lost
   kept one node's capability probe failing for 90 s (seed 1), so its
-  shards never flushed. The ETag bug scenario loses 40% of them.
+  shards never flushed. The ETag bug scenario loses only the answers
+  of the Completes of audited keys that the store applies.
 - **Results.** At `SKYS3_SIM_SEEDS=256`, eight seeds of each scenario,
   with 4 to 11 faults a seed, every seed with four aimed crashes:
   `write_back` 36 s (single PUTs 5 to 23, streamed 0 to 11 with a
@@ -6833,9 +6852,9 @@ of this file. A task with nothing unexpected keeps "None."
 - **Seeded bugs** (`test_hooks::seed_large_object_bug`), each caught at
   seeds 0 to 7: `CompletesWithoutLastPart` as the truncated object
   appears (4 s for eight seeds); `RecordsLocalEtagAfterLostComplete`
-  at the final audit (54 s), and at 31 of seeds 0 to 31 (seed 26
-  streamed two objects); `GivesUpFailedAborts` with a quarter of aborts
-  failing (47 s).
+  at the final audit (45 s; at every seed of 0 to 127 since every
+  applied Complete of a client's key loses its answer, see above);
+  `GivesUpFailedAborts` with a quarter of aborts failing (47 s).
 - **Left open.** Crash replay needs `tokio_unstable` in simulation
   builds, a workspace-wide flag left for a decision. The lifecycle rule
   that ends uncommitted uploads is counted, not simulated. Aimed crashes
