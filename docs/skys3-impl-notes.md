@@ -9781,6 +9781,18 @@ of this file. A task with nothing unexpected keeps "None."
   node's shards have no registers, and the replicated ones are opened from
   their registers, so adopting a directory either way would serve shards
   no register names.
+- **A refused directory is checked before recovery.** The check first ran
+  after the logs were replayed, and opening the index read-write commits
+  a transaction and, on close, saves redb's allocator state and may
+  shrink the file: the runbook's "its data directory is untouched" held
+  for the data but not for `index.redb`, whose size the M8-09 e2e drill
+  saw change in about one start in three. A data directory in the other
+  mode is now refused from its index read without writing
+  (`Index::peek`, redb's read-only open), before any log is recovered.
+  An index that cannot be read that way (after a crash, redb needs a
+  repair only a writer runs) or that holds no bucket's shards goes on to
+  the check after replay as before. The in-process test compares the
+  refused directory byte for byte.
 - **Coordinator duties wait for M8-06.** Nothing adds learners, finishes
   a creation cut short, drops a deleted bucket's shard registers, or
   takes handoff requests. The e2e scenario and the in-process test add

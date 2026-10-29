@@ -203,6 +203,21 @@ impl Index {
         Self::init(builder(config).create_file(file)?)
     }
 
+    /// Reads the index in the file at `path` without writing to it, for a
+    /// start that may yet refuse the data directory and must leave it as
+    /// it was: [`Index::open`] commits a transaction, and closing the index
+    /// saves redb's allocator state and may shrink the file. `None` if the
+    /// file cannot be read that way: there is none, a crash left it in
+    /// need of redb's repair, which only a writer runs, or it lacks a table
+    /// that [`Index::open`] would add. The reader holds the file open, read
+    /// only, until it is dropped.
+    #[must_use]
+    pub fn peek(path: &Path, config: &IndexConfig) -> Option<IndexReader> {
+        let db = builder(config).open_read_only(path).ok()?;
+        let txn = db.begin_read().ok()?;
+        IndexReader::open(&txn).ok()
+    }
+
     /// Opens the index in the block file `name` on a simulated disk,
     /// creating it if it does not exist, so that a simulated crash reverts
     /// the index exactly as a power loss would.

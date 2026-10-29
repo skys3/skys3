@@ -19,7 +19,7 @@ use skys3_gateway::{
     Precondition, ShardPlacement, ShardRef, Shards, SigV4Authenticator, StaticCredentials,
     StsService,
 };
-use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
+use skys3_index::{Checkpointer, Index, IndexConfig, IndexError, IndexReader};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
 use skys3_log::{LogConfig, SegmentLog};
 use skys3_obs::{
@@ -53,6 +53,8 @@ use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
 
+/// The index file in the data directory.
+const INDEX_FILE: &str = "index.redb";
 /// Worker threads per disk for log I/O (§10.4).
 const DISK_THREADS: usize = 4;
 /// Worker threads for index I/O.
@@ -508,7 +510,7 @@ async fn open_storage(
         dirs.push(disk.clone());
         disks.push((disk.label.clone(), real));
     }
-    let path = data_dir.path().join("index.redb");
+    let path = data_dir.path().join(INDEX_FILE);
     let index_config = IndexConfig::from_storage(config.storage());
     let index = on_pool(&pools.index, move || Index::open(&path, &index_config)).await?;
     let index = Arc::clone(opened.insert(Arc::new(index)));
@@ -809,6 +811,9 @@ impl Node {
         // A certificate that does not name this node stops the start before
         // anything is recovered.
         let node_credentials = crate::cluster::credentials(&config, &node_id)?;
+        // So does a data directory that holds shards served in the other
+        // mode, which is then left as it was.
+        check_mode_unopened(&config, data_dir, &pools.index).await?;
         let storage = open_storage(&config, data_dir, &mut pools, &mut opened.index).await?;
         check_mode(&config, data_dir, &storage.index, &pools.index).await?;
 
@@ -1497,18 +1502,73 @@ async fn check_mode(
     }
     let held = {
         let index = Arc::clone(index);
-        on_pool(pool, move || {
-            let read = index.read()?;
-            let mut held: BTreeSet<BucketId> = read
-                .applied_positions()?
-                .into_keys()
-                .map(|shard| shard.bucket)
-                .collect();
-            held.extend(read.configs()?.into_keys().map(|shard| shard.bucket));
-            Ok::<_, IndexError>(held)
-        })
-        .await?
+        on_pool(pool, move || held_buckets(&index.read()?)).await?
     };
+    refuse_held(config, data_dir, held)?;
+    let path = data_dir.path().to_owned();
+    on_pool(pool, move || datadir::record_multi_node(&path, multi_node)).await?;
+    tracing::info!(multi_node, "recorded how the data directory serves");
+    Ok(())
+}
+
+/// Checks, as [`check_mode`] does, a data directory that serves in the
+/// other mode before anything in it is opened for writing, from its index
+/// read without writing ([`Index::peek`]), so that a refused start leaves
+/// the directory as it was (runbook "Moving a single node into a
+/// cluster"). An index that cannot be read that way, as after a crash, or
+/// that holds no bucket's shards, is left to [`check_mode`] once the logs
+/// are replayed.
+///
+/// # Errors
+///
+/// [`StartError::DataDir`] for an index that holds a bucket's shards
+/// served in the other mode.
+async fn check_mode_unopened(
+    config: &Config,
+    data_dir: &DataDir,
+    pool: &BlockingPool,
+) -> Result<(), StartError> {
+    if data_dir.multi_node() == config.cluster().multi_node {
+        return Ok(());
+    }
+    let path = data_dir.path().join(INDEX_FILE);
+    let index_config = IndexConfig::from_storage(config.storage());
+    let held = on_pool(pool, move || {
+        Ok::<_, IndexError>(
+            Index::peek(&path, &index_config).and_then(|read| held_buckets(&read).ok()),
+        )
+    })
+    .await?;
+    match held {
+        Some(held) => refuse_held(config, data_dir, held),
+        None => Ok(()),
+    }
+}
+
+/// The buckets whose shards `read` holds: an applied position or a kept
+/// configuration of one of their shards.
+fn held_buckets(read: &IndexReader) -> Result<BTreeSet<BucketId>, IndexError> {
+    let mut held: BTreeSet<BucketId> = read
+        .applied_positions()?
+        .into_keys()
+        .map(|shard| shard.bucket)
+        .collect();
+    held.extend(read.configs()?.into_keys().map(|shard| shard.bucket));
+    Ok(held)
+}
+
+/// Refuses `data_dir`, which serves in the other mode than `config`'s, if
+/// it holds the shards of a bucket in `held`.
+///
+/// # Errors
+///
+/// [`StartError::DataDir`] if it does.
+fn refuse_held(
+    config: &Config,
+    data_dir: &DataDir,
+    held: BTreeSet<BucketId>,
+) -> Result<(), StartError> {
+    let multi_node = config.cluster().multi_node;
     // Every node keeps STS sessions in a system bucket of its own.
     let held: Vec<String> = held
         .into_iter()
@@ -1533,9 +1593,6 @@ async fn check_mode(
         ))
         .into());
     }
-    let path = data_dir.path().to_owned();
-    on_pool(pool, move || datadir::record_multi_node(&path, multi_node)).await?;
-    tracing::info!(multi_node, "recorded how the data directory serves");
     Ok(())
 }
 
