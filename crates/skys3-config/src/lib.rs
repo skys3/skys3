@@ -74,6 +74,7 @@ mod peering;
 mod replication;
 mod storage;
 mod target;
+mod transport;
 
 pub use admin::{AdminConfig, LogFormat, LoggingConfig};
 pub use buckets::{BucketSettings, BucketsConfig, TargetTransport};
@@ -86,6 +87,7 @@ pub use peering::{CongestionControl, PeeringConfig};
 pub use replication::{AckTimeoutMode, ReplicationConfig};
 pub use storage::{CacheConfig, StorageConfig};
 pub use target::parse_target;
+pub use transport::{TlsFiles, TransportConfig};
 
 use buckets::BucketTable;
 use cluster::{RawCluster, RawControlStore};
@@ -105,6 +107,7 @@ pub(crate) const fn hours(hours: u64) -> Duration {
 pub struct Config {
     cluster: ClusterConfig,
     control_store: ControlStoreConfig,
+    transport: TransportConfig,
     replication: ReplicationConfig,
     storage: StorageConfig,
     cache: CacheConfig,
@@ -124,6 +127,8 @@ struct RawConfig {
     cluster: RawCluster,
     #[serde(default)]
     control_store: RawControlStore,
+    #[serde(default)]
+    transport: TransportConfig,
     #[serde(default)]
     replication: ReplicationConfig,
     #[serde(default)]
@@ -179,6 +184,7 @@ impl Config {
         let cluster = raw.cluster.resolve(&mut checker);
         let cluster_id = cluster.as_ref().map(|cluster| &cluster.cluster_id);
         let control_store = raw.control_store.resolve(cluster_id, &mut checker);
+        raw.transport.check(&mut checker);
         raw.replication.check(&mut checker);
         raw.storage.check(&mut checker);
         raw.cache.check(&mut checker);
@@ -203,6 +209,7 @@ impl Config {
         Ok(Self {
             cluster,
             control_store,
+            transport: raw.transport,
             replication: raw.replication,
             storage: raw.storage,
             cache: raw.cache,
@@ -226,6 +233,12 @@ impl Config {
     #[must_use]
     pub fn control_store(&self) -> &ControlStoreConfig {
         &self.control_store
+    }
+
+    /// `[transport]`.
+    #[must_use]
+    pub fn transport(&self) -> &TransportConfig {
+        &self.transport
     }
 
     /// `[replication]`.

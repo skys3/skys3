@@ -24,9 +24,11 @@ serde_json = "1"
 skys3-gateway = { path = "../crates/skys3-gateway", features = ["test-util"] }
 skys3-index = { path = "../crates/skys3-index" }
 skys3-log = { path = "../crates/skys3-log" }
+skys3-net = { path = "../crates/skys3-net" }
 skys3-obs = { path = "../crates/skys3-obs" }
 skys3-sts = { path = "../crates/skys3-sts" }
 skys3-types = { path = "../crates/skys3-types" }
+tokio = { version = "1", features = ["rt"] }
 
 [[bin]]
 name = "gateway_aws_chunked"
@@ -73,6 +75,20 @@ bench = false
 [[bin]]
 name = "log_record"
 path = "fuzz_targets/log_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_frame"
+path = "fuzz_targets/net_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_spiffe_id"
+path = "fuzz_targets/net_spiffe_id.rs"
 test = false
 doc = false
 bench = false

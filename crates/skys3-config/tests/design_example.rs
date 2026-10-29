@@ -150,6 +150,12 @@ allow_correlated_control_store = true
 coordinator_lease_seconds = 12
 config_poll_interval_seconds = 20
 
+[transport]
+listen = "10.0.0.5:7401"
+tls_cert_file = "/etc/skys3/node.crt"
+tls_key_file = "/etc/skys3/node.key"
+tls_ca_file = "/etc/skys3/ca.crt"
+
 [replication]
 replica_ack_timeout_ms = 2000
 replica_ack_timeout_mode = "fail_fast"
@@ -275,6 +281,9 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.control_store().prefix, "c1-registers/");
     assert_eq!(config.control_store().coordinator_lease().as_secs(), 12);
     assert_eq!(config.control_store().config_poll_interval().as_secs(), 20);
+    assert_eq!(config.transport().listen.port(), 7401);
+    let tls = config.transport().tls_files().expect("all three files");
+    assert_eq!(tls.ca, std::path::Path::new("/etc/skys3/ca.crt"));
     assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
     assert!(config.identity().anonymous_policy.is_some());
     let bootstrap = &config.identity().static_credentials["bootstrap"];
@@ -331,6 +340,7 @@ fn the_reference_documents_every_key() {
     for section in [
         "[cluster]",
         "[control_store]",
+        "[transport]",
         "[replication]",
         "[storage]",
         "[cache]",
