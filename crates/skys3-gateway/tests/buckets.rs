@@ -854,3 +854,49 @@ async fn a_deletion_whose_announcement_failed_is_announced_later() {
         "the deletion was never announced"
     );
 }
+
+/// A reload that read the registers before this gateway changed a bucket
+/// keeps the change: a client that was answered keeps seeing it.
+#[tokio::test]
+async fn a_reload_keeps_the_changes_made_while_it_read() {
+    let setup = setup("").await;
+    setup.create_local("aaa").await;
+    setup.create_local("zzz").await;
+    // The reload lists the buckets and reads "aaa"; before its read of
+    // "zzz", the gateway creates "mmm" and deletes "aaa".
+    let gateway = setup.gateway.clone();
+    setup.store.script([
+        Fault::Pass,
+        Fault::Pass,
+        Fault::before(move || {
+            let gateway = gateway.clone();
+            async move {
+                let headers = [(skys3_gateway::MODE_HEADER, "local")];
+                let created = gateway
+                    .handle(common::request(Method::PUT, "/mmm", &headers, ""))
+                    .await;
+                assert_eq!(created.status(), 200);
+                let deleted = gateway
+                    .handle(common::request(Method::DELETE, "/aaa", &[], ""))
+                    .await;
+                assert_eq!(deleted.status(), 204);
+            }
+        }),
+    ]);
+    setup.gateway.reload_buckets().await.unwrap();
+    setup
+        .call(Method::HEAD, "/mmm", &[], "")
+        .await
+        .assert(200, None);
+    let gone = setup.call(Method::HEAD, "/aaa", &[], "").await;
+    assert_eq!(gone.status, 404);
+
+    // The next reload reads the registers after both changes.
+    setup.gateway.reload_buckets().await.unwrap();
+    setup
+        .call(Method::HEAD, "/mmm", &[], "")
+        .await
+        .assert(200, None);
+    let gone = setup.call(Method::HEAD, "/aaa", &[], "").await;
+    assert_eq!(gone.status, 404);
+}

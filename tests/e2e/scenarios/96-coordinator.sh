@@ -207,7 +207,16 @@ log "bucket $bucket: primaries $(shards cc1 | jq -c '[.[] | {(.shard | tostring)
 # acknowledged key, each through the nodes in $work/live in turn, and
 # record `<key> <status> <start> <end> <node>` per request. They stop when
 # the file `stop` appears.
-echo "cc1 cc2 cc3" >"$work/live"
+#
+# use_nodes <nodes...>: makes the nodes the ones the loops use. The list is
+# written aside and renamed into place: a loop reads the file at any time,
+# and one that found it empty, as `>` leaves it for a moment, would stop
+# (`read` fails at once, and the loops run under `set -e`).
+use_nodes() {
+    echo "$*" >"$work/live.next"
+    mv -f "$work/live.next" "$work/live"
+}
+use_nodes cc1 cc2 cc3
 writer() {
     local n=0 name status start node live
     while [ ! -e "$work/stop" ]; do
@@ -306,7 +315,7 @@ log "the old primaries are members again; no request failed ($(acked) writes ack
 # --- A fourth node joins ------------------------------------------------------
 
 node_start cc4
-echo "cc1 cc2 cc3 cc4" >"$work/live"
+use_nodes cc1 cc2 cc3 cc4
 started=$SECONDS
 share() { [ "$(held cc4 members)" -ge "$1" ] && settled cc1 cc2 cc3 cc4; }
 eventually 180 "cc4 holds its share of the shards" share 3
@@ -328,7 +337,7 @@ empty() {
 eventually 180 "$coordinator holds no shard" empty
 log "drained $coordinator through ${others[0]} in $((SECONDS - started)) s"
 
-echo "${others[*]}" >"$work/live"
+use_nodes "${others[@]}"
 dropped_at=$EPOCHREALTIME
 eventually 60 "the clients no longer use $coordinator" moved_on "$dropped_at"
 killed_at=$EPOCHREALTIME
@@ -353,7 +362,7 @@ log "reads and writes went on: the slowest request after the kill took $slowest 
 node_start "$coordinator"
 answer=$(api DELETE "$successor" "/v1/nodes/$coordinator/drain")
 [ "$(cat "$work/status")" = 200 ] || fail "undraining $coordinator answered $(cat "$work/status"): $answer"
-echo "cc1 cc2 cc3 cc4" >"$work/live"
+use_nodes cc1 cc2 cc3 cc4
 started=$SECONDS
 back() { [ "$(held "$coordinator" members)" -ge 1 ]; }
 eventually 180 "$coordinator receives shards from $successor" back
