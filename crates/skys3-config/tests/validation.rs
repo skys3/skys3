@@ -446,6 +446,10 @@ fn identity_rules() {
             "identity.session_maximum_seconds",
         ],
     );
+    assert_violations(
+        "[identity]\noidc_clock_skew_seconds = 301",
+        &["identity.oidc_clock_skew_seconds"],
+    );
 }
 
 #[test]

@@ -242,6 +242,7 @@ sts_web_identity = false
 session_default_seconds = 900
 session_maximum_seconds = 43200
 identity_max_staleness_hours = 12
+oidc_clock_skew_seconds = 0
 
 [admin]
 listen = "0.0.0.0:9000"
@@ -265,6 +266,7 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(config.control_store().prefix, "c1-registers/");
     assert_eq!(config.control_store().coordinator_lease().as_secs(), 12);
     assert_eq!(config.control_store().config_poll_interval().as_secs(), 20);
+    assert_eq!(config.identity().oidc_clock_skew().as_secs(), 0);
 
     let defaults = &config.buckets().defaults;
     assert_eq!(defaults.mode, BucketMode::Local);

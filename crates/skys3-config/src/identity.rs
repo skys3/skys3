@@ -1,4 +1,5 @@
-//! `[identity]`: anonymous access and STS sessions (§6.2, §11).
+//! `[identity]`: anonymous access, STS sessions, and OIDC token validation
+//! (§6.2, §11).
 
 use std::time::Duration;
 
@@ -24,6 +25,10 @@ pub struct IdentityConfig {
     /// identity configuration may be before new sessions are refused
     /// (§6.2).
     pub identity_max_staleness_hours: u64,
+    /// `oidc_clock_skew_seconds`: how far the node's clock may disagree
+    /// with an identity provider's when a token's `exp`, `nbf`, and `iat`
+    /// are checked (§11).
+    pub oidc_clock_skew_seconds: u64,
 }
 
 impl Default for IdentityConfig {
@@ -34,6 +39,7 @@ impl Default for IdentityConfig {
             session_default_seconds: 3600,
             session_maximum_seconds: 3600,
             identity_max_staleness_hours: 24,
+            oidc_clock_skew_seconds: 60,
         }
     }
 }
@@ -46,6 +52,8 @@ crate::durations! {
         session_maximum => session_maximum_seconds, Duration::from_secs;
         /// `identity_max_staleness_hours`.
         identity_max_staleness => identity_max_staleness_hours, crate::hours;
+        /// `oidc_clock_skew_seconds`.
+        oidc_clock_skew => oidc_clock_skew_seconds, Duration::from_secs;
     }
 }
 
@@ -54,6 +62,9 @@ impl IdentityConfig {
     pub const MIN_SESSION_SECONDS: u64 = 900;
     /// The longest session STS issues, as in AWS STS.
     pub const MAX_SESSION_SECONDS: u64 = 43_200;
+    /// The largest `oidc_clock_skew_seconds`. More would keep expired
+    /// tokens usable for too long.
+    pub const MAX_OIDC_CLOCK_SKEW_SECONDS: u64 = 300;
 
     pub(crate) fn check(&self, checker: &mut Checker) {
         let range = Self::MIN_SESSION_SECONDS..=Self::MAX_SESSION_SECONDS;
@@ -88,6 +99,17 @@ impl IdentityConfig {
         checker.nonzero(
             "identity.identity_max_staleness_hours",
             self.identity_max_staleness_hours,
+        );
+        checker.require(
+            self.oidc_clock_skew_seconds <= Self::MAX_OIDC_CLOCK_SKEW_SECONDS,
+            "identity.oidc_clock_skew_seconds",
+            || {
+                format!(
+                    "is {}; it must be at most {}",
+                    self.oidc_clock_skew_seconds,
+                    Self::MAX_OIDC_CLOCK_SKEW_SECONDS
+                )
+            },
         );
     }
 }

@@ -176,7 +176,7 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 
 ## `[identity]`
 
-Anonymous access and STS sessions (§11).
+Anonymous access, STS sessions, and OIDC token validation (§11).
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
@@ -185,6 +185,7 @@ Anonymous access and STS sessions (§11).
 | `session_default_seconds` | integer | `3600` | From 900 to 43200 (the AWS STS limits), and at most `session_maximum_seconds`. |
 | `session_maximum_seconds` | integer | `3600` | From 900 to 43200. |
 | `identity_max_staleness_hours` | integer | `24` | Positive (§6.2). |
+| `oidc_clock_skew_seconds` | integer | `60` | At most 300. The leeway for a token's `exp`, `nbf`, and `iat` (§11). |
 
 ## `[admin]`
 
