@@ -968,3 +968,36 @@ fn scan_range_reads_part_of_a_segment() {
         ));
     });
 }
+
+#[test]
+fn lazy_records_ride_the_next_group_commit() {
+    run(async {
+        let disk = SimDisk::new(9);
+        let (log, _) = open(disk.mount(), LogConfig::default()).await.unwrap();
+
+        // A lazy record joins the group the next ordinary record starts, in
+        // queue order, and costs no sync of its own.
+        let lazy = tokio::spawn({
+            let log = log.clone();
+            async move { log.append_lazy(&delete(0, 1)).await.unwrap() }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!lazy.is_finished());
+        assert_eq!(log.stats().group_commits, 0);
+        let eager = log.append(&delete(0, 2)).await.unwrap();
+        let lazy = lazy.await.unwrap();
+        assert_eq!(lazy.offset, 0);
+        assert_eq!(eager.offset, lazy.end());
+        assert_eq!(log.stats().group_commits, 1);
+        assert_eq!(log.stats().records, 2);
+
+        // On an idle disk it commits on its own after LAZY_MAX_DELAY.
+        let started = Instant::now();
+        let alone = log.append_lazy(&delete(0, 3)).await.unwrap();
+        assert!(started.elapsed() >= skys3_log::LAZY_MAX_DELAY);
+        assert_eq!(alone.offset, eager.end());
+        assert_eq!(log.stats().group_commits, 2);
+        assert_eq!(log.read(alone).await.unwrap(), delete(0, 3));
+    });
+}

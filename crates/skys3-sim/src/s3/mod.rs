@@ -282,6 +282,13 @@ impl SimS3 {
             .ok()
     }
 
+    /// Returns the tags of the current object at `key`, without a request.
+    /// The store keeps the tags a `PutObject` sets and a copy copies; it
+    /// does not keep the other standard headers of [`PutObject::headers`].
+    pub fn tags(&self, key: &str) -> Option<BTreeMap<String, String>> {
+        self.state().bucket.tags(key)
+    }
+
     /// Returns every key with a current object, in order, without a
     /// request.
     pub fn keys(&self) -> Vec<String> {

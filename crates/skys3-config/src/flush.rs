@@ -55,6 +55,10 @@ pub struct FlushConfig {
     pub flush_conflict_policy: ConflictPolicy,
     /// `max_dirty_bytes`: the cluster's dirty-data budget (§7.6).
     pub max_dirty_bytes: u64,
+    /// `target_region`: the region the flusher signs requests to
+    /// `write_back` targets for, such as `us-east-1`, or `auto` for
+    /// Cloudflare R2 (§7).
+    pub target_region: String,
 }
 
 impl Default for FlushConfig {
@@ -68,6 +72,7 @@ impl Default for FlushConfig {
             flush_part_bytes: 64 * MIB,
             flush_conflict_policy: ConflictPolicy::Hold,
             max_dirty_bytes: 2 * TIB,
+            target_region: "us-east-1".to_owned(),
         }
     }
 }
@@ -123,5 +128,19 @@ impl FlushConfig {
             },
         );
         checker.nonzero("flush.max_dirty_bytes", self.max_dirty_bytes);
+        checker.require(
+            !self.target_region.is_empty()
+                && self
+                    .target_region
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "flush.target_region",
+            || {
+                format!(
+                    "is {:?}; a region is ASCII letters, numbers, and '-'",
+                    self.target_region
+                )
+            },
+        );
     }
 }

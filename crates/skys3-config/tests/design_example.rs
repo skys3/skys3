@@ -208,6 +208,7 @@ streaming_flush_min_bytes = 33554432
 flush_part_bytes = 16777216
 flush_conflict_policy = "overwrite"
 max_dirty_bytes = 1099511627776
+target_region = "auto"
 
 [ec]
 parity_fragments = 3

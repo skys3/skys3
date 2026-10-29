@@ -14,8 +14,8 @@ use skys3_shard::{
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
-    at, config, delete, extent, flushed, import, index_config, open_log, pool, put, put_extents,
-    runtime, shard, tags,
+    at, config, delete, extent, flushed, import, index_config, mpu_complete, mpu_create, mpu_part,
+    open_log, pool, put, put_extents, runtime, shard, tags,
 };
 
 /// A node's disk, log, index, and pool.
@@ -674,5 +674,141 @@ fn shards_stay_on_the_disk_their_hash_picks() {
         ));
         assert_eq!(closed.summary().await.unwrap().objects, 1);
         set.close_all().await.unwrap_err();
+    });
+}
+
+#[test]
+fn subscribers_see_applied_client_writes() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let mut changes = shard.subscribe();
+        let first = shard.commit(put("a", 3, 1)).await.unwrap();
+        let tagged = shard.commit(tags("a", "x")).await.unwrap();
+        let deleted = shard.commit(delete("b")).await.unwrap();
+        // An upload and its parts change no version; its completion does.
+        let upload = shard.commit(mpu_create("m")).await.unwrap().position;
+        let part = shard.commit(mpu_part("m", upload, 1, 4, vec![])).await;
+        let parts = [(1, part.unwrap().position)];
+        let completed = shard.commit(mpu_complete("m", upload, &parts, 4)).await;
+        let completed = completed.unwrap();
+        assert!(completed.outcome.is_applied());
+        // A rejected TAGS and a FLUSHED change no version and are not
+        // reported. The lazy FLUSHED rides the next commit's group.
+        shard.commit(tags("missing", "x")).await.unwrap();
+        let lazy = shard.commit_lazy(flushed("a", tagged.position.seq.get(), false));
+        let (lazy, next) = tokio::join!(lazy, shard.commit(put("c", 1, 2)));
+        assert!(lazy.unwrap().outcome.is_applied());
+        let next = next.unwrap();
+        let expected = [
+            ("a", first.position, Some(3)),
+            ("a", tagged.position, None),
+            ("b", deleted.position, Some(0)),
+            ("m", completed.position, Some(4)),
+            ("c", next.position, Some(1)),
+        ];
+        for (key, position, size) in expected {
+            let change = changes.recv().await.unwrap();
+            assert_eq!(
+                (change.key.as_str(), change.position, change.size),
+                (key, position, size)
+            );
+        }
+        let entries = shard.entries(None, 10).await.unwrap();
+        let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "c", "m"]);
+        assert_eq!(shard.entries(Some("a".into()), 1).await.unwrap()[0].0, "b");
+
+        // A new subscription ends the old one, and closing ends both.
+        let mut newer = shard.subscribe();
+        assert!(changes.recv().await.is_none());
+        assert!(!shard.is_stopped());
+        shard.close().await.unwrap();
+        assert!(shard.is_stopped());
+        assert!(newer.recv().await.is_none());
+        assert!(shard.subscribe().recv().await.is_none());
+    });
+}
+
+#[test]
+fn a_pending_flushed_does_not_hold_up_conditional_writes() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        let shard = node.open(1).await.unwrap();
+        let first = shard.commit(put("a", 3, 1)).await.unwrap();
+        // Nothing else is written, so the FLUSHED waits up to a second.
+        let lazy = tokio::spawn({
+            let shard = shard.clone();
+            let body = flushed("a", first.position.seq.get(), false);
+            async move { shard.commit_lazy(body).await }
+        });
+        tokio::task::yield_now().await;
+        let started = std::time::Instant::now();
+        let written = shard
+            .commit_if(put("a", 4, 2), |entry| match entry {
+                Some(_) => Ok(()),
+                None => Err("missing"),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < skys3_log::LAZY_MAX_DELAY);
+        assert!(written.outcome.is_applied());
+        // The FLUSHED came first, and rode the conditional write's group.
+        assert_eq!(
+            lazy.await.unwrap().unwrap().outcome,
+            Outcome::Applied(Effect::Cleaned)
+        );
+    });
+}
+
+#[test]
+fn a_subscription_during_an_apply_hears_of_it() {
+    runtime().block_on(async {
+        let node = Node::new().await;
+        // Two pool threads: one for the held apply, one for the scan.
+        let pool = BlockingPool::new("index", std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+        let shard = Shard::open(
+            &config(&shard(0), 1),
+            node.log.clone(),
+            Arc::clone(&node.index),
+            pool,
+        )
+        .await
+        .unwrap();
+
+        // Hold the index's write lock, so the next apply waits for it.
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let index = Arc::clone(&node.index);
+        let holder = std::thread::spawn(move || {
+            index
+                .update_control(|_| {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        holding.recv().unwrap();
+        let writer = shard.clone();
+        let commit = tokio::spawn(async move { writer.commit(put("a", 3, 1)).await });
+        // The record becomes durable, and its apply waits for the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!commit.is_finished());
+
+        // A subscriber that scans now finds nothing: the write is not in
+        // the index yet, so it must be reported.
+        let mut changes = shard.subscribe();
+        assert!(shard.entries(None, 10).await.unwrap().is_empty());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        let committed = commit.await.unwrap().unwrap();
+        assert!(committed.outcome.is_applied());
+        let change = changes.try_recv().expect("the write is reported");
+        assert_eq!(
+            (change.key.as_str(), change.position, change.size),
+            ("a", committed.position, Some(3))
+        );
     });
 }

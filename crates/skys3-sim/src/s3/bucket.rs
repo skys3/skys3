@@ -32,6 +32,8 @@ struct Stored {
     etag: ETag,
     metadata: UserMetadata,
     content_type: Option<String>,
+    /// Tags, which only a PUT sets here.
+    tags: BTreeMap<String, String>,
 }
 
 /// One entry in a key's version history: an object, or a delete marker.
@@ -87,6 +89,11 @@ impl Bucket {
             next_id: 1,
             previous: BTreeMap::new(),
         }
+    }
+
+    /// The tags of the key's current object, if it has one.
+    pub(super) fn tags(&self, key: &str) -> Option<BTreeMap<String, String>> {
+        self.current(key).map(|object| object.tags.clone())
     }
 
     /// The key's current object and its version ID, if it has one.
@@ -227,15 +234,25 @@ impl Bucket {
     pub(super) fn put_object(&mut self, request: PutObject) -> S3Result<WriteOutput> {
         check_key(&request.key)?;
         self.check_metadata(&request.metadata)?;
+        let digest = md5(&request.body);
+        if let Some(expected) = &request.content_md5
+            && *expected != base64_md5(&digest)
+        {
+            return Err(
+                S3Error::new(S3ErrorKind::Other, "Content-MD5 does not match the body")
+                    .with_status(400)
+                    .with_code("BadDigest"),
+            );
+        }
         self.check_precondition(&request.key, &request.precondition)?;
-        let etag = md5_etag(&md5(&request.body));
         Ok(self.store(
             request.key,
             Stored {
                 body: request.body,
-                etag,
+                etag: md5_etag(&digest),
                 metadata: request.metadata,
                 content_type: request.content_type,
+                tags: request.tags,
             },
         ))
     }
@@ -501,6 +518,7 @@ impl Bucket {
                 etag,
                 metadata,
                 content_type,
+                tags: source.tags.clone(),
             },
         ))
     }
@@ -624,6 +642,7 @@ impl Bucket {
                 etag,
                 metadata: upload.metadata,
                 content_type: upload.content_type,
+                tags: BTreeMap::new(),
             },
         ))
     }
@@ -760,6 +779,12 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The ETag of a single-part object: the hex MD5 of its body.
+/// The `Content-MD5` form of a digest: base64.
+fn base64_md5(md5: &[u8; 16]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(md5)
+}
+
 pub(super) fn md5_etag(md5: &[u8; 16]) -> ETag {
     ETag::new(hex(md5)).expect("a hex digest is a valid ETag")
 }
