@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::budget::DirtyBudget;
+use crate::import::{self, ImportState, ImportStatus, RemoteReader};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{FlushSettings, Target};
@@ -55,6 +56,8 @@ pub struct BucketStatus {
     /// This node's share of the bucket's dirty-data budget
     /// ([`DirtyBudget`]).
     pub dirty_budget: u64,
+    /// The bucket's namespace import (§9.1).
+    pub import: ImportStatus,
 }
 
 impl BucketStatus {
@@ -86,6 +89,12 @@ impl BucketStatus {
 /// target is unreachable, and starts flushing when the probe is done.
 /// Flushers of buckets and shards that are gone are stopped.
 ///
+/// Each bucket also runs its namespace import (§9.1) from the moment it is
+/// followed: on attach, or resumed from its checkpoint after a restart.
+/// Its flushers keep tombstones and resolve writes of unknown remote state
+/// by its progress, and [`FlushService::remote`] reads the remote for the
+/// keys it has not reached.
+///
 /// Only the `hold` conflict policy exists so far (§7.2); `overwrite` and
 /// `discard_local` arrive with plan M4.
 pub struct FlushService<S, D> {
@@ -113,6 +122,10 @@ struct BucketFlusher<S> {
     name: String,
     probe: Arc<Mutex<ProbeStatus>>,
     probe_task: JoinHandle<()>,
+    /// What client reads of the remote use.
+    remote: RemoteReader<S>,
+    import: Arc<ImportState>,
+    import_task: JoinHandle<()>,
     /// The target, once the probe is done.
     target: Ready<S>,
     shards: BTreeMap<ShardId, ShardFlusher>,
@@ -121,6 +134,7 @@ struct BucketFlusher<S> {
 impl<S> Drop for BucketFlusher<S> {
     fn drop(&mut self) {
         self.probe_task.abort();
+        self.import_task.abort();
     }
 }
 
@@ -202,30 +216,51 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         for (bucket, target, shards) in open {
             let flusher = flushers
                 .entry(bucket.bucket_id.clone())
-                .or_insert_with(|| self.start(bucket, target));
+                .or_insert_with(|| self.start(bucket, target, set));
             self.follow(&bucket.bucket_id, flusher, shards);
         }
     }
 
     /// Starts a bucket's flushers with its target's probe, which makes the
-    /// target ready once it succeeds.
-    fn start(&self, bucket: &BucketDocument, target: &RemoteTarget) -> BucketFlusher<S> {
+    /// target ready once it succeeds, and its namespace import.
+    fn start(
+        &self,
+        bucket: &BucketDocument,
+        target: &RemoteTarget,
+        set: &ShardSet<D>,
+    ) -> BucketFlusher<S> {
         let name = bucket.name.as_str().to_owned();
+        let store = Arc::new((self.connect)(target));
+        let prefix = target.prefix.clone().unwrap_or_default();
+        let import = Arc::new(ImportState::default());
         let parts = TargetParts {
-            store: Arc::new((self.connect)(target)),
-            prefix: target.prefix.clone().unwrap_or_default(),
+            store: Arc::clone(&store),
+            prefix: prefix.clone(),
             cluster: self.cluster.clone(),
             settings: self.settings.clone(),
             wall: Arc::clone(&self.wall),
             counters: self.metrics.counters(&name),
+            import: Arc::clone(&import),
         };
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
         let (ready, target) = watch::channel(None);
         let probe_task = tokio::spawn(run_probe(parts, Arc::clone(&probe), ready));
+        let import_task = tokio::spawn(import::run(
+            Arc::clone(&store),
+            prefix.clone(),
+            bucket.clone(),
+            set.clone(),
+            self.settings.clone(),
+            Arc::clone(&self.wall),
+            Arc::clone(&import),
+        ));
         BucketFlusher {
             name,
             probe,
             probe_task,
+            remote: RemoteReader::new(store, prefix, Arc::clone(&import), Arc::clone(&self.wall)),
+            import,
+            import_task,
             target,
             shards: BTreeMap::new(),
         }
@@ -270,7 +305,18 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .budget
                 .usage(bucket)
                 .map_or(u64::MAX, |usage| usage.share),
+            import: flusher.import.status(),
         })
+    }
+
+    /// The remote target of `bucket` and its import's progress, for client
+    /// reads of keys the import has not reached and lazily loaded metadata
+    /// (§9.1), if the bucket is a `write_back` bucket this node follows.
+    #[must_use]
+    pub fn remote(&self, bucket: &BucketId) -> Option<RemoteReader<S>> {
+        self.lock()
+            .get(bucket)
+            .map(|flusher| flusher.remote.clone())
     }
 
     /// Sets the flush gauges of every bucket flushed here.
@@ -313,6 +359,7 @@ struct TargetParts<S> {
     settings: FlushSettings,
     wall: Arc<dyn WallClock>,
     counters: Counters,
+    import: Arc<ImportState>,
 }
 
 impl<S> TargetParts<S> {
@@ -320,6 +367,7 @@ impl<S> TargetParts<S> {
         Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
             .with_wall_clock(self.wall)
             .with_counters(self.counters)
+            .with_import(self.import)
     }
 }
 
@@ -330,9 +378,11 @@ async fn run_probe<S: ObjectStore>(
     status: Arc<Mutex<ProbeStatus>>,
     ready: watch::Sender<Option<Arc<Target<S>>>>,
 ) {
-    let probe = ConditionalProbe::with_fresh_nonce(&parts.prefix);
     let mut failures = 0;
     loop {
+        // A fresh nonce per run: a failed run may leave scratch keys behind,
+        // which would fail the next run's `If-None-Match: *` that must hold.
+        let probe = ConditionalProbe::with_fresh_nonce(&parts.prefix);
         match probe.run(&*parts.store).await {
             Ok(found) => {
                 let unprotected = found.unprotected();

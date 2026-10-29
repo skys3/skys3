@@ -47,6 +47,11 @@
 //!   shard returns a sorted page from its index, the gateway merges them,
 //!   and a V2 page ends with a continuation token authenticated with the
 //!   gateway's [`ListTokenKeys`].
+//! - The namespace import of a `write_back` bucket (§9.1), through
+//!   [`RemoteReads`]: while it runs, a read of a key it has not reached
+//!   and that has no entry falls through to the remote, and a listing
+//!   merges the remote's listing of such keys with the index. The first
+//!   read of an imported stub loads its metadata as an `ADOPT`.
 //! - [`Shards`] and [`ShardRef`]: the shard interface the gateway calls,
 //!   and routing of each key to its shard with the frozen hash. On a single
 //!   node every shard is local: [`LocalShards`] serves the interface from
@@ -128,6 +133,7 @@ mod listener;
 mod listing;
 mod local;
 mod objects;
+mod remote;
 mod service;
 mod shard;
 pub mod sigv4;
@@ -148,6 +154,7 @@ pub use objects::{
     MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
     parse_upload_id, upload_id,
 };
+pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads};
 #[cfg(any(test, feature = "test-util"))]
 pub use service::TrustAll;
 pub use service::{Authenticator, Gateway, StsService};

@@ -228,6 +228,15 @@ impl State {
         }
     }
 
+    /// Counts another attempt of `key` that must wait, and returns how many
+    /// in a row there were.
+    fn wait(&mut self, key: &str) -> u32 {
+        self.keys.get_mut(key).map_or(1, |tracked| {
+            tracked.failures += 1;
+            tracked.failures
+        })
+    }
+
     /// Ends the flush of `key` with a failure: it retries at `at`.
     fn failed(&mut self, key: &str, error: String, at: Instant) {
         self.flushing -= 1;
@@ -577,8 +586,8 @@ fn finish<S, D: Disk>(
                 state.finished(&key, dispatched);
             } else {
                 // A tombstone stays until the import passes its key
-                // (§4.2): look again later.
-                let at = Instant::now() + target.settings.max_backoff;
+                // (§4.2): look again later, less often the longer it waits.
+                let at = Instant::now() + target.settings.backoff(state.wait(&key));
                 state.failed(&key, "waiting for the import".to_owned(), at);
             }
         }
@@ -592,11 +601,7 @@ fn finish<S, D: Disk>(
         Outcome::Retry(error) => {
             target.counters.retries.inc();
             tracing::debug!(shard = %shard.shard(), key, %error, "a flush will be retried");
-            let failures = state.keys.get_mut(&key).map_or(1, |tracked| {
-                tracked.failures += 1;
-                tracked.failures
-            });
-            let at = Instant::now() + target.settings.backoff(failures);
+            let at = Instant::now() + target.settings.backoff(state.wait(&key));
             state.failed(&key, error, at);
         }
     }

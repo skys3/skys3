@@ -10,7 +10,7 @@ use skys3_io::{BlockingPool, SimDisk, SimMount};
 use skys3_log::record::ExtentRef;
 use skys3_log::{RecordBody, RecordKind, SegmentLog};
 use skys3_shard::{
-    Committed, Effect, Outcome, Rejection, Shard, ShardError, ShardSet, ShardSummary, StateMachine,
+    Committed, Effect, Outcome, Shard, ShardError, ShardSet, ShardSummary, StateMachine,
 };
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
@@ -88,7 +88,7 @@ fn a_new_shard_adopts_its_epoch_and_commits_in_order() {
         );
         let second = shard0.commit(import("a", 2)).await.unwrap();
         assert_eq!(second.position, at(2));
-        assert_eq!(second.outcome, Outcome::Rejected(Rejection::HasEntry));
+        assert_eq!(second.outcome, Outcome::Applied(Effect::RemoteRecorded));
         assert_eq!(shard0.applied(), at(2));
         let reader = shard0.index().read().unwrap();
         assert_eq!(reader.applied(&shard(0)).unwrap(), Some(at(2)));

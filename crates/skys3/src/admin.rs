@@ -30,7 +30,11 @@
 //! - `orphaned_uploads`: remote multipart uploads that flushes left open
 //!   and that wait to be aborted, as the metric of the same name;
 //! - `errors`: the latest flush error of each shard that has one, until
-//!   a later attempt gets its key past it.
+//!   a later attempt gets its key past it;
+//! - `import`: the namespace import (§9.1): `state` (`running` or `done`),
+//!   `after`, the last key imported while it runs, `imported`, the
+//!   `IMPORT` records committed since the node started, and `error`, its
+//!   last error until it gets past it.
 //!
 //! Placement (M3-03) adds shard members, and M4-06 its own fields.
 
@@ -44,6 +48,7 @@ use http_body_util::Full;
 use serde_json::{Value, json};
 use skys3_flush::{BucketStatus, ProbeStatus};
 use skys3_gateway::{LocalShards, ShardRef};
+use skys3_index::ImportCheckpoint;
 use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::SegmentLog;
 use skys3_obs::{AdminApi, ApiFuture, Health};
@@ -267,6 +272,18 @@ fn flush_status(status: &BucketStatus) -> Value {
         "conflicts": conflicts,
         "orphaned_uploads": gauges.orphaned_uploads,
         "errors": errors,
+        "import": json!({
+            "state": match status.import.checkpoint {
+                ImportCheckpoint::Running { .. } => "running",
+                ImportCheckpoint::Done => "done",
+            },
+            "after": match &status.import.checkpoint {
+                ImportCheckpoint::Running { after } => after.clone(),
+                ImportCheckpoint::Done => None,
+            },
+            "imported": status.import.imported,
+            "error": status.import.error,
+        }),
     })
 }
 

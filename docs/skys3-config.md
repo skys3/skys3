@@ -154,6 +154,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. |
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
 | `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
+| `import_max_keys_per_second` | integer | `100000` | Positive. The most remote keys the namespace import of one bucket lists a second (§9.1), so an attach does not crowd out client writes on the shards' logs or exceed the target's request rate. |
 | `target_region` | string | `"us-east-1"` | ASCII letters, numbers, and `-`. The region the flusher signs requests to `write_back` targets for (`"auto"` for Cloudflare R2). Credentials come from the `aws-config` default chain. |
 
 ## `[ec]`

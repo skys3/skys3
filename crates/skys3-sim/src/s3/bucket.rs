@@ -323,6 +323,7 @@ impl Bucket {
             version_id,
             metadata: object.metadata.clone(),
             content_type: object.content_type.clone(),
+            last_modified_ms: None,
         }
     }
 
@@ -457,6 +458,8 @@ impl Bucket {
                     key: key.clone(),
                     etag: object.etag.clone(),
                     size: object.body.len() as u64,
+                    last_modified_ms: None,
+                    storage_class: None,
                 }),
             }
             floor = Some(entry.to_owned());

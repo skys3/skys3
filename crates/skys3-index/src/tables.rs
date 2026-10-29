@@ -33,6 +33,8 @@ pub(crate) const PARTS: TableDefinition<Bytes, Bytes> = TableDefinition::new("pa
 pub(crate) const COVERAGE: TableDefinition<Bytes, Bytes> = TableDefinition::new("coverage");
 /// The node's local copy of control state, keyed by register key.
 pub(crate) const CONTROL: TableDefinition<&str, Bytes> = TableDefinition::new("control");
+/// Each bucket's namespace import checkpoint, keyed by bucket ID.
+pub(crate) const IMPORTS: TableDefinition<&str, Bytes> = TableDefinition::new("imports");
 /// Single values: the format version and the control generation.
 pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 

@@ -50,6 +50,7 @@ use crate::admission::{Admission, AdmitAll};
 use crate::authz::Permissions;
 use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
+use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
 /// The CreateBucket header that sets the bucket's mode: `write_back`,
@@ -98,6 +99,10 @@ pub struct GatewayConfig {
     /// (§7.6, §13). [`GatewayConfig::new`] admits everything; the node
     /// checks the dirty-data budgets and free disk space.
     pub admission: Arc<dyn Admission>,
+    /// The remote targets of `write_back` buckets, which reads of keys the
+    /// namespace import has not reached and lazily loaded metadata use
+    /// (§9.1). [`GatewayConfig::new`] has none: every read is local.
+    pub remote: Option<Arc<dyn RemoteReads>>,
 }
 
 impl GatewayConfig {
@@ -118,6 +123,7 @@ impl GatewayConfig {
             hashing_pool: None,
             list_token_keys: ListTokenKeys::generate(),
             admission: Arc::new(AdmitAll),
+            remote: None,
         }
     }
 }

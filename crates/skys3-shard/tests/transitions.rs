@@ -335,22 +335,51 @@ fn import_creates_a_stub_only_for_a_key_with_no_entry() {
     assert_eq!(object.storage_class.as_deref(), Some("STANDARD"));
     assert!(object.metadata.is_empty(), "metadata is loaded lazily");
 
-    // Any entry blocks an import: a stub, a local write, or a tombstone.
+    // A stub, or an entry whose remote ETag is known, blocks an import.
     rejected(&index, 2, import("k", 6), Rejection::HasEntry);
-    let (_, index) = new_index();
-    step(&index, 1, put("k", 10, 1));
-    rejected(&index, 2, import("k", 6), Rejection::HasEntry);
-    step(&index, 3, delete("k"));
-    rejected(&index, 4, import("k", 6), Rejection::HasEntry);
     let index = clean();
     rejected(&index, 3, import("k", 6), Rejection::HasEntry);
+    step(&index, 4, delete("k"));
+    rejected(&index, 5, import("k", 6), Rejection::HasEntry);
+}
+
+#[test]
+fn import_records_the_remote_etag_of_a_key_written_before_it() {
+    // A write and a delete of keys the import had not reached: their
+    // remote state is unknown until the import tells it.
+    let (_, index) = new_index();
+    step(&index, 1, put("k", 10, 1));
+    step(&index, 2, delete("d"));
+    for (seq, key) in [(3, "k"), (4, "d")] {
+        assert_eq!(
+            step(&index, seq, import(key, 6)),
+            Outcome::Applied(Effect::RemoteRecorded)
+        );
+    }
+    let written = entry(&index, "k").unwrap();
+    assert_eq!(
+        (written.version, written.state, written.remote_etag),
+        (at(1), EntryState::Dirty, Some(etag(6))),
+        "the local version stays, to replace the remote's"
+    );
+    assert_eq!(written.object.unwrap().size, 10);
+    let deleted = entry(&index, "d").unwrap();
+    assert_eq!((deleted.object, deleted.remote_etag), (None, Some(etag(6))));
+    // Once known, the remote ETag is not replaced.
+    rejected(&index, 5, import("k", 7), Rejection::HasEntry);
+    rejected(&index, 6, import("d", 7), Rejection::HasEntry);
 }
 
 #[test]
 fn a_deleted_key_is_imported_again_only_after_its_tombstone_is_flushed() {
     let (_, index) = new_index();
     step(&index, 1, delete("k"));
-    rejected(&index, 2, import("k", 6), Rejection::HasEntry);
+    assert_eq!(
+        step(&index, 2, import("k", 6)),
+        Outcome::Applied(Effect::RemoteRecorded),
+        "the tombstone hides the remote object"
+    );
+    assert!(entry(&index, "k").unwrap().object.is_none());
     step(&index, 3, flushed("k", 1, true));
     assert_eq!(
         step(&index, 4, import("k", 6)),

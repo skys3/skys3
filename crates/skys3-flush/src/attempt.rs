@@ -105,6 +105,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// earlier flush of the key put at the remote while its `FLUSHED` is
     /// not yet applied; it describes the remote better than the entry does.
     pub(crate) async fn run(&self, pending: Option<&Remote>) -> Outcome {
+        // Asked before the entry is read: once the import has passed the
+        // key, the entry read next holds its `IMPORT` (§9.1).
+        let passed = self.target.import.passed(self.key);
         let entry = match self.shard.entry(self.key).await {
             Ok(Some(entry)) => entry,
             Ok(None) => return Outcome::Settled,
@@ -120,8 +123,8 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             None => entry.remote_etag.clone(),
         };
         let result = match &entry.object {
-            Some(object) => self.put(&entry, object, known).await,
-            None => self.delete(&entry, known).await,
+            Some(object) => self.put(&entry, object, known, passed).await,
+            None => self.delete(&entry, known, passed).await,
         };
         result.unwrap_or_else(|error| Outcome::Retry(error.to_string()))
     }
@@ -145,6 +148,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         entry: &Entry,
         object: &ObjectVersion,
         known: Option<ETag>,
+        passed: bool,
     ) -> Result<Outcome, Failure> {
         let version = entry.version;
         let identity = self
@@ -152,7 +156,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             .identity(self.shard.shard(), object.write_identity.unwrap_or(version));
         let expected = match known {
             Some(etag) => Some(etag),
-            None if self.target.import.passed(self.key) => None,
+            None if passed => None,
             // Written locally before the import reached the key (§9.1):
             // the local version is newer than whatever the remote holds.
             None => match self.inspect(&identity, version, None).await? {
@@ -243,9 +247,13 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     /// Flushes a tombstone with `DeleteObject` and `If-Match` on the known
     /// remote ETag. Without one, a HEAD finds what to delete: an earlier
     /// flush of the key may have landed without its `FLUSHED`.
-    async fn delete(&self, entry: &Entry, known: Option<ETag>) -> Result<Outcome, Failure> {
+    async fn delete(
+        &self,
+        entry: &Entry,
+        known: Option<ETag>,
+        record: bool,
+    ) -> Result<Outcome, Failure> {
         let version = entry.version;
-        let record = self.target.import.passed(self.key);
         let mut expected = known;
         for _ in 0..MAX_ROUNDS {
             let etag = match expected.take() {
@@ -286,7 +294,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         // A foreign object at a key the import has not passed predates the
         // local delete, which replaces it; past the import it is a write
         // SkyS3 did not make.
-        if self.ours_before(&info, version) || !self.target.import.passed(self.key) {
+        if self.ours_before(&info, version) || !record {
             Ok(Ok(info.etag))
         } else {
             Ok(Err(Outcome::Conflict(conflict(version, Some(info)))))

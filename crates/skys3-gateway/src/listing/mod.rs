@@ -19,6 +19,10 @@
 //!
 //! With `encoding-type=url`, keys, common prefixes, and the echoed prefix,
 //! delimiter, `start-after`, and markers are URL-encoded ([`url_encode`]).
+//!
+//! While a `write_back` bucket's namespace import runs, the page also
+//! merges the remote's listing of the keys the import has not reached
+//! (§9.1, [`merge`]).
 //! The owner of every object is the bucket owner, as in a bucket with
 //! `BucketOwnerEnforced` ownership; SkyS3 names it by the cluster ID.
 
@@ -30,14 +34,18 @@ use s3s::dto::{
     ListObjectsInput, ListObjectsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
     ObjectStorageClass, Owner,
 };
-use s3s::{S3Result, s3_error};
-use skys3_index::{ListItem, ListQuery, ObjectVersion};
-use skys3_types::BucketDocument;
+use std::sync::Arc;
+
+use s3s::{S3Error, S3Result, s3_error};
+use skys3_index::{ImportCheckpoint, ListItem, ListQuery, ObjectVersion};
 use skys3_types::checksum::ChecksumAlgorithm;
+use skys3_types::{BucketDocument, BucketMode};
 
 use crate::buckets::{GatewayConfig, shard_error};
 use crate::conditions::{last_modified, s3_etag};
+use crate::remote::RemoteReads;
 use crate::shard::Shards;
+use merge::{MergeError, RemoteSide};
 pub(crate) use token::TokenScope;
 pub use token::{ListTokenKeys, ShortTokenKey};
 
@@ -52,6 +60,7 @@ pub(crate) struct Listings<H> {
     shards: H,
     keys: ListTokenKeys,
     owner: Owner,
+    remote: Option<Arc<dyn RemoteReads>>,
 }
 
 /// The parameters V1 and V2 share.
@@ -115,6 +124,7 @@ impl<H: Shards> Listings<H> {
                 id: Some(config.cluster_id.to_string()),
                 display_name: None,
             },
+            remote: config.remote.clone(),
         }
     }
 
@@ -206,9 +216,23 @@ impl<H: Shards> Listings<H> {
         owner: bool,
     ) -> S3Result<Page> {
         let query = request.query(start_after);
-        let merged = merge::list(&self.shards, request.bucket, &query)
+        let bucket = request.bucket;
+        // While a `write_back` bucket's import runs, the remote lists the
+        // keys the import has not reached (§9.1).
+        let remote = self
+            .remote
+            .as_deref()
+            .filter(|_| bucket.mode == BucketMode::WriteBack)
+            .and_then(|remote| match remote.import(&bucket.bucket_id)? {
+                ImportCheckpoint::Running { after } => Some(RemoteSide {
+                    remote,
+                    passed: after,
+                }),
+                ImportCheckpoint::Done => None,
+            });
+        let merged = merge::list(&self.shards, bucket, &query, remote)
             .await
-            .map_err(shard_error)?;
+            .map_err(merge_error)?;
         let last = merged.items.last().map(|item| item.name().to_owned());
         let mut page = Page {
             contents: Vec::new(),
@@ -229,6 +253,16 @@ impl<H: Shards> Listings<H> {
             }
         }
         Ok(page)
+    }
+}
+
+fn merge_error(error: MergeError) -> S3Error {
+    match error {
+        MergeError::Shard(error) => shard_error(error),
+        MergeError::Remote(error) => s3_error!(
+            ServiceUnavailable,
+            "The bucket's remote target cannot be listed: {error}"
+        ),
     }
 }
 

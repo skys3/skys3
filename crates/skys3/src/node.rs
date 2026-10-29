@@ -36,6 +36,7 @@ use crate::admin::{BucketList, ControlState, NodeAdmin};
 use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
+use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
 
@@ -848,22 +849,6 @@ impl Node {
             disk_of,
             &metrics.registry,
         );
-        let mut gateway_config = GatewayConfig::new(&config);
-        gateway_config.retry = retry;
-        gateway_config.hashing_pool = Some(pools.hashing.clone());
-        gateway_config.admission = Arc::new(admission);
-        let ids = IdSource::from_os_rng();
-        let mut gateway = Gateway::new(
-            gateway_config,
-            store.clone(),
-            storage.shards.clone(),
-            ids,
-            auth,
-        )
-        .await?;
-        if let Some(sts) = &sts {
-            gateway = gateway.with_sts(Arc::clone(sts) as Arc<dyn StsService>);
-        }
         let flush = {
             let region = config.flush().target_region.clone();
             let credentials = default_credentials(&region).await;
@@ -882,6 +867,23 @@ impl Node {
                 .with_budget(budget),
             )
         };
+        let mut gateway_config = GatewayConfig::new(&config);
+        gateway_config.retry = retry;
+        gateway_config.hashing_pool = Some(pools.hashing.clone());
+        gateway_config.admission = Arc::new(admission);
+        gateway_config.remote = Some(Arc::new(NodeRemote(Arc::clone(&flush))));
+        let ids = IdSource::from_os_rng();
+        let mut gateway = Gateway::new(
+            gateway_config,
+            store.clone(),
+            storage.shards.clone(),
+            ids,
+            auth,
+        )
+        .await?;
+        if let Some(sts) = &sts {
+            gateway = gateway.with_sts(Arc::clone(sts) as Arc<dyn StsService>);
+        }
         let shared = Arc::new(Shared {
             config,
             retry,

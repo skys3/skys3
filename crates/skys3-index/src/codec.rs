@@ -22,6 +22,7 @@
 //! | control | register key (UTF-8) | [`ControlEntry`] |
 //! | uploads | shard, the object key's bytes, a zero byte, then the upload's epoch and seq | [`Upload`] |
 //! | parts | shard, the upload's epoch and seq, part number (`u16`) | [`Part`] |
+//! | imports | bucket ID (UTF-8) | [`ImportCheckpoint`]: a tag (0 running, 1 done), and for a running import the last key imported, as an option |
 //!
 //! An upload key ends with a fixed 17 bytes, so it decodes whatever bytes
 //! the object key holds, and a shard's uploads sort by key, then by age.
@@ -53,7 +54,8 @@ use skys3_types::{
 };
 
 use crate::entry::{
-    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
+    ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
+    Upload,
 };
 
 /// The format byte every value this build writes starts with, and the
@@ -578,6 +580,47 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlEntry> {
         version,
         value,
     })
+}
+
+/// Encodes a bucket's import checkpoint.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the last key imported is longer than an
+/// object key may be.
+pub fn encode_import(checkpoint: &ImportCheckpoint) -> Result<Vec<u8>> {
+    let mut w = Writer::value();
+    match checkpoint {
+        ImportCheckpoint::Running { after } => {
+            w.u8(0);
+            w.option_str("import.after", after.as_deref(), MAX_KEY_LEN)?;
+        }
+        ImportCheckpoint::Done => w.u8(1),
+    }
+    Ok(w.0)
+}
+
+/// Decodes a bucket's import checkpoint.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded checkpoint.
+pub fn decode_import(bytes: &[u8]) -> Result<ImportCheckpoint> {
+    let mut r = Reader::value(bytes, "import")?;
+    let checkpoint = match r.u8("import.state")? {
+        0 => ImportCheckpoint::Running {
+            after: r.option_str("import.after", MAX_KEY_LEN)?,
+        },
+        1 => ImportCheckpoint::Done,
+        tag => {
+            return Err(CodecError::new(
+                "import.state",
+                format_args!("invalid tag {tag}"),
+            ));
+        }
+    };
+    r.finish("import")?;
+    Ok(checkpoint)
 }
 
 /// Encodes a namespace entry.

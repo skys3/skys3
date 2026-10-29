@@ -55,6 +55,9 @@ pub struct FlushConfig {
     pub flush_conflict_policy: ConflictPolicy,
     /// `max_dirty_bytes`: the cluster's dirty-data budget (§7.6).
     pub max_dirty_bytes: u64,
+    /// `import_max_keys_per_second`: the most remote keys the namespace
+    /// import of one bucket lists a second (§9.1).
+    pub import_max_keys_per_second: u64,
     /// `target_region`: the region the flusher signs requests to
     /// `write_back` targets for, such as `us-east-1`, or `auto` for
     /// Cloudflare R2 (§7).
@@ -72,6 +75,7 @@ impl Default for FlushConfig {
             flush_part_bytes: 64 * MIB,
             flush_conflict_policy: ConflictPolicy::Hold,
             max_dirty_bytes: 2 * TIB,
+            import_max_keys_per_second: 100_000,
             target_region: "us-east-1".to_owned(),
         }
     }
@@ -128,6 +132,10 @@ impl FlushConfig {
             },
         );
         checker.nonzero("flush.max_dirty_bytes", self.max_dirty_bytes);
+        checker.nonzero(
+            "flush.import_max_keys_per_second",
+            self.import_max_keys_per_second,
+        );
         checker.require(
             !self.target_region.is_empty()
                 && self
