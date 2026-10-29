@@ -280,6 +280,26 @@ impl Index {
         Ok(applied)
     }
 
+    /// Removes everything the index holds for `shard`, in one non-durable
+    /// commit: its entries, its record locations, and its applied
+    /// position. A node drops a shard this way once its bucket is deleted.
+    ///
+    /// The shard's records stay in the log until their segments are
+    /// reclaimed, so replay after a crash can bring the shard back; startup
+    /// recovery reclaims shards that no bucket names (§4.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IndexError`] if redb fails. On an error nothing is
+    /// removed.
+    pub fn remove_shard(&self, shard: &ShardRef) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None)?;
+        IndexWriter::open(&txn)?.remove_shard(shard)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Changes the node's local copy of control state (§6.2) in one
     /// durable commit, and returns what `update` returns.
     ///

@@ -17,6 +17,7 @@ proptest! {
     #[test]
     fn records_round_trip(record in record()) {
         let bytes = record.to_bytes().unwrap();
+        record.check().unwrap();
         let (decoded, len) = LogRecord::decode(&bytes).unwrap();
         prop_assert_eq!(len, bytes.len());
         prop_assert_eq!(&decoded, &record);

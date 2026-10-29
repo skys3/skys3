@@ -369,6 +369,23 @@ impl<D: Disk> SegmentLog<D> {
             .await
     }
 
+    /// Checks that [`SegmentLog::append`] would accept `record`, without
+    /// encoding its payload: that it encodes, and that a record for a hot
+    /// segment carries at most `inline_max_bytes` of payload. A shard
+    /// checks a record this way before it gives the record a position, so
+    /// a record that cannot be appended never leaves a gap in its log.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::Encode`] or [`LogError::InlineTooLarge`], as `append`
+    /// would return them.
+    pub fn check(&self, record: &LogRecord) -> Result<(), LogError> {
+        let class = SegmentClass::of(record.kind());
+        self.check_inline(class, record.body.payload().len() as u64)?;
+        record.check()?;
+        Ok(())
+    }
+
     fn check_inline(&self, class: SegmentClass, payload_len: u64) -> Result<(), LogError> {
         if class == SegmentClass::Hot && payload_len > self.inline_max_bytes {
             return Err(LogError::InlineTooLarge {
