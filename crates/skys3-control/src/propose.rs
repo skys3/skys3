@@ -297,20 +297,46 @@ pub async fn read_with_retries<D: RegisterDocument, S: ControlStore>(
     key: &TypedKey<D>,
     policy: &RetryPolicy,
 ) -> Result<Option<Versioned<D>>, ControlError> {
+    let Some(current) = get_with_retries(store, key.key(), policy).await? else {
+        return Ok(None);
+    };
+    let value = D::from_json(&current.value).map_err(|source| ControlError::InvalidRegister {
+        key: key.key().clone(),
+        source,
+    })?;
+    Ok(Some(Versioned {
+        value,
+        version: current.version,
+    }))
+}
+
+/// [`ControlStore::get`]s a register, retrying under `policy` while the
+/// store does not answer.
+///
+/// # Errors
+///
+/// A non-retryable error from the store, and
+/// [`ControlError::RetriesExhausted`] once `policy.max_attempts` reads got
+/// no answer.
+pub async fn get_with_retries<S: ControlStore>(
+    store: &S,
+    key: &RegisterKey,
+    policy: &RetryPolicy,
+) -> Result<Option<Versioned>, ControlError> {
     let mut attempts = 0;
     loop {
         attempts += 1;
-        match read(store, key).await {
+        match store.get(key).await {
             Err(error) if error.is_retryable() => {
                 if attempts >= policy.max_attempts {
                     return Err(ControlError::RetriesExhausted {
-                        key: key.key().clone(),
+                        key: key.clone(),
                         attempts,
                         may_have_applied: false,
                         last: Box::new(error),
                     });
                 }
-                tokio::time::sleep(policy.backoff(attempts, key.key())).await;
+                tokio::time::sleep(policy.backoff(attempts, key)).await;
             }
             result => return result,
         }

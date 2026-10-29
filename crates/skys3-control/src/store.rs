@@ -236,6 +236,11 @@ pub enum ControlError {
     /// nothing.
     #[error("the control store is unavailable: {0}")]
     Unavailable(String),
+    /// The store rejected the request for a reason a retry does not fix,
+    /// such as `403 AccessDenied`, a missing bucket, or a header it does
+    /// not implement, and applied nothing.
+    #[error("the control store rejected the request: {0}")]
+    Rejected(String),
     /// A register holds a value that is not a valid document.
     #[error("register {key} is invalid: {source}")]
     InvalidRegister {
@@ -341,6 +346,8 @@ mod tests {
         assert!(retryable[0].may_have_applied());
         assert!(!retryable[1].may_have_applied());
         assert!(!retryable[2].may_have_applied());
+        let rejected = ControlError::Rejected("403 AccessDenied".into());
+        assert!(!rejected.is_retryable() && !rejected.may_have_applied());
         let io = ControlError::from(io::Error::other("disk"));
         assert!(!io.is_retryable() && io.may_have_applied());
         assert!(!ControlError::NotBootstrapped.may_have_applied());

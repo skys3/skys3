@@ -35,8 +35,8 @@ use skys3_types::{
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid register key {key:?}: {reason}")]
 pub struct KeyError {
-    key: String,
-    reason: &'static str,
+    pub(crate) key: String,
+    pub(crate) reason: &'static str,
 }
 
 impl KeyError {

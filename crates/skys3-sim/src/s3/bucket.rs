@@ -22,6 +22,9 @@ use skys3_types::ETag;
 
 use super::SimS3Config;
 
+/// A key's current object at some moment, with its version ID.
+type Snapshot = (Option<VersionId>, Arc<Stored>);
+
 /// One stored object version's contents.
 #[derive(Debug)]
 struct Stored {
@@ -68,6 +71,10 @@ pub(super) struct Bucket {
     list_tokens: HashMap<String, String>,
     /// Numbers version IDs, upload IDs, and continuation tokens.
     next_id: u64,
+    /// What each written key's current object was before its latest
+    /// write, with its version ID, or `None` if it had none: what a stale
+    /// read answers with.
+    previous: BTreeMap<String, Option<Snapshot>>,
 }
 
 impl Bucket {
@@ -78,7 +85,34 @@ impl Bucket {
             uploads: BTreeMap::new(),
             list_tokens: HashMap::new(),
             next_id: 1,
+            previous: BTreeMap::new(),
         }
+    }
+
+    /// The key's current object and its version ID, if it has one.
+    fn current_version(&self, key: &str) -> Option<Snapshot> {
+        let version = self.keys.get(key)?.last()?;
+        Some((version.id.clone(), Arc::clone(version.object.as_ref()?)))
+    }
+
+    /// Applies a write to `key`, and remembers the key's current object
+    /// from before it if the write changed it, for stale reads.
+    pub(super) fn apply_write<T>(
+        &mut self,
+        key: &str,
+        apply: impl FnOnce(&mut Self) -> S3Result<T>,
+    ) -> S3Result<T> {
+        let before = self.current_version(key);
+        let result = apply(self);
+        let unchanged = |after: &Option<Snapshot>| match (&before, after) {
+            (None, None) => true,
+            (Some((a, x)), Some((b, y))) => a == b && Arc::ptr_eq(x, y),
+            _ => false,
+        };
+        if result.is_ok() && !unchanged(&self.current_version(key)) {
+            self.previous.insert(key.to_owned(), before);
+        }
+        result
     }
 
     fn next_id(&mut self, kind: &str) -> String {
@@ -93,10 +127,24 @@ impl Bucket {
         self.keys.get(key)?.last()?.object.as_ref()
     }
 
-    /// Returns the object a read names: the current one, or a version.
-    fn read_target(&self, key: &str, version_id: Option<&VersionId>) -> S3Result<&Arc<Stored>> {
+    /// Returns the object a read names, and its version ID if the read
+    /// names the object it held before its latest write: a version, the
+    /// current object, or with `stale`, the key's object from before its
+    /// latest write.
+    fn read_target(
+        &self,
+        key: &str,
+        version_id: Option<&VersionId>,
+        stale: bool,
+    ) -> S3Result<(&Arc<Stored>, Option<Option<VersionId>>)> {
         let Some(version_id) = version_id else {
-            return self.current(key).ok_or_else(|| no_such_key(key));
+            if stale && let Some(previous) = self.previous.get(key) {
+                return match previous {
+                    Some((id, object)) => Ok((object, Some(id.clone()))),
+                    None => Err(no_such_key(key)),
+                };
+            }
+            return Ok((self.current(key).ok_or_else(|| no_such_key(key))?, None));
         };
         self.check_versioned()?;
         let version = self
@@ -109,12 +157,13 @@ impl Bucket {
                     format!("{key:?} has no version {version_id}"),
                 )
             })?;
-        version.object.as_ref().ok_or_else(|| {
+        let object = version.object.as_ref().ok_or_else(|| {
             S3Error::new(
                 S3ErrorKind::MethodNotAllowed,
                 format!("version {version_id} of {key:?} is a delete marker"),
             )
-        })
+        })?;
+        Ok((object, None))
     }
 
     fn check_versioned(&self) -> S3Result<()> {
@@ -191,15 +240,17 @@ impl Bucket {
         ))
     }
 
-    pub(super) fn get_object(&self, request: &GetObject) -> S3Result<GetOutput> {
-        let object = self.read_target(&request.key, request.version_id.as_ref())?;
+    /// `GetObject`, answered from before the key's latest write if `stale`.
+    pub(super) fn get_object(&self, request: &GetObject, stale: bool) -> S3Result<GetOutput> {
+        let (object, stale_id) =
+            self.read_target(&request.key, request.version_id.as_ref(), stale)?;
         check_read_conditions(
             &request.key,
             object,
             request.if_match.as_ref(),
             request.if_none_match.as_ref(),
         )?;
-        let info = self.info(&request.key, object, request.version_id.as_ref());
+        let info = self.info(&request.key, object, request.version_id.as_ref(), stale_id);
         let Some(range) = request.range else {
             return Ok(GetOutput {
                 info,
@@ -225,23 +276,36 @@ impl Bucket {
         })
     }
 
-    pub(super) fn head_object(&self, request: &HeadObject) -> S3Result<ObjectInfo> {
-        let object = self.read_target(&request.key, request.version_id.as_ref())?;
+    /// `HeadObject`, answered from before the key's latest write if
+    /// `stale`.
+    pub(super) fn head_object(&self, request: &HeadObject, stale: bool) -> S3Result<ObjectInfo> {
+        let (object, stale_id) =
+            self.read_target(&request.key, request.version_id.as_ref(), stale)?;
         check_read_conditions(
             &request.key,
             object,
             request.if_match.as_ref(),
             request.if_none_match.as_ref(),
         )?;
-        Ok(self.info(&request.key, object, request.version_id.as_ref()))
+        Ok(self.info(&request.key, object, request.version_id.as_ref(), stale_id))
     }
 
-    fn info(&self, key: &str, object: &Stored, version_id: Option<&VersionId>) -> ObjectInfo {
+    /// The attributes of `object`, read as `version_id`, or as the stale
+    /// version `stale_id`, or as the key's current version.
+    fn info(
+        &self,
+        key: &str,
+        object: &Stored,
+        version_id: Option<&VersionId>,
+        stale_id: Option<Option<VersionId>>,
+    ) -> ObjectInfo {
         let version_id = version_id.cloned().or_else(|| {
-            self.keys
-                .get(key)
-                .and_then(|versions| versions.last())
-                .and_then(|version| version.id.clone())
+            stale_id.unwrap_or_else(|| {
+                self.keys
+                    .get(key)
+                    .and_then(|versions| versions.last())
+                    .and_then(|version| version.id.clone())
+            })
         });
         ObjectInfo {
             etag: object.etag.clone(),
@@ -257,7 +321,11 @@ impl Bucket {
         if let Some(version_id) = request.version_id {
             self.check_versioned()?;
             if let Some(etag) = &request.if_match {
-                check_etag(&key, etag, self.read_target(&key, Some(&version_id))?)?;
+                check_etag(
+                    &key,
+                    etag,
+                    self.read_target(&key, Some(&version_id), false)?.0,
+                )?;
             }
             let Some(versions) = self.keys.get_mut(&key) else {
                 return Ok(DeleteOutput {
@@ -306,9 +374,12 @@ impl Bucket {
     /// `max_keys == 0` returns an empty page that is not truncated, as S3
     /// does. It tells the caller nothing about the keys, so callers never
     /// send it.
+    ///
+    /// A `stale` listing lists every key as it was before its latest write.
     pub(super) fn list_objects_v2(
         &mut self,
         request: &ListObjectsV2,
+        stale: bool,
     ) -> S3Result<ListObjectsV2Output> {
         let position = match &request.continuation_token {
             Some(token) => Some(self.list_tokens.get(token).cloned().ok_or_else(|| {
@@ -335,11 +406,25 @@ impl Bucket {
         // returned sorts after it.
         let mut floor = position;
         let mut emitted = 0;
-        for (key, versions) in self.keys.range::<String, _>((start, Bound::Unbounded)) {
+        let range = (start, Bound::Unbounded);
+        let current = self
+            .keys
+            .range::<String, _>(range.clone())
+            .map(|(key, versions)| (key, versions.last().and_then(|v| v.object.as_ref())));
+        let entries: Box<dyn Iterator<Item = (&String, Option<&Arc<Stored>>)>> = if stale {
+            let mut entries: BTreeMap<_, _> = current.collect();
+            for (key, before) in self.previous.range::<String, _>(range) {
+                entries.insert(key, before.as_ref().map(|(_, object)| object));
+            }
+            Box::new(entries.into_iter())
+        } else {
+            Box::new(current)
+        };
+        for (key, object) in entries {
             if !key.starts_with(prefix) {
                 break;
             }
-            let Some(object) = versions.last().and_then(|v| v.object.as_ref()) else {
+            let Some(object) = object else {
                 continue;
             };
             let common_prefix = delimiter.and_then(|delimiter| {
@@ -378,8 +463,14 @@ impl Bucket {
 
     pub(super) fn copy_object(&mut self, request: CopyObject) -> S3Result<WriteOutput> {
         check_key(&request.key)?;
-        let source =
-            Arc::clone(self.read_target(&request.source_key, request.source_version_id.as_ref())?);
+        let source = Arc::clone(
+            self.read_target(
+                &request.source_key,
+                request.source_version_id.as_ref(),
+                false,
+            )?
+            .0,
+        );
         if let Some(etag) = &request.source_if_match {
             check_etag(&request.source_key, etag, &source)?;
         }

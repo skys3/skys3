@@ -1,4 +1,5 @@
-//! Runs the conformance suite against the in-memory and file backends.
+//! Runs the conformance suite against the in-memory, file, and S3
+//! backends, the S3 backend over the simulated S3 store.
 
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -8,9 +9,12 @@ use skys3_control::conformance::{self, Backend};
 use skys3_control::{
     ChangeFeed, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected,
     FileControlStore, FileStoreConfig, KeyPrefix, MemoryControlStore, ProposalIds, PutOutcome,
-    RegisterKey, RetryPolicy, Version, Versioned, bootstrap, bump_generation,
+    RegisterKey, RetryPolicy, S3ControlStore, S3StoreConfig, Version, Versioned, bootstrap,
+    bump_generation,
 };
 use skys3_io::BlockingPool;
+use skys3_sim::SimS3;
+use skys3_sim::s3::{SimS3Config, SimS3Faults};
 use skys3_types::Generation;
 use tempfile::TempDir;
 
@@ -95,6 +99,73 @@ impl Backend for File {
             .await
             .unwrap()
     }
+}
+
+/// S3 control stores over fresh simulated buckets.
+struct S3 {
+    config: SimS3Config,
+    faults: SimS3Faults,
+    seed: u64,
+}
+
+impl S3 {
+    fn new(config: SimS3Config) -> Self {
+        Self {
+            config,
+            faults: SimS3Faults::NONE,
+            seed: 0,
+        }
+    }
+}
+
+impl Backend for S3 {
+    type Store = S3ControlStore<SimS3>;
+
+    async fn store(&mut self) -> S3ControlStore<SimS3> {
+        self.seed += 1;
+        let objects = SimS3::new(self.seed, self.config.clone());
+        objects.set_faults(self.faults.clone());
+        let config = S3StoreConfig {
+            prefix: "skys3-prod-a/".to_owned(),
+            poll_interval: Duration::from_secs(30),
+        };
+        S3ControlStore::new(objects, config).unwrap()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_s3_store_conforms() {
+    conformance::run(&mut S3::new(SimS3Config::default())).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_s3_store_conforms_on_a_versioned_bucket() {
+    let config = SimS3Config {
+        versioning: true,
+        ..SimS3Config::default()
+    };
+    conformance::run(&mut S3::new(config)).await;
+}
+
+/// Delays let racing conditional writes overlap, so the store answers some
+/// with `409 ConditionalRequestConflict`.
+#[tokio::test(start_paused = true)]
+async fn the_s3_store_conforms_with_racing_requests() {
+    let mut backend = S3 {
+        faults: SimS3Faults {
+            max_delay: Duration::from_millis(4),
+            ..SimS3Faults::NONE
+        },
+        ..S3::new(SimS3Config::default())
+    };
+    conformance::run(&mut backend).await;
+    let store = backend.store().await;
+    conformance::racing_creates_have_one_winner(&store, 16).await;
+    conformance::increments_are_linearizable(&store, 6, 8).await;
+    assert!(
+        store.objects().stats().conflicts > 0,
+        "no request conflicted"
+    );
 }
 
 #[tokio::test(start_paused = true)]

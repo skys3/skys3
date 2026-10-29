@@ -21,9 +21,14 @@
 //!   changes.
 //! - [`ChangeStream`] and [`ChangeFeed`]: change delivery driven by the
 //!   generation, from in-process notification or polling.
-//! - Backends: [`MemoryControlStore`] for tests and simulation, and
-//!   [`FileControlStore`] for single-node development. The S3 and etcd
-//!   backends implement the same trait (plan M2-04, M2-05).
+//! - Backends: [`MemoryControlStore`] for tests and simulation,
+//!   [`FileControlStore`] for single-node development, and
+//!   [`S3ControlStore`] over any `skys3-remote` object store, AWS S3 and
+//!   S3-compatible providers. The etcd backend implements the same trait
+//!   (plan M2-05).
+//! - [`ControlProbe`]: the startup probe that refuses a store whose
+//!   conditional writes, conditional deletes, or reads after writes cannot
+//!   be trusted.
 //!
 //! With the `test-util` feature, `faults` injects lost requests and
 //! responses, late requests, conflicts, and outages into any backend, and
@@ -56,7 +61,9 @@ mod feed;
 mod file;
 mod key;
 mod memory;
+mod probe;
 mod propose;
+mod s3;
 mod store;
 
 pub use cluster::{Bootstrap, FIRST_GENERATION, bootstrap, bump_generation, read_cluster};
@@ -64,10 +71,12 @@ pub use feed::ChangeFeed;
 pub use file::{FileControlStore, FileStoreConfig};
 pub use key::{KeyError, KeyPrefix, RegisterKey, RegisterKind, TypedKey};
 pub use memory::MemoryControlStore;
+pub use probe::{ControlProbe, ProbeError, ProbeFailure};
 pub use propose::{
-    DeletionOutcome, ProposalIds, ProposalOutcome, RetryPolicy, proposal_id_of, propose,
-    propose_delete, propose_document, read, read_with_retries,
+    DeletionOutcome, ProposalIds, ProposalOutcome, RetryPolicy, get_with_retries, proposal_id_of,
+    propose, propose_delete, propose_document, read, read_with_retries,
 };
+pub use s3::{S3Changes, S3ControlStore, S3StoreConfig};
 pub use store::{
     Change, ChangeStream, ControlError, ControlStore, DeleteOutcome, Expected, PutOutcome, Version,
     Versioned,
