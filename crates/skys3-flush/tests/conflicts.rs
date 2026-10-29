@@ -452,3 +452,39 @@ fn a_resolution_answers_write_through_waits() {
         assert_eq!(remote_object(&store, "k"), ours("k newer", newer));
     });
 }
+
+/// A flusher that replaces the one that dropped a version, as after a
+/// primary change, does not track the key and never saw the drop: a wait
+/// for the dropped version is not answered `Flushed`, while one for a
+/// version the index shows flushed is.
+#[test]
+fn a_new_flusher_does_not_answer_a_dropped_version_flushed() {
+    runtime().block_on(async {
+        let node = Node::open(24).await;
+        let store = store(24, true);
+        let target = target(&store, protected(), ConflictPolicy::DiscardLocal);
+        let flusher = node.flusher(&target);
+        let dropped = conflicting_put(&node, &store, "k").await;
+        let flushed = node.put("c", "c ours").await;
+        node.settle(&flusher).await;
+        assert_eq!(target.counters().discarded.get(), 1);
+        flusher.stop().await;
+
+        let flusher = node.flusher(&target);
+        // Asked once the new flusher follows the shard.
+        let patience = support::Patience::new();
+        let mut wait = loop {
+            if let Ok(wait) = node.shard.await_flush("k", at(dropped)) {
+                break wait;
+            }
+            assert!(!patience.is_exhausted(), "no flusher follows the shard");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let mut later = node.shard.await_flush("c", at(flushed)).unwrap();
+        assert_eq!(later.answered().await, Some(FlushState::Flushed));
+        // The flusher took the waits in order: the first is not answered.
+        let answer = tokio::time::timeout(Duration::from_millis(1), wait.answered()).await;
+        assert!(answer.is_err(), "answered {answer:?}");
+        drop(flusher);
+    });
+}
