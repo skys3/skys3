@@ -13,14 +13,16 @@ use skys3_flush::{FlushSettings, ShardFlusher, Target};
 use skys3_index::{Entry, EntryState, Index, IndexConfig};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{
-    CompletedPart, Delete, MpuComplete, MpuCreate, MpuPart, Put, PutData, Tags,
+    CompletedPart, Delete, MpuComplete, MpuCreate, MpuPart, Put, PutData, Tags, UploadBegin,
 };
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
 use skys3_remote::probe::{ConditionalWrites, OperationSupport, PreconditionSupport};
 use skys3_shard::{Shard, ShardSet};
 use skys3_sim::SimS3;
 use skys3_sim::s3::SimS3Config;
-use skys3_types::{BucketId, ClusterId, ETag, Epoch, NodeId, ProposalId, ShardConfig, ShardId};
+use skys3_types::{
+    BucketId, ClusterId, ETag, Epoch, EpochSeq, NodeId, ProposalId, Seq, ShardConfig, ShardId,
+};
 
 /// The cluster every test writes as.
 pub fn cluster() -> ClusterId {
@@ -134,6 +136,27 @@ impl Node {
     pub async fn put(&self, key: &str, body: &str) -> u64 {
         let committed = self.shard.commit(put(key, body)).await.unwrap();
         committed.position.seq.get()
+    }
+
+    /// Commits the `UPLOAD_BEGIN` of a streamed PUT of `key` and returns
+    /// its `seq`, which the PUT's write identity names (§7.2).
+    pub async fn begin(&self, key: &str) -> u64 {
+        let body = RecordBody::UploadBegin(UploadBegin {
+            key: key.to_owned(),
+        });
+        let committed = self.shard.commit(body).await.unwrap();
+        committed.position.seq.get()
+    }
+
+    /// Commits the PUT of `key` with `body` that completes the streamed PUT
+    /// begun at `begun`, and returns its `seq`.
+    pub async fn complete(&self, key: &str, body: &str, begun: u64) -> u64 {
+        let RecordBody::Put(mut streamed) = put(key, body) else {
+            unreachable!("put makes a PUT")
+        };
+        streamed.inherited_identity = Some(EpochSeq::new(Epoch::new(1), Seq::new(begun)));
+        let committed = self.shard.commit(RecordBody::Put(streamed)).await;
+        committed.unwrap().position.seq.get()
     }
 
     /// Uploads `parts` of `key` as a multipart upload, with user metadata,

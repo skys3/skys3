@@ -285,8 +285,8 @@ impl<H: Shards> Objects<H> {
         let trailers = extensions.get::<Trailers>().cloned();
         let validator =
             ChecksumValidator::requiring(expected, trailers, self.pool.clone(), Some(required))?;
-        let (verified, data) = self
-            .receive(&shard, &input.key, input.body.take(), validator)
+        let (verified, data, _) = self
+            .receive(&shard, &input.key, input.body.take(), validator, None)
             .await?;
         let part = MpuPart {
             key: input.key,

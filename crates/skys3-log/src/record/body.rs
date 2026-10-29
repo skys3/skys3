@@ -153,6 +153,16 @@ pub struct Extent {
     pub data: Bytes,
 }
 
+/// Starts a streamed single PUT and fixes its write identity (§7.2): the
+/// record's position names the write, and the `PUT` that completes the
+/// upload inherits it ([`Put::inherited_identity`]). It changes no entry,
+/// and an upload that fails leaves it naming no write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadBegin {
+    /// The object key.
+    pub key: String,
+}
+
 /// Replaces an object's tags (`PutObjectTagging`, or `DeleteObjectTagging`
 /// with an empty set).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +245,8 @@ pub enum RecordBody {
     MpuComplete(MpuComplete),
     /// `MPU_ABORT`.
     MpuAbort(MpuAbort),
+    /// `UPLOAD_BEGIN`.
+    UploadBegin(UploadBegin),
     /// `TAGS`.
     Tags(Tags),
     /// `FLUSHED`.
@@ -266,6 +278,7 @@ impl RecordBody {
             Self::MpuPart(_) => RecordKind::MpuPart,
             Self::MpuComplete(_) => RecordKind::MpuComplete,
             Self::MpuAbort(_) => RecordKind::MpuAbort,
+            Self::UploadBegin(_) => RecordKind::UploadBegin,
             Self::Tags(_) => RecordKind::Tags,
             Self::Flushed(_) => RecordKind::Flushed,
             Self::Import(_) => RecordKind::Import,
@@ -286,6 +299,7 @@ impl RecordBody {
             | Self::MpuPart(MpuPart { key, .. })
             | Self::MpuComplete(MpuComplete { key, .. })
             | Self::MpuAbort(MpuAbort { key, .. })
+            | Self::UploadBegin(UploadBegin { key })
             | Self::Tags(Tags { key, .. })
             | Self::Flushed(Flushed { key, .. })
             | Self::Import(Import { key, .. })
@@ -321,6 +335,7 @@ impl RecordBody {
             Self::MpuPart(part) => part.encode(w, position),
             Self::MpuComplete(complete) => complete.encode(w, position),
             Self::MpuAbort(abort) => abort.encode(w, position),
+            Self::UploadBegin(begin) => w.str16("upload_begin.key", &begin.key, 1, MAX_KEY_LEN),
             Self::Tags(tags) => {
                 w.str16("tags.key", &tags.key, 1, MAX_KEY_LEN)?;
                 write_tags(w, "tags.tags", &tags.tags)
@@ -354,6 +369,9 @@ impl RecordBody {
             RecordKind::MpuPart => Self::MpuPart(MpuPart::decode(&mut r, payload, position)?),
             RecordKind::MpuComplete => Self::MpuComplete(MpuComplete::decode(&mut r, position)?),
             RecordKind::MpuAbort => Self::MpuAbort(MpuAbort::decode(&mut r, position)?),
+            RecordKind::UploadBegin => Self::UploadBegin(UploadBegin {
+                key: r.str16("upload_begin.key", 1, MAX_KEY_LEN)?,
+            }),
             RecordKind::Tags => Self::Tags(Tags {
                 key: r.str16("tags.key", 1, MAX_KEY_LEN)?,
                 tags: read_tags(&mut r, "tags.tags")?,

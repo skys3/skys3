@@ -694,7 +694,8 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
                 | RecordBody::MpuCreate(_)
                 | RecordBody::MpuPart(_)
                 | RecordBody::MpuComplete(_)
-                | RecordBody::MpuAbort(_)) => body,
+                | RecordBody::MpuAbort(_)
+                | RecordBody::UploadBegin(_)) => body,
                 other => return Err(format!("a write request carries a {:?}", other.kind())),
             },
             condition: decode_condition(condition, &shard)?,

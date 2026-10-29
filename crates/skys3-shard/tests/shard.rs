@@ -15,7 +15,7 @@ use skys3_shard::{
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq};
 use support::{
     at, config, delete, extent, flushed, import, index_config, mpu_complete, mpu_create, mpu_part,
-    open_log, pool, put, put_extents, runtime, shard, tags,
+    open_log, pool, put, put_extents, runtime, shard, tags, upload_begin,
 };
 
 /// A node's disk, log, index, and pool.
@@ -304,7 +304,12 @@ fn seals_fence_client_writes_and_count_entries() {
             }
         );
         assert!(shard0.is_sealed());
-        for body in [put("e", 1, 6), delete("a"), tags("a", "x")] {
+        for body in [
+            put("e", 1, 6),
+            delete("a"),
+            tags("a", "x"),
+            upload_begin("e"),
+        ] {
             let result = shard0.commit(body).await;
             assert_eq!(result, Err(ShardError::Sealed(shard(0))));
         }

@@ -13,7 +13,9 @@ use skys3_io::{BlockingPool, Clock, MonoTime, SimDisk, SimMount};
 use skys3_log::{LogRecord, RecordBody, SegmentLog};
 use skys3_shard::{Pending, Role, Shard, ShardError};
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq, ShardConfig};
-use support::{at, config, delete, index_config, open_log, pool, put, record, runtime, shard};
+use support::{
+    at, config, delete, extent, flushed, index_config, open_log, pool, put, record, runtime, shard,
+};
 
 fn node(n: u8) -> NodeId {
     format!("node-{n}").parse().unwrap()
@@ -371,6 +373,53 @@ fn a_primary_commits_once_every_member_holds_the_record() {
         assert_eq!(
             leader.records_after(Seq::new(1), 8),
             Pending::Ready(Vec::new())
+        );
+    });
+}
+
+/// A primary queues a record of the other segment class only once the
+/// records before it are durable, so a lazy `FLUSHED` that nothing else
+/// would commit for up to [`skys3_log::LAZY_MAX_DELAY`] is committed at
+/// once instead of holding up the `EXTENT` behind it.
+#[test]
+fn a_lazy_record_does_not_hold_up_one_of_the_other_class() {
+    runtime().block_on(async {
+        let replica = Replica::new().await;
+        let primary = replica.open(&replicated(), &node(1)).await.unwrap();
+        let leader = Arc::clone(primary.leader().unwrap());
+        leader.synced(&node(2), Seq::ZERO);
+        leader.synced(&node(3), Seq::ZERO);
+        until(|| primary.is_serving()).await;
+        let acknowledge = |seq| {
+            leader.acknowledged(&node(2), Seq::new(seq));
+            leader.acknowledged(&node(3), Seq::new(seq));
+        };
+        let written = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.commit(put("a", 10, 1)).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(1)).await;
+        acknowledge(1);
+        written.await.unwrap().unwrap();
+
+        let started = std::time::Instant::now();
+        let lazy = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.commit_lazy(flushed("a", 1, false)).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(2)).await;
+        let appended = {
+            let primary = primary.clone();
+            tokio::spawn(async move { primary.append_extent(extent("b", 0, 600)).await })
+        };
+        until(|| primary.last_sequenced() == Seq::new(3)).await;
+        acknowledge(3);
+        assert!(lazy.await.unwrap().unwrap().outcome.is_applied());
+        assert_eq!(appended.await.unwrap().unwrap().position, at(3));
+        assert!(
+            started.elapsed() < skys3_log::LAZY_MAX_DELAY,
+            "took {:?}",
+            started.elapsed()
         );
     });
 }

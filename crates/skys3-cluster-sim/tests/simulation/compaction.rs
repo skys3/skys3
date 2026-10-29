@@ -23,6 +23,13 @@ use crate::COST;
 /// Three nodes, every shard on all of them, a `write_back` bucket beside a
 /// `local` one, a small clean cache, and compaction with a short TTL for
 /// extents that nothing names and a short release delay for payload.
+///
+/// An overwritten body's `EXTENT` records wait out the TTL from their
+/// segment's seal and then the release delay from the first pass after
+/// it, so a pass every checkpoint interval (1 s) reclaims their segment
+/// about TTL + delay + 1 to 2 s after it sealed. The workload's writes end
+/// about 4 s in, so both are 1 s: with 2 s each, no segment was reclaimed
+/// in most runs whose shards never stalled.
 fn config() -> ClusterConfig {
     ClusterConfig {
         replicas: 3,
@@ -34,10 +41,10 @@ fn config() -> ClusterConfig {
         }),
         compaction: Some(CompactionSettings {
             live_threshold: 0.6,
-            unreferenced_ttl: Duration::from_secs(2),
+            unreferenced_ttl: Duration::from_secs(1),
         }),
         read_registration: ReadRegistration {
-            release_delay: Duration::from_secs(2),
+            release_delay: Duration::from_secs(1),
             ..ReadRegistration::default()
         },
         ..ClusterConfig::default()

@@ -150,7 +150,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | `flush_min_concurrency_per_shard` | integer | `4` | Positive. |
 | `flush_max_concurrency_per_shard` | integer | `64` | At least `flush_min_concurrency_per_shard`. |
 | `flush_max_inflight_bytes_per_target` | integer | `1073741824` (1 GiB) | Positive. |
-| `streaming_flush_min_bytes` | integer | `67108864` (64 MiB) | Positive. |
+| `streaming_flush_min_bytes` | integer | `67108864` (64 MiB) | Positive. A single PUT to a `write_back` bucket whose body reaches it commits an `UPLOAD_BEGIN` while it streams, and takes that record's write identity (§7.2). |
 | `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. |
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
 | `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
@@ -216,7 +216,7 @@ The native QUIC transport between SkyS3 clusters (§7.8).
 | `peer_connections_per_shard` | integer | `64` | Positive. |
 | `peer_max_inflight_bytes` | integer | `268435456` (256 MiB) | At least `peer_frame_bytes`. |
 | `peer_staging_quota_bytes` | integer | `1099511627776` (1 TiB) | At least 64 KiB plus the larger of `peer_frame_bytes` and 64 KiB: one staging and one frame, each charged at least 64 KiB (design §7.8). |
-| `peer_staging_ttl_seconds` | integer | `86400` | Positive. |
+| `peer_staging_ttl_seconds` | integer | `86400` | Positive. Also how long compaction keeps `EXTENT` records that nothing names (§10.3), so a client's request body must arrive within half of it, or it is refused with `400 RequestTimeout`. |
 
 ### `[peering.peers.<cluster-id>]`
 

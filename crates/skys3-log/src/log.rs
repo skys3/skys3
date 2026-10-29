@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use skys3_io::{Clock, Disk, MonoTime, SegmentFile};
 use skys3_types::EpochSeq;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::commit::{Committer, Request};
 use crate::config::LogConfig;
@@ -177,6 +177,9 @@ pub(crate) struct Shared<F> {
     tracking: Mutex<Tracking>,
     failure: OnceLock<Arc<io::Error>>,
     pub(crate) stats: Counters,
+    /// Wakes the committer to commit the lazy records waiting
+    /// ([`SegmentLog::commit_lazy_now`]).
+    pub(crate) lazy_now: Notify,
 }
 
 impl<F: SegmentFile> Shared<F> {
@@ -380,6 +383,7 @@ impl<D: Disk> SegmentLog<D> {
             tracking: Mutex::default(),
             failure: OnceLock::new(),
             stats: Counters::default(),
+            lazy_now: Notify::new(),
         });
         let opened = clock.now();
         for (id, segment) in recovered.segments {
@@ -447,6 +451,18 @@ impl<D: Disk> SegmentLog<D> {
     /// As [`SegmentLog::append`].
     pub async fn append_lazy(&self, record: &LogRecord) -> Result<RecordLocation, LogError> {
         self.queue(record, true).await?.durable().await
+    }
+
+    /// Commits the lazy records queued so far now, in a group of their own
+    /// unless another record starts one first, instead of after
+    /// [`LAZY_MAX_DELAY`].
+    ///
+    /// A writer that must see a lazy record durable before it queues the
+    /// next one calls it: nothing it queues could start the record's group
+    /// meanwhile. With no lazy record waiting, the next one queued commits
+    /// without waiting, so a call costs at most one sync.
+    pub fn commit_lazy_now(&self) {
+        self.shared.lazy_now.notify_one();
     }
 
     /// Appends one record that is already encoded, such as one received

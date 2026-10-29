@@ -88,6 +88,10 @@ pub enum Effect {
         /// How many parts the upload had.
         parts: usize,
     },
+    /// An `UPLOAD_BEGIN` fixed the write identity of a streamed PUT
+    /// (§7.2). It changes no entry: only the `PUT` that inherits the
+    /// identity does.
+    UploadBegun,
     /// A `CONFIG` or `TRUNCATE`, which change no entry.
     Unchanged,
 }
@@ -201,6 +205,9 @@ impl StateMachine {
                 multipart::complete(index, shard, position, complete)?
             }
             RecordBody::MpuAbort(abort) => multipart::abort(index, shard, abort)?,
+            // Its position is the identity; the `PUT` that completes the
+            // upload records it (`put_object`).
+            RecordBody::UploadBegin(_) => Ok(Effect::UploadBegun),
             RecordBody::Tags(tags) => set_tags(index, shard, position, tags)?,
             RecordBody::Flushed(flushed) => flush(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,

@@ -11,7 +11,7 @@ use skys3_shard::{Effect, Outcome, Rejection};
 use skys3_types::Seq;
 use support::{
     adopt, apply, at, delete, dump, entry, etag, flushed, import, location, new_index, put,
-    put_extents, record, set_state, shard, tags,
+    put_extents, record, set_state, shard, streamed, tags, upload_begin,
 };
 
 /// Applies the body at `seq` and returns its outcome.
@@ -457,6 +457,43 @@ fn adopt_is_rejected_once_the_entry_changed() {
 }
 
 #[test]
+fn a_streamed_put_inherits_the_identity_of_its_upload_begin() {
+    let index = clean();
+    let before = dump(&index);
+    // The record changes nothing but the applied position.
+    assert_eq!(
+        step(&index, 3, upload_begin("k")),
+        Outcome::Applied(Effect::UploadBegun)
+    );
+    let after = dump(&index);
+    assert_eq!(
+        (after.entries, after.locations),
+        (before.entries, before.locations)
+    );
+    assert_eq!(after.applied.get(&shard(0)), Some(&at(3)));
+
+    // A write of the key between the two takes its own identity, and the
+    // PUT that completes the upload inherits the begin's.
+    assert_eq!(step(&index, 4, put("k", 20, 4)), DIRTY);
+    assert_eq!(
+        entry(&index, "k").unwrap().object.unwrap().write_identity,
+        None
+    );
+    assert_eq!(step(&index, 5, streamed(put("k", 30, 5), at(3))), DIRTY);
+    let entry = entry(&index, "k").unwrap();
+    assert_eq!(entry.version, at(5));
+    let object = entry.object.unwrap();
+    assert_eq!((object.size, object.write_identity), (30, Some(at(3))));
+    // The remote state the next flush conditions on is kept.
+    assert_eq!(entry.remote_etag, Some(etag(1001)));
+
+    // A tag change is a write of its own: the identity names it.
+    assert_eq!(step(&index, 6, tags("k", "a")), DIRTY);
+    let object = support::entry(&index, "k").unwrap().object.unwrap();
+    assert_eq!(object.write_identity, None);
+}
+
+#[test]
 fn a_config_or_truncate_changes_no_entry() {
     let index = clean();
     let before = dump(&index);
@@ -494,7 +531,7 @@ fn outcomes_describe_themselves() {
         "applied: Cleaned"
     );
     assert_eq!(
-        Rejection::Unsupported(RecordKind::UploadBegin).to_string(),
-        "UploadBegin records are not applied by this build"
+        Rejection::Unsupported(RecordKind::PartFlushed).to_string(),
+        "PartFlushed records are not applied by this build"
     );
 }

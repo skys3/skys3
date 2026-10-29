@@ -62,8 +62,8 @@ pub enum RecordKind {
     MpuComplete,
     /// Aborts a multipart upload (defined).
     MpuAbort,
-    /// Starts a streamed single PUT and fixes its write identity (reserved
-    /// for M4).
+    /// Starts a streamed single PUT and fixes its write identity
+    /// (defined).
     UploadBegin,
     /// The remote accepted a flush (defined).
     Flushed,
@@ -181,6 +181,7 @@ impl RecordKind {
                 | Self::MpuPart
                 | Self::MpuComplete
                 | Self::MpuAbort
+                | Self::UploadBegin
                 | Self::Flushed
                 | Self::Tags
                 | Self::Import

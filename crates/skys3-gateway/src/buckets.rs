@@ -99,6 +99,17 @@ pub struct GatewayConfig {
     /// `extent_bytes`: the size of the `EXTENT` records a large body is
     /// streamed in.
     pub extent_bytes: u64,
+    /// `streaming_flush_min_bytes`: a single PUT to a `write_back` bucket
+    /// whose body reaches this size commits an `UPLOAD_BEGIN` record while
+    /// it streams, and its `PUT` inherits that record's write identity
+    /// (§7.2, §7.3). `None` gives every PUT the identity of its own record.
+    pub streaming_flush_min_bytes: Option<u64>,
+    /// How long a request body may stream as `EXTENT` records before the
+    /// record that names them is committed: half of
+    /// `peer_staging_ttl_seconds`, after which compaction may drop extents
+    /// that nothing names (§10.3). A body that takes longer is refused with
+    /// `400 RequestTimeout`.
+    pub max_body_duration: Duration,
     /// The pool that hashes object bodies (§7.4). Without one, bodies are
     /// hashed on the request's task, which only tests should do; the node
     /// sets one.
@@ -161,6 +172,8 @@ impl GatewayConfig {
             anonymous: anonymous_permissions(config.identity()),
             inline_max_bytes: config.storage().inline_max_bytes,
             extent_bytes: config.storage().extent_bytes,
+            streaming_flush_min_bytes: Some(config.flush().streaming_flush_min_bytes),
+            max_body_duration: config.peering().peer_staging_ttl() / 2,
             hashing_pool: None,
             fills: None,
             list_token_keys: ListTokenKeys::generate(),
