@@ -59,6 +59,17 @@ skip = [
     # moves to getrandom 0.4.
     { crate = "getrandom@0.4", reason = "Windows-only build dependency of aws-lc-sys (cc, jobserver); rand 0.9 uses 0.3" },
     { crate = "r-efi@6", reason = "UEFI-only dependency of getrandom 0.4; getrandom 0.3 uses r-efi 5" },
+    # quinn-proto (the peer transport, skys3-peer) is on rand 0.10, while
+    # proptest, turmoil, and the workspace are on rand 0.9. Remove once
+    # proptest and turmoil move to rand 0.10.
+    { crate = "rand@0.10", reason = "quinn-proto is on rand 0.10; proptest, turmoil, and the workspace on 0.9" },
+    { crate = "rand_core@0.10", reason = "rand 0.10 and rand_pcg 0.10 through quinn-proto; rand 0.9 uses rand_core 0.9" },
+    # quinn-proto depends on ring only on wasm32-unknown-unknown; on every
+    # other target it uses the aws-lc-rs provider of the rest of the
+    # binary. ring's getrandom 0.2 and windows-sys 0.52 are never compiled
+    # for the platforms SkyS3 targets.
+    { crate = "getrandom@0.2", reason = "wasm-only: ring through quinn-proto; rand 0.9 uses getrandom 0.3" },
+    { crate = "windows-sys@0.52", reason = "wasm-only: ring through quinn-proto; tokio uses windows-sys 0.61" },
     # crc-fast's default `std` feature implements digest 0.10's traits and
     # pulls in crypto-common 0.1. Two users enable it: aws-smithy-checksums
     # (through aws-sdk-s3) and s3s (for CRC64NVME and the other CRCs). The

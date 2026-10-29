@@ -65,7 +65,7 @@ pub use message::{MessageClass, MessageKind};
 #[cfg(feature = "turmoil")]
 pub use network::TurmoilNetwork;
 pub use network::{Network, TokioNetwork};
-pub use pki::{Credentials, PkiError};
+pub use pki::{Credentials, PkiError, pki_error};
 /// The DER types [`Credentials::new`] takes, re-exported from `rustls`.
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 pub use transport::{

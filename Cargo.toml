@@ -39,6 +39,7 @@ prometheus-client = "0.25.1"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
 quick-xml = { version = "0.42.0", default-features = false }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "0.9.5"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }

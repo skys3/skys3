@@ -1,7 +1,7 @@
 //! Each load-time rule, broken by a configuration.
 
 use skys3_config::{Config, ConfigError, ControlStoreBackend, ReplicationConfig, Violations};
-use skys3_types::BucketName;
+use skys3_types::{BucketName, ClusterId};
 
 const BASE: &str = r#"
 [cluster]
@@ -441,6 +441,76 @@ fn peering_rules() {
     );
     let config = load("[peering]\npeer_frame_bytes = 16777216").unwrap();
     assert_eq!(config.peering().peer_frame_bytes, 16_777_216);
+}
+
+#[test]
+fn peer_rules() {
+    const TLS: &str = r#"
+[transport]
+tls_cert_file = "/etc/skys3/node.crt"
+tls_key_file = "/etc/skys3/node.key"
+tls_ca_file = "/etc/skys3/ca.crt"
+"#;
+    let peer = r#"
+[peering.peers.skys3-prod-eu]
+ca_file = "/etc/skys3/peers/eu.crt"
+buckets = [
+    { source = "b-91c2", destination = "archive-from-eu" },
+    { source = "b-91c3", destination = "archive-from-eu" },
+]
+"#;
+    let config = load(&format!("{TLS}{peer}")).unwrap();
+    let peers = &config.peering().peers;
+    let eu = &peers[&ClusterId::new("skys3-prod-eu").unwrap()];
+    assert_eq!(eu.ca_file.to_str(), Some("/etc/skys3/peers/eu.crt"));
+    assert_eq!(eu.buckets.len(), 2);
+    assert_eq!(eu.buckets[0].source.as_str(), "b-91c2");
+    assert_eq!(eu.buckets[0].destination.as_str(), "archive-from-eu");
+
+    // A peer this node only sends to lists no pairs.
+    let config = load(&format!(
+        "{TLS}[peering.peers.skys3-prod-eu]\nca_file = \"/eu.crt\""
+    ))
+    .unwrap();
+    assert!(
+        config
+            .peering()
+            .peers
+            .values()
+            .all(|p| p.buckets.is_empty())
+    );
+
+    // Peer connections present the node's certificate.
+    assert_violations(peer, &["peering.peers.skys3-prod-eu"]);
+    assert_violations(
+        &format!("{TLS}[peering.peers.skys3-prod-a]\nca_file = \"/a.crt\""),
+        &["peering.peers.skys3-prod-a"],
+    );
+    assert_violations(
+        &format!("{TLS}[peering.peers.skys3-prod-eu]\nca_file = \"\""),
+        &["peering.peers.skys3-prod-eu.ca_file"],
+    );
+    assert_violations(
+        &format!(
+            "{TLS}[peering.peers.skys3-prod-eu]\nca_file = \"/eu.crt\"\nbuckets = [\
+             {{ source = \"b-1\", destination = \"dst\" }}, {{ source = \"b-1\", destination = \"dst\" }}]"
+        ),
+        &["peering.peers.skys3-prod-eu.buckets"],
+    );
+
+    // Identifiers are checked as they are parsed.
+    for bad in [
+        "[peering.peers.Prod]\nca_file = \"/x\"",
+        "[peering.peers.eu]\nca_file = \"/x\"\nbuckets = [{ source = \"B\", destination = \"dst\" }]",
+        "[peering.peers.eu]\nca_file = \"/x\"\nbuckets = [{ source = \"b\", destination = \"D\" }]",
+        "[peering.peers.eu]\nbuckets = []",
+        "[peering.peers.eu]\nca_file = \"/x\"\ntrust = \"/y\"",
+    ] {
+        assert!(
+            matches!(load(&format!("{TLS}{bad}")), Err(ConfigError::Parse(_))),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
