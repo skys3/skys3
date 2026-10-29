@@ -9,9 +9,11 @@
 //! shard's applied position after each record.
 //!
 //! A record whose transition is not allowed, such as an `IMPORT` of a key
-//! that already has an entry, is rejected: the namespace and the location
-//! map are left as they were, the shard's applied position still advances
-//! past it, and the [`Outcome`] says why.
+//! that already has an entry, is rejected: the namespace and the uploads
+//! are left as they were, the shard's applied position still advances past
+//! it, and the [`Outcome`] says why. The only change a rejected record
+//! makes is to release the bytes of an `MPU_PART` whose upload is gone,
+//! which nothing can reach (see the `multipart` module).
 
 use std::cell::RefCell;
 use std::fmt;
@@ -20,6 +22,8 @@ use skys3_index::{Applier, Entry, EntryState, IndexError, IndexWriter, ObjectVer
 use skys3_log::record::{Adopt, Delete, Flushed, Import, Put, PutData, Tags};
 use skys3_log::{LogRecord, RecordBody, RecordKind, RecordLocation, ShardRef};
 use skys3_types::{EpochSeq, Seq};
+
+use crate::multipart;
 
 /// The shard state machine. It holds no state of its own: everything it
 /// decides comes from the record and the index.
@@ -73,6 +77,16 @@ pub enum Effect {
     Adopted,
     /// An `EXTENT` was entered into the location map.
     Located,
+    /// An `MPU_CREATE` opened an upload.
+    UploadCreated,
+    /// An `MPU_PART` stored a part, replacing any with its number.
+    PartStored,
+    /// An `MPU_ABORT` removed an upload and its `parts`, and released their
+    /// bytes.
+    Aborted {
+        /// How many parts the upload had.
+        parts: usize,
+    },
     /// A `CONFIG` or `TRUNCATE`, which change no entry.
     Unchanged,
 }
@@ -122,6 +136,17 @@ pub enum Rejection {
     /// tombstone carries one.
     #[error("the remote ETag does not match the flushed version")]
     RemoteEtagMismatch,
+    /// An `MPU_PART`, `MPU_COMPLETE`, or `MPU_ABORT` names an upload that
+    /// is not open: never opened, or completed or aborted already.
+    #[error("the upload is not open")]
+    NoSuchUpload,
+    /// An `MPU_COMPLETE` lists a part that is missing, or was replaced
+    /// after the completion read it.
+    #[error("part {number} is not the part the completion names")]
+    PartChanged {
+        /// The part number.
+        number: u16,
+    },
     /// A record kind this state machine does not apply.
     #[error("{0:?} records are not applied by this build")]
     Unsupported(RecordKind),
@@ -137,7 +162,7 @@ impl fmt::Display for Outcome {
 }
 
 /// The outcome of a rule that may reject.
-type Rule = Result<Effect, Rejection>;
+pub(crate) type Rule = Result<Effect, Rejection>;
 
 impl StateMachine {
     /// Applies `record`, stored at `location` on this node, to `index`, and
@@ -166,6 +191,14 @@ impl StateMachine {
                 index.put_location(shard, position, &location)?;
                 Ok(Effect::Located)
             }
+            RecordBody::MpuCreate(create) => multipart::create(index, shard, position, create)?,
+            RecordBody::MpuPart(part) => {
+                multipart::store_part(index, shard, position, part, location)?
+            }
+            RecordBody::MpuComplete(complete) => {
+                multipart::complete(index, shard, position, complete)?
+            }
+            RecordBody::MpuAbort(abort) => multipart::abort(index, shard, abort)?,
             RecordBody::Tags(tags) => set_tags(index, shard, position, tags)?,
             RecordBody::Flushed(flushed) => flush(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
@@ -224,7 +257,7 @@ impl Applier for Recorder {
 
 /// The state a client write leaves the key in: dirty, unless the key is in
 /// conflict, which only the conflict policy resolves (§7.2).
-fn written_state(prior: Option<&Entry>) -> EntryState {
+pub(crate) fn written_state(prior: Option<&Entry>) -> EntryState {
     match prior.map(|entry| entry.state) {
         Some(EntryState::Conflict) => EntryState::Conflict,
         _ => EntryState::Dirty,
@@ -280,8 +313,9 @@ fn delete(
     Ok(Ok(Effect::Tombstoned { state }))
 }
 
-/// Stores a client write's entry, keeping the remote fields of `prior`.
-fn store(
+/// Stores a client write's entry, keeping the remote fields of `prior`, and
+/// dropping the parts of a multipart object `prior` held.
+pub(crate) fn store(
     index: &mut IndexWriter<'_>,
     shard: &ShardRef,
     key: &str,
@@ -290,6 +324,7 @@ fn store(
     object: Option<ObjectVersion>,
     prior: Option<Entry>,
 ) -> Result<(), IndexError> {
+    multipart::drop_parts(index, shard, prior.as_ref())?;
     let (remote_etag, remote_version_id) = prior.map_or((None, None), |prior| {
         (prior.remote_etag, prior.remote_version_id)
     });
@@ -454,6 +489,7 @@ fn adopt_remote(
         remote_etag: Some(adopt.remote_etag.clone()),
         remote_version_id: adopt.remote_version_id.clone(),
     };
+    multipart::drop_parts(index, shard, Some(&entry))?;
     index.put_entry(shard, &adopt.key, &adopted)?;
     Ok(Ok(Effect::Adopted))
 }

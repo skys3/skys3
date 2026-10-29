@@ -6,8 +6,13 @@ use proptest::collection::{btree_map, vec};
 use proptest::option;
 use proptest::prelude::*;
 use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
-use skys3_index::{ControlEntry, Entry, EntryState, ObjectVersion, Payload};
-use skys3_log::record::{Checksum, ChecksumAlgorithm, Checksums, CopySource, ExtentRef, ShardRef};
+use skys3_index::{
+    ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, Upload,
+};
+use skys3_log::record::{
+    Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, ShardRef,
+    UploadChecksum,
+};
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, Generation, Label, Seq, ShardId, VersionIdentity,
@@ -61,6 +66,15 @@ fn payload() -> impl Strategy<Value = Payload> {
             0..8
         )
         .prop_map(Payload::Extents),
+        (position(), btree_map(1..=10_000_u16, any::<u64>(), 1..8)).prop_map(|(upload, parts)| {
+            Payload::Parts {
+                upload,
+                parts: parts
+                    .into_iter()
+                    .map(|(number, size)| ObjectPart { number, size })
+                    .collect(),
+            }
+        }),
     ]
 }
 
@@ -319,14 +333,15 @@ fn format_1_entries_still_decode() {
         remote_version_id: None,
     };
     assert_eq!(entry, expected);
-    // It re-encodes in format 2: a part count, zero, after each digest.
+    // It re-encodes in the current format: a part count, zero, after each
+    // digest.
     let v2 = codec::encode_entry(&entry).unwrap();
-    let mut expected_v2 = ENTRY_V1.replacen("01", "02", 1);
+    let mut expected_v2 = ENTRY_V1.replacen("01", "03", 1);
     expected_v2 = expected_v2.replace("0101020304", "01010203040000");
     expected_v2 = expected_v2.replace("0c0d0e0f", "0c0d0e0f0000");
     assert_eq!(v2, unhex(&expected_v2));
     assert_eq!(codec::decode_entry(&v2).unwrap(), entry);
-    // Format 2 bytes read as format 1 leave the part counts unread.
+    // Current bytes read as format 1 leave the part counts unread.
     assert!(codec::decode_entry(&with(&v2, 0, 1)).is_err());
     // Other values read the same in both formats.
     let applied = codec::encode_applied(EpochSeq::new(Epoch::new(3), Seq::new(4)));
@@ -342,7 +357,7 @@ fn rejects_broken_entries() {
     let bytes = codec::encode_entry(&sample_entry()).unwrap();
     let decode = |bytes: &[u8]| codec::decode_entry(bytes).unwrap_err().field();
     assert_eq!(decode(&[]), "entry");
-    for format in [0, 3, u8::MAX] {
+    for format in [0, 4, u8::MAX] {
         assert_eq!(decode(&with(&bytes, 0, format)), "entry", "format {format}");
     }
     // The state code follows the format byte and the version.
@@ -452,4 +467,238 @@ fn rejects_broken_keys_and_values() {
         codec::decode_control(&control).unwrap_err().field(),
         "control.value"
     );
+}
+
+fn upload_checksum() -> impl Strategy<Value = Option<UploadChecksum>> {
+    option::of(
+        (
+            proptest::sample::select(ChecksumAlgorithm::FLEXIBLE.to_vec()),
+            any::<bool>(),
+        )
+            .prop_map(|(algorithm, composite)| UploadChecksum {
+                algorithm,
+                checksum_type: if composite {
+                    ChecksumType::Composite
+                } else {
+                    ChecksumType::FullObject
+                },
+            })
+            .prop_filter("defined by S3", |checksum| checksum.is_valid()),
+    )
+}
+
+fn upload() -> impl Strategy<Value = Upload> {
+    (
+        any::<u64>(),
+        btree_map("[a-z-]{1,12}", text(20), 0..4),
+        btree_map(
+            text(10).prop_filter("nonempty", |t| !t.is_empty()),
+            text(10),
+            0..4,
+        ),
+        upload_checksum(),
+    )
+        .prop_map(|(initiated_ms, metadata, tags, checksum)| Upload {
+            initiated_ms,
+            metadata,
+            tags,
+            checksum,
+        })
+}
+
+fn part() -> impl Strategy<Value = Part> {
+    (
+        (position(), any::<u64>(), any::<u64>(), etag(), checksums()),
+        prop_oneof![
+            position().prop_map(Payload::Inline),
+            vec(
+                (position(), 1..=skys3_log::record::MAX_PAYLOAD_LEN)
+                    .prop_map(|(position, len)| ExtentRef { position, len }),
+                0..8
+            )
+            .prop_map(Payload::Extents),
+        ],
+    )
+        .prop_map(
+            |((position, size, last_modified_ms, etag, checksums), payload)| Part {
+                position,
+                size,
+                last_modified_ms,
+                etag,
+                checksums,
+                payload,
+            },
+        )
+}
+
+proptest! {
+    #[test]
+    fn uploads_and_parts_round_trip(upload in upload(), part in part()) {
+        let bytes = codec::encode_upload(&upload).unwrap();
+        prop_assert_eq!(bytes[0], VALUE_FORMAT);
+        prop_assert_eq!(codec::decode_upload(&bytes).unwrap(), upload);
+        prop_assert!(codec::decode_upload(&bytes[..bytes.len() - 1]).is_err());
+        // Formats before 3 have no uploads.
+        prop_assert!(codec::decode_upload(&with(&bytes, 0, 2)).is_err());
+
+        let bytes = codec::encode_part(&part).unwrap();
+        prop_assert_eq!(codec::decode_part(&bytes).unwrap(), part);
+        prop_assert!(codec::decode_part(&bytes[..bytes.len() - 1]).is_err());
+        prop_assert!(codec::decode_part(&with(&bytes, 0, 2)).is_err());
+    }
+
+    #[test]
+    fn upload_and_part_keys_round_trip_and_sort(
+        shard in shard(),
+        keys in (".{1,20}", ".{1,20}"),
+        uploads in (position(), position()),
+        numbers in (any::<u16>(), any::<u16>()),
+    ) {
+        let (a, b) = (
+            codec::upload_key(&shard, &keys.0, uploads.0),
+            codec::upload_key(&shard, &keys.1, uploads.1),
+        );
+        prop_assert_eq!(
+            codec::decode_upload_key(&a).unwrap(),
+            (shard.clone(), keys.0.clone(), uploads.0)
+        );
+        // Keys without a zero byte sort by key, then by upload.
+        if !keys.0.contains('\0') && !keys.1.contains('\0') {
+            prop_assert_eq!(a.cmp(&b), (&keys.0, uploads.0).cmp(&(&keys.1, uploads.1)));
+        }
+        let (pa, pb) = (
+            codec::part_key(&shard, uploads.0, numbers.0),
+            codec::part_key(&shard, uploads.0, numbers.1),
+        );
+        prop_assert!(pa.starts_with(&codec::upload_parts_prefix(&shard, uploads.0)));
+        prop_assert_eq!(
+            codec::decode_part_key(&pa).unwrap(),
+            (shard.clone(), uploads.0, numbers.0)
+        );
+        prop_assert_eq!(pa.cmp(&pb), numbers.0.cmp(&numbers.1));
+    }
+
+    #[test]
+    fn arbitrary_upload_bytes_decode_canonically(mut bytes in vec(any::<u8>(), 0..120)) {
+        if !bytes.is_empty() {
+            bytes[0] = VALUE_FORMAT;
+        }
+        if let Ok(upload) = codec::decode_upload(&bytes) {
+            prop_assert_eq!(codec::encode_upload(&upload).unwrap(), bytes.clone());
+        }
+        if let Ok(part) = codec::decode_part(&bytes) {
+            prop_assert_eq!(codec::encode_part(&part).unwrap(), bytes.clone());
+        }
+        if let Ok((shard, key, upload)) = codec::decode_upload_key(&bytes) {
+            prop_assert_eq!(codec::upload_key(&shard, &key, upload), bytes.clone());
+        }
+        if let Ok((shard, upload, number)) = codec::decode_part_key(&bytes) {
+            prop_assert_eq!(codec::part_key(&shard, upload, number), bytes.clone());
+        }
+    }
+}
+
+#[test]
+fn multipart_values_are_validated() {
+    // A multipart payload exists from format 3 on.
+    let mut entry = sample_entry();
+    let object = entry.object.as_mut().unwrap();
+    object.payload = Payload::Parts {
+        upload: EpochSeq::new(Epoch::new(1), Seq::new(1)),
+        parts: vec![
+            ObjectPart { number: 1, size: 5 },
+            ObjectPart { number: 3, size: 1 },
+        ],
+    };
+    let bytes = codec::encode_entry(&entry).unwrap();
+    assert_eq!(codec::decode_entry(&bytes).unwrap(), entry);
+    assert_eq!(
+        codec::decode_entry(&with(&bytes, 0, 2))
+            .unwrap_err()
+            .field(),
+        "object.payload"
+    );
+    // Parts in increasing order, numbered from 1 to 10,000.
+    for parts in [
+        vec![(2, 1), (1, 1)],
+        vec![(1, 1), (1, 1)],
+        vec![(0, 1)],
+        vec![(10_001, 1)],
+    ] {
+        let object = entry.object.as_mut().unwrap();
+        object.payload = Payload::Parts {
+            upload: EpochSeq::new(Epoch::new(1), Seq::new(1)),
+            parts: parts
+                .into_iter()
+                .map(|(number, size)| ObjectPart { number, size })
+                .collect(),
+        };
+        assert_eq!(
+            codec::encode_entry(&entry).unwrap_err().field(),
+            "object.parts"
+        );
+    }
+    // A part's bytes are inline or in extents.
+    let part = Part {
+        position: EpochSeq::new(Epoch::new(1), Seq::new(2)),
+        size: 0,
+        last_modified_ms: 0,
+        etag: ETag::new("e").unwrap(),
+        checksums: BTreeMap::new(),
+        payload: Payload::None,
+    };
+    assert_eq!(
+        codec::encode_part(&part).unwrap_err().field(),
+        "part.payload"
+    );
+    let mut bytes = codec::encode_part(&Part {
+        payload: Payload::Inline(part.position),
+        ..part.clone()
+    })
+    .unwrap();
+    let tag = bytes.len() - 17;
+    bytes.truncate(tag + 1);
+    bytes[tag] = 0;
+    assert_eq!(
+        codec::decode_part(&bytes).unwrap_err().field(),
+        "part.payload"
+    );
+    // An upload's checksum is one S3 defines for multipart uploads.
+    let upload = Upload {
+        initiated_ms: 0,
+        metadata: BTreeMap::new(),
+        tags: BTreeMap::new(),
+        checksum: Some(UploadChecksum {
+            algorithm: ChecksumAlgorithm::Sha1,
+            checksum_type: ChecksumType::FullObject,
+        }),
+    };
+    assert_eq!(
+        codec::encode_upload(&upload).unwrap_err().field(),
+        "upload.checksum"
+    );
+    let valid = codec::encode_upload(&Upload {
+        checksum: UploadChecksum::of(ChecksumAlgorithm::Sha1),
+        ..upload
+    })
+    .unwrap();
+    let last = valid.len() - 1;
+    for (at, value) in [(last, 0), (last, 7), (last - 1, 99)] {
+        assert_eq!(
+            codec::decode_upload(&with(&valid, at, value))
+                .unwrap_err()
+                .field(),
+            "upload.checksum"
+        );
+    }
+    // Upload keys need their separator and position.
+    let key = codec::upload_key(
+        &ShardRef::new(BucketId::new("b").unwrap(), ShardId::new(0)),
+        "k",
+        EpochSeq::new(Epoch::new(1), Seq::new(2)),
+    );
+    assert!(codec::decode_upload_key(&key[..key.len() - 1]).is_err());
+    assert!(codec::decode_upload_key(&with(&key, key.len() - 17, 1)).is_err());
+    let no_key = [&key[..3], &key[key.len() - 17..]].concat();
+    assert!(codec::decode_upload_key(&no_key).is_err());
 }

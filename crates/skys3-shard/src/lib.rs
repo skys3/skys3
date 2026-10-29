@@ -49,6 +49,7 @@
 
 mod error;
 mod machine;
+mod multipart;
 mod pipeline;
 mod set;
 mod shard;

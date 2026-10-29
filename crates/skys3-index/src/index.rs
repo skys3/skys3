@@ -23,9 +23,15 @@ use crate::tables::{
     self, COVERAGE, ControlWriter, FORMAT_VERSION_KEY, IndexReader, IndexWriter, META,
 };
 
-/// The index format version this build reads and writes. It covers the
-/// tables and every encoding in [`codec`].
-pub const FORMAT_VERSION: u64 = 1;
+/// The index format version this build writes, and the newest it opens. It
+/// covers the tables and every encoding in [`codec`]. Version 2 adds the
+/// uploads and parts tables; opening a version 1 index creates them and
+/// marks it version 2, so a build that does not know them refuses it
+/// rather than miss the uploads in it.
+pub const FORMAT_VERSION: u64 = 2;
+
+/// The oldest index format version this build opens.
+pub const MIN_FORMAT_VERSION: u64 = 1;
 
 /// The index's settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,20 +200,28 @@ impl Index {
         let mut coverage = Coverage::new();
         let created = {
             let mut meta = txn.open_table(META)?;
-            for table in [tables::NAMESPACE, tables::LOCATIONS, tables::SHARDS] {
+            for table in [
+                tables::NAMESPACE,
+                tables::LOCATIONS,
+                tables::SHARDS,
+                tables::UPLOADS,
+                tables::PARTS,
+            ] {
                 txn.open_table(table)?;
             }
             txn.open_table(tables::CONTROL)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
-                Some(found) => {
+                Some(found) if !(MIN_FORMAT_VERSION..FORMAT_VERSION).contains(&found) => {
                     return Err(IndexError::UnsupportedFormat {
                         found,
                         supported: FORMAT_VERSION,
                     });
                 }
-                None => {
+                // A new index, or an older one, which the tables just opened
+                // bring up to date.
+                _ => {
                     meta.insert(FORMAT_VERSION_KEY, FORMAT_VERSION)?;
                 }
             }
@@ -219,7 +233,7 @@ impl Index {
                     codec::decode_summary(value.value()).map_err(IndexError::codec("coverage"))?;
                 coverage.entry(disk).or_default().insert(segment, summary);
             }
-            format.is_none()
+            format != Some(FORMAT_VERSION)
         };
         if created {
             txn.set_durability(Durability::Immediate)?;

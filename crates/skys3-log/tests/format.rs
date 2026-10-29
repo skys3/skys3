@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use skys3_log::record::{
-    Checksum, ChecksumAlgorithm, DecodeError, Delete, EncodeError, ErrorClass, Extent, ExtentRef,
-    FORMAT_VERSION, FieldError, LogRecord, MAGIC, MAX_HEADER_LEN, MAX_PAYLOAD_LEN, MAX_TAGS,
-    MIN_FORMAT_VERSION, Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef,
+    Checksum, ChecksumAlgorithm, ChecksumType, CompletedPart, DecodeError, Delete, EncodeError,
+    ErrorClass, Extent, ExtentRef, FORMAT_VERSION, FieldError, LogRecord, MAGIC, MAX_HEADER_LEN,
+    MAX_PAYLOAD_LEN, MAX_TAGS, MIN_FORMAT_VERSION, MpuAbort, MpuComplete, MpuCreate, MpuPart,
+    Problem, Put, PutData, RecordBody, RecordHeader, RecordKind, ShardRef, UploadChecksum,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -22,6 +23,10 @@ use support::{Body, Frame, reseal};
 const PUT: u16 = 1;
 const DELETE: u16 = 2;
 const EXTENT: u16 = 3;
+const MPU_CREATE: u16 = 4;
+const MPU_PART: u16 = 5;
+const MPU_COMPLETE: u16 = 6;
+const MPU_ABORT: u16 = 7;
 const CONFIG: u16 = 18;
 const TRUNCATE: u16 = 17;
 
@@ -293,7 +298,19 @@ fn record_kinds_have_fixed_codes_and_names() {
     assert_eq!(
         defined,
         [
-            "PUT", "DELETE", "EXTENT", "FLUSHED", "TAGS", "IMPORT", "ADOPT", "TRUNCATE", "CONFIG"
+            "PUT",
+            "DELETE",
+            "EXTENT",
+            "MPU_CREATE",
+            "MPU_PART",
+            "MPU_COMPLETE",
+            "MPU_ABORT",
+            "FLUSHED",
+            "TAGS",
+            "IMPORT",
+            "ADOPT",
+            "TRUNCATE",
+            "CONFIG"
         ]
     );
     assert!(!RecordKind::Config.has_key() && !RecordKind::Truncate.has_key());
@@ -1006,9 +1023,9 @@ fn errors_are_classified_and_described() {
             "unknown log record kind 99",
         ),
         (
-            DecodeError::UnsupportedKind(RecordKind::MpuCreate),
+            DecodeError::UnsupportedKind(RecordKind::UploadBegin),
             ErrorClass::Unsupported,
-            "log record kind MPU_CREATE is reserved but not yet supported",
+            "log record kind UPLOAD_BEGIN is reserved but not yet supported",
         ),
         (
             DecodeError::Malformed(FieldError {
@@ -1060,4 +1077,237 @@ fn records_expose_their_key_and_hash() {
         Some(KeyHash::of(&BucketId::new("b1").unwrap(), b"k"))
     );
     assert!(record.body.payload().is_empty());
+}
+
+fn mpu_part(upload: EpochSeq, data: PutData) -> MpuPart {
+    let size = match &data {
+        PutData::Inline(bytes) => bytes.len() as u64,
+        PutData::Extents(extents) => extents.iter().map(|e| u64::from(e.len)).sum(),
+    };
+    MpuPart {
+        key: "k".into(),
+        upload,
+        part_number: 2,
+        size,
+        last_modified_ms: 7,
+        etag: ETag::new("d41d8cd98f00b204e9800998ecf8427e").unwrap(),
+        checksums: BTreeMap::new(),
+        data,
+    }
+}
+
+fn mpu_complete(parts: &[(u16, EpochSeq)]) -> MpuComplete {
+    MpuComplete {
+        key: "k".into(),
+        upload: position(5, 1),
+        last_modified_ms: 8,
+        size: 3,
+        etag: ETag::new("aa-2").unwrap(),
+        checksums: BTreeMap::new(),
+        parts: parts
+            .iter()
+            .map(|&(number, position)| CompletedPart { number, position })
+            .collect(),
+    }
+}
+
+#[test]
+fn multipart_records_follow_the_documented_layout() {
+    let create = MpuCreate {
+        key: "k".into(),
+        initiated_ms: 1_700_000_000_000,
+        metadata: BTreeMap::from([("content-type".into(), "a/b".into())]),
+        tags: BTreeMap::new(),
+        checksum: UploadChecksum::of(ChecksumAlgorithm::Sha256),
+    };
+    let body = Body::default()
+        .str16("k")
+        .u64(1_700_000_000_000)
+        .u16(1)
+        .str16("content-type")
+        .str16("a/b")
+        .u8(0) // no tags
+        .u8(1) // a checksum:
+        .u8(ChecksumAlgorithm::Sha256.code())
+        .u8(1); // COMPOSITE
+    let expected = Frame::new(MPU_CREATE).keyed("k").build(&body.0, &[]);
+    assert_eq!(
+        record(RecordBody::MpuCreate(create)).to_bytes().unwrap(),
+        expected
+    );
+
+    let part = mpu_part(position(5, 1), PutData::Inline(Bytes::from_static(b"abc")));
+    let body = Body::default()
+        .str16("k")
+        .u64(5)
+        .u64(1) // the upload's position
+        .u16(2) // part number
+        .u64(3)
+        .u64(7)
+        .str16("d41d8cd98f00b204e9800998ecf8427e")
+        .u8(0) // no checksums
+        .u8(0); // inline data
+    let expected = Frame::new(MPU_PART).keyed("k").build(&body.0, b"abc");
+    let bytes = record(RecordBody::MpuPart(part)).to_bytes().unwrap();
+    assert_eq!(bytes, expected);
+    assert_eq!(LogRecord::decode(&bytes).unwrap().0.body.payload(), b"abc");
+
+    let complete = mpu_complete(&[(1, position(5, 2)), (3, position(5, 4))]);
+    let body = Body::default()
+        .str16("k")
+        .u64(5)
+        .u64(1)
+        .u64(8)
+        .u64(3)
+        .str16("aa-2")
+        .u8(0) // no checksums
+        .u16(2)
+        .u16(1)
+        .u64(5)
+        .u64(2)
+        .u16(3)
+        .u64(5)
+        .u64(4);
+    let expected = Frame::new(MPU_COMPLETE).keyed("k").build(&body.0, &[]);
+    assert_eq!(
+        record(RecordBody::MpuComplete(complete))
+            .to_bytes()
+            .unwrap(),
+        expected
+    );
+
+    let abort = MpuAbort {
+        key: "k".into(),
+        upload: position(5, 1),
+    };
+    let body = Body::default().str16("k").u64(5).u64(1);
+    let expected = Frame::new(MPU_ABORT).keyed("k").build(&body.0, &[]);
+    assert_eq!(
+        record(RecordBody::MpuAbort(abort)).to_bytes().unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn multipart_records_are_validated() {
+    // A part, completion, or abort names an upload opened before it.
+    for upload in [position(5, 9), position(6, 0)] {
+        let part = mpu_part(upload, PutData::Inline(Bytes::new()));
+        assert_eq!(
+            encode_err(RecordBody::MpuPart(part)).field,
+            "mpu_part.upload"
+        );
+        let abort = MpuAbort {
+            key: "k".into(),
+            upload,
+        };
+        assert_eq!(
+            encode_err(RecordBody::MpuAbort(abort)).field,
+            "mpu_abort.upload"
+        );
+    }
+    for number in [0, 10_001] {
+        let mut part = mpu_part(position(1, 1), PutData::Inline(Bytes::new()));
+        part.part_number = number;
+        assert_eq!(
+            encode_err(RecordBody::MpuPart(part)).field,
+            "mpu_part.part_number"
+        );
+    }
+    let mut part = mpu_part(position(1, 1), PutData::Inline(Bytes::from_static(b"x")));
+    part.size = 2;
+    assert_eq!(encode_err(RecordBody::MpuPart(part)).field, "mpu_part.data");
+    let extent = ExtentRef {
+        position: position(5, 9),
+        len: 1,
+    };
+    let part = mpu_part(position(1, 1), PutData::Extents(vec![extent]));
+    assert_eq!(
+        encode_err(RecordBody::MpuPart(part)).field,
+        "mpu_part.extents"
+    );
+
+    // Completed parts are in increasing order, between the upload and the
+    // completion.
+    let parts_err =
+        |parts: &[(u16, EpochSeq)]| encode_err(RecordBody::MpuComplete(mpu_complete(parts)));
+    assert_eq!(
+        parts_err(&[(2, position(5, 2)), (1, position(5, 3))]).problem,
+        Problem::Unsorted
+    );
+    assert_eq!(
+        parts_err(&[(1, position(5, 2)), (1, position(5, 3))]).problem,
+        Problem::Unsorted
+    );
+    for outside in [position(5, 1), position(5, 9), position(4, 7)] {
+        assert_eq!(parts_err(&[(1, outside)]).field, "mpu_complete.parts");
+    }
+    assert_eq!(
+        parts_err(&[(0, position(5, 2))]).field,
+        "mpu_complete.parts"
+    );
+    assert_eq!(parts_err(&[]).problem, Problem::Empty);
+
+    // Only the multipart checksums S3 defines.
+    for (algorithm, checksum_type) in [
+        (ChecksumAlgorithm::Sha256, ChecksumType::FullObject),
+        (ChecksumAlgorithm::Crc64Nvme, ChecksumType::Composite),
+        (ChecksumAlgorithm::Md5, ChecksumType::FullObject),
+    ] {
+        let create = MpuCreate {
+            key: "k".into(),
+            initiated_ms: 0,
+            metadata: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            checksum: Some(UploadChecksum {
+                algorithm,
+                checksum_type,
+            }),
+        };
+        assert_eq!(
+            encode_err(RecordBody::MpuCreate(create)).field,
+            "mpu_create.checksum"
+        );
+        let body = Body::default()
+            .str16("k")
+            .u64(0)
+            .u16(0)
+            .u8(0)
+            .u8(1)
+            .u8(algorithm.code())
+            .u8(u8::from(checksum_type == ChecksumType::Composite));
+        let bytes = Frame::new(MPU_CREATE).keyed("k").build(&body.0, &[]);
+        assert_eq!(malformed(&bytes).field, "mpu_create.checksum");
+    }
+    for tail in [[9, 0], [ChecksumAlgorithm::Crc32.code(), 2]] {
+        let body = Body::default()
+            .str16("k")
+            .u64(0)
+            .u16(0)
+            .u8(0)
+            .u8(1)
+            .raw(&tail);
+        let bytes = Frame::new(MPU_CREATE).keyed("k").build(&body.0, &[]);
+        assert!(matches!(malformed(&bytes).problem, Problem::InvalidTag(_)));
+    }
+    assert_eq!(
+        UploadChecksum::of(ChecksumAlgorithm::Crc64Nvme)
+            .unwrap()
+            .checksum_type,
+        ChecksumType::FullObject
+    );
+    assert_eq!(UploadChecksum::of(ChecksumAlgorithm::Md5), None);
+
+    // A part count past what the header holds is caught before allocating.
+    let body = Body::default()
+        .str16("k")
+        .u64(5)
+        .u64(1)
+        .u64(0)
+        .u64(0)
+        .str16("e")
+        .u8(0)
+        .u16(10_000);
+    let bytes = Frame::new(MPU_COMPLETE).keyed("k").build(&body.0, &[]);
+    assert_eq!(malformed(&bytes).problem, Problem::Truncated);
 }

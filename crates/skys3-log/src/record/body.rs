@@ -2,7 +2,8 @@
 //!
 //! Each body is encoded as its kind-specific header, field by field in
 //! declaration order, using the primitives of the `wire` module. Only
-//! `PUT` (inline data) and `EXTENT` records have a payload.
+//! `PUT` and `MPU_PART` (inline data) and `EXTENT` records have a payload.
+//! The multipart bodies are in the `multipart` module.
 
 use std::collections::BTreeMap;
 
@@ -14,6 +15,7 @@ use skys3_types::{
 };
 
 use super::error::{FieldError, Problem};
+use super::multipart::{MpuAbort, MpuComplete, MpuCreate, MpuPart};
 use super::wire::{Reader, Writer};
 use super::{MAX_PAYLOAD_LEN, RecordKind, ShardRef};
 
@@ -214,6 +216,14 @@ pub enum RecordBody {
     Delete(Delete),
     /// `EXTENT`.
     Extent(Extent),
+    /// `MPU_CREATE`.
+    MpuCreate(MpuCreate),
+    /// `MPU_PART`.
+    MpuPart(MpuPart),
+    /// `MPU_COMPLETE`.
+    MpuComplete(MpuComplete),
+    /// `MPU_ABORT`.
+    MpuAbort(MpuAbort),
     /// `TAGS`.
     Tags(Tags),
     /// `FLUSHED`.
@@ -239,6 +249,10 @@ impl RecordBody {
             Self::Put(_) => RecordKind::Put,
             Self::Delete(_) => RecordKind::Delete,
             Self::Extent(_) => RecordKind::Extent,
+            Self::MpuCreate(_) => RecordKind::MpuCreate,
+            Self::MpuPart(_) => RecordKind::MpuPart,
+            Self::MpuComplete(_) => RecordKind::MpuComplete,
+            Self::MpuAbort(_) => RecordKind::MpuAbort,
             Self::Tags(_) => RecordKind::Tags,
             Self::Flushed(_) => RecordKind::Flushed,
             Self::Import(_) => RecordKind::Import,
@@ -255,6 +269,10 @@ impl RecordBody {
             Self::Put(Put { key, .. })
             | Self::Delete(Delete { key })
             | Self::Extent(Extent { key, .. })
+            | Self::MpuCreate(MpuCreate { key, .. })
+            | Self::MpuPart(MpuPart { key, .. })
+            | Self::MpuComplete(MpuComplete { key, .. })
+            | Self::MpuAbort(MpuAbort { key, .. })
             | Self::Tags(Tags { key, .. })
             | Self::Flushed(Flushed { key, .. })
             | Self::Import(Import { key, .. })
@@ -263,15 +281,13 @@ impl RecordBody {
         }
     }
 
-    /// The record's payload: a `PUT`'s inline bytes or an `EXTENT`'s data.
+    /// The record's payload: the inline bytes of a `PUT` or an `MPU_PART`,
+    /// or an `EXTENT`'s data.
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         match self {
-            Self::Put(Put {
-                data: PutData::Inline(data),
-                ..
-            })
-            | Self::Extent(Extent { data, .. }) => data,
+            Self::Put(Put { data, .. }) | Self::MpuPart(MpuPart { data, .. }) => data.payload(),
+            Self::Extent(Extent { data, .. }) => data,
             _ => &[],
         }
     }
@@ -288,6 +304,10 @@ impl RecordBody {
             Self::Put(put) => put.encode(w, position),
             Self::Delete(delete) => w.str16("delete.key", &delete.key, 1, MAX_KEY_LEN),
             Self::Extent(extent) => extent.encode(w),
+            Self::MpuCreate(create) => create.encode(w),
+            Self::MpuPart(part) => part.encode(w, position),
+            Self::MpuComplete(complete) => complete.encode(w, position),
+            Self::MpuAbort(abort) => abort.encode(w, position),
             Self::Tags(tags) => {
                 w.str16("tags.key", &tags.key, 1, MAX_KEY_LEN)?;
                 write_tags(w, "tags.tags", &tags.tags)
@@ -317,6 +337,10 @@ impl RecordBody {
                 key: r.str16("delete.key", 1, MAX_KEY_LEN)?,
             }),
             RecordKind::Extent => Self::Extent(Extent::decode(&mut r, payload)?),
+            RecordKind::MpuCreate => Self::MpuCreate(MpuCreate::decode(&mut r)?),
+            RecordKind::MpuPart => Self::MpuPart(MpuPart::decode(&mut r, payload, position)?),
+            RecordKind::MpuComplete => Self::MpuComplete(MpuComplete::decode(&mut r, position)?),
+            RecordKind::MpuAbort => Self::MpuAbort(MpuAbort::decode(&mut r, position)?),
             RecordKind::Tags => Self::Tags(Tags {
                 key: r.str16("tags.key", 1, MAX_KEY_LEN)?,
                 tags: read_tags(&mut r, "tags.tags")?,
@@ -346,12 +370,94 @@ impl RecordBody {
     }
 }
 
-impl Put {
-    const DATA_INLINE: u8 = 0;
-    const DATA_EXTENTS: u8 = 1;
+/// The field names a `PUT`'s data reports errors under.
+const PUT_DATA_FIELDS: DataFields = DataFields {
+    data: "put.data",
+    extents: "put.extents",
+};
+
+/// The field names of a body's [`PutData`], for error reports.
+#[derive(Clone, Copy)]
+pub(super) struct DataFields {
+    pub(super) data: &'static str,
+    pub(super) extents: &'static str,
+}
+
+impl PutData {
+    const INLINE: u8 = 0;
+    const EXTENTS: u8 = 1;
     /// An encoded [`ExtentRef`]: epoch, seq, and length.
     const EXTENT_REF_LEN: usize = 8 + 8 + 4;
 
+    /// The inline bytes; extents are in records of their own.
+    pub(super) fn payload(&self) -> &[u8] {
+        match self {
+            Self::Inline(data) => data,
+            Self::Extents(_) => &[],
+        }
+    }
+
+    /// Writes the data's tag and extent references, checking that they hold
+    /// `size` bytes and precede `position`.
+    pub(super) fn encode(
+        &self,
+        w: &mut Writer<'_>,
+        size: u64,
+        position: EpochSeq,
+        fields: DataFields,
+    ) -> Result<(), FieldError> {
+        match self {
+            Self::Inline(data) => {
+                w.u8(Self::INLINE);
+                check_size(fields.data, size, data.len() as u64)
+            }
+            Self::Extents(extents) => {
+                w.u8(Self::EXTENTS);
+                w.len32(fields.extents, extents.len(), 1, MAX_EXTENTS)?;
+                for extent in extents {
+                    check_extent(fields.extents, extent, position)?;
+                    w.position(extent.position);
+                    w.u32(extent.len);
+                }
+                check_size(fields.extents, size, extents_len(extents))
+            }
+        }
+    }
+
+    /// Reads data written by [`PutData::encode`]; inline data is `payload`.
+    pub(super) fn decode(
+        r: &mut Reader<'_>,
+        size: u64,
+        payload: &[u8],
+        position: EpochSeq,
+        fields: DataFields,
+    ) -> Result<Self, FieldError> {
+        match r.u8(fields.data)? {
+            Self::INLINE => {
+                check_size(fields.data, size, payload.len() as u64)?;
+                Ok(Self::Inline(Bytes::copy_from_slice(payload)))
+            }
+            Self::EXTENTS => {
+                let count = r.len32(fields.extents, 1, MAX_EXTENTS)?;
+                r.check_count(fields.extents, count, Self::EXTENT_REF_LEN)?;
+                let mut extents = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let extent = ExtentRef {
+                        position: r.position(fields.extents)?,
+                        len: r.u32(fields.extents)?,
+                    };
+                    check_extent(fields.extents, &extent, position)?;
+                    extents.push(extent);
+                }
+                check_size(fields.extents, size, extents_len(&extents))?;
+                Ok(Self::Extents(extents))
+            }
+            tag => Err(FieldError::new(fields.data, Problem::InvalidTag(tag))),
+        }
+    }
+}
+
+impl Put {
     fn encode(&self, w: &mut Writer<'_>, position: EpochSeq) -> Result<(), FieldError> {
         w.str16("put.key", &self.key, 1, MAX_KEY_LEN)?;
         w.u64(self.size);
@@ -382,23 +488,7 @@ impl Put {
                 source.remote_etag.as_ref(),
             )?;
         }
-        match &self.data {
-            PutData::Inline(data) => {
-                w.u8(Self::DATA_INLINE);
-                check_size("put.data", self.size, data.len() as u64)?;
-            }
-            PutData::Extents(extents) => {
-                w.u8(Self::DATA_EXTENTS);
-                w.len32("put.extents", extents.len(), 1, MAX_EXTENTS)?;
-                for extent in extents {
-                    check_extent(extent, position)?;
-                    w.position(extent.position);
-                    w.u32(extent.len);
-                }
-                check_size("put.extents", self.size, extents_len(extents))?;
-            }
-        }
-        Ok(())
+        self.data.encode(w, self.size, position, PUT_DATA_FIELDS)
     }
 
     fn decode(r: &mut Reader<'_>, payload: &[u8], position: EpochSeq) -> Result<Self, FieldError> {
@@ -432,28 +522,7 @@ impl Put {
         } else {
             None
         };
-        let data = match r.u8("put.data")? {
-            Self::DATA_INLINE => {
-                check_size("put.data", size, payload.len() as u64)?;
-                PutData::Inline(Bytes::copy_from_slice(payload))
-            }
-            Self::DATA_EXTENTS => {
-                let count = r.len32("put.extents", 1, MAX_EXTENTS)?;
-                r.check_count("put.extents", count, Self::EXTENT_REF_LEN)?;
-                let mut extents = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let extent = ExtentRef {
-                        position: r.position("put.extents")?,
-                        len: r.u32("put.extents")?,
-                    };
-                    check_extent(&extent, position)?;
-                    extents.push(extent);
-                }
-                check_size("put.extents", size, extents_len(&extents))?;
-                PutData::Extents(extents)
-            }
-            tag => return Err(FieldError::new("put.data", Problem::InvalidTag(tag))),
-        };
+        let data = PutData::decode(r, size, payload, position, PUT_DATA_FIELDS)?;
         Ok(Self {
             key,
             size,
@@ -489,20 +558,24 @@ fn check_size(field: &'static str, size: u64, data_len: u64) -> Result<(), Field
     }
 }
 
-fn check_extent(extent: &ExtentRef, position: EpochSeq) -> Result<(), FieldError> {
+fn check_extent(
+    field: &'static str,
+    extent: &ExtentRef,
+    position: EpochSeq,
+) -> Result<(), FieldError> {
     if extent.len == 0 || extent.len > MAX_PAYLOAD_LEN {
         return Err(FieldError::new(
-            "put.extents",
+            field,
             Problem::Invalid(format!(
                 "an extent is {} bytes; it must be from 1 to {MAX_PAYLOAD_LEN}",
                 extent.len
             )),
         ));
     }
-    check_precedes("put.extents", extent.position, position)
+    check_precedes(field, extent.position, position)
 }
 
-fn check_precedes(
+pub(super) fn check_precedes(
     field: &'static str,
     earlier: EpochSeq,
     position: EpochSeq,
@@ -710,15 +783,19 @@ fn decode_config(
     Ok(config)
 }
 
-fn invalid(field: &'static str, error: impl std::fmt::Display) -> FieldError {
+pub(super) fn invalid(field: &'static str, error: impl std::fmt::Display) -> FieldError {
     FieldError::new(field, Problem::Invalid(error.to_string()))
 }
 
-fn write_etag(w: &mut Writer<'_>, field: &'static str, etag: &ETag) -> Result<(), FieldError> {
+pub(super) fn write_etag(
+    w: &mut Writer<'_>,
+    field: &'static str,
+    etag: &ETag,
+) -> Result<(), FieldError> {
     w.str16(field, etag.as_str(), 1, ETag::MAX_LEN)
 }
 
-fn read_etag(r: &mut Reader<'_>, field: &'static str) -> Result<ETag, FieldError> {
+pub(super) fn read_etag(r: &mut Reader<'_>, field: &'static str) -> Result<ETag, FieldError> {
     ETag::new(r.str16(field, 1, ETag::MAX_LEN)?).map_err(|e| invalid(field, e))
 }
 
@@ -793,7 +870,7 @@ fn add_len(
     Ok(())
 }
 
-fn write_metadata(
+pub(super) fn write_metadata(
     w: &mut Writer<'_>,
     field: &'static str,
     metadata: &Metadata,
@@ -814,7 +891,10 @@ fn write_metadata(
     Ok(())
 }
 
-fn read_metadata(r: &mut Reader<'_>, field: &'static str) -> Result<Metadata, FieldError> {
+pub(super) fn read_metadata(
+    r: &mut Reader<'_>,
+    field: &'static str,
+) -> Result<Metadata, FieldError> {
     let count = r.len16(field, 0, MAX_METADATA_LEN)?;
     let mut metadata = Metadata::new();
     let mut total = 0;
@@ -833,7 +913,11 @@ fn read_metadata(r: &mut Reader<'_>, field: &'static str) -> Result<Metadata, Fi
     Ok(metadata)
 }
 
-fn write_tags(w: &mut Writer<'_>, field: &'static str, tags: &TagSet) -> Result<(), FieldError> {
+pub(super) fn write_tags(
+    w: &mut Writer<'_>,
+    field: &'static str,
+    tags: &TagSet,
+) -> Result<(), FieldError> {
     w.len8(field, tags.len(), 0, MAX_TAGS)?;
     for (key, value) in tags {
         w.str16(field, key, 1, MAX_TAG_KEY_LEN)?;
@@ -842,7 +926,7 @@ fn write_tags(w: &mut Writer<'_>, field: &'static str, tags: &TagSet) -> Result<
     Ok(())
 }
 
-fn read_tags(r: &mut Reader<'_>, field: &'static str) -> Result<TagSet, FieldError> {
+pub(super) fn read_tags(r: &mut Reader<'_>, field: &'static str) -> Result<TagSet, FieldError> {
     let count = r.len8(field, 0, MAX_TAGS)?;
     let mut tags = TagSet::new();
     for _ in 0..count {
@@ -853,7 +937,7 @@ fn read_tags(r: &mut Reader<'_>, field: &'static str) -> Result<TagSet, FieldErr
     Ok(tags)
 }
 
-fn write_checksums(
+pub(super) fn write_checksums(
     w: &mut Writer<'_>,
     field: &'static str,
     checksums: &Checksums,
@@ -871,7 +955,10 @@ fn write_checksums(
 /// The first format version with a part count after each checksum digest.
 const PART_COUNTS_SINCE: u16 = 2;
 
-fn read_checksums(r: &mut Reader<'_>, field: &'static str) -> Result<Checksums, FieldError> {
+pub(super) fn read_checksums(
+    r: &mut Reader<'_>,
+    field: &'static str,
+) -> Result<Checksums, FieldError> {
     let part_counts = r.version() >= PART_COUNTS_SINCE;
     let count = r.len8(field, 0, ChecksumAlgorithm::ALL.len())?;
     let mut checksums = Checksums::new();
