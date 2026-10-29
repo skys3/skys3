@@ -182,7 +182,16 @@ log "bucket $bucket ($bucket_id): primaries $(shards r1 | jq -c '[.[] | {(.shard
 # The writer PUTs keys k00000, k00001, ... through the live nodes in turn,
 # and records `<key> <status> <start> <end> <node>` for each, the times in
 # seconds since the epoch. It stops when the file `stop` appears.
-echo "${nodes[*]}" >"$work/live"
+#
+# use_nodes <nodes...>: makes the nodes the ones the writer uses. The list
+# is written aside and renamed into place: the writer reads the file at any
+# time, and found empty, as `>` leaves it for a moment, it would stop
+# (`read` fails at once, and the writer runs under `set -e`).
+use_nodes() {
+    echo "$*" >"$work/live.next"
+    mv -f "$work/live.next" "$work/live"
+}
+use_nodes "${nodes[@]}"
 writer() {
     local n=0 name status start node
     while [ ! -e "$work/stop" ]; do
@@ -207,7 +216,7 @@ survivors=()
 for node in "${nodes[@]}"; do
     [ "$node" = "$victim" ] || survivors+=("$node")
 done
-echo "${survivors[*]}" >"$work/live"
+use_nodes "${survivors[@]}"
 killed_at=$EPOCHREALTIME
 kill -KILL "$(cat "$E2E_DIR/$victim/pid")"
 wait "$(cat "$E2E_DIR/$victim/pid")" 2>/dev/null || true
