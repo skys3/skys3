@@ -4558,6 +4558,13 @@ of this file. A task with nothing unexpected keeps "None."
   (`member_suspect_after` is 700 ms); every shard node 3 belonged to
   ended without it. The scenario declares `4 * COST`, so CI's fixed set
   (`SKYS3_SIM_SEEDS=256`) runs 2 seeds, about 55 s.
+- **The node test read the copy's generation too early.** A Coverage run
+  failed `a_lost_control_store_is_rebuilt_from_the_nodes_copy` with the
+  exported copy at generation 3 and health at 2. Health reports the
+  generation of the node's copy, which follows a bucket creation after the
+  client is answered, so it can still lag the second creation when read.
+  The test now waits until the copy reaches generation 3: the bootstrap's
+  1, plus one per bucket.
 - **Left open.**
   - **Rebuilding an etcd or S3 store from the binary**, with the binary's
     multi-node wiring (M2-08b).
