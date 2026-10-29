@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{Answer, Setup, setup};
 use http::Method;
 use skys3_control::faults::Fault;
@@ -146,11 +148,11 @@ async fn a_configuration_is_stored_returned_and_removed() {
     get(&setup, "logs")
         .await
         .assert(404, Some("NoSuchLifecycleConfiguration"));
-    // Deleting none is no error, and writes nothing.
-    let before = setup.generation().await;
+    // Deleting none is no error, and leaves the register as it is.
+    let before = setup.register("logs").await;
     let again = setup.call(Method::DELETE, "/logs?lifecycle", &[], "").await;
     again.assert(204, None);
-    assert_eq!(setup.generation().await, before);
+    assert_eq!(setup.register("logs").await, before);
 }
 
 #[tokio::test]
@@ -440,4 +442,54 @@ async fn a_change_that_loses_a_race_is_made_again() {
         .assert(503, Some("ServiceUnavailable"));
     let stored = stored_rules(&setup, "logs").await.unwrap();
     assert_eq!(stored[0].expiration, Some(Expiration::Days(2)));
+}
+
+#[tokio::test]
+async fn a_change_whose_answers_were_lost_is_announced() {
+    let setup = setup("").await;
+    setup.create_local("logs").await;
+    let rule = "<Rule><ID>r</ID><Status>Enabled</Status><Filter></Filter>\
+                <Expiration><Days>3</Days></Expiration></Rule>";
+    let before = setup.generation().await;
+    // The read passes; the swap lands, and every answer is lost.
+    setup.store.script([
+        Fault::Pass,
+        Fault::LoseResponse,
+        Fault::LoseResponse,
+        Fault::LoseResponse,
+    ]);
+    put(&setup, "logs", rule)
+        .await
+        .assert(503, Some("ServiceUnavailable"));
+    assert!(stored_rules(&setup, "logs").await.is_some());
+    // It is announced in the background, though the client never retries.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while setup.generation().await <= before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the change was never announced");
+
+    // A retry that finds the change made announces it again, in case it
+    // was lost before anything announced it.
+    let before = setup.generation().await;
+    put(&setup, "logs", rule).await.assert(200, None);
+    assert!(
+        setup.generation().await > before,
+        "the retry announced nothing"
+    );
+    setup
+        .call(Method::DELETE, "/logs?lifecycle", &[], "")
+        .await
+        .assert(204, None);
+    let before = setup.generation().await;
+    setup
+        .call(Method::DELETE, "/logs?lifecycle", &[], "")
+        .await
+        .assert(204, None);
+    assert!(
+        setup.generation().await > before,
+        "the retry announced nothing"
+    );
 }
