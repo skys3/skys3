@@ -340,6 +340,28 @@ fn an_incomplete_newer_attempt_falls_back_to_a_complete_older_one() {
 }
 
 #[test]
+fn a_newer_stripe_that_breaks_the_sequence_falls_back_to_an_older_one() {
+    let mut all = complete(attempt(4, 1));
+    // An abandoned encoding with larger stripes, but as many of them, wrote
+    // four fragments of its first: decodable, but it ends where no stripe 1
+    // found starts.
+    for index in 0..4 {
+        let mut abandoned = found(0, index, attempt(6, 2), 7);
+        abandoned.header.stripe.data_len = 11_000;
+        all.push(abandoned);
+    }
+    let layout = rebuild_one(all).unwrap();
+    assert_eq!(
+        layout
+            .stripes
+            .iter()
+            .map(|s| (s.offset, s.data_len, s.located()))
+            .collect::<Vec<_>>(),
+        [(0, 10_000, 6), (10_000, 10_000, 6), (20_000, 3_333, 6)]
+    );
+}
+
+#[test]
 fn headers_that_disagree_or_leave_gaps_are_refused() {
     let mut all = complete(attempt(4, 1));
     let odd = all.len() - 1;
