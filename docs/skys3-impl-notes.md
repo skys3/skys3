@@ -6307,6 +6307,15 @@ of this file. A task with nothing unexpected keeps "None."
   run. The window's start, on the nodes' wall clock, maps to the history's
   moments through the moment the driver notes at each step
   (`History::now`, new), two steps early.
+- **Fixed: an inherited identity is matched exactly.** The report held a
+  version if the remote's write identity was at or after the identity
+  the version names. A completed upload or streamed PUT names its
+  start's, which can be older than another write of the key: with that
+  write flushed and the completion not, the remote's identity passed,
+  and a lost object went unreported. The remote must now hold exactly
+  the version's identity, or one later than the version itself.
+  Tested in `tests/snapshots.rs`
+  (`an_inherited_identity_older_than_the_remote_write_is_lost`).
 - **Simulation cost.** `tests/simulation/snapshots.rs`: two scenarios
   (with and without backup targets) under crashes, partitions, message
   loss, control-store faults, and remote faults, `Runner::with_cost(4,
@@ -6416,8 +6425,11 @@ of this file. A task with nothing unexpected keeps "None."
   and a move can each leave headers for the same object version, even with
   a different stripe count. `rebuild_layouts` keeps, per fragment index,
   the latest attempt's copy, and per stripe the latest attempt's layout
-  that can be decoded, falling back to an older stripe count when the
-  newest is incomplete. Design §8.4 records the rules.
+  that can be decoded and that later stripes continue to the object's
+  end, so an attempt that moved the stripe boundaries without changing
+  their count cannot hide a complete older one. It falls back to an older
+  stripe count when the newest is incomplete. Design §8.4 records the
+  rules.
 - **The tear window depends on the largest fragment.** A crash can leave
   one group commit plus one record unsynced, and a record can be a 256 MiB
   fragment, so recovery's damage check only looks past that. The store's
@@ -6572,7 +6584,9 @@ of this file. A task with nothing unexpected keeps "None."
   stripe with `FragmentPlanner`, writes the fragments in parallel through
   the `FragmentWriter` trait, re-plans a stripe without nodes whose writes
   failed (three times), and commits `EC_PUBLISH` on a task of its own so
-  it is appended even if the encoder is dropped. An `EncodeObserver` sees
+  it is appended, and its attempt settled, even if the encoder is
+  dropped: settling it in the caller left a cancelled scan's attempt
+  publishing for good, holding the reclamation fence (found in review). An `EncodeObserver` sees
   each step; the simulation crashes nodes at them.
 - **Stripe size bound.** Configuration validation now rejects an
   `ec_stripe_data_bytes` whose fragments in the narrowest geometry
@@ -6781,12 +6795,16 @@ of this file. A task with nothing unexpected keeps "None."
   `FragmentSource` (one async `read` of a fragment range) and a
   `CodedRead` (the entry's coded layout, the object's size, the range)
   and returns a channel of body pieces, the first read before it
-  returns. Pieces are at most 1 MiB within one data fragment. A failed
+  returns. Pieces are at most 1 MiB within one data fragment, cut one
+  at a time as the read goes: listing a multi-TiB range up front held
+  32 bytes per MiB for the whole read. A failed
   fragment (not held, damaged, CRC32C mismatch, short) is skipped for
   the rest of its stripe and an unreachable node for the rest of the
   read; a degraded piece takes data fragments first, then parity, in
   index order. `FragmentReadClient` is the network source, with a local
-  shortcut to the node's own `FragmentServer`.
+  shortcut to the node's own `FragmentServer`, bounded by the same 10 s
+  as a remote answer so a hung local disk reads as an unreachable node
+  and the stripe is decoded around it.
 - **Reads name what they expect.** A fragment ID alone is not enough: a
   fragment reclaimed since the plan (M5-05) or an ID reused on a
   replaced disk would serve another fragment's bytes, which pass their
@@ -6935,6 +6953,17 @@ of this file. A task with nothing unexpected keeps "None."
   Validation (`skys3_types::lifecycle`) runs both in the gateway and in
   `BucketDocument::validate`, which also refuses a configuration on a
   bucket that is not `local`.
+- **Fixed: a change whose answers were lost went unannounced.** A
+  retried PUT or DELETE that found the configuration already in the
+  register returned without bumping the generation, so other nodes kept
+  the old rules, and could go on expiring objects, until an unrelated
+  announcement or the periodic refresh (up to 12 h by default). The
+  equality branch now announces again, as a retried CreateBucket does,
+  so a change that changes nothing, such as deleting no configuration,
+  costs a generation bump; and a swap that may have landed is announced
+  in the background
+  (`settle_later`). Tested in `tests/lifecycle.rs`
+  (`a_change_whose_answers_were_lost_is_announced`).
 - **Only `local` buckets.** A `write_back` (or `write_through`) bucket
   answers PUT with `501 NotImplemented`: its durable home is the remote,
   and expiring the local copy alone would be undone by an import or
