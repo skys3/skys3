@@ -22,7 +22,7 @@ use skys3_io::{SimDisk, SimMount};
 use skys3_net::{Frame, Header, MessageKind, TokioNetwork};
 use skys3_types::{ETag, NodeAddress, NodeId};
 use support::pki::Pki;
-use support::{header, sample};
+use support::{KillMount, header, sample};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -164,6 +164,38 @@ async fn a_node_serves_the_fragment_a_read_names() {
     assert!(
         matches!(local, Err(FragmentReadError::NotHeld { .. })),
         "{local:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_local_read_gives_up_as_unreachable() {
+    let disk = SimDisk::new(1);
+    let mount = KillMount::new(&disk, None);
+    let config = FragmentStoreConfig {
+        disk: 0,
+        segment_bytes: 1 << 20,
+        group_commit_max_bytes: 1 << 20,
+        max_fragment_bytes: 1 << 20,
+    };
+    let (store, _) = FragmentStore::open(mount.clone(), config).await.unwrap();
+    let header = header("k", 256, 3);
+    let id = store
+        .write(&header, Bytes::from(sample(256, 9)))
+        .await
+        .unwrap();
+    let pki = Pki::new();
+    let reader = FragmentReadClient::new(node(1), pki.transport(&node(1)), BTreeMap::new())
+        .with_local(FragmentServer::new(vec![store]));
+    let read = || reader.read(request(node(1), id, &header, 0..8));
+    assert!(read().await.is_ok());
+
+    // A hung disk: the read fails like a node that does not answer, so a
+    // reader decodes around the fragment instead of waiting on it.
+    mount.stall_reads();
+    let error = read().await.unwrap_err();
+    assert!(
+        matches!(&error, FragmentReadError::Unreachable { node: n, .. } if *n == node(1)),
+        "{error}"
     );
 }
 
