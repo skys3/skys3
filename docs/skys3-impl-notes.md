@@ -6182,6 +6182,19 @@ of this file. A task with nothing unexpected keeps "None."
     **seed 0**.
 - **No format changes.** No record, index, or wire format changed; the
   probe result and the admin status gained fields.
+- **The copy audit was stricter than the system (found in the stack's
+  merge-up after the Codex review fixes).** The tokio 1.54 update in #79
+  changed every seed's schedule, and seed 1 of
+  `the_audit_catches_copies_without_their_identity` then ended with one
+  member's entry of a copy clean and two dirty at the same version. The
+  audit required the members to agree on state as well as version, so it
+  stopped there and never reached the seeded bug. That state is correct:
+  a version's `FLUSHED` record rides a later group commit (§7.1), which
+  the final power loss may cut on some members only. The audit now
+  compares versions only and checks each member's entry against the
+  remote store, which already allows a dirty entry whose version the
+  remote holds. M4-13 had made the same change in af73576; this brings
+  it to M4-07's own PR.
 - **Left open.** A copy of a source in another remote bucket is
   uploaded; S3 could copy across buckets the credentials can read, but
   that would need a probe per pair. A server-side copy's entry records
@@ -7027,7 +7040,6 @@ of this file. A task with nothing unexpected keeps "None."
 - **Fuzzing.** A new target, `ec_transfer`, decodes the fragment header
   that starts a write and both message bodies; `log_record` and
   `index_codec` already reach the new record body and values.
-
 ### M5-05 Orphan fragment reclamation
 
 - **The plan's fence had two holes.** Confirming only attempts not in
