@@ -9954,6 +9954,15 @@ of this file. A task with nothing unexpected keeps "None."
   with the body on standard output, gives up after the first attempt with
   exit 23 (curl 8.5), as it cannot truncate what it wrote; the scenarios
   write answers to files.
+- **A loop that read the node list while it was rewritten stopped.** The
+  scenario rewrote `$work/live` with `>`, which truncates the file before
+  writing it; a loop that read it in between got nothing, its `read`
+  failed, and under `set -e` the loop ended without a word. Nothing looked
+  at the loops again until the check that both used the new list, which
+  then timed out ("the clients no longer use cc1") right after the drain:
+  an intermittent CI failure, seen locally once in nine loaded runs as a
+  loop reading the empty file just after the drain. The list is now
+  written aside and renamed into place.
 - **The e2e scenario's cost.** `coordinator` runs 76 s on the development
   machine, beside `replication` (95 s) and `cluster` (81 s) in the etcd
   leg, which the single-node scenarios bound: the leg stays within the
