@@ -15,6 +15,7 @@ use skys3_types::EpochSeq;
 use tokio::sync::mpsc;
 
 use crate::buckets::shard_error;
+use crate::fill::FillBody;
 use crate::shard::{ShardError, ShardRef, Shards};
 
 /// The bytes `range` of an object whose bytes are `payload`.
@@ -55,12 +56,22 @@ pub(crate) async fn read<H: Shards>(
 }
 
 /// The answer to a read of an object whose bytes this cluster does not
-/// hold, until read-through fill (plan M1-20) fetches them.
+/// hold and cannot fill: an evicted version outside a `write_back` bucket
+/// with a [`Fills`](crate::fill::Fills), or the source of a copy.
 pub(super) fn not_cached() -> s3s::S3Error {
     s3_error!(
         ServiceUnavailable,
         "The object's bytes are not cached on this cluster"
     )
+}
+
+/// The response body of `remaining` bytes that a read-through fill streams
+/// (§9.2).
+pub(super) fn filled(body: FillBody, remaining: u64) -> StreamingBlob {
+    StreamingBlob::from(s3s::Body::http_body(ExtentBody {
+        receiver: body,
+        remaining,
+    }))
 }
 
 /// Streams the bytes `range` of the body made of `extents`.
@@ -195,20 +206,21 @@ fn clip(
     Ok(data.slice(from..to))
 }
 
-/// A response body fed by [`send_extents`], of a known length.
-struct ExtentBody {
-    receiver: mpsc::Receiver<Result<Bytes, ShardError>>,
+/// A response body of a known length fed through a channel: by
+/// [`send_extents`], or by a read-through fill.
+struct ExtentBody<E> {
+    receiver: mpsc::Receiver<Result<Bytes, E>>,
     remaining: u64,
 }
 
-impl http_body::Body for ExtentBody {
+impl<E> http_body::Body for ExtentBody<E> {
     type Data = Bytes;
-    type Error = ShardError;
+    type Error = E;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, ShardError>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, E>>> {
         if self.remaining == 0 {
             return Poll::Ready(None);
         }

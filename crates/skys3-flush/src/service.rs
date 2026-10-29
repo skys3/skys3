@@ -17,6 +17,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::budget::DirtyBudget;
+use crate::fill::Filler;
 use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
@@ -88,7 +89,9 @@ impl BucketStatus {
 /// shards open on the node. A flusher tracks its shard's dirty keys at
 /// once, so their bytes count against the [`DirtyBudget`] even while the
 /// target is unreachable, and starts flushing when the probe is done.
-/// Flushers of buckets and shards that are gone are stopped.
+/// Flushers of buckets and shards that are gone are stopped. Each bucket's
+/// [`Filler`] reads evicted versions from the same target (§9.2); it needs
+/// no probe.
 ///
 /// Each bucket also runs its namespace import (§9.1) from the moment it is
 /// followed: on attach, or resumed from its checkpoint after a restart.
@@ -138,6 +141,7 @@ struct BucketFlusher<S> {
     /// The target, once the probe is done.
     target: Ready<S>,
     shards: BTreeMap<ShardId, ShardFlusher>,
+    filler: Filler<S>,
 }
 
 impl<S> Drop for BucketFlusher<S> {
@@ -276,6 +280,13 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             import: Arc::clone(&import),
         };
         let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
+        let filler = Filler::new(
+            Arc::clone(&parts.store),
+            parts.prefix.clone(),
+            parts.settings.clone(),
+            parts.counters.clone(),
+            Arc::clone(&parts.wall),
+        );
         let (ready, target) = watch::channel(None);
         let probe_task = tokio::spawn(run_probe(parts, Arc::clone(&probe), ready));
         let streams =
@@ -311,6 +322,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             import_task: Some(import_task),
             target,
             shards: BTreeMap::new(),
+            filler,
         }
     }
 
@@ -355,6 +367,15 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .map_or(u64::MAX, |usage| usage.share),
             import: flusher.import.status(),
         })
+    }
+
+    /// The read-through fills of `bucket`'s target, if the bucket is a
+    /// `write_back` bucket this node follows.
+    #[must_use]
+    pub fn filler(&self, bucket: &BucketId) -> Option<Filler<S>> {
+        self.lock()
+            .get(bucket)
+            .map(|flusher| flusher.filler.clone())
     }
 
     /// The remote target of `bucket` and its import's progress, for client

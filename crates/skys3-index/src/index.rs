@@ -328,6 +328,32 @@ impl Index {
         Ok(applied)
     }
 
+    /// Makes a node-local change to entries that no record makes, in one
+    /// non-durable commit, and returns what `update` returns. The shards'
+    /// applied positions do not move.
+    ///
+    /// Only the cache transitions of §4.2 are made this way: a read-through
+    /// fill makes an evicted entry clean, and eviction makes a clean entry
+    /// evicted (§9.2, §9.3). They change which payload this node holds,
+    /// never the entry's version, so replay after a crash, which reverts
+    /// the index to its last checkpoint, may lose such a change but never
+    /// contradicts one: the entry is clean or evicted either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns `update`'s error, or an [`IndexError`] if redb fails. On an
+    /// error nothing changes.
+    pub fn update_local<R>(
+        &self,
+        update: impl FnOnce(&mut IndexWriter<'_>) -> Result<R, IndexError>,
+    ) -> Result<R, IndexError> {
+        let mut txn = self.db.begin_write()?;
+        txn.set_durability(Durability::None)?;
+        let result = update(&mut IndexWriter::open(&txn)?)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
     /// Removes everything the index holds for `shard`, in one non-durable
     /// commit: its entries, its record locations, its applied position,
     /// its kept configuration, its step-down (see

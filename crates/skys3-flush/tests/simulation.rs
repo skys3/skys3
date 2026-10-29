@@ -27,8 +27,10 @@
 //!   `CreateMultipartUpload` answer never reached the flusher: every other
 //!   upload was completed or aborted.
 //!
-//! The namespace import racing client writes is in `import_simulation`.
+//! The read-through fill and `ADOPT` scenario is in `fill_simulation`, and
+//! the namespace import racing client writes in `import_simulation`.
 
+mod fill_simulation;
 mod import_simulation;
 mod support;
 
@@ -64,6 +66,11 @@ type Outcome = Result<(), Box<dyn std::error::Error>>;
 #[test]
 fn flushes_reach_the_remote_through_faults() {
     Runner::new().run(scenario);
+}
+
+#[test]
+fn fills_adopt_out_of_band_writes_but_never_over_a_local_one() {
+    Runner::new().run(fill_simulation::scenario);
 }
 
 #[test]

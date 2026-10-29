@@ -19,6 +19,9 @@
 //!   is deleted (§4.1).
 //! - [`ShardSet`]: the shards open on a node, as the gateway opens, seals,
 //!   and drops them.
+//! - [`cache`]: the node-local transitions between clean and evicted, which
+//!   no record makes: a read-through fill ([`Shard::fill`]) and eviction
+//!   ([`Shard::evict`]).
 //!
 //! Replication (M2) runs the same state machine on every member; only the
 //! commit rule changes, and a primary serves reads only while every member
@@ -52,6 +55,7 @@
 //! ```
 
 mod ack;
+pub mod cache;
 mod error;
 mod leader;
 mod lease;
@@ -64,6 +68,7 @@ mod set;
 mod shard;
 
 pub use ack::{AckMode, AckTimeout};
+pub use cache::CacheRefusal;
 pub use error::ShardError;
 pub use leader::{Leader, Outgoing, Pending};
 pub use lease::Grace;

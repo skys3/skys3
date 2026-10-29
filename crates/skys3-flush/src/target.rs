@@ -72,6 +72,9 @@ pub struct FlushSettings {
     pub min_backoff: Duration,
     /// The longest delay between retries of a key; delays double up to it.
     pub max_backoff: Duration,
+    /// `extent_bytes`: the size of the `EXTENT` records a read-through
+    /// fill commits (§9.2), as a PUT's body is committed.
+    pub extent_bytes: u64,
 }
 
 impl FlushSettings {
@@ -108,6 +111,7 @@ impl Default for FlushSettings {
             import_streams: 1,
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
+            extent_bytes: 1 << 20,
         }
     }
 }

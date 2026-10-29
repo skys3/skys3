@@ -14,6 +14,7 @@ exports yet is listed as planned, with the PR that owns it.
   - [3.1 Process, node, and admin listener](#31-process-node-and-admin-listener)
   - [3.2 Flush and loss exposure](#32-flush-and-loss-exposure)
   - [3.3 Replication](#33-replication)
+  - [3.4 Read-through fill](#34-read-through-fill)
 
 ## 1. Scraping
 
@@ -116,3 +117,14 @@ replication runs in the node binary.
 | `skys3_under_replicated_bytes` | gauge | none | defined (M2-11) | Bytes of the object versions held by the shards this node leads whose configuration has fewer members than `replicas` (`under_replicated_bytes`): old data and new writes alike have fewer copies then. 0 when no shard is short of members. |
 | `skys3_oldest_under_replicated_age_seconds` | gauge | none | defined (M2-11) | How long the longest of those shards has had fewer members than `replicas` (`oldest_under_replicated_age`), counted from when this node removed the member or opened the shard short of members: after a restart it starts over. 0 when no shard is short of members. |
 
+### 3.4 Read-through fill
+
+Design section 9.2. A fill reads an evicted version from a `write_back`
+bucket's remote target into the clean cache.
+
+| Name | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `skys3_fills_total` | counter | `bucket` | exported (M1-20) | Evicted versions filled from the remote target and made clean cache. A fill whose version a write replaced meanwhile serves its reads but is not counted. |
+| `skys3_fill_conflicts_total` | counter | `bucket` | exported (M1-20) | Fills that found the remote changed out of band: their precondition failed, or the object or version was gone. Counted whether the remote's version was adopted, a local write came first and the `ADOPT` was dropped, or the remote object was deleted and nothing could be adopted. |
+
+The `bucket` label is the bucket's name, as for the flush metrics.

@@ -2552,6 +2552,7 @@ dependencies = [
  "skys3-shard",
  "skys3-sim",
  "skys3-types",
+ "thiserror",
  "tokio",
  "tracing",
 ]
