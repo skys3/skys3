@@ -501,11 +501,12 @@ fn a_publish_whose_caller_is_dropped_still_settles_its_attempt() {
         // commits all the same, and its attempt must not stay publishing,
         // which would hold orphan reclamation's fence for good.
         encoding.abort();
-        for _ in 0..1000 {
-            if encoder.attempts().state(attempt).is_none() {
-                break;
-            }
-            tokio::task::yield_now().await;
+        // The commit's writes run on blocking threads, so wait in real
+        // time: a count of yields can run out on a busy machine.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while encoder.attempts().state(attempt).is_some() && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert_eq!(encoder.attempts().state(attempt), None);
         let entry = f.shard.entry("k").await.unwrap().unwrap();
