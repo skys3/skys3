@@ -173,14 +173,25 @@ fn sdk_algorithm(headers: &HeaderMap) -> Result<Option<ChecksumAlgorithm>, Integ
     if values.next().is_some() {
         return Err(IntegrityError::UnknownAlgorithm(name));
     }
-    if UNSUPPORTED.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+    parse_algorithm(&name).map(Some)
+}
+
+/// The algorithm an `x-amz-sdk-checksum-algorithm` or
+/// `x-amz-checksum-algorithm` value names.
+///
+/// # Errors
+///
+/// [`IntegrityError::UnsupportedAlgorithm`] for an algorithm S3 defines
+/// and SkyS3 does not support, and [`IntegrityError::UnknownAlgorithm`]
+/// for any other name that is not a supported algorithm.
+pub(crate) fn parse_algorithm(name: &str) -> Result<ChecksumAlgorithm, IntegrityError> {
+    if UNSUPPORTED.iter().any(|u| u.eq_ignore_ascii_case(name)) {
         return Err(IntegrityError::UnsupportedAlgorithm(
             name.to_ascii_uppercase(),
         ));
     }
     name.parse()
-        .map(Some)
-        .map_err(|_| IntegrityError::UnknownAlgorithm(name))
+        .map_err(|_| IntegrityError::UnknownAlgorithm(name.to_owned()))
 }
 
 /// Parses an `x-amz-checksum-*` header or trailer value.

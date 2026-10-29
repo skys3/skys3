@@ -9,7 +9,8 @@
 //! [`Harness::sigv4`] drives requests through SigV4 canonicalization and
 //! verification, and [`aws_chunked`] drives bodies through the chunk
 //! decoder. [`checksums`] reads checksum headers and values, and
-//! [`list_token`] opens continuation tokens.
+//! [`list_token`] opens continuation tokens, and [`tagging`] parses
+//! `x-amz-tagging` headers.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -18,6 +19,7 @@ use bytes::Bytes;
 use http::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Request};
 use s3s::Body;
+use s3s::dto::Tag;
 use skys3_config::Config;
 use skys3_control::{MemoryControlStore, ProposalIds, RetryPolicy, bootstrap};
 use skys3_io::ManualWallClock;
@@ -28,6 +30,10 @@ use crate::buckets::{GatewayConfig, IdSource, MODE_HEADER};
 use crate::checksum::{ExpectedChecksum, ExpectedChecksums};
 use crate::limits::MAX_KEY_BYTES;
 use crate::listing::{ListTokenKeys, TokenScope};
+use crate::objects::{
+    MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, parse_tagging_header, tagging_header,
+    tags_from_xml,
+};
 use crate::service::{Authenticator, Gateway, TrustAll};
 use crate::sigv4::body::BodyError;
 use crate::sigv4::canonical::{self, Head};
@@ -435,6 +441,38 @@ pub fn checksums(data: &[u8]) -> bool {
     }
 }
 
+/// Parses `data` as an `x-amz-tagging` header, and returns whether it was
+/// accepted.
+///
+/// # Panics
+///
+/// If a property fails: an accepted tag set breaks S3's limits, does not
+/// survive being encoded as a header again, or is refused as the tag set
+/// of a PutObjectTagging body.
+#[must_use]
+pub fn tagging(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    let Ok(tags) = parse_tagging_header(&text) else {
+        return false;
+    };
+    assert!(tags.len() <= MAX_OBJECT_TAGS);
+    for (key, value) in &tags {
+        assert!((1..=MAX_TAG_KEY_CHARS).contains(&key.chars().count()));
+        assert!(value.chars().count() <= MAX_TAG_VALUE_CHARS);
+    }
+    let header = tagging_header(&tags);
+    assert_eq!(parse_tagging_header(&header).ok(), Some(tags.clone()));
+    let xml = tags
+        .iter()
+        .map(|(key, value)| Tag {
+            key: Some(key.clone()),
+            value: Some(value.clone()),
+        })
+        .collect();
+    assert_eq!(tags_from_xml(xml).ok(), Some(tags));
+    true
+}
+
 /// Opens `data` as a ListObjectsV2 continuation token, and seals it as the
 /// last item of a page and opens the token again. Returns whether `data`
 /// opened as a token, which only a forgery would.
@@ -527,10 +565,17 @@ fn decode(data: &[u8]) -> Option<Request<Body>> {
     let (&first, rest) = data.split_first()?;
     if first & 0x80 != 0 {
         let (method, target) = &XML_REQUESTS[usize::from(first & 0x7f) % XML_REQUESTS.len()];
+        // DeleteObjects needs a digest of its body; the others take one.
+        let md5 = {
+            use base64::Engine as _;
+            use md5::Digest as _;
+            base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(rest))
+        };
         return Request::builder()
             .method(method)
             .uri(*target)
             .header(http::header::CONTENT_LENGTH, rest.len())
+            .header("content-md5", md5)
             .body(Body::from(rest.to_vec()))
             .ok();
     }
@@ -627,6 +672,15 @@ mod tests {
         assert!(list_token(format!("\x00{token}").as_bytes()));
         // The same token for another listing does not open.
         assert!(!list_token(format!("\x01{token}").as_bytes()));
+    }
+
+    #[test]
+    fn tagging_inputs_parse_or_are_refused() {
+        assert!(tagging(b""));
+        assert!(tagging(b"kind=cat&size=small%20%2B%20round&empty="));
+        assert!(!tagging(b"a=1&a=2"));
+        assert!(!tagging(b"aws:k=v"));
+        assert!(!tagging("k=tab\t".as_bytes()));
     }
 
     #[test]

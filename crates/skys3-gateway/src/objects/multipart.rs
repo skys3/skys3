@@ -204,13 +204,14 @@ impl<H: Shards> Objects<H> {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<CreateMultipartUploadOutput> {
         let input = req.input;
-        if input.tagging.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "x-amz-tagging is not supported yet"
-            ));
-        }
         let metadata = metadata_of(standard_headers!(input), input.metadata.as_ref())?;
+        // The tags are the completed object's, kept in the `MPU_CREATE`.
+        let tags = input
+            .tagging
+            .as_deref()
+            .map(super::tagging::parse_tagging_header)
+            .transpose()?
+            .unwrap_or_default();
         let checksum = upload_checksum(
             input.checksum_algorithm.as_ref(),
             input.checksum_type.as_ref(),
@@ -220,7 +221,7 @@ impl<H: Shards> Objects<H> {
             key: input.key.clone(),
             initiated_ms: now_ms(),
             metadata,
-            tags: Default::default(),
+            tags,
             checksum,
         };
         let position = self

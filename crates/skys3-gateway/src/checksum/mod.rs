@@ -56,6 +56,7 @@ pub use error::IntegrityError;
 pub use hasher::{Digests, Hasher, Hashers, digest};
 pub use multipart::{MultipartChecksum, MultipartEtag};
 pub use pooled::{HASH_BATCH_BYTES, PooledHasher};
+pub(crate) use request::parse_algorithm;
 pub use request::{
     ChecksumValidator, DEFAULT_ALGORITHM, ExpectedChecksum, ExpectedChecksums, VerifiedBody,
 };

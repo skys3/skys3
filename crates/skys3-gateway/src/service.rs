@@ -11,13 +11,15 @@ use http::{Method, Request, Response, StatusCode};
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::{Body, BodySizeLimitExceeded, S3Error, s3_error};
 use skys3_control::{ControlError, ControlStore};
+use skys3_io::BlockingPool;
 use skys3_types::BucketDocument;
 
 use crate::api::Api;
 use crate::authz::{self, Access, NoSignatures, Permissions};
 use crate::buckets::{Buckets, GatewayConfig, IdSource};
+use crate::checksum::{ChecksumValidator, ExpectedChecksums};
 use crate::features;
-use crate::limits::{BodyKind, RequestLimits, Target};
+use crate::limits::{BodyKind, RequestLimits, RequestShape, Target};
 use crate::listing::Listings;
 use crate::objects::{self, Objects};
 use crate::shard::Shards;
@@ -110,7 +112,9 @@ impl<C: ControlStore, H: Shards> Catalog for Buckets<C, H> {
 /// 2. The [`Authenticator`] authenticates it.
 /// 3. An unsigned request is refused unless anonymous access is on.
 /// 4. Requests for features SkyS3 rejects are answered (design §11).
-/// 5. An XML body is read, within its size limit, and checked for depth.
+/// 5. An XML body is read, within its size limit, and checked for depth
+///    and against its `Content-MD5` or `x-amz-checksum-*` value, if it has
+///    one.
 /// 6. `s3s` routes the request to its operation, which the caller's
 ///    permissions must allow ([`crate::authz`]), parses it, and calls the
 ///    operation.
@@ -125,6 +129,7 @@ struct Inner<A> {
     limits: RequestLimits,
     auth: A,
     anonymous: Option<Permissions>,
+    hashing_pool: Option<BlockingPool>,
     catalog: Arc<dyn Catalog>,
     sts: OnceLock<Arc<dyn StsService>>,
 }
@@ -161,6 +166,7 @@ impl<A: Authenticator> Gateway<A> {
     ) -> Result<Self, ControlError> {
         let limits = config.limits;
         let anonymous = config.anonymous.clone();
+        let hashing_pool = config.hashing_pool.clone();
         let objects = Objects::new(shards.clone(), &config);
         let listings = Listings::new(shards.clone(), &config);
         let buckets = Arc::new(Buckets::load(store, shards, config, ids).await?);
@@ -174,6 +180,7 @@ impl<A: Authenticator> Gateway<A> {
                 limits,
                 auth,
                 anonymous,
+                hashing_pool,
                 catalog: buckets,
                 sts: OnceLock::new(),
             }),
@@ -249,6 +256,7 @@ impl<A: Authenticator> Gateway<A> {
                 .await
                 .map_err(|error| body_error(&inner.limits, &*error))?;
             inner.limits.check_xml(&bytes)?;
+            check_integrity(&parts, &shape, bytes, inner.hashing_pool.clone()).await?;
         }
         let head = parts.method == http::Method::HEAD;
         let mut response = inner
@@ -276,6 +284,45 @@ impl<A: Authenticator> Gateway<A> {
 fn strip_trusted_extensions(extensions: &mut http::Extensions) {
     extensions.remove::<Authenticated>();
     extensions.remove::<Trailers>();
+    extensions.remove::<authz::KeyDecisions>();
+    extensions.remove::<authz::CopiedTags>();
+}
+
+/// Checks an XML body against the `Content-MD5` or `x-amz-checksum-*` value
+/// its request supplies, as S3 does for every request that has one.
+/// DeleteObjects requires one (`crate::objects`). The `x-amz-checksum-*`
+/// headers of CompleteMultipartUpload describe the completed object, not
+/// the body, so only its `Content-MD5` is checked here.
+///
+/// # Errors
+///
+/// The [`ChecksumValidator`]'s, such as `400 BadDigest`.
+async fn check_integrity(
+    parts: &http::request::Parts,
+    shape: &RequestShape,
+    body: bytes::Bytes,
+    pool: Option<BlockingPool>,
+) -> Result<(), S3Error> {
+    let completes_upload = parts.method == Method::POST
+        && shape.target == Target::Object
+        && shape.query().any(|(name, _)| name == "uploadId");
+    let expected = if completes_upload {
+        let mut headers = http::HeaderMap::new();
+        for value in parts.headers.get_all("content-md5") {
+            headers.append("content-md5", value.clone());
+        }
+        ExpectedChecksums::from_headers(&headers)?
+    } else {
+        ExpectedChecksums::from_headers(&parts.headers)?
+    };
+    if expected.content_md5().is_none() && expected.checksum().is_none() {
+        return Ok(());
+    }
+    let trailers = parts.extensions.get::<Trailers>().cloned();
+    let mut validator = ChecksumValidator::on(expected, trailers, pool)?;
+    validator.update(body).await?;
+    validator.finish().await?;
+    Ok(())
 }
 
 /// The S3 error for a request body that could not be read.

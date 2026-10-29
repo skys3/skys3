@@ -567,9 +567,9 @@ async fn user_metadata_is_bounded_and_the_write_identity_reserved() {
         assert_eq!(answer.header("x-amz-meta-kept"), Some("yes"));
     }
 
-    // Tagging on upload arrives with plan M1-10.
+    // Appending is not supported.
     setup
-        .put("k", &[("x-amz-tagging", "a=b")], Bytes::new())
+        .put("k", &[("x-amz-write-offset-bytes", "0")], Bytes::new())
         .await
         .assert(501, Some("NotImplemented"));
 }
