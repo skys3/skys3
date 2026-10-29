@@ -740,6 +740,10 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             }
             if current.value.lifecycle == lifecycle {
                 self.remember(name, Some(current.value));
+                // The change may be one whose swap landed but whose answers
+                // were lost, here or on another gateway, before it was
+                // announced. Announcing again costs other nodes only a re-read.
+                self.announce().await;
                 return Ok(());
             }
             let bucket = BucketDocument {
@@ -755,7 +759,14 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
                     return Ok(());
                 }
                 Ok(ProposalOutcome::Rejected) => {}
-                Err(error) => return Err(control_error(&error)),
+                Err(error) => {
+                    // A swap that may have landed is announced once it can
+                    // be, whether or not the client retries.
+                    if error.may_have_applied() {
+                        self.settle_later(None);
+                    }
+                    return Err(control_error(&error));
+                }
             }
         }
         Err(s3_error!(
