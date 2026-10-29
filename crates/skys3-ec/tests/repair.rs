@@ -703,6 +703,53 @@ fn a_stripe_that_lost_too_much_is_reported_and_one_without_room_waits() {
 }
 
 #[test]
+fn a_replica_that_does_not_lead_clears_its_backlog_as_it_runs() {
+    runtime().block_on(async {
+        // A backlog of three fragments with no node to rebuild them on.
+        let f = Fixture::coded(1, 5, EcConfig::default()).await;
+        f.nodes.silence(4);
+        let leading = f.repairer(planner(5, EcConfig::default(), Vec::new()), SETTINGS);
+        leading.pass().await;
+        tokio::time::sleep(SETTINGS.lost_after).await;
+        leading.pass().await;
+        assert_eq!(f.metrics.unrepaired(), 3);
+
+        // The node's replica of the shard stops leading: a primary that has
+        // not reconciled its members, as one that handed the shard off
+        // serves nothing. Its repairer, sharing the node's metrics, leaves
+        // the backlog to the successor.
+        let config = ShardConfig {
+            members: vec![node(0), node(1)],
+            replicas: 2,
+            ..f.shard.config()
+        };
+        let disk = SimDisk::new(12);
+        let clock = Arc::new(MonotonicClock::new());
+        let (log, _) = SegmentLog::open(disk.mount(), LogConfig::default(), clock)
+            .await
+            .unwrap();
+        let index = Index::open_sim(&disk.mount(), "index.redb", &IndexConfig::default()).unwrap();
+        let pool = BlockingPool::new("index", NonZeroUsize::MIN).unwrap();
+        let replica = Shard::open_replica(&config, &node(0), log, Arc::new(index), pool)
+            .await
+            .unwrap();
+        assert!(!replica.is_serving());
+        let following = Repairer::new(
+            replica,
+            Arc::clone(&f.nodes) as Arc<dyn FragmentSource>,
+            Arc::clone(&f.nodes),
+            planner(5, EcConfig::default(), Vec::new()),
+            BlockingPool::inline("repair"),
+            SETTINGS,
+        )
+        .with_metrics(f.metrics.clone());
+        let ran = tokio::time::timeout(SETTINGS.interval * 3, following.run()).await;
+        assert!(ran.is_err(), "a repairer runs until dropped");
+        assert_eq!(f.metrics.unrepaired(), 0);
+    });
+}
+
+#[test]
 fn a_failed_write_is_placed_again_elsewhere() {
     runtime().block_on(async {
         let f = Fixture::coded(1, 8, EcConfig::default()).await;
@@ -1082,6 +1129,37 @@ fn a_move_that_fails_is_abandoned_and_retried() {
         assert!(report.unmoved >= 1, "{report:?}");
         assert!(report.moved > 0, "{report:?}");
         f.settle(&repairer).await;
+        f.check_whole().await;
+    });
+}
+
+#[test]
+fn a_stripe_whose_move_fails_moves_no_more_in_the_pass() {
+    runtime().block_on(async {
+        // Two departing nodes hold fragments of the same stripes, so a
+        // pass plans two drains of each.
+        let f = Fixture::coded(1, 6, EcConfig::default()).await;
+        let repairer = f.repairer(planner(8, EcConfig::default(), vec![0, 1]), MOVING);
+        // The first move's write fails. The stripe's other move was
+        // planned as if that one had left its node, so it waits for the
+        // next pass to plan the stripe again.
+        *f.nodes.failures.lock().unwrap() = 1;
+        let report = repairer.pass().await;
+        assert!(report.moved > 0, "{report:?}");
+        let events = f.events.lock().unwrap().clone();
+        let started = |event: &&RepairEvent| matches!(event.step, RepairStep::MoveStarted { .. });
+        let first = events.iter().find(started).unwrap();
+        let of_stripe: Vec<_> = events
+            .iter()
+            .filter(started)
+            .filter(|event| (&event.key, event.stripe) == (&first.key, first.stripe))
+            .collect();
+        assert_eq!(of_stripe.len(), 1, "{of_stripe:?}");
+        assert!(events.iter().any(|event| {
+            event.attempt == first.attempt && event.step == RepairStep::Abandoned
+        }));
+        f.settle(&repairer).await;
+        assert_eq!((f.on(0).await, f.on(1).await), (0, 0));
         f.check_whole().await;
     });
 }
