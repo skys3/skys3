@@ -5324,6 +5324,15 @@ of this file. A task with nothing unexpected keeps "None."
   that parses as a write identity. A key whose identity the entry does
   not know, such as an imported one, is committed on absence first, and
   its identity is learned from the failed precondition.
+- **Fixed: an imported key's learned identity was a conflict.** Once the
+  import had passed the key, the identity the failed precondition named,
+  the destination's own, was neither this shard's nor before the import,
+  so every first overwrite or delete of an imported key was held in
+  conflict. The flusher now HEADs the target over S3 and takes that
+  identity as the imported version's when the destination still holds
+  the ETag the entry recorded, once per flush; any other identity is
+  still a conflict. Tested in `tests/native.rs`
+  (`an_imported_version_is_overwritten_by_its_learned_identity`).
 - **Multipart objects go as one piece.** The destination answers a
   multipart `COMMIT` `unavailable` (M6-04), so the flusher stages a
   multipart object at flush time as one piece that keeps its multipart

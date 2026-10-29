@@ -172,7 +172,17 @@ impl Destination {
     /// to this destination with `settings` and `DATA` frames of `frame`
     /// bytes.
     pub fn target(self: &Arc<Self>, settings: FlushSettings, frame: u64) -> Arc<Target<SimS3>> {
-        let store = Arc::new(super::remote(1, false));
+        self.target_over(Arc::new(super::remote(1, false)), settings, frame)
+    }
+
+    /// A target as [`Destination::target`] makes, whose S3 interface, as
+    /// a flush HEADs it, is `store`.
+    pub fn target_over(
+        self: &Arc<Self>,
+        store: Arc<SimS3>,
+        settings: FlushSettings,
+        frame: u64,
+    ) -> Arc<Target<SimS3>> {
         let target = Target::new(
             store,
             "",

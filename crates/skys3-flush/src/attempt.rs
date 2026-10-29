@@ -486,7 +486,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             && wid.position < version
     }
 
-    async fn head(&self) -> Result<Option<ObjectInfo>, Failure> {
+    pub(crate) async fn head(&self) -> Result<Option<ObjectInfo>, Failure> {
         match self
             .target
             .store
