@@ -175,6 +175,18 @@ of this file. A task with nothing unexpected keeps "None."
   `--test-threads=1`. The runner builds
   `SKYS3_SIM_SEED=<seed> cargo test -p <package> --test <target> -- <test> --exact`
   from these, and a test checks the exact output.
+- **Advisories published after the stack was written (fixed later in the
+  stack).** cargo-deny began reporting RUSTSEC-2026-0386 (tokio),
+  RUSTSEC-2026-0385 (ctutils), and the rustls and rustls-webpki advisories
+  RUSTSEC-2026-0346 to 0349 and 0382 against the locked versions. M5-02
+  updated its lock first, which left every branch below it failing
+  cargo-deny on its next CI run. tokio enters the lock here, so the
+  update to 1.54.1 is made here. rustls 0.23.46 and rustls-webpki 0.103.16
+  (from M1-23) and ctutils 0.4.6 (from M1-15) are updated in the merges
+  that carry this change up, since a merge keeps the upper branch's lock.
+  The new tokio changes every simulation's schedule for a given seed, as
+  it did on M5-02, so seed-sensitive tests may need the same attention
+  on the branches between.
 
 ### M0-05 Simulated S3 store
 
@@ -1360,6 +1372,21 @@ of this file. A task with nothing unexpected keeps "None."
 - **Signals in tests without `unsafe`.** Sending `SIGTERM` needs
   `libc::kill`, which `forbid(unsafe_code)` rules out, so the end-to-end
   test runs `kill -TERM <pid>`; `Child::kill` sends `SIGKILL`.
+- **A reload undid the gateway's own bucket changes (fixed later in the
+  stack).** The control-store sync calls `reload_buckets` whenever the
+  generation moves, including after this gateway's own changes.
+  `Buckets::reload` listed and read every bucket register, then replaced
+  the whole local copy. A change the gateway made while the reload read,
+  such as a new bucket or a lifecycle configuration answered 200, was
+  overwritten by the older value the reload had read. A client's next
+  request then saw the change missing until the following sync. The SDK
+  matrix's s3-tests hit this on a much later PR (#128):
+  `GetBucketLifecycleConfiguration` answered `NoSuchLifecycleConfiguration`
+  right after a successful put. The gateway now counts its own changes,
+  and a reload keeps the local value of every bucket changed after the
+  reload began. `a_reload_keeps_the_changes_made_while_it_read` creates
+  and deletes buckets from a control-store hook between the reload's
+  reads, and fails without the fix.
 - **Left open.** Nodes do not register under `nodes/` yet:
   `NodeRegistration` needs an intra-cluster address, which arrives with
   the transport (M2-02) and the node registry (M3-02). Bucket status scans
