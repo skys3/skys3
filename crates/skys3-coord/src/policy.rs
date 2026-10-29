@@ -237,6 +237,8 @@ impl PlacementHealth {
 pub struct ClusterScan {
     buckets: BTreeMap<RegisterKey, (Version, BucketDocument)>,
     shards: BTreeMap<RegisterKey, (Version, ShardConfig)>,
+    /// How many registers the last scan could not parse.
+    unreadable: usize,
 }
 
 impl ClusterScan {
@@ -252,17 +254,41 @@ impl ClusterScan {
     ///
     /// The store's errors. The scan keeps what it read before.
     pub async fn refresh<S: ControlStore>(&mut self, store: &S) -> Result<(), ControlError> {
-        let buckets = sync(store, &KeyPrefix::buckets(), &self.buckets, |kind| {
+        let (buckets, unreadable) = sync(store, &KeyPrefix::buckets(), &self.buckets, |kind| {
             matches!(kind, RegisterKind::Bucket(_))
         })
         .await?;
-        let shards = sync(store, &KeyPrefix::shards(), &self.shards, |kind| {
+        let (shards, more) = sync(store, &KeyPrefix::shards(), &self.shards, |kind| {
             matches!(kind, RegisterKind::Shard(..))
         })
         .await?;
         self.buckets = buckets;
         self.shards = shards;
+        self.unreadable = unreadable + more;
         Ok(())
+    }
+
+    /// Every bucket register, with its key and version.
+    pub fn bucket_registers(
+        &self,
+    ) -> impl Iterator<Item = (&RegisterKey, &Version, &BucketDocument)> {
+        self.buckets
+            .iter()
+            .map(|(key, (version, bucket))| (key, version, bucket))
+    }
+
+    /// Every shard register, with its key and version.
+    pub fn shard_registers(&self) -> impl Iterator<Item = (&RegisterKey, &Version, &ShardConfig)> {
+        self.shards
+            .iter()
+            .map(|(key, (version, shard))| (key, version, shard))
+    }
+
+    /// How many registers the last scan listed but could not parse, such
+    /// as ones of a newer format: what they hold is unknown.
+    #[must_use]
+    pub fn unreadable(&self) -> usize {
+        self.unreadable
     }
 
     /// Every bucket register.
@@ -277,18 +303,20 @@ impl ClusterScan {
 }
 
 /// Lists `prefix` and reads every register of a kind `wanted` accepts
-/// whose version is not the one `cached` holds.
+/// whose version is not the one `cached` holds, and counts those that do
+/// not parse.
 async fn sync<D, S>(
     store: &S,
     prefix: &KeyPrefix,
     cached: &BTreeMap<RegisterKey, (Version, D)>,
     wanted: fn(&RegisterKind) -> bool,
-) -> Result<BTreeMap<RegisterKey, (Version, D)>, ControlError>
+) -> Result<(BTreeMap<RegisterKey, (Version, D)>, usize), ControlError>
 where
     D: RegisterDocument + Clone,
     S: ControlStore,
 {
     let mut current = BTreeMap::new();
+    let mut unreadable = 0;
     for (key, version) in store.list(prefix).await? {
         if !wanted(&key.kind()) {
             continue;
@@ -305,10 +333,13 @@ where
             Ok(document) => {
                 current.insert(key, (read.version, document));
             }
-            Err(error) => tracing::warn!(%key, %error, "ignoring a register that does not parse"),
+            Err(error) => {
+                unreadable += 1;
+                tracing::warn!(%key, %error, "ignoring a register that does not parse");
+            }
         }
     }
-    Ok(current)
+    Ok((current, unreadable))
 }
 
 /// Judges placement policy on the coordinator: before each plan of the

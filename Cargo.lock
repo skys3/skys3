@@ -2469,6 +2469,7 @@ dependencies = [
  "serde_urlencoded",
  "skys3-config",
  "skys3-control",
+ "skys3-coord",
  "skys3-gateway",
  "skys3-index",
  "skys3-io",

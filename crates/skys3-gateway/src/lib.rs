@@ -145,7 +145,7 @@ pub mod stub;
 
 pub use admission::{Admission, AdmitAll, Refusal};
 pub use authz::{Permissions, Principal};
-pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, TARGET_HEADER};
+pub use buckets::{GatewayConfig, IdSource, MODE_HEADER, ShardPlacement, TARGET_HEADER};
 pub use conditions::{ConditionFailed, Precondition};
 pub use credentials::{CredentialError, MAX_SECRET_BYTES, MIN_SECRET_BYTES, StaticCredentials};
 pub use limits::{MAX_KEY_BYTES, MAX_PART_NUMBER, MAX_RANGE_HEADER_BYTES, RequestLimits};

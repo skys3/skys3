@@ -30,14 +30,16 @@ use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use skys3_config::FailureDomain;
 use skys3_control::faults::FaultRates;
 use skys3_control::{
     ControlError, ControlStore, ProposalIds, RegisterKind, RetryPolicy, TypedKey, Version, read,
 };
 use skys3_coord::{
-    AdminEndpoint, Announce, Applied, ChangeSet, ControlHints, Coordinator, CoordinatorConfig,
-    Elector, HeartbeatConfig, HeartbeatStatus, Heartbeater, Leadership, LeaseConfig, Lifecycle,
-    NodeEntry, NodeProfile, NodeRegistry, PeerSink, Placement, Pusher, RegistryConfig,
+    AdminEndpoint, Announce, Applied, BucketShards, ChangeSet, ControlHints, Coordinator,
+    CoordinatorConfig, Elector, HeartbeatConfig, HeartbeatStatus, Heartbeater, Leadership,
+    LeaseConfig, Lifecycle, NodeEntry, NodeProfile, NodeRegistry, PeerSink, Placement, Pusher,
+    RegistryConfig,
 };
 use skys3_io::{Clock, MonoTime, MonotonicClock};
 use skys3_net::TurmoilNetwork;
@@ -89,6 +91,12 @@ pub struct CoordinationConfig {
     pub registry: RegistryConfig,
     /// How nodes register and send heartbeats.
     pub heartbeat: HeartbeatConfig,
+    /// Whether the coordinator keeps every bucket register matched by its
+    /// shard registers ([`BucketShards`], plan M3-04), placing missing
+    /// shards at this level, in place of the stand-in placement. For
+    /// clusters whose gateways create the buckets
+    /// ([`ClusterConfig::create_buckets`](crate::ClusterConfig::create_buckets)).
+    pub bucket_shards: Option<FailureDomain>,
 }
 
 impl Default for CoordinationConfig {
@@ -122,6 +130,7 @@ impl Default for CoordinationConfig {
                 resolve_interval: Duration::from_millis(300),
                 retry: lease.retry,
             },
+            bucket_shards: None,
         }
     }
 }
@@ -543,17 +552,20 @@ impl<S: NodeServices> NodeServices for CoordinatedServices<S> {
             tokio::spawn(elector.run());
             leadership
         };
-        let placement = EpochPlacement {
-            node: node.clone(),
-            stale,
-            registers: self.config.registers,
-            next: 0,
-            rest: false,
-            planned: None,
-            audit: Arc::clone(&self.audit),
-        };
         let clock = clock as Arc<dyn Clock>;
         let registry = NodeRegistry::new(Arc::clone(&clock), self.config.registry);
+        let placement = match self.config.bucket_shards {
+            Some(level) => SimPlacement::Buckets(BucketShards::new(registry.clone(), level)),
+            None => SimPlacement::StandIn(EpochPlacement {
+                node: node.clone(),
+                stale,
+                registers: self.config.registers,
+                next: 0,
+                rest: false,
+                planned: None,
+                audit: Arc::clone(&self.audit),
+            }),
+        };
         let endpoint = AdminEndpoint::new(hints.clone()).with_heartbeats(
             registry.clone(),
             leadership.clone(),
@@ -839,6 +851,39 @@ struct Restore {
 impl Drop for Restore {
     fn drop(&mut self) {
         self.store.set_rates(self.rates);
+    }
+}
+
+/// The coordinator's placement: the stand-in, or bucket and shard creation.
+enum SimPlacement {
+    StandIn(EpochPlacement),
+    Buckets(BucketShards),
+}
+
+impl Placement for SimPlacement {
+    fn begin_tenure(&mut self) {
+        match self {
+            Self::StandIn(placement) => placement.begin_tenure(),
+            Self::Buckets(placement) => placement.begin_tenure(),
+        }
+    }
+
+    async fn plan<C: ControlStore>(
+        &mut self,
+        store: &C,
+        proposals: &mut ProposalIds,
+    ) -> Result<Option<ChangeSet>, ControlError> {
+        match self {
+            Self::StandIn(placement) => placement.plan(store, proposals).await,
+            Self::Buckets(placement) => placement.plan(store, proposals).await,
+        }
+    }
+
+    fn applied(&mut self, change: &ChangeSet, applied: &Applied) {
+        match self {
+            Self::StandIn(placement) => placement.applied(change, applied),
+            Self::Buckets(placement) => placement.applied(change, applied),
+        }
     }
 }
 

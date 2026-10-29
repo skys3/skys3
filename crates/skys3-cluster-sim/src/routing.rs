@@ -225,13 +225,20 @@ impl NodeServices for RoutedServices {
         .with_observer(move |served| {
             let mut audit = audit.lock().unwrap_or_else(PoisonError::into_inner);
             audit.served += 1;
-            let placed = &placement[&served.shard];
-            let current = registers
-                .current(&served.shard)
-                .unwrap_or_else(|| placed.clone());
+            // A shard of a bucket the gateways created has no static
+            // placement; its first epoch is 1.
+            let placed = placement.get(&served.shard);
+            let Some(current) = registers.current(&served.shard).or_else(|| placed.cloned()) else {
+                audit.wrong.push(format!(
+                    "{} served a request on shard {}, which has no configuration",
+                    served.node, served.shard
+                ));
+                return;
+            };
+            let first = placed.map_or(Epoch::new(1), |placed| placed.epoch);
             if served.node != current.primary
                 || served.epoch > current.epoch
-                || served.epoch < placed.epoch
+                || served.epoch < first
             {
                 audit.wrong.push(format!(
                     "{} served a request on shard {} in epoch {}, but its primary is {} in \

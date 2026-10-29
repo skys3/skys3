@@ -40,6 +40,10 @@
 //! - [`PolicyWatch`] and [`report`]: the coordinator judges which buckets
 //!   the cluster does not satisfy now, and publishes a [`PolicyReport`]
 //!   through [`PlacementHealth`] for cluster health.
+//! - [`create_bucket`] and [`BucketShards`]: a gateway creates a bucket's
+//!   register and its placed shard registers in one change, and the
+//!   coordinator finishes a creation cut short and drops the shard
+//!   registers of deleted buckets.
 //! - [`AdminEndpoint`]: serves pushes and heartbeats on a node.
 //!
 //! ```
@@ -72,6 +76,7 @@
 //! ```
 
 mod admin;
+mod buckets;
 mod change;
 mod coordinator;
 mod heartbeat;
@@ -85,6 +90,9 @@ mod registry;
 mod testing;
 
 pub use admin::AdminEndpoint;
+pub use buckets::{
+    BucketShards, Creation, CreationError, create_bucket, first_config, registrations,
+};
 pub use change::{
     Applied, ChangeError, ChangeFailed, ChangeSet, Pending, Settled, Write, apply, settle,
 };
