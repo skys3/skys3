@@ -12,7 +12,10 @@
 //!
 //! - **Trimming.** A frame is staged only where the staging neither holds
 //!   its bytes nor has them in flight, so a piece's extents never overlap
-//!   and a `COMMIT` can list them in offset order ([`StagedObject`]).
+//!   and a `COMMIT` can list them in offset order ([`StagedObject`]). The
+//!   bytes a stream's frame was trimmed of may be in flight on another
+//!   stream of the identity, so a `COMMIT` waits for every frame in flight
+//!   of its staging ([`Staging::settled`]).
 //! - **Quota.** What each source cluster stages stays within
 //!   `peer_staging_quota_bytes`. Each staging, and each part of a frame in
 //!   flight or durable, is charged its bytes but at least
@@ -35,6 +38,7 @@ use skys3_config::PeeringConfig;
 use skys3_log::record::{ExtentRef, MAX_EXTENTS};
 use skys3_types::limits::MIN_STAGING_CHARGE;
 use skys3_types::{BucketName, ClusterId, WriteIdentity};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use crate::message::{
@@ -77,6 +81,9 @@ impl StagingLimits {
 pub struct Staging {
     limits: StagingLimits,
     table: Mutex<Table>,
+    /// Woken whenever a frame in flight settles or staging is discarded,
+    /// for [`Staging::settled`].
+    changed: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -206,6 +213,7 @@ impl Staging {
         Self {
             limits,
             table: Mutex::default(),
+            changed: Notify::new(),
         }
     }
 
@@ -310,6 +318,8 @@ impl Staging {
         };
         if let Some(reason) = refusal {
             table.remove(identity);
+            drop(table);
+            self.changed.notify_waiters();
             return Err(reason);
         }
         *source += bytes;
@@ -351,15 +361,19 @@ impl Staging {
         if staged.pending.remove(&range.start) != Some(range.end) {
             return false;
         }
-        if let Some(extent) = extent {
+        let grew = if let Some(extent) = extent {
             staged.durable.insert(range.clone());
             staged.extents.insert(range.start, extent);
-            return true;
-        }
-        let len = charge(range.end - range.start);
-        entry.bytes -= len;
-        release(used, &identity.cluster, len);
-        false
+            true
+        } else {
+            let len = charge(range.end - range.start);
+            entry.bytes -= len;
+            release(used, &identity.cluster, len);
+            false
+        };
+        drop(table);
+        self.changed.notify_waiters();
+        grew
     }
 
     /// The `DURABLE` of `pieces` of `identity`'s staging: each piece with
@@ -379,7 +393,36 @@ impl Staging {
     /// the extents they and the staging wrote are reclaimed as
     /// unreferenced (design §10.3).
     pub fn discard(&self, identity: &WriteIdentity) -> bool {
-        self.table().remove(identity)
+        let discarded = self.table().remove(identity);
+        self.changed.notify_waiters();
+        discarded
+    }
+
+    /// Waits until no frame admitted to `identity`'s staging of
+    /// `generation` is in flight, whichever stream admitted it, or until
+    /// that staging is gone. A frame is staged only where the staging has
+    /// its bytes neither durable nor in flight, so the frames a `COMMIT`'s
+    /// own stream sent may be in flight on another stream of the identity,
+    /// such as one lost with its connection or one a source gave up
+    /// waiting on: the `COMMIT` waits for those too.
+    pub async fn settled(&self, identity: &WriteIdentity, generation: u64) {
+        loop {
+            // Registered before the check, so a change between the two is
+            // not missed.
+            let changed = self.changed.notified();
+            let mut changed = std::pin::pin!(changed);
+            changed.as_mut().enable();
+            let in_flight = self
+                .table()
+                .stagings
+                .get(identity)
+                .filter(|entry| entry.generation == generation)
+                .is_some_and(|entry| entry.pieces.values().any(|piece| !piece.pending.is_empty()));
+            if !in_flight {
+                return;
+            }
+            changed.await;
+        }
     }
 
     /// Keeps the staging of `identity`, if any, from expiring while a
@@ -411,7 +454,9 @@ impl Staging {
     /// Discards every staging that saw no `BEGIN` or `DATA` within the
     /// TTL before `now` and is not pinned, and returns their identities.
     pub fn expire(&self, now: Instant) -> Vec<WriteIdentity> {
-        self.table().expire(now, self.limits.ttl)
+        let expired = self.table().expire(now, self.limits.ttl);
+        self.changed.notify_waiters();
+        expired
     }
 
     /// What is staged durably for `identity`, as a `COMMIT` publishes it.
@@ -454,7 +499,9 @@ impl Staging {
             return;
         }
         table.next_sweep = Some(now + self.limits.ttl.min(SWEEP_INTERVAL));
-        table.expire(now, self.limits.ttl);
+        if !table.expire(now, self.limits.ttl).is_empty() {
+            self.changed.notify_waiters();
+        }
     }
 }
 
@@ -527,6 +574,8 @@ fn report(
 // The tests spell out sets of one range on purpose.
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use skys3_types::{Epoch, EpochSeq, Seq};
 
@@ -589,6 +638,39 @@ mod tests {
 
     fn ranges(report: &StagedRanges, piece: u64) -> Vec<Range<u64>> {
         report.pieces[&piece].as_slice().to_vec()
+    }
+
+    #[tokio::test]
+    async fn settled_waits_for_every_frame_in_flight_or_for_the_staging_to_go() {
+        let staging = Arc::new(Staging::new(LIMITS));
+        let id = identity("us", 1);
+        let now = Instant::now();
+        staging.begin(&begin(&id, "k"), now).unwrap();
+        // Two frames in flight, as from two streams: the second is trimmed
+        // to nothing, and waiting lasts until the first settles.
+        let admitted = staging.admit(&id, &data(1, 0..100), now).unwrap();
+        assert!(admit(&staging, &id, 1, 0..100, now).unwrap().is_empty());
+        let generation = admitted.generation;
+        let waiting = |staging: &Arc<Staging>| {
+            let (staging, id) = (Arc::clone(staging), id.clone());
+            tokio::spawn(async move { staging.settled(&id, generation).await })
+        };
+        let waiter = waiting(&staging);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert!(staging.settle(&id, generation, 1, 0..100, Some(extent(1, &(0..100)))));
+        waiter.await.unwrap();
+        // Staging discarded with a frame in flight ends the wait too, and so
+        // does staging of another generation.
+        staging.admit(&id, &data(1, 100..200), now).unwrap();
+        let waiter = waiting(&staging);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert!(staging.discard(&id));
+        waiter.await.unwrap();
+        staging.begin(&begin(&id, "k"), now).unwrap();
+        staging.admit(&id, &data(1, 0..100), now).unwrap();
+        waiting(&staging).await.unwrap();
     }
 
     #[test]
