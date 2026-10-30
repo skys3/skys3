@@ -15,21 +15,48 @@ pub const START_ATTEMPTS: usize = 5;
 
 /// What the binary logs when an address is taken: the `Display` of
 /// `io::ErrorKind::AddrInUse` on Linux and macOS.
-const ADDRESS_IN_USE: &str = "Address already in use";
+pub const ADDRESS_IN_USE: &str = "Address already in use";
 
 /// How long a readiness probe may wait for an answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// `N` distinct free TCP ports on loopback. The listeners that find them
-/// are held until all are chosen, so none repeats.
+/// Where test ports are chosen: below the kernel's ephemeral ranges
+/// (Linux 32768-60999, macOS 49152-65535 by default), from which the
+/// kernel takes the ports of `127.0.0.1:0` listeners and of outgoing
+/// connections. A port chosen there could be taken before the node binds
+/// it, or while it restarts, by any connection a test opens, such as an
+/// earlier node's to the control store.
+const TEST_PORTS: std::ops::Range<u16> = 20_000..32_000;
+
+/// The next port of [`TEST_PORTS`] to try. Each port is handed out once
+/// per process (until the range wraps), and each process starts at its
+/// own place in the range.
+static NEXT_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `N` distinct free TCP ports on loopback, from [`TEST_PORTS`]. Each is
+/// free when chosen (a listener binds it), and none is handed out twice in
+/// a process, so tests running in parallel do not choose the same port.
 pub fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: [std::net::TcpListener; N] =
-        std::array::from_fn(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    use std::sync::atomic::Ordering;
+    let span = u32::from(TEST_PORTS.end - TEST_PORTS.start);
+    let start = std::process::id().wrapping_mul(7919) % span;
+    let _ = NEXT_PORT.compare_exchange(u32::MAX, start, Ordering::Relaxed, Ordering::Relaxed);
+    let listeners: [std::net::TcpListener; N] = std::array::from_fn(|_| {
+        for _ in 0..span {
+            let offset = NEXT_PORT.fetch_add(1, Ordering::Relaxed) % span;
+            let port = TEST_PORTS.start + u16::try_from(offset).unwrap();
+            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+                return listener;
+            }
+        }
+        panic!("no port of {TEST_PORTS:?} is free on loopback")
+    });
     listeners.map(|listener| listener.local_addr().unwrap().port())
 }
 
-/// A free TCP port on loopback. It is free when chosen only: anything may
-/// bind it before the binary does, which [`Process::start`] recovers from.
+/// A free TCP port on loopback ([`free_ports`]). It is free when chosen
+/// only: anything may bind it before the binary does, which
+/// [`Process::start`] recovers from.
 pub fn free_port() -> u16 {
     let [port] = free_ports();
     port
