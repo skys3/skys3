@@ -7772,6 +7772,22 @@ of this file. A task with nothing unexpected keeps "None."
   objects stay readable until the next pass, as S3 allows. There are no
   per-bucket lifecycle metrics, and bucket status does not report the
   last pass.
+- **A lifecycle change stopped a single node's syncs (fixed later in the
+  stack).** `set_lifecycle` rewrites the bucket register under a new
+  `proposal_id`, as every write must (§6.1), but `LocalShards::config`
+  (M1-09) took a single node's shard configuration's `proposal_id` from the
+  bucket register. Each sync after the change opened the bucket's shards
+  again in a configuration that differed from the open replicas' only in
+  `proposal_id`, in the same epoch 1, which `Shard::reconfigure` refuses.
+  So every sync failed, logging `cannot sync the control-state copy` each
+  `config_poll_interval`, and the copy's generation and sync time in
+  `/v1/health` stopped; buckets and identity still followed, as the sync
+  reloads them before it opens shards, and a restart cleared it until the
+  next change. Multi-node mode opens replicas from shard registers and was
+  not affected. The fix (`claude/fix-control-sync-config`) makes a single
+  node's configuration depend only on the shard and the node, with an
+  all-zero `proposal_id`; data directories written before keep working,
+  since a replica that reopens in its log's epoch appends no new `CONFIG`.
 
 ### M5-11 Re-indexing and restore drills
 
