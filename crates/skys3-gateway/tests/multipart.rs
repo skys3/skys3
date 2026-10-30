@@ -306,15 +306,20 @@ async fn an_upload_completes_with_the_etag_and_checksum_s3_gives() {
     let all = parts.concat();
     assert_eq!(answer.body.as_bytes(), &all[PART - 3..=2 * PART + 2]);
 
-    // The upload is gone once completed.
+    // The upload is gone once completed; a completion sent again answers
+    // as the first did.
     setup
         .list_parts("movie.mp4", &id, "")
         .await
         .assert(404, Some("NoSuchUpload"));
-    setup
+    let again = setup
         .complete("movie.mp4", &id, &[], &[(1, &etags[0])])
-        .await
-        .assert(404, Some("NoSuchUpload"));
+        .await;
+    again.assert(200, None);
+    assert_eq!(
+        element(&again.body, "ETag"),
+        Some(&*format!("\"{s3_etag}\""))
+    );
 
     // ListObjectsV2 lists the completed object with its multipart ETag and
     // size, and not an upload still open.
@@ -629,6 +634,56 @@ async fn requests_for_unknown_or_invalid_uploads_are_refused() {
 
 /// Aborting an upload releases its parts' bytes: compaction may drop their
 /// records (§10.3).
+/// A completion sent again, as a client retries one whose answer it lost,
+/// answers as the first did while the key holds the version it completed;
+/// once the key changed, or for an aborted upload, it answers
+/// `404 NoSuchUpload`, as for any upload that is not open.
+#[tokio::test]
+async fn a_completion_sent_again_answers_as_the_first() {
+    let (setup, _) = local().await;
+    let id = setup
+        .create_upload("again", &[("x-amz-checksum-algorithm", "CRC32")])
+        .await;
+    let etag = setup.part("again", &id, 1, filled(1000, b'a')).await;
+    let first = setup.complete("again", &id, &[], &[(1, &etag)]).await;
+    first.assert(200, None);
+    for _ in 0..2 {
+        let again = setup.complete("again", &id, &[], &[(1, &etag)]).await;
+        again.assert(200, None);
+        for name in ["ETag", "ChecksumCRC32", "ChecksumType", "Key", "Location"] {
+            assert_eq!(
+                element(&again.body, name),
+                element(&first.body, name),
+                "{name}"
+            );
+        }
+    }
+    // Parts it never had do not change the answer: the upload is closed.
+    setup
+        .list_parts("again", &id, "")
+        .await
+        .assert(404, Some("NoSuchUpload"));
+
+    // A new version of the key ends it.
+    setup
+        .call(Method::PUT, "/photos/again", &[], "new")
+        .await
+        .assert(200, None);
+    setup
+        .complete("again", &id, &[], &[(1, &etag)])
+        .await
+        .assert(404, Some("NoSuchUpload"));
+
+    // An aborted upload never completed anything.
+    let aborted = setup.create_upload("aborted", &[]).await;
+    let etag = setup.part("aborted", &aborted, 1, filled(1000, b'b')).await;
+    setup.abort("aborted", &aborted).await.assert(204, None);
+    setup
+        .complete("aborted", &aborted, &[], &[(1, &etag)])
+        .await
+        .assert(404, Some("NoSuchUpload"));
+}
+
 #[tokio::test]
 async fn aborted_uploads_release_their_extents() {
     let (setup, bucket) = local().await;
