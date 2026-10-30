@@ -10134,3 +10134,114 @@ of this file. A task with nothing unexpected keeps "None."
   (`skys3-coord` `handoff/tests.rs`, `skys3/tests/coordinator.rs`); a
   coordinator's metrics are exported only by the nodes that may be
   elected.
+
+### M8-07a Erasure coding in the binary: encoding and coded reads
+
+- **Plan §14 decision 6: fragment stores under `[node] disks`.** One
+  `FragmentStore` per disk, in the disk's own directory beside its log
+  segments, as design §10.1 already had it (the log ignores
+  `frag-<id>.seg`, the store everything else); no `[ec] fragment_disks`.
+  The disk's number in fragment IDs is its position in label order, as
+  for its index, so a data directory keeps it. The registered disks are
+  the capacity placement shares between replicas and fragments; a second
+  list would be capacity no replica could use, with free-space checks
+  and a rule for nodes without it of its own. A fragment goes to the
+  store holding the fewest bytes, which `FragmentServer` already did.
+- **The gate.** `[ec] enabled` (off by default) needs `[cluster]
+  multi_node`; validation refuses it otherwise. A node without it
+  closes connections whose first frame is of erasure coding, as before,
+  and its gateway has no fragment source, so it answers `503` for coded
+  objects: the flag is set on every node and is not turned off once
+  objects are coded (config reference, runbook "Turning erasure coding
+  on").
+- **Per replica, not per primary.** The plan says "an encoder per
+  primary"; the library's `Encoder`, `OrphanJudge`, and `Releaser`
+  already act only while their replica leads and serves, so the node
+  runs them on every open replica of a `local` bucket's shard
+  (`skys3/src/cluster/coding.rs`, `NodeCoding::reconcile`, every
+  second), sharing one `Attempts` tracker per replica, and drops them
+  with the replica. A primary change then needs no hand-off, and a
+  replica reopened after a stop starts a fresh tracker, as a new life of
+  the primary does. The encoder scans every tenth of `ec_after_seconds`
+  (1 to 60 s), the orphan reclaimer sweeps every quarter of
+  `fragment_orphan_after_seconds` (1 to 60 s), and released fragments
+  are swept, with fragment-segment compaction, every
+  `index_checkpoint_interval`, as the log's segments are. None of these
+  got keys.
+- **Placement from registrations.** The planner's candidates are the
+  node's last read of `nodes/` (`ClusterShards` now keeps whole
+  registrations, not only addresses), through
+  `Candidate::from_registration`, so departing and draining nodes get no
+  fragments. Nothing in the binary knows which nodes are silent: a stripe
+  planned onto a node that is down waits for that write to fail and is
+  planned again without it (the M5-12 open point). Orphan queries go to
+  the primary, members, and learners the node's shard map names, or to
+  every registered node for a shard it does not know.
+- **The erasure-coding clients take `Peers`.** `FragmentClient`,
+  `FragmentReadClient`, `OrphanClient`, and `ReleaseClient` took a fixed
+  map of node addresses; they now take `skys3_net::Peers`, the shared
+  map replication and routing use since M8-05b (a `BTreeMap` still
+  converts), so fragments reach nodes that registered after the node
+  started. The simulation compiles unchanged.
+- **Found: members kept a coded object's replicas for an hour.**
+  Compaction dropped a coded version's bytes once its `EC_PUBLISH` was
+  known committed (design §8.4), but classified its `EXTENT` records as
+  extents no entry names, which wait for `unreferenced_ttl` (the
+  binary's `peer_staging_ttl`, an hour): only the `PUT` record went. The
+  library tests and the simulation used short TTLs and never noticed.
+  Such extents now skip that wait (`skys3-shard` `compaction.rs`; test
+  `a_coded_versions_extents_do_not_wait_for_the_staging_ttl`, which
+  fails without the fix); the release delay still applies. Design §10.3
+  says so.
+- **Flaky at first, two ways.** The integration test passed alone and
+  then failed in the full suite, and in two of three runs alone. (1) It
+  read the shard's placement from node 0's `GET /v1/shards`, and a node
+  that holds no replica of a shard reports no members: it timed out
+  whenever placement left node 0 out. The test and the e2e scenario now
+  take the first node that reports the shard placed. (2) Without a
+  coordinator, a member that is shut down is removed from the shard and
+  not admitted again (M8-05b), so when both holders it shut down were
+  members, the primary was left alone below `min_write_replicas`, and the
+  overwrite that followed answered `503` for good. The outages now come
+  last, over every node that does not lead, after the overwrite; it then
+  passed 6 runs in 6.
+- **New metrics.** `skys3_encoded_objects_total`,
+  `skys3_encodings_superseded_total`, `skys3_encodings_abandoned_total`,
+  `skys3_fragment_stored_bytes`, and `skys3_fragment_reads_total{fragment,
+  outcome}` (metrics reference §3.12); M5-07's release metrics are now
+  exported.
+- **Tests.** `skys3/tests/coding.rs`: 4 nodes over the fake etcd, a 2+1
+  geometry; a large object is coded on 3 nodes, the members drop their
+  bytes, every node reads it with no parity read, an `admin` certificate
+  cannot write a fragment, a stray node's fragment is reclaimed as an
+  orphan, an overwrite releases the old fragments, and each node that
+  does not lead is then shut down in turn and the new version read
+  through another node (decoding where it held a data fragment); about
+  28 s.
+- **The e2e scenario's cost.** `erasure-coding`
+  (`tests/e2e/scenarios/97-erasure-coding.sh`, etcd leg only, ports
+  E2E_PORT+50 to +61) ran in 21 to 24 s on the development machine: the object
+  was coded 2 s after its PUT and the members' replicas gone 4 s after
+  it; GET after `kill -9` of a holder answered at once. It needs `[storage]
+  segment_bytes` of 2 MiB so the object's bytes sit in sealed segments,
+  and checkpoints every second, which compaction follows. The etcd leg
+  stays well within the job's 15 minutes. The PKI gains `ec/ec1` to
+  `ec/ec4`. Running the suite locally needs an `aws` on `PATH` even for
+  scenarios that use only curl (`run.sh` checks for it); a stub was
+  enough.
+- **Simulations.** The change touches code the cluster simulation
+  drives (the erasure-coding clients and compaction), and no scenario
+  was added: all 224 simulation tests passed at 256 seeds, in 103
+  minutes on 4 CPUs with the build.
+- **Extension point for M8-07b.** The repairer belongs beside the
+  encoder in `NodeCoding::start_replica`, sharing the replica's
+  `Attempts`, with one `RepairBandwidth` per node; drain moves run in it.
+  It needs node liveness for its checks, which the binary does not have
+  yet beyond registrations.
+- **Open points.** No repair or fragment moves (M8-07b): a lost holder's
+  fragments are read around, never rebuilt (runbook "Fragment holder
+  lost"); fragments are placed on silent nodes until the coordinator
+  marks them; each encoder scans its whole shard every interval; holds
+  and release times are in memory, so a restart only delays
+  reclamation; the restore drill's endpoint and header listing are still
+  missing; a rolling restart that turns the flag on was not drilled.

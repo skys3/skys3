@@ -31,10 +31,11 @@ use prost::Message;
 use skys3_io::Disk;
 use skys3_log::ShardRef;
 use skys3_log::record::MAX_KEY_LEN;
-use skys3_net::{Connection, Frame, Header, MessageKind, Network, Receiver, Sender, Transport};
+use skys3_net::{
+    Connection, Frame, Header, MessageKind, Network, Peers, Receiver, Sender, Transport,
+};
 use skys3_types::{
-    BucketId, CodecId, ETag, Epoch, EpochSeq, FragmentId, Geometry, NodeAddress, NodeId, Seq,
-    ShardId,
+    BucketId, CodecId, ETag, Epoch, EpochSeq, FragmentId, Geometry, NodeId, Seq, ShardId,
 };
 use tokio::time::Instant;
 
@@ -278,7 +279,7 @@ pub struct FragmentReadClient<N: Network, D: Disk> {
 struct ClientInner<N: Network, D: Disk> {
     node: NodeId,
     transport: Transport<N>,
-    peers: BTreeMap<NodeId, NodeAddress>,
+    peers: Peers,
     local: Option<FragmentServer<D>>,
     idle: Mutex<Idle<N::Stream>>,
     next_request: AtomicU64,
@@ -307,16 +308,12 @@ impl<N: Network, D: Disk> FragmentReadClient<N, D> {
     /// The client of node `node`, which reaches the nodes at `peers`
     /// through `transport`.
     #[must_use]
-    pub fn new(
-        node: NodeId,
-        transport: Transport<N>,
-        peers: BTreeMap<NodeId, NodeAddress>,
-    ) -> Self {
+    pub fn new(node: NodeId, transport: Transport<N>, peers: impl Into<Peers>) -> Self {
         Self {
             inner: Arc::new(ClientInner {
                 node,
                 transport,
-                peers,
+                peers: peers.into(),
                 local: None,
                 idle: Mutex::default(),
                 next_request: AtomicU64::new(1),
@@ -452,7 +449,7 @@ impl<N: Network, D: Disk> FragmentReadClient<N, D> {
             .peers
             .get(node)
             .ok_or_else(|| format!("no address for node {node}"))?;
-        let connecting = self.inner.transport.connect(node, address);
+        let connecting = self.inner.transport.connect(node, &address);
         match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
             Ok(Ok(connection)) => Ok(connection),
             Ok(Err(error)) => Err(error.to_string()),
