@@ -9,8 +9,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -133,6 +135,46 @@ func checksums(crc32, crc32c, crc64, sha1, sha256 *string) map[types.ChecksumAlg
 	return found
 }
 
+// multipartCopy copies the object "multipart", which holds data and has the
+// ETag etag, part by part with UploadPartCopy, as the AWS documentation's
+// multipart copy does: the SDK for Go has no copy helper. Each part is a
+// range of the source under If-Match, at the source's own part boundaries,
+// so the copy's multipart ETag is the source's, as in S3.
+func multipartCopy(ctx context.Context, client *s3.Client, etag string, data []byte) {
+	key := aws.String("multipart-copy")
+	source := aws.String(bucket + "/multipart")
+	upload, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &bucket, Key: key})
+	check(err, "CreateMultipartUpload")
+	_, err = client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{Bucket: &bucket, Key: key,
+		UploadId: upload.UploadId, PartNumber: aws.Int32(1), CopySource: source,
+		CopySourceIfNoneMatch: aws.String(etag)})
+	var apiErr smithy.APIError
+	require(errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed",
+		"a failed copy-source condition: %v", err)
+	var parts []types.CompletedPart
+	for first := 0; first < len(data); first += part {
+		last := min(first+part, len(data)) - 1
+		number := aws.Int32(int32(first/part + 1))
+		copied, err := client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{Bucket: &bucket, Key: key,
+			UploadId: upload.UploadId, PartNumber: number, CopySource: source,
+			CopySourceRange:   aws.String(fmt.Sprintf("bytes=%d-%d", first, last)),
+			CopySourceIfMatch: aws.String(etag)})
+		check(err, "UploadPartCopy")
+		sum := md5.Sum(data[first : last+1])
+		partETag := aws.ToString(copied.CopyPartResult.ETag)
+		require(partETag == `"`+hex.EncodeToString(sum[:])+`"`, "part %d ETag %s", *number, partETag)
+		parts = append(parts, types.CompletedPart{PartNumber: number, ETag: copied.CopyPartResult.ETag})
+	}
+	done, err := client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: &bucket,
+		Key: key, UploadId: upload.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}})
+	check(err, "CompleteMultipartUpload")
+	require(aws.ToString(done.ETag) == etag, "copy ETag %s, source %s", aws.ToString(done.ETag), etag)
+	got, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: key})
+	check(err, "GetObject")
+	require(bytes.Equal(readAll(got.Body), data), "multipart copy: GET returned other bytes")
+	logf("multipart copy by UploadPartCopy (%s)", etag)
+}
+
 // onlyReader hides every method but Read, so the SDK cannot seek the body.
 type onlyReader struct{ io.Reader }
 
@@ -209,6 +251,7 @@ func features(ctx context.Context, httpClient *http.Client) {
 	check(err, "multipart download")
 	require(bytes.Equal(buffer.Bytes(), data), "multipart: GET returned other bytes")
 	logf("multipart upload (%s, checksum type %s)", aws.ToString(head.ETag), head.ChecksumType)
+	multipartCopy(ctx, client, aws.ToString(head.ETag), data)
 
 	// Presigned URLs, used without the SDK.
 	presign := s3.NewPresignClient(client)

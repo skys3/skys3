@@ -84,6 +84,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "gateway_copy_range"
+path = "fuzz_targets/gateway_copy_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "gateway_forward"
 path = "fuzz_targets/gateway_forward.rs"
 test = false

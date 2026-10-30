@@ -101,7 +101,7 @@ pub fn parse_upload_id(id: &str) -> Option<EpochSeq> {
 
 /// The upload of `key` that `id` names, which must be open, with up to
 /// `limit` of its parts after part `after`, all from one read of the shard.
-async fn open_upload<H: Shards>(
+pub(super) async fn open_upload<H: Shards>(
     shards: &H,
     shard: &ShardRef,
     key: &str,
@@ -118,7 +118,24 @@ async fn open_upload<H: Shards>(
 }
 
 /// No parts: [`open_upload`] only checks that the upload is open.
-const NO_PARTS: (u16, usize) = (0, 0);
+pub(super) const NO_PARTS: (u16, usize) = (0, 0);
+
+/// The part number of an UploadPart or UploadPartCopy request.
+///
+/// # Errors
+///
+/// `400 InvalidArgument` for a number outside 1 to [`MAX_PARTS`].
+pub(super) fn part_number(number: i32) -> S3Result<u16> {
+    u16::try_from(number)
+        .ok()
+        .filter(|&n| n >= 1 && u32::from(n) <= MAX_PARTS)
+        .ok_or_else(|| {
+            s3_error!(
+                InvalidArgument,
+                "Part number must be an integer between 1 and {MAX_PARTS}, inclusive"
+            )
+        })
+}
 
 /// The checksum an upload asks for, from CreateMultipartUpload's
 /// `x-amz-checksum-algorithm` and `x-amz-checksum-type`.
@@ -176,14 +193,14 @@ fn upload_checksum(
 
 /// The checksum every part of `upload` carries, and the type of the
 /// object's.
-fn effective_checksum(upload: &Upload) -> UploadChecksum {
+pub(super) fn effective_checksum(upload: &Upload) -> UploadChecksum {
     upload.checksum.unwrap_or(UploadChecksum {
         algorithm: DEFAULT_ALGORITHM,
         checksum_type: ChecksumType::FullObject,
     })
 }
 
-fn timestamp(ms: u64) -> Timestamp {
+pub(super) fn timestamp(ms: u64) -> Timestamp {
     Timestamp::from(UNIX_EPOCH + Duration::from_millis(ms))
 }
 
@@ -251,15 +268,7 @@ impl<H: Shards> Objects<H> {
             extensions,
             ..
         } = req;
-        let part_number = u16::try_from(input.part_number)
-            .ok()
-            .filter(|&n| n >= 1 && u32::from(n) <= MAX_PARTS)
-            .ok_or_else(|| {
-                s3_error!(
-                    InvalidArgument,
-                    "Part number must be an integer between 1 and {MAX_PARTS}, inclusive"
-                )
-            })?;
+        let part_number = part_number(input.part_number)?;
         if input.content_length.is_some_and(|length| {
             u64::try_from(length).map_or(true, |n| n > super::MAX_OBJECT_BYTES)
         }) {

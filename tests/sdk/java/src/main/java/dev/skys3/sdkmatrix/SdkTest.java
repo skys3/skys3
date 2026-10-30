@@ -32,6 +32,7 @@ import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.interceptor.Context;
 import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
 import software.amazon.awssdk.core.interceptor.ExecutionInterceptor;
+import software.amazon.awssdk.core.interceptor.SdkExecutionAttribute;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
@@ -48,6 +49,8 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.Tag;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.sts.auth.StsWebIdentityTokenFileCredentialsProvider;
+import software.amazon.awssdk.transfer.s3.S3TransferManager;
+import software.amazon.awssdk.transfer.s3.model.CopyRequest;
 
 /**
  * The SDK matrix's Java client: the AWS SDK for Java 2.x against SkyS3 (plan M1-25).
@@ -132,6 +135,16 @@ public final class SdkTest {
     @Override
     public void beforeTransmission(Context.BeforeTransmission context, ExecutionAttributes attrs) {
       context.httpRequest().firstMatchingHeader("x-amz-content-sha256").ifPresent(forms::add);
+    }
+  }
+
+  /** Records the name of every operation a client sends. */
+  private static final class Operations implements ExecutionInterceptor {
+    final List<String> names = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public void beforeTransmission(Context.BeforeTransmission context, ExecutionAttributes attrs) {
+      names.add(attrs.getAttribute(SdkExecutionAttribute.OPERATION_NAME));
     }
   }
 
@@ -224,6 +237,7 @@ public final class SdkTest {
 
     // The asynchronous client's multipart support splits a large upload.
     byte[] large = body(40, 2 * PART + 1_000_000);
+    Operations operations = new Operations();
     try (S3AsyncClient async =
         S3AsyncClient.builder()
             .endpointOverride(URI.create(ENDPOINT))
@@ -232,9 +246,30 @@ public final class SdkTest {
             .credentialsProvider(credentials)
             .multipartEnabled(true)
             .multipartConfiguration(c -> c.thresholdInBytes((long) PART).minimumPartSizeInBytes((long) PART))
+            .overrideConfiguration(o -> o.addExecutionInterceptor(operations))
             .build()) {
       async.putObject(r -> r.bucket(BUCKET).key("multipart"), AsyncRequestBody.fromBytes(large)).join();
+
+      // The transfer manager copies a large object part by part with
+      // UploadPartCopy. The parts have the source's boundaries, so their
+      // MD5s, and the copy's multipart ETag, are the source's, as in S3.
+      try (S3TransferManager transfers = S3TransferManager.builder().s3Client(async).build()) {
+        transfers
+            .copy(
+                CopyRequest.builder()
+                    .copyObjectRequest(
+                        c ->
+                            c.sourceBucket(BUCKET)
+                                .sourceKey("multipart")
+                                .destinationBucket(BUCKET)
+                                .destinationKey("multipart-copy"))
+                    .build())
+            .completionFuture()
+            .join();
+      }
     }
+    long partCopies = operations.names.stream().filter("UploadPartCopy"::equals).count();
+    check(partCopies == 3, "UploadPartCopy requests: " + operations.names);
     HeadObjectResponse head =
         s3.headObject(r -> r.bucket(BUCKET).key("multipart").checksumMode(ChecksumMode.ENABLED));
     check(head.eTag().endsWith("-3\""), "ETag " + head.eTag());
@@ -248,6 +283,12 @@ public final class SdkTest {
         Arrays.equals(second.asByteArray(), Arrays.copyOfRange(large, PART, 2 * PART)),
         "part 2: other bytes");
     log("multipart upload (" + head.eTag() + ", checksum type " + head.checksumType() + ")");
+    HeadObjectResponse copied = s3.headObject(r -> r.bucket(BUCKET).key("multipart-copy"));
+    check(copied.eTag().equals(head.eTag()), "copy ETag " + copied.eTag() + ", source " + head.eTag());
+    check(
+        Arrays.equals(s3.getObjectAsBytes(r -> r.bucket(BUCKET).key("multipart-copy")).asByteArray(), large),
+        "multipart copy: GET returned other bytes");
+    log("multipart copy by UploadPartCopy (" + copied.eTag() + ")");
 
     // Presigned URLs, used without the SDK.
     HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();

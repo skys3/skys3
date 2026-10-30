@@ -9,8 +9,9 @@
 //! [`Harness::sigv4`] drives requests through SigV4 canonicalization and
 //! verification, and [`aws_chunked`] drives bodies through the chunk
 //! decoder. [`checksums`] reads checksum headers and values, and
-//! [`list_token`] opens continuation tokens, and [`tagging`] parses
-//! `x-amz-tagging` headers.
+//! [`list_token`] opens continuation tokens, [`tagging`] parses
+//! `x-amz-tagging` headers, and [`copy_source_range`] parses
+//! `x-amz-copy-source-range` headers.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -31,8 +32,8 @@ use crate::checksum::{ExpectedChecksum, ExpectedChecksums};
 use crate::limits::MAX_KEY_BYTES;
 use crate::listing::{ListTokenKeys, TokenScope};
 use crate::objects::{
-    MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, parse_tagging_header, tagging_header,
-    tags_from_xml,
+    CopyRange, MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, parse_tagging_header,
+    tagging_header, tags_from_xml,
 };
 use crate::service::{Authenticator, Gateway, TrustAll};
 use crate::sigv4::body::BodyError;
@@ -470,6 +471,35 @@ pub fn tagging(data: &[u8]) -> bool {
         })
         .collect();
     assert_eq!(tags_from_xml(xml).ok(), Some(tags));
+    true
+}
+
+/// Parses `data` as an `x-amz-copy-source-range` value, which UploadPartCopy
+/// takes from clients, and returns whether it is one.
+///
+/// # Panics
+///
+/// If a property fails: an accepted range does not start at or before its
+/// end, does not survive being written again, or selects other bytes of a
+/// source than it names.
+#[must_use]
+pub fn copy_source_range(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    let Ok(range) = CopyRange::parse(&text) else {
+        return false;
+    };
+    assert!(range.first <= range.last);
+    let again = format!("bytes={}-{}", range.first, range.last);
+    assert_eq!(CopyRange::parse(&again).ok(), Some(range));
+    for size in [range.last, range.last.saturating_add(1), u64::MAX] {
+        match range.within(size) {
+            Ok(bytes) => {
+                assert!(range.last < size);
+                assert_eq!(bytes, range.first..range.last + 1);
+            }
+            Err(_) => assert!(range.last >= size),
+        }
+    }
     true
 }
 
