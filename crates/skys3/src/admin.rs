@@ -10,6 +10,7 @@
 //! | `GET /v1/buckets/<name>/conflicts` | The keys of the bucket that this node's flushers hold in conflict (§7.2). |
 //! | `POST /v1/buckets/<name>/conflicts/<policy>/<key>` | Resolves the conflict `key` is held in under `policy` (M4-06, below). |
 //! | `GET /v1/buckets/<name>/reconcile` | The bucket's reconciliation scans on this node (§9.1, M7-07, below). |
+//! | `GET /v1/shards` | Every shard of every bucket: its configuration as this node knows it, and this node's role in it (M8-05b, below). |
 //!
 //! Answers are JSON objects; later fields are added, never renamed. A
 //! bucket's status counts the objects and the unflushed entries (dirty,
@@ -92,6 +93,26 @@
 //! from `skys3_coord::PlacementHealth` (design §12), and bucket status the
 //! shards' members (M3-04).
 //!
+//! **Shards** (§5, §6.3, plan M8-05b). `GET /v1/shards` answers the
+//! `node_id` and `shards`, one object per shard of every bucket the node
+//! knows, in bucket order: `bucket`, `bucket_id`, and `shard`; `source`,
+//! where the node knows the configuration from: `replica`, its own replica
+//! of the shard, `map`, the gateway's shard map (a shard this node holds no
+//! replica of, as last learned from a register or a redirect), or `null`
+//! where it knows none yet; from the configuration, `epoch`, `primary`,
+//! `members`, `learners`, `replicas`, and `min_write_replicas`; and
+//! `role`, this node's: `primary`, `member`, `learner`, `stopped` (a
+//! replica that stopped serving, as a deposed primary's or a removed
+//! member's does until it is opened again), or `none`. A replica also
+//! reports `serving`, whether it serves client requests (a primary whose
+//! members hold its log and grant it leases), and `stepped_down`, whether
+//! it handed the shard off. A single node reports each shard of its own
+//! replica, as primary. With `[cluster] multi_node = true` the answer also
+//! has `peers`, the transport address of each registered node, and
+//! `routing`, the gateway's counts since the node started: `forwarded`
+//! (calls sent to another node), `redirects` (redirect hints that updated
+//! the shard map), and `register_reads`.
+//!
 //! **Conflicts** (§7.2, plan M4-06). A conflict is held by the flusher of
 //! the key's shard on that shard's primary, so a node lists and resolves
 //! only the conflicts its own flushers hold; an operator asks each node.
@@ -156,7 +177,10 @@ use skys3_io::{Disk, SystemWallClock, WallClock};
 use skys3_log::SegmentLog;
 use skys3_obs::{AdminApi, ApiFuture, HandshakeLimit, Health};
 use skys3_remote::ObjectStore;
-use skys3_types::{BucketDocument, BucketId, ClusterId, Generation, Label, NodeAddress, NodeId};
+use skys3_shard::{Role, ShardSet};
+use skys3_types::{
+    BucketDocument, BucketId, ClusterId, Generation, Label, NodeAddress, NodeId, ShardConfig,
+};
 use tokio::sync::watch;
 
 use crate::datadir::DiskDir;
@@ -265,6 +289,87 @@ impl<S: ObjectStore, D: Disk> Flushers for FlushService<S, D> {
     }
 }
 
+/// The future of [`ShardsReport::report`].
+pub type ReportFuture<'a> = Pin<Box<dyn Future<Output = Value> + Send + 'a>>;
+
+/// What `GET /v1/shards` reports on a node with `[cluster] multi_node =
+/// true`, whose shards live on several nodes (plan M8-05b).
+pub trait ShardsReport: Send + Sync + 'static {
+    /// The answer for the shards of `buckets`.
+    fn report<'a>(&'a self, buckets: &'a [BucketDocument]) -> ReportFuture<'a>;
+}
+
+/// The entry of `shard` of `bucket` in `GET /v1/shards`, for node `node`:
+/// as its replica in `set` holds it, or else as `known` gives it.
+pub(crate) async fn shard_entry<D: Disk>(
+    bucket: &BucketDocument,
+    shard: &ShardRef,
+    set: &ShardSet<D>,
+    known: Option<ShardConfig>,
+    node: &NodeId,
+) -> Value {
+    let mut entry = json!({
+        "bucket": bucket.name.as_str(),
+        "bucket_id": bucket.bucket_id.as_str(),
+        "shard": shard.shard.get(),
+    });
+    if let Some(replica) = set.get(&shard.into()).await {
+        entry["source"] = json!("replica");
+        describe(&mut entry, &replica.config());
+        entry["role"] = json!(if replica.is_stopped() {
+            "stopped"
+        } else {
+            role_name(replica.role())
+        });
+        entry["serving"] = json!(replica.is_serving());
+        entry["stepped_down"] = json!(replica.stepped_down().is_some());
+    } else if let Some(config) = known {
+        entry["source"] = json!("map");
+        describe(&mut entry, &config);
+        entry["role"] = json!(role_in(&config, node));
+    } else {
+        entry["source"] = Value::Null;
+        entry["role"] = json!("none");
+    }
+    entry
+}
+
+/// Adds the fields of `config` to a shard's entry in `/v1/shards`.
+fn describe(entry: &mut Value, config: &ShardConfig) {
+    fn names(nodes: &[NodeId]) -> Vec<&str> {
+        nodes.iter().map(NodeId::as_str).collect()
+    }
+    entry["epoch"] = json!(config.epoch.get());
+    entry["primary"] = json!(config.primary.as_str());
+    entry["members"] = json!(names(&config.members));
+    entry["learners"] = json!(names(&config.learners));
+    entry["replicas"] = json!(config.replicas);
+    entry["min_write_replicas"] = json!(config.min_write_replicas);
+}
+
+/// The name of a replica's role in `/v1/shards`.
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Alone | Role::Primary => "primary",
+        Role::Member => "member",
+        Role::Learner => "learner",
+        _ => "unknown",
+    }
+}
+
+/// What `config` makes `node`, which holds no replica of its shard.
+fn role_in(config: &ShardConfig, node: &NodeId) -> &'static str {
+    if config.primary == *node {
+        "primary"
+    } else if config.is_member(node) {
+        "member"
+    } else if config.is_learner(node) {
+        "learner"
+    } else {
+        "none"
+    }
+}
+
 /// The node's admin API.
 pub struct NodeAdmin<D: Disk> {
     /// The node's ID.
@@ -285,6 +390,10 @@ pub struct NodeAdmin<D: Disk> {
     pub flush: Arc<dyn Flushers>,
     /// The node's cluster services, with `[cluster] multi_node = true`.
     pub cluster: Option<ClusterView>,
+    /// The shards replicated across nodes, with `[cluster] multi_node =
+    /// true`; `None` for a single node, whose shards are in
+    /// [`NodeAdmin::shards`].
+    pub replicated: Option<Arc<dyn ShardsReport>>,
 }
 
 impl<D: Disk> fmt::Debug for NodeAdmin<D> {
@@ -390,6 +499,22 @@ impl<D: Disk> NodeAdmin<D> {
         status
     }
 
+    /// The answer to `GET /v1/shards`.
+    pub async fn shards(&self) -> Value {
+        let buckets = (self.buckets)();
+        if let Some(replicated) = &self.replicated {
+            return replicated.report(&buckets).await;
+        }
+        let mut shards = Vec::new();
+        for bucket in &buckets {
+            for shard in ShardRef::all(bucket) {
+                let set = self.shards.set();
+                shards.push(shard_entry(bucket, &shard, set, None, &self.node_id).await);
+            }
+        }
+        json!({ "node_id": self.node_id.as_str(), "shards": shards })
+    }
+
     /// The answer to `GET /v1/buckets/<name>/conflicts`.
     fn conflicts(&self, bucket: &BucketDocument) -> Value {
         let flush = self.flush.status(&bucket.bucket_id);
@@ -474,7 +599,10 @@ impl<D: Disk> NodeAdmin<D> {
 
     async fn route(&self, method: &Method, path: &str) -> Option<Response<Full<Bytes>>> {
         let route = path.strip_prefix("/v1/")?;
-        let known = route == "health" || route == "buckets" || route.starts_with("buckets/");
+        let known = route == "health"
+            || route == "shards"
+            || route == "buckets"
+            || route.starts_with("buckets/");
         if !known {
             return None;
         }
@@ -529,6 +657,7 @@ impl<D: Disk> NodeAdmin<D> {
         }
         let body = match route {
             "health" => self.health().await,
+            "shards" => self.shards().await,
             "buckets" => {
                 let mut statuses = Vec::new();
                 for bucket in (self.buckets)() {
@@ -745,5 +874,42 @@ mod tests {
         assert_eq!(percent_decode("%zz"), None);
         assert_eq!(percent_decode("%+1"), None);
         assert_eq!(percent_decode("%ff"), None);
+    }
+
+    #[test]
+    fn shard_roles_are_named_as_the_shards_route_reports_them() {
+        let node = |name: &str| NodeId::new(name).unwrap();
+        let config = ShardConfig {
+            bucket_id: BucketId::new("b-1").unwrap(),
+            shard: skys3_types::ShardId::new(0),
+            epoch: skys3_types::Epoch::new(3),
+            primary: node("a"),
+            members: vec![node("a"), node("b")],
+            learners: vec![node("c")],
+            min_write_replicas: 2,
+            replicas: 3,
+            proposal_id: skys3_types::ProposalId::new("p").unwrap(),
+        };
+        assert_eq!(role_in(&config, &node("a")), "primary");
+        assert_eq!(role_in(&config, &node("b")), "member");
+        assert_eq!(role_in(&config, &node("c")), "learner");
+        assert_eq!(role_in(&config, &node("d")), "none");
+        for (role, name) in [
+            (Role::Alone, "primary"),
+            (Role::Primary, "primary"),
+            (Role::Member, "member"),
+            (Role::Learner, "learner"),
+        ] {
+            assert_eq!(role_name(role), name);
+        }
+        let mut entry = json!({});
+        describe(&mut entry, &config);
+        assert_eq!(
+            entry,
+            json!({
+                "epoch": 3, "primary": "a", "members": ["a", "b"], "learners": ["c"],
+                "replicas": 3, "min_write_replicas": 2,
+            })
+        );
     }
 }

@@ -2,10 +2,13 @@
 //! disks it was created with, and disks fenced after an I/O failure
 //! (design §10.1, §10.4).
 //!
-//! The data directory holds `node.json`, written once when the node is
-//! created: its cluster, its ID, a random instance ID that names this data
-//! directory (the file control store records it as its owner), and its
-//! disks, each with a label and the path it was configured at. Each disk directory holds `disk.json`, which
+//! The data directory holds `node.json`, written when the node is created:
+//! its cluster, its ID, a random instance ID that names this data
+//! directory (the file control store records it as its owner), its
+//! disks, each with a label and the path it was configured at, and
+//! whether it serves as one node of several (`multi_node`, plan M8-05b),
+//! which only a data directory that holds no bucket's shards may change
+//! ([`record_multi_node`]). Each disk directory holds `disk.json`, which
 //! names the cluster, the node, and the disk's label, so a disk mounted at
 //! the wrong path, or another node's disk, is never used. A node keeps the
 //! disks it was created with: shard replicas are placed on disks by label
@@ -113,6 +116,12 @@ struct NodeFile {
     /// share it, even when configured with the same node ID.
     instance_id: String,
     disks: Vec<RecordedDisk>,
+    /// Whether the node's replicas follow shard registers, as one node of
+    /// several (`[cluster] multi_node`), rather than serving every shard
+    /// alone. Absent, and false, in files of single nodes and of builds
+    /// before plan M8-05b.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    multi_node: bool,
 }
 
 /// `disk.json`.
@@ -153,6 +162,7 @@ pub struct DataDir {
     node_id: NodeId,
     instance_id: String,
     disks: Vec<DiskDir>,
+    multi_node: bool,
     _lock: File,
 }
 
@@ -191,6 +201,7 @@ impl DataDir {
             node_id: node.node_id,
             instance_id: node.instance_id,
             disks,
+            multi_node: node.multi_node,
             _lock: lock,
         })
     }
@@ -220,6 +231,34 @@ impl DataDir {
     pub fn disks(&self) -> &[DiskDir] {
         &self.disks
     }
+
+    /// Whether the node serves as one node of several, its replicas
+    /// following shard registers (`[cluster] multi_node`), as `node.json`
+    /// said when the directory was opened. A new node starts as a single
+    /// one.
+    #[must_use]
+    pub fn multi_node(&self) -> bool {
+        self.multi_node
+    }
+}
+
+/// Records durably in the `node.json` of the data directory `dir`, which
+/// the caller holds open, whether the node serves as one node of several.
+/// The caller checks first that the node holds no bucket's shards: a
+/// single node's replicas and a cluster's cannot be told apart once open
+/// (plan M8-05b). The open [`DataDir`] goes on reporting what it read.
+///
+/// # Errors
+///
+/// [`DataDirError`] if `node.json` cannot be read or written.
+pub fn record_multi_node(dir: &Path, multi_node: bool) -> Result<(), DataDirError> {
+    let path = dir.join(NODE_FILE);
+    let mut node = read_json::<NodeFile>(&path)?.ok_or_else(|| DataDirError::Invalid {
+        path: path.clone(),
+        reason: "the file is gone".to_owned(),
+    })?;
+    node.multi_node = multi_node;
+    write_json(dir, NODE_FILE, &node)
 }
 
 /// Locks the data directory against other processes.
@@ -300,6 +339,7 @@ fn create_node(
         node_id,
         instance_id: random_base32(26),
         disks,
+        multi_node: false,
     };
     write_json(dir, NODE_FILE, &node)?;
     tracing::info!(node_id = %node.node_id, data_dir = %dir.display(), "created the node");
@@ -541,6 +581,38 @@ mod tests {
         fewer.disks.pop();
         let message = mismatch(DataDir::open(&fewer, &cluster("c"), None));
         assert!(message.contains("keeps its disks"), "{message}");
+    }
+
+    #[test]
+    fn whether_a_node_is_one_of_several_is_kept_across_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), &["d0"]);
+        let first = DataDir::open(&config, &cluster("c"), None).unwrap();
+        assert!(!first.multi_node());
+        let path = dir.path().join("data").join(NODE_FILE);
+        // A single node's file is as builds before the field wrote it.
+        assert!(!fs::read_to_string(&path).unwrap().contains("multi_node"));
+        record_multi_node(first.path(), true).unwrap();
+        drop(first);
+        let again = DataDir::open(&config, &cluster("c"), None).unwrap();
+        assert!(again.multi_node());
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"multi_node\": true")
+        );
+        record_multi_node(again.path(), false).unwrap();
+        drop(again);
+        assert!(
+            !DataDir::open(&config, &cluster("c"), None)
+                .unwrap()
+                .multi_node()
+        );
+        let message = match record_multi_node(&dir.path().join("none"), true) {
+            Err(DataDirError::Invalid { reason, .. }) => reason,
+            other => panic!("{other:?}"),
+        };
+        assert!(message.contains("gone"), "{message}");
     }
 
     #[test]

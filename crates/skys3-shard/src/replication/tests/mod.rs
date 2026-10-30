@@ -493,3 +493,39 @@ async fn stalled_link() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// A primary whose member has no known address yet, as on a node of the
+/// binary whose member registers after the shard opened, links to it once
+/// the address is known, without the shard reopening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_primary_links_a_member_whose_address_comes_later() {
+    let pki = Pki::new();
+    let (address, _member) = member(&pki).await;
+    let peers = skys3_net::Peers::new();
+    let (set, clock) = shard_set(13).await;
+    let timing = ReplicationConfig::default();
+    let primary = Replication::new(
+        node(1),
+        set,
+        pki.transport(&node(1)),
+        peers.clone(),
+        clock,
+        timing,
+    );
+    let shard = primary.open(&config()).await.unwrap();
+    let leader = Arc::clone(shard.leader().unwrap());
+    tokio::time::sleep(timing.link_timeout * 2).await;
+    assert!(
+        !leader.holds_leases(),
+        "a lease from a member it cannot reach"
+    );
+
+    peers.insert(node(2), address.to_string().parse().unwrap());
+    tokio::time::timeout(WAIT, async {
+        while !leader.holds_leases() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the primary links its member once its address is known");
+}
