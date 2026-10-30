@@ -43,7 +43,7 @@ use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{ReadId, ReadPlan, Registered};
+use skys3_shard::{ReadId, ReadPlan, Registered, StreamedBody};
 use skys3_types::{Epoch, EpochSeq, ShardConfig};
 
 pub use client::{RoutedShards, RoutingConfig, RoutingStats};
@@ -126,6 +126,8 @@ pub enum Request {
     },
     /// [`Shards::append_extent`](crate::Shards::append_extent).
     AppendExtent(Extent),
+    /// [`Shards::announce`](crate::Shards::announce).
+    Announce(StreamedBody),
     /// [`Shards::write`](crate::Shards::write).
     Write {
         /// The record.
@@ -140,8 +142,8 @@ pub enum Request {
 }
 
 impl Request {
-    /// Whether the request only reads, so that sending it again after its
-    /// answer was lost changes nothing.
+    /// Whether the request only reads, or announces a streamed body, so
+    /// that sending it again after its answer was lost changes nothing.
     #[must_use]
     pub fn is_read(&self) -> bool {
         !matches!(
@@ -190,6 +192,8 @@ pub enum Response {
     Released,
     /// The extent of [`Request::AppendExtent`].
     Extent(ExtentRef),
+    /// [`Request::Announce`] was passed to the flusher.
+    Announced,
     /// The outcome of [`Request::Write`].
     Written(Result<EpochSeq, ConditionFailed>),
     /// The summary of [`Request::Seal`].

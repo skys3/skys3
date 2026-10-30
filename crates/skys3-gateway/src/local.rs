@@ -10,7 +10,9 @@ use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{Committed, Outcome, ReadId, ReadPlan, Registered, Rejection, Shard, ShardSet};
+use skys3_shard::{
+    Committed, Outcome, ReadId, ReadPlan, Registered, Rejection, Shard, ShardSet, StreamedBody,
+};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, ShardConfig};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -319,6 +321,11 @@ impl<D: Disk> Shards for LocalShards<D> {
             .append_extent(extent)
             .await
             .map_err(|error| convert(shard, error))
+    }
+
+    async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
+        let local = self.find(shard).await?;
+        local.announce(body).map_err(|error| convert(shard, error))
     }
 
     async fn write(

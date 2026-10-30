@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use skys3_config::FlushConfig;
+use skys3_config::{FlushConfig, PeeringConfig};
 use skys3_io::{SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::UploadId;
@@ -75,11 +75,20 @@ pub struct FlushSettings {
     /// `extent_bytes`: the size of the `EXTENT` records a read-through
     /// fill commits (§9.2), as a PUT's body is committed.
     pub extent_bytes: u64,
-    /// Whether multipart uploads stream to the remote while the client
-    /// uploads (§7.3). Without it, a multipart object is sent only once
-    /// its completion commits; remote uploads streamed earlier are still
+    /// Whether multipart uploads and large single PUTs stream to the
+    /// remote while the client uploads (§7.3). Without it, an object is
+    /// sent only once it commits; remote uploads streamed earlier are still
     /// completed or aborted.
     pub streaming: bool,
+    /// `flush_part_bytes`: the part size of the remote multipart upload a
+    /// streamed single PUT is sent as (§7.3).
+    pub part_bytes: u64,
+    /// How long after the last announcement of a streamed single PUT's body
+    /// its `PUT` may still commit: `peer_staging_ttl_seconds`, twice the
+    /// gateway's deadline for a body (§10.3), which leaves room for clock
+    /// drift and the commit itself. A remote upload whose `PUT` has not
+    /// committed by then never completes, and is aborted.
+    pub body_timeout: Duration,
 }
 
 impl FlushSettings {
@@ -92,6 +101,7 @@ impl FlushSettings {
                 .max(1),
             max_inflight_bytes: config.flush_max_inflight_bytes_per_target,
             import_keys_per_second: config.import_max_keys_per_second,
+            part_bytes: config.flush_part_bytes,
             ..Self::default()
         }
     }
@@ -118,6 +128,8 @@ impl Default for FlushSettings {
             max_backoff: Duration::from_secs(30),
             extent_bytes: 1 << 20,
             streaming: true,
+            part_bytes: FlushConfig::default().flush_part_bytes,
+            body_timeout: PeeringConfig::default().peer_staging_ttl(),
         }
     }
 }

@@ -976,6 +976,8 @@ impl Node {
             };
             let settings = FlushSettings {
                 extent_bytes: config.storage().extent_bytes,
+                // A body the gateway streams for at most half the TTL.
+                body_timeout: config.peering().peer_staging_ttl(),
                 ..FlushSettings::from_config(config.flush())
             };
             Arc::new(

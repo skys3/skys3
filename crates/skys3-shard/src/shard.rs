@@ -15,7 +15,7 @@ use skys3_index::{
 };
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::truncated_by;
-use skys3_log::record::{Extent, ExtentRef, MpuPart, Put, PutData};
+use skys3_log::record::{Extent, ExtentRef, Metadata, MpuPart, Put, PutData, TagSet};
 use skys3_log::{LogRecord, RecordBody, RecordKind, SegmentClass, SegmentLog, ShardRef};
 use skys3_types::{Epoch, EpochSeq, Label, NodeId, Seq, ShardConfig};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -66,7 +66,9 @@ pub enum Change {
         /// `MPU_COMPLETE`, 0 for a `DELETE`, and `None` for a `TAGS`,
         /// which keeps the size it had.
         size: Option<u64>,
-        /// For an `MPU_COMPLETE`, the upload it completed.
+        /// The upload whose remote stream the version may complete
+        /// (§7.3): for an `MPU_COMPLETE`, the upload it completed; for the
+        /// `PUT` of a streamed single PUT, its `UPLOAD_BEGIN`.
         upload: Option<EpochSeq>,
     },
     /// An `MPU_CREATE` opened an upload of `key`, named by its position.
@@ -95,6 +97,38 @@ pub enum Change {
         /// The upload.
         upload: EpochSeq,
     },
+    /// The gateway receiving a streamed single PUT announced more of its
+    /// body ([`Shard::announce`]). Nothing is committed: it tells the
+    /// flusher which applied extents the body has so far, so that it can
+    /// send them before the `PUT` commits (§7.3).
+    Streamed(StreamedBody),
+}
+
+/// The body of a streamed single PUT so far, as the gateway that receives
+/// it announces it to the shard's primary (§7.3).
+///
+/// A streamed PUT's `EXTENT` records name its key and their offsets, but
+/// not the upload, and two bodies of one key may stream at once. The
+/// gateway knows which extents are its body's, and tells the primary's
+/// flusher, which sends them to the remote as parts while the client
+/// uploads. An announcement is a hint and is never committed: a flusher
+/// that misses one, or a later primary, sends what its remote upload lacks
+/// once the `PUT` commits, from the extents the `PUT` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedBody {
+    /// The object key.
+    pub key: String,
+    /// The position of the body's `UPLOAD_BEGIN`, whose write identity its
+    /// `PUT` inherits (§7.2).
+    pub upload: EpochSeq,
+    /// The metadata the `PUT` will store, which the remote upload is
+    /// created with.
+    pub metadata: Metadata,
+    /// The tags the `PUT` will store.
+    pub tags: TagSet,
+    /// Applied extents of the body, each with its offset in the body. An
+    /// announcement need not repeat those of earlier ones.
+    pub extents: Vec<(u64, ExtentRef)>,
 }
 
 /// What a shard holds, as deleting its bucket needs to know (§4.1).
@@ -2402,8 +2436,10 @@ impl<D: Disk> Shard<D> {
     /// Reports every client write applied from now on, in position order:
     /// each `PUT`, `DELETE`, `TAGS`, and `MPU_COMPLETE` that stored a new
     /// version, and each `MPU_CREATE`, `MPU_PART`, and `MPU_ABORT` that
-    /// opened, filled, or aborted an upload. The shard's flusher follows it
-    /// (§7.1, §7.3). A shard has one subscriber; a
+    /// opened, filled, or aborted an upload, interleaved with the
+    /// [announcements](Self::announce) of streamed bodies as they arrive.
+    /// The shard's flusher follows it (§7.1, §7.3). A shard has one
+    /// subscriber; a
     /// new subscription replaces the previous one, whose stream then ends.
     /// The stream also ends when the shard stops.
     ///
@@ -2418,6 +2454,31 @@ impl<D: Disk> Shard<D> {
             sequencer.subscriber = Some(sender);
         }
         receiver
+    }
+
+    /// Passes the announcement of a streamed single PUT's body on to the
+    /// subscriber, if the shard has one: its flusher, on the primary
+    /// (§7.3). It commits nothing, and a replica without a subscriber
+    /// drops it. Only a primary that serves client requests takes it, as
+    /// only one takes the body's `PUT`.
+    ///
+    /// The subscriber hears of it in order with the writes applied: an
+    /// announcement made before the body's `PUT` is sent comes before the
+    /// `PUT`'s [`Change::Stored`].
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::NotPrimary`] on a member, and
+    /// [`ShardError::Unavailable`] if the shard stopped or its primary does
+    /// not serve.
+    pub fn announce(&self, body: StreamedBody) -> Result<(), ShardError> {
+        let sequencer = self.sequencer();
+        sequencer.check_serving(self.shard())?;
+        if let Some(subscriber) = &sequencer.subscriber {
+            // A subscriber that went away needs nothing.
+            let _ = subscriber.send(Change::Streamed(body));
+        }
+        Ok(())
     }
 
     /// Whether the shard stopped: it was closed, or a record failed. A
@@ -2847,7 +2908,7 @@ fn change(record: &LogRecord) -> Option<(EpochSeq, Change)> {
         upload,
     };
     let change = match &record.body {
-        RecordBody::Put(put) => stored(&put.key, Some(put.size), None),
+        RecordBody::Put(put) => stored(&put.key, Some(put.size), put.inherited_identity),
         RecordBody::MpuComplete(complete) => {
             stored(&complete.key, Some(complete.size), Some(complete.upload))
         }
@@ -2891,6 +2952,8 @@ fn report(
                 Change::Opened { .. } => *effect == Effect::UploadCreated,
                 Change::Part { .. } => *effect == Effect::PartStored,
                 Change::Aborted { .. } => matches!(effect, Effect::Aborted { .. }),
+                // Never made from a record.
+                Change::Streamed(_) => false,
             }
         };
         if let Some(change) = changes.remove(position).filter(applied) {

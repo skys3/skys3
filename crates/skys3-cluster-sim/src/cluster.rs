@@ -26,8 +26,8 @@ use skys3_sim::history::{History, Operation, Outcome};
 use skys3_sim::s3::{SimS3Config, SimS3Faults};
 use skys3_sim::{SimContext, SimS3};
 use skys3_types::{
-    BucketDocument, BucketId, BucketMode, BucketName, ClusterId, Epoch, Label, NodeAddress, NodeId,
-    RegisterDocument, RemoteTarget, ShardConfig, ShardCount,
+    BucketDocument, BucketId, BucketMode, BucketName, ClusterId, ETag, Epoch, Label, NodeAddress,
+    NodeId, RegisterDocument, RemoteTarget, ShardConfig, ShardCount,
 };
 
 use crate::creation;
@@ -38,7 +38,7 @@ use crate::node::{
 };
 use crate::pki::Pki;
 use crate::replication::register;
-use crate::workload::{Client, Routes, Timings, Workload};
+use crate::workload::{Client, Routes, Timings, Workload, etag_of};
 
 /// The shape of a simulated cluster.
 #[derive(Clone, Debug, PartialEq)]
@@ -805,7 +805,11 @@ impl<S: NodeServices> World<S> {
     ) -> Result<Self, BoxError> {
         let cluster = ClusterId::new(CLUSTER)?;
         let control = context.s3(SimS3Config::default());
-        let remote = context.s3(SimS3Config::default());
+        // Streamed bodies send parts as small as the flushers' 512 bytes.
+        let remote = context.s3(SimS3Config {
+            min_part_size: 1,
+            ..SimS3Config::default()
+        });
         remote.set_faults(config.remote_faults.clone());
         let settings = settings(&cluster, config)?;
         let store = S3ControlStore::new(
@@ -1008,11 +1012,22 @@ impl<S: NodeServices> World<S> {
             if write_back {
                 let remote_key = format!("{}{key}", remote_prefix(&bucket));
                 let object = self.remote.object(&remote_key);
-                survivor.flushed = Some(object.map(|o| o.info.etag.to_string()));
+                survivor.flushed = Some(object.map(|o| written(&o.body, &o.info.etag)));
             }
             survivors.insert(name, survivor);
         }
         Ok((survivors, evicted))
+    }
+}
+
+/// The value the write of a remote object holding `body` with `etag`
+/// wrote: its ETag, but the MD5 of its bytes for a streamed single `PUT`,
+/// which completes a multipart upload of two parts or more (§7.4). The
+/// workload's multipart uploads have one part.
+fn written(body: &[u8], etag: &ETag) -> String {
+    match etag.as_str().rsplit_once('-') {
+        Some((_, parts)) if parts.parse::<u32>().is_ok_and(|parts| parts >= 2) => etag_of(body),
+        _ => etag.to_string(),
     }
 }
 
@@ -1196,11 +1211,13 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     gateway.inline_max_bytes = 512;
     gateway.extent_bytes = 512;
     gateway.streaming_flush_min_bytes = Some(1024);
+    gateway.flush_part_bytes = 512;
     // A body streams for at most half the TTL after which compaction drops
     // extents that nothing names, as the gateway's own configuration has it.
     if let Some(compaction) = shape.compaction {
         gateway.max_body_duration = compaction.unreferenced_ttl / 2;
     }
+    let body_timeout = gateway.max_body_duration * 2;
     gateway.read_registration_renew_interval = shape.read_registration.renew_every;
     gateway.retry = RetryPolicy {
         max_attempts: 5,
@@ -1220,6 +1237,10 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         flush: FlushSettings {
             // Fills commit extents as small as a PUT's.
             extent_bytes: 512,
+            // A streamed body, at least 1024 bytes, has two parts or more.
+            part_bytes: 512,
+            // The flusher gives up a body twice as late as its gateway.
+            body_timeout,
             concurrency: 2,
             min_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(1),

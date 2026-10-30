@@ -11,7 +11,7 @@ use bytes::Bytes;
 use skys3_index::Index;
 use skys3_io::{BlockingPool, Clock, MonoTime, SimDisk, SimMount};
 use skys3_log::{LogRecord, RecordBody, SegmentLog};
-use skys3_shard::{Pending, Role, Shard, ShardError};
+use skys3_shard::{Pending, Role, Shard, ShardError, StreamedBody};
 use skys3_types::{Epoch, EpochSeq, NodeId, Seq, ShardConfig};
 use support::{
     at, config, delete, extent, flushed, index_config, open_log, pool, put, record, runtime, shard,
@@ -163,6 +163,17 @@ fn roles_follow_the_configuration() {
         }
         assert!(matches!(
             member.entry("k").await,
+            Err(ShardError::NotPrimary { .. })
+        ));
+        let announced = StreamedBody {
+            key: "k".into(),
+            upload: at(1),
+            metadata: Default::default(),
+            tags: Default::default(),
+            extents: Vec::new(),
+        };
+        assert!(matches!(
+            member.announce(announced),
             Err(ShardError::NotPrimary { .. })
         ));
         // A replicated shard changes only by removing members (§6.4).

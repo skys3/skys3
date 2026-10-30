@@ -90,4 +90,4 @@ pub use lease::Grace;
 pub use machine::{Effect, Outcome, Recorder, Rejection, StateMachine};
 pub use reads::{ReadCounts, ReadId, ReadPlan, ReadSettings, Reads, Registered};
 pub use set::ShardSet;
-pub use shard::{Change, Committed, Role, Shard, ShardSummary};
+pub use shard::{Change, Committed, Role, Shard, ShardSummary, StreamedBody};

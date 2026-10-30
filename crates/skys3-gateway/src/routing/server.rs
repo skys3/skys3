@@ -214,6 +214,10 @@ impl<S: Shards, D: Disk> ForwardServer<S, D> {
             Request::AppendExtent(extent) => {
                 Response::Extent(shards.append_extent(shard, extent).await?)
             }
+            Request::Announce(body) => {
+                shards.announce(shard, body).await?;
+                Response::Announced
+            }
             Request::Write { body, condition } => {
                 Response::Written(shards.write(shard, body, condition).await?)
             }

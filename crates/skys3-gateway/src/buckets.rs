@@ -104,6 +104,10 @@ pub struct GatewayConfig {
     /// it streams, and its `PUT` inherits that record's write identity
     /// (§7.2, §7.3). `None` gives every PUT the identity of its own record.
     pub streaming_flush_min_bytes: Option<u64>,
+    /// `flush_part_bytes`: the part size a streamed single PUT is sent to
+    /// the remote in. Its gateway announces the body to the shard's
+    /// primary each time this many more bytes of it are applied (§7.3).
+    pub flush_part_bytes: u64,
     /// How long a request body may stream as `EXTENT` records before the
     /// record that names them is committed: half of
     /// `peer_staging_ttl_seconds`, after which compaction may drop extents
@@ -173,6 +177,7 @@ impl GatewayConfig {
             inline_max_bytes: config.storage().inline_max_bytes,
             extent_bytes: config.storage().extent_bytes,
             streaming_flush_min_bytes: Some(config.flush().streaming_flush_min_bytes),
+            flush_part_bytes: config.flush().flush_part_bytes,
             max_body_duration: config.peering().peer_staging_ttl() / 2,
             hashing_pool: None,
             fills: None,

@@ -151,7 +151,7 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 | `flush_max_concurrency_per_shard` | integer | `64` | At least `flush_min_concurrency_per_shard`. |
 | `flush_max_inflight_bytes_per_target` | integer | `1073741824` (1 GiB) | Positive. |
 | `streaming_flush_min_bytes` | integer | `67108864` (64 MiB) | Positive. A single PUT to a `write_back` bucket whose body reaches it commits an `UPLOAD_BEGIN` while it streams, and takes that record's write identity (§7.2). |
-| `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. |
+| `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. The part size of the remote multipart upload that such a PUT streams to (§7.3); a body of more than 10,000 parts is sent as one `PutObject` after it commits. |
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
 | `max_dirty_bytes` | integer | `2199023255552` (2 TiB) | Positive. The cluster's dirty-data budget (§7.6): once the dirty bytes of every `write_back` bucket together reach it, writes that add data get `503 SlowDown` until flushing drains them. Each node enforces a share of it (design §7.6). |
 | `import_max_keys_per_second` | integer | `100000` | Positive. The most remote keys the namespace import of one bucket lists a second (§9.1), so an attach does not crowd out client writes on the shards' logs or exceed the target's request rate. |

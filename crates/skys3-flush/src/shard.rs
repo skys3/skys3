@@ -483,6 +483,9 @@ async fn run<S: ObjectStore, D: Disk>(
                 streams.pump(&shard, target, &mut streaming);
             }
             let release = lock(&state).next_release();
+            let timeout = target
+                .as_ref()
+                .and_then(|target| streams.next_timeout(&target.settings));
             tokio::select! {
                 change = changes.recv() => match change {
                     Some(change) => follow(&state, &streams, &*wall, change),
@@ -510,6 +513,8 @@ async fn run<S: ObjectStore, D: Disk>(
                 () = sleep_until(release), if release.is_some() => {
                     lock(&state).release_due(Instant::now());
                 }
+                // The next pump gives up on the body whose `PUT` timed out.
+                () = sleep_until(timeout), if timeout.is_some() => {}
                 changed = ready.changed(), if target.is_none() && awaiting => {
                     awaiting = changed.is_ok();
                 }
@@ -546,6 +551,7 @@ fn follow(state: &Mutex<State>, streams: &Streams, wall: &dyn WallClock, change:
             ..
         } => streams.part(upload, number, position),
         Change::Aborted { upload, .. } => streams.aborted(upload),
+        Change::Streamed(body) => streams.announced(body),
     }
 }
 

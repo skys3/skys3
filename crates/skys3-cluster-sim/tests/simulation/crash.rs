@@ -256,6 +256,14 @@ impl Shards for EagerShards {
         self.inner.append_extent(shard, extent).await
     }
 
+    async fn announce(
+        &self,
+        shard: &ShardRef,
+        body: skys3_gateway::StreamedBody,
+    ) -> Result<(), ShardError> {
+        self.inner.announce(shard, body).await
+    }
+
     async fn write(
         &self,
         shard: &ShardRef,

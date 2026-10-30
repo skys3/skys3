@@ -13,7 +13,7 @@ use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_net::{Connection, Frame, Network, Transport};
-use skys3_shard::{ReadId, ReadPlan, Registered, ShardSet};
+use skys3_shard::{ReadId, ReadPlan, Registered, ShardSet, StreamedBody};
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeAddress, NodeId, ShardConfig};
 use tokio::time::Instant;
 
@@ -679,6 +679,13 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
     ) -> Result<ExtentRef, ShardError> {
         match self.call(shard, Request::AppendExtent(extent)).await? {
             Response::Extent(extent) => Ok(extent),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn announce(&self, shard: &ShardRef, body: StreamedBody) -> Result<(), ShardError> {
+        match self.call(shard, Request::Announce(body)).await? {
+            Response::Announced => Ok(()),
             _ => Err(mismatched(shard)),
         }
     }

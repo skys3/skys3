@@ -35,6 +35,16 @@
 //!   upload filled from the local log. An upload of that kind that does
 //!   not complete is aborted, and one whose abort fails is kept by the
 //!   [`Target`] to abort later.
+//! - **Streamed single PUTs** (§7.3). A single PUT that reaches
+//!   `streaming_flush_min_bytes` streams the same way, as a remote
+//!   multipart upload in parts of `flush_part_bytes` that carries its
+//!   `UPLOAD_BEGIN`'s identity: the gateway receiving the body announces
+//!   its extents to the primary ([`skys3_shard::Shard::announce`]), each
+//!   part is sent once they cover it, and the flush of the `PUT` completes
+//!   the upload. The entry records the multipart ETag the remote returns as
+//!   its `remote_etag`, beside the MD5 `local_etag` clients see (§7.4). A
+//!   body whose `PUT` does not commit within
+//!   [`FlushSettings::body_timeout`] has its remote upload aborted.
 //! - **Tags** (`TAGS`) need no request of their own: a version made by
 //!   `TAGS` is flushed like any other, the bytes uploaded again with the
 //!   new tags and the `TAGS` record's write identity.
@@ -81,6 +91,7 @@ mod metrics;
 mod multipart;
 mod service;
 mod shard;
+mod single;
 mod stream;
 mod target;
 

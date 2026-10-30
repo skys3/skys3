@@ -1420,6 +1420,14 @@ impl Shards for ReplicatedShards {
         Ok(extent)
     }
 
+    async fn announce(
+        &self,
+        shard: &ShardRef,
+        body: skys3_gateway::StreamedBody,
+    ) -> Result<(), ShardError> {
+        self.local.announce(shard, body).await
+    }
+
     async fn write(
         &self,
         shard: &ShardRef,

@@ -17,7 +17,9 @@ use common::{Answer, Setup, config, setup_with};
 use http::{Method, Request};
 use s3s::Body;
 use skys3_gateway::{GatewayConfig, ShardRef, Shards};
+use skys3_index::Payload;
 use skys3_log::{LogRecord, RecordBody};
+use skys3_shard::Change;
 use skys3_types::{EpochSeq, Seq};
 
 /// Bodies over 1,024 bytes go in extents of 1,000, and PUTs to
@@ -188,6 +190,72 @@ async fn streamed_puts_inherit_the_identity_of_their_upload_begin() {
         all[1]
     );
     assert_eq!(begins(&setup, &shard).await.last().unwrap().0, next);
+}
+
+#[tokio::test]
+async fn streamed_puts_announce_their_body_to_the_primary() {
+    let mut config = streaming();
+    config.flush_part_bytes = 2500;
+    let setup = setup_with(config).await;
+    let bucket = setup.create_write_back("remote").await;
+    let shard = ShardRef::for_key(&bucket, "big");
+    let replica = setup
+        .shards
+        .local()
+        .set()
+        .get(&(&shard).into())
+        .await
+        .unwrap();
+    let mut changes = replica.subscribe();
+
+    let headers = [("x-amz-meta-color", "blue"), ("x-amz-tagging", "team=a")];
+    let request = with_body(Method::PUT, "/remote/big", &headers, fill(10_500));
+    setup.send(request).await.assert(200, None);
+    let begin = identity(&setup, &shard, "big").await.unwrap();
+    let entry = setup.shards.entry(&shard, "big").await.unwrap().unwrap();
+    let Some(Payload::Extents(extents)) = entry.object.as_ref().map(|o| o.payload.clone()) else {
+        panic!("the body is not in extents: {entry:?}");
+    };
+
+    // The body is announced at once, with the PUT's metadata and tags,
+    // and again each time 2,500 more bytes of extents are applied; each
+    // extent once, with its offset. Then the PUT is stored, naming the
+    // upload whose stream it completes.
+    let mut announced = Vec::new();
+    let mut announcements = 0;
+    loop {
+        match changes.recv().await.unwrap() {
+            Change::Streamed(body) => {
+                announcements += 1;
+                assert_eq!((body.key.as_str(), body.upload), ("big", begin));
+                assert_eq!(body.metadata["x-amz-meta-color"], "blue");
+                assert_eq!(body.tags["team"], "a");
+                announced.extend(body.extents);
+            }
+            Change::Stored { key, upload, .. } => {
+                assert_eq!((key.as_str(), upload), ("big", Some(begin)));
+                break;
+            }
+            other => panic!("unexpected change {other:?}"),
+        }
+    }
+    assert!(announcements >= 2, "{announcements} announcements");
+    assert!(announced.len() >= 3, "{announced:?}");
+    let mut offset = 0;
+    for ((at, extent), named) in announced.iter().zip(&extents) {
+        assert_eq!((*at, extent), (offset, named));
+        offset += u64::from(named.len);
+    }
+
+    // A body below the threshold commits no UPLOAD_BEGIN, and announces
+    // nothing.
+    put(&setup, "remote", "big", fill(2000))
+        .await
+        .assert(200, None);
+    match changes.recv().await.unwrap() {
+        Change::Stored { upload: None, .. } => {}
+        other => panic!("unexpected change {other:?}"),
+    }
 }
 
 #[tokio::test]

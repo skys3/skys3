@@ -93,7 +93,7 @@ use holders::{HolderReads, Keep};
 pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};
-use upload::Upload;
+use upload::{Streaming, Upload};
 
 /// How many times a GET resolves its key again after a read-through fill
 /// found the key changed, such as after the fill adopted the remote's
@@ -251,6 +251,7 @@ pub(crate) struct Objects<H> {
     inline_max_bytes: usize,
     extent_bytes: usize,
     streaming_flush_min_bytes: Option<u64>,
+    flush_part_bytes: u64,
     max_body_duration: Duration,
     pool: Option<BlockingPool>,
     fills: Option<Arc<dyn Fills>>,
@@ -267,6 +268,7 @@ impl<H: Shards> Objects<H> {
             inline_max_bytes: usize::try_from(config.inline_max_bytes).unwrap_or(usize::MAX),
             extent_bytes: usize::try_from(config.extent_bytes).unwrap_or(usize::MAX),
             streaming_flush_min_bytes: config.streaming_flush_min_bytes,
+            flush_part_bytes: config.flush_part_bytes,
             max_body_duration: config.max_body_duration,
             pool: config.hashing_pool.clone(),
             fills: config.fills.clone(),
@@ -333,17 +335,17 @@ impl<H: Shards> Objects<H> {
         let trailers = extensions.get::<Trailers>().cloned();
         let validator = ChecksumValidator::on(expected, trailers, self.pool.clone())?;
         // Only a bucket with a remote target streams a PUT to it (§7.3).
-        let stream_from = self
+        let stream = self
             .streaming_flush_min_bytes
-            .filter(|_| bucket.mode == BucketMode::WriteBack);
+            .filter(|_| bucket.mode == BucketMode::WriteBack)
+            .map(|min_bytes| Streaming {
+                min_bytes,
+                part_bytes: self.flush_part_bytes,
+                metadata: metadata.clone(),
+                tags: tags.clone(),
+            });
         let (verified, data, inherited_identity) = self
-            .receive(
-                &shard,
-                &input.key,
-                input.body.take(),
-                validator,
-                stream_from,
-            )
+            .receive(&shard, &input.key, input.body.take(), validator, stream)
             .await?;
 
         let put = Put {
@@ -375,8 +377,9 @@ impl<H: Shards> Objects<H> {
     /// inline, or as `EXTENT` records while it arrives ([`Upload`]). It
     /// returns once the body has been read to its end and passed its
     /// checks, and its extents are applied, with the position of the
-    /// `UPLOAD_BEGIN` it committed once it reached `stream_from` bytes,
-    /// whose write identity its `PUT` inherits (§7.2).
+    /// `UPLOAD_BEGIN` it committed once it reached `stream`'s threshold,
+    /// whose write identity its `PUT` inherits (§7.2), and announced to the
+    /// shard's primary (§7.3).
     ///
     /// # Errors
     ///
@@ -390,7 +393,7 @@ impl<H: Shards> Objects<H> {
         key: &str,
         body: Option<StreamingBlob>,
         mut validator: ChecksumValidator,
-        stream_from: Option<u64>,
+        stream: Option<Streaming>,
     ) -> S3Result<(VerifiedBody, PutData, Option<EpochSeq>)> {
         let mut upload = Upload::new(
             self.shards.clone(),
@@ -400,7 +403,7 @@ impl<H: Shards> Objects<H> {
             self.extent_bytes,
             self.max_body_duration,
         )
-        .streamed(stream_from);
+        .streamed(stream);
         let mut body = s3s::Body::from(body.unwrap_or_else(empty_blob));
         let mut length = 0u64;
         while let Some(frame) = upload.before_deadline(body.frame()).await? {
