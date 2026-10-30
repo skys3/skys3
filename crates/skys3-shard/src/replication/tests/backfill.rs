@@ -161,7 +161,7 @@ async fn until_promoted(store: &MemoryControlStore) {
 }
 
 /// Shard `b-1/0` in epoch 3, led by node 1 alone, with node 2 its learner.
-fn learner_config() -> ShardConfig {
+pub(super) fn learner_config() -> ShardConfig {
     ShardConfig {
         epoch: Epoch::new(3),
         members: vec![node(1)],
