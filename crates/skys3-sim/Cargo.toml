@@ -19,7 +19,7 @@ rand.workspace = true
 skys3-io.workspace = true
 skys3-remote.workspace = true
 skys3-types.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 turmoil.workspace = true
 
 [dev-dependencies]

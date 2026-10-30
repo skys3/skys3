@@ -13,6 +13,8 @@
 //! - [`history`] and [`check`]: histories of client operations on keys,
 //!   and the checkers that judge them: per-key linearizability, and that
 //!   every acknowledged write survives.
+//! - [`tasks`]: aligns Tokio's process-wide task IDs before each seed, as
+//!   they decide the order a crashed host's tasks are dropped in.
 //!
 //! The cluster harness, which runs several nodes in one simulation, is the
 //! `skys3-cluster-sim` crate: it needs the node's crates, which use this one
@@ -23,10 +25,12 @@
 //! Scenario tests live in an integration test target named `simulation`
 //! (`tests/simulation.rs` or `tests/simulation/main.rs`) in the crate whose
 //! code they exercise, and run their scenarios through a [`Runner`]. CI's
-//! simulation job runs every such target with a larger fixed seed set:
+//! simulation job runs every such target with a larger fixed seed set,
+//! each test in a process of its own, so that no other test's tasks move
+//! the task IDs a run sees ([`tasks`]):
 //!
 //! ```text
-//! SKYS3_SIM_SEEDS=256 cargo test --workspace --all-features --test simulation
+//! SKYS3_SIM_SEEDS=256 scripts/ci/simulation.sh
 //! ```
 //!
 //! A scenario whose seeds are much slower than most declares its cost with
@@ -55,6 +59,7 @@ pub mod check;
 pub mod history;
 pub mod runner;
 pub mod s3;
+pub mod tasks;
 
 pub use runner::{NodeClock, Runner, SeedSet, SimContext};
 pub use s3::SimS3;
