@@ -5539,6 +5539,20 @@ of this file. A task with nothing unexpected keeps "None."
   - *Remaining skew.* A part acknowledged after the completion applied,
     but before the flusher read its change, still counts. The bound is
     the change's queueing delay in the flusher's loop.
+- **An open in flight counted as no stream (later CI).** On a later
+  branch of the stack the write-through simulation failed at seed 4,
+  about one run in five and only with other simulations in the same
+  process: a streamed body's remote upload was logged as opened but never
+  completed or aborted. A plain `PUT` had replaced the body while the
+  flusher was opening the remote upload, and the flusher would have
+  aborted it once `body_timeout` passed. But `ShardStatus::streams`
+  counted only streams whose remote upload was `Open`, not `Opening`, so
+  between the open's `PART_FLUSHED` and the flusher taking the open's
+  result the shard looked idle, and the simulation's drain audited the
+  remote then. `Streams::len` now counts every stream whose open has
+  started; the remote may hold an upload the open is about to record.
+  With it the failing pair passed 25 runs in a row, and
+  `an_upload_being_opened_is_counted` fails without it.
 - **Left open.**
   - Plan M4-04 adds the `ListParts` reconciliation. Until then, a part
     whose `PART_FLUSHED` was lost is sent again, which is correct but
