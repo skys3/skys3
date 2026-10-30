@@ -41,7 +41,7 @@ use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{Put, PutData};
 use skys3_log::{LogConfig, RecordBody, SegmentLog};
 use skys3_obs::{AdminApi, Health, MetricsRegistry};
-use skys3_remote::{ObjectStore, PutObject, UserMetadata};
+use skys3_remote::{DeleteObject, ObjectStore, PutObject, UserMetadata};
 use skys3_shard::{Shard, ShardSet};
 use skys3_sim::SimS3;
 use skys3_sim::s3::SimS3Config;
@@ -761,6 +761,12 @@ struct FlushRig {
 
 impl FlushRig {
     async fn new() -> Self {
+        Self::with_settings("").await
+    }
+
+    /// A rig whose bucket `photos` also has the keys `table` sets in its
+    /// `[buckets.photos]` table.
+    async fn with_settings(table: &str) -> Self {
         let store = SimS3::new(1, SimS3Config::default());
         let mount = SimDisk::new(1).mount();
         let log_config = LogConfig {
@@ -797,7 +803,7 @@ impl FlushRig {
         let config: Config = format!(
             "[cluster]\ncluster_id = \"{CLUSTER}\"\n\
              [control_store]\netcd_endpoints = [\"https://etcd.example:2379\"]\n\
-             [buckets.photos]\nmode = \"write_back\"\n"
+             [buckets.photos]\nmode = \"write_back\"\n{table}\n"
         )
         .parse()
         .unwrap();
@@ -917,6 +923,94 @@ impl FlushRig {
         self.follower.abort();
         self.service.shutdown().await;
     }
+}
+
+/// `reconciliation-differences`: another writer adds, overwrites, and
+/// deletes objects under the bucket's prefix; the reconciliation scan
+/// reports each, counted by kind; once the remote is put back as SkyS3
+/// left it, the next scan reports nothing.
+#[test]
+fn drill_reconciliation_report() {
+    in_process(async || {
+        let rig = FlushRig::with_settings("reconcile_interval_seconds = 1").await;
+        rig.write("kept", "kept: ours").await;
+        rig.write("removed", "removed: ours").await;
+        rig.drained().await;
+        let ours = |key: &str| rig.store.object(&format!("team/{key}")).unwrap().body;
+        let (kept, removed) = (ours("kept"), ours("removed"));
+        rig.out_of_band("kept", "kept: theirs").await;
+        rig.out_of_band("added", "added: theirs").await;
+        let delete = DeleteObject::new("team/removed");
+        rig.store.delete_object(delete).await.unwrap();
+
+        // Symptoms: the differences, by kind.
+        let kind = |kind: &str| {
+            let samples = samples(&rig.registry.encode().unwrap());
+            let series =
+                format!("skys3_reconcile_differences{{bucket=\"photos\",kind=\"{kind}\"}}");
+            samples.get(&series).copied().unwrap_or(0.0)
+        };
+        until("a scan reports the three changes", async || {
+            kind("remote_only") + kind("etag_mismatch") + kind("index_only") == 3.0
+        })
+        .await;
+        assert_eq!(kind("size_mismatch"), 0.0);
+        assert!(rig.bucket_metric("skys3_reconcile_scans_total") >= 1.0);
+        // Diagnosis: the report names each key, what each side holds, and
+        // who wrote the remote's object.
+        let (status, report) = rig.call(Method::GET, "/v1/buckets/photos/reconcile").await;
+        assert_eq!(status, StatusCode::OK, "{report}");
+        assert_eq!(report["enabled"], true);
+        assert_eq!(report["interval_seconds"], 1);
+        let last = &report["last"];
+        assert_eq!(last["shards"], serde_json::json!([0]), "{report}");
+        assert_eq!(last["unconfirmed"], 0);
+        let differences: Vec<(&str, &str)> = last["differences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| (d["key"].as_str().unwrap(), d["kind"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            differences,
+            [
+                ("added", "remote_only"),
+                ("kept", "etag_mismatch"),
+                ("removed", "index_only")
+            ],
+            "{report}"
+        );
+        let kept_difference = &last["differences"][1];
+        assert_eq!(kept_difference["index"]["state"], "clean", "{report}");
+        assert_eq!(kept_difference["remote"]["writer"], "outside", "{report}");
+        assert_eq!(kept_difference["remote"]["write_identity"], Value::Null);
+        assert_eq!(last["differences"][2]["remote"], Value::Null, "{report}");
+        // The scan changed nothing: the keys are still clean.
+        rig.drained().await;
+
+        // Remediation: SkyS3's versions are right, so the operator puts
+        // them back at the remote and removes the other writer's object.
+        for (key, body) in [("kept", kept), ("removed", removed)] {
+            let request = PutObject::new(format!("team/{key}"), body);
+            rig.store.put_object(request).await.unwrap();
+        }
+        let delete = DeleteObject::new("team/added");
+        rig.store.delete_object(delete).await.unwrap();
+
+        // Verification: the next scan finds nothing.
+        until("a scan finds nothing", async || {
+            kind("remote_only") + kind("etag_mismatch") + kind("index_only") == 0.0
+        })
+        .await;
+        let (_, report) = rig.call(Method::GET, "/v1/buckets/photos/reconcile").await;
+        assert_eq!(report["last"]["differences"], Value::Array(Vec::new()));
+        // An unknown bucket has no report: the listener answers 404.
+        let unknown = rig
+            .admin
+            .call(&Method::GET, "/v1/buckets/nothing/reconcile");
+        assert!(unknown.await.is_none());
+        rig.shutdown().await;
+    });
 }
 
 /// Runs `drill` on a single-threaded runtime: the simulated disk's index
@@ -1088,6 +1182,9 @@ fn drill_out_of_band_writes() {
             .call(Method::POST, "/v1/buckets/photos/conflicts/hold/kept")
             .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        // A bucket without `reconcile_interval_seconds` is not scanned.
+        let (_, report) = rig.call(Method::GET, "/v1/buckets/photos/reconcile").await;
+        assert_eq!(report["enabled"], false, "{report}");
         rig.shutdown().await;
     });
 }

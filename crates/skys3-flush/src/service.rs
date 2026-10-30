@@ -33,6 +33,7 @@ use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::origin::{self, Origin, OriginConnect};
 use crate::peer::discovery::{Choice, Discovery, Probe};
 use crate::peer::{Native, PeerBug, PeerTransport, TransportStatus, hooks as peer_hooks};
+use crate::reconcile::{self, ReconcileStatus, ScanInputs, ScanJob, ScanState};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{CopySources, FlushSettings, Target};
 
@@ -218,6 +219,13 @@ impl BucketStatus {
 ///
 /// A `write_back` bucket imports its namespace from, and fills from, the
 /// target's S3 endpoint, whatever its transport.
+///
+/// **Reconciliation scans** (§9.1). A `write_back` bucket whose
+/// `reconcile_interval_seconds` is set ([`FlushService::with_buckets`]) is
+/// scanned by each node after every interval, over the shards the node
+/// leads then: the scan lists the target's S3 endpoint and compares it
+/// with those shards' index, and only reports
+/// ([`FlushService::reconciliation`]).
 pub struct FlushService<S, D> {
     cluster: ClusterId,
     settings: FlushSettings,
@@ -245,6 +253,8 @@ pub struct FlushService<S, D> {
     /// The import tasks of buckets no longer followed, told to stop and
     /// not yet waited for: the bucket's next import waits for them first.
     stopping: Mutex<BTreeMap<BucketId, Vec<JoinHandle<()>>>>,
+    /// The reconciliation scan of each bucket that has one here.
+    scans: Mutex<BTreeMap<BucketId, BucketScan<S>>>,
     _disk: std::marker::PhantomData<fn() -> D>,
 }
 
@@ -254,6 +264,23 @@ impl<S, D> fmt::Debug for FlushService<S, D> {
             .field("cluster", &self.cluster)
             .field("settings", &self.settings)
             .finish_non_exhaustive()
+    }
+}
+
+/// The reconciliation scan of one bucket on this node (§9.1).
+struct BucketScan<S> {
+    /// The shards and target it reads, which every reconcile updates.
+    inputs: Arc<ScanInputs<S>>,
+    state: Arc<ScanState>,
+    /// `reconcile_interval_seconds`.
+    interval: Duration,
+    task: JoinHandle<()>,
+}
+
+impl<S> Drop for BucketScan<S> {
+    fn drop(&mut self) {
+        // A scan only reads, so it may stop anywhere.
+        self.task.abort();
     }
 }
 
@@ -370,6 +397,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             buckets: Mutex::default(),
             copy_sources: Mutex::default(),
             stopping: Mutex::default(),
+            scans: Mutex::default(),
             _disk: std::marker::PhantomData,
         }
     }
@@ -471,7 +499,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// open in `set` as their primary is flushed, and nothing else, and
     /// runs the import of each `write_back` bucket whose shard 0 is one of
     /// them and serves. Shows each bucket's import progress as the newest
-    /// its replicas on the node applied.
+    /// its replicas on the node applied. Runs the reconciliation scan of
+    /// each `write_back` bucket with an interval over the shards here.
     pub async fn reconcile(&self, buckets: &[BucketDocument], set: &ShardSet<D>) {
         self.follow_origins(buckets);
         self.follow_copy_sources(buckets);
@@ -525,6 +554,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             }
             keep
         });
+        let mut scans = lock(&self.scans);
+        let mut scanned = BTreeSet::new();
         for (bucket, target, role, shards, progress) in open {
             let flusher = flushers
                 .entry(bucket.bucket_id.clone())
@@ -544,9 +575,68 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                     None => self.stop_import(&bucket.bucket_id, flusher),
                 }
             }
+            if self.follow_scan(&mut scans, bucket, flusher, &shards) {
+                scanned.insert(bucket.bucket_id.clone());
+            }
             let charged = role == Role::WriteBack;
             self.follow(&bucket.bucket_id, flusher, shards, charged);
         }
+        scans.retain(|id, _| scanned.contains(id));
+    }
+
+    /// Runs the reconciliation scan of a `write_back` bucket whose
+    /// `reconcile_interval_seconds` is set, over `shards`, its shards
+    /// whose primary is on this node (§9.1), and returns whether it runs.
+    /// The scan reads the target's S3 endpoint, whatever the flushers'
+    /// transport, and yields to the flushers' window of the target the
+    /// bucket has now.
+    fn follow_scan(
+        &self,
+        scans: &mut BTreeMap<BucketId, BucketScan<S>>,
+        bucket: &BucketDocument,
+        flusher: &BucketFlusher<S>,
+        shards: &[Shard<D>],
+    ) -> bool {
+        let Some(record) = &flusher.record else {
+            return false;
+        };
+        let interval = self
+            .bucket_settings
+            .as_ref()
+            .map_or(Duration::ZERO, |buckets| {
+                buckets.get(&bucket.name).reconcile_interval()
+            });
+        if interval.is_zero() {
+            return false;
+        }
+        let scan = scans.entry(bucket.bucket_id.clone()).or_insert_with(|| {
+            let inputs = Arc::new(ScanInputs::default());
+            let state = Arc::new(ScanState::default());
+            let task = tokio::spawn(reconcile::run(ScanJob {
+                bucket: bucket.clone(),
+                cluster: self.cluster.clone(),
+                store: Arc::clone(&record.store),
+                prefix: record.prefix.clone(),
+                inputs: Arc::clone(&inputs),
+                interval,
+                settings: self.settings.clone(),
+                wall: Arc::clone(&self.wall),
+                state: Arc::clone(&state),
+                metrics: self.metrics.clone(),
+            }));
+            BucketScan {
+                inputs,
+                state,
+                interval,
+                task,
+            }
+        });
+        let readers = shards
+            .iter()
+            .map(|shard| Arc::new(shard.clone()) as Arc<dyn reconcile::ShardReader>)
+            .collect();
+        scan.inputs.set(readers, Arc::clone(&flusher.target));
+        true
     }
 
     /// Starts the bucket's import on this node, its owner, unless it runs
@@ -1050,6 +1140,17 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         resolver.resolve(key, policy).await
     }
 
+    /// The reconciliation scans of `bucket` on this node (§9.1), if it is
+    /// a `write_back` bucket this node follows with a
+    /// `reconcile_interval_seconds`: the last finished scan's report, and
+    /// the one in progress.
+    #[must_use]
+    pub fn reconciliation(&self, bucket: &BucketId) -> Option<ReconcileStatus> {
+        let scans = lock(&self.scans);
+        let scan = scans.get(bucket)?;
+        Some(scan.state.status(scan.interval))
+    }
+
     /// The read-through fills of `bucket`'s target, if the bucket is a
     /// `write_back` bucket this node follows, or a `read_only` one.
     #[must_use]
@@ -1101,6 +1202,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// import resumes from its stored checkpoints.
     pub async fn shutdown(&self) {
         lock(&self.origins).clear();
+        lock(&self.scans).clear();
         let flushers = std::mem::take(&mut *self.lock());
         for (_, mut flusher) in flushers {
             // The import stops between steps; once its task ends, none of

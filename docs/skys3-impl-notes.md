@@ -8964,6 +8964,84 @@ of this file. A task with nothing unexpected keeps "None."
   `probe_error: null`). The drill now waits until the status names the
   probe's error before reading the rest, as an operator would.
 
+### M7-07 Reconciliation scan
+
+- **The scan needed shard handles the flush service could not hold.**
+  `FlushService<S, D>` puts no `Disk` bound on `D`, and `Shard<D>` needs
+  one, so keeping the bucket's shards for its scan would have added the
+  bound to a public type, breaking `skys3::remote::NodeRemote` and any
+  sibling branch that names the service without it. The scan reads shards
+  through a small object-safe trait instead (`ShardReader`: `entries`,
+  `peek`, `import_progress`, `applied`, and whether the replica leads),
+  which also makes "the scan only reads" hold by type: it has no handle
+  that can commit.
+- **`Shard::entry` is not a pure read.** It admits a client read, which a
+  step-down waits for, and makes a clean payload recently used in the clean
+  cache, which changes eviction order. The scan's second read of a
+  candidate goes through a new `Shard::peek`, which reads the entry as
+  `Shard::entries` does, with neither.
+- **Listings carry no version IDs.** `ListObjectsV2` returns key, ETag,
+  size, and time only, so the planned "version mismatch" would have needed
+  a HEAD of every key, up to a thousand times the scan's requests. Version
+  IDs are not compared; an out-of-band rewrite with identical bytes is not
+  seen, and is recorded so in design section 9.1. HEADs confirm candidates
+  only.
+- **A foreign or unknown write identity is not a kind of difference.** It
+  is only known from a HEAD, which the scan sends for candidates only, and
+  an object of another writer that matches the index is no difference.
+  So the writer (`outside`, `own`, `foreign`, `unknown`) is a property of
+  each difference the report and log carry, and the metric's `kind` label
+  has the four comparison kinds.
+- **A listing and the index are never read at one moment.** The first
+  workload test, writes and deletes flushed during scans with delayed and
+  failing requests, found false positives as soon as dirty entries were
+  compared (checked by breaking the filter on purpose), so dirty entries,
+  tombstones, and conflicts are skipped, and every candidate is confirmed
+  by a HEAD and a second read of its entry. One race remains that neither
+  catches: a key absent at both reads whose object was written, flushed,
+  deleted, and flushed in between. A write of the key's shard after its
+  applied position at the first read is therefore not reported; the
+  remaining hole needs a multipart or streamed upload begun before the
+  scan read the index, completed, flushed, deleted, and flushed within one
+  confirmation, and is noted in the code.
+- **Reserved keys on both sides.** The import skips the probe's scratch
+  prefix, the snapshots' directory, and the peer descriptor; a client may
+  still write such a key through SkyS3, and comparing it with a listing
+  that skips them would report it as `index_only`. The import's filter
+  became `import::mirrored`, which both sides use.
+- **The flushers' window would misread the scan.** Sending listings
+  through the target's adaptive window (§7.7) would feed their latency, a
+  page of 1,000 keys, to the controller sized on small writes, and shrink
+  the flushers' window. The scan sends one request at a time outside the
+  window, paced by `reconcile_requests_per_second` with the import's token
+  bucket (made `pub(crate)`), and waits while the window is full.
+- **A paused clock gives every report the same time.** The tests use a
+  manual wall clock, so reports' start times could not tell scans apart;
+  the status gained `scans`, the count of finished scans.
+- **A report claimed shards it had stopped comparing (review).** A
+  confirmation that found the primary stepped down, or whose second index
+  read failed, skipped its candidate but kept the shard, so the report
+  listed the shard as covered with differences missing; on the last page
+  nothing checked again. Both now drop the shard for the rest of the scan,
+  as a failed page read did, and the scan stops listing once no shard is
+  left, instead of fetching every remaining page.
+- **The scan interval was no barrier in the tests.** The flush crate's
+  scan tests failed about one run in ten under CPU load: a report still
+  covered shard 1 after the test closed it, or missed a key deleted just
+  before. It was the test, not the scan: each failing run had a scan
+  finished or under way before the test's last change, which the test then
+  took as the next report. The tests run on a paused clock, and the
+  runtime jumps to the next timer, the 60-second scan interval, whenever it
+  waits for the index's blocking thread, so the interval in simulated time
+  says nothing about when a scan runs. `next_report` now waits for a scan
+  that starts after the call, taking the finished-scan count and whether
+  one is running as its baseline; a scan takes its shards and marks itself
+  running in one step, so that scan saw every earlier change.
+- **No cluster-simulation scenario.** The scan writes nothing, so a
+  scenario would check only the absence of reports under faults, which the
+  flush crate's workload test does in under a second. The simulation jobs'
+  time is unchanged.
+
 ### M7-08 Security review
 
 - **The review is a document.** `docs/skys3-security-review.md` has one
