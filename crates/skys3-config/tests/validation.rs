@@ -427,6 +427,14 @@ fn flush_rules() {
 fn ec_rules() {
     assert_violations("[ec]\nmin_eligible_nodes = 2", &["ec.min_eligible_nodes"]);
     assert_violations("[ec]\nparity_fragments = 0", &["ec.parity_fragments"]);
+    // A stripe has at most 255 fragments.
+    load("[ec]\nmax_data_fragments = 253").unwrap();
+    load("[ec]\nmax_data_fragments = 251\nparity_fragments = 4").unwrap();
+    assert_violations("[ec]\nmax_data_fragments = 254", &["ec.max_data_fragments"]);
+    assert_violations(
+        "[ec]\nmax_data_fragments = 4294967295\nparity_fragments = 4294967295\nmin_eligible_nodes = 4294967295",
+        &["ec.max_data_fragments", "ec.min_eligible_nodes"],
+    );
 }
 
 #[test]
