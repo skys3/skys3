@@ -42,7 +42,6 @@ use skys3_sim::check::{Survivors, Violation};
 use skys3_sim::history::Operation;
 use skys3_types::{BucketDocument, BucketMode, ShardId};
 
-use crate::cluster::written;
 use crate::workload::Routes;
 
 /// Whether the `local` buckets have backup targets (§8.9), how writes to
@@ -96,11 +95,13 @@ impl Backup {
     }
 
     /// The `[buckets.<name>]` tables of the `local` buckets `names`, as the
-    /// flushers see them, or, with `gateway`, as the gateways do.
+    /// flushers see them, or, with `gateway`, as the gateways do; with
+    /// `peer`, their backups go to the SkyS3 peer's bucket.
     pub(crate) fn tables<'a>(
         self,
         names: impl IntoIterator<Item = &'a str>,
         gateway: bool,
+        peer: bool,
     ) -> String {
         let mut tables = String::new();
         if !self.enabled() {
@@ -111,11 +112,16 @@ impl Backup {
             Self::AckedLocally if !gateway => "write_through",
             _ => "local",
         };
+        let base = if peer {
+            format!("{}/{}", crate::peer::ENDPOINT, crate::peer::BUCKET)
+        } else {
+            "https://remote.sim.internal/remote".to_owned()
+        };
         for name in names {
             let _ = write!(
                 tables,
                 "[buckets.{name}]\nmode = \"local\"\n\
-                 backup_target = \"https://remote.sim.internal/remote/{}\"\n\
+                 backup_target = \"{base}/{}\"\n\
                  backup_ack = \"{ack}\"\n",
                 prefix(name)
             );
@@ -143,17 +149,15 @@ pub(crate) type Flushers = Mutex<Vec<Weak<FlushService<SimS3, SimMount>>>>;
 /// How often the drain looks at the flushers.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 
-/// Waits, for at most `limit`, until the backup flushers of the live nodes
-/// cover every shard of the `local` buckets of `routes` and have nothing
-/// left to send: no key dirty, being flushed, or held in conflict. Returns
-/// whether they did; if not, the audit says what the backup lacks.
-pub(crate) async fn drain(flushers: Arc<Flushers>, routes: Routes, limit: Duration) -> bool {
-    let buckets: Vec<BucketDocument> = routes
-        .buckets
-        .iter()
-        .filter(|bucket| bucket.mode == BucketMode::Local)
-        .cloned()
-        .collect();
+/// Waits, for at most `limit`, until the flushers of the live nodes cover
+/// every shard of `buckets` and have nothing left to send: no key dirty,
+/// being flushed, or held in conflict. Returns whether they did; if not,
+/// the audit says what the target lacks.
+pub(crate) async fn drain(
+    flushers: Arc<Flushers>,
+    buckets: Vec<BucketDocument>,
+    limit: Duration,
+) -> bool {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
         if drained(&flushers, &buckets) {
@@ -196,17 +200,19 @@ fn drained(flushers: &Flushers, buckets: &[BucketDocument]) -> bool {
     })
 }
 
-/// Checks that the backup target of every `local` bucket in `routes` holds
-/// exactly what every member holds of each of its `keys` keys, as
-/// `survivors` found them after recovery, and returns how many keys the
-/// backups hold an object for.
+/// Checks that the target of every bucket in `routes` that `prefix` gives
+/// a key prefix in it, as `target` reads it, holds exactly what every
+/// member holds of each of its `keys` keys, as `survivors` found them
+/// after recovery, and returns how many keys the targets hold an object
+/// for.
 ///
 /// # Errors
 ///
-/// The first key whose backup holds another version, or nothing, or an
+/// The first key whose target holds another version, or nothing, or an
 /// object the members deleted.
 pub(crate) fn audit(
-    remote: &SimS3,
+    target: &dyn Fn(&str) -> Option<String>,
+    prefix: impl Fn(&BucketDocument) -> Option<String>,
     routes: &Routes,
     keys: usize,
     survivors: &BTreeMap<String, Survivors>,
@@ -214,12 +220,10 @@ pub(crate) fn audit(
 ) -> Result<usize, Violation> {
     let mut held = 0;
     for (name, bucket, key) in routes.keys(keys) {
-        let Some(prefix) = backup_prefix(&bucket) else {
+        let Some(prefix) = prefix(&bucket) else {
             continue;
         };
-        let backup = remote
-            .object(&format!("{prefix}{key}"))
-            .map(|object| written(&object.body, &object.info.etag));
+        let backup = target(&format!("{prefix}{key}"));
         held += usize::from(backup.is_some());
         let copies = survivors
             .get(&name)
@@ -250,8 +254,8 @@ mod tests {
     #[test]
     fn the_tables_say_what_each_side_sees() {
         let names = ["bucket-0", "bucket-1"];
-        assert_eq!(Backup::Off.tables(names, false), "");
-        let tables = Backup::Asynchronous.tables(names, false);
+        assert_eq!(Backup::Off.tables(names, false, false), "");
+        let tables = Backup::Asynchronous.tables(names, false, false);
         assert!(tables.contains("[buckets.bucket-1]"), "{tables}");
         assert!(
             tables.contains(
@@ -260,22 +264,29 @@ mod tests {
             "{tables}"
         );
         assert!(tables.contains("backup_ack = \"local\""), "{tables}");
-        let through = Backup::WriteThrough.tables(names, true);
+        let through = Backup::WriteThrough.tables(names, true, false);
         assert!(
             through.contains("backup_ack = \"write_through\""),
             "{through}"
         );
         // The seeded bugs change only what the gateways see.
-        let flushers = Backup::AckedLocally.tables(names, false);
+        let flushers = Backup::AckedLocally.tables(names, false, false);
         assert!(
             flushers.contains("backup_ack = \"write_through\""),
             "{flushers}"
         );
-        let gateways = Backup::AckedLocally.tables(names, true);
+        let gateways = Backup::AckedLocally.tables(names, true, false);
         assert!(gateways.contains("backup_ack = \"local\""), "{gateways}");
         assert_eq!(
-            Backup::ForgetsDeletes.tables(names, true),
-            Backup::Asynchronous.tables(names, true)
+            Backup::ForgetsDeletes.tables(names, true, false),
+            Backup::Asynchronous.tables(names, true, false)
+        );
+        let peer = Backup::Asynchronous.tables(names, false, true);
+        assert!(
+            peer.contains(
+                "backup_target = \"https://peer.sim.internal/peer-sink/backup/bucket-0/\""
+            ),
+            "{peer}"
         );
         assert!(Backup::AckedLocally.audited_at_ack() && Backup::WriteThrough.audited_at_ack());
         assert!(!Backup::Asynchronous.audited_at_ack());

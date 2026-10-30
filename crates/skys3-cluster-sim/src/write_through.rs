@@ -17,12 +17,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use skys3_sim::SimS3;
 use skys3_sim::check::{Survivors, Violation, check_durable};
 use skys3_sim::history::{History, Operation};
 use skys3_types::{BucketDocument, BucketMode};
 
-use crate::cluster::{remote_prefix, written};
+use crate::cluster::remote_prefix;
 use crate::workload::{OnAck, Routes};
 
 /// How `write_back` buckets acknowledge writes (§7.5), and whether the
@@ -61,6 +60,10 @@ pub(crate) fn write_back_prefix(bucket: &BucketDocument) -> Option<String> {
     (bucket.mode == BucketMode::WriteBack).then(|| remote_prefix(bucket).to_owned())
 }
 
+/// What a target holds for a key in it: the value its write wrote, or
+/// `None`.
+pub(crate) type Lookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// How long a write-through write waits for its flush in the simulation
 /// (`write_through_timeout_seconds`), well within a client's timeout.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
@@ -72,7 +75,7 @@ pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
 /// they found.
 #[derive(Clone)]
 pub(crate) struct RemoteAudit {
-    remote: SimS3,
+    remote: Lookup,
     /// The remote key of each key audited, by the name the history gives
     /// it.
     keys: Arc<BTreeMap<String, String>>,
@@ -85,7 +88,7 @@ impl RemoteAudit {
     /// An audit of the `keys` keys of each bucket in `routes` that
     /// `prefix` gives a key prefix in `remote`, over `history`.
     pub(crate) fn new(
-        remote: SimS3,
+        remote: Lookup,
         routes: &Routes,
         keys: usize,
         history: History,
@@ -152,10 +155,7 @@ impl RemoteAudit {
             .iter()
             .filter(|(name, _)| only.is_none_or(|only| only == name.as_str()))
             .map(|(name, remote_key)| {
-                let flushed = self
-                    .remote
-                    .object(remote_key)
-                    .map(|object| written(&object.body, &object.info.etag));
+                let flushed = (self.remote)(remote_key);
                 let survivor = Survivors {
                     flushed: Some(flushed),
                     ..Survivors::default()
