@@ -2491,6 +2491,20 @@ of this file. A task with nothing unexpected keeps "None."
   never answer. `free_ports` holds its listeners until all are chosen, so
   a gateway and an admin port never coincide. A test holds a configured
   port and checks the node moves.
+- **Test ports come from below the ephemeral range (later CI).** Two
+  in-process tests of later branches failed to bind a port `free_port`
+  had chosen: a node's transport on restart, and the first node of a
+  three-node cluster whose ports were all chosen up front. Port 0 hands
+  out ports from the kernel's ephemeral range, which is also where every
+  outgoing connection gets its local port, so an earlier node's
+  connection to the control store, or anything else a parallel test
+  dialled, could take the port before the node bound it. `free_ports` now
+  picks ports from 20000-31999, below Linux's (32768-60999) and macOS's
+  (49152-65535) default ranges, checking each with a bind, and walks the
+  range with a process-wide counter that starts at a place derived from
+  the process ID, so a port is handed out once per process and parallel
+  tests never choose the same one. `Process::start`'s retry stays for
+  whatever else may hold a port.
 
 ## M2 Replicated shards
 
@@ -5446,6 +5460,20 @@ of this file. A task with nothing unexpected keeps "None."
   - *Remaining skew.* A part acknowledged after the completion applied,
     but before the flusher read its change, still counts. The bound is
     the change's queueing delay in the flusher's loop.
+- **An open in flight counted as no stream (later CI).** On a later
+  branch of the stack the write-through simulation failed at seed 4,
+  about one run in five and only with other simulations in the same
+  process: a streamed body's remote upload was logged as opened but never
+  completed or aborted. A plain `PUT` had replaced the body while the
+  flusher was opening the remote upload, and the flusher would have
+  aborted it once `body_timeout` passed. But `ShardStatus::streams`
+  counted only streams whose remote upload was `Open`, not `Opening`, so
+  between the open's `PART_FLUSHED` and the flusher taking the open's
+  result the shard looked idle, and the simulation's drain audited the
+  remote then. `Streams::len` now counts every stream whose open has
+  started; the remote may hold an upload the open is about to record.
+  With it the failing pair passed 25 runs in a row, and
+  `an_upload_being_opened_is_counted` fails without it.
 - **Left open.**
   - Plan M4-04 adds the `ListParts` reconciliation. Until then, a part
     whose `PART_FLUSHED` was lost is sent again, which is correct but
@@ -9821,6 +9849,18 @@ of this file. A task with nothing unexpected keeps "None."
   taking 314 s. Under a CPU hog on every core, the scenario passed all seven
   runs (two batches), a node getting in within a second of the drain;
   the whole `control-stores.sh` passed again in 5 m 12 s.
+- **A restart lost its transport port (CI).** On a later branch of the
+  stack, `a_claim_found_after_starting_from_the_copy_stops_the_node`
+  failed once with `binding the transport to 127.0.0.1:42805 ... Address
+  already in use`: the restart from the copy bound the port the first
+  start had used, and in the moment the node was down another test of the
+  same binary, or a connection it opened (the port is in the kernel's
+  ephemeral range, as `free_port` takes it from there), held it. The test
+  now starts the node through `start_n1`, which picks a fresh port for
+  each start and tries again on another when the bind finds it taken, up
+  to `START_ATTEMPTS` times, as `Process::start` already does for the
+  binary. A different port on restart changes nothing the test checks:
+  the claim is told by the instance ID, not the address.
 - **Not done here.** Handoff commands are refused on the node's transport
   (no handoff sink until the binary serves shards across nodes, M8-05b),
   and replication and forwarded requests are closed after their first
@@ -9955,6 +9995,16 @@ of this file. A task with nothing unexpected keeps "None."
   including those a primary had just filled for another node's gateway.
   The scenario sets `reserve_fraction = 0.0`, as the single-node cluster
   does.
+- **A takeover test read every shard after one took over (restack).**
+  `three_nodes_replicate_route_take_over_and_readmit` stops the primary of
+  shard 0, waits until a write to shard 0 succeeds, and then read each of
+  the twelve keys once. The stopped node can be primary of other shards
+  too, which take over on their own lease timers, and the bucket ID (so
+  which shard each key falls in) differs per run: in about one run in
+  twelve a key such as `key-0` sat on a shard that had not taken over
+  yet, and its single GET failed. Each read now polls with `eventually`
+  (30 seconds), so a key lost by the takeover still fails the test; 24
+  runs in a row passed with it.
 - **Open points.** STS sessions stay node-local (a session issued by one
   node is unknown to the others); a node does not follow a peer's address
   change on a link that is already up; `nodes/` is not in the local copy,
