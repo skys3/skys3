@@ -37,11 +37,11 @@ use std::time::Duration;
 
 use skys3_flush::FlushService;
 use skys3_io::SimMount;
-use skys3_sim::SimS3;
 use skys3_sim::check::{Survivors, Violation};
 use skys3_sim::history::Operation;
 use skys3_types::{BucketDocument, BucketMode, ShardId};
 
+use crate::peer_s3::SimStore;
 use crate::workload::Routes;
 
 /// Whether the `local` buckets have backup targets (§8.9), how writes to
@@ -144,7 +144,7 @@ pub(crate) fn backup_prefix(bucket: &BucketDocument) -> Option<String> {
 
 /// The flush services of every node's every life, which the drain asks
 /// how far their backups are.
-pub(crate) type Flushers = Mutex<Vec<Weak<FlushService<SimS3, SimMount>>>>;
+pub(crate) type Flushers = Mutex<Vec<Weak<FlushService<SimStore, SimMount>>>>;
 
 /// How often the drain looks at the flushers.
 const DRAIN_POLL: Duration = Duration::from_millis(100);

@@ -159,6 +159,11 @@ pub struct PutObject {
     pub content_md5: Option<String>,
     /// `If-None-Match: *` or `If-Match`.
     pub precondition: WritePrecondition,
+    /// The write's apply-by time, in milliseconds since the Unix epoch,
+    /// sent as `x-skys3-apply-by` to a store that may be a SkyS3 peer: the
+    /// peer refuses to sequence the write later (design §7.8). Other stores
+    /// ignore the header.
+    pub apply_by_ms: Option<u64>,
 }
 
 impl PutObject {
@@ -182,6 +187,7 @@ impl PutObject {
             tags: BTreeMap::new(),
             content_md5: None,
             precondition: WritePrecondition::None,
+            apply_by_ms: None,
         }
     }
 
@@ -318,6 +324,11 @@ pub struct DeleteObject {
     pub version_id: Option<VersionId>,
     /// `If-Match`: delete only if the current object has this ETag.
     pub if_match: Option<ETag>,
+    /// The write's apply-by time, in milliseconds since the Unix epoch,
+    /// sent as `x-skys3-apply-by` to a store that may be a SkyS3 peer: the
+    /// peer refuses to sequence the write later (design §7.8). Other stores
+    /// ignore the header.
+    pub apply_by_ms: Option<u64>,
 }
 
 impl DeleteObject {
@@ -449,6 +460,11 @@ pub struct CopyObject {
     pub tagging_directive: TaggingDirective,
     /// The destination's precondition.
     pub precondition: WritePrecondition,
+    /// The write's apply-by time, in milliseconds since the Unix epoch,
+    /// sent as `x-skys3-apply-by` to a store that may be a SkyS3 peer: the
+    /// peer refuses to sequence the write later (design §7.8). Other stores
+    /// ignore the header.
+    pub apply_by_ms: Option<u64>,
 }
 
 impl CopyObject {
@@ -463,6 +479,7 @@ impl CopyObject {
             metadata_directive: MetadataDirective::Copy,
             tagging_directive: TaggingDirective::Copy,
             precondition: WritePrecondition::None,
+            apply_by_ms: None,
         }
     }
 
@@ -610,6 +627,11 @@ pub struct CompleteMultipartUpload {
     pub parts: Vec<CompletedPart>,
     /// `If-None-Match: *` or `If-Match`.
     pub precondition: WritePrecondition,
+    /// The write's apply-by time, in milliseconds since the Unix epoch,
+    /// sent as `x-skys3-apply-by` to a store that may be a SkyS3 peer: the
+    /// peer refuses to sequence the write later (design §7.8). Other stores
+    /// ignore the header.
+    pub apply_by_ms: Option<u64>,
 }
 
 /// `AbortMultipartUpload`.

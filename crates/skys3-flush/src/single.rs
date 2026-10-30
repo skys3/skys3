@@ -146,7 +146,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
 /// The extents that hold a version's bytes, by offset: those it names, or
 /// its inline bytes as one. `None` for a version without bytes in the log,
 /// or whose extents do not add up to its size.
-fn body_extents(payload: &Payload, size: u64) -> Option<BTreeMap<u64, ExtentRef>> {
+pub(crate) fn body_extents(payload: &Payload, size: u64) -> Option<BTreeMap<u64, ExtentRef>> {
     let mut extents = BTreeMap::new();
     match payload {
         Payload::Inline(position) => {

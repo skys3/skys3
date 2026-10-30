@@ -166,6 +166,7 @@ fn commits(inline: bool) -> impl Strategy<Value = Commit> {
             key,
             precondition,
             write,
+            apply_by_ms: None,
         },
     )
 }

@@ -105,11 +105,103 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 }
             }
         }
+        self.complete_opened(open, key, upload_id, completed, identity, version, expected)
+            .await
+    }
+
+    /// Flushes `object`, a single PUT at `version` whose body is over
+    /// [`MAX_BOUNDED_BYTES`](crate::MAX_BOUNDED_BYTES), to a target whose
+    /// S3 writes carry apply-by times (§7.8): as a remote multipart upload
+    /// of `flush_part_bytes` parts read from its extents, whose small
+    /// completion carries the apply-by time, conditioned on `expected`.
+    /// The remote ETag is then a multipart one, as after a streamed PUT
+    /// (§7.3).
+    pub(crate) async fn put_body_parts(
+        &self,
+        version: EpochSeq,
+        object: &ObjectVersion,
+        identity: &WriteIdentity,
+        expected: Option<ETag>,
+    ) -> Result<Outcome, Failure> {
+        let part_bytes = self.target.settings.part_bytes.max(1);
+        let count = object.size.div_ceil(part_bytes);
+        let extents = crate::single::body_extents(&object.payload, object.size)
+            .filter(|_| count <= u64::from(u16::MAX))
+            .ok_or_else(|| {
+                Failure::Local("the object's body cannot be uploaded in parts".into())
+            })?;
+        self.target.abort_orphaned_uploads().await;
+        let key = self.remote_key();
+        let put = put_request(key.clone(), object, identity)?;
+        let create = CreateMultipartUpload {
+            key: put.key,
+            metadata: put.metadata,
+            content_type: put.content_type,
+            headers: put.headers,
+            tags: put.tags,
+        };
+        let upload_id = self
+            .target
+            .store
+            .create_multipart_upload(create)
+            .await
+            .map_err(Failure::Remote)?;
+        let open = OpenUpload::new(self.target, key.clone(), upload_id.clone());
+        let mut completed = Vec::new();
+        for number in (1..=u16::MAX).take_while(|n| u64::from(*n) <= count) {
+            let (start, end) = stream::part_range(number, part_bytes);
+            let range = (start, end.min(object.size));
+            let Some(span) = stream::span(&extents, range) else {
+                open.abort().await;
+                return Err(Failure::Local(format!(
+                    "the object's extents do not hold bytes {start} to {}",
+                    range.1
+                )));
+            };
+            let part = stream::Piece {
+                number,
+                range,
+                span: &span,
+            };
+            match stream::upload_span(self.shard, self.target, self.key, &upload_id, part, None)
+                .await
+            {
+                Ok(etag) => completed.push(CompletedPart {
+                    part_number: u32::from(number),
+                    etag,
+                }),
+                Err(failure) => {
+                    open.abort().await;
+                    return Err(failure);
+                }
+            }
+        }
+        self.complete_opened(open, key, upload_id, completed, identity, version, expected)
+            .await
+    }
+
+    /// Completes the remote upload `upload_id` of `key` that this attempt
+    /// opened, `open`, with `completed`, as the version at `version`,
+    /// conditioned on `expected` (§7.2): a failed precondition is followed
+    /// as for a `PutObject`, and an upload that does not complete is
+    /// aborted.
+    #[expect(clippy::too_many_arguments, reason = "one completion's parts")]
+    async fn complete_opened(
+        &self,
+        open: OpenUpload<'_, S>,
+        key: String,
+        upload_id: UploadId,
+        completed: Vec<CompletedPart>,
+        identity: &WriteIdentity,
+        version: EpochSeq,
+        expected: Option<ETag>,
+    ) -> Result<Outcome, Failure> {
         let request = CompleteMultipartUpload {
             key,
             upload_id,
             parts: completed,
             precondition: WritePrecondition::None,
+            apply_by_ms: None,
         };
         match self
             .conditional(Write::Complete(&request), identity, version, expected)
@@ -235,6 +327,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             upload_id: id.clone(),
             parts,
             precondition: WritePrecondition::None,
+            apply_by_ms: None,
         };
         match self
             .conditional(Write::Complete(&request), identity, version, expected)

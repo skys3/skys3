@@ -51,6 +51,7 @@ use crate::checksum::{
     ChecksumValidator, DEFAULT_ALGORITHM, ExpectedChecksums, MultipartChecksum, MultipartEtag,
 };
 use crate::conditions::{Precondition, invalid_part, no_such_upload};
+use crate::peer_s3::ApplyBy;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::Trailers;
 
@@ -220,8 +221,13 @@ impl<H: Shards> Objects<H> {
         bucket: &BucketDocument,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<CreateMultipartUploadOutput> {
+        let carrier = self.carrier(bucket, &req.extensions);
+        let metadata = metadata_of(
+            standard_headers!(req.input),
+            req.input.metadata.as_ref(),
+            carrier,
+        )?;
         let input = req.input;
-        let metadata = metadata_of(standard_headers!(input), input.metadata.as_ref())?;
         // The tags are the completed object's, kept in the `MPU_CREATE`.
         let tags = input
             .tagging
@@ -325,9 +331,13 @@ impl<H: Shards> Objects<H> {
         bucket: &BucketDocument,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<CompleteMultipartUploadOutput> {
+        // The completion publishes the version, so it alone carries a
+        // peer's apply-by time (§7.8): parts change no key.
+        let apply_by = ApplyBy::of(&req.extensions);
         let input = req.input;
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(apply_by);
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
         let every_part = (0, MAX_PARTS as usize);

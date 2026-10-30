@@ -92,7 +92,8 @@ use skys3_index::{ObjectVersion, Payload};
 use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
 use skys3_log::record::{
-    ExtentRef, IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put, PutData,
+    ExtentRef, IDENTITY_METADATA, IDENTITY_METADATA_RESERVED, MAX_METADATA_LEN, Metadata, Put,
+    PutData,
 };
 use skys3_types::checksum::ChecksumAlgorithm;
 use skys3_types::{BucketDocument, BucketMode, EpochSeq, NodeId, WriteIdentity};
@@ -104,6 +105,7 @@ use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
 use crate::fill::{FillError, Fills};
 use crate::hot_cache::{HotCache, ObjectName, VersionName};
 use crate::origin::OriginValidations;
+use crate::peer_s3::{ApplyBy, Carrier, PeerAccess, reveals_identity};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
@@ -208,7 +210,7 @@ macro_rules! overrides {
 /// Fills a GetObject or HeadObject output from a resolved read, then
 /// replaces the headers the request overrides.
 macro_rules! describe {
-    ($output:expr, $found:expr, $checksum_mode:expr, $overrides:expr) => {{
+    ($output:expr, $found:expr, $checksum_mode:expr, $overrides:expr, $reveal:expr) => {{
         let found: &Found = &$found;
         let object = &found.object;
         let header = |name: &str| object.metadata.get(name).cloned();
@@ -226,7 +228,7 @@ macro_rules! describe {
         $output.e_tag = Some(s3_etag(object));
         $output.last_modified = Some(last_modified(object));
         $output.storage_class = storage_class(object);
-        let metadata: s3s::dto::Metadata = user_metadata(&object.metadata).collect();
+        let metadata: s3s::dto::Metadata = user_metadata(&object.metadata, $reveal).collect();
         $output.metadata = (!metadata.is_empty()).then_some(metadata);
         $output.tag_count = i32::try_from(object.tags.len())
             .ok()
@@ -289,6 +291,9 @@ pub(crate) struct Objects<H> {
     buckets: BucketsConfig,
     /// What the origins of `read_only` buckets were seen to hold (§9.5).
     validations: OriginValidations,
+    /// Which access keys are peer clusters' flushers, which may store their
+    /// write identity with what they write (§7.8).
+    peer_access: PeerAccess,
 }
 
 impl<H: Shards> Objects<H> {
@@ -311,7 +316,18 @@ impl<H: Shards> Objects<H> {
             write_through: WriteThrough::new(config.buckets.clone(), config.write_through_timeout),
             buckets: config.buckets.clone(),
             validations: config.origin_validations.clone(),
+            peer_access: config.peer_access.clone(),
         }
+    }
+
+    /// Who may set the write identity on a write to `bucket` by the
+    /// request with `extensions`.
+    pub(crate) fn carrier<'a>(
+        &'a self,
+        bucket: &'a BucketDocument,
+        extensions: &'a http::Extensions,
+    ) -> Carrier<'a> {
+        Carrier::of(&self.peer_access, extensions, &bucket.name)
     }
 
     /// Answers a write to `bucket` that committed `version` of `key` in
@@ -370,7 +386,7 @@ impl<H: Shards> Objects<H> {
         {
             return Err(entity_too_large());
         }
-        let metadata = stored_metadata(&input)?;
+        let metadata = stored_metadata(&input, self.carrier(bucket, &extensions))?;
         let tags = input
             .tagging
             .as_deref()
@@ -378,7 +394,8 @@ impl<H: Shards> Objects<H> {
             .transpose()?
             .unwrap_or_default();
         let condition =
-            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?;
+            Precondition::of_write(input.if_match.as_ref(), input.if_none_match.as_ref())?
+                .apply_by(ApplyBy::of(&extensions));
         let shard = ShardRef::for_key(bucket, &input.key);
         self.admit(bucket, &shard)?;
         if condition != Precondition::None {
@@ -512,7 +529,13 @@ impl<H: Shards> Objects<H> {
             body: Some(body),
             ..GetObjectOutput::default()
         };
-        describe!(output, found, input.checksum_mode, overrides);
+        describe!(
+            output,
+            found,
+            input.checksum_mode,
+            overrides,
+            reveals_identity(&req.extensions)
+        );
         Ok(output)
     }
 
@@ -637,7 +660,13 @@ impl<H: Shards> Objects<H> {
             .resolve(bucket, &input.key, conditions, selector, false)
             .await?;
         let mut output = HeadObjectOutput::default();
-        describe!(output, found, input.checksum_mode, overrides);
+        describe!(
+            output,
+            found,
+            input.checksum_mode,
+            overrides,
+            reveals_identity(&req.extensions)
+        );
         Ok(output)
     }
 
@@ -977,24 +1006,32 @@ fn storage_class(object: &ObjectVersion) -> Option<s3s::dto::StorageClass> {
 /// `400 InvalidArgument` for the write identity's reserved name, and
 /// `400 MetadataTooLarge` for user metadata over
 /// [`MAX_USER_METADATA_BYTES`] or metadata over what a record holds.
-fn stored_metadata(input: &PutObjectInput) -> S3Result<Metadata> {
-    metadata_of(standard_headers!(input), input.metadata.as_ref())
+fn stored_metadata(input: &PutObjectInput, carrier: Carrier<'_>) -> S3Result<Metadata> {
+    metadata_of(standard_headers!(input), input.metadata.as_ref(), carrier)
 }
 
 /// [`stored_metadata`] from the standard headers, as [`standard_headers!`]
 /// lists them, and the user metadata of a PutObject, a CopyObject, or a
-/// CreateMultipartUpload.
+/// CreateMultipartUpload. The write identity is kept only from a peer's
+/// flusher that may carry it (`carrier`, §7.8), outside the user
+/// metadata's limit, in the room reserved for it.
 fn metadata_of(
     standard: [(&str, &Option<String>); 6],
     user: Option<&s3s::dto::Metadata>,
+    carrier: Carrier<'_>,
 ) -> S3Result<Metadata> {
     let mut metadata: Metadata = standard
         .into_iter()
         .filter_map(|(name, value)| Some((name.to_owned(), value.clone()?)))
         .collect();
     let mut user_bytes = 0;
+    let mut identity = None;
     for (name, value) in user.into_iter().flatten() {
         let name = name.to_ascii_lowercase();
+        if name == WriteIdentity::METADATA_KEY && carrier.accepts(value) {
+            identity = Some(value.clone());
+            continue;
+        }
         if name == WriteIdentity::METADATA_KEY {
             return Err(s3_error!(
                 InvalidArgument,
@@ -1015,16 +1052,20 @@ fn metadata_of(
              {MAX_USER_METADATA_BYTES} bytes of user metadata"
         ));
     }
+    if let Some(identity) = identity {
+        metadata.insert(IDENTITY_METADATA.to_owned(), identity);
+    }
     Ok(metadata)
 }
 
-/// The user metadata clients see: names without their prefix, and never
-/// the write identity, which an object imported or adopted from the remote
-/// can carry (§7.2).
-fn user_metadata(metadata: &Metadata) -> impl Iterator<Item = (String, String)> + '_ {
-    metadata.iter().filter_map(|(name, value)| {
+/// The user metadata clients see: names without their prefix, and the
+/// write identity, which an object imported or adopted from the remote, or
+/// written by a peer, can carry (§7.2), only if `reveal`: for a peer's
+/// flusher (§7.8).
+fn user_metadata(metadata: &Metadata, reveal: bool) -> impl Iterator<Item = (String, String)> + '_ {
+    metadata.iter().filter_map(move |(name, value)| {
         let name = name.strip_prefix(USER_METADATA_PREFIX)?;
-        (name != WriteIdentity::METADATA_KEY).then(|| (name.to_owned(), value.clone()))
+        (reveal || name != WriteIdentity::METADATA_KEY).then(|| (name.to_owned(), value.clone()))
     })
 }
 

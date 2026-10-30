@@ -15,9 +15,9 @@ use skys3_control::{ControlError, FileControlStore, ProposalIds, RetryPolicy, re
 use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig, GatewayListener, HotCache,
-    HotCacheMetrics, IdSource, LocalShards, ShardRef, Shards, SigV4Authenticator,
-    StaticCredentials, StsService,
+    BucketLookup, CredentialError, FillBody, FillError, Fills, Gateway, GatewayConfig,
+    GatewayListener, HotCache, HotCacheMetrics, IdSource, LocalShards, ShardRef, Shards,
+    SigV4Authenticator, StaticCredentials, StsService,
 };
 use skys3_index::{Checkpointer, Index, IndexConfig, IndexError};
 use skys3_io::{BlockingPool, MonotonicClock, RealDisk, SystemWallClock, WallClock};
@@ -34,7 +34,7 @@ use skys3_sts::{
     StsEndpoint, StsSettings, ValidatorSettings,
 };
 use skys3_types::Generation;
-use skys3_types::{BucketDocument, BucketId, BucketMode, Label, NodeId};
+use skys3_types::{BucketDocument, BucketId, BucketMode, BucketName, Label, NodeId};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
@@ -44,6 +44,7 @@ use crate::admission::{DiskSpace, NodeAdmission, Place, Watched, watch_space};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner, open_file_store};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
 use crate::metrics::{ControlMetrics, NodeMetrics};
+use crate::peering::NodePeering;
 use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
@@ -784,6 +785,8 @@ pub struct Node {
     checkpointer: Arc<Checkpointer<RealDisk>>,
     background: JoinSet<()>,
     shared: Arc<Shared>,
+    /// The QUIC endpoint of native replication, if the node peers.
+    peer_endpoint: Option<skys3_peer::PeerEndpoint>,
     _data_dir: DataDir,
 }
 
@@ -1004,6 +1007,9 @@ impl Node {
         };
         let snapshots = SnapshotService::new(Box::new(connect.clone()), config.buckets().clone())
             .with_wall_clock(Arc::clone(&wall));
+        // Native replication with peer clusters (§7.8), if any is
+        // configured.
+        let peering = NodePeering::open(&config, Arc::clone(&wall))?;
         let flush = {
             let settings = FlushSettings {
                 extent_bytes: config.storage().extent_bytes,
@@ -1011,17 +1017,19 @@ impl Node {
                 body_timeout: config.peering().peer_staging_ttl(),
                 ..FlushSettings::from_config(config.flush())
             };
-            Arc::new(
-                FlushService::new(
-                    cluster.clone(),
-                    settings,
-                    Box::new(connect),
-                    FlushMetrics::register(&metrics.registry),
-                )
-                .with_budget(budget)
-                .with_buckets(config.buckets().clone())
-                .with_origin_connect(Box::new(connect_origin)),
+            let service = FlushService::new(
+                cluster.clone(),
+                settings,
+                Box::new(connect),
+                FlushMetrics::register(&metrics.registry),
             )
+            .with_budget(budget)
+            .with_buckets(config.buckets().clone())
+            .with_origin_connect(Box::new(connect_origin));
+            Arc::new(match &peering {
+                Some(peering) => service.with_peer_transport(peering.transport(&config)),
+                None => service,
+            })
         };
         let mut gateway_config = GatewayConfig::new(&config);
         gateway_config.retry = retry;
@@ -1037,6 +1045,10 @@ impl Node {
             config.cache().hot_cache_bytes_per_node,
             HotCacheMetrics::register(&metrics.registry),
         );
+        gateway_config.descriptors = peering.as_ref().and_then(NodePeering::descriptors);
+        // The destination side applies peers' commits as the gateway's
+        // writes are applied.
+        let peer_gateway_config = peering.as_ref().map(|_| gateway_config.clone());
         let ids = IdSource::from_os_rng();
         let mut gateway = Gateway::new(
             gateway_config,
@@ -1125,6 +1137,18 @@ impl Node {
         background.spawn(Arc::clone(&shared).sweep_sessions(sessions));
         background.spawn(Arc::clone(&shared).follow_flushes());
         background.spawn(Arc::clone(&shared).follow_lifecycle(lifecycle_metrics));
+        let peer_endpoint = peering.as_ref().map(NodePeering::closer);
+        if let (Some(peering), Some(gateway_config)) = (peering, peer_gateway_config) {
+            let gateway = shared.gateway.clone();
+            let buckets: BucketLookup = Arc::new(move |name: &BucketName| gateway.bucket(name));
+            let (shared, shards) = (Arc::clone(&shared), storage.shards.clone());
+            background.spawn(peering.adapt_pool());
+            background.spawn(async move {
+                peering
+                    .serve(&shared.config, &gateway_config, shards, buckets)
+                    .await;
+            });
+        }
         background.spawn(watch_space(space, watched, DISK_WATCH_INTERVAL));
         {
             // The policies go in before the cache scans the replicas open
@@ -1156,6 +1180,7 @@ impl Node {
             checkpointer: storage.checkpointer,
             background,
             shared,
+            peer_endpoint,
             _data_dir: opened.data_dir.take().expect("the data directory is open"),
         })
     }
@@ -1220,6 +1245,7 @@ impl Node {
             checkpointer,
             mut background,
             shared,
+            peer_endpoint,
             _data_dir: data_dir,
             ..
         } = self;
@@ -1228,6 +1254,9 @@ impl Node {
         let _ = stop_gateway.send(());
         let _ = gateway_task.await;
         background.shutdown().await;
+        if let Some(endpoint) = peer_endpoint {
+            endpoint.close();
+        }
         checkpoints.abort();
         let _ = checkpoints.await;
         shared.flush.shutdown().await;
