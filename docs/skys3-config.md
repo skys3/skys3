@@ -127,7 +127,7 @@ The node storage engine (§10) and read registrations (§8.7).
 | `group_commit_max_delay_us` | integer | `500` | How long a group commit waits for more records, from the first record's arrival. Records already queued join without a wait even after it. May be 0. Timers round it up to the next millisecond tick. |
 | `group_commit_max_bytes` | integer | `4194304` (4 MiB) | Positive. |
 | `index_checkpoint_interval_seconds` | integer | `10` | Positive (§10.2). |
-| `compaction_live_threshold` | float | `0.5` | Greater than 0 and less than 1. Segments with a lower live ratio are reclaimed (§10.3). |
+| `compaction_live_threshold` | float | `0.5` | Greater than 0 and less than 1. Log and fragment segments with a lower live ratio are reclaimed (§10.3). |
 | `read_registration_ttl_seconds` | integer | `30` | Positive. |
 | `read_registration_renew_interval_seconds` | integer | `10` | Positive, and less than `read_registration_ttl_seconds`. |
 | `disk_min_free_bytes` | integer | `1073741824` (1 GiB) | May be 0, which turns the check off. Admission control (§13): while a log disk has less free space than this, writes that add data to the shards on it get `503 SlowDown`, and while the data directory's file system has less, every such write does. Deletes are still admitted. The margin keeps the disk from filling, since the first write error takes a disk out of service (§10.4). |

@@ -420,15 +420,15 @@ fn recovery_refuses_records_it_cannot_use() {
         let mut newer_version = whole.clone();
         newer_version[8] = 3;
         reseal(&mut newer_version);
-        let mut reserved_kind = whole.clone();
-        reserved_kind[10] = 16; // EC_RELEASE, not defined yet
-        reseal(&mut reserved_kind);
+        let mut unknown_kind = whole.clone();
+        unknown_kind[10] = 20; // a kind a later build may define
+        reseal(&mut unknown_kind);
         let mut broken_header = whole.clone();
         broken_header[22] = 1; // reserved byte
         reseal(&mut broken_header);
         let cases = [
             (newer_version, ErrorClass::Unsupported),
-            (reserved_kind, ErrorClass::Unsupported),
+            (unknown_kind, ErrorClass::Unsupported),
             (broken_header, ErrorClass::Invalid),
         ];
         for (tail, class) in cases {

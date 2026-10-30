@@ -1,13 +1,14 @@
 //! `EC_RELOCATE` (§8.6): it moves fragments of the key's current coded
 //! version to new locations, all or none, and the shard's index from node
 //! to fragments follows; a record whose version or fragments moved on is
-//! dropped.
+//! dropped. What relocations and writes replace waits in the shard's index
+//! of released fragments until an `EC_RELEASE` removes it (§8.7).
 
 mod support;
 
 use skys3_index::Index;
 use skys3_log::RecordBody;
-use skys3_log::record::{EcPublish, EcRelocate, FragmentMove};
+use skys3_log::record::{EcPublish, EcRelease, EcRelocate, FragmentMove};
 use skys3_shard::{Effect, Outcome, Rejection};
 use skys3_types::{
     AttemptId, CodecId, CodedStripe, Epoch, FragmentId, FragmentLocation, Geometry, NodeId,
@@ -276,4 +277,78 @@ fn a_relocation_names_the_entry_s_version_which_a_retag_moves() {
     let coded = entry(&index, "k").unwrap().object.unwrap().coded.unwrap();
     assert_eq!((coded.version, coded.publish), (at(1), at(2)));
     assert_eq!(coded.stripes[0].fragments()[0], location(9, 9));
+}
+
+/// The fragments the shard has yet to release, with the key and version
+/// each names.
+fn released(index: &Index) -> Vec<(FragmentLocation, String, u64)> {
+    index
+        .read()
+        .unwrap()
+        .released(&shard(0), None, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|(location, released)| (location, released.key, released.version.seq.get()))
+        .collect()
+}
+
+fn release(key: &str, fragments: Vec<FragmentLocation>) -> RecordBody {
+    RecordBody::EcRelease(EcRelease {
+        key: key.into(),
+        fragments,
+    })
+}
+
+fn released_count(fragments: usize) -> Outcome {
+    Outcome::Applied(Effect::Released { fragments })
+}
+
+#[test]
+fn writes_and_relocations_release_what_they_replace() {
+    let (_, index) = new_index();
+    step(&index, 1, put("k", 20, 1));
+    step(&index, 2, publish("k", 1));
+    assert!(released(&index).is_empty());
+
+    // A relocation releases the fragment it moves away from, under the
+    // version the layout's fragments were written for.
+    let moves = vec![moved(0, 1, location(2, 1), location(7, 100))];
+    assert_eq!(step(&index, 3, relocate("k", 1, moves)), RELOCATED);
+    assert_eq!(released(&index), [(location(2, 1), "k".into(), 1)]);
+    // A rejected one releases nothing.
+    let stale = vec![moved(0, 1, location(2, 1), location(9, 9))];
+    assert!(matches!(
+        step(&index, 4, relocate("k", 1, stale)),
+        Outcome::Rejected(_)
+    ));
+    assert_eq!(released(&index).len(), 1);
+
+    // An overwrite releases the whole layout, relocated fragment included.
+    step(&index, 5, put("k", 20, 5));
+    let all = released(&index);
+    assert_eq!(all.len(), 7);
+    assert!(all.iter().all(|(_, key, seq)| key == "k" && *seq == 1));
+    assert!(all.iter().any(|(at, ..)| *at == location(7, 100)));
+
+    // An EC_RELEASE removes what it names for its key, once.
+    let some = vec![location(1, 0), location(2, 1), location(7, 100)];
+    assert_eq!(
+        step(&index, 6, release("k", some.clone())),
+        released_count(3)
+    );
+    assert_eq!(released(&index).len(), 4);
+    assert_eq!(step(&index, 7, release("k", some)), released_count(0));
+    let rest: Vec<FragmentLocation> = released(&index).into_iter().map(|(at, ..)| at).collect();
+    assert_eq!(
+        step(&index, 8, release("j", rest.clone())),
+        released_count(0)
+    );
+    assert_eq!(step(&index, 9, release("k", rest)), released_count(4));
+    assert!(released(&index).is_empty());
+
+    // A delete releases a coded version too.
+    step(&index, 10, publish("k", 5));
+    step(&index, 11, delete("k"));
+    assert_eq!(released(&index).len(), 6);
+    assert!(released(&index).iter().all(|(_, _, seq)| *seq == 5));
 }

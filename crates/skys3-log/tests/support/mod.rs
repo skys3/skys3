@@ -10,10 +10,10 @@ use proptest::sample::{Index, subsequence};
 
 use skys3_log::record::{
     Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
-    EcPublish, EcRelocate, Extent, ExtentRef, Flushed, FragmentMove, Import, ImportCheckpoint,
-    ImportProgress, ImportRange, LogRecord, MAX_IMPORT_RANGES, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
-    MpuComplete, MpuCreate, MpuPart, PartFlushed, Put, PutData, RecordBody, RemoteStep, ShardRef,
-    TagSet, Tags, UploadBegin, UploadChecksum,
+    EcPublish, EcRelease, EcRelocate, Extent, ExtentRef, Flushed, FragmentMove, Import,
+    ImportCheckpoint, ImportProgress, ImportRange, LogRecord, MAX_IMPORT_RANGES, MAX_PAYLOAD_LEN,
+    Metadata, MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed, Put, PutData, RecordBody,
+    RemoteStep, ShardRef, TagSet, Tags, UploadBegin, UploadChecksum,
 };
 use skys3_types::{
     AttemptId, BucketId, CodecId, CodedStripe, ETag, Epoch, EpochSeq, FragmentId, FragmentLocation,
@@ -374,6 +374,18 @@ pub fn ec_relocate(position: EpochSeq) -> impl Strategy<Value = EcRelocate> {
         )
 }
 
+/// A valid `EC_RELEASE`: one to eight fragments, in increasing order.
+pub fn ec_release() -> impl Strategy<Value = EcRelease> {
+    let location = (node_id(), any::<u128>()).prop_map(|(node, id)| FragmentLocation {
+        node,
+        fragment: FragmentId::new(id),
+    });
+    (key(), btree_set(location, 1..=8)).prop_map(|(key, fragments)| EcRelease {
+        key,
+        fragments: fragments.into_iter().collect(),
+    })
+}
+
 fn node_id() -> impl Strategy<Value = NodeId> {
     label(NodeId::MAX_LEN).prop_map(|s| NodeId::new(s).unwrap())
 }
@@ -485,6 +497,7 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
             ),
         ec_publish(position).prop_map(RecordBody::EcPublish),
         ec_relocate(position).prop_map(RecordBody::EcRelocate),
+        ec_release().prop_map(RecordBody::EcRelease),
         shard_config(shard, position.epoch).prop_map(RecordBody::Config),
         Just(RecordBody::Truncate),
         import_progress().prop_map(RecordBody::ImportProgress),
