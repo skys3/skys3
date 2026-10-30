@@ -150,8 +150,8 @@ pub struct ShardStatus {
     /// in conflict.
     pub last_error: Option<String>,
     /// Remote multipart uploads streamed for the shard's uploads (§7.3)
-    /// that are open, not completed or aborted yet; for a native target,
-    /// the streamed bodies being staged (§7.8).
+    /// that are open or being opened, not completed or aborted yet; for a
+    /// native target, the streamed bodies being staged (§7.8).
     pub streams: u64,
     /// Whether the flusher stopped, because its shard did.
     pub stopped: bool,
