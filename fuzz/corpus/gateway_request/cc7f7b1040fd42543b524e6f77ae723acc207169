@@ -1,0 +1,4 @@
+/fuzz/big?partNumber=2&uploadIdloadId=u
+x-amz-copy-source: fuzz=u
+x-amz-copy-source: fuzz/k?vs=0-4
+

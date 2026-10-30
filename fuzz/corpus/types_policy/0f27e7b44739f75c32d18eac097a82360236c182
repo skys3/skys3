@@ -1,0 +1,2 @@
+et/key
+{"Version": "2012-10-1", "Statement":[{"Effect": "Al", "Condition": {"gLike": {"se": ["home/*",        9999999999e0	  ] }   }}]  }

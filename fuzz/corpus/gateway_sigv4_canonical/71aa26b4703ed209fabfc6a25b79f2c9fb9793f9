@@ -1,0 +1,7 @@
+fed
+Host: examrle.amaz:na0s.com
+-Header1: VALfuzz/c
+content-encoding: aws-chåuden
+x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
+x-amz-decoded-content-length: 5
+x-amz-trailer: x-amz-checksum-crc32

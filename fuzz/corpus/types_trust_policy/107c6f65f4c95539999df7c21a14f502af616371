@@ -1,0 +1,18 @@
+subject&
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal"
+
+
+
+
+
+
+
+
+
+
+:
+
+
+
+
+ {"Federated": "idp.example"}, "Action": "Ats:*"}]}

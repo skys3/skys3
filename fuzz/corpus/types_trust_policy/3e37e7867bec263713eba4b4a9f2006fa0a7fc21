@@ -1,0 +1,2 @@
+r`````rmain
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:aws:iam::1.com"}, "Action": "sts:AssumeR\\\\\\\\\\\\\\\\\\\\\\\\\\0\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\oleWithWebIdentity", "Condition": {"StringEquals": {"": "repo:example/app:*"}}}}

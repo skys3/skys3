@@ -1,0 +1,4 @@
+/fuzz/k
+origin: httple
+access-control-request-method :PUT
+

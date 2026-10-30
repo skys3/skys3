@@ -1,0 +1,2 @@
+bucket/key
+{"Version": "2012-10-17", "Statement": [{"Effect": "A", "Action": "FFFFd*e*f*", "Condition": {"Sx": [2.*2]}}}]}

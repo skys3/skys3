@@ -1,0 +1,11 @@
+{
+ "keys": [
+  { "kty": "EC",
+   "kid": "SSSSS=SSSec-1",
+   "use": "sig",
+   "alg": "ES256",
+   "crv": "P=25*",
+   "x": "9pnnO-bpDgPh6UZL-oZ8SRNSbluHZ3nAM" 
+}
+
+ M }

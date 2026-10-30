@@ -1,0 +1,2 @@
+audject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https://idp.example", "http:1:8080"]}, "Action": ["sts:AssumeRoleWithWebty", "sts:*"], "Condition": {"StringLike": {"Idp.example:sub": ["a*", "?b"], "idp.example:azp": "c"}}}, {"Effect": "Deny", "Principal": {"Federated": "idp.example"}, "Action": "sts:*"}]}

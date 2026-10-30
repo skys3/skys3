@@ -130,7 +130,7 @@ bench/                  performance suite (§16.3)
 | `cargo-deny` (licenses, advisories, bans) and an MSRV build | M0-01 | Every push and PR |
 | Simulation with a fixed seed set | M0-04 | Every push and PR |
 | Simulation with random seeds and long runs | M2-03 | Nightly. A failing seed becomes a regression test with its replay command. |
-| Fuzz smoke runs | M1-01 | Every push and PR, briefly per target. Long runs nightly (M7-03). |
+| Fuzz smoke runs | M1-01 | Every push and PR, briefly per target, from the committed corpus. Long runs nightly (M7-03, `fuzz-nightly.yml`). |
 | Protocol model check | M2-01 | Changes under `spec/`, and nightly |
 | etcd integration | M2-05 | Every push and PR |
 | SDK matrix | M1-25 | PRs that touch the gateway or identity, and nightly |
@@ -981,6 +981,8 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 - Long runs of every fuzz target, a corpus kept in the repository, and fixes for what they find.
 - **Done when:** every target has run for the agreed time with no open findings.
+- **The agreed time (decided in M7-03).** Every target runs 10 CPU-minutes before the PR merges, three at a time on four cores, and from then on 30 minutes on a core of its own every night (`.github/workflows/fuzz-nightly.yml`), which carries the corpus each night grows to the next in an Actions cache, so the nights add up. About half the targets, the small text parsers and frame-level decoders, found no new coverage in the second half of their first 10 minutes; the larger ones still did in their last minutes, which is what the nightly runs are for.
+- **The corpus (decided in M7-03).** `fuzz/corpus/<target>` holds each target's corpus, minimized with `cargo fuzz cmin` to the inputs that reach code no smaller input reaches (`fuzz/run.sh --cmin`), at most `max_len` bytes each: 1.1 MB in 11,193 files after the campaign, at most 340 KB for one target. It was seeded from the SigV4 test suite, S3 request and XML bodies, tokens, key sets, policies, the log record golden vectors, and rebuild exports. Every run starts from it: the pull-request smoke job, the nightly job, and local runs through `fuzz/run.sh`, which also sets each target's input length, allocation, memory, and time bounds from its parser's limits in design §12.
 
 #### M7-04 Metrics, alerts, and dashboards
 

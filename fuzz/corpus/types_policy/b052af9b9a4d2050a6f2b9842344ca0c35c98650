@@ -1,0 +1,2 @@
+bu/key
+{"Version": "2012-117", "Id": "p", "Statement": [{"Sid": "read", "Effect": "Allow", "NotAction":  ["arn:aw"]$, *"}]}

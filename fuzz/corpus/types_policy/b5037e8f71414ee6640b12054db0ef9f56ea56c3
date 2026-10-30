@@ -1,0 +1,7 @@
+bucketkey
+{"Version":"2012-10-17", "Statement": [{"Resource": "*f*", "Condition": {"StrngLe": {"s3:prefix"
+
+
+
+:[
+ 2,22004000]}}}]}

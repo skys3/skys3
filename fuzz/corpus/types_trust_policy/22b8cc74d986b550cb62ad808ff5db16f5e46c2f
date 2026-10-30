@@ -1,0 +1,2 @@
+suttref:ridp.examplein
+{"Statement": {"Effect": "Allow", "Principal": {"Federated": "amaomi"}

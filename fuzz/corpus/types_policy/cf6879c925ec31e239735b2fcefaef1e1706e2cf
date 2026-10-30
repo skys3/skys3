@@ -1,0 +1,2 @@
+aaaaaaaaab
+{"Version": "210-17", "Statement": {"Effect": "s3:*", "Resource": "", "Resource": ":s*"}}

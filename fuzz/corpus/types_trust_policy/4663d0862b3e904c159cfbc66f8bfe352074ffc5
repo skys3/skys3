@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-017 a", "Id": "t", "Statement": [{"Sid":  "AlloW", "Principal": {"Federated": []}, "Action": ["sts:meRoleWithWebIdentity", "sts:*"], "Condition": {"StringLike": {"idp": 0.00mpl

@@ -1,0 +1,2 @@
+ketkey
+{"Version": "20-1", "Statement": {"Effect": "Allo@", "Action"										:"*", "Rece": "*"}}

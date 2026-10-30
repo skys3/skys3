@@ -1,0 +1,2 @@
+subject
+{ "Id": "t", "Statement" :[{"Sid": "a", "Effect": "Al", "Prin": "ts:*"}]}

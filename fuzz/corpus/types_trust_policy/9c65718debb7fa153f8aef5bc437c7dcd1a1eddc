@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "NotAction" :{"Federated": ["httpsZ://idp.example", "http://1s://idp.exame\\12ple", "http://127.0.0.1:8080"]}, "Action": ["sts:AsxumeRoleWithWebIlentity", "sts:*"], "Condition": {"Stri27derated": "idp.example"}, "Action": "sts:*"}]}

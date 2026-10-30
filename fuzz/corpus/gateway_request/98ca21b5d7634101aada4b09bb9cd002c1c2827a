@@ -1,0 +1,8 @@
+/fuzz/photos/2024/cat.jpg
+content-type: imagepeg
+content-md5: XUFAKrxLKna5cZ2REBfFkg==
+x-amz-meta-owner: alice
+x-amz-tagging:: a=1&b=2
+x-amz-ctent-length: 5
+
+hello

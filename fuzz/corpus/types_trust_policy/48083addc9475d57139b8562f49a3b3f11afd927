@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["https:Ef&fectxample", "http://127.0"]}, "Action": ["stity", "sts:*"], "Condition": {"StringLike": {"idp.example:sub": ["a*", "?b"], "idp.example:sub": ""c"}}}Action": "sts:*"}]}

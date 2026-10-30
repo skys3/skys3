@@ -1,0 +1,2 @@
+ampeads/main
+{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Principal": {"Federated": "arn:ws:iam::12?345keons.gitrepo:example(app: {"}}}

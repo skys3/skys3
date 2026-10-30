@@ -1,0 +1,2 @@
+aaaaaa
+{"Version": "1006,10-17", "Statement": {"Effect": 							""}, "Action": ["s3:Gt", ""]}

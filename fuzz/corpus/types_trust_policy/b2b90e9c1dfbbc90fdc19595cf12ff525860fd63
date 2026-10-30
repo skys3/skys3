@@ -1,0 +1,2 @@
+subject
+{"Version": "2012-10-17", "Id": "t", "Statement": [{"Sid": "a", "Effect": "Allow", "Principal": {"Federated": ["httpsZ:////idp.222)2222222222Princi21:8080"]}, "Action": ["l", "http://1s://idp.entity", "sts:*"], "Condition": {"StringLike": {"idp.exadp": "a", "":"a", "": "Allow", ]}

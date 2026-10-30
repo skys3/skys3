@@ -341,8 +341,10 @@ jobs:
           SKYS3_ETCD_ENDPOINTS: http://127.0.0.1:2379
 
   # A brief cargo-fuzz run of every target in fuzz/, found with `cargo fuzz
-  # list` so new targets join automatically. Long runs are nightly (M7-03).
-  # A crash fails the job and uploads the input that caused it.
+  # list` so new targets join automatically, from its committed corpus and
+  # under its bounds (fuzz/run.sh). Long runs are nightly
+  # (fuzz-nightly.yml). A crash fails the job and uploads the input that
+  # caused it.
   fuzz:
     name: Fuzz smoke runs
     needs: changes
@@ -376,7 +378,7 @@ jobs:
         run: |
           for target in $(cargo +nightly fuzz list); do
             echo "::group::$target"
-            cargo +nightly fuzz run --target "$FUZZ_TARGET" "$target" -- -max_total_time="$FUZZ_SECONDS" -timeout=10
+            fuzz/run.sh "$target" "$FUZZ_SECONDS"
             echo "::endgroup::"
           done
 
