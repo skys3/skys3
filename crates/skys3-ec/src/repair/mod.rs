@@ -75,7 +75,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_config::EcConfig;
-use skys3_coord::{FragmentPlanner, MoveReason, ReplaceRequest};
+use skys3_coord::{FragmentPlanner, MoveReason, NodeState, ReplaceRequest};
 use skys3_index::{Entry, Index, IndexError};
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::{EcRelocate, FragmentMove};
@@ -303,6 +303,12 @@ pub enum RepairBug {
     /// Moves fragments in every pass, before its repairs, and without
     /// waiting for other repairers' repairs.
     MovesBeforeRepairs,
+    /// Never counts a silent node's fragments lost, however long it stays
+    /// silent: only fragments a node answers it does not hold are.
+    TrustSilent,
+    /// Leaves a departing node's fragments to the moves that drain it,
+    /// never checking them, even once the node falls silent.
+    LeaveDepartingToMoves,
 }
 
 /// A shard primary's repairer (§8.6). The module documentation describes a
@@ -602,6 +608,13 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
                     lost.extend(held.iter().map(|held| (node.clone(), held.fragment)));
                     continue;
                 }
+                let departing = planner
+                    .topology()
+                    .get(node)
+                    .is_some_and(|candidate| candidate.state == NodeState::Departing);
+                if departing && self.has_bug(RepairBug::LeaveDepartingToMoves) {
+                    continue;
+                }
                 if held.is_empty() {
                     continue;
                 }
@@ -640,7 +653,9 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
             } else {
                 silent.insert(node.clone());
                 let since = *health.silent_since.get_or_insert(now);
-                if now.duration_since(since) >= self.settings.lost_after {
+                if now.duration_since(since) >= self.settings.lost_after
+                    && !self.has_bug(RepairBug::TrustSilent)
+                {
                     lost.extend(held.iter().map(|held| (node.clone(), held.fragment)));
                 }
             }
@@ -1119,6 +1134,8 @@ enum RepairBug {
     Unthrottled,
     UnfencedMove,
     MovesBeforeRepairs,
+    TrustSilent,
+    LeaveDepartingToMoves,
 }
 
 /// Whose transfer takes the bandwidth cap: a repair's, or a move's, which

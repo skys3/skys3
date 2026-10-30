@@ -38,14 +38,17 @@ use skys3_index::IndexReader;
 use skys3_log::ShardRef;
 use skys3_types::{AttemptId, Label, NodeId};
 
-use super::{CodingConfig, Crash, CrashKind, CrashTarget, Driver, NODES, World, lock, planner};
+use super::{
+    CodingConfig, Crash, CrashKind, CrashTarget, Driver, MEMBERS, NODES, World, lock, planner,
+};
 
 /// Nodes that join or are drained, and how the moves are hurt.
 #[derive(Debug, Clone)]
 pub struct RebalanceConfig {
     /// How many nodes join, `n6` on, on empty disks.
     pub joins: usize,
-    /// How many of `n1` to `n5`, drawn from the seed, are drained.
+    /// How many of `n1` to `n5`, drawn from the seed, are drained: of `n3`
+    /// to `n5` when the move crash loses its node for good.
     pub drains: usize,
     /// Whether placement keeps fragments apart by rack (`failure_domain =
     /// "rack"`): the six first nodes in three racks of two, the first node
@@ -139,7 +142,10 @@ pub enum MoveTarget {
 }
 
 /// A crash during the moves: `kind` strikes `target` at `point` of the
-/// first move to reach it, which restarts `downtime` later.
+/// first move to reach it, which restarts `downtime` later. A crash that
+/// loses its node for good ([`CrashKind::Lose`]) strikes only a node
+/// outside the shard, whose members this cluster cannot replace: the
+/// first move whose old or new holder is one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveCrash {
     /// The step.
@@ -247,7 +253,10 @@ pub(super) fn planner_source(world: Arc<World>) -> PlannerSource {
 
 /// Every key of `shard` with a coded layout in `reader`: the objects the
 /// run wrote, and the copies its readers made, which are coded too.
-fn coded_keys(reader: &IndexReader, shard: &ShardRef) -> Result<BTreeSet<String>, String> {
+pub(super) fn coded_keys(
+    reader: &IndexReader,
+    shard: &ShardRef,
+) -> Result<BTreeSet<String>, String> {
     let mut keys = BTreeSet::new();
     for node in reader.fragment_nodes(shard).map_err(|e| e.to_string())? {
         let rows = reader
@@ -325,7 +334,17 @@ impl Driver<'_> {
         self.moves.crash = config.crash;
         self.moves.seen = lock(&self.world.repair.events).len();
         let mut rng = StdRng::seed_from_u64(self.world.seed ^ 0x0044_5241_494e);
-        let mut pool: Vec<usize> = (1..NODES).collect();
+        // A drained node that a move crash loses for good is one outside
+        // the shard, whose members this cluster cannot replace.
+        let first = if config
+            .crash
+            .is_some_and(|crash| crash.kind == CrashKind::Lose)
+        {
+            MEMBERS
+        } else {
+            1
+        };
+        let mut pool: Vec<usize> = (first..NODES).collect();
         pool.shuffle(&mut rng);
         let mut topology = lock(&self.world.topology);
         for &n in pool.iter().take(config.drains) {
@@ -366,24 +385,37 @@ impl Driver<'_> {
         };
         let events = lock(&self.world.repair.events);
         let moves = move_attempts(&events);
+        let ends = |attempt| {
+            events
+                .iter()
+                .find_map(|(_, _, started)| match &started.step {
+                    RepairStep::MoveStarted { from, to, .. } if started.attempt == attempt => {
+                        Some((from.clone(), to.clone()))
+                    }
+                    _ => None,
+                })
+        };
+        // A node lost for good is one outside the shard, as above.
+        let outside = |node: &NodeId| self.world.position(node).is_some_and(|n| n >= MEMBERS);
+        let strikes = |attempt| match (crash.kind, crash.target, ends(attempt)) {
+            (CrashKind::Lose, MoveTarget::OldHolder, Some((from, _))) => outside(&from),
+            (CrashKind::Lose, MoveTarget::NewHolder, Some((_, to))) => outside(&to),
+            (CrashKind::Lose, MoveTarget::Primary, _) => false,
+            _ => true,
+        };
         let reached = events[self.moves.seen..]
             .iter()
             .find(|(_, _, event)| {
-                moves.contains(&event.attempt) && crash.point.reached(&event.step)
+                moves.contains(&event.attempt)
+                    && crash.point.reached(&event.step)
+                    && strikes(event.attempt)
             })
             .cloned();
         self.moves.seen = events.len();
         let Some((primary, _, event)) = reached else {
             return;
         };
-        let ends = events
-            .iter()
-            .find_map(|(_, _, started)| match &started.step {
-                RepairStep::MoveStarted { from, to, .. } if started.attempt == event.attempt => {
-                    Some((from.clone(), to.clone()))
-                }
-                _ => None,
-            });
+        let ends = ends(event.attempt);
         drop(events);
         self.moves.crash = None;
         let Some((from, to)) = ends else {
@@ -401,11 +433,14 @@ impl Driver<'_> {
         let slot = &self.world.nodes[node];
         if crash.target == MoveTarget::NewHolder && crash.kind == CrashKind::PowerAtNextSync {
             // As for a repair: the cut is armed as the copy's write leaves.
+            *lock(&self.world.cut_for_attempt[node]) = None;
             self.world.cut_at_repair_write[node].store(true, Ordering::SeqCst);
             self.cut[node] = false;
             self.report
                 .crashes
                 .push((slot.id.to_string(), CrashKind::PowerAtNextSync));
+            let strike = self.plan_strike(node, crash.kind);
+            self.cutting[node] = Some(strike);
             return;
         }
         let crash = Crash {
@@ -414,7 +449,8 @@ impl Driver<'_> {
             kind: crash.kind,
             downtime: crash.downtime,
         };
-        self.due.push((now, node, crash));
+        let strike = self.plan_strike(node, crash.kind);
+        self.due.push((now, node, crash, Some(strike)));
     }
 
     /// The stripes of the coded layouts of the first member that is up:
