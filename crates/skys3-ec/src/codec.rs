@@ -72,6 +72,42 @@ pub trait EcCodec: fmt::Debug + Send + Sync {
         Ok(start..end)
     }
 
+    /// The bytes of every fragment that decoding bytes `within` of a data
+    /// fragment needs: a range read that lost a data fragment reads these
+    /// bytes of `k` other fragments and decodes only them (§8.5,
+    /// [`EcCodec::decode_columns`]). The range contains `within`, and is
+    /// the same in every fragment of the stripe.
+    ///
+    /// # Errors
+    ///
+    /// [`EcError::OutsideFragment`] if `within` is empty or ends past the
+    /// fragment length, and the errors of [`EcCodec::fragment_len`].
+    fn columns(
+        &self,
+        geometry: Geometry,
+        data_len: u64,
+        within: Range<u64>,
+    ) -> Result<Range<u64>, EcError>;
+
+    /// Rebuilds bytes `columns` of every data fragment of a stripe from the
+    /// same bytes of any `k` of its fragments: `fragments` holds, for each
+    /// fragment present, its bytes `columns`, where `columns` is a range
+    /// [`EcCodec::columns`] returned. Returns the `k` data fragments' bytes
+    /// `columns`, in index order.
+    ///
+    /// # Errors
+    ///
+    /// [`EcError::OutsideFragment`] if `columns` is not such a range, and
+    /// otherwise as [`EcCodec::decode`], with fragment lengths checked
+    /// against the length of `columns`.
+    fn decode_columns(
+        &self,
+        geometry: Geometry,
+        data_len: u64,
+        columns: Range<u64>,
+        fragments: &[Option<&[u8]>],
+    ) -> Result<Vec<Vec<u8>>, EcError>;
+
     /// Encodes one stripe: returns its `k + m` fragments, in index order.
     ///
     /// # Errors

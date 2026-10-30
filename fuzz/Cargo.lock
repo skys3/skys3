@@ -2375,6 +2375,7 @@ dependencies = [
 name = "skys3-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "crc32c",
  "libfuzzer-sys",
  "prost",
@@ -2421,6 +2422,7 @@ dependencies = [
  "skys3-config",
  "skys3-control",
  "skys3-coord",
+ "skys3-ec",
  "skys3-index",
  "skys3-io",
  "skys3-log",

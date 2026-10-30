@@ -45,6 +45,11 @@
 //!   `fragment_orphan_after_seconds` ([`OrphanReclaimer`],
 //!   [`OrphanClient`]), and reclaim those its [`OrphanJudge`] finds that
 //!   no committed layout references and none ever will.
+//! - **Coded reads** ([`read`]): a range of a coded object read from the
+//!   data fragments that cover it ([`read_coded`]), and decoded from any
+//!   `k` fragments of a stripe that lost one, missing or corrupt, through
+//!   a [`FragmentSource`] ([`FragmentReadClient`] over the cluster
+//!   transport, served by [`FragmentServer::serve_reads`]).
 //!
 //! ```
 //! use skys3_ec::{CodecId, EcCodec, Geometry, codec, current_codec};
@@ -69,6 +74,7 @@ mod error;
 pub mod fragment;
 mod layout;
 pub mod orphans;
+pub mod read;
 mod reed_solomon;
 mod store;
 mod transfer;
@@ -84,6 +90,10 @@ pub use layout::{
 };
 pub use orphans::{
     OrphanClient, OrphanConfirmer, OrphanJudge, OrphanReclaimer, OrphanServer, Suspect, Verdict,
+};
+pub use read::{
+    CodedBody, CodedRead, CodedReadError, FragmentBytes, FragmentIdentity, FragmentReadClient,
+    FragmentReadError, FragmentRequest, FragmentSource, read_coded,
 };
 pub use reed_solomon::ReedSolomonV1;
 pub use skys3_types::{

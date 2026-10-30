@@ -1,5 +1,7 @@
 //! Errors of the erasure-coding layer.
 
+use std::ops::Range;
+
 use skys3_types::{CodecId, GeometryError};
 
 /// Why an erasure-coding operation failed.
@@ -65,6 +67,16 @@ pub enum EcError {
         index: usize,
         /// `k`.
         data_fragments: usize,
+    },
+
+    /// A range of fragment bytes that is empty, ends past the stripe's
+    /// fragment length, or is not one the codec decodes on its own.
+    #[error("bytes {range:?} are not a range of a fragment of {fragment_len} bytes")]
+    OutsideFragment {
+        /// The range passed.
+        range: Range<u64>,
+        /// The stripe's fragment length.
+        fragment_len: u64,
     },
 
     /// Fewer than `k` fragments are available.

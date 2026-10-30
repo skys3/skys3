@@ -40,4 +40,4 @@ rcgen.workspace = true
 # Enables `test-util` for this crate's own tests.
 skys3-ec = { path = ".", features = ["test-util"] }
 skys3-sim.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }

@@ -50,7 +50,10 @@
 //! (`holders`); when no holder still has the version, the read resolves
 //! the key again. Before it asks a holder, a GET looks the version up in
 //! the node's [`HotCache`], and a whole object read from another node's
-//! holder fills it. A GET of an evicted version of a `write_back`
+//! holder fills it. A GET of a coded version reads it from the fragments
+//! its layout names, decoding a stripe that lost some (§8.5, `coded`);
+//! when too few of a stripe's fragments can be read, the read resolves
+//! the key again. A GET of an evicted version of a `write_back`
 //! bucket reads it through a fill from the remote ([`Fills`]); when the fill
 //! finds the remote changed and adopts its version, the read resolves the
 //! key again, at most [`MAX_FILL_ROUNDS`] times.
@@ -60,6 +63,7 @@
 //! multipart uploads in `multipart`, and UploadPartCopy, which reads its
 //! source as a GET does, in `part_copy`.
 
+mod coded;
 mod download;
 mod holders;
 mod upload;
@@ -75,6 +79,7 @@ use s3s::dto::{
     PutObjectOutput, Range, StreamingBlob,
 };
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
+use skys3_ec::FragmentSource;
 use skys3_index::{ObjectVersion, Payload};
 use skys3_io::BlockingPool;
 use skys3_log::RecordBody;
@@ -268,6 +273,7 @@ pub(crate) struct Objects<H> {
     remote: Option<Arc<dyn RemoteReads>>,
     holders: HolderReads,
     hot_cache: HotCache,
+    fragments: Option<Arc<dyn FragmentSource>>,
     write_through: WriteThrough,
 }
 
@@ -286,6 +292,7 @@ impl<H: Shards> Objects<H> {
             remote: config.remote.clone(),
             holders: HolderReads::new(config.read_registration_renew_interval),
             hot_cache: config.hot_cache.clone(),
+            fragments: config.fragments.clone(),
             write_through: WriteThrough::new(config.buckets.clone(), config.write_through_timeout),
         }
     }
@@ -522,6 +529,26 @@ impl<H: Shards> Objects<H> {
             }
             if let Some(body) = self.read_hot(bucket, key, &found) {
                 return Ok((found, body));
+            }
+            if found.object.coded.is_some() {
+                match self.read_coded(bucket, key, &found).await? {
+                    Ok(body) => return Ok((found, body)),
+                    // Too few fragments of a stripe: the version may have
+                    // been replaced and its fragments reclaimed since the
+                    // plan, so the key is resolved again.
+                    Err(error) if rounds + 1 < MAX_FILL_ROUNDS => {
+                        tracing::debug!(shard = %found.shard, key, %error,
+                            "a coded read did not start");
+                        rounds += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(s3_error!(
+                            ServiceUnavailable,
+                            "The object's fragments could not be read: {error}"
+                        ));
+                    }
+                }
             }
             if !found.evicted {
                 if found.holders.is_empty() {
