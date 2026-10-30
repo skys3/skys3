@@ -19,6 +19,7 @@ use tokio::time::Instant;
 #[derive(Debug, Clone)]
 pub struct RepairMetrics {
     repaired: Counter,
+    moved: Counter,
     bytes: Counter,
     duration: Histogram,
     unrepaired: Gauge,
@@ -32,6 +33,7 @@ impl Default for RepairMetrics {
     fn default() -> Self {
         Self {
             repaired: Counter::default(),
+            moved: Counter::default(),
             bytes: Counter::default(),
             // From a second to about three days.
             duration: Histogram::new(exponential_buckets(1.0, 2.0, 19)),
@@ -53,9 +55,16 @@ impl RepairMetrics {
              a committed EC_RELOCATE.",
             metrics.repaired.clone(),
         );
+        registry.register(
+            "moved_fragments",
+            "Fragments this node's shard primaries moved to another node, to drain a node, \
+             respect a failure domain's cap, or balance the nodes, with a committed \
+             EC_RELOCATE.",
+            metrics.moved.clone(),
+        );
         registry.register_with_unit(
             "repair",
-            "Bytes this node's repairs read and wrote.",
+            "Bytes this node's repairs and fragment moves read and wrote.",
             Unit::Bytes,
             metrics.bytes.clone(),
         );
@@ -86,7 +95,13 @@ impl RepairMetrics {
         self.repaired.get()
     }
 
-    /// The bytes repairs read and wrote so far.
+    /// The fragments moved so far.
+    #[must_use]
+    pub fn moved(&self) -> u64 {
+        self.moved.get()
+    }
+
+    /// The bytes repairs and moves read and wrote so far.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes.get()
@@ -98,7 +113,12 @@ impl RepairMetrics {
         self.unrepaired.get()
     }
 
-    /// Counts `bytes` a repair read or wrote.
+    /// Counts a fragment moved.
+    pub(crate) fn moved_fragment(&self) {
+        self.moved.inc();
+    }
+
+    /// Counts `bytes` a repair or a move read or wrote.
     pub(crate) fn transferred(&self, bytes: u64) {
         self.bytes.inc_by(bytes);
     }
@@ -152,9 +172,12 @@ mod tests {
         metrics.transferred(10);
         metrics.repaired_after(Duration::from_secs(3));
         assert_eq!((metrics.repaired(), metrics.bytes()), (1, 10));
+        metrics.moved_fragment();
+        assert_eq!(metrics.moved(), 1);
         let text = registry.encode().unwrap();
         for name in [
             "skys3_repaired_fragments_total",
+            "skys3_moved_fragments_total",
             "skys3_repair_bytes_total",
             "skys3_repair_duration_seconds_bucket",
             "skys3_unrepaired_fragments",
