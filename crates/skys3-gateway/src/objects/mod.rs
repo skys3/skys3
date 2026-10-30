@@ -58,6 +58,12 @@
 //! finds the remote changed and adopts its version, the read resolves the
 //! key again, at most [`MAX_FILL_ROUNDS`] times.
 //!
+//! **`read_only` buckets** (§9.5, `origin`) reject writes, and check every
+//! GET and HEAD against the bucket's origin, by a HEAD or, under a TTL, by
+//! what one saw recently, before they serve the cached version the origin
+//! holds; a gateway that cannot fill an evicted version reads it straight
+//! from the origin.
+//!
 //! DeleteObject and DeleteObjects are in `delete`, CopyObject in `copy`,
 //! GetObjectTagging, PutObjectTagging, and DeleteObjectTagging in `tagging`,
 //! multipart uploads in `multipart`, and UploadPartCopy, which reads its
@@ -66,6 +72,7 @@
 mod coded;
 mod download;
 mod holders;
+mod origin;
 mod upload;
 mod write_through;
 
@@ -79,6 +86,7 @@ use s3s::dto::{
     PutObjectOutput, Range, StreamingBlob,
 };
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Result, s3_error};
+use skys3_config::BucketsConfig;
 use skys3_ec::FragmentSource;
 use skys3_index::{ObjectVersion, Payload};
 use skys3_io::BlockingPool;
@@ -95,6 +103,7 @@ use crate::checksum::{ChecksumValidator, ExpectedChecksums, VerifiedBody};
 use crate::conditions::{Precondition, ReadConditions, last_modified, s3_etag};
 use crate::fill::{FillError, Fills};
 use crate::hot_cache::{HotCache, ObjectName, VersionName};
+use crate::origin::OriginValidations;
 use crate::remote::RemoteReads;
 use crate::shard::{ShardRef, Shards};
 use crate::sigv4::{Authenticated, BodyError, Trailers};
@@ -275,6 +284,10 @@ pub(crate) struct Objects<H> {
     hot_cache: HotCache,
     fragments: Option<Arc<dyn FragmentSource>>,
     write_through: WriteThrough,
+    /// Each bucket's settings: a `read_only` bucket's freshness (§9.5).
+    buckets: BucketsConfig,
+    /// What the origins of `read_only` buckets were seen to hold (§9.5).
+    validations: OriginValidations,
 }
 
 impl<H: Shards> Objects<H> {
@@ -294,6 +307,8 @@ impl<H: Shards> Objects<H> {
             hot_cache: config.hot_cache.clone(),
             fragments: config.fragments.clone(),
             write_through: WriteThrough::new(config.buckets.clone(), config.write_through_timeout),
+            buckets: config.buckets.clone(),
+            validations: config.origin_validations.clone(),
         }
     }
 
@@ -575,6 +590,22 @@ impl<H: Shards> Objects<H> {
             match self.fill(bucket, key, &found).await? {
                 Ok(body) => return Ok((found, body)),
                 Err(FillError::Changed) if rounds + 1 < MAX_FILL_ROUNDS => rounds += 1,
+                // Only the shard's primary fills: elsewhere, a version of
+                // an origin is read straight from it (§9.5).
+                Err(FillError::Unavailable(reason)) if bucket.mode == BucketMode::ReadOnly => {
+                    tracing::debug!(shard = %found.shard, key, %reason,
+                        "no fill; reading the origin");
+                    match self.read_origin(bucket, key, &found).await? {
+                        Some(body) => return Ok((found, body)),
+                        None if rounds + 1 < MAX_FILL_ROUNDS => rounds += 1,
+                        None => {
+                            return Err(s3_error!(
+                                ServiceUnavailable,
+                                "The object changed while it was read; please retry"
+                            ));
+                        }
+                    }
+                }
                 Err(error) => {
                     return Err(s3_error!(
                         ServiceUnavailable,
@@ -679,19 +710,21 @@ impl<H: Shards> Objects<H> {
     ///
     /// # Errors
     ///
-    /// `503 ServiceUnavailable` for a bucket that is not `write_back` or a
-    /// gateway without [`Fills`]; the fill's errors.
+    /// `503 ServiceUnavailable` for a bucket that is neither `write_back`
+    /// nor `read_only`, or a gateway without [`Fills`] for a `write_back`
+    /// one; the fill's errors.
     async fn fill(
         &self,
         bucket: &BucketDocument,
         key: &str,
         found: &Found,
     ) -> S3Result<Result<StreamingBlob, FillError>> {
-        let Some(fills) = self
-            .fills
-            .as_ref()
-            .filter(|_| bucket.mode == BucketMode::WriteBack)
-        else {
+        let fills = self.fills.as_ref();
+        let Some(fills) = fills.filter(|_| bucket.mode.has_target()) else {
+            if bucket.mode == BucketMode::ReadOnly {
+                let none = "this node does not fill".to_owned();
+                return Ok(Err(FillError::Unavailable(none)));
+            }
             return Err(download::not_cached());
         };
         let read = fills

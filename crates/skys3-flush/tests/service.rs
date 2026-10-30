@@ -6,10 +6,14 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use skys3_flush::{DirtyBudget, FlushMetrics, FlushService, FlushSettings, ProbeStatus};
+use skys3_flush::{
+    DEFAULT_CREDENTIALS, DirtyBudget, FlushMetrics, FlushService, FlushSettings, ProbeStatus,
+    profile_credentials,
+};
 use skys3_io::{ManualWallClock, SimMount, WallClock};
 use skys3_obs::MetricsRegistry;
 use skys3_remote::probe::ConditionalOperation;
+use skys3_remote::{ObjectStore, PutObject};
 use skys3_sim::SimS3;
 use skys3_sim::s3::{Conditionals, SimS3Config, SimS3Faults};
 use skys3_types::{
@@ -298,5 +302,100 @@ fn other_buckets_and_closed_shards_are_not_flushed() {
         service.reconcile(&[bucket, other.clone()], &node.set).await;
         assert_eq!(budget.check(&other.bucket_id), Ok(()));
         assert!(format!("{service:?}").contains("FlushService"));
+    });
+}
+
+/// A `read_only` bucket over an origin in `remote`, under `team/`.
+fn read_only() -> BucketDocument {
+    BucketDocument {
+        target: Some(RemoteTarget {
+            endpoint: "https://s3.example".to_owned(),
+            bucket: "remote".to_owned(),
+            prefix: Some("team/".to_owned()),
+        }),
+        ..bucket(BucketMode::ReadOnly)
+    }
+}
+
+#[test]
+fn read_only_buckets_have_an_origin_and_no_flushers() {
+    runtime().block_on(async {
+        let node = Node::open(24).await;
+        let store = SimS3::new(24, SimS3Config::default());
+        let service = service(&store, &MetricsRegistry::new());
+        let bucket = read_only();
+        service
+            .reconcile(std::slice::from_ref(&bucket), &node.set)
+            .await;
+        // Nothing is flushed to an origin, and it has no import.
+        assert!(service.status(&bucket.bucket_id).is_none());
+        assert!(service.remote(&bucket.bucket_id).is_none());
+        assert_eq!(service.target_of(&bucket), None);
+        let origin = service.origin(&bucket.bucket_id).unwrap();
+        assert_eq!(origin.target(), bucket.target.as_ref().unwrap());
+        assert_eq!(origin.credentials(), DEFAULT_CREDENTIALS);
+        assert!(service.filler(&bucket.bucket_id).is_some());
+        // The origin is read under the target's prefix.
+        store
+            .put_object(PutObject::new("team/k", "origin"))
+            .await
+            .unwrap();
+        let object = origin.remote().head("k").await.unwrap().unwrap();
+        assert_eq!(object.object.size, 6);
+        assert!(format!("{origin:?}").contains("Origin"));
+        // A bucket that is gone loses its origin, and so does a service
+        // that stops.
+        service.reconcile(&[], &node.set).await;
+        assert!(service.origin(&bucket.bucket_id).is_none());
+        assert!(service.filler(&bucket.bucket_id).is_none());
+        service
+            .reconcile(std::slice::from_ref(&bucket), &node.set)
+            .await;
+        assert!(service.origin(&bucket.bucket_id).is_some());
+        service.shutdown().await;
+        assert!(service.origin(&bucket.bucket_id).is_none());
+    });
+}
+
+#[test]
+fn origins_are_read_with_their_buckets_profiles() {
+    runtime().block_on(async {
+        let node = Node::open(25).await;
+        let store = SimS3::new(25, SimS3Config::default());
+        let config: skys3_config::Config = "[cluster]\ncluster_id = \"c-test\"\n\
+             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [buckets.photos]\nmode = \"read_only\"\norigin_profile = \"reader\"\n"
+            .parse()
+            .unwrap();
+        let profiles = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connect = {
+            let (store, profiles) = (store.clone(), Arc::clone(&profiles));
+            move |_: &RemoteTarget, profile: Option<&str>| {
+                profiles.lock().unwrap().push(profile.map(str::to_owned));
+                store.with_credentials(profile.unwrap_or_default())
+            }
+        };
+        let service = service(&store, &MetricsRegistry::new())
+            .with_buckets(config.buckets().clone())
+            .with_origin_connect(Box::new(connect));
+        let bucket = read_only();
+        for _ in 0..2 {
+            service
+                .reconcile(std::slice::from_ref(&bucket), &node.set)
+                .await;
+        }
+        let origin = service.origin(&bucket.bucket_id).unwrap();
+        assert_eq!(origin.credentials(), profile_credentials("reader"));
+        assert_eq!(origin.credentials(), "profile:reader");
+        // The origin's store is built once, with the bucket's profile.
+        assert_eq!(*profiles.lock().unwrap(), [Some("reader".to_owned())]);
+        // The profile's credentials are the ones the origin is read with.
+        store
+            .put_object(PutObject::new("team/k", "origin"))
+            .await
+            .unwrap();
+        store.deny("reader", "team/k", true);
+        let error = origin.remote().head("k").await.unwrap_err();
+        assert_eq!(error.status(), Some(403));
     });
 }

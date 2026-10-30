@@ -20,7 +20,9 @@
 //!   that named it then: a version never changes.
 //! - **Coalescing.** Concurrent reads of one version join one fill, and
 //!   each is served its range as soon as the fill has committed the extents
-//!   it covers, while later extents are still being read.
+//!   it covers, while later extents are still being read. The readers of a
+//!   fill wake in the order they began waiting ([`Tracker`]), so a
+//!   simulation replays from its seed.
 //! - **`ADOPT`.** A remote read that fails its precondition, or finds the
 //!   object or the version gone, means the remote changed out of band. The
 //!   remote is the system of record for clean data, so the fill HEADs the
@@ -50,7 +52,7 @@ use skys3_remote::{
 };
 use skys3_shard::{Outcome, Shard};
 use skys3_types::EpochSeq;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc};
 
 use crate::import::loaded_metadata;
 use crate::metrics::Counters;
@@ -101,6 +103,60 @@ struct Progress {
 /// A fill in progress: of a version of a key of a shard.
 type FillKey = (ShardRef, String, EpochSeq);
 
+/// One fill's [`Progress`], as its readers follow it.
+///
+/// Not a `watch` channel: one registers each waiter with one of several
+/// notifiers that tokio's thread-local random number generator picks, and
+/// wakes them notifier by notifier, so the readers of one fill would wake
+/// in an order the simulation's seed does not decide. A [`Notify`] wakes
+/// them in the order they began waiting.
+#[derive(Debug, Default)]
+struct Tracker {
+    progress: Mutex<Progress>,
+    changed: Notify,
+}
+
+impl Tracker {
+    /// Waits until `ready` finds what it needs in the progress, and
+    /// returns that.
+    async fn wait_for<T>(&self, ready: impl Fn(&Progress) -> Option<T>) -> T {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Registered before the check, so no change in between is
+            // missed.
+            changed.as_mut().enable();
+            if let Some(found) = ready(&lock(&self.progress)) {
+                return found;
+            }
+            changed.await;
+        }
+    }
+}
+
+/// The fill's side of its [`Tracker`]. A fill dropped before it ends, as
+/// when its runtime stops, ends its progress as stopped.
+struct Reporter(Arc<Tracker>);
+
+impl Reporter {
+    fn update(&self, change: impl FnOnce(&mut Progress)) {
+        change(&mut lock(&self.0.progress));
+        self.0.changed.notify_waiters();
+    }
+
+    fn end(&self, end: Result<(), FillError>) {
+        self.update(|progress| progress.end = Some(end));
+    }
+}
+
+impl Drop for Reporter {
+    fn drop(&mut self) {
+        if lock(&self.0.progress).end.is_none() {
+            self.end(Err(stopped()));
+        }
+    }
+}
+
 /// The read-through fills of one `write_back` bucket's remote target.
 ///
 /// Cloning a filler returns another handle to the same fills.
@@ -141,7 +197,7 @@ struct Inner<S> {
     /// The in-flight budget, in KiB, as a flush target keeps one.
     inflight: Semaphore,
     inflight_kib: u32,
-    fills: Mutex<HashMap<FillKey, watch::Receiver<Progress>>>,
+    fills: Mutex<HashMap<FillKey, Arc<Tracker>>>,
 }
 
 impl<S: ObjectStore> Filler<S> {
@@ -205,12 +261,10 @@ impl<S: ObjectStore> Filler<S> {
         version: EpochSeq,
         range: Range<u64>,
     ) -> Result<FillBody, FillError> {
-        let mut progress = self.join(shard, key, version);
+        let progress = self.join(shard, key, version);
         let begun = progress
-            .wait_for(|p| p.end.is_some() || p.filled > range.start)
-            .await
-            .map(|p| p.end.clone())
-            .unwrap_or_else(|_| Some(Err(stopped())));
+            .wait_for(|p| (p.end.is_some() || p.filled > range.start).then(|| p.end.clone()))
+            .await;
         if let Some(Err(error)) = begun {
             return Err(error);
         }
@@ -221,30 +275,26 @@ impl<S: ObjectStore> Filler<S> {
 
     /// The progress of the fill of `version` of `key`, started if none is
     /// in progress.
-    fn join<D: Disk>(
-        &self,
-        shard: &Shard<D>,
-        key: &str,
-        version: EpochSeq,
-    ) -> watch::Receiver<Progress> {
+    fn join<D: Disk>(&self, shard: &Shard<D>, key: &str, version: EpochSeq) -> Arc<Tracker> {
         let id = (shard.shard().clone(), key.to_owned(), version);
         let mut fills = lock(&self.inner.fills);
         if let Some(progress) = fills.get(&id) {
-            return progress.clone();
+            return Arc::clone(progress);
         }
-        let (sender, receiver) = watch::channel(Progress::default());
-        fills.insert(id.clone(), receiver.clone());
+        let tracker = Arc::new(Tracker::default());
+        fills.insert(id.clone(), Arc::clone(&tracker));
+        let reporter = Reporter(Arc::clone(&tracker));
         let filler = self.clone();
         let shard = shard.clone();
         tokio::spawn(async move {
-            let end = filler.fill(&shard, &id.1, version, &sender).await;
+            let end = filler.fill(&shard, &id.1, version, &reporter).await;
             // Forget the fill before announcing its end, so that a read
             // that comes later starts a new one rather than join a failed
             // one.
             lock(&filler.inner.fills).remove(&id);
-            sender.send_modify(|progress| progress.end = Some(end));
+            reporter.end(end);
         });
-        receiver
+        tracker
     }
 
     /// Fills the evicted version `version` of `key`, reporting each extent
@@ -254,7 +304,7 @@ impl<S: ObjectStore> Filler<S> {
         shard: &Shard<D>,
         key: &str,
         version: EpochSeq,
-        progress: &watch::Sender<Progress>,
+        progress: &Reporter,
     ) -> Result<(), FillError> {
         let entry = shard
             .entry(key)
@@ -304,7 +354,7 @@ impl<S: ObjectStore> Filler<S> {
                     .await
                     .map_err(|error| FillError::Failed(error.to_string()))?;
                 extents.push(extent);
-                progress.send_modify(|progress| {
+                progress.update(|progress| {
                     progress.extents.push(extent);
                     progress.filled += u64::from(extent.len);
                 });
@@ -421,7 +471,7 @@ impl<S: ObjectStore> Filler<S> {
 /// is sent, the receiver is gone, or the fill ends without the extent.
 async fn send_range<D: Disk>(
     shard: Shard<D>,
-    mut progress: watch::Receiver<Progress>,
+    progress: Arc<Tracker>,
     range: Range<u64>,
     sender: mpsc::Sender<io::Result<Bytes>>,
 ) {
@@ -429,21 +479,19 @@ async fn send_range<D: Disk>(
     let mut index = 0;
     while start < range.end {
         let next = progress
-            .wait_for(|p| p.extents.len() > index || p.end.is_some())
-            .await
-            .map(|p| (p.extents.get(index).copied(), p.end.clone()));
+            .wait_for(|p| {
+                (p.extents.len() > index || p.end.is_some())
+                    .then(|| (p.extents.get(index).copied(), p.end.clone()))
+            })
+            .await;
         let extent = match next {
-            Ok((Some(extent), _)) => extent,
-            Ok((None, end)) => {
+            (Some(extent), _) => extent,
+            (None, end) => {
                 let error = match end {
                     Some(Err(error)) => error,
                     _ => FillError::Failed("the fill ended short of the range".to_owned()),
                 };
                 let _ = sender.send(Err(io::Error::other(error))).await;
-                return;
-            }
-            Err(_) => {
-                let _ = sender.send(Err(io::Error::other(stopped()))).await;
                 return;
             }
         };
@@ -565,5 +613,37 @@ mod tests {
         assert_eq!(clip(&data, 10, &(12..15)).unwrap(), "234");
         assert_eq!(clip(&data, 10, &(0..100)).unwrap(), "0123456789");
         assert_eq!(clip(&data, 10, &(15..100)).unwrap(), "56789");
+    }
+
+    #[test]
+    fn readers_of_a_fill_wake_in_the_order_they_began_waiting() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tracker = Arc::new(Tracker::default());
+            let woken = Arc::new(Mutex::new(Vec::new()));
+            let mut readers = Vec::new();
+            for reader in 0..16 {
+                let (tracker, woken) = (Arc::clone(&tracker), Arc::clone(&woken));
+                readers.push(tokio::spawn(async move {
+                    tracker.wait_for(|p| (p.filled > 0).then_some(())).await;
+                    lock(&woken).push(reader);
+                }));
+            }
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            let reporter = Reporter(Arc::clone(&tracker));
+            reporter.update(|progress| progress.filled = 1);
+            for reader in readers {
+                reader.await.unwrap();
+            }
+            assert_eq!(*lock(&woken), (0..16).collect::<Vec<_>>());
+            // A fill that goes away without an end ends as stopped.
+            drop(reporter);
+            let end = tracker.wait_for(|p| p.end.clone()).await;
+            assert!(matches!(end, Err(FillError::Failed(_))), "{end:?}");
+        });
     }
 }

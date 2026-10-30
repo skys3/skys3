@@ -1,6 +1,6 @@
 //! The flushers of every `write_back` bucket, and of every `local` bucket
 //! with a backup target, whose shards are open on a node, each with its
-//! target's capability probe.
+//! target's capability probe; and the origins of `read_only` buckets.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,6 +23,7 @@ use crate::conflict::{Unresolved, effective_policy, may_discard};
 use crate::fill::Filler;
 use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
+use crate::origin::{self, Origin, OriginConnect};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{FlushSettings, Target};
 
@@ -122,6 +123,13 @@ impl BucketStatus {
 /// `clean_copies`, so it keeps every payload that a `FLUSHED` made clean
 /// (`skys3_shard::CleanCache::evicts`).
 ///
+/// **Origins** (§9.5). A `read_only` bucket's target is an origin that
+/// SkyS3 does not own: the service keeps only how to read it ([`Origin`]),
+/// for the gateway's revalidations and forwarded listings and for fills,
+/// with the credentials its `origin_profile` names
+/// ([`FlushService::with_origin_connect`]). Nothing is flushed to it,
+/// probed, or imported.
+///
 /// **Conflicts** (§7.2). A bucket's flushers apply its
 /// `flush_conflict_policy` from its settings, `hold` without them: a key
 /// held in conflict waits for [`FlushService::resolve`], and `overwrite`
@@ -132,6 +140,11 @@ pub struct FlushService<S, D> {
     cluster: ClusterId,
     settings: FlushSettings,
     connect: Connect<S>,
+    /// Builds the stores of origins with their own credentials; without
+    /// it, origins are read through `connect`, with the default chain.
+    origin_connect: Option<OriginConnect<S>>,
+    /// The origin of each `read_only` bucket.
+    origins: Mutex<BTreeMap<BucketId, Origin<S>>>,
     wall: Arc<dyn WallClock>,
     metrics: FlushMetrics,
     budget: Arc<DirtyBudget>,
@@ -220,6 +233,8 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             cluster,
             settings,
             connect,
+            origin_connect: None,
+            origins: Mutex::default(),
             wall: Arc::new(SystemWallClock),
             metrics,
             budget: Arc::new(DirtyBudget::unlimited()),
@@ -245,6 +260,16 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     #[must_use]
     pub fn with_probe_nonces(mut self, first: u64) -> Self {
         self.probe_nonces = Some(Arc::new(AtomicU64::new(first)));
+        self
+    }
+
+    /// Reads the origins of `read_only` buckets through the stores
+    /// `connect` builds, with the credentials of each bucket's
+    /// `origin_profile` (§9.5). Without it, origins are read through the
+    /// service's own `connect`, with the default credential chain.
+    #[must_use]
+    pub fn with_origin_connect(mut self, connect: OriginConnect<S>) -> Self {
+        self.origin_connect = Some(connect);
         self
     }
 
@@ -296,6 +321,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// `buckets`, and every `local` one with a backup target, with shards
     /// open in `set` as their primary is flushed, and nothing else.
     pub async fn reconcile(&self, buckets: &[BucketDocument], set: &ShardSet<D>) {
+        self.follow_origins(buckets);
         let mut open = Vec::new();
         for bucket in buckets {
             let Some((target, role)) = self.followed(bucket) else {
@@ -455,6 +481,39 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         }
     }
 
+    /// Keeps how to read the origin of every `read_only` bucket in
+    /// `buckets`, and of no other.
+    fn follow_origins(&self, buckets: &[BucketDocument]) {
+        let wanted = origin::origins(buckets);
+        let mut origins = lock(&self.origins);
+        origins.retain(|id, _| wanted.contains_key(id));
+        for (id, (bucket, target)) in wanted {
+            if origins.contains_key(id) {
+                continue;
+            }
+            let name = bucket.name.as_str();
+            let (store, profile) = match &self.origin_connect {
+                Some(connect) => {
+                    let profile = self
+                        .bucket_settings
+                        .as_ref()
+                        .and_then(|buckets| buckets.get(&bucket.name).origin_profile.as_deref());
+                    (connect(target, profile), profile)
+                }
+                None => ((self.connect)(target), None),
+            };
+            let origin = Origin::new(
+                target,
+                profile,
+                store,
+                &self.settings,
+                self.metrics.counters(name),
+                &self.wall,
+            );
+            origins.insert(id.clone(), origin);
+        }
+    }
+
     /// Runs a flusher for each of `shards`, with their dirty bytes counted
     /// against the budget if `charged`, and stops the bucket's other
     /// flushers.
@@ -542,11 +601,21 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     }
 
     /// The read-through fills of `bucket`'s target, if the bucket is a
-    /// `write_back` bucket this node follows.
+    /// `write_back` bucket this node follows, or a `read_only` one.
     #[must_use]
     pub fn filler(&self, bucket: &BucketId) -> Option<Filler<S>> {
+        if let Some(origin) = lock(&self.origins).get(bucket) {
+            return Some(origin.filler().clone());
+        }
         let flushers = self.lock();
         Some(flushers.get(bucket)?.record.as_ref()?.filler.clone())
+    }
+
+    /// How this node reads the origin of `bucket`, if it is a `read_only`
+    /// bucket (§9.5).
+    #[must_use]
+    pub fn origin(&self, bucket: &BucketId) -> Option<Origin<S>> {
+        lock(&self.origins).get(bucket).cloned()
     }
 
     /// The remote target of `bucket` and its import's progress, for client
@@ -573,6 +642,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     /// their keys stay dirty and are flushed after the next start. An
     /// import resumes from its stored checkpoints.
     pub async fn shutdown(&self) {
+        lock(&self.origins).clear();
         let flushers = std::mem::take(&mut *self.lock());
         for (_, mut flusher) in flushers {
             // The import stops between steps; once its task ends, none of

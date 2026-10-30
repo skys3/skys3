@@ -1760,3 +1760,37 @@ async fn version_ids_need_a_versioned_bucket() {
         invalid
     );
 }
+
+#[tokio::test]
+async fn credentials_can_be_refused_reads() {
+    let store = store();
+    store.put_object(PutObject::new("k", "body")).await.unwrap();
+    let guest = store.with_credentials("guest");
+    let owner = store.with_credentials("owner");
+    store.deny("guest", "k", true);
+    store.deny("guest", "missing", true);
+    assert!(store.denies("guest", "k"));
+    for key in ["k", "missing"] {
+        let error = guest.get_object(GetObject::new(key)).await.unwrap_err();
+        assert_eq!((error.status(), error.code()), (Some(403), "AccessDenied"));
+        let error = guest.head_object(HeadObject::new(key)).await.unwrap_err();
+        assert_eq!(error.status(), Some(403));
+    }
+    // Other credentials, and requests without any, read as before; and
+    // writes are not refused.
+    assert_eq!(
+        owner.head_object(HeadObject::new("k")).await.unwrap().size,
+        4
+    );
+    assert_eq!(
+        store.get_object(GetObject::new("k")).await.unwrap().body,
+        "body"
+    );
+    guest.put_object(PutObject::new("k", "new")).await.unwrap();
+    store.deny("guest", "k", false);
+    assert!(!store.denies("guest", "k"));
+    assert_eq!(
+        guest.get_object(GetObject::new("k")).await.unwrap().body,
+        "new"
+    );
+}

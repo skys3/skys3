@@ -24,6 +24,7 @@ use std::time::Duration;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use skys3::control::{self, NodeStore};
+use skys3::remote::NodeRemote;
 use skys3::storage;
 use skys3_config::BucketsConfig;
 use skys3_control::faults::FaultyStore;
@@ -32,8 +33,8 @@ use skys3_coord::HandoffSink;
 use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
-    FillBody, FillError, Fills, Gateway, GatewayConfig, HotCache, IdSource, LocalShards, ShardRef,
-    Shards, TrustAll,
+    FillBody, FillError, Fills, Gateway, GatewayConfig, HotCache, IdSource, LocalShards,
+    OriginValidations, ShardRef, Shards, TrustAll,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{
@@ -56,6 +57,7 @@ use crate::backup::Flushers;
 use crate::cluster::HotCaches;
 use crate::faults::Fault;
 use crate::lifecycle::{self, Lifecycle};
+use crate::origin::{Origin, OriginBug};
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -186,6 +188,9 @@ pub(crate) struct NodeSettings {
     /// Whether nodes write index snapshots of the buckets whose settings
     /// name a snapshot target (§8.9).
     pub snapshots: bool,
+    /// The `read_only` buckets' origin, if the run has one (§9.5): the
+    /// gateways then read origins as the node binary does.
+    pub origin: Option<Origin>,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -385,6 +390,20 @@ pub(crate) async fn run<S: NodeServices>(
     if settings.hot_cache.ignore_version {
         gateway_config.hot_cache.ignore_versions();
     }
+    // What the gateway learns of origins, its own in each life.
+    gateway_config.origin_validations = OriginValidations::new();
+    if let Some(origin) = &settings.origin {
+        gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
+        match origin.bug {
+            Some(OriginBug::SkipRevalidation) => {
+                gateway_config.origin_validations.skip_revalidation()
+            }
+            Some(OriginBug::IgnoreCredentials) => {
+                gateway_config.origin_validations.ignore_credentials()
+            }
+            None => {}
+        }
+    }
     shared
         .hot_caches
         .lock()
@@ -505,13 +524,17 @@ fn flush_service(
     remote: &SimS3,
     seed: u64,
 ) -> FlushService<SimS3, SimMount> {
-    let remote = remote.clone();
+    let (remote, origin) = (remote.clone(), remote.clone());
     FlushService::new(
         settings.cluster.clone(),
         settings.flush.clone(),
         Box::new(move |_| remote.clone()),
         FlushMetrics::register(&MetricsRegistry::new()),
     )
+    // An origin is the remote store, read with the bucket's credentials.
+    .with_origin_connect(Box::new(move |_, profile| {
+        origin.with_credentials(profile.unwrap_or(skys3_flush::DEFAULT_CREDENTIALS))
+    }))
     .with_wall_clock(Arc::new(SimWallClock))
     .with_buckets(settings.buckets.clone())
     .with_probe_nonces(seed)

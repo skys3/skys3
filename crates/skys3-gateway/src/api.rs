@@ -44,7 +44,7 @@ use s3s::dto::{
 };
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use skys3_control::ControlStore;
-use skys3_types::{BucketDocument, BucketName};
+use skys3_types::{BucketDocument, BucketMode, BucketName};
 
 use crate::buckets::{Buckets, MODE_HEADER, TARGET_HEADER};
 use crate::checksum::ExpectedChecksums;
@@ -300,6 +300,14 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         let bucket = self.writable(&req.input.bucket)?;
         let (source, _) = copy_source(&req.input.copy_source)?;
         let source = self.bucket(source)?;
+        if source.mode == BucketMode::ReadOnly {
+            // A copy reads its source's entry as it is, which a read of an
+            // origin must check first (§9.5).
+            return Err(s3_error!(
+                NotImplemented,
+                "CopyObject from a read_only bucket is not supported; GET the object and PUT it"
+            ));
+        }
         ok(self.objects.copy(&bucket, &source, req).await?)
     }
 
@@ -308,6 +316,13 @@ impl<C: ControlStore, H: Shards> S3 for Api<C, H> {
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let bucket = self.bucket(&req.input.bucket)?;
+        if bucket.mode == BucketMode::ReadOnly {
+            // Tags are not read from an origin (§9.5).
+            return Err(s3_error!(
+                NotImplemented,
+                "The tags of a read_only bucket's objects are not read from its origin"
+            ));
+        }
         ok(self.objects.get_tagging(&bucket, req.input).await?)
     }
 

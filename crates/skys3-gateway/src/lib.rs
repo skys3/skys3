@@ -145,6 +145,7 @@ mod listener;
 mod listing;
 mod local;
 mod objects;
+mod origin;
 mod peering;
 mod remote;
 pub mod routing;
@@ -170,6 +171,7 @@ pub use objects::{
     MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS, MAX_USER_METADATA_BYTES, MIN_PART_BYTES,
     parse_upload_id, upload_id,
 };
+pub use origin::{MAX_ORIGIN_VALIDATIONS, OriginHead, OriginScope, OriginValidations};
 pub use peering::{BucketLookup, PeerCommits, PeerExtents};
 pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads};
 #[cfg(any(test, feature = "test-util"))]

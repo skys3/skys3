@@ -770,7 +770,11 @@ pub fn decode_request(frame: &Frame) -> Decoded<(ShardRef, Epoch, Request)> {
                 | RecordBody::MpuPart(_)
                 | RecordBody::MpuComplete(_)
                 | RecordBody::MpuAbort(_)
-                | RecordBody::UploadBegin(_)) => body,
+                | RecordBody::UploadBegin(_)
+                // What a read records of a remote: lazily loaded metadata
+                // (§9.1), and the versions of an origin (§9.5).
+                | RecordBody::Import(_)
+                | RecordBody::Adopt(_)) => body,
                 other => return Err(format!("a write request carries a {:?}", other.kind())),
             },
             condition: decode_condition(condition, &shard)?,

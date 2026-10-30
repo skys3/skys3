@@ -24,6 +24,11 @@
 //!   MetadataTooLarge`.
 //! - **Versioning**, when enabled, keeps every version, adds delete markers,
 //!   and serves reads and deletes of specific versions.
+//! - **Credentials.** Requests are made with the credentials a handle
+//!   names ([`SimS3::with_credentials`]), and the store refuses `GetObject`
+//!   and `HeadObject` of the keys [`SimS3::deny`] denies them with `403
+//!   AccessDenied`, as a bucket policy would, whether the key holds an
+//!   object or not.
 //! - **Read-after-write consistency**, as on AWS S3, unless
 //!   [`Fault::StaleRead`] faults make a `GetObject` or `HeadObject`
 //!   answer, or a `ListObjectsV2` list, what keys held before their latest
@@ -54,7 +59,7 @@
 mod bucket;
 mod faults;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -186,6 +191,8 @@ pub struct SimS3Stats {
 #[derive(Clone, Debug)]
 pub struct SimS3 {
     shared: Arc<Shared>,
+    /// The credentials this handle's requests are made with, if any.
+    credentials: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -205,6 +212,8 @@ struct State {
     stats: SimS3Stats,
     /// Successful requests whose caller never got the answer, by operation.
     unanswered: HashMap<Operation, u64>,
+    /// The `(credentials, key)` pairs whose reads are refused.
+    denied: BTreeSet<(String, String)>,
 }
 
 /// A request's effect on conflict detection.
@@ -236,9 +245,11 @@ impl SimS3 {
                     next_request: 0,
                     stats: SimS3Stats::default(),
                     unanswered: HashMap::new(),
+                    denied: BTreeSet::new(),
                 }),
                 config,
             }),
+            credentials: None,
         }
     }
 
@@ -259,10 +270,55 @@ impl SimS3 {
                     next_request: 0,
                     stats: SimS3Stats::default(),
                     unanswered: HashMap::new(),
+                    denied: BTreeSet::new(),
                 }),
                 config: self.shared.config.clone(),
             }),
+            credentials: None,
         }
+    }
+
+    /// A handle on the same bucket whose requests are made with the
+    /// credentials named `credentials`, which [`SimS3::deny`] may refuse
+    /// keys.
+    #[must_use]
+    pub fn with_credentials(&self, credentials: &str) -> Self {
+        SimS3 {
+            shared: Arc::clone(&self.shared),
+            credentials: Some(credentials.into()),
+        }
+    }
+
+    /// Refuses, or with `denied` false allows again, reads of `key` made
+    /// with the credentials `credentials`, from now on.
+    pub fn deny(&self, credentials: &str, key: &str, denied: bool) {
+        let pair = (credentials.to_owned(), key.to_owned());
+        let mut state = self.state();
+        if denied {
+            state.denied.insert(pair);
+        } else {
+            state.denied.remove(&pair);
+        }
+    }
+
+    /// Whether reads of `key` made with `credentials` are refused now.
+    pub fn denies(&self, credentials: &str, key: &str) -> bool {
+        let pair = (credentials.to_owned(), key.to_owned());
+        self.state().denied.contains(&pair)
+    }
+
+    /// The `403` of a read of `key` this handle's credentials may not make,
+    /// if they may not.
+    fn refusal(&self, key: &str) -> S3Result<()> {
+        let Some(credentials) = &self.credentials else {
+            return Ok(());
+        };
+        if self.denies(credentials, key) {
+            return Err(S3Error::new(S3ErrorKind::Other, "access denied")
+                .with_status(403)
+                .with_code("AccessDenied"));
+        }
+        Ok(())
     }
 
     /// Returns the bucket's configuration.
@@ -569,6 +625,8 @@ impl ObjectStore for SimS3 {
     }
 
     async fn get_object(&self, request: GetObject) -> S3Result<GetOutput> {
+        // Refused as the request arrives, before any fault or delay.
+        self.refusal(&request.key)?;
         self.request(Operation::GetObject, Tracking::NONE, |bucket, stale| {
             bucket.get_object(&request, stale)
         })
@@ -576,6 +634,8 @@ impl ObjectStore for SimS3 {
     }
 
     async fn head_object(&self, request: HeadObject) -> S3Result<ObjectInfo> {
+        // Refused as the request arrives, before any fault or delay.
+        self.refusal(&request.key)?;
         self.request(Operation::HeadObject, Tracking::NONE, |bucket, stale| {
             bucket.head_object(&request, stale)
         })

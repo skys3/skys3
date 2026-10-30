@@ -87,6 +87,11 @@
 //!   payload, and with `backup_ack = "write_through"` losing every node
 //!   after an acknowledgement loses no write, under takeovers and remote
 //!   faults, with seeded bugs caught.
+//! - [`origin`]: `read_only` buckets over an origin that an out-of-band
+//!   writer changes while clients read through every node: every answer is
+//!   one the origin gave, as the reader's credentials see it, within the
+//!   freshness mode's bound, and seeded bugs of revalidation and of the
+//!   credential scope are caught.
 //! - [`conflicts`]: an out-of-band writer at the remote store of a
 //!   `write_back` bucket under takeovers and remote faults, with the final
 //!   remote state audited against each conflict policy, held conflicts
@@ -114,6 +119,7 @@ mod hot_cache;
 mod learners;
 mod leases;
 mod lifecycle;
+mod origin;
 mod reads;
 mod rebalancing;
 mod rebuild;
