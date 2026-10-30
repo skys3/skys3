@@ -149,9 +149,9 @@ Write-back flushing (§7). `ack_policy` and `flush_conflict_policy` are the defa
 |---|---|---|---|
 | `ack_policy` | `"local"` or `"write_through"` | `"local"` | §7.5. |
 | `write_through_timeout_seconds` | integer | `30` | Positive. How long a write to a `write_through` bucket waits for the remote flush before it is answered `503 SlowDown`; the write stays committed locally and is flushed later (§7.5). |
-| `flush_min_concurrency_per_shard` | integer | `4` | Positive. |
-| `flush_max_concurrency_per_shard` | integer | `64` | At least `flush_min_concurrency_per_shard`. |
-| `flush_max_inflight_bytes_per_target` | integer | `1073741824` (1 GiB) | Positive. |
+| `flush_min_concurrency_per_shard` | integer | `4` | Positive. The floor of adaptive flush concurrency (§7.7): a node keeps at least this many requests in flight to a target for each of the target's shards it flushes, whatever the latency or throttling. |
+| `flush_max_concurrency_per_shard` | integer | `64` | At least `flush_min_concurrency_per_shard`. The ceiling: at most this many requests in flight to a target per shard the node flushes, and at most this many keys flushed at once by one shard. Equal bounds fix the concurrency. |
+| `flush_max_inflight_bytes_per_target` | integer | `1073741824` (1 GiB) | Positive. The bytes a node's flushers hold in memory for requests to one target: a single PUT's body, or one part of a multipart or streamed upload, from reading it until its answer. A larger body waits for the whole bound. |
 | `streaming_flush_min_bytes` | integer | `67108864` (64 MiB) | Positive. A single PUT to a `write_back` bucket whose body reaches it commits an `UPLOAD_BEGIN` while it streams, and takes that record's write identity (§7.2). |
 | `flush_part_bytes` | integer | `67108864` (64 MiB) | From 5 MiB to 5 GiB, the S3 part-size limits. The part size of the remote multipart upload that such a PUT streams to (§7.3); a body of more than 10,000 parts is sent as one `PutObject` after it commits. |
 | `flush_conflict_policy` | `"hold"` or `"overwrite"` | `"hold"` | `"discard_local"` loses acknowledged writes, so only a `[buckets.<name>]` table may choose it (§7.2). |
