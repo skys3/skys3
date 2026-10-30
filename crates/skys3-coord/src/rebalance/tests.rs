@@ -83,6 +83,7 @@ async fn join(store: &MemoryControlStore, n: u8, shape: Shape) {
             disk_id: Label::new("nvme0").unwrap(),
             capacity_bytes: shape.capacity,
         }],
+        instance: None,
     };
     register(
         store,

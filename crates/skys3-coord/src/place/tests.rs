@@ -105,6 +105,7 @@ fn candidates_come_from_registrations_and_registry_entries() {
                 capacity_bytes: 5,
             },
         ],
+        instance_id: None,
         departing: false,
         proposal_id: ProposalId::new("p1").unwrap(),
     };
@@ -146,6 +147,7 @@ fn a_node_marked_departing_is_never_chosen() {
                 disk_id: label("nvme0".into()),
                 capacity_bytes: TB,
             }],
+            instance_id: None,
             departing: n == 2,
             proposal_id: ProposalId::new(format!("p{n}")).unwrap(),
         })

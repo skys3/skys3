@@ -10,15 +10,18 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_flush::{FlushMetrics, FlushService, ImportStatus, RemoteReader, loaded_metadata};
-use skys3_index::{EntryState, ImportCheckpoint, Index, IndexConfig, ListItem, Payload};
+use skys3_index::{
+    EntryState, ImportCheckpoint, ImportRanges, Index, IndexConfig, ListItem, Payload,
+};
 use skys3_io::{SimDisk, SimMount};
+use skys3_log::RecordBody;
 use skys3_obs::MetricsRegistry;
 use skys3_remote::{ObjectInfo, ObjectStore, PutObject, UserMetadata};
 use skys3_sim::SimS3;
 use skys3_sim::s3::SimS3Config;
 use skys3_types::{
     BucketDocument, BucketMode, BucketName, ETag, Epoch, EpochSeq, ProposalId, RemoteTarget, Seq,
-    ShardCount,
+    ShardConfig, ShardCount, ShardId,
 };
 use support::{Node, Patience, cluster, md5_etag, runtime, settings, shard_ref};
 
@@ -387,4 +390,59 @@ fn index_bytes_per_imported_entry() {
         (100..=600).contains(&per_entry),
         "{per_entry} bytes per entry"
     );
+}
+
+/// An import stopped, or whose node crashed, after shard 0 held its last
+/// progress and before every other shard did, left a shard behind for
+/// good: the next run resumed from shard 0's progress, found the import
+/// done, and ended, so the lagging shard's tombstones waited for an import
+/// that never passed their keys. The next run now commits the progress it
+/// resumes to every other shard first.
+#[test]
+fn a_resumed_import_brings_every_shard_up_to_shard_0s_progress() {
+    runtime().block_on(async {
+        let node = Node::open(83).await;
+        let bucket = BucketDocument {
+            shards: ShardCount::new(2).unwrap(),
+            ..bucket()
+        };
+        let second = ShardConfig {
+            shard: ShardId::new(1),
+            ..support::config()
+        };
+        let lagging = node.set.open(&second).await.unwrap();
+        // The earlier run's progress: split in two, then done. Shard 1
+        // holds only the split.
+        let mut ranges = ImportRanges::split(None, ["m".to_owned()]);
+        lagging
+            .commit(RecordBody::ImportProgress(ranges.to_progress(1)))
+            .await
+            .unwrap();
+        ranges.set(0, ImportCheckpoint::Done);
+        ranges.set(1, ImportCheckpoint::Done);
+        node.shard
+            .commit(RecordBody::ImportProgress(ranges.to_progress(2)))
+            .await
+            .unwrap();
+        assert!(!passed(&lagging, "k").await);
+
+        let store = SimS3::new(83, SimS3Config::default());
+        let service = service(&store, 10, 1_000_000);
+        let patience = Patience::new();
+        while !passed(&lagging, "k").await {
+            assert!(!patience.is_exhausted(), "shard 1 never got the progress");
+            service
+                .reconcile(std::slice::from_ref(&bucket), &node.set)
+                .await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(lagging.import_progress().await.unwrap(), Some((2, ranges)));
+        service.shutdown().await;
+    });
+}
+
+/// Whether `shard`'s import progress has passed `key`.
+async fn passed(shard: &skys3_shard::Shard<SimMount>, key: &str) -> bool {
+    let progress = shard.import_progress().await.unwrap();
+    progress.is_some_and(|(_, ranges)| ranges.passed(key))
 }

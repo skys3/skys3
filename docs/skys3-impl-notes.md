@@ -9599,6 +9599,160 @@ of this file. A task with nothing unexpected keeps "None."
 - **The AWS SDK's GetBucketVersioning path ends with `/`.** The mock test
   expected `/bucket` and got `/bucket/`.
 
+### M8-04 Transport and node registration in the binary
+
+- **The gate.** Everything here runs only with `[cluster] multi_node =
+  true`. Without it the node starts as before: no transport listener, no
+  registration, and the M8-03 guard still refuses a store whose `nodes/`
+  names another node. Configuration loading refuses `multi_node` with
+  `backend = "file"`, without the three `[transport]` files, and without
+  an address other nodes can reach (`advertise`, or a `listen` that is
+  neither a wildcard address nor port 0).
+- **Plan §14 decision 2.** `[transport] advertise` (a node address,
+  defaulting to `listen`), `[node] zone` and `rack` (optional labels,
+  registered as they are), and one handshake cap per listener:
+  `[transport] max_inflight_handshakes`, `[gateway]
+  max_inflight_handshakes`, and `[peering] peer_max_inflight_handshakes`,
+  256 each (the admin listener's connection cap), from 1 to 65,536. One
+  key per listener rather than one for all, because the gateway faces
+  clients and the transport only nodes, and an operator sizes them apart.
+  Recorded in design §6.7 and §12, plan §14, and the configuration
+  reference.
+- **Startup order.** The node checks that its `[transport]` certificate
+  names its `node_id` before it recovers anything (a peer verifying "the
+  node it meant" would refuse it later anyway), opens storage and the
+  control store, binds the transport, registers, and only then binds the
+  gateway and the admin listener; the transport's accept loop and the
+  heartbeater start with the other background tasks. A registration that
+  fails for any reason other than a claim (a store that does not answer)
+  is logged, and the heartbeater retries it: the node serves from its copy
+  meanwhile, as without `multi_node`.
+- **A claim found late stops the node (review finding).** The first
+  version refused a claim only at startup: a node that started from its
+  copy while the store did not answer, and found its ID registered by
+  another data directory once the store answered, retried that like any
+  failure and went on serving under the other node's ID. Now the
+  heartbeater records the claim (`HeartbeatStatus::claimed_by`, reported
+  as `cluster.registration.claimed_by`) and stops, and `Node::run_until`
+  stops the node with `NodeError::Cluster`, through the same shutdown as
+  a failed checkpoint, logging both instance IDs and naming the runbook
+  "Node ID in use". Stopping rather than withdrawing from serving: the
+  node cannot become itself again without an operator, who either gives
+  it another ID or deletes the other registration, and a stopped process
+  is what the service manager and the alerts already watch.
+  `a_claim_found_after_starting_from_the_copy_stops_the_node` cuts the
+  store off with a TCP forwarder, and fails without the change (the node
+  keeps serving).
+- **What "its own node ID with a different identity" means.** The task
+  asked that a node refuse a registration claiming its node ID with
+  another identity. Certificates cannot tell the nodes apart (two
+  processes can be given the same certificate, which is how an operator
+  starts a duplicate by mistake), and the address changes legitimately.
+  The identity is the data directory's instance ID, which
+  `NodeRegistration` now records as an optional `instance_id`, written
+  only when set, so registers of earlier builds and of the simulation
+  read and compare as before. `register` refuses one that records another
+  instance (`RegistrationError::Claimed`), and adopts one without, which
+  then gains it. A deliberately replaced data directory needs the
+  registration deleted first: runbook "Node ID in use".
+- **No elector yet.** Who coordinates is M8-06's (`[cluster]
+  coordinator`). The node's `AdminEndpoint` answers heartbeats with a
+  follower's leadership, the extension point M8-06 replaces, and the
+  heartbeater follows whatever `coordinator.lease` names. The in-process
+  test and the e2e scenario play the coordinator: the test with a
+  stand-in `AdminEndpoint` that holds the lease and acknowledges as
+  coordinator (`delivered` rises), the e2e scenario by writing a lease
+  that names c1 through etcd's JSON gateway, so c2 and c3 heartbeat c1
+  over mutual TLS and c1 answers as a follower (`answered` rises,
+  `delivered` stays 0). The status gained `answered` and
+  `registration_error` for that.
+- **Pushed generations.** A `ControlChanged` from any node ends the
+  control-store follower's wait once per generation: the follower
+  remembers the highest pushed generation it woke for, so a node that
+  pushes a forged high generation over and over costs one read of
+  `cluster.json`, not a busy loop. The sync itself still reads the store.
+- **Handshake caps (T7, #108).** `skys3-obs` gained `HandshakeLimit`, a
+  semaphore with `skys3_handshakes_in_flight{listener}` and
+  `skys3_handshakes_total{listener,outcome}`. The TCP listeners
+  (transport, gateway) accept a connection, then wait for a slot before
+  they spawn its task, and accept nothing more meanwhile, so a flood waits
+  in the kernel's accept queue. Acquiring before `accept` left the gauge
+  at 1 at rest (the loop always held a slot for the next connection), so
+  the order is accept then acquire. The QUIC endpoint cannot leave a
+  connection waiting without holding its state, so it takes a slot with
+  `try_acquire` and refuses at the cap (`Incoming::refuse`, new in
+  `skys3-peer`); the source sees a failed handshake at once instead of
+  waiting out its connect timeout.
+- **What the flood costs.** In the e2e scenario 1,000 silent connections
+  against a cap of 4 left 134 established (the listener's backlog; the
+  kernel drops further SYNs, and the client retries them), at most 4
+  handshakes in flight, 4 timed out after the 10-second handshake timeout,
+  and the node's RSS grew by at most 1 MiB (51 MiB before, 51 to 52 MiB
+  at its peak, over three runs). The in-process test checks
+  that a node's own handshake waits while the flood holds every slot and
+  gets in once it ends.
+- **A flood leaves late connections behind.** The scenario's first CI run
+  failed at "c3 refused c1 after the flood". The flood's connections do
+  not all end when its client closes them: the kernel completes, as their
+  retransmissions arrive, handshakes the full accept queue held back, and
+  such a connection, whose client is gone, can hold a slot until the
+  handshake timeout. Run without its wait for the slots to free, the
+  scenario failed the same way locally under load (`refused (timed out)`,
+  4 more handshakes timed out 10 s after the flood, with 129 queued
+  connections behind them), and the gauge's check could pass in the moment
+  before such connections arrived. The scenario now waits until no
+  handshake is in flight and the listener's accept queue
+  (`/proc/net/tcp`) is empty over four samples in a row, then gives the
+  node's handshake 30 s, more than one handshake timeout, and logs how
+  long it took. The product works as designed: at its cap a listener makes
+  new connections wait for at most one handshake timeout per round of
+  stale ones.
+- **The refactor.** The first commit moves the control-store follower and
+  the peering service out of `node.rs` into `crates/skys3/src/cluster/`
+  (`control.rs`, `peering.rs`) without changing them; the new services
+  are files of their own there (`transport.rs`, `registration.rs`,
+  `hints.rs`).
+- **etcd's JSON gateway needs a client-capable server certificate.** With
+  `--client-cert-auth`, the gateway reaches etcd's gRPC server with the
+  server certificate, which then fails the client check (`503`) unless it
+  has the `clientAuth` usage. `pki.sh` now gives the etcd server
+  certificate both usages.
+- **Where the 3-node scenario runs, and its cost.** `scenarios/90-cluster.sh`
+  carries a new marker, `# e2e: etcd`: it runs only in the etcd leg of
+  `control-stores.sh`, in the background beside that leg's single-node
+  scenarios, on ports E2E_PORT+90 to +98 and the etcd member that leg
+  already runs (prefix `c3/`). It took 40 to 42 seconds in every local
+  run. The etcd leg's single-node scenarios take about 4 minutes and the
+  file leg's peering scenario about 5.5, so the job's wall time does not
+  change.
+  Locally, with the AWS CLI from its image and the Docker daemon started
+  for the run, the whole `control-stores.sh` passed in 5 m 23 s with the
+  scenario (M8-03 measured 5 m 43 s without it), the peering scenario
+  taking 314 s. Under a CPU hog on every core, the scenario passed all seven
+  runs (two batches), a node getting in within a second of the drain;
+  the whole `control-stores.sh` passed again in 5 m 12 s.
+- **A restart lost its transport port (CI).** On a later branch of the
+  stack, `a_claim_found_after_starting_from_the_copy_stops_the_node`
+  failed once with `binding the transport to 127.0.0.1:42805 ... Address
+  already in use`: the restart from the copy bound the port the first
+  start had used, and in the moment the node was down another test of the
+  same binary, or a connection it opened (the port is in the kernel's
+  ephemeral range, as `free_port` takes it from there), held it. The test
+  now starts the node through `start_n1`, which picks a fresh port for
+  each start and tries again on another when the bind finds it taken, up
+  to `START_ATTEMPTS` times, as `Process::start` already does for the
+  binary. A different port on restart changes nothing the test checks:
+  the claim is told by the instance ID, not the address.
+- **Not done here.** Handoff commands are refused on the node's transport
+  (no handoff sink until the binary serves shards across nodes, M8-05b),
+  and replication and forwarded requests are closed after their first
+  frame. Only the etcd store is exercised with several nodes, in process
+  (the etcd stand-in) and end to end; the S3 store registers through the
+  same `ControlStore` interface but no test runs nodes on it together. A node refused at
+  startup for its certificate or a claim has already created its data
+  directory (the data directory is opened first), which records the
+  configured node ID.
+
 ### M8-05a Replicated shards as library code
 
 - **The plan's home could not hold it.** The plan put the code in a

@@ -31,6 +31,11 @@ pub struct ClusterConfig {
     pub cluster_id: ClusterId,
     /// `failure_domain`: the level placement must respect.
     pub failure_domain: FailureDomain,
+    /// `multi_node`: whether the node runs as one of several nodes of the
+    /// cluster (§6.2): it binds the intra-cluster transport, registers in
+    /// `nodes/`, sends heartbeats, and receives pushed generations. Off by
+    /// default, until the cluster is complete in the binary (plan M8-09).
+    pub multi_node: bool,
 }
 
 /// `[cluster]` as written.
@@ -40,6 +45,8 @@ pub(crate) struct RawCluster {
     cluster_id: String,
     #[serde(default)]
     failure_domain: FailureDomain,
+    #[serde(default)]
+    pub(crate) multi_node: bool,
 }
 
 impl RawCluster {
@@ -48,6 +55,7 @@ impl RawCluster {
             Ok(cluster_id) => Some(ClusterConfig {
                 cluster_id,
                 failure_domain: self.failure_domain,
+                multi_node: self.multi_node,
             }),
             Err(error) => {
                 checker.report("cluster.cluster_id", error);

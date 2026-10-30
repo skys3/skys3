@@ -64,6 +64,7 @@ async fn store(nodes: usize) -> MemoryControlStore {
                 disk_id: Label::new("nvme0").unwrap(),
                 capacity_bytes: 1 << 40,
             }],
+            instance: None,
         };
         register(&store, &cluster(), &profile, &mut ids, &retry())
             .await

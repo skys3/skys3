@@ -58,6 +58,7 @@ fn profile(n: u8, address: NodeAddress) -> NodeProfile {
             disk_id: Label::new("disk-0").unwrap(),
             capacity_bytes: 1 << 30,
         }],
+        instance: None,
     }
 }
 
@@ -279,6 +280,9 @@ async fn a_node_follows_the_coordinator_when_the_lease_moves() {
     let mut status = heartbeater.subscribe();
     let task = tokio::spawn(heartbeater.run());
     until(&mut status, |status| status.registrations == 1).await;
+    // Node 1 answers, but delivers nothing: it is not coordinator.
+    let answered = until(&mut status, |status| status.answered >= 1).await;
+    assert_eq!((answered.delivered, answered.coordinator), (0, None));
 
     // The lease moves to node 3, and the node follows it.
     let lease = read(&store, &TypedKey::coordinator_lease())
@@ -455,6 +459,8 @@ async fn a_registration_left_unsettled_is_settled_before_the_next_attempt() {
         matches!(error, RegistrationError::Unsettled { .. }),
         "{error}"
     );
+    let reported = heartbeater.subscribe().borrow().registration_error.clone();
+    assert_eq!(reported, Some(error.to_string()));
     let before = skys3_control::read_cluster(&inner, &pki.cluster, &retry())
         .await
         .unwrap()
@@ -470,5 +476,61 @@ async fn a_registration_left_unsettled_is_settled_before_the_next_attempt() {
         .value
         .generation;
     assert!(after > before);
-    assert_eq!(heartbeater.subscribe().borrow().registrations, 1);
+    let status = heartbeater.subscribe().borrow().clone();
+    assert_eq!((status.registrations, status.registration_error), (1, None));
+}
+
+#[tokio::test]
+async fn a_registration_claimed_by_another_data_directory_stops_the_heartbeater() {
+    let pki = Pki::new();
+    let store = store(&pki, 1).await;
+    let address: NodeAddress = "127.0.0.1:7003".parse().unwrap();
+    // Another data directory registered node 3 first.
+    let theirs = NodeProfile {
+        instance: Some(Label::new("theirs").unwrap()),
+        ..profile(3, address.clone())
+    };
+    crate::join::register(
+        &store,
+        &pki.cluster,
+        &theirs,
+        &mut ProposalIds::seeded(3),
+        &retry(),
+    )
+    .await
+    .unwrap();
+    let ours = NodeProfile {
+        instance: Some(Label::new("ours").unwrap()),
+        ..profile(3, address)
+    };
+    let heartbeater = Heartbeater::new(
+        store.clone(),
+        pki.transport(&node(3)),
+        pki.cluster.clone(),
+        ours,
+        clock(),
+        config(),
+        ProposalIds::seeded(103),
+    );
+    let status = heartbeater.subscribe();
+    // The claim is never retried: the task ends.
+    tokio::time::timeout(WAIT, heartbeater.run())
+        .await
+        .expect("the heartbeater went on after the claim");
+    let status = status.borrow().clone();
+    assert_eq!(status.claimed_by, Some(Label::new("theirs").unwrap()));
+    assert_eq!(status.registrations, 0);
+    assert!(
+        status
+            .registration_error
+            .is_some_and(|error| error.contains("another data directory"))
+    );
+    let registration = read(&store, &TypedKey::node(&node(3)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        registration.value.instance_id,
+        Some(Label::new("theirs").unwrap())
+    );
 }

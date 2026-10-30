@@ -13,6 +13,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use s3s::Body;
+use skys3_obs::{HandshakeLimit, HandshakeOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
@@ -33,11 +34,16 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// hyper's smallest read buffer.
 const MIN_BUFFER: usize = 8 * 1024;
 
+/// The TLS handshakes a listener runs at once unless
+/// [`GatewayListener::with_handshake_limit`] sets another cap.
+const DEFAULT_MAX_HANDSHAKES: u32 = 256;
+
 /// A bound gateway listener, ready to serve.
 pub struct GatewayListener<A> {
     listener: TcpListener,
     gateway: Gateway<A>,
     tls: Option<TlsAcceptor>,
+    handshakes: HandshakeLimit,
 }
 
 impl<A: Authenticator> GatewayListener<A> {
@@ -51,6 +57,7 @@ impl<A: Authenticator> GatewayListener<A> {
             listener: TcpListener::bind(listen).await?,
             gateway,
             tls: None,
+            handshakes: HandshakeLimit::new(DEFAULT_MAX_HANDSHAKES),
         })
     }
 
@@ -60,6 +67,18 @@ impl<A: Authenticator> GatewayListener<A> {
     #[must_use]
     pub fn with_tls(mut self, config: Arc<rustls::ServerConfig>) -> Self {
         self.tls = Some(TlsAcceptor::from(config));
+        self
+    }
+
+    /// Caps the TLS handshakes the listener runs at once with `limit`
+    /// (design §12; `[gateway] max_inflight_handshakes`): a connection
+    /// gets a task only once a handshake slot is free, and the listener
+    /// accepts no other meanwhile, so further connections wait in the
+    /// kernel's accept queue, which holds no task or TLS state. Without
+    /// TLS there is no handshake to cap.
+    #[must_use]
+    pub fn with_handshake_limit(mut self, limit: HandshakeLimit) -> Self {
+        self.handshakes = limit;
         self
     }
 
@@ -85,6 +104,7 @@ impl<A: Authenticator> GatewayListener<A> {
             listener,
             gateway,
             tls,
+            handshakes,
         } = self;
         let limits = *gateway.limits();
         let mut builder = http1::Builder::new();
@@ -109,24 +129,38 @@ impl<A: Authenticator> GatewayListener<A> {
                     }
                 },
             };
+            // With TLS, the connection waits for a handshake slot before
+            // it gets a task, and the listener accepts nothing meanwhile.
+            let handshake = match &tls {
+                Some(tls) => tokio::select! {
+                    () = &mut shutdown => break,
+                    permit = handshakes.acquire() => Some((tls.clone(), permit)),
+                },
+                None => None,
+            };
             let gateway = gateway.clone();
             let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                 let gateway = gateway.clone();
                 async move { Ok::<_, Infallible>(gateway.handle(request.map(Body::from)).await) }
             });
-            let (builder, watcher, tls) = (builder.clone(), graceful.watcher(), tls.clone());
+            let (builder, watcher) = (builder.clone(), graceful.watcher());
             connections.spawn(async move {
-                let Some(tls) = tls else {
+                let Some((tls, permit)) = handshake else {
                     return serve_connection(&builder, watcher, stream, service, peer).await;
                 };
                 match tokio::time::timeout(HEADER_READ_TIMEOUT, tls.accept(stream)).await {
                     Ok(Ok(stream)) => {
-                        serve_connection(&builder, watcher, stream, service, peer).await
+                        permit.finish(HandshakeOutcome::Completed);
+                        serve_connection(&builder, watcher, stream, service, peer).await;
                     }
                     Ok(Err(error)) => {
+                        permit.finish(HandshakeOutcome::Failed);
                         tracing::debug!(%peer, %error, "a TLS handshake with the gateway failed");
                     }
-                    Err(_) => tracing::debug!(%peer, "a TLS handshake with the gateway timed out"),
+                    Err(_) => {
+                        permit.finish(HandshakeOutcome::TimedOut);
+                        tracing::debug!(%peer, "a TLS handshake with the gateway timed out");
+                    }
                 }
             });
         }
@@ -172,6 +206,7 @@ impl<A> fmt::Debug for GatewayListener<A> {
         f.debug_struct("GatewayListener")
             .field("local_addr", &self.listener.local_addr().ok())
             .field("tls", &self.tls.is_some())
+            .field("handshakes", &self.handshakes)
             .finish_non_exhaustive()
     }
 }
