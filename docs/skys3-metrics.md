@@ -19,6 +19,7 @@ exports yet is listed as planned, with the PR that owns it.
   - [3.6 Segment compaction](#36-segment-compaction)
   - [3.7 Hot cache](#37-hot-cache)
   - [3.8 Lifecycle](#38-lifecycle)
+  - [3.9 Repair](#39-repair)
 
 ## 1. Scraping
 
@@ -189,3 +190,18 @@ interval.
 |---|---|---|---|---|
 | `skys3_lifecycle_expired_total` | counter | none | exported (M5-10) | Object versions that lifecycle rules expired on this node's shard primaries: `DELETE`s its passes committed. |
 | `skys3_lifecycle_aborted_uploads_total` | counter | none | exported (M5-10) | Incomplete multipart uploads that lifecycle rules aborted on this node's shard primaries. |
+
+### 3.9 Repair
+
+Design sections 8.6 and 16.3. Each shard primary's repairer finds the
+fragments its coded objects lost, rebuilds them on other nodes, and relocates
+them with `EC_RELOCATE`. A node's repairers share its metrics, over every
+shard it leads; the gauges change at each repair pass.
+
+| Name | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `skys3_repaired_fragments_total` | counter | none | defined (M5-08) | Fragments this node's shard primaries rebuilt on another node and relocated with a committed `EC_RELOCATE`. |
+| `skys3_repair_bytes_total` | counter | none | defined (M5-08) | Bytes this node's repairs read and wrote: what `repair_bytes_per_second_per_node` caps. |
+| `skys3_repair_duration_seconds` | histogram | none | defined (M5-08) | The repair time: for each fragment repaired, the time from when its shard primary found it lost to when its `EC_RELOCATE` committed. Buckets from 1 s, doubling, to about 3 days. |
+| `skys3_unrepaired_fragments` | gauge | none | defined (M5-08) | Fragments the shards this node leads know lost and have not repaired yet. |
+| `skys3_oldest_unrepaired_age_seconds` | gauge | none | defined (M5-08) | How long the oldest of those fragments has been known lost; 0 when there is none. |

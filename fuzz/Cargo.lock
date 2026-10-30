@@ -2335,6 +2335,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32c",
+ "prometheus-client",
  "prost",
  "reed-solomon-simd",
  "skys3-config",
@@ -2343,6 +2344,7 @@ dependencies = [
  "skys3-io",
  "skys3-log",
  "skys3-net",
+ "skys3-obs",
  "skys3-shard",
  "skys3-types",
  "thiserror",

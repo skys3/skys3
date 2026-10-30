@@ -64,6 +64,11 @@
 //!   gateway, decoding stripes while fragment holders crash, lose their
 //!   fragment disk, or corrupt what they send, with seeded read bugs
 //!   caught.
+//! - [`repair`]: holders of coded stripes lost for good or losing their
+//!   fragment disk while reads go on, and every stripe made whole again
+//!   within a bound, most damaged first and within the bandwidth cap,
+//!   through crashes of the primary and the new holders, with seeded
+//!   repair bugs caught.
 //! - [`compaction`]: segment compaction on replicated shards under
 //!   crashes, message loss, and power losses at sync boundaries, with
 //!   every member's dirty bytes and every shard's latest `CONFIG` record
@@ -125,6 +130,7 @@ mod rebalancing;
 mod rebuild;
 mod registry;
 mod removal;
+mod repair;
 mod replacement;
 mod replication;
 mod restart;

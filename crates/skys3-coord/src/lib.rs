@@ -118,7 +118,8 @@ pub use change::{
 };
 pub use coordinator::{Coordinator, CoordinatorConfig, NoPlacement, Placement};
 pub use fragments::{
-    FragmentPlanner, GeometryPolicy, NoGeometry, StripePlan, StripeRequest, StripeRoom,
+    FragmentPlanner, GeometryPolicy, NoGeometry, ReplaceRequest, StripePlan, StripeRequest,
+    StripeRoom,
 };
 pub use handoff::{
     Handoff, HandoffAck, HandoffClient, HandoffError, HandoffFuture, HandoffSink, RequestHandoff,

@@ -62,8 +62,8 @@
 //! Each defined kind's fields are encoded in the declaration order of its
 //! body type ([`Put`], [`Delete`], [`Extent`], [`MpuCreate`], [`MpuPart`],
 //! [`MpuComplete`], [`MpuAbort`], [`UploadBegin`], [`Tags`], [`Flushed`],
-//! [`PartFlushed`], [`Import`], [`Adopt`], [`EcPublish`], `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig)
-//! without the bucket, shard, and epoch the fixed header holds, and
+//! [`PartFlushed`], [`Import`], [`Adopt`], [`EcPublish`], [`EcRelocate`],
+//! `CONFIG` as [`ShardConfig`](skys3_types::ShardConfig) without the bucket, shard, and epoch the fixed header holds, and
 //! `TRUNCATE`, which has no fields):
 //!
 //! - integers as fixed-width little-endian values; positions as epoch then
@@ -120,7 +120,7 @@ pub use body::{
     MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN,
     Metadata, Put, PutData, RecordBody, TagSet, Tags, UploadBegin,
 };
-pub use coding::{EcPublish, MAX_STRIPES};
+pub use coding::{EcPublish, EcRelocate, FragmentMove, MAX_MOVES, MAX_STRIPES};
 pub use error::{DecodeError, EncodeError, ErrorClass, FieldError, Problem};
 pub use header::{RecordHeader, RecordKind, ShardRef};
 pub use multipart::{

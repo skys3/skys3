@@ -68,9 +68,12 @@ pub struct StripeInfo {
 /// The object version a stripe is part of: what its index entry holds
 /// besides the payload's location (§8.4).
 ///
-/// Everything but `tags` is fixed for the life of a version. Tags change
-/// with `TAGS` records without a new version, so a header holds the tags
-/// the version had when the attempt that wrote it read the object.
+/// A `TAGS` record changes a version's tags without a new version, and
+/// makes itself the version's write identity, dropping an inherited one and
+/// the identity metadata of another cluster's write. So a header holds the
+/// tags, `identity`, and identity metadata the version had when the
+/// attempt that wrote it read the object; everything else is fixed for the
+/// life of the version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMeta {
     /// The object's size in bytes.

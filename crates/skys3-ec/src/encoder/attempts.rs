@@ -1,9 +1,20 @@
-//! The fragment-writing attempts a shard primary has in progress (§8.4).
+//! The fragment-writing attempts a shard primary has in progress (§8.4),
+//! and what every kind of attempt (encoding, repair, moves) shares: their
+//! IDs, and the commit of their publishing record.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use skys3_index::IndexError;
+use skys3_io::Disk;
+use skys3_log::RecordBody;
+use skys3_shard::{Committed, Shard, ShardError};
 use skys3_types::{AttemptId, Epoch, EpochSeq};
+use tokio::sync::oneshot;
+
+/// How many attempt numbers one durable reservation takes.
+const ATTEMPT_BLOCK: u64 = 64;
 
 /// Where an attempt that writes fragments is (§8.4, plan M5-04).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +164,147 @@ impl Attempts {
 
     fn lock(&self) -> MutexGuard<'_, HashMap<AttemptId, AttemptState>> {
         self.states.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Draws attempt IDs for one kind of attempt of a shard on this node:
+/// the shard's epoch and a number from blocks the shard's index reserves
+/// durably ([`Index::reserve_attempts`](skys3_index::Index::reserve_attempts)),
+/// so no number is used twice on the node, across restarts and kinds too.
+#[derive(Debug, Default)]
+pub(crate) struct AttemptNumbers {
+    numbers: Mutex<Range<u64>>,
+}
+
+impl AttemptNumbers {
+    /// A new attempt ID for `shard`, in the epoch it sequences in.
+    pub(crate) fn next<D: Disk>(&self, shard: &Shard<D>) -> Result<AttemptId, IndexError> {
+        let mut numbers = self.numbers.lock().unwrap_or_else(PoisonError::into_inner);
+        if numbers.is_empty() {
+            // A rare durable commit: one per `ATTEMPT_BLOCK` attempts.
+            *numbers = shard
+                .index()
+                .reserve_attempts(shard.shard(), ATTEMPT_BLOCK)?;
+        }
+        let number = numbers.next().expect("a reserved block is not empty");
+        Ok(AttemptId::new(shard.sequencing(), number))
+    }
+}
+
+/// An attempt being written: dropped before the attempt publishes, it
+/// forgets the attempt, which then never publishes.
+pub(crate) struct Writing<'a> {
+    pub(crate) attempts: &'a Attempts,
+    pub(crate) attempt: AttemptId,
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.attempts.release(self.attempt);
+    }
+}
+
+/// What became of an attempt's publishing record.
+pub(crate) enum Publication {
+    /// It committed, and was applied or rejected as the outcome says.
+    Committed(Committed),
+    /// The attempt was abandoned, by orphan reclamation's fence, before
+    /// the record was appended.
+    Abandoned,
+    /// Nothing was appended: the attempt is over.
+    NotAppended(ShardError),
+    /// The record may be appended, but its commit was not confirmed. The
+    /// attempt stays in progress until the record commits.
+    Unconfirmed(ShardError),
+}
+
+/// Commits `body`, the publishing record of `attempt`, whose fragments
+/// are all durable: only if `attempts` has not abandoned the attempt, and
+/// only while `shard` still sequences in the attempt's epoch (§8.4). Calls
+/// `appended` once the record is sequenced.
+///
+/// The commit and the attempt's bookkeeping run on a task of their own, so
+/// the record is appended, and the attempt settled, even if this future is
+/// dropped. The attempt is finished in `attempts` unless its record may
+/// yet commit.
+pub(crate) async fn publish<D: Disk>(
+    shard: &Shard<D>,
+    attempts: &Attempts,
+    attempt: AttemptId,
+    body: RecordBody,
+    appended: impl FnOnce(),
+) -> Publication {
+    if !attempts.publish(attempt) {
+        attempts.finish(attempt);
+        return Publication::Abandoned;
+    }
+    let (sequenced, on_sequenced) = oneshot::channel();
+    let committing = tokio::spawn(commit(
+        shard.clone(),
+        attempts.clone(),
+        attempt,
+        body,
+        sequenced,
+    ));
+    if on_sequenced.await.is_ok() {
+        appended();
+    }
+    match committing.await {
+        Ok(publication) => publication,
+        Err(error) => Publication::Unconfirmed(ShardError::Unavailable {
+            shard: shard.shard().clone(),
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// [`publish`]'s task: commits `body` and settles `attempt` in `attempts`,
+/// sending on `sequenced` once the record is sequenced.
+async fn commit<D: Disk>(
+    shard: Shard<D>,
+    attempts: Attempts,
+    attempt: AttemptId,
+    body: RecordBody,
+    sequenced: oneshot::Sender<()>,
+) -> Publication {
+    let before = shard.last_sequenced();
+    let committer = shard.clone();
+    // Only in the attempt's epoch: a later primary may have judged its
+    // fragments orphans (§8.4). The commit runs on a task of its own too,
+    // so the caller hears that the record is sequenced before it commits.
+    let commit = tokio::spawn(async move { committer.commit_in(attempt.epoch, body).await });
+    while shard.last_sequenced() == before && !commit.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let appended = shard.last_sequenced() != before;
+    if appended {
+        // The caller may be gone: the attempt is settled all the same.
+        let _ = sequenced.send(());
+    }
+    match commit.await {
+        Ok(Ok(committed)) => {
+            attempts.finish(attempt);
+            Publication::Committed(committed)
+        }
+        Ok(Err(error)) => {
+            let position = match &error {
+                ShardError::NotAcknowledged { position, .. } => *position,
+                _ => None,
+            };
+            if appended || position.is_some() {
+                // The record may commit yet: the attempt stays in progress
+                // until it does.
+                attempts.sequenced(attempt, position);
+                Publication::Unconfirmed(error)
+            } else {
+                attempts.finish(attempt);
+                Publication::NotAppended(error)
+            }
+        }
+        Err(error) => Publication::Unconfirmed(ShardError::Unavailable {
+            shard: shard.shard().clone(),
+            reason: error.to_string(),
+        }),
     }
 }
 

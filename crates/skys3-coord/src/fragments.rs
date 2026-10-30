@@ -31,7 +31,9 @@
 //! `EC_PUBLISH` record holds (plan M5-04). The geometry and locations are
 //! recorded per stripe and never recomputed: a stripe keeps its geometry
 //! when the cluster grows or shrinks, and only new stripes see the change.
-//! Repair (M5-08) and fragment moves (M5-09) keep the same two rules.
+//! Repair (M5-08) and fragment moves (M5-09) keep the same two rules:
+//! [`FragmentPlanner::replace`] places fragments of a stripe again around
+//! the ones it keeps.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -325,6 +327,32 @@ impl<'a> StripeRequest<'a> {
     }
 }
 
+/// Fragments of a recorded stripe to place again, around the ones it keeps,
+/// as [`FragmentPlanner::replace`] takes them: what repair rebuilds (§8.6).
+#[derive(Debug, Clone, Copy)]
+pub struct ReplaceRequest<'a> {
+    /// The object's bucket.
+    pub bucket: &'a BucketId,
+    /// The object's shard.
+    pub shard: ShardId,
+    /// The object key.
+    pub key: &'a str,
+    /// The stripe's number within the object.
+    pub stripe: u32,
+    /// The stripe's recorded geometry, which the fragments keep.
+    pub geometry: Geometry,
+    /// The stripe's data length, which sizes its fragments.
+    pub data_len: u64,
+    /// The nodes of the fragments the stripe keeps where they are. They
+    /// count toward the caps, and no new fragment goes to them.
+    pub keep: &'a [NodeId],
+    /// How many fragments to place.
+    pub count: usize,
+    /// Nodes that must receive none, such as one whose fragment was lost
+    /// or whose write failed.
+    pub avoid: &'a [NodeId],
+}
+
 /// Where a new stripe goes: its geometry and the node of each fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripePlan {
@@ -500,7 +528,14 @@ impl FragmentPlanner {
             .within(request.key.as_bytes())
             .within(&[0])
             .within(&request.stripe.to_be_bytes());
-        let Some(nodes) = self.choose_nodes(geometry, seed, fragment_bytes, request.avoid) else {
+        let Some(nodes) = self.choose_nodes(
+            geometry,
+            seed,
+            fragment_bytes,
+            request.avoid,
+            &[],
+            geometry.total_fragments(),
+        ) else {
             // The geometry fits the room, and the room is exactly what the
             // per-node and per-domain caps leave, so this is unreachable.
             return Err(self.no_geometry(room));
@@ -511,21 +546,61 @@ impl FragmentPlanner {
         Ok(StripePlan { geometry, nodes })
     }
 
-    /// Chooses the node of each fragment of a `geometry` stripe, in index
-    /// order, or `None` if the caps leave too few.
+    /// Places `request.count` fragments of a recorded stripe again: on
+    /// eligible nodes other than `request.avoid` and the nodes it keeps,
+    /// with the kept fragments counted toward the per-domain cap of the
+    /// stripe's geometry, and preferred as a new stripe's are. The nodes
+    /// count the new fragments' bytes.
+    ///
+    /// Returns `None` if the caps leave too few nodes, as in a cluster
+    /// with no spare node outside the stripe: repair then waits for one
+    /// (§8.3).
+    pub fn replace(&mut self, request: &ReplaceRequest<'_>) -> Option<Vec<NodeId>> {
+        let geometry = request.geometry;
+        let fragment_bytes = request.data_len.div_ceil(geometry.data_fragments() as u64);
+        let seed = Seed::new(request.bucket, request.shard)
+            .within(request.key.as_bytes())
+            .within(&[1])
+            .within(&request.stripe.to_be_bytes());
+        let nodes = self.choose_nodes(
+            geometry,
+            seed,
+            fragment_bytes,
+            request.avoid,
+            request.keep,
+            request.count,
+        )?;
+        for node in &nodes {
+            self.hold(node, fragment_bytes);
+        }
+        Some(nodes)
+    }
+
+    /// Chooses the node of each of `count` fragments of a `geometry`
+    /// stripe that keeps fragments on `kept`, in index order, or `None`
+    /// if the caps leave too few.
     fn choose_nodes(
         &self,
         geometry: Geometry,
         seed: Seed,
         fragment_bytes: u64,
         avoid: &[NodeId],
+        kept: &[NodeId],
+        count: usize,
     ) -> Option<Vec<NodeId>> {
         let level = self.topology.level();
         let cap = geometry.parity_fragments();
         let mut chosen: Vec<&Candidate> = Vec::with_capacity(geometry.total_fragments());
-        let mut taken: BTreeSet<&NodeId> = BTreeSet::new();
+        let mut taken: BTreeSet<&NodeId> = kept.iter().collect();
         let mut in_domain: BTreeMap<Domain, usize> = BTreeMap::new();
-        for _ in 0..geometry.total_fragments() {
+        for candidate in kept.iter().filter_map(|node| self.topology.get(node)) {
+            if let Some(domain) = candidate.domain(level) {
+                *in_domain.entry(domain).or_default() += 1;
+            }
+            chosen.push(candidate);
+        }
+        let first = chosen.len();
+        for _ in 0..count {
             let (candidate, domain, _) = self
                 .topology
                 .eligible()
@@ -551,7 +626,7 @@ impl FragmentPlanner {
             taken.insert(&candidate.node);
             chosen.push(candidate);
         }
-        Some(chosen.into_iter().map(|c| c.node.clone()).collect())
+        Some(chosen[first..].iter().map(|c| c.node.clone()).collect())
     }
 
     /// Orders `a` and `b` by the share of their capacity their fragments

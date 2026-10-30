@@ -315,6 +315,7 @@ fn record_kinds_have_fixed_codes_and_names() {
             "IMPORT",
             "ADOPT",
             "EC_PUBLISH",
+            "EC_RELOCATE",
             "TRUNCATE",
             "CONFIG"
         ]
@@ -1029,9 +1030,9 @@ fn errors_are_classified_and_described() {
             "unknown log record kind 99",
         ),
         (
-            DecodeError::UnsupportedKind(RecordKind::EcRelocate),
+            DecodeError::UnsupportedKind(RecordKind::EcRelease),
             ErrorClass::Unsupported,
-            "log record kind EC_RELOCATE is reserved but not yet supported",
+            "log record kind EC_RELEASE is reserved but not yet supported",
         ),
         (
             DecodeError::Malformed(FieldError {

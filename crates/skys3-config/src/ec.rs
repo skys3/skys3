@@ -30,6 +30,10 @@ pub struct EcConfig {
     /// `fragment_orphan_after_seconds`: when unreferenced fragments may be
     /// reclaimed (§8.4).
     pub fragment_orphan_after_seconds: u64,
+    /// `fragment_repair_after_seconds`: how long a node may leave a shard
+    /// primary's fragment checks unanswered before the primary rebuilds its
+    /// fragments elsewhere (§8.6).
+    pub fragment_repair_after_seconds: u64,
     /// `repair_bytes_per_second_per_node`: the repair bandwidth cap (§8.6).
     pub repair_bytes_per_second_per_node: u64,
 }
@@ -42,6 +46,7 @@ impl Default for EcConfig {
             min_eligible_nodes: 5,
             fragment_release_delay_seconds: 60,
             fragment_orphan_after_seconds: 3600,
+            fragment_repair_after_seconds: 600,
             repair_bytes_per_second_per_node: 100 * MIB,
         }
     }
@@ -53,6 +58,8 @@ crate::durations! {
         fragment_release_delay => fragment_release_delay_seconds, Duration::from_secs;
         /// `fragment_orphan_after_seconds`.
         fragment_orphan_after => fragment_orphan_after_seconds, Duration::from_secs;
+        /// `fragment_repair_after_seconds`.
+        fragment_repair_after => fragment_repair_after_seconds, Duration::from_secs;
     }
 }
 
@@ -121,6 +128,10 @@ impl EcConfig {
         checker.nonzero(
             "ec.fragment_orphan_after_seconds",
             self.fragment_orphan_after_seconds,
+        );
+        checker.nonzero(
+            "ec.fragment_repair_after_seconds",
+            self.fragment_repair_after_seconds,
         );
         checker.nonzero(
             "ec.repair_bytes_per_second_per_node",

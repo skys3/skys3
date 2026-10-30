@@ -34,8 +34,7 @@
 
 mod attempts;
 
-use std::ops::Range;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -48,6 +47,7 @@ use skys3_shard::{Effect, Outcome, Rejection, Role, Shard, ShardError};
 use skys3_types::{AttemptId, CodedStripe, Epoch, EpochSeq, NodeId, Seq};
 use tokio::task::JoinSet;
 
+pub(crate) use attempts::{AttemptNumbers, Publication, Writing, publish};
 pub use attempts::{AttemptState, Attempts};
 
 use crate::fragment::{FragmentHeader, MAX_FRAGMENT_LEN, ObjectMeta, PartSize, StripeInfo};
@@ -56,9 +56,6 @@ use crate::{EcError, current_codec};
 
 // The configuration bounds stripes by the fragment format's limit.
 const _: () = assert!(MAX_FRAGMENT_LEN == skys3_config::MAX_FRAGMENT_BYTES);
-
-/// How many attempt numbers one durable reservation takes.
-const ATTEMPT_BLOCK: u64 = 64;
 
 /// How many entries a scan reads at a time.
 const SCAN_PAGE: usize = 256;
@@ -267,7 +264,7 @@ pub struct Encoder<D: Disk, W: FragmentWriter> {
     clock: Arc<dyn WallClock>,
     settings: EncoderSettings,
     attempts: Attempts,
-    numbers: Mutex<Range<u64>>,
+    numbers: AttemptNumbers,
     observer: Option<EncodeObserver>,
 }
 
@@ -289,7 +286,7 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
             clock,
             settings,
             attempts: Attempts::default(),
-            numbers: Mutex::new(0..0),
+            numbers: AttemptNumbers::default(),
             observer: None,
         }
     }
@@ -410,7 +407,7 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
             return Ok(Encoded::Skipped(Skip::TooLarge));
         };
 
-        let attempt = self.next_attempt()?;
+        let attempt = self.numbers.next(&self.shard)?;
         self.attempts.begin(attempt);
         // Forgets the attempt if this future is dropped before it appends.
         let _writing = Writing {
@@ -464,22 +461,7 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
 
     /// Whether this replica leads the shard.
     fn leads(&self) -> bool {
-        matches!(self.shard.role(), Role::Primary | Role::Alone) && self.shard.is_serving()
-    }
-
-    /// A new attempt ID: the shard's epoch and a number never used before
-    /// on this node.
-    fn next_attempt(&self) -> Result<AttemptId, EncodeError> {
-        let mut numbers = self.numbers.lock().unwrap_or_else(PoisonError::into_inner);
-        if numbers.is_empty() {
-            // A rare durable commit: one per `ATTEMPT_BLOCK` attempts.
-            *numbers = self
-                .shard
-                .index()
-                .reserve_attempts(self.shard.shard(), ATTEMPT_BLOCK)?;
-        }
-        let number = numbers.next().expect("a reserved block is not empty");
-        Ok(AttemptId::new(self.shard.sequencing(), number))
+        leads(&self.shard)
     }
 
     /// Writes every stripe's fragments and returns the record that
@@ -625,128 +607,45 @@ impl<D: Disk, W: FragmentWriter> Encoder<D, W> {
         &self,
         key: &str,
         attempt: AttemptId,
-        publish: EcPublish,
+        publish_record: EcPublish,
     ) -> Result<Encoded, EncodeError> {
-        if !self.attempts.publish(attempt) {
-            self.attempts.finish(attempt);
-            self.emit(key, attempt, EncodeStep::Abandoned);
-            return Err(EncodeError::Abandoned(attempt));
-        }
-        // The commit and the attempt's bookkeeping run on a task of their
-        // own, so the record is appended, and the attempt settled, even if
-        // this future is dropped.
-        let publishing = Publishing {
-            shard: self.shard.clone(),
-            attempts: self.attempts.clone(),
-            observer: self.observer.clone(),
-            key: key.to_owned(),
-            attempt,
-        };
-        match tokio::spawn(publishing.run(publish)).await {
-            Ok(result) => result,
-            Err(error) => Err(EncodeError::Publish(ShardError::Unavailable {
-                shard: self.shard.shard().clone(),
-                reason: error.to_string(),
-            })),
-        }
-    }
-
-    fn emit(&self, key: &str, attempt: AttemptId, step: EncodeStep) {
-        emit(self.observer.as_ref(), key, attempt, step);
-    }
-}
-
-/// An attempt's publishing record being committed, on a task of its own.
-struct Publishing<D: Disk> {
-    shard: Shard<D>,
-    attempts: Attempts,
-    observer: Option<EncodeObserver>,
-    key: String,
-    attempt: AttemptId,
-}
-
-impl<D: Disk> Publishing<D> {
-    /// Commits `publish` and settles the attempt: forgotten once its
-    /// record commits or is never appended, and publishing, at the
-    /// record's position if known, while the record may commit yet.
-    async fn run(self, publish: EcPublish) -> Result<Encoded, EncodeError> {
-        let (key, attempt) = (self.key.as_str(), self.attempt);
-        let emit = |step| emit(self.observer.as_ref(), key, attempt, step);
-        // The commit runs on a task of its own too, so an observer hears
-        // that the record is sequenced before it commits.
-        let before = self.shard.last_sequenced();
-        let shard = self.shard.clone();
-        // Only in the attempt's epoch: a later primary may have judged its
-        // fragments orphans (§8.4).
-        let commit = tokio::spawn(async move {
-            shard
-                .commit_in(attempt.epoch, RecordBody::EcPublish(publish))
-                .await
-        });
-        while self.shard.last_sequenced() == before && !commit.is_finished() {
-            tokio::task::yield_now().await;
-        }
-        let appended = self.shard.last_sequenced() != before;
-        if appended {
-            emit(EncodeStep::Appended);
-        }
-        let committed = match commit.await {
-            Ok(Ok(committed)) => committed,
-            Ok(Err(error)) => {
-                let position = match &error {
-                    ShardError::NotAcknowledged { position, .. } => *position,
-                    _ => None,
-                };
-                if appended || position.is_some() {
-                    // The record may commit yet: the attempt stays in
-                    // progress until it does.
-                    self.attempts.sequenced(attempt, position);
-                } else {
-                    self.attempts.finish(attempt);
-                    emit(EncodeStep::Abandoned);
-                }
+        let body = RecordBody::EcPublish(publish_record);
+        let appended = || self.emit(key, attempt, EncodeStep::Appended);
+        let committed = match publish(&self.shard, &self.attempts, attempt, body, appended).await {
+            Publication::Committed(committed) => committed,
+            Publication::Abandoned => {
+                self.emit(key, attempt, EncodeStep::Abandoned);
+                return Err(EncodeError::Abandoned(attempt));
+            }
+            Publication::NotAppended(error) => {
+                self.emit(key, attempt, EncodeStep::Abandoned);
                 return Err(EncodeError::Publish(error));
             }
-            Err(error) => {
-                return Err(EncodeError::Publish(ShardError::Unavailable {
-                    shard: self.shard.shard().clone(),
-                    reason: error.to_string(),
-                }));
-            }
+            Publication::Unconfirmed(error) => return Err(EncodeError::Publish(error)),
         };
-        self.attempts.finish(attempt);
         let published = committed.outcome == Outcome::Applied(Effect::Published);
-        emit(EncodeStep::Committed {
-            position: committed.position,
-            published,
-        });
+        self.emit(
+            key,
+            attempt,
+            EncodeStep::Committed {
+                position: committed.position,
+                published,
+            },
+        );
         Ok(match committed.outcome {
             Outcome::Rejected(rejection) => Encoded::Rejected(rejection),
             _ => Encoded::Published(committed.position),
         })
     }
-}
 
-fn emit(observer: Option<&EncodeObserver>, key: &str, attempt: AttemptId, step: EncodeStep) {
-    if let Some(observer) = observer {
-        observer(&EncodeEvent {
-            key: key.to_owned(),
-            attempt,
-            step,
-        });
-    }
-}
-
-/// An attempt being written: dropped before the attempt publishes, it
-/// forgets the attempt, which then never publishes.
-struct Writing<'a> {
-    attempts: &'a Attempts,
-    attempt: AttemptId,
-}
-
-impl Drop for Writing<'_> {
-    fn drop(&mut self) {
-        self.attempts.release(self.attempt);
+    fn emit(&self, key: &str, attempt: AttemptId, step: EncodeStep) {
+        if let Some(observer) = &self.observer {
+            observer(&EncodeEvent {
+                key: key.to_owned(),
+                attempt,
+                step,
+            });
+        }
     }
 }
 
@@ -767,36 +666,74 @@ impl Attempt<'_> {
         stripe: StripeInfo,
         index: usize,
     ) -> FragmentHeader {
-        let object = self.object;
-        let parts = match &object.payload {
-            Payload::Parts { parts, .. } => parts
-                .iter()
-                .map(|part| PartSize {
-                    number: part.number,
-                    size: part.size,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        FragmentHeader {
-            shard: shard.clone(),
-            key: self.key.to_owned(),
-            version: self.entry.version,
-            attempt: self.attempt,
+        // A geometry has at most 255 fragments.
+        let index = index as u8;
+        let version = self.entry.version;
+        fragment_header(
+            shard,
+            self.key,
+            self.entry,
+            version,
+            self.attempt,
             stripe,
-            // A geometry has at most 255 fragments.
-            index: index as u8,
-            object: ObjectMeta {
-                size: object.size,
-                last_modified_ms: object.last_modified_ms,
-                etag: object.local_etag.clone(),
-                identity: object.write_identity.unwrap_or(self.entry.version),
-                metadata: object.metadata.clone(),
-                tags: object.tags.clone(),
-                checksums: object.checksums.clone(),
-                parts,
-            },
-        }
+            index,
+        )
+    }
+}
+
+/// Whether `shard`'s replica on this node leads the shard and serves: what
+/// every fragment-writing attempt waits for.
+pub(crate) fn leads<D: Disk>(shard: &Shard<D>) -> bool {
+    matches!(shard.role(), Role::Primary | Role::Alone) && shard.is_serving()
+}
+
+/// The header of fragment `index` of stripe `stripe` of `key`'s version
+/// `entry`, written by `attempt` (§8.4). `version` is the position the
+/// header names: the entry's when it is encoded, and the coded layout's
+/// when a repair rebuilds a fragment, which a retag leaves behind the
+/// entry's. The rest is the object as `entry` holds it now, its tags and
+/// write identity included.
+///
+/// # Panics
+///
+/// If `entry` has no object: only an object's fragments are written.
+pub(crate) fn fragment_header(
+    shard: &skys3_log::ShardRef,
+    key: &str,
+    entry: &Entry,
+    version: EpochSeq,
+    attempt: AttemptId,
+    stripe: StripeInfo,
+    index: u8,
+) -> FragmentHeader {
+    let object = entry.object.as_ref().expect("fragments are an object's");
+    let parts = match &object.payload {
+        Payload::Parts { parts, .. } => parts
+            .iter()
+            .map(|part| PartSize {
+                number: part.number,
+                size: part.size,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    FragmentHeader {
+        shard: shard.clone(),
+        key: key.to_owned(),
+        version,
+        attempt,
+        stripe,
+        index,
+        object: ObjectMeta {
+            size: object.size,
+            last_modified_ms: object.last_modified_ms,
+            etag: object.local_etag.clone(),
+            identity: object.write_identity.unwrap_or(entry.version),
+            metadata: object.metadata.clone(),
+            tags: object.tags.clone(),
+            checksums: object.checksums.clone(),
+            parts,
+        },
     }
 }
 
