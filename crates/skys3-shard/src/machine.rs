@@ -88,6 +88,9 @@ pub enum Effect {
         /// How many parts the upload had.
         parts: usize,
     },
+    /// A `PART_FLUSHED` recorded a step of a streamed upload's remote
+    /// counterpart (§7.3): it was opened, took a part, or ended.
+    RemoteUploadMoved,
     /// An `UPLOAD_BEGIN` fixed the write identity of a streamed PUT
     /// (§7.2). It changes no entry: only the `PUT` that inherits the
     /// identity does.
@@ -153,6 +156,11 @@ pub enum Rejection {
         /// The part number.
         number: u16,
     },
+    /// A `PART_FLUSHED` names a remote upload this replica does not hold
+    /// for the local upload: never opened, ended already, or replaced by
+    /// another.
+    #[error("the remote upload is not recorded")]
+    NoRemoteUpload,
     /// A record kind this state machine does not apply.
     #[error("{0:?} records are not applied by this build")]
     Unsupported(RecordKind),
@@ -210,6 +218,7 @@ impl StateMachine {
             RecordBody::UploadBegin(_) => Ok(Effect::UploadBegun),
             RecordBody::Tags(tags) => set_tags(index, shard, position, tags)?,
             RecordBody::Flushed(flushed) => flush(index, shard, flushed)?,
+            RecordBody::PartFlushed(flushed) => multipart::part_flushed(index, shard, flushed)?,
             RecordBody::Import(import) => import_stub(index, shard, position, import)?,
             RecordBody::Adopt(adopt) => adopt_remote(index, shard, position, adopt)?,
             // A replica's own bookkeeping: the configuration it adopted,

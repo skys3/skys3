@@ -5,7 +5,10 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use skys3_index::{FORMAT_VERSION, Index, IndexError, IndexWriter, Part, Payload, Upload};
+use skys3_index::{
+    FORMAT_VERSION, Index, IndexError, IndexWriter, Part, Payload, RemotePart, RemoteUpload,
+    ShardTable, Upload,
+};
 use skys3_log::record::{ChecksumAlgorithm, ExtentRef, ShardRef, UploadChecksum};
 use skys3_log::{LogRecord, RecordLocation};
 use skys3_types::{ETag, Epoch, EpochSeq, Seq};
@@ -131,6 +134,97 @@ fn uploads_and_parts_are_stored_listed_and_removed() {
     let keys: Vec<_> = dump.uploads.keys().cloned().collect();
     assert_eq!(keys, [(other.clone(), "a/1".to_owned(), position(2))]);
     assert!(dump.parts.is_empty());
+}
+
+#[test]
+fn remote_uploads_are_stored_replaced_removed_and_copied() {
+    let disk = skys3_io::SimDisk::new(2);
+    let index = Index::open_sim(&disk.mount(), "index.redb", &index_config()).unwrap();
+    let (s, other) = (shard(0), shard(1));
+    let remote = |key: &str, id: &str| RemoteUpload {
+        key: key.to_owned(),
+        id: id.to_owned(),
+    };
+    let sent = |seq| RemotePart {
+        position: position(seq),
+        etag: ETag::new(format!("e{seq}")).unwrap(),
+    };
+    write(&index, |w| {
+        w.put_remote_upload(&s, position(3), &remote("a", "r1"))?;
+        w.put_remote_upload(&s, position(5), &remote("b", "r2"))?;
+        w.put_remote_upload(&other, position(3), &remote("a", "r3"))?;
+        w.put_remote_part(&s, position(3), 2, &sent(8))?;
+        w.put_remote_part(&s, position(3), 1, &sent(7))?;
+        w.put_remote_part(&s, position(5), 1, &sent(9))?;
+        assert_eq!(w.remote_upload(&s, position(3))?, Some(remote("a", "r1")));
+        assert_eq!(w.remote_upload(&s, position(4))?, None);
+        Ok(())
+    });
+    let read = index.read().unwrap();
+    assert_eq!(
+        read.remote_upload(&s, position(3)).unwrap(),
+        Some((remote("a", "r1"), vec![(1, sent(7)), (2, sent(8))]))
+    );
+    assert_eq!(read.remote_upload(&s, position(4)).unwrap(), None);
+    assert_eq!(
+        read.remote_uploads(&s).unwrap(),
+        [
+            (position(3), remote("a", "r1")),
+            (position(5), remote("b", "r2"))
+        ]
+    );
+    let dump = read.dump().unwrap();
+    assert_eq!(dump.remote_uploads.len(), 3);
+    assert_eq!(dump.remote_parts.len(), 3);
+
+    // The rows of a shard copy to a learner whole.
+    let learner = Index::open_sim(&disk.mount(), "learner.redb", &index_config()).unwrap();
+    learner.begin_install(&s, position(20)).unwrap();
+    for table in [ShardTable::RemoteUploads, ShardTable::RemoteParts] {
+        assert_eq!(ShardTable::from_code(table.code()), Some(table));
+        let rows = read.shard_rows(table, &s, None, 1 << 20).unwrap();
+        // Rows of one table do not install in the other.
+        let wrong = match table {
+            ShardTable::RemoteUploads => ShardTable::RemoteParts,
+            _ => ShardTable::RemoteUploads,
+        };
+        assert!(matches!(
+            learner.install_rows(&s, wrong, &rows),
+            Err(IndexError::Snapshot(_))
+        ));
+        learner.install_rows(&s, table, &rows).unwrap();
+    }
+    let copied = learner.read().unwrap();
+    assert_eq!(
+        copied.remote_upload(&s, position(3)).unwrap(),
+        read.remote_upload(&s, position(3)).unwrap()
+    );
+    assert_eq!(
+        copied.remote_uploads(&s).unwrap(),
+        read.remote_uploads(&s).unwrap()
+    );
+    assert!(copied.remote_uploads(&other).unwrap().is_empty());
+    drop((read, copied));
+
+    // A new remote upload replaces the row and drops its parts; removing
+    // one removes its parts.
+    write(&index, |w| {
+        w.put_remote_upload(&s, position(3), &remote("a", "r4"))?;
+        assert!(w.remove_remote_upload(&s, position(5))?);
+        assert!(!w.remove_remote_upload(&s, position(5))?);
+        Ok(())
+    });
+    let read = index.read().unwrap();
+    assert_eq!(
+        read.remote_upload(&s, position(3)).unwrap(),
+        Some((remote("a", "r4"), Vec::new()))
+    );
+    assert_eq!(read.dump().unwrap().remote_parts.len(), 0);
+    drop(read);
+    index.remove_shard(&s).unwrap();
+    let dump = index.read().unwrap().dump().unwrap();
+    let keys: Vec<_> = dump.remote_uploads.keys().cloned().collect();
+    assert_eq!(keys, [(other, position(3))]);
 }
 
 #[test]

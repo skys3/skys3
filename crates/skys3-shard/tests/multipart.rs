@@ -4,14 +4,14 @@
 
 mod support;
 
-use skys3_index::{EntryState, Index, ObjectPart, Payload};
+use skys3_index::{EntryState, Index, ObjectPart, Payload, RemotePart, RemoteUpload};
 use skys3_log::RecordBody;
-use skys3_log::record::ExtentRef;
+use skys3_log::record::{ExtentRef, RemoteStep};
 use skys3_shard::{Effect, Outcome, Rejection};
-use skys3_types::EpochSeq;
+use skys3_types::{ETag, EpochSeq};
 use support::{
     adopt, apply, at, delete, dump, entry, extent, flushed, location, mpu_abort, mpu_complete,
-    mpu_create, mpu_part, new_index, put, record, shard,
+    mpu_create, mpu_part, new_index, part_flushed, put, record, shard,
 };
 
 fn step(index: &Index, seq: u64, body: RecordBody) -> Outcome {
@@ -265,6 +265,113 @@ fn adopting_a_remote_version_drops_the_object_parts() {
 }
 
 #[test]
+fn part_flushed_follows_the_remote_upload_until_it_ends() {
+    let index = open_upload();
+    let moved = Outcome::Applied(Effect::RemoteUploadMoved);
+    let etag = ETag::new("5d41402abc4b2a76b9719d911017c592").unwrap();
+    let part = |number, seq| RemoteStep::Part {
+        number,
+        position: at(seq),
+        remote_etag: etag.clone(),
+    };
+    let remote = |index: &Index| {
+        let reader = index.read().unwrap();
+        reader.remote_upload(&shard(0), at(1)).unwrap()
+    };
+    // A part of a remote upload that is not recorded is refused.
+    let refused = Outcome::Rejected(Rejection::NoRemoteUpload);
+    assert_eq!(
+        step(&index, 7, part_flushed("k", at(1), "r-1", part(1, 2))),
+        refused
+    );
+    assert_eq!(
+        step(
+            &index,
+            8,
+            part_flushed("k", at(1), "r-1", RemoteStep::Opened)
+        ),
+        moved
+    );
+    assert_eq!(
+        step(&index, 9, part_flushed("k", at(1), "r-1", part(1, 2))),
+        moved
+    );
+    assert_eq!(
+        step(&index, 10, part_flushed("k", at(1), "r-1", part(2, 5))),
+        moved
+    );
+    // Steps of another remote upload of the same local one are refused.
+    assert_eq!(
+        step(&index, 11, part_flushed("k", at(1), "r-0", part(3, 6))),
+        refused
+    );
+    let expected = (
+        RemoteUpload {
+            key: "k".into(),
+            id: "r-1".into(),
+        },
+        vec![
+            (
+                1,
+                RemotePart {
+                    position: at(2),
+                    etag: etag.clone(),
+                },
+            ),
+            (
+                2,
+                RemotePart {
+                    position: at(5),
+                    etag: etag.clone(),
+                },
+            ),
+        ],
+    );
+    assert_eq!(remote(&index), Some(expected));
+    // The local upload is aborted: the remote one stays until it ends. No
+    // entry or local upload changes.
+    step(&index, 12, mpu_abort("k", at(1)));
+    let before = dump(&index);
+    assert_eq!(before.remote_uploads.len(), 1);
+    assert_eq!(before.remote_parts.len(), 2);
+    assert_eq!(
+        step(
+            &index,
+            13,
+            part_flushed("k", at(1), "r-0", RemoteStep::Ended)
+        ),
+        refused
+    );
+    assert_eq!(
+        step(
+            &index,
+            14,
+            part_flushed("k", at(1), "r-1", RemoteStep::Ended)
+        ),
+        moved
+    );
+    let after = dump(&index);
+    assert!(after.remote_uploads.is_empty() && after.remote_parts.is_empty());
+    assert_eq!(after.entries, before.entries);
+    assert_eq!(remote(&index), None);
+
+    // Opening again replaces a remote upload and forgets its parts.
+    step(
+        &index,
+        15,
+        part_flushed("k", at(1), "r-2", RemoteStep::Opened),
+    );
+    step(&index, 16, part_flushed("k", at(1), "r-2", part(1, 2)));
+    step(
+        &index,
+        17,
+        part_flushed("k", at(1), "r-3", RemoteStep::Opened),
+    );
+    let (upload, parts) = remote(&index).unwrap();
+    assert_eq!((upload.id.as_str(), parts.len()), ("r-3", 0));
+}
+
+#[test]
 fn multipart_outcomes_describe_themselves() {
     assert_eq!(
         Outcome::Rejected(Rejection::PartChanged { number: 4 }).to_string(),
@@ -273,5 +380,9 @@ fn multipart_outcomes_describe_themselves() {
     assert_eq!(
         Rejection::NoSuchUpload.to_string(),
         "the upload is not open"
+    );
+    assert_eq!(
+        Rejection::NoRemoteUpload.to_string(),
+        "the remote upload is not recorded"
     );
 }

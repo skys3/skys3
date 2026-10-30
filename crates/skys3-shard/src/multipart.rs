@@ -8,6 +8,9 @@
 //!   flush can reproduce the multipart ETag, and inherits the upload's write
 //!   identity: the position of its `MPU_CREATE`.
 //! - `MPU_ABORT` removes an open upload and its parts.
+//! - `PART_FLUSHED` follows the remote upload a streaming flush keeps for a
+//!   local one (§7.3): its ID once opened, the part each remote part holds,
+//!   and nothing once it ended. It changes no entry and no local upload.
 //!
 //! **Releasing bytes.** A part that no upload or object can reach any more
 //! (an aborted upload's, a part replaced by a later one with its number, a
@@ -21,9 +24,12 @@
 //! those by reference.
 
 use skys3_index::{
-    Entry, IndexError, IndexWriter, ObjectPart, ObjectVersion, Part, Payload, Upload,
+    Entry, IndexError, IndexWriter, ObjectPart, ObjectVersion, Part, Payload, RemotePart,
+    RemoteUpload, Upload,
 };
-use skys3_log::record::{MpuAbort, MpuComplete, MpuCreate, MpuPart, PutData};
+use skys3_log::record::{
+    MpuAbort, MpuComplete, MpuCreate, MpuPart, PartFlushed, PutData, RemoteStep,
+};
 use skys3_log::{RecordLocation, ShardRef};
 use skys3_types::EpochSeq;
 
@@ -169,6 +175,51 @@ pub(crate) fn abort(
         index.remove_part(shard, abort.upload, number)?;
     }
     Ok(Ok(Effect::Aborted { parts: released }))
+}
+
+/// `PART_FLUSHED`: a step of the remote upload of a local upload (§7.3).
+///
+/// - Opened: the remote upload is recorded, replacing any other, whatever
+///   became of the local upload meanwhile: the remote one must still be
+///   completed or aborted.
+/// - A part: recorded as what the remote holds under its number, if the
+///   remote upload is the one recorded.
+/// - Ended: the remote upload and its parts are forgotten, if it is the one
+///   recorded.
+pub(crate) fn part_flushed(
+    index: &mut IndexWriter<'_>,
+    shard: &ShardRef,
+    flushed: &PartFlushed,
+) -> Result<Rule, IndexError> {
+    if flushed.step == RemoteStep::Opened {
+        let remote = RemoteUpload {
+            key: flushed.key.clone(),
+            id: flushed.remote_upload_id.clone(),
+        };
+        index.put_remote_upload(shard, flushed.upload, &remote)?;
+        return Ok(Ok(Effect::RemoteUploadMoved));
+    }
+    let recorded = index.remote_upload(shard, flushed.upload)?;
+    if recorded.is_none_or(|remote| remote.id != flushed.remote_upload_id) {
+        return Ok(Err(Rejection::NoRemoteUpload));
+    }
+    match &flushed.step {
+        RemoteStep::Part {
+            number,
+            position,
+            remote_etag,
+        } => {
+            let part = RemotePart {
+                position: *position,
+                etag: remote_etag.clone(),
+            };
+            index.put_remote_part(shard, flushed.upload, *number, &part)?;
+        }
+        RemoteStep::Ended | RemoteStep::Opened => {
+            index.remove_remote_upload(shard, flushed.upload)?;
+        }
+    }
+    Ok(Ok(Effect::RemoteUploadMoved))
 }
 
 /// Removes the parts of the multipart object `prior` held, if it was one,

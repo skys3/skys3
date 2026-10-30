@@ -8,6 +8,7 @@ use base64::Engine as _;
 use bytes::{Bytes, BytesMut};
 use skys3_index::{Entry, EntryState, ObjectVersion, Payload};
 use skys3_io::Disk;
+use skys3_log::record::{Metadata, TagSet};
 use skys3_remote::probe::ConditionalOperation;
 use skys3_remote::{
     CompleteMultipartUpload, DeleteObject, HeadObject, ObjectInfo, ObjectStore, PutObject, S3Error,
@@ -16,6 +17,7 @@ use skys3_remote::{
 use skys3_shard::Shard;
 use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
 
+use crate::stream::Streams;
 use crate::target::Target;
 
 /// How many times one attempt follows a failed precondition with another
@@ -98,6 +100,8 @@ pub(crate) struct Attempt<'a, S, D: Disk> {
     pub(crate) shard: &'a Shard<D>,
     pub(crate) target: &'a Target<S>,
     pub(crate) key: &'a str,
+    /// The streams of the shard's uploads (§7.3).
+    pub(crate) streams: &'a Streams,
 }
 
 impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
@@ -173,7 +177,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         }
         let request = put_request(self.remote_key(), object, &identity)?;
         let _permit = self.target.reserve(object.size).await;
-        let body = self.read(&object.payload, object.size).await?;
+        let body = read_payload(self.shard, &object.payload, object.size).await?;
         let request = PutObject { body, ..request };
         Ok(
             match self
@@ -354,36 +358,40 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             Err(error) => Err(Failure::Remote(error)),
         }
     }
+}
 
-    /// Reads `size` bytes from the local log: those of a version, or of a
-    /// part of one.
-    pub(crate) async fn read(&self, payload: &Payload, size: u64) -> Result<Bytes, Failure> {
-        let body = match payload {
-            Payload::Inline(position) => self.shard.payload(*position).await?,
-            Payload::Extents(extents) => {
-                let mut body = BytesMut::new();
-                for extent in extents {
-                    body.extend_from_slice(&self.shard.payload(extent.position).await?);
-                }
-                body.freeze()
+/// Reads `size` bytes of `payload` from `shard`'s local log: those of a
+/// version, or of a part of one.
+pub(crate) async fn read_payload<D: Disk>(
+    shard: &Shard<D>,
+    payload: &Payload,
+    size: u64,
+) -> Result<Bytes, Failure> {
+    let body = match payload {
+        Payload::Inline(position) => shard.payload(*position).await?,
+        Payload::Extents(extents) => {
+            let mut body = BytesMut::new();
+            for extent in extents {
+                body.extend_from_slice(&shard.payload(extent.position).await?);
             }
-            // An imported or evicted stub changed by `TAGS`: its bytes must
-            // be filled from the remote first (plan M1-20).
-            Payload::None => return Err(Failure::Local("the version has no local bytes".into())),
-            Payload::Parts { .. } => {
-                return Err(Failure::Local(
-                    "a multipart object is read part by part".into(),
-                ));
-            }
-        };
-        if body.len() as u64 != size {
-            return Err(Failure::Local(format!(
-                "the version's bytes are {} long, not {size}",
-                body.len()
-            )));
+            body.freeze()
         }
-        Ok(body)
+        // An imported or evicted stub changed by `TAGS`: its bytes must be
+        // filled from the remote first (plan M1-20).
+        Payload::None => return Err(Failure::Local("the version has no local bytes".into())),
+        Payload::Parts { .. } => {
+            return Err(Failure::Local(
+                "a multipart object is read part by part".into(),
+            ));
+        }
+    };
+    if body.len() as u64 != size {
+        return Err(Failure::Local(format!(
+            "the version's bytes are {} long, not {size}",
+            body.len()
+        )));
     }
+    Ok(body)
 }
 
 /// Why an attempt must be retried.
@@ -473,10 +481,27 @@ pub(crate) fn put_request(
     object: &ObjectVersion,
     identity: &WriteIdentity,
 ) -> Result<PutObject, Failure> {
+    let mut request = request_headers(key, &object.metadata, &object.tags, identity)?;
+    // A single PUT's ETag is the MD5 of its bytes; a copy's need not be.
+    if object.copy_source.is_none() {
+        request.content_md5 = content_md5(&object.local_etag);
+    }
+    Ok(request)
+}
+
+/// A `PutObject` without a body of an object with stored `metadata` and
+/// `tags`, written with `identity`: the metadata split into user metadata,
+/// `Content-Type`, and the other standard headers.
+pub(crate) fn request_headers(
+    key: String,
+    stored: &Metadata,
+    tags: &TagSet,
+    identity: &WriteIdentity,
+) -> Result<PutObject, Failure> {
     let mut metadata = UserMetadata::new();
     let mut headers = BTreeMap::new();
     let mut request = PutObject::new(key, Bytes::new());
-    for (name, value) in &object.metadata {
+    for (name, value) in stored {
         if let Some(user) = name.strip_prefix("x-amz-meta-") {
             metadata
                 .insert(user, value.clone())
@@ -490,11 +515,7 @@ pub(crate) fn put_request(
     metadata.set_write_identity(identity);
     request.metadata = metadata;
     request.headers = headers;
-    request.tags = object.tags.clone();
-    // A single PUT's ETag is the MD5 of its bytes; a copy's need not be.
-    if object.copy_source.is_none() {
-        request.content_md5 = content_md5(&object.local_etag);
-    }
+    request.tags = tags.clone();
     Ok(request)
 }
 

@@ -531,7 +531,7 @@ fn outcomes_describe_themselves() {
         "applied: Cleaned"
     );
     assert_eq!(
-        Rejection::Unsupported(RecordKind::PartFlushed).to_string(),
-        "PartFlushed records are not applied by this build"
+        Rejection::Unsupported(RecordKind::EcPublish).to_string(),
+        "EcPublish records are not applied by this build"
     );
 }

@@ -9,7 +9,9 @@
 //! `FULL_OBJECT`. Format 3 adds the payload of a multipart object (tag 3:
 //! the upload's position, a `u16` part count, and each part's number
 //! (`u16`) and size (`u64`)), and the [`Upload`] and [`Part`] values, which
-//! only it has. Every other value is the same in all three. Integers in
+//! only it has. Every other value is the same in all three. The
+//! [`RemoteUpload`] and [`RemotePart`] values came later, with index
+//! version 8, in format 3; they too exist only in format 3. Integers in
 //! values are little-endian. Keys use big-endian integers so that redb's
 //! byte order sorts them numerically:
 //!
@@ -22,6 +24,8 @@
 //! | control | register key (UTF-8) | [`ControlEntry`] |
 //! | uploads | shard, the object key's bytes, a zero byte, then the upload's epoch and seq | [`Upload`] |
 //! | parts | shard, the upload's epoch and seq, part number (`u16`) | [`Part`] |
+//! | remote_uploads | shard, the upload's epoch and seq | [`RemoteUpload`]: the object key and the remote upload ID (`u16` lengths) |
+//! | remote_parts | shard, the upload's epoch and seq, part number (`u16`) | [`RemotePart`]: the `MPU_PART` position and the remote ETag |
 //! | shard_map | shard | the gateway's [`ShardConfig`], as its register's JSON |
 //! | configs | shard | the [`ShardConfig`] of the shard's latest applied `CONFIG` record, as its register's JSON |
 //! | takeovers | shard | the [`ShardConfig`] a member proposed to take over in, as its register's JSON |
@@ -48,7 +52,8 @@ use std::fmt;
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, MAX_EXTENTS,
     MAX_KEY_LEN, MAX_METADATA_LEN, MAX_PAYLOAD_LEN, MAX_STORAGE_CLASS_LEN, MAX_TAG_KEY_LEN,
-    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_VERSION_ID_LEN, Metadata, ShardRef, TagSet, UploadChecksum,
+    MAX_TAG_VALUE_LEN, MAX_TAGS, MAX_UPLOAD_ID_LEN, MAX_VERSION_ID_LEN, Metadata, ShardRef, TagSet,
+    UploadChecksum,
 };
 use skys3_log::{RecordLocation, SegmentId, SegmentSummary};
 use skys3_types::limits::MAX_PARTS;
@@ -59,7 +64,7 @@ use skys3_types::{
 
 use crate::entry::{
     ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part, Payload,
-    Upload,
+    RemotePart, RemoteUpload, Upload,
 };
 use crate::import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 
@@ -943,6 +948,99 @@ pub fn decode_part(bytes: &[u8]) -> Result<Part> {
     check_part_payload(&part.payload)?;
     r.finish("part")?;
     Ok(part)
+}
+
+/// Returns the remote-uploads key of the remote upload of the local
+/// upload opened at `upload` in `shard`: the same bytes as the prefix of
+/// that upload's parts ([`upload_parts_prefix`]).
+#[must_use]
+pub fn remote_upload_key(shard: &ShardRef, upload: EpochSeq) -> Vec<u8> {
+    upload_parts_prefix(shard, upload)
+}
+
+/// Decodes a remote-uploads key into its shard and upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not a shard and a position.
+pub fn decode_remote_upload_key(bytes: &[u8]) -> Result<(ShardRef, EpochSeq)> {
+    let field = "remote upload key";
+    let mut r = Reader(bytes, VALUE_FORMAT);
+    let shard = r.shard(field)?;
+    let upload = read_key_position(&mut r, field)?;
+    r.finish(field)?;
+    Ok((shard, upload))
+}
+
+/// Encodes a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the key or the ID is empty or too long.
+pub fn encode_remote_upload(upload: &RemoteUpload) -> Result<Vec<u8>> {
+    let mut w = Writer::value();
+    write_nonempty(&mut w, "remote_upload.key", &upload.key, MAX_KEY_LEN)?;
+    write_nonempty(&mut w, "remote_upload.id", &upload.id, MAX_UPLOAD_ID_LEN)?;
+    Ok(w.0)
+}
+
+/// Decodes a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded remote upload.
+pub fn decode_remote_upload(bytes: &[u8]) -> Result<RemoteUpload> {
+    let mut r = Reader::value(bytes, "remote_upload")?;
+    check_has_uploads(&r, "remote_upload")?;
+    let upload = RemoteUpload {
+        key: read_nonempty(&mut r, "remote_upload.key", MAX_KEY_LEN)?,
+        id: read_nonempty(&mut r, "remote_upload.id", MAX_UPLOAD_ID_LEN)?,
+    };
+    r.finish("remote_upload")?;
+    Ok(upload)
+}
+
+/// Encodes a part of a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if the ETag is too long.
+pub fn encode_remote_part(part: &RemotePart) -> Result<Vec<u8>> {
+    let mut w = Writer::value();
+    w.position(part.position);
+    write_etag(&mut w, "remote_part.etag", &part.etag)?;
+    Ok(w.0)
+}
+
+/// Decodes a part of a remote upload.
+///
+/// # Errors
+///
+/// Returns a [`CodecError`] if `bytes` is not an encoded remote part.
+pub fn decode_remote_part(bytes: &[u8]) -> Result<RemotePart> {
+    let mut r = Reader::value(bytes, "remote_part")?;
+    check_has_uploads(&r, "remote_part")?;
+    let part = RemotePart {
+        position: r.position("remote_part.position")?,
+        etag: r.etag("remote_part.etag")?,
+    };
+    r.finish("remote_part")?;
+    Ok(part)
+}
+
+fn write_nonempty(w: &mut Writer, field: &'static str, text: &str, max: usize) -> Result<()> {
+    if text.is_empty() {
+        return Err(CodecError::new(field, "empty"));
+    }
+    w.str16(field, text, max)
+}
+
+fn read_nonempty(r: &mut Reader<'_>, field: &'static str, max: usize) -> Result<String> {
+    let text = r.str16(field, max)?;
+    if text.is_empty() {
+        return Err(CodecError::new(field, "empty"));
+    }
+    Ok(text)
 }
 
 /// Checks that a part's bytes are inline or in extents, or that the part

@@ -75,6 +75,11 @@ pub struct FlushSettings {
     /// `extent_bytes`: the size of the `EXTENT` records a read-through
     /// fill commits (§9.2), as a PUT's body is committed.
     pub extent_bytes: u64,
+    /// Whether multipart uploads stream to the remote while the client
+    /// uploads (§7.3). Without it, a multipart object is sent only once
+    /// its completion commits; remote uploads streamed earlier are still
+    /// completed or aborted.
+    pub streaming: bool,
 }
 
 impl FlushSettings {
@@ -112,6 +117,7 @@ impl Default for FlushSettings {
             min_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
             extent_bytes: 1 << 20,
+            streaming: true,
         }
     }
 }
@@ -198,6 +204,11 @@ impl<S> Target<S> {
     /// The preconditions the target honors.
     pub fn writes(&self) -> &ConditionalWrites {
         &self.writes
+    }
+
+    /// The counters its flushers count events in.
+    pub fn counters(&self) -> &Counters {
+        &self.counters
     }
 
     /// How many remote multipart uploads flushes left open, because their

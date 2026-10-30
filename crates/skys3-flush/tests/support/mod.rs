@@ -13,7 +13,8 @@ use skys3_flush::{FlushSettings, ShardFlusher, Target};
 use skys3_index::{Entry, EntryState, Index, IndexConfig};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::{
-    CompletedPart, Delete, MpuComplete, MpuCreate, MpuPart, Put, PutData, Tags, UploadBegin,
+    CompletedPart, Delete, MpuAbort, MpuComplete, MpuCreate, MpuPart, Put, PutData, Tags,
+    UploadBegin,
 };
 use skys3_log::{LogConfig, RecordBody, SegmentLog, ShardRef};
 use skys3_remote::probe::{ConditionalWrites, OperationSupport, PreconditionSupport};
@@ -69,12 +70,15 @@ pub fn writes(put: bool, complete: bool, delete: bool) -> ConditionalWrites {
     }
 }
 
-/// Settings with short backoffs.
+/// Settings with short backoffs, which send multipart objects only once
+/// they complete: the tests of streaming (§7.3) turn it on
+/// ([`streaming_target`]).
 pub fn settings() -> FlushSettings {
     FlushSettings {
         concurrency: 4,
         min_backoff: Duration::from_millis(10),
         max_backoff: Duration::from_millis(200),
+        streaming: false,
         ..FlushSettings::default()
     }
 }
@@ -162,6 +166,18 @@ impl Node {
     /// Uploads `parts` of `key` as a multipart upload, with user metadata,
     /// standard headers, and a tag, and completes it.
     pub async fn multipart(&self, key: &str, parts: &[&str]) -> Multipart {
+        let upload = self.create(key).await;
+        let mut stored = Vec::new();
+        for (number, body) in (1..).zip(parts) {
+            let position = self.part(key, upload, number, body).await;
+            stored.push((number, position, *body));
+        }
+        self.finish(key, upload, &stored).await
+    }
+
+    /// Opens a multipart upload of `key`, with user metadata, standard
+    /// headers, and a tag, and returns its position.
+    pub async fn create(&self, key: &str) -> EpochSeq {
         let create = RecordBody::MpuCreate(MpuCreate {
             key: key.to_owned(),
             initiated_ms: 1_700_000_000_000,
@@ -173,31 +189,49 @@ impl Node {
             tags: BTreeMap::from([("kind".to_owned(), "video".to_owned())]),
             checksum: None,
         });
-        let upload = self.shard.commit(create).await.unwrap().position;
-        let mut completed = Vec::new();
-        for (number, body) in (1..).zip(parts) {
-            let part = RecordBody::MpuPart(MpuPart {
-                key: key.to_owned(),
-                upload,
-                part_number: number,
-                size: body.len() as u64,
-                last_modified_ms: 1_700_000_000_001,
-                etag: md5_etag(body.as_bytes()),
-                checksums: BTreeMap::new(),
-                data: PutData::Inline(Bytes::copy_from_slice(body.as_bytes())),
-            });
-            let position = self.shard.commit(part).await.unwrap().position;
-            completed.push(CompletedPart { number, position });
-        }
-        let etag = multipart_etag(parts);
+        self.shard.commit(create).await.unwrap().position
+    }
+
+    /// Stores `body` as part `number` of the upload of `key` at `upload`,
+    /// and returns the part's position.
+    pub async fn part(&self, key: &str, upload: EpochSeq, number: u16, body: &str) -> EpochSeq {
+        let part = RecordBody::MpuPart(MpuPart {
+            key: key.to_owned(),
+            upload,
+            part_number: number,
+            size: body.len() as u64,
+            last_modified_ms: 1_700_000_000_001,
+            etag: md5_etag(body.as_bytes()),
+            checksums: BTreeMap::new(),
+            data: PutData::Inline(Bytes::copy_from_slice(body.as_bytes())),
+        });
+        self.shard.commit(part).await.unwrap().position
+    }
+
+    /// Completes the upload of `key` at `upload` with `parts`: each one's
+    /// number, position, and body.
+    pub async fn finish(
+        &self,
+        key: &str,
+        upload: EpochSeq,
+        parts: &[(u16, EpochSeq, &str)],
+    ) -> Multipart {
+        let bodies: Vec<&str> = parts.iter().map(|(_, _, body)| *body).collect();
+        let etag = multipart_etag(&bodies);
         let complete = RecordBody::MpuComplete(MpuComplete {
             key: key.to_owned(),
             upload,
             last_modified_ms: 1_700_000_000_002,
-            size: parts.iter().map(|body| body.len() as u64).sum(),
+            size: bodies.iter().map(|body| body.len() as u64).sum(),
             etag: etag.clone(),
             checksums: BTreeMap::new(),
-            parts: completed,
+            parts: parts
+                .iter()
+                .map(|(number, position, _)| CompletedPart {
+                    number: *number,
+                    position: *position,
+                })
+                .collect(),
         });
         let committed = self.shard.commit(complete).await.unwrap();
         assert!(committed.outcome.is_applied(), "{:?}", committed.outcome);
@@ -206,6 +240,16 @@ impl Node {
             complete: committed.position.seq.get(),
             etag,
         }
+    }
+
+    /// Aborts the upload of `key` at `upload`.
+    pub async fn abort(&self, key: &str, upload: EpochSeq) {
+        let abort = RecordBody::MpuAbort(MpuAbort {
+            key: key.to_owned(),
+            upload,
+        });
+        let committed = self.shard.commit(abort).await.unwrap();
+        assert!(committed.outcome.is_applied(), "{:?}", committed.outcome);
     }
 
     /// Commits a DELETE of `key`.
@@ -354,6 +398,22 @@ pub fn target_with(store: &SimS3, writes: ConditionalWrites) -> Arc<Target<SimS3
         writes,
         cluster(),
         settings(),
+    ))
+}
+
+/// A target on `store` honoring `writes` that streams multipart uploads
+/// while they are uploaded (§7.3).
+pub fn streaming_target(store: &SimS3, writes: ConditionalWrites) -> Arc<Target<SimS3>> {
+    let settings = FlushSettings {
+        streaming: true,
+        ..settings()
+    };
+    Arc::new(Target::new(
+        Arc::new(store.clone()),
+        "",
+        writes,
+        cluster(),
+        settings,
     ))
 }
 

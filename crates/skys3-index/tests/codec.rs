@@ -8,7 +8,7 @@ use proptest::prelude::*;
 use skys3_index::codec::{self, MIN_VALUE_FORMAT, VALUE_FORMAT};
 use skys3_index::{
     ControlEntry, Entry, EntryState, ImportCheckpoint, ImportRange, ImportRanges, ObjectPart,
-    ObjectVersion, Part, Payload, Upload,
+    ObjectVersion, Part, Payload, RemotePart, RemoteUpload, Upload,
 };
 use skys3_log::record::{
     Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CopySource, ExtentRef, ShardRef,
@@ -882,4 +882,102 @@ fn import_ranges_reject_unknown_states_and_disorder() {
     };
     assert!(running.passed("a") && running.passed("m") && !running.passed("n"));
     assert!(!ImportCheckpoint::Running { after: None }.passed(""));
+}
+
+proptest! {
+    #[test]
+    fn remote_uploads_and_parts_round_trip(
+        shard in shard(),
+        upload in position(),
+        number in any::<u16>(),
+        key in ".{1,40}",
+        id in "[!-~]{1,80}",
+        position in position(),
+        etag in etag(),
+    ) {
+        let remote = RemoteUpload { key, id };
+        let bytes = codec::encode_remote_upload(&remote).unwrap();
+        prop_assert_eq!(bytes[0], VALUE_FORMAT);
+        prop_assert_eq!(codec::decode_remote_upload(&bytes).unwrap(), remote);
+        prop_assert!(codec::decode_remote_upload(&bytes[..bytes.len() - 1]).is_err());
+        // Formats before 3 have no uploads.
+        prop_assert!(codec::decode_remote_upload(&with(&bytes, 0, 2)).is_err());
+
+        let part = RemotePart { position, etag };
+        let bytes = codec::encode_remote_part(&part).unwrap();
+        prop_assert_eq!(codec::decode_remote_part(&bytes).unwrap(), part);
+        prop_assert!(codec::decode_remote_part(&bytes[..bytes.len() - 1]).is_err());
+        prop_assert!(codec::decode_remote_part(&with(&bytes, 0, 2)).is_err());
+
+        // A remote upload's key is its local upload's parts prefix, so the
+        // two tables name an upload alike.
+        let key = codec::remote_upload_key(&shard, upload);
+        prop_assert_eq!(&key, &codec::upload_parts_prefix(&shard, upload));
+        prop_assert!(codec::part_key(&shard, upload, number).starts_with(&key));
+        prop_assert_eq!(codec::decode_remote_upload_key(&key).unwrap(), (shard, upload));
+    }
+
+    #[test]
+    fn arbitrary_remote_upload_bytes_decode_canonically(mut bytes in vec(any::<u8>(), 0..120)) {
+        if !bytes.is_empty() {
+            bytes[0] = VALUE_FORMAT;
+        }
+        if let Ok(remote) = codec::decode_remote_upload(&bytes) {
+            prop_assert_eq!(codec::encode_remote_upload(&remote).unwrap(), bytes.clone());
+        }
+        if let Ok(part) = codec::decode_remote_part(&bytes) {
+            prop_assert_eq!(codec::encode_remote_part(&part).unwrap(), bytes.clone());
+        }
+        if let Ok((shard, upload)) = codec::decode_remote_upload_key(&bytes) {
+            prop_assert_eq!(codec::remote_upload_key(&shard, upload), bytes.clone());
+        }
+    }
+}
+
+#[test]
+fn remote_uploads_need_a_key_and_an_id() {
+    let valid = RemoteUpload {
+        key: "k".to_owned(),
+        id: "u".to_owned(),
+    };
+    let bytes = codec::encode_remote_upload(&valid).unwrap();
+    for (remote, field) in [
+        (
+            RemoteUpload {
+                key: String::new(),
+                ..valid.clone()
+            },
+            "remote_upload.key",
+        ),
+        (
+            RemoteUpload {
+                id: String::new(),
+                ..valid.clone()
+            },
+            "remote_upload.id",
+        ),
+        (
+            RemoteUpload {
+                id: "u".repeat(skys3_log::record::MAX_UPLOAD_ID_LEN + 1),
+                ..valid.clone()
+            },
+            "remote_upload.id",
+        ),
+    ] {
+        assert_eq!(
+            codec::encode_remote_upload(&remote).unwrap_err().field(),
+            field
+        );
+    }
+    // The same bytes with an empty ID: the key, then a zero length.
+    let mut empty = bytes[..bytes.len() - 3].to_vec();
+    empty.extend_from_slice(&[0, 0]);
+    assert_eq!(
+        codec::decode_remote_upload(&empty).unwrap_err().field(),
+        "remote_upload.id"
+    );
+    // Trailing bytes are refused.
+    let mut long = bytes.clone();
+    long.push(0);
+    assert!(codec::decode_remote_upload(&long).is_err());
 }

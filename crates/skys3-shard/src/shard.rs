@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use skys3_index::{
-    Entry, EntryState, Index, IndexError, IndexWriter, ListPage, ListQuery, Part, Payload, Upload,
+    Entry, EntryState, Index, IndexError, IndexWriter, ListPage, ListQuery, Part, Payload,
+    RemoteParts, RemoteUpload, Upload,
 };
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::truncated_by;
@@ -50,18 +51,50 @@ pub struct Committed {
     pub outcome: Outcome,
 }
 
-/// A client write the shard applied, as [`Shard::subscribe`] reports it:
-/// a `PUT`, `DELETE`, or `TAGS` that stored a new version of its key.
+/// A client write the shard applied, as [`Shard::subscribe`] reports it to
+/// the shard's flusher.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Change {
-    /// The key written.
-    pub key: String,
-    /// The position of the record, which is the new version's.
-    pub position: EpochSeq,
-    /// The new version's size: the object's for a `PUT` or an
-    /// `MPU_COMPLETE`, 0 for a `DELETE`, and `None` for a `TAGS`, which
-    /// keeps the size it had.
-    pub size: Option<u64>,
+pub enum Change {
+    /// A `PUT`, `DELETE`, `TAGS`, or `MPU_COMPLETE` stored a new version of
+    /// its key.
+    Stored {
+        /// The key written.
+        key: String,
+        /// The position of the record, which is the new version's.
+        position: EpochSeq,
+        /// The new version's size: the object's for a `PUT` or an
+        /// `MPU_COMPLETE`, 0 for a `DELETE`, and `None` for a `TAGS`,
+        /// which keeps the size it had.
+        size: Option<u64>,
+        /// For an `MPU_COMPLETE`, the upload it completed.
+        upload: Option<EpochSeq>,
+    },
+    /// An `MPU_CREATE` opened an upload of `key`, named by its position.
+    Opened {
+        /// The key.
+        key: String,
+        /// The position of the `MPU_CREATE`.
+        upload: EpochSeq,
+    },
+    /// An `MPU_PART` stored a part of an open upload, replacing any with
+    /// its number.
+    Part {
+        /// The key.
+        key: String,
+        /// The upload.
+        upload: EpochSeq,
+        /// The part number.
+        number: u16,
+        /// The position of the `MPU_PART`.
+        position: EpochSeq,
+    },
+    /// An `MPU_ABORT` removed an open upload.
+    Aborted {
+        /// The key.
+        key: String,
+        /// The upload.
+        upload: EpochSeq,
+    },
 }
 
 /// What a shard holds, as deleting its bucket needs to know (§4.1).
@@ -1796,6 +1829,42 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
+    /// The remote upload a streaming flush keeps for the upload opened at
+    /// `upload` (§7.3), with the parts it holds, as `PART_FLUSHED` records
+    /// left them.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails, and as
+    /// [`Shard::check_readable`].
+    pub async fn remote_upload(
+        &self,
+        upload: EpochSeq,
+    ) -> Result<Option<(RemoteUpload, RemoteParts)>, ShardError> {
+        let _read = self.admit_read()?;
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.remote_upload(&shard, upload)
+        })
+        .await
+    }
+
+    /// Every remote upload streaming flushes keep for the shard, by local
+    /// upload (§7.3).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails, and as
+    /// [`Shard::check_readable`].
+    pub async fn remote_uploads(&self) -> Result<Vec<(EpochSeq, RemoteUpload)>, ShardError> {
+        let _read = self.admit_read()?;
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.remote_uploads(&shard)
+        })
+        .await
+    }
+
     /// The payload of the record at `position`, as an entry or a part names
     /// it: an `EXTENT`'s data, or the inline bytes of a `PUT` or an
     /// `MPU_PART`.
@@ -2330,9 +2399,11 @@ impl<D: Disk> Shard<D> {
         .await
     }
 
-    /// Reports every client write applied from now on: each `PUT`,
-    /// `DELETE`, and `TAGS` that stored a new version, in position order.
-    /// The shard's flusher follows it (§7.1). A shard has one subscriber; a
+    /// Reports every client write applied from now on, in position order:
+    /// each `PUT`, `DELETE`, `TAGS`, and `MPU_COMPLETE` that stored a new
+    /// version, and each `MPU_CREATE`, `MPU_PART`, and `MPU_ABORT` that
+    /// opened, filled, or aborted an upload. The shard's flusher follows it
+    /// (§7.1, §7.3). A shard has one subscriber; a
     /// new subscription replaces the previous one, whose stream then ends.
     /// The stream also ends when the shard stops.
     ///
@@ -2752,7 +2823,8 @@ fn is_client_write(body: &RecordBody) -> bool {
 
 /// The key of the entry `body` changes: every record that names a key
 /// except an `EXTENT`, which changes only the location map, the multipart
-/// records other than `MPU_COMPLETE`, which change only uploads, and an
+/// records other than `MPU_COMPLETE`, which change only uploads, a
+/// `PART_FLUSHED`, which changes only remote uploads, and an
 /// `UPLOAD_BEGIN`, which changes nothing.
 fn entry_key(body: &RecordBody) -> Option<&str> {
     match body {
@@ -2760,6 +2832,7 @@ fn entry_key(body: &RecordBody) -> Option<&str> {
         | RecordBody::MpuCreate(_)
         | RecordBody::MpuPart(_)
         | RecordBody::MpuAbort(_)
+        | RecordBody::PartFlushed(_)
         | RecordBody::UploadBegin(_) => None,
         other => other.key(),
     }
@@ -2767,33 +2840,60 @@ fn entry_key(body: &RecordBody) -> Option<&str> {
 
 /// The change a client write would report once applied, by position.
 fn change(record: &LogRecord) -> Option<(EpochSeq, Change)> {
-    let (key, size) = match &record.body {
-        RecordBody::Put(put) => (&put.key, Some(put.size)),
-        RecordBody::MpuComplete(complete) => (&complete.key, Some(complete.size)),
-        RecordBody::Delete(delete) => (&delete.key, Some(0)),
-        RecordBody::Tags(tags) => (&tags.key, None),
-        _ => return None,
-    };
-    let change = Change {
+    let stored = |key: &String, size, upload| Change::Stored {
         key: key.clone(),
         position: record.position,
         size,
+        upload,
+    };
+    let change = match &record.body {
+        RecordBody::Put(put) => stored(&put.key, Some(put.size), None),
+        RecordBody::MpuComplete(complete) => {
+            stored(&complete.key, Some(complete.size), Some(complete.upload))
+        }
+        RecordBody::Delete(delete) => stored(&delete.key, Some(0), None),
+        RecordBody::Tags(tags) => stored(&tags.key, None, None),
+        RecordBody::MpuCreate(create) => Change::Opened {
+            key: create.key.clone(),
+            upload: record.position,
+        },
+        RecordBody::MpuPart(part) => Change::Part {
+            key: part.key.clone(),
+            upload: part.upload,
+            number: part.part_number,
+            position: record.position,
+        },
+        RecordBody::MpuAbort(abort) => Change::Aborted {
+            key: abort.key.clone(),
+            upload: abort.upload,
+        },
+        _ => return None,
     };
     Some((record.position, change))
 }
 
-/// Sends the subscriber each change whose record stored a new version.
+/// Sends the subscriber each change whose record was applied: a new
+/// version stored, or an upload opened, given a part, or aborted.
 fn report(
     subscriber: &mpsc::UnboundedSender<Change>,
     outcomes: &BTreeMap<EpochSeq, Outcome>,
     changes: &mut BTreeMap<EpochSeq, Change>,
 ) {
     for (position, outcome) in outcomes {
-        let stored = matches!(
-            outcome,
-            Outcome::Applied(Effect::Stored { .. } | Effect::Tombstoned { .. })
-        );
-        if let Some(change) = changes.remove(position).filter(|_| stored) {
+        let applied = |change: &Change| {
+            let Outcome::Applied(effect) = outcome else {
+                return false;
+            };
+            match change {
+                Change::Stored { .. } => {
+                    matches!(effect, Effect::Stored { .. } | Effect::Tombstoned { .. })
+                }
+                Change::Opened { .. } => *effect == Effect::UploadCreated,
+                Change::Part { .. } => *effect == Effect::PartStored,
+                Change::Aborted { .. } => matches!(effect, Effect::Aborted { .. }),
+            }
+        };
+        if let Some(change) = changes.remove(position).filter(applied) {
             // A subscriber that went away needs nothing.
             let _ = subscriber.send(change);
         }

@@ -67,7 +67,8 @@ pub enum RecordKind {
     UploadBegin,
     /// The remote accepted a flush (defined).
     Flushed,
-    /// The remote accepted one part of a streamed upload (reserved for M4).
+    /// A streamed upload's remote counterpart moved on: it was opened,
+    /// took a part, or ended (defined).
     PartFlushed,
     /// Replaces an object's tags (defined).
     Tags,
@@ -183,6 +184,7 @@ impl RecordKind {
                 | Self::MpuAbort
                 | Self::UploadBegin
                 | Self::Flushed
+                | Self::PartFlushed
                 | Self::Tags
                 | Self::Import
                 | Self::Adopt

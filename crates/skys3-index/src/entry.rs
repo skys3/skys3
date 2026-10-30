@@ -172,6 +172,33 @@ pub struct Part {
     pub payload: Payload,
 }
 
+/// The remote multipart upload that the primary's flusher opened for a
+/// local upload, to stream its parts while the client uploads (§7.3). The
+/// local upload is named by the position of its `MPU_CREATE`; the remote
+/// one stays recorded until a `PART_FLUSHED` ends it, also after the local
+/// upload completed or was aborted, so the flusher can still complete or
+/// abort it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteUpload {
+    /// The object key.
+    pub key: String,
+    /// The remote upload's ID.
+    pub id: String,
+}
+
+/// A part a [`RemoteUpload`] holds: which local part was sent, and the
+/// remote's ETag for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePart {
+    /// The position of the `MPU_PART` record whose bytes were sent.
+    pub position: EpochSeq,
+    /// The ETag the remote returned for the part.
+    pub etag: ETag,
+}
+
+/// The parts a [`RemoteUpload`] holds, in part order.
+pub type RemoteParts = Vec<(u16, RemotePart)>;
+
 /// How far a bucket's namespace import has got (§9.1): what the import
 /// resumes from after a restart.
 #[derive(Debug, Clone, PartialEq, Eq)]

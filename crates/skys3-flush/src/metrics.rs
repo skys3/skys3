@@ -6,15 +6,24 @@ use std::sync::atomic::AtomicU64;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Unit;
 use skys3_obs::MetricsRegistry;
 
 /// The label set of every flush metric: `bucket`, the bucket's name.
 type Labels = Vec<(String, String)>;
 
+/// The buckets of the streaming-overlap histogram: tenths of an object.
+const OVERLAP_BUCKETS: [f64; 10] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
+/// A streaming-overlap histogram.
+fn overlap_histogram() -> Histogram {
+    Histogram::new(OVERLAP_BUCKETS)
+}
+
 /// The counters one target's flushers count events in. The default
 /// counters belong to no registry.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Counters {
     /// Versions flushed: the remote accepted them, or already held them.
     pub flushes: Counter,
@@ -26,6 +35,22 @@ pub struct Counters {
     pub fills: Counter,
     /// Fills that found the remote changed out of band (§9.2).
     pub fill_conflicts: Counter,
+    /// For each streamed multipart object, the fraction of its bytes the
+    /// remote held when the client completed it (§7.3, §16.3).
+    pub streaming_overlap: Histogram,
+}
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self {
+            flushes: Counter::default(),
+            retries: Counter::default(),
+            conflicts: Counter::default(),
+            fills: Counter::default(),
+            fill_conflicts: Counter::default(),
+            streaming_overlap: overlap_histogram(),
+        }
+    }
 }
 
 /// A bucket's flush gauges at one moment.
@@ -47,7 +72,7 @@ pub struct Gauges {
 }
 
 /// The flush metrics of a node.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FlushMetrics {
     dirty_bytes: Family<Labels, Gauge>,
     dirty_budget: Family<Labels, Gauge>,
@@ -60,6 +85,26 @@ pub struct FlushMetrics {
     conflicts: Family<Labels, Counter>,
     fills: Family<Labels, Counter>,
     fill_conflicts: Family<Labels, Counter>,
+    streaming_overlap: Family<Labels, Histogram, fn() -> Histogram>,
+}
+
+impl Default for FlushMetrics {
+    fn default() -> Self {
+        Self {
+            dirty_bytes: Family::default(),
+            dirty_budget: Family::default(),
+            oldest_dirty_age: Family::default(),
+            flush_lag: Family::default(),
+            conflicted_keys: Family::default(),
+            orphaned_uploads: Family::default(),
+            flushes: Family::default(),
+            retries: Family::default(),
+            conflicts: Family::default(),
+            fills: Family::default(),
+            fill_conflicts: Family::default(),
+            streaming_overlap: Family::new_with_constructor(overlap_histogram),
+        }
+    }
 }
 
 impl FlushMetrics {
@@ -131,6 +176,13 @@ impl FlushMetrics {
              remote version was adopted or a local write came first.",
             metrics.fill_conflicts.clone(),
         );
+        registry.register_with_unit(
+            "flush_streaming_overlap",
+            "For each streamed multipart object, the fraction of its bytes already at the \
+             remote target when the client completed the upload.",
+            Unit::Other("ratio".to_owned()),
+            metrics.streaming_overlap.clone(),
+        );
         metrics
     }
 
@@ -144,6 +196,7 @@ impl FlushMetrics {
             conflicts: self.conflicts.get_or_create_owned(&labels),
             fills: self.fills.get_or_create_owned(&labels),
             fill_conflicts: self.fill_conflicts.get_or_create_owned(&labels),
+            streaming_overlap: self.streaming_overlap.get_or_create_owned(&labels),
         }
     }
 

@@ -421,7 +421,7 @@ fn recovery_refuses_records_it_cannot_use() {
         newer_version[8] = 3;
         reseal(&mut newer_version);
         let mut reserved_kind = whole.clone();
-        reserved_kind[10] = 10; // PART_FLUSHED, not defined yet
+        reserved_kind[10] = 14; // EC_PUBLISH, not defined yet
         reseal(&mut reserved_kind);
         let mut broken_header = whole.clone();
         broken_header[22] = 1; // reserved byte

@@ -11,8 +11,8 @@ use proptest::sample::{Index, subsequence};
 use skys3_log::record::{
     Adopt, Checksum, ChecksumAlgorithm, ChecksumType, Checksums, CompletedPart, CopySource, Delete,
     Extent, ExtentRef, Flushed, Import, LogRecord, MAX_PAYLOAD_LEN, Metadata, MpuAbort,
-    MpuComplete, MpuCreate, MpuPart, Put, PutData, RecordBody, ShardRef, TagSet, Tags, UploadBegin,
-    UploadChecksum,
+    MpuComplete, MpuCreate, MpuPart, PartFlushed, Put, PutData, RecordBody, RemoteStep, ShardRef,
+    TagSet, Tags, UploadBegin, UploadChecksum,
 };
 use skys3_types::{
     BucketId, ETag, Epoch, EpochSeq, KeyHash, NodeId, ProposalId, Seq, ShardConfig, ShardId,
@@ -222,6 +222,34 @@ fn mpu_complete(position: EpochSeq) -> impl Strategy<Value = MpuComplete> {
         )
 }
 
+fn part_flushed(position: EpochSeq) -> impl Strategy<Value = PartFlushed> {
+    let step = prop_oneof![
+        Just(None),
+        Just(Some(None)),
+        (1..=10_000_u16, 1..=1_000_u64, etag())
+            .prop_map(Some)
+            .prop_map(Some),
+    ];
+    (key(), position_before(position), "[!-~]{1,200}", step)
+        .prop_filter("the part fits after the upload", |(_, upload, _, _)| {
+            upload.seq.get() < u64::MAX - 1_000
+        })
+        .prop_map(|(key, upload, remote_upload_id, step)| PartFlushed {
+            key,
+            upload,
+            remote_upload_id,
+            step: match step {
+                None => RemoteStep::Opened,
+                Some(None) => RemoteStep::Ended,
+                Some(Some((number, offset, remote_etag))) => RemoteStep::Part {
+                    number,
+                    position: EpochSeq::new(upload.epoch, Seq::new(upload.seq.get() + offset)),
+                    remote_etag,
+                },
+            },
+        })
+}
+
 fn put(position: EpochSeq) -> impl Strategy<Value = Put> {
     (
         (key(), any::<u64>(), etag()),
@@ -310,6 +338,7 @@ fn body(shard: ShardRef, position: EpochSeq) -> impl Strategy<Value = RecordBody
         (key(), position_before(position))
             .prop_map(|(key, upload)| RecordBody::MpuAbort(MpuAbort { key, upload })),
         key().prop_map(|key| RecordBody::UploadBegin(UploadBegin { key })),
+        part_flushed(position).prop_map(RecordBody::PartFlushed),
         (key(), tags()).prop_map(|(key, tags)| RecordBody::Tags(Tags { key, tags })),
         (
             key(),
