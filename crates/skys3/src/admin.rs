@@ -118,8 +118,12 @@
 //!   `departing`) and `silent_seconds`, how long since the coordinator last
 //!   heard from it (its last heartbeat, or the coordinator's tenure or the
 //!   registration if later), `null` on other nodes; `shards`, the number
-//!   of shard registers; and `placement`, as in `health`, `null` on other
-//!   nodes.
+//!   of shard registers; `placement`, as in `health`, `null` on other
+//!   nodes; and `fragments`, what this node's fragment stores hold, `null`
+//!   without `[ec] enabled`: `held`, the fragments, released ones
+//!   included, and `unreleased`, those no shard primary has released
+//!   (plan M8-07b). A drained node holds no fragment a layout names once
+//!   `unreleased` is 0.
 //! - `POST /v1/shards/<bucket>/<n>/handoff`, with an optional JSON body
 //!   `{"to": "<node-id>"}`, starts a planned handoff of shard `n` (§5.4):
 //!   its primary steps down and `to`, another member, proposes itself.
@@ -137,7 +141,9 @@
 //!   `503` when the store or the primary does not answer.
 //! - `POST /v1/nodes/<id>/drain` marks the node's registration `draining`
 //!   (§6.7): the coordinator assigns it nothing more, moves its shards to
-//!   other nodes, and hands off those it leads. `DELETE` clears the mark.
+//!   other nodes, and hands off those it leads, and with erasure coding
+//!   the shard primaries move its fragments to other nodes (§8.3).
+//!   `DELETE` clears the mark.
 //!   Any node serves either. It answers `200` with the `node_id`,
 //!   `draining`, `changed`, and the `generation` that announced the
 //!   change; `404` for a node that is not registered.

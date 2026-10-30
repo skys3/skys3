@@ -1,4 +1,4 @@
-//! Erasure coding on a node (design §8.2–§8.5, §8.7; plan M8-07a): with
+//! Erasure coding on a node (design §8.2–§8.7; plans M8-07a, M8-07b): with
 //! `[ec] enabled = true` and `[cluster] multi_node = true`, the node runs
 //! what the coding simulation runs on each of its nodes, through the same
 //! library code (`skys3_ec`).
@@ -15,12 +15,21 @@
 //!   holds ([`CodingServices`]). Mutual TLS names the sender, and only node
 //!   certificates may send these kinds (design §12).
 //! - **Per replica of a `local` bucket's shard.** One [`Attempts`] tracker
-//!   shared by an [`Encoder`] and the replica's [`OrphanJudge`], and a
-//!   [`Releaser`]. Each works only while the replica leads the shard and
-//!   serves, so they run on every replica and act on the primary's. A
-//!   replica that stops or closes takes them with it; the replica that
-//!   opens in its place starts afresh, as a new life of the primary does
-//!   (design §8.4).
+//!   shared by an [`Encoder`], a [`Repairer`], and the replica's
+//!   [`OrphanJudge`], and a [`Releaser`]. Each works only while the replica
+//!   leads the shard and serves, so they run on every replica and act on
+//!   the primary's. A replica that stops or closes takes them with it; the
+//!   replica that opens in its place starts afresh, as a new life of the
+//!   primary does (design §8.4, §8.6).
+//! - **Repair and moves.** The repairer checks the shard's fragments on
+//!   their nodes, rebuilds those lost on other nodes, and, in a pass that
+//!   found none lost, moves fragments off nodes that are draining or
+//!   departing, out of over-full failure domains, and toward each node's
+//!   share (§8.3, §8.6). It passes every tenth of
+//!   `fragment_repair_after_seconds`, from 1 to 30 seconds
+//!   ([`RepairSettings::from_config`]), and every repairer of the node
+//!   shares one [`RepairBandwidth`] of `repair_bytes_per_second_per_node`
+//!   and the repair metrics.
 //! - **Fragment release and orphans.** The node keeps released fragments
 //!   in its [`FragmentHolds`] for `fragment_release_delay_seconds` and
 //!   while reads hold them, sweeps them every `index_checkpoint_interval`
@@ -33,11 +42,11 @@
 //!
 //! The node places fragments on the nodes registered under `nodes/`, as it
 //! last read them, under the `[ec]` policy and `[cluster] failure_domain`
-//! ([`FragmentPlanner`]); a registration marked departing or draining
-//! receives none. It neither repairs lost fragments nor moves fragments
-//! off a drained node yet (plan M8-07b): a repairer per replica belongs
-//! beside the encoder in [`NodeCoding::start_replica`], sharing its
-//! attempt tracker, and drain moves run in that repairer.
+//! ([`FragmentPlanner`]): a registration marked departing or draining
+//! receives none, and its fragments are moved off; a node the node's own
+//! fragment traffic found silent is suspect, ranked after live nodes
+//! ([`liveness`]). [`CodingServices::held`] counts what the node's stores
+//! hold, which tells when a drained node is empty.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -55,7 +64,8 @@ use skys3_ec::{
     Attempts, EncodeEvent, EncodeStep, Encoder, EncoderSettings, FragmentClient, FragmentHolds,
     FragmentId, FragmentReadClient, FragmentRequest, FragmentServer, FragmentSource, FragmentStore,
     FragmentStoreConfig, HoldSettings, OrphanClient, OrphanJudge, OrphanReclaimer, OrphanServer,
-    PlannerSource, ReleaseClient, ReleaseMetrics, ReleaseSettings, Releaser,
+    PlannerSource, ReleaseClient, ReleaseMetrics, ReleaseSettings, Releaser, RepairBandwidth,
+    RepairMetrics, RepairSettings, Repairer,
 };
 use skys3_gateway::ShardRef;
 use skys3_gateway::routing::ShardMap;
@@ -69,13 +79,18 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use super::replication::{ClusterShards, Registrations};
 use crate::node::StartError;
+use liveness::{Silence, Watched};
+
+pub(crate) mod liveness;
 
 /// The node's fragment server.
 pub(crate) type NodeFragments = FragmentServer<RealDisk>;
 /// The node's judges of orphan queries, one per replica of a coded shard.
 type NodeOrphans = OrphanServer<RealDisk>;
-/// The node's fragment reads, for its gateway.
+/// The node's fragment reads, for its gateway and its repairers.
 type ReadClient = FragmentReadClient<TokioNetwork, RealDisk>;
+/// The node's fragment writes, for its encoders and repairers.
+type Writer = Watched<FragmentClient<TokioNetwork, RealDisk>>;
 
 /// How often the node follows its replicas of `local` buckets' shards.
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(1);
@@ -172,10 +187,10 @@ impl CodingMetrics {
     }
 }
 
-/// The node's fragment reads, counted by fragment and outcome.
+/// The gateway's fragment reads, counted by fragment and outcome.
 #[derive(Debug)]
 struct CountedReads {
-    inner: ReadClient,
+    inner: Watched<ReadClient>,
     metrics: CodingMetrics,
 }
 
@@ -221,7 +236,31 @@ impl std::fmt::Debug for CodingServices {
     }
 }
 
+/// What a node's fragment stores hold ([`CodingServices::held`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HeldFragments {
+    /// The fragments the stores hold, released ones included.
+    pub(crate) fragments: usize,
+    /// Those of them no shard primary has released: fragments a layout
+    /// may name, or orphans not reclaimed yet. A drained node is empty
+    /// once this is 0.
+    pub(crate) unreleased: usize,
+}
+
 impl CodingServices {
+    /// What the node's fragment stores hold now.
+    pub(crate) fn held(&self) -> HeldFragments {
+        let holds = self.fragments.holds();
+        let mut held = HeldFragments::default();
+        for id in self.fragments.stores().iter().flat_map(FragmentStore::ids) {
+            held.fragments += 1;
+            if !holds.is_some_and(|holds| holds.is_released(id)) {
+                held.unreleased += 1;
+            }
+        }
+        held
+    }
+
     /// Whether a connection whose first frame is of `kind` is one of
     /// erasure coding. Answers never open one.
     pub(crate) fn is_coding(kind: MessageKind) -> bool {
@@ -277,10 +316,33 @@ impl ReplicaCoding {
 
 impl Drop for ReplicaCoding {
     fn drop(&mut self) {
+        // Only asks for cancellation: a task polled on another worker
+        // finishes that poll first, which is why the repairer's backlog is
+        // forgotten by its own task ([`finally`]), not here.
         for task in &self.tasks {
             task.abort();
         }
     }
+}
+
+/// `future`, then `cleanup` once `future` is dropped, whether it completed
+/// or its task was aborted. A task's future is dropped only after its last
+/// poll, so `cleanup` runs after anything that poll did, even when the
+/// abort was asked for while another worker polled it.
+async fn finally<F: Future>(future: F, cleanup: impl FnOnce()) -> F::Output {
+    /// Runs its closure when dropped.
+    struct Cleanup<C: FnOnce()>(Option<C>);
+
+    impl<C: FnOnce()> Drop for Cleanup<C> {
+        fn drop(&mut self) {
+            if let Some(cleanup) = self.0.take() {
+                cleanup();
+            }
+        }
+    }
+
+    let _cleanup = Cleanup(Some(cleanup));
+    future.await
 }
 
 /// Erasure coding on a node (see the [module](self) docs).
@@ -293,14 +355,20 @@ pub(crate) struct NodeCoding {
     holds: FragmentHolds,
     transport: Transport<TokioNetwork>,
     peers: Peers,
-    writer: Arc<FragmentClient<TokioNetwork, RealDisk>>,
+    silence: Silence,
+    writer: Arc<Writer>,
     releases: Arc<ReleaseClient<TokioNetwork, RealDisk>>,
     reads: ReadClient,
+    /// The repairers' reads, which take no holds.
+    repair_reads: Arc<dyn FragmentSource>,
     planner: PlannerSource,
     primaries: PrimariesOf,
     wall: Arc<dyn WallClock>,
     pool: BlockingPool,
     metrics: CodingMetrics,
+    repair: RepairSettings,
+    bandwidth: RepairBandwidth,
+    repairs: RepairMetrics,
     replicas: Mutex<BTreeMap<skys3_log::ShardRef, ReplicaCoding>>,
 }
 
@@ -344,6 +412,7 @@ impl NodeCoding {
         let server = FragmentServer::new(stores.clone()).with_holds(holds.clone());
         let transport = cluster.transport().clone();
         let peers = cluster.peers().clone();
+        let silence = Silence::default();
         let writer = FragmentClient::new(transport.clone(), peers.clone())
             .with_local(node.clone(), server.clone());
         let releases = ReleaseClient::new(
@@ -352,19 +421,24 @@ impl NodeCoding {
             peers.clone(),
             Some(server.clone()),
         );
-        let reads = FragmentReadClient::new(node.clone(), transport.clone(), peers.clone())
-            .with_local(server.clone())
-            .with_holds(config.storage().read_registration_renew_interval());
+        let read_client = || {
+            FragmentReadClient::new(node.clone(), transport.clone(), peers.clone())
+                .with_local(server.clone())
+        };
+        let reads = read_client().with_holds(config.storage().read_registration_renew_interval());
+        let unheld = read_client();
         let registrations = cluster.registrations();
         let level = config.cluster().failure_domain;
         let planned = Arc::clone(&registrations);
+        let judge = silence.clone();
         let planner: PlannerSource = Arc::new(move || {
             let nodes: Vec<Candidate> = lock(&planned)
                 .values()
-                .map(|(_, registration)| Candidate::from_registration(registration))
+                .map(|(_, registration)| judge.judge(Candidate::from_registration(registration)))
                 .collect();
             FragmentPlanner::new(Topology::new(level, nodes), policy)
         });
+        let repair = RepairSettings::from_config(config.ec());
         Ok(Self {
             node: node.clone(),
             config: config.clone(),
@@ -375,13 +449,18 @@ impl NodeCoding {
             holds,
             transport,
             peers,
-            writer: Arc::new(writer),
+            writer: Arc::new(Watched::new(writer, silence.clone())),
             releases: Arc::new(releases),
             reads,
+            repair_reads: Arc::new(Watched::new(unheld, silence.clone())),
+            silence,
             planner,
             wall,
             pool,
             metrics: CodingMetrics::register(registry),
+            repair,
+            bandwidth: RepairBandwidth::new(repair.bytes_per_second),
+            repairs: RepairMetrics::register(registry),
             replicas: Mutex::default(),
         })
     }
@@ -399,7 +478,7 @@ impl NodeCoding {
     /// what each read may fetch while it streams (§8.7).
     pub(crate) fn source(&self) -> Arc<dyn FragmentSource> {
         Arc::new(CountedReads {
-            inner: self.reads.clone(),
+            inner: Watched::new(self.reads.clone(), self.silence.clone()),
             metrics: self.metrics.clone(),
         })
     }
@@ -515,9 +594,8 @@ impl NodeCoding {
     }
 
     /// Starts erasure coding on `replica`, a shard of a `local` bucket with
-    /// `settings`: its judge answers orphan queries, and its encoder and
-    /// releaser work while it leads. M8-07b's repairer, which moves
-    /// fragments off drained nodes too, starts here, sharing `attempts`.
+    /// `settings`: its judge answers orphan queries, and its encoder,
+    /// repairer, and releaser work while it leads.
     fn start_replica(&self, replica: Shard<RealDisk>, settings: &BucketSettings) -> ReplicaCoding {
         let shard = replica.shard().clone();
         // One tracker of the shard's fragment-writing attempts on this
@@ -536,8 +614,19 @@ impl NodeCoding {
             Arc::clone(&self.wall),
             EncoderSettings::from_bucket(settings),
         )
-        .with_attempts(attempts)
+        .with_attempts(attempts.clone())
         .with_observer(Arc::new(move |event: &EncodeEvent| metrics.observe(event)));
+        let repairer = Repairer::new(
+            replica.clone(),
+            Arc::clone(&self.repair_reads),
+            Arc::clone(&self.writer),
+            Arc::clone(&self.planner),
+            self.pool.clone(),
+            self.repair,
+        )
+        .with_attempts(attempts)
+        .with_bandwidth(self.bandwidth.clone())
+        .with_metrics(self.repairs.clone());
         let releaser = Releaser::new(
             replica.clone(),
             Arc::clone(&self.releases),
@@ -546,10 +635,16 @@ impl NodeCoding {
             ReleaseSettings::default(),
         );
         tracing::debug!(%shard, "erasure coding runs on a replica");
+        // A repairer stopped in a pass leaves the fragments it knew lost
+        // counted; its task forgets them once it is gone, after its last
+        // update, and the shard's next primary finds them again.
+        let repairs = self.repairs.clone();
+        let repairing = finally(repairer.run(), move || repairs.forget(&shard));
         ReplicaCoding {
             shard: replica,
             tasks: vec![
                 tokio::spawn(encoder.run(scan_interval(settings))),
+                tokio::spawn(repairing),
                 tokio::spawn(releaser.run()),
             ],
         }
@@ -629,4 +724,67 @@ fn primaries(map: ShardMap, registrations: Registrations) -> PrimariesOf {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Plain inserts and removals, which a panic cannot leave half done.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::mpsc;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    /// A future whose first poll reports that it started, blocks its
+    /// worker until told to go on, then records an update, as a repair
+    /// pass's backlog update would, and stays pending.
+    struct BlockingPoll {
+        started: mpsc::Sender<()>,
+        go: mpsc::Receiver<()>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Future for BlockingPoll {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            self.started.send(()).unwrap();
+            self.go.recv().unwrap();
+            lock(&self.log).push("update");
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cleanup_runs_after_the_last_poll_of_an_aborted_task() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (started, polling) = mpsc::channel();
+        let (go, waiting) = mpsc::channel();
+        let polled = BlockingPoll {
+            started,
+            go: waiting,
+            log: Arc::clone(&log),
+        };
+        let cleaned = Arc::clone(&log);
+        let task = tokio::spawn(finally(polled, move || lock(&cleaned).push("forget")));
+        // The task is in the middle of a poll on a worker when it is
+        // aborted, as a repairer in a pass is when its replica's coding is
+        // dropped.
+        polling.recv().unwrap();
+        task.abort();
+        // A cleanup run when the abort is asked for, as the replica's drop
+        // ran it, would land here, before the poll's update.
+        assert!(lock(&log).is_empty());
+        go.send(()).unwrap();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(*lock(&log), ["update", "forget"]);
+    }
+
+    #[tokio::test]
+    async fn the_cleanup_runs_once_the_future_completes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let cleaned = Arc::clone(&log);
+        let done = finally(async { 7 }, move || lock(&cleaned).push("forget")).await;
+        assert_eq!(done, 7);
+        assert_eq!(*lock(&log), ["forget"]);
+    }
 }

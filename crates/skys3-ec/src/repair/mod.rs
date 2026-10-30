@@ -118,8 +118,13 @@ pub struct RepairSettings {
 }
 
 impl RepairSettings {
-    /// How often a pass runs by default.
+    /// The longest time between two passes: a node's fragments are found
+    /// lost at most this long after `fragment_repair_after_seconds`.
     pub const INTERVAL: Duration = Duration::from_secs(30);
+
+    /// The shortest time between two passes, each of which reads the
+    /// shard's whole fragment inventory.
+    pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
 
     /// How many of a node's fragments a pass checks by default.
     pub const CHECKS_PER_NODE: usize = 16;
@@ -128,12 +133,17 @@ impl RepairSettings {
     /// the next pass, and the losses it may find, is never far off.
     pub const MOVES_PER_PASS: usize = 16;
 
-    /// The settings `[ec]` gives.
+    /// The settings `[ec]` gives. A pass runs every tenth of
+    /// `fragment_repair_after_seconds`, from [`RepairSettings::MIN_INTERVAL`]
+    /// to [`RepairSettings::INTERVAL`], so a silent node's fragments are
+    /// found lost at most a tenth late, and a drain moves up to
+    /// [`RepairSettings::MOVES_PER_PASS`] fragments that often.
     #[must_use]
     pub fn from_config(config: &EcConfig) -> Self {
+        let lost_after = config.fragment_repair_after();
         Self {
-            interval: Self::INTERVAL,
-            lost_after: config.fragment_repair_after(),
+            interval: (lost_after / 10).clamp(Self::MIN_INTERVAL, Self::INTERVAL),
+            lost_after,
             checks_per_node: Self::CHECKS_PER_NODE,
             replans: 3,
             bytes_per_second: config.repair_bytes_per_second_per_node,
@@ -450,7 +460,7 @@ impl<D: Disk, W: FragmentWriter> Repairer<D, W> {
     pub async fn run(self) {
         loop {
             let report = self.pass().await;
-            if report.lost > 0 {
+            if report.lost > 0 || report.moved > 0 || report.unmoved > 0 {
                 tracing::info!(shard = %self.shard.shard(), ?report, "a repair pass ended");
             }
             tokio::time::sleep(self.settings.interval).await;
@@ -1216,5 +1226,32 @@ fn stripe_info(stripe: &CodedStripe, count: usize) -> StripeInfo {
         data_len: stripe.data_len(),
         geometry: stripe.geometry(),
         codec: stripe.codec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pass_runs_every_tenth_of_the_repair_delay_within_bounds() {
+        let settings = |seconds| {
+            RepairSettings::from_config(&EcConfig {
+                fragment_repair_after_seconds: seconds,
+                repair_bytes_per_second_per_node: 7,
+                ..EcConfig::default()
+            })
+        };
+        let default = RepairSettings::from_config(&EcConfig::default());
+        assert_eq!(default.interval, RepairSettings::INTERVAL);
+        assert_eq!(default.lost_after, Duration::from_secs(600));
+        assert_eq!(settings(120).interval, Duration::from_secs(12));
+        assert_eq!(settings(5).interval, RepairSettings::MIN_INTERVAL);
+        assert_eq!(settings(86_400).interval, RepairSettings::INTERVAL);
+        let short = settings(5);
+        assert_eq!(short.lost_after, Duration::from_secs(5));
+        assert_eq!(short.bytes_per_second, 7);
+        assert_eq!(short.checks_per_node, RepairSettings::CHECKS_PER_NODE);
+        assert_eq!(short.moves_per_pass, RepairSettings::MOVES_PER_PASS);
     }
 }
