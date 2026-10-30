@@ -2333,8 +2333,15 @@ dependencies = [
 name = "skys3-ec"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "crc32c",
  "reed-solomon-simd",
+ "skys3-config",
+ "skys3-io",
+ "skys3-log",
+ "skys3-types",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

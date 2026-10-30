@@ -1,6 +1,6 @@
 //! Errors of the erasure-coding layer.
 
-use crate::CodecId;
+use skys3_types::{CodecId, GeometryError};
 
 /// Why an erasure-coding operation failed.
 ///
@@ -80,4 +80,25 @@ pub enum EcError {
     /// let through. This indicates a bug, not bad input.
     #[error("reed-solomon backend error: {0}")]
     Backend(String),
+}
+
+impl From<GeometryError> for EcError {
+    fn from(error: GeometryError) -> Self {
+        Self::InvalidGeometry {
+            data: error.data,
+            parity: error.parity,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Geometry;
+
+    #[test]
+    fn an_invalid_geometry_converts() {
+        let error = EcError::from(Geometry::new(0, 2).unwrap_err());
+        assert_eq!(error, EcError::InvalidGeometry { data: 0, parity: 2 });
+    }
 }
