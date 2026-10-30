@@ -97,6 +97,8 @@ struct State {
     /// The buffer holds every record after `base`; the log holds every
     /// record up to it.
     base: Seq,
+    /// The bytes of the records in `buffer`.
+    buffered: usize,
     /// The commit limit the pipeline has: the lowest `seq` every member
     /// acknowledged.
     limit: Seq,
@@ -106,6 +108,37 @@ struct State {
     /// The last `seq` the primary must commit before it serves: its whole
     /// log once every member has reported.
     target: Option<Seq>,
+}
+
+/// How many bytes of committed records a primary keeps in memory for its
+/// learners outside the acknowledgement set (§6.4).
+pub(crate) const LEARNER_BUFFER_BYTES: usize = 16 << 20;
+
+impl State {
+    /// The last record the buffer may drop once `commit` is the watermark:
+    /// `commit`, unless a learner outside the acknowledgement set that
+    /// reported its log is behind it. Commits do not wait for such a
+    /// learner, so without this its link would chase them: each record it
+    /// lacks would be dropped as soon as it commits, and read back from
+    /// the log, a scan of every segment, only to be dropped again by the
+    /// next commit before the link sent it. The learner would then never
+    /// hold every record the primary had sequenced a check ago, and never
+    /// join while writes go on. The buffer keeps what such a learner lacks
+    /// from where the buffer starts, up to [`LEARNER_BUFFER_BYTES`]; past
+    /// that, the learner reads the log, as before.
+    fn kept_through(&self, commit: Seq) -> Seq {
+        if self.buffered > LEARNER_BUFFER_BYTES {
+            return commit;
+        }
+        self.learners
+            .iter()
+            .filter(|learner| !self.acking.contains(*learner))
+            .filter_map(|learner| self.progress.get(learner))
+            .filter(|progress| progress.synced)
+            .map(|progress| progress.acked.max(self.base))
+            .min()
+            .map_or(commit, |behind| behind.min(commit))
+    }
 }
 
 /// A primary's replication state, shared by the shard and the links to its
@@ -246,6 +279,7 @@ impl Leader {
                 .collect(),
             buffer: BTreeMap::new(),
             base,
+            buffered: 0,
             limit: Seq::ZERO,
             commit: Seq::ZERO,
             target: None,
@@ -662,7 +696,12 @@ impl Leader {
             bytes,
             lazy,
         };
-        self.state().buffer.insert(position.seq, outgoing);
+        let mut state = self.state();
+        state.buffered += outgoing.bytes.len();
+        if let Some(replaced) = state.buffer.insert(position.seq, outgoing) {
+            state.buffered -= replaced.bytes.len();
+        }
+        drop(state);
         self.changed();
     }
 
@@ -689,14 +728,21 @@ impl Leader {
     /// Keeps records read from the log after `after`, which the primary no
     /// longer held in memory (see [`Pending::InLog`]).
     pub fn restore(&self, after: Seq, records: Vec<(EpochSeq, Bytes)>) {
-        let mut state = self.state();
+        let mut guard = self.state();
+        let state = &mut *guard;
         for (position, bytes) in records {
-            state.buffer.entry(position.seq).or_insert(Outgoing {
-                seq: position.seq,
-                epoch: position.epoch,
-                bytes,
-                lazy: false,
-            });
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                state.buffer.entry(position.seq)
+            {
+                let len = bytes.len();
+                entry.insert(Outgoing {
+                    seq: position.seq,
+                    epoch: position.epoch,
+                    bytes,
+                    lazy: false,
+                });
+                state.buffered += len;
+            }
         }
         state.base = state.base.min(after);
     }
@@ -843,10 +889,15 @@ impl Leader {
         let commit = acked.min(*self.durable.borrow());
         if commit > state.commit {
             state.commit = commit;
-            state.buffer = state
-                .buffer
-                .split_off(&Seq::new(commit.get().saturating_add(1)));
-            state.base = state.base.max(commit);
+            let keep = state.kept_through(commit);
+            if keep > state.base {
+                let kept = state
+                    .buffer
+                    .split_off(&Seq::new(keep.get().saturating_add(1)));
+                let dropped = std::mem::replace(&mut state.buffer, kept);
+                state.buffered -= dropped.values().map(|r| r.bytes.len()).sum::<usize>();
+                state.base = keep;
+            }
             self.changed();
         }
         if let Some(target) = state.target {
@@ -875,4 +926,66 @@ impl Leader {
 
 fn lock(sequencer: &Mutex<Sequencer>) -> MutexGuard<'_, Sequencer> {
     sequencer.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(name: &str) -> NodeId {
+        name.parse().unwrap()
+    }
+
+    /// A primary at commit 10 with members `m2` and `m3` and learners `l4`,
+    /// which holds every record up to 6, and `l5`, which has not reported
+    /// its log; its buffer holds `buffered` bytes of records after `base`.
+    fn state(base: u64, buffered: usize) -> State {
+        let progress = |acked: u64, synced: bool| Progress {
+            synced,
+            acked: Seq::new(acked),
+            heard: 1,
+        };
+        State {
+            members: vec![node("m2"), node("m3")],
+            learners: vec![node("l4"), node("l5")],
+            acking: BTreeSet::new(),
+            backfilled: BTreeSet::new(),
+            snapshots: BTreeMap::new(),
+            stale: BTreeSet::new(),
+            promoting: None,
+            progress: BTreeMap::from([
+                (node("m2"), progress(10, true)),
+                (node("m3"), progress(10, true)),
+                (node("l4"), progress(6, true)),
+                (node("l5"), progress(0, false)),
+            ]),
+            buffer: BTreeMap::new(),
+            base: Seq::new(base),
+            buffered,
+            limit: Seq::new(10),
+            commit: Seq::new(10),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn the_buffer_keeps_what_a_learner_outside_the_set_lacks_within_its_bound() {
+        let commit = Seq::new(10);
+        // l4 lacks the records after 6; nothing is known of what l5 lacks.
+        assert_eq!(state(2, 1000).kept_through(commit), Seq::new(6));
+        // Behind where the buffer starts, the learner reads the log up to
+        // there, and the buffer keeps what follows.
+        assert_eq!(state(8, 1000).kept_through(commit), Seq::new(8));
+        // Past the bound, the buffer keeps only what has not committed.
+        let full = state(2, LEARNER_BUFFER_BYTES + 1);
+        assert_eq!(full.kept_through(commit), commit);
+        // A learner in the set holds up the commits instead.
+        let mut joined = state(2, 1000);
+        joined.acking.insert(node("l4"));
+        assert_eq!(joined.kept_through(commit), commit);
+        // And one that holds every committed record lacks none of them.
+        let mut ahead = state(2, 1000);
+        ahead.progress.get_mut(&node("l4")).unwrap().acked = Seq::new(12);
+        assert_eq!(ahead.kept_through(commit), commit);
+    }
 }

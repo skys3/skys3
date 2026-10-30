@@ -388,6 +388,66 @@ fn a_primary_commits_once_every_member_holds_the_record() {
     });
 }
 
+/// A learner outside the acknowledgement set is not waited for, so the
+/// records it lacks commit without it. The primary keeps them in memory
+/// for it, up to a bound (tested in `leader.rs`), rather than dropping
+/// each one as it commits: otherwise the learner's link chases the commits
+/// through the log under a steady stream of writes, and the learner never
+/// catches up to join (§6.4; found by the kill, partition, and peering
+/// suite, plan M8-08).
+#[test]
+fn committed_records_a_learner_lacks_stay_in_memory_for_it() {
+    runtime().block_on(async {
+        let replica = Replica::new().await;
+        let config = ShardConfig {
+            learners: vec![node(4)],
+            ..replicated()
+        };
+        let primary = replica.open(&config, &node(1)).await.unwrap();
+        let leader = Arc::clone(primary.leader().unwrap());
+        leader.synced(&node(2), Seq::ZERO);
+        leader.synced(&node(3), Seq::ZERO);
+        until(|| primary.is_serving()).await;
+        // The learner reported its log, and is not in the set yet.
+        leader.synced(&node(4), Seq::ZERO);
+        let commit = |key: &'static str, len: usize, seq: u64| {
+            let primary = primary.clone();
+            let leader = Arc::clone(&leader);
+            async move {
+                let written = tokio::spawn({
+                    let primary = primary.clone();
+                    async move { primary.commit(put(key, len, seq)).await }
+                });
+                until(|| primary.last_sequenced() == Seq::new(seq)).await;
+                leader.acknowledged(&node(2), Seq::new(seq));
+                leader.acknowledged(&node(3), Seq::new(seq));
+                written.await.unwrap().unwrap();
+                until(|| leader.commit() == Seq::new(seq)).await;
+            }
+        };
+        commit("a", 10, 1).await;
+        commit("b", 10, 2).await;
+        // Both committed without the learner, and both are still sent
+        // from memory.
+        let Pending::Ready(records) = leader.records_after(Seq::ZERO, 8) else {
+            panic!("the records the learner lacks were dropped");
+        };
+        let seqs: Vec<u64> = records.iter().map(|r| r.seq.get()).collect();
+        assert_eq!(seqs, [1, 2]);
+        // Once the learner holds them, the next commit drops them.
+        leader.acknowledged(&node(4), Seq::new(2));
+        commit("c", 10, 3).await;
+        assert_eq!(
+            leader.records_after(Seq::ZERO, 8),
+            Pending::InLog(Seq::new(2))
+        );
+        let Pending::Ready(records) = leader.records_after(Seq::new(2), 8) else {
+            panic!("the record the learner lacks was dropped");
+        };
+        assert_eq!(records.len(), 1);
+    });
+}
+
 /// A primary queues a record of the other segment class only once the
 /// records before it are durable, so a lazy `FLUSHED` that nothing else
 /// would commit for up to [`skys3_log::LAZY_MAX_DELAY`] is committed at

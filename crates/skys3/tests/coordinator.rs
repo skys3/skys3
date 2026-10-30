@@ -618,3 +618,87 @@ async fn a_lost_member_is_replaced_and_a_deleted_bucket_dropped_everywhere() {
     assert_eq!(health["shards_open"], system, "{health}");
     cluster.shutdown().await;
 }
+
+/// A drained node's replicas stop where the moves left them, and its bucket
+/// status no longer counts their objects: they are the members' now (found
+/// by the kill, partition, and peering suite, plan M8-08, where a stopped
+/// replica's entry kept `unflushed` above 0 for good).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drained_nodes_stopped_replicas_leave_its_bucket_status() {
+    let cluster = Cluster::start(4).await;
+    let coordinator = cluster.coordinator().await;
+    cluster
+        .client(coordinator)
+        .create_bucket()
+        .bucket("moved")
+        .send()
+        .await
+        .unwrap();
+    // A node knows the configurations of the shards it holds.
+    let placed = || async {
+        let mut placed = 0;
+        for n in 0..4 {
+            for i in cluster.running() {
+                let entry = cluster.shard(i, "moved", n).await;
+                if entry["source"] == "replica" && entry["members"].as_array().unwrap().len() == 3 {
+                    placed += 1;
+                    break;
+                }
+            }
+        }
+        placed == 4
+    };
+    eventually("every shard has 3 members", placed).await;
+    for i in 0..8_u8 {
+        let data = support::body(i, 1000);
+        put(
+            &cluster.client(coordinator),
+            "moved",
+            &format!("key-{i}"),
+            &data,
+        )
+        .await;
+    }
+    // A node other than the coordinator that holds a replica of the
+    // bucket, and counts its objects.
+    let mut drained = None;
+    for i in cluster.running() {
+        let status = admin_json(&cluster.admin(i), "/v1/buckets/moved").await;
+        if i != coordinator && status["objects"].as_u64().unwrap() > 0 {
+            drained = Some(i);
+            break;
+        }
+    }
+    let drained = drained.expect("a node other than the coordinator holds a replica");
+    let path = format!("/v1/nodes/{}/drain", cluster.names[drained]);
+    let (status, answer) = post(&cluster.admin(coordinator), "POST", &path, "").await;
+    assert_eq!(status, 200, "{answer}");
+    eventually(
+        "the drained node serves no replica of the bucket",
+        || async {
+            let answer = admin_json(&cluster.admin(drained), "/v1/shards").await;
+            answer["shards"].as_array().unwrap().iter().all(|entry| {
+                entry["bucket"] != "moved"
+                    || entry["source"] != "replica"
+                    || entry["role"] == "stopped"
+            })
+        },
+    )
+    .await;
+    let status = admin_json(&cluster.admin(drained), "/v1/buckets/moved").await;
+    assert!(status["shards_stopped"].as_u64().unwrap() > 0, "{status}");
+    assert_eq!(status["shards_open"], 0, "{status}");
+    assert_eq!(status["objects"], 0, "{status}");
+    assert_eq!(status["unflushed"], 0, "{status}");
+    // The others hold every object, three times over.
+    eventually("the other nodes count every object three times", || async {
+        let mut objects = 0;
+        for i in cluster.running() {
+            let status = admin_json(&cluster.admin(i), "/v1/buckets/moved").await;
+            objects += status["objects"].as_u64().unwrap();
+        }
+        objects == 8 * 3
+    })
+    .await;
+    cluster.shutdown().await;
+}
