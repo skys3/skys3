@@ -124,8 +124,8 @@ crates/
   skys3-cluster-sim/    cluster simulation harness: real nodes, faults, workload (§16.1)
 spec/                   protocol model
 deploy/                 Prometheus alerting rules and Grafana dashboard (M7-04)
-tests/                  SDK matrix, s3-tests subset, end-to-end suite (tests/e2e), provider and fault-injection tests
-bench/                  performance suite (§16.3)
+tests/                  SDK matrix, s3-tests subset, end-to-end suite (tests/e2e), provider and fault-injection tests,
+                        performance harness (§16.3, tests/e2e/perf)
 ```
 
 ## 5. CI and test infrastructure
@@ -146,6 +146,7 @@ bench/                  performance suite (§16.3)
 | Crash consistency: power loss at every sync boundary, and `kill -9` loops against the binary | M1-14 | Every push and PR with fixed seeds and a few kills; nightly with random seeds and many kills |
 | Control-store conformance against AWS S3 and R2 | M2-06 | Nightly, when their credentials are set as CI secrets |
 | Kill and partition tests | M2-20 | Nightly |
+| Performance harness: unit tests and a `smoke` run without thresholds | M7-06a | Every push and PR, in the end-to-end job |
 | Shaped-link and performance suites | M6-09, M7-06 | On fixed hardware, before each release |
 
 ## 6. M0 Foundations
@@ -1014,6 +1015,7 @@ Most of M4 depends only on M1 and can run beside M2 and M3. M4-04, and the failo
 
 - Every measurement in §16.3 on fixed hardware, including fsyncs per acknowledged PUT against the §5.3 table, failover distributions, flush lag against target round trips, import rate, streaming overlap, the durability window, cache and compaction behavior, read scaling, and local-bucket space and repair time.
 - **Done when:** the §16.3 targets are met, or the design is revised with the measurements attached.
+- **The harness (M7-06a).** `tests/e2e/perf/perf.py`, run on every PR with its `smoke` profile by the e2e scenario `98-perf` (no thresholds), and with its `full` profile on the release hardware ([docs/skys3-performance.md](skys3-performance.md)). It measures PUT latency with fsyncs and records per group commit (new `skys3_log_*` metrics), read scaling, failover and the durability window, flush by target round trip, import, and fill latency. What remains for M7-06 is the cache, local-bucket, and section 19 (questions 5 and 6) scenarios, which report `not_implemented` today, and the measurement run itself; M6-09 is the `peer` scenario and its run.
 
 #### M7-07 Reconciliation scan
 

@@ -49,7 +49,7 @@ use crate::cluster::replication::{ClusterShards, Routed};
 use crate::control::backend::{self, Backend, ConnectError, Opener};
 use crate::control::{self, ControlCopy, NodeStore, OpenStoreError, StoreOwner};
 use crate::datadir::{self, DataDir, DataDirError, DiskDir};
-use crate::metrics::{ControlMetrics, NodeMetrics};
+use crate::metrics::{ControlMetrics, LogMetrics, NodeMetrics};
 use crate::remote::NodeRemote;
 use crate::sessions::{SESSIONS_BUCKET_ID, SystemSessions};
 use crate::storage::{self, on_pool};
@@ -834,6 +834,11 @@ impl Node {
         check_mode(&config, data_dir, &storage.index, &pools.index).await?;
 
         let metrics = NodeMetrics::new(config.identity().identity_max_staleness());
+        let logs: Vec<SegmentLog<RealDisk>> =
+            storage.disks.iter().map(|(_, log)| log.clone()).collect();
+        LogMetrics::register(&metrics.registry, move || {
+            LogMetrics::sum(&logs.iter().map(SegmentLog::stats).collect::<Vec<_>>())
+        });
         let health = Health::new();
         let serving = health.register("gateway");
         let storage_ready = health.register("storage");

@@ -9508,6 +9508,84 @@ of this file. A task with nothing unexpected keeps "None."
   epoch 1, at the base commit too. It comes from
   `skys3::cluster::control`, outside this task, and fails nothing.
 
+### M7-06a Performance harness
+
+- **No node counted its fsyncs (surprise).** The task assumed the metrics
+  reference had counters for fsyncs and group-commit sizes; only
+  `SegmentLog::stats()` had them, in process (group commits, records,
+  bytes), used by tests and `group_commit_bench`. The PR adds file syncs
+  and commit time to `LogStats` (one sync per segment a group writes, plus
+  the directory's after a new segment) and exports all five as
+  `skys3_log_*` counters (metrics reference section 3.13), read from the
+  logs at each scrape by a custom `prometheus-client` metric, so the
+  commit path does no extra work. Design §16.3 now says how section 5.3's
+  counts are derived from them. Serial durable rounds cannot be counted
+  from outside, only bounded (median PUT latency over mean group-commit
+  time), and control-store calls on the write path are not measured.
+- **Python, not a Rust crate (decided, measured).** The harness sits in
+  `tests/e2e/perf` beside `cluster.py` and the chaos suite, stdlib only,
+  instead of the plan's `bench/` (the plan's layout now says so). The fear
+  was that Python cannot push a node; the generator spreads a case's
+  clients over spawned processes (threads within each) and records its own
+  CPU per case, flagging `may_have_limited` above 85% of a core. Measured
+  here: a PUT or GET costs it 0.5 to 0.65 ms of CPU, about 2,000 requests
+  a second per core; against MinIO it peaked at about 1,000 PUT/s with its
+  busiest process 14% busy, and no case of the e2e runs came near the
+  flag. A release node on many cores may need the generator on another
+  host, which the flag tells.
+- **The harness launches nothing (decided).** Whatever starts the cluster
+  writes a JSON target file with endpoints, credentials, the remote store,
+  and kill/start/shape hooks; the e2e scenario `98-perf` is the launcher
+  for CI and for a one-host release run (`SKYS3_PERF_PROFILE=full`), so
+  there is no second cluster launcher. Its hooks
+  (`tests/e2e/perf/e2e-hooks.sh`) reuse lib.sh's `node_start`.
+- **No netem here, so a relay for the flush round trips.** The container
+  has no `tc` qdiscs at all (not even `prio`), as M8-08 found for netem.
+  The `flush` scenario therefore falls back to a delaying TCP relay in the
+  harness when the target has no `target` link hook; each case records its
+  shaper. Shaping the control store needs hooks (netem); without them the
+  shaped failover cases report `skipped`, and the smoke profile runs
+  failover unshaped. The netem path through hooks has not run.
+- **Bucket defaults.** The perf cluster's first run failed: without
+  `mode` the default is `write_back`, which needs a target header; the
+  scenario sets `mode = "local"` and creates write_back buckets with the
+  header.
+- **A new bucket's target is not followed at once.** Right after an import
+  finished, a GET through another node answered `503` ("the bucket's
+  target is not followed here") until that node's configuration poll; the
+  `import` scenario retries reads three times, as an SDK does, and counts
+  each failed attempt (`failed_reads`).
+- **Disk.** A first long run (16 MiB PUTs at 32 writers, 4 GiB per case)
+  wrote 8.5 GB in minutes and was stopped before the shared disk filled.
+  Nothing the harness writes is deleted, so `put.max_bytes` caps each
+  case (16 GiB in `full`), every writer still sends one object, and the
+  runbook asks for about half a terabyte for `full`.
+- **Scenario time limit.** run.sh gave every scenario 600 s; the full
+  profile takes hours, so `SKYS3_E2E_SCENARIO_TIMEOUT` overrides it.
+- **What the container measured (no evidence for §16.3).** An unoptimized
+  e2e build, three nodes on one 4-CPU host over a virtual disk that
+  reports itself rotational. Smoke: fsyncs per acknowledged 1 KiB and
+  64 KiB PUT exactly 3.0 at concurrency 1 (§5.3's three sync
+  participants), 2.0 to 2.2 at 4; a killed node's primary shards took
+  writes again after 6.5 s (`primary_grace`, as M8-08 found) and its
+  backup shards after 3.1 s (`member_suspect_after`). Longer PUT/GET run:
+  group commit shared syncs as concurrency rose (0.9 fsyncs and 3.3
+  records per group commit at 32 writers), 1 MiB PUTs took 6 syncs at
+  concurrency 1 (an extent record and the PUT record, each a group), and
+  the serial-rounds bound was 5 to 18, meaningless on this build.
+- **The e2e run.** `tests/e2e/control-stores.sh` locally: the file and S3
+  legs passed; the etcd leg passed every scenario, `perf` in 71 s, except
+  `cluster`, whose check that a refused start leaves a single node's data
+  directory unchanged (file names and sizes) failed once while all three
+  legs ran at once. `cluster` alone, and then the whole etcd leg again
+  (`perf` in 60 s), passed. The refused start only recovers the log and
+  opens the index before it stops, which this PR does not change, so it
+  was not pursued further; it may recur under load.
+- **Extension points.** `cache` (hit rate under eviction, compaction write
+  amplification), `local` (stored bytes per logical byte, encoding
+  backlog, repair time), `peer` (M6-09), `hot_bucket` and `metadata`
+  (§19 questions 5 and 6) report `not_implemented`.
+
 ## M8 Cluster binary
 
 ### M8-01 End-to-end harness and single-node suite
