@@ -2491,6 +2491,20 @@ of this file. A task with nothing unexpected keeps "None."
   never answer. `free_ports` holds its listeners until all are chosen, so
   a gateway and an admin port never coincide. A test holds a configured
   port and checks the node moves.
+- **Test ports come from below the ephemeral range (later CI).** Two
+  in-process tests of later branches failed to bind a port `free_port`
+  had chosen: a node's transport on restart, and the first node of a
+  three-node cluster whose ports were all chosen up front. Port 0 hands
+  out ports from the kernel's ephemeral range, which is also where every
+  outgoing connection gets its local port, so an earlier node's
+  connection to the control store, or anything else a parallel test
+  dialled, could take the port before the node bound it. `free_ports` now
+  picks ports from 20000-31999, below Linux's (32768-60999) and macOS's
+  (49152-65535) default ranges, checking each with a bind, and walks the
+  range with a process-wide counter that starts at a place derived from
+  the process ID, so a port is handed out once per process and parallel
+  tests never choose the same one. `Process::start`'s retry stays for
+  whatever else may hold a port.
 
 ## M2 Replicated shards
 
