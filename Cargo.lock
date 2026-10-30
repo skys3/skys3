@@ -2509,6 +2509,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "md-5",
+ "quinn",
  "rand 0.9.5",
  "rcgen",
  "s3s",
@@ -2801,6 +2802,7 @@ dependencies = [
 name = "skys3-peer"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "bytes",
  "crc32c",

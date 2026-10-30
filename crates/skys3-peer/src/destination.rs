@@ -258,11 +258,14 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     ///   staging is gone: the source gets an `ABORT` with the reason, and
     ///   the stream's later `DATA` is dropped until a new `BEGIN`.
     /// - `ABORT` discards the staging it names.
-    /// - `COMMIT` waits for the stream's frames in flight, so that the
-    ///   staging holds every frame sent before it, and is answered with the
-    ///   `APPLIED` of the [`CommitSink`]. A commit that commits consumes the
-    ///   staging, and so does one that is refused or whose bytes do not
-    ///   match: the source stages the object again.
+    /// - `COMMIT` waits for the stream's frames in flight, and for those
+    ///   other streams of its identity have in flight, which the stream's
+    ///   own frames may have been trimmed against ([`Staging::settled`]),
+    ///   so that the staging holds every frame sent before it; and it keeps
+    ///   the staging from expiring meanwhile ([`Staging::pin`]). It is
+    ///   answered with the `APPLIED` of the [`CommitSink`]. A commit that
+    ///   commits consumes the staging, and so does one that is refused or
+    ///   whose bytes do not match: the source stages the object again.
     /// - `BATCH` is applied by the [`CommitSink`], with no staging, and
     ///   each of its items is answered with its own `APPLIED`, in item
     ///   order.
@@ -346,13 +349,25 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     }
                 }
                 Message::Commit(commit) => {
+                    // Staging live as the COMMIT arrives stays until it is
+                    // applied, however long its frames in flight take, or
+                    // until the stream's task is aborted.
+                    let pinned = Pinned::new(&self.staging, &commit.identity);
                     drop(
                         appends
                             .acquire_many(MAX_APPENDS_PER_STREAM)
                             .await
                             .expect("the semaphore is never closed"),
                     );
+                    // The stream's frames were staged only where no other
+                    // stream of the identity had their bytes in flight,
+                    // such as one lost with its connection: those land
+                    // first too.
+                    if let Some(generation) = pinned.generation {
+                        self.staging.settled(&commit.identity, generation).await;
+                    }
                     let applied = self.commit(commit).await;
+                    drop(pinned);
                     if matches!(applied.outcome, Outcome::Committed { .. })
                         && current
                             .as_ref()
@@ -466,6 +481,32 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// A [`Staging::pin`] of one identity's staging, released when dropped,
+/// as when a stream's task is aborted while its `COMMIT` is applied.
+struct Pinned {
+    staging: Arc<Staging>,
+    identity: WriteIdentity,
+    generation: Option<u64>,
+}
+
+impl Pinned {
+    fn new(staging: &Arc<Staging>, identity: &WriteIdentity) -> Self {
+        Self {
+            staging: Arc::clone(staging),
+            identity: identity.clone(),
+            generation: staging.pin(identity),
+        }
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        if let Some(generation) = self.generation {
+            self.staging.unpin(&self.identity, generation);
         }
     }
 }
