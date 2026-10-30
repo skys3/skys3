@@ -16,7 +16,7 @@ use serde_json::Value;
 use skys3_coord::CoordinatorMetrics;
 use skys3_ec::{ReleaseMetrics, RepairMetrics};
 use skys3_flush::{DirtyBudget, FlushMetrics};
-use skys3_gateway::HotCacheMetrics;
+use skys3_gateway::{HotCacheMetrics, PeerRefusals};
 use skys3_obs::{AdminConfig, AdminListener, Health, MetricsRegistry};
 use skys3_shard::lifecycle::LifecycleMetrics;
 use skys3_shard::replication::ReplicationMetrics;
@@ -65,6 +65,7 @@ async fn catalog() -> MetricsRegistry {
     drop(CacheMetrics::register(&registry));
     drop(CompactionMetrics::register(&registry));
     drop(HotCacheMetrics::register(&registry));
+    drop(PeerRefusals::register(&registry));
     drop(LifecycleMetrics::register(&registry));
     drop(RepairMetrics::register(&registry));
     drop(ReleaseMetrics::register(&registry));
