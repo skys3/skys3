@@ -26,6 +26,7 @@ pub mod admin;
 mod admission;
 pub mod control;
 pub mod datadir;
+mod metrics;
 mod node;
 pub mod rebuild;
 pub mod remote;

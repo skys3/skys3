@@ -46,6 +46,9 @@ aws-sdk-s3.workspace = true
 aws-smithy-http-client.workspace = true
 aws-types.workspace = true
 md-5.workspace = true
+# The coordinator's and repair's metrics, for the metrics reference tests.
+skys3-coord.workspace = true
+skys3-ec.workspace = true
 # Enables `test-util` for the in-memory shards in unit tests.
 skys3-gateway = { workspace = true, features = ["test-util"] }
 skys3-sim.workspace = true
@@ -54,3 +57,5 @@ skys3-sts = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
 tokio-rustls.workspace = true
+# Parses the Prometheus alerting rules under deploy/ in the metrics tests.
+yaml-rust2.workspace = true

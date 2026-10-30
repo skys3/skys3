@@ -25,6 +25,7 @@ use skys3_types::{
 
 use crate::change::{Applied, ChangeSet};
 use crate::coordinator::{NoPlacement, Placement};
+use crate::metrics::CoordinatorMetrics;
 use crate::place::{Domain, Topology};
 use crate::registry::{NodeRegistry, NodeState};
 
@@ -357,6 +358,7 @@ pub struct PolicyWatch<P = NoPlacement> {
     level: FailureDomain,
     scan: ClusterScan,
     health: PlacementHealth,
+    metrics: CoordinatorMetrics,
     placement: P,
 }
 
@@ -379,6 +381,7 @@ impl PolicyWatch {
             level,
             scan: ClusterScan::new(),
             health: PlacementHealth::new(),
+            metrics: CoordinatorMetrics::default(),
             placement: NoPlacement,
         }
     }
@@ -392,6 +395,7 @@ impl<P> PolicyWatch<P> {
             level: self.level,
             scan: self.scan,
             health: self.health,
+            metrics: self.metrics,
             placement,
         }
     }
@@ -400,6 +404,17 @@ impl<P> PolicyWatch<P> {
     #[must_use]
     pub fn with_health(mut self, health: PlacementHealth) -> Self {
         self.health = health;
+        self
+    }
+
+    /// Reports each judgement in `metrics` too
+    /// (`skys3_placement_unsatisfied_buckets` and
+    /// `skys3_placement_short_shards`): the metrics the
+    /// [`Coordinator`](crate::Coordinator) running this watch reports its
+    /// tenures in.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: CoordinatorMetrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -432,6 +447,7 @@ impl<P> PolicyWatch<P> {
                 .collect()
         };
         let now = names(&report);
+        self.metrics.set_placement(Some(&report));
         let before = self
             .health
             .publish(Some(report.clone()))
@@ -463,6 +479,7 @@ impl<P: Placement> Placement for PolicyWatch<P> {
     fn begin_tenure(&mut self) {
         // A report from an earlier tenure is stale.
         self.health.publish(None);
+        self.metrics.set_placement(None);
         self.placement.begin_tenure();
     }
 

@@ -47,6 +47,8 @@
 //! - [`PolicyWatch`] and [`report`]: the coordinator judges which buckets
 //!   the cluster does not satisfy now, and publishes a [`PolicyReport`]
 //!   through [`PlacementHealth`] for cluster health.
+//! - [`CoordinatorMetrics`]: whether the node is coordinator, and how many
+//!   buckets and shards its latest judgement found unsatisfied.
 //! - [`create_bucket`] and [`BucketShards`]: a gateway creates a bucket's
 //!   register and its placed shard registers in one change, and the
 //!   coordinator finishes a creation cut short and drops the shard
@@ -102,6 +104,7 @@ mod handoff;
 mod heartbeat;
 mod join;
 mod lease;
+mod metrics;
 mod place;
 mod policy;
 mod push;
@@ -131,6 +134,7 @@ pub use heartbeat::{
 };
 pub use join::{NodeProfile, Registered, Registration, RegistrationError, register};
 pub use lease::{Elector, Leadership, LeaseConfig, LeaseConfigError};
+pub use metrics::CoordinatorMetrics;
 pub use place::{Candidate, Domain, NewShard, Placed, ShardRequest, Topology, Unsatisfiable};
 pub use policy::{
     BucketPolicy, ClusterScan, CoLocated, PlacementHealth, PolicyReport, PolicyWatch, ShortShard,

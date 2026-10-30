@@ -278,7 +278,9 @@ async fn the_watch_publishes_what_the_registers_say() {
     registry.begin_tenure();
     registry.refresh(&store).await.unwrap();
     let health = PlacementHealth::new();
+    let metrics = CoordinatorMetrics::default();
     let mut watch = PolicyWatch::new(registry.clone(), FailureDomain::Rack)
+        .with_metrics(metrics.clone())
         .with_placement(NoPlacement)
         .with_health(health.clone());
     assert!(format!("{watch:?}").contains("PolicyWatch"));
@@ -319,6 +321,8 @@ async fn the_watch_publishes_what_the_registers_say() {
     assert_eq!(report.domains, 3);
     let names: Vec<_> = report.unsatisfied.iter().map(|b| b.name.as_str()).collect();
     assert_eq!(names, ["bucket-2"]);
+    // Its one shard has two domains of the four it needs.
+    assert_eq!(metrics.values(), (0, 1, 1));
     assert_eq!(watch.health().latest(), Some(report));
 
     // Moving shard 0 of bucket 1 into one rack is reported, and moving it
@@ -332,6 +336,7 @@ async fn the_watch_publishes_what_the_registers_say() {
     let report = health.latest().unwrap();
     let names: Vec<_> = report.unsatisfied.iter().map(|b| b.name.as_str()).collect();
     assert_eq!(names, ["bucket-1", "bucket-2"]);
+    assert_eq!(metrics.values(), (0, 2, 2));
 
     let current = skys3_control::read(&store, &key).await.unwrap().unwrap();
     let mut back = first.clone();
@@ -350,6 +355,7 @@ async fn the_watch_publishes_what_the_registers_say() {
     // A new tenure clears the stale report until the next plan.
     watch.begin_tenure();
     assert_eq!(health.latest(), None);
+    assert_eq!(metrics.values(), (0, 0, 0));
     let change = ChangeSet::new();
     let applied = Applied {
         written: Vec::new(),
