@@ -258,12 +258,14 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
     ///   staging is gone: the source gets an `ABORT` with the reason, and
     ///   the stream's later `DATA` is dropped until a new `BEGIN`.
     /// - `ABORT` discards the staging it names.
-    /// - `COMMIT` waits for the stream's frames in flight, so that the
-    ///   staging holds every frame sent before it, and keeps the staging
-    ///   from expiring meanwhile ([`Staging::pin`]). It is answered with the
-    ///   `APPLIED` of the [`CommitSink`]. A commit that commits consumes the
-    ///   staging, and so does one that is refused or whose bytes do not
-    ///   match: the source stages the object again.
+    /// - `COMMIT` waits for the stream's frames in flight, and for those
+    ///   other streams of its identity have in flight, which the stream's
+    ///   own frames may have been trimmed against ([`Staging::settled`]),
+    ///   so that the staging holds every frame sent before it; and it keeps
+    ///   the staging from expiring meanwhile ([`Staging::pin`]). It is
+    ///   answered with the `APPLIED` of the [`CommitSink`]. A commit that
+    ///   commits consumes the staging, and so does one that is refused or
+    ///   whose bytes do not match: the source stages the object again.
     /// - `BATCH` is applied by the [`CommitSink`], with no staging, and
     ///   each of its items is answered with its own `APPLIED`, in item
     ///   order.
@@ -357,6 +359,13 @@ impl<S: ExtentSink, C: CommitSink> StagingService<S, C> {
                             .await
                             .expect("the semaphore is never closed"),
                     );
+                    // The stream's frames were staged only where no other
+                    // stream of the identity had their bytes in flight,
+                    // such as one lost with its connection: those land
+                    // first too.
+                    if let Some(generation) = pinned.generation {
+                        self.staging.settled(&commit.identity, generation).await;
+                    }
                     let applied = self.commit(commit).await;
                     drop(pinned);
                     if matches!(applied.outcome, Outcome::Committed { .. })
