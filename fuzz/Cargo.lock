@@ -2501,6 +2501,7 @@ dependencies = [
 name = "skys3-obs"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "http",
  "http-body-util",
@@ -2510,6 +2511,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

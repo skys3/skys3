@@ -36,6 +36,9 @@
 //! - **Policies** ([`policy`]): the subset of the IAM policy language that
 //!   authorizes requests, and the trust policies that say who may assume a
 //!   role ([`policy::trust`]) (§11).
+//! - **AWS endpoints** ([`aws`]): which host names are AWS, and the
+//!   partition, with its own bucket namespace, and region an S3 endpoint
+//!   names.
 //! - **Lifecycle** ([`lifecycle`]): a `local` bucket's expiration and
 //!   upload-cleanup rules, as its register stores them, and their
 //!   evaluation (§8.7).
@@ -52,6 +55,7 @@
 //! ```
 
 mod address;
+pub mod aws;
 pub mod checksum;
 mod ec;
 mod id;
