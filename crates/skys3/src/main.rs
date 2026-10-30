@@ -27,8 +27,10 @@
 //!
 //! `control identity put` writes the OIDC providers and roles of an
 //! identity file into the control store, and `control identity delete`
-//! removes the named ones (`skys3::identity`). With the file control
-//! store, the node must be stopped, and follows the change when it starts.
+//! removes the named ones (`skys3::identity`), in the configured backend.
+//! With the file control store, the node must be stopped, and follows the
+//! change when it starts; an etcd or S3 store takes the change while the
+//! nodes run, and they follow it within their poll interval.
 
 use std::collections::BTreeSet;
 use std::io::Write;

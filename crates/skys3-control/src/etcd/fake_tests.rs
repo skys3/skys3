@@ -74,6 +74,20 @@ impl Backend for Fakes {
 }
 
 #[tokio::test]
+async fn a_value_over_the_bound_is_refused() {
+    bounded(async {
+        let fake = Fake::start(None).await;
+        fake.put(
+            "c/buckets/b.json",
+            &vec![b' '; crate::MAX_REGISTER_BYTES + 1],
+        );
+        let error = store(&fake).get(&key()).await.unwrap_err();
+        assert!(matches!(error, ControlError::TooLarge { .. }), "{error}");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn the_store_conforms_over_the_fake() {
     bounded(async {
         let mut fakes = Fakes {

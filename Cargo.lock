@@ -2471,6 +2471,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "skys3-config",

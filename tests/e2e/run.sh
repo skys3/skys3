@@ -6,7 +6,10 @@
 #   tests/e2e/run.sh [<scenario>...]
 #
 # Runs every scenario by default, or those named (`objects`, `flush`, ...:
-# the script names without their number and `.sh`), in order. It prints a
+# the script names without their number and `.sh`), in order. With an etcd
+# or S3 control store (SKYS3_E2E_CONTROL), the default is the scenarios of
+# the single-node cluster: those that run clusters of their own (`# e2e:
+# parallel`) run them over the file store whatever the setting. It prints a
 # summary and exits non-zero if any failed. Everything a run makes, the
 # PKI, configurations, data directories, and logs, is in SKYS3_E2E_DIR
 # (default target/e2e-run), which CI uploads when the job fails.
@@ -20,6 +23,13 @@
 #   SKYS3_E2E_MINIO   the MinIO server binary; by default `minio` on the
 #                     PATH, or the one tests/e2e/minio.sh builds from
 #                     source and caches
+#   SKYS3_E2E_CONTROL the single-node cluster's control store (plan M8-03):
+#                     `file` (the default); `etcd`, one etcd member over
+#                     mutual TLS with the PKI's etcd certificates; or `s3`,
+#                     a bucket of a second SkyS3 cluster (MinIO fails the
+#                     startup probe, which this setting also checks)
+#   SKYS3_E2E_ETCD    the etcd server binary for `etcd`; by default the
+#                     pinned release tests/e2e/etcd.sh downloads and caches
 #   SKYS3_E2E_DIR     where the run's files go; emptied first
 #   SKYS3_E2E_PORT    the first of the ports the suite listens on (19000);
 #                     it uses 100 from there, and UDP 7443 to 7445
@@ -42,8 +52,13 @@ export E2E_HERE
 export E2E_DIR=${SKYS3_E2E_DIR:-$repo/target/e2e-run}
 export E2E_PORT=${SKYS3_E2E_PORT:-19000}
 export E2E_FAULT=${SKYS3_E2E_FAULT:-}
+export E2E_CONTROL=${SKYS3_E2E_CONTROL:-file}
 # shellcheck source=tests/e2e/lib.sh
 . "$E2E_HERE/lib.sh"
+case "$E2E_CONTROL" in
+file | etcd | s3) ;;
+*) fail "SKYS3_E2E_CONTROL is file, etcd, or s3, not $E2E_CONTROL" ;;
+esac
 
 # Which scenarios to run.
 scenarios=()
@@ -51,7 +66,9 @@ for script in "$E2E_HERE"/scenarios/*.sh; do
     name=$(basename "$script" .sh)
     name=${name#[0-9][0-9]-}
     if [ $# -eq 0 ]; then
-        scenarios+=("$script")
+        if [ "$E2E_CONTROL" = file ] || ! grep -q '^# e2e: parallel$' "$script"; then
+            scenarios+=("$script")
+        fi
     else
         for wanted in "$@"; do
             [ "$wanted" = "$name" ] && scenarios+=("$script")
@@ -160,12 +177,148 @@ eventually 30 "the OIDC issuer answers" curl -fsS --max-time 2 --cacert "$pki/e2
     "$ISSUER_URL/.well-known/openid-configuration"
 log "MinIO and the OIDC issuer are up"
 
+# --- The single-node cluster's control store --------------------------------
+#
+# Its [control_store] table. etcd serves its clients over mutual TLS; the
+# member's peer URL is plaintext on loopback, as it has no peers.
+#
+# The S3 store cannot be MinIO: it ignores If-Match on DeleteObject, so a
+# conditional delete at a stale version is applied, and the startup probe
+# (design section 6.1) refuses it, which the suite checks. The store is a
+# bucket of a second single-node SkyS3 cluster, `ctl`, over the file store,
+# which the node reaches with a profile of its own, never the flushers'
+# credential.
+mkdir -p "$E2E_DIR/n1"
+case "$E2E_CONTROL" in
+file)
+    control_store='backend = "file"'
+    ;;
+etcd)
+    etcd_binary=$(bash "$E2E_HERE/etcd.sh")
+    etcd_url=https://127.0.0.1:$((E2E_PORT + 70))
+    etcd_peer=http://127.0.0.1:$((E2E_PORT + 71))
+    "$etcd_binary" --name e2e --data-dir "$E2E_DIR/etcd" \
+        --listen-client-urls "$etcd_url" --advertise-client-urls "$etcd_url" \
+        --listen-peer-urls "$etcd_peer" --initial-advertise-peer-urls "$etcd_peer" \
+        --initial-cluster "e2e=$etcd_peer" \
+        --cert-file "$pki/etcd-server.pem" --key-file "$pki/etcd-server.key" \
+        --client-cert-auth --trusted-ca-file "$pki/e2e-ca.pem" \
+        >"$E2E_DIR/logs/etcd.log" 2>&1 &
+    pids+=($!)
+    eventually 60 "etcd is healthy" curl -fsS --max-time 2 --cacert "$pki/e2e-ca.pem" \
+        --cert "$pki/etcd-client.pem" --key "$pki/etcd-client.key" "$etcd_url/health"
+    # Without a client certificate, etcd refuses the TLS handshake.
+    if curl -fsS --max-time 2 --cacert "$pki/e2e-ca.pem" "$etcd_url/health" >/dev/null 2>&1; then
+        fail "etcd answered a client without a certificate"
+    fi
+    log "etcd is up at $etcd_url (mutual TLS)"
+    control_store="backend = \"etcd\"
+etcd_endpoints = [\"$etcd_url\"]
+etcd_tls_ca_file = \"$pki/e2e-ca.pem\"
+etcd_tls_cert_file = \"$pki/etcd-client.pem\"
+etcd_tls_key_file = \"$pki/etcd-client.key\""
+    ;;
+s3)
+    ctl_s3=http://127.0.0.1:$((E2E_PORT + 80))
+    ctl_key=AKIASKYS3E2ECONTROL ctl_secret=skys3-e2e-control-secret-0123456789
+    cat >"$E2E_DIR/n1/aws-credentials" <<EOF
+[skys3-control]
+aws_access_key_id = $ctl_key
+aws_secret_access_key = $ctl_secret
+
+[minio-control]
+aws_access_key_id = $MINIO_KEY
+aws_secret_access_key = $MINIO_SECRET
+EOF
+    # A node whose control store is a MinIO bucket does not start.
+    minio s3api create-bucket --bucket minio-control >/dev/null
+    mkdir -p "$E2E_DIR/minio-control"
+    cat >"$E2E_DIR/minio-control/skys3.toml" <<EOF
+[cluster]
+cluster_id = "minio-control"
+
+[node]
+node_id = "m1"
+data_dir = "$E2E_DIR/minio-control/data"
+
+[gateway]
+listen = "127.0.0.1:$((E2E_PORT + 85))"
+
+[control_store]
+backend = "s3"
+endpoint = "$MINIO_URL"
+bucket = "minio-control"
+profile = "minio-control"
+
+[storage]
+disk_min_free_bytes = 0
+
+[admin]
+listen = "127.0.0.1:$((E2E_PORT + 86))"
+EOF
+    if AWS_CONFIG_FILE=$E2E_DIR/aws/no-config AWS_SHARED_CREDENTIALS_FILE=$E2E_DIR/n1/aws-credentials \
+        AWS_EC2_METADATA_DISABLED=true timeout 120 "$E2E_BINARY" \
+        --config "$E2E_DIR/minio-control/skys3.toml" >"$E2E_DIR/logs/minio-control.log" 2>&1; then
+        fail "a node started over a MinIO control store"
+    fi
+    grep -q 'failed the startup probe' "$E2E_DIR/logs/minio-control.log" ||
+        fail "a node over a MinIO control store failed otherwise: $(tail -n 5 "$E2E_DIR/logs/minio-control.log")"
+    log "a node refuses a MinIO control store: $(grep -o 'control-store probe failed.*' "$E2E_DIR/logs/minio-control.log")"
+
+    # The cluster that serves the control bucket.
+    mkdir -p "$E2E_DIR/ctl"
+    printf '%s' "$ctl_secret" >"$E2E_DIR/ctl/secret"
+    echo "127.0.0.1:$((E2E_PORT + 81))" >"$E2E_DIR/ctl/admin"
+    cat >"$E2E_DIR/ctl/skys3.toml" <<EOF
+[cluster]
+cluster_id = "ctl"
+
+[node]
+node_id = "ctl1"
+data_dir = "$E2E_DIR/ctl/data"
+
+[gateway]
+listen = "127.0.0.1:$((E2E_PORT + 80))"
+
+[control_store]
+backend = "file"
+
+[storage]
+disk_min_free_bytes = 0
+
+[buckets.defaults]
+mode = "local"
+shards_per_bucket = 1
+replicas = 1
+min_write_replicas = 1
+
+[identity.static_credentials.control]
+access_key_id = "$ctl_key"
+secret_access_key_file = "$E2E_DIR/ctl/secret"
+policy = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}}'
+
+[admin]
+listen = "127.0.0.1:$((E2E_PORT + 81))"
+EOF
+    node_start ctl
+    create_bucket "$ctl_s3" "$ctl_key" "$ctl_secret" skys3-control
+    log "the control store is the bucket skys3-control of the cluster ctl"
+    # MinIO and ctl share 127.0.0.1, one failure scope, which a write_back
+    # bucket's target must not share with an S3 control store unless the
+    # configuration allows it.
+    control_store="backend = \"s3\"
+endpoint = \"$ctl_s3\"
+bucket = \"skys3-control\"
+profile = \"skys3-control\"
+allow_correlated_control_store = true"
+    ;;
+esac
+
 # --- The single-node cluster ------------------------------------------------
 
 export N1_S3=https://127.0.0.1:$E2E_PORT
 export N1_ADMIN=127.0.0.1:$((E2E_PORT + 1))
 export N1_KEY=AKIASKYS3E2EADMIN N1_SECRET=skys3-e2e-admin-secret-0123456789abc
-mkdir -p "$E2E_DIR/n1"
 printf '%s' "$N1_SECRET" >"$E2E_DIR/n1/secret"
 echo "$N1_ADMIN" >"$E2E_DIR/n1/admin"
 cat >"$E2E_DIR/n1/skys3.toml" <<EOF
@@ -182,7 +335,7 @@ tls_cert_file = "$pki/gateway.pem"
 tls_key_file = "$pki/gateway.key"
 
 [control_store]
-backend = "file"
+$control_store
 config_poll_interval_seconds = 1
 
 [storage]
@@ -227,13 +380,19 @@ minio_secret=$MINIO_SECRET
     echo "AWS_SECRET_ACCESS_KEY=$minio_secret"
     echo "AWS_EC2_METADATA_DISABLED=true"
     echo "AWS_CONFIG_FILE=$E2E_DIR/aws/no-config"
-    echo "AWS_SHARED_CREDENTIALS_FILE=$E2E_DIR/aws/no-credentials"
+    if [ "$E2E_CONTROL" = s3 ]; then
+        echo "AWS_SHARED_CREDENTIALS_FILE=$E2E_DIR/n1/aws-credentials"
+    else
+        echo "AWS_SHARED_CREDENTIALS_FILE=$E2E_DIR/aws/no-credentials"
+    fi
     [ -f "$pki/trust.pem" ] && echo "SSL_CERT_FILE=$pki/trust.pem"
 } >"$E2E_DIR/n1/env"
 
-# The identity registers: the first start creates the file control store,
-# and `skys3 control identity put` loads the issuer and the role into it
-# while the node is stopped (the file store is the node's alone).
+# The identity registers, loaded by `skys3 control identity put` with the
+# node's configuration and environment. The first start creates the
+# control store's registers. The file store is the node's alone, so the
+# command runs while the node is stopped; an etcd or S3 store takes it
+# while the node runs, and the node follows the generation it announces.
 cat >"$E2E_DIR/n1/identity.json" <<EOF
 {
   "providers": {
@@ -265,13 +424,34 @@ cat >"$E2E_DIR/n1/identity.json" <<EOF
   }
 }
 EOF
+identity_put() {
+    (
+        set -a
+        # shellcheck disable=SC1091 # written above
+        . "$E2E_DIR/n1/env"
+        set +a
+        exec "$E2E_BINARY" control identity put --config "$E2E_DIR/n1/skys3.toml" \
+            --file "$E2E_DIR/n1/identity.json"
+    ) | tee "$E2E_DIR/logs/identity-put.log"
+    grep -q '^created: identity/roles/e2e-writer.json$' "$E2E_DIR/logs/identity-put.log" ||
+        fail "control identity put did not create the role"
+}
+# at_generation <n>: whether n1's copy is at generation <n> or later.
+at_generation() {
+    admin "$N1_ADMIN" /v1/health | jq -e --argjson n "$1" '.control_store.generation >= $n'
+}
 node_start n1
-node_stop n1
-"$E2E_BINARY" control identity put --config "$E2E_DIR/n1/skys3.toml" \
-    --file "$E2E_DIR/n1/identity.json" | tee "$E2E_DIR/logs/identity-put.log"
-grep -q '^created: identity/roles/e2e-writer.json$' "$E2E_DIR/logs/identity-put.log" ||
-    fail "control identity put did not create the role"
-node_start n1
+if [ "$E2E_CONTROL" = file ]; then
+    node_stop n1
+    identity_put
+    node_start n1
+else
+    identity_put
+    generation=$(sed -n 's/^announced at generation \([0-9]*\);.*/\1/p' "$E2E_DIR/logs/identity-put.log")
+    [ -n "$generation" ] || fail "control identity put announced no generation"
+    eventually 30 "n1 follows generation $generation" at_generation "$generation"
+    log "n1 follows the identity registers at generation $generation"
+fi
 
 # --- Scenarios --------------------------------------------------------------
 #
