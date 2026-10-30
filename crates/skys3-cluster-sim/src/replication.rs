@@ -10,6 +10,12 @@
 //! node does: from the register through the node's faulty control store,
 //! or from the configuration of the latest `CONFIG` record while it cannot
 //! be read.
+//!
+//! The replicated shards, register following, and the handoffs a
+//! coordinator asks for are the production code of `skys3-cluster`
+//! (plan M8-05a); this module adds the seeded bugs, the audits, which
+//! the library's [`ReplicaObserver`] feeds, the stand-in for the shard
+//! registers ([`SimRegisters`]), and the driver of periodic handoffs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -17,8 +23,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, TypedKey};
-use skys3_coord::{Handoff, HandoffFuture, HandoffSink};
+use skys3_cluster::{
+    BoxFuture, Handoffs, Opening, ReplicaObserver, ReplicatedShards, ShardConfigs,
+};
+use skys3_control::{
+    ControlError, ProposalIds, RegisterKey, RegisterKind, RetryPolicy, S3ControlStore, TypedKey,
+};
+use skys3_coord::HandoffSink;
 use skys3_gateway::{
     ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError, ShardRef,
     ShardSummary, Shards, UploadParts,
@@ -28,7 +39,7 @@ use skys3_io::{Clock, MonoTime, MonotonicClock, SimMount};
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_log::{LogStats, RecordBody, SegmentLog};
 use skys3_net::{Listener, TurmoilNetwork};
-use skys3_shard::replication::{ControlRegisters, Replication, ReplicationConfig};
+use skys3_shard::replication::{ControlRegisters, HandedOff, Replication, ReplicationConfig};
 use skys3_shard::{Grace, Role, Shard};
 use skys3_sim::SimS3;
 use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, RegisterDocument, Seq, ShardConfig};
@@ -36,6 +47,9 @@ use skys3_types::{BucketDocument, Epoch, EpochSeq, NodeId, RegisterDocument, Seq
 use crate::holders::{HolderAudit, HolderCounts, HolderFaults, Holders, own_plan};
 use crate::learners::{Audited, LearnerAudit, LearnerDriver, LearnerPlan};
 use crate::node::{BoxError, NodeEnv, NodeServices, TRANSPORT_PORT};
+
+/// A node's replicated shards, as the library runs them.
+pub(crate) type Replicas = ReplicatedShards<TurmoilNetwork, SimMount>;
 
 /// Replicated node services: every node opens its replica of each shard
 /// whose register names it, as primary or member, and the gateway's
@@ -78,7 +92,7 @@ pub struct ReplicatedServices {
     /// Whether members take over from a silent primary (plan M2-12).
     takeover: bool,
     /// How often primaries hand a shard off, and until when (plan M2-13).
-    handoffs: Option<Handoffs>,
+    handoffs: Option<HandoffPlan>,
     /// A seeded bug: a primary that stepped down still answers reads.
     stepped_down_read: bool,
     /// When the test driver adds learners, if it does (plan M2-14).
@@ -93,7 +107,7 @@ pub struct ReplicatedServices {
 
 /// When primaries hand their shards off ([`ReplicatedServices::with_handoffs`]).
 #[derive(Clone, Copy, Debug)]
-struct Handoffs {
+struct HandoffPlan {
     every: Duration,
     until: Duration,
 }
@@ -111,6 +125,66 @@ pub(crate) fn register(store: &S3ControlStore<SimS3>, shard: &ShardRef) -> Optio
     let key = TypedKey::shard(&shard.bucket, shard.shard);
     let object = store.objects().object(&store.object_key(key.key()))?;
     ShardConfig::from_json(&object.body).ok()
+}
+
+/// The shard configurations the harness gives the library's replicated
+/// shards: the registers, read straight from the control bucket without a
+/// request or a fault, as a stand-in for the shard map (plan M2-08) and
+/// the local copies of control state (M2-16).
+pub(crate) struct SimRegisters {
+    /// The raw control store, if the cluster has one.
+    pub(crate) store: Option<S3ControlStore<SimS3>>,
+    /// The static placement the harness wrote, epoch 1 of every shard.
+    pub(crate) placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
+    /// Whether a shard whose register cannot be read has its placement's
+    /// configuration, as opening a shard takes it, or none, as following
+    /// the registers does.
+    pub(crate) placed: bool,
+}
+
+impl SimRegisters {
+    /// The configuration of `shard`, as [`SimRegisters::placed`] says.
+    pub(crate) fn current(&self, shard: &ShardRef) -> Option<ShardConfig> {
+        let held = self.store.as_ref().and_then(|store| register(store, shard));
+        if self.placed {
+            held.or_else(|| self.placement.get(shard).cloned())
+        } else {
+            held
+        }
+    }
+}
+
+impl ShardConfigs for SimRegisters {
+    /// The shards of the static placement, and those whose registers
+    /// exist, which includes the shards of buckets the gateways created
+    /// (plan M3-04), unknown to the static placement.
+    fn shards(&self) -> BoxFuture<'_, Result<BTreeSet<ShardRef>, ControlError>> {
+        let created: Vec<ShardRef> = self.store.as_ref().map_or_else(Vec::new, |store| {
+            let prefix = store.config().prefix.as_str();
+            store
+                .objects()
+                .keys()
+                .into_iter()
+                .filter_map(|key| {
+                    let key = RegisterKey::new(key.strip_prefix(prefix)?).ok()?;
+                    match key.kind() {
+                        RegisterKind::Shard(bucket, shard) => Some(ShardRef { bucket, shard }),
+                        _ => None,
+                    }
+                })
+                .collect()
+        });
+        let shards = self.placement.keys().cloned().chain(created).collect();
+        Box::pin(async move { Ok(shards) })
+    }
+
+    fn config<'a>(
+        &'a self,
+        shard: &'a ShardRef,
+    ) -> BoxFuture<'a, Result<Option<ShardConfig>, ControlError>> {
+        let config = self.current(shard);
+        Box::pin(async move { Ok(config) })
+    }
 }
 
 /// How long the seeded bug of
@@ -170,9 +244,9 @@ pub(crate) struct Audit {
     /// The control store without faults, for the checks of the replicas
     /// against their registers.
     registers: Option<S3ControlStore<SimS3>>,
-    /// Each node's replication in its current life, for the handoffs a
-    /// coordinator asks for (plan M3-06).
-    replications: BTreeMap<NodeId, Replication<TurmoilNetwork, SimMount>>,
+    /// What starts the handoffs a coordinator asks each node for, in the
+    /// node's current life (plan M3-06).
+    asked_handoffs: BTreeMap<NodeId, Handoffs<TurmoilNetwork, SimMount>>,
     /// The handoffs coordinators asked for and primaries began: the shard,
     /// the epoch the primary stepped down in, and when, in simulated time.
     asked: Vec<(ShardRef, Epoch, Duration)>,
@@ -328,7 +402,7 @@ impl ReplicatedServices {
     #[must_use]
     pub fn with_handoffs(self, every: Duration, until: Duration) -> Self {
         Self {
-            handoffs: Some(Handoffs { every, until }),
+            handoffs: Some(HandoffPlan { every, until }),
             ..self.with_takeover()
         }
     }
@@ -603,12 +677,8 @@ impl ReplicatedServices {
     /// replicas in its current life (plan M3-06).
     #[must_use]
     pub fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
-        let replication = self.audit().replications.get(node)?.clone();
-        Some(Arc::new(AskedHandoffs {
-            node: node.clone(),
-            replication,
-            audit: Arc::clone(&self.audit),
-        }))
+        let handoffs = self.audit().asked_handoffs.get(node)?.clone();
+        Some(Arc::new(handoffs))
     }
 
     /// Records, at `now` in simulated time, which epochs of which shards a
@@ -665,58 +735,124 @@ impl ReplicatedServices {
     }
 }
 
-/// Starts the handoffs a coordinator asks a node for (plan M3-06), as the
-/// node binary will: only on the node's serving primary of the shard, in
-/// the epoch the request names, to another member.
-struct AskedHandoffs {
+/// What one life of a node's replicated shards report, into the audit:
+/// the replicas they open and find, whose grace it follows, and the
+/// handoffs coordinators ask for (plan M3-06).
+struct Auditor {
     node: NodeId,
+    /// The node's clock in this life.
+    clock: Arc<MonotonicClock>,
     replication: Replication<TurmoilNetwork, SimMount>,
     audit: Arc<Mutex<Audit>>,
+    /// The shards whose grace this life follows.
+    followed: Mutex<BTreeSet<ShardRef>>,
 }
 
-impl HandoffSink for AskedHandoffs {
-    fn hand_off(&self, handoff: Handoff) -> HandoffFuture<'_> {
-        Box::pin(async move {
-            let shard = skys3_log::ShardRef::new(handoff.bucket.clone(), handoff.shard);
-            let replica = self
-                .replication
-                .set()
-                .get(&shard)
-                .await
-                .ok_or_else(|| format!("shard {shard} is not open here"))?;
-            let config = replica.config();
-            if config.epoch != handoff.epoch {
-                return Err(format!(
-                    "the replica is in epoch {}, not {}",
-                    config.epoch, handoff.epoch
-                ));
-            }
-            if config.primary != self.node || !replica.is_serving() || replica.is_stopped() {
-                return Err("the replica is not the shard's serving primary".to_owned());
-            }
-            if handoff.to == self.node || !config.is_member(&handoff.to) {
-                return Err(format!("{} is not another member", handoff.to));
-            }
-            let at = turmoil::sim_elapsed().unwrap_or_default();
-            {
-                let mut audit = lock(&self.audit);
-                audit.handoffs.begun += 1;
-                audit.asked.push((gateway_ref(&shard), config.epoch, at));
-            }
-            let (replication, audit, to) = (
-                self.replication.clone(),
-                Arc::clone(&self.audit),
-                handoff.to,
-            );
-            tokio::spawn(async move {
-                match replication.hand_off(&shard, &to).await {
-                    Ok(handed) if handed.sent => lock(&audit).handoffs.sent += 1,
-                    Ok(_) => {}
-                    Err(error) => tracing::info!(%shard, %error, "an asked handoff failed"),
+impl ReplicaObserver<SimMount> for Auditor {
+    /// Audits `replica`, which this node opened, unless it is audited
+    /// already, and follows its grace.
+    fn opened(&self, replica: &Shard<SimMount>) {
+        let shard = &gateway_ref(replica.shard());
+        if let Some(grace) = self.replication.grace(replica.shard()) {
+            self.follow_grace(shard, grace);
+        }
+        let mut audit = lock(&self.audit);
+        audit
+            .current
+            .insert((self.node.clone(), shard.clone()), replica.clone());
+        if !audit
+            .replicas
+            .iter()
+            .any(|(_, _, open)| open.durable().same_channel(&replica.durable()))
+        {
+            audit
+                .replicas
+                .push((self.node.clone(), replica.config(), replica.clone()));
+        }
+    }
+
+    /// Audits `replica`, this node's replica of its shard, unless it is
+    /// audited already: a learner that installed a snapshot opened it
+    /// again (§6.7). A learner's earlier replicas of the shard leave the
+    /// audit then, since the snapshot discarded what they held.
+    fn found(&self, replica: &Shard<SimMount>) {
+        let mut audit = lock(&self.audit);
+        let durable = replica.durable();
+        if audit
+            .replicas
+            .iter()
+            .any(|(_, _, open)| open.durable().same_channel(&durable))
+        {
+            return;
+        }
+        if replica.role() == Role::Learner {
+            audit
+                .replicas
+                .retain(|(node, _, old)| *node != self.node || old.shard() != replica.shard());
+        }
+        let key = (self.node.clone(), gateway_ref(replica.shard()));
+        audit.current.insert(key, replica.clone());
+        audit
+            .replicas
+            .push((self.node.clone(), replica.config(), replica.clone()));
+    }
+
+    fn handoff_began(&self, shard: &ShardRef, epoch: Epoch) {
+        let at = turmoil::sim_elapsed().unwrap_or_default();
+        let mut audit = lock(&self.audit);
+        audit.handoffs.begun += 1;
+        audit.asked.push((shard.clone(), epoch, at));
+    }
+
+    fn handoff_ended(
+        &self,
+        _shard: &ShardRef,
+        result: &Result<HandedOff, skys3_shard::ShardError>,
+    ) {
+        if matches!(result, Ok(handed) if handed.sent) {
+            lock(&self.audit).handoffs.sent += 1;
+        }
+    }
+}
+
+impl Auditor {
+    /// Follows the grace of this node's replica of `shard` into the audit:
+    /// in simulated time, when it passes as of each grant. Each life
+    /// follows a shard once.
+    fn follow_grace(&self, shard: &ShardRef, grace: Arc<Grace>) {
+        if !lock(&self.followed).insert(shard.clone()) {
+            return;
+        }
+        let (clock, audit) = (Arc::clone(&self.clock), Arc::clone(&self.audit));
+        let key = (self.node.clone(), shard.clone());
+        let mut granted = grace.subscribe();
+        let mut step_downs = grace.subscribe_step_downs();
+        let released = (Arc::clone(&audit), key.clone());
+        tokio::spawn(async move {
+            let (audit, key) = released;
+            loop {
+                let stepped = *step_downs.borrow_and_update();
+                if let Some(epoch) = stepped {
+                    let now = turmoil::sim_elapsed().unwrap_or_default();
+                    let mut audit = lock(&audit);
+                    audit.handoffs.received += 1;
+                    audit.step_downs.insert(key.clone(), (epoch, now));
                 }
-            });
-            Ok(())
-        })
+                if step_downs.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                granted.borrow_and_update();
+                let passes = simulated(&clock, grace.passes_at());
+                lock(&audit).graces.insert(key.clone(), passes);
+                if granted.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
     }
 }
 
@@ -773,7 +909,7 @@ impl Audit {
 }
 
 impl NodeServices for ReplicatedServices {
-    type Shards = ReplicatedShards;
+    type Shards = AuditedShards;
 
     fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
         ReplicatedServices::handoff_sink(self, node)
@@ -800,9 +936,9 @@ impl NodeServices for ReplicatedServices {
         ready
     }
 
-    async fn start(&self, env: NodeEnv) -> Result<ReplicatedShards, BoxError> {
+    async fn start(&self, env: NodeEnv) -> Result<AuditedShards, BoxError> {
         let (shards, listener) = self.start_replicas(&env).await?;
-        let serving = shards.replication.clone();
+        let serving = shards.replication().clone();
         tokio::spawn(async move { serving.serve(listener).await });
         Ok(shards)
     }
@@ -814,7 +950,7 @@ impl ReplicatedServices {
     pub(crate) async fn start_replicas(
         &self,
         env: &NodeEnv,
-    ) -> Result<(ReplicatedShards, Listener<TurmoilNetwork>), BoxError> {
+    ) -> Result<(AuditedShards, Listener<TurmoilNetwork>), BoxError> {
         let set = env.shards.set().clone();
         {
             let mut audit = self.audit();
@@ -850,12 +986,35 @@ impl ReplicatedServices {
             .transport
             .bind((std::net::Ipv4Addr::UNSPECIFIED, TRANSPORT_PORT).into())
             .await?;
+        let auditor = Auditor {
+            node: env.node.clone(),
+            clock: Arc::clone(&env.clock),
+            replication: replication.clone(),
+            audit: Arc::clone(&self.audit),
+            followed: Mutex::default(),
+        };
+        // Nodes read the registers straight from the control bucket, as a
+        // stand-in for the local copies, unless they open their replicas
+        // as a restarted node does.
+        let configs = Arc::new(SimRegisters {
+            store: store.as_ref().map(|store| store.inner().clone()),
+            placement: Arc::clone(&env.placement),
+            placed: true,
+        });
+        let opening = if self.local_copies {
+            Opening::Resume
+        } else {
+            Opening::Configs(Arc::clone(&configs) as Arc<dyn ShardConfigs>)
+        };
+        let replicas = Replicas::new(env.shards.clone(), replication.clone())
+            .with_opening(opening)
+            .with_observer(Arc::new(auditor));
         self.audit()
-            .replications
-            .insert(env.node.clone(), replication.clone());
+            .asked_handoffs
+            .insert(env.node.clone(), replicas.handoffs());
         if let Some(handoffs) = self.handoffs {
             let driver = HandoffDriver {
-                replication: replication.clone(),
+                replication,
                 node: env.node.clone(),
                 position: env.position,
                 handoffs,
@@ -863,20 +1022,14 @@ impl ReplicatedServices {
             };
             tokio::spawn(driver.run());
         }
-        let shards = ReplicatedShards {
-            local: env.shards.clone(),
-            replication,
-            registers: store.as_ref().map(|store| store.inner().clone()),
-            placement: Arc::clone(&env.placement),
-            node: env.node.clone(),
-            clock: Arc::clone(&env.clock),
+        let shards = AuditedShards {
+            replicas,
+            configs,
             alone: self.alone,
             resubmit: self.resubmit,
             members_read: self.members_read,
             stepped_down_read: self.stepped_down_read,
-            local_copies: self.local_copies,
             audit: Arc::clone(&self.audit),
-            followed: Arc::default(),
             holders: Holders::new(
                 self.holders,
                 env.seed ^ 0x484f_4c44,
@@ -886,13 +1039,7 @@ impl ReplicatedServices {
         if self.local_copies {
             // Every replica the node keeps a configuration of, with the
             // registers read concurrently, as a restarted node does.
-            for (shard, resumed) in shards.replication.resume_kept().await? {
-                match resumed {
-                    Ok(Some(replica)) => shards.audit_opened(&replica),
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(%shard, %error, "a replica did not resume"),
-                }
-            }
+            shards.replicas.resume_kept().await?;
         }
         if let (Some(plan), Some(store)) = (self.learners, store) {
             let mut nodes: Vec<NodeId> = env.peers.keys().cloned().collect();
@@ -918,7 +1065,7 @@ struct HandoffDriver {
     replication: Replication<TurmoilNetwork, SimMount>,
     node: NodeId,
     position: usize,
-    handoffs: Handoffs,
+    handoffs: HandoffPlan,
     audit: Arc<Mutex<Audit>>,
 }
 
@@ -964,129 +1111,73 @@ impl HandoffDriver {
     }
 }
 
-/// The gateway's shards on a replicated node: replicas open in their
-/// placement's configuration, and writes are checked against what the
-/// members hold when they are acknowledged.
+/// The gateway's shards on a replicated node: the library's
+/// [`ReplicatedShards`], with replicas open in their register's
+/// configuration (or their placement's), with the seeded bugs of the
+/// services, and with reads and acknowledged writes checked against the
+/// audit.
 #[derive(Clone)]
-pub struct ReplicatedShards {
-    local: LocalShards<SimMount>,
-    pub(crate) replication: Replication<TurmoilNetwork, SimMount>,
-    /// The control store without the node's faults, for reading registers.
-    registers: Option<S3ControlStore<SimS3>>,
-    /// The placement the harness wrote, epoch 1 of every shard.
-    pub(crate) placement: Arc<BTreeMap<ShardRef, ShardConfig>>,
-    pub(crate) node: NodeId,
-    /// The node's clock in this life.
-    clock: Arc<MonotonicClock>,
+pub struct AuditedShards {
+    pub(crate) replicas: Replicas,
+    /// The registers, read without the node's faults, and the placement.
+    pub(crate) configs: Arc<SimRegisters>,
     alone: bool,
     resubmit: bool,
     members_read: bool,
     stepped_down_read: bool,
-    local_copies: bool,
     pub(crate) audit: Arc<Mutex<Audit>>,
-    /// The shards whose grace this life follows.
-    followed: Arc<Mutex<BTreeSet<ShardRef>>>,
     /// The node's replicas as holders of read payload.
     holders: Holders,
 }
 
-impl fmt::Debug for ReplicatedShards {
+impl fmt::Debug for AuditedShards {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReplicatedShards")
-            .field("node", &self.node)
+        f.debug_struct("AuditedShards")
+            .field("node", self.node_id())
             .finish_non_exhaustive()
     }
 }
 
-impl ReplicatedShards {
+impl AuditedShards {
+    /// The node's replicas, as a single node serves them.
+    fn local(&self) -> &LocalShards<SimMount> {
+        self.replicas.local()
+    }
+
+    /// The node's replication.
+    pub(crate) fn replication(&self) -> &Replication<TurmoilNetwork, SimMount> {
+        self.replicas.replication()
+    }
+
+    /// The node.
+    pub(crate) fn node_id(&self) -> &NodeId {
+        self.replicas.node_id()
+    }
+
+    /// The placement the harness wrote, epoch 1 of every shard.
+    pub(crate) fn placement(&self) -> &Arc<BTreeMap<ShardRef, ShardConfig>> {
+        &self.configs.placement
+    }
+
     /// The shard's configuration now: its register's, or the placement's
     /// if the register cannot be read.
     pub(crate) fn current(&self, shard: &ShardRef) -> Option<ShardConfig> {
-        self.registers
-            .as_ref()
-            .and_then(|store| register(store, shard))
-            .or_else(|| self.placement.get(shard).cloned())
+        self.configs.current(shard)
     }
 
     /// Whether this node's replica of `shard` has led it as primary in
     /// this life or an earlier one.
     pub(crate) fn has_led(&self, shard: &ShardRef) -> bool {
+        let node = self.node_id();
         lock(&self.audit)
             .replicas
             .iter()
-            .any(|(node, config, replica)| {
-                *node == self.node
+            .any(|(of, config, replica)| {
+                of == node
                     && config.bucket_id == shard.bucket
                     && config.shard == shard.shard
                     && replica.leader().is_some()
             })
-    }
-
-    /// Opens this node's replica of `shard` in `config`, or brings the open
-    /// one up to it, and audits it.
-    pub(crate) async fn open_config(
-        &self,
-        shard: &ShardRef,
-        config: &ShardConfig,
-    ) -> Result<(), ShardError> {
-        let replica =
-            self.replication
-                .open(config)
-                .await
-                .map_err(|error| ShardError::Unavailable {
-                    shard: shard.clone(),
-                    reason: error.to_string(),
-                })?;
-        self.audit_opened(&replica);
-        Ok(())
-    }
-
-    /// Audits `replica`, which this node opened, unless it is audited
-    /// already, and follows its grace.
-    fn audit_opened(&self, replica: &Shard<SimMount>) {
-        let shard = &gateway_ref(replica.shard());
-        if let Some(grace) = self.replication.grace(replica.shard()) {
-            self.follow_grace(shard, grace);
-        }
-        let mut audit = lock(&self.audit);
-        audit
-            .current
-            .insert((self.node.clone(), shard.clone()), replica.clone());
-        if !audit
-            .replicas
-            .iter()
-            .any(|(_, _, open)| open.durable().same_channel(&replica.durable()))
-        {
-            audit
-                .replicas
-                .push((self.node.clone(), replica.config(), replica.clone()));
-        }
-    }
-
-    /// Audits `replica`, this node's replica of its shard, unless it is
-    /// audited already: a learner that installed a snapshot opened it
-    /// again (§6.7). A learner's earlier replicas of the shard leave the
-    /// audit then, since the snapshot discarded what they held.
-    pub(crate) fn track(&self, replica: &Shard<SimMount>) {
-        let mut audit = lock(&self.audit);
-        let durable = replica.durable();
-        if audit
-            .replicas
-            .iter()
-            .any(|(_, _, open)| open.durable().same_channel(&durable))
-        {
-            return;
-        }
-        if replica.role() == Role::Learner {
-            audit
-                .replicas
-                .retain(|(node, _, old)| *node != self.node || old.shard() != replica.shard());
-        }
-        let key = (self.node.clone(), gateway_ref(replica.shard()));
-        audit.current.insert(key, replica.clone());
-        audit
-            .replicas
-            .push((self.node.clone(), replica.config(), replica.clone()));
     }
 
     /// Records an acknowledgement of `position` that some member of the
@@ -1102,17 +1193,18 @@ impl ReplicatedShards {
             .insert(shard.clone(), (now, position.epoch));
         let key = (shard.clone(), position.epoch);
         match audit.committers.get(&key) {
-            Some(other) if *other != self.node => {
+            Some(other) if *other != *self.node_id() => {
                 let rival = format!(
                     "{} acknowledged the write at {position} of shard {shard}, but {other} \
                      acknowledged writes in epoch {} too",
-                    self.node, position.epoch
+                    self.node_id(),
+                    position.epoch
                 );
                 audit.rivals.push(rival);
             }
             Some(_) => {}
             None => {
-                audit.committers.insert(key, self.node.clone());
+                audit.committers.insert(key, self.node_id().clone());
             }
         }
         drop(audit);
@@ -1127,56 +1219,17 @@ impl ReplicatedShards {
                 let early = format!(
                     "{} acknowledged the write at {position} of shard {shard} while {member} \
                      held only seq {durable} durably",
-                    self.node
+                    self.node_id()
                 );
                 audit.early.push(early);
             }
         }
     }
 
-    /// Follows the grace of this node's replica of `shard` into the audit:
-    /// in simulated time, when it passes as of each grant. Each life
-    /// follows a shard once.
-    fn follow_grace(&self, shard: &ShardRef, grace: Arc<Grace>) {
-        if !lock(&self.followed).insert(shard.clone()) {
-            return;
-        }
-        let (clock, audit) = (Arc::clone(&self.clock), Arc::clone(&self.audit));
-        let key = (self.node.clone(), shard.clone());
-        let mut granted = grace.subscribe();
-        let mut step_downs = grace.subscribe_step_downs();
-        let released = (Arc::clone(&audit), key.clone());
-        tokio::spawn(async move {
-            let (audit, key) = released;
-            loop {
-                let stepped = *step_downs.borrow_and_update();
-                if let Some(epoch) = stepped {
-                    let now = turmoil::sim_elapsed().unwrap_or_default();
-                    let mut audit = lock(&audit);
-                    audit.handoffs.received += 1;
-                    audit.step_downs.insert(key.clone(), (epoch, now));
-                }
-                if step_downs.changed().await.is_err() {
-                    return;
-                }
-            }
-        });
-        tokio::spawn(async move {
-            loop {
-                granted.borrow_and_update();
-                let passes = simulated(&clock, grace.passes_at());
-                lock(&audit).graces.insert(key.clone(), passes);
-                if granted.changed().await.is_err() {
-                    return;
-                }
-            }
-        });
-    }
-
     /// Counts a read of `shard` that ended with `result`, and checks a
     /// served one against the grace of the shard's other members.
     async fn audit_read<T>(&self, shard: &ShardRef, result: &Result<T, ShardError>) {
-        let Some(replica) = self.replication.set().get(&shard.into()).await else {
+        let Some(replica) = self.replication().set().get(&shard.into()).await else {
             return;
         };
         let Some(leader) = replica.leader() else {
@@ -1198,13 +1251,13 @@ impl ReplicatedShards {
             .step_downs
             .iter()
             .filter(|((member, of), (stepped, at))| {
-                of == shard && *member != self.node && *stepped >= epoch && *at <= now
+                of == shard && *member != *self.node_id() && *stepped >= epoch && *at <= now
             })
             .map(|((member, _), (stepped, at))| {
                 format!(
                     "{} served a read of shard {shard} in epoch {epoch} at {now:?}, but its \
                      primary had stepped down to {member} in epoch {stepped} at {at:?}",
-                    self.node
+                    self.node_id()
                 )
             })
             .collect();
@@ -1219,7 +1272,7 @@ impl ReplicatedShards {
                 let stale = format!(
                     "{} served a read of shard {shard} at {now:?}, but the primary_grace of \
                      {member} had passed at {passed:?}",
-                    self.node
+                    self.node_id()
                 );
                 audit.stale.push(stale);
             }
@@ -1227,50 +1280,29 @@ impl ReplicatedShards {
     }
 }
 
-impl Shards for ReplicatedShards {
+impl Shards for AuditedShards {
     async fn open(&self, shard: &ShardRef, bucket: &BucketDocument) -> Result<(), ShardError> {
         if self.alone {
-            return self.local.open(shard, bucket).await;
+            return self.local().open(shard, bucket).await;
         }
-        if self.replication.set().get(&shard.into()).await.is_some() {
-            return Ok(());
-        }
-        if self.local_copies {
-            let resumed = self.replication.resume(&shard.into()).await;
-            let resumed = resumed.map_err(|error| ShardError::Unavailable {
-                shard: shard.clone(),
-                reason: error.to_string(),
-            })?;
-            if let Some(replica) = resumed {
-                self.audit_opened(&replica);
-            }
-            return Ok(());
-        }
-        let Some(config) = self
-            .current(shard)
-            .filter(|c| c.is_member(&self.node) || c.is_learner(&self.node))
-        else {
-            // Another node's shard, or one this node was removed from.
-            return Ok(());
-        };
-        self.open_config(shard, &config).await
+        self.replicas.open(shard, bucket).await
     }
 
     async fn seal(&self, shard: &ShardRef) -> Result<ShardSummary, ShardError> {
-        self.local.seal(shard).await
+        self.replicas.seal(shard).await
     }
 
     async fn unseal(&self, shard: &ShardRef) -> Result<(), ShardError> {
-        self.local.unseal(shard).await
+        self.replicas.unseal(shard).await
     }
 
     async fn remove(&self, shard: &ShardRef) -> Result<(), ShardError> {
-        self.local.remove(shard).await
+        self.replicas.remove(shard).await
     }
 
     async fn entry(&self, shard: &ShardRef, key: &str) -> Result<Option<Entry>, ShardError> {
         if self.members_read
-            && let Some(replica) = self.local.set().get(&shard.into()).await
+            && let Some(replica) = self.local().set().get(&shard.into()).await
             && replica.role() == Role::Member
         {
             // The seeded bug: read the member's index, which may lag its
@@ -1285,7 +1317,7 @@ impl Shards for ReplicatedShards {
             });
         }
         if self.stepped_down_read
-            && let Some(replica) = self.local.set().get(&shard.into()).await
+            && let Some(replica) = self.local().set().get(&shard.into()).await
             && replica.stepped_down().is_some()
         {
             // The seeded bug: a primary that stepped down reads its index.
@@ -1300,7 +1332,7 @@ impl Shards for ReplicatedShards {
             self.audit_read(shard, &read).await;
             return read;
         }
-        let entry = self.local.entry(shard, key).await;
+        let entry = self.replicas.entry(shard, key).await;
         self.audit_read(shard, &entry).await;
         entry
     }
@@ -1309,11 +1341,11 @@ impl Shards for ReplicatedShards {
         &self,
         shard: &ShardRef,
     ) -> Result<Option<(u64, ImportRanges)>, ShardError> {
-        self.local.import_progress(shard).await
+        self.replicas.import_progress(shard).await
     }
 
     async fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, ShardError> {
-        let page = self.local.list(shard, query).await;
+        let page = self.replicas.list(shard, query).await;
         self.audit_read(shard, &page).await;
         page
     }
@@ -1326,7 +1358,7 @@ impl Shards for ReplicatedShards {
         after: u16,
         limit: usize,
     ) -> Result<Option<UploadParts>, ShardError> {
-        self.local.upload(shard, key, upload, after, limit).await
+        self.replicas.upload(shard, key, upload, after, limit).await
     }
 
     async fn uploads(
@@ -1336,7 +1368,7 @@ impl Shards for ReplicatedShards {
         after: Option<(String, Option<EpochSeq>)>,
         limit: usize,
     ) -> Result<Vec<(String, EpochSeq, Upload)>, ShardError> {
-        self.local.uploads(shard, prefix, after, limit).await
+        self.replicas.uploads(shard, prefix, after, limit).await
     }
 
     async fn parts(
@@ -1346,30 +1378,30 @@ impl Shards for ReplicatedShards {
         after: u16,
         limit: usize,
     ) -> Result<Vec<(u16, Part)>, ShardError> {
-        self.local.parts(shard, upload, after, limit).await
+        self.replicas.parts(shard, upload, after, limit).await
     }
 
     async fn payload(&self, shard: &ShardRef, position: EpochSeq) -> Result<Bytes, ShardError> {
-        self.local.payload(shard, position).await
+        self.replicas.payload(shard, position).await
     }
 
     fn node(&self) -> Option<NodeId> {
-        Some(self.node.clone())
+        self.replicas.node()
     }
 
     async fn plan(&self, shard: &ShardRef, key: &str) -> Result<ReadPlan, ShardError> {
-        if let Some(replica) = self.local.set().get(&shard.into()).await
+        if let Some(replica) = self.local().set().get(&shard.into()).await
             && ((self.members_read && replica.role() == Role::Member)
                 || (self.stepped_down_read && replica.stepped_down().is_some()))
         {
             // The seeded bugs of `entry`, for the plans of GETs.
-            let plan = own_plan(&replica, shard, key, &self.node);
+            let plan = own_plan(&replica, shard, key, self.node_id());
             if replica.stepped_down().is_some() {
                 self.audit_read(shard, &plan).await;
             }
             return plan;
         }
-        let plan = self.local.plan(shard, key).await;
+        let plan = self.replicas.plan(shard, key).await;
         self.audit_read(shard, &plan).await;
         plan
     }
@@ -1383,7 +1415,7 @@ impl Shards for ReplicatedShards {
         layout: Vec<ExtentRef>,
     ) -> Result<Option<Registered>, ShardError> {
         self.holders
-            .register(&self.local, shard, holder, key, version, layout)
+            .register(self.local(), shard, holder, key, version, layout)
             .await
     }
 
@@ -1393,7 +1425,7 @@ impl Shards for ReplicatedShards {
         holder: &NodeId,
         read: ReadId,
     ) -> Result<bool, ShardError> {
-        self.local.renew(shard, holder, read).await
+        self.replicas.renew(shard, holder, read).await
     }
 
     async fn release(
@@ -1402,7 +1434,7 @@ impl Shards for ReplicatedShards {
         holder: &NodeId,
         read: ReadId,
     ) -> Result<(), ShardError> {
-        self.local.release(shard, holder, read).await
+        self.replicas.release(shard, holder, read).await
     }
 
     async fn fetch(
@@ -1413,7 +1445,7 @@ impl Shards for ReplicatedShards {
         position: EpochSeq,
     ) -> Result<Bytes, ShardError> {
         self.holders
-            .fetch(&self.local, shard, holder, read, position)
+            .fetch(self.local(), shard, holder, read, position)
             .await
     }
 
@@ -1422,7 +1454,7 @@ impl Shards for ReplicatedShards {
         shard: &ShardRef,
         extent: Extent,
     ) -> Result<ExtentRef, ShardError> {
-        let extent = self.local.append_extent(shard, extent).await?;
+        let extent = self.replicas.append_extent(shard, extent).await?;
         self.audit_acknowledged(shard, extent.position);
         Ok(extent)
     }
@@ -1432,7 +1464,7 @@ impl Shards for ReplicatedShards {
         shard: &ShardRef,
         body: skys3_gateway::StreamedBody,
     ) -> Result<(), ShardError> {
-        self.local.announce(shard, body).await
+        self.replicas.announce(shard, body).await
     }
 
     async fn flushed(
@@ -1442,7 +1474,7 @@ impl Shards for ReplicatedShards {
         version: EpochSeq,
         wait: Duration,
     ) -> Result<skys3_gateway::FlushState, ShardError> {
-        self.local.flushed(shard, key, version, wait).await
+        self.replicas.flushed(shard, key, version, wait).await
     }
 
     async fn write(
@@ -1453,14 +1485,14 @@ impl Shards for ReplicatedShards {
     ) -> Result<Result<EpochSeq, ConditionFailed>, ShardError> {
         let again = self.resubmit.then(|| (body.clone(), condition.clone()));
         let started = turmoil::sim_elapsed().unwrap_or_default();
-        let written = self.local.write(shard, body, condition).await;
+        let written = self.replicas.write(shard, body, condition).await;
         let took = turmoil::sim_elapsed()
             .unwrap_or_default()
             .saturating_sub(started);
         if let (Err(ShardError::NotAcknowledged { .. }), Some((body, condition))) =
             (&written, again)
         {
-            let (local, shard) = (self.local.clone(), shard.clone());
+            let (local, shard) = (self.local().clone(), shard.clone());
             tokio::spawn(async move {
                 tokio::time::sleep(RESUBMIT_DELAY).await;
                 let _ = local.write(&shard, body, condition).await;

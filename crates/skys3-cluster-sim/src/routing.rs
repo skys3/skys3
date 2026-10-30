@@ -14,11 +14,11 @@ use skys3_net::TurmoilNetwork;
 use skys3_types::{Epoch, NodeId, ShardConfig};
 
 use crate::node::{BoxError, ControlHandle, NodeEnv, NodeServices};
-use crate::replication::{ReplicatedServices, ReplicatedShards};
+use crate::replication::{AuditedShards, ReplicatedServices};
 
 /// The shards a routing node's gateway calls.
 pub type RoutingShards =
-    RoutedShards<ReplicatedShards, SimMount, TurmoilNetwork, NodeStore<ControlHandle>>;
+    RoutedShards<AuditedShards, SimMount, TurmoilNetwork, NodeStore<ControlHandle>>;
 
 /// Replicated node services whose gateways serve every key: each gateway
 /// sends a request to the primary its shard map names, in process or to
@@ -212,7 +212,7 @@ impl NodeServices for RoutedServices {
         for config in self.stale_maps(&env.placement) {
             map.learn(config).await;
         }
-        let replication = local.replication.clone();
+        let replication = local.replication().clone();
         let (audit, placement, registers) = (
             Arc::clone(&self.audit),
             Arc::clone(&env.placement),

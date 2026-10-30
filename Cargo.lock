@@ -2499,6 +2499,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "skys3-cluster"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rcgen",
+ "skys3-control",
+ "skys3-coord",
+ "skys3-gateway",
+ "skys3-index",
+ "skys3-io",
+ "skys3-log",
+ "skys3-net",
+ "skys3-shard",
+ "skys3-types",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "skys3-cluster-sim"
 version = "0.1.0"
 dependencies = [
@@ -2514,6 +2533,7 @@ dependencies = [
  "rcgen",
  "s3s",
  "skys3",
+ "skys3-cluster",
  "skys3-config",
  "skys3-control",
  "skys3-coord",
