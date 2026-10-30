@@ -40,13 +40,15 @@
 //!   upload was completed or aborted.
 //!
 //! The read-through fill and `ADOPT` scenario is in `fill_simulation`, the
-//! namespace import racing client writes in `import_simulation`, and
-//! streaming multipart flush in `stream_simulation`.
+//! namespace import racing client writes in `import_simulation`,
+//! streaming multipart flush in `stream_simulation`, and primary changes
+//! at each step of a streamed upload in `takeover_simulation`.
 
 mod fill_simulation;
 mod import_simulation;
 mod stream_simulation;
 mod support;
+mod takeover_simulation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -95,6 +97,11 @@ fn flushes_reach_the_remote_through_faults() {
 #[test]
 fn streamed_uploads_reach_the_remote_only_after_their_local_commit() {
     Runner::with_cost(8, 2).run(stream_simulation::scenario);
+}
+
+#[test]
+fn primary_changes_at_every_step_of_a_streamed_upload_leave_no_partial_object() {
+    Runner::with_cost(8, 4).run(takeover_simulation::scenario);
 }
 
 #[test]

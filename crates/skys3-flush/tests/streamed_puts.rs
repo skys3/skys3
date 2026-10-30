@@ -238,9 +238,12 @@ fn a_put_that_commits_after_a_restart_completes_the_resumed_upload() {
         .await;
 
         // A new flusher resumes the remote upload from the index, but does
-        // not know which extents its part came from: the completion sends
-        // every part again, to the same remote upload.
+        // not know which extents its part came from. It lists the remote
+        // upload, and the completion keeps the part whose ETag is the MD5 of
+        // the `PUT`'s first bytes: it sends only the other two parts, to the
+        // same remote upload.
         flusher.stop().await;
+        let before = store.stats().requests;
         let flusher = node.flusher(&target);
         wait_until("the resumed stream", async || flusher.status().streams == 1).await;
         let uploads = store.uploads();
@@ -249,6 +252,8 @@ fn a_put_that_commits_after_a_restart_completes_the_resumed_upload() {
         assert_streamed(&node, &store, "big", body, begun).await;
         wait_for_no_streams(&node, &flusher, &store).await;
         assert_eq!(uploads.len(), 1);
+        // `ListParts`, two `UploadPart`s, and the Complete.
+        assert_eq!(store.stats().requests - before, 4);
     });
 }
 

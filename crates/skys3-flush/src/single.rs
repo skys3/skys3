@@ -7,8 +7,12 @@
 //! part is shorter. A part the stream sent from exactly the extents the
 //! `PUT` names in its range is listed as the remote holds it. Every other
 //! part is sent now from the `PUT`'s extents, with the `Content-MD5` of its
-//! bytes. The completion carries the §7.2 precondition, conditioned like
-//! any flush on the `remote_etag` of the version the remote holds.
+//! bytes, unless the remote upload already holds a part of its number
+//! whose ETag is that MD5: a stream resumed after a restart or a primary
+//! change lists its remote upload first, and the old primary's parts are
+//! read and hashed locally rather than sent again (§7.3). The completion
+//! carries the §7.2 precondition, conditioned like any flush on the
+//! `remote_etag` of the version the remote holds.
 //!
 //! The remote ETag of the object is then a multipart ETag, which the
 //! `FLUSHED` records as the entry's `remote_etag`: later flushes of the key
@@ -24,8 +28,7 @@ use skys3_remote::{CompletedPart, ObjectStore};
 use skys3_types::{ETag, EpochSeq, WriteIdentity};
 
 use crate::attempt::{Attempt, Failure, Outcome};
-use crate::multipart::verdict_after;
-use crate::stream::{self, Claim, Verdict, part_range, span};
+use crate::stream::{self, Claim, Piece, Verdict, part_range, span};
 
 /// The most parts a remote multipart upload may have (S3's limit).
 const MAX_PARTS: u64 = 10_000;
@@ -51,13 +54,17 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         version: EpochSeq,
         object: &ObjectVersion,
         upload: EpochSeq,
-        claim: Claim,
+        mut claim: Claim,
         identity: &WriteIdentity,
         expected: Option<ETag>,
     ) -> Result<Outcome, Failure> {
         let streams = self.streams;
+        if let Err(failure) = self.reconcile(upload, &mut claim).await {
+            return self.claim_failed(version, upload, failure, identity).await;
+        }
         let (part_bytes, spans) = claim
             .body
+            .clone()
             .unwrap_or_else(|| (self.target.settings.part_bytes, BTreeMap::new()));
         let part_bytes = part_bytes.max(1);
         let count = object.size.div_ceil(part_bytes);
@@ -95,14 +102,19 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                     etag.clone()
                 }
                 None => {
+                    let part = Piece {
+                        number,
+                        range,
+                        span: &span,
+                    };
+                    let listed = claim.listed.as_ref().and_then(|listed| listed.get(&number));
                     let sent = stream::upload_span(
                         self.shard,
                         self.target,
                         self.key,
                         &claim.id,
-                        number,
-                        range,
-                        &span,
+                        part,
+                        listed,
                     )
                     .await;
                     match sent {
@@ -111,8 +123,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                             etag
                         }
                         Err(failure) => {
-                            streams.release(upload, verdict_after(&failure));
-                            return Err(failure);
+                            return self.claim_failed(version, upload, failure, identity).await;
                         }
                     }
                 }
