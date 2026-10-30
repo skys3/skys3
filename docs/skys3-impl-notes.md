@@ -8686,6 +8686,22 @@ of this file. A task with nothing unexpected keeps "None."
     3. Seeds 100 to 115 had one on all but 100 and 111.
   - A dedicated scenario would have cost a full run more; this one cost
     no more than before. The seeded bugs do not use this path.
+- **A COMMIT waited only for its own stream's frames (later CI).** The
+  duplicate-commit scenario failed at seed 3 on a later branch, about one
+  run in ten of the group: a `COMMIT` on a stream whose `RESUME` and
+  `DATA` covered the whole object was answered `incomplete`, though the
+  staging was live and pinned. The source had given up on stream 1 after
+  its answer timeout and sent the object again on stream 2 while stream
+  1's `DATA` was still being written. Trimming stages a frame only where
+  the staging has its bytes neither durable nor in flight, from any
+  stream, so stream 2's frames were trimmed to nothing; its `COMMIT`
+  waited for its own appends (none) and read the staging before stream
+  1's landed. A `COMMIT` now also waits, once pinned, until its staging
+  has no frame in flight from any stream (`Staging::settled`, woken by a
+  `Notify` on settle, discard, refusal and expiry); appends are detached
+  tasks that always settle or discard, so the wait ends. Design section
+  7.8's "One record" says so. `a_commit_waits_for_frames_another_stream_has_in_flight`
+  fails without the change; the group passed 30 runs in a row with it.
 - **Seeds and run times at 256 seeds.** Every new scenario uses
   `Runner::with_cost`. With `SKYS3_SIM_SEEDS=256`, one at `COST` runs
   seeds 0 to 7, and one at twice that runs seeds 0 to 3; the replay
