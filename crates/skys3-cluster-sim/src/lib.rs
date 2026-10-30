@@ -90,6 +90,7 @@
 mod backup;
 mod cluster;
 pub mod coding;
+mod conflicts;
 mod coordination;
 mod creation;
 mod faults;
@@ -110,6 +111,7 @@ pub use cluster::{
     Cluster, ClusterConfig, HotCaches, Invariant, ReadRegistration, Rebuild, Report, RunError,
     View, WriteTiming,
 };
+pub use conflicts::{ConflictAudit, Conflicts};
 pub use coordination::{
     Change, ChangeStage, CoordinatedServices, CoordinationConfig, CoordinatorLoss, Forgotten,
     LostCoordinator, PUSH_PORT, PushDelays, RegistryView,
@@ -125,6 +127,8 @@ pub use replication::{
 };
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
+/// The seeded bugs of conflict handling ([`Conflicts::bug`]).
+pub use skys3_flush::test_hooks::ConflictBug;
 /// The seeded bugs of index snapshots ([`Snapshots::bug`]).
 pub use skys3_flush::test_hooks::SnapshotBug;
 pub use snapshots::{SnapshotAudit, Snapshots};

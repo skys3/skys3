@@ -17,8 +17,15 @@
 //!   write identity of the version. After a failed precondition the
 //!   flusher HEADs the key: its own identity means an earlier attempt
 //!   succeeded, an earlier write of the shard is superseded, and anything
-//!   else is a conflict, held under the `hold` policy. Operations the
-//!   capability probe found unprotected are sent unconditionally.
+//!   else is a conflict. Operations the capability probe found
+//!   unprotected are sent unconditionally.
+//! - **Conflict policies** (§7.2). A conflict is held under `hold`, the
+//!   default, until an operator resolves it under a chosen policy
+//!   ([`FlushService::resolve`]); `overwrite` resolves it by sending the
+//!   local version unconditionally, and `discard_local`, which a
+//!   `write_back` bucket's own table must choose, by adopting the remote's
+//!   write with an `ADOPT` that drops the local version. Either way the key
+//!   returns to dirty, and its next flush carries out the resolution.
 //! - **Multipart objects** (§7.4) are sent as a remote multipart upload
 //!   with the client's part boundaries, so the remote ETag is the local
 //!   one. The remote `CreateMultipartUpload` carries the write identity of
@@ -92,6 +99,7 @@
 
 mod attempt;
 mod budget;
+mod conflict;
 mod fill;
 mod import;
 mod metrics;
@@ -105,6 +113,7 @@ mod target;
 
 pub use attempt::Conflict;
 pub use budget::{DirtyBudget, Exhausted, Usage, share};
+pub use conflict::Unresolved;
 pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
 pub use import::{
     DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject, RemoteReader,
@@ -118,6 +127,7 @@ pub use target::{FlushSettings, ImportDone, ImportProgress, Target};
 /// Failpoints and seeded bugs for tests (the `test-util` feature).
 #[cfg(feature = "test-util")]
 pub mod test_hooks {
+    pub use crate::conflict::{ConflictBug, seed_conflict_bug};
     pub use crate::snapshot::hooks::{SnapshotBug, seed_snapshot_bug};
     pub use crate::stream::test_hooks::*;
 }

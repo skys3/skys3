@@ -6,7 +6,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use skys3_config::{FlushConfig, PeeringConfig};
+use skys3_config::{ConflictPolicy, FlushConfig, PeeringConfig};
 use skys3_io::{SystemWallClock, WallClock};
 use skys3_log::ShardRef;
 use skys3_remote::UploadId;
@@ -144,6 +144,8 @@ pub struct Target<S> {
     pub(crate) import: Arc<dyn ImportProgress>,
     pub(crate) wall: Arc<dyn WallClock>,
     pub(crate) counters: Counters,
+    /// What a flush that finds an out-of-band write does (§7.2).
+    pub(crate) conflict_policy: ConflictPolicy,
     /// The in-flight budget, in KiB.
     inflight: Semaphore,
     inflight_kib: u32,
@@ -165,8 +167,8 @@ impl<S> Target<S> {
     /// A target: `store`, under the key prefix `prefix` (empty for a whole
     /// bucket), honoring the preconditions in `writes` (from the
     /// capability probe), written by `cluster`. Every key is taken as
-    /// imported, ages are measured on the system clock, and nothing is
-    /// counted until the `with_*` methods say otherwise.
+    /// imported, ages are measured on the system clock, conflicts are held,
+    /// and nothing is counted until the `with_*` methods say otherwise.
     pub fn new(
         store: Arc<S>,
         prefix: impl Into<String>,
@@ -186,6 +188,7 @@ impl<S> Target<S> {
             import: Arc::new(ImportDone),
             wall: Arc::new(SystemWallClock),
             counters: Counters::default(),
+            conflict_policy: ConflictPolicy::Hold,
             inflight: Semaphore::new(inflight_kib as usize),
             inflight_kib,
             orphans: Mutex::default(),
@@ -211,6 +214,23 @@ impl<S> Target<S> {
     pub fn with_counters(mut self, counters: Counters) -> Self {
         self.counters = counters;
         self
+    }
+
+    /// Sets what a flush that finds an out-of-band write does (§7.2):
+    /// `hold` the key, `overwrite` the remote's write, or `discard_local`,
+    /// adopting the remote's write in place of the local version. The
+    /// caller decides whether the bucket may discard
+    /// ([`FlushService`](crate::FlushService) allows it only for a
+    /// `write_back` bucket whose own table opted in).
+    #[must_use]
+    pub fn with_conflict_policy(mut self, policy: ConflictPolicy) -> Self {
+        self.conflict_policy = policy;
+        self
+    }
+
+    /// What a flush that finds an out-of-band write does.
+    pub fn conflict_policy(&self) -> ConflictPolicy {
+        self.conflict_policy
     }
 
     /// The preconditions the target honors.

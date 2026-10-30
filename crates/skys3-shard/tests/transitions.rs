@@ -434,25 +434,49 @@ fn adopt_is_rejected_once_the_entry_changed() {
         adopt("k", 1, 7),
         Rejection::NotClean(EntryState::Dirty),
     );
+    step(&index, 6, delete("k"));
     rejected(
         &index,
-        6,
+        7,
         adopt("k", 4, 7),
-        Rejection::NotClean(EntryState::Dirty),
-    );
-    step(&index, 7, delete("k"));
-    rejected(
-        &index,
-        8,
-        adopt("k", 7, 7),
         Rejection::NotClean(EntryState::Dirty),
     );
 
     for state in [EntryState::Flushing, EntryState::Conflict] {
         let (_, index) = new_index();
         step(&index, 1, put("k", 10, 1));
-        set_state(&index, at(2), "k", state);
-        rejected(&index, 3, adopt("k", 1, 7), Rejection::NotClean(state));
+        step(&index, 2, put("k", 10, 2));
+        set_state(&index, at(3), "k", state);
+        rejected(&index, 4, adopt("k", 1, 7), Rejection::NotClean(state));
+    }
+}
+
+/// The `discard_local` conflict policy drops the dirty version whose flush
+/// found an out-of-band write, an object or a tombstone, for the remote's
+/// (§7.2): the same `ADOPT`, naming the dirty version.
+#[test]
+fn adopt_discards_the_dirty_version_it_names() {
+    for (write, state) in [
+        (put("k", 20, 1), EntryState::Dirty),
+        (delete("k"), EntryState::Dirty),
+        (put("k", 20, 1), EntryState::Flushing),
+        (put("k", 20, 1), EntryState::Conflict),
+    ] {
+        let (_, index) = new_index();
+        step(&index, 1, write);
+        if state != EntryState::Dirty {
+            set_state(&index, at(2), "k", state);
+        }
+        assert_eq!(
+            step(&index, 3, adopt("k", 1, 77)),
+            Outcome::Applied(Effect::Adopted)
+        );
+        let entry = entry(&index, "k").unwrap();
+        assert_eq!(
+            (entry.version, entry.state, entry.remote_etag),
+            (at(3), EntryState::Evicted, Some(etag(77)))
+        );
+        assert_eq!(entry.object.unwrap().local_etag, etag(77));
     }
 }
 

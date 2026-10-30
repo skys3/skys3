@@ -648,6 +648,34 @@ impl Client {
         Ok(())
     }
 
+    /// Writes a new value to each of `keys`, as [`Routes::keys`] lists
+    /// them, once the faults have healed, retrying a key until a write of
+    /// it is acknowledged, and returns the value each key was acknowledged
+    /// with.
+    pub(crate) async fn write_each(
+        &mut self,
+        keys: &[(String, BucketDocument, String)],
+        attempts: usize,
+    ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        let mut acknowledged = BTreeMap::new();
+        for (n, (name, bucket, key)) in keys.iter().enumerate() {
+            for attempt in 0..attempts {
+                self.seen.remove(name);
+                self.put(bucket, key, n * attempts + attempt, Condition::None)
+                    .await?;
+                if let Some(value) = self.seen.get(name) {
+                    acknowledged.insert(name.clone(), value.clone());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if !acknowledged.contains_key(name) {
+                return Err(format!("no write of {name} was acknowledged").into());
+            }
+        }
+        Ok(acknowledged)
+    }
+
     /// Reads every key from its primary until each gives a definite
     /// answer, after the faults have healed: the reads that close the
     /// history.

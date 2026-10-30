@@ -33,6 +33,7 @@ use skys3_types::{
 };
 
 use crate::backup::{self, Backup};
+use crate::conflicts::{self, ConflictAudit, Conflicts, Final};
 use crate::creation;
 use crate::faults::{Endpoint, Fault, FaultPlan};
 use crate::lifecycle::{self, Lifecycle, LifecycleAudit, ShardLogs};
@@ -141,6 +142,12 @@ pub struct ClusterConfig {
     /// the lost-key reports built from them ([`Snapshots`]). `None` by
     /// default.
     pub snapshots: Option<Snapshots>,
+    /// The `write_back` buckets' conflict policy, an out-of-band writer at
+    /// the remote store, and the audit of the final remote state against
+    /// the policy ([`Conflicts`]). `None` by default; it does not combine
+    /// with [`ClusterConfig::snapshots`], which may name the `write_back`
+    /// buckets' tables too.
+    pub conflicts: Option<Conflicts>,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -214,6 +221,7 @@ impl Default for ClusterConfig {
             lifecycle: None,
             backup: Backup::Off,
             snapshots: None,
+            conflicts: None,
         }
     }
 }
@@ -313,6 +321,9 @@ pub struct Report {
     pub lifecycle: LifecycleAudit,
     /// What the restore drill found ([`ClusterConfig::snapshots`]).
     pub snapshots: SnapshotAudit,
+    /// What the audit of the conflict policy found
+    /// ([`ClusterConfig::conflicts`]).
+    pub conflicts: ConflictAudit,
 }
 
 /// An operator's rebuild of the control store from the nodes' exports
@@ -587,6 +598,11 @@ impl<S: NodeServices> Cluster<S> {
                 .snapshots
                 .map_or_else(Default::default, |s| s.bug),
         );
+        skys3_flush::test_hooks::seed_conflict_bug(
+            self.config
+                .conflicts
+                .map_or_else(Default::default, |c| c.bug),
+        );
         if let Some(planned) = self.cut {
             world.slots[planned.node]
                 .power
@@ -702,6 +718,23 @@ impl<S: NodeServices> Cluster<S> {
             let client = lifecycle::client(lifecycle.clone(), routes.clone(), workload.timeout);
             sim.client("lifecycle", client);
         }
+        let final_phase = conflicts::Shared::default();
+        if let Some(conflicts) = self.config.conflicts {
+            let writer = conflicts::writer(
+                conflicts::Writer {
+                    store: world.remote.clone(),
+                    routes: routes.clone(),
+                    history: history.clone(),
+                    workload: workload.clone(),
+                    flushers: Arc::clone(&world.shared.flushers),
+                    nodes: self.config.nodes,
+                },
+                conflicts.writes,
+                context.fork_seed(),
+                Arc::clone(&final_phase),
+            );
+            sim.client("out-of-band", writer);
+        }
         self.drive(&mut sim, &mut driver, &history, false)?;
         if let Some(drill) = &mut driver.drill {
             drill.finish(sim.since_epoch(), &history, &world.remote);
@@ -737,6 +770,23 @@ impl<S: NodeServices> Cluster<S> {
                 done.store(drained, Ordering::SeqCst);
                 Ok(())
             });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
+        // The final writes meet out-of-band writes, and the operator
+        // resolves what is held.
+        if let Some(conflicts) = self.config.conflicts {
+            let run = Final {
+                conflicts,
+                store: world.remote.clone(),
+                routes: routes.clone(),
+                history: history.clone(),
+                workload: workload.clone(),
+                flushers: Arc::clone(&world.shared.flushers),
+                cluster: world.shared.settings.cluster.clone(),
+                seed: context.fork_seed(),
+                phase: Arc::clone(&final_phase),
+            };
+            sim.client("conflicts", conflicts::finish(run));
             self.drive(&mut sim, &mut driver, &history, true)?;
         }
 
@@ -798,6 +848,20 @@ impl<S: NodeServices> Cluster<S> {
         } else {
             0
         };
+        let conflicts = match self.config.conflicts {
+            Some(conflicts) => conflicts::audit(
+                conflicts,
+                &final_phase,
+                &world.remote,
+                &world.shared.settings.cluster,
+                &routes,
+                workload.keys,
+                &survivors,
+                &operations,
+            )
+            .map_err(RunError::Check)?,
+            None => ConflictAudit::default(),
+        };
         let snapshots = match (&driver.drill, &self.config.snapshots) {
             (Some(drill), Some(_)) => snapshots::audit(
                 drill,
@@ -812,6 +876,7 @@ impl<S: NodeServices> Cluster<S> {
         };
         Ok(Report {
             snapshots,
+            conflicts,
             history: operations,
             faults: driver.faults,
             lives: world.slots.iter().map(|slot| slot.lives()).sum(),
@@ -1439,6 +1504,10 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         .snapshots
         .map(|snapshots| snapshots.tables(&local, &write_back, shape.backup))
         .unwrap_or_default();
+    let (conflict_policy, conflict_tables) = shape
+        .conflicts
+        .map(|conflicts| conflicts.configuration(write_back.iter().map(String::as_str)))
+        .unwrap_or_default();
     let parse = |gateway: bool| -> Result<skys3_config::Config, BoxError> {
         let backups = shape
             .backup
@@ -1446,8 +1515,8 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         Ok(format!(
             "[cluster]\ncluster_id = \"{cluster}\"\n\
              [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n\
-             [flush]\nack_policy = \"{ack_policy}\"\n\
-             {defaults}{snapshot_defaults}{backups}{snapshot_tables}"
+             [flush]\nack_policy = \"{ack_policy}\"\n{conflict_policy}\
+             {defaults}{snapshot_defaults}{backups}{snapshot_tables}{conflict_tables}"
         )
         .parse()?)
     };
