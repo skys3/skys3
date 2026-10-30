@@ -20,6 +20,8 @@
 //!   flush service, which the cluster simulation shares with the node.
 //! - [`sessions`]: STS session records in the internal system bucket.
 //! - [`admin`]: the admin API under `/v1/`: health and bucket status.
+//! - [`identity`]: the operator's writes of OIDC providers and roles into
+//!   the control store.
 //! - [`rebuild`]: the operator's rebuild of a lost control store from the
 //!   nodes' exports of their local copies.
 //! - [`tls`]: the gateway's TLS configuration.
@@ -28,6 +30,7 @@ pub mod admin;
 mod admission;
 pub mod control;
 pub mod datadir;
+pub mod identity;
 mod metrics;
 mod node;
 mod peering;
