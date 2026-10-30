@@ -910,11 +910,13 @@ async fn three_nodes_replicate_route_take_over_and_readmit() {
     assert_eq!(after["epoch"], 2, "{after}");
     assert_ne!(after["primary"], primary.as_str(), "{after}");
     assert_eq!(after["members"].as_array().unwrap().len(), 2, "{after}");
+    // Shard 0 took over, but the stopped node may have been primary of
+    // other shards too: a key there reads once its own shard took over.
     for (key, data) in &written {
-        assert!(
-            reads(&clients[alive], "replicated", key, data).await,
-            "{key}"
-        );
+        eventually(&format!("{key} reads after the takeover"), || {
+            reads(&clients[alive], "replicated", key, data)
+        })
+        .await;
     }
 
     // Restarted, the old primary keeps no replica of the shard, whose
