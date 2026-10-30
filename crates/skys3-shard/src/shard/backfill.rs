@@ -6,7 +6,10 @@
 //! - **The snapshot** is the shard's rows in the index, read in one read
 //!   transaction at the primary's applied position. A clean entry of a
 //!   `write_back` bucket goes as evicted: its payload is not copied, since
-//!   the remote holds it (§6.7).
+//!   the remote holds it (§6.7). A clean entry of a bucket whose payload
+//!   the node keeps ([`Shard::evicts_clean`]) goes as it is: a `local`
+//!   bucket's replicas are its durable home, also once its backup target
+//!   holds the entry (§8.9).
 //! - **Installing** discards what the learner held: a `TRUNCATE` at
 //!   `(epoch, 0)` invalidates every record of an older epoch, and the
 //!   index marks the shard as installing at `(epoch, Seq::MAX)`, after
@@ -16,9 +19,10 @@
 //!   applied position to the snapshot's, durably.
 //! - **Payload** is named by log position (§10.2). A learner finds the
 //!   positions that its entries need and that it does not locate: those
-//!   of every entry that is not clean (dirty, flushing, or in conflict,
-//!   which in a `local` bucket is every entry), and those of every open
-//!   multipart upload. It stores the records the primary sends for them
+//!   of every entry that is not clean (dirty, flushing, or in conflict),
+//!   of every clean entry of a bucket whose payload the node keeps (in a
+//!   `local` bucket, every entry), and those of every open multipart
+//!   upload. It stores the records the primary sends for them
 //!   in its own log, unapplied, as they are at or before its applied
 //!   position, and records their locations durably.
 
@@ -134,7 +138,10 @@ impl<D: Disk> Shard<D> {
     }
 
     /// The next chunk of the snapshot's rows in `table` after the key
-    /// `after`, as a learner gets them: clean entries evicted.
+    /// `after`, as a learner gets them: clean entries evicted, if this
+    /// node evicts the bucket's clean payload ([`Shard::evicts_clean`]).
+    /// A `local` bucket's clean entries, which a backup target made clean,
+    /// keep their payload (§8.9).
     pub(crate) async fn snapshot_rows(
         &self,
         reader: &Arc<IndexReader>,
@@ -142,9 +149,10 @@ impl<D: Disk> Shard<D> {
         after: Option<Vec<u8>>,
     ) -> Result<Vec<ShardRow>, ShardError> {
         let (reader, shard) = (Arc::clone(reader), self.shard().clone());
+        let evicts = self.evicts_clean();
         run(&self.inner.pool, self.shard(), move || {
             let mut rows = reader.shard_rows(table, &shard, after.as_deref(), CHUNK_BYTES)?;
-            if table == ShardTable::Namespace {
+            if table == ShardTable::Namespace && evicts {
                 let codec = |source| IndexError::Codec {
                     table: "namespace",
                     source,
@@ -217,12 +225,15 @@ impl<D: Disk> Shard<D> {
 
     /// Up to a page of the positions whose payload this replica's entries,
     /// from `cursor` on, need and it does not locate, and where the next
-    /// page starts, or `None` after the last.
+    /// page starts, or `None` after the last. Clean entries need none if
+    /// this node evicts the bucket's clean payload
+    /// ([`Shard::evicts_clean`]).
     pub(crate) async fn missing_payload(
         &self,
         cursor: FillCursor,
     ) -> Result<(Vec<EpochSeq>, Option<FillCursor>), ShardError> {
         let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        let evicts = self.evicts_clean();
         run(&self.inner.pool, self.shard(), move || {
             let reader = index.read()?;
             let mut needed = Vec::new();
@@ -235,7 +246,12 @@ impl<D: Disk> Shard<D> {
                         let Some(object) = &entry.object else {
                             continue;
                         };
-                        if matches!(entry.state, EntryState::Clean | EntryState::Evicted) {
+                        let evictable = match entry.state {
+                            EntryState::Evicted => true,
+                            EntryState::Clean => evicts,
+                            _ => false,
+                        };
+                        if evictable {
                             continue;
                         }
                         positions(&object.payload, &mut needed);

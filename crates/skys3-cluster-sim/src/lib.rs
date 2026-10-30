@@ -87,6 +87,7 @@
 //! });
 //! ```
 
+mod backup;
 mod cluster;
 pub mod coding;
 mod coordination;
@@ -103,6 +104,7 @@ mod s3;
 mod workload;
 mod write_through;
 
+pub use backup::Backup;
 pub use cluster::{
     Cluster, ClusterConfig, HotCaches, Invariant, ReadRegistration, Rebuild, Report, RunError,
     View, WriteTiming,

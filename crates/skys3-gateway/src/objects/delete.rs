@@ -1,10 +1,12 @@
 //! DeleteObject and DeleteObjects (design §4.2, §11).
 //!
 //! **DeleteObject** commits a tombstone, also for a key with no object,
-//! and answers `204` either way. In a `local` bucket, which is never
-//! flushed, a `FLUSHED` record follows that removes the tombstone (§4.2).
-//! In a `write_through` bucket the answer waits until the remote no longer
-//! holds the key (§7.5).
+//! and answers `204` either way. In a `local` bucket without a backup
+//! target, which is never flushed, a `FLUSHED` record follows that removes
+//! the tombstone (§4.2); with one, the tombstone stays until the flusher
+//! has deleted the key at the backup (§8.9). In a `write_through` bucket,
+//! and a `local` one with `backup_ack = "write_through"`, the answer waits
+//! until the remote no longer holds the key (§7.5).
 //!
 //! **DeleteObjects** deletes up to [`MAX_DELETE_KEYS`] keys of one bucket,
 //! each as DeleteObject would, and answers with what happened to each key:
@@ -69,10 +71,7 @@ impl<H: Shards> Objects<H> {
         }
         let condition = Precondition::of_write(input.if_match.as_ref(), None)?;
         let shard = ShardRef::for_key(bucket, &input.key);
-        let delete = Removal {
-            local: is_local(bucket),
-            wait: self.write_through.wait_of(bucket),
-        };
+        let delete = self.removal(bucket);
         delete
             .remove(&self.shards, shard, input.key, condition)
             .await?;
@@ -114,10 +113,7 @@ impl<H: Shards> Objects<H> {
             .get::<KeyDecisions>()
             .cloned()
             .unwrap_or_default();
-        let removal = Removal {
-            local: is_local(bucket),
-            wait: self.write_through.wait_of(bucket),
-        };
+        let removal = self.removal(bucket);
         let mut outcomes: Vec<Option<S3Result<()>>> = objects.iter().map(|_| None).collect();
         let mut pending = JoinSet::new();
         let mut work = objects.iter().enumerate();
@@ -181,8 +177,14 @@ impl<H: Shards> Objects<H> {
     }
 }
 
-fn is_local(bucket: &BucketDocument) -> bool {
-    bucket.mode == BucketMode::Local
+impl<H> Objects<H> {
+    /// How `bucket`'s deletes are answered.
+    fn removal(&self, bucket: &BucketDocument) -> Removal {
+        Removal {
+            unflushed: bucket.mode == BucketMode::Local && !self.write_through.backed_up(bucket),
+            wait: self.write_through.wait_of(bucket),
+        }
+    }
 }
 
 /// The precondition of one key of a DeleteObjects request.
@@ -214,8 +216,9 @@ fn key_condition(object: &ObjectIdentifier) -> S3Result<Precondition> {
 /// How a bucket's deletes are answered.
 #[derive(Debug, Clone, Copy)]
 struct Removal {
-    /// Whether the bucket is a `local` one, never flushed.
-    local: bool,
+    /// Whether the bucket is never flushed: a `local` one without a backup
+    /// target (§8.9).
+    unflushed: bool,
     /// How long a delete waits for the remote flush, in a `write_through`
     /// bucket (§7.5).
     wait: Option<Duration>,
@@ -226,10 +229,12 @@ impl Removal {
     /// answers once it is durable and applied, and in a `write_through`
     /// bucket once the remote no longer holds the key.
     ///
-    /// Nothing flushes a `local` bucket, so its tombstone would stay
-    /// forever. There a `FLUSHED` follows that removes it if no later write
-    /// of the key came first; it is not part of the answer, and if a crash
-    /// loses it, the tombstone only takes space.
+    /// Nothing flushes a `local` bucket without a backup target, so its
+    /// tombstone would stay forever. There a `FLUSHED` follows that removes
+    /// it if no later write of the key came first; it is not part of the
+    /// answer, and if a crash loses it, the tombstone only takes space. A
+    /// backup target's flusher removes the tombstone itself, once the key
+    /// is deleted there.
     async fn remove<H: Shards>(
         self,
         shards: &H,
@@ -245,7 +250,7 @@ impl Removal {
         if let Some(timeout) = self.wait {
             return reach_remote(shards, &shard, &key, position, timeout).await;
         }
-        if self.local {
+        if self.unflushed {
             remove_tombstone(shards, shard, key, position);
         }
         Ok(())
@@ -253,7 +258,8 @@ impl Removal {
 }
 
 /// Commits, in the background, the `FLUSHED` that removes the tombstone
-/// of `key` at `position` from a `local` bucket's shard.
+/// of `key` at `position` from the shard of a `local` bucket without a
+/// backup target.
 fn remove_tombstone<H: Shards>(shards: &H, shard: ShardRef, key: String, position: EpochSeq) {
     let shards = shards.clone();
     let flushed = RecordBody::Flushed(Flushed {

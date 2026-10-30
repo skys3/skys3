@@ -20,7 +20,7 @@ use std::time::Duration;
 use skys3_sim::SimS3;
 use skys3_sim::check::{Survivors, Violation, check_durable};
 use skys3_sim::history::{History, Operation};
-use skys3_types::BucketMode;
+use skys3_types::{BucketDocument, BucketMode};
 
 use crate::cluster::{remote_prefix, written};
 use crate::workload::{OnAck, Routes};
@@ -55,18 +55,26 @@ impl WriteThrough {
     }
 }
 
+/// The remote key prefix of `bucket` if it is a `write_back` bucket, whose
+/// writes the audit of write-through buckets checks.
+pub(crate) fn write_back_prefix(bucket: &BucketDocument) -> Option<String> {
+    (bucket.mode == BucketMode::WriteBack).then(|| remote_prefix(bucket).to_owned())
+}
+
 /// How long a write-through write waits for its flush in the simulation
 /// (`write_through_timeout_seconds`), well within a client's timeout.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Checks that the remote store holds every acknowledged write of the
-/// `write_back` buckets, or a write that may have come after it. Clones
-/// share what they found.
+/// buckets audited, or a write that may have come after it: the
+/// `write_back` buckets of write-through clusters, and the `local` ones
+/// with a backup target that acknowledges by it (§8.9). Clones share what
+/// they found.
 #[derive(Clone)]
 pub(crate) struct RemoteAudit {
     remote: SimS3,
-    /// The remote key of each key of a `write_back` bucket, by the name
-    /// the history gives it.
+    /// The remote key of each key audited, by the name the history gives
+    /// it.
     keys: Arc<BTreeMap<String, String>>,
     history: History,
     violation: Arc<Mutex<Option<Violation>>>,
@@ -74,17 +82,19 @@ pub(crate) struct RemoteAudit {
 }
 
 impl RemoteAudit {
-    /// An audit of the `keys` keys of each bucket in `routes` against
-    /// `remote`, over `history`.
-    pub(crate) fn new(remote: SimS3, routes: &Routes, keys: usize, history: History) -> Self {
+    /// An audit of the `keys` keys of each bucket in `routes` that
+    /// `prefix` gives a key prefix in `remote`, over `history`.
+    pub(crate) fn new(
+        remote: SimS3,
+        routes: &Routes,
+        keys: usize,
+        history: History,
+        prefix: impl Fn(&BucketDocument) -> Option<String>,
+    ) -> Self {
         let keys = routes
             .keys(keys)
             .into_iter()
-            .filter(|(_, bucket, _)| bucket.mode == BucketMode::WriteBack)
-            .map(|(name, bucket, key)| {
-                let remote_key = format!("{}{key}", remote_prefix(&bucket));
-                (name, remote_key)
-            })
+            .filter_map(|(name, bucket, key)| Some((name, format!("{}{key}", prefix(&bucket)?))))
             .collect();
         Self {
             remote,
@@ -136,7 +146,7 @@ impl RemoteAudit {
     }
 
     /// What the remote store holds of the key named `only`, or of every
-    /// key; a key of a `local` bucket has no survivor.
+    /// key audited.
     fn survivors(&self, only: Option<&str>) -> BTreeMap<String, Survivors> {
         self.keys
             .iter()

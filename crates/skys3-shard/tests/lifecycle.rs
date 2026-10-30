@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use proptest::prelude::*;
-use skys3_index::Index;
+use skys3_index::{EntryState, Index};
 use skys3_io::{BlockingPool, MonotonicClock, SimDisk, SimMount};
 use skys3_log::record::Put;
 use skys3_log::{LogConfig, RecordBody, SegmentLog};
 use skys3_obs::MetricsRegistry;
-use skys3_shard::lifecycle::{LifecycleMetrics, LifecycleReport, expire, run_pass};
+use skys3_shard::lifecycle::{LifecycleMetrics, LifecycleReport, Tombstones, expire, run_pass};
 use skys3_shard::{Shard, ShardError, ShardSet};
 use skys3_types::lifecycle::{
     DAY_MS, Expiration, LifecycleConfiguration, LifecycleRule, RuleFilter,
@@ -317,7 +317,9 @@ async fn check_pass(
         open_uploads.insert(position, (key, !aborted));
     }
 
-    let report = expire(&shard, &config, now_ms).await.unwrap();
+    let report = expire(&shard, &config, now_ms, Tombstones::Remove)
+        .await
+        .unwrap();
     assert_eq!(report, expected, "{config:#?}");
     for (key, version) in &kept {
         let entry = shard.entry(key).await.unwrap();
@@ -333,7 +335,9 @@ async fn check_pass(
         assert_eq!(found.is_some(), *open, "{key}");
     }
     // A second pass finds nothing more to do.
-    let again = expire(&shard, &config, now_ms).await.unwrap();
+    let again = expire(&shard, &config, now_ms, Tombstones::Remove)
+        .await
+        .unwrap();
     assert_eq!(again, LifecycleReport::default());
 }
 
@@ -370,7 +374,9 @@ fn every_page_of_a_large_shard_is_visited() {
         let config = LifecycleConfiguration {
             rules: vec![rule("old", "old/", Some(Expiration::Days(1)), Some(1))],
         };
-        let report = expire(&shard, &config, 10 * DAY_MS).await.unwrap();
+        let report = expire(&shard, &config, 10 * DAY_MS, Tombstones::Remove)
+            .await
+            .unwrap();
         assert_eq!((report.expired, report.aborted), (300, 300));
         let left = shard.entries(None, 1000).await.unwrap();
         assert_eq!(left.len(), 300);
@@ -400,7 +406,9 @@ fn an_expiration_leaves_a_version_written_after_the_scan() {
         let config = LifecycleConfiguration {
             rules: vec![rule("all", "", Some(Expiration::Days(1)), None)],
         };
-        let report = expire(&shard, &config, 10 * DAY_MS).await.unwrap();
+        let report = expire(&shard, &config, 10 * DAY_MS, Tombstones::Remove)
+            .await
+            .unwrap();
         let written = overwrite.await.unwrap().unwrap().position;
         assert_eq!(report.expired, 1);
         assert_eq!(shard.entry("a").await.unwrap().unwrap().version, written);
@@ -464,10 +472,10 @@ fn a_node_runs_passes_on_the_shards_it_leads() {
             bucket(BucketMode::Local, None),
             bucket(BucketMode::WriteBack, Some(config.clone())),
         ];
-        let report = run_pass(&set, &others, now, &metrics).await;
+        let report = run_pass(&set, &others, now, &metrics, |_| Tombstones::Remove).await;
         assert_eq!(report, LifecycleReport::default());
         let local = [bucket(BucketMode::Local, Some(config))];
-        let report = run_pass(&set, &local, now, &metrics).await;
+        let report = run_pass(&set, &local, now, &metrics, |_| Tombstones::Remove).await;
         assert_eq!(report.expired, 2);
         assert_eq!(report.failed, 0);
         let text = registry.encode().unwrap();
@@ -480,14 +488,46 @@ fn a_node_runs_passes_on_the_shards_it_leads() {
         // A sealed shard refuses the pass's deletes: the pass reports it.
         led.commit(object("z", 1, &none, 0)).await.unwrap();
         set.seal(&support::shard(0)).await.unwrap();
-        let report = run_pass(&set, &local, now, &metrics).await;
+        let report = run_pass(&set, &local, now, &metrics, |_| Tombstones::Remove).await;
         assert_eq!((report.expired, report.failed), (0, 1));
-        let (_, error) = expire(&led, &local[0].lifecycle.clone().unwrap(), now)
-            .await
-            .unwrap_err();
+        let (_, error) = expire(
+            &led,
+            &local[0].lifecycle.clone().unwrap(),
+            now,
+            Tombstones::Remove,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, ShardError::Sealed(_)), "{error:?}");
         set.unseal(&support::shard(0)).await.unwrap();
-        let report = run_pass(&set, &local, now, &metrics).await;
+        let report = run_pass(&set, &local, now, &metrics, |_| Tombstones::Remove).await;
         assert_eq!(report.expired, 1);
+    });
+}
+
+#[test]
+fn a_backed_up_bucket_keeps_its_tombstones_for_the_backup() {
+    runtime().block_on(async {
+        let (_disk, shard) = open(Duration::ZERO).await;
+        let none = BTreeMap::new();
+        let written = shard.commit(object("a", 4, &none, 0)).await.unwrap();
+        let config = LifecycleConfiguration {
+            rules: vec![rule("all", "", Some(Expiration::Days(1)), None)],
+        };
+        let report = expire(&shard, &config, 10 * DAY_MS, Tombstones::Keep)
+            .await
+            .unwrap();
+        assert_eq!(report.expired, 1);
+        // The tombstone waits for the backup's flusher, which deletes the
+        // key there and removes it (§8.9).
+        let tombstone = shard.entry("a").await.unwrap().unwrap();
+        assert!(tombstone.object.is_none());
+        assert!(tombstone.version > written.position);
+        assert_eq!(tombstone.state, EntryState::Dirty);
+        // A second pass leaves it.
+        let again = expire(&shard, &config, 10 * DAY_MS, Tombstones::Keep)
+            .await
+            .unwrap();
+        assert_eq!(again, LifecycleReport::default());
     });
 }

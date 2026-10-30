@@ -25,6 +25,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use skys3::control::{self, NodeStore};
 use skys3::storage;
+use skys3_config::BucketsConfig;
 use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
 use skys3_coord::HandoffSink;
@@ -46,9 +47,11 @@ use skys3_shard::{
 };
 use skys3_sim::{NodeClock, SimS3};
 use skys3_types::{
-    BucketDocument, ClusterId, EpochSeq, Generation, Label, NodeAddress, NodeId, ShardConfig,
+    BucketDocument, BucketMode, ClusterId, EpochSeq, Generation, Label, NodeAddress, NodeId,
+    ShardConfig,
 };
 
+use crate::backup::Flushers;
 use crate::cluster::HotCaches;
 use crate::faults::Fault;
 use crate::lifecycle::{self, Lifecycle};
@@ -173,6 +176,12 @@ pub(crate) struct NodeSettings {
     pub hot_cache: HotCaches,
     /// Lifecycle passes, if nodes run them (§8.7).
     pub lifecycle: Option<Lifecycle>,
+    /// Each bucket's settings as the flushers see them: the `local`
+    /// buckets' backup targets (§8.9).
+    pub buckets: BucketsConfig,
+    /// A seeded bug: the clean cache is told the `local` buckets'
+    /// `clean_copies` too, and evicts payload a backup made clean.
+    pub evict_local: bool,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -252,6 +261,8 @@ pub(crate) struct Shared<S> {
     pub compacted: Arc<AtomicU64>,
     /// The hot cache of every node's every life, by node.
     pub hot_caches: Mutex<Vec<(NodeId, HotCache)>>,
+    /// The flush service of every node's every life.
+    pub flushers: Arc<Flushers>,
 }
 
 impl<S> Shared<S> {
@@ -353,7 +364,16 @@ pub(crate) async fn run<S: NodeServices>(
         seed: seed.rotate_left(17),
     };
     let shards = shared.services.start(env).await?;
-    let flush = Arc::new(flush_service(settings, &shared.remote));
+    let flush = Arc::new(flush_service(
+        settings,
+        &shared.remote,
+        seed.rotate_left(29),
+    ));
+    shared
+        .flushers
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Arc::downgrade(&flush));
     let mut gateway_config = settings.gateway.clone();
     // A hot cache of the node's own, empty in each life, as the node
     // binary's is.
@@ -387,18 +407,20 @@ pub(crate) async fn run<S: NodeServices>(
     )
     .await?;
     open_shards(&shards, &gateway.buckets()).await?;
+    let evict_local = settings.evict_local;
     if let Some(cache) = cache {
-        install_clean_copies(&recovered.shards, &gateway.buckets());
+        install_clean_copies(&recovered.shards, &gateway.buckets(), evict_local);
         let set = recovered.shards.set().clone();
         tokio::spawn(async move { cache.run(set).await });
     }
     {
         let (gateway, local) = (gateway.clone(), recovered.shards.clone());
-        tokio::spawn(async move { follow_flushes(&flush, &gateway, &local).await });
+        tokio::spawn(async move { follow_flushes(&flush, &gateway, &local, evict_local).await });
     }
     if let Some(lifecycle) = settings.lifecycle.clone() {
         let (gateway, set) = (gateway.clone(), recovered.shards.set().clone());
-        tokio::spawn(async move { lifecycle::follow(&lifecycle, &gateway, &set).await });
+        let buckets = settings.gateway.buckets.clone();
+        tokio::spawn(async move { lifecycle::follow(&lifecycle, &gateway, &set, &buckets).await });
     }
 
     let checkpointer = Arc::clone(&recovered.checkpointer);
@@ -464,8 +486,14 @@ async fn open_shards<H: Shards>(shards: &H, buckets: &[BucketDocument]) -> Resul
 
 /// The node's flushers: every `write_back` bucket flushes to `remote`, the
 /// harness's one remote store, whatever its target names; bucket prefixes
-/// keep their keys apart.
-fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3, SimMount> {
+/// keep their keys apart. Their capability probes take nonces from `seed`,
+/// so that a seed replays the scratch keys they write, which a parallel
+/// import's split points see.
+fn flush_service(
+    settings: &NodeSettings,
+    remote: &SimS3,
+    seed: u64,
+) -> FlushService<SimS3, SimMount> {
     let remote = remote.clone();
     FlushService::new(
         settings.cluster.clone(),
@@ -474,30 +502,41 @@ fn flush_service(settings: &NodeSettings, remote: &SimS3) -> FlushService<SimS3,
         FlushMetrics::register(&MetricsRegistry::new()),
     )
     .with_wall_clock(Arc::new(SimWallClock))
+    .with_buckets(settings.buckets.clone())
+    .with_probe_nonces(seed)
 }
 
-/// Keeps a flusher on every `write_back` bucket shard open on the node, and
-/// gives the clean cache each bucket's `clean_copies`, as the node binary
-/// does (§7.1, §9.3).
+/// Keeps a flusher on every shard open on the node of a `write_back`
+/// bucket or a `local` one with a backup target, and gives the clean cache
+/// each bucket's `clean_copies`, as the node binary does (§7.1, §8.9,
+/// §9.3); with `evict_local`, a seeded bug, the `local` buckets' too.
 async fn follow_flushes(
     flush: &FlushService<SimS3, SimMount>,
     gateway: &Gateway<TrustAll>,
     shards: &LocalShards<SimMount>,
+    evict_local: bool,
 ) {
     loop {
         let buckets = gateway.buckets();
-        install_clean_copies(shards, &buckets);
+        install_clean_copies(shards, &buckets, evict_local);
         flush.reconcile(&buckets, shards.set()).await;
         tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
     }
 }
 
 /// Gives the clean cache each bucket's `clean_copies`, before it scans
-/// or a flush lands, as the node binary does (§9.3).
-fn install_clean_copies(shards: &LocalShards<SimMount>, buckets: &[BucketDocument]) {
+/// or a flush lands, as the node binary does (§9.3): every bucket but the
+/// `local` ones, which are never evicted (§8.9), unless `evict_local`
+/// seeds that bug.
+fn install_clean_copies(
+    shards: &LocalShards<SimMount>,
+    buckets: &[BucketDocument],
+    evict_local: bool,
+) {
     if let Some(cache) = shards.set().cache() {
         let copies = buckets
             .iter()
+            .filter(|b| b.mode != BucketMode::Local || evict_local)
             .map(|b| (b.bucket_id.clone(), b.clean_copies));
         cache.set_clean_copies(copies);
     }

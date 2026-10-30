@@ -145,7 +145,7 @@ async fn settle(service: &FlushService<SimS3, skys3_io::SimMount>, node: &Node) 
     let patience = Patience::new();
     loop {
         let status = service.status(&bucket().bucket_id).ok_or("no flusher")?;
-        let done = status.import.checkpoint == ImportCheckpoint::Done;
+        let done = status.import.as_ref().unwrap().checkpoint == ImportCheckpoint::Done;
         let unclean = node.unclean().await;
         if done && unclean.is_empty() {
             return Ok(());

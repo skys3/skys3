@@ -71,6 +71,10 @@ pub enum CacheRefusal {
     /// at its part boundaries.
     #[error("the payload does not hold the object's bytes")]
     Payload,
+    /// The node keeps every payload of the shard's bucket: the cache does
+    /// not evict it ([`CleanCache::evicts`]), as for a `local` bucket.
+    #[error("the bucket's payload is never evicted on this node")]
+    Kept,
 }
 
 /// Evicted → Clean: the bytes of the evicted version `version` of `key`

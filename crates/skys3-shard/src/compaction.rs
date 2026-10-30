@@ -16,7 +16,9 @@
 //!   [`IndexReader::holders`] finds what names it): copied, except clean
 //!   payload, which is evicted instead unless the clean cache ranks it
 //!   among its most recently used and is within its bounds
-//!   ([`CleanCache`]). Without a cache, clean payload is copied too.
+//!   ([`CleanCache`]). Clean payload of a bucket the cache does not evict
+//!   ([`CleanCache::evicts`]), such as a `local` bucket's, is copied, and
+//!   so is all of it without a cache.
 //! - each shard's latest `CONFIG` record (the configuration the index
 //!   keeps), so the log still holds the replica's membership (§6.2):
 //!   copied.
@@ -847,7 +849,12 @@ fn classify(
                         state: EntryState::Clean,
                         version,
                     }) => match &context.cache {
-                        Some((cache, hot)) if !cache.is_hot(*hot, shard, key, *version) => {
+                        // A bucket the cache does not evict, such as a
+                        // `local` one, keeps every payload (§8.9).
+                        Some((cache, hot))
+                            if cache.evicts(&shard.bucket)
+                                && !cache.is_hot(*hot, shard, key, *version) =>
+                        {
                             Fate::Evict { version: *version }
                         }
                         _ => Fate::Copy,

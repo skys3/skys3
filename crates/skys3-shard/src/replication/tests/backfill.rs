@@ -24,6 +24,7 @@ use super::learners::{Promotions, add_learner, current, nodes, two_members};
 use super::removal::{initial, put, register, until};
 use super::takeover::run;
 use super::{Link, Pki, WAIT, connect, durable_through, next, node, shard};
+use crate::cache::{CacheMetrics, CacheSettings, CleanCache};
 use crate::lineage::Lineage;
 use crate::replication::wire::{
     self, Append, Backfill, BackfillAck, Row, SnapshotRows, Sync, SyncAck,
@@ -36,10 +37,19 @@ use crate::shard::{Role, Shard};
 
 #[test]
 fn a_new_learner_gets_a_snapshot_and_then_its_payload() {
-    run(new_learner());
+    run(new_learner(true));
 }
 
-async fn new_learner() {
+/// A `local` bucket's nodes keep every payload, also of an entry a backup
+/// target made clean (§8.9): a learner gets that payload too.
+#[test]
+fn a_learner_of_a_bucket_whose_payload_is_kept_gets_its_clean_payload() {
+    run(new_learner(false));
+}
+
+/// A learner joins a shard of two members; with `evicts`, their caches
+/// evict the bucket's clean payload, as a `write_back` bucket's.
+async fn new_learner(evicts: bool) {
     let pki = Pki::new();
     let store = MemoryControlStore::new();
     let promotions = Promotions {
@@ -50,6 +60,13 @@ async fn new_learner() {
         epochs: Arc::default(),
     };
     let nodes = nodes(&pki, &store, &two_members(), promotions, None).await;
+    if evicts {
+        for replication in &nodes.replications {
+            let cache = CleanCache::new(CacheSettings::default(), CacheMetrics::default());
+            cache.set_clean_copies([(shard().bucket, 1)]);
+            replication.set().use_cache(&cache).await;
+        }
+    }
     nodes.replications[1].open(&two_members()).await.unwrap();
     let primary = nodes.replications[0].open(&two_members()).await.unwrap();
     until(|| primary.is_serving()).await;
@@ -110,14 +127,19 @@ async fn new_learner() {
         vec![9; 600]
     );
     assert_eq!(&learner.payload(part.position).await.unwrap()[..], b"parts");
-    // The clean entry's payload stays with the remote.
     let entry = |key: &str| {
         let read = learner.index().read().unwrap();
         read.entry(&shard(), key).unwrap().unwrap()
     };
-    assert_eq!(entry("c").state, EntryState::Evicted);
-    assert_eq!(entry("c").object.unwrap().payload, Payload::None);
-    assert!(learner.payload(clean).await.is_err());
+    if evicts {
+        // The clean entry's payload stays with the remote.
+        assert_eq!(entry("c").state, EntryState::Evicted);
+        assert_eq!(entry("c").object.unwrap().payload, Payload::None);
+        assert!(learner.payload(clean).await.is_err());
+    } else {
+        assert_eq!(entry("c").state, EntryState::Clean);
+        assert_eq!(learner.payload(clean).await.unwrap(), vec![7; 20]);
+    }
     assert_eq!(entry("a").state, EntryState::Dirty);
 }
 

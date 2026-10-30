@@ -537,6 +537,7 @@ fn eviction(context: &mut SimContext) -> Result<(), Box<dyn std::error::Error>> 
                 reserve_fraction: 0.0,
             };
             let cache = CleanCache::new(settings, CacheMetrics::default());
+            cache.set_clean_copies([(shard_ref(0).bucket, 1)]);
             let set = ShardSet::new(Arc::clone(&index), log.clone(), pool.clone());
             set.use_cache(&cache).await;
             let mut shards = Vec::new();
@@ -1044,7 +1045,9 @@ fn compaction(context: &mut SimContext) -> Result<(), Box<dyn std::error::Error>
                     max_bytes: rng.random_range(0..4000),
                     reserve_fraction: 0.0,
                 };
-                CleanCache::new(settings, CacheMetrics::default())
+                let cache = CleanCache::new(settings, CacheMetrics::default());
+                cache.set_clean_copies([(shard_ref(0).bucket, 1)]);
+                cache
             });
             if let Some(cache) = &cache {
                 set.use_cache(cache).await;

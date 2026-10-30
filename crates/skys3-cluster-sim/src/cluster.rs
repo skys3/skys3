@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ use skys3_types::{
     NodeId, RegisterDocument, RemoteTarget, ShardConfig, ShardCount,
 };
 
+use crate::backup::{self, Backup};
 use crate::creation;
 use crate::faults::{Endpoint, Fault, FaultPlan};
 use crate::lifecycle::{self, Lifecycle, LifecycleAudit, ShardLogs};
@@ -40,7 +41,7 @@ use crate::node::{
 use crate::pki::Pki;
 use crate::replication::register;
 use crate::workload::{Client, Routes, Timings, Workload, etag_of};
-use crate::write_through::{self, RemoteAudit, WriteThrough};
+use crate::write_through::{self, RemoteAudit, WriteThrough, write_back_prefix};
 
 /// The shape of a simulated cluster.
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +130,10 @@ pub struct ClusterConfig {
     /// was expired by exactly one committed `DELETE` ([`Lifecycle`]).
     /// `None` by default.
     pub lifecycle: Option<Lifecycle>,
+    /// Whether every `local` bucket has a backup target in the remote
+    /// store (§8.9), how its writes are acknowledged, and the audit that
+    /// the backup gets every committed change ([`Backup`]). Off by default.
+    pub backup: Backup,
 }
 
 /// The hot cache of every node (§9.2), new in each life.
@@ -200,6 +205,7 @@ impl Default for ClusterConfig {
             hot_cache: HotCaches::default(),
             write_through: WriteThrough::Off,
             lifecycle: None,
+            backup: Backup::Off,
         }
     }
 }
@@ -283,10 +289,17 @@ pub struct Report {
     /// `GET`s each node's gateway served from its hot cache, over every
     /// life; nodes that served none are left out.
     pub hot_cache_hits: BTreeMap<NodeId, u64>,
-    /// Acknowledged writes of `write_back` buckets checked against the
-    /// remote store alone when they were acknowledged
-    /// ([`ClusterConfig::write_through`]).
+    /// Acknowledged writes checked against the remote store alone when
+    /// they were acknowledged: of `write_back` buckets
+    /// ([`ClusterConfig::write_through`]), and of `local` buckets whose
+    /// backup acknowledges (`Backup::WriteThrough`).
     pub remote_checked: u64,
+    /// Keys of `local` buckets whose backup target holds an object at the
+    /// end ([`ClusterConfig::backup`]).
+    pub backed_up: usize,
+    /// Whether the backup flushers had nothing left to send before the
+    /// final audit ([`ClusterConfig::backup`]).
+    pub backups_drained: bool,
     /// What the audit of the final logs found of the lifecycle rules'
     /// expirations ([`ClusterConfig::lifecycle`]).
     pub lifecycle: LifecycleAudit,
@@ -403,6 +416,10 @@ const CUT_DOWNTIME: Duration = Duration::from_millis(300);
 const FENCE_DELAY: Duration = Duration::from_secs(1);
 /// Attempts of each final read.
 const FINAL_READ_ATTEMPTS: usize = 120;
+
+/// How long the driver waits, once every fault healed, for the backup
+/// flushers to send what they hold (§8.9).
+const BACKUP_DRAIN_LIMIT: Duration = Duration::from_secs(60);
 
 /// A change the driver makes when a fault heals.
 #[derive(Debug, Clone)]
@@ -553,6 +570,8 @@ impl<S: NodeServices> Cluster<S> {
         plan: &FaultPlan,
     ) -> Result<Report, RunError> {
         let world = World::build(context, &self.config, self.services.clone())?;
+        // Every node runs on this thread, and so does the seeded bug, if any.
+        skys3_flush::test_hooks::forget_deletes(self.config.backup.forgets_deletes());
         if let Some(planned) = self.cut {
             world.slots[planned.node]
                 .power
@@ -628,12 +647,18 @@ impl<S: NodeServices> Cluster<S> {
         if let Some(lifecycle) = &self.config.lifecycle {
             lifecycle.start(sim.elapsed());
         }
-        driver.audit = self.config.write_through.audited().then(|| {
+        let (write_through, backup) = (self.config.write_through, self.config.backup);
+        driver.audit = (write_through.audited() || backup.audited_at_ack()).then(|| {
             RemoteAudit::new(
                 world.remote.clone(),
                 &routes,
                 workload.keys,
                 history.clone(),
+                |bucket| match bucket.mode {
+                    BucketMode::WriteBack if write_through.audited() => write_back_prefix(bucket),
+                    BucketMode::Local if backup.audited_at_ack() => backup::backup_prefix(bucket),
+                    _ => None,
+                },
             )
         });
         let writes = Timings::default();
@@ -674,6 +699,19 @@ impl<S: NodeServices> Cluster<S> {
         );
         sim.client("verifier", reader.read_all(FINAL_READ_ATTEMPTS));
         self.drive(&mut sim, &mut driver, &history, true)?;
+        // Every committed change of a `local` bucket reaches its backup:
+        // wait until the flushers have sent everything.
+        let drained = Arc::new(AtomicBool::new(false));
+        if self.config.backup.enabled() {
+            let (flushers, routes) = (Arc::clone(&world.shared.flushers), routes.clone());
+            let done = Arc::clone(&drained);
+            sim.client("backup-drain", async move {
+                let drained = backup::drain(flushers, routes, BACKUP_DRAIN_LIMIT).await;
+                done.store(drained, Ordering::SeqCst);
+                Ok(())
+            });
+            self.drive(&mut sim, &mut driver, &history, true)?;
+        }
 
         let registers = routes
             .placement
@@ -719,6 +757,20 @@ impl<S: NodeServices> Cluster<S> {
                 check_durable(&operations, &one).map_err(RunError::Check)?;
             }
         }
+        // Once the flushers are idle, the backup holds what the members
+        // hold (§8.9).
+        let backed_up = if self.config.backup.enabled() {
+            backup::audit(
+                &world.remote,
+                &routes,
+                workload.keys,
+                &survivors,
+                &operations,
+            )
+            .map_err(RunError::Check)?
+        } else {
+            0
+        };
         Ok(Report {
             history: operations,
             faults: driver.faults,
@@ -740,6 +792,8 @@ impl<S: NodeServices> Cluster<S> {
             hot_cache_hits: world.shared.hot_cache_hits(),
             remote_checked: driver.audit.as_ref().map_or(0, RemoteAudit::checked),
             lifecycle,
+            backed_up,
+            backups_drained: drained.load(Ordering::SeqCst),
         })
     }
 
@@ -942,6 +996,7 @@ impl<S: NodeServices> World<S> {
                 remote: remote.clone(),
                 compacted: Arc::new(AtomicU64::new(0)),
                 hot_caches: Mutex::default(),
+                flushers: Arc::default(),
             }),
             routes: Routes {
                 buckets,
@@ -1092,6 +1147,7 @@ impl<S: NodeServices> World<S> {
                 .map_or_else(|| routes.placement[&shard].members.clone(), |c| c.members);
 
             let write_back = bucket.mode == BucketMode::WriteBack;
+            let caching = settings.clean_cache.is_some() || settings.compaction.is_some();
             let mut survivor = Survivors::default();
             for member in &members {
                 let (index, shards, segments) = &indexes[member];
@@ -1112,12 +1168,20 @@ impl<S: NodeServices> World<S> {
                 let clean = entry.as_ref().is_none_or(|entry| {
                     matches!(entry.state, EntryState::Clean | EntryState::Evicted)
                 });
-                // With a cache, a dirty copy must still hold its bytes.
-                let held = clean
-                    || (settings.clean_cache.is_none() && settings.compaction.is_none())
-                    || entry
+                // A `local` bucket's members are its durable home: an entry
+                // a backup made clean must hold its bytes like a dirty one
+                // (§8.9), and an evicted one holds nothing.
+                let evicted_here = !write_back
+                    && entry
                         .as_ref()
-                        .is_some_and(|entry| holds_bytes(&read, &shard, entry, segments));
+                        .is_some_and(|entry| entry.state == EntryState::Evicted);
+                // With a cache, a dirty copy must still hold its bytes.
+                let held = (write_back && clean)
+                    || (!evicted_here
+                        && (!caching
+                            || entry
+                                .as_ref()
+                                .is_none_or(|entry| holds_bytes(&read, &shard, entry, segments))));
                 survivor.copies.push(
                     entry
                         .filter(|_| held)
@@ -1323,13 +1387,24 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     } else {
         "local"
     };
-    let config: skys3_config::Config = format!(
-        "[cluster]\ncluster_id = \"{cluster}\"\n\
-         [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n\
-         [flush]\nack_policy = \"{ack_policy}\"\n{defaults}"
-    )
-    .parse()?;
-    let mut gateway = GatewayConfig::new(&config);
+    // The `local` buckets' backup targets, as the flushers see them and as
+    // the gateways do, which a seeded bug may make differ.
+    let local: Vec<String> = (0..shape.buckets.saturating_sub(shape.write_back_buckets))
+        .map(|b| format!("bucket-{b}"))
+        .collect();
+    let parse = |gateway: bool| -> Result<skys3_config::Config, BoxError> {
+        let backups = shape
+            .backup
+            .tables(local.iter().map(String::as_str), gateway);
+        Ok(format!(
+            "[cluster]\ncluster_id = \"{cluster}\"\n\
+             [control_store]\netcd_endpoints = [\"https://etcd.sim.internal:2379\"]\n\
+             [flush]\nack_policy = \"{ack_policy}\"\n{defaults}{backups}"
+        )
+        .parse()?)
+    };
+    let config = parse(false)?;
+    let mut gateway = GatewayConfig::new(&parse(true)?);
     if shape.create_buckets {
         gateway.placement = ShardPlacement::Cluster(shape.failure_domain);
     }
@@ -1383,6 +1458,8 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
         compaction: shape.compaction,
         hot_cache: shape.hot_cache,
         lifecycle: shape.lifecycle.clone(),
+        buckets: config.buckets().clone(),
+        evict_local: shape.backup.evicts_local(),
     })
 }
 
