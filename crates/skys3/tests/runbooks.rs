@@ -184,7 +184,12 @@ async fn drill_dirty_budget() {
     );
     let refusals = "skys3_admission_refusals_total{reason=\"bucket_budget\"}";
     assert_eq!(metric(&node, refusals).await, 1.0);
-    // Diagnosis: the bucket's flush status names why nothing drains.
+    // Diagnosis: the bucket's flush status names why nothing drains, once
+    // the probe of the unreachable target has failed.
+    until("the probe reports its error", async || {
+        admin_json(&node.admin, "/v1/buckets/archive").await["flush"]["probe_error"].is_string()
+    })
+    .await;
     let status = admin_json(&node.admin, "/v1/buckets/archive").await;
     let flush = &status["flush"];
     assert_eq!(flush["dirty_bytes"], 4096, "{status}");
