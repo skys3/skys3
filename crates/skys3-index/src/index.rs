@@ -40,8 +40,9 @@ use crate::tables::{
 /// coded layouts of entries (value format 4), each shard's index from node
 /// to fragments, and the attempt numbers a primary reserved (§8.4); an
 /// older build could not read a coded entry, and could reuse an attempt
-/// number.
-pub const FORMAT_VERSION: u64 = 9;
+/// number. Version 10 adds each shard's import progress (§9.1); an older
+/// build would apply a late `IMPORT` over a removed tombstone.
+pub const FORMAT_VERSION: u64 = 10;
 
 /// The oldest index format version this build opens.
 pub const MIN_FORMAT_VERSION: u64 = 1;
@@ -256,6 +257,7 @@ impl Index {
             txn.open_table(tables::TAKEOVERS)?;
             txn.open_table(tables::FRAGMENTS)?;
             txn.open_table(tables::ATTEMPTS)?;
+            txn.open_table(tables::IMPORT_PROGRESS)?;
             let format = meta.get(FORMAT_VERSION_KEY)?.map(|v| v.value());
             match format {
                 Some(FORMAT_VERSION) => {}
@@ -475,6 +477,7 @@ impl Index {
                 tables::ShardTable::RemoteUploads => tables::REMOTE_UPLOADS,
                 tables::ShardTable::RemoteParts => tables::REMOTE_PARTS,
                 tables::ShardTable::Fragments => tables::FRAGMENTS,
+                tables::ShardTable::ImportProgress => tables::IMPORT_PROGRESS,
             };
             let mut table = txn.open_table(definition)?;
             for (key, value) in rows {
@@ -558,8 +561,10 @@ impl Index {
         Ok(result)
     }
 
-    /// The import ranges of `bucket` and their checkpoints (§9.1), or
-    /// `None` if its import never started on this node.
+    /// The import ranges of `bucket` and their checkpoints (§9.1) as a
+    /// build that kept them in the node's index stored them, or `None`.
+    /// An import now keeps its progress in the log ([`IndexReader::import_progress`])
+    /// and resumes from this only when the log has none.
     ///
     /// # Errors
     ///
@@ -576,11 +581,8 @@ impl Index {
     }
 
     /// Stores the import ranges of `bucket` and their checkpoints, or
-    /// removes them, in one durable commit.
-    ///
-    /// A checkpoint does not come from the log, so replay cannot restore
-    /// it; it is made durable at once instead, once a page of `IMPORT`
-    /// records it covers is applied. Each store costs one sync.
+    /// removes them, in one durable commit, as builds did before the
+    /// import kept its progress in the log ([`Index::import_ranges`]).
     ///
     /// # Errors
     ///

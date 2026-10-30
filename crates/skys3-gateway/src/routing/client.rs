@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_control::{ControlStore, RetryPolicy, TypedKey, read_with_retries};
-use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
+use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_io::Disk;
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
@@ -508,6 +508,16 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
     async fn unseal(&self, shard: &ShardRef) -> Result<(), ShardError> {
         match self.call(shard, Request::Unseal).await? {
             Response::Unsealed => Ok(()),
+            _ => Err(mismatched(shard)),
+        }
+    }
+
+    async fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> Result<Option<(u64, ImportRanges)>, ShardError> {
+        match self.call(shard, Request::ImportProgress).await? {
+            Response::ImportProgress(progress) => Ok(progress),
             _ => Err(mismatched(shard)),
         }
     }

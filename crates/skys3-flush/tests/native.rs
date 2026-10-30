@@ -439,6 +439,30 @@ async fn a_delete_of_a_key_the_destination_never_had_settles() {
     assert_eq!(committed(&destination.seen()), [identity(seq)]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_write_of_the_shard_at_the_destination_is_never_replaced() {
+    let destination = Destination::start(true).await;
+    let target = destination.default_target(FRAME);
+    // A newer primary of the shard flushed its later write of the key.
+    let newer = Node::open(16).await;
+    newer.put("other", "x").await;
+    let later = newer.put("k", "later").await;
+    let flusher = newer.flusher(&target);
+    newer.settle(&flusher).await;
+    flusher.stop().await;
+    // An old primary, which never applied it, flushes its earlier version:
+    // it must leave the later write, and hold no conflict.
+    let old = Node::open(17).await;
+    let earlier = old.put("k", "earlier").await;
+    assert!(earlier < later);
+    let flusher = old.flusher(&target);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(flusher.status().conflicts.is_empty());
+    assert_eq!(destination.bytes("k").await.unwrap(), "later".as_bytes());
+    assert_eq!(old.entry("k").await.unwrap().state, EntryState::Dirty);
+    flusher.stop().await;
+}
+
 /// An imported key's entry knows the destination's ETag but not its
 /// identity: the identity the first failed precondition names is taken as
 /// the imported version's while the destination still holds its ETag, and

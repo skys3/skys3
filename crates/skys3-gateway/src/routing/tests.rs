@@ -996,6 +996,43 @@ fn announcements_round_trip_and_malformed_ones_are_refused() {
 }
 
 #[test]
+fn import_progress_round_trips_and_malformed_progress_is_refused() {
+    let shard = shard(0);
+    let frame = wire::request_frame(&shard, Epoch::new(1), &Request::ImportProgress).unwrap();
+    let (_, _, request) = wire::decode_request(&frame).unwrap();
+    assert_eq!(request, Request::ImportProgress);
+    let running = skys3_index::ImportCheckpoint::Running {
+        after: Some("m".into()),
+    };
+    for progress in [
+        None,
+        Some((3, running.into())),
+        Some((4, skys3_index::ImportCheckpoint::Done.into())),
+    ] {
+        let reply = Reply::Served {
+            response: Response::ImportProgress(progress),
+            epoch: Epoch::new(1),
+            hint: None,
+        };
+        let frame = wire::reply_frame(&reply, 3);
+        assert_eq!(wire::decode_reply(&frame, &shard), Ok(reply));
+    }
+    let answer = wire::Answer {
+        result: Some(wire::Result::ImportProgress(vec![0xff; 5])),
+    };
+    let reply = wire::ForwardReply {
+        outcome: wire::OUTCOME_SERVED,
+        epoch: 1,
+        ..wire::ForwardReply::default()
+    };
+    let frame = Frame::new(
+        Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+        Bytes::from(answer.encode_to_vec()),
+    );
+    assert!(wire::decode_reply(&frame, &shard).is_err());
+}
+
+#[test]
 fn flush_waits_round_trip_and_malformed_ones_are_refused() {
     let shard = shard(0);
     for state in [

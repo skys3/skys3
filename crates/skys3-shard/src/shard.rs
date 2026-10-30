@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
 use skys3_index::{
-    Entry, EntryState, Index, IndexError, IndexWriter, ListPage, ListQuery, Part, Payload,
-    RemoteParts, RemoteUpload, Upload,
+    Entry, EntryState, ImportRanges, Index, IndexError, IndexWriter, ListPage, ListQuery, Part,
+    Payload, RemoteParts, RemoteUpload, Upload,
 };
 use skys3_io::{BlockingPool, Disk};
 use skys3_log::record::truncated_by;
@@ -2494,6 +2494,22 @@ impl<D: Disk> Shard<D> {
         let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
             index.read()?.entries(&shard, start_after.as_deref(), limit)
+        })
+        .await
+    }
+
+    /// The latest import progress the shard applied (§9.1): the number of
+    /// its `IMPORT_PROGRESS` record and the import's ranges, or `None` if
+    /// it applied none. Every `IMPORT` of a key the ranges have passed was
+    /// applied before it.
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn import_progress(&self) -> Result<Option<(u64, ImportRanges)>, ShardError> {
+        let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
+        run(&self.inner.pool, self.shard(), move || {
+            index.read()?.import_progress(&shard)
         })
         .await
     }

@@ -16,7 +16,7 @@ use skys3_remote::ObjectStore;
 use skys3_types::{BucketDocument, BucketId, BucketMode, RemoteTarget};
 
 use crate::fill::Filler;
-use crate::import::{ImportState, RemoteReader};
+use crate::import::RemoteReader;
 use crate::metrics::Counters;
 use crate::target::FlushSettings;
 
@@ -79,13 +79,7 @@ impl<S: ObjectStore> Origin<S> {
             target: target.clone(),
             credentials: profile
                 .map_or_else(|| DEFAULT_CREDENTIALS.to_owned(), profile_credentials),
-            // Nothing is imported: the reader is never asked how far.
-            remote: RemoteReader::new(
-                Arc::clone(&store),
-                prefix.clone(),
-                Arc::new(ImportState::default()),
-                Arc::clone(wall),
-            ),
+            remote: RemoteReader::new(Arc::clone(&store), prefix.clone(), Arc::clone(wall)),
             filler: Filler::new(store, prefix, settings.clone(), counters, Arc::clone(wall)),
         }
     }

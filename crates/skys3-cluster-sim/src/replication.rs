@@ -23,7 +23,7 @@ use skys3_gateway::{
     ConditionFailed, LocalShards, Precondition, ReadId, ReadPlan, Registered, ShardError, ShardRef,
     ShardSummary, Shards, UploadParts,
 };
-use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
+use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_io::{Clock, MonoTime, MonotonicClock, SimMount};
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_log::{LogStats, RecordBody, SegmentLog};
@@ -1303,6 +1303,13 @@ impl Shards for ReplicatedShards {
         let entry = self.local.entry(shard, key).await;
         self.audit_read(shard, &entry).await;
         entry
+    }
+
+    async fn import_progress(
+        &self,
+        shard: &ShardRef,
+    ) -> Result<Option<(u64, ImportRanges)>, ShardError> {
+        self.local.import_progress(shard).await
     }
 
     async fn list(&self, shard: &ShardRef, query: &ListQuery) -> Result<ListPage, ShardError> {

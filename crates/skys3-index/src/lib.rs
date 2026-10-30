@@ -62,12 +62,12 @@ mod tables;
 
 pub use checkpointer::{Checkpointer, ReplayReport};
 pub use entry::{
-    Coded, ControlEntry, Entry, EntryState, ImportCheckpoint, ObjectPart, ObjectVersion, Part,
-    Payload, RemotePart, RemoteParts, RemoteUpload, Upload,
+    Coded, ControlEntry, Entry, EntryState, ObjectPart, ObjectVersion, Part, Payload, RemotePart,
+    RemoteParts, RemoteUpload, Upload,
 };
 pub use error::IndexError;
 pub use holders::{Holder, Holders};
-pub use import::{ImportRange, ImportRanges, MAX_IMPORT_RANGES};
+pub use import::{ImportCheckpoint, ImportRange, ImportRanges, MAX_IMPORT_RANGES};
 pub use index::{
     Applier, Checkpoint, FORMAT_VERSION, Index, IndexConfig, LogState, MIN_FORMAT_VERSION,
 };

@@ -66,6 +66,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             (Some(_), Some(identity)) => Precondition::Matches(identity),
         };
         for _ in 0..MAX_ROUNDS {
+            // Only a primary that holds its leases writes the destination
+            // (§6.5, §7.1).
+            self.shard.check_readable()?;
             let commit = Commit {
                 identity: identity.clone(),
                 bucket: native.bucket.clone(),
@@ -105,6 +108,11 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 // The version the flush conditioned on is gone, perhaps
                 // deleted by an earlier flush whose answer was lost.
                 None => Precondition::Absent,
+                // A later write of this shard, which a newer primary
+                // flushed: never replaced (§7.1).
+                Some(current) if self.wrote_after(&current, version) => {
+                    return Err(Failure::Later);
+                }
                 // An earlier write of this shard, which the version
                 // supersedes; or, before the import passed the key, a write
                 // the local version is newer than (§9.1).

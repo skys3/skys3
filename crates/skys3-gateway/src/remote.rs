@@ -4,7 +4,9 @@
 //! While a bucket's namespace import runs, the index does not yet hold the
 //! keys the import has not reached. A read that finds no entry for such a
 //! key falls through to a remote HEAD, and a listing merges the remote's
-//! listing of them with the index. An imported stub carries no metadata;
+//! listing of them with the index. Which keys those are is the key's
+//! shard's import progress, asked of its primary (`imports`): a key whose
+//! progress cannot be had is not read through. An imported stub carries no metadata;
 //! the first HEAD or GET of it loads its `Content-Type` and user metadata
 //! from the remote and commits them as an `ADOPT`. The node implements
 //! [`RemoteReads`] over its flush service; without one, none of this
@@ -21,7 +23,7 @@ use std::ops::Range;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use skys3_index::{ImportCheckpoint, ListItem, ObjectVersion};
+use skys3_index::{ListItem, ObjectVersion};
 use skys3_types::{BucketId, ETag};
 
 use crate::origin::{OriginHead, OriginScope};
@@ -76,18 +78,16 @@ pub struct RemotePage {
 /// boxed futures so that the gateway can hold any implementation behind one
 /// `Arc<dyn RemoteReads>`.
 pub trait RemoteReads: fmt::Debug + Send + Sync + 'static {
-    /// How far the namespace import of `bucket` has got without a gap, or
-    /// `None` if this node does not read the bucket's target.
-    fn import(&self, bucket: &BucketId) -> Option<ImportCheckpoint>;
-
-    /// Whether the namespace import of `bucket` has passed `key`, or this
-    /// node does not read the bucket's target. An import that lists key
-    /// ranges in parallel (§9.1) may pass a key before [`import`] says so;
-    /// by default, only [`import`] is asked.
+    /// Whether this node reads the target of `bucket`, a `write_back`
+    /// bucket. Whether a key falls through to it is the key's shard's to
+    /// say, by its import progress (§9.1, [`Shards::import_progress`]); a
+    /// bucket whose target is not read answers as its index does. By
+    /// default, every target is read.
     ///
-    /// [`import`]: RemoteReads::import
-    fn passed(&self, bucket: &BucketId, key: &str) -> bool {
-        self.import(bucket).is_none_or(|import| import.passed(key))
+    /// [`Shards::import_progress`]: crate::Shards::import_progress
+    fn reads(&self, bucket: &BucketId) -> bool {
+        let _ = bucket;
+        true
     }
 
     /// HEADs `key`: `None` if the remote has no object there.

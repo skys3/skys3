@@ -142,8 +142,8 @@ pub use concurrency::{
 pub use conflict::Unresolved;
 pub use fill::{FILL_CHUNK_BYTES, FillBody, FillError, Filler};
 pub use import::{
-    DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject, RemoteReader,
-    loaded_metadata,
+    Commit, DEFAULT_CONTENT_TYPE, IMPORT_PAGE_KEYS, ImportState, ImportStatus, RemoteObject,
+    RemoteReader, loaded_metadata,
 };
 pub use metrics::{Counters, FlushMetrics, Gauges};
 pub use origin::{DEFAULT_CREDENTIALS, Origin, OriginConnect, profile_credentials};
@@ -154,7 +154,7 @@ pub use peer::{
 };
 pub use service::{BucketStatus, Connect, FlushService, ProbeStatus};
 pub use shard::{ConflictStatus, Phase, ShardFlusher, ShardStatus};
-pub use target::{CopySources, FlushSettings, ImportDone, ImportProgress, Target};
+pub use target::{CopySources, FlushSettings, Target};
 
 /// Failpoints and seeded bugs for tests (the `test-util` feature).
 #[cfg(feature = "test-util")]

@@ -31,10 +31,10 @@ use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
 use skys3_coord::HandoffSink;
 use skys3_flush::snapshot::SnapshotService;
-use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
+use skys3_flush::{Commit, FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     FillBody, FillError, Fills, Gateway, GatewayConfig, HotCache, IdSource, LocalShards,
-    OriginValidations, ShardRef, Shards, TrustAll,
+    OriginValidations, Precondition, ShardRef, Shards, TrustAll,
 };
 use skys3_index::{Index, IndexConfig};
 use skys3_io::{
@@ -194,6 +194,13 @@ pub(crate) struct NodeSettings {
     /// The `read_only` buckets' origin, if the run has one (§9.5): the
     /// gateways then read origins as the node binary does.
     pub origin: Option<Origin>,
+    /// Whether the gateways read `write_back` targets for keys the import
+    /// has not passed (§9.1), as the node binary does. Off unless the
+    /// remote holds objects to import: a gateway that has not yet seen its
+    /// bucket's import progress, as after a restart, reads through, which
+    /// would serve the out-of-band writes some runs make at keys the index
+    /// has dropped.
+    pub remote_reads: bool,
     /// The SkyS3 peer the buckets flush to over the native protocol, if
     /// any.
     pub peer: Option<Peer>,
@@ -388,14 +395,17 @@ pub(crate) async fn run<S: NodeServices>(
         Some(side) => Some(NodePeering::bind(side, slot.position, seed.rotate_left(41)).await?),
         None => None,
     };
-    let flush = Arc::new(flush_service(
-        settings,
-        &remote,
-        seed.rotate_left(29),
-        peering
-            .as_ref()
-            .map(|peering| (peering, slot.position, slot.host.as_str())),
-    ));
+    let flush = Arc::new(
+        flush_service(
+            settings,
+            &remote,
+            seed.rotate_left(29),
+            peering
+                .as_ref()
+                .map(|peering| (peering, slot.position, slot.host.as_str())),
+        )
+        .with_commit(commit_through(&shards)),
+    );
     shared
         .flushers
         .lock()
@@ -410,8 +420,12 @@ pub(crate) async fn run<S: NodeServices>(
     }
     // What the gateway learns of origins, its own in each life.
     gateway_config.origin_validations = OriginValidations::new();
-    if let Some(origin) = &settings.origin {
+    // Reads of `write_back` targets for keys the import has not reached,
+    // and of origins (§9.1, §9.5).
+    if settings.remote_reads || settings.origin.is_some() {
         gateway_config.remote = Some(Arc::new(NodeRemote::new(Arc::clone(&flush))));
+    }
+    if let Some(origin) = &settings.origin {
         match origin.bug {
             Some(OriginBug::SkipRevalidation) => {
                 gateway_config.origin_validations.skip_revalidation()
@@ -574,6 +588,26 @@ fn flush_service(
         }
         _ => service,
     }
+}
+
+/// Commits the records of an import this node owns through `shards`, the
+/// shards the gateway calls, which reach each shard's primary wherever it
+/// is (§9.1).
+fn commit_through<H: Shards>(shards: &H) -> Commit {
+    let shards = shards.clone();
+    Arc::new(move |shard, body| {
+        let shards = shards.clone();
+        Box::pin(async move {
+            let shard = ShardRef {
+                bucket: shard.bucket,
+                shard: shard.shard,
+            };
+            match shards.write(&shard, body, Precondition::None).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            }
+        })
+    })
 }
 
 /// Keeps a flusher on every shard open on the node of a `write_back`

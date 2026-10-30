@@ -28,7 +28,7 @@ use crate::budget::DirtyBudget;
 use crate::concurrency::{ConcurrencyStatus, Stamping};
 use crate::conflict::{Unresolved, effective_policy, may_discard};
 use crate::fill::Filler;
-use crate::import::{self, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
+use crate::import::{self, Commit, ImportJob, ImportState, ImportStatus, RemoteReader, Stop};
 use crate::metrics::{Counters, FlushMetrics, Gauges};
 use crate::origin::{self, Origin, OriginConnect};
 use crate::peer::discovery::{Choice, Discovery, Probe};
@@ -133,11 +133,24 @@ impl BucketStatus {
 /// [`Filler`] reads evicted versions from the same target (§9.2); it needs
 /// no probe.
 ///
-/// Each bucket also runs its namespace import (§9.1) from the moment it is
-/// followed: on attach, or resumed from its checkpoint after a restart.
-/// Its flushers keep tombstones and resolve writes of unknown remote state
-/// by its progress, and [`FlushService::remote`] reads the remote for the
-/// keys it has not reached.
+/// **Primary-scoped work across failover** (§7.1, §9.1). A bucket's shard
+/// flushers run on the replicas that are their shard's primary, and
+/// nowhere else, and write the remote only while the replica serves and
+/// holds its leases, which each write checks. A replica becomes primary by
+/// a takeover, a handoff, or a restart, and stops being one when it is
+/// deposed; the next reconcile starts or stops the work. A new primary rebuilds
+/// everything from its index, which its log keeps: dirty entries,
+/// tombstones, remote uploads, and the remote ETags of `FLUSHED` records.
+/// A version flushed without its `FLUSHED` is found by its write identity,
+/// and a conflict is found again by flushing.
+///
+/// Each `write_back` bucket's namespace import (§9.1) runs on the node
+/// whose replica of the bucket's shard 0 serves as primary, its owner,
+/// from the moment it is followed: on attach, or resumed from the progress
+/// shard 0 holds. Its flushers keep tombstones and resolve writes of
+/// unknown remote state by the progress their own shard applied, and
+/// [`FlushService::remote`] reads the remote for the keys the import has
+/// not reached.
 ///
 /// **Backup targets** (§8.9). A `local` bucket whose settings
 /// ([`FlushService::with_buckets`]) name a `backup_target` is flushed to
@@ -224,6 +237,8 @@ pub struct FlushService<S, D> {
     probe_nonces: Option<Arc<AtomicU64>>,
     /// How `auto` and `native` targets reach SkyS3 peers, if they can.
     peers: Option<Arc<PeerTransport>>,
+    /// How imports commit records to shards whose primary is elsewhere.
+    commit: Option<Commit>,
     buckets: Mutex<BTreeMap<BucketId, BucketFlusher<S>>>,
     /// The copy sources of each remote bucket the buckets flush to.
     copy_sources: Mutex<BTreeMap<Location, CopySources>>,
@@ -302,11 +317,12 @@ struct SystemOfRecord<S> {
     /// What client reads of the remote use.
     remote: RemoteReader<S>,
     import: Arc<ImportState>,
-    /// Stops the import when raised or dropped.
-    stop_import: watch::Sender<bool>,
-    /// The import's task, until it is waited for or handed on.
-    import_task: Option<JoinHandle<()>>,
+    /// The import's task while it runs on this node, its owner, and what
+    /// stops it when raised or dropped.
+    import_task: Option<(watch::Sender<bool>, JoinHandle<()>)>,
     filler: Filler<S>,
+    store: Arc<S>,
+    prefix: String,
 }
 
 impl<S> Drop for BucketFlusher<S> {
@@ -314,8 +330,8 @@ impl<S> Drop for BucketFlusher<S> {
         self.probe_task.abort();
         // Not aborted: the import stops between steps, and its task ends
         // once no checkpoint write of it is pending (`import::Stop`).
-        if let Some(record) = &self.record {
-            record.stop_import.send_replace(true);
+        if let Some((stop, _)) = self.record.as_ref().and_then(|r| r.import_task.as_ref()) {
+            stop.send_replace(true);
         }
     }
 }
@@ -350,6 +366,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             bucket_settings: None,
             probe_nonces: None,
             peers: None,
+            commit: None,
             buckets: Mutex::default(),
             copy_sources: Mutex::default(),
             stopping: Mutex::default(),
@@ -392,6 +409,16 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
     #[must_use]
     pub fn with_peer_transport(mut self, peers: PeerTransport) -> Self {
         self.peers = Some(Arc::new(peers));
+        self
+    }
+
+    /// Commits the records of imports this node owns through `commit`,
+    /// which reaches each shard's primary wherever it is. Without it they
+    /// are committed to the node's own replicas, which serves a node that
+    /// is the primary of every shard.
+    #[must_use]
+    pub fn with_commit(mut self, commit: Commit) -> Self {
+        self.commit = Some(commit);
         self
     }
 
@@ -441,7 +468,10 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
 
     /// Starts and stops flushers so that every `write_back` bucket in
     /// `buckets`, and every `local` one with a backup target, with shards
-    /// open in `set` as their primary is flushed, and nothing else.
+    /// open in `set` as their primary is flushed, and nothing else, and
+    /// runs the import of each `write_back` bucket whose shard 0 is one of
+    /// them and serves. Shows each bucket's import progress as the newest
+    /// its replicas on the node applied.
     pub async fn reconcile(&self, buckets: &[BucketDocument], set: &ShardSet<D>) {
         self.follow_origins(buckets);
         self.follow_copy_sources(buckets);
@@ -451,26 +481,36 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 continue;
             };
             let mut shards = Vec::new();
+            let mut progress = None;
             for shard in bucket.shards.shards() {
                 let shard_ref = ShardRef::new(bucket.bucket_id.clone(), shard);
+                let Some(shard) = set.get(&shard_ref).await else {
+                    continue;
+                };
+                if role == Role::WriteBack
+                    && let Ok(Some((update, ranges))) = shard.import_progress().await
+                    && progress.as_ref().is_none_or(|(newest, _)| *newest < update)
+                {
+                    progress = Some((update, ranges));
+                }
                 // Only a shard's primary flushes it (§7.1): a member or a
                 // learner refuses the `FLUSHED` records its primary does
-                // not send.
-                if let Some(shard) = set.get(&shard_ref).await
-                    && !shard.is_stopped()
-                    && !shard.role().follows()
-                {
+                // not send. A primary that does not serve, not yet or no
+                // longer, keeps its flusher, which writes nothing: every
+                // remote write checks that the shard serves and holds its
+                // leases first.
+                if !shard.is_stopped() && !shard.role().follows() {
                     shards.push(shard);
                 }
             }
-            open.push((bucket, target, role, shards));
+            open.push((bucket, target, role, shards, progress));
         }
         // What waits for a backup is durable in the cluster: it counts
         // against no budget.
         self.budget.plan(
             open.iter()
-                .filter(|(_, _, role, _)| *role == Role::WriteBack)
-                .map(|(bucket, _, _, shards)| {
+                .filter(|(_, _, role, ..)| *role == Role::WriteBack)
+                .map(|(bucket, _, _, shards, _)| {
                     (*bucket, u32::try_from(shards.len()).unwrap_or(u32::MAX))
                 }),
         );
@@ -481,37 +521,106 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             let keep = wanted.contains(id);
             if !keep {
                 self.metrics.remove(&flusher.name);
-                if let Some(record) = &mut flusher.record {
-                    record.stop_import.send_replace(true);
-                    if let Some(task) = record.import_task.take() {
-                        let mut stopping = lock(&self.stopping);
-                        let tasks = stopping.entry(id.clone()).or_default();
-                        tasks.retain(|task| !task.is_finished());
-                        tasks.push(task);
-                    }
-                }
+                self.stop_import(id, flusher);
             }
             keep
         });
-        for (bucket, target, role, shards) in open {
+        for (bucket, target, role, shards, progress) in open {
             let flusher = flushers
                 .entry(bucket.bucket_id.clone())
-                .or_insert_with(|| self.start(bucket, &target, role, set));
+                .or_insert_with(|| self.start(bucket, &target, role));
             self.follow_transport(flusher);
+            if let Some(record) = &flusher.record {
+                if let Some((update, ranges)) = progress {
+                    record.import.observe(update, ranges);
+                }
+                // The import runs on the serving primary of shard 0 (§9.1).
+                let owner = shards
+                    .iter()
+                    .find(|shard| shard.shard().shard == ShardId::new(0) && shard.is_serving())
+                    .cloned();
+                match owner {
+                    Some(owner) => self.start_import(bucket, flusher, owner, set),
+                    None => self.stop_import(&bucket.bucket_id, flusher),
+                }
+            }
             let charged = role == Role::WriteBack;
             self.follow(&bucket.bucket_id, flusher, shards, charged);
         }
     }
 
+    /// Starts the bucket's import on this node, its owner, unless it runs
+    /// already, once any import of the bucket that was told to stop has
+    /// ended.
+    fn start_import(
+        &self,
+        bucket: &BucketDocument,
+        flusher: &mut BucketFlusher<S>,
+        owner: Shard<D>,
+        set: &ShardSet<D>,
+    ) {
+        let Some(record) = &mut flusher.record else {
+            return;
+        };
+        if record.import_task.is_some() {
+            return;
+        }
+        let streams =
+            self.bucket_settings
+                .as_ref()
+                .map_or(self.settings.import_streams, |buckets| {
+                    usize::try_from(buckets.get(&bucket.name).import_parallel_streams)
+                        .unwrap_or(usize::MAX)
+                });
+        let previous = lock(&self.stopping)
+            .remove(&bucket.bucket_id)
+            .unwrap_or_default();
+        let (stop_import, stop) = Stop::new();
+        let commit = self
+            .commit
+            .clone()
+            .unwrap_or_else(|| import::local_commit(set.clone()));
+        let task = tokio::spawn(import::run(ImportJob {
+            store: Arc::clone(&record.store),
+            prefix: record.prefix.clone(),
+            bucket: bucket.clone(),
+            set: set.clone(),
+            owner,
+            commit,
+            settings: self.settings.clone(),
+            streams,
+            wall: Arc::clone(&self.wall),
+            state: Arc::clone(&record.import),
+            stop,
+            previous,
+        }));
+        record.import_task = Some((stop_import, task));
+    }
+
+    /// Tells the bucket's import on this node, if it runs, to stop, and
+    /// keeps its task for the bucket's next import to wait for.
+    fn stop_import(&self, bucket: &BucketId, flusher: &mut BucketFlusher<S>) {
+        let Some(record) = &mut flusher.record else {
+            return;
+        };
+        if let Some((stop, task)) = record.import_task.take() {
+            stop.send_replace(true);
+            let mut stopping = lock(&self.stopping);
+            let tasks = stopping.entry(bucket.clone()).or_default();
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
+        }
+    }
+
     /// Starts a bucket's flushers, on the target its discovery chooses or
     /// with its target's probe, which makes the target ready once it
-    /// succeeds, and, for a `write_back` bucket, its namespace import.
+    /// succeeds, and, for a `write_back` bucket, what its import and reads
+    /// use.
     fn start(
         &self,
         bucket: &BucketDocument,
         target: &RemoteTarget,
         role: Role,
-        set: &ShardSet<D>,
     ) -> BucketFlusher<S> {
         let name = bucket.name.as_str().to_owned();
         let import = (role == Role::WriteBack).then(|| Arc::new(ImportState::default()));
@@ -537,7 +646,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             bucket: target.bucket.parse().ok(),
             apply_by: None,
         };
-        let record = import.map(|import| self.system_of_record(bucket, &parts, import, set));
+        let record = import.map(|import| system_of_record(&parts, import));
         let discovery = self.discovery(&name, target, transport, &parts);
         let plain = discovery.is_none();
         let mut flusher = BucketFlusher {
@@ -756,55 +865,6 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         self.peers
             .as_ref()
             .map_or(Duration::ZERO, |peers| peers.quarantine())
-    }
-
-    /// Starts the namespace import of `bucket`, a `write_back` bucket whose
-    /// target `parts` holds, and makes the reads of the target.
-    fn system_of_record(
-        &self,
-        bucket: &BucketDocument,
-        parts: &TargetParts<S>,
-        import: Arc<ImportState>,
-        set: &ShardSet<D>,
-    ) -> SystemOfRecord<S> {
-        let (store, prefix) = (Arc::clone(&parts.store), parts.prefix.clone());
-        let filler = Filler::new(
-            Arc::clone(&store),
-            prefix.clone(),
-            parts.settings.clone(),
-            parts.counters.clone(),
-            Arc::clone(&parts.wall),
-        );
-        let streams =
-            self.bucket_settings
-                .as_ref()
-                .map_or(self.settings.import_streams, |buckets| {
-                    usize::try_from(buckets.get(&bucket.name).import_parallel_streams)
-                        .unwrap_or(usize::MAX)
-                });
-        let previous = lock(&self.stopping)
-            .remove(&bucket.bucket_id)
-            .unwrap_or_default();
-        let (stop_import, stop) = Stop::new();
-        let import_task = tokio::spawn(import::run(ImportJob {
-            store: Arc::clone(&store),
-            prefix: prefix.clone(),
-            bucket: bucket.clone(),
-            set: set.clone(),
-            settings: self.settings.clone(),
-            streams,
-            wall: Arc::clone(&self.wall),
-            state: Arc::clone(&import),
-            stop,
-            previous,
-        }));
-        SystemOfRecord {
-            remote: RemoteReader::new(store, prefix, Arc::clone(&import), Arc::clone(&self.wall)),
-            import,
-            stop_import,
-            import_task: Some(import_task),
-            filler,
-        }
     }
 
     /// Lists, for each remote bucket the buckets in `buckets` flush to,
@@ -1045,11 +1105,9 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
         for (_, mut flusher) in flushers {
             // The import stops between steps; once its task ends, none of
             // its checkpoint writes is pending (`import::Stop`).
-            if let Some(record) = &mut flusher.record {
-                record.stop_import.send_replace(true);
-                if let Some(task) = record.import_task.take() {
-                    let _ = task.await;
-                }
+            if let Some((stop, task)) = flusher.record.as_mut().and_then(|r| r.import_task.take()) {
+                stop.send_replace(true);
+                let _ = task.await;
             }
             for (_, shard) in std::mem::take(&mut flusher.shards) {
                 shard.stop().await;
@@ -1131,7 +1189,7 @@ impl<S> TargetParts<S> {
             target = target.with_apply_by(window);
         }
         match self.import {
-            Some(import) => target.with_import(import),
+            Some(_) => target.with_import(),
             None => target,
         }
     }
@@ -1273,4 +1331,29 @@ async fn run_probe<S: ObjectStore>(
         }
     };
     tokio::join!(copies, abort_orphans(&target));
+}
+
+/// What a `write_back` bucket's target holds besides its flushers: reads
+/// of the target, fills, and the import's progress. The import itself
+/// runs only on the bucket's owner ([`FlushService::reconcile`]).
+fn system_of_record<S: ObjectStore>(
+    parts: &TargetParts<S>,
+    import: Arc<ImportState>,
+) -> SystemOfRecord<S> {
+    let (store, prefix) = (Arc::clone(&parts.store), parts.prefix.clone());
+    let filler = Filler::new(
+        Arc::clone(&store),
+        prefix.clone(),
+        parts.settings.clone(),
+        parts.counters.clone(),
+        Arc::clone(&parts.wall),
+    );
+    SystemOfRecord {
+        remote: RemoteReader::new(Arc::clone(&store), prefix.clone(), Arc::clone(&parts.wall)),
+        import,
+        import_task: None,
+        filler,
+        store,
+        prefix,
+    }
 }

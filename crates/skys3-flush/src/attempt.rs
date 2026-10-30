@@ -94,6 +94,8 @@ pub(crate) enum Found {
     Supersede(ETag),
     /// A write SkyS3 did not make.
     Foreign(ObjectInfo),
+    /// A later write of this shard (see [`Attempt::ours_after`]).
+    Later,
 }
 
 /// The request that writes an object version, sent once per round with the
@@ -133,7 +135,10 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
     pub(crate) async fn run(&self, pending: Option<&Remote>) -> Outcome {
         // Asked before the entry is read: once the import has passed the
         // key, the entry read next holds its `IMPORT` (§9.1).
-        let passed = self.target.import.passed(self.key);
+        let passed = match self.passed().await {
+            Ok(passed) => passed,
+            Err(error) => return Outcome::Retry(error.to_string()),
+        };
         let entry = match self.shard.entry(self.key).await {
             Ok(Some(entry)) => entry,
             Ok(None) => return Outcome::Settled,
@@ -182,6 +187,16 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         result.unwrap_or_else(|error| Outcome::Retry(error.to_string()))
     }
 
+    /// Whether the bucket's import has passed the key, by the progress
+    /// the key's shard applied (§9.1).
+    async fn passed(&self) -> Result<bool, skys3_shard::ShardError> {
+        if !self.target.import {
+            return Ok(true);
+        }
+        let progress = self.shard.import_progress().await?;
+        Ok(progress.is_some_and(|(_, ranges)| ranges.passed(self.key)))
+    }
+
     pub(crate) fn remote_key(&self) -> String {
         format!("{}{}", self.target.prefix, self.key)
     }
@@ -218,6 +233,8 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             Found::Foreign(info) => info,
             Found::Mine(info) => return Ok(Some(flushed(version, Some(info), true))),
             Found::Missing | Found::Supersede(_) => return Ok(None),
+            // A newer primary flushed a later write: never replaced.
+            Found::Later => return Err(Failure::Later),
         };
         let last_modified_ms = info.last_modified_ms.unwrap_or_else(|| {
             u64::try_from(self.target.wall.now().as_millis()).unwrap_or(u64::MAX)
@@ -270,6 +287,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 Found::Mine(info) => return Ok(flushed(version, Some(info), true)),
                 Found::Supersede(etag) => Some(etag),
                 Found::Foreign(info) => Some(info.etag),
+                Found::Later => return Err(Failure::Later),
             },
         };
         if let Payload::Parts { upload, parts } = &object.payload {
@@ -339,6 +357,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             Write::Complete(_) => ConditionalOperation::CompleteMultipartUpload,
         });
         for _ in 0..MAX_ROUNDS {
+            // Only a primary that holds its leases writes the remote: one a
+            // member has stopped granting to may have been replaced (§6.5).
+            self.shard.check_readable()?;
             let precondition = match (&expected, protected) {
                 (_, false) => WritePrecondition::None,
                 (Some(etag), true) => WritePrecondition::IfMatch(etag.clone()),
@@ -376,6 +397,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 // deleted by an earlier flush whose answer was lost: no
                 // remote write can be overwritten, so create the version.
                 Found::Missing => expected = None,
+                Found::Later => return Err(Failure::Later),
                 Found::Foreign(info) => {
                     tracing::debug!(key = self.key, %error, "a flush found a foreign object");
                     return Ok(Err(Outcome::Conflict(conflict(version, Some(info)))));
@@ -400,6 +422,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         }
         if self.resolution == Some(ConflictPolicy::Overwrite) {
             // The local delete wins over whatever the remote holds.
+            self.shard.check_readable()?;
             let request = DeleteObject::new(self.remote_key());
             self.target
                 .store
@@ -417,6 +440,7 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                     Err(outcome) => return Ok(outcome),
                 },
             };
+            self.shard.check_readable()?;
             let mut request = DeleteObject::new(self.remote_key());
             if self.protected(ConditionalOperation::DeleteObject) {
                 request = request.with_if_match(etag.clone());
@@ -445,6 +469,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             None => return Ok(Err(flushed(version, None, record))),
             Some(info) => info,
         };
+        if self.ours_after(&info, version) {
+            return Err(Failure::Later);
+        }
         // A foreign object at a key the import has not passed predates the
         // local delete, which replaces it; past the import it is a write
         // SkyS3 did not make.
@@ -473,6 +500,8 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             .is_some_and(|value| identity.matches(value))
         {
             Found::Mine(info)
+        } else if self.ours_after(&info, version) {
+            Found::Later
         } else if expected == Some(&info.etag) || self.ours_before(&info, version) {
             Found::Supersede(info.etag)
         } else {
@@ -492,11 +521,29 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
 
     /// Whether `wid` names a write of this shard from before `version`.
     pub(crate) fn wrote_before(&self, wid: &WriteIdentity, version: EpochSeq) -> bool {
+        self.of_shard(wid) && wid.position < version
+    }
+
+    /// Whether the remote object is a write of this shard from after
+    /// `version`. Every primary flushes only committed writes, which every
+    /// later primary holds, so the replica has not applied that write yet,
+    /// or is no longer the primary: the version must not replace it.
+    fn ours_after(&self, info: &ObjectInfo, version: EpochSeq) -> bool {
+        info.metadata
+            .write_identity()
+            .and_then(|value| value.parse::<WriteIdentity>().ok())
+            .is_some_and(|wid| self.wrote_after(&wid, version))
+    }
+
+    /// Whether `wid` names a write of this shard from after `version`.
+    pub(crate) fn wrote_after(&self, wid: &WriteIdentity, version: EpochSeq) -> bool {
+        self.of_shard(wid) && wid.position > version
+    }
+
+    /// Whether `wid` names a write of this shard.
+    fn of_shard(&self, wid: &WriteIdentity) -> bool {
         let shard = self.shard.shard();
-        wid.cluster == self.target.cluster
-            && wid.bucket == shard.bucket
-            && wid.shard == shard.shard
-            && wid.position < version
+        wid.cluster == self.target.cluster && wid.bucket == shard.bucket && wid.shard == shard.shard
     }
 
     pub(crate) async fn head(&self) -> Result<Option<ObjectInfo>, Failure> {
@@ -555,6 +602,8 @@ pub(crate) enum Failure {
     Local(String),
     /// Failed preconditions kept finding a newer remote object.
     Changing,
+    /// The remote holds a later write of the shard than the version.
+    Later,
     /// The link to a native target failed, or no answer came in time.
     Link(LinkError),
     /// A native target did not apply the write (§7.8).
@@ -574,6 +623,7 @@ impl fmt::Display for Failure {
             Failure::Remote(error) => write!(f, "the remote failed: {error}"),
             Failure::Local(reason) => f.write_str(reason),
             Failure::Changing => f.write_str("the remote object kept changing"),
+            Failure::Later => f.write_str("the remote holds a later write of the shard"),
             Failure::Link(error) => write!(f, "the link to the peer failed: {error}"),
             Failure::Peer(reason) => write!(f, "the peer did not apply the write: {reason}"),
         }

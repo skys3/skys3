@@ -42,7 +42,7 @@ pub mod wire;
 use std::time::Duration;
 
 use bytes::Bytes;
-use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
+use skys3_index::{Entry, ImportRanges, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
 use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, StreamedBody};
@@ -150,6 +150,8 @@ pub enum Request {
     Seal,
     /// [`Shards::unseal`](crate::Shards::unseal).
     Unseal,
+    /// [`Shards::import_progress`](crate::Shards::import_progress).
+    ImportProgress,
 }
 
 impl Request {
@@ -214,6 +216,9 @@ pub enum Response {
     Sealed(ShardSummary),
     /// [`Request::Unseal`] lifted a seal.
     Unsealed,
+    /// The progress number and ranges of [`Request::ImportProgress`], or
+    /// `None` if the shard applied none.
+    ImportProgress(Option<(u64, ImportRanges)>),
 }
 
 /// What a replica answers a forwarded request.

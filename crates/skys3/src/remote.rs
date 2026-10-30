@@ -11,7 +11,6 @@ use skys3_gateway::{
     OriginHead, OriginScope, RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage,
     RemoteReads,
 };
-use skys3_index::ImportCheckpoint;
 use skys3_io::Disk;
 use skys3_remote::ObjectStore;
 use skys3_types::{BucketId, ETag};
@@ -53,14 +52,13 @@ fn failed(error: impl fmt::Display) -> RemoteError {
 }
 
 impl<S: ObjectStore, D: Disk> RemoteReads for NodeRemote<S, D> {
-    fn import(&self, bucket: &BucketId) -> Option<ImportCheckpoint> {
-        self.0.remote(bucket).map(|reader| reader.import())
-    }
-
-    fn passed(&self, bucket: &BucketId, key: &str) -> bool {
-        self.0
-            .remote(bucket)
-            .is_none_or(|reader| reader.passed(key))
+    /// Whether the flush service follows the bucket's target. Whether a
+    /// key falls through to it is its shard's progress to say (§9.1), not
+    /// the progress the node's own replicas applied: a node that holds no
+    /// replica of the bucket, or has not reconciled since it started, has
+    /// seen none.
+    fn reads(&self, bucket: &BucketId) -> bool {
+        self.0.remote(bucket).is_some()
     }
 
     fn head<'a>(
