@@ -2491,6 +2491,20 @@ of this file. A task with nothing unexpected keeps "None."
   never answer. `free_ports` holds its listeners until all are chosen, so
   a gateway and an admin port never coincide. A test holds a configured
   port and checks the node moves.
+- **Test ports come from below the ephemeral range (later CI).** Two
+  in-process tests of later branches failed to bind a port `free_port`
+  had chosen: a node's transport on restart, and the first node of a
+  three-node cluster whose ports were all chosen up front. Port 0 hands
+  out ports from the kernel's ephemeral range, which is also where every
+  outgoing connection gets its local port, so an earlier node's
+  connection to the control store, or anything else a parallel test
+  dialled, could take the port before the node bound it. `free_ports` now
+  picks ports from 20000-31999, below Linux's (32768-60999) and macOS's
+  (49152-65535) default ranges, checking each with a bind, and walks the
+  range with a process-wide counter that starts at a place derived from
+  the process ID, so a port is handed out once per process and parallel
+  tests never choose the same one. `Process::start`'s retry stays for
+  whatever else may hold a port.
 
 ## M2 Replicated shards
 
@@ -5446,6 +5460,20 @@ of this file. A task with nothing unexpected keeps "None."
   - *Remaining skew.* A part acknowledged after the completion applied,
     but before the flusher read its change, still counts. The bound is
     the change's queueing delay in the flusher's loop.
+- **An open in flight counted as no stream (later CI).** On a later
+  branch of the stack the write-through simulation failed at seed 4,
+  about one run in five and only with other simulations in the same
+  process: a streamed body's remote upload was logged as opened but never
+  completed or aborted. A plain `PUT` had replaced the body while the
+  flusher was opening the remote upload, and the flusher would have
+  aborted it once `body_timeout` passed. But `ShardStatus::streams`
+  counted only streams whose remote upload was `Open`, not `Opening`, so
+  between the open's `PART_FLUSHED` and the flusher taking the open's
+  result the shard looked idle, and the simulation's drain audited the
+  remote then. `Streams::len` now counts every stream whose open has
+  started; the remote may hold an upload the open is about to record.
+  With it the failing pair passed 25 runs in a row, and
+  `an_upload_being_opened_is_counted` fails without it.
 - **Left open.**
   - Plan M4-04 adds the `ListParts` reconciliation. Until then, a part
     whose `PART_FLUSHED` was lost is sent again, which is correct but
