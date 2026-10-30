@@ -43,6 +43,7 @@ quinn = { version = "0.11.12", default-features = false, features = ["runtime-to
 rand = "0.9.5"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"] }
 redb = { version = "4.3.0", default-features = false, features = ["std"] }
+reed-solomon-simd = "3.1.0"
 rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
 rustls = { version = "0.23.45", default-features = false }
 rustls-native-certs = "0.8.4"
@@ -57,6 +58,7 @@ skys3 = { path = "crates/skys3" }
 skys3-config = { path = "crates/skys3-config" }
 skys3-control = { path = "crates/skys3-control" }
 skys3-coord = { path = "crates/skys3-coord" }
+skys3-ec = { path = "crates/skys3-ec" }
 skys3-flush = { path = "crates/skys3-flush" }
 skys3-gateway = { path = "crates/skys3-gateway" }
 skys3-index = { path = "crates/skys3-index" }
@@ -79,3 +81,9 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false }
 turmoil = "0.7.2"
 zeroize = "1.9.0"
+
+# Every erasure decode runs a transform over all of GF(2^16), whatever the
+# fragment size, which takes tens of milliseconds unoptimized. Tests decode
+# thousands of stripes (skys3-ec), so the codec is optimized in dev builds.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3
