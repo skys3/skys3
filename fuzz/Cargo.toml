@@ -86,6 +86,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ec_orphans"
+path = "fuzz_targets/ec_orphans.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "ec_transfer"
 path = "fuzz_targets/ec_transfer.rs"
 test = false

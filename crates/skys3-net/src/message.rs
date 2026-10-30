@@ -46,6 +46,13 @@ pub enum MessageKind {
     /// Fragment node to shard primary: the fragment's ID once it is
     /// durable, or why it is not.
     FragmentWritten = 8,
+    /// Fragment node to shard primary: which of its fragments, unreferenced
+    /// for `fragment_orphan_after_seconds`, are orphans it may reclaim
+    /// (§8.4).
+    OrphanQuery = 9,
+    /// Shard primary to fragment node: a verdict per fragment of an
+    /// [`MessageKind::OrphanQuery`], or why it gives none.
+    OrphanVerdicts = 10,
 
     /// Primary to member or learner: a lease beacon sent at a primary-local
     /// time, carrying the commit watermark as a heartbeat (§5.4).
@@ -80,7 +87,7 @@ pub enum MessageKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageClass {
     /// Log replication, reconciliation, and backfill (§5.1, §6.4, §6.6),
-    /// and the fragment writes of erasure coding (§8.4).
+    /// and the fragment writes and orphan queries of erasure coding (§8.4).
     Replication,
     /// Leases and planned handoff (§5.4).
     Lease,
@@ -104,7 +111,9 @@ impl MessageKind {
             | Self::Backfill
             | Self::BackfillAck
             | Self::FragmentWrite
-            | Self::FragmentWritten => MessageClass::Replication,
+            | Self::FragmentWritten
+            | Self::OrphanQuery
+            | Self::OrphanVerdicts => MessageClass::Replication,
             Self::Beacon | Self::BeaconAck | Self::StepDown => MessageClass::Lease,
             Self::Forward | Self::ForwardReply => MessageClass::Request,
             Self::NodeHeartbeat | Self::ControlChanged | Self::Handoff | Self::AdminReply => {
@@ -143,7 +152,7 @@ impl Role {
 mod tests {
     use super::*;
 
-    const ALL: [MessageKind; 18] = [
+    const ALL: [MessageKind; 20] = [
         MessageKind::Unspecified,
         MessageKind::Append,
         MessageKind::AppendAck,
@@ -153,6 +162,8 @@ mod tests {
         MessageKind::BackfillAck,
         MessageKind::FragmentWrite,
         MessageKind::FragmentWritten,
+        MessageKind::OrphanQuery,
+        MessageKind::OrphanVerdicts,
         MessageKind::Beacon,
         MessageKind::BeaconAck,
         MessageKind::StepDown,
@@ -179,7 +190,7 @@ mod tests {
             assert_eq!(kind.class(), expected, "{kind:?}");
             assert_eq!(MessageKind::try_from(kind as i32), Ok(kind));
         }
-        assert!(MessageKind::try_from(9).is_err());
+        assert!(MessageKind::try_from(11).is_err());
     }
 
     #[test]

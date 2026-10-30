@@ -4,23 +4,34 @@
 //! in full from its replicas or from `k` fragments of each stripe. Seeded
 //! bugs show that the checks catch publishing before every fragment is
 //! durable, dropping replicas before `EC_PUBLISH` commits, and applying an
-//! `EC_PUBLISH` of a superseded version. See
-//! `skys3_cluster_sim::coding`.
+//! `EC_PUBLISH` of a superseded version.
+//!
+//! Orphan reclamation (plan M5-05) runs on every node in the scenarios
+//! that race it with publication, slow encodings past
+//! `fragment_orphan_after_seconds`, and change the primary by takeover,
+//! with the primary dead or cut off; no committed layout may name a
+//! reclaimed fragment, and every orphan must be reclaimed. Seeded bugs
+//! show that the checks catch a judge that confirms orphans of attempts in
+//! progress, one that answers before reconciliation, and a deposed one
+//! that judges its successor's attempts. See `skys3_cluster_sim::coding`.
 
 use std::time::Duration;
 
 use rand::Rng;
 use rand::seq::IndexedRandom;
 use skys3_cluster_sim::coding::{
-    self, CodingConfig, Crash, CrashKind, CrashPoint, CrashTarget, seed_shard_bug,
+    self, CodingConfig, Crash, CrashKind, CrashPoint, CrashTarget, OrphanConfig, seed_shard_bug,
 };
 use skys3_ec::SeededBug as StoreBug;
+use skys3_ec::orphans::JudgeBug;
 use skys3_shard::SeededBug;
 use skys3_sim::{Runner, SimContext};
 
 /// What one run of the six-node cluster costs, in seeds of a typical
 /// scenario: about a second in a debug build. A seed of the crash
-/// scenario makes thirty runs, one of a seeded-bug scenario two.
+/// scenario makes thirty runs, one of a seeded-bug scenario two. Runs
+/// with slow fragment writes take about three seconds, and runs with a
+/// primary change about ten, so those scenarios declare more.
 const RUN_COST: u64 = 8;
 
 /// Every node a crash can hit.
@@ -154,6 +165,168 @@ fn applying_a_superseded_publish_is_caught() {
             &config,
             |_| seed_shard_bug(Some(SeededBug::PublishSuperseded)),
             &["not the", "does not decode"],
+        )
+    });
+}
+
+/// Orphan reclamation on every node, asking about fragments once they are
+/// `orphan_after` old.
+fn reclaiming(orphan_after: Duration, bug: Option<JudgeBug>) -> Option<OrphanConfig> {
+    Some(OrphanConfig {
+        orphan_after,
+        sweep: Duration::from_millis(20),
+        bug,
+    })
+}
+
+#[test]
+fn reclamation_racing_publication_reclaims_only_orphans() {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
+        // Fragments are asked about while their attempts write and
+        // publish. A crash at a drawn step leaves orphans, as does the
+        // first object's overwrite, which supersedes its attempt.
+        let point = *CrashPoint::ALL.choose(context.rng()).expect("points");
+        let target = *TARGETS.choose(context.rng()).expect("targets");
+        let orphan_after = Duration::from_millis(context.rng().random_range(0..60));
+        let crashed = CodingConfig {
+            orphans: reclaiming(orphan_after, None),
+            ..drawn_crash(context, point, target)
+        };
+        let report = coding::run(context, &crashed)
+            .map_err(|error| format!("{:?}: {error}", crashed.crashes))?;
+        tracing::debug!(?report, "a crash run passed");
+        let superseded = CodingConfig {
+            overwrite: true,
+            orphans: reclaiming(orphan_after, None),
+            ..CodingConfig::default()
+        };
+        let report = coding::run(context, &superseded)?;
+        if report.rejected == 0 || report.reclaimed == 0 {
+            return Err(format!("the superseded attempt left no orphan: {report:?}").into());
+        }
+        Ok(())
+    });
+}
+
+/// Fragment writes slow enough that every attempt outlasts
+/// `orphan_after`.
+fn outlasting(bug: Option<JudgeBug>) -> CodingConfig {
+    CodingConfig {
+        write_delay: Duration::from_millis(150),
+        orphans: reclaiming(Duration::from_millis(100), bug),
+        ..CodingConfig::default()
+    }
+}
+
+#[test]
+fn encodings_outlasting_orphan_after_keep_their_fragments() {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
+        let report = coding::run(context, &outlasting(None))?;
+        if report.published < 4 {
+            return Err(format!("objects were left unpublished: {report:?}").into());
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn confirming_an_orphan_of_an_attempt_in_progress_is_caught() {
+    Runner::with_cost(4, 4 * RUN_COST).run(|context| {
+        caught(
+            context,
+            &outlasting(None),
+            |config| *config = outlasting(Some(JudgeBug::IgnoreAttempts)),
+            &["which was reclaimed"],
+        )
+    });
+}
+
+/// A primary change: the members take over once `crashes` struck at
+/// `point`.
+fn primary_change(point: CrashPoint, crashes: Vec<Crash>, bug: Option<JudgeBug>) -> CodingConfig {
+    CodingConfig {
+        crashes: Some((point, crashes)),
+        orphans: reclaiming(Duration::from_millis(300), bug),
+        takeover: true,
+        ..CodingConfig::default()
+    }
+}
+
+/// `kind` hitting `target` `delay` milliseconds after the point, for
+/// `downtime` milliseconds.
+fn strike(target: CrashTarget, kind: CrashKind, delay: u64, downtime: u64) -> Crash {
+    Crash {
+        delay: Duration::from_millis(delay),
+        target,
+        kind,
+        downtime: Duration::from_millis(downtime),
+    }
+}
+
+#[test]
+fn reclamation_across_a_primary_change_reclaims_only_orphans() {
+    Runner::with_cost(1, 16 * RUN_COST).run(|context| {
+        // The primary dies, or is cut off from its members and the shard
+        // register while fragment holders still reach it, at a drawn
+        // step, for longer than the members' grace: one of them takes
+        // over and encodes what is left, while every node asks the first
+        // members about its fragments, in a drawn order.
+        for kind in [CrashKind::Kill, CrashKind::Isolate] {
+            let point = *CrashPoint::ALL.choose(context.rng()).expect("points");
+            let downtime = context.rng().random_range(9_000..12_000);
+            let primary = strike(CrashTarget::Primary, kind, 0, downtime);
+            let config = primary_change(point, vec![primary], None);
+            let report = coding::run(context, &config)
+                .map_err(|error| format!("{kind:?} at {point:?}: {error}"))?;
+            if report.epoch < 2 {
+                return Err(format!("no primary change: {report:?}").into());
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+fn answering_before_reconciliation_is_caught() {
+    Runner::with_cost(2, 8 * RUN_COST).run(|context| {
+        // A member dies as an attempt's EC_PUBLISH is appended, so the
+        // record cannot commit; the primary dies once the other member
+        // holds it. That member takes over while the first is still down,
+        // and rolls the record forward only once it serves, when the
+        // first is back or removed.
+        let crashes = vec![
+            strike(CrashTarget::Member(2), CrashKind::Kill, 0, 12_000),
+            strike(CrashTarget::Primary, CrashKind::Kill, 200, 16_000),
+        ];
+        let point = CrashPoint::Appended;
+        let config = primary_change(point, crashes.clone(), None);
+        let bugged = primary_change(point, crashes, Some(JudgeBug::BeforeServing));
+        caught(
+            context,
+            &config,
+            |config| *config = bugged,
+            &["which was reclaimed"],
+        )
+    });
+}
+
+#[test]
+fn a_deposed_primary_judging_a_later_epoch_is_caught() {
+    Runner::with_cost(2, 16 * RUN_COST).run(|context| {
+        // The primary is cut off from its members and the register, and
+        // fragment holders ask it about its successor's fragments.
+        let crashes = vec![strike(CrashTarget::Primary, CrashKind::Isolate, 0, 12_000)];
+        let config = primary_change(CrashPoint::StripeStarted, crashes.clone(), None);
+        let bugged = primary_change(
+            CrashPoint::StripeStarted,
+            crashes,
+            Some(JudgeBug::IgnoreLaterEpochs),
+        );
+        caught(
+            context,
+            &config,
+            |config| *config = bugged,
+            &["which was reclaimed"],
         )
     });
 }

@@ -40,6 +40,11 @@
 //!   every fragment is durable. Each attempt has an [`AttemptId`] drawn
 //!   from numbers the index reserves durably, and [`Attempts`] tracks
 //!   those in progress, the fence orphan reclamation needs (§8.4).
+//! - **Orphan reclamation** ([`orphans`]): fragment nodes ask the shard
+//!   primary about fragments they have held for
+//!   `fragment_orphan_after_seconds` ([`OrphanReclaimer`],
+//!   [`OrphanClient`]), and reclaim those its [`OrphanJudge`] finds that
+//!   no committed layout references and none ever will.
 //!
 //! ```
 //! use skys3_ec::{CodecId, EcCodec, Geometry, codec, current_codec};
@@ -63,6 +68,7 @@ mod encoder;
 mod error;
 pub mod fragment;
 mod layout;
+pub mod orphans;
 mod reed_solomon;
 mod store;
 mod transfer;
@@ -75,6 +81,9 @@ pub use encoder::{
 pub use error::EcError;
 pub use layout::{
     FoundFragment, ObjectLayout, ObjectVersion, RebuildError, StripeLayout, rebuild_layouts,
+};
+pub use orphans::{
+    OrphanClient, OrphanConfirmer, OrphanJudge, OrphanReclaimer, OrphanServer, Suspect, Verdict,
 };
 pub use reed_solomon::ReedSolomonV1;
 pub use skys3_types::{

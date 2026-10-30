@@ -794,6 +794,29 @@ impl<D: Disk> Shard<D> {
             .map_err(|error| error.sequenced_at(position))
     }
 
+    /// Commits `body` like [`Shard::commit`], but only if the replica still
+    /// sequences records in `epoch` when the record would be appended. A
+    /// shard primary's fragment-writing attempts publish this way, so an
+    /// attempt started under one primary is never published under a later
+    /// one, which may have judged its fragments orphans (§8.4).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`], with nothing appended, if the replica
+    /// sequences in another epoch; otherwise as [`Shard::commit`].
+    pub async fn commit_in(&self, epoch: Epoch, body: RecordBody) -> Result<Committed, ShardError> {
+        let (position, reply) = {
+            let mut sequencer = self.sequencer();
+            if sequencer.next.epoch != epoch {
+                return Err(self.unavailable("the replica no longer sequences in that epoch"));
+            }
+            self.submit_locked(&mut sequencer, body, false)?
+        };
+        self.within_ack(self.answer(reply))
+            .await
+            .map_err(|error| error.sequenced_at(position))
+    }
+
     /// The answer to a record's writer.
     async fn answer(&self, reply: WriteReceiver) -> Result<Committed, ShardError> {
         reply
