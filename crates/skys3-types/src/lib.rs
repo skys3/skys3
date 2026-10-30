@@ -36,6 +36,9 @@
 //! - **Policies** ([`policy`]): the subset of the IAM policy language that
 //!   authorizes requests, and the trust policies that say who may assume a
 //!   role ([`policy::trust`]) (§11).
+//! - **Lifecycle** ([`lifecycle`]): a `local` bucket's expiration and
+//!   upload-cleanup rules, as its register stores them, and their
+//!   evaluation (§8.7).
 //!
 //! ```
 //! use skys3_types::{BucketId, ClusterId, EpochSeq, ShardCount, WriteIdentity, shard_for_key};
@@ -53,6 +56,7 @@ pub mod checksum;
 mod ec;
 mod id;
 mod identity;
+pub mod lifecycle;
 pub mod limits;
 pub mod policy;
 mod position;

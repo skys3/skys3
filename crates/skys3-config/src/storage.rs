@@ -43,6 +43,9 @@ pub struct StorageConfig {
     /// on the data directory's file system, new writes get `503 SlowDown`
     /// (§13). 0 turns the check off.
     pub disk_min_free_bytes: u64,
+    /// `lifecycle_interval_seconds`: how often each shard primary evaluates
+    /// its bucket's lifecycle rules over its index (§8.7).
+    pub lifecycle_interval_seconds: u64,
 }
 
 impl Default for StorageConfig {
@@ -58,6 +61,7 @@ impl Default for StorageConfig {
             read_registration_ttl_seconds: 30,
             read_registration_renew_interval_seconds: 10,
             disk_min_free_bytes: GIB,
+            lifecycle_interval_seconds: 3600,
         }
     }
 }
@@ -72,6 +76,8 @@ crate::durations! {
         read_registration_ttl => read_registration_ttl_seconds, Duration::from_secs;
         /// `read_registration_renew_interval_seconds`.
         read_registration_renew_interval => read_registration_renew_interval_seconds, Duration::from_secs;
+        /// `lifecycle_interval_seconds`.
+        lifecycle_interval => lifecycle_interval_seconds, Duration::from_secs;
     }
 }
 
@@ -119,6 +125,10 @@ impl StorageConfig {
             (
                 "storage.read_registration_renew_interval_seconds",
                 self.read_registration_renew_interval_seconds,
+            ),
+            (
+                "storage.lifecycle_interval_seconds",
+                self.lifecycle_interval_seconds,
             ),
         ] {
             checker.nonzero(key, value);

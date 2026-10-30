@@ -131,6 +131,7 @@ The node storage engine (§10) and read registrations (§8.7).
 | `read_registration_ttl_seconds` | integer | `30` | Positive. |
 | `read_registration_renew_interval_seconds` | integer | `10` | Positive, and less than `read_registration_ttl_seconds`. |
 | `disk_min_free_bytes` | integer | `1073741824` (1 GiB) | May be 0, which turns the check off. Admission control (§13): while a log disk has less free space than this, writes that add data to the shards on it get `503 SlowDown`, and while the data directory's file system has less, every such write does. Deletes are still admitted. The margin keeps the disk from filling, since the first write error takes a disk out of service (§10.4). |
+| `lifecycle_interval_seconds` | integer | `3600` | Positive. How often each shard primary evaluates its bucket's lifecycle rules over its index, expiring objects and aborting abandoned multipart uploads (§8.7). An object is expired within this long after its expiry time. |
 
 ## `[cache]`
 

@@ -531,6 +531,7 @@ async fn a_commit_replayed_after_a_primary_change_returns_the_stored_result() {
         clean_copies: 0,
         target: None,
         created_unix_ms: 0,
+        lifecycle: None,
         proposal_id: ProposalId::new("p").unwrap(),
     };
     let key = "k";

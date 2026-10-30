@@ -209,6 +209,7 @@ compaction_live_threshold = 0.4
 read_registration_ttl_seconds = 60
 read_registration_renew_interval_seconds = 20
 disk_min_free_bytes = 0
+lifecycle_interval_seconds = 600
 
 [cache]
 hot_cache_bytes_per_node = 1073741824
@@ -347,6 +348,7 @@ fn every_key_parses_and_is_resolved() {
     assert_eq!(defaults.index_snapshot_interval().as_secs(), 600);
     assert_eq!(defaults.max_dirty_bytes, 100 << 30);
     assert_eq!(config.storage().disk_min_free_bytes, 0);
+    assert_eq!(config.storage().lifecycle_interval().as_secs(), 600);
 
     let logs = config
         .buckets()

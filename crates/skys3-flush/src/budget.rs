@@ -288,6 +288,7 @@ mod tests {
             clean_copies: 1,
             target: None,
             created_unix_ms: 0,
+            lifecycle: None,
             proposal_id: ProposalId::new("p").unwrap(),
         }
     }

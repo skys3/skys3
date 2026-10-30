@@ -15,7 +15,8 @@
 //! its issue at most, so a client that kept a token instead of rereading
 //! the file would fail its next refresh within the load phase.
 //!
-//! The AWS SDK for Rust always runs, in this test. The other clients run
+//! The AWS SDK for Rust always runs, in this test, and also checks bucket
+//! lifecycle rules, which the node applies every second here. The other clients run
 //! when `SKYS3_SDK_CLIENTS` names them (such as `python go javascript java
 //! cli s3-tests`): each runs `tests/sdk/run.sh client <name>` with the
 //! environment `tests/sdk/run.sh` documents, all at once, in containers
@@ -209,6 +210,11 @@ policy = '{{"Version": "2012-10-17", "Statement": {{"Effect": "Allow", "Action":
         alt_secret.display()
     );
     config_text(dir, gateway, admin, &alt)
+        // A lifecycle pass every second (`rust_lifecycle`).
+        .replace(
+            "index_checkpoint_interval_seconds = 1\n",
+            "index_checkpoint_interval_seconds = 1\nlifecycle_interval_seconds = 1\n",
+        )
         .replace(
             &format!("listen = \"{gateway}\"\n"),
             &format!(
@@ -581,6 +587,7 @@ async fn rust_features(matrix: &Matrix) {
     rust_multipart(&s3, bucket).await;
     rust_part_copy(&s3, bucket).await;
     rust_presigned(&s3, bucket, &matrix.ca()).await;
+    rust_lifecycle(&s3).await;
 
     // Listing, copies, tags, ranges, and batch deletes.
     let listed = s3
@@ -647,6 +654,167 @@ async fn rust_features(matrix: &Matrix) {
         .unwrap();
     assert!(deleted.errors().is_empty(), "{:?}", deleted.errors());
     s3.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+/// Lifecycle rules on a `local` bucket (design section 8.7): a rule with a
+/// prefix and a tag filter and one with a prefix only expire, at a date
+/// already past, exactly the objects they match, on the node's next pass;
+/// a rule whose days have not passed and an upload-cleanup rule leave
+/// their objects and uploads alone. The configuration round-trips through
+/// the SDK, and is removed.
+async fn rust_lifecycle(s3: &aws_sdk_s3::Client) {
+    use aws_sdk_s3::primitives::DateTime;
+    use aws_sdk_s3::types::{
+        AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus,
+        LifecycleExpiration, LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter,
+    };
+
+    let bucket = "sdk-lifecycle";
+    s3.create_bucket().bucket(bucket).send().await.unwrap();
+    let temp = || Tag::builder().key("class").value("temp").build().unwrap();
+    for key in ["logs/tagged", "logs/plain", "keep/tagged", "tmp/scratch"] {
+        let mut put = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body(7, 100).into());
+        if key.ends_with("tagged") {
+            put = put.tagging("class=temp");
+        }
+        put.send().await.unwrap();
+    }
+    let upload = s3
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key("logs/upload")
+        .send()
+        .await
+        .unwrap();
+
+    let past = DateTime::from_secs(1_577_836_800); // 2020-01-01
+    let rule = |id: &str, filter: LifecycleRuleFilter| {
+        LifecycleRule::builder()
+            .id(id)
+            .status(ExpirationStatus::Enabled)
+            .filter(filter)
+    };
+    let prefix = |prefix: &str| LifecycleRuleFilter::builder().prefix(prefix).build();
+    let tagged_logs = LifecycleRuleFilter::builder()
+        .and(
+            LifecycleRuleAndOperator::builder()
+                .prefix("logs/")
+                .tags(temp())
+                .build(),
+        )
+        .build();
+    let rules = vec![
+        rule("tagged-logs", tagged_logs)
+            .expiration(LifecycleExpiration::builder().date(past).build())
+            .build()
+            .unwrap(),
+        rule("tmp", prefix("tmp/"))
+            .expiration(LifecycleExpiration::builder().date(past).build())
+            .build()
+            .unwrap(),
+        rule("keep", prefix("keep/"))
+            .expiration(LifecycleExpiration::builder().days(30).build())
+            .build()
+            .unwrap(),
+        rule("uploads", prefix(""))
+            .abort_incomplete_multipart_upload(
+                AbortIncompleteMultipartUpload::builder()
+                    .days_after_initiation(1)
+                    .build(),
+            )
+            .build()
+            .unwrap(),
+    ];
+    let configuration = BucketLifecycleConfiguration::builder()
+        .set_rules(Some(rules))
+        .build()
+        .unwrap();
+    s3.put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(configuration)
+        .send()
+        .await
+        .unwrap();
+    let stored = s3
+        .get_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+    let ids: Vec<_> = stored.rules().iter().filter_map(|rule| rule.id()).collect();
+    assert_eq!(ids, ["tagged-logs", "tmp", "keep", "uploads"]);
+    let and = stored.rules()[0]
+        .filter()
+        .and_then(|filter| filter.and())
+        .unwrap();
+    assert_eq!((and.prefix(), and.tags().len()), (Some("logs/"), 1));
+    let expiration = stored.rules()[0].expiration().unwrap();
+    assert_eq!(expiration.date(), Some(&past));
+
+    // The node runs a pass every second; wait for the expirations.
+    let started = Instant::now();
+    let keys = || async {
+        let listed = s3.list_objects_v2().bucket(bucket).send().await.unwrap();
+        let keys: Vec<String> = listed
+            .contents()
+            .iter()
+            .filter_map(|object| object.key().map(str::to_owned))
+            .collect();
+        keys
+    };
+    loop {
+        let left = keys().await;
+        if left == ["keep/tagged", "logs/plain"] {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the expired objects are still there: {left:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let missing = s3
+        .head_object()
+        .bucket(bucket)
+        .key("tmp/scratch")
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing.raw_response().map(|r| r.status().as_u16()),
+        Some(404)
+    );
+    let uploads = s3
+        .list_multipart_uploads()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploads.uploads().len(), 1, "the upload has a day to go");
+
+    s3.delete_bucket_lifecycle()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+    let gone = s3
+        .get_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code(), Some("NoSuchLifecycleConfiguration"));
+    s3.abort_multipart_upload()
+        .bucket(bucket)
+        .key("logs/upload")
+        .upload_id(upload.upload_id().unwrap())
+        .send()
+        .await
+        .unwrap();
 }
 
 /// A three-part upload with CRC32 part checksums: a composite checksum,
