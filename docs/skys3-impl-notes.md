@@ -9900,6 +9900,16 @@ of this file. A task with nothing unexpected keeps "None."
   including those a primary had just filled for another node's gateway.
   The scenario sets `reserve_fraction = 0.0`, as the single-node cluster
   does.
+- **A takeover test read every shard after one took over (restack).**
+  `three_nodes_replicate_route_take_over_and_readmit` stops the primary of
+  shard 0, waits until a write to shard 0 succeeds, and then read each of
+  the twelve keys once. The stopped node can be primary of other shards
+  too, which take over on their own lease timers, and the bucket ID (so
+  which shard each key falls in) differs per run: in about one run in
+  twelve a key such as `key-0` sat on a shard that had not taken over
+  yet, and its single GET failed. Each read now polls with `eventually`
+  (30 seconds), so a key lost by the takeover still fails the test; 24
+  runs in a row passed with it.
 - **Open points.** STS sessions stay node-local (a session issued by one
   node is unknown to the others); a node does not follow a peer's address
   change on a link that is already up; `nodes/` is not in the local copy,
