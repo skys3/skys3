@@ -83,11 +83,14 @@ pub struct ClusterConfig {
     pub remote_faults: SimS3Faults,
     /// Whether the buckets are created through the S3 API, each by a
     /// different node's gateway, before the workload starts, with their
-    /// shards placed on the registered nodes, kept apart at the `node`
-    /// level (plan M3-04), instead of written by the harness with a static
-    /// placement. The nodes must register themselves
-    /// ([`CoordinatedServices`](crate::CoordinatedServices)).
+    /// shards placed on the registered nodes, kept apart at the
+    /// `failure_domain` level (plan M3-04), instead of written by the
+    /// harness with a static placement. The nodes must register
+    /// themselves ([`CoordinatedServices`](crate::CoordinatedServices)).
     pub create_buckets: bool,
+    /// The level at which gateways keep the members of the shards they
+    /// create apart (`failure_domain`, §6.7): `node` by default.
+    pub failure_domain: FailureDomain,
     /// How many of the nodes, the last ones, join the cluster later: they
     /// hold no shard in the static placement, and their hosts stay down,
     /// with empty disks, until a [`Fault::Join`] starts them. Placement
@@ -175,6 +178,7 @@ impl Default for ClusterConfig {
             latency: (Duration::from_millis(1), Duration::from_millis(5)),
             remote_faults: SimS3Faults::default(),
             create_buckets: false,
+            failure_domain: FailureDomain::Node,
             joining: 0,
             clean_cache: None,
             clean_copies: 1,
@@ -1187,7 +1191,7 @@ fn settings(cluster: &ClusterId, shape: &ClusterConfig) -> Result<NodeSettings, 
     .parse()?;
     let mut gateway = GatewayConfig::new(&config);
     if shape.create_buckets {
-        gateway.placement = ShardPlacement::Cluster(FailureDomain::Node);
+        gateway.placement = ShardPlacement::Cluster(shape.failure_domain);
     }
     gateway.inline_max_bytes = 512;
     gateway.extent_bytes = 512;
@@ -1385,6 +1389,11 @@ impl<S: NodeServices> Driver<'_, S> {
         let now = sim.elapsed();
         if heal_all {
             self.plan.clear();
+        }
+        for fault in self.world.shared.services.triggered_faults() {
+            if !heal_all {
+                self.start(sim, now, fault);
+            }
         }
         let origin = self.origin.unwrap_or(Duration::MAX);
         while self

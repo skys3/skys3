@@ -50,6 +50,7 @@ use skys3_types::{
 };
 
 use crate::cluster::HotCaches;
+use crate::faults::Fault;
 use crate::s3;
 
 /// A node's handle on the shared control store: the S3 backend over the
@@ -125,6 +126,14 @@ pub trait NodeServices: Clone + 'static {
     fn handoff_sink(&self, node: &NodeId) -> Option<Arc<dyn HandoffSink>> {
         let _ = node;
         None
+    }
+
+    /// Faults that must fall at a protocol state rather than at a time,
+    /// such as the coordinator's crash in the middle of a change, which
+    /// the services triggered since the last call. The driver takes them
+    /// after every step of the workload and starts them at once.
+    fn triggered_faults(&self) -> Vec<Fault> {
+        Vec::new()
     }
 }
 

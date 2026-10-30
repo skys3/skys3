@@ -37,6 +37,10 @@
 //!   held, and forgetting the node once no shard names it.
 //! - [`rebalancing`]: nodes that join a loaded cluster receive their share
 //!   of shards and primaries, with writes waiting only for handoffs.
+//! - [`heal`]: the M3 exit criterion: a node lost, replaced, forgotten,
+//!   and succeeded by a new one, a rack lost under `failure_domain =
+//!   "rack"`, and a coordinator lost in the middle of a change, each
+//!   healed with no operator action.
 //! - [`registry`]: nodes that join with nothing but their credentials, and
 //!   a coordinator that forgets a silent node only once no shard names it.
 //! - [`restart`]: a whole-cluster restart while the control store is
@@ -73,6 +77,7 @@ mod coordinator;
 mod crash;
 mod handoff;
 mod harness;
+mod heal;
 mod hot_cache;
 mod learners;
 mod leases;
