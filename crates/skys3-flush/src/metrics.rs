@@ -37,6 +37,12 @@ pub struct Counters {
     /// Conflicts resolved by adopting the out-of-band write and dropping
     /// the local version (`discard_local`, §7.2).
     pub discarded: Counter,
+    /// Copies flushed as a server-side `CopyObject` (§7.2, §11).
+    pub copies: Counter,
+    /// Copies meant for a server-side `CopyObject` that were sent as
+    /// regular uploads: the remote source had changed, or the target
+    /// refused the copy.
+    pub copy_fallbacks: Counter,
     /// Evicted versions filled from the remote into the clean cache.
     pub fills: Counter,
     /// Fills that found the remote changed out of band (§9.2).
@@ -57,6 +63,8 @@ impl Default for Counters {
             conflicts: Counter::default(),
             overwritten: Counter::default(),
             discarded: Counter::default(),
+            copies: Counter::default(),
+            copy_fallbacks: Counter::default(),
             fills: Counter::default(),
             fill_conflicts: Counter::default(),
             streaming_overlap: overlap_histogram(),
@@ -107,6 +115,8 @@ pub struct FlushMetrics {
     conflicts: Family<Labels, Counter>,
     overwritten: Family<Labels, Counter>,
     discarded: Family<Labels, Counter>,
+    copies: Family<Labels, Counter>,
+    copy_fallbacks: Family<Labels, Counter>,
     fills: Family<Labels, Counter>,
     fill_conflicts: Family<Labels, Counter>,
     streaming_overlap: Family<Labels, Histogram, fn() -> Histogram>,
@@ -130,6 +140,8 @@ impl Default for FlushMetrics {
             conflicts: Family::default(),
             overwritten: Family::default(),
             discarded: Family::default(),
+            copies: Family::default(),
+            copy_fallbacks: Family::default(),
             fills: Family::default(),
             fill_conflicts: Family::default(),
             streaming_overlap: Family::new_with_constructor(overlap_histogram),
@@ -235,6 +247,18 @@ impl FlushMetrics {
             metrics.discarded.clone(),
         );
         registry.register(
+            "flush_copies",
+            "Copies flushed as a server-side CopyObject from a clean source in the same \
+             remote bucket.",
+            metrics.copies.clone(),
+        );
+        registry.register(
+            "flush_copy_fallbacks",
+            "Copies meant for a server-side CopyObject that were sent as regular uploads, \
+             because the remote source had changed or the target refused the copy.",
+            metrics.copy_fallbacks.clone(),
+        );
+        registry.register(
             "fills",
             "Evicted versions filled from the remote target into the clean cache.",
             metrics.fills.clone(),
@@ -265,6 +289,8 @@ impl FlushMetrics {
             conflicts: self.conflicts.get_or_create_owned(&labels),
             overwritten: self.overwritten.get_or_create_owned(&labels),
             discarded: self.discarded.get_or_create_owned(&labels),
+            copies: self.copies.get_or_create_owned(&labels),
+            copy_fallbacks: self.copy_fallbacks.get_or_create_owned(&labels),
             fills: self.fills.get_or_create_owned(&labels),
             fill_conflicts: self.fill_conflicts.get_or_create_owned(&labels),
             streaming_overlap: self.streaming_overlap.get_or_create_owned(&labels),

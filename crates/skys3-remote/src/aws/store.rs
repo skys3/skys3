@@ -15,7 +15,8 @@ use crate::model::{
     AbortMultipartUpload, CompleteMultipartUpload, CopyObject, CreateMultipartUpload, DeleteObject,
     DeleteOutput, GetObject, GetOutput, HeadObject, ListObjectsV2, ListObjectsV2Output, ListParts,
     ListPartsOutput, ListedObject, ListedPart, MAX_LIST_KEYS, MAX_LIST_PARTS, MetadataDirective,
-    ObjectInfo, PutObject, UploadId, UploadPart, VersionId, WriteOutput, WritePrecondition,
+    ObjectInfo, PutObject, TaggingDirective, UploadId, UploadPart, VersionId, WriteOutput,
+    WritePrecondition,
 };
 use crate::{ObjectStore, S3Error, S3ErrorKind, S3Result, UserMetadata};
 
@@ -84,6 +85,11 @@ fn last_modified(value: Option<&DateTime>) -> Option<u64> {
 fn size(operation: &str, value: Option<i64>) -> S3Result<u64> {
     let value = value.ok_or_else(|| malformed(operation, "no size"))?;
     u64::try_from(value).map_err(|_| malformed(operation, format!("negative size {value}")))
+}
+
+/// `x-amz-tagging-count`, which S3 leaves out for an object without tags.
+fn tag_count(value: Option<i32>) -> u32 {
+    value.map_or(0, |count| u32::try_from(count).unwrap_or(0))
 }
 
 /// Converts a model count to the SDK's `i32`, saturating.
@@ -200,6 +206,7 @@ impl ObjectStore for AwsS3 {
             metadata: user_metadata(output.metadata()),
             content_type: output.content_type().map(str::to_owned),
             last_modified_ms: last_modified(output.last_modified()),
+            tag_count: tag_count(output.tag_count()),
         };
         let body = output.body.collect().await.map_err(|error| {
             S3Error::new(
@@ -237,6 +244,7 @@ impl ObjectStore for AwsS3 {
             metadata: user_metadata(output.metadata()),
             content_type: output.content_type().map(str::to_owned),
             last_modified_ms: last_modified(output.last_modified()),
+            tag_count: tag_count(output.tag_count()),
         })
     }
 
@@ -336,10 +344,22 @@ impl ObjectStore for AwsS3 {
             MetadataDirective::Replace {
                 metadata,
                 content_type,
+                headers,
             } => builder
                 .metadata_directive(sdk::MetadataDirective::Replace)
                 .set_metadata(metadata_map(&metadata))
-                .set_content_type(content_type),
+                .set_content_type(content_type)
+                .set_cache_control(headers.get("cache-control").cloned())
+                .set_content_disposition(headers.get("content-disposition").cloned())
+                .set_content_encoding(headers.get("content-encoding").cloned())
+                .set_content_language(headers.get("content-language").cloned())
+                .set_expires(expires(&headers)),
+        };
+        builder = match request.tagging_directive {
+            TaggingDirective::Copy => builder.tagging_directive(sdk::TaggingDirective::Copy),
+            TaggingDirective::Replace(tags) => builder
+                .tagging_directive(sdk::TaggingDirective::Replace)
+                .set_tagging((!tags.is_empty()).then(|| tagging(&tags))),
         };
         let output = builder
             .send()

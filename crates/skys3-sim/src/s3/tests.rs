@@ -3,7 +3,8 @@ use std::fmt::Debug;
 use bytes::Bytes;
 use md5::{Digest, Md5};
 use skys3_remote::{
-    ByteRange, CompletedPart, ListedObject, MAX_KEY_LEN, MetadataDirective, VersionId,
+    ByteRange, CompletedPart, ListedObject, MAX_KEY_LEN, MetadataDirective, TaggingDirective,
+    VersionId,
 };
 use tokio::time::Instant;
 
@@ -149,6 +150,7 @@ async fn put_get_and_head_round_trip() {
         metadata,
         content_type: Some("text/plain".into()),
         last_modified_ms: None,
+        tag_count: 0,
     };
     assert_eq!(got.info, expected);
     assert_eq!(
@@ -326,6 +328,7 @@ async fn user_metadata_is_limited_to_2_kib() {
     let copy = CopyObject::new("k", "c").with_metadata_directive(MetadataDirective::Replace {
         metadata: over,
         content_type: None,
+        headers: BTreeMap::new(),
     });
     assert_eq!(
         kind(store.copy_object(copy).await),
@@ -610,6 +613,105 @@ async fn r2_profile_honors_only_put_and_copy_source() {
     let delete = DeleteObject::new("k").with_if_match(etag("0123"));
     store.delete_object(delete).await.unwrap();
     assert_eq!(store.keys(), ["c"]);
+}
+
+#[tokio::test]
+async fn copy_directives_are_honored_ignored_or_rejected() {
+    let tags = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    let mut marked = UserMetadata::new();
+    marked.insert("mark", "replaced").unwrap();
+    let replace = || {
+        CopyObject::new("src", "dst")
+            .with_metadata_directive(MetadataDirective::Replace {
+                metadata: marked.clone(),
+                content_type: Some("a/b".into()),
+                headers: BTreeMap::from([("cache-control".into(), "no-cache".into())]),
+            })
+            .with_tagging_directive(TaggingDirective::Replace(tags(&[("new", "1")])))
+    };
+    for (directives, replaced_metadata, replaced_tags) in [
+        (CopyDirectives::AWS_S3, true, true),
+        (CopyDirectives::WITHOUT_TAGS, true, false),
+        (
+            CopyDirectives {
+                metadata: ConditionalSupport::Ignored,
+                tagging: ConditionalSupport::Honored,
+            },
+            false,
+            true,
+        ),
+    ] {
+        let store = SimS3::new(
+            1,
+            SimS3Config {
+                copy_directives: directives,
+                ..config()
+            },
+        );
+        let source = PutObject::new("src", "data").with_tags(tags(&[("old", "0")]));
+        store.put_object(source).await.unwrap();
+        store.copy_object(replace()).await.unwrap();
+        let copy = store.object("dst").unwrap();
+        assert_eq!(copy.body, Bytes::from("data"));
+        assert_eq!(
+            copy.info.metadata == marked,
+            replaced_metadata,
+            "{directives:?}"
+        );
+        let expected = if replaced_tags {
+            tags(&[("new", "1")])
+        } else {
+            tags(&[("old", "0")])
+        };
+        assert_eq!(store.tags("dst"), Some(expected), "{directives:?}");
+        assert_eq!(copy.info.tag_count, 1);
+        // A plain copy keeps the source's metadata and tags everywhere.
+        store
+            .copy_object(CopyObject::new("src", "plain"))
+            .await
+            .unwrap();
+        assert_eq!(store.tags("plain"), Some(tags(&[("old", "0")])));
+        assert_eq!(store.applied(Operation::CopyObject), ["dst", "plain"]);
+        assert_eq!(store.applied(Operation::PutObject), ["src"]);
+    }
+
+    // A provider that rejects a directive fails the copy, and writes
+    // nothing; one without it still copies.
+    for directives in [
+        CopyDirectives {
+            metadata: ConditionalSupport::Rejected,
+            tagging: ConditionalSupport::Honored,
+        },
+        CopyDirectives {
+            metadata: ConditionalSupport::Honored,
+            tagging: ConditionalSupport::Rejected,
+        },
+    ] {
+        let store = SimS3::new(
+            1,
+            SimS3Config {
+                copy_directives: directives,
+                ..config()
+            },
+        );
+        put(&store, "src", "data").await;
+        assert_eq!(
+            kind(store.copy_object(replace()).await),
+            S3ErrorKind::NotImplemented
+        );
+        assert_eq!(store.keys(), ["src"]);
+        assert!(store.applied(Operation::CopyObject).is_empty());
+        store
+            .copy_object(CopyObject::new("src", "dst"))
+            .await
+            .unwrap();
+        assert_eq!(store.keys(), ["dst", "src"]);
+    }
 }
 
 // 409 ConditionalRequestConflict.
@@ -1339,6 +1441,7 @@ async fn copies_keep_or_replace_metadata() {
         CopyObject::new("src", "replaced").with_metadata_directive(MetadataDirective::Replace {
             metadata: replacement.clone(),
             content_type: None,
+            headers: BTreeMap::new(),
         });
     store.copy_object(replace).await.unwrap();
     let replaced = store.object("replaced").unwrap();
@@ -1363,6 +1466,7 @@ async fn copying_an_object_to_itself_must_replace_metadata() {
     let replace = CopyObject::new("k", "k").with_metadata_directive(MetadataDirective::Replace {
         metadata: UserMetadata::new(),
         content_type: Some("a/b".into()),
+        headers: BTreeMap::new(),
     });
     store.copy_object(replace).await.unwrap();
     let head = store.head_object(HeadObject::new("k")).await.unwrap();

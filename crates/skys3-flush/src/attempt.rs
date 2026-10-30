@@ -19,13 +19,14 @@ use skys3_remote::{
 use skys3_shard::{Outcome as Applied, Shard};
 use skys3_types::{ETag, EpochSeq, Seq, WriteIdentity};
 
+use crate::copy::Copied;
 use crate::import::loaded_metadata;
 use crate::stream::{Streams, test_hooks};
 use crate::target::Target;
 
 /// How many times one attempt follows a failed precondition with another
 /// request before it gives up and retries later: the remote kept changing.
-const MAX_ROUNDS: usize = 3;
+pub(crate) const MAX_ROUNDS: usize = 3;
 
 /// What a flush put at the remote for one version of a key, until the
 /// `FLUSHED` that records it is applied.
@@ -250,6 +251,18 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
             return self
                 .complete_body(version, object, upload, claim, &identity, expected)
                 .await;
+        }
+        // A copy of a clean source in the same remote bucket is copied
+        // there, unless the source changed (§7.2, §11).
+        let mut expected = expected;
+        if let Some(source) = self.copy_source(object) {
+            match self
+                .copy(version, object, source, &identity, expected)
+                .await?
+            {
+                Copied::Done(outcome) => return Ok(outcome),
+                Copied::Upload(etag) => expected = etag,
+            }
         }
         let request = put_request(self.remote_key(), object, &identity)?;
         let _permit = self.target.reserve(object.size).await;
@@ -513,7 +526,7 @@ impl From<skys3_shard::ShardError> for Failure {
 /// `412`, `404 NoSuchKey` to `If-Match` on a missing object, or `409
 /// ConditionalRequestConflict` from a racing write (§7.2). Nothing was
 /// written; the remote must be read.
-fn failed_precondition(error: &S3Error) -> bool {
+pub(crate) fn failed_precondition(error: &S3Error) -> bool {
     matches!(
         error.kind(),
         S3ErrorKind::PreconditionFailed
@@ -551,7 +564,7 @@ pub(crate) fn flushed(version: EpochSeq, info: Option<ObjectInfo>, record: bool)
     }
 }
 
-fn conflict(version: EpochSeq, info: Option<ObjectInfo>) -> Conflict {
+pub(crate) fn conflict(version: EpochSeq, info: Option<ObjectInfo>) -> Conflict {
     Conflict {
         seq: version.seq,
         remote_identity: info

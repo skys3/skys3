@@ -316,6 +316,7 @@ fn loaded_metadata_always_has_a_content_type() {
         metadata: UserMetadata::new(),
         content_type: content_type.map(str::to_owned),
         last_modified_ms: None,
+        tag_count: 0,
     };
     assert_eq!(
         loaded_metadata(&info(Some("image/png")))["content-type"],

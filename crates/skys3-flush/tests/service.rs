@@ -97,12 +97,30 @@ fn flushes_write_back_buckets_under_their_prefix() {
 
         let seq = node.put("cat.jpg", "meow").await;
         let probe = reconcile_until_probed(&service, &node, &bucket).await;
-        assert_eq!(
-            probe,
-            ProbeStatus::Done {
-                unprotected: Vec::new()
-            }
+        assert!(
+            matches!(&probe, ProbeStatus::Done { unprotected, .. } if unprotected.is_empty()),
+            "{probe:?}"
         );
+        // Copies are probed once the writes are, while flushing runs.
+        let patience = Patience::new();
+        loop {
+            let probe = service.status(&bucket.bucket_id).unwrap().probe;
+            let copies = matches!(
+                probe,
+                ProbeStatus::Done {
+                    server_side_copy: true,
+                    ..
+                }
+            );
+            if copies {
+                break;
+            }
+            assert!(
+                !patience.is_exhausted(),
+                "copies were never probed: {probe:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let patience = Patience::new();
         while !patience.is_exhausted() {
             if store.object("team/cat.jpg").is_some() {
@@ -227,7 +245,9 @@ fn the_probe_finds_unprotected_operations_and_retries() {
                 unprotected: vec![
                     ConditionalOperation::CompleteMultipartUpload,
                     ConditionalOperation::DeleteObject
-                ]
+                ],
+                // The copies' destination preconditions are ignored too.
+                server_side_copy: false,
             }
         );
         // Once the probe is done, the tracked key is flushed.
