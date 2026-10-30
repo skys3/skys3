@@ -26,17 +26,19 @@
 //!
 //! **Abandoned uploads.** An abort that fails, and an upload left open by
 //! an attempt that was cancelled (its flusher stopped), are kept by the
-//! target and aborted at the start of later multipart flushes. Uploads
-//! whose IDs never reached the flusher (a lost `CreateMultipartUpload`
-//! answer) or were lost with the node's memory are left to the remote
-//! bucket's abort-incomplete-uploads lifecycle rule (§7.3).
+//! target and aborted at the start of later multipart flushes, and by the
+//! bucket's flusher after a backoff, so that no later flush is needed.
+//! Uploads whose IDs never reached the flusher (a lost
+//! `CreateMultipartUpload` answer) or were lost with the node's memory are
+//! left to the remote bucket's abort-incomplete-uploads lifecycle rule
+//! (§7.3).
 
 use skys3_index::{ObjectPart, ObjectVersion, Part};
 use skys3_io::Disk;
 use skys3_log::record::{Metadata, RemoteStep, TagSet};
 use skys3_remote::{
     AbortMultipartUpload, CompleteMultipartUpload, CompletedPart, CreateMultipartUpload,
-    ObjectStore, PutObject, S3ErrorKind, UploadId, WritePrecondition,
+    ObjectInfo, ObjectStore, PutObject, S3ErrorKind, UploadId, WritePrecondition,
 };
 use skys3_types::{ETag, EpochSeq, WriteIdentity};
 
@@ -125,8 +127,9 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
                 // A Complete whose answer was lost may have been applied,
                 // which consumed the upload.
                 if open.abort().await == Abort::Gone
-                    && let Found::Mine(info) = self.inspect(identity, version, None).await?
+                    && let Found::Mine(mut info) = self.inspect(identity, version, None).await?
                 {
+                    self.seeded_etag(&mut info).await;
                     return Ok(flushed(version, Some(info), true));
                 }
                 Err(failure)
@@ -222,6 +225,11 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         expected: Option<ETag>,
     ) -> Result<Outcome, Failure> {
         let streams = self.streams;
+        let mut parts = parts;
+        if hooks::large_object_bug() == LargeObjectBug::CompletesWithoutLastPart && parts.len() > 1
+        {
+            parts.pop();
+        }
         let request = CompleteMultipartUpload {
             key: self.remote_key(),
             upload_id: id.clone(),
@@ -279,11 +287,24 @@ impl<S: ObjectStore, D: Disk> Attempt<'_, S, D> {
         let verdict = verdict_after(&failure);
         self.streams.release(upload, verdict);
         if verdict == Verdict::Abort
-            && let Found::Mine(info) = self.inspect(identity, version, None).await?
+            && let Found::Mine(mut info) = self.inspect(identity, version, None).await?
         {
+            self.seeded_etag(&mut info).await;
             return Ok(flushed(version, Some(info), true));
         }
         Err(failure)
+    }
+
+    /// The seeded bug [`LargeObjectBug::RecordsLocalEtagAfterLostComplete`]:
+    /// takes the key's local ETag for the remote one a HEAD found after a
+    /// Complete. Does nothing unless the bug is seeded.
+    pub(crate) async fn seeded_etag(&self, info: &mut ObjectInfo) {
+        if hooks::large_object_bug() == LargeObjectBug::RecordsLocalEtagAfterLostComplete
+            && let Ok(Some(entry)) = self.shard.entry(self.key).await
+            && let Some(object) = entry.object
+        {
+            info.etag = object.local_etag;
+        }
     }
 
     /// The parts of the upload opened at `upload`, as the index holds them,
@@ -349,7 +370,7 @@ impl<S: ObjectStore> Target<S> {
     /// Aborts up to 16 of the remote multipart uploads that flushes left
     /// open ([`Target::orphaned_uploads`]), oldest first; those whose abort
     /// fails again are kept. Every multipart flush calls it before it opens
-    /// its own upload.
+    /// its own upload, and the bucket's flusher after a backoff.
     pub async fn abort_orphaned_uploads(&self) {
         for _ in 0..self.orphaned_uploads().min(ORPHANS_PER_FLUSH) {
             let Some((key, upload_id)) = self.take_orphan() else {
@@ -442,4 +463,56 @@ pub(crate) fn create_request(
         headers: put.headers,
         tags: put.tags,
     })
+}
+
+/// A bug seeded into the large-object flushes of every flusher on this
+/// thread, for the simulation that shows its audits catch them (the
+/// `test-util` feature exports [`seed_large_object_bug`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LargeObjectBug {
+    /// No bug.
+    #[default]
+    None,
+    /// A streamed completion leaves the last of its parts out of the
+    /// `CompleteMultipartUpload`, so that the remote assembles a truncated
+    /// object.
+    CompletesWithoutLastPart,
+    /// A completion whose Complete answer was lost, and that a HEAD then
+    /// finds applied, records the key's local ETag as the version's remote
+    /// one instead of the ETag the HEAD found: wrong for a streamed single
+    /// `PUT`, whose remote ETag is a multipart one.
+    RecordsLocalEtagAfterLostComplete,
+    /// A stream whose remote upload must be aborted gives up after one
+    /// failed `AbortMultipartUpload`, and records the upload as ended
+    /// anyway.
+    GivesUpFailedAborts,
+}
+
+pub(crate) use hooks::large_object_bug;
+#[cfg(feature = "test-util")]
+pub use hooks::seed_large_object_bug;
+
+mod hooks {
+    use std::cell::Cell;
+
+    use super::LargeObjectBug;
+
+    thread_local! {
+        static BUG: Cell<LargeObjectBug> = const { Cell::new(LargeObjectBug::None) };
+    }
+
+    /// Seeds `bug` into the large-object flushes of every flusher this
+    /// thread runs. A deterministic simulation runs every node on its
+    /// test's thread, so other tests run the real code.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn seed_large_object_bug(bug: LargeObjectBug) {
+        BUG.with(|seeded| seeded.set(bug));
+    }
+
+    /// The bug seeded on this thread.
+    pub(crate) fn large_object_bug() -> LargeObjectBug {
+        BUG.with(Cell::get)
+    }
 }

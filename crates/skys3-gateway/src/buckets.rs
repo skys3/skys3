@@ -113,6 +113,12 @@ pub struct GatewayConfig {
     /// the remote in. Its gateway announces the body to the shard's
     /// primary each time this many more bytes of it are applied (§7.3).
     pub flush_part_bytes: u64,
+    /// The smallest size of every part of a multipart upload but the last
+    /// that `CompleteMultipartUpload` accepts: S3's 5 MiB
+    /// ([`MIN_PART_BYTES`](crate::MIN_PART_BYTES)). It is not a
+    /// configuration key: simulations lower it to keep objects of several
+    /// parts small.
+    pub min_part_bytes: u64,
     /// How long a request body may stream as `EXTENT` records before the
     /// record that names them is committed: half of
     /// `peer_staging_ttl_seconds`, after which compaction may drop extents
@@ -200,6 +206,7 @@ impl GatewayConfig {
             extent_bytes: config.storage().extent_bytes,
             streaming_flush_min_bytes: Some(config.flush().streaming_flush_min_bytes),
             flush_part_bytes: config.flush().flush_part_bytes,
+            min_part_bytes: crate::MIN_PART_BYTES,
             max_body_duration: config.peering().peer_staging_ttl() / 2,
             hashing_pool: None,
             fills: None,

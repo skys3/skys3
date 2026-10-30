@@ -2480,6 +2480,7 @@ dependencies = [
 name = "skys3-cluster-sim"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "http",
  "http-body-util",

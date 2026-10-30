@@ -160,11 +160,13 @@ pub(super) struct Plan {
     pub(super) lost_as_timeout: bool,
 }
 
-/// The fault state of a store: the random profile, the queue of scripted
-/// faults, and the seeded generator.
+/// The fault state of a store: the random profile, the profiles of single
+/// operations, the queue of scripted faults, and the seeded generator.
 #[derive(Debug)]
 pub(super) struct Injector {
     pub(super) faults: SimS3Faults,
+    /// Profiles that replace `faults` for one operation each.
+    operations: Vec<(Operation, SimS3Faults)>,
     scripted: VecDeque<(Operation, Fault)>,
     rng: SmallRng,
 }
@@ -173,6 +175,7 @@ impl Injector {
     pub(super) fn new(rng: SmallRng) -> Self {
         Injector {
             faults: SimS3Faults::NONE,
+            operations: Vec::new(),
             scripted: VecDeque::new(),
             rng,
         }
@@ -182,10 +185,23 @@ impl Injector {
         self.scripted.push_back((operation, fault));
     }
 
+    /// Draws the random faults of `operation` from `faults`, or from the
+    /// store's profile again with `None`.
+    pub(super) fn set_operation(&mut self, operation: Operation, faults: Option<SimS3Faults>) {
+        self.operations.retain(|(op, _)| *op != operation);
+        if let Some(faults) = faults {
+            self.operations.push((operation, faults));
+        }
+    }
+
     /// Plans one request of `operation`. The first scripted fault for the
     /// operation, if any, replaces the random error fault.
     pub(super) fn plan(&mut self, operation: Operation) -> Plan {
-        let faults = &self.faults;
+        let faults = self
+            .operations
+            .iter()
+            .find(|(op, _)| *op == operation)
+            .map_or(&self.faults, |(_, faults)| faults);
         let delay = |rng: &mut SmallRng| {
             if faults.max_delay.is_zero() {
                 Duration::ZERO
@@ -361,6 +377,35 @@ mod tests {
             ..SimS3Faults::NONE
         }
         .validate();
+    }
+
+    #[test]
+    fn an_operation_can_have_faults_of_its_own() {
+        let mut injector = injector(SimS3Faults::NONE);
+        let lossy = SimS3Faults {
+            lost_response_probability: 1.0,
+            ..SimS3Faults::NONE
+        };
+        injector.set_operation(Operation::CompleteMultipartUpload, Some(lossy.clone()));
+        injector.set_operation(Operation::UploadPart, Some(SimS3Faults::OUTAGE));
+        // A second profile for an operation replaces the first.
+        injector.set_operation(Operation::UploadPart, Some(lossy));
+        for _ in 0..20 {
+            let complete = injector.plan(Operation::CompleteMultipartUpload);
+            assert_eq!(complete.fault, Some(Fault::LostResponse));
+            let part = injector.plan(Operation::UploadPart);
+            assert_eq!(part.fault, Some(Fault::LostResponse));
+            assert_eq!(injector.plan(Operation::PutObject).fault, None);
+        }
+        // Scripted faults still come first.
+        injector.script(Operation::CompleteMultipartUpload, Fault::SlowDown);
+        let scripted = injector.plan(Operation::CompleteMultipartUpload);
+        assert_eq!(scripted.fault, Some(Fault::SlowDown));
+        injector.set_operation(Operation::CompleteMultipartUpload, None);
+        assert_eq!(
+            injector.plan(Operation::CompleteMultipartUpload).fault,
+            None
+        );
     }
 
     #[test]
