@@ -29,6 +29,14 @@ use crate::shard::{
 /// epoch, so this bounds only a configuration changing many times at once.
 const MAX_ROUNDS: usize = 8;
 
+/// The first pause before a call asks again a shard that is moving to a
+/// new primary ([`between_primaries`]); each pause doubles, up to
+/// [`MOVE_PAUSE_MAX`].
+const MOVE_PAUSE: Duration = Duration::from_millis(20);
+
+/// The longest pause between two asks of a shard moving to a new primary.
+const MOVE_PAUSE_MAX: Duration = Duration::from_millis(200);
+
 /// The timing of [`RoutedShards`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingConfig {
@@ -290,7 +298,71 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
     }
 
     /// Sends `request` to the primary of `shard` and returns its answer.
+    ///
+    /// While the shard moves to a new primary, its old primary refuses
+    /// once it stepped down for a planned handoff, until it reads its
+    /// successor in the register, and the new one refuses until it has
+    /// brought its members up to its log (§5.4, §6.6). A request waits that
+    /// out (design §6.7, *Writes during moves*): it asks again, with
+    /// pauses that grow from [`MOVE_PAUSE`] to [`MOVE_PAUSE_MAX`], reading
+    /// the register meanwhile, which may name the new primary sooner, for
+    /// at most [`RoutingConfig::request_timeout`] in all: an ask again
+    /// that has not ended by then is given up, as a client's timeout gives
+    /// up a request, and a write may then have been applied. Those refusals come
+    /// before the primary sequences anything, so a write asked again is
+    /// not applied twice. Without the wait, every write and read that
+    /// reached the old primary in that window failed with `503`, for up
+    /// to its register poll and the new primary's reconciliation, which a
+    /// client's 3 attempts did not always outlast (found by the e2e
+    /// coordinator scenario, and by the kill, partition, and peering
+    /// suite, plan M8-08).
     async fn call(&self, shard: &ShardRef, request: Request) -> Result<Response, ShardError> {
+        let deadline = Instant::now() + self.config.request_timeout;
+        let mut pause = MOVE_PAUSE;
+        let mut routed = self.route(shard, &request).await;
+        loop {
+            let error = match routed {
+                Err(error) if between_primaries(&error) => error,
+                routed => return routed,
+            };
+            if Instant::now() + pause >= deadline {
+                return Err(error);
+            }
+            let asked = self.inner.map.get(shard).map(|config| config.epoch);
+            let _ = tokio::time::timeout_at(deadline, self.read_register(shard, asked)).await;
+            tokio::time::sleep_until((Instant::now() + pause).min(deadline)).await;
+            if Instant::now() >= deadline {
+                return Err(error);
+            }
+            pause = (pause * 2).min(MOVE_PAUSE_MAX);
+            // An ask again ends with the call's time, as the client's
+            // timeout would end it: a write cut off may have been applied.
+            routed = tokio::time::timeout_at(deadline, self.route(shard, &request))
+                .await
+                .unwrap_or_else(|_| Err(self.out_of_time(shard, &request)));
+        }
+    }
+
+    /// The error of a call whose request timeout ran out while it asked a
+    /// moving shard again: a write may have been applied by then (§5.2).
+    fn out_of_time(&self, shard: &ShardRef, request: &Request) -> ShardError {
+        let timeout = self.config.request_timeout;
+        let reason = if request.is_read() {
+            format!("no primary served the request within {timeout:?} while the shard moved")
+        } else {
+            format!(
+                "no primary answered within {timeout:?} while the shard moved, and may have applied it"
+            )
+        };
+        ShardError::Unavailable {
+            shard: shard.clone(),
+            reason,
+        }
+    }
+
+    /// Sends `request` to the primary of `shard` once, following redirects
+    /// and reading the register as [`RoutedShards::call`] describes.
+    async fn route(&self, shard: &ShardRef, request: &Request) -> Result<Response, ShardError> {
         let mut unanswered = "the gateway knows no configuration of the shard".to_owned();
         // The epoch of the configuration whose members were asked last.
         let mut asked = None;
@@ -298,7 +370,7 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
         for _ in 0..MAX_ROUNDS {
             if let Some(config) = self.newer(shard, asked) {
                 asked = Some(config.epoch);
-                match self.ask_members(shard, &config, &request).await {
+                match self.ask_members(shard, &config, request).await {
                     Round::Done(result) => return result,
                     Round::Redirected => continue,
                     Round::Unanswered(why) => unanswered = why,
@@ -551,6 +623,15 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> RoutedShards<L, D, N, C> {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Every update leaves the value consistent.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether `error` is a primary's refusal while its shard moves to a new
+/// primary: [`skys3_shard::STEPPED_DOWN`] or [`skys3_shard::RECONCILING`],
+/// as the replica's error ends, here and across the forward wire. Both
+/// come before the primary sequences anything.
+fn between_primaries(error: &ShardError) -> bool {
+    matches!(error, ShardError::Unavailable { reason, .. }
+        if reason.ends_with(skys3_shard::STEPPED_DOWN) || reason.ends_with(skys3_shard::RECONCILING))
 }
 
 /// The error of an answer to another call than the one asked.
@@ -807,7 +888,8 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
     /// Sequences the writes together on this node's replica when the map
     /// names this node the shard's primary, so that they share a group
     /// commit. Otherwise, and for writes the replica refuses because it no
-    /// longer serves, each write is routed on its own, all at once.
+    /// longer serves or the shard is moving to a new primary, each write is
+    /// routed on its own, all at once.
     async fn write_all(
         &self,
         shard: &ShardRef,
@@ -823,10 +905,12 @@ impl<L: Shards, D: Disk, N: Network, C: ControlStore> Shards for RoutedShards<L,
                 .await
         {
             for (slot, outcome) in written.iter_mut().zip(local) {
-                if !matches!(
-                    outcome,
-                    Err(ShardError::NotPrimary { .. } | ShardError::NotFound(_))
-                ) {
+                let reroute = match &outcome {
+                    Err(ShardError::NotPrimary { .. } | ShardError::NotFound(_)) => true,
+                    Err(error) => between_primaries(error),
+                    Ok(_) => false,
+                };
+                if !reroute {
                     *slot = Some(outcome);
                 }
             }
