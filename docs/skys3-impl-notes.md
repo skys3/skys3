@@ -10104,6 +10104,20 @@ of this file. A task with nothing unexpected keeps "None."
   the node restarted, each was dead, and every write that drew one failed
   as "may have applied it", up to 8 in a row, beyond any SDK's retries.
   A lost answer now drops the node's idle connections.
+- **A re-admitted member removed again stayed open (fixed later in the
+  stack).** Fix (2) relies on the member's watch over its primary, which
+  held one replica object. A node removed and added back as a learner
+  before its grace passed (a restart and the primary's removal, then the
+  coordinator's repair, within seconds) stopped that replica and opened
+  a new one, but the old watch kept its slot, waiting on the shard's
+  grace, which the new replica's grants renewed; promoted, the new
+  replica started no watch of its own. Removed again while up, by the
+  next rebalancing move, it never proposed the takeover that tells it so,
+  and stayed a member of the configuration before for good, holding the
+  kill, partition, and peering suite's convergence check (M8-08, seed 42,
+  chaos/1 at `53.6213` beside `54.6614`). A watch now belongs to its
+  replica: a replica opened in another's place gets its own once it is a
+  member, and the old one ends when it next wakes.
 - **curl does not retry into a pipe.** `--retry` with `-o /dev/null`, or
   with the body on standard output, gives up after the first attempt with
   exit 23 (curl 8.5), as it cannot truncate what it wrote; the scenarios
