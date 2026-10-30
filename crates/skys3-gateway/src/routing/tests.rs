@@ -25,8 +25,8 @@ use skys3_net::{
     CertificateDer, Credentials, Frame, Header, MessageKind, PeerIdentity, PrivateKeyDer,
     TokioNetwork, Transport,
 };
-use skys3_shard::Change;
 use skys3_shard::replication::{Replication, ReplicationConfig};
+use skys3_shard::{Change, FlushState};
 use skys3_types::{
     BucketDocument, BucketId, BucketMode, ClusterId, ETag, Epoch, EpochSeq, NodeAddress, NodeId,
     ProposalId, Seq, ShardConfig, ShardCount, ShardId,
@@ -370,6 +370,25 @@ async fn every_call_is_forwarded_to_the_primary() {
         .await
         .unwrap();
     assert_eq!(changes.recv().await, Some(Change::Streamed(announced)));
+
+    // A write-through write's wait reaches the primary's flusher, which
+    // answers it; a wait it does not answer in time is pending.
+    let waited = tokio::spawn({
+        let (gateway, shard) = (gateway.clone(), shard.clone());
+        async move {
+            gateway
+                .flushed(&shard, "gone", at, Duration::from_secs(5))
+                .await
+        }
+    });
+    let Some(Change::Awaited(waiter)) = changes.recv().await else {
+        panic!("the wait reaches the flusher");
+    };
+    assert_eq!((waiter.key(), waiter.version()), ("gone", at));
+    waiter.answer(FlushState::Flushed);
+    assert_eq!(timed(waited).await.unwrap(), Ok(FlushState::Flushed));
+    let pending = gateway.flushed(&shard, "gone", at, Duration::from_millis(50));
+    assert_eq!(timed(pending).await, Ok(FlushState::Pending));
 
     // A multipart upload and its parts.
     let create = RecordBody::MpuCreate(MpuCreate {
@@ -976,6 +995,74 @@ fn announcements_round_trip_and_malformed_ones_are_refused() {
 }
 
 #[test]
+fn flush_waits_round_trip_and_malformed_ones_are_refused() {
+    let shard = shard(0);
+    for state in [
+        FlushState::Flushed,
+        FlushState::Conflict,
+        FlushState::Pending,
+    ] {
+        let reply = Reply::Served {
+            response: Response::Flushed(state),
+            epoch: Epoch::new(1),
+            hint: None,
+        };
+        let frame = wire::reply_frame(&reply, 3);
+        assert_eq!(wire::decode_reply(&frame, &shard), Ok(reply));
+    }
+    let answer = wire::Answer {
+        result: Some(wire::Result::Flushed(7)),
+    };
+    let reply = wire::ForwardReply {
+        outcome: wire::OUTCOME_SERVED,
+        epoch: 1,
+        ..wire::ForwardReply::default()
+    };
+    let frame = Frame::new(
+        Header::new(MessageKind::ForwardReply).with_body(reply.encode_to_vec()),
+        Bytes::from(answer.encode_to_vec()),
+    );
+    assert!(wire::decode_reply(&frame, &shard).is_err());
+
+    let valid = wire::FlushQuery {
+        key: "k".into(),
+        version: Some(wire::Position { epoch: 1, seq: 2 }),
+        wait_ms: 5_000,
+    };
+    let decoded = |query: wire::FlushQuery| {
+        let forward = wire::Forward {
+            bucket_id: "b-r".into(),
+            shard: 0,
+            epoch: 1,
+            op: Some(wire::Op::Flushed(query)),
+        };
+        let frame = Frame::new(
+            Header::new(MessageKind::Forward).with_body(forward.encode_to_vec()),
+            Bytes::new(),
+        );
+        wire::decode_request(&frame).map(|(_, _, request)| request)
+    };
+    assert_eq!(
+        decoded(valid.clone()),
+        Ok(Request::Flushed {
+            key: "k".into(),
+            version: EpochSeq::new(Epoch::new(1), Seq::new(2)),
+            wait: Duration::from_secs(5),
+        })
+    );
+    let refused = |change: &dyn Fn(&mut wire::FlushQuery)| {
+        let mut query = valid.clone();
+        change(&mut query);
+        decoded(query).is_err()
+    };
+    assert!(refused(&|q| q.key.clear()));
+    assert!(refused(&|q| q.key = "k".repeat(1025)));
+    assert!(refused(&|q| q.version = None));
+    assert!(refused(&|q| q.wait_ms = 60_001));
+    assert!(!refused(&|q| q.wait_ms = 60_000));
+}
+
+#[test]
 fn malformed_requests_are_refused() {
     let shard = shard(0);
     let request = Request::Entry { key: "k".into() };
@@ -1218,6 +1305,11 @@ proptest! {
                     cluster: ClusterId::new("prod-eu").unwrap(),
                     shard: shard(3),
                 }),
+            },
+            Request::Flushed {
+                key: format!("k{key}"),
+                version: EpochSeq::new(Epoch::new(epoch), Seq::new(4)),
+                wait: Duration::from_millis(limit as u64),
             },
             Request::Announce(StreamedBody {
                 key: format!("k{key}"),

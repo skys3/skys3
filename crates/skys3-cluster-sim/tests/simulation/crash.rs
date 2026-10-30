@@ -264,6 +264,16 @@ impl Shards for EagerShards {
         self.inner.announce(shard, body).await
     }
 
+    async fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: std::time::Duration,
+    ) -> Result<skys3_gateway::FlushState, ShardError> {
+        self.inner.flushed(shard, key, version, wait).await
+    }
+
     async fn write(
         &self,
         shard: &ShardRef,

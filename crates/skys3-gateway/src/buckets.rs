@@ -139,6 +139,11 @@ pub struct GatewayConfig {
     /// `read_registration_renew_interval_seconds`: how often a GET renews
     /// the registration of the read it streams with its holder (§8.7).
     pub read_registration_renew_interval: Duration,
+    /// `write_through_timeout_seconds`: how long a write to a
+    /// `write_through` bucket waits for its version to reach the remote
+    /// target before it is answered `503 SlowDown` (§7.5). Which buckets
+    /// wait is their `ack_policy` in [`GatewayConfig::buckets`].
+    pub write_through_timeout: Duration,
     /// The node's hot cache of recently read objects (§9.2):
     /// [`GatewayConfig::new`] makes one of `hot_cache_bytes_per_node`
     /// without metrics. Clones of a configuration share it, so gateways
@@ -186,6 +191,7 @@ impl GatewayConfig {
             remote: None,
             placement: ShardPlacement::Local,
             read_registration_renew_interval: config.storage().read_registration_renew_interval(),
+            write_through_timeout: config.flush().write_through_timeout(),
             hot_cache: HotCache::new(config.cache().hot_cache_bytes_per_node),
         }
     }

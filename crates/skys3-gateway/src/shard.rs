@@ -11,12 +11,13 @@
 
 use std::fmt;
 use std::future::Future;
+use std::time::Duration;
 
 use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{ReadId, ReadPlan, Registered, StreamedBody};
+use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, StreamedBody};
 use skys3_types::{BucketDocument, BucketId, Epoch, EpochSeq, NodeId, ShardId, shard_for_key};
 
 use crate::conditions::{ConditionFailed, Precondition};
@@ -336,6 +337,27 @@ pub trait Shards: fmt::Debug + Clone + Send + Sync + 'static {
         shard: &ShardRef,
         body: StreamedBody,
     ) -> impl Future<Output = Result<(), ShardError>> + Send;
+
+    /// Waits at most `wait` for `version` of `key`, a version a write the
+    /// shard acknowledged committed, to reach the bucket's remote target
+    /// (§7.5): [`FlushState::Flushed`] once the remote holds it or a later
+    /// version of the key, [`FlushState::Conflict`] if the key is held in
+    /// conflict, and [`FlushState::Pending`] if neither happened in time.
+    /// The primary's flusher answers it; it reads only, so asking again
+    /// is safe.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shards::entry`], and [`ShardError::Unavailable`] while no
+    /// flusher follows the shard, such as on a new primary, or when the
+    /// flusher stops before it answers.
+    fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> impl Future<Output = Result<FlushState, ShardError>> + Send;
 
     /// Commits `body`, a record that names a key (a `PUT`, a `DELETE`, a
     /// `TAGS`, a `FLUSHED`, or a multipart record), if `condition` holds of

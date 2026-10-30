@@ -215,12 +215,16 @@ impl<H: Shards> Objects<H> {
     async fn set_tags(&self, bucket: &BucketDocument, key: String, tags: TagSet) -> S3Result<()> {
         let shard = ShardRef::for_key(bucket, &key);
         self.admit(bucket, &shard)?;
-        let record = RecordBody::Tags(Tags { key, tags });
-        self.shards
+        let record = RecordBody::Tags(Tags {
+            key: key.clone(),
+            tags,
+        });
+        let version = self
+            .shards
             .write(&shard, record, Precondition::Exists)
             .await
             .map_err(shard_error)??;
-        Ok(())
+        self.acknowledge(bucket, &shard, &key, version).await
     }
 }
 

@@ -237,6 +237,10 @@ impl Timings {
     }
 }
 
+/// What a client calls with the history's name of a key each time a write
+/// of it is acknowledged, right after the history records it.
+pub(crate) type OnAck = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The simulated time since the run began.
 fn elapsed() -> Duration {
     turmoil::sim_elapsed().unwrap_or_default()
@@ -253,6 +257,8 @@ pub(crate) struct Client {
     seen: BTreeMap<String, String>,
     /// Where the client records its writes' times, if anywhere.
     timings: Option<Timings>,
+    /// What the client tells of each acknowledged write, if anything.
+    on_ack: Option<OnAck>,
 }
 
 impl Client {
@@ -271,6 +277,22 @@ impl Client {
             rng: SmallRng::seed_from_u64(seed),
             seen: BTreeMap::new(),
             timings: None,
+            on_ack: None,
+        }
+    }
+
+    /// The same client, telling `on_ack` of each acknowledged write.
+    pub(crate) fn with_acks(mut self, on_ack: Option<OnAck>) -> Self {
+        self.on_ack = on_ack;
+        self
+    }
+
+    /// Records the answer of a write of the key the history names `name`.
+    fn answer_write(&self, pending: Pending, outcome: Outcome, name: &str) {
+        let acknowledged = outcome == Outcome::Done;
+        self.history.answer(pending, outcome);
+        if acknowledged && let Some(on_ack) = &self.on_ack {
+            on_ack(name);
         }
     }
 
@@ -450,7 +472,7 @@ impl Client {
         let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK => {
-                    self.seen.insert(name, value);
+                    self.seen.insert(name.clone(), value);
                     Outcome::Done
                 }
                 StatusCode::PRECONDITION_FAILED if condition != Condition::None => {
@@ -467,7 +489,7 @@ impl Client {
             Err(_) => Outcome::Unknown,
         };
         self.time(bucket, key, sent, &outcome);
-        self.history.answer(pending, outcome);
+        self.answer_write(pending, outcome, &name);
         Ok(())
     }
 
@@ -535,7 +557,7 @@ impl Client {
         let outcome = match answer {
             Ok(response) => match response.status() {
                 StatusCode::OK if String::from_utf8_lossy(response.body()).contains(&value) => {
-                    self.seen.insert(name, value);
+                    self.seen.insert(name.clone(), value);
                     Outcome::Done
                 }
                 StatusCode::PRECONDITION_FAILED if condition != Condition::None => {
@@ -547,7 +569,7 @@ impl Client {
             Err(_) => Outcome::Unknown,
         };
         self.time(bucket, key, sent, &outcome);
-        self.history.answer(pending, outcome);
+        self.answer_write(pending, outcome, &name);
         Ok(())
     }
 
@@ -622,7 +644,7 @@ impl Client {
             Err(_) => Outcome::Unknown,
         };
         self.time(bucket, key, sent, &outcome);
-        self.history.answer(pending, outcome);
+        self.answer_write(pending, outcome, &name);
         Ok(())
     }
 

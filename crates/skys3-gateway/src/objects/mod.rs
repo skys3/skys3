@@ -17,6 +17,10 @@
 //! write identity (§7.2); a body that fails leaves the record naming no
 //! write.
 //!
+//! **Write-through.** In a `write_back` bucket whose `ack_policy` is
+//! `write_through`, every write that makes a version of a key is answered
+//! only once the remote target holds it (§7.5, `write_through`).
+//!
 //! **Metadata.** The record keeps the standard headers S3 stores
 //! (`Cache-Control`, `Content-Disposition`, `Content-Encoding`,
 //! `Content-Language`, `Content-Type`, `Expires`) and user metadata under
@@ -58,6 +62,7 @@
 mod download;
 mod holders;
 mod upload;
+mod write_through;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -94,6 +99,7 @@ pub use tagging::{MAX_OBJECT_TAGS, MAX_TAG_KEY_CHARS, MAX_TAG_VALUE_CHARS};
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use tagging::{parse_tagging_header, tagging_header, tags_from_xml};
 use upload::{Streaming, Upload};
+use write_through::WriteThrough;
 
 /// How many times a GET resolves its key again after a read-through fill
 /// found the key changed, such as after the fill adopted the remote's
@@ -259,6 +265,7 @@ pub(crate) struct Objects<H> {
     remote: Option<Arc<dyn RemoteReads>>,
     holders: HolderReads,
     hot_cache: HotCache,
+    write_through: WriteThrough,
 }
 
 impl<H: Shards> Objects<H> {
@@ -276,6 +283,31 @@ impl<H: Shards> Objects<H> {
             remote: config.remote.clone(),
             holders: HolderReads::new(config.read_registration_renew_interval),
             hot_cache: config.hot_cache.clone(),
+            write_through: WriteThrough::new(config.buckets.clone(), config.write_through_timeout),
+        }
+    }
+
+    /// Answers a write to `bucket` that committed `version` of `key` in
+    /// `shard`: at once, or for a `write_through` bucket once the remote
+    /// target holds the version (§7.5).
+    ///
+    /// # Errors
+    ///
+    /// For a `write_through` bucket, `503 SlowDown` if the version does not
+    /// reach the remote in time, and `409 OperationAborted` if its key is
+    /// held in conflict; the write stays committed either way.
+    async fn acknowledge(
+        &self,
+        bucket: &BucketDocument,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+    ) -> S3Result<()> {
+        match self.write_through.wait_of(bucket) {
+            Some(timeout) => {
+                write_through::reach_remote(&self.shards, shard, key, version, timeout).await
+            }
+            None => Ok(()),
         }
     }
 
@@ -361,10 +393,13 @@ impl<H: Shards> Objects<H> {
             data,
         };
         let checksums = put.checksums.clone();
-        self.shards
+        let key = put.key.clone();
+        let version = self
+            .shards
             .write(&shard, RecordBody::Put(put), condition)
             .await
             .map_err(shard_error)??;
+        self.acknowledge(bucket, &shard, &key, version).await?;
         let mut output = PutObjectOutput {
             e_tag: Some(s3s::dto::ETag::Strong(verified.etag.as_str().to_owned())),
             ..PutObjectOutput::default()

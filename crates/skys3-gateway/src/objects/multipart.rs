@@ -425,10 +425,13 @@ impl<H: Shards> Objects<H> {
                 })
                 .collect(),
         };
-        self.shards
+        let version = self
+            .shards
             .write(&shard, RecordBody::MpuComplete(complete), condition)
             .await
             .map_err(shard_error)??;
+        self.acknowledge(bucket, &shard, &input.key, version)
+            .await?;
         let mut output = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket.clone()),
             location: Some(format!("/{}/{}", input.bucket, input.key)),

@@ -303,10 +303,13 @@ impl<H: Shards> Objects<H> {
             checksums: put.checksums.clone(),
             ..object
         };
-        self.shards
+        let key = put.key.clone();
+        let version = self
+            .shards
             .write(&shard, RecordBody::Put(put), condition)
             .await
             .map_err(shard_error)??;
+        self.acknowledge(bucket, &shard, &key, version).await?;
         let mut result = CopyObjectResult {
             e_tag: Some(s3_etag(&copied)),
             last_modified: Some(last_modified(&copied)),

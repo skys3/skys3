@@ -39,11 +39,13 @@ mod server;
 mod tests;
 pub mod wire;
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use skys3_index::{Entry, ListPage, ListQuery, Part, Upload};
 use skys3_log::RecordBody;
 use skys3_log::record::{Extent, ExtentRef};
-use skys3_shard::{ReadId, ReadPlan, Registered, StreamedBody};
+use skys3_shard::{FlushState, ReadId, ReadPlan, Registered, StreamedBody};
 use skys3_types::{Epoch, EpochSeq, ShardConfig};
 
 pub use client::{RoutedShards, RoutingConfig, RoutingStats};
@@ -128,6 +130,15 @@ pub enum Request {
     AppendExtent(Extent),
     /// [`Shards::announce`](crate::Shards::announce).
     Announce(StreamedBody),
+    /// [`Shards::flushed`](crate::Shards::flushed).
+    Flushed {
+        /// The key.
+        key: String,
+        /// The version waited for.
+        version: EpochSeq,
+        /// How long the replica may wait.
+        wait: Duration,
+    },
     /// [`Shards::write`](crate::Shards::write).
     Write {
         /// The record.
@@ -142,8 +153,9 @@ pub enum Request {
 }
 
 impl Request {
-    /// Whether the request only reads, or announces a streamed body, so
-    /// that sending it again after its answer was lost changes nothing.
+    /// Whether the request only reads, announces a streamed body, or waits
+    /// for a flush, so that sending it again after its answer was lost
+    /// changes nothing.
     #[must_use]
     pub fn is_read(&self) -> bool {
         !matches!(
@@ -194,6 +206,8 @@ pub enum Response {
     Extent(ExtentRef),
     /// [`Request::Announce`] was passed to the flusher.
     Announced,
+    /// Where the version of [`Request::Flushed`] is.
+    Flushed(FlushState),
     /// The outcome of [`Request::Write`].
     Written(Result<EpochSeq, ConditionFailed>),
     /// The summary of [`Request::Seal`].

@@ -1428,6 +1428,16 @@ impl Shards for ReplicatedShards {
         self.local.announce(shard, body).await
     }
 
+    async fn flushed(
+        &self,
+        shard: &ShardRef,
+        key: &str,
+        version: EpochSeq,
+        wait: Duration,
+    ) -> Result<skys3_gateway::FlushState, ShardError> {
+        self.local.flushed(shard, key, version, wait).await
+    }
+
     async fn write(
         &self,
         shard: &ShardRef,
