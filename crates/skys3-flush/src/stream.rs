@@ -941,11 +941,13 @@ impl Streams {
         }
     }
 
-    /// How many remote uploads the streams keep.
+    /// How many remote uploads the streams keep, counting those being
+    /// opened: the remote may hold one already, whose ID the open is about
+    /// to record.
     pub(crate) fn len(&self) -> usize {
         self.lock()
             .values()
-            .filter(|stream| matches!(stream.remote, Remote::Open(_)))
+            .filter(|stream| !matches!(stream.remote, Remote::Unopened))
             .count()
     }
 
@@ -1419,6 +1421,24 @@ mod tests {
 
     fn position(seq: u64) -> EpochSeq {
         EpochSeq::new(Epoch::new(1), Seq::new(seq))
+    }
+
+    /// A stream counts as soon as its open starts, not when the open
+    /// returns: a flusher that reports none while an open is in flight
+    /// looks idle with a remote upload about to appear.
+    #[test]
+    fn an_upload_being_opened_is_counted() {
+        let streams = Streams::default();
+        let upload = position(1);
+        streams.opened("k", upload);
+        assert_eq!(streams.len(), 0);
+        streams.lock().get_mut(&upload).unwrap().remote = Remote::Opening;
+        assert_eq!(streams.len(), 1);
+        streams.finish(Step::Opened(
+            upload,
+            Some((UploadId("r".to_owned()), Vec::new())),
+        ));
+        assert_eq!(streams.len(), 1);
     }
 
     /// The overlap counts the parts the remote acknowledged before the
