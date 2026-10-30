@@ -690,6 +690,85 @@ async fn a_lost_answer_fails_a_write_and_moves_a_read_on() {
     assert_eq!(gateway.stats().register_reads, 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_answer_drops_the_nodes_idle_connections() {
+    let cluster = Cluster::start(timing()).await;
+    // Node 4 refuses every request as not holding the shard, until it
+    // "restarts": every connection it accepted ends. It answers only once
+    // it has accepted two connections: the request that holds the first
+    // keeps it busy, so another request has to open a second.
+    let transport = cluster.pki.transport(&node(4));
+    let listener = transport
+        .bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address: NodeAddress = listener.local_addr().unwrap().to_string().parse().unwrap();
+    let connections = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
+    let (count, accepted) = tokio::sync::watch::channel(0_usize);
+    let held = Arc::clone(&connections);
+    tokio::spawn(async move {
+        while let Ok(incoming) = listener.accept().await {
+            count.send_modify(|count| *count += 1);
+            let mut two = count.subscribe();
+            held.lock().unwrap().spawn(async move {
+                let Ok(mut connection) = incoming.handshake().await else {
+                    return;
+                };
+                while let Ok(Some(frame)) = connection.recv().await {
+                    if two.wait_for(|count| *count >= 2).await.is_err() {
+                        return;
+                    }
+                    let (shard, _, _) = wire::decode_request(&frame).unwrap();
+                    let reply = Reply::Refused(ShardError::NotFound(shard));
+                    let answer = wire::reply_frame(&reply, frame.header.request_id);
+                    if connection.send(&answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let shards = MemoryShards::open_as(SimDisk::new(5), node(5))
+        .await
+        .unwrap();
+    let set = shards.local().set().clone();
+    let gateway = RoutedShards::new(
+        node(5),
+        shards.local().clone(),
+        set,
+        ShardMap::in_memory(),
+        cluster.pki.transport(&node(5)),
+        BTreeMap::from([(node(4), address)]),
+        cluster.store.clone(),
+    )
+    .with_config(timing(), RetryPolicy::default());
+    gateway.map().learn(config(0, 3, &[4])).await;
+
+    // Concurrent reads leave several idle connections to node 4.
+    let first_shard = shard(0);
+    let read = || gateway.entry(&first_shard, "k");
+    let reads = timed(async { tokio::join!(read(), read(), read(), read()) }).await;
+    assert!(reads.0.is_err() && reads.3.is_err());
+    let before = *accepted.borrow();
+    assert!(before >= 2, "{before} connections");
+
+    // Node 4 restarts. The first write is lost on an idle connection; the
+    // next one connects anew rather than meet another dead connection.
+    connections.lock().unwrap().abort_all();
+    let delete = || RecordBody::Delete(Delete { key: "k".into() });
+    let first = timed(gateway.write(&shard(0), delete(), Precondition::None)).await;
+    assert!(
+        first
+            .unwrap_err()
+            .to_string()
+            .contains("may have applied it")
+    );
+    let second = timed(gateway.write(&shard(0), delete(), Precondition::None)).await;
+    let error = second.unwrap_err().to_string();
+    assert!(!error.contains("may have applied it"), "{error}");
+    assert_eq!(*accepted.borrow(), before + 1);
+}
+
 #[tokio::test]
 async fn the_map_only_moves_forward_and_survives_a_restart() {
     let disk = SimDisk::new(3);

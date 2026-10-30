@@ -856,6 +856,7 @@ impl FlushRig {
             flush: service.clone(),
             cluster: None,
             replicated: None,
+            operations: None,
         };
         let rig = Self {
             store,

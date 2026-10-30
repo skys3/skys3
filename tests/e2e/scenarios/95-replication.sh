@@ -18,17 +18,18 @@
 #   from MinIO whichever node's gateway asks, and is flushed exactly once: once the bucket is
 #   flushed, MinIO holds exactly one version of each key the writer
 #   wrote, acknowledged or not, with its bytes, and every acknowledged key;
-# - that the restarted node rejoins as a learner: no node runs the
-#   coordinator in this build (plan M8-06), so the scenario adds it to the
-#   learners of every shard that lost it, by a CAS on its register in
-#   etcd, as the coordinator's replacement would; the shard's primary
-#   backfills it and promotes it to member, and the restarted node serves
-#   reads of every acknowledged key.
+# - that the restarted node rejoins as a learner: the coordinator (any node
+#   may be elected, `[cluster] coordinator = true`, plan M8-06) adds it
+#   back to every shard that lost it, the only node it can, while it is
+#   still down; once it is back, the shard's primary backfills it and
+#   promotes it to member, and the restarted node serves reads of every
+#   acknowledged key.
 #
 # The nodes run the default replication timing, whose failover the design
-# bounds at under 10 seconds. It runs only over etcd (`# e2e: etcd`),
-# beside the cluster scenario, takes about a minute and a half, and uses
-# the ports E2E_PORT+21 to E2E_PORT+29.
+# bounds at under 10 seconds. Rebalancing, which waits while a node is
+# suspect, moves nothing until the victim is back. It runs only over etcd
+# (`# e2e: etcd`), beside the cluster scenario, takes about a minute and a
+# half, and uses the ports E2E_PORT+21 to E2E_PORT+29.
 # e2e: etcd
 set -euo pipefail
 . "$E2E_HERE/lib.sh"
@@ -40,14 +41,6 @@ mkdir -p "$work"
 key=AKIASKYS3E2EREPLICA secret=skys3-e2e-replica-secret-0123456789
 bucket=replicated
 remote=e2e-replicated
-
-# etcd's JSON gateway, with the suite's client certificate.
-etcd_call() {
-    curl -sS --fail-with-body --max-time 10 --cacert "$pki/e2e-ca.pem" \
-        --cert "$pki/etcd-client.pem" --key "$pki/etcd-client.key" \
-        -X POST "$E2E_ETCD_URL$1" -d "$2"
-}
-b64() { printf '%s' "$1" | base64 -w0; }
 
 # configure <node> <port offset>: the directory $E2E_DIR/<node> and the
 # configuration of node <node>, its gateway at E2E_PORT+<offset>, its
@@ -62,6 +55,7 @@ configure() {
 [cluster]
 cluster_id = "rc"
 multi_node = true
+coordinator = true
 
 [node]
 node_id = "$node"
@@ -141,10 +135,14 @@ put() {
         -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" --data-binary "$(body_of "$2")" \
         -X PUT "$1/$bucket/$2" 2>/dev/null || true
 }
-# get <endpoint> <key>: the object's body, or a failure.
+# get <endpoint> <key>: the object's body, or a failure; retried on a 5xx
+# answer, 3 attempts in all, as the AWS SDKs do, since rebalancing may
+# hand a primary to the restarted node as it reads. The body goes to a
+# file first: curl cannot retry into a pipe, which it cannot truncate.
 get() {
-    curl -sS --fail-with-body --max-time 30 --aws-sigv4 "aws:amz:us-east-1:s3" \
-        --user "$key:$secret" -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" "$1/$bucket/$2"
+    curl -sS --fail-with-body --max-time 30 --retry 2 -o "$work/got" --aws-sigv4 "aws:amz:us-east-1:s3" \
+        --user "$key:$secret" -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" "$1/$bucket/$2" &&
+        cat "$work/got"
 }
 
 # --- Placement --------------------------------------------------------------
@@ -312,29 +310,13 @@ log "the target holds every acknowledged key exactly once: $summary"
 
 # --- The restarted node rejoins as a learner ----------------------------------
 
-node_start "$victim"
-# Restarted, it holds no replica of the shards whose registers left it out.
+# The shards the takeover left the victim out of as a member: the
+# coordinator names it their learner, and their primaries backfill it once
+# it is back.
 left_out=$(shards "${survivors[0]}" | jq -r --arg v "$victim" '.[] | select(.members | index($v) | not) | .shard')
 [ -n "$left_out" ] || fail "every shard still names $victim"
-for shard in $left_out; do
-    shards "$victim" | jq -e --argjson s "$shard" '.[] | select(.shard == $s) | .source != "replica"' >/dev/null ||
-        fail "$victim, restarted, serves shard $shard, which its register left it out of"
-done
-# The scenario plays the coordinator: a CAS on each register adds the node
-# as a learner, at the next epoch.
-for shard in $left_out; do
-    register=rc/shards/$bucket_id/$shard.json
-    range=$(etcd_call /v3/kv/range "{\"key\": \"$(b64 "$register")\"}")
-    revision=$(jq -r '.kvs[0].mod_revision' <<<"$range")
-    config=$(jq -r '.kvs[0].value | @base64d' <<<"$range" |
-        jq -c --arg v "$victim" --arg p "e2e-learner-$shard" \
-            '.epoch += 1 | .learners += [$v] | .proposal_id = $p')
-    answer=$(etcd_call /v3/kv/txn "{
-        \"compare\": [{\"key\": \"$(b64 "$register")\", \"target\": \"MOD\", \"result\": \"EQUAL\", \"mod_revision\": \"$revision\"}],
-        \"success\": [{\"request_put\": {\"key\": \"$(b64 "$register")\", \"value\": \"$(b64 "$config")\"}}]}")
-    jq -e .succeeded <<<"$answer" >/dev/null || fail "the CAS on $register failed: $answer"
-done
-log "added $victim as a learner of shards $(echo $left_out)"
+node_start "$victim"
+log "restarted $victim, left out of shards $(echo $left_out)"
 
 # rejoined: whether the restarted node is a member of every shard again,
 # each of 3 members; the roles it reports on the way are kept in `roles`.

@@ -442,7 +442,8 @@ jobs:
   # finish within the peering scenario's five minutes. The etcd leg also
   # runs the three-node cluster scenario (plan M8-04: registration,
   # heartbeats, refused strangers, and a handshake flood), about a minute
-  # beside its single-node scenarios. When the suite
+  # beside its single-node scenarios, and the replication and coordinator
+  # scenarios (plans M8-05b and M8-06), beside them too. When the suite
   # fails, its directories (logs, configurations, and data directories)
   # are uploaded. The job also checks the alerting rules and runs their unit
   # tests with promtool from a pinned Prometheus release, which takes

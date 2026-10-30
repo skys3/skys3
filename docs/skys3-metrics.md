@@ -251,13 +251,15 @@ before every placement round. Only the node that is coordinator reports a
 judgement; every other node reports 0, and a tenure that ends clears its
 node's gauges, so the maximum over the nodes is the cluster's value. The
 metrics are defined by M7-04 (`skys3_coord::CoordinatorMetrics`) and exported
-once the coordinator runs in the node binary.
+since M8-06 by the nodes that may be elected (`[cluster] coordinator =
+true`); a node that may not exports none of them, so the sums and maxima
+are over the candidates.
 
 | Name | Type | Labels | Design | Status | Description |
 |---|---|---|---|---|---|
-| `skys3_coordinator` | gauge | none | §6.7 | defined (M7-04) | 1 while this node holds the coordinator lease and serves its tenure, otherwise 0. The sum over the nodes is 1 in a healthy cluster; it is 0 while no node holds the lease, and briefly more than 1 while a node that lost the lease has not noticed. |
-| `skys3_placement_unsatisfied_buckets` | gauge | none | §6.7 | defined (M7-04) | Buckets whose placement policy the cluster does not satisfy now, as the coordinator last judged them: shards short of members in separate failure domains, members sharing a domain, or too few eligible domains for `replicas`. The admin API's placement health lists them. 0 on every node but the coordinator. |
-| `skys3_placement_short_shards` | gauge | none | §6.7 | defined (M7-04) | Shards of those buckets with fewer members in separate failure domains than `replicas`, counting only members on registered nodes that are not departing and carry the label `failure_domain` needs. 0 on every node but the coordinator. |
+| `skys3_coordinator` | gauge | none | §6.7 | exported (M8-06) | 1 while this node holds the coordinator lease and serves its tenure, otherwise 0. The sum over the nodes is 1 in a healthy cluster; it is 0 while no node holds the lease, and briefly more than 1 while a node that lost the lease has not noticed. |
+| `skys3_placement_unsatisfied_buckets` | gauge | none | §6.7 | exported (M8-06) | Buckets whose placement policy the cluster does not satisfy now, as the coordinator last judged them: shards short of members in separate failure domains, members sharing a domain, or too few eligible domains for `replicas`. The admin API's placement health lists them. 0 on every node but the coordinator. |
+| `skys3_placement_short_shards` | gauge | none | §6.7 | exported (M8-06) | Shards of those buckets with fewer members in separate failure domains than `replicas`, counting only members on registered nodes that are not departing and carry the label `failure_domain` needs. 0 on every node but the coordinator. |
 
 ### 3.11 Fragment release
 

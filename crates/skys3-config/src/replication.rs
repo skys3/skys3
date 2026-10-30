@@ -48,6 +48,19 @@ pub struct ReplicationConfig {
     /// `node_forget_after_hours`: how long a node may stay unreachable
     /// before the coordinator forgets it (§6.7).
     pub node_forget_after_hours: u64,
+    /// `removal_interval_seconds`: the least time between two member
+    /// removals the coordinator makes, across the cluster (§6.7,
+    /// *Replacement*).
+    pub removal_interval_seconds: u64,
+    /// `rebalance_max_moves`: the most shard moves one rebalancing batch
+    /// starts (§6.7, *Rebalancing*).
+    pub rebalance_max_moves: u32,
+    /// `rebalance_handoff_interval_seconds`: the least time between two
+    /// handoffs the coordinator asks for, across the cluster (§6.7).
+    pub rebalance_handoff_interval_seconds: u64,
+    /// `rebalance_handoff_retry_seconds`: how long a handoff the
+    /// coordinator asked for is given to land before it asks again (§6.7).
+    pub rebalance_handoff_retry_seconds: u64,
 }
 
 impl Default for ReplicationConfig {
@@ -61,6 +74,10 @@ impl Default for ReplicationConfig {
             primary_grace_ms: 6000,
             assumed_clock_drift: 0.01,
             node_forget_after_hours: 24,
+            removal_interval_seconds: 10,
+            rebalance_max_moves: 4,
+            rebalance_handoff_interval_seconds: 2,
+            rebalance_handoff_retry_seconds: 10,
         }
     }
 }
@@ -79,6 +96,12 @@ crate::durations! {
         primary_grace => primary_grace_ms, Duration::from_millis;
         /// `node_forget_after_hours`.
         node_forget_after => node_forget_after_hours, crate::hours;
+        /// `removal_interval_seconds`.
+        removal_interval => removal_interval_seconds, Duration::from_secs;
+        /// `rebalance_handoff_interval_seconds`.
+        rebalance_handoff_interval => rebalance_handoff_interval_seconds, Duration::from_secs;
+        /// `rebalance_handoff_retry_seconds`.
+        rebalance_handoff_retry => rebalance_handoff_retry_seconds, Duration::from_secs;
     }
 }
 
@@ -126,6 +149,22 @@ impl ReplicationConfig {
             (
                 "replication.node_forget_after_hours",
                 self.node_forget_after_hours,
+            ),
+            (
+                "replication.removal_interval_seconds",
+                self.removal_interval_seconds,
+            ),
+            (
+                "replication.rebalance_max_moves",
+                u64::from(self.rebalance_max_moves),
+            ),
+            (
+                "replication.rebalance_handoff_interval_seconds",
+                self.rebalance_handoff_interval_seconds,
+            ),
+            (
+                "replication.rebalance_handoff_retry_seconds",
+                self.rebalance_handoff_retry_seconds,
             ),
         ];
         for (key, value) in durations {

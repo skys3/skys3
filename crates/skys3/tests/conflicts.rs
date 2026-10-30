@@ -228,6 +228,7 @@ fn conflicts_are_listed_and_resolved_under_each_policy() {
             flush: service.clone(),
             cluster: None,
             replicated: None,
+            operations: None,
         };
 
         // Listing: each key, its shard, its local `seq`, and the remote's
