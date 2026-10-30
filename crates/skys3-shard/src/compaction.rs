@@ -29,6 +29,12 @@
 //!   which a member that is behind may be sent: the segment waits. So do
 //!   segments with records of a shard not open on the node.
 //!
+//! - the replicated payload of a coded version (§8.4), until the replica
+//!   knows that the version's `EC_PUBLISH` record committed: its commit
+//!   watermark covers the record ([`Shard::replicated_through`]), or the
+//!   replica is alone. From then on nothing names it, and it is dropped
+//!   after the release delay like other unreferenced payload. This is how
+//!   a replica drops its copy of an object once the object is coded.
 //! - payload a live read registration pins ([`Reads::is_pinned`]), which
 //!   a gateway is streaming from this node (§8.7): copied, never evicted.
 //! - payload nothing names, until compaction has found it so for the
@@ -76,13 +82,14 @@ use skys3_log::{
     SegmentInfo, SegmentLog, SegmentScanner, ShardRef,
 };
 use skys3_obs::MetricsRegistry;
-use skys3_types::{EpochSeq, Label, ShardConfig};
+use skys3_types::{EpochSeq, Label, Seq, ShardConfig};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::cache::{CleanCache, Hot};
 #[cfg(doc)]
 use crate::reads::ReadSettings;
 use crate::reads::Reads;
+use crate::seeded::{SeededBug, is_seeded};
 use crate::set::ShardSet;
 use crate::shard::Shard;
 
@@ -347,6 +354,10 @@ struct Relocated {
     dropped: u64,
 }
 
+/// The `seq` through which each shard's records are known to have
+/// committed on this replica.
+type Committed = HashMap<ShardRef, Seq>;
+
 /// The replicas whose records a segment holds, found as they are needed.
 struct Replicas<D: Disk> {
     found: HashMap<ShardRef, Option<Shard<D>>>,
@@ -366,6 +377,23 @@ impl<D: Disk> Replicas<D> {
             self.found.insert(shard.clone(), replica);
         }
         self.found.get(shard).and_then(Option::as_ref)
+    }
+
+    /// The `seq` through which each shard of `records` is known to have
+    /// committed on this replica: its commit watermark, or every record
+    /// for a replica alone. A shard not open here has none.
+    async fn committed(&mut self, set: &ShardSet<D>, records: &[Scanned]) -> Committed {
+        let mut committed = Committed::new();
+        for record in records {
+            if committed.contains_key(&record.shard) {
+                continue;
+            }
+            if let Some(replica) = self.get(set, &record.shard).await {
+                let through = replica.replicated_through().unwrap_or(Seq::MAX);
+                committed.insert(record.shard.clone(), through);
+            }
+        }
+        committed
     }
 
     /// Whether every record of `records` may leave the log as far as
@@ -525,7 +553,8 @@ impl<D: Disk> Compactor<D> {
             if !replicas.release(&self.set, &chunk).await {
                 return Ok(None);
             }
-            let (chunk, fates) = self.classify(chunk, context).await?;
+            let committed = replicas.committed(&self.set, &chunk).await;
+            let (chunk, fates) = self.classify(chunk, committed, context).await?;
             if fates.contains(&Fate::Wait) {
                 return Ok(None);
             }
@@ -581,7 +610,8 @@ impl<D: Disk> Compactor<D> {
                 report.kept += 1;
                 return Ok(());
             }
-            let (chunk, fates) = self.classify(chunk, context).await?;
+            let committed = replicas.committed(&self.set, &chunk).await;
+            let (chunk, fates) = self.classify(chunk, committed.clone(), context).await?;
             if fates.contains(&Fate::Wait) {
                 report.kept += 1;
                 return Ok(());
@@ -610,7 +640,7 @@ impl<D: Disk> Compactor<D> {
                     .run(move || {
                         reads.exclusive(|| {
                             index.update_durable(|writer| {
-                                relocate(writer, &chunk, &copies, expired, &reads)
+                                relocate(writer, &chunk, &copies, &committed, expired, &reads)
                             })
                         })
                     })
@@ -638,6 +668,7 @@ impl<D: Disk> Compactor<D> {
     async fn classify(
         &self,
         chunk: Vec<Scanned>,
+        committed: Committed,
         context: &Context,
     ) -> Result<(Vec<Scanned>, Vec<Fate>), CompactionError> {
         let index = Arc::clone(self.set.index());
@@ -646,7 +677,7 @@ impl<D: Disk> Compactor<D> {
             .set
             .pool()
             .run(move || {
-                let fates = classify(&index.read()?, &chunk, &context)?;
+                let fates = classify(&index.read()?, &chunk, &committed, &context)?;
                 Ok::<_, IndexError>((chunk, fates))
             })
             .await??;
@@ -775,6 +806,7 @@ fn holders_of<'a>(
 fn classify(
     reader: &IndexReader,
     chunk: &[Scanned],
+    committed: &Committed,
     context: &Context,
 ) -> Result<Vec<Fate>, IndexError> {
     let mut memo = HashMap::new();
@@ -797,7 +829,10 @@ fn classify(
                 Fate::Copy
             } else {
                 let holders = holders_of(&mut memo, shard, key, || reader.holders(shard, key))?;
-                match holders.get(&record.position) {
+                let holder = holders
+                    .get(&record.position)
+                    .filter(|holder| !dropped_as_coded(holder, shard, committed));
+                match holder {
                     None if record.kind == RecordKind::Extent && !context.expired => Fate::Wait,
                     None if !lock(&context.unreferenced).for_at_least(
                         shard,
@@ -836,6 +871,7 @@ fn relocate(
     writer: &mut IndexWriter<'_>,
     chunk: &[Scanned],
     copies: &[Option<RecordLocation>],
+    committed: &Committed,
     expired: bool,
     reads: &Reads,
 ) -> Result<Relocated, IndexError> {
@@ -852,7 +888,10 @@ fn relocate(
             continue;
         }
         let holders = holders_of(&mut memo, shard, key, || writer.holders(shard, key))?;
-        if holders.contains_key(&record.position)
+        let named = holders
+            .get(&record.position)
+            .is_some_and(|holder| !dropped_as_coded(holder, shard, committed));
+        if named
             || (record.kind == RecordKind::Extent && !expired)
             || reads.is_pinned(shard, record.position)
         {
@@ -863,6 +902,18 @@ fn relocate(
         relocated.dropped += u64::from(record.location.len);
     }
     Ok(relocated)
+}
+
+/// Whether `holder` names replicated bytes this replica drops: those of a
+/// coded version whose `EC_PUBLISH` it knows committed in `shard`.
+fn dropped_as_coded(holder: &Holder, shard: &ShardRef, committed: &Committed) -> bool {
+    let Holder::Coded { publish } = holder else {
+        return false;
+    };
+    is_seeded(SeededBug::DropBeforeCommit)
+        || committed
+            .get(shard)
+            .is_some_and(|through| publish.seq <= *through)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

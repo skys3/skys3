@@ -64,6 +64,7 @@ impl Applier for TestApplier {
                         storage_class: None,
                         copy_source: put.copy_source.clone(),
                         payload,
+                        coded: None,
                     }),
                     remote_etag: prior.as_ref().and_then(|p| p.remote_etag.clone()),
                     remote_version_id: prior.and_then(|p| p.remote_version_id),

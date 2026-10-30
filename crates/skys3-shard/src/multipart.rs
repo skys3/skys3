@@ -145,6 +145,7 @@ pub(crate) fn complete(
             upload: complete.upload,
             parts: kept,
         },
+        coded: None,
     };
     store(
         index,

@@ -185,7 +185,7 @@ Erasure coding of `local` buckets (§8).
 | `clean_copies` | integer | `1` | From 0 to `replicas` (§9.3). |
 | `import_parallel_streams` | integer | `32` | From 1 to 256. Key ranges a new namespace import lists in parallel, each with its own checkpoint; one rate limit, `import_max_keys_per_second`, covers them all (§9.1). |
 | `ec_min_object_bytes` | integer | `4194304` (4 MiB) | Positive (§8.2). |
-| `ec_stripe_data_bytes` | integer | `67108864` (64 MiB) | Positive. |
+| `ec_stripe_data_bytes` | integer | `67108864` (64 MiB) | Positive. Each fragment of a stripe in the narrowest geometry (`k = min_eligible_nodes − parity_fragments`, from 1 to `max_data_fragments`), `⌈ec_stripe_data_bytes / k⌉` rounded up to 64 bytes, is at most 256 MiB, the fragment store's limit: 768 MiB with the defaults. |
 | `ec_after_seconds` | integer | `600` | May be 0. |
 | `backup_ack` | `"local"` or `"write_through"` | `"local"` | A named `local` bucket with `"write_through"` needs a `backup_target` (§8.9). |
 | `index_snapshot_interval_seconds` | integer | `3600` | Positive (§8.9). |

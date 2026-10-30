@@ -809,6 +809,7 @@ impl<S: ObjectStore> RemoteReader<S> {
                 storage_class: None,
                 copy_source: None,
                 payload: Payload::None,
+                coded: None,
             },
             version_id: info.version_id.map(|id| id.0),
         }
@@ -829,6 +830,7 @@ fn stub(import: Import) -> ObjectVersion {
         storage_class: import.storage_class,
         copy_source: None,
         payload: Payload::None,
+        coded: None,
     }
 }
 

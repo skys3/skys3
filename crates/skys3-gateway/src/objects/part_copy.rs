@@ -420,6 +420,7 @@ mod tests {
             storage_class: None,
             copy_source: None,
             payload: skys3_index::Payload::None,
+            coded: None,
         }
     }
 

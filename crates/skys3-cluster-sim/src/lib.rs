@@ -88,6 +88,7 @@
 //! ```
 
 mod cluster;
+pub mod coding;
 mod coordination;
 mod creation;
 mod faults;
