@@ -93,6 +93,7 @@ pub mod coding;
 mod conflicts;
 mod coordination;
 mod creation;
+pub mod drill;
 mod faults;
 mod holders;
 mod learners;

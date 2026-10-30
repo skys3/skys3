@@ -21,6 +21,7 @@ bytes.workspace = true
 md-5.workspace = true
 prometheus-client.workspace = true
 skys3-config.workspace = true
+skys3-ec.workspace = true
 skys3-index.workspace = true
 skys3-io.workspace = true
 skys3-log.workspace = true
