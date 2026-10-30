@@ -242,6 +242,29 @@ impl SimS3 {
         }
     }
 
+    /// Returns a new bucket that holds what this one holds now: its
+    /// objects, versions, and multipart uploads. It shares nothing with
+    /// this one and injects no faults, so a test can look at the store as
+    /// it was at one moment, such as the moment it assumes a whole cluster
+    /// lost, while the simulation goes on writing to this one.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        let bucket = self.state().bucket.clone();
+        SimS3 {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    bucket,
+                    injector: Injector::new(SmallRng::seed_from_u64(0)),
+                    in_flight: BTreeMap::new(),
+                    next_request: 0,
+                    stats: SimS3Stats::default(),
+                    unanswered: HashMap::new(),
+                }),
+                config: self.shared.config.clone(),
+            }),
+        }
+    }
+
     /// Returns the bucket's configuration.
     pub fn config(&self) -> &SimS3Config {
         &self.shared.config

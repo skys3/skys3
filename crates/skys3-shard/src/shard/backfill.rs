@@ -126,8 +126,13 @@ impl<D: Disk> Shard<D> {
     }
 
     /// A consistent view of the index for a snapshot, and the applied
-    /// position the snapshot is taken at.
-    pub(crate) async fn snapshot(&self) -> Result<(Arc<IndexReader>, EpochSeq), ShardError> {
+    /// position the snapshot is taken at: a learner's (§6.7), or an index
+    /// snapshot written to a bucket's snapshot target (§8.9).
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn snapshot(&self) -> Result<(Arc<IndexReader>, EpochSeq), ShardError> {
         let (index, shard) = (Arc::clone(&self.inner.index), self.shard().clone());
         run(&self.inner.pool, self.shard(), move || {
             let reader = index.read()?;
@@ -142,7 +147,11 @@ impl<D: Disk> Shard<D> {
     /// node evicts the bucket's clean payload ([`Shard::evicts_clean`]).
     /// A `local` bucket's clean entries, which a backup target made clean,
     /// keep their payload (§8.9).
-    pub(crate) async fn snapshot_rows(
+    ///
+    /// # Errors
+    ///
+    /// [`ShardError::Unavailable`] if the index fails.
+    pub async fn snapshot_rows(
         &self,
         reader: &Arc<IndexReader>,
         table: ShardTable,

@@ -101,6 +101,7 @@ mod pki;
 mod replication;
 mod routing;
 mod s3;
+mod snapshots;
 mod workload;
 mod write_through;
 
@@ -124,6 +125,9 @@ pub use replication::{
 };
 pub use routing::{RoutedServices, RoutingShards};
 pub use s3::S3_PORT;
+/// The seeded bugs of index snapshots ([`Snapshots::bug`]).
+pub use skys3_flush::test_hooks::SnapshotBug;
+pub use snapshots::{SnapshotAudit, Snapshots};
 pub use workload::Workload;
 pub use write_through::WriteThrough;
 

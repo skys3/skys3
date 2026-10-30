@@ -29,6 +29,7 @@ use skys3_config::BucketsConfig;
 use skys3_control::faults::FaultyStore;
 use skys3_control::{ProposalIds, RetryPolicy, S3ControlStore, read_cluster};
 use skys3_coord::HandoffSink;
+use skys3_flush::snapshot::SnapshotService;
 use skys3_flush::{FlushMetrics, FlushService, FlushSettings};
 use skys3_gateway::{
     FillBody, FillError, Fills, Gateway, GatewayConfig, HotCache, IdSource, LocalShards, ShardRef,
@@ -182,6 +183,9 @@ pub(crate) struct NodeSettings {
     /// A seeded bug: the clean cache is told the `local` buckets'
     /// `clean_copies` too, and evicts payload a backup made clean.
     pub evict_local: bool,
+    /// Whether nodes write index snapshots of the buckets whose settings
+    /// name a snapshot target (§8.9).
+    pub snapshots: bool,
 }
 
 /// One node of the cluster, shared by the driver and the node's host.
@@ -413,9 +417,16 @@ pub(crate) async fn run<S: NodeServices>(
         let set = recovered.shards.set().clone();
         tokio::spawn(async move { cache.run(set).await });
     }
+    let snapshots = settings.snapshots.then(|| {
+        let remote = shared.remote.clone();
+        SnapshotService::new(Box::new(move |_| remote.clone()), settings.buckets.clone())
+            .with_wall_clock(Arc::new(SimWallClock))
+    });
     {
         let (gateway, local) = (gateway.clone(), recovered.shards.clone());
-        tokio::spawn(async move { follow_flushes(&flush, &gateway, &local, evict_local).await });
+        tokio::spawn(async move {
+            follow_flushes(&flush, snapshots.as_ref(), &gateway, &local, evict_local).await;
+        });
     }
     if let Some(lifecycle) = settings.lifecycle.clone() {
         let (gateway, set) = (gateway.clone(), recovered.shards.set().clone());
@@ -507,11 +518,13 @@ fn flush_service(
 }
 
 /// Keeps a flusher on every shard open on the node of a `write_back`
-/// bucket or a `local` one with a backup target, and gives the clean cache
+/// bucket or a `local` one with a backup target, and a snapshot writer on
+/// every one of a bucket with a snapshot target, and gives the clean cache
 /// each bucket's `clean_copies`, as the node binary does (§7.1, §8.9,
 /// §9.3); with `evict_local`, a seeded bug, the `local` buckets' too.
 async fn follow_flushes(
     flush: &FlushService<SimS3, SimMount>,
+    snapshots: Option<&SnapshotService<SimS3, SimMount>>,
     gateway: &Gateway<TrustAll>,
     shards: &LocalShards<SimMount>,
     evict_local: bool,
@@ -520,6 +533,9 @@ async fn follow_flushes(
         let buckets = gateway.buckets();
         install_clean_copies(shards, &buckets, evict_local);
         flush.reconcile(&buckets, shards.set()).await;
+        if let Some(snapshots) = snapshots {
+            snapshots.reconcile(&buckets, shards.set()).await;
+        }
         tokio::time::sleep(FLUSH_FOLLOW_INTERVAL).await;
     }
 }

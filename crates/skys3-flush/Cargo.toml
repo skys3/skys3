@@ -35,6 +35,7 @@ tracing.workspace = true
 [dev-dependencies]
 http.workspace = true
 http-body.workspace = true
+proptest.workspace = true
 rand.workspace = true
 rcgen.workspace = true
 s3s.workspace = true
