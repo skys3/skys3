@@ -167,7 +167,7 @@ mod tests {
     fn config(text: &str) -> Config {
         format!(
             "[cluster]\ncluster_id = \"c\"\n\
-             [control_store]\netcd_endpoints = [\"https://e:2379\"]\n{text}"
+             [control_store]\nbackend = \"file\"\n{text}"
         )
         .parse()
         .unwrap()

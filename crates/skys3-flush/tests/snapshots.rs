@@ -54,7 +54,7 @@ fn service(store: &SimS3, mode: BucketMode) -> SnapshotService<SimS3, SimMount> 
     };
     let config: Config = format!(
         "[cluster]\ncluster_id = \"c-test\"\n\
-         [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+         [control_store]\nbackend = \"file\"\n\
          [buckets.photos]\nmode = \"{mode}\"\n\
          index_snapshot_interval_seconds = 1\n\
          snapshot_target = \"https://s3.example/remote/{SNAPSHOTS}\"\n"

@@ -58,7 +58,7 @@ pub fn config(extra: &str) -> GatewayConfig {
     let control_store = if extra.contains("[control_store]") {
         ""
     } else {
-        "[control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n"
+        "[control_store]\nbackend = \"file\"\n"
     };
     let text = format!("[cluster]\ncluster_id = \"test\"\n{control_store}{extra}");
     let config: Config = text.parse().unwrap();

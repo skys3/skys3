@@ -1,5 +1,5 @@
 //! Replicated shards and routing (design §5, §6.3–§6.6, §9.2; plan
-//! M8-05b): with `[cluster] multi_node = true`, a node serves the shards
+//! M8-05b): every node of a cluster serves the shards
 //! whose registers name it as the cluster simulation's nodes do, through
 //! the same library code.
 //!
@@ -32,8 +32,8 @@
 //!   more, although the shard registers outlive the bucket until the
 //!   coordinator deletes them (design §6.7).
 //!
-//! What a coordinator does runs only on the nodes with `[cluster]
-//! coordinator = true` ([`super::coordinator`]): adding learners,
+//! What a coordinator does runs on the node that holds the coordinator
+//! lease ([`super::coordinator`]): adding learners,
 //! re-admitting a returning node, finishing a bucket creation cut short,
 //! dropping the shard registers of a deleted bucket, and asking for
 //! handoffs. Replication itself needs none of it: placement happens when
@@ -134,7 +134,7 @@ impl<C: ShardConfigs> ShardConfigs for LiveShards<C> {
     }
 }
 
-/// The replicated shards of a node with `[cluster] multi_node = true`,
+/// The replicated shards of a node of a cluster,
 /// the gateway's routed shards over them, and what keeps them following
 /// the registers (see the [module](self) docs).
 pub(crate) struct ClusterShards {

@@ -569,7 +569,7 @@ fn the_configuration_follows_node_forget_after() {
     let config = RegistryConfig::new(Duration::from_secs(3));
     assert_eq!(config.suspect_after, Duration::from_secs(3));
     let text = "[cluster]\ncluster_id = \"prod\"\n\
-                [control_store]\netcd_endpoints = [\"https://etcd:2379\"]\n\
+                [control_store]\nbackend = \"file\"\n\
                 [replication]\nnode_forget_after_hours = 2\n";
     let config: skys3_config::Config = text.parse().unwrap();
     let config = RegistryConfig::from_config(&config);

@@ -1,5 +1,5 @@
-//! Nodes with `[cluster] coordinator = true` (plan M8-06; design §6.7,
-//! §12), on the in-process stand-in for etcd: one of them is elected
+//! The coordinator of a cluster (plan M8-06; design §6.7, §12), on the
+//! in-process stand-in for etcd: one of the nodes is elected
 //! coordinator, and another takes over when it stops; operators hand
 //! shards off, and drain nodes, through any node's admin API; a handoff
 //! request reaches a primary only from the coordinator or an `admin`
@@ -38,8 +38,8 @@ rebalance_handoff_interval_seconds = 1
 rebalance_handoff_retry_seconds = 2
 ";
 
-/// The configuration of node `name` of the cluster in `root`, a candidate
-/// for coordinator, its transport on `port`.
+/// The configuration of node `name` of the cluster in `root`, which may be
+/// elected coordinator as every node may, its transport on `port`.
 fn coordinated_config(
     root: &Path,
     pki: &Pki,
@@ -49,13 +49,10 @@ fn coordinated_config(
 ) -> skys3_config::Config {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let text = node_config(&dir, pki, store, name, name, port, 256)
-        .replace("multi_node = true", "multi_node = true\ncoordinator = true")
-        .replace(
-            "config_poll_interval_seconds = 1",
-            "config_poll_interval_seconds = 1\ncoordinator_lease_seconds = 2",
-        )
-        + FAST;
+    let text = node_config(&dir, pki, store, name, name, port, 256).replace(
+        "config_poll_interval_seconds = 1",
+        "config_poll_interval_seconds = 1\ncoordinator_lease_seconds = 2",
+    ) + FAST;
     text.parse().unwrap()
 }
 
@@ -282,10 +279,16 @@ async fn a_coordinator_is_elected_hands_off_and_is_succeeded() {
     let other = (coordinator + 1) % 3;
     let view = cluster.view(other).await;
     assert_eq!(view["placement"], Value::Null, "{view}");
+    // Every node may be elected: the field stays, always true.
     assert_eq!(view["coordinator"]["candidate"], true, "{view}");
     assert_eq!(view["nodes"].as_array().unwrap().len(), 3, "{view}");
-    // Without erasure coding, a node has no fragment stores to report.
-    assert_eq!(view["fragments"], Value::Null, "{view}");
+    // Every node runs erasure coding, but three nodes are fewer than
+    // `min_eligible_nodes` (5 by default): its fragment stores hold none.
+    assert_eq!(
+        view["fragments"],
+        json!({"held": 0, "unreleased": 0}),
+        "{view}"
+    );
     // The coordinator judges the nodes' health from their heartbeats.
     eventually("the coordinator hears from every node", || async {
         let view = cluster.view(coordinator).await;

@@ -84,7 +84,7 @@ impl Destination {
     pub async fn start(batches: bool) -> Arc<Destination> {
         let text = format!(
             "[cluster]\ncluster_id = \"dest\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [transport]\ntls_cert_file = \"/n.crt\"\ntls_key_file = \"/n.key\"\n\
              tls_ca_file = \"/ca.crt\"\n\
              [buckets.{BUCKET}]\nmode = \"local\"\npeer_source = \"{}\"\n\

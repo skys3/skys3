@@ -317,7 +317,7 @@ mod tests {
             [cluster]
             cluster_id = "c"
             [control_store]
-            etcd_endpoints = ["https://e:2379"]
+            backend = "file"
             [flush]
             max_dirty_bytes = 1000
             [buckets.small]

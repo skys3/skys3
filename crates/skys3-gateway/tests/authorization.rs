@@ -1305,7 +1305,7 @@ policy = '{{"Version": "2012-10-17", "Statement": {{"Effect": "Allow", "Action":
     );
     let text = format!(
         "[cluster]\ncluster_id = \"test\"\n[control_store]\n\
-         etcd_endpoints = [\"https://etcd.invalid:2379\"]\n{identity}"
+         backend = \"file\"\n{identity}"
     );
     let node: skys3_config::Config = text.parse().unwrap();
     let credentials = StaticCredentials::load(node.identity()).unwrap();

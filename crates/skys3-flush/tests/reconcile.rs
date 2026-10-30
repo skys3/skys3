@@ -75,7 +75,7 @@ impl World {
         store.set_faults(faults);
         let parsed: Config = format!(
             "[cluster]\ncluster_id = \"c-test\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [buckets.photos]\nreconcile_interval_seconds = {interval}\n"
         )
         .parse()

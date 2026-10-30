@@ -44,7 +44,7 @@ impl World {
     /// `store` with streaming on, whose writes wait at most `timeout`.
     async fn new(store: SimS3, timeout: Duration) -> World {
         let config: Config = "[cluster]\ncluster_id = \"c-test\"\n\
-             [control_store]\netcd_endpoints = [\"https://etcd.invalid:2379\"]\n\
+             [control_store]\nbackend = \"file\"\n\
              [flush]\nack_policy = \"write_through\""
             .parse()
             .unwrap();
