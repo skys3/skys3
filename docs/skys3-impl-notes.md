@@ -8736,6 +8736,13 @@ of this file. A task with nothing unexpected keeps "None."
   tries to write the fence on the blocking pool and logs the failure, so
   a test that waits for the gauge can read `node.log` before that line.
   The drill now waits for the line.
+- **The budget drill read the probe error before the probe failed
+  (Coverage).** `drill_dirty_budget` read the bucket's flush status right
+  after the refused write, about a second after the target was attached,
+  and asserted `probe_error`; under the instrumented Coverage build the
+  probe of the unreachable target had not failed yet (`probe: running`,
+  `probe_error: null`). The drill now waits until the status names the
+  probe's error before reading the rest, as an operator would.
 
 ### M7-08 Security review
 
