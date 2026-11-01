@@ -13,7 +13,7 @@ use s3s::{Body, S3Error};
 use skys3_gateway::sigv4::{AuthMethod, Authenticated};
 use skys3_gateway::{
     Authenticator, DESCRIPTOR_KEY, Gateway, GatewayConfig, MODE_HEADER, PeerDescriptors,
-    Permissions, Principal,
+    PeerRefusal, PeerRefusals, Permissions, Principal,
 };
 use skys3_types::{BucketName, ClusterId, WriteIdentity};
 
@@ -91,7 +91,11 @@ async fn call(
 }
 
 async fn start(descriptors: bool) -> Gateway<ByKey> {
-    let gateway = gateway_with(receiving(descriptors), ByKey).await;
+    start_with(receiving(descriptors)).await
+}
+
+async fn start_with(config: GatewayConfig) -> Gateway<ByKey> {
+    let gateway = gateway_with(config, ByKey).await;
     for name in ["archive", "photos"] {
         call(
             &gateway,
@@ -656,4 +660,61 @@ fn md5(body: &str) -> String {
     use base64::Engine as _;
     use md5::Digest as _;
     base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body.as_bytes()))
+}
+
+#[tokio::test]
+async fn refusals_of_a_peers_writes_are_counted_by_reason() {
+    let refusals = PeerRefusals::default();
+    let mut config = receiving(false);
+    config.peer_access = config.peer_access.clone().with_refusals(refusals.clone());
+    let gateway = start_with(config).await;
+    let us = ClusterId::new("prod-us").unwrap();
+    let count = |reason| refusals.get(Some(&us), reason);
+
+    // A peer's write to a bucket whose peer_source is not the peer, as
+    // when the destination's configuration lacks it.
+    call(
+        &gateway,
+        Method::PUT,
+        "/photos/k",
+        &[(KEY_HEADER, PEER_KEY)],
+        "x",
+    )
+    .await
+    .assert(403, Some("AccessDenied"));
+    assert_eq!(count(PeerRefusal::PeerSource), 1);
+
+    // Write identities for a bucket pair the peer lacks, or for another
+    // cluster.
+    for identity in ["prod-us/b-other/3/2.17", "prod-ap/b-src/3/2.17"] {
+        let headers = [(KEY_HEADER, PEER_KEY), ("x-amz-meta-skys3-wid", identity)];
+        call(&gateway, Method::PUT, "/archive/k", &headers, "x")
+            .await
+            .assert(400, Some("InvalidArgument"));
+    }
+    assert_eq!(count(PeerRefusal::BucketPair), 2);
+
+    // Clients' refused writes are not peers', and accepted writes count
+    // nothing.
+    call(&gateway, Method::PUT, "/archive/k", &[], "client")
+        .await
+        .assert(403, Some("AccessDenied"));
+    call(
+        &gateway,
+        Method::PUT,
+        "/photos/k",
+        &[("x-amz-meta-skys3-wid", IDENTITY)],
+        "client",
+    )
+    .await
+    .assert(400, Some("InvalidArgument"));
+    let peer = [(KEY_HEADER, PEER_KEY), ("x-amz-meta-skys3-wid", IDENTITY)];
+    call(&gateway, Method::PUT, "/archive/k", &peer, "peer")
+        .await
+        .assert(200, None);
+    assert_eq!(count(PeerRefusal::PeerSource), 1);
+    assert_eq!(count(PeerRefusal::BucketPair), 2);
+    for reason in PeerRefusal::ALL {
+        assert_eq!(refusals.get(None, reason), 0, "{reason:?}");
+    }
 }

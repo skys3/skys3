@@ -12,7 +12,7 @@ mod support;
 
 use std::time::Duration;
 
-use skys3_flush::FlushSettings;
+use skys3_flush::{FlushSettings, RefusalCode};
 use skys3_index::EntryState;
 use skys3_log::record::IDENTITY_METADATA;
 use skys3_peer::{Message, Precondition, StagedRanges};
@@ -123,8 +123,45 @@ async fn a_dropped_link_resends_only_what_the_destination_lacks() {
     let node = Node::open(3).await;
     let text = body(1000);
     let seq = node.put("big", &text).await;
-    destination.faults().cut_after_data = Some(5);
+    {
+        let mut faults = destination.faults();
+        faults.cut_after_data = Some(5);
+        faults.down_after_cut = true;
+    }
     let flusher = node.flusher(&destination.default_target(FRAME));
+    // The link stays down after the cut until the destination has staged
+    // what the first stream sent, so that the next `RESUME` reports it,
+    // however long its appends take.
+    until("the first stream's frames staged", || {
+        if !destination.faults().down {
+            return false;
+        }
+        let sent: Vec<(u64, u64)> = destination
+            .seen()
+            .received
+            .iter()
+            .filter_map(|m| match m {
+                Message::Data(data) => Some((data.offset, data.offset + data.bytes.len() as u64)),
+                _ => None,
+            })
+            .collect();
+        let Some(&(_, end)) = sent.iter().max_by_key(|(_, end)| *end) else {
+            return false;
+        };
+        let durable = destination
+            .staging
+            .report(&wid(seq), [0])
+            .and_then(|staged| staged.pieces.get(&0).cloned())
+            .unwrap_or_default();
+        let missing = durable.missing(end);
+        sent.iter().all(|&(start, stop)| {
+            missing
+                .iter()
+                .all(|gap| gap.end <= start || stop <= gap.start)
+        })
+    })
+    .await;
+    destination.faults().down = false;
     node.settle(&flusher).await;
     flusher.stop().await;
     assert_eq!(destination.bytes("big").await.unwrap(), text.as_bytes());
@@ -353,6 +390,69 @@ async fn a_body_whose_put_never_commits_is_aborted() {
     .await;
     assert_eq!(flusher.status().streams, 0);
     flusher.stop().await;
+}
+
+/// A body announced as soon as its flusher starts is staged: the flusher
+/// follows the shard from when it is started, not from when its task
+/// first runs, which on this single thread is only after the announcement.
+#[tokio::test]
+async fn a_body_announced_before_its_flusher_runs_is_staged() {
+    let destination = Destination::start(true).await;
+    let node = Node::open(14).await;
+    let settings = FlushSettings {
+        streaming: true,
+        ..settings()
+    };
+    let text = body(300);
+    let begun = node.begin("big").await;
+    let extents = node.extents("big", &text, 100).await;
+    let flusher = node.flusher(&destination.target(settings, FRAME));
+    node.announce("big", begun, &extents);
+    until("the body staged", || {
+        destination
+            .staged(&identity(begun))
+            .is_some_and(|staged| staged.extents(0, 300).is_some())
+    })
+    .await;
+    flusher.stop().await;
+}
+
+/// A destination that refuses the staging (§7.6): the refusals of a
+/// streamed body's own stream count before its `PUT` commits, those of its
+/// flush after, and only then does the key wait on a refusal. Once the
+/// destination takes the staging again, the key flushes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_staging_counts_for_streamed_bodies_and_their_flush() {
+    let destination = Destination::start(true).await;
+    destination.faults().refuse_begins = true;
+    let node = Node::open(13).await;
+    let settings = FlushSettings {
+        streaming: true,
+        ..settings()
+    };
+    let target = destination.target(settings, FRAME);
+    let flusher = node.flusher(&target);
+    let text = body(300);
+    let begun = node.begin("big").await;
+    let extents = node.extents("big", &text, 100).await;
+    node.announce("big", begun, &extents);
+    until("the body's stream refused", || {
+        target.refusals().count(RefusalCode::Refused) >= 1
+    })
+    .await;
+    let refusal = target.refusals().latest().unwrap();
+    assert_eq!(refusal.code, RefusalCode::Refused);
+    assert!(refusal.error.starts_with("big: "), "{}", refusal.error);
+    assert_eq!(flusher.status().refused, 0, "no dirty version waits yet");
+
+    let seq = node.complete_extents("big", &text, begun, &extents).await;
+    until("the flush refused", || flusher.status().refused == 1).await;
+    destination.faults().refuse_begins = false;
+    node.settle(&flusher).await;
+    assert_eq!(flusher.status().refused, 0);
+    flusher.stop().await;
+    assert_eq!(destination.bytes("big").await.unwrap(), text.as_bytes());
+    assert_eq!(node.entry("big").await.unwrap().version, at(seq));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

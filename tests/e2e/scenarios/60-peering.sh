@@ -21,84 +21,13 @@ quic_port=7443
 pa_s3=http://127.0.0.1:$((E2E_PORT + 30))
 pa_admin=127.0.0.1:$((E2E_PORT + 31))
 pb_s3=http://127.0.0.1:$((E2E_PORT + 40))
-admin_key=AKIASKYS3E2EPEERADMIN
-admin_secret=skys3-e2e-peer-admin-secret-0123456789
+admin_key=$PEER_ADMIN_KEY
+admin_secret=$PEER_ADMIN_SECRET
 # The key pa's flushers sign S3 requests to pb with (s3_access_key_ids).
-peer_key=AKIASKYS3E2EPAPEER
-peer_secret=skys3-e2e-pa-peer-secret-0123456789abc
+peer_key=$PEER_FLUSH_KEY
 
-# configure <cluster> <node> <gateway port> <quic port> <extra>: a node's
-# directory and configuration.
-configure() {
-    local cluster=$1 node=$2 port=$3 quic=$4 extra=$5 dir=$E2E_DIR/$1
-    mkdir -p "$dir"
-    printf '%s' "$admin_secret" >"$dir/admin-secret"
-    printf '%s' "$peer_secret" >"$dir/peer-secret"
-    echo "127.0.0.1:$((port + 1))" >"$dir/admin"
-    cat >"$dir/skys3.toml" <<EOF
-[cluster]
-cluster_id = "$cluster"
-
-[node]
-node_id = "$node"
-data_dir = "$dir/data"
-
-[gateway]
-listen = "127.0.0.1:$port"
-
-[control_store]
-backend = "file"
-config_poll_interval_seconds = 1
-
-[transport]
-listen = "127.0.0.1:$((port + 2))"
-tls_cert_file = "$pki/$cluster-$node.pem"
-tls_key_file = "$pki/$cluster-$node.key"
-tls_ca_file = "$pki/$cluster-ca.pem"
-
-[storage]
-disk_min_free_bytes = 0
-
-[buckets.defaults]
-mode = "local"
-shards_per_bucket = 2
-replicas = 1
-min_write_replicas = 1
-
-[identity]
-sts_web_identity = false
-
-[identity.static_credentials.admin]
-access_key_id = "$admin_key"
-secret_access_key_file = "$dir/admin-secret"
-policy = '{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "*", "Resource": "*"}}'
-
-[admin]
-listen = "127.0.0.1:$((port + 1))"
-
-[logging]
-filter = "info"
-
-[peering]
-quic_listen = "127.0.0.1:$quic"
-peer_connect_timeout_ms = 2000
-$extra
-EOF
-    {
-        echo "AWS_ACCESS_KEY_ID=$peer_key"
-        echo "AWS_SECRET_ACCESS_KEY=$peer_secret"
-        echo "AWS_EC2_METADATA_DISABLED=true"
-        echo "AWS_CONFIG_FILE=$E2E_DIR/aws/no-config"
-        echo "AWS_SHARED_CREDENTIALS_FILE=$E2E_DIR/aws/no-credentials"
-    } >"$dir/env"
-}
-
-at() {
-    local endpoint=$1
-    shift
-    AWS_ACCESS_KEY_ID=$admin_key AWS_SECRET_ACCESS_KEY=$admin_secret \
-        aws --endpoint-url "$endpoint" "$@"
-}
+configure() { peer_configure "$@"; }
+at() { peer_aws "$@"; }
 
 transport_is() {
     [ "$(metric "$pa_admin" "skys3_flush_transport{bucket=\"outbound\",transport=\"$1\"}")" = 1 ]

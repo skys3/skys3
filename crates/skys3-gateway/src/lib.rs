@@ -174,7 +174,9 @@ pub use objects::{
     parse_upload_id, upload_id,
 };
 pub use origin::{MAX_ORIGIN_VALIDATIONS, OriginHead, OriginScope, OriginValidations};
-pub use peer_s3::{DESCRIPTOR_KEY, PeerAccess, PeerDescriptors};
+pub use peer_s3::{
+    DESCRIPTOR_KEY, PeerAccess, PeerDescriptors, PeerRefusal, PeerRefusals, UNKNOWN_PEER,
+};
 pub use peering::{BucketLookup, PeerCommits, PeerExtents};
 pub use remote::{RemoteError, RemoteFuture, RemoteListing, RemoteObject, RemotePage, RemoteReads};
 #[cfg(any(test, feature = "test-util"))]

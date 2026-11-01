@@ -67,7 +67,7 @@ use crate::limits::RequestLimits;
 use crate::listing::ListTokenKeys;
 use crate::objects::backed_up;
 use crate::origin::OriginValidations;
-use crate::peer_s3::{PeerAccess, PeerDescriptors};
+use crate::peer_s3::{PeerAccess, PeerDescriptors, PeerRefusal};
 use crate::remote::RemoteReads;
 use crate::shard::{ShardError, ShardRef, ShardSummary, Shards};
 
@@ -444,11 +444,19 @@ impl<C: ControlStore, H: Shards> Buckets<C, H> {
             // A peer's flusher writes only the buckets that receive from
             // it, whatever `peer_local_writes` lets this cluster's clients
             // do: its key is the peer's, not a local client's.
-            (Some(peer), source) if source.as_ref() != Some(peer) => Err(s3_error!(
-                AccessDenied,
-                "The request is cluster {peer}'s, and bucket {name} does not receive \
-                 replication from it"
-            )),
+            (Some(peer), source) if source.as_ref() != Some(peer) => {
+                // The peer's flusher retries it until a configuration
+                // changes (§7.6): count it where operators look.
+                self.config
+                    .peer_access
+                    .refusals()
+                    .count(Some(peer), PeerRefusal::PeerSource);
+                Err(s3_error!(
+                    AccessDenied,
+                    "The request is cluster {peer}'s, and bucket {name} does not receive \
+                     replication from it"
+                ))
+            }
             (None, Some(source)) if !settings.peer_local_writes => Err(s3_error!(
                 AccessDenied,
                 "Bucket {name} receives native replication from cluster {source} and is \

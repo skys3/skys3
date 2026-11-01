@@ -1,0 +1,45 @@
+# Unit tests of the alerting rules in skys3-alerts.yml, for promtool:
+#
+#   promtool test rules skys3-alerts.test.yml
+#
+# CI runs them with promtool from a pinned Prometheus release
+# (scripts/ci/promtool.sh; docs/skys3-metrics.md, section 4). Each case
+# feeds synthetic series, one sample a minute, and checks which alerts fire
+# when.
+
+rule_files:
+  - skys3-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # SkyS3FlushRefused (plan M8-02): a bucket whose target refuses its
+  # flushes. Three keys of `outbound` wait on a refusal from minute 1 to
+  # minute 16, then flush; `inbound` never has a refused key.
+  - interval: 1m
+    input_series:
+      - series: 'skys3_flush_refused_keys{job="skys3",instance="node-1:7490",bucket="outbound"}'
+        values: '0 3x15 0x10'
+      - series: 'skys3_flush_refused_keys{job="skys3",instance="node-2:7490",bucket="outbound"}'
+        values: '0x26'
+      - series: 'skys3_flush_refused_keys{job="skys3",instance="node-1:7490",bucket="inbound"}'
+        values: '0x26'
+    alert_rule_test:
+      # Pending: refused keys have not waited 10 minutes yet.
+      - eval_time: 10m
+        alertname: SkyS3FlushRefused
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: SkyS3FlushRefused
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              bucket: outbound
+            exp_annotations:
+              summary: "The remote target of bucket outbound refuses its flushes."
+              description: "3 dirty keys of bucket outbound wait on a refusal: the target answers 401 or 403, or a SkyS3 peer answers refused (skys3_flush_refusals_total gives the code, and the bucket's flush status the target). They are retried with backoff and flush once the credentials, the bucket policy, or the peer's peer_source and bucket pairs are fixed (design section 7.6)."
+              runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#flush-refused
+      # Once the keys flush, the gauge falls back to 0 and the alert ends.
+      - eval_time: 20m
+        alertname: SkyS3FlushRefused
+        exp_alerts: []

@@ -56,7 +56,18 @@
 //!   `configured`, the bucket's `target_transport`; `in_use`, `quic`, `s3`,
 //!   or `null` while flushing waits for a transport; `peer`, whether the
 //!   target served a peer descriptor that verified; `reason`, why, in
-//!   words; and `switches`, how often the transport changed.
+//!   words; and `switches`, how often the transport changed;
+//! - `refused_keys`: the dirty keys a refusal holds up (§7.6), as the
+//!   metric `skys3_flush_refused_keys`: those whose latest flush attempt
+//!   the target refused, or every dirty key while it refuses the probe;
+//! - `last_refusal`: the target's latest refusal since the node started,
+//!   `null` before one: its `code` (`AccessDenied`, `InvalidAccessKeyId`,
+//!   `SignatureDoesNotMatch`, `refused` for a SkyS3 peer's native refusal,
+//!   or `other`), the `target` (`<endpoint>/<bucket>`), `error`, what was
+//!   refused (`probe: ...`, `copy probe: ...`, or `<key>: ...`) and how,
+//!   and `at_unix_ms`.
+//!   Flushing retries refused keys with its usual backoff, so it resumes
+//!   by itself once the target takes the writes again.
 //!
 //! Once the node runs the coordinator, `health` gains a `placement` object
 //! from `skys3_coord::PlacementHealth` (design §12), and bucket status the
@@ -554,7 +565,7 @@ fn flush_status(status: &BucketStatus) -> Value {
         .filter_map(|shard| shard.last_error.clone())
         .collect();
     let (probe, probe_error, unprotected, server_side_copy) = match &status.probe {
-        ProbeStatus::Running { error } => ("running", error.clone(), Vec::new(), false),
+        ProbeStatus::Running { error, .. } => ("running", error.clone(), Vec::new(), false),
         ProbeStatus::Done {
             unprotected,
             server_side_copy,
@@ -615,6 +626,13 @@ fn flush_status(status: &BucketStatus) -> Value {
             "peer": transport.peer,
             "reason": transport.reason,
             "switches": transport.switches,
+        })),
+        "refused_keys": gauges.refused_keys,
+        "last_refusal": status.last_refusal.as_ref().map(|refusal| json!({
+            "code": refusal.code.as_str(),
+            "target": refusal.target,
+            "error": refusal.error,
+            "at_unix_ms": millis(refusal.at),
         })),
     })
 }

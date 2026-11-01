@@ -34,6 +34,7 @@ use crate::origin::{self, Origin, OriginConnect};
 use crate::peer::discovery::{Choice, Discovery, Probe};
 use crate::peer::{Native, PeerBug, PeerTransport, TransportStatus, hooks as peer_hooks};
 use crate::reconcile::{self, ReconcileStatus, ScanInputs, ScanJob, ScanState};
+use crate::refusal::{Refusal, RefusalCode, Refusals};
 use crate::shard::{Ready, ShardFlusher, ShardStatus};
 use crate::target::{CopySources, FlushSettings, Target};
 
@@ -48,6 +49,9 @@ pub enum ProbeStatus {
     Running {
         /// The last run's error.
         error: Option<String>,
+        /// Whether the target refused the last run, with a `401` or `403`
+        /// (§7.6): every dirty key then waits on that refusal.
+        refused: bool,
     },
     /// Finished. The operations that are not protected are sent
     /// unconditionally (§7.2).
@@ -60,6 +64,17 @@ pub enum ProbeStatus {
         /// not wait for them: until that probe succeeds, this is `false`.
         server_side_copy: bool,
     },
+}
+
+impl ProbeStatus {
+    /// A probe that has not finished a run yet.
+    #[must_use]
+    pub fn running() -> Self {
+        ProbeStatus::Running {
+            error: None,
+            refused: false,
+        }
+    }
 }
 
 /// A bucket's flush state on this node.
@@ -95,6 +110,9 @@ pub struct BucketStatus {
     /// S3 REST only, by its `target_transport` or because the node reaches
     /// no peers.
     pub transport: Option<TransportStatus>,
+    /// The latest refusal of the target since the node started, by the
+    /// probe or a flush (§7.6); flushing retries after it.
+    pub last_refusal: Option<Refusal>,
 }
 
 impl BucketStatus {
@@ -104,6 +122,12 @@ impl BucketStatus {
         let age =
             |since: Option<Duration>| since.map_or(0.0, |s| now.saturating_sub(s).as_secs_f64());
         let statuses = self.shards.iter().map(|(_, status)| status);
+        // While the target refuses the probe, every dirty key waits on the
+        // refusal; afterwards, those whose own latest attempt was refused.
+        let refused_keys = match self.probe {
+            ProbeStatus::Running { refused: true, .. } => statuses.clone().map(|s| s.dirty).sum(),
+            _ => statuses.clone().map(|s| s.refused).sum(),
+        };
         Gauges {
             dirty_bytes: statuses.clone().map(|s| s.dirty_bytes).sum(),
             oldest_dirty_age: age(statuses.clone().filter_map(|s| s.oldest_dirty).min()),
@@ -117,6 +141,7 @@ impl BucketStatus {
                 .concurrency
                 .and_then(|window| window.base_round_trip)
                 .map_or(0.0, |base| base.as_secs_f64()),
+            refused_keys,
         }
     }
 }
@@ -730,6 +755,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             settings: self.settings.clone(),
             wall: Arc::clone(&self.wall),
             counters: self.metrics.counters(&name),
+            refusals: self.metrics.refusals(&name, &target_name(target)),
             import: import.clone(),
             conflict_policy: configured_policy,
             copy_sources: self.copy_sources_of(target),
@@ -753,7 +779,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             on_s3: false,
             native_until: None,
             tenures: BTreeMap::new(),
-            probe: Arc::new(Mutex::new(ProbeStatus::Running { error: None })),
+            probe: Arc::new(Mutex::new(ProbeStatus::running())),
             probe_task: tokio::spawn(async {}),
             target: Ready::new(None),
             shards: BTreeMap::new(),
@@ -875,7 +901,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
             // Nothing is flushed until the discovery chooses.
             Choice::Waiting => (
                 Ready::new(None),
-                ProbeStatus::Running { error: None },
+                ProbeStatus::running(),
                 tokio::spawn(async {}),
             ),
             // The peer evaluates every precondition itself: nothing to
@@ -896,7 +922,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 (ready, done(), task)
             }
             Choice::PlainS3 { .. } => {
-                let probe = Arc::new(Mutex::new(ProbeStatus::Running { error: None }));
+                let probe = Arc::new(Mutex::new(ProbeStatus::running()));
                 let ready = Ready::new(None);
                 let nonces = self.probe_nonces.clone();
                 let task = tokio::spawn(run_probe(
@@ -1103,6 +1129,7 @@ impl<S: ObjectStore, D: Disk> FlushService<S, D> {
                 .discovery
                 .as_ref()
                 .map(|(discovery, _)| discovery.status()),
+            last_refusal: flusher.parts.refusals.latest(),
         })
     }
 
@@ -1231,6 +1258,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How a refusal names `target`: `<endpoint>/<bucket>`.
+fn target_name(target: &RemoteTarget) -> String {
+    format!(
+        "{}/{}",
+        target.endpoint.trim_end_matches('/'),
+        target.bucket
+    )
+}
+
 /// A remote bucket: its endpoint and name.
 type Location = (String, String);
 
@@ -1247,6 +1283,8 @@ struct TargetParts<S> {
     settings: FlushSettings,
     wall: Arc<dyn WallClock>,
     counters: Counters,
+    /// Where the target's refusals are reported (§7.6).
+    refusals: Refusals,
     /// The bucket's import; `None` for a backup target, which imports
     /// nothing, so every key counts as imported.
     import: Option<Arc<ImportState>>,
@@ -1268,6 +1306,7 @@ impl<S> Clone for TargetParts<S> {
             settings: self.settings.clone(),
             wall: Arc::clone(&self.wall),
             counters: self.counters.clone(),
+            refusals: self.refusals.clone(),
             import: self.import.clone(),
             conflict_policy: self.conflict_policy,
             copy_sources: self.copy_sources.clone(),
@@ -1284,6 +1323,7 @@ impl<S> TargetParts<S> {
         let mut target = Target::new(self.store, self.prefix, writes, self.cluster, self.settings)
             .with_wall_clock(self.wall)
             .with_counters(self.counters)
+            .with_refusals(self.refusals)
             .with_conflict_policy(self.conflict_policy)
             .with_copy_sources(self.copy_sources)
             .with_native(native);
@@ -1362,6 +1402,8 @@ async fn run_probe<S: ObjectStore>(
 ) {
     let prefix = parts.prefix.clone();
     let settings = parts.settings.clone();
+    // Refusals of either probe are counted with the flushes' (§7.6).
+    let (refusals, wall) = (parts.refusals.clone(), Arc::clone(&parts.wall));
     // Probes are not flushes: they go to the store directly, outside the
     // target's window (§7.7), with apply-by times to what may be a SkyS3
     // peer (§7.8).
@@ -1397,9 +1439,17 @@ async fn run_probe<S: ObjectStore>(
             }
             Err(error) => {
                 failures += 1;
-                tracing::warn!(%error, "the target's capability probe failed");
+                let refused = RefusalCode::of(&error.error);
+                if let Some(code) = refused {
+                    // Retried all the same, as a refused flush is (§7.6).
+                    refusals.record(code, format!("probe: {error}"), wall.now());
+                    tracing::warn!(%error, "the target refused its capability probe");
+                } else {
+                    tracing::warn!(%error, "the target's capability probe failed");
+                }
                 *lock(&status) = ProbeStatus::Running {
                     error: Some(error.to_string()),
+                    refused: refused.is_some(),
                 };
                 tokio::time::sleep(settings.backoff(failures)).await;
             }
@@ -1412,7 +1462,14 @@ async fn run_probe<S: ObjectStore>(
                 Ok(support) => break support,
                 Err(error) => {
                     failures += 1;
-                    tracing::warn!(%error, "the target's server-side copy probe failed");
+                    // Counted, but it holds up no key: copies are uploaded
+                    // until the probe succeeds.
+                    if let Some(code) = RefusalCode::of(&error.error) {
+                        refusals.record(code, format!("copy probe: {error}"), wall.now());
+                        tracing::warn!(%error, "the target refused its server-side copy probe");
+                    } else {
+                        tracing::warn!(%error, "the target's server-side copy probe failed");
+                    }
                     tokio::time::sleep(settings.backoff(failures)).await;
                 }
             }

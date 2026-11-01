@@ -22,7 +22,7 @@
 #                     source and caches
 #   SKYS3_E2E_DIR     where the run's files go; emptied first
 #   SKYS3_E2E_PORT    the first of the ports the suite listens on (19000);
-#                     it uses 100 from there, and UDP 7443 and 7444
+#                     it uses 100 from there, and UDP 7443 to 7445
 #   SKYS3_E2E_PKI     a directory tests/e2e/pki.sh wrote, to use instead
 #                     of a new PKI in SKYS3_E2E_DIR (CI makes it first, to
 #                     install its CA)

@@ -310,9 +310,9 @@ fn expired_as_committed(ended: &Ended) -> bool {
 /// cannot help.
 fn refused(ended: &Ended) -> Result<(), Failure> {
     match ended {
-        Ended::Aborted(AbortReason::Refused, detail) => Err(Failure::Peer(format!(
-            "the destination refused the staging: {detail}"
-        ))),
+        Ended::Aborted(AbortReason::Refused, detail) => {
+            Err(Failure::aborted(AbortReason::Refused, detail))
+        }
         _ => Ok(()),
     }
 }

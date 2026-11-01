@@ -217,7 +217,10 @@ fn the_probe_finds_unprotected_operations_and_retries() {
             .await;
         let failed = loop {
             let status = service.status(&bucket.bucket_id).unwrap();
-            if let ProbeStatus::Running { error: Some(error) } = status.probe {
+            if let ProbeStatus::Running {
+                error: Some(error), ..
+            } = status.probe
+            {
                 break error;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;

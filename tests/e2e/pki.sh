@@ -24,13 +24,14 @@
 #                               etcd control store
 #
 # The clusters and nodes are those of PKI_NODES, `cluster/node` pairs
-# separated by spaces (default: the single-node cluster and the two peered
-# ones of the suite). Everything is EC P-256 except the token key, and
-# valid for two days. Existing files are kept, so a rerun reuses them.
+# separated by spaces (default: the single-node cluster, and the two pairs
+# of peered clusters of the suite). Everything is EC P-256 except the token
+# key, and valid for two days. Existing files are kept, so a rerun reuses
+# them.
 set -euo pipefail
 
 dir=${1:?usage: pki.sh <dir>}
-nodes=${PKI_NODES:-"e2e/n1 pa/pa1 pb/pb1"}
+nodes=${PKI_NODES:-"e2e/n1 pa/pa1 pb/pb1 ra/ra1 rb/rb1"}
 mkdir -p "$dir"
 cd "$dir"
 

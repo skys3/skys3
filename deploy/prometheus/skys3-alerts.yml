@@ -50,6 +50,15 @@ groups:
           summary: "Flushes of bucket {{ $labels.bucket }} keep failing."
           description: "The oldest change the flushers of bucket {{ $labels.bucket }} work on is {{ $value | humanizeDuration }} old, and their attempts are being retried: the remote target is unreachable, refusing, or throttling (design sections 7.7 and 13)."
           runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#flush-stalled
+      - alert: SkyS3FlushRefused
+        expr: sum by (bucket) (skys3_flush_refused_keys) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The remote target of bucket {{ $labels.bucket }} refuses its flushes."
+          description: "{{ $value }} dirty keys of bucket {{ $labels.bucket }} wait on a refusal: the target answers 401 or 403, or a SkyS3 peer answers refused (skys3_flush_refusals_total gives the code, and the bucket's flush status the target). They are retried with backoff and flush once the credentials, the bucket policy, or the peer's peer_source and bucket pairs are fixed (design section 7.6)."
+          runbook_url: https://github.com/skys3/skys3/blob/main/docs/skys3-runbooks.md#flush-refused
       - alert: SkyS3PeerTransportFallback
         expr: max by (bucket) (skys3_flush_transport{transport="s3"}) == 1
         for: 30m
