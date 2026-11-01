@@ -65,6 +65,7 @@ impl Remote {
         let remote = RemoteObject {
             object,
             version_id: Some("v1".to_owned()),
+            last_modified_ms: Some(1_700_000_000_000),
         };
         let bytes = Bytes::copy_from_slice(body.as_bytes());
         self.lock().objects.insert(key.to_owned(), (remote, bytes));
