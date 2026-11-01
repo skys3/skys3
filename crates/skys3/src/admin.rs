@@ -33,6 +33,12 @@
 //!   `seq`, and the remote object's ETag and write identity;
 //! - `orphaned_uploads`: remote multipart uploads that flushes left open
 //!   and that wait to be aborted, as the metric of the same name;
+//! - `concurrency`: the target's adaptive window (§7.7), `null` until the
+//!   probe is done: `limit`, the requests the flushers may have in flight,
+//!   between `floor` and `ceiling`; `in_flight`, those that are;
+//!   `inflight_bytes`, the bytes held for them; and
+//!   `base_round_trip_seconds`, the base round trip the window is sized
+//!   against, `null` until measured;
 //! - `streamed_uploads`: remote multipart uploads that stream open local
 //!   uploads, or wait to be completed or aborted (§7.3);
 //! - `errors`: the latest flush error of each shard that has one, until
@@ -468,6 +474,14 @@ fn flush_status(status: &BucketStatus) -> Value {
         "conflict_policy": policy_name(status.conflict_policy),
         "conflicts": conflicts,
         "orphaned_uploads": gauges.orphaned_uploads,
+        "concurrency": status.concurrency.map(|window| json!({
+            "limit": window.limit,
+            "in_flight": window.in_flight,
+            "floor": window.floor,
+            "ceiling": window.ceiling,
+            "inflight_bytes": window.inflight_bytes,
+            "base_round_trip_seconds": window.base_round_trip.map(|base| base.as_secs_f64()),
+        })),
         "errors": errors,
         "backup": status.backup,
         // A backup target imports nothing (§8.9).
